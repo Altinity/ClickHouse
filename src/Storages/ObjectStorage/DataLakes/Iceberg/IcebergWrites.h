@@ -46,7 +46,6 @@ namespace DB
 
 String removeEscapedSlashes(const String & json_str);
 
-<<<<<<< HEAD
 String stringifyJSON(const Poco::Dynamic::Var & json, unsigned indent = 0);
 
 /// Per-file column statistics carried over verbatim from a source manifest entry during a manifest-only rewrite.
@@ -67,7 +66,6 @@ struct DataFileEntryLineage
     std::optional<Int64> file_sequence_number;
 };
 
-=======
 /// Read a data-file sidecar and return its contents in Iceberg wire format.
 /// The returned struct carries the row count, byte size, and per-column statistics.
 IcebergSerializedFileStats readDataFileSidecar(
@@ -99,7 +97,6 @@ IcebergSerializedFileStats serializeDataFileStats(
 /// \param per_file_stats  Per-file pre-serialized statistics (export-commit path).
 ///     When non-empty each entry overrides both the record count / file size AND the column
 ///     statistics for the corresponding file.  Leave empty to preserve the existing behaviour.
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 void generateManifestFile(
     Poco::JSON::Object::Ptr metadata,
     const std::vector<String> & partition_columns,
@@ -117,7 +114,6 @@ void generateManifestFile(
     WriteBuffer & buf,
     Iceberg::FileContentType content_type,
     std::optional<Int64> user_defined_sequence_number = std::nullopt,
-<<<<<<< HEAD
     /// Optional snapshot-id override for ADDED entries; used when regenerating a manifest whose
     /// adding snapshot is known from the source manifest-list entry (and may already be expired
     /// from table metadata), so rewritten entries keep the original lineage instead of being
@@ -132,7 +128,10 @@ void generateManifestFile(
     /// Optional per-file manifest-entry lineage parallel to `data_file_names`; when non-empty entries are written as EXISTING keeping their original snapshot-id and sequence number, else as ADDED by the new snapshot.
     const std::vector<DataFileEntryLineage> & per_file_entry_lineage = {},
     /// Optional schema to serialize into the manifest's Avro `schema` header; when null the table's current schema is used.
-    Poco::JSON::Object::Ptr schema_to_serialize = nullptr);
+    Poco::JSON::Object::Ptr schema_to_serialize = nullptr,
+    /// Optional per-file pre-serialized statistics (export-commit path). When non-empty each entry
+    /// overrides both the record count / file size AND the column statistics for the corresponding file.
+    const std::vector<IcebergSerializedFileStats> & per_file_stats = {});
 
 /// Per manifest-list entry file/row counts and lineage for rewritten manifests.
 struct ManifestListEntryCounts
@@ -152,9 +151,6 @@ struct ManifestListEntryCounts
     std::optional<Int64> added_snapshot_id;
     std::optional<Int64> added_sequence_number;
 };
-=======
-    const std::vector<IcebergSerializedFileStats> & per_file_stats = {});
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 void generateManifestList(
     const Iceberg::IcebergPathResolver & path_resolver,

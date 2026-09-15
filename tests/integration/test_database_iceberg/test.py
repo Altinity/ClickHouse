@@ -34,11 +34,8 @@ from pyiceberg.table.sorting import UNSORTED_SORT_ORDER
 from helpers.cluster import ClickHouseCluster
 from helpers.config_cluster import minio_secret_key, minio_access_key
 from helpers.client import QueryRuntimeException
-<<<<<<< HEAD
 from helpers.s3_tools import get_file_contents, list_s3_objects
-=======
 from helpers.test_tools import TSV
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 BASE_URL = "http://rest:8181/v1"
 
@@ -2014,9 +2011,6 @@ def test_iceberg_file_progress_callback(started_cluster):
     )
 
 
-<<<<<<< HEAD
-def test_alter_database_settings_not_supported(started_cluster):
-=======
 def test_namespace_filter(started_cluster):
     node = started_cluster.instances["node1"]
 
@@ -2235,8 +2229,7 @@ def _test_cluster_joins(started_cluster, join_mode):
     assert res == "Jack\tBlack\nJack\tSilver\nJohn\tBlack\nJohn\tSilver\n"
 
 
-def test_partitioning_by_time(started_cluster):
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+def test_alter_database_settings_not_supported(started_cluster):
     node = started_cluster.instances["node1"]
 
     db_name = f"iceberg_alter_settings_{uuid.uuid4().hex}"

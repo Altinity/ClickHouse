@@ -51,13 +51,9 @@ StoragePtr createQueueStorage(const StorageFactory::Arguments & args)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "External data source must have arguments");
 
     auto configuration = std::make_shared<Configuration>();
-<<<<<<< HEAD
     /// Parse with the create context so a `SETTINGS s3_allow_server_credentials_in_user_queries = 1` on the
     /// `CREATE` is honored (see `StorageS3Configuration::fromAST`); the processing context stays global below.
-    StorageObjectStorageConfiguration::initialize(*configuration, args.engine_args, args.getLocalContext(), false, &args.table_id);
-=======
-    configuration->initialize(args.engine_args, args.getContext(), false, &args.table_id);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+    configuration->initialize(args.engine_args, args.getLocalContext(), false, &args.table_id);
 
     // Use format settings from global server context + settings from
     // the SETTINGS clause of the create query. Settings from current

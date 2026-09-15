@@ -175,7 +175,6 @@ static bool isTemporaryMetadataFile(const String & file_name)
     return Poco::UUID{}.tryParse(substring);
 }
 
-<<<<<<< HEAD
 /// Parse an all-digit version string into Int32, mapping overflow/garbage to BAD_ARGUMENTS.
 /// std::stoi throws std::out_of_range for values above INT_MAX, which would surface as an
 /// opaque STD_EXCEPTION (see issue #109612) instead of a clean BAD_ARGUMENTS.
@@ -193,10 +192,7 @@ static Int32 parseMetadataVersion(const String & version_str, const String & fil
     return version;
 }
 
-static MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path)
-=======
 Iceberg::MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path)
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 {
     String file_name = std::filesystem::path(path).filename();
     if (isTemporaryMetadataFile(file_name))
@@ -1429,7 +1425,7 @@ MetadataFileWithInfo getLatestMetadataFileAndVersionWithCatalog(
     DataLake::TableMetadata table_metadata;
     table_metadata.withDataLakeSpecificProperties().withLocation();
     const auto & [namespace_name, table_name] = DataLake::parseTableName(table_identifier);
-    catalog->getTableMetadata(namespace_name, table_name, table_metadata);
+    catalog->getTableMetadata(namespace_name, table_name, local_context, table_metadata);
 
     auto specific_properties = table_metadata.getDataLakeSpecificProperties();
     if (!specific_properties.has_value() || specific_properties->iceberg_metadata_file_location.empty())

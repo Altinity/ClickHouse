@@ -11,11 +11,7 @@
 #include <Common/NamedCollections/NamedCollectionsFactory.h>
 #include <Core/QualifiedTableName.h>
 #include <base/defines.h>
-<<<<<<< HEAD
-=======
-#include <boost/algorithm/string/predicate.hpp>
 #include <Poco/String.h>
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 namespace DB
 {
@@ -1066,7 +1062,6 @@ void FunctionSecretArgumentsFinder::findYTsaurusStorageTableEngineSecretArgument
     markSecretArgument(2);
 }
 
-<<<<<<< HEAD
 void FunctionSecretArgumentsFinder::findBigQuerySecretArguments()
 {
     /// bigquery('project', 'dataset', 'table'[, 'access_token'][, key = value, ...])
@@ -1150,7 +1145,8 @@ void FunctionSecretArgumentsFinder::findBigQuerySecretArguments()
                 markSecretArgument(i);
         }
     }
-=======
+}
+
 void FunctionSecretArgumentsFinder::findIcebergTableEngineSecretArguments()
 {
     auto storage_type = findIcebergStorageType(0);
@@ -1161,7 +1157,6 @@ void FunctionSecretArgumentsFinder::findIcebergTableEngineSecretArguments()
         findAzureBlobStorageTableEngineSecretArguments();
 
     function->arguments->unskipArguments();
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 void FunctionSecretArgumentsFinder::findDatabaseEngineSecretArguments()

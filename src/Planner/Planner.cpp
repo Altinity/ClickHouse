@@ -186,13 +186,10 @@ namespace Setting
     extern const SettingsBool serialize_string_in_memory_with_zero_byte;
     extern const SettingsString temporary_files_codec;
     extern const SettingsNonZeroUInt64 temporary_files_buffer_size;
-<<<<<<< HEAD
     extern const SettingsBool make_distributed_plan;
     extern const SettingsBool query_plan_enable_optimizations;
     extern const SettingsUInt64 query_plan_max_limit_for_top_k_optimization;
-=======
     extern const SettingsBool use_hive_partitioning;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 namespace ServerSetting

@@ -328,22 +328,11 @@ CatalogTables GlueCatalog::listTablesInNamespaceDirect(const std::string & names
 
 bool GlueCatalog::existsTable(const std::string & database_name, const std::string & table_name) const
 {
-<<<<<<< HEAD
-    TableMetadata metadata;
-    return tryGetTableMetadata(database_name, table_name, metadata);
-=======
     if (!isNamespaceAllowed(database_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", database_name);
 
-    Aws::Glue::Model::GetTableRequest request;
-    request.SetDatabaseName(database_name);
-    request.SetName(table_name);
-
-    ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTable);
-    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTableMicroseconds);
-    auto outcome = glue_client->GetTable(request);
-    return outcome.IsSuccess();
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+    TableMetadata metadata;
+    return tryGetTableMetadata(database_name, table_name, getContext(), metadata);
 }
 
 bool GlueCatalog::tryGetTableMetadata(
@@ -668,16 +657,11 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
 
 void GlueCatalog::createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*metadata_content*/) const
 {
-<<<<<<< HEAD
-=======
     if (!isNamespaceAllowed(namespace_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to create table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
 
-    createNamespaceIfNotExists(namespace_name);
-
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     Aws::Glue::Model::CreateTableRequest request;
     request.SetDatabaseName(namespace_name);
 

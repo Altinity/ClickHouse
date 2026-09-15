@@ -489,17 +489,13 @@ void FutureSetFromSubquery::buildSetInplace(const ContextPtr & context)
     SizeLimits network_transfer_limits(settings[Setting::max_rows_to_transfer], settings[Setting::max_bytes_to_transfer], settings[Setting::transfer_overflow_mode]);
     auto prepared_sets_cache = context->getPreparedSetsCache();
 
-<<<<<<< HEAD
     if (settings[Setting::make_distributed_plan])
     {
         prepareForDistributedPlan(context);
         prepared_sets_cache = nullptr;
     }
 
-    auto plan = build(network_transfer_limits, prepared_sets_cache);
-=======
     auto plan = build_unsafe(network_transfer_limits, prepared_sets_cache);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
     if (!plan)
         return;
@@ -556,7 +552,6 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
     const auto & settings = context->getSettingsRef();
     SizeLimits network_transfer_limits(settings[Setting::max_rows_to_transfer], settings[Setting::max_bytes_to_transfer], settings[Setting::transfer_overflow_mode]);
 
-<<<<<<< HEAD
     /// This is a *speculative* build, run during primary key / skip index analysis so that index
     /// analysis can use the set. Prefer a build that does not destroy the canonical `source` plan: if
     /// the in-place pipeline stops without creating the set (e.g. a subquery timeout with
@@ -594,19 +589,6 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
     std::unique_ptr<QueryPlan> plan;
     bool source_preserved = false;
     if (!set_and_key->external_table)
-=======
-    auto plan = build_unsafe(network_transfer_limits, prepared_sets_cache);
-    if (!plan)
-        return nullptr;
-
-    set_and_key->set->fillSetElements();
-    auto builder = plan->buildQueryPipeline(QueryPlanOptimizationSettings(context), BuildQueryPipelineSettings(context));
-    auto pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
-    pipeline.complete(std::make_shared<EmptySink>(std::make_shared<const Block>(Block())));
-
-    CompletedPipelineExecutor executor(pipeline);
-    if (context->hasQueryContext())
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     {
         try
         {
@@ -688,7 +670,7 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
         /// `CreatingSetStep` to the canonical `set_and_key` (as this code always did). On a silent failure
         /// `source` is gone, so the deferred build cannot rebuild — exactly the previous behavior; the set
         /// is never reused with partial rows, because the deferred build throws "Not-ready Set" instead.
-        plan = build(network_transfer_limits, prepared_sets_cache);
+        plan = build_unsafe(network_transfer_limits, prepared_sets_cache);
         if (!plan)
             return nullptr;
 

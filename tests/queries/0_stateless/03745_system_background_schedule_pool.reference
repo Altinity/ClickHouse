@@ -1,11 +1,7 @@
 1
 buffer_flush	default	test_buffer_03745	1	StorageBuffer (default.test_buffer_03745)/Bg
 schedule	default	test_merge_tree_03745	1	BackgroundJobsAssignee:DataProcessing
-<<<<<<< HEAD
-=======
 schedule	default	test_merge_tree_03745	1	BackgroundJobsAssignee:Moving
-schedule	default	test_merge_tree_03745	1	BackgroundJobsAssignee:Streaming
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 schedule	default	test_merge_tree_03745	1	default.test_merge_tree_03745 (CleanupThread)
 streaming	default	test_merge_tree_03745	1	BackgroundJobsAssignee:Streaming
 distributed	default	test_distributed_03745	1	default.test_distributed_03745.DistributedInsertQueue.default/Bg

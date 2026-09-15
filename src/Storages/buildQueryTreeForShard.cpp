@@ -1117,13 +1117,8 @@ public:
     {
         if (auto * join_node = node->as<JoinNode>())
         {
-<<<<<<< HEAD
-            bool prefer_local_join = getContext()->getSettingsRef()[Setting::parallel_replicas_prefer_local_join];
-            bool should_use_global_join = !prefer_local_join || !allStoragesAreMergeTree(join_node->getRightTableExpressionNode());
-=======
             bool prefer_local_join = !force_prefer_local_join && getContext()->getSettingsRef()[Setting::parallel_replicas_prefer_local_join];
-            bool should_use_global_join = !prefer_local_join || !allStoragesAreMergeTree(join_node->getRightTableExpression());
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+            bool should_use_global_join = !prefer_local_join || !allStoragesAreMergeTree(join_node->getRightTableExpressionNode());
             if (should_use_global_join)
                 join_node->setLocality(JoinLocality::Global);
         }

@@ -124,13 +124,10 @@ extern const int ICEBERG_SPECIFICATION_VIOLATION;
 extern const int S3_ERROR;
 extern const int TABLE_ALREADY_EXISTS;
 extern const int SUPPORT_IS_DISABLED;
-<<<<<<< HEAD
 extern const int FILE_ALREADY_EXISTS;
-=======
 extern const int METADATA_MISMATCH;
 extern const int UNFINISHED;
 extern const int INCORRECT_DATA;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 namespace Setting
@@ -274,14 +271,10 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
         .metadata_compression_method = compression_method,
         .table_path = table_path,
         .table_uuid = table_uuid,
-<<<<<<< HEAD
         .path_resolver = IcebergPathResolver(
             table_location, root_derivation.table_root, configuration->getTypeName(), configuration->getNamespace()),
         .table_root_was_derived = root_derivation.relation == IcebergPathResolver::RootRelation::AdoptedDescendant,
-=======
-        .path_resolver = IcebergPathResolver(table_location, table_path, configuration->getTypeName(), configuration->getNamespace()),
         .common_namespace = configuration->getNamespace(),
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     };
 }
 
@@ -683,11 +676,7 @@ IcebergMetadata::getState(const ContextPtr & local_context, const String & metad
     auto dump_metadata = [&]()->String { return dumpMetadataObjectToString(metadata_object); };
     insertRowToLogTable(
         local_context,
-<<<<<<< HEAD
-        [&] { return dumpMetadataObjectToString(metadata_object); },
-=======
         dump_metadata,
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         DB::IcebergMetadataLogLevel::Metadata,
         persistent_components.path_resolver.getTableRoot(),
         Iceberg::IcebergPathFromMetadata::deserialize(metadata_path),
@@ -907,7 +896,7 @@ void IcebergMetadata::createInitial(
     if (catalog_manages_location)
     {
         DataLake::TableMetadata existing_table;
-        if (catalog->tryGetTableMetadata(namespace_name, table_name, existing_table))
+        if (catalog->tryGetTableMetadata(namespace_name, table_name, local_context, existing_table))
         {
             if (if_not_exists)
                 return;
@@ -1411,7 +1400,7 @@ std::optional<String> IcebergMetadata::sortingKey(ContextPtr context) const
         persistent_components.metadata_compression_method,
         persistent_components.table_uuid);
     auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
-    const auto & ch_schema = *persistent_components.schema_processor->getClickhouseTableSchemaById(current_schema_id);
+    const auto & ch_schema = *persistent_components.schema_processor->getClickHouseTableSchemaById(current_schema_id);
     auto display = getSortingKeyDisplayStringFromMetadata(metadata_object, ch_schema);
     if (display)
         return display;
@@ -1710,7 +1699,7 @@ std::optional<String> IcebergMetadata::getPartitionKey(ContextPtr local_context,
     auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
     return getPartitionKeyStringFromMetadata(
         metadata_object,
-        *persistent_components.schema_processor->getClickhouseTableSchemaById(current_schema_id),
+        *persistent_components.schema_processor->getClickHouseTableSchemaById(current_schema_id),
         local_context);
 }
 
@@ -1732,7 +1721,6 @@ KeyDescription IcebergMetadata::getSortingKey(ContextPtr local_context, TableSta
     return result;
 }
 
-<<<<<<< HEAD
 DataLakeMetadataPtr IcebergMetadata::createWithDeserialization(
     const ObjectStoragePtr & object_storage,
     const StorageObjectStorageConfigurationWeakPtr & configuration,
@@ -1776,7 +1764,8 @@ DataLakeMetadataPtr IcebergMetadata::createWithDeserialization(
         .table_root_was_derived = false};
     auto metadata = std::make_unique<IcebergMetadata>(object_storage, configuration.lock(), std::move(deserialized_persistent_components), local_context);
     return metadata;
-=======
+}
+
 SinkToStoragePtr IcebergMetadata::import(
     std::shared_ptr<DataLake::ICatalog> catalog,
     const std::function<void(const std::string &)> & new_file_path_callback,
@@ -2064,6 +2053,12 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 *buffer_manifest_entry,
                 Iceberg::FileContentType::DATA,
                 /* user_defined_sequence_number */ std::nullopt,
+                /* user_defined_snapshot_id */ std::nullopt,
+                /* data_file_formats */ {},
+                /* per_file_statistics */ {},
+                /* data_file_sort_order_ids */ {},
+                /* per_file_entry_lineage */ {},
+                /* schema_to_serialize */ nullptr,
                 per_file_stats);
             buffer_manifest_entry->finalize();
             manifest_lengths += buffer_manifest_entry->count();
@@ -2332,7 +2327,6 @@ Poco::JSON::Object::Ptr IcebergMetadata::getMetadataJSON(ContextPtr local_contex
         log,
         persistent_components.metadata_compression_method,
         persistent_components.table_uuid);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 }

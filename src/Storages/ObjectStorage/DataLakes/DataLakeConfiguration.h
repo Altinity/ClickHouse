@@ -22,15 +22,11 @@
 #include <Storages/StorageFactory.h>
 #include <Storages/ColumnsDescription.h>
 #include <Formats/FormatFilterInfo.h>
-<<<<<<< HEAD
 #include <Formats/FormatFactory.h>
-=======
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTSetQuery.h>
-#include <Disks/DiskType.h>
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 #include <optional>
 #include <memory>
 #include <string>
@@ -431,7 +427,6 @@ public:
 #endif
     }
 
-<<<<<<< HEAD
     bool supportsLazyMaterialization(StorageMetadataPtr storage_metadata_snapshot, ContextPtr context) const override
     {
         assertInitialized();
@@ -443,7 +438,8 @@ public:
     bool dataFilesAreImmutable() const override
     {
         return true;
-=======
+    }
+
     bool isClusterSupported() const override { return is_cluster_supported; }
 
     ASTPtr createArgsWithAccessData() const override
@@ -480,7 +476,6 @@ public:
         }
 
         return res;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     }
 
 private:

@@ -205,11 +205,8 @@ namespace Setting
     extern const SettingsBool table_engine_read_through_distributed_cache;
     extern const SettingsUInt64 s3_path_filter_limit;
     extern const SettingsBool use_parquet_metadata_cache;
-<<<<<<< HEAD
     extern const SettingsBool s3_validate_etag_on_read;
-=======
     extern const SettingsBool use_object_storage_list_objects_cache;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
 }
 
@@ -1336,14 +1333,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         else
         {
             ProfileEvents::increment(ProfileEvents::ObjectStorageReadObjects);
-<<<<<<< HEAD
             compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->compression_method);
             read_buf = createReadBuffer(
                 object_info->relative_path_with_metadata, object_storage, context_, log, std::nullopt, !headers_requested);
-=======
-            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->getCompressionMethod());
-            read_buf = createReadBuffer(object_info->relative_path_with_metadata, object_storage, context_, log);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         }
 
         Block initial_header = read_from_format_info.format_header;

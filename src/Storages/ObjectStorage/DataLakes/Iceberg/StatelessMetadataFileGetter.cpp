@@ -183,11 +183,7 @@ ManifestFileCacheKeys getManifestList(
         auto dump_metadata = [&]()->String { return manifest_list_deserializer.getMetadataContent(); };
         insertRowToLogTable(
             local_context,
-<<<<<<< HEAD
-            [&] { return manifest_list_deserializer.getMetadataContent(); },
-=======
             dump_metadata,
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
             DB::IcebergMetadataLogLevel::ManifestListMetadata,
             persistent_table_components.path_resolver.getTableRoot(),
             filename,
@@ -253,11 +249,7 @@ ManifestFileCacheKeys getManifestList(
             auto dump_row_metadata = [&]()->String { return manifest_list_deserializer.getContent(i); };
             insertRowToLogTable(
                 local_context,
-<<<<<<< HEAD
-                [&] { return manifest_list_deserializer.getContent(i); },
-=======
                 dump_row_metadata,
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
                 DB::IcebergMetadataLogLevel::ManifestListEntry,
                 persistent_table_components.path_resolver.getTableRoot(),
                 filename,

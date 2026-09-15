@@ -41,12 +41,9 @@
 #include <Poco/Timestamp.h>
 #include <Common/ThreadPool_fwd.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
-<<<<<<< HEAD
 #include <Storages/MergeTree/PatchParts/PatchPartIndex.h>
-=======
 #include <Storages/MergeTree/MergeTreePartExportStatus.h>
 #include <Storages/MergeTree/MergeTreePartExportManifest.h>
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/ordered_index.hpp>
@@ -1602,11 +1599,8 @@ protected:
     friend class VersionMetadataOnDisk; // for access to log
     friend class VersionMetadataOnKeeper; // for access to log
     friend class MutationsState; // for access to log
-<<<<<<< HEAD
     friend class UniqueKeyDenseIndexOps; // for access to log + data_parts_by_info
-=======
     friend class ExportPartTask;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
     bool require_part_metadata;
 

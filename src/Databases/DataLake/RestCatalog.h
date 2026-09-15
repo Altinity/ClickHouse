@@ -93,24 +93,6 @@ public:
 
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
 
-<<<<<<< HEAD
-=======
-    String getClientId() const { return client_id; }
-    String getClientSecret() const { return client_secret; }
-
-protected:
-    RestCatalog(
-        const std::string & warehouse_,
-        const std::string & base_url_,
-        const std::string & auth_scope_,
-        const std::string & oauth_server_uri_,
-        bool oauth_server_use_request_body_,
-        const std::string & namespaces_,
-        DB::ContextPtr context_);
-
-    void createNamespaceIfNotExists(const String & namespace_name, const String & location) const;
-
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     struct Config
     {
         /// Prefix is a path of the catalog endpoint,
@@ -161,6 +143,7 @@ protected:
         const std::string & auth_scope_,
         const std::string & oauth_server_uri_,
         bool oauth_server_use_request_body_,
+        const std::string & namespaces_,
         DB::ContextPtr context_);
 
     void createNamespaceIfNotExists(const String & namespace_name, const String & location) const override;
@@ -360,13 +343,9 @@ public:
         const std::string & google_adc_client_secret_,
         const std::string & google_adc_refresh_token_,
         const std::string & google_adc_quota_project_id_,
-<<<<<<< HEAD
+        const std::string & namespaces_,
         DB::ContextPtr context_,
         bool allow_server_credentials_in_user_queries_);
-=======
-        const std::string & namespaces_,
-        DB::ContextPtr context_);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
     DB::DatabaseDataLakeCatalogType getCatalogType() const override
     {
@@ -433,6 +412,7 @@ public:
         const std::string & auth_header_,
         const std::string & oauth_server_uri_,
         bool oauth_server_use_request_body_,
+        const std::string & namespaces_,
         DB::ContextPtr context_);
 
     DB::DatabaseDataLakeCatalogType getCatalogType() const override

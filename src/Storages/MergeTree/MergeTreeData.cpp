@@ -12,15 +12,12 @@
 
 #include <Storages/MergeTree/ExportList.h>
 #include <Access/AccessControl.h>
-<<<<<<< HEAD
 #if CLICKHOUSE_CLOUD
 #include <Access/ContextAccess.h>
 #include <Access/EnabledMaskingPolicies.h>
 #include <Access/MaskingPolicy.h>
 #endif
-=======
 #include <TableFunctions/TableFunctionFactory.h>
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 #include <AggregateFunctions/AggregateFunctionCount.h>
 #include <Analyzer/QueryTreeBuilder.h>
 #include <Analyzer/Utils.h>
@@ -31,9 +28,7 @@
 #include <Columns/ColumnAggregateFunction.h>
 #include <Columns/ColumnConst.h>
 #include <Compression/CompressedReadBuffer.h>
-<<<<<<< HEAD
 #include <Compression/CompressionCodecQuantized.h>
-=======
 #include <Storages/MergeTree/ExportPartTask.h>
 #include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Interpreters/ActionsDAG.h>
@@ -41,7 +36,6 @@
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Processors/QueryPlan/QueryPlan.h>
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 #include <Compression/CompressionFactory.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <Core/QueryProcessingStage.h>
@@ -164,11 +158,8 @@
 #include <Common/scope_guard_safe.h>
 #include <Common/thread_local_rng.h>
 #include <Common/typeid_cast.h>
-<<<<<<< HEAD
 #include <Common/formatReadable.h>
-=======
 #include <Functions/generateSnowflakeID.h>
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 #include <boost/algorithm/string/join.hpp>
 
@@ -458,13 +449,10 @@ namespace ErrorCodes
     extern const int DATA_TYPE_CANNOT_BE_USED_IN_KEY;
     extern const int TOO_LARGE_LIGHTWEIGHT_UPDATES;
     extern const int FAULT_INJECTED;
-<<<<<<< HEAD
     extern const int TABLE_IS_PERMANENTLY_READ_ONLY;
-=======
     extern const int UNKNOWN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
     extern const int PENDING_MUTATIONS_NOT_ALLOWED;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 namespace FailPoints
@@ -6332,15 +6320,9 @@ void MergeTreeData::changeSettings(
 {
     if (new_settings)
     {
-<<<<<<< HEAD
-        bool has_storage_policy_changed = false;
-
         auto new_changes = new_settings->as<const ASTSetQuery &>().changes;
         MergeTreeSettings::resolveDiskSetting(new_changes, getContext(), /*is_loading_from_existing_metadata=*/true);
 
-=======
-        const auto & new_changes = new_settings->as<const ASTSetQuery &>().changes;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         StoragePolicyPtr new_storage_policy = nullptr;
 
         for (const auto & change : new_changes)
@@ -11886,6 +11868,16 @@ try
             element.rows = (*merge_entry)->rows_written;
             element.peak_memory_usage = (*merge_entry)->getMemoryTracker().getPeak();
         }
+        else if (exports_entry)
+        {
+            element.rows_read = (*exports_entry)->rows_read;
+            element.bytes_read_uncompressed = (*exports_entry)->bytes_read_uncompressed;
+            element.peak_memory_usage = (*exports_entry)->getPeakMemoryUsage();
+            element.query_id = (*exports_entry)->query_id;
+
+            /// no need to lock because at this point no one is writing to the destination file paths
+            element.remote_file_paths = (*exports_entry)->destination_file_paths;
+        }
 
         if (profile_counters)
         {
@@ -11894,69 +11886,8 @@ try
 
         element.mutation_ids = mutation_ids;
 
-<<<<<<< HEAD
         element.projections_duration_ms = projections_duration_ms;
     });
-=======
-    /// TODO: Stop stopwatch in outer code to exclude ZK timings and so on
-    part_log_elem.duration_ms = elapsed_ns / 1000000;
-
-    part_log_elem.database_name = table_id.database_name;
-    part_log_elem.table_name = table_id.table_name;
-    part_log_elem.table_uuid = table_id.uuid;
-    part_log_elem.partition_id = MergeTreePartInfo::fromPartName(new_part_name, format_version).getPartitionId();
-
-    if (result_part)
-        part_log_elem.partition = result_part->partition.serializeToString(result_part->getMetadataSnapshot());
-    else if (!source_parts.empty())
-        part_log_elem.partition = source_parts.front()->partition.serializeToString(source_parts.front()->getMetadataSnapshot());
-
-    part_log_elem.part_name = new_part_name;
-
-    if (result_part)
-    {
-        part_log_elem.disk_name = result_part->getDataPartStorage().getDiskName();
-        part_log_elem.path_on_disk = result_part->getDataPartStorage().getFullPath();
-        part_log_elem.bytes_compressed_on_disk = result_part->getBytesOnDisk();
-        part_log_elem.bytes_uncompressed = result_part->getBytesUncompressedOnDisk();
-        part_log_elem.rows = result_part->rows_count;
-        part_log_elem.part_format = result_part->getFormat();
-    }
-
-    part_log_elem.source_part_names.reserve(source_parts.size());
-    for (const auto & source_part : source_parts)
-        part_log_elem.source_part_names.push_back(source_part->name);
-
-    if (merge_entry)
-    {
-        part_log_elem.rows_read = (*merge_entry)->rows_read;
-        part_log_elem.bytes_read_uncompressed = (*merge_entry)->bytes_read_uncompressed;
-
-        part_log_elem.rows = (*merge_entry)->rows_written;
-        part_log_elem.peak_memory_usage = (*merge_entry)->getMemoryTracker().getPeak();
-    }
-    else if (exports_entry)
-    {
-        part_log_elem.rows_read = (*exports_entry)->rows_read;
-        part_log_elem.bytes_read_uncompressed = (*exports_entry)->bytes_read_uncompressed;
-        part_log_elem.peak_memory_usage = (*exports_entry)->getPeakMemoryUsage();
-        part_log_elem.query_id = (*exports_entry)->query_id;
-
-        /// no need to lock because at this point no one is writing to the destination file paths
-        part_log_elem.remote_file_paths = (*exports_entry)->destination_file_paths;
-    }
-
-    if (profile_counters)
-    {
-        part_log_elem.profile_counters = profile_counters;
-    }
-
-    part_log_elem.mutation_ids = mutation_ids;
-
-    part_log_elem.projections_duration_ms = projections_duration_ms;
-
-    part_log->add(std::move(part_log_elem));
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 catch (...)
 {

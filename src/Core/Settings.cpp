@@ -9017,11 +9017,6 @@ Source SQL dialect for the polyglot transpiler (e.g. 'sqlite', 'mysql', 'postgre
     DECLARE(Bool, enable_adaptive_memory_spill_scheduler, false, R"(
 Trigger processor to spill data into external storage adpatively. grace join is supported at present.
 )", EXPERIMENTAL) \
-<<<<<<< HEAD
-    DECLARE_WITH_ALIAS(Bool, allow_delta_kernel_rs, true, R"(
-Allow the `delta-kernel-rs` implementation for reading Delta Lake tables.
-)", BETA, allow_experimental_delta_kernel_rs) \
-=======
     DECLARE(String, object_storage_cluster, "", R"(
 Cluster to make distributed requests to object storages with alternative syntax.
 )", EXPERIMENTAL) \
@@ -9031,10 +9026,9 @@ Possible values:
 - Positive integer.
 - 0 — All hosts in cluster.
 )", EXPERIMENTAL) \
-    DECLARE(Bool, allow_experimental_delta_kernel_rs, true, R"(
-Allow experimental delta-kernel-rs implementation.
-)", BETA) \
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+    DECLARE_WITH_ALIAS(Bool, allow_delta_kernel_rs, true, R"(
+Allow the `delta-kernel-rs` implementation for reading Delta Lake tables.
+)", BETA, allow_experimental_delta_kernel_rs) \
     DECLARE_WITH_ALIAS(Bool, allow_insert_into_iceberg, false, R"(
 Allow to execute `insert` queries into iceberg.
 )", BETA, allow_experimental_insert_into_iceberg) \
@@ -9304,12 +9298,9 @@ If false (default), AI functions refuse to use a named-collection `endpoint` tha
 
 #define OBSOLETE_SETTINGS(M, ALIAS) \
     /** Obsolete settings which are kept around for compatibility reasons. They have no effect anymore. */ \
-<<<<<<< HEAD
     MAKE_OBSOLETE(M, Bool, distributed_cache_use_clients_cache_for_write, false) \
-=======
     MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_manifest_ttl, 86400) \
     MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_max_retries, 3) \
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     MAKE_OBSOLETE(M, Bool, allow_experimental_query_deduplication, false) \
     MAKE_OBSOLETE(M, Bool, query_condition_cache_store_conditions_as_plaintext, false) \
     MAKE_OBSOLETE(M, Bool, update_insert_deduplication_token_in_dependent_materialized_views, 0) \

@@ -2885,13 +2885,12 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
             required_access.emplace_back(AccessType::SYSTEM_DROP_FORMAT_SCHEMA_CACHE);
             break;
         case Type::CLEAR_S3_CLIENT_CACHE:
-<<<<<<< HEAD
             required_access.emplace_back(AccessType::SYSTEM_DROP_S3_CLIENT_CACHE);
             break;
-        case Type::CLEAR_DISTRIBUTED_CACHE:
-=======
         case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+            required_access.emplace_back(AccessType::SYSTEM_DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE);
+            break;
+        case Type::CLEAR_DISTRIBUTED_CACHE:
         {
             required_access.emplace_back(AccessType::SYSTEM_DROP_DISTRIBUTED_CACHE);
             break;

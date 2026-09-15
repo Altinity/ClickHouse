@@ -282,6 +282,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::auth_header],
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -298,6 +299,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::auth_header],
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -350,13 +352,9 @@ void DatabaseDataLake::initialize() const
                 google_adc_client_secret,
                 google_adc_refresh_token,
                 google_adc_quota_project_id,
-<<<<<<< HEAD
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 Context::getGlobalContextInstance(),
                 allow_server_credentials_in_user_queries);
-=======
-                settings[DatabaseDataLakeSetting::namespaces].value,
-                Context::getGlobalContextInstance());
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
             break;
         }
         case DB::DatabaseDataLakeCatalogType::UNITY:
@@ -472,7 +470,6 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
     return catalog_impl;
 }
 
-<<<<<<< HEAD
 void DatabaseDataLake::initializeOrLeaveUnavailable() const
 {
     try
@@ -507,10 +504,7 @@ void DatabaseDataLake::resetCatalog(String reason) const
     catalog_unavailable_reason = std::move(reason);
 }
 
-std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfiguration(
-=======
 StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     DatabaseDataLakeStorageType type,
     DataLakeStorageSettingsPtr storage_settings) const
 {
@@ -950,25 +944,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     const auto catalog_uuid = table_metadata.getTableUUID();
     const UUID table_uuid = catalog_uuid ? parseFromString<UUID>(*catalog_uuid) : UUIDHelpers::Nil;
 
-<<<<<<< HEAD
-    if (can_use_parallel_replicas && !is_secondary_query)
-    {
-        auto storage_id = StorageID(getDatabaseName(), name, table_uuid);
-        auto storage_cluster = std::make_shared<StorageObjectStorageCluster>(
-            parallel_replicas_cluster_name,
-            configuration,
-            configuration->createObjectStorage(context_copy, /* is_readonly */ false, get_credentials_refresh_callback(storage_id)),
-            storage_id,
-            columns,
-            ConstraintsDescription{},
-            nullptr,
-            context_,
-            /// Use is_table_function = true,
-            /// because this table is actually stateless like a table function.
-            /* is_table_function */true);
-=======
     std::string cluster_name = configuration->isClusterSupported() ? settings[DatabaseDataLakeSetting::object_storage_cluster].value : "";
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
     if (cluster_name.empty() && can_use_parallel_replicas && !is_secondary_query)
         cluster_name = parallel_replicas_cluster_name;
@@ -976,12 +952,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     auto storage_cluster = std::make_shared<StorageObjectStorageCluster>(
         cluster_name,
         configuration,
-<<<<<<< HEAD
         configuration->createObjectStorage(context_copy, /* is_readonly */ false, get_credentials_refresh_callback(StorageID(getDatabaseName(), name, table_uuid))),
-        context_copy,
-=======
-        configuration->createObjectStorage(context_copy, /* is_readonly */ false, catalog->getCredentialsConfigurationCallback(StorageID(getDatabaseName(), name, table_uuid))),
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         StorageID(getDatabaseName(), name, table_uuid),
         /* columns */columns,
         /* constraints */ConstraintsDescription{},
@@ -1492,7 +1463,6 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Engine `{}` must have arguments", database_engine_name);
         }
 
-<<<<<<< HEAD
         if (database_engine_name == "Iceberg"
             && catalog_type != DatabaseDataLakeCatalogType::ICEBERG_REST
             && catalog_type != DatabaseDataLakeCatalogType::S3_TABLES
@@ -1501,11 +1471,6 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
         {
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Engine `Iceberg` must use `rest`, `s3tables`, `biglake`, or `onelake` catalog type only");
-=======
-        if (database_engine_name == "Iceberg" && catalog_type != DatabaseDataLakeCatalogType::ICEBERG_REST)
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Engine `Iceberg` must have `rest` catalog type only");
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         }
 
         for (auto & engine_arg : engine_args)

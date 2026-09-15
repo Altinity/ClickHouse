@@ -63,13 +63,8 @@ TEST(IcebergSchemaProcessor, GetSimpleTypeDate)
 
 TEST(IcebergSchemaProcessor, GetSimpleTypeTime)
 {
-<<<<<<< HEAD
-    auto type = IcebergSchemaProcessor::getSimpleType("time");
-    EXPECT_EQ(type->getName(), "Int64");
-=======
     auto type = IcebergSchemaProcessor::getSimpleType("time", getContext().context);
-    EXPECT_EQ(type->getName(), "Time64(6)");
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+    EXPECT_EQ(type->getName(), "Int64");
 }
 
 TEST(IcebergSchemaProcessor, GetSimpleTypeTimestamp)

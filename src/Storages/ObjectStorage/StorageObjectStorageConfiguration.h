@@ -376,7 +376,8 @@ public:
         return 0;
     }
 
-<<<<<<< HEAD
+    virtual bool isClusterSupported() const { return true; }
+
     String format = "auto";
     String compression_method = "auto";
     String structure = "auto";
@@ -393,9 +394,6 @@ public:
     /// Set when `initPartitionStrategy` evaluates an omitted partition strategy.
     bool partition_strategy_was_inferred = false;
     std::shared_ptr<IPartitionStrategy> partition_strategy;
-=======
-    virtual bool isClusterSupported() const { return true; }
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
     /// Set by the storage when it is being loaded from existing metadata (server startup or RESTORE), so the
     /// S3 client build can downgrade restricted server-managed credentials to anonymous instead of aborting
@@ -410,7 +408,6 @@ public:
     /// server startup/upgrade. Defaults to true so table functions keep strict validation.
     bool is_create_query = true;
 
-<<<<<<< HEAD
     /// Set for server-internal tables (e.g. the system log-pipeline S3Queue tables) so their S3 client build
     /// always downgrades restricted server-managed credentials to anonymous instead of aborting, even when the
     /// operator disabled `s3_load_table_anonymously_if_credentials_restricted`. Not user-controllable: user
@@ -422,22 +419,6 @@ public:
     /// collection. `initialize` materializes it back into the engine args so that the persisted
     /// DDL does not depend on the setting at attach time.
     String url_overridden_by_base_setting;
-=======
-private:
-    String format = "auto";
-    String compression_method = "auto";
-    String structure = "auto";
-
-    PartitionStrategyFactory::StrategyType partition_strategy_type = PartitionStrategyFactory::StrategyType::NONE;
-    std::shared_ptr<IPartitionStrategy> partition_strategy;
-    /// Whether partition column values are contained in the actual data.
-    /// And alternative is with hive partitioning, when they are contained in file path.
-    bool partition_columns_in_data_file = true;
-    /// Tracks whether `partition_columns_in_data_file` was explicitly provided by the user.
-    /// When false, `initPartitionStrategy` recomputes the default once the effective strategy is known
-    /// (which may have been chosen implicitly via `file_like_engine_default_partition_strategy`).
-    bool partition_columns_in_data_file_was_set = false;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 protected:
     void initializeFromParsedArguments(const StorageParsedArguments & parsed_arguments);

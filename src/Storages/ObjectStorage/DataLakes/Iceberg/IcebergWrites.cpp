@@ -346,13 +346,13 @@ String removeEscapedSlashes(const String & json_str)
     return result;
 }
 
-<<<<<<< HEAD
 String stringifyJSON(const Poco::Dynamic::Var & json, unsigned indent)
 {
     std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
     Poco::JSON::Stringifier::stringify(json, oss, indent);
     return removeEscapedSlashes(oss.str());
-=======
+}
+
 IcebergSerializedFileStats readDataFileSidecar(
     const String & sidecar_storage_path,
     const ObjectStoragePtr & object_storage,
@@ -505,7 +505,6 @@ IcebergSerializedFileStats serializeDataFileStats(
     serialize_bounds(stats.getUpperBounds(), result.upper_bounds);
 
     return result;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 static void extendSchemaForPartitions(
@@ -608,16 +607,13 @@ void generateManifestFile(
     WriteBuffer & buf,
     Iceberg::FileContentType content_type,
     std::optional<Int64> user_defined_sequence_number,
-<<<<<<< HEAD
     std::optional<Int64> user_defined_snapshot_id,
     const std::vector<String> & data_file_formats,
     const std::vector<DataFileColumnStatistics> & per_file_statistics,
     const std::vector<std::optional<Int32>> & data_file_sort_order_ids,
     const std::vector<DataFileEntryLineage> & per_file_entry_lineage,
-    Poco::JSON::Object::Ptr schema_to_serialize)
-=======
+    Poco::JSON::Object::Ptr schema_to_serialize,
     const std::vector<IcebergSerializedFileStats> & per_file_stats)
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 {
     chassert(
         data_file_formats.empty() || data_file_formats.size() == data_file_names.size(),
@@ -713,7 +709,6 @@ void generateManifestFile(
         data_file.field(Iceberg::f_file_format)
             = avro::GenericDatum(data_file_formats.empty() ? format : data_file_formats[file_idx]);
 
-<<<<<<< HEAD
         /// Writes (field-id, value) pairs into the union-typed `field_name` array of the data_file record.
         auto set_fields = [&]<typename K, typename T, typename U>(
                               const std::vector<std::pair<K, T>> & statistics, const std::string & field_name, U && dump_function)
@@ -732,41 +727,8 @@ void generateManifestFile(
             }
         };
 
-        if (!per_file_statistics.empty())
-        {
-            /// Manifest-only rewrite: carry over the source file's column stats verbatim.
-            const auto & stats = per_file_statistics[file_idx];
-            /// Bounds are raw bytes; convert to std::vector<uint8_t> to produce an Avro `bytes` datum.
-            auto to_bytes = [](Int32, const String & value)
-            { return std::vector<uint8_t>(value.begin(), value.end()); };
-            set_fields(stats.column_sizes, Iceberg::f_column_sizes, [](Int32, Int64 value) { return value; });
-            set_fields(stats.value_counts, Iceberg::f_value_counts, [](Int32, Int64 value) { return value; });
-            set_fields(stats.null_value_counts, Iceberg::f_null_value_counts, [](Int32, Int64 value) { return value; });
-            set_fields(stats.lower_bounds, Iceberg::f_lower_bounds, to_bytes);
-            set_fields(stats.upper_bounds, Iceberg::f_upper_bounds, to_bytes);
-        }
-        else if (data_file_statistics)
-        {
-            auto statistics = data_file_statistics->getColumnSizes();
-            set_fields(statistics, Iceberg::f_column_sizes, [](size_t, size_t value) { return static_cast<Int64>(value); });
-
-            statistics = data_file_statistics->getNullCounts();
-            set_fields(statistics, Iceberg::f_null_value_counts, [](size_t, size_t value) { return static_cast<Int64>(value); });
-
-            std::unordered_map<size_t, size_t> field_id_to_column_index;
-            auto field_ids = data_file_statistics->getFieldIds();
-            for (size_t i = 0; i < field_ids.size(); ++i)
-                field_id_to_column_index[field_ids[i]] = i;
-
-            auto dump_fields = [&](size_t field_id, Field value)
-            { return dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_column_index.at(field_id)]); };
-
-            auto lower_statistics = data_file_statistics->getLowerBounds();
-            if (canWriteStatistics(lower_statistics, field_id_to_column_index, sample_block))
-=======
-        /// vibe coded - needs extra attention
         /// Export path: per-file serialized stats override everything (record count, file size,
-        /// and all column statistics).  Existing insert/mutation paths use the aggregate path below.
+        /// and all column statistics).  Existing insert/mutation paths use the branches below.
         if (!per_file_stats.empty() && file_idx < per_file_stats.size())
         {
             const auto & pf = per_file_stats[file_idx];
@@ -790,7 +752,6 @@ void generateManifestFile(
             };
 
             auto write_bytes_map = [&](const std::vector<std::pair<Int32, std::vector<uint8_t>>> & entries, const String & field_name)
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
             {
                 if (entries.empty())
                     return;
@@ -818,26 +779,21 @@ void generateManifestFile(
         }
         else
         {
-            /// Regular INSERT / mutation path: aggregate column statistics applied to every file.
-            if (data_file_statistics)
+            if (!per_file_statistics.empty())
             {
-                auto set_fields = [&]<typename T, typename U>(
-                                      const std::vector<std::pair<size_t, T>> & statistics, const std::string & field_name, U && dump_function)
-                {
-                    auto & data_file_record = data_file.field(field_name);
-                    data_file_record.selectBranch(1);
-                    auto & record_values = data_file_record.value<avro::GenericArray>();
-                    auto schema_element = record_values.schema()->leafAt(0);
-                    for (const auto & [field_id, value] : statistics)
-                    {
-                        avro::GenericDatum record_datum(schema_element);
-                        auto & record = record_datum.value<avro::GenericRecord>();
-                        record.field(Iceberg::f_key) = static_cast<Int32>(field_id);
-                        record.field(Iceberg::f_value) = dump_function(field_id, value);
-                        record_values.value().push_back(record_datum);
-                    }
-                };
-
+                /// Manifest-only rewrite: carry over the source file's column stats verbatim.
+                const auto & stats = per_file_statistics[file_idx];
+                /// Bounds are raw bytes; convert to std::vector<uint8_t> to produce an Avro `bytes` datum.
+                auto to_bytes = [](Int32, const String & value)
+                { return std::vector<uint8_t>(value.begin(), value.end()); };
+                set_fields(stats.column_sizes, Iceberg::f_column_sizes, [](Int32, Int64 value) { return value; });
+                set_fields(stats.value_counts, Iceberg::f_value_counts, [](Int32, Int64 value) { return value; });
+                set_fields(stats.null_value_counts, Iceberg::f_null_value_counts, [](Int32, Int64 value) { return value; });
+                set_fields(stats.lower_bounds, Iceberg::f_lower_bounds, to_bytes);
+                set_fields(stats.upper_bounds, Iceberg::f_upper_bounds, to_bytes);
+            }
+            else if (data_file_statistics)
+            {
                 auto statistics = data_file_statistics->getColumnSizes();
                 set_fields(statistics, Iceberg::f_column_sizes, [](size_t, size_t value) { return static_cast<Int64>(value); });
 
@@ -867,9 +823,6 @@ void generateManifestFile(
             data_file.field(Iceberg::f_record_count) = avro::GenericDatum(static_cast<Int64>(data_file_row_counts[file_idx]));
             data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(static_cast<Int64>(data_file_byte_counts[file_idx]));
         }
-<<<<<<< HEAD
-        data_file.field(Iceberg::f_record_count) = avro::GenericDatum(static_cast<Int64>(data_file_row_counts[file_idx]));
-        data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(static_cast<Int64>(data_file_byte_counts[file_idx]));
 
         /// Preserve the source file's sort_order_id.
         if (!data_file_sort_order_ids.empty() && data_file_sort_order_ids[file_idx].has_value())
@@ -879,8 +832,6 @@ void generateManifestFile(
             sort_order_field.value<Int32>() = *data_file_sort_order_ids[file_idx];
         }
 
-=======
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         avro::GenericRecord & partition_record = data_file.field("partition").value<avro::GenericRecord>();
         for (size_t i = 0; i < partition_columns.size(); ++i)
         {

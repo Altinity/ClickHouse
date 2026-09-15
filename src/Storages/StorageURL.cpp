@@ -2621,7 +2621,7 @@ void registerStorageURL(StorageFactory & factory)
             StorageURL::overrideURLInEngineArgs(object_storage_args, config.url, context, /*skip_userinfo=*/ false);
 
             auto configuration = std::make_shared<StorageWebConfiguration>();
-            StorageObjectStorageConfiguration::initialize(*configuration, object_storage_args, context, /* with_table_structure */ false);
+            configuration->initialize(object_storage_args, context, /* with_table_structure */ false);
 
             /// Same contract as `createStorageObjectStorage`: only a user-issued `CREATE` applies the
             /// `file_like_engine_default_partition_strategy` default; ATTACH / startup / RESTORE must

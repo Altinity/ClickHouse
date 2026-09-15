@@ -232,14 +232,12 @@ private:
     std::unique_ptr<QueryPlan> source;
     QueryTreeNodePtr query_tree;
 
-<<<<<<< HEAD
     /// Why the destructive in-place build in `buildOrderedSetInplace` failed after it consumed `source`.
     /// The set can never be built once that happened, so `build` rethrows this instead of returning a null
     /// plan, which its callers would silently take for "nothing left to build".
     std::exception_ptr in_place_build_failure;
-=======
+
     mutable std::mutex mutex;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 };
 
 using FutureSetFromSubqueryPtr = std::shared_ptr<FutureSetFromSubquery>;

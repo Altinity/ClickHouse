@@ -200,23 +200,15 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
     else
         options.PageSizeHint = settings.get()->list_object_keys_size;
 
-<<<<<<< HEAD
     /// Re-issue ListBlobs per page through the client wrapper (which strips the endpoint prefix); the SDK's
     /// MoveToNextPage refetches pages 2..N directly and would leave the raw Azure prefix on their blob names.
     while (true)
-=======
-    AzureBlobStorage::ListBlobsPagedResponse blob_list_response;
-
-    auto list_blobs = [&]()->void
     {
-        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AzureListObjectsMicroseconds);
-        blob_list_response = client_ptr->ListBlobs(options);
-    };
-
-    for (list_blobs(); blob_list_response.HasPage(); blob_list_response.MoveToNextPage())
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
-    {
-        auto blob_list_response = client_ptr->ListBlobs(options);
+        AzureBlobStorage::ListBlobsPagedResponse blob_list_response;
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AzureListObjectsMicroseconds);
+            blob_list_response = client_ptr->ListBlobs(options);
+        }
 
         ProfileEvents::increment(ProfileEvents::AzureListObjects);
         if (client_ptr->IsClientForDisk())

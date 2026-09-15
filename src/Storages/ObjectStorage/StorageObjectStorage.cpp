@@ -36,28 +36,21 @@
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/TableSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLakeMetadataDeltaKernel.h>
 #include <Interpreters/StorageID.h>
-<<<<<<< HEAD
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
-=======
-#include <Common/parseGlobs.h>
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 #include <Databases/LoadingStrictnessLevel.h>
 #include <Databases/DatabasesCommon.h>
 #include <Databases/DataLake/Common.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/HivePartitioningUtils.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
-<<<<<<< HEAD
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeString.h>
-=======
 #include <Storages/ObjectStorage/MultiFileStorageObjectStorageSink.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ChunkPartitioner.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Poco/JSON/Parser.h>
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 
 namespace DB
@@ -79,16 +72,13 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int INCORRECT_DATA;
     extern const int BAD_ARGUMENTS;
-<<<<<<< HEAD
     extern const int ACCESS_DENIED;
+    extern const int FILE_ALREADY_EXISTS;
 }
 
 namespace FailPoints
 {
     extern const char datalake_simulate_missing_table_state[];
-=======
-    extern const int FILE_ALREADY_EXISTS;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 String StorageObjectStorage::getPathSample(ContextPtr context)
@@ -261,14 +251,8 @@ StorageObjectStorage::StorageObjectStorage(
     /// of the table, so that CREATE, ATTACH and server startup do not depend on the endpoint.
     hive_partitioning_sample_path_deferred = !is_table_function && need_resolve_sample_path && !need_resolve_columns_or_format;
 
-<<<<<<< HEAD
     if (updated_configuration && sample_path.empty() && need_resolve_sample_path
         && !hive_partitioning_sample_path_deferred && !configuration->partition_strategy)
-=======
-    /// FIXME: We need to call getPathSample() lazily on select
-    /// in case it failed to be initialized in constructor.
-    if (updated_configuration && sample_path.empty() && need_resolve_sample_path && !configuration->getPartitionStrategy())
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     {
         try
         {
@@ -373,13 +357,8 @@ VirtualColumnsDescription StorageObjectStorage::createVirtualColumns(
         columns,
         context,
         format_settings,
-<<<<<<< HEAD
         configuration->partition_strategy_type,
         sample_path);
-=======
-        configuration->getPartitionStrategyType(),
-        sample_path));
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
     if (configuration->getType() == ObjectStorageType::Web && !columns.has("_headers"))
     {
@@ -1122,7 +1101,6 @@ bool hasPartitionStrategyArgument(const ASTs & args)
 
 void StorageObjectStorage::addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const
 {
-<<<<<<< HEAD
     configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->format, context, /*with_structure=*/false);
 
     if (configuration->partition_strategy_was_inferred
@@ -1152,9 +1130,6 @@ void StorageObjectStorage::addInferredEngineArgsToCreateQuery(ASTs & args, const
             make_intrusive<ASTLiteral>("none")};
         args.push_back(makeASTOperator("equals", std::move(partition_strategy_args)));
     }
-=======
-    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->getFormat(), context, /*with_structure=*/false);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 SchemaCache & StorageObjectStorage::getSchemaCache(const ContextPtr & context, const std::string & storage_engine_name)

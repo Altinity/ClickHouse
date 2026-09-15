@@ -106,7 +106,6 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
     /// `{_partition_id}` tables as wildcard (see `initPartitionStrategy`).
     configuration->is_create_query = args.mode == LoadingStrictnessLevel::CREATE;
 
-<<<<<<< HEAD
     /// Server-internal log-pipeline object storage tables live in the `system` database and are named
     /// `<log>_s3` (the plain S3 engine sink) or `<log>_s3queue`. Users cannot create tables there, so this is a
     /// safe internal marker. These tables must never abort server startup when server-managed credentials are
@@ -116,11 +115,8 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         && (args.table_id.table_name.ends_with("_s3") || args.table_id.table_name.ends_with("_s3queue")))
         configuration->force_anonymous_load_fallback = true;
 
-    return std::make_shared<StorageObjectStorage>(
-=======
     return std::make_shared<StorageObjectStorageCluster>(
         cluster_name,
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         configuration,
         // We only want to perform write actions (e.g. create a container in Azure) when the table is being created,
         // and we want to avoid it when we load the table after a server restart.

@@ -329,7 +329,6 @@ void registerTableFunctionIcebergCluster(TableFunctionFactory & factory)
     );
 
     factory.registerFunction<TableFunctionIcebergCluster>(
-<<<<<<< HEAD
         {.description = R"DOCS_MD(
 This is an extension to the [iceberg](/reference/functions/table-functions/iceberg) table function.
 
@@ -379,24 +378,6 @@ SELECT * FROM icebergS3Cluster('cluster_simple', 'http://test.s3.amazonaws.com/c
 )DOCS_MD", .category = FunctionDocumentation::Category::TableFunction},
         {.allow_readonly = false}
     );
-=======
-        {
-            .description = R"(The table function can be used to read the Iceberg table stored on any object store in parallel for many nodes in a specified cluster.)",
-            .examples{
-#   if USE_AWS_S3
-                {"icebergCluster", "SELECT * FROM icebergCluster(cluster, url, [, NOSIGN | access_key_id, secret_access_key, [session_token]], format, [,compression], storage_type='s3')", ""},
-#   endif
-#   if USE_AZURE_BLOB_STORAGE
-                {"icebergCluster", "SELECT * FROM icebergCluster(cluster, connection_string|storage_account_url, container_name, blobpath, [account_name, account_key, format, compression], storage_type='azure')", ""},
-#   endif
-#   if USE_HDFS
-                {"icebergCluster", "SELECT * FROM icebergCluster(cluster, uri, [format], [structure], [compression_method], storage_type='hdfs')", ""},
-#   endif
-            },
-            .category = FunctionDocumentation::Category::TableFunction
-        },
-        {.allow_readonly = false});
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 #   if USE_AWS_S3
     factory.registerFunction<TableFunctionIcebergS3Cluster>(

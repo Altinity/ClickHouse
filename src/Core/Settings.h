@@ -128,12 +128,9 @@ class WriteBuffer;
     M(CLASS_NAME, DeduplicateInsertSelectMode) \
     M(CLASS_NAME, DeduplicateInsertMode) \
     M(CLASS_NAME, FileLikeEngineDefaultPartitionStrategy) \
-<<<<<<< HEAD
     M(CLASS_NAME, UniqueKeyProbeImplementation) \
-    M(CLASS_NAME, SkipUnavailableShardsMode)
-=======
-    M(CLASS_NAME, ExportPartitionAllOnError) \
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+    M(CLASS_NAME, SkipUnavailableShardsMode) \
+    M(CLASS_NAME, ExportPartitionAllOnError)
 
 
 COMMON_SETTINGS_SUPPORTED_TYPES(Settings, DECLARE_SETTING_TRAIT)

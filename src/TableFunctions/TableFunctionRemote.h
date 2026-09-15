@@ -47,14 +47,11 @@ private:
     StorageID remote_table_id = StorageID::createEmpty();
     ASTPtr remote_table_function_ptr;
     ASTPtr sharding_key = nullptr;
-<<<<<<< HEAD
+    ColumnsDescription remote_table_columns;
 
     /// Changes from a SETTINGS clause among the arguments, applied to the `DistributedSettings`
     /// of the created `StorageDistributed`, e.g. SETTINGS skip_unavailable_shards = 1.
     SettingsChanges settings_changes;
-=======
-    ColumnsDescription remote_table_columns;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 };
 
 }

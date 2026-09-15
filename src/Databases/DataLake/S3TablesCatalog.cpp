@@ -62,14 +62,9 @@ S3TablesCatalog::S3TablesCatalog(
     const String & base_url_,
     const String & region_,
     const CatalogSettings & catalog_settings_,
-<<<<<<< HEAD
     DB::ContextPtr context_,
     bool allow_server_credentials_in_user_queries_)
-    : RestCatalog(warehouse_, base_url_, "", "", false, context_)
-=======
-    DB::ContextPtr context_)
     : RestCatalog(warehouse_, base_url_, "", "", false, catalog_settings_.namespaces, context_)
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     , region(region_)
     , storage_endpoint(catalog_settings_.storage_endpoint)
     , signing_service("s3tables")

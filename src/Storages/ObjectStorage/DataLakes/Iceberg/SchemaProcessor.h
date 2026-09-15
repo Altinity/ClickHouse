@@ -91,15 +91,9 @@ public:
     explicit IcebergSchemaProcessor(ContextPtr context_, bool allow_geo_parser_ = false)
         : WithContext(context_), allow_geo_parser(allow_geo_parser_) {}
 
-<<<<<<< HEAD
-    void addIcebergTableSchema(Poco::JSON::Object::Ptr schema_ptr);
-    std::shared_ptr<NamesAndTypesList> getClickHouseTableSchemaById(Int32 id);
-    std::shared_ptr<const ActionsDAG> getSchemaTransformationDagByIds(Int32 old_id, Int32 new_id);
-=======
     void addIcebergTableSchema(Poco::JSON::Object::Ptr schema_ptr, ContextPtr context_);
-    std::shared_ptr<NamesAndTypesList> getClickhouseTableSchemaById(Int32 id);
+    std::shared_ptr<NamesAndTypesList> getClickHouseTableSchemaById(Int32 id);
     std::shared_ptr<const ActionsDAG> getSchemaTransformationDagByIds(ContextPtr context_, Int32 old_id, Int32 new_id);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     NameAndTypePair getFieldCharacteristics(Int32 schema_version, Int32 source_id) const;
     std::optional<NameAndTypePair> tryGetFieldCharacteristics(Int32 schema_version, Int32 source_id) const;
     NamesAndTypesList tryGetFieldsCharacteristics(Int32 schema_id, const std::vector<Int32> & source_ids) const;

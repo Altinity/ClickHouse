@@ -25,13 +25,10 @@ struct PersistentTableComponents
     const String table_path;
     const std::optional<String> table_uuid;
     const IcebergPathResolver path_resolver;
-<<<<<<< HEAD
     /// True when the resolver works against a table root deeper than `table_path`. Operations scoped
     /// to `table_path` then reach outside this table, so they must refuse to run.
     const bool table_root_was_derived;
-=======
     const String common_namespace;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
     /// Invalidate cached metadata for this table under both keys we may have used to cache it
     /// (`table_path` and `table_uuid`).

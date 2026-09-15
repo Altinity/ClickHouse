@@ -112,9 +112,8 @@ void StorageObjectStorageConfiguration::initialize(
     if (!disk_name.empty())
         fromDisk(disk_name, engine_args, local_context, with_table_structure);
     else if (auto named_collection = tryGetNamedCollectionWithOverrides(engine_args, local_context, true, nullptr, table_id))
-<<<<<<< HEAD
     {
-        configuration_to_initialize.fromNamedCollection(*named_collection, local_context);
+        fromNamedCollection(*named_collection, local_context);
 
         /// A base-URL setting (e.g. `s3_base`) rewrote a relative URL coming from the named
         /// collection. Materialize the resolved URL back into the engine args as a `url='...'`
@@ -122,13 +121,10 @@ void StorageObjectStorageConfiguration::initialize(
         /// restart) does not depend on the value of the setting at attach time.
         /// `skip_userinfo=true` keeps credentials that may originate from the base setting
         /// out of the persisted arguments.
-        if (!configuration_to_initialize.url_overridden_by_base_setting.empty())
+        if (!url_overridden_by_base_setting.empty())
             StorageURL::overrideURLInEngineArgs(
-                engine_args, configuration_to_initialize.url_overridden_by_base_setting, local_context, /*skip_userinfo=*/ true);
+                engine_args, url_overridden_by_base_setting, local_context, /*skip_userinfo=*/ true);
     }
-=======
-        fromNamedCollection(*named_collection, local_context);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     else
         fromAST(engine_args, local_context, with_table_structure);
 
@@ -143,14 +139,9 @@ void StorageObjectStorageConfiguration::initialize(
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The `partition_strategy` argument is incompatible with data lakes");
         }
     }
-<<<<<<< HEAD
-    else if (!configuration_to_initialize.partition_strategy_was_set
-        && configuration_to_initialize.partition_strategy_type == PartitionStrategyFactory::StrategyType::NONE
-        && configuration_to_initialize.getRawPath().hasPartitionWildcard()
-=======
-    else if (getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::NONE
+    else if (!partition_strategy_was_set
+        && partition_strategy_type == PartitionStrategyFactory::StrategyType::NONE
         && getRawPath().hasPartitionWildcard()
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         && local_context->getSettingsRef()[Setting::file_like_engine_default_partition_strategy].value
             == FileLikeEngineDefaultPartitionStrategy::WILDCARD)
     {

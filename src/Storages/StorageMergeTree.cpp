@@ -158,11 +158,8 @@ namespace ErrorCodes
     extern const int PART_IS_LOCKED;
     extern const int PART_IS_TEMPORARILY_LOCKED;
     extern const int FAULT_INJECTED;
-<<<<<<< HEAD
     extern const int INVALID_TRANSACTION;
-=======
     extern const int INCOMPATIBLE_COLUMNS;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 namespace ActionLocks

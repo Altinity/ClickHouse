@@ -661,12 +661,6 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
 
 IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context)
 {
-<<<<<<< HEAD
-    /// Only a follower reached by another node's cluster function (SECONDARY_QUERY) just fetches
-    /// raw data. Everything else is the initiator of the distributed read, including internal
-    /// contexts that never set the kind (NO_QUERY), e.g. a Replicated database DDL worker.
-    if (context->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY)
-=======
     QueryTreeInfo info;
 
     auto & query_node = query_tree->as<QueryNode &>();
@@ -721,9 +715,10 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
         }
     }
 
-    /// Initiator executes query on remote node.
-    if (context->getClientInfo().query_kind == ClientInfo::QueryKind::INITIAL_QUERY)
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+    /// Only a follower reached by another node's cluster function (SECONDARY_QUERY) just fetches
+    /// raw data. Everything else is the initiator of the distributed read, including internal
+    /// contexts that never set the kind (NO_QUERY), e.g. a Replicated database DDL worker.
+    if (context->getClientInfo().query_kind != ClientInfo::QueryKind::SECONDARY_QUERY)
         if (to_stage >= QueryProcessingStage::Enum::WithMergeableState)
             return QueryProcessingStage::Enum::WithMergeableState;
 

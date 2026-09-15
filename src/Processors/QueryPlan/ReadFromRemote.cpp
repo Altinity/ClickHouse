@@ -721,14 +721,11 @@ void ReadFromRemote::addLazyPipe(
             my_shard.query_plan, /*extension=*/std::nullopt, my_shard.shard_info.pool);
         remote_query_executor->setLogger(my_log);
         remote_query_executor->setDistributedFanout(my_distributed_fanout);
-<<<<<<< HEAD
         /// Attach the shared tracker so exception-based shard skips on the lazy path are also bounded by
         /// `max_skip_unavailable_shards_num` / `max_skip_unavailable_shards_ratio`, like the non-lazy path.
         remote_query_executor->setUnavailableShardTracker(my_unavailable_shard_tracker);
-=======
         remote_query_executor->setRemoteFunction(my_is_remote_function);
         remote_query_executor->setShardCount(my_shard_count);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
         auto pipe = createRemoteSourcePipe(
             remote_query_executor, add_agg_info, add_totals, add_extremes, async_read, async_query_sending, parallel_marshalling_threads);

@@ -24,11 +24,8 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 
 #include <IO/CompressionMethod.h>
-<<<<<<< HEAD
 
-=======
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataFileEntry.h>
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergIterator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergTableStateSnapshot.h>
@@ -224,7 +221,6 @@ public:
 
     void drop(ContextPtr context) override;
 
-<<<<<<< HEAD
     static DataLakeMetadataPtr createWithDeserialization(
         const ObjectStoragePtr & object_storage,
         const StorageObjectStorageConfigurationWeakPtr & configuration,
@@ -237,9 +233,8 @@ public:
     {
         return persistent_components;
     }
-=======
+
     Poco::JSON::Object::Ptr getMetadataJSON(ContextPtr local_context) const;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
     std::optional<String> partitionKey(ContextPtr) const override;
     std::optional<String> sortingKey(ContextPtr) const override;

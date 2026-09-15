@@ -171,16 +171,15 @@
 namespace DB
 {
 
-<<<<<<< HEAD
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int TABLE_ALREADY_EXISTS;
-=======
+}
+
 namespace ServerSetting
 {
     extern const ServerSettingsBool allow_experimental_export_merge_tree_partition;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 void attachSystemTablesServer(ContextPtr context, IDatabase & system_database, bool has_zookeeper, [[maybe_unused]] bool has_keeper_server)

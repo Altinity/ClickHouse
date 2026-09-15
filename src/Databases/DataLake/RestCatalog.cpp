@@ -62,11 +62,8 @@ namespace DB::ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
     extern const int FAULT_INJECTED;
-<<<<<<< HEAD
     extern const int ACCESS_DENIED;
-=======
     extern const int CATALOG_NAMESPACE_DISABLED;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 namespace DB::Setting
@@ -353,12 +350,7 @@ OneLakeCatalog::OneLakeCatalog(
     bool oauth_server_use_request_body_,
     const std::string & namespaces_,
     DB::ContextPtr context_)
-<<<<<<< HEAD
-    : RestCatalog(warehouse_, base_url_, auth_scope_, oauth_server_uri_, oauth_server_use_request_body_, context_)
-=======
     : RestCatalog(warehouse_, base_url_, auth_scope_, oauth_server_uri_, oauth_server_use_request_body_, namespaces_, context_)
-    , tenant_id(onelake_tenant_id)
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 {
     CatalogState initial_state;
     initial_state.tenant_id = onelake_tenant_id;
@@ -643,8 +635,9 @@ HorizonCatalog::HorizonCatalog(
     const std::string & auth_header_,
     const std::string & oauth_server_uri_,
     bool oauth_server_use_request_body_,
+    const std::string & namespaces_,
     DB::ContextPtr context_)
-    : RestCatalog(warehouse_, base_url_, auth_scope_, oauth_server_uri_, oauth_server_use_request_body_, context_)
+    : RestCatalog(warehouse_, base_url_, auth_scope_, oauth_server_uri_, oauth_server_use_request_body_, namespaces_, context_)
 {
     CatalogState initial_state;
     if (!catalog_credential_.empty())
@@ -988,15 +981,10 @@ BigLakeCatalog::BigLakeCatalog(
     const std::string & google_adc_client_secret_,
     const std::string & google_adc_refresh_token_,
     const std::string & google_adc_quota_project_id_,
-<<<<<<< HEAD
+    const std::string & namespaces_,
     DB::ContextPtr context_,
     bool allow_server_credentials_in_user_queries_)
-    : RestCatalog(warehouse_, base_url_, "", "", false, context_)
-=======
-    const std::string & namespaces_,
-    DB::ContextPtr context_)
     : RestCatalog(warehouse_, base_url_, "", "", false, namespaces_, context_)
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     , google_project_id(google_project_id_)
     , google_service_account(google_service_account_)
     , google_metadata_service(google_metadata_service_)
@@ -1244,15 +1232,11 @@ bool RestCatalog::empty() const
     {
         if (found_table)
             return true;
-<<<<<<< HEAD
-        const auto tables = listTablesInNamespace(namespace_name, /* limit */1);
-=======
 
         if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
             return false;
 
-        const auto tables = getTables(namespace_name, /* limit */1);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+        const auto tables = listTablesInNamespace(namespace_name, /* limit */1);
         if (!tables.empty())
             found_table = true;
         return found_table;
@@ -1550,13 +1534,11 @@ RestCatalog::Namespaces RestCatalog::parseNamespaces(DB::ReadBuffer & buf, const
 
 DB::Names RestCatalog::listTablesInNamespace(const std::string & base_namespace, size_t limit) const
 {
-<<<<<<< HEAD
-    const auto state_snapshot = state.get();
-=======
     if (!allowed_namespaces.isNamespaceAllowed(base_namespace, /*nested*/ false))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Namespace {} is filtered by `namespaces` database parameter", base_namespace);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+
+    const auto state_snapshot = state.get();
 
     auto encoded_namespace = encodeNamespaceForURI(base_namespace);
     const std::string endpoint = std::filesystem::path(NAMESPACES_ENDPOINT) / encoded_namespace / "tables";
@@ -1683,7 +1665,6 @@ bool RestCatalog::tryGetTableMetadata(
     }
     catch (const DB::HTTPException & ex)
     {
-<<<<<<< HEAD
         /// Only HTTP 404 from the catalog means "table does not exist". Anything else —
         /// 401/403 (expired or revoked credentials), 5xx, and so on — must propagate:
         /// swallowing it would make an existing table silently disappear (`UNKNOWN_TABLE`
@@ -1694,12 +1675,6 @@ bool RestCatalog::tryGetTableMetadata(
             return false;
         }
         throw;
-=======
-        if (ex.code() == DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED)
-            throw;
-        LOG_DEBUG(log, "tryGetTableMetadata response: {}", ex.what());
-        return false;
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     }
 }
 
@@ -1783,15 +1758,9 @@ bool RestCatalog::getTableMetadataImpl(
     {
         const bool allow_geo_parser
             = getContext()->getSettingsRef()[DB::Setting::allow_experimental_geo_types_in_iceberg].value;
-<<<<<<< HEAD
-        auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(allow_geo_parser);
-        auto id = DB::IcebergMetadata::parseTableSchema(metadata_object, schema_processor, log);
-        auto schema = schema_processor.getClickHouseTableSchemaById(id);
-=======
         auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(context_, allow_geo_parser);
         auto id = DB::IcebergMetadata::parseTableSchema(metadata_object, schema_processor, context_, log);
-        auto schema = schema_processor.getClickhouseTableSchemaById(id);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+        auto schema = schema_processor.getClickHouseTableSchemaById(id);
         result.setSchema(*schema);
     }
 
@@ -1917,18 +1886,12 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
 
 void RestCatalog::createTable(const String & namespace_name, const String & table_name, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr metadata_content) const
 {
-<<<<<<< HEAD
-    const auto state_snapshot = state.get();
-    const std::string endpoint = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables").generic_string();
-=======
     if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to create table {}, namespace {} is filtered by `namespaces` database parameter", table_name, namespace_name);
 
-    createNamespaceIfNotExists(namespace_name, metadata_content->getValue<String>("location"));
-
-    const std::string endpoint = (base_url / config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables").generic_string();
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+    const auto state_snapshot = state.get();
+    const std::string endpoint = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables").generic_string();
 
     Poco::JSON::Object::Ptr request_body = new Poco::JSON::Object;
     request_body->set("name", table_name);
@@ -2112,19 +2075,13 @@ bool RestCatalog::updateSchema(
 
 void RestCatalog::dropTable(const String & namespace_name, const String & table_name, bool /*delete_data*/) const
 {
-<<<<<<< HEAD
-    const auto state_snapshot = state.get();
-    const std::string endpoint = fmt::format("{}/namespaces/{}/tables/{}?purgeRequested=False", base_url, namespace_name, table_name);
-=======
     if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to drop table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
 
-    const std::string endpoint
-        = (base_url / config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables" / table_name).generic_string()
-        + "?purgeRequested=False";
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+    const auto state_snapshot = state.get();
+    const std::string endpoint = fmt::format("{}/namespaces/{}/tables/{}?purgeRequested=False", base_url, namespace_name, table_name);
 
     Poco::JSON::Object::Ptr request_body = nullptr;
     try

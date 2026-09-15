@@ -28,13 +28,8 @@ MultipleFileWriter::MultipleFileWriter(
     : max_data_file_num_rows(max_data_file_num_rows_)
     , max_data_file_num_bytes(max_data_file_num_bytes_)
     , schema(schema_)
-<<<<<<< HEAD
-    , stats(schema_)
-    , column_mapper(Iceberg::createColumnMapperFromFields(schema_))
-=======
     , aggregate_stats(schema_)
-    , column_mapper(std::make_shared<ColumnMapper>())
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
+    , column_mapper(Iceberg::createColumnMapperFromFields(schema_))
     , filename_generator(filename_generator_)
     , path_resolver(path_resolver_)
     , object_storage(object_storage_)

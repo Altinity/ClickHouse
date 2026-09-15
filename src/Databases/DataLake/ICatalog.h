@@ -10,21 +10,15 @@
 #include <Databases/DataLake/DatabaseDataLakeStorageType.h>
 #include <Poco/JSON/Object.h>
 
-<<<<<<< HEAD
 #include <functional>
 #include <unordered_map>
 
 namespace DB
 {
 struct DatabaseDataLakeSettings;
-=======
-namespace DB
-{
 
 class Context;
 using ContextPtr = std::shared_ptr<const Context>;
-
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 namespace DataLake

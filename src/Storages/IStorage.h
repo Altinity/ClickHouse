@@ -490,7 +490,6 @@ public:
         ContextPtr /*context*/,
         bool /*async_insert*/);
 
-<<<<<<< HEAD
     /** Checks on the initiator that the current user is allowed to insert into this table, in
       * addition to the `INSERT` privilege on the table name checked by the interpreter.
       *
@@ -502,7 +501,7 @@ public:
       * the privileges the user had when the query was issued.
       */
     virtual void checkInsertIsAllowed(ContextPtr /*context*/) const {}
-=======
+
     virtual bool supportsImport(ContextPtr) const
     {
       return false;
@@ -546,8 +545,6 @@ It is currently only implemented in StorageObjectStorage.
   {
       throw Exception(ErrorCodes::NOT_IMPLEMENTED, "commitExportPartitionTransaction is not implemented for storage type {}", getName());
   }
-    
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
     /** Writes the data to a table in distributed manner.
       * It is supposed that implementation looks into SELECT part of the query and executes distributed

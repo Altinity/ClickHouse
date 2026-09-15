@@ -180,11 +180,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     auto dump_metadata = [&]()->String { return manifest_file_deserializer_->getMetadataContent(); };
     insertRowToLogTable(
         context_,
-<<<<<<< HEAD
-        [&] { return manifest_file_deserializer_->getMetadataContent(); },
-=======
         dump_metadata,
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         DB::IcebergMetadataLogLevel::ManifestFileMetadata,
         path_resolver_.getTableRoot(),
         path_to_manifest_file_,
@@ -248,13 +244,8 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
             continue;
         auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
         auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
-<<<<<<< HEAD
         partition_spec_vec.emplace_back(source_id, transform_name, partition_name, static_cast<Int32>(i));
-        auto partition_ast = getASTFromTransform(transform_name, numeric_column_name);
-=======
-        partition_spec_vec.emplace_back(source_id, transform_name, partition_name);
         auto partition_ast = getASTFromTransform(transform_name, numeric_column_name, context_->getSettingsRef()[Setting::iceberg_partition_timezone]);
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         /// Unsupported partition key expression
         if (partition_ast == nullptr)
             continue;
@@ -342,11 +333,7 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
         auto dump_metadata = [&]()->String { return manifest_file_deserializer->getContent(row_index); };
         insertRowToLogTable(
             context,
-<<<<<<< HEAD
-            [&] { return manifest_file_deserializer->getContent(row_index); },
-=======
             dump_metadata,
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
             DB::IcebergMetadataLogLevel::ManifestFileEntry,
             path_resolver.getTableRoot(),
             path_to_manifest_file,
@@ -460,11 +447,7 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
     auto dump_metadata = [&]()->String { return manifest_file_deserializer->getContent(row_index); };
     insertRowToLogTable(
         context,
-<<<<<<< HEAD
-        [&] { return manifest_file_deserializer->getContent(row_index); },
-=======
         dump_metadata,
->>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         DB::IcebergMetadataLogLevel::ManifestFileEntry,
         path_resolver.getTableRoot(),
         path_to_manifest_file,
