@@ -564,6 +564,9 @@ void Gc::redeleteBlobs(
         }
     }
 
+    /// Every delete of the batch has already run. If `applyRedeleteOutcome` throws, the batch stays deleted
+    /// but unrecorded: the round fails before its outcome logs and `gc/state` commit, every entry stays
+    /// `delete_pending`, and the next round records the deleted ones as `Absent`.
     for (size_t i = 0; i < scheduled; ++i)
     {
         if (errors[i])
