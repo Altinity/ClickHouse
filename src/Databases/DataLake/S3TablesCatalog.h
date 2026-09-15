@@ -7,11 +7,8 @@
 #include <Databases/DataLake/RestCatalog.h>
 #include <IO/S3/Credentials.h>
 
-<<<<<<< HEAD
 #include <Poco/Net/HTTPRequest.h>
 
-=======
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 #include <aws/core/auth/signer/AWSAuthV4Signer.h>
 
 #include <memory>
@@ -34,7 +31,6 @@ public:
         const String & base_url_,
         const String & region_,
         const DataLake::CatalogSettings & catalog_settings_,
-<<<<<<< HEAD
         DB::ContextPtr context_,
         bool allow_server_credentials_in_user_queries_);
 
@@ -43,20 +39,12 @@ public:
     CatalogTables getTables() const override;
 
     bool managesTableLocation() const override { return true; }
-=======
-        DB::ContextPtr context_);
-
-    DB::DatabaseDataLakeCatalogType getCatalogType() const override { return DB::DatabaseDataLakeCatalogType::S3_TABLES; }
-
-    DB::Names getTables() const override;
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 
     bool tryGetTableMetadata(
         const std::string & namespace_name,
         const std::string & table_name,
         TableMetadata & result) const override;
 
-<<<<<<< HEAD
     void dropTable(const String & namespace_name, const String & table_name, bool delete_data) const override;
 
 protected:
@@ -77,27 +65,11 @@ protected:
         Poco::JSON::Object::Ptr request_body,
         const String & method,
         bool ignore_result) const override;
-=======
-    void dropTable(const String & namespace_name, const String & table_name) const override;
-
-    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
-
-protected:
-    DB::HTTPHeaderEntries getAuthHeaders(
-        bool update_token,
-        const String & method = {},
-        const Poco::URI & url = {},
-        const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {}) const override;
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 
 private:
     const String region;
     const String storage_endpoint;
-<<<<<<< HEAD
     const String signing_service;
-=======
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider;
     std::unique_ptr<Aws::Client::AWSAuthV4Signer> signer;
 };

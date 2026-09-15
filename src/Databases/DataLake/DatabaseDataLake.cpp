@@ -427,12 +427,8 @@ void DatabaseDataLake::initialize() const
                 url,
                 settings[DatabaseDataLakeSetting::region].value,
                 catalog_parameters,
-<<<<<<< HEAD
                 Context::getGlobalContextInstance(),
                 allow_server_credentials_in_user_queries);
-=======
-                Context::getGlobalContextInstance());
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 #else
             throw Exception(
                 ErrorCodes::SUPPORT_IS_DISABLED,
@@ -529,11 +525,8 @@ std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfigur
         case DatabaseDataLakeCatalogType::ICEBERG_REST:
         case DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE:
         case DatabaseDataLakeCatalogType::S3_TABLES:
-<<<<<<< HEAD
         case DatabaseDataLakeCatalogType::ICEBERG_DELTA_SHARING:
         case DatabaseDataLakeCatalogType::ICEBERG_HORIZON:
-=======
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
         {
             switch (type)
             {
@@ -1670,19 +1663,11 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
             case DatabaseDataLakeCatalogType::S3_TABLES:
             {
                 if (!args.create_query.attach
-<<<<<<< HEAD
-                    && !args.context->getSettingsRef()[Setting::allow_experimental_database_iceberg])
-                {
-                    throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-                                    "DatabaseDataLake with S3 Tables catalog (Iceberg REST) is beta. "
-                                    "To allow its usage, enable setting allow_database_iceberg");
-=======
                     && !args.context->getSettingsRef()[Setting::allow_experimental_database_s3_tables])
                 {
                     throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
                                     "DatabaseDataLake with S3 Tables catalog is experimental. "
                                     "To allow its usage, enable setting allow_experimental_database_s3_tables");
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
                 }
 
                 engine_func->name = "Iceberg";

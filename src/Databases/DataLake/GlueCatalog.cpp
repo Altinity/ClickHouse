@@ -357,19 +357,8 @@ CatalogTables GlueCatalog::listTablesInNamespaceDirect(const std::string & names
 
 bool GlueCatalog::existsTable(const std::string & database_name, const std::string & table_name) const
 {
-<<<<<<< HEAD
     TableMetadata metadata;
     return tryGetTableMetadata(database_name, table_name, metadata);
-=======
-    Aws::Glue::Model::GetTableRequest request;
-    request.SetDatabaseName(database_name);
-    request.SetName(table_name);
-
-    ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTable);
-    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTableMicroseconds);
-    auto outcome = glue_client->GetTable(request);
-    return outcome.IsSuccess();
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 }
 
 bool GlueCatalog::tryGetTableMetadata(
@@ -682,7 +671,8 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     db_input.SetName(namespace_name);
     create_request.SetDatabaseInput(db_input);
 
-<<<<<<< HEAD
+    ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogCreateDatabase);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogCreateDatabaseMicroseconds);
     auto outcome = glue_client->CreateDatabase(create_request);
     if (!outcome.IsSuccess() && outcome.GetError().GetErrorType() != Aws::Glue::GlueErrors::ALREADY_EXISTS)
     {
@@ -691,11 +681,6 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
             "Exception calling CreateDatabase for namespace {}: {}",
             namespace_name, outcome.GetError().GetMessage());
     }
-=======
-    ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogCreateDatabase);
-    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogCreateDatabaseMicroseconds);
-    glue_client->CreateDatabase(create_request);
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 }
 
 void GlueCatalog::createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*metadata_content*/) const

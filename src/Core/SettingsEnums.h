@@ -465,11 +465,8 @@ enum class DatabaseDataLakeCatalogType : uint8_t
     ICEBERG_BIGLAKE,
     PAIMON_REST,
     S3_TABLES,
-<<<<<<< HEAD
     ICEBERG_DELTA_SHARING,
     ICEBERG_HORIZON,
-=======
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 };
 
 DECLARE_SETTING_ENUM(DatabaseDataLakeCatalogType)

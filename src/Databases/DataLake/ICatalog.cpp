@@ -113,7 +113,6 @@ void TableMetadata::setLocation(const std::string & location_)
     auto pos_to_bucket = pos + std::strlen("://");
     auto path_separator_offset = location_.substr(pos_to_bucket).find('/');
 
-<<<<<<< HEAD
     size_t pos_to_path = 0;
     if (path_separator_offset == std::string::npos)
     {
@@ -126,21 +125,6 @@ void TableMetadata::setLocation(const std::string & location_)
             throw DB::Exception(
                 DB::ErrorCodes::NOT_IMPLEMENTED,
                 "Location without a path is only supported for the s3 scheme: {}", location_);
-=======
-    if (pos_to_path == std::string::npos)
-    {
-        /// An empty path is allowed for AWS S3 Tables: the table location is just `s3://<bucket>`.
-        if (storage_type_str == "s3://")
-        {
-            location_without_path = location_;
-            path.clear();
-            bucket = location_.substr(pos_to_bucket);
-            return;
-        }
-
-        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "Unexpected location format: {}", location_);
-    }
->>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 
         pos_to_path = location_.size();
         location_without_path = location_;
