@@ -408,6 +408,10 @@ Gc::RedeleteIo Gc::performRedeleteIo(const RetiredEntry & entry, const Layout & 
 {
     RedeleteIo io;
     io.blob_key = layout.blobKey(entry.ref);
+    /// The condemned incarnation is a PERSISTED pair and cannot itself be a precondition, so
+    /// the round observes the blob and compares the two renderings. Observing first also
+    /// settles the absent case without spending a conditional delete against a key that is
+    /// already gone.
     const std::optional<Meta> observed = op.head(io.blob_key, Retry::standard());
     if (observed)
         io.del = entry.token.matches(observed->etag) ? op.remove(io.blob_key, observed->etag, Retry::standard()) : Removal::Mismatch;
@@ -428,6 +432,8 @@ void Gc::applyRedeleteOutcome(
                                                                 : OutcomeKind::Replaced;
     OutcomeEntry outcome{.kind = entry.kind, .ref = entry.ref, .token = entry.token, .outcome = outcome_kind};
     const String del_outcome{removalName(io.del)};
+    /// The single content-delete site is attributable per row. A mismatch (a writer recreated
+    /// the incarnation) is terminal-OK: the fresh incarnation is a live object.
     EventEmitter{*store}.emit(
         [&](CasEvent & e)
         {
@@ -441,6 +447,9 @@ void Gc::applyRedeleteOutcome(
             e.reason = "delete_pending published by a prior pass; exact-incarnation delete (pre-CAS)";
             e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}, {"key", io.blob_key}};
         });
+    /// The audit row is observability only -- the delete in `performRedeleteIo` already executed
+    /// regardless of this cap. Skipping it here bounds the per-shard `GcOutcomes` body without
+    /// skipping or deferring any destructive work.
     if (round_work_budget.outcomeEntryAvailable())
     {
         outcome_log.entries.push_back(std::move(outcome));
@@ -448,10 +457,16 @@ void Gc::applyRedeleteOutcome(
     }
     ++report.redeleted;
     ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
+    /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
+    /// writer already published a fresh incarnation at this hash, and that writer's own
+    /// republication path (`PartWriteTxn::ensureBlobPresent`) reconciles the meta back to Clean
+    /// right after the publication; deleting it here would race that legitimate Clean write for
+    /// no reason (the meta is advisory, but there is no reason to touch it on that path at all).
     if (io.del == Removal::Removed || io.del == Removal::Gone)
     {
         meta_writer->scheduleConfirmedMetaDelete(entry.ref);
     }
+    /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
     meta_writer->forgetCondemnMarker(entry.ref, entry.token);
 }
 
