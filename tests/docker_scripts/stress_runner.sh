@@ -70,7 +70,13 @@ start_server || { echo "Failed to start server"; exit 1; }
 cd /repo && python3 /repo/ci/jobs/scripts/clickhouse_proc.py logs_export_start || echo "ERROR: Failed to start log exports"
 
 clickhouse-client --query "CREATE DATABASE datasets"
-clickhouse-client < /repo/tests/docker_scripts/create.sql
+# Do not pipe into clickhouse-client: `set -e` ignores a failing producer.
+CREATE_SQL=$(mktemp)
+python3 /repo/ci/jobs/scripts/pick_endpoint.py create-sql /repo/tests/docker_scripts/create.sql > "$CREATE_SQL"
+clickhouse-client < "$CREATE_SQL"
+rm -f "$CREATE_SQL"
+S3_BASE=$(python3 /repo/ci/jobs/scripts/pick_endpoint.py tpcds)
+export S3_BASE
 bash /repo/tests/docker_scripts/create_tpcds.sh
 bash /repo/tests/docker_scripts/create_tpch.sh
 clickhouse-client --query "SHOW TABLES FROM datasets"
