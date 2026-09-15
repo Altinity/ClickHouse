@@ -213,6 +213,8 @@ struct PoolConfig
     std::function<void()> teardown_phase2_throw_for_test = {};
     std::function<void()> teardown_phase3_throw_for_test = {};
 
+    std::function<void(const BlobRef &)> gc_redelete_apply_hook_for_test = {};
+
     /// Mount-lease TTL: how long a freshly-renewed mount lease is valid. The local
     /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
     /// once `this` elapses with no successful renew. The background renewer runs every
