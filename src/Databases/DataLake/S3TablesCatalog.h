@@ -48,7 +48,6 @@ public:
     void dropTable(const String & namespace_name, const String & table_name, bool delete_data) const override;
 
 protected:
-<<<<<<< HEAD
     /// Override the network primitives instead of `getAuthHeaders` so the SigV4 signer has
     /// access to the final URL, method, and request body for canonicalisation.
     /// `catalog_state` and `auth_headers` are unused here: authentication is derived from the
@@ -66,15 +65,6 @@ protected:
         Poco::JSON::Object::Ptr request_body,
         const String & method,
         bool ignore_result) const override;
-=======
-    DB::HTTPHeaderEntries getAuthHeaders(
-        bool update_token,
-        const String & method = {},
-        const Poco::URI & url = {},
-        const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {},
-        bool * used_cached_oauth_token = nullptr) const override;
->>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 
 private:
     const String region;

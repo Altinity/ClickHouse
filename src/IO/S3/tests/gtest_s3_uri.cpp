@@ -6,6 +6,8 @@
 
 #if USE_AWS_S3
 
+#include <IO/S3/Client.h>
+
 TEST(IOTestS3URI, PathStyleNoKey)
 {
     using namespace DB;
@@ -41,6 +43,12 @@ TEST(IOTestS3URI, PathStyleWithKey)
 TEST(IOTestS3URI, ResolveS3Endpoint)
 {
     using namespace DB;
+
+    /// expandRegionToAmazonPath() goes through the SDK's endpoint provider, which requires
+    /// the AWS SDK (and its CRT allocator) to be initialized. In the server this happens
+    /// implicitly because every S3 client is created through ClientFactory; here the test may
+    /// be the only thing running, so initialize it explicitly.
+    S3::ClientFactory::instance();
 
     ASSERT_EQ(S3::expandRegionToAmazonPath("us-east-1"),
               "https://s3.us-east-1.amazonaws.com");

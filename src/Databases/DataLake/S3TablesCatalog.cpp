@@ -261,17 +261,7 @@ void S3TablesCatalog::dropTable(const String & namespace_name, const String & ta
     }
 }
 
-<<<<<<< HEAD
 namespace
-=======
-DB::HTTPHeaderEntries S3TablesCatalog::getAuthHeaders(
-    bool /*update_token*/,
-    const String & method,
-    const Poco::URI & url,
-    const DB::HTTPHeaderEntries & extra_headers,
-    const String & body,
-    bool * /*used_cached_oauth_token*/) const
->>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 {
 
 /// `signRequestWithAWSV4` returns the full set of headers that the AWS SDK kept on

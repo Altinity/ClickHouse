@@ -323,17 +323,10 @@ void RestCatalog::validateAuthHeaders(const DB::HTTPHeaderEntry & header) const
     getContext()->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(header_to_check);
 }
 
-<<<<<<< HEAD
-DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const CatalogState & catalog_state, bool update_token) const
-=======
 DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
+    const CatalogState & catalog_state,
     bool update_token,
-    const String & /*method*/,
-    const Poco::URI & /*url*/,
-    const DB::HTTPHeaderEntries & /*extra_headers*/,
-    const String & /*body*/,
     bool * used_cached_oauth_token) const
->>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 {
     fiu_do_on(DB::FailPoints::check_database_datalake_negative,
     {
@@ -546,7 +539,10 @@ void RestCatalog::applySettingsChangesToState(
     }
 }
 
-DB::HTTPHeaderEntries OneLakeCatalog::getAuthHeaders(const CatalogState & catalog_state, bool update_token) const
+DB::HTTPHeaderEntries OneLakeCatalog::getAuthHeaders(
+    const CatalogState & catalog_state,
+    bool update_token,
+    bool * used_cached_oauth_token) const
 {
     DB::HTTPHeaderEntries headers;
     if (!catalog_state.refresh_token.empty())
@@ -556,7 +552,7 @@ DB::HTTPHeaderEntries OneLakeCatalog::getAuthHeaders(const CatalogState & catalo
     }
     else
     {
-        headers = RestCatalog::getAuthHeaders(catalog_state, update_token);
+        headers = RestCatalog::getAuthHeaders(catalog_state, update_token, used_cached_oauth_token);
     }
     headers.emplace_back("User-Agent", fmt::format("ClickHouse/{}{} OneLake-Catalog", VERSION_STRING, VERSION_OFFICIAL));
     return headers;
@@ -1045,17 +1041,10 @@ BigLakeCatalog::BigLakeCatalog(
     state.set(std::make_unique<const CatalogState>(std::move(initial_state)));
 }
 
-<<<<<<< HEAD
-DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(const CatalogState & catalog_state, bool update_token) const
-=======
 DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
+    const CatalogState & catalog_state,
     bool update_token,
-    const String & method,
-    const Poco::URI & url,
-    const DB::HTTPHeaderEntries & extra_headers,
-    const String & body,
     bool * used_cached_oauth_token) const
->>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 {
     /// Google Cloud OAuth2 for BigLake.
     /// Uses GCP metadata service or Application Default Credentials to get access token.
@@ -1094,11 +1083,7 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
         return headers;
     }
 
-<<<<<<< HEAD
-    return RestCatalog::getAuthHeaders(catalog_state, update_token);
-=======
-    return RestCatalog::getAuthHeaders(update_token, method, url, extra_headers, body, used_cached_oauth_token);
->>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
+    return RestCatalog::getAuthHeaders(catalog_state, update_token, used_cached_oauth_token);
 }
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() const
@@ -1120,24 +1105,10 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() con
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 {
-<<<<<<< HEAD
-    const auto & context = getContext();
-=======
     ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
 
-    if (!google_adc_client_id.empty() && !google_adc_client_secret.empty() && !google_adc_refresh_token.empty())
-    {
-        try
-        {
-            return retrieveGoogleCloudAccessTokenFromRefreshToken();
-        }
-        catch (const DB::Exception & e)
-        {
-            LOG_DEBUG(log, "Failed to use ADC credentials, falling back to metadata service: {}", e.what());
-        }
-    }
->>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
+    const auto & context = getContext();
 
     /// An explicit Application Default Credentials triple is a user-supplied credential, so it is honored.
     /// Fail closed if it does not work: do not fall back to the server's GCP metadata service, which would
@@ -1270,11 +1241,7 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
 
     auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
     {
-<<<<<<< HEAD
-        auto result_headers = auth_headers ? *auth_headers : getAuthHeaders(catalog_state, update_token);
-=======
-        auto result_headers = getAuthHeaders(update_token, Poco::Net::HTTPRequest::HTTP_GET, url, headers, {}, &used_cached_oauth_token);
->>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
+        auto result_headers = auth_headers ? *auth_headers : getAuthHeaders(catalog_state, update_token, &used_cached_oauth_token);
         std::move(headers.begin(), headers.end(), std::back_inserter(result_headers));
 
         return DB::BuilderRWBufferFromHTTP(url)
@@ -1869,10 +1836,6 @@ void RestCatalog::sendRequest(const CatalogState & catalog_state, const String &
 
     LOG_TEST(log, "REST catalog {} {} body ({} bytes): {}", method, endpoint, body_str.size(), body_str);
 
-    DB::HTTPHeaderEntries headers = getAuthHeaders(catalog_state, /* update_token = */ true);
-    headers.emplace_back("Content-Type", "application/json");
-    headers.emplace_back("X-Iceberg-Access-Delegation", "vended-credentials");
-
     const auto & context = getContext();
 
     DB::ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback;
@@ -1887,28 +1850,11 @@ void RestCatalog::sendRequest(const CatalogState & catalog_state, const String &
     /// enable_url_encoding=false to allow using tables with encoded sequences in names like 'foo%2Fbar'
     Poco::URI url(endpoint, /* enable_url_encoding */ false);
 
-<<<<<<< HEAD
-    auto wb = DB::BuilderRWBufferFromHTTP(url)
-        .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
-        .withMethod(method)
-        .withSettings(context->getReadSettings())
-        .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
-        .withHostFilter(&context->getRemoteHostFilter())
-        .withHeaders(headers)
-        .withOutCallback(out_stream_callback)
-        /// Send the JSON body with an explicit Content-Length: Snowflake Horizon rejects
-        /// chunked transfer encoding on catalog commits with HTTP 500 and an empty body.
-        .withOutCallbackFixedContentLength(body_str.size())
-        .withSkipNotFound(false)
-        .create(credentials);
-=======
-    DB::HTTPHeaderEntries extra_headers;
-    extra_headers.emplace_back("Content-Type", "application/json");
-
     auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
     {
-        DB::HTTPHeaderEntries headers = getAuthHeaders(update_token, method, url, extra_headers, body_str, &used_cached_oauth_token);
+        DB::HTTPHeaderEntries headers = getAuthHeaders(catalog_state, update_token, &used_cached_oauth_token);
         headers.emplace_back("Content-Type", "application/json");
+        headers.emplace_back("X-Iceberg-Access-Delegation", "vended-credentials");
         return DB::BuilderRWBufferFromHTTP(url)
             .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
             .withMethod(method)
@@ -1917,10 +1863,12 @@ void RestCatalog::sendRequest(const CatalogState & catalog_state, const String &
             .withHostFilter(&context->getRemoteHostFilter())
             .withHeaders(headers)
             .withOutCallback(out_stream_callback)
+            /// Send the JSON body with an explicit Content-Length: Snowflake Horizon rejects
+            /// chunked transfer encoding on catalog commits with HTTP 500 and an empty body.
+            .withOutCallbackFixedContentLength(body_str.size())
             .withSkipNotFound(false)
             .create(credentials);
     };
->>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 
     try
     {
