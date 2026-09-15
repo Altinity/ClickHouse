@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include "config.h"
 
@@ -23,6 +24,7 @@ class ReadBufferFromAzureBlobStorage : public ReadBufferFromFileBase
 public:
     using ContainerClientPtr = std::shared_ptr<const AzureBlobStorage::ContainerClient>;
     using BlobClientPtr = std::unique_ptr<const AzureBlobStorage::BlobClient>;
+    using AzureClientRefreshCallback = AzureBlobStorage::ContainerClientRefreshCallback;
 
     ReadBufferFromAzureBlobStorage(
         ContainerClientPtr blob_container_client_,
@@ -34,7 +36,8 @@ public:
         bool restricted_seek_ = false,
         size_t read_until_position_ = 0,
         BlobStorageLogWriterPtr blob_storage_log_ = {},
-        String container_for_logging_ = {});
+        String container_for_logging_ = {},
+        AzureClientRefreshCallback credentials_refresh_callback_ = {});
 
     off_t seek(off_t off, int whence) override;
 
@@ -70,9 +73,26 @@ private:
     void initialize(size_t attempt);
     void setMetadataFromResponse(const Azure::Storage::Blobs::Models::DownloadBlobDetails & details, size_t blob_size) const;
 
+<<<<<<< HEAD
     std::unique_ptr<Azure::Core::IO::BodyStream> data_stream;
     ContainerClientPtr blob_container_client;
     BlobClientPtr blob_client;
+=======
+    /// Creates the client on first use. Thread-safe.
+    const AzureBlobStorage::BlobClient & getBlobClient() const;
+
+    std::pair<ContainerClientPtr, BlobClientPtr> tryGetRefreshedClient(const Azure::Core::RequestFailedException & e) const;
+
+    /// On an auth failure, swap in refreshed credentials and retry (sequential path only, once per buffer).
+    bool tryRefreshCredentials(const Azure::Core::RequestFailedException & e);
+
+    std::unique_ptr<Azure::Core::IO::BodyStream> data_stream;
+    ContainerClientPtr blob_container_client;
+    mutable BlobClientPtr blob_client;
+    mutable std::once_flag blob_client_created;
+    const AzureClientRefreshCallback credentials_refresh_callback;
+    bool credentials_refreshed = false;
+>>>>>>> f48e9b4c000 (Merge c1e347245072ec922b8ed0c86d54b5f69594285d into 4a10b4a0a5866e0c620a19b14bfc478c1c5bccb1)
 
     const String path;
     size_t max_single_read_retries;
