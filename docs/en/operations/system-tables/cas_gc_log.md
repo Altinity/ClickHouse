@@ -48,6 +48,7 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `entries_condemned` ([UInt64](/sql-reference/data-types/int-uint)) — Retired entries newly condemned this round (retired-cursor pipeline stage 1).
 - `entries_graduated` ([UInt64](/sql-reference/data-types/int-uint)) — Retired entries newly floor-passed and republished `delete_pending` this round (pipeline stage 2; deleted the next round).
 - `entries_redeleted` ([UInt64](/sql-reference/data-types/int-uint)) — Pending exact-token blob deletes executed this round (pipeline stage 3).
+- `entries_redelete_failed` ([UInt64](/sql-reference/data-types/int-uint)) — Pending blob deletes whose `HEAD` or exact-token `DELETE` failed this round. Each such entry stays `delete_pending` and is retried in the next round; a non-zero value fails the round.
 - `fence_outs` ([UInt64](/sql-reference/data-types/int-uint)) — Expired mounts fenced out by this round's heartbeat floor.
 - `anomalies` ([UInt64](/sql-reference/data-types/int-uint)) — Fold clamps surfaced (and survived) this round. A steady non-zero value warrants a look at the round log details.
 - `duration_ms` ([UInt64](/sql-reference/data-types/int-uint)) — The round wall-clock duration (on a `Finish` row).
@@ -80,7 +81,7 @@ The phases, in execution order:
 | `fold_ref_intake` | Read and fold every new ref log and the manifest bodies its edges name. | one `GET` per new log, one `GET` per manifest edge |
 | `fold_reduce` | The per-shard in-degree merge: condemn, spare, graduate. | prior-run streaming `GET`s, one `HEAD` per zero-transition candidate, run `PUT`s |
 | `fold_seal_write` | Publish the new fold seal. | one `PUT` |
-| `pending_deletes` | The single content-delete site: exact-token deletes of previously published `delete_pending` entries, plus the outcome logs. | one `DELETE` per entry, one outcome-log `PUT` per shard |
+| `pending_deletes` | The single content-delete site: exact-token deletes of previously published `delete_pending` entries, plus the outcome logs. `phase_metrics` carries `jobs_scheduled` (entries sent to the GC I/O pool; `0` when the phase ran sequentially) and `jobs_failed`. | one `HEAD` and at most one `DELETE` per entry, one outcome-log `PUT` per shard with rows |
 | `meta_pool_wait` | Drain the round's per-hash freshness-meta writes. | none on this thread — see the caveat below |
 | `round_commit` | The generation-retention prune and the round's single `gc/state` compare-and-swap. | prune `LIST`s and deletes, one compare-and-swap |
 | `handoff_reclaim` | Wholesale-reclaim generations a moved run ref stranded below the retention cursor. | prefix `LIST`s and deletes |
@@ -128,6 +129,10 @@ Two caveats when reading these rows:
 - Work scheduled onto the GC meta pool runs on other threads, so the `meta_pool_wait` row's
   `ProfileEvents` delta is **empty by construction**. Read its `phase_metrics` `jobs_scheduled` /
   `jobs_completed` next to its duration instead: they distinguish a deep queue from a slow endpoint.
+- Requests issued by GC I/O pool workers — the `pending_deletes` fan-out and the fold read-ahead of
+  `fold_ref_intake` and `fold_reduce` — also run on other threads and are missing from those phase
+  rows' `ProfileEvents`. They still count in `system.events`. On `pending_deletes`, read
+  `phase_metrics` `jobs_scheduled` / `jobs_failed` next to `redeleted`.
 - Phase durations do not sum to the round's `duration_ms`. The round also performs untimed
   bookkeeping between phases, and the `Finish` row's `duration_ms` remains the authority on total
   round time.
