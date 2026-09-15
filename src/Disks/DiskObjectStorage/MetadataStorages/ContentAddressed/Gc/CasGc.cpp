@@ -478,6 +478,7 @@ void Gc::redeleteBlob(RedeleteRoundContext & ctx, const RetiredEntry & entry, co
             "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays delete_pending "
             "and is retried in the next round: {}",
             blobIdOf(entry.ref), layout.blobKey(entry.ref), entry.condemn_round, getCurrentExceptionMessage(false));
+        ++ctx.report.redelete_failed;
         throw;
     }
     applyRedeleteOutcome(ctx, entry, io);
@@ -547,6 +548,7 @@ void Gc::redeleteBlobs(
         {
             first_error = std::current_exception();
         }
+        ctx.jobs_scheduled += handles.size();
 
         ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
         for (size_t i = 0; i < handles.size(); ++i)
@@ -566,6 +568,7 @@ void Gc::redeleteBlobs(
     {
         if (errors[i])
         {
+            ++ctx.report.redelete_failed;
             if (!first_error)
                 first_error = errors[i];
             continue;
@@ -875,6 +878,17 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     pending_deletes_timer.emplace(phase_sink, "pending_deletes");
     const uint64_t redeleted_before = report.redeleted;
     const uint64_t graduated_before = report.graduated;
+    const uint64_t redelete_failed_before = report.redelete_failed;
+    uint64_t redelete_jobs_scheduled = 0;
+    const auto record_redelete_job_metrics = [&]
+    {
+        pending_deletes_timer->metric("jobs_scheduled", redelete_jobs_scheduled);
+        pending_deletes_timer->metric("jobs_failed", report.redelete_failed - redelete_failed_before);
+    };
+    SCOPE_EXIT_SAFE({
+        if (pending_deletes_timer)
+            record_redelete_job_metrics();
+    });
     std::map<uint64_t, OutcomeLog> outcomes;
     for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
     {
@@ -902,7 +916,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             .shard = shard,
             .round_work_budget = round_work_budget,
             .report = report,
-            .outcomes = outcomes};
+            .outcomes = outcomes,
+            .jobs_scheduled = redelete_jobs_scheduled};
         redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
         for (const RetiredEntry & entry : merge.spared)
         {
@@ -1052,6 +1067,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     pending_deletes_timer->metric("replaced", report.replaced);
     pending_deletes_timer->metric("spared", report.spared);
     pending_deletes_timer->metric("outcome_logs_written", outcomes.size());
+    record_redelete_job_metrics();
     pending_deletes_timer.reset();   /// emits the `pending_deletes` row
 
     /// Wait for the round's whole batch of per-hash freshness-meta writes (condemned during the

@@ -272,6 +272,33 @@ void runRedeleteScenario(uint64_t concurrency, RedeleteRun & out, uint64_t outco
     ASSERT_TRUE(allBlobsAbsent(*backend, *store));
 }
 
+struct PendingDeletesRows
+{
+    std::vector<std::map<String, UInt64>> rows;
+
+    UInt64 total(const String & key) const
+    {
+        UInt64 sum = 0;
+        for (const auto & row : rows)
+            if (const auto it = row.find(key); it != row.end())
+                sum += it->second;
+        return sum;
+    }
+
+    bool lastRowHas(const String & key) const { return !rows.empty() && rows.back().contains(key); }
+};
+
+GcPhaseSink recordPendingDeletes(std::shared_ptr<PendingDeletesRows> out, GcPhaseSink next = {})
+{
+    return [out = std::move(out), next = std::move(next)](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "pending_deletes")
+            out->rows.push_back(rec.metrics);
+        if (next)
+            next(rec);
+    };
+}
+
 }
 
 TEST(CASGCRedeleteConcurrency, ParallelRedeleteReclaimsEveryBlob)
@@ -280,20 +307,27 @@ TEST(CASGCRedeleteConcurrency, ParallelRedeleteReclaimsEveryBlob)
     auto store = openPoolWithIoConcurrency(backend, 4);
     Gc gc(store, kGc);
     publishThenDrop(*backend, store, gc);
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows));
 
     size_t redeleted = 0;
     size_t deleted = 0;
+    size_t redelete_failed = 0;
     for (int i = 0; i < 8 && !allBlobsAbsent(*backend, *store); ++i)
     {
         const RoundReport rep = runRegularRoundReclaiming(gc);
         store->renewWatermarkOnce();
         redeleted += rep.redeleted;
         deleted += rep.deleted;
+        redelete_failed += rep.redelete_failed;
     }
 
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
     EXPECT_EQ(redeleted, kBlobs);
     EXPECT_EQ(deleted, kBlobs);
+    EXPECT_EQ(redelete_failed, 0u);
+    EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("jobs_failed"), 0u);
 }
 
 TEST(CASGCRedeleteConcurrency, BlobDeletesActuallyOverlap)
@@ -323,6 +357,8 @@ TEST(CASGCRedeleteConcurrency, ConcurrencyOneDeletesSequentially)
     auto store = openPoolWithIoConcurrency(backend, 1);
     Gc gc(store, kGc);
     publishThenDrop(*backend, store, gc);
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows));
 
     backend->arm(allBlobKeys(*store), /*k_overlap*/ 1);
     for (int i = 0; i < 8 && !allBlobsAbsent(*backend, *store); ++i)
@@ -334,6 +370,8 @@ TEST(CASGCRedeleteConcurrency, ConcurrencyOneDeletesSequentially)
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
     EXPECT_EQ(backend->blobRemoves(), kBlobs);
     EXPECT_EQ(backend->peakInFlight(), 1u);
+    ASSERT_TRUE(rows->lastRowHas("jobs_scheduled"));
+    EXPECT_EQ(rows->total("jobs_scheduled"), 0u) << "concurrency 1 must not use the pool";
 }
 
 TEST(CASGCRedeleteConcurrency, WorkerRemoveFaultKeepsSiblingOutcomesAndPoolAlive)
@@ -616,6 +654,8 @@ TEST(CASGCRedeleteConcurrency, TwoWorkerFailuresAreEachCountedAndTheRoundThrowsO
     ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
 
     backend->armRemoveFaults({blobKeyOf(*store, kFaultedBlob), blobKeyOf(*store, kReplacedBlob)});
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows));
     const auto failed_before = failedCounter();
     RoundReport progress;
     EXPECT_ANY_THROW(gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress));
@@ -624,6 +664,11 @@ TEST(CASGCRedeleteConcurrency, TwoWorkerFailuresAreEachCountedAndTheRoundThrowsO
     EXPECT_TRUE(backend->allFired()) << "both faulted deletes must have run on pool workers";
     EXPECT_EQ(failedCounter() - failed_before, 2u);
     EXPECT_EQ(progress.redeleted, kBlobs - 2);
+    EXPECT_EQ(progress.redelete_failed, 2u);
+    ASSERT_EQ(rows->rows.size(), 1u);
+    ASSERT_TRUE(rows->lastRowHas("jobs_failed")) << "the phase metrics must survive the round's exception";
+    EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("jobs_failed"), 2u);
     expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob, kReplacedBlob});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
@@ -642,6 +687,8 @@ TEST(CASGCRedeleteConcurrency, WorkerHeadFaultIsCountedAndRetriedNextRound)
     ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
 
     backend->armHeadFaults({blobKeyOf(*store, kFaultedBlob)});
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows));
     const auto failed_before = failedCounter();
     RoundReport progress;
     EXPECT_ANY_THROW(gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress));
@@ -650,6 +697,10 @@ TEST(CASGCRedeleteConcurrency, WorkerHeadFaultIsCountedAndRetriedNextRound)
     EXPECT_TRUE(backend->allFired()) << "the faulted HEAD must have run on a pool worker";
     EXPECT_EQ(failedCounter() - failed_before, 1u);
     EXPECT_EQ(progress.redeleted, kBlobs - 1);
+    EXPECT_EQ(progress.redelete_failed, 1u);
+    ASSERT_EQ(rows->rows.size(), 1u);
+    EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
+    EXPECT_EQ(rows->total("jobs_failed"), 1u);
     expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
@@ -669,7 +720,8 @@ TEST(CASGCRedeleteConcurrency, SchedulingFailureAttemptsNothingAndTheNextRoundRe
 
     SCOPE_EXIT({ CannotAllocateThreadFaultInjector::setFaultProbability(0); });
     auto injected = std::make_shared<std::atomic<bool>>(false);
-    gc.setPhaseSink([injected](const GcPhaseRecord & rec)
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows, [injected](const GcPhaseRecord & rec)
     {
         if (rec.phase == "fold_seal_write")
         {
@@ -680,7 +732,7 @@ TEST(CASGCRedeleteConcurrency, SchedulingFailureAttemptsNothingAndTheNextRoundRe
         {
             CannotAllocateThreadFaultInjector::setFaultProbability(0);
         }
-    });
+    }));
 
     const auto failed_before = failedCounter();
     RoundReport progress;
@@ -700,7 +752,12 @@ TEST(CASGCRedeleteConcurrency, SchedulingFailureAttemptsNothingAndTheNextRoundRe
     ASSERT_TRUE(injected->load()) << "the fault was never armed before pending_deletes";
     EXPECT_EQ(code, DB::ErrorCodes::CANNOT_SCHEDULE_TASK);
     EXPECT_EQ(progress.redeleted, 0u);
+    EXPECT_EQ(progress.redelete_failed, 0u);
     EXPECT_EQ(failedCounter() - failed_before, 0u) << "an entry that was never submitted is not a failed delete";
+    ASSERT_EQ(rows->rows.size(), 1u);
+    ASSERT_TRUE(rows->lastRowHas("jobs_scheduled"));
+    EXPECT_EQ(rows->total("jobs_scheduled"), 0u);
+    EXPECT_EQ(rows->total("jobs_failed"), 0u);
     expectBodiesPresentOnlyFor(*backend, *store, {1, 2, 3, 4, 5, 6});
 
     const RoundReport next = runRegularRoundReclaiming(gc);

@@ -164,6 +164,7 @@ struct RoundReport
     size_t condemned = 0;         /// entries newly condemned into the retired list this round
     size_t graduated = 0;         /// entries newly floor-passed (published delete_pending) this round
     size_t redeleted = 0;         /// pending deletes executed this round (exact-token blob deletes)
+    size_t redelete_failed = 0;
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
 
@@ -740,6 +741,7 @@ private:
         GcRoundWorkBudget & round_work_budget;
         RoundReport & report;
         std::map<uint64_t, OutcomeLog> & outcomes;
+        uint64_t & jobs_scheduled;
     };
 
     static RedeleteIo performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op);

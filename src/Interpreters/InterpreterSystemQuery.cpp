@@ -2372,6 +2372,7 @@ ColumnsDescription contentAddressedGcRoundColumns()
         {"entries_condemned", std::make_shared<DataTypeUInt64>()},
         {"entries_graduated", std::make_shared<DataTypeUInt64>()},
         {"entries_redeleted", std::make_shared<DataTypeUInt64>()},
+        {"entries_redelete_failed", std::make_shared<DataTypeUInt64>()},
         {"fence_outs", std::make_shared<DataTypeUInt64>()},
         {"anomalies", std::make_shared<DataTypeUInt64>()},
         /// Task 7: the retire pipeline's REMAINING (not this-round-delta) sizes, read from the gc/state
@@ -2399,6 +2400,7 @@ void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String
     res_columns[i++]->insert(rep.condemned);
     res_columns[i++]->insert(rep.graduated);
     res_columns[i++]->insert(rep.redeleted);
+    res_columns[i++]->insert(rep.redelete_failed);
     res_columns[i++]->insert(rep.fence_outs);
     res_columns[i++]->insert(rep.anomalies.size());
     res_columns[i++]->insert(rep.pending_candidates);
