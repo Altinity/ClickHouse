@@ -58,12 +58,7 @@
 
 #include <Analyzer/Resolve/IdentifierResolveScope.h>
 
-<<<<<<< HEAD
-=======
-#include <Core/Streaming/CursorTree_fwd.h>
-
 #include <functional>
->>>>>>> 5b547003b27 (Merge pull request #2249 from Altinity/fix/join-filter-pushdown-through-rename)
 #include <ranges>
 
 namespace DB
@@ -1369,13 +1364,8 @@ void filterConjunctions(
         return;
     }
 
-<<<<<<< HEAD
     std::deque<QueryTreeNodePtr> conjunctions;
-    std::deque<QueryTreeNodePtr> processing{ expression };
-=======
-    QueryTreeNodesDeque conjunctions;
-    QueryTreeNodesDeque processing{expression};
->>>>>>> 5b547003b27 (Merge pull request #2249 from Altinity/fix/join-filter-pushdown-through-rename)
+    std::deque<QueryTreeNodePtr> processing{expression};
 
     while (!processing.empty())
     {

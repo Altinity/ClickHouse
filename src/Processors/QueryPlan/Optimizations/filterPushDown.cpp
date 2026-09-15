@@ -676,12 +676,6 @@ static size_t tryPushDownOverJoinStep(QueryPlan::Node * parent_node, QueryPlan::
         right_stream_filter_push_down_input_columns_available = canPrefilterJoinSide(kind, strictness, JoinTableSide::Right);
     }
 
-<<<<<<< HEAD
-    if (logical_join && logical_join->getJoinOperator().kind == JoinKind::Left)
-        right_stream_filter_push_down_input_columns_available = false;
-    else if (logical_join && logical_join->getJoinOperator().kind == JoinKind::Right)
-        left_stream_filter_push_down_input_columns_available = false;
-
     /** `ANY INNER` join emits at most one row per key, deduplicating both sides.
       * Both sides are blocked: filtering the right stream can change which match is taken for the left row.
       * If the left side has multiple rows with the same value, only one survives
@@ -699,13 +693,10 @@ static size_t tryPushDownOverJoinStep(QueryPlan::Node * parent_node, QueryPlan::
         left_stream_filter_push_down_input_columns_available = false;
     }
 
-    /** We disable push down to right table in cases:
-=======
     /** `canPrefilterJoinSide` only decides whether this side's own columns may be
       * used as ordinary filter inputs (false on the null-producing outer-JOIN side).
       * Equivalent-key filters can still be attached to that child. That attach is
       * gated by `allow_push_down_to_right`:
->>>>>>> 5b547003b27 (Merge pull request #2249 from Altinity/fix/join-filter-pushdown-through-rename)
       * 1. Right side is already filled. Example: JOIN with Dictionary.
       * 2. `ASOF` right join is not supported.
       */
