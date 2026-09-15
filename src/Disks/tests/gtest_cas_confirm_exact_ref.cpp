@@ -70,6 +70,7 @@ namespace ProfileEvents
     extern const Event CASRelinkConfirmRefusedLaneWedged;
     extern const Event CASRelinkConfirmRefusedLaneBroken;
     extern const Event CASRelinkConfirmRefusedMountCannotSpeak;
+    extern const Event CASRelinkConfirmRefusedTableNotResident;
 }
 
 using namespace DB::Cas;
@@ -446,7 +447,15 @@ TEST(CASConfirmExactRef, ColdTableIsUnknownWithZeroBackendRequests)
     const size_t cached_before = store->refTablesCachedCountForTest();
     backend->resetCounts();
 
+    /// A namespace with no resident runtime -- cold or evicted, the two are the same map state -- is a
+    /// residency case, not a mount-health one; the live gate must be able to tell the two apart.
+    const uint64_t not_resident_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedTableNotResident);
+    const uint64_t cannot_speak_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak);
     EXPECT_EQ(store->confirmExactRef(cold, "x", id.ref), ConfirmAnswer::Unknown);
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedTableNotResident) - not_resident_before, 1u)
+        << "a namespace this mount has never opened must be reported as not resident";
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak) - cannot_speak_before, 0u)
+        << "a cold namespace is a residency case, not a mount-health one; MountCannotSpeak must stay zero";
 
     EXPECT_EQ(backendRequests(*backend), 0u)
         << "a cold table must answer Unknown without recovering from storage";
@@ -474,7 +483,13 @@ TEST(CASConfirmExactRef, EvictedTableIsUnknownWithZeroBackendRequests)
     ASSERT_FALSE(store->refTableCachedForTest(ns_a)) << "ns_a must have been evicted";
 
     backend->resetCounts();
+    const uint64_t not_resident_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedTableNotResident);
+    const uint64_t cannot_speak_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak);
     EXPECT_EQ(store->confirmExactRef(ns_a, "x", id_a.ref), ConfirmAnswer::Unknown);
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedTableNotResident) - not_resident_before, 1u)
+        << "an evicted table must be reported as not resident, the same as a never-opened one";
+    EXPECT_EQ(refusalCount(ProfileEvents::CASRelinkConfirmRefusedMountCannotSpeak) - cannot_speak_before, 0u)
+        << "an evicted namespace is a residency case, not a mount-health one; MountCannotSpeak must stay zero";
     EXPECT_EQ(backendRequests(*backend), 0u)
         << "an evicted table must answer Unknown without re-recovering";
     EXPECT_FALSE(store->refTableCachedForTest(ns_a))
