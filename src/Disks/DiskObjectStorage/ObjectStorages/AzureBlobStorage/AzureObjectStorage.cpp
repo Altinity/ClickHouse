@@ -520,10 +520,6 @@ void AzureObjectStorage::removeObjectImpl(
                         elapsed,
                         error_code,
                         error_message);
-
-                if (successful_objects)
-                    successful_objects->emplace_back(object);
-
                 return;
             }
 
@@ -531,43 +527,6 @@ void AzureObjectStorage::removeObjectImpl(
             throw;
         }
         auto elapsed = watch.elapsedMicroseconds();
-
-<<<<<<< HEAD
-        /// If object doesn't exist.
-        if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
-        {
-            auto elapsed = watch.elapsedMicroseconds();
-            if (blob_storage_log)
-                blob_storage_log->addEvent(
-                    BlobStorageLogElement::EventType::Delete,
-                    /* bucket */ connection_params.getContainer(),
-                    /* remote_path */ path,
-                    object.local_path,
-                    object.bytes_size,
-                    elapsed,
-                    error_code,
-                    error_message);
-            return;
-        }
-
-        tryLogCurrentException(__PRETTY_FUNCTION__);
-        throw;
-    }
-    auto elapsed = watch.elapsedMicroseconds();
-
-    if (blob_storage_log)
-        blob_storage_log->addEvent(
-            BlobStorageLogElement::EventType::Delete,
-            /* bucket */ connection_params.getContainer(),
-            /* remote_path */ path,
-            object.local_path,
-            object.bytes_size,
-            elapsed,
-            success ? 0 : error_code,
-            success ? "" : error_message);
-=======
-        if (successful_objects)
-            successful_objects->emplace_back(object);
 
         if (blob_storage_log)
             blob_storage_log->addEvent(
@@ -581,7 +540,6 @@ void AzureObjectStorage::removeObjectImpl(
                 success ? "" : error_message);
         return;
     }
->>>>>>> f48e9b4c000 (Merge c1e347245072ec922b8ed0c86d54b5f69594285d into 4a10b4a0a5866e0c620a19b14bfc478c1c5bccb1)
 }
 
 void AzureObjectStorage::removeObjectIfExists(const StoredObject & object)
@@ -705,16 +663,13 @@ void AzureObjectStorage::removeObjectsIfExist(const StoredObjects & objects)
         return;
     }
 
-<<<<<<< HEAD
-    removeObjectsBatchIfExists(objects, client_ptr, blob_storage_log);
-=======
     /// A batch is bound to the client that created it, so the batch that hit the expired credentials is redone.
     StoredObjectsSpan rest_objects = objects;
     for (size_t attempt = 0; ; ++attempt)
     {
         try
         {
-            removeObjectsBatchIfExists(rest_objects, client.get(), blob_storage_log, successful_objects);
+            removeObjectsBatchIfExists(rest_objects, client.get(), blob_storage_log);
             return;
         }
         catch (const Azure::Core::RequestFailedException & e)
@@ -724,7 +679,6 @@ void AzureObjectStorage::removeObjectsIfExist(const StoredObjects & objects)
             throw;
         }
     }
->>>>>>> f48e9b4c000 (Merge c1e347245072ec922b8ed0c86d54b5f69594285d into 4a10b4a0a5866e0c620a19b14bfc478c1c5bccb1)
 }
 
 static void setAzureBlobTag(

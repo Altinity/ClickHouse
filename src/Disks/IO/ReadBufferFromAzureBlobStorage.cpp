@@ -381,22 +381,17 @@ void ReadBufferFromAzureBlobStorage::initialize(size_t attempt)
 
 std::optional<size_t> ReadBufferFromAzureBlobStorage::tryGetFileSize()
 {
-<<<<<<< HEAD
-    if (!blob_client)
-        blob_client = std::make_unique<Azure::Storage::Blobs::BlobClient>(blob_container_client->GetBlobClient(path));
-
-    if (!file_size)
-        file_size = blob_client->GetProperties().Value.BlobSize;
-=======
     if (file_size)
         return file_size;
->>>>>>> f48e9b4c000 (Merge c1e347245072ec922b8ed0c86d54b5f69594285d into 4a10b4a0a5866e0c620a19b14bfc478c1c5bccb1)
+
+    if (!blob_client)
+        blob_client = std::make_unique<Azure::Storage::Blobs::BlobClient>(blob_container_client->GetBlobClient(path));
 
     for (size_t attempt = 0; ; ++attempt)
     {
         try
         {
-            file_size = getBlobClient().GetProperties().Value.BlobSize;
+            file_size = blob_client->GetProperties().Value.BlobSize;
             return file_size;
         }
         catch (const Azure::Core::RequestFailedException & e)
@@ -456,7 +451,7 @@ size_t ReadBufferFromAzureBlobStorage::readBigAt(char * to, size_t n, size_t ran
 
     ContainerClientPtr refreshed_container_client;
     BlobClientPtr refreshed_blob_client;
-    const AzureBlobStorage::BlobClient * current_blob_client = &getBlobClient();
+    const AzureBlobStorage::BlobClient * current_blob_client = blob_client.get();
     bool credentials_refreshed_locally = false;
 
     for (size_t i = 0; i < max_single_download_retries && n > 0; ++i)
@@ -474,11 +469,7 @@ size_t ReadBufferFromAzureBlobStorage::readBigAt(char * to, size_t n, size_t ran
             download_options.Range = {static_cast<int64_t>(range_begin), n};
             Azure::Core::Context azure_context = Azure::Core::Context().WithValue(PocoAzureHTTPClient::getSDKContextKeyForBufferRetry(), size_t{0});
 
-<<<<<<< HEAD
-            auto download_response = blob_client->Download(download_options, azure_context);
-=======
             auto download_response = current_blob_client->Download(download_options, azure_context);
->>>>>>> f48e9b4c000 (Merge c1e347245072ec922b8ed0c86d54b5f69594285d into 4a10b4a0a5866e0c620a19b14bfc478c1c5bccb1)
             if (blob_storage_log)
             {
                 blob_storage_log->addEvent(
