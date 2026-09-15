@@ -85,9 +85,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
     extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
     extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
-    extern const ContentAddressedSettingsUInt64 gc_read_concurrency;
-    extern const ContentAddressedSettingsUInt64 gc_redelete_concurrency;
-    extern const ContentAddressedSettingsUInt64 gc_redelete_min_batch_size;
+    extern const ContentAddressedSettingsUInt64 gc_io_concurrency;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
     extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
@@ -311,9 +309,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
     , manifest_decode_cache_bytes(settings_[ContentAddressedSetting::manifest_decode_cache_bytes].value)
     , gc_meta_pool_size(settings_[ContentAddressedSetting::gc_meta_pool_size].value)
-    , gc_read_concurrency(settings_[ContentAddressedSetting::gc_read_concurrency].value)
-    , gc_redelete_concurrency(settings_[ContentAddressedSetting::gc_redelete_concurrency].value)
-    , gc_redelete_min_batch_size(settings_[ContentAddressedSetting::gc_redelete_min_batch_size].value)
+    , gc_io_concurrency(settings_[ContentAddressedSetting::gc_io_concurrency].value)
     , gc_bulk_delete_chunk_keys(settings_[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value)
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
     , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
@@ -804,9 +800,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_round_handoff_prefix_wholesale_budget = gc_round_handoff_prefix_wholesale_budget;
     pool_config.gc_round_outcome_entry_budget = gc_round_outcome_entry_budget;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
-    pool_config.gc_read_concurrency = gc_read_concurrency;
-    pool_config.gc_redelete_concurrency = gc_redelete_concurrency;
-    pool_config.gc_redelete_min_batch_size = gc_redelete_min_batch_size;
+    pool_config.gc_io_concurrency = gc_io_concurrency;
     pool_config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
     pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;

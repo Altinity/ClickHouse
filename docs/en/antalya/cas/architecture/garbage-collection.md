@@ -226,9 +226,7 @@ the user-facing configuration surface.
 | Setting | Default | Bounds |
 |---|---|---|
 | `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes |
-| `cas_gc_read_concurrency` | 16 | bounded pool for the fold's read-ahead; `1` disables |
-| `cas_gc_redelete_concurrency` | 1 | bounded pool for the `pending_deletes` `HEAD` + conditional `DELETE` fan-out; `1` keeps it sequential |
-| `cas_gc_redelete_min_batch_size` | 2 | minimum `pending_deletes` batch size required to enable the parallel fan-out |
+| `cas_gc_io_concurrency` | 16 | bounded pool for the fold's read-ahead, the orphan-sweep planning reads, the rebuild read-ahead and the `pending_deletes` `HEAD` + conditional `DELETE` fan-out; other GC requests run on the round thread; `1` runs the covered requests sequentially |
 
 ## Observability {#observability}
 

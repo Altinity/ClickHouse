@@ -174,13 +174,14 @@ struct PoolConfig
     /// feedback_ca_gc_never_throw_on_404) and `Gc::runRegularRound` waits for the round's whole batch
     /// before the round's single gc/state CAS, so the meta writes are durable before that CAS commits.
     uint64_t gc_meta_pool_size = 16;
-    /// Bounded pool size for the fold's read-ahead of checkpoints, ref logs, manifest bodies and
-    /// zero-candidate HEADs. Every decision stays on the round thread, in the order it always ran;
-    /// only the fetch overlaps. `1` issues no read-ahead at all and is the sequential round, request
+    /// Bounded pool size for the GC requests that overlap: the fold's read-ahead of checkpoints, ref
+    /// logs, manifest bodies and zero-candidate HEADs, the orphan-manifest sweep planning reads, the
+    /// rebuild read-ahead, and the `pending_deletes` HEAD + conditional DELETE fan-out. Meta writes
+    /// have their own pool (`gc_meta_pool_size`); every other GC request runs on the round thread.
+    /// Every decision stays on the round thread, in the order it always ran; only the requests
+    /// overlap. `1` issues no read-ahead and no fan-out at all and is the sequential round, request
     /// for request.
-    uint64_t gc_read_concurrency = 16;
-    uint64_t gc_redelete_concurrency = 1;
-    uint64_t gc_redelete_min_batch_size = 2;
+    uint64_t gc_io_concurrency = 16;
     /// Tests drive `renewWatermarkOnce` explicitly; gates both persistent runtime workers.
     bool background_watermark = false;
     /// Installed on the pool before a writable mount can start its runtime-owned workers.

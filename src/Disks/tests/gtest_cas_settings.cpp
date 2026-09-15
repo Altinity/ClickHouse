@@ -26,8 +26,6 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
-    extern const ContentAddressedSettingsUInt64 gc_redelete_concurrency;
-    extern const ContentAddressedSettingsUInt64 gc_redelete_min_batch_size;
     extern const ContentAddressedSettingsString scratch_path;
     extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
 }
@@ -178,15 +176,15 @@ TEST(CASContentAddressedSettings, InvalidBoundsDiagnosticNamesExternalConfigKeys
     expectLoadFailureWithExactMessage(
         "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shards>0</cas_gc_shards>",
         ErrorCodes::BAD_ARGUMENTS,
-        "content_addressed disk: cas_gc_interval_sec, cas_gc_shards and cas_gc_read_concurrency must be >= 1 "
+        "content_addressed disk: cas_gc_interval_sec, cas_gc_shards and cas_gc_io_concurrency must be >= 1 "
         "(got 60, 0, 16)");
-    /// The fold's read-ahead pool is refused at zero for the same reason the shard count is: a zero
-    /// would be a silently disabled subsystem rather than a configuration the pool can honour. One is
-    /// the sequential fold and is the way to turn the read-ahead off.
+    /// The GC I/O pool is refused at zero for the same reason the shard count is: a zero would be a
+    /// silently disabled subsystem rather than a configuration the pool can honour. One is the way to
+    /// run the covered GC I/O sequentially.
     expectLoadFailureWithExactMessage(
-        "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_read_concurrency>0</cas_gc_read_concurrency>",
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_io_concurrency>0</cas_gc_io_concurrency>",
         ErrorCodes::BAD_ARGUMENTS,
-        "content_addressed disk: cas_gc_interval_sec, cas_gc_shards and cas_gc_read_concurrency must be >= 1 "
+        "content_addressed disk: cas_gc_interval_sec, cas_gc_shards and cas_gc_io_concurrency must be >= 1 "
         "(got 60, 1, 0)");
 }
 
@@ -209,46 +207,6 @@ TEST(CASSettings, BulkDeleteChunkKeysBoundsAreEnforced)
     ContentAddressedSettings s;
     EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
     EXPECT_EQ(s[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value, 1u);
-}
-
-TEST(CASSettings, RedeleteConcurrencyBoundsAreEnforced)
-{
-    expectLoadFailureWithExactMessage(
-        "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<cas_gc_redelete_concurrency>0</cas_gc_redelete_concurrency>",
-        ErrorCodes::BAD_ARGUMENTS,
-        "content_addressed disk: cas_gc_redelete_concurrency must be >= 1 (got 0)");
-
-    {
-        auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
-        ContentAddressedSettings s;
-        s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
-        EXPECT_EQ(s[ContentAddressedSetting::gc_redelete_concurrency].value, 1u);
-        EXPECT_EQ(s[ContentAddressedSetting::gc_redelete_min_batch_size].value, 2u);
-    }
-
-    auto cfg = makeConfig(
-        "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<cas_gc_redelete_concurrency>8</cas_gc_redelete_concurrency>");
-    ContentAddressedSettings s;
-    EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
-    EXPECT_EQ(s[ContentAddressedSetting::gc_redelete_concurrency].value, 8u);
-}
-
-TEST(CASSettings, RedeleteMinBatchSizeBoundsAreEnforced)
-{
-    expectLoadFailureWithExactMessage(
-        "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<cas_gc_redelete_min_batch_size>0</cas_gc_redelete_min_batch_size>",
-        ErrorCodes::BAD_ARGUMENTS,
-        "content_addressed disk: cas_gc_redelete_min_batch_size must be >= 1 (got 0)");
-
-    auto cfg = makeConfig(
-        "<cas_server_root_id>srv1</cas_server_root_id>"
-        "<cas_gc_redelete_min_batch_size>7</cas_gc_redelete_min_batch_size>");
-    ContentAddressedSettings s;
-    EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
-    EXPECT_EQ(s[ContentAddressedSetting::gc_redelete_min_batch_size].value, 7u);
 }
 
 TEST(CASContentAddressedSettings, InvalidEnumDiagnosticsNameExternalConfigKeys)
