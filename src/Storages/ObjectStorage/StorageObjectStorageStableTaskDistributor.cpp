@@ -86,7 +86,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t numb
         auto processed_file_list_ptr = replica_to_files_to_be_processed.find(number_of_current_replica);
         if (processed_file_list_ptr == replica_to_files_to_be_processed.end())
         { // It is possible that replica was lost after check in the begining of the method
-            auto file_identifier = getFileIdentifier(file);
+            auto file_identifier = getSchedulingIdentifier(file, send_over_whole_archive);
             auto file_replica_idx = getReplicaForFile(file_identifier);
             unprocessed_files.emplace(file_identifier, std::make_pair(file, file_replica_idx));
             connection_to_files[file_replica_idx].push_back(file);
@@ -151,11 +151,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getPreQueuedFile(size_t
         auto next_file = files.back();
         files.pop_back();
 
-<<<<<<< HEAD
         auto file_identifier = getSchedulingIdentifier(next_file, send_over_whole_archive);
-=======
-        auto file_identifier = getFileIdentifier(next_file);
->>>>>>> 2a605117a49 (Merge pull request #2201 from Altinity/feature/antalya-26.6/pr-1748)
         auto it = unprocessed_files.find(file_identifier);
         if (it == unprocessed_files.end())
             continue;
@@ -200,7 +196,6 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
             }
         }
 
-<<<<<<< HEAD
         String file_identifier;
         if (send_over_whole_archive && object_info->isArchive())
         {
@@ -213,9 +208,6 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
         {
             file_identifier = object_info->getIdentifier();
         }
-=======
-        String file_identifier = getFileIdentifier(object_info, true);
->>>>>>> 2a605117a49 (Merge pull request #2201 from Altinity/feature/antalya-26.6/pr-1748)
 
         if (iceberg_read_optimization_enabled)
         {
@@ -290,11 +282,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
                 auto next_file = it->second.first;
                 unprocessed_files.erase(it);
 
-<<<<<<< HEAD
                 auto file_path = getSchedulingIdentifier(next_file, send_over_whole_archive);
-=======
-                auto file_path = getFileIdentifier(next_file);
->>>>>>> 2a605117a49 (Merge pull request #2201 from Altinity/feature/antalya-26.6/pr-1748)
                 LOG_TRACE(
                     log,
                     "Iterator exhausted. Assigning unprocessed file {} to replica {} from matched replica {}",
@@ -358,31 +346,11 @@ void StorageObjectStorageStableTaskDistributor::rescheduleTasksFromReplica(size_
     replica_to_files_to_be_processed.erase(number_of_current_replica);
     for (const auto & file : files)
     {
-<<<<<<< HEAD
         auto file_identifier = getSchedulingIdentifier(file, send_over_whole_archive);
-=======
-        auto file_identifier = getFileIdentifier(file);
->>>>>>> 2a605117a49 (Merge pull request #2201 from Altinity/feature/antalya-26.6/pr-1748)
         auto file_replica_idx = getReplicaForFile(file_identifier);
         unprocessed_files.emplace(file_identifier, std::make_pair(file, file_replica_idx));
         connection_to_files[file_replica_idx].push_back(file);
     }
-}
-
-String StorageObjectStorageStableTaskDistributor::getFileIdentifier(ObjectInfoPtr file_object, bool write_to_log) const
-{
-    if (send_over_whole_archive && file_object->isArchive())
-    {
-        auto file_identifier = file_object->getPathOrPathToArchiveIfArchive();
-        if (write_to_log)
-        {
-            LOG_TEST(log, "Will send over the whole archive {} to replicas. "
-                        "This will be suboptimal, consider turning on "
-                        "cluster_function_process_archive_on_multiple_nodes setting", file_identifier);
-        }
-        return file_identifier;
-    }
-    return file_object->getIdentifier();
 }
 
 }
