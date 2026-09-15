@@ -1,0 +1,6 @@
+<clickhouse>
+    <!-- Stateless tests enable this via tests/config/install.sh; integration tests do not.
+         With it on, the server compares the Hello's client_name against the Query packet's
+         ClientInfo and rejects a mismatch with CLIENT_INFO_DOES_NOT_MATCH. -->
+    <validate_tcp_client_information>true</validate_tcp_client_information>
+</clickhouse>
