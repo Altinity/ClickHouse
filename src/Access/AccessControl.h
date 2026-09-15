@@ -50,11 +50,7 @@ class SettingsProfilesCache;
 class SettingsProfileElements;
 class ClientInfo;
 class ExternalAuthenticators;
-<<<<<<< HEAD
-=======
-class AccessChangesNotifier;
 struct ConnectionTimeouts;
->>>>>>> a894ddeb080 (Merge pull request #2140 from Altinity/feature/antalya-26.6/auto-grp-pr-1658)
 struct Settings;
 
 

@@ -165,7 +165,7 @@ void ASTAuthenticationData::formatImpl(WriteBuffer & ostr, const FormatSettings 
                 }
 
                 if (valid_until)
-                    formatValidUntil(*valid_until, ostr, settings);
+                    formatValidUntil(*valid_until, valid_until_is_interval, ostr, settings);
 
                 return;
             }

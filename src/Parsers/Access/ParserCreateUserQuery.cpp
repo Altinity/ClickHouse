@@ -332,11 +332,6 @@ namespace
             if (http_auth_scheme)
                 auth_data->children.push_back(std::move(http_auth_scheme));
 
-<<<<<<< HEAD
-            ASTPtr method_valid_until;
-            if (parseValidUntil(pos, expected, method_valid_until, auth_data->valid_until_is_interval))
-                auth_data->setValidUntil(std::move(method_valid_until));
-=======
             if (jwt_processor)
             {
                 auth_data->has_jwt_processor = true;
@@ -349,8 +344,9 @@ namespace
                 auth_data->children.push_back(std::move(jwt_claims));
             }
 
-            parseValidUntil(pos, expected, auth_data->valid_until);
->>>>>>> a894ddeb080 (Merge pull request #2140 from Altinity/feature/antalya-26.6/auto-grp-pr-1658)
+            ASTPtr method_valid_until;
+            if (parseValidUntil(pos, expected, method_valid_until, auth_data->valid_until_is_interval))
+                auth_data->setValidUntil(std::move(method_valid_until));
 
             return true;
         });

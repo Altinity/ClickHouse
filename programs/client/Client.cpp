@@ -39,13 +39,10 @@
 #include <Client/JWTProvider.h>
 #include <Client/CommandJWTProvider.h>
 #include <Client/ClientBaseHelpers.h>
-<<<<<<< HEAD
+#include <Client/OAuthLogin.h>
 #include <Client/PortsProbe.h>
 #include <Common/NetException.h>
 #include <Core/Defines.h>
-=======
-#include <Client/OAuthLogin.h>
->>>>>>> a894ddeb080 (Merge pull request #2140 from Altinity/feature/antalya-26.6/auto-grp-pr-1658)
 
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <Formats/FormatFactory.h>

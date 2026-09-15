@@ -63,11 +63,8 @@
 #include <Storages/Distributed/DistributedSettings.h>
 #include <Storages/CompressionCodecSelector.h>
 #include <IO/AsynchronousReader.h>
-<<<<<<< HEAD
 #include <IO/LongConnectionLimit.h>
-=======
 #include <IO/ConnectionTimeouts.h>
->>>>>>> a894ddeb080 (Merge pull request #2140 from Altinity/feature/antalya-26.6/auto-grp-pr-1658)
 #include <IO/S3Settings.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage/AzureBlobStorageCommon.h>
 #include <Disks/DiskLocal.h>

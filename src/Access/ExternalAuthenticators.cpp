@@ -1,8 +1,5 @@
-<<<<<<< HEAD
 #include <Common/StringUtils.h>
-=======
 #include <Access/Credentials.h>
->>>>>>> a894ddeb080 (Merge pull request #2140 from Altinity/feature/antalya-26.6/auto-grp-pr-1658)
 #include <Access/ExternalAuthenticators.h>
 #include <Access/LDAPClient.h>
 #include <Access/SettingsAuthResponseParser.h>

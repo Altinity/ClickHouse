@@ -129,7 +129,6 @@ bool authenticateUserByHTTP(
     /// (both methods are insecure).
     bool has_credentials_in_query_params = params.has("user") || params.has("password");
 
-<<<<<<< HEAD
     /// Whether the request carries an `Authorization` header that should be treated as
     /// credentials. The sentinel value `never` (which `play.html` sets on the requests it can
     /// add headers to) disables it.
@@ -153,9 +152,8 @@ bool authenticateUserByHTTP(
     /// its own configured credentials, an `Authorization` header is still rejected as a mix of
     /// authentication methods, regardless of the query parameters (see below).
     bool has_http_credentials = has_authorization_header && !has_credentials_in_query_params;
-=======
+
     String bearer_token;
->>>>>>> a894ddeb080 (Merge pull request #2140 from Altinity/feature/antalya-26.6/auto-grp-pr-1658)
 
     std::string spnego_challenge;
 #if USE_SSL

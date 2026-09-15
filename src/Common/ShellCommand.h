@@ -66,13 +66,11 @@ public:
 
         bool pipe_stdin_only = false;
 
-<<<<<<< HEAD
         size_t pipe_capacity = 0;
-=======
+
         /// Put the child in its own process group, so that a single `kill(-pid, ...)`
         /// from the parent terminates the entire subprocess tree.
         bool new_process_group = false;
->>>>>>> a894ddeb080 (Merge pull request #2140 from Altinity/feature/antalya-26.6/auto-grp-pr-1658)
 
         DestructorStrategy terminate_in_destructor_strategy = DestructorStrategy(false, 0);
 
