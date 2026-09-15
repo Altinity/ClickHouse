@@ -1955,7 +1955,6 @@ def test_iceberg_file_progress_callback(started_cluster):
     )
 
 
-<<<<<<< HEAD
 def test_alter_database_settings_not_supported(started_cluster):
     node = started_cluster.instances["node1"]
 
@@ -2253,7 +2252,8 @@ def test_catalog_listing_error_surfaces_in_system_tables(started_cluster):
     assert "table_x" in result
 
     node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
-=======
+
+
 def test_partitioning_by_time(started_cluster):
     node = started_cluster.instances["node1"]
 
@@ -2348,4 +2348,3 @@ def test_partitioning_by_string(started_cluster):
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
 
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "a:b,c[d=e/f%g?h\ttest\t12:00:00.000000\n"
->>>>>>> ce7967042ba (Merge pull request #2129 from Altinity/feature/antalya-26.6/pr-1761)

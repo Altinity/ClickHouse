@@ -9,11 +9,7 @@
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeCustom.h>
-<<<<<<< HEAD
 #include <DataTypes/DataTypeDateTime64.h>
-=======
-#include <DataTypes/DataTypesDecimal.h>
->>>>>>> ce7967042ba (Merge pull request #2129 from Altinity/feature/antalya-26.6/pr-1761)
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesDecimal.h>
@@ -700,8 +696,16 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
         case TypeIndex::UInt64:
         case TypeIndex::Int64:
         case TypeIndex::DateTime:
-<<<<<<< HEAD
+        case TypeIndex::Time:
             return "long";
+        case TypeIndex::Time64:
+        {
+            auto scale = getDecimalScale(*type);
+            if (scale <= 6)
+                return "long";
+            else
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+        }
         case TypeIndex::DateTime64:
         {
             if (getDecimalScale(*type) != 6)
@@ -712,18 +716,6 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
             timestamp_type->set("logicalType", "timestamp-micros");
             timestamp_type->set("adjust-to-utc", assert_cast<const DataTypeDateTime64 &>(*type).hasExplicitTimeZone());
             return timestamp_type;
-=======
-        case TypeIndex::DateTime64:
-        case TypeIndex::Time:
-            return "long";
-        case TypeIndex::Time64:
-        {
-            auto scale = getDecimalScale(*type);
-            if (scale <= 6)
-                return "long";
-            else
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
->>>>>>> ce7967042ba (Merge pull request #2129 from Altinity/feature/antalya-26.6/pr-1761)
         }
         case TypeIndex::Float32:
             return "float";

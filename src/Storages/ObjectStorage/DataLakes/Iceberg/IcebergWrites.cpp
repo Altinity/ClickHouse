@@ -170,7 +170,6 @@ std::vector<uint8_t> dumpValue(T value)
     return bytes;
 }
 
-<<<<<<< HEAD
 template <typename DecimalType>
 std::vector<uint8_t> dumpDecimalValue(const Field & field)
 {
@@ -247,7 +246,8 @@ avro::GenericDatum makeDecimalFixedDatum(const Field & field, const avro::NodePt
     avro::GenericDatum datum(schema);
     datum.value<avro::GenericFixed>().value() = std::move(bytes);
     return datum;
-=======
+}
+
 DataTypePtr getTimeTypeOrNull(DataTypePtr type)
 {
     if (type->isNullable())
@@ -286,7 +286,6 @@ Int64 getTimeValueInMicroseconds(const Field & field, DataTypePtr type)
     }
 
     throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected Time or Time64, got {}", type->getName());
->>>>>>> ce7967042ba (Merge pull request #2129 from Altinity/feature/antalya-26.6/pr-1761)
 }
 
 std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
@@ -311,7 +310,6 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
             return dumpValue(getTimeValueInMicroseconds(field, type));
         case TypeIndex::Int64:
             return dumpValue(field.safeGet<Int64>());
-<<<<<<< HEAD
         case TypeIndex::UInt8:
         case TypeIndex::Int8:
         case TypeIndex::UInt16:
@@ -320,10 +318,8 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
             return dumpValue(static_cast<Int32>(applyVisitor(FieldVisitorConvertToNumber<Int64>(), field)));
         case TypeIndex::UInt64:
             return dumpValue(applyVisitor(FieldVisitorConvertToNumber<Int64>(), field));
-=======
         case TypeIndex::Time64:
             return dumpValue(getTimeValueInMicroseconds(field, type));
->>>>>>> ce7967042ba (Merge pull request #2129 from Altinity/feature/antalya-26.6/pr-1761)
         case TypeIndex::DateTime64:
             return dumpValue(field.safeGet<Decimal64>().getValue().value);
         case TypeIndex::String:
@@ -423,14 +419,14 @@ static void extendSchemaForPartitions(
     /// concrete Avro type, so for a Nullable partition column it goes inside the
     /// `["null", T]` union branch, not on the union itself (an annotated union is not
     /// a valid Avro schema and makes the manifest schema fail to compile).
-    auto make_annotated_type = [](DataTypePtr type) -> Poco::Dynamic::Var
+    auto make_annotated_type = [](DataTypePtr type, Int32 type_field_id) -> Poco::Dynamic::Var
     {
         auto logical_type = getAvroLogicalType(type);
         if (logical_type.isEmpty())
-            return getAvroType(type);
+            return getAvroType(type, type_field_id);
 
         Poco::JSON::Object::Ptr type_field = new Poco::JSON::Object;
-        type_field->set(Iceberg::f_type, getAvroType(type));
+        type_field->set(Iceberg::f_type, getAvroType(type, type_field_id));
         type_field->set(Iceberg::f_logicalType, logical_type);
         return type_field;
     };
@@ -444,19 +440,15 @@ static void extendSchemaForPartitions(
         Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
         field->set(Iceberg::f_field_id, field_id);
         field->set(Iceberg::f_name, partition_columns[i]);
-<<<<<<< HEAD
-        field->set(Iceberg::f_type, getAvroType(partition_types[i], field_id));
-=======
         if (partition_types[i]->isNullable())
         {
             Poco::JSON::Array::Ptr union_array = new Poco::JSON::Array;
             union_array->add("null");
-            union_array->add(make_annotated_type(removeNullable(partition_types[i])));
+            union_array->add(make_annotated_type(removeNullable(partition_types[i]), field_id));
             field->set(Iceberg::f_type, union_array);
         }
         else
-            field->set(Iceberg::f_type, make_annotated_type(partition_types[i]));
->>>>>>> ce7967042ba (Merge pull request #2129 from Altinity/feature/antalya-26.6/pr-1761)
+            field->set(Iceberg::f_type, make_annotated_type(partition_types[i], field_id));
         partition_fields->add(field);
     }
 
@@ -709,7 +701,10 @@ void generateManifestFile(
             /// Build the Avro datum holding the partition value; throws on an unsupported type.
             auto make_value_datum = [&](const avro::NodePtr & value_schema) -> avro::GenericDatum
             {
-<<<<<<< HEAD
+                auto partition_time_type = getTimeTypeOrNull(partition_types[i]);
+                if (partition_time_type)
+                    return avro::GenericDatum(getTimeValueInMicroseconds(partition_values[i], partition_types[i]));
+
                 /// Decimals are dispatched on the column type rather than on the `Field` type, because
                 /// `DateTime64` also lives in a `DecimalField` while Iceberg writes it as a plain `long`.
                 switch (removeNullable(partition_types[i])->getTypeId())
@@ -725,11 +720,6 @@ void generateManifestFile(
                     default:
                         break;
                 }
-=======
-                auto partition_time_type = getTimeTypeOrNull(partition_types[i]);
-                if (partition_time_type)
-                    return avro::GenericDatum(getTimeValueInMicroseconds(partition_values[i], partition_types[i]));
->>>>>>> ce7967042ba (Merge pull request #2129 from Altinity/feature/antalya-26.6/pr-1761)
 
                 switch (partition_values[i].getType())
                 {
