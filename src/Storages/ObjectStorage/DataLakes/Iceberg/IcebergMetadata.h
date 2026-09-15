@@ -185,7 +185,6 @@ public:
 
     void drop(ContextPtr context) override;
 
-<<<<<<< HEAD
     static DataLakeMetadataPtr createWithDeserialization(
         const ObjectStoragePtr & object_storage,
         const StorageObjectStorageConfigurationWeakPtr & configuration,
@@ -198,10 +197,9 @@ public:
     {
         return persistent_components;
     }
-=======
+
     std::optional<String> partitionKey(ContextPtr) const override;
     std::optional<String> sortingKey(ContextPtr) const override;
->>>>>>> 31cd3f9714e (Merge pull request #2141 from Altinity/feature/antalya-26.6/auto-grp-pr-1662)
 
 private:
     static Iceberg::PersistentTableComponents initializePersistentTableComponents(
