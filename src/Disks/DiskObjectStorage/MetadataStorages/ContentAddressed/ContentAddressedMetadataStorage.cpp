@@ -552,6 +552,7 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         e.entries_condemned = r.entries_condemned;
         e.entries_graduated = r.entries_graduated;
         e.entries_redeleted = r.entries_redeleted;
+        e.entries_redelete_failed = r.entries_redelete_failed;
         e.fence_outs = r.fence_outs;
         e.anomalies = r.anomalies;
         e.duration_ms = r.duration_ms;

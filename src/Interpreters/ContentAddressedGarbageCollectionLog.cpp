@@ -49,13 +49,14 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"entries_condemned", std::make_shared<DataTypeUInt64>(), "Retired entries newly condemned this round (retired-cursor pipeline stage 1)."},
         {"entries_graduated", std::make_shared<DataTypeUInt64>(), "Retired entries newly floor-passed and republished delete_pending this round (stage 2; deleted the NEXT round)."},
         {"entries_redeleted", std::make_shared<DataTypeUInt64>(), "Pending exact-token blob deletes executed this round (stage 3)."},
+        {"entries_redelete_failed", std::make_shared<DataTypeUInt64>(), "Pending blob deletes whose HEAD or exact-token DELETE failed this round. Each one stays delete_pending and is retried next round; a non-zero value fails the round."},
         {"fence_outs", std::make_shared<DataTypeUInt64>(), "Expired mounts fenced out by this round's heartbeat floor."},
         {"anomalies", std::make_shared<DataTypeUInt64>(), "Fold clamps surfaced (and survived) this round; steady >0 warrants a look at the round log details."},
         {"duration_ms", std::make_shared<DataTypeUInt64>(), "Round wall-clock duration (Finish)."},
         {"error", std::make_shared<DataTypeString>(), "Exception text when outcome = Aborted, Stopped or Error. On a Stopped row it names the engine\'s refusal, not the teardown."},
         {"error_code", std::make_shared<DataTypeInt32>(), "Exception code when outcome = Aborted, Stopped or Error; 0 otherwise. The structured twin of `error`: key monitoring on this column, not on message text."},
         {"ProfileEvents", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeUInt64>()),
-            "On a Start/Finish row: the per-round ProfileEvents delta (the Cas* counters and S3 events for this round). On a Phase row: THAT PHASE's delta, so `GROUP BY phase` over `ProfileEvents['S3ListObjects']` attributes the round's LIST budget to the phase that spent it. Empty on the `meta_pool_wait` row by construction — that phase's work runs on other threads (read its `phase_metrics` instead)."},
+            "On a Start/Finish row: the per-round ProfileEvents delta (the Cas* counters and S3 events for this round). On a Phase row: THAT PHASE's delta, so `GROUP BY phase` over `ProfileEvents['S3ListObjects']` attributes the round's LIST budget to the phase that spent it. Empty on the `meta_pool_wait` row by construction — that phase's work runs on other threads (read its `phase_metrics` instead). Requests issued by GC I/O pool workers (the `pending_deletes` fan-out and the fold read-ahead) are likewise missing from their phase rows; they still count in `system.events`."},
         {"round_id", std::make_shared<DataTypeString>(),
             "Correlator for every row of one round attempt (its Start, each Phase, and its Finish). Minted per attempt; unlike `round` it exists even for a round that never committed and for a round that never led. Group by this column to reconstruct one round."},
         {"phase", lc_string,
@@ -63,7 +64,7 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"phase_duration_microseconds", std::make_shared<DataTypeUInt64>(),
             "Wall-clock duration of this phase in microseconds (Phase rows only). Microseconds because several phases are routinely sub-millisecond and the point is to see when they are not. Phase durations do not sum to the round's `duration_ms`: the round also does untimed bookkeeping between phases."},
         {"phase_metrics", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeUInt64>()),
-            "Phase-specific semantic counts a phase computes for itself and no ProfileEvent can supply (Phase rows only) — for example `changed_shards` on defer_decision, `logs_accounted`/`logs_applied` on fold_ref_intake, `transactions_unapplied` on fold_reduce, `jobs_scheduled`/`jobs_completed` on meta_pool_wait. The verb counts ride the `ProfileEvents` column of the same row."},
+            "Phase-specific semantic counts a phase computes for itself and no ProfileEvent can supply (Phase rows only) — for example `changed_shards` on defer_decision, `logs_accounted`/`logs_applied` on fold_ref_intake, `transactions_unapplied` on fold_reduce, `jobs_scheduled`/`jobs_completed` on meta_pool_wait, `jobs_scheduled`/`jobs_failed` on pending_deletes. The verb counts ride the `ProfileEvents` column of the same row."},
     };
 }
 
@@ -90,6 +91,7 @@ void ContentAddressedGarbageCollectionLogElement::appendToBlock(MutableColumns &
     columns[i++]->insert(entries_condemned);
     columns[i++]->insert(entries_graduated);
     columns[i++]->insert(entries_redeleted);
+    columns[i++]->insert(entries_redelete_failed);
     columns[i++]->insert(fence_outs);
     columns[i++]->insert(anomalies);
     columns[i++]->insert(duration_ms);

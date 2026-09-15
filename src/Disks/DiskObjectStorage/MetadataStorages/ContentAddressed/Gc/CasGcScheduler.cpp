@@ -235,6 +235,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.entries_condemned = r.condemned;
         fin.entries_graduated = r.graduated;
         fin.entries_redeleted = r.redeleted;
+        fin.entries_redelete_failed = r.redelete_failed;
         fin.fence_outs = r.fence_outs;
         fin.anomalies = r.anomalies.size();
     };
