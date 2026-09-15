@@ -129,6 +129,7 @@ common_ft_job_config = Job.Config(
         include_paths=[
             "./ci/jobs/functional_tests.py",
             "./ci/jobs/scripts/clickhouse_proc.py",
+            "./ci/jobs/scripts/pick_endpoint.py",
             "./ci/jobs/scripts/server_cleanup.py",
             "./ci/jobs/scripts/functional_tests_results.py",
             "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
@@ -169,6 +170,7 @@ common_stress_job_config = Job.Config(
             "./tests/queries/0_stateless/",
             "./ci/jobs/stress_job.py",
             "./ci/jobs/scripts/clickhouse_proc.py",
+            "./ci/jobs/scripts/pick_endpoint.py",
             "./ci/jobs/scripts/stress/stress.py",
             "./tests/clickhouse-test",
             "./tests/config",
@@ -1269,7 +1271,11 @@ class JobConfigs:
             requires=[ArtifactNames.DEB_AMD_RELEASE],
         ),
     )
-    # why it's master only?
+    # Despite the name, only release_branches.py uses these.
+    # Six batches, not four: the whole integration suite is about 110000 test-seconds, which
+    # four batches of three xdist workers cannot fit into the two-hour pytest session timeout
+    # however well they are balanced. At four batches this job timed out on roughly half of
+    # all release-branch runs.
     integration_test_asan_master_jobs = common_integration_test_job_config.parametrize(
         *[
             Job.ParamSet(
@@ -1994,7 +2000,7 @@ class JobConfigs:
 
     sign_macos_binary_jobs = Job.Config(
         name=JobNames.SIGN_MACOS,
-        runs_on=RunnerLabels.STYLE_CHECK_AMD,
+        runs_on=RunnerLabels.RELEASE_RUNNER,
         command="python3 ./ci/jobs/sign_macos_binary.py --build-type {PARAMETER}",
         run_in_docker="altinityinfra/utils+--network=host+root",
         timeout=3600,

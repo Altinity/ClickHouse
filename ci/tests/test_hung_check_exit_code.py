@@ -248,12 +248,15 @@ class _FailedProc:
 def _reason_for_stderr(tmp_path, stderr, liveness):
     case = _make_test_case(tmp_path)
     Path(case.stderr_file).write_text(stderr, encoding="utf-8")
-    saved = _runner.check_server_liveness
+    saved = (_runner.check_server_liveness, _runner.probed_server_process)
     _runner.check_server_liveness = lambda *a, **k: liveness
+    # Stub args carry no `http_port`; process evidence reads "gone" so a failed
+    # probe stays on the immediate-abort path (ClickHouse/ClickHouse#115692).
+    _runner.probed_server_process = lambda args: (False, None, None)
     try:
         return case.process_result_impl(_FailedProc(), 1.0).reason
     finally:
-        _runner.check_server_liveness = saved
+        _runner.check_server_liveness, _runner.probed_server_process = saved
 
 
 def test_probe_only_failure_is_not_reported_as_a_death(tmp_path):
@@ -316,6 +319,7 @@ def _reason_for_failed_health_check(tmp_path, liveness):
         "send": _runner.TestCase.send_test_name_failed,
         "skip": _runner.TestCase.should_skip_test,
         "liveness": _runner.check_server_liveness,
+        "process": _runner.probed_server_process,
         "configure": _runner.TestCase.configure_testcase_args,
     }
     _runner.TestCase.send_test_name_failed = boom
@@ -326,6 +330,7 @@ def _reason_for_failed_health_check(tmp_path, liveness):
         RuntimeError("stop after the health-check site")
     )
     _runner.check_server_liveness = lambda *a, **k: liveness
+    _runner.probed_server_process = lambda args: (False, None, None)
     try:
         return case.run(args, Suite(), "").reason
     finally:
@@ -333,6 +338,7 @@ def _reason_for_failed_health_check(tmp_path, liveness):
         _runner.TestCase.should_skip_test = saved["skip"]
         _runner.TestCase.configure_testcase_args = saved["configure"]
         _runner.check_server_liveness = saved["liveness"]
+        _runner.probed_server_process = saved["process"]
 
 
 def test_health_check_send_failure_reports_the_probe(tmp_path):
@@ -385,6 +391,7 @@ def _reason_for_connection_error(tmp_path, liveness, exception):
         "skip": _runner.TestCase.should_skip_test,
         "configure": _runner.TestCase.configure_testcase_args,
         "liveness": _runner.check_server_liveness,
+        "process": _runner.probed_server_process,
     }
     _runner.TestCase.should_skip_test = lambda self, suite: None
 
@@ -393,12 +400,14 @@ def _reason_for_connection_error(tmp_path, liveness, exception):
 
     _runner.TestCase.configure_testcase_args = raise_connection_error
     _runner.check_server_liveness = lambda *a, **k: liveness
+    _runner.probed_server_process = lambda args: (False, None, None)
     try:
         return case.run(args, Suite(), "").reason
     finally:
         _runner.TestCase.should_skip_test = saved["skip"]
         _runner.TestCase.configure_testcase_args = saved["configure"]
         _runner.check_server_liveness = saved["liveness"]
+        _runner.probed_server_process = saved["process"]
 
 
 def test_connection_error_with_a_failed_probe_reports_the_probe(tmp_path):
@@ -838,7 +847,11 @@ def test_the_deadline_handshake_is_not_vacuous():
 def _probe_calls(stop_testing, worker, hung_check=True):
     calls = []
 
-    saved = (_runner.check_server_liveness, _runner.print_c_stacktraces)
+    saved = (
+        _runner.check_server_liveness,
+        _runner.print_c_stacktraces,
+        _runner.probed_server_process,
+    )
 
     def counting_probe(*a, **k):
         calls.append(1)
@@ -846,12 +859,21 @@ def _probe_calls(stop_testing, worker, hung_check=True):
 
     _runner.check_server_liveness = counting_probe
     _runner.print_c_stacktraces = lambda *a, **k: None
+    # The stub args carry no `http_port`, and the machine running the tests may
+    # keep a real server on the default one. These arms are about whether the
+    # probe runs at all, so the process evidence reads "gone": a failed probe
+    # aborts on the spot instead of entering `HungCheckMonitor`'s grace.
+    _runner.probed_server_process = lambda args: (False, None, None)
     try:
         exit_code, _ = _drive_parent_monitor_loop(
             worker, stop_testing, args=_runner_args(hung_check=hung_check)
         )
     finally:
-        _runner.check_server_liveness, _runner.print_c_stacktraces = saved
+        (
+            _runner.check_server_liveness,
+            _runner.print_c_stacktraces,
+            _runner.probed_server_process,
+        ) = saved
     return len(calls), exit_code
 
 
@@ -896,6 +918,7 @@ def _parent_probe_carrier_with_a_competitor(competitor_code):
         _runner.check_server_liveness,
         _runner.print_c_stacktraces,
         _runner.try_claim_stop_cause,
+        _runner.probed_server_process,
     )
     real_claim = _runner.try_claim_stop_cause
     carriers = []
@@ -916,6 +939,9 @@ def _parent_probe_carrier_with_a_competitor(competitor_code):
     _runner.check_server_liveness = lambda *a, **k: False
     _runner.print_c_stacktraces = fake_collect
     _runner.try_claim_stop_cause = capturing_claim
+    # "Gone" evidence keeps the failed probe on the immediate-abort path (see
+    # `_probe_calls`), which is where the claim-before-collect ordering lives.
+    _runner.probed_server_process = lambda args: (False, None, None)
     try:
         _drive_parent_monitor_loop(
             _worker_signalling_nothing,
@@ -927,6 +953,7 @@ def _parent_probe_carrier_with_a_competitor(competitor_code):
             _runner.check_server_liveness,
             _runner.print_c_stacktraces,
             _runner.try_claim_stop_cause,
+            _runner.probed_server_process,
         ) = saved
     assert collected, "the sweep never ran, so nothing competed"
     return carriers[0].value
@@ -1192,6 +1219,11 @@ ns = {"__name__": "__main__", "__file__": runner}
 exec(compile(definitions, runner, "exec"), ns)
 if os.environ.get("STUB_LIVENESS_FAILS") == "1":
     ns["check_server_liveness"] = lambda *a, **k: False
+    # The CI job running these tests keeps a real server on the default HTTP
+    # port, whose listening socket would grant `HungCheckMonitor`'s recovery
+    # grace and let the run finish green. These arms pin the fast-abort path,
+    # so the process evidence reads "gone".
+    ns["probed_server_process"] = lambda *a, **k: (False, None, None)
 if os.environ.get("STUB_HEALTH_CHECK_RAISES") == "1":
     # Reaches the WORKER decision site (`run`'s health-check block) rather than
     # the parent's periodic probe.
