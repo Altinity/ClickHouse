@@ -71,22 +71,15 @@ struct IcebergDataObjectInfo : public ObjectInfo, std::enable_shared_from_this<I
     /// Full path to the data object file
     /// It is used to filter position deletes objects by data file path.
     /// It is also used to create a filter for the data object in the position delete transform.
-<<<<<<< HEAD
-    explicit IcebergDataObjectInfo(
-        Iceberg::ProcessedManifestFileEntryPtr data_manifest_file_entry_,
-        const String & resolved_storage_path_,
-        Int32 schema_id_relevant_to_iterator_,
-        std::vector<std::pair<String, Field>> identity_partition_columns_);
-=======
     /// If resolved_storage_ and resolved_key_ are provided, the file may be located
     /// outside the table location (possibly in a different storage).
     explicit IcebergDataObjectInfo(
         Iceberg::ProcessedManifestFileEntryPtr data_manifest_file_entry_,
         const String & metadata_path_,
         Int32 schema_id_relevant_to_iterator_,
+        std::vector<std::pair<String, Field>> identity_partition_columns_,
         ObjectStoragePtr resolved_storage_ = nullptr,
         const String & resolved_key_ = "");
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 
     explicit IcebergDataObjectInfo(const RelativePathWithMetadata & path_);
     explicit IcebergDataObjectInfo(const RelativePathWithMetadata & path_, const Iceberg::IcebergObjectSerializableInfo & info_);

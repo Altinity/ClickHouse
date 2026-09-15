@@ -206,7 +206,6 @@ ObjectInfoPtr ObjectIteratorSplitByBuckets::next(size_t id)
 
 String ObjectInfo::getIdentifier(bool include_file_bucket_info) const
 {
-<<<<<<< HEAD
     return getIdentifierForPath(getPath(), include_file_bucket_info);
 }
 
@@ -216,15 +215,6 @@ String ObjectInfo::getIdentifierForPath(const String & path, bool include_file_b
     if (relative_path_with_metadata.read_source_index)
         result = std::to_string(*relative_path_with_metadata.read_source_index) + ":" + result;
     if (include_file_bucket_info && file_bucket_info)
-=======
-    return getIdentifierForPath(getPath());
-}
-
-String ObjectInfo::getIdentifierForPath(const String & path) const
-{
-    String result = path;
-    if (file_bucket_info)
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
         result += file_bucket_info->getIdentifier();
     return result;
 }

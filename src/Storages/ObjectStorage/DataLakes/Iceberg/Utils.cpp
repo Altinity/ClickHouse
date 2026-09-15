@@ -44,11 +44,8 @@
 #include <Functions/FunctionFactory.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Interpreters/sortBlock.h>
-<<<<<<< HEAD
 #include <Poco/String.h>
-=======
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 
 #if USE_AVRO
 

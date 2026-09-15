@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-#include <Core/ProtocolDefines.h>
-=======
 #include <Poco/String.h>
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 #include "config.h"
 
 #include <Core/Field.h>
@@ -61,16 +57,13 @@ String computePartitionId(const Row & partition_key_value)
 #if USE_AVRO
 
 IcebergDataObjectInfo::IcebergDataObjectInfo(
-<<<<<<< HEAD
     Iceberg::ProcessedManifestFileEntryPtr data_manifest_file_entry_,
-    const String & resolved_storage_path_,
+    const String & metadata_path_,
     Int32 schema_id_relevant_to_iterator_,
-    std::vector<std::pair<String, Field>> identity_partition_columns_)
-    : ObjectInfo(RelativePathWithMetadata(resolved_storage_path_))
-=======
-    Iceberg::ProcessedManifestFileEntryPtr data_manifest_file_entry_, const String & metadata_path_, Int32 schema_id_relevant_to_iterator_, ObjectStoragePtr resolved_storage_, const String & resolved_key_)
+    std::vector<std::pair<String, Field>> identity_partition_columns_,
+    ObjectStoragePtr resolved_storage_,
+    const String & resolved_key_)
     : ObjectInfo(RelativePathWithMetadata(resolved_key_.empty() ? metadata_path_ : resolved_key_))
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
     , info{
           data_manifest_file_entry_->parsed_entry->file_path_key,
           metadata_path_,
@@ -83,13 +76,9 @@ IcebergDataObjectInfo::IcebergDataObjectInfo(
           /* position_deletes_objects */ {},
           /* equality_deletes_objects */ {},
           data_manifest_file_entry_->parsed_entry->record_count,
-<<<<<<< HEAD
           data_manifest_file_entry_->parsed_entry->file_size_in_bytes,
           std::move(identity_partition_columns_)}
-=======
-          data_manifest_file_entry_->parsed_entry->file_size_in_bytes}
     , resolved_storage(std::move(resolved_storage_))
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 {
     /// resolved_storage and resolved_key must be provided together or neither must be provided
     /// (default-constructed, meaning the path has not been resolved yet).

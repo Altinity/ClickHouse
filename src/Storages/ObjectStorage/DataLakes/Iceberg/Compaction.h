@@ -35,6 +35,7 @@ void compactIcebergTable(
 void compactIcebergManifests(
     const PersistentTableComponents & persistent_table_components,
     DB::ObjectStoragePtr object_storage_,
+    std::shared_ptr<SecondaryStorages> secondary_storages_,
     const DataLakeStorageSettings & data_lake_settings,
     DB::SharedHeader sample_block_,
     DB::ContextPtr context_,

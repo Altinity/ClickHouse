@@ -987,12 +987,8 @@ IcebergStorageSink::IcebergStorageSink(
     , table_id(table_id_)
     , persistent_table_components(persistent_table_components_)
     , data_lake_settings(configuration_->getDataLakeSettings())
-<<<<<<< HEAD
     , write_format(configuration_->format)
-=======
-    , write_format(configuration_->getFormat())
     , secondary_storages(std::move(secondary_storages_))
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 {
     auto [last_version, metadata_path, compression_method] = getLatestMetadataFileAndVersionWithCatalog(
         object_storage,
@@ -1402,17 +1398,13 @@ bool IcebergStorageSink::initializeMetadata()
             try
             {
                 generateManifestList(
-<<<<<<< HEAD
                     persistent_table_components.path_resolver,
-                    metadata, object_storage, context,
+                    metadata, object_storage, *secondary_storages, context,
                     manifest_entries,
                     new_snapshot,
                     manifest_entry_sizes,
                     *buffer_manifest_list,
                     Iceberg::FileContentType::DATA,
-=======
-                    persistent_table_components.path_resolver, metadata, object_storage, *secondary_storages, context, manifest_entries, new_snapshot, manifest_entry_sizes, *buffer_manifest_list, Iceberg::FileContentType::DATA,
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
                     /* use_previous_snapshots = */ true);
                 buffer_manifest_list->finalize();
             }

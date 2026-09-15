@@ -12,7 +12,11 @@ extern const int BAD_ARGUMENTS;
 namespace DB::Iceberg
 {
 
-<<<<<<< HEAD
+IcebergPathFromMetadata IcebergPathFromMetadata::makeStorageIdentity(const ObjectStoragePtr & storage, const String & key)
+{
+    return IcebergPathFromMetadata(storage->getDescription() + '\0' + storage->getObjectsNamespace() + '\0' + key);
+}
+
 namespace
 {
 std::string_view trimTrailingSlashes(std::string_view str)
@@ -69,11 +73,6 @@ IcebergPathResolver::TableRootDerivation IcebergPathResolver::deriveTableRoot(
         return {queried_path, RootRelation::Unknown};
 
     return {String(candidate), RootRelation::AdoptedDescendant};
-=======
-IcebergPathFromMetadata IcebergPathFromMetadata::makeStorageIdentity(const ObjectStoragePtr & storage, const String & key)
-{
-    return IcebergPathFromMetadata(storage->getDescription() + '\0' + storage->getObjectsNamespace() + '\0' + key);
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 }
 
 // This function is used to get the file path inside the directory which corresponds to Iceberg table from the full blob path which is written in manifest and metadata files.

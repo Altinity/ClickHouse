@@ -97,19 +97,14 @@ Iceberg::ManifestFileCacheableInfo getManifestFile(
         if (use_iceberg_metadata_cache)
             read_settings.enable_filesystem_cache = false;
 
-<<<<<<< HEAD
         // Test-only: simulate per-object latency.
         fiu_do_on(FailPoints::iceberg_slow_manifest_read,
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
         });
 
-        auto buffer = createReadBuffer(manifest_object_info, object_storage, local_context, log, read_settings);
-        auto manifest_file_deserializer = std::make_unique<Iceberg::AvroForIcebergDeserializer>(
-=======
         auto buffer = createReadBuffer(manifest_object_info, storage_to_use, local_context, log, read_settings);
         auto manifest_file_deserializer = std::make_shared<Iceberg::AvroForIcebergDeserializer>(
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
             std::move(buffer), filename, getFormatSettings(local_context));
 
         return Iceberg::ManifestFileCacheableInfo{std::move(manifest_file_deserializer), bytes_size};
@@ -259,12 +254,8 @@ ManifestFileCacheKeys getManifestList(
             Int32 partition_spec_id = static_cast<Int32>(
                 manifest_list_deserializer.getValueFromRowByName(i, f_partition_spec_id, TypeIndex::Int32).safeGet<Int32>());
             manifest_file_cache_keys.emplace_back(
-<<<<<<< HEAD
-                manifest_file_name, manifest_length, added_sequence_number, added_snapshot_id.safeGet<Int64>(), content_type,
-                partition_spec_id);
-=======
-                manifest_file_name, static_cast<size_t>(manifest_length), added_sequence_number, added_snapshot_id.safeGet<Int64>(), content_type);
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
+                manifest_file_name, static_cast<size_t>(manifest_length), added_sequence_number, added_snapshot_id.safeGet<Int64>(),
+                content_type, partition_spec_id);
 
             insertRowToLogTable(
                 local_context,

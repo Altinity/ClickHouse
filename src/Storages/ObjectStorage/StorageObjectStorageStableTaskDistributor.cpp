@@ -21,6 +21,11 @@ String getSchedulingIdentifier(const ObjectInfoPtr & object_info, bool send_over
     if (send_over_whole_archive && object_info->isArchive())
         return object_info->getIdentifierForPath(object_info->getPathToArchive());
 
+    /// For Iceberg objects addressed by an external (absolute) path, schedule by that metadata path
+    /// so the same physical file maps to a stable replica regardless of the coordinator's key.
+    if (auto metadata_path = getMetadataPathFromObjectInfo(object_info))
+        return object_info->getIdentifierForPath(*metadata_path);
+
     return object_info->getIdentifier();
 }
 
@@ -206,66 +211,4 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
     return {};
 }
 
-<<<<<<< HEAD
-=======
-void StorageObjectStorageStableTaskDistributor::saveLastNodeActivity(size_t number_of_current_replica)
-{
-    Poco::Timestamp now;
-    std::lock_guard lock(mutex);
-    last_node_activity[number_of_current_replica] = now;
-}
-
-void StorageObjectStorageStableTaskDistributor::rescheduleTasksFromReplica(size_t number_of_current_replica)
-{
-    LOG_INFO(log, "Replica {} is marked as lost, tasks are returned to queue", number_of_current_replica);
-    std::lock_guard lock(mutex);
-
-    auto processed_file_list_ptr = replica_to_files_to_be_processed.find(number_of_current_replica);
-    if (processed_file_list_ptr == replica_to_files_to_be_processed.end())
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Replica number {} was marked as lost already",
-            number_of_current_replica
-        );
-
-    if (replica_to_files_to_be_processed.size() < 2)
-        throw Exception(
-            ErrorCodes::CANNOT_READ_ALL_DATA,
-            "All replicas were marked as lost"
-        );
-
-    auto files = std::move(processed_file_list_ptr->second);
-    replica_to_files_to_be_processed.erase(number_of_current_replica);
-    for (const auto & file : files)
-    {
-        auto file_identifier = getFileIdentifier(file);
-        auto file_replica_idx = getReplicaForFile(file_identifier);
-        unprocessed_files.emplace(file_identifier, std::make_pair(file, file_replica_idx));
-        connection_to_files[file_replica_idx].push_back(file);
-    }
-}
-
-String StorageObjectStorageStableTaskDistributor::getFileIdentifier(ObjectInfoPtr file_object, bool write_to_log) const
-{
-    if (send_over_whole_archive && file_object->isArchive())
-    {
-        auto file_identifier = file_object->getPathOrPathToArchiveIfArchive();
-        if (write_to_log)
-        {
-            LOG_TEST(log, "Will send over the whole archive {} to replicas. "
-                        "This will be suboptimal, consider turning on "
-                        "cluster_function_process_archive_on_multiple_nodes setting", file_identifier);
-        }
-        return file_identifier;
-    }
-
-    /// For Iceberg objects addressed by an external (absolute) path, schedule by that metadata path
-    /// so the same physical file maps to a stable replica regardless of the coordinator's key.
-    if (auto metadata_path = getMetadataPathFromObjectInfo(file_object))
-        return file_object->getIdentifierForPath(*metadata_path);
-
-    return file_object->getIdentifier();
-}
-
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 }

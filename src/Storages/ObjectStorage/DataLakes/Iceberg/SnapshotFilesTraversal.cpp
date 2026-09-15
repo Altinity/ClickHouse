@@ -107,14 +107,8 @@ void collectMetadataRootFiles(
     /// taken from metadata contents, so feeding it to the resolver inside `visit` would misparse it.
     out.insert(metadata_path);
 
-<<<<<<< HEAD
     /// version-hint.text is not a metadata path: it is a fixed object under the storage root.
     out.insert(std::filesystem::path(resolver.getTableRoot()) / "metadata" / "version-hint.text");
-=======
-    /// `getTableLocation` has no trailing '/' (unlike `FileNamesGenerator`, which appends one).
-    auto version_hint = IcebergPathFromMetadata::deserialize(fmt::format("{}/metadata/version-hint.text", resolver.getTableLocation()));
-    visit(version_hint);
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 
     if (metadata->has(f_metadata_log))
     {

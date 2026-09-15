@@ -246,12 +246,9 @@ static Plan getPlan(
             plan.manifest_list_to_manifest_files[snapshot.manifest_list_path].push_back(manifest_file.manifest_file_path);
             if (!plan.manifest_file_to_first_snapshot.contains(manifest_file.manifest_file_path))
                 plan.manifest_file_to_first_snapshot[manifest_file.manifest_file_path] = snapshot.snapshot_id;
-<<<<<<< HEAD
             if (!plan.manifest_file_lineage.contains(manifest_file.manifest_file_path))
                 plan.manifest_file_lineage[manifest_file.manifest_file_path] = {manifest_file.added_snapshot_id};
-=======
             plan.referenced_file_paths.insert(manifest_file.manifest_file_path);
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
             auto files_handle = getManifestFileEntriesHandle(
                 object_storage, persistent_table_components, context, log, manifest_file, static_cast<Int32>(current_schema_id), secondary_storages);
 
@@ -281,44 +278,31 @@ static Plan getPlan(
                     persistent_table_components.path_resolver);
 
                 IcebergDataObjectInfoPtr data_object_info = std::make_shared<IcebergDataObjectInfo>(
-<<<<<<< HEAD
                     data_file,
-                    persistent_table_components.path_resolver.resolve(data_file->parsed_entry->file_path_key),
+                    raw_metadata_path,
                     0,
-                    Iceberg::getIdentityPartitionColumnValues(*data_file, *persistent_table_components.schema_processor));
+                    Iceberg::getIdentityPartitionColumnValues(*data_file, *persistent_table_components.schema_processor),
+                    resolved_storage,
+                    resolved_key);
                 /// One DataFilePlan per source *data file*, keyed by the data file's own path.
                 /// Keying by the manifest path made every data file after the first in a
                 /// manifest reuse the first file's plan, so writeDataFiles rewrote only one
                 /// file per manifest and the rest of the manifest's data silently disappeared
                 /// from the compacted table. The map still deduplicates the same data file
                 /// referenced from multiple snapshots' manifest lists.
-                const auto & data_file_path = data_file->parsed_entry->file_path_key;
-                std::shared_ptr<DataFilePlan> data_file_ptr;
-                if (!plan.path_to_data_file.contains(data_file_path))
-=======
-                    data_file, raw_metadata_path, 0, resolved_storage, resolved_key);
                 std::shared_ptr<DataFilePlan> data_file_ptr;
                 auto path_identifier = Iceberg::IcebergPathFromMetadata::makeStorageIdentity(resolved_storage, resolved_key);
                 if (!plan.path_to_data_file.contains(path_identifier))
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
                 {
                     data_file_ptr = std::make_shared<DataFilePlan>(DataFilePlan{
                         .data_object_info = data_object_info,
                         .manifest_list = manifest_files[manifest_file.manifest_file_path],
                         .patched_path = plan.generator.generateDataFileName()});
-<<<<<<< HEAD
-                    plan.path_to_data_file[data_file_path] = data_file_ptr;
-                }
-                else
-                {
-                    data_file_ptr = plan.path_to_data_file[data_file_path];
-=======
                     plan.path_to_data_file[path_identifier] = data_file_ptr;
                 }
                 else
                 {
                     data_file_ptr = plan.path_to_data_file[path_identifier];
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
                 }
                 plan.partitions[partition_index].push_back(data_file_ptr);
                 plan.snapshot_id_to_data_files[snapshot.snapshot_id].push_back(plan.partitions[partition_index].back());
@@ -372,7 +356,6 @@ static void writeDataFiles(
 
     for (auto & [_, data_file] : initial_plan.path_to_data_file)
     {
-<<<<<<< HEAD
         /// The transform requires `ChunkInfoRowNumbers` in every chunk even when it has nothing
         /// to delete, and only the Parquet input formats attach it. Data files with attached
         /// position deletes are guaranteed to be Parquet by `addPositionDeleteObject`, but a data
@@ -387,19 +370,9 @@ static void writeDataFiles(
                 format_settings,
                 // todo make compaction using same FormatParserSharedResources
                 std::make_shared<FormatParserSharedResources>(context->getSettingsRef(), 1),
-                context);
-=======
-        auto delete_file_transform = std::make_shared<IcebergBitmapPositionDeleteTransform>(
-            sample_block,
-            data_file->data_object_info,
-            object_storage,
-            format_settings,
-            // todo make compaction using same FormatParserSharedResources
-            std::make_shared<FormatParserSharedResources>(context->getSettingsRef(), 1),
-            context,
-            path_resolver,
-            secondary_storages);
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
+                context,
+                path_resolver,
+                secondary_storages);
 
         ObjectStoragePtr storage_to_use = data_file->data_object_info->getResolvedStorage();
         if (!storage_to_use)
@@ -474,7 +447,7 @@ static bool writeConsolidatedManifestFile(
     int metadata_version,
     Poco::JSON::Object::Ptr metadata_object,
     const PersistentTableComponents & persistent_table_components,
-    ObjectStoragePtr object_storage, ContextPtr context,
+    ObjectStoragePtr object_storage, SecondaryStorages & secondary_storages, ContextPtr context,
     SharedHeader sample_block_,
     String write_format,
     CompressionMethod compression_method,
@@ -678,7 +651,8 @@ static bool writeConsolidatedManifestFile(
     std::unordered_set<String> delete_manifest_paths;
 
     auto current_manifest_list = getManifestList(
-        object_storage, persistent_table_components, context, IcebergPathFromMetadata::deserialize(current_manifest_list_path), log);
+        object_storage, persistent_table_components, context, IcebergPathFromMetadata::deserialize(current_manifest_list_path), log,
+        secondary_storages);
 
     for (const auto & manifest_file : current_manifest_list)
     {
@@ -707,7 +681,8 @@ static bool writeConsolidatedManifestFile(
         }
 
         auto files_handle = getManifestFileEntriesHandle(
-            object_storage, persistent_table_components, context, log, manifest_file, static_cast<Int32>(current_schema_id));
+            object_storage, persistent_table_components, context, log, manifest_file, static_cast<Int32>(current_schema_id),
+            secondary_storages);
 
         for (const auto & data_file : files_handle.getFilesWithoutDeleted(FileContentType::DATA))
         {
@@ -943,6 +918,7 @@ static bool writeConsolidatedManifestFile(
             path_resolver,
             metadata_object,
             object_storage,
+            secondary_storages,
             context,
             consolidated_manifest_paths,
             new_snapshot.snapshot,
@@ -1434,6 +1410,7 @@ static void clearOldFiles(const std::vector<std::pair<ObjectStoragePtr, String>>
 void compactIcebergManifests(
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage_,
+    std::shared_ptr<SecondaryStorages> secondary_storages_,
     const DataLakeStorageSettings & data_lake_settings,
     SharedHeader sample_block_,
     ContextPtr context_,
@@ -1498,6 +1475,7 @@ void compactIcebergManifests(
                 metadata_object,
                 persistent_table_components,
                 object_storage_,
+                *secondary_storages_,
                 context_,
                 sample_block_,
                 write_format,

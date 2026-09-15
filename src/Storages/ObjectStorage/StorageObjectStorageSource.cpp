@@ -701,15 +701,9 @@ Chunk StorageObjectStorageSource::generate()
                 chunk,
                 read_from_format_info.requested_virtual_columns,
                 {
-<<<<<<< HEAD
-                    .path = path,
+                    .path = path_for_virtual_column,
                     .storage_id = storage_id,
                     .size = object_size,
-=======
-                    .path = path_for_virtual_column,
-                    .storage_id = storage_snapshot->storage.getStorageID(),
-                    .size = object_info->isArchive() ? object_info->fileSizeInArchive() : object_metadata->size_bytes,
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
                     .filename = &filename,
                     /// Report an unknown modification time (e.g. a web object whose HTTP response has no
                     /// `Last-Modified` header) as `NULL` in `_time`, not as the default epoch `1970-01-01`.
@@ -918,15 +912,10 @@ Chunk StorageObjectStorageSource::generate()
         }
 
         if (reader.getInputFormat() && read_context->getSettingsRef()[Setting::use_cache_for_count_from_files]
-<<<<<<< HEAD
             && !format_filter_info->filter_actions_dag
             && !hasAttachedDeletes(*reader.getObjectInfo())
             && !reader.getObjectInfo()->rows_to_read)
-            addNumRowsToCache(*reader.getObjectInfo(), total_rows_in_file);
-=======
-            && !format_filter_info->filter_actions_dag)
             addNumRowsToCache(reader.getObjectInfo(), total_rows_in_file);
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 
         total_rows_in_file = 0;
 
@@ -951,13 +940,8 @@ Chunk StorageObjectStorageSource::generate()
 void StorageObjectStorageSource::addNumRowsToCache(const ObjectInfoPtr & object_info, size_t num_rows)
 {
     const auto cache_key = getKeyForSchemaCache(
-<<<<<<< HEAD
-        getUniqueStoragePathIdentifier(*configuration, object_info),
-        object_info.getFileFormat().value_or(configuration->format),
-=======
         getUniqueStoragePathIdentifier(*configuration, object_info, object_storage),
-        object_info->getFileFormat().value_or(configuration->getFormat()),
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
+        object_info->getFileFormat().value_or(configuration->format),
         format_settings,
         read_context);
     schema_cache.addNumRows(cache_key, num_rows);
@@ -1022,24 +1006,16 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
             if (query_settings.ignore_non_existent_file)
             {
-<<<<<<< HEAD
-                auto metadata = object_storage->tryGetObjectMetadata(metadata_object, with_tags);
-=======
-                auto metadata = storage_to_use->tryGetObjectMetadata(path, with_tags);
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
+                auto metadata = storage_to_use->tryGetObjectMetadata(metadata_object, with_tags);
                 if (!metadata)
                     return {};
 
                 object_info->setObjectMetadata(metadata.value());
             }
             else
-<<<<<<< HEAD
             {
-                object_info->setObjectMetadata(object_storage->getObjectMetadata(metadata_object, with_tags));
+                object_info->setObjectMetadata(storage_to_use->getObjectMetadata(metadata_object, with_tags));
             }
-=======
-                object_info->setObjectMetadata(storage_to_use->getObjectMetadata(path, with_tags));
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
         }
 
         if (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0
@@ -1097,13 +1073,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             return std::nullopt;
 
         const auto cache_key = getKeyForSchemaCache(
-<<<<<<< HEAD
-            getUniqueStoragePathIdentifier(*configuration, *object_info),
-            object_info->getFileFormat().value_or(configuration->format),
-=======
             getUniqueStoragePathIdentifier(*configuration, object_info, object_storage),
-            object_info->getFileFormat().value_or(configuration->getFormat()),
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
+            object_info->getFileFormat().value_or(configuration->format),
             format_settings,
             context_);
 
@@ -1178,18 +1149,14 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         else
         {
             ProfileEvents::increment(ProfileEvents::ObjectStorageReadObjects);
-<<<<<<< HEAD
             compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->compression_method);
-            read_buf = createReadBuffer(
-                object_info->relative_path_with_metadata, object_storage, context_, log, std::nullopt, !headers_requested);
-=======
-            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->getCompressionMethod());
             read_buf = createReadBuffer(
                 object_info->relative_path_with_metadata,
                 getResolvedStorageFromObjectInfo(object_info, object_storage),
                 context_,
-                log);
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
+                log,
+                std::nullopt,
+                !headers_requested);
         }
 
         Block initial_header = read_from_format_info.format_header;
@@ -2161,7 +2128,6 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     }
 }
 
-<<<<<<< HEAD
 static size_t getKnownArchiveSize(const ObjectInfoPtr & object_info)
 {
     const auto object_metadata = object_info->getObjectMetadata();
@@ -2172,7 +2138,8 @@ static size_t getKnownArchiveSize(const ObjectInfoPtr & object_info)
             object_info->getPath());
 
     return object_metadata->size_bytes;
-=======
+}
+
 void StorageObjectStorageSource::ReadTaskIterator::resolveIcebergObjectStorageIfNeeded([[maybe_unused]] const ObjectInfoPtr & object)
 {
 #if USE_AVRO
@@ -2195,7 +2162,6 @@ void StorageObjectStorageSource::ReadTaskIterator::resolveIcebergObjectStorageIf
         iceberg_info->relative_path_with_metadata.relative_path = resolved->second;
     }
 #endif
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 }
 
 ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
@@ -2339,14 +2305,10 @@ ObjectInfoPtr StorageObjectStorageSource::ArchiveIterator::next(size_t processor
                 }
 
                 if (!archive_object->getObjectMetadata())
-<<<<<<< HEAD
-                    archive_object->setObjectMetadata(object_storage->getObjectMetadata(archive_object->relative_path_with_metadata, /*with_tags=*/ false));
-=======
                 {
                     ObjectStoragePtr storage_to_use = getResolvedStorageFromObjectInfo(archive_object, object_storage);
-                    archive_object->setObjectMetadata(storage_to_use->getObjectMetadata(archive_object->getPath(), /*with_tags=*/ false));
+                    archive_object->setObjectMetadata(storage_to_use->getObjectMetadata(archive_object->relative_path_with_metadata, /*with_tags=*/ false));
                 }
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 
                 archive_reader = createArchiveReader(archive_object);
                 file_enumerator = archive_reader->firstFile();
@@ -2372,14 +2334,10 @@ ObjectInfoPtr StorageObjectStorageSource::ArchiveIterator::next(size_t processor
                 return {};
 
             if (!archive_object->getObjectMetadata())
-<<<<<<< HEAD
-                archive_object->setObjectMetadata(object_storage->getObjectMetadata(archive_object->relative_path_with_metadata, /*with_tags=*/ false));
-=======
             {
                 ObjectStoragePtr storage_to_use = getResolvedStorageFromObjectInfo(archive_object, object_storage);
-                archive_object->setObjectMetadata(storage_to_use->getObjectMetadata(archive_object->getPath(), /*with_tags=*/ false));
+                archive_object->setObjectMetadata(storage_to_use->getObjectMetadata(archive_object->relative_path_with_metadata, /*with_tags=*/ false));
             }
->>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 
             archive_reader = createArchiveReader(archive_object);
             if (!archive_reader->fileExists(path_in_archive))
