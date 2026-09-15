@@ -10,6 +10,7 @@
 #include <Compression/CompressedReadBuffer.h>
 #include <Compression/CompressedWriteBuffer.h>
 #include <Compression/CompressionFactory.h>
+#include <Core/AntalyaProtocol.h>
 #include <Core/ProtocolDefines.h>
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
@@ -2136,7 +2137,9 @@ void TCPHandler::processUnexpectedHello()
 void TCPHandler::sendHello()
 {
     writeVarUInt(Protocol::Server::Hello, *out);
-    writeStringBinary(VERSION_NAME, *out);
+    /// Unconditional: the client writes its Hello first, so the server is the only side that can
+    /// advertise without already knowing what the peer is. See `docs/en/antalya/protocol.md`.
+    writeStringBinary(AntalyaProtocol::appendMarker(VERSION_NAME), *out);
     writeVarUInt(VERSION_MAJOR, *out);
     writeVarUInt(VERSION_MINOR, *out);
     writeVarUInt(DBMS_TCP_PROTOCOL_VERSION, *out);

@@ -1,0 +1,18 @@
+<clickhouse>
+    <remote_servers>
+        <!-- Single shard, so a `remote()` call against it has shard_count == 1. -->
+        <plain_cluster>
+            <shard>
+                <replica><host>node2</host><port>9000</port></replica>
+            </shard>
+        </plain_cluster>
+        <!-- Same, but authenticated with a cluster secret, which makes the worker
+             take the interserver branch of TCPHandler::receiveHello. -->
+        <secret_cluster>
+            <secret>antalya_secret</secret>
+            <shard>
+                <replica><host>node2</host><port>9000</port></replica>
+            </shard>
+        </secret_cluster>
+    </remote_servers>
+</clickhouse>
