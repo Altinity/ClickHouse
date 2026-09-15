@@ -3,10 +3,17 @@
 #include <atomic>
 #include <stdexcept>
 
+#include <Common/ProfileEvents.h>
+
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
+
+namespace ProfileEvents
+{
+extern const Event CASGCRetiredRedeleteFailed;
+}
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -107,6 +114,7 @@ TEST(CASGCRedeleteConcurrency, FailedRemoveKeepsSiblingOutcomesAndPoolAlive)
     Gc gc(store, kGc);
     publishThenDrop(*backend, store, gc);
 
+    const auto failed_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed].load();
     size_t failed_rounds = 0;
     for (int i = 0; i < 8 && !allBlobsAbsent(*backend, *store); ++i)
     {
@@ -126,6 +134,7 @@ TEST(CASGCRedeleteConcurrency, FailedRemoveKeepsSiblingOutcomesAndPoolAlive)
     }
 
     EXPECT_EQ(failed_rounds, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed].load() - failed_before, 1u);
     EXPECT_FALSE(backend->armed.load());
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
 }

@@ -44,6 +44,7 @@ namespace ProfileEvents
     extern const Event CASGCRetiredSpared;
     extern const Event CASGCRetiredGraduated;
     extern const Event CASGCRetiredRedeleted;
+    extern const Event CASGCRetiredRedeleteFailed;
     extern const Event CASGCRetireReplaced;
     extern const Event CASGCCondemnMarkerUnconfirmedCarry;
     extern const Event CASGCHeartbeatFenceOuts;
@@ -464,7 +465,20 @@ void Gc::redeleteBlob(
     RoundReport & report,
     OutcomeLog & outcome_log)
 {
-    const RedeleteIo io = performRedeleteIo(entry, layout, op);
+    RedeleteIo io;
+    try
+    {
+        io = performRedeleteIo(entry, layout, op);
+    }
+    catch (...)
+    {
+        ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
+        LOG_WARNING(logger,
+            "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays delete_pending "
+            "and is retried in the next round: {}",
+            blobIdOf(entry.ref), layout.blobKey(entry.ref), entry.condemn_round, getCurrentExceptionMessage(false));
+        throw;
+    }
     applyRedeleteOutcome(entry, io, new_round, generation, round_work_budget, report, outcome_log);
 }
 
@@ -504,6 +518,15 @@ void Gc::redeleteBlobs(
                     catch (...)
                     {
                         io_results[i].error = std::current_exception();
+                        ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
+                        LOG_WARNING(
+                            logger,
+                            "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays "
+                            "delete_pending and is retried in the next round: {}",
+                            blobIdOf(entries[i].ref),
+                            layout.blobKey(entries[i].ref),
+                            entries[i].condemn_round,
+                            getCurrentExceptionMessage(false));
                     }
                 });
         }
