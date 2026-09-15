@@ -169,7 +169,6 @@ bool ManifestFileIterator::ManifestFileEntriesHandle::areAllDataFilesSortedBySor
 
 bool ManifestFileIterator::ManifestFileEntriesHandle::areAllDataFilesEligibleForLazyMaterialization(Int32 table_schema_id) const
 {
-<<<<<<< HEAD
     /// Equality deletes force reading all physical columns of the data files they apply to
     /// (see IcebergMetadata::getInitialSchemaByPath), so the pruned main read is impossible.
     if (!equality_delete_files->empty())
@@ -192,7 +191,6 @@ bool ManifestFileIterator::ManifestFileEntriesHandle::areAllDataFilesEligibleFor
 
 std::optional<UInt64> ManifestFileIterator::ManifestFileEntriesHandle::getRowsCountInAllFilesExcludingDeleted(FileContentType content) const
 {
-    UInt64 result = 0;
     /// `record_count` is a required file-level field in all format versions, so the sum is
     /// exact: no fallback to optional per-column statistics is needed. The field is parsed
     /// as a raw Int64 though, so a corrupted manifest file may carry a negative value; it
@@ -200,16 +198,7 @@ std::optional<UInt64> ManifestFileIterator::ManifestFileEntriesHandle::getRowsCo
     /// silently produce a wrong -- or, after the conversion to size_t, absurdly huge --
     /// count) and rather than rejected (the count is only an optimization, a malformed
     /// value must not make the table unreadable).
-    for (const auto & file : getFilesWithoutDeleted(content))
-    {
-        if (file->parsed_entry->record_count < 0)
-            return std::nullopt;
-        result += static_cast<UInt64>(file->parsed_entry->record_count);
-    }
-    return result;
-=======
     return getRecordCountInAllFilesExcludingDeleted(getFilesWithoutDeleted(content));
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 }
 
 std::optional<Int64> ManifestFileIterator::ManifestFileEntriesHandle::getBytesCountInAllDataFilesExcludingDeleted() const

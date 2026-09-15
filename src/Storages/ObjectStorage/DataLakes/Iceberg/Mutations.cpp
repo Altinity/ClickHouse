@@ -45,12 +45,8 @@ namespace DB::ErrorCodes
 extern const int BAD_ARGUMENTS;
 extern const int LOGICAL_ERROR;
 extern const int LIMIT_EXCEEDED;
-<<<<<<< HEAD
 extern const int NOT_IMPLEMENTED;
-=======
 extern const int SUPPORT_IS_DISABLED;
-extern const int QUERY_WAS_CANCELLED;
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 }
 
 namespace DB::DataLakeStorageSetting

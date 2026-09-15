@@ -316,39 +316,10 @@ IcebergIterator::IcebergIterator(
     , blocking_queue(100)
     , callback(std::move(callback_))
 {
-<<<<<<< HEAD
     /// Decoding any manifest reads settings from the context, so a missing one is fatal either way.
     if (!local_context)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Context is required to construct IcebergIterator");
 
-=======
-    auto delete_file = deletes_iterator.next();
-    while (delete_file.has_value())
-    {
-        if (delete_file.value()->parsed_entry->equality_ids.has_value())
-        {
-            equality_deletes_files.emplace_back(std::move(delete_file.value()));
-        }
-        else if (delete_file.value()->parsed_entry->isDeletionVector())
-        {
-            deletion_vector_files.emplace_back(std::move(delete_file.value()));
-        }
-        else
-        {
-            parquet_position_deletes_files.emplace_back(std::move(delete_file.value()));
-        }
-        delete_file = deletes_iterator.next();
-    }
-    LOG_DEBUG(
-        logger,
-        "Taken {} deletion vector files, {} parquet position delete files and {} equality delete files in iceberg iterator",
-        deletion_vector_files.size(),
-        parquet_position_deletes_files.size(),
-        equality_deletes_files.size());
-    std::sort(equality_deletes_files.begin(), equality_deletes_files.end());
-    std::sort(deletion_vector_files.begin(), deletion_vector_files.end());
-    std::sort(parquet_position_deletes_files.begin(), parquet_position_deletes_files.end());
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     producer_task = std::make_unique<ThreadFromGlobalPool>(
         [this, thread_group = CurrentThread::getGroup()]()
         {
@@ -479,8 +450,10 @@ void IcebergIterator::decodeDeleteManifests()
         {
             if (delete_file->parsed_entry->equality_ids.has_value())
                 equality_deletes_files.emplace_back(std::move(delete_file));
+            else if (delete_file->parsed_entry->isDeletionVector())
+                deletion_vector_files.emplace_back(std::move(delete_file));
             else
-                position_deletes_files.emplace_back(std::move(delete_file));
+                parquet_position_deletes_files.emplace_back(std::move(delete_file));
         }
     }
     chassert(in_flight.empty());
@@ -488,9 +461,15 @@ void IcebergIterator::decodeDeleteManifests()
 
     /// Sort objects by common_partition_specification, partition_key_value and added_sequence_number.
     /// This is needed to efficiently match delete and data manifests in defineDeletesSpan().
-    LOG_DEBUG(logger, "Taken {} position deletes file and {} equality deletes files in iceberg iterator", position_deletes_files.size(), equality_deletes_files.size());
+    LOG_DEBUG(
+        logger,
+        "Taken {} deletion vector files, {} parquet position delete files and {} equality delete files in iceberg iterator",
+        deletion_vector_files.size(),
+        parquet_position_deletes_files.size(),
+        equality_deletes_files.size());
     std::sort(equality_deletes_files.begin(), equality_deletes_files.end());
-    std::sort(position_deletes_files.begin(), position_deletes_files.end());
+    std::sort(deletion_vector_files.begin(), deletion_vector_files.end());
+    std::sort(parquet_position_deletes_files.begin(), parquet_position_deletes_files.end());
 }
 
 ObjectInfoPtr IcebergIterator::next(size_t)
@@ -500,33 +479,18 @@ ObjectInfoPtr IcebergIterator::next(size_t)
     Iceberg::ProcessedManifestFileEntryPtr manifest_file_entry;
     if (blocking_queue.pop(manifest_file_entry))
     {
-<<<<<<< HEAD
         IcebergDataObjectInfoPtr object_info
             = std::make_shared<IcebergDataObjectInfo>(
                 manifest_file_entry,
                 persistent_components.path_resolver.resolve(manifest_file_entry->parsed_entry->file_path_key),
                 table_state_snapshot->schema_id,
                 Iceberg::getIdentityPartitionColumnValues(*manifest_file_entry, *persistent_components.schema_processor));
-        for (const auto & position_delete :
-             defineDeletesSpan(manifest_file_entry, position_deletes_files, /* is_equality_delete */ false, logger))
-=======
-        const auto & raw_metadata_path = manifest_file_entry->parsed_entry->file_path_key.serialize();
-        auto [storage_to_use, resolved_key] = resolveObjectStorageForPath(
-            persistent_components.table_location, raw_metadata_path,
-            object_storage, *secondary_storages, local_context,
-            persistent_components.path_resolver);
-
-        IcebergDataObjectInfoPtr object_info = std::make_shared<IcebergDataObjectInfo>(
-            manifest_file_entry, raw_metadata_path, table_state_snapshot->schema_id, storage_to_use, resolved_key);
-
-        object_info->info.requires_external_storage = (storage_to_use != object_storage);
 
         const auto & data_file_path = object_info->info.data_object_file_path_key;
         bool has_deletion_vector = false;
 
         for (const auto & deletion_vector :
              defineDeletesSpan(manifest_file_entry, deletion_vector_files, /* is_equality_delete */ false, logger))
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         {
             const auto & referenced_data_file = deletion_vector->parsed_entry->lower_reference_data_file_path;
             if (!referenced_data_file.has_value() || referenced_data_file.value() != data_file_path)
@@ -544,19 +508,6 @@ ObjectInfoPtr IcebergIterator::next(size_t)
 
             if (!object_info->info.record_count.has_value())
             {
-<<<<<<< HEAD
-                ProfileEvents::increment(ProfileEvents::IcebergMinMaxNonPrunedDeleteFiles);
-                LOG_TEST(
-                    logger,
-                    "Processing position delete file `{}` for data file `{}` with reference data file bounds: "
-                    "(lower bound: `{}`, upper bound: `{}`)",
-                    position_delete->parsed_entry->file_path_key,
-                    data_file_path,
-                    lower.has_value() ? lower->serialize() : "[no lower bound]",
-                    upper.has_value() ? upper->serialize() : "[no upper bound]");
-                object_info->addPositionDeleteObject(
-                    position_delete, persistent_components.path_resolver.resolve(position_delete->parsed_entry->file_path_key));
-=======
                 throw Exception(
                     ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                     "Data file '{}' is missing record_count required to validate deletion vector positions",
@@ -564,18 +515,13 @@ ObjectInfoPtr IcebergIterator::next(size_t)
             }
 
             const auto & parsed_entry = deletion_vector->parsed_entry;
-            const auto puffin_metadata_path = parsed_entry->file_path_key.serialize();
-            auto [puffin_storage, puffin_key] = resolveObjectStorageForPath(
-                persistent_components.table_location, puffin_metadata_path,
-                object_storage, *secondary_storages, local_context,
-                persistent_components.path_resolver);
 
             /// For icebergCluster, next() runs on the initiator's task-distribution path: DV
             /// I/O / CRC / roaring materialization happen here, then excluded_rows is sent on
             /// the wire per task. Workers apply the bitmap and do not re-read the Puffin blob.
             auto excluded_rows = Iceberg::loadDeletionVector(
-                puffin_storage,
-                puffin_key,
+                object_storage,
+                persistent_components.path_resolver.resolve(parsed_entry->file_path_key),
                 parsed_entry->content_offset.value(),
                 parsed_entry->content_size_in_bytes.value(),
                 data_file_path,
@@ -632,9 +578,8 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                         lower.has_value() ? lower->serialize() : "[no lower bound]",
                         upper.has_value() ? upper->serialize() : "[no upper bound]");
                     object_info->addPositionDeleteObject(
-                        position_delete, position_delete->parsed_entry->file_path_key.serialize());
+                        position_delete, persistent_components.path_resolver.resolve(position_delete->parsed_entry->file_path_key));
                 }
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
             }
         }
 

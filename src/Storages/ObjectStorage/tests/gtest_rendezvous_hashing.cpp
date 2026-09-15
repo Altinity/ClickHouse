@@ -1,13 +1,8 @@
 #include <gtest/gtest.h>
-<<<<<<< HEAD
 #include <Core/ProtocolDefines.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
 #include <Interpreters/ClusterFunctionReadTask.h>
-#include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
-=======
-
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
 

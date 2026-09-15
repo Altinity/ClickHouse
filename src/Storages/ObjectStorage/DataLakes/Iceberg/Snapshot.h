@@ -16,7 +16,6 @@ struct IcebergDataSnapshot
     DB::ManifestFileCacheKeys manifest_list_entries;
     Int64 snapshot_id;
     Int64 schema_id_on_snapshot_commit;
-<<<<<<< HEAD
     /// Row-count hint from the snapshot summary (`total-records`). Only used to log a
     /// warning when it disagrees with the row count derived from the manifest files; never
     /// used as a data source, because the summary is maintained incrementally by writers
@@ -24,19 +23,9 @@ struct IcebergDataSnapshot
     std::optional<size_t> total_rows;
     std::optional<size_t> total_bytes;
     std::optional<size_t> total_position_delete_rows;
-=======
-    /// From snapshot summary (`total-records`). Compared to the manifest-derived count for a
-    /// mismatch warning only — never used as the trivial COUNT answer. Summary totals are
-    /// maintained incrementally by writers and can be poisoned by a bad commit in table history.
-    std::optional<size_t> total_rows;
-    std::optional<size_t> total_bytes;
-    std::optional<size_t> total_position_delete_rows;
     /// Rows in equality-delete files (snapshot summary). Not a count of deleted data rows;
     /// used only to fail closed early when present and > 0.
     std::optional<size_t> total_equality_delete_rows;
-    std::optional<String> partition_key;
-    std::optional<String> sorting_key;
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 
     std::optional<size_t> getTotalRows() const
     {

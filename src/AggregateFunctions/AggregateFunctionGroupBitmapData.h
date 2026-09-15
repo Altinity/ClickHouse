@@ -626,9 +626,6 @@ public:
     }
 
     /**
-<<<<<<< HEAD
-     * Return new set of the smallest `limit` values (as UnsignedT) which are no less than `range_start`.
-=======
      * Count set bits in `[range_start, range_end)` without allocating a result bitmap.
      * Used by need-only-count DV filtering to avoid an O(N) dense Filter over file rows.
      * Implemented via roaring `rank` so repeated per-row-group queries stay O(containers),
@@ -674,9 +671,7 @@ public:
     }
 
     /**
-     * Return new set of the smallest `limit` values in set which is no less than `range_start`.
-     * It's used in subset and currently only support UInt32
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
+     * Return new set of the smallest `limit` values (as UnsignedT) which are no less than `range_start`.
      */
     UInt64 rb_limit(UInt64 range_start, UInt64 limit, RoaringBitmapWithSmallSet & r1) const /// NOLINT
     {

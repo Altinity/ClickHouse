@@ -13,11 +13,8 @@
 #include <DataTypes/DataTypeNullable.h>
 #include <Common/FieldAccurateComparison.h>
 #include <Common/checkStackSize.h>
-<<<<<<< HEAD
 #include <Common/HashTable/HashSet.h>
-=======
 #include <base/arithmeticOverflow.h>
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 #include <Formats/FormatFilterInfo.h>
 #include <Interpreters/castColumn.h>
 #include <IO/CompressionMethod.h>
@@ -364,7 +361,6 @@ void Reader::getHyperrectangleForRowGroup(const parq::RowGroup * meta, Hyperrect
     }
 }
 
-<<<<<<< HEAD
 bool Reader::spatialBboxStatsHaveNoNulls(const parq::RowGroup & meta, size_t spatial_key_condition_idx) const
 {
     for (size_t bbox_pc_idx : spatial_key_condition_bbox_col_indices.at(spatial_key_condition_idx))
@@ -376,7 +372,8 @@ bool Reader::spatialBboxStatsHaveNoNulls(const parq::RowGroup & meta, size_t spa
             return false;
     }
     return true;
-=======
+}
+
 std::vector<size_t> buildRowGroupGlobalOffsets(const parq::FileMetaData & file_metadata)
 {
     if (file_metadata.num_rows < 0)
@@ -411,7 +408,6 @@ std::vector<size_t> buildRowGroupGlobalOffsets(const parq::FileMetaData & file_m
     /// mismatches would break previously readable files.
 
     return global_offsets;
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 }
 
 void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UInt64>> & row_groups_to_read)
@@ -747,23 +743,18 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         if (meta->columns.size() != total_primitive_columns_in_file)
             throw Exception(ErrorCodes::INCORRECT_DATA, "Row group {} has unexpected number of columns: {} != {}", row_group_idx, meta->columns.size(), total_primitive_columns_in_file);
 
-<<<<<<< HEAD
-        total_rows += size_t(meta->num_rows); // before potentially skipping the row group
-
         /// Lazy materialization: skip row groups that contain none of the requested rows.
         std::pair<size_t, size_t> requested_rows_slice {0, 0};
         if (rows_to_read)
         {
-            size_t group_start_row = total_rows - size_t(meta->num_rows);
+            size_t group_start_row = global_offsets[row_group_idx];
             const auto * begin_it = std::lower_bound(rows_to_read->begin(), rows_to_read->end(), group_start_row);
-            const auto * end_it = std::lower_bound(begin_it, rows_to_read->end(), total_rows);
+            const auto * end_it = std::lower_bound(begin_it, rows_to_read->end(), global_offsets[row_group_idx + 1]);
             if (begin_it == end_it)
                 continue;
             requested_rows_slice = {size_t(begin_it - rows_to_read->begin()), size_t(end_it - rows_to_read->begin())};
         }
 
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         Hyperrectangle hyperrectangle(extended_sample_block.columns(), Range::createWholeUniverse());
         if ((options.format.parquet.filter_push_down && format_filter_info->key_condition)
             || !spatial_key_conditions.empty())
@@ -839,9 +830,9 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         }
     }
 
-    if (rows_to_read && !rows_to_read->empty() && rows_to_read->back() >= total_rows)
+    if (rows_to_read && !rows_to_read->empty() && rows_to_read->back() >= global_offsets.back())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Requested to read row {} of a parquet file that has only {} rows", rows_to_read->back(), total_rows);
+            "Requested to read row {} of a parquet file that has only {} rows", rows_to_read->back(), global_offsets.back());
 
     if (row_groups.empty())
         return; // all row groups were skipped

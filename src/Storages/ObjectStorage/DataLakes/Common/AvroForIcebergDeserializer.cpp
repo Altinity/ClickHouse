@@ -17,11 +17,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <base/find_symbols.h>
 #include <Common/assert_cast.h>
-<<<<<<< HEAD
-=======
 #include <Poco/String.h>
-#include <Common/ElapsedTimeProfileEventIncrement.h>
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 
 namespace DB::ErrorCodes
 {

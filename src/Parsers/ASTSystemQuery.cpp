@@ -635,11 +635,7 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         case Type::CLEAR_PARQUET_METADATA_CACHE:
         case Type::CLEAR_POINT_IN_POLYGON_CACHE:
         case Type::CLEAR_AVRO_SCHEMA_CACHE:
-<<<<<<< HEAD
-=======
         case Type::CLEAR_PUFFIN_FILES_CACHE:
-        case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         case Type::RESET_COVERAGE:
         case Type::RESTART_REPLICAS:
         case Type::JEMALLOC_PURGE:
