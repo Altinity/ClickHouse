@@ -732,38 +732,29 @@ private:
         Removal del = Removal::Gone;
     };
 
+    struct RedeleteRoundContext
+    {
+        uint64_t new_round;
+        uint64_t snap_generation;
+        uint64_t shard;
+        GcRoundWorkBudget & round_work_budget;
+        RoundReport & report;
+        std::map<uint64_t, OutcomeLog> & outcomes;
+    };
+
     static RedeleteIo performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op);
 
-    void applyRedeleteOutcome(
-        const RetiredEntry & entry,
-        const RedeleteIo & io,
-        uint64_t new_round,
-        uint64_t snap_generation,
-        GcRoundWorkBudget & round_work_budget,
-        RoundReport & report,
-        OutcomeLog & outcome_log);
+    void applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteIo & io);
 
-    void redeleteBlob(
-        const RetiredEntry & entry,
-        const Layout & layout,
-        CasOperation & op,
-        uint64_t new_round,
-        uint64_t snap_generation,
-        GcRoundWorkBudget & round_work_budget,
-        RoundReport & report,
-        OutcomeLog & outcome_log);
+    void redeleteBlob(RedeleteRoundContext & ctx, const RetiredEntry & entry, const Layout & layout, CasOperation & op);
 
     void redeleteBlobs(
+        RedeleteRoundContext & ctx,
         const std::vector<RetiredEntry> & entries,
         ThreadPool & pool,
         size_t concurrency,
         const Layout & layout,
-        CasOperation & op,
-        uint64_t new_round,
-        uint64_t snap_generation,
-        GcRoundWorkBudget & round_work_budget,
-        RoundReport & report,
-        OutcomeLog & outcome_log);
+        CasOperation & op);
 
     /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
     /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
