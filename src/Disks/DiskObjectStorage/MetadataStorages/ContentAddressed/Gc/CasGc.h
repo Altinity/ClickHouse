@@ -730,10 +730,9 @@ private:
     {
         String blob_key;
         Removal del = Removal::Gone;
-        std::exception_ptr error;
     };
 
-    RedeleteIo performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op);
+    static RedeleteIo performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op);
 
     void applyRedeleteOutcome(
         const RetiredEntry & entry,
@@ -756,6 +755,8 @@ private:
 
     void redeleteBlobs(
         const std::vector<RetiredEntry> & entries,
+        ThreadPool & pool,
+        size_t concurrency,
         const Layout & layout,
         CasOperation & op,
         uint64_t new_round,
@@ -1014,12 +1015,10 @@ private:
     /// initialized before that check.
     std::unique_ptr<GcMetaWriter> meta_writer;
 
-    /// The fold's read-ahead pool, sized by `gc_read_concurrency`. A `unique_ptr` for the same reason
-    /// as `meta_writer`: the size comes from `store->poolConfig()`, which may only be read after the
-    /// constructor body has validated `store`.
-    std::unique_ptr<ThreadPool> read_pool;
-
-    std::unique_ptr<ThreadPool> redelete_pool;
+    /// The GC I/O pool: the fold's and rebuild's read-ahead, the orphan-manifest sweep planning reads,
+    /// and the `pending_deletes` fan-out, sized by `gc_io_concurrency`. A `unique_ptr` for the same reason as `meta_writer`: the size comes from
+    /// `store->poolConfig()`, which may only be read after the constructor body has validated `store`.
+    std::unique_ptr<ThreadPool> io_pool;
 
     /// Probe B1's two numbers for the round: the ref-log POSITIONS the sealed coverage declares covered
     /// (counted arithmetically over each namespace's cut -- not by listed ids, which under arithmetic

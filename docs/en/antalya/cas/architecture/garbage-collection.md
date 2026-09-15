@@ -324,7 +324,7 @@ exit — a hold, an unusable checkpoint, the probe budget — leaves it unproven
 gate.
 
 **Read-ahead.** The checkpoint, walk-position, manifest-edge and (in phase 9) zero-candidate `HEAD`
-reads are hinted ahead onto a bounded pool (`cas_gc_read_concurrency`, default 16; `1` disables) and
+reads are hinted ahead onto a bounded pool (`cas_gc_io_concurrency`, default 16; `1` runs the reads inline) and
 taken by the walk at exactly the sites, and in exactly the order, of the inline reads, so every
 decision, decode, counter and event stays on the round thread and the phase's semantic metrics do
 not depend on the setting. Two things do: a request a worker performed lands on that worker's
@@ -761,7 +761,7 @@ retried by the next round's cursors — with the one exception of phase 14's han
 is one-shot and leaves its remainder to `cas-fsck`. The per-round budgets are ordinary
 `content_addressed` disk settings, documented under
 [advanced GC pacing settings](/antalya/cas/configuration#advanced-gc-pacing-settings) on the
-configuration page (`cas_gc_meta_pool_size` and `cas_gc_read_concurrency` sit in its main
+configuration page (`cas_gc_meta_pool_size` and `cas_gc_io_concurrency` sit in its main
 [disk-settings table](/antalya/cas/configuration#disk-settings)). `0` means unbounded for every
 `cas_gc_round_*` budget; `cas_manifest_sweep_list_budget_keys = 0` disables the sweep,
 `cas_manifest_sweep_delete_budget_keys = 0` lists without nominating, and the two pool sizes and
@@ -781,9 +781,7 @@ the chunk size reject `0`:
 | `cas_gc_round_sweep_recovery_op_budget` | 5000 | committed-tail ref-log reads the sweep's recovery walk may spend (phase 9) |
 | `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for write-once families (phases 15, 17); `1` to `1000` |
 | `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes (phase 12) |
-| `cas_gc_read_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 9); `1` disables |
-| `cas_gc_redelete_concurrency` | 1 | bounded pool for the `pending_deletes` `HEAD` + conditional `DELETE` fan-out (phase 11); `1` keeps it sequential |
-| `cas_gc_redelete_min_batch_size` | 2 | minimum `pending_deletes` batch size required to enable the parallel fan-out (phase 11) |
+| `cas_gc_io_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 9), the orphan-sweep planning reads (phase 9), the rebuild read-ahead and the `pending_deletes` `HEAD` + conditional `DELETE` fan-out (phase 11); other GC requests run on the round thread; `1` runs the covered requests sequentially |
 
 The fold-batching controls `gc_fold_threshold` (default 1), `gc_fold_max_defer_rounds` (default 8)
 and `gc_frontier_probe_budget` (default unbounded) are internal `PoolConfig` fields with no disk

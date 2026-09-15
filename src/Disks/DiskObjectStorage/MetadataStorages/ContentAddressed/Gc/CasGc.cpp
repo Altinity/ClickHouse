@@ -20,6 +20,8 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
+#include <Common/scope_guard_safe.h>
+#include <Common/threadPoolCallbackRunner.h>
 #include <base/defines.h>
 #include <base/scope_guard.h>
 #include <unordered_set>
@@ -341,19 +343,16 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     /// `store->poolConfig()` AFTER the null check above.
     meta_writer = std::make_unique<GcMetaWriter>(
         store, logger, static_cast<size_t>(store->poolConfig().gc_meta_pool_size));
-    /// The fold's read-ahead pool, built here for the same reason. The queue is UNBOUNDED because the
-    /// hinting sites throttle themselves against `GcReadAhead::window`; a bounded queue would only
-    /// move the throttle into `scheduleOrThrowOnError`, blocking the round thread instead of the
-    /// hint loop that already knows how much it wants in flight.
-    const size_t read_concurrency = std::max<size_t>(1, store->poolConfig().gc_read_concurrency);
-    read_pool = std::make_unique<ThreadPool>(
+    /// The GC I/O pool (read-ahead and the `pending_deletes` fan-out), built here for the same reason.
+    /// The queue is UNBOUNDED because the hinting sites throttle themselves against
+    /// `GcReadAhead::window`; a bounded queue would only move the throttle into
+    /// `scheduleOrThrowOnError`, blocking the round thread instead of the hint loop that already knows
+    /// how much it wants in flight.
+    const size_t io_concurrency = std::max<size_t>(1, store->poolConfig().gc_io_concurrency);
+    io_pool = std::make_unique<ThreadPool>(
         CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled,
-        /*max_threads*/ read_concurrency, /*max_free_threads*/ read_concurrency, /*queue_size*/ 0);
-    const size_t redelete_concurrency = std::max<size_t>(1, store->poolConfig().gc_redelete_concurrency);
-    if (redelete_concurrency > 1)
-        redelete_pool = std::make_unique<ThreadPool>(
-            CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled,
-            /*max_threads*/ redelete_concurrency, /*max_free_threads*/ redelete_concurrency, /*queue_size*/ 0);
+        /*max_threads*/ io_concurrency, /*max_free_threads*/ io_concurrency, /*queue_size*/ 0,
+        /*shutdown_on_exception*/ false);
 }
 
 void Gc::runNamespaceJanitorPage(
@@ -499,6 +498,8 @@ void Gc::redeleteBlob(
 
 void Gc::redeleteBlobs(
     const std::vector<RetiredEntry> & entries,
+    ThreadPool & pool,
+    size_t concurrency,
     const Layout & layout,
     CasOperation & op,
     uint64_t new_round,
@@ -507,57 +508,83 @@ void Gc::redeleteBlobs(
     RoundReport & report,
     OutcomeLog & outcome_log)
 {
-    if (!redelete_pool || entries.size() < store->poolConfig().gc_redelete_min_batch_size)
+    if (concurrency <= 1 || entries.size() <= 1)
     {
         for (const RetiredEntry & entry : entries)
             redeleteBlob(entry, layout, op, new_round, snap_generation, round_work_budget, report, outcome_log);
         return;
     }
 
+    using RunnerTask = ThreadPoolCallbackRunnerLocal<void>::Task;
     std::vector<RedeleteIo> io_results(entries.size());
-    const uint64_t admitted_generation = op.generation();
-    size_t scheduled = 0;
+    std::vector<std::exception_ptr> errors(entries.size());
     std::exception_ptr first_error;
-    try
+    size_t scheduled = 0;
     {
-        for (; scheduled < entries.size(); ++scheduled)
+        ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::UNKNOWN);
+        std::vector<std::shared_ptr<RunnerTask>> handles;
+        handles.reserve(entries.size());
+        SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
+
+        const uint64_t admitted_generation = op.generation();
+        try
         {
-            redelete_pool->scheduleOrThrowOnError(
-                [&, i = scheduled]
-                {
-                    try
+            for (; scheduled < entries.size(); ++scheduled)
+            {
+                handles.emplace_back(runner.enqueueAndGiveOwnership(
+                    [slot = &io_results[scheduled],
+                     entry = entries[scheduled],
+                     layout_ptr = &layout,
+                     pool_store = store,
+                     gc_logger = logger,
+                     admitted_generation]
                     {
-                        CasOperation job_op = store->openRequests().resume(admitted_generation);
-                        io_results[i] = performRedeleteIo(entries[i], layout, job_op);
-                    }
-                    catch (...)
-                    {
-                        io_results[i].error = std::current_exception();
-                        ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
-                        LOG_WARNING(
-                            logger,
-                            "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays "
-                            "delete_pending and is retried in the next round: {}",
-                            blobIdOf(entries[i].ref),
-                            layout.blobKey(entries[i].ref),
-                            entries[i].condemn_round,
-                            getCurrentExceptionMessage(false));
-                    }
-                });
+                        try
+                        {
+                            CasOperation job_op = pool_store->openRequests().resume(admitted_generation);
+                            *slot = performRedeleteIo(entry, *layout_ptr, job_op);
+                        }
+                        catch (...)
+                        {
+                            ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
+                            LOG_WARNING(
+                                gc_logger,
+                                "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays "
+                                "delete_pending and is retried in the next round: {}",
+                                blobIdOf(entry.ref),
+                                layout_ptr->blobKey(entry.ref),
+                                entry.condemn_round,
+                                getCurrentExceptionMessage(false));
+                            throw;
+                        }
+                    }));
+            }
+        }
+        catch (...)
+        {
+            first_error = std::current_exception();
+        }
+
+        ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
+        for (size_t i = 0; i < handles.size(); ++i)
+        {
+            try
+            {
+                handles[i]->future.get();
+            }
+            catch (...)
+            {
+                errors[i] = std::current_exception();
+            }
         }
     }
-    catch (...)
-    {
-        first_error = std::current_exception();
-    }
-    redelete_pool->wait();
 
     for (size_t i = 0; i < scheduled; ++i)
     {
-        if (io_results[i].error)
+        if (errors[i])
         {
             if (!first_error)
-                first_error = io_results[i].error;
+                first_error = errors[i];
             continue;
         }
         applyRedeleteOutcome(entries[i], io_results[i], new_round, snap_generation, round_work_budget, report, outcome_log);
@@ -886,7 +913,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         static const std::vector<RetiredEntry> kNothingToDelete;
         const std::vector<RetiredEntry> & redelete_now =
             suppress_destructive ? kNothingToDelete : merge.redelete;
-        redeleteBlobs(redelete_now, layout, op, new_round, generation, round_work_budget, report, outcomes[shard]);
+        redeleteBlobs(
+            redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op, new_round, generation,
+            round_work_budget, report, outcomes[shard]);
         for (const RetiredEntry & entry : merge.spared)
         {
             /// A fresh dedup-adopt raced the condemn (see the matching CasGcFold Debug log emitted
@@ -1795,8 +1824,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// The fold's read-ahead. It fetches through `op`'s own admitted generation and hands every result
     /// back at the site that would otherwise have read inline, so the walk's order, its counters, its
     /// holds and its events are what they were; only the moment of the fetch moves. At
-    /// `gc_read_concurrency` 1 it hints nothing and every take IS the original inline read.
-    GcReadAhead reads(op, store->openRequests(), *read_pool, store->poolConfig().gc_read_concurrency);
+    /// `gc_io_concurrency` 1 it hints nothing and every take IS the original inline read.
+    GcReadAhead reads(op, store->openRequests(), *io_pool, store->poolConfig().gc_io_concurrency);
     FoldResult result;
 
     /// 1. Group the round's one enumeration of `cas/ns/stream/` (taken before the defer decision) into
@@ -2169,7 +2198,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// position, this epoch's next positions, and a decoded log's manifest edges -- so the phase's round
     /// trips overlap instead of running strictly one after another. Every take happens where the inline
     /// read happened, in the same order, and increments the same counters, which is why this row's
-    /// semantic metrics are identical at any `gc_read_concurrency`. Its S3 VERB counts are not: a request
+    /// semantic metrics are identical at any `gc_io_concurrency`. Its S3 VERB counts are not: a request
     /// a worker performed lands on that worker's ProfileEvents, the same gap `meta_pool_wait` has always
     /// had. Read `CASGCReadAheadHit`/`Miss`/`Wasted` on this row for the read-ahead's own behaviour.
     std::optional<GcPhaseTimer> intake_timer;
@@ -3381,7 +3410,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             /// cut and `_ckpt` frontier the round's own universe came from -- which is exactly what an
             /// authoritative universe means, and is why this is the gate's term and not a separate one.
             universe_authoritative,
-            &work_budget, read_pool.get(), store->poolConfig().gc_read_concurrency);
+            &work_budget, io_pool.get(), store->poolConfig().gc_io_concurrency);
         for (const ManifestSweepResult::Nomination & nomination : result.orphan_sweep.nominations)
             orphan_source_retirements.insert(
                 orphan_source_retirements.end(),
@@ -4166,7 +4195,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// them one at a time, exactly as it did before: a rebuild walks a plan it already holds rather
     /// than discovering its next key from the body it just read, so a lookahead would have nothing to
     /// hide behind.
-    GcReadAhead reads(op, store->openRequests(), *read_pool, store->poolConfig().gc_read_concurrency);
+    GcReadAhead reads(op, store->openRequests(), *io_pool, store->poolConfig().gc_io_concurrency);
 
     /// Read bookkeeping health before the lease (the lease acquire on an absent state CREATES a
     /// bootstrap body, which must not make scenario (а) look healthy). A generation-0 ref-baseline
