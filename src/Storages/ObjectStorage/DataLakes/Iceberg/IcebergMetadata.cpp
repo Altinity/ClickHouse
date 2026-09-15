@@ -121,11 +121,8 @@ extern const int ICEBERG_SPECIFICATION_VIOLATION;
 extern const int S3_ERROR;
 extern const int TABLE_ALREADY_EXISTS;
 extern const int SUPPORT_IS_DISABLED;
-<<<<<<< HEAD
 extern const int FILE_ALREADY_EXISTS;
-=======
 extern const int INCORRECT_DATA;
->>>>>>> 911f0dcb139 (Merge pull request #2125 from Altinity/feature/antalya-26.6/pr-1655)
 }
 
 namespace Setting
@@ -691,7 +688,6 @@ void IcebergMetadata::mutate(
         catalog);
 }
 
-<<<<<<< HEAD
 void IcebergMetadata::checkTableRootIsQueriedPath(std::string_view operation) const
 {
     if (!persistent_components.table_root_was_derived)
@@ -707,7 +703,6 @@ void IcebergMetadata::checkTableRootIsQueriedPath(std::string_view operation) co
         persistent_components.table_path);
 }
 
-=======
 void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICatalog> catalog, const StorageID & storage_id)
 {
     if (!context->getSettingsRef()[Setting::allow_insert_into_iceberg].value)
@@ -754,7 +749,7 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
         filename_generator, metadata_info.path, parent_snapshot_id,
         /* added_files */ 0, /* added_records */ 0, /* added_files_size */ 0,
         /* num_partitions */ 0, /* added_delete_files */ 0, /* num_deleted_rows */ 0,
-        std::nullopt, std::nullopt, /*is_truncate=*/true);
+        std::nullopt, std::nullopt, MetadataGenerator::SnapshotOperation::Append, /*is_truncate=*/true);
 
     auto storage_manifest_list_name = resolver.resolve(manifest_list_path);
 
@@ -785,8 +780,6 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
     }
 }
 
-
->>>>>>> 911f0dcb139 (Merge pull request #2125 from Altinity/feature/antalya-26.6/pr-1655)
 void IcebergMetadata::checkMutationIsPossible(const MutationCommands & commands)
 {
     checkTableRootIsQueriedPath("Mutation");

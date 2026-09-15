@@ -44,17 +44,14 @@ public:
         Int64 num_deleted_rows,
         std::optional<Int64> user_defined_snapshot_id = std::nullopt,
         std::optional<Int64> user_defined_timestamp = std::nullopt,
-<<<<<<< HEAD
-        SnapshotOperation operation = SnapshotOperation::Append);
+        SnapshotOperation operation = SnapshotOperation::Append,
+        bool is_truncate = false);
 
     /// Create a manifest-only rewrite snapshot (`replace` operation) carrying `total-*` counters forward so `OPTIMIZE ... MANIFEST` is idempotent.
     NextMetadataResult generateManifestOnlySnapshot(
         FileNamesGenerator & generator,
         const Iceberg::IcebergPathFromMetadata & metadata_file_path,
         Int64 parent_snapshot_id);
-=======
-        bool is_truncate = false);
->>>>>>> 911f0dcb139 (Merge pull request #2125 from Altinity/feature/antalya-26.6/pr-1655)
 
     void generateAddColumnMetadata(const String & column_name, DataTypePtr type);
     void generateDropColumnMetadata(const String & column_name);
