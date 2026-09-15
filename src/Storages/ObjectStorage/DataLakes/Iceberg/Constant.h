@@ -49,6 +49,7 @@ DEFINE_ICEBERG_FIELD(logicalType); /// this field has a camelCase name
 DEFINE_ICEBERG_FIELD(transform);
 DEFINE_ICEBERG_FIELD(direction);
 
+DEFINE_ICEBERG_FIELD(unknown);
 DEFINE_ICEBERG_FIELD(uuid);
 DEFINE_ICEBERG_FIELD(value);
 DEFINE_ICEBERG_FIELD(manifest_length);
