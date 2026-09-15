@@ -739,7 +739,7 @@ private:
         const RetiredEntry & entry,
         const RedeleteIo & io,
         uint64_t new_round,
-        uint64_t generation,
+        uint64_t snap_generation,
         GcRoundWorkBudget & round_work_budget,
         RoundReport & report,
         OutcomeLog & outcome_log);
@@ -749,7 +749,7 @@ private:
         const Layout & layout,
         CasOperation & op,
         uint64_t new_round,
-        uint64_t generation,
+        uint64_t snap_generation,
         GcRoundWorkBudget & round_work_budget,
         RoundReport & report,
         OutcomeLog & outcome_log);
@@ -759,7 +759,7 @@ private:
         const Layout & layout,
         CasOperation & op,
         uint64_t new_round,
-        uint64_t generation,
+        uint64_t snap_generation,
         GcRoundWorkBudget & round_work_budget,
         RoundReport & report,
         OutcomeLog & outcome_log);

@@ -422,7 +422,7 @@ void Gc::applyRedeleteOutcome(
     const RetiredEntry & entry,
     const RedeleteIo & io,
     uint64_t new_round,
-    uint64_t generation,
+    uint64_t snap_generation,
     GcRoundWorkBudget & round_work_budget,
     RoundReport & report,
     OutcomeLog & outcome_log)
@@ -442,7 +442,7 @@ void Gc::applyRedeleteOutcome(
             e.object_hash = blobIdOf(entry.ref);
             e.token = renderIncarnation(entry.token);
             e.round = new_round;
-            e.gen = generation;
+            e.gen = snap_generation;
             e.outcome = del_outcome;
             e.reason = "delete_pending published by a prior pass; exact-incarnation delete (pre-CAS)";
             e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}, {"key", io.blob_key}};
@@ -475,7 +475,7 @@ void Gc::redeleteBlob(
     const Layout & layout,
     CasOperation & op,
     uint64_t new_round,
-    uint64_t generation,
+    uint64_t snap_generation,
     GcRoundWorkBudget & round_work_budget,
     RoundReport & report,
     OutcomeLog & outcome_log)
@@ -494,7 +494,7 @@ void Gc::redeleteBlob(
             blobIdOf(entry.ref), layout.blobKey(entry.ref), entry.condemn_round, getCurrentExceptionMessage(false));
         throw;
     }
-    applyRedeleteOutcome(entry, io, new_round, generation, round_work_budget, report, outcome_log);
+    applyRedeleteOutcome(entry, io, new_round, snap_generation, round_work_budget, report, outcome_log);
 }
 
 void Gc::redeleteBlobs(
@@ -502,7 +502,7 @@ void Gc::redeleteBlobs(
     const Layout & layout,
     CasOperation & op,
     uint64_t new_round,
-    uint64_t generation,
+    uint64_t snap_generation,
     GcRoundWorkBudget & round_work_budget,
     RoundReport & report,
     OutcomeLog & outcome_log)
@@ -510,12 +510,12 @@ void Gc::redeleteBlobs(
     if (!redelete_pool || entries.size() < store->poolConfig().gc_redelete_min_batch_size)
     {
         for (const RetiredEntry & entry : entries)
-            redeleteBlob(entry, layout, op, new_round, generation, round_work_budget, report, outcome_log);
+            redeleteBlob(entry, layout, op, new_round, snap_generation, round_work_budget, report, outcome_log);
         return;
     }
 
     std::vector<RedeleteIo> io_results(entries.size());
-    const uint64_t gen = op.generation();
+    const uint64_t admitted_generation = op.generation();
     size_t scheduled = 0;
     std::exception_ptr first_error;
     try
@@ -527,7 +527,7 @@ void Gc::redeleteBlobs(
                 {
                     try
                     {
-                        CasOperation job_op = store->openRequests().resume(gen);
+                        CasOperation job_op = store->openRequests().resume(admitted_generation);
                         io_results[i] = performRedeleteIo(entries[i], layout, job_op);
                     }
                     catch (...)
@@ -560,7 +560,7 @@ void Gc::redeleteBlobs(
                 first_error = io_results[i].error;
             continue;
         }
-        applyRedeleteOutcome(entries[i], io_results[i], new_round, generation, round_work_budget, report, outcome_log);
+        applyRedeleteOutcome(entries[i], io_results[i], new_round, snap_generation, round_work_budget, report, outcome_log);
     }
 
     if (first_error)
