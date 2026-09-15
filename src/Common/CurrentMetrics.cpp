@@ -370,6 +370,8 @@
     M(PaimonMetadataFilesCacheFiles, "Number of cached files in the Paimon metadata cache") \
     M(ParquetMetadataCacheBytes, "Size of the Parquet metadata cache in bytes") \
     M(ParquetMetadataCacheFiles, "Number of cached files in the Parquet metadata cache") \
+    M(PuffinFilesCacheBytes, "Size of the Puffin files cache in bytes (deletion vectors plus memoized footers)") \
+    M(PuffinFilesCacheFiles, "Number of cached entries in the Puffin files cache (deletion vectors plus memoized footers)") \
     M(AvroSchemaCacheBytes, "Size of the Avro schema cache in bytes") \
     M(AvroSchemaCacheCells, "Number of cached Avro schemas, including both registered and fetched schemas.") \
     M(AvroSchemaRegistryCacheBytes, "Size of the Avro schema registry cache in bytes") \

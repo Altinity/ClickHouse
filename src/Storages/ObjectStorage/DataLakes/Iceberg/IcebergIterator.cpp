@@ -46,6 +46,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDeletionVector.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
@@ -75,6 +76,7 @@ namespace DB
 namespace ErrorCodes
 {
 extern const int LOGICAL_ERROR;
+extern const int ICEBERG_SPECIFICATION_VIOLATION;
 }
 namespace Setting
 {
@@ -448,8 +450,10 @@ void IcebergIterator::decodeDeleteManifests()
         {
             if (delete_file->parsed_entry->equality_ids.has_value())
                 equality_deletes_files.emplace_back(std::move(delete_file));
+            else if (delete_file->parsed_entry->isDeletionVector())
+                deletion_vector_files.emplace_back(std::move(delete_file));
             else
-                position_deletes_files.emplace_back(std::move(delete_file));
+                parquet_position_deletes_files.emplace_back(std::move(delete_file));
         }
     }
     chassert(in_flight.empty());
@@ -457,9 +461,15 @@ void IcebergIterator::decodeDeleteManifests()
 
     /// Sort objects by common_partition_specification, partition_key_value and added_sequence_number.
     /// This is needed to efficiently match delete and data manifests in defineDeletesSpan().
-    LOG_DEBUG(logger, "Taken {} position deletes file and {} equality deletes files in iceberg iterator", position_deletes_files.size(), equality_deletes_files.size());
+    LOG_DEBUG(
+        logger,
+        "Taken {} deletion vector files, {} parquet position delete files and {} equality delete files in iceberg iterator",
+        deletion_vector_files.size(),
+        parquet_position_deletes_files.size(),
+        equality_deletes_files.size());
     std::sort(equality_deletes_files.begin(), equality_deletes_files.end());
-    std::sort(position_deletes_files.begin(), position_deletes_files.end());
+    std::sort(deletion_vector_files.begin(), deletion_vector_files.end());
+    std::sort(parquet_position_deletes_files.begin(), parquet_position_deletes_files.end());
 }
 
 ObjectInfoPtr IcebergIterator::next(size_t)
@@ -475,42 +485,102 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                 persistent_components.path_resolver.resolve(manifest_file_entry->parsed_entry->file_path_key),
                 table_state_snapshot->schema_id,
                 Iceberg::getIdentityPartitionColumnValues(*manifest_file_entry, *persistent_components.schema_processor));
-        for (const auto & position_delete :
-             defineDeletesSpan(manifest_file_entry, position_deletes_files, /* is_equality_delete */ false, logger))
+
+        const auto & data_file_path = object_info->info.data_object_file_path_key;
+        bool has_deletion_vector = false;
+
+        for (const auto & deletion_vector :
+             defineDeletesSpan(manifest_file_entry, deletion_vector_files, /* is_equality_delete */ false, logger))
         {
-            const auto & data_file_path = object_info->info.data_object_file_path_key;
-            const auto & lower = position_delete->parsed_entry->lower_reference_data_file_path;
-            const auto & upper = position_delete->parsed_entry->upper_reference_data_file_path;
-            bool can_contain_data_file_deletes
-                = (!lower.has_value() || *lower <= data_file_path)
-                && (!upper.has_value() || *upper >= data_file_path);
-            /// Skip position deletes that do not match the data file path.
-            if (!can_contain_data_file_deletes)
+            const auto & referenced_data_file = deletion_vector->parsed_entry->lower_reference_data_file_path;
+            if (!referenced_data_file.has_value() || referenced_data_file.value() != data_file_path)
+                continue;
+
+            if (has_deletion_vector)
             {
-                ProfileEvents::increment(ProfileEvents::IcebergMinMaxPrunedDeleteFiles);
-                LOG_TEST(
-                    logger,
-                    "Skipping position delete file `{}` for data file `{}` because position delete has out of bounds reference data file "
-                    "bounds: "
-                    "(lower bound: `{}`, upper bound: `{}`)",
-                    position_delete->parsed_entry->file_path_key,
-                    data_file_path,
-                    lower.has_value() ? lower->serialize() : "[no lower bound]",
-                    upper.has_value() ? upper->serialize() : "[no upper bound]");
+                throw Exception(
+                    ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                    "Multiple deletion vectors match data file '{}'",
+                    data_file_path);
             }
-            else
+
+            Iceberg::requireParquetDataFileForRowDeletes(object_info->info.file_format, "Deletion vectors");
+
+            if (!object_info->info.record_count.has_value())
             {
-                ProfileEvents::increment(ProfileEvents::IcebergMinMaxNonPrunedDeleteFiles);
-                LOG_TEST(
-                    logger,
-                    "Processing position delete file `{}` for data file `{}` with reference data file bounds: "
-                    "(lower bound: `{}`, upper bound: `{}`)",
-                    position_delete->parsed_entry->file_path_key,
-                    data_file_path,
-                    lower.has_value() ? lower->serialize() : "[no lower bound]",
-                    upper.has_value() ? upper->serialize() : "[no upper bound]");
-                object_info->addPositionDeleteObject(
-                    position_delete, persistent_components.path_resolver.resolve(position_delete->parsed_entry->file_path_key));
+                throw Exception(
+                    ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                    "Data file '{}' is missing record_count required to validate deletion vector positions",
+                    data_file_path);
+            }
+
+            const auto & parsed_entry = deletion_vector->parsed_entry;
+
+            /// For icebergCluster, next() runs on the initiator's task-distribution path: DV
+            /// I/O / CRC / roaring materialization happen here, then excluded_rows is sent on
+            /// the wire per task. Workers apply the bitmap and do not re-read the deletion-vector
+            /// object (Puffin or Delta `.bin`).
+            auto excluded_rows = Iceberg::loadDeletionVector(
+                object_storage,
+                persistent_components.path_resolver.resolve(parsed_entry->file_path_key),
+                parsed_entry->content_offset.value(),
+                parsed_entry->content_size_in_bytes.value(),
+                data_file_path,
+                referenced_data_file,
+                parsed_entry->record_count,
+                *object_info->info.record_count,
+                local_context,
+                logger);
+
+            object_info->data_lake_metadata.emplace();
+            if (excluded_rows)
+                object_info->data_lake_metadata->excluded_rows = std::move(excluded_rows);
+            has_deletion_vector = true;
+            LOG_DEBUG(
+                logger,
+                "Attached deletion vector from file `{}` to data file `{}`",
+                parsed_entry->file_path_key,
+                data_file_path);
+        }
+
+        if (!has_deletion_vector)
+        {
+            for (const auto & position_delete :
+                 defineDeletesSpan(manifest_file_entry, parquet_position_deletes_files, /* is_equality_delete */ false, logger))
+            {
+                const auto & lower = position_delete->parsed_entry->lower_reference_data_file_path;
+                const auto & upper = position_delete->parsed_entry->upper_reference_data_file_path;
+                bool can_contain_data_file_deletes
+                    = (!lower.has_value() || *lower <= data_file_path)
+                    && (!upper.has_value() || *upper >= data_file_path);
+                /// Skip position deletes that do not match the data file path.
+                if (!can_contain_data_file_deletes)
+                {
+                    ProfileEvents::increment(ProfileEvents::IcebergMinMaxPrunedDeleteFiles);
+                    LOG_TEST(
+                        logger,
+                        "Skipping position delete file `{}` for data file `{}` because position delete has out of bounds reference data file "
+                        "bounds: "
+                        "(lower bound: `{}`, upper bound: `{}`)",
+                        position_delete->parsed_entry->file_path_key,
+                        data_file_path,
+                        lower.has_value() ? lower->serialize() : "[no lower bound]",
+                        upper.has_value() ? upper->serialize() : "[no upper bound]");
+                }
+                else
+                {
+                    ProfileEvents::increment(ProfileEvents::IcebergMinMaxNonPrunedDeleteFiles);
+                    LOG_TEST(
+                        logger,
+                        "Processing position delete file `{}` for data file `{}` with reference data file bounds: "
+                        "(lower bound: `{}`, upper bound: `{}`)",
+                        position_delete->parsed_entry->file_path_key,
+                        data_file_path,
+                        lower.has_value() ? lower->serialize() : "[no lower bound]",
+                        upper.has_value() ? upper->serialize() : "[no upper bound]");
+                    object_info->addPositionDeleteObject(
+                        position_delete, persistent_components.path_resolver.resolve(position_delete->parsed_entry->file_path_key));
+                }
             }
         }
 

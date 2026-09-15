@@ -112,7 +112,8 @@ private:
     IDataLakeMetadata::FileProgressCallback callback;
     /// Filled once under `deletes_mutex` and never mutated afterwards, so `next` may read them
     /// unguarded once it has gone through `ensureDeletesReady`.
-    std::vector<Iceberg::ProcessedManifestFileEntryPtr> position_deletes_files;
+    std::vector<Iceberg::ProcessedManifestFileEntryPtr> deletion_vector_files;
+    std::vector<Iceberg::ProcessedManifestFileEntryPtr> parquet_position_deletes_files;
     std::vector<Iceberg::ProcessedManifestFileEntryPtr> equality_deletes_files;
     std::mutex deletes_mutex;
     bool deletes_ready TSA_GUARDED_BY(deletes_mutex) = false;
