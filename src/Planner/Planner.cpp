@@ -82,6 +82,8 @@
 #include <Planner/CollectSets.h>
 #include <Planner/CollectTableExpressionData.h>
 #include <Planner/findQueryForParallelReplicas.h>
+#include <Planner/findDistributedObjectStorageCandidate.h>
+#include <Planner/buildDistributedObjectStorageQueryPlan.h>
 #include <Planner/PlannerActionsVisitor.h>
 #include <Planner/PlannerContext.h>
 #include <Planner/PlannerCorrelatedSubqueries.h>
@@ -2302,7 +2304,23 @@ void Planner::buildPlanForQueryNode()
     }
 
     JoinTreeQueryPlan join_tree_query_plan;
-    if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
+    /// object_storage_cluster_join_mode='distributed': only the outermost, initial-query Planner instance may
+    /// claim this optimization -- a nested Planner created for a subquery/CTE (select_query_options.is_subquery)
+    /// or a plain analysis pass (only_analyze) never does, and neither does a secondary-query Planner running on
+    /// a worker. findDistributedObjectStorageCandidate() itself never recurses into a narrower candidate, so
+    /// this is a whole-or-nothing decision for the outermost query alone: if it's not safe, ordinary planning
+    /// (including its own nested-Planner recursion for any subquery, see PlannerJoinTree.cpp's
+    /// buildQueryPlanForTableExpression()) handles the whole query. Independent of parallel replicas below.
+    std::optional<DistributedObjectStorageCandidate> distributed_object_storage_candidate;
+    if (!select_query_options.only_analyze && !select_query_options.is_subquery
+        && query_context->getClientInfo().query_kind == ClientInfo::QueryKind::INITIAL_QUERY)
+        distributed_object_storage_candidate = findDistributedObjectStorageCandidate(query_tree, query_context);
+
+    if (distributed_object_storage_candidate)
+    {
+        join_tree_query_plan = buildDistributedObjectStorageQueryPlan(query_tree, *distributed_object_storage_candidate, select_query_info, planner_context);
+    }
+    else if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
         && planner_context->getGlobalPlannerContext()->parallel_replicas_node == &query_node)
     {
         join_tree_query_plan = buildQueryPlanForParallelReplicas(query_node, planner_context, select_query_info.storage_limits);

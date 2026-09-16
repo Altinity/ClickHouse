@@ -53,6 +53,36 @@ public:
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 
+    /// Executes an already-prepared cluster query (see Planner/buildDistributedObjectStorageQueryPlan.h)
+    /// through the existing *Cluster() task-iterator protocol: resolves the cluster, default-database-
+    /// qualifies `query_to_send`, adds a single ReadFromCluster step. Unlike read(), does no query
+    /// preparation itself -- the caller has already produced a self-contained AST with the driver rewritten
+    /// into its explicit `*Cluster()` form, wherever it sits.
+    void readPreparedClusterQuery(
+        QueryPlan & query_plan,
+        const Names & column_names,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        QueryProcessingStage::Enum processed_stage,
+        ASTPtr query_to_send,
+        SharedHeader sample_block);
+
+    /// Builds a standalone, resolved explicit `*Cluster(cluster_name, ...)` AST function call for this exact
+    /// storage, reusing the same per-engine rewrite rules updateQueryToSendIfNeeded() applies to a real query
+    /// (credentials/structure/format arguments included) instead of reconstructing them here. Used by
+    /// buildDistributedObjectStorageQueryPlan.cpp to build the replacement for a driver TableNode via
+    /// IQueryTreeNode::cloneAndReplace() -- mirrors StorageDistributed::buildQueryTreeDistributed()'s own
+    /// exact-node replacement pattern. Does not mutate any query already in flight: builds and rewrites a
+    /// throwaway single-table SELECT of its own.
+    ASTPtr buildClusterTableFunctionAST(const String & dispatch_cluster_name, const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context);
+
+    /// Whether this storage is known to resolve identically/safely on every worker when re-resolved during a
+    /// SECONDARY_QUERY under object_storage_cluster_join_mode='distributed' -- used by
+    /// findDistributedObjectStorageCandidate() both for driver eligibility and non-driver JOIN-partner
+    /// safety. False by default; overridden by StorageObjectStorageCluster.
+    virtual bool isResolvedViaDataLakeCatalog() const { return false; }
+
     bool isRemote() const final { return true; }
     bool supportsSubcolumns() const override  { return true; }
     bool supportsOptimizationToSubcolumns() const override { return false; }
@@ -149,7 +179,8 @@ public:
         QueryProcessingStage::Enum processed_stage_,
         ClusterPtr cluster_,
         LoggerPtr log_,
-        std::optional<Tables> external_tables_)
+        std::optional<Tables> external_tables_,
+        bool is_whole_query_dispatch_ = false)
         : SourceStepWithFilter(
             std::move(sample_block),
             column_names_,
@@ -162,6 +193,7 @@ public:
         , cluster(std::move(cluster_))
         , log(log_)
         , external_tables(external_tables_)
+        , is_whole_query_dispatch(is_whole_query_dispatch_)
     {
     }
 
@@ -175,6 +207,13 @@ private:
     std::optional<RemoteQueryExecutor::Extension> extension;
     std::shared_ptr<const ActionsDAG> listing_filter_dag;
     std::optional<Tables> external_tables;
+
+    /// True only for the object_storage_cluster_join_mode='distributed' whole-query dispatch path
+    /// (readPreparedClusterQuery()): this step's own output represents the entire dispatched
+    /// JOIN/aggregate query, not one table, so a filter pushed down onto it by the optimizer describes
+    /// that output -- not a predicate over the driver's own raw columns -- and must never be handed to
+    /// getTaskIteratorExtension() for object-storage file-level pruning (see createExtension()).
+    bool is_whole_query_dispatch = false;
 
     void createExtension();
     ContextPtr updateSettings(const Settings & settings);
