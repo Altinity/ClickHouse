@@ -124,6 +124,7 @@ void CasGcScheduler::start()
         {
             std::lock_guard lock(mutex);
             scheduler_state = SchedulerState::Stopped;
+            round_requested = false;
         }
         wake.notify_all();
         if (thread.joinable())
@@ -146,6 +147,7 @@ void CasGcScheduler::stop()
             return;
         }
         scheduler_state = SchedulerState::Stopped;
+        round_requested = false;
     }
     wake.notify_all();
     if (thread.joinable())

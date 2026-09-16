@@ -483,6 +483,42 @@ TEST(CASGCStopStart, ConcurrentStopStartFromTwoThreadsStaysConsistent)
     storage->gcStop();
 }
 
+TEST(CASGCStopStart, RequestRoundSoonConcurrentWithStopStartDoesNotRace)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    CasGcScheduler sched(store, std::chrono::seconds(3600), "CasGcRequestStopRaceTest", "ca-disk");
+    sched.start();
+
+    std::promise<void> start;
+    const auto begin = start.get_future().share();
+
+    auto requester = std::async(std::launch::async, [&]
+    {
+        begin.wait();
+        for (size_t i = 0; i < 1000; ++i)
+            sched.requestRoundSoon();
+    });
+    auto lifecycle = std::async(std::launch::async, [&]
+    {
+        begin.wait();
+        for (size_t i = 0; i < 1000; ++i)
+        {
+            sched.stop();
+            sched.start();
+        }
+    });
+
+    start.set_value();
+    ASSERT_EQ(requester.wait_for(std::chrono::seconds(60)), std::future_status::ready);
+    ASSERT_EQ(lifecycle.wait_for(std::chrono::seconds(60)), std::future_status::ready);
+    requester.get();
+    lifecycle.get();
+
+    sched.stop();
+    EXPECT_FALSE(sched.gcHealth().is_leader);
+}
+
 /// (T11 cannot-verify, acceptance matrix) Operator intent PERSISTS across a transient recovery: after the
 /// operator STOPs GC, the disk loses its mount lease (transient-not-live) and self-remounts back to Live —
 /// and NOTHING restarts the GC scheduler. Recovery is a Pool-internal operation with no reference to the

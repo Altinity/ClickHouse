@@ -163,7 +163,7 @@ public:
 
     /// Test seam (rev.7 §3 [C1]): block up to `timeout` for BOTH the pacing and heartbeat loops to have
     /// SELF-EXITED via the terminal-lifecycle check — a `Vanished` pool or a published FORGET intent — as
-    /// opposed to exiting through `stop()`'s `stopping` flag. Returns false on timeout. Predicate-based
+    /// opposed to exiting through `stop()` transitioning `scheduler_state` to `Stopped`. Returns false on timeout. Predicate-based
     /// wait (no sleeps); the loops set their flag under `terminal_exit_mutex` before notifying, so there is
     /// no lost-wakeup window. Lets a test prove the self-exit path fired without relying on any wall-clock
     /// delay.
@@ -236,7 +236,7 @@ private:
 
     /// rev.7 §3 [C1] test-observation seam: set (under `terminal_exit_mutex`) by `loop`/`heartbeatLoop`
     /// respectively when they SELF-EXIT via the terminal-lifecycle check, NOT when `stop()` flips
-    /// `stopping`. `waitForTerminalSelfExitForTest` waits on `terminal_exit_cv` for BOTH, so a test proves
+    /// `scheduler_state` to `Stopped`. `waitForTerminalSelfExitForTest` waits on `terminal_exit_cv` for BOTH, so a test proves
     /// the self-exit path fired without any sleep. Purely diagnostic; production behavior never reads them.
     std::atomic<bool> loop_exited_on_terminal_for_test{false};
     std::atomic<bool> hb_exited_on_terminal_for_test{false};
