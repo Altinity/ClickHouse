@@ -975,11 +975,14 @@ class JobConfigs:
             for total_batches in (2,)
             for batch in range(1, total_batches + 1)
         ],
+        # One shard can lose worker concurrency mid-suite under MSan and
+        # overrun the shared 3.5h functional-test budget.
         *[
             Job.ParamSet(
                 parameter=f"amd_msan, WasmEdge, parallel, {batch}/{total_batches}",
                 runs_on=RunnerLabels.FUNC_TESTER_AMD,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
+                timeout=3600 * 4,
             )
             for total_batches in (8,)
             for batch in range(1, total_batches + 1)
