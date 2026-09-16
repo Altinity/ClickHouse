@@ -95,6 +95,36 @@ client does not strip. An upstream `clickhouse-client` prints
 `Connected to ClickHouse (antalya:1) server version ...` in its interactive banner. An Antalya
 client strips the marker and prints what upstream would have printed.
 
+## No opt-out {#no-opt-out}
+
+There is no server setting that suppresses the marker. A node either speaks this protocol or is not
+an Antalya build.
+
+`server_name` is already a build-time value - upstream sets it from the CMake project name, and any
+fork may set it to anything - so a native client cannot treat it as a fixed string and must already
+tolerate an arbitrary one. Nothing a server stores or compares reads it: `client_name` is the field
+that reaches `system.query_log` and `validate_tcp_client_information`, and it is never marked. What
+is left is the displayed name on a peer that does not strip the suffix, which is cosmetic.
+
+A per-node switch would buy nothing against that and would cost a state in which two Antalya nodes
+that both support a feature silently fail to negotiate it, because one of them was configured not to
+say so. If a peer is ever found that breaks on the suffix, the fix is to stop appending it - a bug to
+fix once, not a knob for every operator to discover.
+
+## Relationship to the native protocol spec {#native-protocol-spec}
+
+`docs/en/interfaces/specs/NativeProtocol.md` is the canonical description of the *upstream* native
+protocol, and it is the file a third-party client (`ch-go`, `clickhouse-go`, `clickhouse-driver`) is
+built against. It tracks upstream through every rebase, so Antalya keeps its delta against that file
+to the smallest thing that stops a client author from being surprised: one sentence on the
+`ServerHello` `server_name` row, pointing here. Everything about the counter itself is documented in
+this file.
+
+A future Antalya-only wire change documents itself here and leaves that delta as it is - unless it
+changes the layout of a packet the spec describes field by field. A client that does not know about
+an added field cannot parse the stream past it, so such a change must be described in the spec
+itself, not only here.
+
 ## Implementation {#implementation}
 
 `src/Core/AntalyaProtocol.h` holds the version constant, the marker grammar and the `appendMarker`
