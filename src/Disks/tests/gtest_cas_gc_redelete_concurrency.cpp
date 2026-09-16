@@ -290,12 +290,12 @@ struct PendingDeletesRows
 
 GcPhaseSink recordPendingDeletes(std::shared_ptr<PendingDeletesRows> rows, GcPhaseSink next_sink = {})
 {
-    return [rows = std::move(rows), next_sink = std::move(next_sink)](const GcPhaseRecord & rec)
+    return [captured_rows = std::move(rows), captured_next_sink = std::move(next_sink)](const GcPhaseRecord & rec)
     {
         if (rec.phase == "pending_deletes")
-            rows->rows.push_back(rec.metrics);
-        if (next_sink)
-            next_sink(rec);
+            captured_rows->rows.push_back(rec.metrics);
+        if (captured_next_sink)
+            captured_next_sink(rec);
     };
 }
 
