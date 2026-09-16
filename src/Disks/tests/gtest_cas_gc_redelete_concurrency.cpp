@@ -288,14 +288,14 @@ struct PendingDeletesRows
     bool lastRowHas(const String & key) const { return !rows.empty() && rows.back().contains(key); }
 };
 
-GcPhaseSink recordPendingDeletes(std::shared_ptr<PendingDeletesRows> out, GcPhaseSink next = {})
+GcPhaseSink recordPendingDeletes(std::shared_ptr<PendingDeletesRows> rows, GcPhaseSink next_sink = {})
 {
-    return [out = std::move(out), next = std::move(next)](const GcPhaseRecord & rec)
+    return [rows = std::move(rows), next_sink = std::move(next_sink)](const GcPhaseRecord & rec)
     {
         if (rec.phase == "pending_deletes")
-            out->rows.push_back(rec.metrics);
-        if (next)
-            next(rec);
+            rows->rows.push_back(rec.metrics);
+        if (next_sink)
+            next_sink(rec);
     };
 }
 
