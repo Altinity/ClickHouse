@@ -1,6 +1,8 @@
 #include <Storages/ObjectStorage/MultiFileStorageObjectStorageSink.h>
 #include <Interpreters/Context.h>
 #include <Common/logger_useful.h>
+#include <IO/ReadBufferFromFileBase.h>
+#include <IO/ReadHelpers.h>
 #include <filesystem>
 
 namespace DB
@@ -11,6 +13,15 @@ namespace ErrorCodes
     extern const int FILE_ALREADY_EXISTS;
 }
 
+namespace
+{
+    /// The commit file lives in the same directory as the data files.
+    std::string commitFilePath(const std::string & base_path, const String & transaction_id)
+    {
+        return (std::filesystem::path(base_path).parent_path() / ("commit_" + transaction_id)).string();
+    }
+}
+
 MultiFileStorageObjectStorageSink::MultiFileStorageObjectStorageSink(
     const std::string & base_path_,
     const String & transaction_id_,
@@ -18,30 +29,29 @@ MultiFileStorageObjectStorageSink::MultiFileStorageObjectStorageSink(
     StorageObjectStorageConfigurationPtr configuration_,
     std::size_t max_bytes_per_file_,
     std::size_t max_rows_per_file_,
-    bool overwrite_if_exists_,
+    bool overwrite_existing_data_files_,
     const std::function<void(const std::string &)> & new_file_path_callback_,
     const std::optional<FormatSettings> & format_settings_,
     SharedHeader sample_block_,
     ContextPtr context_)
     : SinkToStorage(sample_block_),
     base_path(base_path_),
-    transaction_id(transaction_id_),
+    commit_file_path(commitFilePath(base_path_, transaction_id_)),
     object_storage(object_storage_),
     configuration(configuration_),
     max_bytes_per_file(max_bytes_per_file_),
     max_rows_per_file(max_rows_per_file_),
-    overwrite_if_exists(overwrite_if_exists_),
+    overwrite_existing_data_files(overwrite_existing_data_files_),
     new_file_path_callback(new_file_path_callback_),
     format_settings(format_settings_),
     sample_block(sample_block_),
     context(context_)
 {
-    current_sink = createNewSink();
 }
 
 MultiFileStorageObjectStorageSink::~MultiFileStorageObjectStorageSink()
 {
-    if (isCancelled())
+    if (isCancelled() && current_sink)
         current_sink->cancel();
 }
 
@@ -72,15 +82,13 @@ std::shared_ptr<StorageObjectStorageSink> MultiFileStorageObjectStorageSink::cre
 {
     auto new_path = generateNewFilePath();
 
-    /// todo
-    /// sounds like bad design, but callers might decide to ignore the exception, and if we throw it before the callback
-    /// they will not be able to grab the file path.
-    /// maybe I should consider moving the file already exists policy in here?
+    /// The callback runs before the conflict check on purpose: the caller discards the reported
+    /// path along with the failure, and when rewriting is allowed this check is off anyway.
     new_file_path_callback(new_path);
 
     file_paths.emplace_back(std::move(new_path));
 
-    if (!overwrite_if_exists && object_storage->exists(StoredObject(file_paths.back())))
+    if (!overwrite_existing_data_files && object_storage->exists(StoredObject(file_paths.back())))
     {
         throw Exception(ErrorCodes::FILE_ALREADY_EXISTS, "File {} already exists", file_paths.back());
     }
@@ -99,20 +107,28 @@ void MultiFileStorageObjectStorageSink::consume(Chunk & chunk)
 {
     if (isCancelled())
     {
-        current_sink->cancel();
+        if (current_sink)
+            current_sink->cancel();
         return;
     }
 
-    const auto written_bytes = current_sink->getWrittenBytes();
-    
-    const bool exceeded_bytes_limit = max_bytes_per_file && written_bytes >= max_bytes_per_file;
-    const bool exceeded_rows_limit = max_rows_per_file && current_sink_written_rows >= max_rows_per_file;
-
-    if (exceeded_bytes_limit || exceeded_rows_limit)
+    if (!current_sink)
     {
-        current_sink->onFinish();
         current_sink = createNewSink();
-        current_sink_written_rows = 0;
+    }
+    else
+    {
+        const auto written_bytes = current_sink->getWrittenBytes();
+
+        const bool exceeded_bytes_limit = max_bytes_per_file && written_bytes >= max_bytes_per_file;
+        const bool exceeded_rows_limit = max_rows_per_file && current_sink_written_rows >= max_rows_per_file;
+
+        if (exceeded_bytes_limit || exceeded_rows_limit)
+        {
+            current_sink->onFinish();
+            current_sink = createNewSink();
+            current_sink_written_rows = 0;
+        }
     }
 
     current_sink->consume(chunk);
@@ -121,20 +137,41 @@ void MultiFileStorageObjectStorageSink::consume(Chunk & chunk)
 
 void MultiFileStorageObjectStorageSink::onFinish()
 {
+    if (!current_sink)
+        return;
+
     current_sink->onFinish();
     commit();
 }
 
-void MultiFileStorageObjectStorageSink::commit()
+std::optional<std::vector<std::string>> MultiFileStorageObjectStorageSink::tryReadCommittedPaths(
+    const std::string & base_path_,
+    const String & transaction_id_,
+    const ObjectStoragePtr & object_storage_,
+    const ContextPtr & context_)
 {
-    /// the commit file path should be in the same directory as the data files
-    const auto commit_file_path = fs::path(base_path).parent_path() / ("commit_" + transaction_id);
+    const auto path = commitFilePath(base_path_, transaction_id_);
 
-    if (!overwrite_if_exists && object_storage->exists(StoredObject(commit_file_path)))
+    if (!object_storage_->exists(StoredObject(path)))
+        return {};
+
+    auto in = object_storage_->readObject(StoredObject(path), context_->getReadSettings());
+
+    std::vector<std::string> committed_paths;
+    while (!in->eof())
     {
-        throw Exception(ErrorCodes::FILE_ALREADY_EXISTS, "Commit file {} already exists, aborting {} export", commit_file_path, transaction_id);
+        String committed_path;
+        readStringUntilNewlineInto(committed_path, *in);
+        in->tryIgnore(1);
+        if (!committed_path.empty())
+            committed_paths.emplace_back(std::move(committed_path));
     }
 
+    return committed_paths;
+}
+
+void MultiFileStorageObjectStorageSink::commit()
+{
     auto out = object_storage->writeObject(
         StoredObject(commit_file_path), 
         WriteMode::Rewrite, /* attributes= */
