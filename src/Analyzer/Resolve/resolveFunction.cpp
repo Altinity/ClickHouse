@@ -789,7 +789,10 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
                 {
                     if (auto * constant = secret_node->as<ConstantNode>())
                         arguments_projection_names[n] = "[HIDDEN id: " + std::to_string(assign_mask(*constant)) + "]";
-                    else if (mask_secret_constants(secret_node))
+                    /// A mask also renames the constant in the `ActionsDAG`, so masking a constant that
+                    /// feeds an `arrayJoin` gives that `arrayJoin` a name of its own and the planner adds a
+                    /// second `ARRAY JOIN` for it, multiplying the rows. Leave such a subtree unmasked.
+                    else if (!hasFunctionNode(secret_node, "arrayJoin") && mask_secret_constants(secret_node))
                         arguments_projection_names[n] = "[HIDDEN]";
                 });
         }

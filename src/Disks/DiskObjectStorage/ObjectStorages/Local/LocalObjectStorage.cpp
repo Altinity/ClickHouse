@@ -243,6 +243,17 @@ void LocalObjectStorage::removeObjectsIfExist(const StoredObjects & objects)
         removeObjectIfExists(object);
 }
 
+namespace
+{
+/// An entry removed while we are looking at it (ENOENT), or one whose parent path component was
+/// concurrently replaced by a non-directory (ENOTDIR). Every other error (EACCES, EIO, ...) is a
+/// real failure and must propagate.
+bool isVanishedEntryError(const std::error_code & error)
+{
+    return error == std::errc::no_such_file_or_directory || error == std::errc::not_a_directory;
+}
+}
+
 ObjectMetadata LocalObjectStorage::getObjectMetadata(const std::string & path, bool) const
 {
     ObjectMetadata object_metadata;
@@ -266,13 +277,19 @@ std::optional<ObjectMetadata> LocalObjectStorage::tryGetObjectMetadata(const std
     auto time = fs::last_write_time(path, error);
     if (error)
     {
-        if (error == std::errc::no_such_file_or_directory)
+        if (isVanishedEntryError(error))
             return {};
         throw fs::filesystem_error("Got unexpected error while getting last write time", path, error);
     }
 
-    /// no_such_file_or_directory is ignored only for last_write_time for consistency
-    object_metadata.size_bytes = fs::file_size(path);
+    object_metadata.size_bytes = fs::file_size(path, error);
+    if (error)
+    {
+        /// The entry can vanish between the two stats.
+        if (isVanishedEntryError(error))
+            return {};
+        throw fs::filesystem_error("Got unexpected error while getting file size", path, error);
+    }
 
     object_metadata.etag = std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count());
     object_metadata.last_modified = Poco::Timestamp::fromEpochTime(
@@ -285,15 +302,27 @@ void LocalObjectStorage::listObjects(const std::string & path, RelativePathsWith
     if (!fs::exists(path) || !fs::is_directory(path))
         return;
 
+    /// Listing is a best-effort snapshot: an entry that disappears while the directory is being read
+    /// is omitted, the same way a remote object storage omits a concurrently deleted object.
     for (const auto & entry : fs::directory_iterator(path))
     {
-        if (entry.is_directory())
+        std::error_code error;
+        const bool is_directory = entry.is_directory(error);
+        if (error)
+        {
+            if (isVanishedEntryError(error))
+                continue;
+            throw fs::filesystem_error("Got unexpected error while listing directory", entry.path(), error);
+        }
+
+        if (is_directory)
         {
             listObjects(entry.path(), children, 0);
             continue;
         }
 
-        children.emplace_back(std::make_shared<RelativePathWithMetadata>(entry.path(), getObjectMetadata(entry.path(), false)));
+        if (auto object_metadata = tryGetObjectMetadata(entry.path(), false))
+            children.emplace_back(std::make_shared<RelativePathWithMetadata>(entry.path(), std::move(*object_metadata)));
     }
 }
 
