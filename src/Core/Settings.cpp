@@ -5183,10 +5183,6 @@ If settings are set to non-default values, then those settings are honored (only
 This setting takes a ClickHouse version number as a string, like `22.3`, `22.8`. An empty value means that this setting is disabled.
 
 Disabled by default.
-
-:::note
-In ClickHouse Cloud the compatibility setting must be set by ClickHouse Cloud support.  Please [open a case](https://clickhouse.cloud/support) to have it set.
-:::
 )", 0) \
     \
     DECLARE(Map, additional_table_filters, "", R"(
