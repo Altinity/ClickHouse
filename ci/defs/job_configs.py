@@ -1043,6 +1043,8 @@ class JobConfigs:
             for batch in range(1, total_batches + 1)
         ]
     )
+    # Eight batches: shard 2/4 regularly hits the 3.5h Praktika timeout on
+    # ARM ASan + Azure (e.g. runs 34863139502, 35023807366).
     functional_tests_jobs_azure = common_ft_job_config.set_allow_failure(
         True
     ).parametrize(
@@ -1052,7 +1054,7 @@ class JobConfigs:
                 runs_on=RunnerLabels.ARM_LARGE,
                 requires=[ArtifactNames.CH_ARM_ASAN_UBSAN_GH],
             )
-            for total_batches in (4,)
+            for total_batches in (8,)
             for batch in range(1, total_batches + 1)
         ],
         *[
