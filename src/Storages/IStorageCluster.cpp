@@ -140,10 +140,8 @@ ActionsDAG andListingFilterDAGs(ActionsDAG first, ActionsDAG second)
 namespace
 {
 
-/// Whole-query dispatch and ordinary remote execution need opposite `object_storage_cluster*` settings on the
-/// worker side (see ReadFromCluster::updateSettings()'s own comment): this mirrors that same normalization
-/// onto `query_to_send`'s own query-level SETTINGS clause, since a query-level SETTINGS entry there would
-/// otherwise re-override whatever ReadFromCluster::updateSettings() sets on the outgoing context.
+/// Applies the same normalization as ReadFromCluster::updateSettings, but to the query's own SETTINGS clause,
+/// which the worker would otherwise apply on top of the context settings and undo it.
 void sanitizeObjectStorageClusterQuerySettings(ASTPtr & query, bool is_whole_query_dispatch)
 {
     auto * select_query = query->as<ASTSelectQuery>();
@@ -182,6 +180,16 @@ void sanitizeObjectStorageClusterQuerySettings(ASTPtr & query, bool is_whole_que
 
 void ReadFromCluster::applyFilters(ActionDAGNodes added_filter_nodes)
 {
+    if (is_whole_query_dispatch)
+    {
+        /// query_info here describes the whole dispatched query, not one table expression, so the per-table
+        /// mapping SourceStepWithFilter::applyFilters builds (query_info.buildNodeNameToInputNodeColumn) does
+        /// not apply and throws. Use the base implementation, which skips it. Nothing downstream needs the
+        /// result either: createExtension passes no predicate in this mode.
+        SourceStepWithFilterBase::applyFilters(std::move(added_filter_nodes));
+        return;
+    }
+
     SourceStepWithFilter::applyFilters(std::move(added_filter_nodes));
     /// Empty later `applyFilters` (optimizer walk stops at JOIN) wipes
     /// `filter_actions_dag` and must not drop wrap `WHERE`.
@@ -206,9 +214,8 @@ void ReadFromCluster::createExtension()
     if (extension)
         return;
 
-    /// In whole-query dispatch mode this step's output is the entire dispatched JOIN/aggregate query's
-    /// result, not the driver's raw columns -- any filter pushed down onto it (see the class comment) must
-    /// not be forwarded as a driver-table predicate for object-storage file-level pruning.
+    /// In whole-query dispatch this step's output is the dispatched query's result, not the driver's rows, so a
+    /// filter over it is not a predicate over the driver's columns and must not drive file-level pruning.
     const ActionsDAG * filter = is_whole_query_dispatch
         ? nullptr
         : (listing_filter_dag ? listing_filter_dag.get() : (filter_actions_dag ? filter_actions_dag.get() : query_info.filter_actions_dag.get()));
@@ -629,15 +636,6 @@ void IStorageCluster::readPreparedClusterQuery(
     if (query_info.planner_context && query_info.planner_context->getMutableQueryContext())
         external_tables = query_info.planner_context->getMutableQueryContext()->getExternalTables();
 
-    /// query_info.planner_context/table_expression describe the *whole* dispatched query here, not a single
-    /// per-table expression the way SourceStepWithFilter/applyFilters() expect: buildNodeNameToInputNodeColumn()
-    /// looks up query_info.table_expression in query_info.planner_context, which throws -- and dereferences a
-    /// null table_expression while formatting that very error -- if it's ever consulted. This step is not a
-    /// normal per-table Planner source, so drop them once external_tables above is captured; the driver's own
-    /// filter/task-iterator pruning is separately suppressed for is_whole_query_dispatch (see createExtension()).
-    query_info.planner_context.reset();
-    query_info.table_expression.reset();
-
     auto reading = std::make_unique<ReadFromCluster>(
         column_names,
         query_info,
@@ -679,11 +677,9 @@ ASTPtr IStorageCluster::buildClusterTableFunctionAST(
 
     ASTPtr query = select_query;
 
-    /// updateQueryForDistributedEngineIfNeeded() (called via updateQueryToSendIfNeeded() below) resolves the
-    /// dispatch cluster via getClusterName(context), which itself prefers the query-level `object_storage_cluster`
-    /// setting -- scope that here on a throwaway context copy rather than relying on the real query's own
-    /// settings, since this may be called to build a driver replacement whose own cluster differs from
-    /// whatever the initiator's ambient context carries.
+    /// updateQueryToSendIfNeeded resolves the cluster through getClusterName, which prefers the query-level
+    /// `object_storage_cluster` setting. Scope the intended cluster on a throwaway context copy so the result
+    /// does not depend on whatever the initiator's ambient settings happen to carry.
     auto scoped_context = Context::createCopy(context);
     scoped_context->setSetting("object_storage_cluster", dispatch_cluster_name);
 
@@ -958,16 +954,10 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     /// Cluster table functions should always skip unavailable shards.
     new_settings[Setting::skip_unavailable_shards] = true;
 
-    /// Worker-localization scoping for object_storage_cluster_join_mode='distributed' (see
-    /// findDistributedObjectStorageCandidate.h): on the whole-query dispatch path
-    /// (readPreparedClusterQuery()), the driver is already rewritten into its own explicit `*Cluster()` call,
-    /// so any *other* DataLake-catalog table re-resolved on the worker (via DatabaseDataLake) must not itself
-    /// pick up a leftover `object_storage_cluster` from the initiator's session/query settings -- that setting
-    /// takes priority over a table's own configured cluster in StorageObjectStorageCluster::getClusterName(),
-    /// which would otherwise silently re-distribute a table this optimization already proved safe to
-    /// recompute in full, locally, on every worker. An ordinary (non-whole-query) ReadFromCluster reached
-    /// after the candidate was rejected must conversely behave exactly like `allow`, not leak 'distributed'
-    /// worker localization it never actually earned.
+    /// The dispatched driver carries its cluster as an explicit table-function argument, so workers must not
+    /// also inherit `object_storage_cluster` -- it outranks a table's own cluster in getClusterName and would
+    /// make every partner table fan out again. Conversely, a ReadFromCluster reached after the candidate was
+    /// rejected must behave exactly like `allow`.
     if (is_whole_query_dispatch)
         new_settings[Setting::object_storage_cluster] = "";
     else if (new_settings[Setting::object_storage_cluster_join_mode] == ObjectStorageClusterJoinMode::DISTRIBUTED)

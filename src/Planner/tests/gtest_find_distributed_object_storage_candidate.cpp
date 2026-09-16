@@ -17,6 +17,7 @@
 #include <Core/NamesAndTypes.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Databases/DatabaseMemory.h>
+#include <Databases/DatabasesCommon.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Parsers/ParserSelectQuery.h>
@@ -37,13 +38,29 @@ NamesAndTypesList testColumns()
     return {{"id", std::make_shared<DataTypeUInt64>()}};
 }
 
+/// A DatabaseMemory that reports itself as a DataLake catalog, which is what makes the tables inside it
+/// eligible (findDistributedObjectStorageCandidate asks DatabaseCatalog::isDatalakeCatalog).
+class FakeDataLakeDatabase : public DatabaseWithOwnTablesBase
+{
+public:
+    explicit FakeDataLakeDatabase(const String & name_, ContextPtr context_)
+        : DatabaseWithOwnTablesBase(name_, "FakeDataLakeDatabase(" + name_ + ")", context_)
+    {
+    }
+
+    String getEngineName() const override { return "FakeDataLakeCatalog"; }
+    bool isDatalakeCatalog() const override { return true; }
+
+private:
+    ASTPtr getCreateDatabaseQueryImpl() const override { return nullptr; }
+};
+
 /// Minimal IStorageCluster test double, configurable per instance.
 class FakeClusterStorage : public IStorageCluster
 {
 public:
-    FakeClusterStorage(const StorageID & table_id, String cluster_name_, bool resolved_via_datalake_catalog_)
+    FakeClusterStorage(const StorageID & table_id, String cluster_name_)
         : IStorageCluster(cluster_name_, table_id, getLogger("test"))
-        , resolved_via_datalake_catalog(resolved_via_datalake_catalog_)
     {
         StorageInMemoryMetadata metadata;
         metadata.setColumns(ColumnsDescription{testColumns()});
@@ -51,16 +68,12 @@ public:
     }
 
     std::string getName() const override { return "FakeClusterStorage"; }
-    bool isResolvedViaDataLakeCatalog() const override { return resolved_via_datalake_catalog; }
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node *, const ActionsDAG *, const ContextPtr &, ClusterPtr, StorageMetadataPtr) const override
     {
         return {};
     }
-
-private:
-    bool resolved_via_datalake_catalog;
 };
 
 /// Modelled on src/Planner/tests/gtest_planner_empty_projection.cpp.
@@ -84,26 +97,31 @@ private:
         tryRegisterAggregateFunctions();
 
         static constexpr auto database_name = "find_distributed_object_storage_candidate_test_db";
-        DatabasePtr database = std::make_shared<DatabaseMemory>(database_name, context);
+        DatabasePtr database = std::make_shared<FakeDataLakeDatabase>(database_name, context);
 
-        auto attach_cluster_table = [&](const String & table_name, String cluster_name, bool resolved_via_datalake_catalog)
+        auto attach_cluster_table = [&](const DatabasePtr & db, const String & table_name, String cluster_name)
         {
-            database->attachTable(
+            db->attachTable(
                 context,
                 table_name,
-                std::make_shared<FakeClusterStorage>(StorageID(database_name, table_name), std::move(cluster_name), resolved_via_datalake_catalog),
+                std::make_shared<FakeClusterStorage>(StorageID(db->getDatabaseName(), table_name), std::move(cluster_name)),
                 {});
         };
 
         /// A distributed driver, e.g. ice.event_page.
-        attach_cluster_table("driver", "vig-test", /*resolved_via_datalake_catalog=*/true);
+        attach_cluster_table(database, "driver", "vig-test");
         /// A second DataLake-catalog table under the same cluster -- never an independent driver on the
         /// right of a JOIN, just a plain (if wasteful) safe partner.
-        attach_cluster_table("second_datalake_table", "vig-test", /*resolved_via_datalake_catalog=*/true);
+        attach_cluster_table(database, "second_datalake_table", "vig-test");
         /// A safe co-resolved table with no cluster dispatch of its own (e.g. ice.geo_location_lookup).
-        attach_cluster_table("safe_lookup", "", /*resolved_via_datalake_catalog=*/true);
-        /// A Cluster-engine table not resolved through DatabaseDataLake -- not safe.
-        attach_cluster_table("unsafe_cluster_table", "some-cluster", /*resolved_via_datalake_catalog=*/false);
+        attach_cluster_table(database, "safe_lookup", "");
+
+        /// A Cluster-engine table in an ordinary database -- not resolved through a DataLake catalog, so not
+        /// safe to re-resolve on a worker.
+        static constexpr auto plain_database_name = "find_distributed_object_storage_candidate_test_plain_db";
+        DatabasePtr plain_database = std::make_shared<DatabaseMemory>(plain_database_name, context);
+        attach_cluster_table(plain_database, "unsafe_cluster_table", "some-cluster");
+        DatabaseCatalog::instance().attachDatabase(plain_database->getDatabaseName(), plain_database);
 
         database->attachTable(
             context,
@@ -256,7 +274,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsDriverWithoutSelectAccess)
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, context).has_value());
 }
 
-/// Same access check, but the table without SELECT access is buried inside a subquery ("q21" shape) rather
+/// Same access check, but the table without SELECT access is buried inside a subquery rather
 /// than at the dispatch boundary's own top-level JOIN -- the recursive intermediate-subquery walk must reach
 /// it too, not just the tables directly visible at the outermost level.
 TEST(FindDistributedObjectStorageCandidate, RejectsBuriedDriverWithoutSelectAccess)
@@ -334,7 +352,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsUnsafeClusterTableAsDriver)
     state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
 
     auto query_tree
-        = analyze("SELECT unsafe_cluster_table.id FROM unsafe_cluster_table INNER JOIN safe_lookup ON unsafe_cluster_table.id = safe_lookup.id", state.context);
+        = analyze("SELECT t.id FROM find_distributed_object_storage_candidate_test_plain_db.unsafe_cluster_table AS t INNER JOIN safe_lookup ON t.id = safe_lookup.id", state.context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
 }
 
@@ -344,7 +362,7 @@ TEST(FindDistributedObjectStorageCandidate, RejectsUnsafeIStorageClusterTableAsR
     state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
 
     auto query_tree
-        = analyze("SELECT driver.id FROM driver INNER JOIN unsafe_cluster_table ON driver.id = unsafe_cluster_table.id", state.context);
+        = analyze("SELECT driver.id FROM driver INNER JOIN find_distributed_object_storage_candidate_test_plain_db.unsafe_cluster_table AS t ON driver.id = t.id", state.context);
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
 }
 
@@ -476,14 +494,14 @@ TEST(FindDistributedObjectStorageCandidate, RejectsExplicitClusterTableFunctionA
 
     auto table_function_node = std::make_shared<TableFunctionNode>("icebergS3Cluster");
     auto explicit_cluster_storage = std::make_shared<FakeClusterStorage>(
-        StorageID("system", "explicit_cluster_table"), "other-cluster", /*resolved_via_datalake_catalog=*/false);
+        StorageID("system", "explicit_cluster_table"), "other-cluster");
     table_function_node->resolve(nullptr, explicit_cluster_storage, state.context, {});
     join_node.getRightTableExpression() = table_function_node;
 
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
 }
 
-/// "q21" shape: driver buried in a subquery joined against another safe table; outer query is the candidate.
+/// Driver buried in a subquery joined against another safe table; the outer query is the candidate.
 TEST(FindDistributedObjectStorageCandidate, AcceptsBuriedDriverWithSafeOuterJoin)
 {
     const auto & state = State::instance();
@@ -515,13 +533,13 @@ TEST(FindDistributedObjectStorageCandidate, RejectsWhenOuterJoinPartnerIsUnsafe)
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
 }
 
-/// Real "q21" shape: the driver sits behind one intermediate subquery (`transaction_event`, standing in for
+/// The full buried-driver shape: the driver sits behind one intermediate subquery (`transaction_event`, standing in for
 /// `txnlog`) on the left of the outer LEFT JOIN; the right side (`alert_events`) is itself a LEFT JOIN against
 /// a further subquery with its own GROUP BY (`policy_matches`), and `alert_events` itself also has a GROUP BY.
 /// None of that RHS structure is inspected for a competing driver or restricted for GROUP BY/JOIN -- it's
 /// worker-local content, recomputed whole on every worker. The outer query's own GROUP BY/ORDER BY/LIMIT are
 /// the dispatch boundary's own, handled by stock finalization on top of the dispatched read.
-TEST(FindDistributedObjectStorageCandidate, AcceptsRealQ21Shape)
+TEST(FindDistributedObjectStorageCandidate, AcceptsBuriedDriverWithNestedRightSide)
 {
     const auto & state = State::instance();
     state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
@@ -544,10 +562,49 @@ TEST(FindDistributedObjectStorageCandidate, AcceptsRealQ21Shape)
     EXPECT_EQ(candidate->driver->getStorageID().table_name, "driver");
 }
 
-/// Real "q17" shape: one root LEFT JOIN between the driver and a safe lookup table, with WHERE, GROUP BY,
+/// Direct-driver shape: one root LEFT JOIN between the driver and a safe lookup table, with WHERE, GROUP BY,
 /// ORDER BY and LIMIT all sitting directly on the dispatch boundary itself (not an intermediate subquery) --
 /// freely allowed there, unlike on a driver-path intermediate subquery.
-TEST(FindDistributedObjectStorageCandidate, AcceptsRealQ17Shape)
+/// The buried-driver shape expressed with CTEs: the driver sits inside a CTE used as the JOIN's left side. The analyzer
+/// resolves a CTE reference into the same QueryNode a derived table would produce, so the left-spine walk must
+/// find the driver through it exactly as it does through a subquery.
+TEST(FindDistributedObjectStorageCandidate, AcceptsBuriedDriverInsideCommonTableExpression)
+{
+    const auto & state = State::instance();
+    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+
+    auto query_tree = analyze(
+        "WITH transaction_event AS (SELECT driver.id FROM driver), "
+        "alert_events AS (SELECT safe_lookup.id FROM safe_lookup) "
+        "SELECT transaction_event.id, count() FROM transaction_event "
+        "LEFT JOIN alert_events ON transaction_event.id = alert_events.id "
+        "GROUP BY transaction_event.id",
+        state.context);
+
+    auto candidate = findDistributedObjectStorageCandidate(query_tree, state.context);
+    ASSERT_TRUE(candidate.has_value());
+    EXPECT_EQ(candidate->driver->getStorageID().getTableName(), "driver");
+}
+
+/// A CTE on the driver's own left path is still an intermediate subquery: if it aggregates, each worker would
+/// finalize its own slice of the driver as though it were the whole group.
+TEST(FindDistributedObjectStorageCandidate, RejectsAggregatingCommonTableExpressionOnDriverPath)
+{
+    const auto & state = State::instance();
+    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+
+    auto query_tree = analyze(
+        "WITH transaction_event AS (SELECT driver.id FROM driver GROUP BY driver.id), "
+        "alert_events AS (SELECT safe_lookup.id FROM safe_lookup) "
+        "SELECT transaction_event.id, count() FROM transaction_event "
+        "LEFT JOIN alert_events ON transaction_event.id = alert_events.id "
+        "GROUP BY transaction_event.id",
+        state.context);
+
+    EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, state.context).has_value());
+}
+
+TEST(FindDistributedObjectStorageCandidate, AcceptsDirectDriverWithFilterAndAggregation)
 {
     const auto & state = State::instance();
     state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));

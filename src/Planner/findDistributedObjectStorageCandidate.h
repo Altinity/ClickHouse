@@ -15,35 +15,30 @@ using QueryTreeNodePtr = std::shared_ptr<IQueryTreeNode>;
 class Context;
 using ContextPtr = std::shared_ptr<const Context>;
 
-/// A whole-query JOIN-pushdown candidate for object_storage_cluster_join_mode='distributed'. `query_node`
-/// (the exact QueryTreeNodePtr passed to findDistributedObjectStorageCandidate()) is always the dispatch
-/// boundary: the entire query is forwarded as a whole to `driver`'s cluster, never a narrower subquery.
+/// A whole-query JOIN-pushdown candidate for `object_storage_cluster_join_mode='distributed'`. The entire query
+/// passed to findDistributedObjectStorageCandidate is dispatched to `driver`'s cluster as one unit.
 struct DistributedObjectStorageCandidate
 {
-    /// The driving TableNode, reachable from the dispatch boundary only via the left path of every
-    /// JOIN/subquery crossing (see findDriverOnLeftSpine() in the .cpp).
+    /// The driving table, reachable from the dispatch boundary only via the left path of every JOIN/subquery
+    /// crossing.
     const TableNode * driver = nullptr;
 
-    /// driver's resolved storage.
     IStorageCluster * driver_storage = nullptr;
 };
 
-/// Whole-query dispatch is an all-or-nothing decision for `query_node` itself: either the entire subtree
-/// reachable from it is safe to forward as one query to a single DataLake-catalog driver's cluster, or it
-/// isn't and the caller falls back to ordinary planning for this exact QueryNode -- there is no narrower
-/// fallback candidate search. Returns nullopt when: mode isn't 'distributed', `query_node` has no JOIN at
-/// all (nothing here for this mode to optimize), no eligible driver is reachable via the left spine, or any
-/// unsafe leaf is reachable anywhere in the subtree (explicit `*Cluster()`, local/Distributed table,
-/// row policy, missing SELECT access, or a structurally unsupported shape).
+/// Decides whether `query_node` as a whole can be executed on a single DataLake-catalog driver's cluster.
 ///
-/// The driver is found by walking strictly down the left spine of `query_node`'s own JOIN/subquery tree:
-/// QueryNode -> its join tree; supported JoinNode (INNER ALL or LEFT) -> left operand only; intermediate
-/// QueryNode crossed along the way -> only if partition-preserving (see isSafeIntermediateSubquery() in the
-/// .cpp); TableNode -> an eligible DataLake-catalog driver with a non-empty cluster. The right side of any
-/// JOIN, and anything below it, is never inspected for a competing driver -- it is validated only as
-/// worker-local, safe-to-recompute-in-full content (see allWorkerLocalReferencesAreSafe() in the .cpp), which
-/// is why a DataLake-catalog table, or even a nested JOIN/GROUP BY over several such tables, is accepted on
-/// the right without ever being considered for the driver role itself.
+/// The driver is found by walking strictly down the left spine: QueryNode -> its join tree; INNER ALL or LEFT
+/// JOIN -> left operand only; an intermediate QueryNode -> only if partition-preserving; TableNode -> eligible if
+/// it resolves through a DataLake catalog and has a non-empty cluster. Everything else reachable from
+/// `query_node` is then checked as worker-local content that each worker recomputes in full. That check covers
+/// table references only -- other functions the query calls (`dictGet`, a UDF, `hostName`) simply move to the
+/// workers and are assumed to be consistent there, as they are for `Distributed`.
+///
+/// All-or-nothing for `query_node` itself -- there is no narrower fallback candidate. Returns nullopt when the
+/// mode is not 'distributed', there is no JOIN, no eligible driver is reachable, or any unsafe leaf appears
+/// anywhere in the subtree (explicit `*Cluster()` table function, local/`Distributed` table, row policy, missing
+/// SELECT access, unsupported shape). The caller then falls back to ordinary planning.
 std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCandidate(
     const QueryTreeNodePtr & query_node, const ContextPtr & context);
 

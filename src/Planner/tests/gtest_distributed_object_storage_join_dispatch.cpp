@@ -12,6 +12,7 @@
 #include <Core/NamesAndTypes.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Databases/DatabaseMemory.h>
+#include <Databases/DatabasesCommon.h>
 #include <IO/WriteBufferFromString.h>
 #include <Interpreters/ClientInfo.h>
 #include <Interpreters/Context.h>
@@ -73,6 +74,23 @@ private:
     const char * getStorageEngineName() const override { return "FakeDriverStorage"; }
 };
 
+/// A DatabaseMemory that reports itself as a DataLake catalog: that is what makes the tables inside it eligible
+/// for dispatch (findDistributedObjectStorageCandidate asks DatabaseCatalog::isDatalakeCatalog).
+class FakeDataLakeDatabase : public DatabaseWithOwnTablesBase
+{
+public:
+    explicit FakeDataLakeDatabase(const String & name_, ContextPtr context_)
+        : DatabaseWithOwnTablesBase(name_, "FakeDataLakeDatabase(" + name_ + ")", context_)
+    {
+    }
+
+    String getEngineName() const override { return "FakeDataLakeCatalog"; }
+    bool isDatalakeCatalog() const override { return true; }
+
+private:
+    ASTPtr getCreateDatabaseQueryImpl() const override { return nullptr; }
+};
+
 /// Minimal driver stand-in; getTaskIteratorExtension() is only invoked during real pipeline execution,
 /// which these tests never trigger -- they only check the plan.
 class FakeDriverStorage : public IStorageCluster
@@ -87,7 +105,6 @@ public:
     }
 
     std::string getName() const override { return "FakeDriverStorage"; }
-    bool isResolvedViaDataLakeCatalog() const override { return true; }
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node *, const ActionsDAG *, const ContextPtr &, ClusterPtr, StorageMetadataPtr) const override
@@ -137,7 +154,6 @@ public:
     }
 
     std::string getName() const override { return "FakeSafeLookupStorage"; }
-    bool isResolvedViaDataLakeCatalog() const override { return true; }
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node *, const ActionsDAG *, const ContextPtr &, ClusterPtr, StorageMetadataPtr) const override
@@ -211,7 +227,7 @@ private:
         static constexpr auto database_name = "distributed_object_storage_join_dispatch_test_db";
         static constexpr auto cluster_name = "vig-test";
 
-        DatabasePtr database = std::make_shared<DatabaseMemory>(database_name, context);
+        DatabasePtr database = std::make_shared<FakeDataLakeDatabase>(database_name, context);
 
         driver = std::make_shared<FakeDriverStorage>(StorageID(database_name, "driver"), cluster_name);
         database->attachTable(context, "driver", driver, {});
@@ -252,7 +268,7 @@ String planAndExplain(const String & query, const ContextMutablePtr & context)
 
 /// Like planAndExplain(), but also runs the query plan optimizer (predicate pushdown included) before
 /// explaining -- this is what actually drives ReadFromCluster::applyFilters() during a real EXPLAIN/execution,
-/// which planAndExplain() alone never touches. Needed to reproduce the live q17 crash trigger: a WHERE on the
+/// which planAndExplain() alone never touches. Needed to reproduce a live exception: a WHERE on the
 /// driver gets pushed down as a filter onto the whole-query ReadFromCluster step, whose SelectQueryInfo used to
 /// carry a mismatched planner_context/table_expression pair for a per-table filter lookup that this step isn't.
 String planOptimizeAndExplain(const String & query, const ContextMutablePtr & context)
@@ -289,7 +305,8 @@ ReadFromCluster * findReadFromCluster(QueryPlan::Node * node)
 
 }
 
-/// Core "q17" regression: whole query dispatches as one ReadFromCluster step, no local JOIN.
+/// Core case: the driver is the JOIN's leftmost table, and the whole query dispatches as one
+/// ReadFromCluster step with no local JOIN.
 TEST(DistributedObjectStorageJoinDispatch, DriverOwnsWholeJoinWhenModeIsDistributed)
 {
     auto & state = State::instance();
@@ -343,7 +360,7 @@ TEST(DistributedObjectStorageJoinDispatch, DriverIsWrappedWhenModeIsNotDistribut
     EXPECT_NE(plan_text.find("JoinLogical"), String::npos) << "expected a local JOIN step, got:\n" << plan_text;
 }
 
-/// "q21" regression: driver buried in a subquery, outer JOIN + GROUP BY all dispatch as one ReadFromCluster,
+/// Driver buried in a subquery: the outer JOIN and GROUP BY still dispatch as one ReadFromCluster,
 /// with stock MergingAggregated finalization reused on top.
 TEST(DistributedObjectStorageJoinDispatch, BuriedDriverOwnsWholeOuterQueryWithGroupBy)
 {
@@ -392,10 +409,10 @@ TEST(DistributedObjectStorageJoinDispatch, ReadFromClusterHeaderCarriesUnmergedA
         << "expected ReadFromCluster's header to carry the unmerged aggregate state type, got:\n" << read_from_cluster_block;
 }
 
-/// Real "q17"-shaped projection: a CASE expression reading columns from both sides of the JOIN, plus count(),
+/// A realistic projection: a CASE expression reading columns from both sides of the JOIN, plus count(),
 /// GROUP BY, ORDER BY and LIMIT all on the dispatch boundary itself. Exercises the header/rename machinery
 /// with more than one plain passthrough column, unlike the trivial single-column projections above.
-TEST(DistributedObjectStorageJoinDispatch, ComplexQ17ProjectionBuildsSuccessfully)
+TEST(DistributedObjectStorageJoinDispatch, ComplexProjectionOverBothJoinSidesBuildsSuccessfully)
 {
     auto & state = State::instance();
     state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
@@ -417,14 +434,14 @@ TEST(DistributedObjectStorageJoinDispatch, ComplexQ17ProjectionBuildsSuccessfull
         << "expected stock final-merge aggregation on top of the dispatched read, got:\n" << plan_text;
 }
 
-/// Regression for the live q17 SIGSEGV: a WHERE on the driver survives real plan optimization (not just
+/// Regression for a live exception: a WHERE on the driver survives real plan optimization (not just
 /// candidate discovery/plan construction), which pushes it down as a filter onto the whole-query
 /// ReadFromCluster step and calls ReadFromCluster::applyFilters() -> SourceStepWithFilter::applyFilters() ->
-/// SelectQueryInfo::buildNodeNameToInputNodeColumn(). That used to look up a per-table `table_expression` in a
-/// `planner_context` describing the *whole* dispatched query, throwing while formatting the error message by
-/// dereferencing a null table_expression. readPreparedClusterQuery() must not leave that pair set on the
-/// SelectQueryInfo it hands to ReadFromCluster.
-TEST(DistributedObjectStorageJoinDispatch, ComplexQ17ProjectionWithWhereSurvivesPlanOptimization)
+/// SelectQueryInfo::buildNodeNameToInputNodeColumn(), which looks up a per-table `table_expression` in a
+/// `planner_context` that here describes the *whole* dispatched query -- it throws, and used to dereference a
+/// null table_expression while formatting that very error. In whole-query mode applyFilters must therefore use
+/// SourceStepWithFilterBase::applyFilters, which does not build that per-table mapping at all.
+TEST(DistributedObjectStorageJoinDispatch, ComplexProjectionWithWhereSurvivesPlanOptimization)
 {
     auto & state = State::instance();
     state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
@@ -444,11 +461,11 @@ TEST(DistributedObjectStorageJoinDispatch, ComplexQ17ProjectionWithWhereSurvives
     EXPECT_EQ(plan_text.find("JoinLogical"), String::npos) << "expected no local JOIN step, got:\n" << plan_text;
 }
 
-/// Real "q21" shape: driver behind one intermediate subquery, outer LEFT JOIN against a RHS subquery that
+/// The full buried-driver shape: driver behind one intermediate subquery, outer LEFT JOIN against a RHS subquery that
 /// itself LEFT JOINs a further GROUP BY subquery and also has its own GROUP BY. None of that RHS content is a
 /// competing driver -- it's recomputed whole on every worker -- and the whole thing must still build into a
 /// single dispatched ReadFromCluster with stock finalization for the outer GROUP BY on top.
-TEST(DistributedObjectStorageJoinDispatch, RealQ21ShapeBuildsSuccessfully)
+TEST(DistributedObjectStorageJoinDispatch, BuriedDriverWithNestedRightSideBuildsSuccessfully)
 {
     auto & state = State::instance();
     state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
@@ -470,10 +487,10 @@ TEST(DistributedObjectStorageJoinDispatch, RealQ21ShapeBuildsSuccessfully)
         << "expected stock final-merge aggregation on top of the dispatched read, got:\n" << plan_text;
 }
 
-/// The same q21 shape, but asserting the rewrite itself: exactly one driver -- `driver`, buried inside
+/// The same shape, but asserting the rewrite itself: exactly one driver -- `driver`, buried inside
 /// `transaction_event` -- becomes the explicit cluster function; every other DataLake table reachable from the
 /// RHS (`safe_lookup`, `dim2`) stays an ordinary catalog identifier, never itself rewritten into a driver.
-TEST(DistributedObjectStorageJoinDispatch, RealQ21ShapeRewritesOnlyTheBuriedDriver)
+TEST(DistributedObjectStorageJoinDispatch, RewritesOnlyTheBuriedDriverAndNoPartner)
 {
     auto & state = State::instance();
     state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
@@ -496,6 +513,42 @@ TEST(DistributedObjectStorageJoinDispatch, RealQ21ShapeRewritesOnlyTheBuriedDriv
 
     EXPECT_NE(plan_text.find("safe_lookup"), String::npos) << "expected safe_lookup to remain an ordinary catalog identifier, got:\n" << plan_text;
     EXPECT_NE(plan_text.find("dim2"), String::npos) << "expected dim2 to remain an ordinary catalog identifier, got:\n" << plan_text;
+}
+
+/// The same shape written with CTEs rather than derived tables. The setting documents CTE support, and the
+/// analyzer resolves a CTE into a QueryNode just as it does a derived table -- but a CTE reference serializes to
+/// its bare name unless the body is inlined, which would not resolve on a worker.
+/// queryNodeToDistributedSelectQuery is what inlines it; this pins that down, including for a CTE
+/// (`policy_matches`) referenced from inside another CTE.
+TEST(DistributedObjectStorageJoinDispatch, BuriedDriverWithCommonTableExpressions)
+{
+    auto & state = State::instance();
+    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
+
+    auto plan_text = planAndExplain(
+        "WITH transaction_event AS (SELECT driver.id FROM driver), "
+        "policy_matches AS (SELECT dim2.lookup_id AS id FROM dim2 GROUP BY dim2.lookup_id), "
+        "alert_events AS (SELECT safe_lookup.lookup_id AS id FROM safe_lookup "
+        "LEFT JOIN policy_matches ON safe_lookup.lookup_id = policy_matches.id "
+        "GROUP BY safe_lookup.lookup_id) "
+        "SELECT transaction_event.id, count() FROM transaction_event "
+        "LEFT JOIN alert_events ON transaction_event.id = alert_events.id "
+        "GROUP BY transaction_event.id",
+        state.context);
+
+    EXPECT_NE(plan_text.find("ReadFromCluster"), String::npos) << plan_text;
+    EXPECT_EQ(plan_text.find("JoinLogical"), String::npos) << "expected no local JOIN step, got:\n" << plan_text;
+    EXPECT_NE(plan_text.find("MergingAggregated"), String::npos)
+        << "expected stock final-merge aggregation on top of the dispatched read, got:\n" << plan_text;
+
+    /// Exactly one driver, and no dangling CTE name: every CTE body must appear inlined in the forwarded query.
+    size_t driver_function_count = 0;
+    for (size_t pos = plan_text.find("fakeDriverFunction("); pos != String::npos; pos = plan_text.find("fakeDriverFunction(", pos + 1))
+        ++driver_function_count;
+    EXPECT_EQ(driver_function_count, 1u) << "expected exactly one explicit driver cluster function, got:\n" << plan_text;
+
+    EXPECT_NE(plan_text.find("safe_lookup"), String::npos) << plan_text;
+    EXPECT_NE(plan_text.find("dim2"), String::npos) << plan_text;
 }
 
 /// SourceStepWithFilter::required_source_columns is checked against the driver's own StorageSnapshot

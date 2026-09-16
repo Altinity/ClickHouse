@@ -66,11 +66,6 @@ public:
 
     String getClusterName(ContextPtr context) const override;
 
-    /// True only for tables resolved through a shared DataLake catalog (set by DatabaseDataLake::tryGetTableImpl()),
-    /// not for an explicit engine table like `CREATE TABLE ... ENGINE = IcebergS3Cluster(...)`.
-    bool isResolvedViaDataLakeCatalog() const override { return resolved_via_datalake_catalog; }
-    void markResolvedViaDataLakeCatalog() { resolved_via_datalake_catalog = true; }
-
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 
     std::optional<QueryPipeline> distributedWrite(
@@ -222,7 +217,6 @@ private:
     StorageObjectStorageConfigurationPtr configuration;
     const ObjectStoragePtr object_storage;
     bool cluster_name_in_settings;
-    bool resolved_via_datalake_catalog = false;
 
     /// non-clustered storage to fall back on pure realisation if needed
     std::shared_ptr<StorageObjectStorage> pure_storage;

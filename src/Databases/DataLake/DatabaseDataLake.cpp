@@ -107,7 +107,6 @@ namespace Setting
     extern const SettingsBool parallel_replicas_for_cluster_engines;
     extern const SettingsString cluster_for_parallel_replicas;
     extern const SettingsBool database_datalake_require_metadata_access;
-    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
 
 }
 
@@ -752,18 +751,6 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     if (cluster_name.empty() && can_use_parallel_replicas && !is_secondary_query)
         cluster_name = parallel_replicas_cluster_name;
 
-    /// Under object_storage_cluster_join_mode='distributed', a co-resolved DataLake table must localize
-    /// rather than dispatch its own ReadFromCluster (the driver itself is rewritten separately into an
-    /// explicit `*Cluster()` call before being sent to workers -- see findDistributedObjectStorageCandidate.h).
-    /// query_kind == SECONDARY_QUERY alone is too wide (also true for an unrelated Distributed/remote() query),
-    /// so mirror TableFunctionObjectStorageCluster's own worker-detection signal instead.
-    const auto & client_info = context_->getClientInfo();
-    const bool is_distributed_object_storage_worker
-        = is_secondary_query && client_info.collaborate_with_initiator && context_->hasClusterFunctionReadTaskCallback();
-
-    if (is_distributed_object_storage_worker && query_settings[Setting::object_storage_cluster_join_mode] == ObjectStorageClusterJoinMode::DISTRIBUTED)
-        cluster_name.clear();
-
     auto storage_cluster = std::make_shared<StorageObjectStorageCluster>(
         cluster_name,
         configuration,
@@ -787,8 +774,6 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     if (context_->hasQueryContext() && context_->getSettingsRef()[Setting::log_queries])
         context_->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Storage, storage_cluster->getName());
-
-    storage_cluster->markResolvedViaDataLakeCatalog();
 
     storage_cluster->startup();
     return storage_cluster;

@@ -53,11 +53,9 @@ public:
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 
-    /// Executes an already-prepared cluster query (see Planner/buildDistributedObjectStorageQueryPlan.h)
-    /// through the existing *Cluster() task-iterator protocol: resolves the cluster, default-database-
-    /// qualifies `query_to_send`, adds a single ReadFromCluster step. Unlike read(), does no query
-    /// preparation itself -- the caller has already produced a self-contained AST with the driver rewritten
-    /// into its explicit `*Cluster()` form, wherever it sits.
+    /// Reads a query the caller has already prepared (see Planner/buildDistributedObjectStorageQueryPlan.h),
+    /// through the same ReadFromCluster/task-iterator protocol read() uses. Unlike read(), does no query
+    /// preparation of its own: `query_to_send` is already self-contained and `sample_block` already computed.
     void readPreparedClusterQuery(
         QueryPlan & query_plan,
         const Names & column_names,
@@ -68,20 +66,12 @@ public:
         ASTPtr query_to_send,
         SharedHeader sample_block);
 
-    /// Builds a standalone, resolved explicit `*Cluster(cluster_name, ...)` AST function call for this exact
-    /// storage, reusing the same per-engine rewrite rules updateQueryToSendIfNeeded() applies to a real query
-    /// (credentials/structure/format arguments included) instead of reconstructing them here. Used by
-    /// buildDistributedObjectStorageQueryPlan.cpp to build the replacement for a driver TableNode via
-    /// IQueryTreeNode::cloneAndReplace() -- mirrors StorageDistributed::buildQueryTreeDistributed()'s own
-    /// exact-node replacement pattern. Does not mutate any query already in flight: builds and rewrites a
-    /// throwaway single-table SELECT of its own.
-    ASTPtr buildClusterTableFunctionAST(const String & dispatch_cluster_name, const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context);
-
-    /// Whether this storage is known to resolve identically/safely on every worker when re-resolved during a
-    /// SECONDARY_QUERY under object_storage_cluster_join_mode='distributed' -- used by
-    /// findDistributedObjectStorageCandidate() both for driver eligibility and non-driver JOIN-partner
-    /// safety. False by default; overridden by StorageObjectStorageCluster.
-    virtual bool isResolvedViaDataLakeCatalog() const { return false; }
+    /// Builds a standalone, resolved `*Cluster(cluster_name, ...)` table-function call for this storage. Generic
+    /// across engines because the per-engine rewrite is done by the virtual updateQueryToSendIfNeeded, which
+    /// also supplies credentials, structure and format arguments. Works on a throwaway single-table SELECT of
+    /// its own, so no query in flight is touched.
+    ASTPtr buildClusterTableFunctionAST(
+        const String & dispatch_cluster_name, const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context);
 
     bool isRemote() const final { return true; }
     bool supportsSubcolumns() const override  { return true; }
@@ -208,11 +198,8 @@ private:
     std::shared_ptr<const ActionsDAG> listing_filter_dag;
     std::optional<Tables> external_tables;
 
-    /// True only for the object_storage_cluster_join_mode='distributed' whole-query dispatch path
-    /// (readPreparedClusterQuery()): this step's own output represents the entire dispatched
-    /// JOIN/aggregate query, not one table, so a filter pushed down onto it by the optimizer describes
-    /// that output -- not a predicate over the driver's own raw columns -- and must never be handed to
-    /// getTaskIteratorExtension() for object-storage file-level pruning (see createExtension()).
+    /// Set only by readPreparedClusterQuery. This step's output is then the whole dispatched query's result
+    /// rather than one table's rows, which changes how filters may be used (see applyFilters, createExtension).
     bool is_whole_query_dispatch = false;
 
     void createExtension();

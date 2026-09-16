@@ -28,6 +28,9 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+/// This mirrors buildQueryPlanForParallelReplicas (Planner/findParallelReplicasQuery.cpp) step for step:
+/// header of the original query -> rewrite the tree -> header of the rewritten tree -> serialize to SQL ->
+/// remote read -> convert the remote header back to the original one by position. Keep the two in sync.
 JoinTreeQueryPlan buildDistributedObjectStorageQueryPlan(
     const QueryTreeNodePtr & dispatch_boundary_node,
     const DistributedObjectStorageCandidate & candidate,
@@ -37,20 +40,18 @@ JoinTreeQueryPlan buildDistributedObjectStorageQueryPlan(
     const auto context = planner_context->getQueryContext();
     constexpr auto processed_stage = QueryProcessingStage::WithMergeableState;
 
-    /// The header stock (unmodified) planning would have produced, computed against the query tree before
-    /// the driver is rewritten -- so downstream code (the caller's own finalization) sees exactly the column
-    /// names/types it would have without this optimization, matching buildQueryPlanForParallelReplicas()'s own
-    /// original-vs-worker header handling.
+    /// The header the unmodified query would have produced, so the caller's finalization sees the column
+    /// names/types it expects.
     auto initial_header = InterpreterSelectQueryAnalyzer::getSampleBlock(
         dispatch_boundary_node->clone(), context, SelectQueryOptions(processed_stage).analyze());
 
-    /// Reuses the exact snapshot the analyzer resolved the driver against (TableNode owns it), rather than
-    /// fetching a fresh one here: metadata could otherwise have changed between analysis and dispatch, leaving
-    /// the dispatched query resolved against one snapshot and the replacement built from another.
+    /// Reuse the snapshot the analyzer resolved the driver against, so the dispatched query and its replacement
+    /// are built from the same metadata version.
+    auto * driver_storage = candidate.driver_storage;
     const auto & driver_storage_snapshot = candidate.driver->getStorageSnapshot();
 
-    auto cluster_function_ast = candidate.driver_storage->buildClusterTableFunctionAST(
-        candidate.driver_storage->getClusterName(context), driver_storage_snapshot, context);
+    auto cluster_function_ast = driver_storage->buildClusterTableFunctionAST(
+        driver_storage->getClusterName(context), driver_storage_snapshot, context);
 
     auto cluster_function_query_tree = buildQueryTree(cluster_function_ast, context);
     auto & cluster_function_node = cluster_function_query_tree->as<FunctionNode &>();
@@ -68,10 +69,8 @@ JoinTreeQueryPlan buildDistributedObjectStorageQueryPlan(
         query_analysis_pass.run(node, context);
     }
 
-    /// candidate.driver's own subtree is not traversed further -- it becomes a leaf, exact-node replacement,
-    /// mirroring StorageDistributed::buildQueryTreeDistributed()'s own pattern. cloneAndReplace() rebinds every
-    /// weak reference (e.g. ColumnNode source pointers) elsewhere in the tree from the old node to
-    /// `replacement`.
+    /// Exact-node replacement, as StorageDistributed::buildQueryTreeDistributed does. cloneAndReplace rebinds
+    /// every weak reference to the driver (e.g. ColumnNode sources) elsewhere in the tree.
     IQueryTreeNode::ReplacementMap replacement_map;
     replacement_map.emplace(candidate.driver, replacement);
     auto modified_query_tree = dispatch_boundary_node->cloneAndReplace(replacement_map);
@@ -79,10 +78,8 @@ JoinTreeQueryPlan buildDistributedObjectStorageQueryPlan(
     auto [remote_header, new_planner_context] = InterpreterSelectQueryAnalyzer::getSampleBlockAndPlannerContext(
         modified_query_tree, context, SelectQueryOptions(processed_stage).analyze());
 
-    /// Convert grouping function specializations (e.g. groupingForGroupingSets -> grouping) in a separate
-    /// clone so the AST sent to the driver's cluster contains the generic function name that can be
-    /// re-resolved by each worker's own analyzer -- modified_query_tree itself must keep the specialized
-    /// functions, since it was already used above for header computation and its planner context.
+    /// Strip grouping-function specializations in a separate clone: the workers re-resolve the generic function
+    /// themselves, but modified_query_tree must keep them, having already produced the header above.
     auto query_tree_for_ast = modified_query_tree->clone();
     removeGroupingFunctionSpecializations(query_tree_for_ast);
     ASTPtr query_to_send = queryNodeToDistributedSelectQuery(query_tree_for_ast);
@@ -90,11 +87,8 @@ JoinTreeQueryPlan buildDistributedObjectStorageQueryPlan(
     if (!query_to_send->as<ASTSelectQuery>())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Distributed object-storage dispatch: expected a plain SELECT at the dispatch boundary");
 
-    /// SourceStepWithFilter::required_source_columns (and thus updatePrewhereInfo()'s own
-    /// driver_storage_snapshot->getSampleBlockForColumns(required_source_columns) lookup) is checked against
-    /// storage_snapshot, i.e. the driver's own snapshot here -- not the whole dispatched query's output schema
-    /// (that's remote_header, a separate concept). Use the driver's own physical columns, matching what a
-    /// normal per-table read() of the driver alone would pass.
+    /// SourceStepWithFilter checks required_source_columns against storage_snapshot, which here is the driver's.
+    /// Pass the driver's own physical columns, exactly as an ordinary per-table read would.
     Names column_names = driver_storage_snapshot->getColumns(GetColumnsOptions(GetColumnsOptions::AllPhysical)).getNames();
 
     SelectQueryInfo query_info = select_query_info;
@@ -105,7 +99,7 @@ JoinTreeQueryPlan buildDistributedObjectStorageQueryPlan(
     JoinTreeQueryPlan result;
     result.stage = processed_stage;
 
-    candidate.driver_storage->readPreparedClusterQuery(
+    driver_storage->readPreparedClusterQuery(
         result.query_plan,
         column_names,
         driver_storage_snapshot,
@@ -115,12 +109,9 @@ JoinTreeQueryPlan buildDistributedObjectStorageQueryPlan(
         query_to_send,
         remote_header);
 
-    /// The remote result's header uses whatever column naming the rewritten/re-analyzed query produced;
-    /// convert it back, by position, to the header the unmodified query would have produced -- e.g. an
-    /// aggregate like sum() is still AggregateFunction(sum, ...) at this stage, not its finalized type,
-    /// matching buildQueryPlanForParallelReplicas()'s own original-vs-worker header conversion. Generic and
-    /// position-based rather than the previous per-projection-node ColumnNode renaming, which broke down for
-    /// a complex projection mixing CASE expressions over both JOIN sides with an aggregate.
+    /// The rewritten query numbers its tables independently, so the remote header's column names differ from the
+    /// original's (e.g. `__table1` vs `__table5`) even though the types line up. Rename by position, the same way
+    /// buildQueryPlanForParallelReplicas does. Aggregates are still AggregateFunction(...) at this stage.
     auto converting_actions = ActionsDAG::makeConvertingActions(
         result.query_plan.getCurrentHeader()->getColumnsWithTypeAndName(),
         initial_header->getColumnsWithTypeAndName(),
