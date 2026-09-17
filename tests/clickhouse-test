@@ -1134,10 +1134,15 @@ LLDB_SLOW_BUILD_TIMEOUT = 120
 def get_stacktraces_from_lldb(pid, timeout: float = LLDB_TIMEOUT):
     # The budget bounds a wedged lldb (e.g. signal-handler deadlock on the
     # inferior); it is not an estimate of the work, which scales with the
-    # binary's unwind/symbol cost. Killing lldb leaves the server untouched.
+    # binary's unwind/symbol cost. Killing lldb leaves the server untouched
+    # only without lldb's JIT-loader breakpoint: the linker folds the empty
+    # `__jit_debug_register_code` with other functions, so the `int3` a killed
+    # lldb leaves there traps server threads with SIGTRAP, a fatal signal to
+    # the server, and it wedges (state S, no logs, ignores SIGTERM).
     _ensure_lldb_installed()  # TEMPORARY: see _ensure_lldb_installed docstring.
     return shell_get_output(
-        f"lldb --batch -p {pid} -o 'thread backtrace all' -o 'detach' -o 'quit'",
+        f"lldb --batch -O 'settings set plugin.jit-loader.gdb.enable off' "
+        f"-p {pid} -o 'thread backtrace all' -o 'detach' -o 'quit'",
         timeout=timeout,
     )
 
