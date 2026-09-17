@@ -1,0 +1,9 @@
+multiple_objects_per_file	1
+content_match	1
+point_match	1
+range_match	1
+content_match_after_cache_drop	1
+range_match_after_cache_drop	1
+merged_content_match	1
+content_match_after_fsck	1
+dropped_ok

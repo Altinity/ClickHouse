@@ -775,6 +775,17 @@ bool DiskObjectStorage::isContentAddressed() const
     return metadata_storage->isContentAddressed();
 }
 
+std::optional<IDisk::ContentDefinedCompression> DiskObjectStorage::getContentDefinedCompression() const
+{
+    if (!metadata_storage->chunkingEnabled())
+        return std::nullopt;
+    IDisk::ContentDefinedCompression params;
+    params.min_bytes = metadata_storage->chunkMinBytes();
+    params.avg_bytes = metadata_storage->chunkAvgBytes();
+    params.max_bytes = metadata_storage->chunkMaxBytes();
+    return params;
+}
+
 bool DiskObjectStorage::supportsAtomicFileWrites() const
 {
     return metadata_storage->supportsAtomicFileWrites();

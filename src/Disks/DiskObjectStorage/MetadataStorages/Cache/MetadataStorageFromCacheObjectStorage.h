@@ -64,6 +64,10 @@ public:
 
     bool isReadOnly() const override;
     bool isContentAddressed() const override;
+    bool chunkingEnabled() const override;
+    UInt64 chunkMinBytes() const override;
+    UInt64 chunkAvgBytes() const override;
+    UInt64 chunkMaxBytes() const override;
     bool isTransactional() const override;
     bool isPlain() const override;
     bool isWriteOnce() const override;

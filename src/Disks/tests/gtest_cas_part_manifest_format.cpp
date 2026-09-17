@@ -1,13 +1,22 @@
 #include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <utility>
 #include <vector>
 
 #include <magic_enum.hpp>
 
 using namespace DB::Cas;
+
+namespace DB::ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+    extern const int LIMIT_EXCEEDED;
+    extern const int UNKNOWN_FORMAT_VERSION;
+}
 
 namespace
 {
@@ -751,4 +760,51 @@ TEST(CASPartManifestFormat, ChunkCountKeyIsCriticalForForwardCompatibility)
 {
     const String text = encodePartManifest(chunkedSample());
     EXPECT_NE(text.find("\"!nchunks\":"), String::npos);
+}
+
+/// A pre-feature decoder does not know `!nchunks` (or `place=chunked`). It still walks keys with
+/// `skipUnknown`, and the leading `!` is what turns that into UNKNOWN_FORMAT_VERSION — before it
+/// would have reported the unknown `place` word as CORRUPTED_DATA. Drive that exact loop against a
+/// real chunked record so the fixture is the production wire, not a toy `{"!x":1}`.
+TEST(CASPartManifestFormat, PreFeatureDecoderRejectsChunkedRecordAsUnknownFormat)
+{
+    const String text = encodePartManifest(chunkedSample());
+    const String marker = "\"place\":\"chunked\"";
+    const size_t at = text.find(marker);
+    ASSERT_NE(at, String::npos);
+    const size_t line_start = text.rfind('\n', at) + 1;
+    const size_t line_end = text.find('\n', at);
+    ASSERT_NE(line_end, String::npos);
+    const String line = text.substr(line_start, line_end - line_start);
+
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
+    {
+        DB::ReadBufferFromMemory in(line.data(), line.size());
+        JsonObjectReader r(in, KeyStrictness::Tolerant, "pre-feature part manifest entry");
+        String key;
+        while (r.nextKey(key))
+        {
+            /// Keys a build without Chunked knows: path, place, size, blob-ref fields.
+            if (key == "path" || key == "place" || key == "algo" || key == "digest")
+                r.readString();
+            else if (key == "size")
+                r.readU64Number();
+            else
+                r.skipUnknown(key);
+        }
+    });
+}
+
+/// Encode-side twin of the decode cap: a writer must not emit a chunk list this build would refuse
+/// to read back. Dummy refs only — no blobs are published.
+TEST(CASPartManifestFormat, EncodeRejectsChunkCountAboveCap)
+{
+    PartManifest m = chunkedSample();
+    for (auto & e : m.entries)
+    {
+        if (e.placement != EntryPlacement::Chunked)
+            continue;
+        e.chunks.resize(kMaxChunksPerEntry + 1, e.chunks.front());
+    }
+    expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&] { encodePartManifest(m); });
 }

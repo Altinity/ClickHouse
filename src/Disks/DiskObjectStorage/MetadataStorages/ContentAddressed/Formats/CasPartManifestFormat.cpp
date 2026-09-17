@@ -14,6 +14,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int LIMIT_EXCEEDED;
 }
 }
 
@@ -148,7 +149,15 @@ String encodePartManifest(const PartManifest & m)
     }
 
     for (const ManifestEntry * e : sorted)
+    {
+        /// Same ceiling decode enforces. A chunk list this build would refuse to read back must
+        /// never be written; throw before emitting the record so the object cannot exist.
+        if (e->placement == EntryPlacement::Chunked && e->chunks.size() > kMaxChunksPerEntry)
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                "PartManifest: chunked entry '{}' has {} chunks, above the cap {}",
+                e->path, e->chunks.size(), kMaxChunksPerEntry);
         writeEntryRecord(out, *e);
+    }
 
     writeTrailerLine(out, sorted.size());
 

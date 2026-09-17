@@ -323,6 +323,12 @@ public:
     /// disk transaction delegates writes to the metadata transaction's content-addressed buffer.
     virtual bool isContentAddressed() const { return false; }
 
+    /// Content-defined chunking of large part files. Default off for every metadata type except CAS.
+    virtual bool chunkingEnabled() const { return false; }
+    virtual UInt64 chunkMinBytes() const { return 1ull << 20; }
+    virtual UInt64 chunkAvgBytes() const { return 4ull << 20; }
+    virtual UInt64 chunkMaxBytes() const { return 16ull << 20; }
+
     /// [TXN-ONE-PIPELINE] True when a transaction from this storage stages every mutation into a
     /// transaction-private overlay at call time (eager) rather than queuing effects for FIFO replay in
     /// commit. When true, DiskObjectStorageTransaction routes every mutating method straight to the

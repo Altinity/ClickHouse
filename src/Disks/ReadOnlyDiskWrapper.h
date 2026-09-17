@@ -94,6 +94,7 @@ public:
     /// the delegate's answer through the wrapper, or a wrapped content-addressed disk silently
     /// drops out of the CAS introspection paths.
     bool isContentAddressed() const override { return delegate->isContentAddressed(); }
+    std::optional<ContentDefinedCompression> getContentDefinedCompression() const override { return delegate->getContentDefinedCompression(); }
 
     std::unordered_map<String, String> getSerializedMetadata(const std::vector<String> & file_paths) const override { return delegate->getSerializedMetadata(file_paths); }
 

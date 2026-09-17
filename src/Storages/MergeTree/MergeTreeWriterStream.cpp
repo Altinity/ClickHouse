@@ -2,6 +2,7 @@
 #include <Storages/MergeTree/IDataPartStorage.h>
 #include <Storages/MergeTree/MergeTreeIndexGranularityInfo.h>
 #include <Storages/MergeTree/SizeAdaptiveSpoolBuffer.h>
+#include <Storages/MergeTree/CdcCompressedWriteBuffer.h>
 #include <IO/PackedFilesWriter.h>
 
 namespace DB
@@ -43,6 +44,36 @@ static std::unique_ptr<WriteBufferFromFileBase> openStreamFile(
     return data_part_storage->writeFile(file_path, buf_size, write_settings);
 }
 
+static std::unique_ptr<WriteBuffer> makeColumnCompressor(
+    WriteBuffer & out,
+    const CompressionCodecPtr & compression_codec,
+    size_t max_compress_block_size,
+    const WriteSettings & query_write_settings,
+    const MutableDataPartStoragePtr & data_part_storage)
+{
+    if (auto cdc = data_part_storage->getContentDefinedCompression())
+    {
+        Cas::ChunkerParams params;
+        params.min_bytes = cdc->min_bytes;
+        params.avg_bytes = cdc->avg_bytes;
+        params.max_bytes = cdc->max_bytes;
+        params.validate();
+        return std::make_unique<CdcCompressedWriteBuffer>(
+            out,
+            compression_codec,
+            params,
+            max_compress_block_size,
+            query_write_settings.use_adaptive_write_buffer,
+            query_write_settings.adaptive_write_buffer_initial_size);
+    }
+    return std::make_unique<CompressedWriteBuffer>(
+        out,
+        compression_codec,
+        max_compress_block_size,
+        query_write_settings.use_adaptive_write_buffer,
+        query_write_settings.adaptive_write_buffer_initial_size);
+}
+
 
 void MergeTreeWriterStream::preFinalize()
 {
@@ -51,7 +82,7 @@ void MergeTreeWriterStream::preFinalize()
     /// Otherwise some data might stuck in the buffers above plain_file and marks_file
     /// Also the order is important
     compressed_hashing.finalize();
-    compressor.finalize();
+    compressor->finalize();
     plain_hashing.finalize();
 
     marks_compressed_hashing.finalize();
@@ -76,7 +107,7 @@ void MergeTreeWriterStream::finalize()
 void MergeTreeWriterStream::cancel() noexcept
 {
     compressed_hashing.cancel();
-    compressor.cancel();
+    compressor->cancel();
     plain_hashing.cancel();
 
     marks_compressed_hashing.cancel();
@@ -115,8 +146,8 @@ MergeTreeWriterStream::MergeTreeWriterStream(
     is_size_adaptive(packed_writer != nullptr && (!packed_data_name_.empty() || !packed_marks_name_.empty())),
     plain_file(openStreamFile(data_part_storage, packed_writer, packed_data_name_, data_path_ + data_file_extension, max_compress_block_size_, query_write_settings, packed_spill_threshold_, &spool_coupled_spilled)),
     plain_hashing(*plain_file),
-    compressor(plain_hashing, compression_codec_, max_compress_block_size_, query_write_settings.use_adaptive_write_buffer, query_write_settings.adaptive_write_buffer_initial_size),
-    compressed_hashing(compressor),
+    compressor(makeColumnCompressor(plain_hashing, compression_codec_, max_compress_block_size_, query_write_settings, data_part_storage)),
+    compressed_hashing(*compressor),
     marks_file(openStreamFile(data_part_storage, packed_writer, packed_marks_name_, marks_path_ + marks_file_extension, 4096, query_write_settings, packed_spill_threshold_, &spool_coupled_spilled)),
     marks_hashing(*marks_file),
     marks_compressor(marks_hashing, marks_compression_codec_, marks_compress_block_size_, query_write_settings.use_adaptive_write_buffer, query_write_settings.adaptive_write_buffer_initial_size),
@@ -159,10 +190,14 @@ void MergeTreeWriterStream::addToChecksums(MergeTreeDataPartChecksums & checksum
 
 MarkInCompressedFile MergeTreeWriterStream::getCurrentMark() const
 {
+    size_t offset_in_decompressed_block = compressed_hashing.offset();
+    if (const auto * cdc = dynamic_cast<const CdcCompressedWriteBuffer *>(compressor.get()))
+        offset_in_decompressed_block = cdc->offsetInCurrentCompressedBlock();
+
     return MarkInCompressedFile
     {
         .offset_in_compressed_file = plain_hashing.count(),
-        .offset_in_decompressed_block = compressed_hashing.offset()
+        .offset_in_decompressed_block = offset_in_decompressed_block
     };
 }
 

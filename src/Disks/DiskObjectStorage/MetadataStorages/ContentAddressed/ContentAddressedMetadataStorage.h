@@ -406,7 +406,10 @@ public:
     /// below `chunkerParams().min_bytes` is never split even when this is on, because the chunker
     /// cannot cut below its floor -- such a file yields one chunk and is published as an ordinary
     /// whole-file blob.
-    bool chunkingEnabled() const { return chunking_enabled; }
+    bool chunkingEnabled() const override { return chunking_enabled; }
+    UInt64 chunkMinBytes() const override { return chunker_params.min_bytes; }
+    UInt64 chunkAvgBytes() const override { return chunker_params.avg_bytes; }
+    UInt64 chunkMaxBytes() const override { return chunker_params.max_bytes; }
     /// The validated chunker configuration for this disk.
     const Cas::ChunkerParams & chunkerParams() const { return chunker_params; }
 

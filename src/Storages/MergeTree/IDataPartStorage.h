@@ -194,6 +194,14 @@ public:
     /// whole-part transaction rather than its own sub-transaction (otherwise the projection is lost
     /// from the committed manifest — B58).
     virtual bool isContentAddressed() const { return false; }
+    /// FastCDC parameters for compression-block cuts when the part lives on a chunking CAS disk.
+    struct ContentDefinedCompression
+    {
+        UInt64 min_bytes = 1ull << 20;
+        UInt64 avg_bytes = 4ull << 20;
+        UInt64 max_bytes = 16ull << 20;
+    };
+    virtual std::optional<ContentDefinedCompression> getContentDefinedCompression() const { return std::nullopt; }
     /// True when the underlying disk publishes a file write atomically in one shot (no partial
     /// content ever becomes visible under the file's final name). Such disks do not need the
     /// tmp-file + `replaceFile` crash-safety dance that plain local writes require.

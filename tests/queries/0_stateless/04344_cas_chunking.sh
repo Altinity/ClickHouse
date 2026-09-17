@@ -79,7 +79,12 @@ SELECT 'point_match',
 SELECT 'range_match',
        (SELECT sum(cityHash64(a, s)) FROM t_cas_chunked WHERE a BETWEEN 100000 AND 700000)
      = (SELECT sum(cityHash64(a, s)) FROM t_ref_chunked WHERE a BETWEEN 100000 AND 700000);
+EOF
 
+# Snapshot before the concatenative merge so we can see chunk re-publication avoided.
+avoided_before=$(${CLICKHOUSE_CLIENT} --query "SELECT ifNull(sum(value), 0) FROM system.events WHERE event = 'CASBlobBodyPutAvoided' SETTINGS system_events_show_zero_values = 1")
+
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
 -- A merge reads every chunk of both inputs and writes a new (also chunked) part.
 OPTIMIZE TABLE t_cas_chunked FINAL;
 OPTIMIZE TABLE t_ref_chunked FINAL;
@@ -88,6 +93,35 @@ SELECT 'merged_content_match',
        (SELECT sum(cityHash64(a, s, d)) FROM t_cas_chunked)
      = (SELECT sum(cityHash64(a, s, d)) FROM t_ref_chunked);
 SELECT 'merged_count_match', (SELECT count() FROM t_cas_chunked) = (SELECT count() FROM t_ref_chunked);
+EOF
+
+avoided_after=$(${CLICKHOUSE_CLIENT} --query "SELECT ifNull(sum(value), 0) FROM system.events WHERE event = 'CASBlobBodyPutAvoided' SETTINGS system_events_show_zero_values = 1")
+${CLICKHOUSE_CLIENT} --query "SELECT 'merge_reused_chunks', ${avoided_after} > ${avoided_before}"
+
+# Concatenative merge re-references parent chunks. GC must not collect them while
+# the child still names them, and the merged .bin must still be a multi-object file.
+${CLICKHOUSE_CLIENT} --query "SYSTEM CAS GC RUN '${DISK_NAME}'" > /dev/null
+
+${CLICKHOUSE_CLIENT} --multiquery <<EOF
+SELECT 'content_match_after_concat_gc',
+       (SELECT sum(cityHash64(a, s, d)) FROM t_cas_chunked)
+     = (SELECT sum(cityHash64(a, s, d)) FROM t_ref_chunked);
+SELECT 'merged_still_chunked',
+       (SELECT max(cnt) > 1 FROM (
+            SELECT count() AS cnt FROM system.remote_data_paths
+            WHERE disk_name = '${DISK_NAME}' AND local_path LIKE '%.bin'
+            GROUP BY local_path));
+
+-- Overlapping keys: a merge that weaves rows. Correctness only — sharing is not asserted.
+INSERT INTO t_cas_chunked SELECT number, hex(sipHash128(number, 1)), toDate('2020-01-01') + (number % 3000) FROM numbers(200000, 400000);
+INSERT INTO t_ref_chunked SELECT number, hex(sipHash128(number, 1)), toDate('2020-01-01') + (number % 3000) FROM numbers(200000, 400000);
+OPTIMIZE TABLE t_cas_chunked FINAL;
+OPTIMIZE TABLE t_ref_chunked FINAL;
+
+SELECT 'interleaved_content_match',
+       (SELECT sum(cityHash64(a, s, d)) FROM t_cas_chunked)
+     = (SELECT sum(cityHash64(a, s, d)) FROM t_ref_chunked);
+SELECT 'interleaved_count_match', (SELECT count() FROM t_cas_chunked) = (SELECT count() FROM t_ref_chunked);
 
 -- A mutation rewrites some column files and carries the rest forward, mixing republished chunked
 -- entries with re-referenced ones.
@@ -113,6 +147,6 @@ DROP TABLE t_ref_chunked;
 SELECT 'dropped_ok';
 EOF
 
-# FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, which
-# would stream that expected warning to stderr and be flagged as a failure.
-${CLICKHOUSE_CLIENT} --send_logs_level=fatal --query "SYSTEM CAS FORGET '${DISK_NAME}'"
+# FORGET logs an operator WARNING. The client already has --send_logs_level from
+# shell_config; a second copy is rejected, so swallow the expected warning.
+${CLICKHOUSE_CLIENT} --query "SYSTEM CAS FORGET '${DISK_NAME}'" >/dev/null 2>&1

@@ -219,6 +219,8 @@ public:
 
     bool isContentAddressed() const override;
 
+    std::optional<ContentDefinedCompression> getContentDefinedCompression() const override;
+
     bool supportsAtomicFileWrites() const override;
 
     /// Get structure of object storage this disk works with. Examples:

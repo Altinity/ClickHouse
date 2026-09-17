@@ -476,6 +476,17 @@ public:
     /// A clean predicate so callers do not have to reach through `getDataSourceDescription`.
     virtual bool isContentAddressed() const { return false; }
 
+    /// When set, MergeTree should cut compression blocks with these FastCDC parameters so a
+    /// concatenative merge re-emits identical compressed blocks for CAS to share. nullopt = leave
+    /// `max_compress_block_size` cuts unchanged (every non-chunking disk).
+    struct ContentDefinedCompression
+    {
+        UInt64 min_bytes = 1ull << 20;
+        UInt64 avg_bytes = 4ull << 20;
+        UInt64 max_bytes = 16ull << 20;
+    };
+    virtual std::optional<ContentDefinedCompression> getContentDefinedCompression() const { return std::nullopt; }
+
     /// True when a file write on this disk publishes atomically (see `IDataPartStorage::supportsAtomicFileWrites`).
     virtual bool supportsAtomicFileWrites() const { return false; }
 

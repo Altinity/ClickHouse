@@ -294,7 +294,7 @@ void MergeTreeDataPartWriterOnDisk::calculateAndSerializeSkipIndices(const Block
                     if (stream->compressed_hashing.offset() >= settings.min_compress_block_size)
                         stream->compressed_hashing.next();
 
-                    MarkInCompressedFile mark{stream->plain_hashing.count(), stream->compressed_hashing.offset()};
+                    MarkInCompressedFile mark = stream->getCurrentMark();
 
                     writeBinaryLittleEndian(mark.offset_in_compressed_file, marks_out);
                     writeBinaryLittleEndian(mark.offset_in_decompressed_block, marks_out);

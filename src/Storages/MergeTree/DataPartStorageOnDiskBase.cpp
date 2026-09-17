@@ -280,6 +280,18 @@ bool DataPartStorageOnDiskBase::isContentAddressed() const
     return volume->getDisk()->isContentAddressed();
 }
 
+std::optional<IDataPartStorage::ContentDefinedCompression> DataPartStorageOnDiskBase::getContentDefinedCompression() const
+{
+    auto params = volume->getDisk()->getContentDefinedCompression();
+    if (!params)
+        return std::nullopt;
+    IDataPartStorage::ContentDefinedCompression out;
+    out.min_bytes = params->min_bytes;
+    out.avg_bytes = params->avg_bytes;
+    out.max_bytes = params->max_bytes;
+    return out;
+}
+
 bool DataPartStorageOnDiskBase::supportsAtomicFileWrites() const
 {
     return volume->getDisk()->supportsAtomicFileWrites();

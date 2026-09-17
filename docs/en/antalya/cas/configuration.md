@@ -199,33 +199,100 @@ By default a blob is one whole part file, so two files deduplicate only when the
 identical. That is the right trade for inserts, but it means a merge or mutation that re-emits most
 of its input bytes still publishes entirely new blobs.
 
-With `cas_chunking_enabled`, a part file is split at boundaries chosen by a rolling hash over its
-content rather than at fixed offsets, and each chunk becomes an ordinary blob. Because the boundaries
-follow the content, an unchanged run lands in the same chunk regardless of what moved around it, so a
-rewrite pays only for the chunks that actually changed. A file below `cas_chunk_min_bytes` is never
-split: it yields a single chunk and is published as one whole-file blob, byte-identical to chunking
-being off.
+With `cas_chunking_enabled`, MergeTree cuts **uncompressed** column bytes with FastCDC and compresses
+each window as one ClickHouse block. CAS then publishes each compressed block as its own blob. A
+concatenative merge that re-emits the same uncompressed run therefore produces the same compressed
+blocks and re-references them instead of uploading a new whole file. FastCDC over already-compressed
+`.bin` bytes is not used: LZ4/ZSTD output of a rewrite is not byte-identical even when the
+uncompressed input was, so ciphertext-level cuts never shared. A file below `cas_chunk_min_bytes` is
+never split: it yields a single chunk and is published as one whole-file blob, byte-identical to
+chunking being off.
 
 It is off by default because the trade is workload-dependent:
 
-- **It pays off** when a rewrite re-emits byte-identical compressed frames — most visibly a merge of
-  parts whose sort keys concatenate rather than interleave (time-ordered inserts into a time-ordered
-  `ORDER BY`). On the 16 × 42 MB `CODEC(LZ4)` merge from
+- **It pays off** when a rewrite re-emits the same uncompressed runs — most visibly a merge of parts
+  whose sort keys concatenate rather than interleave (time-ordered inserts into a time-ordered
+  `ORDER BY`). On seven days of AWS Public Blockchain Bitcoin transactions (`ORDER BY (block_number,
+  index)`), enabling it cut the object-store footprint after background merges by 22% (14.39 GB to
+  11.20 GB) with 1.44× insert PUTs. That saving is leftover insert parts sharing chunks with merge
+  outputs. `OPTIMIZE FINAL` on the same table avoided 6 body PUTs vs 428 off / 9917 on (~23×), and
+  after GC unique live bytes were the same (~7.01 vs ~7.03 GB) — chunking cannot shrink one encoding
+  of unique data. On the
+  16 × 42 MB `CODEC(LZ4)` merge from
   [issue #2314](https://github.com/Altinity/ClickHouse/issues/2314), enabling it cut the bytes
   written by `OPTIMIZE FINAL` by 85% (1.18 GB to 171 MB) and the pool's total size by 54%
   (1.86 GB to 846 MB).
-- **It does not pay off** when a merge re-sorts rows so that the compressed frames differ
-  throughout. Content-defined chunking recognises moved bytes, not re-encoded ones, so an
-  interleaving merge produces close to no sharing.
-- **It always costs requests.** Each chunk is a separate object, so a file costs one `HEAD`, one
-  `PUT` and one freshness-meta write per chunk instead of one of each. On the same experiment the
-  pool's object count grew from 197 to 489. Raise `cas_chunk_min_bytes` and `cas_chunk_avg_bytes` to
-  trade dedup granularity for fewer requests.
+- **It does not pay off** when a merge re-sorts or interleaves rows so the uncompressed windows
+  differ throughout. Then CAS still stores more objects per file and sharing stays close to none.
+- **It always costs requests on a single-file rewrite.** Each chunk is a separate object, so a file
+  costs one `HEAD`, one `PUT` and one freshness-meta write per chunk instead of one of each. On the
+  #2314 lab merge the pool's object count grew from 197 to 489. Raise `cas_chunk_min_bytes` and
+  `cas_chunk_avg_bytes` to trade dedup granularity for fewer requests. On the Bitcoin run above,
+  background-merge object count **fell** (59406 → 39791) because shared chunks replaced duplicate
+  whole-file blobs.
 
-Chunk boundaries are not a persisted format: a manifest lists its chunks explicitly, so changing
-these settings only affects files written afterwards and can never make an existing part unreadable.
-A part written with chunking on is, however, unreadable by a build that predates the feature, which
-reports `UNKNOWN_FORMAT_VERSION` rather than mistaking the manifest for corrupt.
+The production defaults (1 MiB / 4 MiB / 16 MiB) are the right starting point. `cas_chunk_avg_bytes`
+is the boundary *period*, not the realised mean: because no cut is taken below `cas_chunk_min_bytes`,
+the realised mean is about `cas_chunk_min_bytes + cas_chunk_avg_bytes` (~5 MB). A large `.bin` of
+size `S` therefore becomes roughly `S / 5 MiB` objects, each with its own HEAD + PUT + `.meta`. The
+floor is also what prevents pathological small objects: a file below `cas_chunk_min_bytes` yields one
+chunk and is published as an ordinary whole-file blob, and a stream that produces fewer than two
+chunks stays a blob as well.
+
+A one-shot envelope (not CI) on concatenative Wide parts of incompressible `sipHash` payload showed
+the same merge-write pattern for `CODEC(LZ4)`, `ZSTD`, and `NONE`: chunking on avoids blob-body PUTs
+that chunking off does not, and `WriteBufferFromS3Bytes` for `OPTIMIZE FINAL` is lower. Codec is not
+the discriminator — sort order is. A coarser pair (min 4 MiB / avg 16 MiB) cuts the object-count
+multiplier versus the production defaults and still beats an unchunked merge on write bytes, with
+fewer `CASBlobBodyPutAvoided` events. The same concatenative shape at ~256 MiB of payload still
+avoids body PUTs on `OPTIMIZE FINAL`. An interleaving merge of overlapping keys avoids none. A
+small-region `ALTER UPDATE` avoids none (the rewritten granules are new bytes); a full-column
+rewrite avoids a handful. Four concurrent readers during `OPTIMIZE FINAL` returned matching
+checksums. Published AWS S3 us-east-1 list prices (`$0.005` / 1000 PUTs, `$0.0004` / 1000 GETs)
+make the request *bill* negligible at these sizes; the operational cost is request amplification
+and listing/GC work, not dollars.
+
+The 85% write-byte cut is not a general merge result. It needs concatenative, byte-identical
+compressed frames. A check with `rows_per_part = 16000` (not a multiple of `index_granularity`)
+and `randomPrintableASCII(1 + rand() % 2560)` still ran to completion, but
+`CASBlobBodyPutAvoided` on `OPTIMIZE FINAL` dropped to 4 — the same order as "close to nothing",
+not the 218 of the 16 × 42 MB aligned run. Variable-length rows re-pack granules; CDC then has
+nothing identical to reuse and you still pay per chunk.
+
+Test-sized floors (64 KiB / 128 KiB / 256 KiB) on a ~42 MiB column produced 544 objects for one
+part. That is the high-object-count corner: raise the production floors unless you are measuring
+chunk reuse. A concatenative `OPTIMIZE` of that part then avoided 534 body PUTs and wrote 287 KB.
+
+A single chunked entry is capped at 65536 chunks (`LIMIT_EXCEEDED` on write, `CORRUPTED_DATA` on
+decode of a larger declared count). At the 16 MiB ceiling that is a 1 TiB file before the cap; at the
+~5 MB realised mean it is ~325 GB in one column file. The cap exists so a declared count cannot size
+an allocation from untrusted interserver bytes.
+
+**Staging.** Chunking runs only when `cas_staging_backend` is `local` (the default). `s3` staging
+promotes by a server-side copy of one `[header][payload]` object and does not split, even if
+`cas_chunking_enabled` is on. Do not expect S3 staging to show the merge-write savings above.
+
+**Cache.** Each chunk is its own object and therefore its own filesystem-cache key. A concatenative
+merge can HIT the same key from the parent part and the child part. A bounded range read that
+crosses a chunk boundary touches two keys. After `SYSTEM DROP FILESYSTEM CACHE`, a sequential scan
+plus a bounded range read is a cold remote GET per chunk; the same SQL again is served from cache
+(this envelope: 467 GETs then 0). Wall-clock duration is not an SLA.
+
+**Versions.** Chunk boundaries are not a persisted format: a manifest lists its chunks explicitly, so
+changing `cas_chunk_min_bytes` / `cas_chunk_avg_bytes` only affects files written afterwards and
+cannot make an existing part unreadable. A part written with chunking on is, however, unreadable by
+a build that predates the feature, which reports `UNKNOWN_FORMAT_VERSION` rather than mistaking the
+manifest for corrupt. That is a safe rejection, not a safe downgrade:
+
+- Enable chunking only after every replica and every backup/restore consumer is on a binary that
+  understands `EntryPlacement::Chunked`.
+- A new node may write chunked manifests while an old peer is still in the cluster; fetches and
+  reads of those parts on the old peer fail closed.
+- Rolling back the binary, or restoring a backup of chunked parts onto a pre-feature build, cannot
+  read those parts. Turn the setting off first and wait until no chunked parts remain, or restore
+  onto a new-enough binary.
+
+See [migration](/antalya/cas/operations/migration#chunking-versions) for the operator checklist.
 
 ## Migration from unprefixed keys {#migration-from-unprefixed-keys}
 

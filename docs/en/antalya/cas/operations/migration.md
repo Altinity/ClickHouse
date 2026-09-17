@@ -211,3 +211,26 @@ means the member is not a decommission candidate yet.
 `SYSTEM CAS GC RUN` on the pool will no longer wait on or fence its heartbeat. See
 [mount, unmount, crash](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle) for how the
 claim, drain, and retirement steps fit into the mount-slot lifecycle.
+
+## Chunking and mixed-version clusters {#chunking-versions}
+
+`cas_chunking_enabled` is a disk setting captured at mount (a restart is required to toggle it) and
+it only affects **new writes**. Existing parts stay readable either way: a chunked manifest lists
+its chunks explicitly, so turning the flag off does not make those parts unreadable to a binary that
+understands the placement.
+
+A **pre-feature binary does not**. It fails closed with `UNKNOWN_FORMAT_VERSION` on a chunked
+manifest rather than treating it as corrupt. That is a safe rejection, not a safe operational
+downgrade:
+
+1. Finish the rolling upgrade so every replica, and every process that might restore a backup of
+   these parts, is on a binary that knows `EntryPlacement::Chunked`.
+2. Only then set `cas_chunking_enabled` and restart.
+3. Do not enable it in a mixed-version cluster. A new replica can write chunked parts that an old
+   replica cannot fetch or query.
+4. To roll back the binary, turn chunking off first and wait until no chunked parts remain (merge
+   them away, or restore onto a new-enough binary). Restoring a backup of chunked parts onto a
+   pre-feature ClickHouse will not read them.
+
+The setting and the chunk-size knobs, the request-cost trade, and the local-vs-S3 staging split are
+documented under [content-defined chunking](/antalya/cas/configuration#chunking).

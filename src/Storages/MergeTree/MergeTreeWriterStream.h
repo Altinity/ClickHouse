@@ -68,7 +68,7 @@ struct MergeTreeWriterStream
     /// compressed_hashing -> compressor -> plain_hashing -> plain_file
     std::unique_ptr<WriteBufferFromFileBase> plain_file;
     HashingWriteBuffer plain_hashing;
-    CompressedWriteBuffer compressor;
+    std::unique_ptr<WriteBuffer> compressor;
     HashingWriteBuffer compressed_hashing;
 
     /// marks_compressed_hashing -> marks_compressor -> marks_hashing -> marks_file

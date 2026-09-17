@@ -176,6 +176,26 @@ bool MetadataStorageFromCacheObjectStorage::isContentAddressed() const
     return underlying->isContentAddressed();
 }
 
+bool MetadataStorageFromCacheObjectStorage::chunkingEnabled() const
+{
+    return underlying->chunkingEnabled();
+}
+
+UInt64 MetadataStorageFromCacheObjectStorage::chunkMinBytes() const
+{
+    return underlying->chunkMinBytes();
+}
+
+UInt64 MetadataStorageFromCacheObjectStorage::chunkAvgBytes() const
+{
+    return underlying->chunkAvgBytes();
+}
+
+UInt64 MetadataStorageFromCacheObjectStorage::chunkMaxBytes() const
+{
+    return underlying->chunkMaxBytes();
+}
+
 bool MetadataStorageFromCacheObjectStorage::isTransactional() const
 {
     return underlying->isTransactional();

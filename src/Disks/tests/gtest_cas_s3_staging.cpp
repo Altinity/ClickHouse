@@ -38,6 +38,10 @@
 namespace DB::ContentAddressedSetting
 {
     extern const ContentAddressedSettingsString staging_backend;
+    extern const ContentAddressedSettingsBool chunking_enabled;
+    extern const ContentAddressedSettingsUInt64 chunk_min_bytes;
+    extern const ContentAddressedSettingsUInt64 chunk_avg_bytes;
+    extern const ContentAddressedSettingsUInt64 chunk_max_bytes;
 }
 
 namespace DB::ErrorCodes
@@ -842,6 +846,45 @@ void writeThroughS3Transaction(DB::ContentAddressedTransaction & tx, const std::
     buf->finalize();
 }
 
+}
+
+/// `writeFile` takes the S3-staging branch BEFORE the chunking branch. A large `.bin` that WOULD
+/// split under local staging must still produce exactly one S3 staging object, not N chunk files.
+TEST(CASS3Staging, ChunkingEnabledStillStagesOneWholeObject)
+{
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto scratch = std::filesystem::temp_directory_path()
+        / ("cas_s3_staging_chunking_" + unique);
+    auto settings = DB::Cas::tests::makeSettingsForTest("mountChunkingS3", scratch);
+    settings[DB::ContentAddressedSetting::staging_backend] = "s3";
+    settings[DB::ContentAddressedSetting::chunking_enabled] = true;
+    /// Tight floors so a few-MB payload would split if the chunking write path ran.
+    settings[DB::ContentAddressedSetting::chunk_min_bytes] = 262144ull;
+    settings[DB::ContentAddressedSetting::chunk_avg_bytes] = 524288ull;
+    settings[DB::ContentAddressedSetting::chunk_max_bytes] = 2097152ull;
+    settings.validate();
+    auto metadata_storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        object_storage, "pool", "srv1", /*disk_name_=*/"", /*context_=*/nullptr, settings);
+    metadata_storage->startup();
+    ASSERT_TRUE(metadata_storage->chunkingEnabled());
+
+    auto tx = metadata_storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    /// ~4 MiB, well above the chunker floor. Unique-ish bytes so CDC would cut more than once.
+    std::string payload(4ull << 20, '\0');
+    for (size_t i = 0; i < payload.size(); ++i)
+        payload[i] = static_cast<char>(i * 131u + 17u);
+    writeThroughS3Transaction(
+        ca_tx,
+        "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin",
+        payload);
+
+    DB::RelativePathsWithMetadata staged;
+    object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
+    EXPECT_EQ(staged.size(), 1u)
+        << "S3 staging must promote one whole [header][payload] object even when chunking is on";
 }
 
 TEST(CASS3Staging, WritableS3StagingRequiresNativeOnlyCopy)

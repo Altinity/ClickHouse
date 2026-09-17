@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -429,9 +430,12 @@ private:
     /// nothing when the current chunk is empty, so a file whose last byte fell exactly on a boundary
     /// does not produce a trailing zero-length chunk.
     void closeChunkSink();
-    /// Chunked mode: feed `data` through the chunker, spilling to per-chunk sinks and cutting where
-    /// the chunker says. Called from `nextImpl` and `finalizeImpl`.
+    /// The stream is split at ClickHouse compressed-block boundaries when the payload is a
+    /// compressed column file (each block is one CAS blob). Otherwise Gear FastCDC is used.
+    /// Called from `nextImpl` and `finalizeImpl`.
     void writeChunked(const char * data, size_t size);
+    void writeChunkedGear(const char * data, size_t size);
+    void emitChunkedSpan(const char * data, size_t size);
     /// Chunked mode: remove every staged chunk temp file. Used on cancel and on the error paths,
     /// where ownership never transferred.
     void removeChunkTempFiles() noexcept;
@@ -467,6 +471,9 @@ private:
     Cas::BlobHashAlgo chunk_hash_algo{};
     /// Boundary detector for this file. Owns no payload.
     std::optional<Cas::ContentChunker> chunker;
+    enum class ChunkLayout : uint8_t { Undecided, CompressedBlocks, Gear };
+    ChunkLayout chunk_layout = ChunkLayout::Undecided;
+    std::string chunk_pending;
     /// Chunks completed so far, in byte order.
     std::vector<StagedChunk> staged_chunks;
     /// The in-progress chunk's temp path and its byte count. `sink`/`hashing` above are reused per

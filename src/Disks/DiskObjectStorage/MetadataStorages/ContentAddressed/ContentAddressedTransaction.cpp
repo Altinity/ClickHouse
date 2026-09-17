@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasClickHouseCompressedBlocks.h>
 #include <IO/ReadBuffer.h>
 #include <IO/ConcatReadBufferFromFile.h>
 #include <IO/ReadBufferFromFile.h>
@@ -2088,7 +2089,15 @@ void CaContentWriteBuffer::closeChunkSink()
     current_chunk_bytes = 0;
 }
 
-void CaContentWriteBuffer::writeChunked(const char * data, size_t size)
+void CaContentWriteBuffer::emitChunkedSpan(const char * data, size_t size)
+{
+    if (size == 0)
+        return;
+    hashing->write(data, size);
+    current_chunk_bytes += size;
+}
+
+void CaContentWriteBuffer::writeChunkedGear(const char * data, size_t size)
 {
     size_t offset_in_data = 0;
     while (offset_in_data < size)
@@ -2096,16 +2105,50 @@ void CaContentWriteBuffer::writeChunked(const char * data, size_t size)
         const Cas::ChunkerFeedResult res = chunker->feed(std::string_view(data + offset_in_data, size - offset_in_data));
         if (res.taken != 0)
         {
-            hashing->write(data + offset_in_data, res.taken);
-            current_chunk_bytes += res.taken;
+            emitChunkedSpan(data + offset_in_data, res.taken);
             offset_in_data += res.taken;
         }
         if (!res.boundary)
-            break;   /// the chunker consumed everything it was given without cutting
+            break;
 
         closeChunkSink();
         chunker->startChunk();
         openChunkSink();
+    }
+}
+
+void CaContentWriteBuffer::writeChunked(const char * data, size_t size)
+{
+    chunk_pending.append(data, size);
+    if (chunk_layout == ChunkLayout::Undecided)
+    {
+        size_t block_bytes = 0;
+        if (Cas::tryPeekClickHouseCompressedBlockSize(chunk_pending, block_bytes))
+            chunk_layout = ChunkLayout::CompressedBlocks;
+        else if (chunk_pending.size() >= 16 + COMPRESSED_BLOCK_HEADER_SIZE)
+            chunk_layout = ChunkLayout::Gear;
+        else
+            return;
+    }
+
+    if (chunk_layout == ChunkLayout::Gear)
+    {
+        writeChunkedGear(chunk_pending.data(), chunk_pending.size());
+        chunk_pending.clear();
+        return;
+    }
+
+    while (true)
+    {
+        size_t block_bytes = 0;
+        if (!Cas::tryPeekClickHouseCompressedBlockSize(chunk_pending, block_bytes))
+            break;
+        if (chunk_pending.size() < block_bytes)
+            break;
+        emitChunkedSpan(chunk_pending.data(), block_bytes);
+        closeChunkSink();
+        openChunkSink();
+        chunk_pending.erase(0, block_bytes);
     }
 }
 
@@ -2126,6 +2169,14 @@ void CaContentWriteBuffer::finalizeImpl()
     if (is_chunked)
     {
         next();
+        if (!chunk_pending.empty())
+        {
+            if (chunk_layout == ChunkLayout::CompressedBlocks)
+                emitChunkedSpan(chunk_pending.data(), chunk_pending.size());
+            else
+                writeChunkedGear(chunk_pending.data(), chunk_pending.size());
+            chunk_pending.clear();
+        }
         /// The trailing partial chunk (if any) closes here; `closeChunkSink` drops it when the last
         /// byte fell exactly on a boundary.
         closeChunkSink();

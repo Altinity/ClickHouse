@@ -464,8 +464,7 @@ StreamsWithMarks MergeTreeDataPartWriterWide::getCurrentMarksForColumn(const Nam
 
         StreamNameAndMark stream_with_mark;
         stream_with_mark.stream_name = stream_name;
-        stream_with_mark.mark.offset_in_compressed_file = stream.plain_hashing.count();
-        stream_with_mark.mark.offset_in_decompressed_block = stream.compressed_hashing.offset();
+        stream_with_mark.mark = stream.getCurrentMark();
 
         result.push_back(stream_with_mark);
     };
@@ -564,8 +563,7 @@ void MergeTreeDataPartWriterWide::writeColumn(
     serialize_settings.stream_mark_getter = [&](const ISerialization::SubstreamPath & substream_path) -> MarkInCompressedFile
     {
         auto stream_name = getStreamName(name_and_type, substream_path);
-        auto & stream = column_streams.at(stream_name);
-        return {stream->plain_hashing.count(), stream->compressed_hashing.offset()};
+        return column_streams.at(stream_name)->getCurrentMark();
     };
 
     for (const auto & granule : granules)
