@@ -15,11 +15,15 @@
 #include <Databases/DataLake/StorageCredentials.h>
 #include <fmt/ranges.h>
 
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
+
 namespace DB::ErrorCodes
 {
     extern const int DATALAKE_DATABASE_ERROR;
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
+    extern const int CATALOG_NAMESPACE_DISABLED;
 }
 
 namespace
@@ -126,9 +130,10 @@ CatalogTables UnityCatalog::listTablesInNamespaceDirect(const std::string & name
 void UnityCatalog::getTableMetadata(
     const std::string & namespace_name,
     const std::string & table_name,
+    DB::ContextPtr context_,
     TableMetadata & result) const
 {
-    if (!tryGetTableMetadata(namespace_name, table_name, result))
+    if (!tryGetTableMetadata(namespace_name, table_name, context_, result))
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "No response from unity catalog");
 }
 
@@ -193,8 +198,12 @@ void UnityCatalog::getCredentials(const String & table_id, TableMetadata & metad
 bool UnityCatalog::tryGetTableMetadata(
     const std::string & schema_name,
     const std::string & table_name,
+    DB::ContextPtr /* context_ */,
     TableMetadata & result) const
 {
+    if (!isNamespaceAllowed(schema_name))
+        throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", schema_name);
+
     auto full_table_name = warehouse + "." + schema_name + "." + table_name;
     Poco::Dynamic::Var json;
     std::string json_str;
@@ -317,6 +326,9 @@ bool UnityCatalog::tryGetTableMetadata(
 
 bool UnityCatalog::existsTable(const std::string & schema_name, const std::string & table_name) const
 {
+    if (!isNamespaceAllowed(schema_name))
+        throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", schema_name);
+
     String json_str;
     Poco::Dynamic::Var json;
     try
@@ -429,7 +441,7 @@ DataLake::ICatalog::Namespaces UnityCatalog::getSchemas(const std::string & base
                 chassert(schema_info->get("catalog_name").extract<String>() == warehouse);
                 UnityCatalogFullSchemaName schema_name = parseFullSchemaName(schema_info->get("full_name").extract<String>());
 
-                if (schema_name.schema_name.starts_with(base_prefix))
+                if (isNamespaceAllowed(schema_name.schema_name) && schema_name.schema_name.starts_with(base_prefix))
                     schemas.push_back(schema_name.schema_name);
 
                 if (limit && schemas.size() > limit)
@@ -471,6 +483,7 @@ UnityCatalog::UnityCatalog(
     const std::string & catalog_,
     const std::string & base_url_,
     const std::string & catalog_credential_,
+    const std::string & namespaces_,
     DB::ContextPtr context_)
     : ICatalog(catalog_)
     , DB::WithContext(context_)
@@ -478,6 +491,12 @@ UnityCatalog::UnityCatalog(
     , log(getLogger("UnityCatalog(" + catalog_ + ")"))
     , bearer_token(catalog_credential_)
 {
+    boost::split(allowed_namespaces, namespaces_, boost::is_any_of(", "), boost::token_compress_on);
+}
+
+bool UnityCatalog::isNamespaceAllowed(const std::string & namespace_) const
+{
+    return allowed_namespaces.contains("*") || allowed_namespaces.contains(namespace_);
 }
 
 /// getCredentialsConfigurationCallback method is supported only for S3 storage

@@ -12,6 +12,7 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Formats/FormatFilterInfo.h>
+#include <Storages/Cache/ObjectStorageListObjectsCache.h>
 
 namespace DB
 {
@@ -98,6 +99,12 @@ protected:
     size_t total_files_read = 0;
     LoggerPtr log = getLogger("StorageObjectStorageSource");
 
+    struct ConstColumnWithValue
+    {
+        NameAndTypePair name_and_type;
+        Field value;
+    };
+
     struct ReaderHolder : private boost::noncopyable
     {
     public:
@@ -106,7 +113,8 @@ protected:
             std::unique_ptr<ReadBuffer> read_buf_,
             std::shared_ptr<ISource> source_,
             std::unique_ptr<QueryPipeline> pipeline_,
-            std::unique_ptr<PullingPipelineExecutor> reader_);
+            std::unique_ptr<PullingPipelineExecutor> reader_,
+            std::map<size_t, ConstColumnWithValue> && constant_columns_with_values_);
 
         ReaderHolder() = default;
         ReaderHolder(ReaderHolder && other) noexcept { *this = std::move(other); }
@@ -126,6 +134,9 @@ protected:
         std::shared_ptr<ISource> source;
         std::unique_ptr<QueryPipeline> pipeline;
         std::unique_ptr<PullingPipelineExecutor> reader;
+
+    public:
+        std::map<size_t, ConstColumnWithValue> constant_columns_with_values;
     };
 
     ReaderHolder reader;
@@ -198,18 +209,33 @@ private:
 class StorageObjectStorageSource::GlobIterator : public IObjectIterator, WithContext
 {
 public:
+    struct ListObjectsCacheWithKey
+    {
+        ListObjectsCacheWithKey(ObjectStorageListObjectsCache & cache_, const ObjectStorageListObjectsCache::Key & key_) : cache(cache_), key(key_) {}
+
+        void set(ObjectStorageListObjectsCache::Value && value) const
+        {
+            cache.set(key, std::make_shared<ObjectStorageListObjectsCache::Value>(std::move(value)));
+        }
+
+    private:
+        ObjectStorageListObjectsCache & cache;
+        ObjectStorageListObjectsCache::Key key;
+    };
+
+    using ConfigurationPtr = std::shared_ptr<StorageObjectStorageConfiguration>;
+
     GlobIterator(
-        ObjectStoragePtr object_storage_,
-        StorageObjectStorageConfigurationPtr configuration_,
+        const ObjectStorageIteratorPtr & object_storage_iterator_,
+        ConfigurationPtr configuration_,
         const ActionsDAG::Node * predicate,
         const NamesAndTypesList & virtual_columns_,
         const NamesAndTypesList & hive_columns_,
         ContextPtr context_,
         ObjectInfos * read_keys_,
-        size_t list_object_keys_size,
         bool throw_on_zero_files_match_,
-        bool with_tags,
-        std::function<void(FileProgress)> file_progress_callback_ = {});
+        std::function<void(FileProgress)> file_progress_callback_ = {},
+        std::unique_ptr<ListObjectsCacheWithKey> list_cache_ = nullptr);
 
     ~GlobIterator() override = default;
 
@@ -222,7 +248,7 @@ private:
     void createFilterAST(const String & any_key);
     void fillBufferForKey(const std::string & uri_key);
 
-    const ObjectStoragePtr object_storage;
+    ObjectStorageIteratorPtr object_storage_iterator;
     const StorageObjectStorageConfigurationPtr configuration;
     const NamesAndTypesList virtual_columns;
     const NamesAndTypesList hive_columns;
@@ -234,7 +260,6 @@ private:
     ObjectInfos object_infos;
     ObjectInfos * read_keys;
     ExpressionActionsPtr filter_expr;
-    ObjectStorageIteratorPtr object_storage_iterator;
     bool recursive{false};
     bool match_web_paths_only{false};
     std::vector<String> expanded_keys;
@@ -252,6 +277,9 @@ private:
     size_t total_listed = 0;
     size_t total_glob_filtered = 0;
     size_t total_predicate_filtered = 0;
+
+    std::unique_ptr<ListObjectsCacheWithKey> list_cache;
+    ObjectInfos object_list;
 };
 
 class StorageObjectStorageSource::KeysIterator : public IObjectIterator
@@ -277,7 +305,7 @@ private:
     const ObjectStoragePtr object_storage;
     const NamesAndTypesList virtual_columns;
     const std::function<void(FileProgress)> file_progress_callback;
-    const std::vector<String> keys;
+    const Strings keys;
     std::atomic<size_t> index = 0;
     const bool ignore_non_existent_files;
     const bool skip_object_metadata;

@@ -6,6 +6,7 @@
 #include <Storages/MergeTree/BackgroundJobsAssignee.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/prepareReadingFromFormat.h>
+#include "Storages/ObjectStorage/ObjectStorageFilePathGenerator.h"
 #include <Interpreters/ActionsDAG.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
@@ -59,7 +60,9 @@ public:
         ASTPtr partition_by_ = nullptr,
         ASTPtr order_by_ = nullptr,
         bool is_table_function_ = false,
-        bool lazy_init = false);
+        bool lazy_init = false,
+        bool updated_configuration = false, // avoid double update configuration from cluster and local versions
+        std::optional<std::string> sample_path_ = std::nullopt);
 
     String getName() const override;
 
@@ -91,6 +94,26 @@ public:
         const std::shared_ptr<DataLake::ICatalog> & catalog,
         const StorageMetadataPtr & metadata_snapshot,
         const ContextPtr & context);
+
+    bool supportsImport(ContextPtr) const override;
+
+    SinkToStoragePtr import(
+        const std::string & /* file_name */,
+        Block & /* block_with_partition_values */,
+        const std::function<void(const std::string &)> & new_file_path_callback,
+        MergeTreePartExportFileAlreadyExistsPolicy /* file_already_exists_policy */,
+        std::size_t /* max_bytes_per_file */,
+        std::size_t /* max_rows_per_file */,
+        const std::optional<std::string> & /* iceberg_metadata_json_string */,
+        const std::optional<FormatSettings> & /* format_settings_ */,
+        ContextPtr /* context */) override;
+
+    ExportPartitionCommitInfo commitExportPartitionTransaction(
+        const String & transaction_id,
+        const String & partition_id,
+        const Strings & exported_paths,
+        const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
+        ContextPtr local_context) override;
 
     void truncate(
         const ASTPtr & query,
@@ -155,7 +178,7 @@ public:
 
     static std::pair<ColumnsDescription, std::string> resolveSchemaAndFormatFromData(
         const ObjectStoragePtr & object_storage,
-        const StorageObjectStorageConfigurationPtr & configuration,
+        StorageObjectStorageConfigurationPtr & configuration,
         const std::optional<FormatSettings> & format_settings,
         std::string & sample_path,
         const ContextPtr & context);

@@ -49,6 +49,7 @@
 #include <Common/JemallocCacheArena.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/MovesList.h>
+#include <Storages/MergeTree/ExportList.h>
 #include <Storages/MergeTree/ReplicatedFetchList.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -186,6 +187,8 @@ namespace ProfileEvents
     extern const Event BackupThrottlerSleepMicroseconds;
     extern const Event MergesThrottlerBytes;
     extern const Event MergesThrottlerSleepMicroseconds;
+    extern const Event ExportsThrottlerBytes;
+    extern const Event ExportsThrottlerSleepMicroseconds;
     extern const Event MutationsThrottlerBytes;
     extern const Event MutationsThrottlerSleepMicroseconds;
     extern const Event QueryLocalReadThrottlerBytes;
@@ -287,6 +290,7 @@ namespace CurrentMetrics
     extern const Metric IndexUncompressedCacheCells;
     extern const Metric ZooKeeperSessionExpired;
     extern const Metric ZooKeeperConnectionLossStartedTimestampSeconds;
+    extern const Metric IsSwarmModeEnabled;
 }
 
 
@@ -423,6 +427,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_local_write_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_merges_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_mutations_bandwidth_for_server;
+    extern const ServerSettingsUInt64 max_exports_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_remote_read_network_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_remote_write_network_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_replicated_fetches_network_bandwidth_for_server;
@@ -646,6 +651,7 @@ struct ContextSharedPart : boost::noncopyable
     GlobalOvercommitTracker global_overcommit_tracker;
     MergeList merge_list;                                       /// The list of executable merge (for (Replicated)?MergeTree)
     MovesList moves_list;                                       /// The list of executing moves (for (Replicated)?MergeTree)
+    ExportsList exports_list;                                   /// The list of executing exports (for (Replicated)?MergeTree)
     ReplicatedFetchList replicated_fetch_list;
     RefreshSet refresh_set;                                 /// The list of active refreshes (for MaterializedView)
     ConfigurationPtr users_config TSA_GUARDED_BY(mutex);                              /// Config with the users, profiles and quotas sections.
@@ -697,6 +703,8 @@ struct ContextSharedPart : boost::noncopyable
 
     mutable ThrottlerPtr distributed_cache_read_throttler;  /// A server-wide throttler for distributed cache read
     mutable ThrottlerPtr distributed_cache_write_throttler; /// A server-wide throttler for distributed cache write
+
+    mutable ThrottlerPtr exports_throttler;                 /// A server-wide throttler for exports
 
     MultiVersion<Macros> macros;                            /// Substitutions extracted from config.
     std::unique_ptr<DDLWorker> ddl_worker TSA_GUARDED_BY(mutex); /// Process ddl commands from zk.
@@ -801,6 +809,7 @@ struct ContextSharedPart : boost::noncopyable
     std::map<String, UInt16> server_ports TSA_GUARDED_BY(server_ports_mutex);
 
     std::atomic<bool> shutdown_called = false;
+    std::atomic<bool> swarm_mode_enabled = true;
 
     Stopwatch uptime_watch TSA_GUARDED_BY(mutex);
 
@@ -999,6 +1008,8 @@ struct ContextSharedPart : boost::noncopyable
       */
     void shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
     {
+        swarm_mode_enabled = false;
+        CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 0);
         bool is_shutdown_called = shutdown_called.exchange(true);
         if (is_shutdown_called)
             return;
@@ -1334,6 +1345,9 @@ struct ContextSharedPart : boost::noncopyable
 
         if (auto bandwidth = server_settings[ServerSetting::max_merges_bandwidth_for_server])
             merges_throttler = std::make_shared<Throttler>(bandwidth, ProfileEvents::MergesThrottlerBytes, ProfileEvents::MergesThrottlerSleepMicroseconds);
+
+        if (auto bandwidth = server_settings[ServerSetting::max_exports_bandwidth_for_server])
+            exports_throttler = std::make_shared<Throttler>(bandwidth, ProfileEvents::ExportsThrottlerBytes, ProfileEvents::ExportsThrottlerSleepMicroseconds);
     }
 };
 
@@ -1510,6 +1524,8 @@ MergeList & Context::getMergeList() { return shared->merge_list; }
 const MergeList & Context::getMergeList() const { return shared->merge_list; }
 MovesList & Context::getMovesList() { return shared->moves_list; }
 const MovesList & Context::getMovesList() const { return shared->moves_list; }
+ExportsList & Context::getExportsList() { return shared->exports_list; }
+const ExportsList & Context::getExportsList() const { return shared->exports_list; }
 ReplicatedFetchList & Context::getReplicatedFetchList() { return shared->replicated_fetch_list; }
 const ReplicatedFetchList & Context::getReplicatedFetchList() const { return shared->replicated_fetch_list; }
 RefreshSet & Context::getRefreshSet() { return shared->refresh_set; }
@@ -3727,8 +3743,11 @@ void Context::setCurrentQueryId(const String & query_id)
 
     client_info.current_query_id = query_id_to_set;
 
-    if (client_info.query_kind == ClientInfo::QueryKind::INITIAL_QUERY)
+    if (client_info.query_kind == ClientInfo::QueryKind::INITIAL_QUERY
+        && (getApplicationType() != ApplicationType::SERVER || client_info.initial_query_id.empty()))
+    {
         client_info.initial_query_id = client_info.current_query_id;
+    }
 }
 
 void Context::killCurrentQuery() const
@@ -3908,6 +3927,13 @@ void Context::makeQueryContextForMutate(const MergeTreeSettings & merge_tree_set
     classifier.reset(); // It is assumed that there are no active queries running using this classifier, otherwise this will lead to crashes
     (*settings)[Setting::workload]
         = merge_tree_settings[MergeTreeSetting::mutation_workload].value.empty() ? getMutationWorkload() : merge_tree_settings[MergeTreeSetting::mutation_workload];
+}
+
+void Context::makeQueryContextForExportPart()
+{
+    makeQueryContext();
+    classifier.reset(); // It is assumed that there are no active queries running using this classifier, otherwise this will lead to crashes
+    // Export part operations don't have a specific workload setting, so we leave the default workload
 }
 
 void Context::makeSessionContext()
@@ -5796,6 +5822,11 @@ ThrottlerPtr Context::getDistributedCacheWriteThrottler() const
     return shared->distributed_cache_write_throttler;
 }
 
+ThrottlerPtr Context::getExportsThrottler() const
+{
+    return shared->exports_throttler;
+}
+
 void Context::reloadRemoteThrottlerConfig(size_t read_bandwidth, size_t write_bandwidth) const
 {
     if (read_bandwidth)
@@ -6618,7 +6649,6 @@ std::shared_ptr<Cluster> Context::getCluster(const std::string & cluster_name) c
     throw Exception(ErrorCodes::CLUSTER_DOESNT_EXIST, "Requested cluster '{}' not found", cluster_name);
 }
 
-
 std::shared_ptr<Cluster> Context::tryGetCluster(const std::string & cluster_name) const
 {
     std::shared_ptr<Cluster> res = nullptr;
@@ -6637,6 +6667,21 @@ std::shared_ptr<Cluster> Context::tryGetCluster(const std::string & cluster_name
     return res;
 }
 
+void Context::unregisterInAutodiscoveryClusters()
+{
+    std::lock_guard lock(shared->clusters_mutex);
+    if (!shared->cluster_discovery)
+        return;
+    shared->cluster_discovery->unregisterAll();
+}
+
+void Context::registerInAutodiscoveryClusters()
+{
+    std::lock_guard lock(shared->clusters_mutex);
+    if (!shared->cluster_discovery)
+        return;
+    shared->cluster_discovery->registerAll();
+}
 
 void Context::reloadClusterConfig() const
 {
@@ -6713,12 +6758,12 @@ void Context::startClusterDiscovery()
 /// On repeating calls updates existing clusters and adds new clusters, doesn't delete old clusters
 void Context::setClustersConfig(const ConfigurationPtr & config, bool enable_discovery, const String & config_name)
 {
+    ClusterDiscovery * discovery_to_update = nullptr;
+    ClusterDiscovery * discovery_just_created_ptr = nullptr;
+    std::unique_ptr<ClusterDiscovery> discovery_to_disable;
+    bool clusters_changed = false;
     {
         std::lock_guard lock(shared->clusters_mutex);
-        if (ConfigHelper::getBool(*config, "allow_experimental_cluster_discovery") && enable_discovery && !shared->cluster_discovery)
-        {
-            shared->cluster_discovery = std::make_unique<ClusterDiscovery>(*config, getGlobalContext(), getMacros());
-        }
 
         /// Do not update clusters if this part of config wasn't changed.
         /// Note: clusters_config must be checked for null separately from clusters, because
@@ -6726,19 +6771,76 @@ void Context::setClustersConfig(const ConfigurationPtr & config, bool enable_dis
         /// shared->clusters using the fallback getConfigRef() without setting shared->clusters_config.
         /// If setClustersConfig() then runs before the config reloader stores its ConfigurationPtr,
         /// dereferencing shared->clusters_config would throw Poco::NullPointerException.
-        if (shared->clusters && shared->clusters_config && isSameConfiguration(*config, *shared->clusters_config, config_name))
-            return;
+        ///
+        /// Still start a discovery object created after server start when only the allow-flag
+        /// flipped (remote_servers subtree unchanged) — otherwise the worker never runs.
+        /// The reverse transition (allow 1 -> 0) must tear discovery down even when remote_servers
+        /// is unchanged; otherwise the worker stays registered until restart.
+        const bool remote_servers_unchanged
+            = shared->clusters && shared->clusters_config
+            && isSameConfiguration(*config, *shared->clusters_config, config_name);
 
-        auto old_clusters_config = shared->clusters_config;
-        shared->clusters_config = config;
+        const bool discovery_enabled
+            = ConfigHelper::getBool(*config, "allow_experimental_cluster_discovery") && enable_discovery;
 
-        if (!shared->clusters)
-            shared->clusters = std::make_shared<Clusters>(*shared->clusters_config, *settings, getMacros(), config_name);
-        else
-            shared->clusters->updateClusters(*shared->clusters_config, *settings, config_name, old_clusters_config);
+        /// Validate discovery before creating the object or committing Clusters so a bad reload
+        /// cannot leave clusters_config advanced while discovery stays on the previous view.
+        /// Also validate when allow is turned off: an existing ClusterDiscovery is still updated.
+        if (!remote_servers_unchanged && (discovery_enabled || shared->cluster_discovery))
+            ClusterDiscovery::validateConfig(*config, getGlobalContext(), config_name);
 
-        ++shared->clusters_version;
+        bool discovery_just_created = false;
+        if (discovery_enabled)
+        {
+            if (!shared->cluster_discovery)
+            {
+                shared->cluster_discovery = std::make_unique<ClusterDiscovery>(*config, getGlobalContext(), getMacros());
+                discovery_just_created = true;
+            }
+        }
+        else if (shared->cluster_discovery)
+        {
+            discovery_to_disable = std::move(shared->cluster_discovery);
+        }
+
+        if (!remote_servers_unchanged)
+        {
+            auto old_clusters_config = shared->clusters_config;
+            shared->clusters_config = config;
+
+            if (!shared->clusters)
+                shared->clusters = std::make_shared<Clusters>(*shared->clusters_config, *settings, getMacros(), config_name);
+            else
+                shared->clusters->updateClusters(*shared->clusters_config, *settings, config_name, old_clusters_config);
+
+            if (shared->cluster_discovery && !discovery_just_created)
+                discovery_to_update = shared->cluster_discovery.get();
+
+            ++shared->clusters_version;
+            clusters_changed = true;
+        }
+
+        /// Constructor already applied config. Start outside this lock if the server is ready;
+        /// otherwise programs/server/Server.cpp calls startClusterDiscovery() after listen.
+        if (discovery_just_created)
+            discovery_just_created_ptr = shared->cluster_discovery.get();
     }
+
+    /// Tear down outside clusters_mutex: joins the worker and may touch ZooKeeper.
+    if (discovery_to_disable)
+        discovery_to_disable->disableAndShutdown();
+
+    /// Apply discovery updates outside clusters_mutex: may start the worker and touch ZooKeeper.
+    if (discovery_to_update)
+        discovery_to_update->updateFromConfig(*config, config_name);
+
+    /// Re-check server readiness without clusters_mutex (isServerCompletelyStarted takes shared->mutex).
+    if (discovery_just_created_ptr && getApplicationType() == ApplicationType::SERVER && isServerCompletelyStarted())
+        discovery_just_created_ptr->start();
+
+    /// Avoid DDL host-id refresh / log noise when remote_servers (and discovery) did not change.
+    /// Still notify when discovery was just created or disabled (e.g. allow-flag-only reload).
+    if (clusters_changed || discovery_to_update || discovery_just_created_ptr || discovery_to_disable)
     {
         SharedLockGuard lock(shared->mutex);
         if (shared->ddl_worker)
@@ -7682,12 +7784,35 @@ void Context::stopServers(const ServerType & server_type) const
     shared->stop_servers_callback(server_type);
 }
 
-
 void Context::shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
 {
     shared->shutdown();
 }
 
+bool Context::stopSwarmMode()
+{
+    bool expected_is_enabled = true;
+    bool is_stopped_now = shared->swarm_mode_enabled.compare_exchange_strong(expected_is_enabled, false);
+    if (is_stopped_now)
+        CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 0);
+    // return true if stop successful
+    return is_stopped_now;
+}
+
+bool Context::startSwarmMode()
+{
+    bool expected_is_enabled = false;
+    bool is_started_now = shared->swarm_mode_enabled.compare_exchange_strong(expected_is_enabled, true);
+    if (is_started_now)
+        CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 1);
+    // return true if start successful
+    return is_started_now;
+}
+
+bool Context::isSwarmModeEnabled() const
+{
+    return shared->swarm_mode_enabled;
+}
 
 Context::ApplicationType Context::getApplicationType() const
 {
