@@ -24,6 +24,8 @@ Both are pinned here.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -61,30 +63,6 @@ def test_sanitizer_jobs_are_unaffected():
     )
 
 
-def _stateless_flaky_jobs(workflow):
-    return [
-        job
-        for job in workflow.jobs
-        if "flaky" in job.name.lower() and "stateless" in job.name.lower()
-    ]
-
-
 def test_every_merge_queue_flaky_check_also_runs_in_pr_ci():
-    # A flaky check that exists only in the merge queue can only ever report a
-    # bad test once the merge is already in progress. Pin that each merge-queue
-    # flaky check also runs in PR CI - as the same job config, sharing name,
-    # build, and runner - so the PR sees the same configuration first (and with
-    # the larger iteration count and time budget - see `is_merge_queue_event`
-    # in functional_tests.py).
-    from ci.workflows.merge_queue import workflow as mq_workflow
-    from ci.workflows.pull_request import workflow as pr_workflow
-
-    mq_jobs = _stateless_flaky_jobs(mq_workflow)
-    pr_jobs_by_name = {job.name: job for job in _stateless_flaky_jobs(pr_workflow)}
-    assert mq_jobs, "merge queue lost its stateless flaky check"
-    for mq_job in mq_jobs:
-        pr_job = pr_jobs_by_name.get(mq_job.name)
-        assert pr_job is not None, f"{mq_job.name} runs in the merge queue but not in PR CI"
-        assert pr_job.runs_on == mq_job.runs_on
-        assert pr_job.requires == mq_job.requires
-        assert pr_job.command == mq_job.command
+    # Altinity does not run the Inc PR-side flaky checks (`35581c26fe7`).
+    pytest.skip("PR flaky-check jobs are commented out")
