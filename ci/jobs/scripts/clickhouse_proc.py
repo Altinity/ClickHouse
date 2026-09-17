@@ -651,7 +651,9 @@ fi
 
 clickhouse-client --query "SHOW DATABASES"
 clickhouse-client --query "CREATE DATABASE datasets"
-clickhouse-client < ./tests/docker_scripts/create.sql
+python3 ./ci/jobs/scripts/pick_endpoint.py create-sql ./tests/docker_scripts/create.sql | clickhouse-client
+S3_BASE=$(python3 ./ci/jobs/scripts/pick_endpoint.py tpcds)
+export S3_BASE
 bash ./tests/docker_scripts/create_tpcds.sh
 bash ./tests/docker_scripts/create_tpch.sh
 clickhouse-client --query "SHOW TABLES FROM datasets"
@@ -707,7 +709,14 @@ fi
             tail = ""
             try:
                 with open(log_file, errors="ignore") as f:
-                    tail = "".join(f.readlines()[-15:]).strip()
+                    lines = f.readlines()
+                # SHOW TABLES rows land in the same log; prefer the CH error.
+                for line in reversed(lines):
+                    if "Code:" in line or "POCO_EXCEPTION" in line:
+                        tail = line.strip()
+                        break
+                if not tail:
+                    tail = "".join(lines[-15:]).strip()
             except OSError:
                 pass
             self.stateful_setup_error = (
