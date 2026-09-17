@@ -28,7 +28,7 @@ CreatingSets
         PrimaryKey
           Keys: 
             value
-          Condition: (value in 6-element set)
+          Condition: (value in 5-element set)
           Parts: 1/1
           Granules: 1/1
 CreatingSets
@@ -39,6 +39,6 @@ CreatingSets
         PrimaryKey
           Keys: 
             value
-          Condition: (value in 1-element set)
+          Condition: (value in 0-element set)
           Parts: 0/1
           Granules: 0/1
