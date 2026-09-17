@@ -9,7 +9,9 @@
 #include <Common/FailPoint.h>
 #include <Common/ThreadPool.h>
 #include <Common/TransactionID.h>
+#include <Common/Stopwatch.h>
 #include <Common/ZooKeeper/IKeeper.h>
+#include <Common/logger_useful.h>
 #include <Common/noexcept_scope.h>
 
 #include <base/sleep.h>
@@ -29,6 +31,77 @@ namespace ErrorCodes
 namespace FailPoints
 {
     extern const char transaction_after_commit_pause[];
+}
+
+namespace
+{
+
+/// A metadata write made after the commit point, or during rollback, has no one to report
+/// an error to: the caller is a noexcept callback and the transaction's fate is already
+/// decided in the transaction log. Instead of letting the exception terminate the server,
+/// the write is retried for a bounded time. `LOGICAL_ERROR` and `NOT_IMPLEMENTED` are invariant
+/// violations and are rethrown at once. When the budget is exhausted, or the server is
+/// shutting down, the error is rethrown too: this keeps the old behaviour rather than
+/// hiding a write that did not happen. The budget is per object; a write that hangs
+/// inside the storage is not interrupted.
+constexpr UInt64 TRANSACTION_METADATA_STORE_RETRY_TIMEOUT_SECONDS = 60;
+constexpr UInt64 TRANSACTION_METADATA_STORE_RETRY_BACKOFF_MS = 100;
+constexpr UInt64 TRANSACTION_METADATA_STORE_RETRY_MAX_BACKOFF_MS = 2000;
+
+/// `describe` is called only when a log line is written, so a callback that never fails
+/// formats nothing.
+template <typename Describe, typename F>
+void retryMetadataStore(LoggerPtr log, Describe && describe, F && store)
+{
+    Stopwatch watch;
+    UInt64 backoff_ms = TRANSACTION_METADATA_STORE_RETRY_BACKOFF_MS;
+    size_t attempts = 0;
+    while (true)
+    {
+        ++attempts;
+        try
+        {
+            store();
+            if (attempts > 1)
+                LOG_INFO(log, "Stored transaction metadata for {} after {} attempts", describe(), attempts);
+            return;
+        }
+        catch (...)
+        {
+            int code = getCurrentExceptionCode();
+            if (code == ErrorCodes::LOGICAL_ERROR || code == ErrorCodes::NOT_IMPLEMENTED)
+                throw;
+
+            bool give_up = watch.elapsedSeconds() >= TRANSACTION_METADATA_STORE_RETRY_TIMEOUT_SECONDS
+                || TransactionLog::instance().isShuttingDown();
+            if (give_up)
+            {
+                LOG_ERROR(log, "Cannot store transaction metadata for {} after {} attempts in {:.1f} s, giving up: {}",
+                    describe(), attempts, watch.elapsedSeconds(), getCurrentExceptionMessage(false));
+                throw;
+            }
+
+            if (attempts == 1)
+                LOG_WARNING(log, "Cannot store transaction metadata for {}, will retry: {}", describe(), getCurrentExceptionMessage(false));
+            else
+                LOG_DEBUG(log, "Cannot store transaction metadata for {}, attempt {}: {}", describe(), attempts, getCurrentExceptionMessage(false));
+        }
+
+        sleepForMilliseconds(backoff_ms);
+        backoff_ms = std::min(backoff_ms * 2, TRANSACTION_METADATA_STORE_RETRY_MAX_BACKOFF_MS);
+    }
+}
+
+String partDescription(const IMergeTreeDataPart & part)
+{
+    return fmt::format("part {} of {}", part.name, part.storage.getStorageID().getNameForLogs());
+}
+
+String mutationDescription(const IStorage & storage, const String & mutation_id)
+{
+    return fmt::format("mutation {} of {}", mutation_id, storage.getStorageID().getNameForLogs());
+}
+
 }
 
 static void checkNotOrdinaryDatabase(const StoragePtr & storage)
@@ -275,6 +348,8 @@ void MergeTreeTransaction::afterCommit(CSN assigned_csn) noexcept
         committed_mutations = mutations;
     }
 
+    auto log = getLogger("MergeTreeTransaction");
+
     /// Persist per-part version metadata BEFORE flipping `csn` below.
     /// `csn.exchange(assigned_csn)` is the signal that `MergeTreeTransaction::waitStateChange`
     /// blocks on; doing the disk-backed `setAndStore...CSN` calls first ensures that once a
@@ -288,23 +363,20 @@ void MergeTreeTransaction::afterCommit(CSN assigned_csn) noexcept
     /// `setAndStore...CSN` did not complete; `TransactionLog::getCSN(tid)` returns the right
     /// answer after restart.
     for (const auto & part : created_parts)
-    {
-        part->version->setAndStoreCreationCSN(assigned_csn);
-    }
+        retryMetadataStore(log, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreCreationCSN(assigned_csn); });
 
     for (const auto & part : removed_parts)
-    {
-        part->version->setAndStoreRemovalCSN(assigned_csn);
-    }
+        retryMetadataStore(log, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreRemovalCSN(assigned_csn); });
 
     for (const auto & storage_and_mutation : committed_mutations)
-        storage_and_mutation.first->setMutationCSN(storage_and_mutation.second, assigned_csn);
+        retryMetadataStore(log, [&] { return mutationDescription(*storage_and_mutation.first, storage_and_mutation.second); },
+            [&] { storage_and_mutation.first->setMutationCSN(storage_and_mutation.second, assigned_csn); });
 
     /// Test-only pause point. With this failpoint enabled, a regression test can verify that
     /// `waitStateChange` does not return until every part has its new CSN persisted (above).
-    /// Not wrapped in try/catch: `pauseFailPoint` only takes a mutex and a condvar, and the
-    /// surrounding `setAndStore...CSN` calls already trust their callees not to throw under
-    /// the same `noexcept` contract.
+    /// Not wrapped in try/catch: `pauseFailPoint` only takes a mutex and a condvar. The writes
+    /// above go through retryMetadataStore, which absorbs recoverable storage errors within its
+    /// retry budget.
     FailPointInjection::pauseFailPoint(FailPoints::transaction_after_commit_pause);
 
     /// Flip the atomic last so that `waitStateChange` only wakes up after all metadata is durable.
@@ -337,9 +409,15 @@ bool MergeTreeTransaction::rollback() noexcept
         parts_to_activate = removing_parts;
     }
 
-    /// Forcefully stop related mutations if any
+    auto log = getLogger("MergeTreeTransaction");
+
+    /// Forcefully stop related mutations if any. killMutation erases the mutation from the
+    /// table's map before deleting its file, so a repeated call after a failed deletion is a
+    /// no-op; a file left behind is removed at the next load, because its transaction has
+    /// no CSN.
     for (const auto & table_and_mutation : mutations_to_kill)
-        table_and_mutation.first->killMutation(table_and_mutation.second);
+        retryMetadataStore(log, [&] { return mutationDescription(*table_and_mutation.first, table_and_mutation.second); },
+            [&] { table_and_mutation.first->killMutation(table_and_mutation.second); });
 
     /// Discard changes in active parts set
     /// Remove parts that were created, restore parts that were removed (except parts that were created by this transaction too)
@@ -348,7 +426,7 @@ bool MergeTreeTransaction::rollback() noexcept
     for (const auto & part : parts_to_remove)
     {
         /// Write special RolledBackCSN, so we will be able to cleanup transaction log
-        part->version->setAndStoreCreationCSN(Tx::RolledBackCSN);
+        retryMetadataStore(log, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreCreationCSN(Tx::RolledBackCSN); });
     }
 
     for (const auto & part : parts_to_remove)
@@ -367,7 +445,7 @@ bool MergeTreeTransaction::rollback() noexcept
     {
         /// Clear removal_tid from version metadata file, so we will not need to distinguish TIDs that were not committed
         /// and TIDs that were committed long time ago and were removed from the log on log cleanup.
-        part->version->setAndStoreRemovalTID(Tx::EmptyTID);
+        retryMetadataStore(log, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreRemovalTID(Tx::EmptyTID); });
         part->version->unlockRemovalTID(tid, TransactionInfoContext{part->storage.getStorageID(), part->name});
     }
 
