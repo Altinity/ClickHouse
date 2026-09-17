@@ -5615,3 +5615,52 @@ def test_delta_kernel_retry_on_stale_token_via_catalog_callback(started_cluster)
         f"Expected the catalog-callback retry log line to fire for query {retry_query_id}, "
         f"found {retry_hits} hits — the stale-token retry path was not exercised."
     )
+
+
+def test_liquid_clustering(started_cluster):
+    """Test reading a Delta Lake table that uses liquid clustering.
+
+    Creates a table with CLUSTER BY via Spark SQL, writes data, runs OPTIMIZE,
+    then reads it from ClickHouse via the delta-kernel-rs path.  Liquid
+    clustering tables require the `v2Checkpoint` and `domainMetadata` reader
+    features, which are only supported by the delta-kernel-rs path.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_liquid_clustering")
+
+    # Create a liquid-clustered Delta table via Spark SQL.
+    # delta-spark 3.3.0 supports CLUSTER BY.
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
+        USING DELTA CLUSTER BY (a)
+    """)
+    spark.sql(f"""
+        INSERT INTO delta.`{delta_path}`
+        SELECT id as a, CAST(id + 1 AS STRING) as b FROM range(100)
+    """)
+    spark.sql(f"OPTIMIZE delta.`{delta_path}`")
+
+    files = default_upload_directory(
+        started_cluster,
+        "s3",
+        delta_path,
+        "",
+    )
+    assert len(files) > 0
+
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    # Verify row count and data.
+    assert int(instance.query(f"SELECT count() FROM {TABLE_NAME}")) == 100
+    assert instance.query(f"SELECT * FROM {TABLE_NAME} ORDER BY a") == instance.query(
+        "SELECT number as a, toString(number + 1) as b FROM numbers(100)"
+    )
+
+    # Verify predicate pushdown on the clustering column.
+    result = instance.query(f"SELECT a FROM {TABLE_NAME} WHERE a = 42")
+    assert result.strip() == "42"
+
+    # Verify aggregation works.
+    assert int(instance.query(f"SELECT sum(a) FROM {TABLE_NAME}")) == sum(range(100))
