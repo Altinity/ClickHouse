@@ -5,6 +5,8 @@ from ci.defs.altinity_jobs import AltinityArtifactConfigs, AltinityJobConfigs
 from ci.defs.defs import (
     BINARIES_WITH_LONG_RETENTION,
     DOCKERS,
+    GH_AUTH_TRUSTED_LAMBDA_NAME,
+    LOOM_SECRETS,
     SECRETS,
     ArtifactConfigs,
 )
@@ -104,7 +106,7 @@ workflow = Workflow.Config(
     dockers=DOCKERS,
     enable_dockers_manifest_merge=True,
     set_latest_for_docker_merged_manifest=True,
-    secrets=SECRETS,
+    secrets=SECRETS + LOOM_SECRETS,
     enable_job_filtering_by_changes=False,
     enable_cache=True,
     enable_report=True,
@@ -117,6 +119,7 @@ workflow = Workflow.Config(
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
         "python3 ./ci/jobs/scripts/workflow_hooks/parse_ci_tags.py",
         # "python3 ./ci/jobs/scripts/workflow_hooks/merge_sync_pr.py", # NOTE (strtgbb): we don't do this
+        # "python3 ./ci/jobs/scripts/workflow_hooks/loom_code_refresh.py",
     ],
     workflow_filter_hooks=[should_skip_job],
     post_hooks=[],
