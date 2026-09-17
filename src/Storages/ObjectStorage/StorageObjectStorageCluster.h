@@ -92,7 +92,7 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
-    IDataLakeMetadata * getExternalMetadata(ContextPtr query_context);
+    std::shared_ptr<IDataLakeMetadata> getExternalMetadata(ContextPtr query_context);
 
     std::shared_ptr<DataLake::ICatalog> getCatalog() const { return pure_storage ? pure_storage->getCatalog() : nullptr; }
 

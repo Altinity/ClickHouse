@@ -341,7 +341,8 @@ BlockIO InterpreterCreateQuery::createDatabase(ASTCreateQuery & create)
     else if (create.uuid != UUIDHelpers::Nil && !DatabaseCatalog::instance().hasUUIDMapping(create.uuid))
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot find UUID mapping for {}, it's a bug", create.uuid);
 
-    DatabasePtr database = DatabaseFactory::instance().get(create, metadata_path / "", getContext(), mode, internal);
+    DatabasePtr database = DatabaseFactory::instance().get(
+        create, metadata_path / "", getContext(), mode, internal, is_metadata_replay);
 
     if (create.uuid != UUIDHelpers::Nil)
         create.setDatabase(TABLE_WITH_UUID_NAME_PLACEHOLDER);
@@ -819,7 +820,8 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
         if (create.columns_list->projections)
             for (const auto & projection_ast : create.columns_list->projections->children)
             {
-                auto projection = ProjectionDescription::getProjectionFromAST(projection_ast, properties.columns, nullptr, getContext(), mode);
+                auto projection = ProjectionDescription::getProjectionFromAST(
+                    projection_ast, properties.columns, nullptr, getContext(), mode, create.attach_short_syntax);
                 properties.projections.add(std::move(projection));
             }
 

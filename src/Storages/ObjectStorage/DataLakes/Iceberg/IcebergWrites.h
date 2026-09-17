@@ -129,6 +129,9 @@ void generateManifestFile(
     const std::vector<DataFileEntryLineage> & per_file_entry_lineage = {},
     /// Optional schema to serialize into the manifest's Avro `schema` header; when null the table's current schema is used.
     Poco::JSON::Object::Ptr schema_to_serialize = nullptr,
+    /// Optional freshly-computed per-file statistics parallel to `data_file_names`; when set each entry's stats
+    /// describe only its own data file, else the shared `data_file_statistics` is used for every entry.
+    const std::vector<const DataFileStatistics *> * per_file_fresh_statistics = nullptr,
     /// Optional per-file pre-serialized statistics (export-commit path). When non-empty each entry
     /// overrides both the record count / file size AND the column statistics for the corresponding file.
     const std::vector<IcebergSerializedFileStats> & per_file_stats = {});

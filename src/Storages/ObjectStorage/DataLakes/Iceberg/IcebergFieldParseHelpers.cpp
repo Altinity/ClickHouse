@@ -4,6 +4,7 @@
 #include <cctype>
 #include <limits>
 
+#include <base/arithmeticOverflow.h>
 #include <Columns/IColumn.h>
 #include <Common/Exception.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -123,8 +124,10 @@ namespace
     /// To handle this issue we subtract 1 from the integral part for lower_bound and add 1 to integral
     /// part of upper_bound. This produces: 17.22 -> [16.0, 18.0]. So this is more rough boundary,
     /// but at least it doesn't lead to incorrect results.
+    /// `compensate_rounding` widens the bound as described above; pass false to read the value exactly
+    /// as the manifest declares it.
     template <typename DecimalType>
-    std::optional<Field> deserializeDecimalBound(const std::string & str, UInt32 scale, bool lower_bound)
+    std::optional<Field> deserializeDecimalBound(const std::string & str, UInt32 scale, bool lower_bound, bool compensate_rounding = true)
     {
         using NativeType = typename DecimalType::NativeType;
         using UnsignedType = make_unsigned_t<NativeType>;
@@ -140,13 +143,16 @@ namespace
 
         NativeType unscaled_value = static_cast<NativeType>(unscaled);
 
-        if (scale)
+        if (compensate_rounding && scale)
         {
             NativeType scaler = lower_bound ? -10 : 10;
             for (UInt32 i = 1; i < scale; ++i)
                 scaler *= 10;
 
-            unscaled_value += scaler;
+            /// The bound is stored as raw bytes and is never checked against the declared precision, so
+            /// widening it can leave the type. A value that has no widened form is not a usable bound.
+            if (common::addOverflow(unscaled_value, scaler, unscaled_value))
+                return std::nullopt;
         }
 
         return DecimalField<DecimalType>(unscaled_value, scale);
@@ -154,7 +160,8 @@ namespace
 
 }
 
-std::optional<Field> deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_type, bool lower_bound)
+std::optional<Field>
+deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_type, bool lower_bound, bool compensate_rounding)
 {
     auto non_nullable_type = removeNullable(expected_type);
     auto column = non_nullable_type->createColumn();
@@ -165,13 +172,13 @@ std::optional<Field> deserializeFieldFromBinaryRepr(const std::string & str, Dat
 
         const UInt32 scale = getDecimalScale(*non_nullable_type);
         if (checkDecimal<Decimal32>(*non_nullable_type))
-            return deserializeDecimalBound<Decimal32>(str, scale, lower_bound);
+            return deserializeDecimalBound<Decimal32>(str, scale, lower_bound, compensate_rounding);
         if (checkDecimal<Decimal64>(*non_nullable_type))
-            return deserializeDecimalBound<Decimal64>(str, scale, lower_bound);
+            return deserializeDecimalBound<Decimal64>(str, scale, lower_bound, compensate_rounding);
         if (checkDecimal<Decimal128>(*non_nullable_type))
-            return deserializeDecimalBound<Decimal128>(str, scale, lower_bound);
+            return deserializeDecimalBound<Decimal128>(str, scale, lower_bound, compensate_rounding);
         if (checkDecimal<Decimal256>(*non_nullable_type))
-            return deserializeDecimalBound<Decimal256>(str, scale, lower_bound);
+            return deserializeDecimalBound<Decimal256>(str, scale, lower_bound, compensate_rounding);
         return std::nullopt;
     }
 

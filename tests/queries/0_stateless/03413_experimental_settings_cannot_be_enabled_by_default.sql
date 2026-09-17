@@ -6,8 +6,6 @@
 -- These are in the exceptions list inside NOT IN.
 SELECT name, value FROM system.settings WHERE tier = 'Experimental' AND type = 'Bool' AND value != '0' AND name NOT IN (
   'throw_on_unsupported_query_inside_transaction',
-  'ai_function_throw_on_error',
-  'ai_function_throw_on_quota_exceeded',
   'time_series_prefer_recent_samples_table',
   'allow_experimental_export_merge_tree_part',
 -- turned ON for Altinity Antalya builds specifically

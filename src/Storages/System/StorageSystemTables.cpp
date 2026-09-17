@@ -330,7 +330,7 @@ namespace
 /// Returns data lake metadata (Iceberg, DeltaLake, ...) of the table, if it has any.
 /// Object storage table engines are instantiated as StorageObjectStorageCluster, which is not derived
 /// from StorageObjectStorage, so both storage types have to be handled here.
-IDataLakeMetadata * tryGetDataLakeMetadata(const StoragePtr & table, ContextPtr context)
+std::shared_ptr<IDataLakeMetadata> tryGetDataLakeMetadata(const StoragePtr & table, ContextPtr context)
 {
     if (auto * object_storage = dynamic_cast<StorageObjectStorage *>(table.get()))
         return object_storage->getExternalMetadata(context);
@@ -894,7 +894,7 @@ protected:
                     try
                     {
                         // Extract from specific DataLake metadata if suitable
-                        if (auto * dl_meta = tryGetDataLakeMetadata(table, context))
+                        if (auto dl_meta = tryGetDataLakeMetadata(table, context))
                         {
                             if (auto p = dl_meta->partitionKey(context); p.has_value())
                             {
@@ -925,7 +925,7 @@ protected:
                     try
                     {
                         // Extract from specific DataLake metadata if suitable
-                        if (auto * dl_meta = tryGetDataLakeMetadata(table, context))
+                        if (auto dl_meta = tryGetDataLakeMetadata(table, context))
                         {
                             if (auto p = dl_meta->sortingKey(context); p.has_value())
                             {

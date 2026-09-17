@@ -24,6 +24,7 @@
 #include <Poco/String.h>
 #include <Storages/ColumnsDescription.h>
 #include <Parsers/ASTFunction.h>
+#include <Common/FieldAccurateComparison.h>
 #include <Common/quoteString.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <IO/ReadBufferFromString.h>
@@ -435,7 +436,47 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
                 auto left = deserializeFieldFromBinaryRepr(left_str, name_and_type.type, true);
                 auto right = deserializeFieldFromBinaryRepr(right_str, name_and_type.type, false);
                 if (!left || !right)
+                {
+                    /// Pruning is skipped either way, but at scale 38 a bound that only loses its widened
+                    /// form can still be a value the column holds, so this is not on its own a malformed
+                    /// manifest and stays out of the warning log.
+                    LOG_DEBUG(
+                        getLogger("ManifestFileIterator"),
+                        "Manifest file '{}' declares a bound that cannot be read as a usable range border "
+                        "for column id {} of data file '{}'; skipping min/max pruning for this column",
+                        path_to_manifest_file,
+                        column_id,
+                        parsed_entry->file_path_key.serialize());
                     continue;
+                }
+
+                /// At a non-zero scale the outward shift moves each decimal bound one integral unit, so it
+                /// un-inverts any declared pair no more than `2 * 10^scale` apart. Only the values as
+                /// declared expose that inversion, which is why they are read again here.
+                std::optional<DB::Field> declared_left = left;
+                std::optional<DB::Field> declared_right = right;
+                if (DB::WhichDataType(DB::removeNullable(name_and_type.type)).isDecimal())
+                {
+                    declared_left = deserializeFieldFromBinaryRepr(
+                        left_str, name_and_type.type, true, /*compensate_rounding=*/false);
+                    declared_right = deserializeFieldFromBinaryRepr(
+                        right_str, name_and_type.type, false, /*compensate_rounding=*/false);
+                }
+
+                /// A pair inverted as declared means the manifest's statistics are untrustworthy, so no
+                /// range derived from them is safe to prune on. Dropping the column's bounds is therefore
+                /// right where swapping or clamping them would prune on a value nothing vouches for.
+                if (accurateLess(*declared_right, *declared_left))
+                {
+                    LOG_WARNING(
+                        getLogger("ManifestFileIterator"),
+                        "Manifest file '{}' declares a lower bound above the upper bound for column id "
+                        "{} of data file '{}'; skipping min/max pruning for this column",
+                        path_to_manifest_file,
+                        column_id,
+                        parsed_entry->file_path_key.serialize());
+                    continue;
+                }
 
                 hyperrectangles.emplace(column_id, DB::Range(*left, true, *right, true));
             }

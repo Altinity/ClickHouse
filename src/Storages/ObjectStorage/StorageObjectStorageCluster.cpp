@@ -6,7 +6,13 @@
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTSetQuery.h>
+#include <Databases/DatabasesCommon.h>
+#include <Databases/DataLake/Common.h>
+#include <Databases/DataLake/ICatalog.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Storages/AlterCommands.h>
+#include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <TableFunctions/TableFunctionFactory.h>
 
 #include <Core/Settings.h>
@@ -29,11 +35,13 @@
 #include <Storages/extractTableFunctionFromSelectQuery.h>
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
 
+#include <Common/CurrentThread.h>
 #include <Common/FailPoint.h>
 namespace DB
 {
 namespace Setting
 {
+    extern const SettingsBool iceberg_delete_data_on_drop;
     extern const SettingsBool use_hive_partitioning;
     extern const SettingsBool cluster_function_process_archive_on_multiple_nodes;
     extern const SettingsObjectStorageGranularityLevel cluster_table_function_split_granularity;
@@ -52,6 +60,7 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
     extern const int INVALID_SETTING_VALUE;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace FailPoints
@@ -120,6 +129,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     , cluster_name_in_settings(false)
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
+    configuration->check(context_);
 
     const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto");
     const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && catalog;
@@ -185,7 +195,6 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
     else
         validateSupportedColumns(columns, *configuration);
-    configuration->check(context_);
 
     if (updated_configuration && sample_path.empty()
             && context_->getSettingsRef()[Setting::use_hive_partitioning]
@@ -850,7 +859,7 @@ StorageMetadataHandle StorageObjectStorageCluster::getInMemoryMetadataPtr(Contex
     return IStorageCluster::getInMemoryMetadataPtr(context, bypass_metadata_cache);
 }
 
-IDataLakeMetadata * StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
+std::shared_ptr<IDataLakeMetadata> StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
 {
     if (getClusterName(query_context).empty())
         return pure_storage->getExternalMetadata(query_context);

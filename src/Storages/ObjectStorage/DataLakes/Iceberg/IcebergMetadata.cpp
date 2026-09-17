@@ -2066,6 +2066,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
                 /* data_file_sort_order_ids */ {},
                 /* per_file_entry_lineage */ {},
                 /* schema_to_serialize */ nullptr,
+                /* per_file_fresh_statistics */ nullptr,
                 per_file_stats);
             buffer_manifest_entry->finalize();
             manifest_lengths += buffer_manifest_entry->count();

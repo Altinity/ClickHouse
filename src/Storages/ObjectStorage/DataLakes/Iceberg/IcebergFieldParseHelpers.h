@@ -30,7 +30,10 @@ std::vector<Int64> fieldToInt64Array(const Field & value, std::string_view conte
 
 /// Deserialize a single lower/upper bound value from Iceberg's binary representation.
 /// See https://iceberg.apache.org/spec/#appendix-d-single-value-serialization
-std::optional<Field> deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_type, bool lower_bound);
+/// `compensate_rounding` widens a decimal bound by one integral unit; pass false to read the value
+/// exactly as the manifest declares it.
+std::optional<Field>
+deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_type, bool lower_bound, bool compensate_rounding = true);
 
 }
 
