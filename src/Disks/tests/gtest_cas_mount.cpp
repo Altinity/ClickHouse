@@ -805,7 +805,7 @@ TEST(CASMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
     k.start();
 
     const String mount_key = l.mountKey("r");
-    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();  /// NOLINT(clang-analyzer-deadcode.DeadStores)
+    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost];  /// NOLINT(clang-analyzer-deadcode.DeadStores)
 
     /// Simulate `rm -rf` of the backing store: the mount slot object is gone, but the renewer still
     /// names a (now stale) incarnation as its precondition.
@@ -821,7 +821,7 @@ TEST(CASMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
         EXPECT_EQ(e.code(), DB::ErrorCodes::FILE_DOESNT_EXIST) << e.message();
         EXPECT_NE(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
     }
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost], lost_before)
         << "renewer classification is metric-free; the runtime records operational loss";
 }
 
@@ -847,7 +847,7 @@ TEST(CASMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
     k.start();
 
     const String mount_key = l.mountKey("r");
-    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost];
 
     /// Simulate `rm -rf` of the backing store: the mount slot object is gone before we ever attempt
     /// a renewal, so the farewell's guarded write is the first thing to observe it.
@@ -855,7 +855,7 @@ TEST(CASMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
 
     EXPECT_NO_THROW(k.release())
         << "clean release against a vanished store must be a no-op, not a LOGICAL_ERROR abort";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost], lost_before);
 }
 
 /// rev.6: a bare `claimMount` (no `proven_dead_incarnation`) NEVER reclaims a same-uuid, different-epoch
@@ -1452,11 +1452,11 @@ TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
     const auto reclaimer_slot_before = overlap_ops.op.read(overlap_mount_key, Retry::standard());
     ASSERT_TRUE(reclaimer_slot_before.has_value());
     const uint64_t overlap_violations_before
-        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation];
 
     first.reset();   /// must not abort, must not terminate
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation],
               overlap_violations_before + 1);
     const auto reclaimer_slot_after = overlap_ops.op.read(overlap_mount_key, Retry::standard());
     ASSERT_TRUE(reclaimer_slot_after.has_value());

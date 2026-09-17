@@ -550,11 +550,11 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     CasOperation op = requests.admit();
 
     using ProfileEvents::global_counters;
-    const auto blob_put_before   = global_counters[ProfileEvents::CASBlobPut].load();
-    const auto blob_dedup_before = global_counters[ProfileEvents::CASBlobPutDeduplicated].load();
-    const auto blob_head_before  = global_counters[ProfileEvents::CASBlobHead].load();
-    const auto blob_miss_before  = global_counters[ProfileEvents::CASBlobHeadMiss].load();
-    const auto gc_put_before     = global_counters[ProfileEvents::CASGCPut].load();
+    const auto blob_put_before   = global_counters[ProfileEvents::CASBlobPut];
+    const auto blob_dedup_before = global_counters[ProfileEvents::CASBlobPutDeduplicated];
+    const auto blob_head_before  = global_counters[ProfileEvents::CASBlobHead];
+    const auto blob_miss_before  = global_counters[ProfileEvents::CASBlobHeadMiss];
+    const auto gc_put_before     = global_counters[ProfileEvents::CASGCPut];
 
     const String blob_key = "pool/blobs/ab/abcdef0123456789";
 
@@ -571,11 +571,11 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     /// Under coverage builds ProfileEvents propagate into a thread-local subtree that does not reach
     /// `global_counters`; deltas read 0 there only (see gtest_unique_key_index_cache).
 #if !WITH_COVERAGE
-    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut].load()      - blob_put_before,   1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPutDeduplicated].load() - blob_dedup_before, 1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CASBlobHead].load()     - blob_head_before,  1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CASBlobHeadMiss].load() - blob_miss_before,  1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CASGCPut].load()        - gc_put_before,     1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut]      - blob_put_before,   1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPutDeduplicated] - blob_dedup_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobHead]     - blob_head_before,  1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobHeadMiss] - blob_miss_before,  1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASGCPut]        - gc_put_before,     1u);
 #else
     (void)blob_put_before; (void)blob_dedup_before; (void)blob_head_before;
     (void)blob_miss_before; (void)gc_put_before;
@@ -590,7 +590,7 @@ TEST(CASInstrumentedBackend, PublishBlobDelegatesOnceAndRecordsOnePhysicalBlobWr
     CasOperation op = requests.admit();
 
     using ProfileEvents::global_counters;
-    const auto blob_put_before = global_counters[ProfileEvents::CASBlobPut].load();
+    const auto blob_put_before = global_counters[ProfileEvents::CASBlobPut];
 
     const auto request = streamingPublication("pool/blobs/ab/published", "fresh", "payload", 7);
     op.publish(request, Retry::once());
@@ -602,7 +602,7 @@ TEST(CASInstrumentedBackend, PublishBlobDelegatesOnceAndRecordsOnePhysicalBlobWr
     ASSERT_TRUE(published.has_value());
     EXPECT_EQ(published->bytes, "freshpayload");
 #if !WITH_COVERAGE
-    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut].load() - blob_put_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut] - blob_put_before, 1u);
 #else
     (void)blob_put_before;
 #endif
@@ -1305,6 +1305,20 @@ public:
                 Aws::S3::S3Errors::NO_SUCH_KEY);
 
         return DB::LocalObjectStorage::readObject(object, read_settings, read_hint, use_external_buffer, restrict_seek);
+    }
+
+    DB::SmallObjectDataWithMetadata readSmallObjectAndGetObjectMetadata( /// NOLINT
+        const DB::StoredObject & object,
+        const DB::ReadSettings & read_settings,
+        size_t max_size_bytes,
+        std::optional<size_t> read_hint) const override
+    {
+        if (object.remote_path == throw_on_read_path)
+            throw DB::S3Exception(
+                "NoSuchKey: The specified key does not exist.",
+                Aws::S3::S3Errors::NO_SUCH_KEY);
+
+        return DB::LocalObjectStorage::readSmallObjectAndGetObjectMetadata(object, read_settings, max_size_bytes, read_hint);
     }
 
 private:

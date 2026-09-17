@@ -13,6 +13,7 @@
 #include <IO/ReadHelpers.h>
 #include <IO/Expect404ResponseScope.h>
 #include <IO/ReadSettings.h>
+#include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <IO/WriteSettings.h>

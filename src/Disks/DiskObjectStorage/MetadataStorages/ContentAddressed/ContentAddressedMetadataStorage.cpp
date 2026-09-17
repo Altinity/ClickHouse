@@ -496,74 +496,75 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         auto log = ctx->getContentAddressedGarbageCollectionLog();
         if (!log)
             return;
-        ContentAddressedGarbageCollectionLogElement e;
-        const auto now = std::chrono::system_clock::now();
-        e.event_time = std::chrono::system_clock::to_time_t(now);
-        e.event_time_microseconds = timeInMicroseconds(now);
-        switch (r.event_type)
-        {
-            case Cas::GcRoundLogRecord::EventType::Start:
-                e.event_type = ContentAddressedGarbageCollectionLogElement::START;
-                break;
-            case Cas::GcRoundLogRecord::EventType::Finish:
-                e.event_type = ContentAddressedGarbageCollectionLogElement::FINISH;
-                break;
-            case Cas::GcRoundLogRecord::EventType::Phase:
-                e.event_type = ContentAddressedGarbageCollectionLogElement::PHASE;
-                break;
-        }
-        e.disk_name = r.disk_name.empty() ? disk : r.disk_name;
-        e.srid = r.srid;
-        e.gc_id = r.gc_id;
-        e.trigger = r.trigger == Cas::GcRoundLogRecord::Trigger::Manual
-            ? ContentAddressedGarbageCollectionLogElement::MANUAL
-            : ContentAddressedGarbageCollectionLogElement::SCHEDULED;
-        switch (r.outcome)
-        {
-            case Cas::GcRoundLogRecord::Outcome::Unknown:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::UNKNOWN;
-                break;
-            case Cas::GcRoundLogRecord::Outcome::Success:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::SUCCESS;
-                break;
-            case Cas::GcRoundLogRecord::Outcome::NotALeader:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::NOT_A_LEADER;
-                break;
-            case Cas::GcRoundLogRecord::Outcome::Failed:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::FAILED;
-                break;
-            case Cas::GcRoundLogRecord::Outcome::Deferred:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::DEFERRED;
-                break;
-            case Cas::GcRoundLogRecord::Outcome::Aborted:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::ABORTED;
-                break;
-            case Cas::GcRoundLogRecord::Outcome::Stopped:
-                e.outcome = ContentAddressedGarbageCollectionLogElement::STOPPED;
-                break;
-        }
-        e.round = r.round;
-        e.candidates_marked = r.candidates_marked;
-        e.objects_deleted = r.objects_deleted;
-        e.objects_absent = r.objects_absent;
-        e.objects_replaced = r.objects_replaced;
-        e.objects_spared = r.objects_spared;
-        e.manifests_deleted = r.manifests_deleted;
-        e.entries_condemned = r.entries_condemned;
-        e.entries_graduated = r.entries_graduated;
-        e.entries_redeleted = r.entries_redeleted;
-        e.fence_outs = r.fence_outs;
-        e.anomalies = r.anomalies;
-        e.duration_ms = r.duration_ms;
-        e.error = r.error;
-        e.error_code = r.error_code;
-        e.profile_events = r.profile_events;
-        e.round_id = r.round_id;
-        e.phase = r.phase;
-        e.phase_duration_microseconds = r.phase_duration_microseconds;
-        e.phase_metrics = r.phase_metrics;
         /// Best-effort: SystemLog::add never blocks GC; a full queue drops the row with a warning.
-        log->add(std::move(e));
+        log->add([&](ContentAddressedGarbageCollectionLogElement & e)
+        {
+            const auto now = std::chrono::system_clock::now();
+            e.event_time = std::chrono::system_clock::to_time_t(now);
+            e.event_time_microseconds = timeInMicroseconds(now);
+            switch (r.event_type)
+            {
+                case Cas::GcRoundLogRecord::EventType::Start:
+                    e.event_type = ContentAddressedGarbageCollectionLogElement::START;
+                    break;
+                case Cas::GcRoundLogRecord::EventType::Finish:
+                    e.event_type = ContentAddressedGarbageCollectionLogElement::FINISH;
+                    break;
+                case Cas::GcRoundLogRecord::EventType::Phase:
+                    e.event_type = ContentAddressedGarbageCollectionLogElement::PHASE;
+                    break;
+            }
+            e.disk_name = r.disk_name.empty() ? disk : r.disk_name;
+            e.srid = r.srid;
+            e.gc_id = r.gc_id;
+            e.trigger = r.trigger == Cas::GcRoundLogRecord::Trigger::Manual
+                ? ContentAddressedGarbageCollectionLogElement::MANUAL
+                : ContentAddressedGarbageCollectionLogElement::SCHEDULED;
+            switch (r.outcome)
+            {
+                case Cas::GcRoundLogRecord::Outcome::Unknown:
+                    e.outcome = ContentAddressedGarbageCollectionLogElement::UNKNOWN;
+                    break;
+                case Cas::GcRoundLogRecord::Outcome::Success:
+                    e.outcome = ContentAddressedGarbageCollectionLogElement::SUCCESS;
+                    break;
+                case Cas::GcRoundLogRecord::Outcome::NotALeader:
+                    e.outcome = ContentAddressedGarbageCollectionLogElement::NOT_A_LEADER;
+                    break;
+                case Cas::GcRoundLogRecord::Outcome::Failed:
+                    e.outcome = ContentAddressedGarbageCollectionLogElement::FAILED;
+                    break;
+                case Cas::GcRoundLogRecord::Outcome::Deferred:
+                    e.outcome = ContentAddressedGarbageCollectionLogElement::DEFERRED;
+                    break;
+                case Cas::GcRoundLogRecord::Outcome::Aborted:
+                    e.outcome = ContentAddressedGarbageCollectionLogElement::ABORTED;
+                    break;
+                case Cas::GcRoundLogRecord::Outcome::Stopped:
+                    e.outcome = ContentAddressedGarbageCollectionLogElement::STOPPED;
+                    break;
+            }
+            e.round = r.round;
+            e.candidates_marked = r.candidates_marked;
+            e.objects_deleted = r.objects_deleted;
+            e.objects_absent = r.objects_absent;
+            e.objects_replaced = r.objects_replaced;
+            e.objects_spared = r.objects_spared;
+            e.manifests_deleted = r.manifests_deleted;
+            e.entries_condemned = r.entries_condemned;
+            e.entries_graduated = r.entries_graduated;
+            e.entries_redeleted = r.entries_redeleted;
+            e.fence_outs = r.fence_outs;
+            e.anomalies = r.anomalies;
+            e.duration_ms = r.duration_ms;
+            e.error = r.error;
+            e.error_code = r.error_code;
+            e.profile_events = r.profile_events;
+            e.round_id = r.round_id;
+            e.phase = r.phase;
+            e.phase_duration_microseconds = r.phase_duration_microseconds;
+            e.phase_metrics = r.phase_metrics;
+        });
     };
 }
 
@@ -587,27 +588,28 @@ Cas::CasEventSink ContentAddressedMetadataStorage::makeCasEventSink() const
         auto log = ctx->getContentAddressedLog();
         if (!log)
             return;
-        ContentAddressedLogElement e;
-        const auto now = std::chrono::system_clock::now();
-        e.event_time = std::chrono::system_clock::to_time_t(now);
-        e.event_time_microseconds = timeInMicroseconds(now);
-        e.event_type = toString(ev.type);
-        e.disk_name = disk;
-        e.namespace_ = std::move(ev.namespace_);
-        e.ref_name = std::move(ev.ref_name);
-        e.object_kind = toString(ev.object_kind);
-        e.object_hash = std::move(ev.object_hash);
-        e.token = std::move(ev.token);
-        e.round = ev.round;
-        e.gen = ev.gen;
-        e.at_version = ev.at_version;
-        e.outcome = std::move(ev.outcome);
-        e.reason = std::move(ev.reason);
-        e.thread_id = getThreadId();
-        e.query_id = CurrentThread::getQueryId();
-        e.detail = std::move(ev.detail);
         /// Best-effort: SystemLog::add never blocks the Core; a full queue drops the row with a warning.
-        log->add(std::move(e));
+        log->add([&](ContentAddressedLogElement & e)
+        {
+            const auto now = std::chrono::system_clock::now();
+            e.event_time = std::chrono::system_clock::to_time_t(now);
+            e.event_time_microseconds = timeInMicroseconds(now);
+            e.event_type = toString(ev.type);
+            e.disk_name = disk;
+            e.namespace_ = std::move(ev.namespace_);
+            e.ref_name = std::move(ev.ref_name);
+            e.object_kind = toString(ev.object_kind);
+            e.object_hash = std::move(ev.object_hash);
+            e.token = std::move(ev.token);
+            e.round = ev.round;
+            e.gen = ev.gen;
+            e.at_version = ev.at_version;
+            e.outcome = std::move(ev.outcome);
+            e.reason = std::move(ev.reason);
+            e.thread_id = getThreadId();
+            e.query_id = CurrentThread::getQueryId();
+            e.detail = std::move(ev.detail);
+        });
     };
 }
 

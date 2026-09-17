@@ -82,14 +82,14 @@ TEST(CASGCManifestBulkDelete, FiveBodiesInChunksOfTwoAreThreeRequests)
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                 .gc_bulk_delete_chunk_keys = 2, .gc_fold_max_defer_rounds = 0});
     const auto ids = seedDroppedManifests(*backend, store->layout(), 5);
-    const auto requests_before = ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests].load();
+    const auto requests_before = ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests];
 
     Gc gc(store, kGc);
     const uint64_t deleted = reclaim(gc, store, *backend, ids, 16);
 
     EXPECT_EQ(deleted, 5u);
     EXPECT_EQ(backend->bulkRemoveCalls(), 3u) << "2 + 2 + 1";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests].load() - requests_before, 3u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests] - requests_before, 3u);
     OperationForTest op(*backend);
     for (const ManifestId & id : ids)
         EXPECT_FALSE((*op).head(store->layout().manifestKey(id), Retry::once()).has_value());

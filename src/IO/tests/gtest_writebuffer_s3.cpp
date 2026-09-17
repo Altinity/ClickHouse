@@ -47,6 +47,7 @@
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Settings.h>
 
+#include <Poco/Net/HTTPBasicStreamBuf.h>
 #include <Poco/TemporaryFile.h>
 
 
@@ -230,6 +231,37 @@ inline std::string readRequestBody(const std::shared_ptr<Aws::IOStream> & body, 
     return data;
 }
 
+/// `ReadBufferFromIStream` (used by `ReadBufferFromS3`) requires the response body's streambuf to be a
+/// `Poco::Net::HTTPBasicStreamBuf`, so the mocked GetObject body is served through one.
+class StringHTTPBasicStreamBuf : public Poco::Net::HTTPBasicStreamBuf
+{
+public:
+    explicit StringHTTPBasicStreamBuf(std::string body) : BasicBufferedStreamBuf(std::max<size_t>(body.size(), 1), IOS::in), bodyStream(std::move(body))
+    {
+    }
+
+private:
+    std::stringstream bodyStream;
+
+    int readFromDevice(char_type * buf, std::streamsize n) override
+    {
+        bodyStream.read(buf, n);
+        return static_cast<int>(bodyStream.gcount());
+    }
+};
+
+/// An `Aws::IOStream` that owns its streambuf.
+class StreamWithOwnedBuf : public Aws::IOStream
+{
+public:
+    explicit StreamWithOwnedBuf(std::unique_ptr<std::streambuf> buf_) : Aws::IOStream(buf_.get()), buf(std::move(buf_))
+    {
+    }
+
+private:
+    std::unique_ptr<std::streambuf> buf;
+};
+
 /// A CopyObject / UploadPartCopy `CopySource` has the form "bucket/key".
 inline std::pair<std::string, std::string> splitCopySource(const std::string & copy_source)
 {
@@ -355,9 +387,8 @@ struct Client : DB::S3::Client
             chassert(ret == 2);
         }
 
-        auto factory = request.GetResponseStreamFactory();
-        Aws::Utils::Stream::ResponseStream responseStream(factory);
-        responseStream.GetUnderlyingStream() << std::stringstream(data.substr(begin, end - begin + 1)).rdbuf();
+        Aws::Utils::Stream::ResponseStream responseStream(Aws::New<StreamWithOwnedBuf>(
+            "mock response stream", std::make_unique<StringHTTPBasicStreamBuf>(data.substr(begin, end - begin + 1))));
 
         Aws::AmazonWebServiceResult<Aws::Utils::Stream::ResponseStream> awsStream(std::move(responseStream), Aws::Http::HeaderValueCollection());
         Aws::S3::Model::GetObjectResult getObjectResult(std::move(awsStream));

@@ -12,6 +12,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/WriteMode.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
 
 #include <atomic>
@@ -235,6 +236,17 @@ public:
         if (access_error)
             throw DB::S3Exception("injected fault: " + object.remote_path, *access_error);
         return DB::LocalObjectStorage::readObject(object, read_settings, read_hint, use_external_buffer, restrict_seek);
+    }
+
+    DB::SmallObjectDataWithMetadata readSmallObjectAndGetObjectMetadata( /// NOLINT
+        const DB::StoredObject & object,
+        const DB::ReadSettings & read_settings,
+        size_t max_size_bytes,
+        std::optional<size_t> read_hint) const override
+    {
+        if (access_error)
+            throw DB::S3Exception("injected fault: " + object.remote_path, *access_error);
+        return DB::LocalObjectStorage::readSmallObjectAndGetObjectMetadata(object, read_settings, max_size_bytes, read_hint);
     }
 
     DB::ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override

@@ -251,14 +251,14 @@ TEST(IOTestAwsS3Client, DoesNotRetryPreconditionFailed)
 TEST(IOTestAwsS3Client, SingleAttemptRetryStrategyRefusesAndCounts)
 {
     using ProfileEvents::global_counters;
-    const auto before = global_counters[ProfileEvents::S3SingleAttemptRetryConsultations].load();
+    const auto before = global_counters[ProfileEvents::S3SingleAttemptRetryConsultations];
     DB::S3::SingleAttemptRetryStrategy strategy;
     const Aws::Client::AWSError<Aws::Client::CoreErrors> retryable_5xx(
         Aws::Client::CoreErrors::INTERNAL_FAILURE, /*isRetryable=*/true);
     EXPECT_FALSE(strategy.ShouldRetry(retryable_5xx, /*attempted=*/0));
     EXPECT_FALSE(strategy.ShouldRetry(retryable_5xx, /*attempted=*/1));
     EXPECT_EQ(strategy.GetMaxAttempts(), 1);
-    EXPECT_EQ(global_counters[ProfileEvents::S3SingleAttemptRetryConsultations].load() - before, 2u);
+    EXPECT_EQ(global_counters[ProfileEvents::S3SingleAttemptRetryConsultations] - before, 2u);
 }
 
 struct ConditionalPutWireObservation
@@ -1027,6 +1027,8 @@ std::unique_ptr<DB::S3::Client> makeClientWithHttpClient(const std::string & htt
         DB::S3::CredentialsConfiguration{
             .use_environment_credentials = false,
             .use_insecure_imds_request = false,
+            /// A server-configured client, like a disk: `gcp_oauth` without an ADC triple is not refused.
+            .forbid_implicit_credentials = false,
         });
 }
 

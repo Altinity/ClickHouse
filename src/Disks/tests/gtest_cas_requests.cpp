@@ -1542,14 +1542,14 @@ TEST(CASRequests, CleanConflictsArePacedFlatAndDoNotAdvanceTheReissueCounter)
     (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
     constexpr int K = 4;
     RaceMaker races(backend, clock, "k", K, /*ambiguous=*/false);
-    const auto pauses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause].load();
-    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load();
+    const auto pauses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause];
+    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue];
 
     WriteResult result = op.readModifyWrite("k", appendX(), Retry::standard());
 
     ASSERT_TRUE(std::holds_alternative<Committed>(result));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause].load() - pauses_before, K);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load() - reissues_before, 0u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause] - pauses_before, K);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue] - reissues_before, 0u);
     ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K));
     for (uint64_t s : clock.sleeps)
         EXPECT_LE(s, 200u);   /// flat: every pause is one `backoff(1)` draw, whatever the loss count
@@ -1565,14 +1565,14 @@ TEST(CASRequests, AConflictThatSettledAFaultKeepsTheGrowingSchedule)
     (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
     constexpr int K = 3;
     RaceMaker races(backend, clock, "k", K, /*ambiguous=*/true);
-    const auto pauses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause].load();
-    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load();
+    const auto pauses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause];
+    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue];
 
     WriteResult result = op.readModifyWrite("k", appendX(), Retry::standard());
 
     ASSERT_TRUE(std::holds_alternative<Committed>(result));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause].load() - pauses_before, 0u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load() - reissues_before, K);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConflictPause] - pauses_before, 0u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue] - reissues_before, K);
     ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K));
     for (size_t i = 0; i < clock.sleeps.size(); ++i)
         EXPECT_LE(clock.sleeps[i], std::min<uint64_t>(5000, 200ull << i)) << "reissue " << i;
@@ -2242,7 +2242,7 @@ namespace
 DB::S3::PocoHTTPClientConfiguration networkFailureClientConfiguration()
 {
     DB::RemoteHostFilter remote_host_filter;
-    return DB::S3::ClientFactory::instance().createClientConfiguration(
+    auto configuration = DB::S3::ClientFactory::instance().createClientConfiguration(
         "some-region",
         remote_host_filter,
         /* s3_max_redirects = */ 100,
@@ -2253,6 +2253,9 @@ DB::S3::PocoHTTPClientConfiguration networkFailureClientConfiguration()
         /* for_disk_s3 = */ false,
         /* opt_disk_name = */ {},
         /* request_throttler = */ {});
+    /// The client is built directly, bypassing ClientFactory::create(), which normally fills retryStrategy.
+    configuration.retryStrategy = std::make_shared<DB::S3::Client::RetryStrategy>(configuration.retry_strategy);
+    return configuration;
 }
 
 /// A client whose `PutObject` always fails with a `NETWORK_CONNECTION` `AWSError` carrying `text`
@@ -2335,8 +2338,8 @@ TEST(CASRequestsConnectHint, HintedFailuresReissueWithoutARead)
     backend->failNextWriteWith("k", connectHint());
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load();
-    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load();
+    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint];
+    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue];
 
     WriteResult result = op.create("k", "v", Retry::standard());
     const auto * committed = std::get_if<Committed>(&result);
@@ -2348,8 +2351,8 @@ TEST(CASRequestsConnectHint, HintedFailuresReissueWithoutARead)
     ASSERT_EQ(clock.sleeps.size(), 2u);
     EXPECT_EQ(clock.sleeps[0], 50u);                    /// the flat pause, twice
     EXPECT_EQ(clock.sleeps[1], 50u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 2u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load() - reissues_before, 2u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint] - hints_before, 2u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue] - reissues_before, 2u);
 }
 
 TEST(CASRequestsConnectHint, ReissueMeetsPreconditionAndAdoptsOwnBytes)
@@ -2445,7 +2448,7 @@ TEST(CASRequestsConnectHint, OnceKeepsOneWriteAndOneRead)
     backend->failNextWriteWith("k", connectHint());
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load();
+    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint];
     WriteResult result = op.create("k", "v", Retry::once());
     const auto * gave_up = std::get_if<GaveUp>(&result);
     ASSERT_NE(gave_up, nullptr);
@@ -2455,7 +2458,7 @@ TEST(CASRequestsConnectHint, OnceKeepsOneWriteAndOneRead)
     EXPECT_TRUE(clock.sleeps.empty());
     /// The counter is "hint seen", recorded at classification: `Retry::once` never acts on it, but the
     /// attempt's transport error still named a failed connection.
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint] - hints_before, 1u);
 }
 
 TEST(CASRequestsConnectHint, EarlierAmbiguityStillSettlesByRead)
@@ -2525,7 +2528,7 @@ TEST(CASRequestsConnectHint, RefusalAfterAnEarlierAmbiguitySettlesByRead)
     });
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load();
+    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint];
     WriteResult result = op.create("k", "v", Retry::standard());
     const auto * committed = std::get_if<Committed>(&result);
     ASSERT_NE(committed, nullptr);
@@ -2540,7 +2543,7 @@ TEST(CASRequestsConnectHint, RefusalAfterAnEarlierAmbiguitySettlesByRead)
     EXPECT_TRUE(refusal_fired_on_second_attempt);
     /// The refusal classification wins outright: a definite refusal is never a hint, so the counter
     /// must not move even though the exception's code and text also match `isConnectFailureHint`.
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 0u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint] - hints_before, 0u);
 }
 
 /// A single exception can ALSO be both refreshable-credential-class (`isRefreshableCredentialError`
@@ -2557,7 +2560,7 @@ TEST(CASRequestsConnectHint, RefreshedCredentialTextDoesNotDoubleCountTheHint)
         Aws::S3::S3Errors::NETWORK_CONNECTION, "ExpiredToken")));
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load();
+    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint];
 
     WriteResult result = op.create("k", "v", Retry::standard());
     const auto * committed = std::get_if<Committed>(&result);
@@ -2568,7 +2571,7 @@ TEST(CASRequestsConnectHint, RefreshedCredentialTextDoesNotDoubleCountTheHint)
     EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
     /// The refresh -- not the hint's flat pause -- drove the reissue, so the hint counter must not move
     /// even though the exception's code and text also match `isConnectFailureHint`.
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 0u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint] - hints_before, 0u);
 }
 
 /// The counter's ambiguity-precedence twin: the credential-owned reissue above requires
@@ -2596,7 +2599,7 @@ TEST(CASRequestsConnectHint, CredentialRefreshAfterAnEarlierAmbiguityStillCounts
     });
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load();
+    const auto hints_before = ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint];
 
     WriteResult result = op.create("k", "v", Retry::standard());
     const auto * committed = std::get_if<Committed>(&result);
@@ -2612,7 +2615,7 @@ TEST(CASRequestsConnectHint, CredentialRefreshAfterAnEarlierAmbiguityStillCounts
     EXPECT_TRUE(hint_fired_on_second_attempt);
     /// The hint mechanism, not a credential-owned reissue, actually resent this attempt, so the counter
     /// counts it even though the exception's name also matches the refreshable-credential class.
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint].load() - hints_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestConnectFailureHint] - hints_before, 1u);
 }
 
 TEST(CASRequestsConnectHint, GatesRefuseTheReissue)
@@ -2885,11 +2888,11 @@ TEST(CASRequestsFuse, ReadUnderOnceCountsTheFuseWithoutReissuing)
     backend->failNextReadWith("k", fuseTimeout());
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const auto fuses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load();
+    const auto fuses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse];
     expectThrowsCode(DB::ErrorCodes::S3_ERROR, [&] { (void)op.read("k", Retry::once()); });
     EXPECT_EQ(backend->getTotal(), 1u) << "Retry::once performs no second attempt";
     EXPECT_TRUE(clock.sleeps.empty());
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load() - fuses_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse] - fuses_before, 1u);
 }
 
 /// The fuse counter's credential-refresh twin of `CASRequestsConnectHint.RefreshedCredentialTextDoesNotDoubleCountTheHint`:
@@ -2905,7 +2908,7 @@ TEST(CASRequestsFuse, RefreshedCredentialTextDoesNotDoubleCountTheFuse)
         Aws::S3::S3Errors::NETWORK_CONNECTION, "ExpiredToken")));
     auto requests = makeRequests(backend, clock);
     auto op = requests.admit();
-    const auto fuses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load();
+    const auto fuses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse];
 
     WriteResult result = op.create("k", "v", Retry::standard());
     const auto * committed = std::get_if<Committed>(&result);
@@ -2916,7 +2919,7 @@ TEST(CASRequestsFuse, RefreshedCredentialTextDoesNotDoubleCountTheFuse)
     EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
     /// The refresh -- not the fuse's immediate reissue -- drove the resend, so the fuse counter must not
     /// move even though the exception's code and text also match `isFirstAttemptFuseTimeout`.
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load() - fuses_before, 0u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse] - fuses_before, 0u);
 }
 
 /// The read loop's own twin of `RefreshedCredentialTextDoesNotDoubleCountTheFuse`: a first read attempt
@@ -2934,7 +2937,7 @@ TEST(CASRequestsFuse, ReadRefreshedCredentialTextDoesNotDoubleCountTheFuse)
     backend->failNextReadWith("k", std::make_exception_ptr(DB::S3Exception(
         "Poco::Exception. Code: 1000, e.code() = 0, Timeout: the socket",
         Aws::S3::S3Errors::NETWORK_CONNECTION, "ExpiredToken")));
-    const auto fuses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load();
+    const auto fuses_before = ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse];
 
     const auto seen = op.read("k", Retry::standard());
     ASSERT_TRUE(seen.has_value());
@@ -2944,7 +2947,7 @@ TEST(CASRequestsFuse, ReadRefreshedCredentialTextDoesNotDoubleCountTheFuse)
     EXPECT_TRUE(clock.sleeps.empty());
     /// The refresh -- not the fuse's immediate reissue -- drove the resend, so the fuse counter must not
     /// move even though the exception's code and text also match `isFirstAttemptFuseTimeout`.
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load() - fuses_before, 0u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse] - fuses_before, 0u);
 }
 
 #endif

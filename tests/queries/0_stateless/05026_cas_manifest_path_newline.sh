@@ -45,7 +45,10 @@ ${CLICKHOUSE_CLIENT} --query "SELECT v, count() FROM ${TABLE} GROUP BY v ORDER B
     SETTINGS optimize_use_projections = 1, force_optimize_projection = 1;"
 
 # No manifest body without a committed owner: the successful `INSERT` left nothing orphaned, and on the
-# broken tree the failed one did -- that object wedged every later collection round.
+# broken tree the failed one did -- that object wedged every later collection round. `MergeTree` commits the
+# temporary part before renaming it, so the rename republishes the ref and leaves the `tmp_insert_` manifest
+# to a collection round: run one first.
+${CLICKHOUSE_CLIENT} --query "SYSTEM CAS GC RUN '${DISK_NAME}'" > /dev/null
 ${CLICKHOUSE_CLIENT} --query "SYSTEM CAS FSCK '${DISK_NAME}'" --format TSVWithNames \
     | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
                   { print "unreachable", $col["unreachable"]; print "dangling", $col["dangling"] }'

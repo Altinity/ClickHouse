@@ -74,7 +74,7 @@ CasHotKeys::Decide appendTicket(int ticket)
 
 uint64_t counter(ProfileEvents::Event event)
 {
-    return ProfileEvents::global_counters[event].load();
+    return ProfileEvents::global_counters[event];
 }
 
 /// A one-shot gate a write hook parks on: the first write of the key waits here until the test

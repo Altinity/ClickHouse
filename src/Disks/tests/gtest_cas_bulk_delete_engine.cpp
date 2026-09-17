@@ -51,12 +51,12 @@ TEST(CASBulkDeleteEngine, AFailedAttemptReissuesTheWholeChunkAndAlreadyDeletedKe
         ASSERT_EQ(op.remove(keys[0].str(), h->etag, Retry::once()), Removal::Removed);
     }
     backend->failNextBulkRemoveWith(std::make_exception_ptr(Poco::TimeoutException("injected")));
-    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load();
+    const auto reissues_before = ProfileEvents::global_counters[ProfileEvents::CASRequestReissue];
 
     op.removeManyWriteOnce(keys, Retry::standard());
 
     EXPECT_EQ(backend->bulkRemoveCalls(), 2u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue].load() - reissues_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestReissue] - reissues_before, 1u);
     for (const WriteOnceKey & key : keys)
         EXPECT_FALSE(op.head(key.str(), Retry::once()).has_value()) << key.str();
 }

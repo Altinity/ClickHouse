@@ -326,9 +326,9 @@ TEST(CASGCRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
 
     backend->resetCounts();
     const uint64_t fold_builds_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];
     ASSERT_FALSE(gc.runRegularRound().deferred);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - fold_builds_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt] - fold_builds_before, 1u);
     EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u)
         << "the hot walk must enumerate the stream tree exactly once";
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
@@ -353,9 +353,9 @@ TEST(CASGCRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
     phases.clear();
     backend->resetCounts();
     const uint64_t defer_builds_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];
     ASSERT_TRUE(gc.runRegularRound().deferred);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - defer_builds_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt] - defer_builds_before, 1u);
     EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u)
         << "a deferred round still builds exactly one complete hot walk plan";
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
@@ -429,13 +429,13 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     Gc gc(store, kGc);
     gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
     const uint64_t plans_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];
 
     const RoundReport report = gc.runRegularRound();
 
     ASSERT_TRUE(report.acquired_lease);
     ASSERT_TRUE(report.deferred);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - plans_before, 1u)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt] - plans_before, 1u)
         << "DEFER still constructs its one immutable hot walk plan, never a second janitor-derived plan";
     EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u);
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)

@@ -2238,6 +2238,8 @@ void ServerSettings::checkUnknownSettings(const Poco::Util::AbstractConfiguratio
         "distributed_cache_log",
         "distributed_cache_server_log",
         "instrumentation_trace_log",
+        "cas_log",
+        "cas_gc_log",
         "default_system_log_flush_policy",
         "create_union_system_log_tables",
         /// Legacy system log section names that older releases (or cloud deployments) read but the

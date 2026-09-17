@@ -311,7 +311,7 @@ struct Client : DB::S3::Client
     static DB::S3::PocoHTTPClientConfiguration GetClientConfiguration()
     {
         DB::RemoteHostFilter remote_host_filter;
-        return DB::S3::ClientFactory::instance().createClientConfiguration(
+        auto configuration = DB::S3::ClientFactory::instance().createClientConfiguration(
             "some-region",
             remote_host_filter,
             /* s3_max_redirects = */ 100,
@@ -322,6 +322,9 @@ struct Client : DB::S3::Client
             /* for_disk_s3 = */ false,
             /* opt_disk_name = */ {},
             /* request_throttler = */ {});
+        /// The client is built directly, bypassing ClientFactory::create(), which normally fills retryStrategy.
+        configuration.retryStrategy = std::make_shared<DB::S3::Client::RetryStrategy>(configuration.retry_strategy);
+        return configuration;
     }
 
     void setInjectionModel(std::shared_ptr<MockS3::InjectionModel> injections_)

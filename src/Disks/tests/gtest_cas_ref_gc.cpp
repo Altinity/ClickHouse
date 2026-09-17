@@ -915,12 +915,12 @@ TEST(CASRefGcCleanupAuthority, RebirthDuringAChunkDeletesOnlyTheOldLifesKeys)
                 janitor_deleted = it->second;
     });
     using ProfileEvents::global_counters;
-    const auto ref_cleanup_deleted_before = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
+    const auto ref_cleanup_deleted_before = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted];
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     ASSERT_TRUE(ref_cleanup_suppressed.has_value()) << "the ref_object_cleanup phase row never fired";
     EXPECT_EQ(*ref_cleanup_suppressed, 0u)
         << "round two must actually run destructive work, not merely leave everything alone because it was suppressed";
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load(), ref_cleanup_deleted_before)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted], ref_cleanup_deleted_before)
         << "cleanupRefObjects' own plan/cohort must delete NOTHING this round: the old life is not in it "
            "(no catalog entry names it) and the reborn life's own checkpoint-named log is not yet deletable";
     ASSERT_TRUE(janitor_deleted.has_value()) << "the namespace_cleanup phase row never fired";
@@ -1048,7 +1048,7 @@ TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
     /// supported"; the fallback's per-key calls that follow are not armed and succeed.
     backend->failNextBulkRemoveWith(std::make_exception_ptr(
         DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "no batch delete")));
-    const auto cleaned_before = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
+    const auto cleaned_before = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted];
 
     OperationForTest op(*backend);
     Gc gc(store, kGc);
@@ -1058,7 +1058,7 @@ TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
         EXPECT_FALSE((*op).head(layout.refLogKey(life, id), Retry::once()).has_value());
     for (const RefTxnId & id : plan.deletable_snapshots)
         EXPECT_FALSE((*op).head(layout.refSnapshotKey(life, id), Retry::once()).has_value());
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load() - cleaned_before, cohort_size)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted] - cleaned_before, cohort_size)
         << "the budget/profile-event accounting counts objects, unaffected by the fallback";
     /// 1 failed bulk attempt + one request per key in the cohort.
     EXPECT_EQ(backend->bulkRemoveCalls(), 1 + cohort_size);
@@ -1070,11 +1070,11 @@ TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
 TEST(CASRefGc, RefIntakeIncrementsObservabilityCounters)
 {
     using ProfileEvents::global_counters;
-    const auto list_pages_before = global_counters[ProfileEvents::CASRefGlobalListPages].load();
-    const auto log_gets_before   = global_counters[ProfileEvents::CASRefLogBodyGets].load();
-    const auto mf_gets_before    = global_counters[ProfileEvents::CASRefManifestBodyFoldGets].load();
-    const auto edges_before      = global_counters[ProfileEvents::CASRefEmittedEdges].load();
-    const auto cleaned_before    = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
+    const auto list_pages_before = global_counters[ProfileEvents::CASRefGlobalListPages];
+    const auto log_gets_before   = global_counters[ProfileEvents::CASRefLogBodyGets];
+    const auto mf_gets_before    = global_counters[ProfileEvents::CASRefManifestBodyFoldGets];
+    const auto edges_before      = global_counters[ProfileEvents::CASRefEmittedEdges];
+    const auto cleaned_before    = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted];
 
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -1101,11 +1101,11 @@ TEST(CASRefGc, RefIntakeIncrementsObservabilityCounters)
     Gc gc(store, kGc);
     runToFixpoint(store, gc);
 
-    EXPECT_GT(global_counters[ProfileEvents::CASRefGlobalListPages].load(), list_pages_before);
-    EXPECT_GT(global_counters[ProfileEvents::CASRefLogBodyGets].load(), log_gets_before);
-    EXPECT_GT(global_counters[ProfileEvents::CASRefManifestBodyFoldGets].load(), mf_gets_before);
-    EXPECT_GT(global_counters[ProfileEvents::CASRefEmittedEdges].load(), edges_before);
-    EXPECT_GT(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load(), cleaned_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefGlobalListPages], list_pages_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefLogBodyGets], log_gets_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefManifestBodyFoldGets], mf_gets_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefEmittedEdges], edges_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted], cleaned_before);
 }
 
 /// Task 13 e2e (in-process regression twin of the rustfs integration test): the whole snapshot+log

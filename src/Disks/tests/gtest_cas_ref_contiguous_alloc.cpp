@@ -493,9 +493,9 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     const RootNamespace ns{"srv1/contig_survivor"};
     ASSERT_EQ(publishRef(survivor, ns, "ref_1", 1), (RefTxnId{survivor->writerEpoch(), 1}));
     const uint64_t skipped_before
-        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant];
     const uint64_t violations_before
-        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation];
 
     /// The prefix is cleared and the pool recreated underneath the still-running survivor.
     ASSERT_GT(eraseKeysContaining(*backend, ""), 0u);
@@ -512,7 +512,7 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     EXPECT_FALSE(survivor->mayMutate())
         << "a survivor whose slot was reclaimed must be fenced closed by its own failing renewal, not "
            "left writing into the new pool";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant],
               skipped_before + 1)
         << "the conclusive foreign-successor observation must be counted when deposition is detected";
     EXPECT_NE(messageOfThrow([&] { publishRef(survivor, ns, "ref_2", 2); }), String())
@@ -530,14 +530,14 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     const auto successor_slot_before = (*teardown_op).read(survivor_mount_key, Retry::once());
     ASSERT_TRUE(successor_slot_before.has_value());
     const uint64_t skipped_after_deposition
-        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant];
 
     survivor.reset();
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant],
               skipped_after_deposition)
         << "terminal teardown must not count the already-observed successor twice";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation],
               violations_before)
         << "and must NOT report an exclusivity violation: this is a failover, not a broken guarantee";
     const auto successor_slot_after = (*teardown_op).read(survivor_mount_key, Retry::once());

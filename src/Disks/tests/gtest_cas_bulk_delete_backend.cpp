@@ -126,17 +126,17 @@ TEST(CASBulkDeleteBackend, InstrumentedCountsOneRequestAndOneDeletePerKeyClass)
     const WriteOnceKey log = kLayout.writeOnceRefLogKey(life, RefTxnId{1, 1});
     ASSERT_TRUE(std::holds_alternative<Committed>(op.create(log.str(), "log", Retry::once())));
 
-    const auto requests_before = ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests].load();
-    const auto manifest_before = ProfileEvents::global_counters[ProfileEvents::CASManifestDelete].load();
-    const auto root_before = ProfileEvents::global_counters[ProfileEvents::CASRootDelete].load();
+    const auto requests_before = ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests];
+    const auto manifest_before = ProfileEvents::global_counters[ProfileEvents::CASManifestDelete];
+    const auto root_before = ProfileEvents::global_counters[ProfileEvents::CASRootDelete];
 
     std::vector<WriteOnceKey> batch = keys.present;
     batch.push_back(log);
     op.removeManyWriteOnce(batch, Retry::once());
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests].load() - requests_before, 1u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASManifestDelete].load() - manifest_before, 3u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRootDelete].load() - root_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBulkDeleteRequests] - requests_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASManifestDelete] - manifest_before, 3u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRootDelete] - root_before, 1u);
 }
 
 #if USE_AWS_S3

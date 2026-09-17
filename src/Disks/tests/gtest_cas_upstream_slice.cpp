@@ -272,7 +272,7 @@ public:
         /// max_retries is deliberately nonzero: it is the disk client's own attempt loop, and the
         /// only thing that distinguishes it from the single-attempt clone. The two slow-down flags
         /// are off so that loop spins without waiting out a real backoff.
-        return DB::S3::ClientFactory::instance().createClientConfiguration(
+        auto configuration = DB::S3::ClientFactory::instance().createClientConfiguration(
             "some-region",
             remote_host_filter,
             /* s3_max_redirects = */ 100,
@@ -283,6 +283,9 @@ public:
             /* for_disk_s3 = */ false,
             /* opt_disk_name = */ {},
             /* request_throttler = */ {});
+        /// The client is built directly, bypassing ClientFactory::create(), which normally fills retryStrategy.
+        configuration.retryStrategy = std::make_shared<DB::S3::Client::RetryStrategy>(configuration.retry_strategy);
+        return configuration;
     }
 
     void script(std::vector<ScriptedGetObjectStep> steps) const

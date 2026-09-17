@@ -2041,7 +2041,7 @@ TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     seedObject(op, layout.gcStateKey(), encodeGcState(state));
 
     const uint64_t signals_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals];
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(removing.ns, life_id);
     const String unreadable_ref_log_key = layout.refLogKey(life, RefTxnId{5, 6});
     const uint64_t append_writes_before = backend->writes(unreadable_ref_log_key);
@@ -2051,7 +2051,7 @@ TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     Gc restarted_process(store, gc_id);
     EXPECT_TRUE(restarted_process.runRegularRound().acquired_lease);
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals].load() - signals_before, 2u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals] - signals_before, 2u);
     EXPECT_EQ(backend->writes(unreadable_ref_log_key), append_writes_before)
         << "the diagnostic cannot append the unreadable ref log";
     const String captured = log_capture.captured();
@@ -2086,11 +2086,11 @@ TEST(CASGCRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePla
         .coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{9, 9}}});
 
     const uint64_t events_before =
-        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load();
+        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives];
     const RefPlan plan = tests::buildRefWalkPlanForTest(scan, cut);
 
     EXPECT_EQ(
-        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load() - events_before,
+        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives] - events_before,
         1u);
     EXPECT_EQ(plan.droppedParentRows(), 1u);
     EXPECT_EQ(plan.size(), 1u);
@@ -2182,7 +2182,7 @@ struct PoolAndExternal
 
 uint64_t eventCount(ProfileEvents::Event event)
 {
-    return ProfileEvents::global_counters[event].load();
+    return ProfileEvents::global_counters[event];
 }
 
 }

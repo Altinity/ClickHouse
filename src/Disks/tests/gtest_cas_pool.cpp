@@ -1711,10 +1711,10 @@ TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)
     EXPECT_FALSE(invalid_store->tryRemountOnce()) << "a foreign owner is never taken over at remount";
 
     const uint64_t violations_before
-        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation];
     invalid_store.reset();   /// must not abort, must not terminate
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation],
               violations_before + 1)
         << "the release must report the broken single-writer guarantee rather than dying on it";
     const auto occupant_after = readObj(*foreign_backend, foreign_mount_key);
@@ -2170,9 +2170,9 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
     ASSERT_TRUE(std::holds_alternative<Committed>(
         (*successor_op).replace(key, encodeMountLease(successor), ours->etag, Retry::standard())));
     const uint64_t skipped_before
-        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant];
     const uint64_t violations_before
-        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation];
 
     int failure_code = 0;
     String failure_message;
@@ -2204,7 +2204,7 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
     EXPECT_NE(failure_message.find("held by a foreign server"), String::npos) << failure_message;
     EXPECT_FALSE(runtime.mayMutate());
     EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::TransientNotLive);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant],
               skipped_before + 1);
     const auto failed = std::find_if(events.begin(), events.end(), [](const CasEvent & event)
     {
@@ -2220,14 +2220,14 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
     const uint64_t gets_before_teardown = backend->getCount(key);
     const uint64_t writes_before_teardown = backend->putOverwriteCount(key);
     const uint64_t skipped_before_teardown
-        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant];
     runtime.finishTeardown(true);
     EXPECT_EQ(backend->headCount(key), heads_before_teardown);
     EXPECT_EQ(backend->getCount(key), gets_before_teardown);
     EXPECT_EQ(backend->putOverwriteCount(key), writes_before_teardown);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant],
               skipped_before_teardown);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(), violations_before);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation], violations_before);
     const auto successor_after_teardown = readObj(*backend, key);
     ASSERT_TRUE(successor_after_teardown.has_value());
     EXPECT_EQ(successor_after_teardown->bytes, successor_before_teardown->bytes);
@@ -3150,13 +3150,13 @@ TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
 
     using ProfileEvents::global_counters;
-    const auto sealed_before = global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load();
+    const auto sealed_before = global_counters[ProfileEvents::CASRefRecoveryEpochSealed];
 
     /// ns2's FIRST recovery under this incarnation happens now, at epoch 3 -- strictly after both
     /// remounts. Its only data is at epoch 1, so epochs 1 and 2 are both dead for it.
     EXPECT_EQ(store->listRefs(ns2).size(), 1u);
 
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load(), sealed_before + 2)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 2)
         << "both dead epochs must be closed -- the chain link is what a later reader needs to tell an "
            "EMPTY epoch from a LOST one, and that is independent of how each mount ended";
     EXPECT_TRUE(readObj(*backend, layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{1, 2})).has_value())
@@ -3879,7 +3879,7 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
     runtime.armMountFence(uuid, 1, anchor + 1000);
     backend->barrier = &renewal_barrier;
     backend->fault = RuntimeRenewBackend::Fault::BlockThenDelegate;
-    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost];
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
     renewal_barrier.waitUntilArrived();
     runtime.tripMountLost();
@@ -3889,7 +3889,7 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
     EXPECT_EQ(remount_calls.load(), 1u);
     EXPECT_EQ(fresh_epochs.load(), 1u);
     EXPECT_EQ(runtime.remountRequestedGenerationForTest(), 1u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost], lost_before + 1);
     remount_barrier.release();
     runtime.stopBackgroundWorkers();
     runtime.finishTeardown(false);
@@ -4522,17 +4522,17 @@ TEST(CASPoolRemount, WholeChainResultsAreNumberedAndStepLabelled)
 
     store->tripMountLost();
     backend->failNextRead(store->layout().poolMetaKey());
-    const uint64_t attempts_before = ProfileEvents::global_counters[ProfileEvents::CASRemountAttempts].load();
-    const uint64_t succeeded_before = ProfileEvents::global_counters[ProfileEvents::CASRemountSucceeded].load();
-    const uint64_t failed_before = ProfileEvents::global_counters[ProfileEvents::CASRemountFailed].load();
+    const uint64_t attempts_before = ProfileEvents::global_counters[ProfileEvents::CASRemountAttempts];
+    const uint64_t succeeded_before = ProfileEvents::global_counters[ProfileEvents::CASRemountSucceeded];
+    const uint64_t failed_before = ProfileEvents::global_counters[ProfileEvents::CASRemountFailed];
     EXPECT_FALSE(store->tryRemountOnce());
 
     fenceOutMount(*backend, store->layout().mountKey("test"));
     EXPECT_TRUE(store->tryRemountOnce());
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountAttempts].load(), attempts_before + 2);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountSucceeded].load(), succeeded_before + 1);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountFailed].load(), failed_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountAttempts], attempts_before + 2);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountSucceeded], succeeded_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountFailed], failed_before + 1);
 
     const std::vector<CasEvent> observed_events = events->snapshot();
     std::vector<CasEvent> remounts;
@@ -4627,7 +4627,7 @@ TEST(CASPoolRemount, LeaseLossHasOneOperationalOwner)
         .pool_prefix = "lease-loss-owner",
         .server_root_id = "test",
     });
-    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost];
 
     store->tripMountLost();
     store->tripMountLost();
@@ -4636,7 +4636,7 @@ TEST(CASPoolRemount, LeaseLossHasOneOperationalOwner)
     store->beginShutdownForTest();
     store->tripMountLost();
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost], lost_before + 1);
 }
 
 TEST(CASPoolRemount, LiveForgetDoesNotCountOperationalLeaseLoss)
@@ -4647,12 +4647,12 @@ TEST(CASPoolRemount, LiveForgetDoesNotCountOperationalLeaseLoss)
         .server_root_id = "test",
     });
     ASSERT_EQ(store->lifecycle(), PoolLifecycle::Live);
-    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost];
 
     store->forgetDisk([] {}, "deliberate test decommission");
 
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedForgotten);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost], lost_before)
         << "a deliberate terminal decommission is not an operational recovery generation";
 }
 
@@ -4696,8 +4696,8 @@ TEST(CASPool, ConcurrentNamespaceCreationsNeverRaceEachOtherOnTheCatalog)
     (void)pool->namespaceLife(DB::Cas::RootNamespace{"warmup"});
 
     const uint64_t writes_before = backend->writeCount(key);
-    const auto reads_before = ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts].load();
-    const auto resolves_before = ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load();
+    const auto reads_before = ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts];
+    const auto resolves_before = ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead];
     std::vector<std::thread> threads;
     for (int i = 0; i < N; ++i)
         threads.emplace_back([&, i] { (void)pool->namespaceLife(DB::Cas::RootNamespace{"ns" + std::to_string(i)}); });
@@ -4705,9 +4705,9 @@ TEST(CASPool, ConcurrentNamespaceCreationsNeverRaceEachOtherOnTheCatalog)
         t.join();
 
     EXPECT_EQ(backend->writeCount(key) - writes_before, 2u * N) << "two catalog steps per creation, each one write";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load() - resolves_before, 0u)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead] - resolves_before, 0u)
         << "no refused precondition, so no resolve read";
-    EXPECT_LE(ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts].load() - reads_before, 1u)
+    EXPECT_LE(ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts] - reads_before, 1u)
         << "at most one lane read; every later hold started from the cache";
 
     /// Another server writes the catalog between two of this pool's mutations: one extra read and one
@@ -4723,12 +4723,12 @@ TEST(CASPool, ConcurrentNamespaceCreationsNeverRaceEachOtherOnTheCatalog)
             DB::Cas::CatalogEntry{.ns = DB::Cas::RootNamespace{"zz"}, .state = DB::Cas::NsState::Live, .incarnation = UInt128{99}});
     }
     const uint64_t writes_mid = backend->writeCount(key);
-    const auto resolves_mid = ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load();
-    const auto lane_reads_mid = ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts].load();
+    const auto resolves_mid = ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead];
+    const auto lane_reads_mid = ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts];
     (void)pool->namespaceLife(DB::Cas::RootNamespace{"after"});
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load() - resolves_mid, 1u)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead] - resolves_mid, 1u)
         << "one resolve read for the external write";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts].load() - lane_reads_mid, 0u)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts] - lane_reads_mid, 0u)
         << "the next hold starts from what the resolve read saw";
     EXPECT_EQ(backend->writeCount(key) - writes_mid, 3u) << "one refused, two landed";
 }

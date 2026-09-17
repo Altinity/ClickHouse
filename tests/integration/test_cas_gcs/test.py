@@ -863,7 +863,12 @@ def test_ordinary_goog4_traffic_keeps_upstream_semantics():
         assert record["request_class"] == "ordinary_non_cas", record
         assert headers.get("authorization", "").startswith("GOOG4-HMAC-SHA256 "), record
         assert "x-goog-if-generation-match" not in headers, record
-        assert "if-match" not in headers, record
+        # Ordinary reads pin the object by its ETag (never by a generation).
+        if_match = headers.get("if-match")
+        assert if_match is None or (
+            record["method"] == "GET"
+            and if_match.strip('"') == ordinary_etag.strip('"')
+        ), record
         assert "if-none-match" not in headers, record
         assert "x-amz-copy-source" not in headers, record
         assert "x-goog-copy-source" not in headers, record

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
 #include <Disks/WriteMode.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
@@ -127,6 +128,40 @@ std::shared_ptr<VersioningObjectStorage> makeVersioningObjectStorageForTest(std:
     return std::make_shared<VersioningObjectStorage>(std::move(settings), versioned);
 }
 
+/// A `LocalObjectStorage` whose native token is the object's mtime in nanoseconds (a valid generation
+/// value), taken from the `<sec>.<nsec>_<inode>_<size>` local etag.
+class GenerationTokenObjectStorage : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const override
+    {
+        auto metadata = DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+        if (metadata)
+        {
+            String mtime = metadata->etag.substr(0, metadata->etag.find('_'));
+            std::erase(mtime, '.');
+            metadata->etag = mtime;
+        }
+        return metadata;
+    }
+};
+
+std::shared_ptr<GenerationTokenObjectStorage> makeGenerationTokenObjectStorageForTest()
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_unit_generation_token_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<GenerationTokenObjectStorage>(std::move(settings));
+}
+
 /// Captures what `ObjectStorageBackend` logs at WARNING and above, so a test can assert both that a
 /// warning was raised and that none was. Same shape as the capture in gtest_cas_settings.cpp.
 class ScopedBackendLogCapture
@@ -213,11 +248,10 @@ TEST(CASBackendGeneration, NativeHeadUsesNativeTokenMetadataApi)
 /// S3 client below, which is the only place a Native write can produce a response incarnation.
 TEST(CASBackendGeneration, StampedTokenTypeFollowsNativeKind)
 {
-    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    auto storage = makeGenerationTokenObjectStorageForTest();
     auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
     b->setNativeTokenTypeForTest(Dialect::Generation);
 
-    /// A local file's etag is its mtime in nanoseconds, which is also a valid generation value.
     const String key = DB::Cas::tests::nativeKeyUnder(storage, "p/gen/tok");
     {
         auto out = storage->writeObject(DB::StoredObject(key), DB::WriteMode::Rewrite);
@@ -407,7 +441,7 @@ public:
     static DB::S3::PocoHTTPClientConfiguration GetClientConfiguration()
     {
         DB::RemoteHostFilter remote_host_filter;
-        return DB::S3::ClientFactory::instance().createClientConfiguration(
+        auto configuration = DB::S3::ClientFactory::instance().createClientConfiguration(
             "some-region",
             remote_host_filter,
             /* s3_max_redirects = */ 100,
@@ -418,6 +452,9 @@ public:
             /* for_disk_s3 = */ false,
             /* opt_disk_name = */ {},
             /* request_throttler = */ {});
+        /// The client is built directly, bypassing ClientFactory::create(), which normally fills retryStrategy.
+        configuration.retryStrategy = std::make_shared<DB::S3::Client::RetryStrategy>(configuration.retry_strategy);
+        return configuration;
     }
 
     /// The response ETag/generation the NEXT successful PutObject returns; empty means the response

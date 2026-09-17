@@ -66,7 +66,7 @@ TEST(CASThrottlingGate, EveryUserVisibleStatementSucceedsUnderFirstPerKeyThrottl
     /// mount claim and the epoch allocation under this same throttled backend.
     auto store = DB::Cas::tests::openPoolForTest(throttled);
 
-    const auto resolve_reads_before = ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load();
+    const auto resolve_reads_before = ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead];
 
     const RootNamespace ns{"test/throttle_gate"};
 
@@ -121,7 +121,7 @@ TEST(CASThrottlingGate, EveryUserVisibleStatementSucceedsUnderFirstPerKeyThrottl
     /// Under coverage builds ProfileEvents propagate into a thread-local subtree that does not reach
     /// `global_counters`; deltas read 0 there only (see gtest_unique_key_index_cache).
 #if !WITH_COVERAGE
-    EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead].load() - resolve_reads_before, 0u)
+    EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CASRequestResolveRead] - resolve_reads_before, 0u)
         << "no throttled write was settled by a read -- the engine's ambiguity-resolution path never ran";
 #else
     (void)resolve_reads_before;

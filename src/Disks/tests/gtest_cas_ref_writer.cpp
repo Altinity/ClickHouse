@@ -2173,12 +2173,12 @@ TEST(CASRefWriteContract, PostWriteFenceLossIsCounted)
     CasRequests requests(backend, Fence::open());
     CasOperation op = requests.admit([&live] { return live; });
 
-    const auto before = global_counters[ProfileEvents::CASRequestFenceLostPostWrite].load();
+    const auto before = global_counters[ProfileEvents::CASRequestFenceLostPostWrite];
     const WriteResult result = op.create("k", "v", Retry::standard());
     const auto * gave_up = std::get_if<GaveUp>(&result);
     ASSERT_TRUE(gave_up != nullptr) << "a post-write fence loss must never be reported as committed";
     EXPECT_EQ(gave_up->why, GaveUp::Why::FenceLost);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRequestFenceLostPostWrite].load(), before + 1);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRequestFenceLostPostWrite], before + 1);
 }
 
 /// A commit surfaces the incarnation it created -- from the attempt's own response, and equally from a
@@ -2702,8 +2702,8 @@ TEST(CASRefWriterRuntimeIdentity, LatePredecessorInvalidationLeavesSuccessorAtta
 TEST(CASRefWriterSnapshotPublish, PublishIncrementsSnapshotCounters)
 {
     using ProfileEvents::global_counters;
-    const auto bytes_before = global_counters[ProfileEvents::CASRefSnapshotPutBytes].load();
-    const auto logs_before  = global_counters[ProfileEvents::CASRefSnapshotTailLogs].load();
+    const auto bytes_before = global_counters[ProfileEvents::CASRefSnapshotPutBytes];
+    const auto logs_before  = global_counters[ProfileEvents::CASRefSnapshotTailLogs];
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -2719,8 +2719,8 @@ TEST(CASRefWriterSnapshotPublish, PublishIncrementsSnapshotCounters)
 
     ASSERT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value())
         << "the threshold trigger must have published a snapshot";
-    EXPECT_GT(global_counters[ProfileEvents::CASRefSnapshotPutBytes].load(), bytes_before);
-    EXPECT_GT(global_counters[ProfileEvents::CASRefSnapshotTailLogs].load(), logs_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefSnapshotPutBytes], bytes_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefSnapshotTailLogs], logs_before);
 }
 
 /// A fresh mount that recovers a large PRE-EXISTING tail (left by a predecessor whose own thresholds
@@ -2829,12 +2829,12 @@ TEST(CASRefWriterSnapshotPublish, TriggerFiresOnCountAboveThresholdWithoutAging)
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     auto store = openPoolWithConfig(backend, config);
 
-    const auto before = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();
+    const auto before = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched];
     publishEmptyPart(store, ns, "a");   /// tail: 2
     publishEmptyPart(store, ns, "b");   /// tail: 4 > 3 -> dispatches, clock frozen throughout
     store->waitForSnapshotPublishSettleForTest(ns);
 
-    EXPECT_GT(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(), before)
+    EXPECT_GT(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched], before)
         << "the count trigger must fire without any aging, even under a frozen clock";
 }
 
@@ -3060,11 +3060,11 @@ TEST(CASRefWriterSnapshotPublish, ClampedCounterSubClampsInsteadOfUnderflowingOn
     /// A wrapped counter would read as ~UINT64_MAX, permanently latching `over_threshold` (the C4
     /// storm regression). With the huge threshold configured above, a dispatch firing here can ONLY
     /// mean the counter is corrupted -- a clamped counter of 0 never crosses it.
-    const auto dispatched_before = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();
+    const auto dispatched_before = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched];
     for (int i = 0; i < 5; ++i)
         store->resolveRef(ns, "a");
     store->waitForSnapshotPublishSettleForTest(ns);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(), dispatched_before)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched], dispatched_before)
         << "a correctly-clamped counter must never latch the threshold trigger";
 }
 
@@ -3116,13 +3116,13 @@ TEST(CASRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublis
            "this from a non-retrying policy";
     EXPECT_GT(clock->longestPause(), 0u) << "at least one of those reissues must have paced with a real backoff";
 
-    const auto dispatched_before = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();
+    const auto dispatched_before = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched];
     for (int i = 0; i < 30; ++i)
     {
         store->resolveRef(ns, "a");
         store->waitForSnapshotPublishSettleForTest(ns);
     }
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(), dispatched_before)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched], dispatched_before)
         << "reads within the backoff window must not re-dispatch a publish (the storm latch is broken)";
 }
 
@@ -3173,18 +3173,18 @@ TEST(CASRefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUn
 
     EXPECT_TRUE(successor->resolveRef(ns, "before_seal").has_value());
     successor->waitForSnapshotPublishSettleForTest(ns);
-    const auto dispatched_at_seal = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();
+    const auto dispatched_at_seal = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched];
     for (int i = 0; i < 5; ++i)
         EXPECT_TRUE(successor->resolveRef(ns, "before_seal").has_value());
     successor->waitForSnapshotPublishSettleForTest(ns);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(), dispatched_at_seal)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched], dispatched_at_seal)
         << "a recovered seal must not dispatch or re-dispatch an unpublishable snapshot candidate";
 
     /// One ordinary append transaction above the recovered seal must reopen the scheduler. `dropRef`
     /// is exactly one ordinary ref-log append, unlike `publishEmptyPart`'s two-phase part publication.
     successor->dropRef(ns, "before_seal");
     successor->waitForSnapshotPublishSettleForTest(ns);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(), dispatched_at_seal + 1)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched], dispatched_at_seal + 1)
         << "an ordinary successor above the seal must make the threshold candidate publishable again";
 }
 
@@ -3260,10 +3260,10 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     EXPECT_GT(clock->longestPause(), 0u) << "at least one of those reissues must have paced with a real backoff";
 
     /// A read within the backoff window (frozen clock) must not re-dispatch.
-    const auto d1 = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();
+    const auto d1 = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched];
     store->resolveRef(ns, "a");
     store->waitForSnapshotPublishSettleForTest(ns);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(), d1)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched], d1)
         << "a read within the backoff window must not re-dispatch";
     EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
 
@@ -3272,7 +3272,7 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     *fake_now += 2000;
     store->resolveRef(ns, "a");
     store->waitForSnapshotPublishSettleForTest(ns);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(), d1 + 1)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched], d1 + 1)
         << "after the backoff elapses exactly one retry is dispatched";
     EXPECT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value())
         << "the retry publishes a durable snapshot (freshness preserved)";
@@ -3300,13 +3300,13 @@ TEST(CASRefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
     config.snapshot_log_bytes_threshold = 1ULL << 40;
     auto store = openPoolWithConfig(backend, config);
 
-    const auto d0 = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();
+    const auto d0 = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched];
 
     /// Drive ONE successful publish: 4 entries (4 > 3).
     publishEmptyPart(store, ns, "a");
     publishEmptyPart(store, ns, "b");
     store->waitForSnapshotPublishSettleForTest(ns);
-    ASSERT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(), d0 + 1);
+    ASSERT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched], d0 + 1);
     const auto first_snap = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(first_snap.has_value());
     EXPECT_TRUE(store->newestPublishedSnapshotIdForTest(ns) == first_snap);
@@ -3316,7 +3316,7 @@ TEST(CASRefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
     /// a covered-counting trigger to 6 > 3. Must not dispatch.
     publishEmptyPart(store, ns, "c");
     store->waitForSnapshotPublishSettleForTest(ns);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(), d0 + 1)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched], d0 + 1)
         << "entries covered by the newest snapshot must not count toward the trigger";
     EXPECT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns) == first_snap);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 2u);
@@ -3325,7 +3325,7 @@ TEST(CASRefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
     /// and it covers the whole uncovered tail.
     publishEmptyPart(store, ns, "d");
     store->waitForSnapshotPublishSettleForTest(ns);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(), d0 + 2);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSnapshotPublishDispatched], d0 + 2);
     const auto second_snap = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(second_snap.has_value());
     EXPECT_TRUE(*first_snap < *second_snap);
@@ -3450,9 +3450,9 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
     /// The sweep is piggybacked on this mount's very first touch; its (uncertain) failure is INSULATED
     /// from the read (resolveRef/listRefs call `sweepStalePrecommitsForRead`, not
     /// `maybeSweepStalePrecommits` directly): the read itself still succeeds, the failure is counted.
-    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefSweepDeferred].load();
+    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefSweepDeferred];
     EXPECT_NO_THROW(successor->listRefs(ns));
-    const uint64_t deferred_after = ProfileEvents::global_counters[ProfileEvents::CASRefSweepDeferred].load();
+    const uint64_t deferred_after = ProfileEvents::global_counters[ProfileEvents::CASRefSweepDeferred];
     EXPECT_EQ(deferred_after, deferred_before + 1)
         << "the read-only caller must observe (and count) the deferred sweep failure, not throw";
     EXPECT_TRUE(successor->refLaneWedgedForTest(ns));
@@ -3592,15 +3592,15 @@ TEST(CASRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     /// FIRST trigger (read path): the sweep's removal PUT is uncertain -> the lane wedges; the read
     /// itself still succeeds and counts the deferral (existing contract) -- but the shot must NOT be
     /// consumed: the flag is re-armed for a later trigger.
-    const uint64_t deferred_before = global_counters[ProfileEvents::CASRefSweepDeferred].load();
-    const uint64_t rearmed_before = global_counters[ProfileEvents::CASRefSweepRearmed].load();
-    const uint64_t reclaimed_before = global_counters[ProfileEvents::CASRefStalePrecommitsReclaimed].load();
+    const uint64_t deferred_before = global_counters[ProfileEvents::CASRefSweepDeferred];
+    const uint64_t rearmed_before = global_counters[ProfileEvents::CASRefSweepRearmed];
+    const uint64_t reclaimed_before = global_counters[ProfileEvents::CASRefStalePrecommitsReclaimed];
     EXPECT_NO_THROW(successor->listRefs(ns));
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSweepDeferred].load(), deferred_before + 1);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSweepDeferred], deferred_before + 1);
     EXPECT_TRUE(successor->refLaneWedgedForTest(ns));
     EXPECT_TRUE(successor->needsStalePrecommitSweepForTest(ns))
         << "a failed sweep must re-arm needs_stale_precommit_sweep, not consume the once-per-mount shot";
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSweepRearmed].load(), rearmed_before + 1);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSweepRearmed], rearmed_before + 1);
     backend->disarmFaults();
     EXPECT_GT(clock->pauseCount(), 1u)
         << "the reissues must pace through the injected sleep, never a real one";
@@ -3608,7 +3608,7 @@ TEST(CASRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     /// Within the backoff window (the injected clock has not advanced) a read must NOT re-attempt --
     /// the bounded-backoff storm latch: no new deferral, flag still armed.
     EXPECT_NO_THROW(successor->listRefs(ns));
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefSweepDeferred].load(), deferred_before + 1)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefSweepDeferred], deferred_before + 1)
         << "within the backoff window the sweep must not re-attempt (PUT-storm latch)";
     EXPECT_TRUE(successor->needsStalePrecommitSweepForTest(ns));
 
@@ -3636,7 +3636,7 @@ TEST(CASRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
             reclaimed_refs.push_back(e.ref_name);
     std::sort(reclaimed_refs.begin(), reclaimed_refs.end());
     EXPECT_EQ(reclaimed_refs, (std::vector<String>{"stale_a", "stale_b", "stale_c"}));
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefStalePrecommitsReclaimed].load(), reclaimed_before + 3);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefStalePrecommitsReclaimed], reclaimed_before + 3);
 }
 
 /// Verified-clean semantics: a sweep that finds NOTHING stale clears the flag on its very first pass
@@ -3663,13 +3663,13 @@ TEST(CASRefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
         seen->push(e);
     });
 
-    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefSweepDeferred].load();
-    const uint64_t reclaimed_before = global_counters[ProfileEvents::CASRefStalePrecommitsReclaimed].load();
+    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefSweepDeferred];
+    const uint64_t reclaimed_before = global_counters[ProfileEvents::CASRefStalePrecommitsReclaimed];
     EXPECT_NO_THROW(successor->listRefs(ns));
     EXPECT_FALSE(successor->needsStalePrecommitSweepForTest(ns))
         << "a clean first pass IS the verified-clean sweep: the flag clears without any removal";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefSweepDeferred].load(), deferred_before);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefStalePrecommitsReclaimed].load(), reclaimed_before);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefSweepDeferred], deferred_before);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefStalePrecommitsReclaimed], reclaimed_before);
     const std::vector<CasEvent> observed = seen->snapshot();
     EXPECT_EQ(std::count_if(observed.begin(), observed.end(),
         [](const CasEvent & e) { return e.type == CasEventType::PrecommitReclaim; }), 0);
@@ -5411,16 +5411,16 @@ TEST(CASRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     store->setRefRecoveryRetrySleepForTest([&backend](uint64_t, const auto &) { backend->disarmFaults(); });
 
     using ProfileEvents::global_counters;
-    const auto retries_before = global_counters[ProfileEvents::CASRefRecoveryRetries].load();
-    const auto sealed_before = global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load();
+    const auto retries_before = global_counters[ProfileEvents::CASRefRecoveryRetries];
+    const auto sealed_before = global_counters[ProfileEvents::CASRefRecoveryEpochSealed];
 
     EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must succeed after retrying past the fault";
 
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries].load(), retries_before + 1);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries], retries_before + 1);
     /// TWO dead epochs (1 and 2) are closed by this walk, and a whole attempt is re-driven per transient
     /// failure -- so the seals of the epochs the failed attempt already closed are ADOPTED on the retry
     /// rather than minted again. Exactly two are minted in total.
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load(), sealed_before + 2);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 2);
 }
 
 TEST(CASRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
@@ -5458,13 +5458,13 @@ TEST(CASRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
     backend->list_fault_count = 2;
 
     using ProfileEvents::global_counters;
-    const auto retries_before = global_counters[ProfileEvents::CASRefRecoveryRetries].load();
-    const auto sealed_before = global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load();
+    const auto retries_before = global_counters[ProfileEvents::CASRefRecoveryRetries];
+    const auto sealed_before = global_counters[ProfileEvents::CASRefRecoveryEpochSealed];
 
     ASSERT_TRUE(store->namespaceFilesLifeIfReadable(ns));
     EXPECT_EQ(backend->list_fault_count, 2);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries].load(), retries_before);
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load(), sealed_before + 2)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries], retries_before);
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed], sealed_before + 2)
         << "two dead epochs (1 and 2) are closed without enumerating their stream";
 }
 
@@ -5576,13 +5576,13 @@ TEST(CASRefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
     backend->vanish_once_keys.insert(vkey);
 
     using ProfileEvents::global_counters;
-    const auto retries_before = global_counters[ProfileEvents::CASRefRecoveryRetries].load();
+    const auto retries_before = global_counters[ProfileEvents::CASRefRecoveryRetries];
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->listRefs(ns); });
 
     EXPECT_FALSE(backend->vanish_once_keys.contains(vkey))
         << "the test must reach the checkpoint-named snapshot GET, not fail on earlier fixture validation";
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries].load(), retries_before)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryRetries], retries_before)
         << "missing immutable checkpoint authority is terminal; the outer transient-retry loop must NOT re-drive it";
     EXPECT_EQ(sleep_calls->load(), 0u) << "no backoff sleep for missing immutable checkpoint authority";
 }

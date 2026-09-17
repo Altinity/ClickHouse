@@ -8,7 +8,7 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/copyData.h>
-#include <Disks/IO/WriteBufferWithFinalizeCallback.h>
+#include <Disks/IO/WriteBufferInlineOrBlob.h>
 #include <Disks/IDiskTransaction.h>
 #include <Common/thread_local_rng.h>
 #include <Common/config_version.h>
@@ -796,10 +796,10 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::tryCreateW
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "Autocommit writes are not supported for content part files on a content-addressed disk");
 
-        auto inner = writeFile(path, buf_size, mode, settings);
-        auto commit_callback = [owner](size_t) mutable { owner->commit(); };
-        return std::make_unique<WriteBufferWithFinalizeCallback>(
-            std::move(inner), std::move(commit_callback), path, /*create_blob_if_empty=*/true);
+        auto create_inner = [this, path, buf_size, mode, settings] { return writeFile(path, buf_size, mode, settings); };
+        auto commit_callback = [owner](FinalizeResult) mutable { owner->commit(); };
+        return std::make_unique<WriteBufferInlineOrBlob>(
+            path, /*max_inline_bytes=*/0, /*create_blob_if_empty=*/true, std::move(create_inner), std::move(commit_callback), buf_size);
     }
 
     /// Non-autocommit (or verbatim autocommit): pin the owning disk transaction for the returned buffer's
@@ -809,10 +809,10 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::tryCreateW
     /// `owner` (which owns this ContentAddressedTransaction by shared_ptr) keeps that `this` valid until the
     /// buffer — and so this callback — is destroyed after finalize (the lifetime guarantee now
     /// expressed generically via `owner`). No cycle: the transaction does not hold the buffer.
-    auto inner = writeFile(path, buf_size, mode, settings);
-    auto keep_alive_callback = [owner](size_t) mutable {};
-    return std::make_unique<WriteBufferWithFinalizeCallback>(
-        std::move(inner), std::move(keep_alive_callback), path, /*create_blob_if_empty=*/true);
+    auto create_inner = [this, path, buf_size, mode, settings] { return writeFile(path, buf_size, mode, settings); };
+    auto keep_alive_callback = [owner](FinalizeResult) mutable {};
+    return std::make_unique<WriteBufferInlineOrBlob>(
+        path, /*max_inline_bytes=*/0, /*create_blob_if_empty=*/true, std::move(create_inner), std::move(keep_alive_callback), buf_size);
 }
 
 std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
@@ -1831,10 +1831,10 @@ CaContentWriteBuffer::CaContentWriteBuffer(
     std::string temp_dir,
     Cas::BlobHashAlgo hash_algo,
     size_t buf_size,
-    bool use_adaptive_buffer_size,
+    bool use_adaptive_buffer_size_,
     size_t adaptive_buffer_initial_size,
     OnFinalized on_finalized_)
-    : WriteBufferFromFileBase(clampCasWriteBufferSize(use_adaptive_buffer_size ? adaptive_buffer_initial_size : buf_size), nullptr, 0)
+    : WriteBufferFromFileBase(clampCasWriteBufferSize(use_adaptive_buffer_size_ ? adaptive_buffer_initial_size : buf_size), nullptr, 0)
     , on_finalized(std::move(on_finalized_))
 {
     fs::create_directories(temp_dir);
@@ -1850,7 +1850,7 @@ CaContentWriteBuffer::CaContentWriteBuffer(
         /*mode=*/0666,
         /*existing_memory=*/nullptr,
         /*alignment=*/0,
-        use_adaptive_buffer_size,
+        use_adaptive_buffer_size_,
         clampCasWriteBufferSize(adaptive_buffer_initial_size));
     hashing = Cas::makeBlobHashingWriteBuffer(hash_algo, *sink);
 }
@@ -1861,11 +1861,11 @@ CaContentWriteBuffer::CaContentWriteBuffer(
     std::string envelope_header,
     Cas::BlobHashAlgo hash_algo,
     size_t buf_size,
-    bool use_adaptive_buffer_size,
+    bool use_adaptive_buffer_size_,
     size_t adaptive_buffer_initial_size,
     OnFinalized on_finalized_,
     std::function<void()> check_fence_before_finalize_)
-    : WriteBufferFromFileBase(clampCasWriteBufferSize(use_adaptive_buffer_size ? adaptive_buffer_initial_size : buf_size), nullptr, 0)
+    : WriteBufferFromFileBase(clampCasWriteBufferSize(use_adaptive_buffer_size_ ?adaptive_buffer_initial_size : buf_size), nullptr, 0)
     , on_finalized(std::move(on_finalized_))
     , temp_path(std::move(object_key))
     , is_s3_staging(true)

@@ -245,10 +245,10 @@ TEST(CASGCRebuild, HealthyStateRequiresForce)
 
     backend->resetCounts();
     const uint64_t plans_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];
     const RebuildReport forced = gc.rebuildBaseline(/*force*/ true);
     ASSERT_TRUE(forced.performed) << forced.refusal;
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - plans_before, 1u)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt] - plans_before, 1u)
         << "healthy FORCE REBUILD must share the same one-shot authoritative plan builder";
     EXPECT_EQ(backend->getCount(store->layout().refCatalogKey()), 2u)
         << "healthy FORCE REBUILD may read the catalog for the conclusive drain and the one post-LIST cut only";
@@ -413,12 +413,12 @@ TEST(CASGCRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
         .last_epoch_seal = std::nullopt}));
     const uint64_t catalog_cas_before = backend->putOverwriteCount(layout.refCatalogKey());
     const uint64_t plans_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];
 
     Gc gc(store, kGc);
     const RebuildReport report = gc.rebuildBaseline(/*force*/ false);
     ASSERT_TRUE(report.performed) << report.refusal;
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - plans_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt] - plans_before, 1u);
     EXPECT_EQ(backend->putOverwriteCount(layout.refCatalogKey()), catalog_cas_before);
     const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(op, layout);
     ASSERT_EQ(catalog.catalog.entries.size(), 1u);

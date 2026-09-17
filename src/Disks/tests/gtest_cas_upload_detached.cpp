@@ -216,7 +216,7 @@ TEST(CASUploadDetached, ExistingCleanHeadsAndObservesWithoutPublication)
     writeMetaClean(*backend, store->layout(), u128Of(payload), payload.size());
     auto build = precommitBuildFor(store, RootNamespace{"srv1/protocol-clean"}, "part", payload);
     backend->watch(store->layout().blobKey(ref), store->layout().blobMetaKey(ref));
-    const uint64_t avoided_before = ProfileEvents::global_counters[ProfileEvents::CASBlobBodyPutAvoided].load();
+    const uint64_t avoided_before = ProfileEvents::global_counters[ProfileEvents::CASBlobBodyPutAvoided];
 
     const BlobUploadResult result = build->uploadBlobDetached(
         BlobUploadRequest{ref, BlobSource::fromString(payload), payload.size()});
@@ -227,7 +227,7 @@ TEST(CASUploadDetached, ExistingCleanHeadsAndObservesWithoutPublication)
     EXPECT_EQ(backend->blob_heads, 1u);
     EXPECT_EQ(backend->meta_gets, 1u);
     EXPECT_EQ(backend->publish_calls, 0u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBlobBodyPutAvoided].load(), avoided_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBlobBodyPutAvoided], avoided_before + 1);
 }
 
 TEST(CASUploadDetached, ExistingBodyWithoutMetadataBackfillsWithoutPublication)
@@ -294,7 +294,7 @@ TEST(CASUploadDetached, PresentCondemnedPublishesFreshAndQueuedOldDeleteMisses)
     DB::Cas::tests::OperationForTest condemned_probe(*backend);
     const Etag condemned_token = (*condemned_probe).head(blob_key, Retry::standard())->etag;
     backend->watch(blob_key, store->layout().blobMetaKey(ref));
-    const uint64_t avoided_before = ProfileEvents::global_counters[ProfileEvents::CASBlobBodyPutAvoided].load();
+    const uint64_t avoided_before = ProfileEvents::global_counters[ProfileEvents::CASBlobBodyPutAvoided];
 
     const BlobUploadResult result = build->uploadBlobDetached(
         BlobUploadRequest{ref, BlobSource::fromString(payload), payload.size()});
@@ -304,7 +304,7 @@ TEST(CASUploadDetached, PresentCondemnedPublishesFreshAndQueuedOldDeleteMisses)
     EXPECT_EQ(backend->operations.front(), "head");
     EXPECT_EQ(backend->blob_heads, 1u);
     EXPECT_EQ(backend->publish_calls, 1u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBlobBodyPutAvoided].load(), avoided_before);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBlobBodyPutAvoided], avoided_before);
     {
         DB::Cas::tests::OperationForTest op(*backend);
         EXPECT_EQ((*op).remove(blob_key, condemned_token, Retry::once()), Removal::Mismatch);
