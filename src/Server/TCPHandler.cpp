@@ -2137,8 +2137,6 @@ void TCPHandler::processUnexpectedHello()
 void TCPHandler::sendHello()
 {
     writeVarUInt(Protocol::Server::Hello, *out);
-    /// Unconditional: the client writes its Hello first, so the server is the only side that can
-    /// advertise without already knowing what the peer is. See `docs/en/antalya/protocol.md`.
     writeStringBinary(AntalyaProtocol::appendMarker(VERSION_NAME), *out);
     writeVarUInt(VERSION_MAJOR, *out);
     writeVarUInt(VERSION_MINOR, *out);

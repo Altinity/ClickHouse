@@ -159,8 +159,7 @@ TEST(SanitizeUntrustedServerString, MaxPasswordComplexityRulesCapIsTight)
 
 TEST(SanitizeUntrustedServerString, PreservesAnAntalyaProtocolMarker)
 {
-    /// The client parses `server_name` only after sanitizing it, so the marker must pass through
-    /// byte for byte. See `Core/AntalyaProtocol.h`.
+    /// The client parses the marker only after sanitizing, so it must pass through byte for byte.
     String name = AntalyaProtocol::appendMarker("ClickHouse");
     const String before = name;
     sanitizeUntrustedServerString(name);
@@ -170,8 +169,7 @@ TEST(SanitizeUntrustedServerString, PreservesAnAntalyaProtocolMarker)
 
 TEST(SanitizeUntrustedServerString, CannotForgeAnAntalyaProtocolMarker)
 {
-    /// Control bytes are replaced, never deleted, so a hostile `server_name` cannot be collapsed
-    /// into a canonical marker. Switching the helper to deletion would break this.
+    /// Control bytes are replaced, never deleted, so a hostile name cannot collapse into a marker.
     String hostile = "ClickHouse\x01 (antalya:\x02" "1)";
     sanitizeUntrustedServerString(hostile);
     EXPECT_EQ(AntalyaProtocol::parseMarker(hostile), 0u);

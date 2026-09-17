@@ -12,7 +12,6 @@ namespace DB
 namespace AntalyaProtocol
 {
 
-/// The largest version the grammar can spell: `MAX_MARKER_DIGITS` nines.
 constexpr UInt64 MAX_VERSION = intExp10(static_cast<int>(MAX_MARKER_DIGITS)) - 1;
 
 static_assert(
@@ -46,7 +45,7 @@ UInt64 parseMarker(std::string_view name) noexcept
     }
 
     const size_t digits = close - first_digit;
-    /// One version must have exactly one spelling on the wire: no empty run, no leading zero.
+    /// Exactly one spelling per version: no empty digit run, no leading zero.
     if (digits == 0 || name[first_digit] == '0')
         return 0;
 

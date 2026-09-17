@@ -627,9 +627,6 @@ void Connection::receiveHello()
     {
         readStringBinary(server_name, *in, DBMS_MAX_HELLO_STRING_SIZE);
         sanitizeUntrustedServerString(server_name);
-
-        /// The marker is stripped here, so `server_name` reads exactly as it would coming from an
-        /// upstream server.
         server_antalya_protocol_version = AntalyaProtocol::negotiate(AntalyaProtocol::stripMarker(server_name));
         readVarUInt(server_version_major, *in);
         readVarUInt(server_version_minor, *in);

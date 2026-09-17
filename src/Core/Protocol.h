@@ -68,9 +68,7 @@ const char JWT_AUTHENTICAION_MARKER[] = " JWT AUTHENTICATION ";
 
 };
 
-/// `client_name` that `Cluster` passes to `Connection` for server-to-server connections
-/// (Distributed, `*Cluster`, swarm, parallel replicas), reaching the Hello packet as
-/// "<VERSION_NAME> server". The counterpart of `DEFAULT_CLIENT_NAME` ("client").
+/// `client_name` for server-to-server connections, the counterpart of `DEFAULT_CLIENT_NAME`.
 static constexpr std::string_view SERVER_CLIENT_NAME = "server";
 
 namespace Protocol

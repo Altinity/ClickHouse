@@ -24,15 +24,15 @@ TEST(AntalyaProtocol, ParseRejectsNonCanonicalMarkers)
         "",
         "ClickHouse server",
         "ClickHouse client",
-        "(antalya:1)",                      /// no base name, so no leading space either
-        "ClickHouse server(antalya:1)",     /// missing the separating space
-        "ClickHouse server (antalya:1",     /// unterminated
-        "ClickHouse server (antalya:)",     /// no digits
-        "ClickHouse server (antalya:0)",    /// zero is not a valid version
-        "ClickHouse server (antalya:01)",   /// leading zero is not canonical
-        "ClickHouse server (antalya:1234567890)",  /// 10 digits, above the cap
-        "ClickHouse server (antalya:1) v2",        /// marker must be the suffix
-        "ClickHouse server (ANTALYA:1)",    /// case sensitive
+        "(antalya:1)",
+        "ClickHouse server(antalya:1)",
+        "ClickHouse server (antalya:1",
+        "ClickHouse server (antalya:)",
+        "ClickHouse server (antalya:0)",
+        "ClickHouse server (antalya:01)",
+        "ClickHouse server (antalya:1234567890)",
+        "ClickHouse server (antalya:1) v2",
+        "ClickHouse server (ANTALYA:1)",
         "ClickHouse server (antalya:1x)",
         "ClickHouse server (antalya:1 )",
         "antalya:1)",
@@ -45,7 +45,6 @@ TEST(AntalyaProtocol, ParseRejectsNonCanonicalMarkers)
 
 TEST(AntalyaProtocol, ParseTakesTheTrailingMarkerWhenRepeated)
 {
-    /// The scan is anchored at the end, so a doubled marker yields the last value.
     EXPECT_EQ(parseMarker("ClickHouse server (antalya:99) (antalya:1)"), 1u);
 }
 
@@ -55,7 +54,6 @@ TEST(AntalyaProtocol, StripMarkerRemovesOnlyTheMarker)
     EXPECT_EQ(stripMarker(marked), 42u);
     EXPECT_EQ(marked, "ClickHouse server");
 
-    /// The widest marker the grammar allows, to pin the digit arithmetic at both ends.
     String widest = "ClickHouse (antalya:999999999)";
     EXPECT_EQ(stripMarker(widest), 999999999u);
     EXPECT_EQ(widest, "ClickHouse");
