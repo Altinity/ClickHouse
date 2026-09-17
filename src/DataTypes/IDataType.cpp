@@ -1,8 +1,6 @@
 #include <cstddef>
 #include <Columns/IColumn.h>
 #include <Columns/ColumnConst.h>
-#include <Columns/ColumnSparse.h>
-#include <Columns/ColumnReplicated.h>
 
 #include <Common/checkStackSize.h>
 #include <Common/Exception.h>
@@ -88,17 +86,10 @@ MutableColumnPtr IDataType::createUninitializedColumnWithSize(size_t size) const
 
 MutableColumnPtr IDataType::createColumn(const ISerialization & serialization) const
 {
-    auto kind_stack = serialization.getKindStack();
-    auto column = createColumn();
-    for (auto kind : kind_stack)
-    {
-        if (kind == ISerialization::Kind::SPARSE)
-            column = ColumnSparse::create(std::move(column));
-        else if (kind == ISerialization::Kind::REPLICATED)
-            column = ColumnReplicated::create(std::move(column), ColumnUInt8::create());
-    }
-
-    return column;
+    /// Let the serialization wrap the base column into the layout it deserializes into: ColumnSparse for the
+    /// Sparse kind, ColumnReplicated for Replicated, ColumnBLOB for Detached, and any custom wrapping such as
+    /// the ColumnConst produced by the quantized-vector codebook serialization.
+    return serialization.wrapColumnForDeserialization(createColumn());
 }
 
 MutableColumnConstPtr IDataType::createColumnConst(size_t size, const Field & field) const
@@ -199,9 +190,12 @@ std::unique_ptr<IDataType::SubstreamData> IDataType::getSubcolumnData(
                         auto tmp_subpath = subpath;
                         if (tmp_subpath[i].creator)
                         {
+                            /// Build the serialization before the type is wrapped, so that a creator
+                            /// inspecting its prev_type argument sees the type the serialization
+                            /// actually serializes. Same order as in ISerialization::createFromPath.
+                            dynamic_subcolumn_data->serialization = tmp_subpath[i].creator->create(dynamic_subcolumn_data->serialization, dynamic_subcolumn_data->type);
                             dynamic_subcolumn_data->type = tmp_subpath[i].creator->create(dynamic_subcolumn_data->type);
                             dynamic_subcolumn_data->column = tmp_subpath[i].creator->create(dynamic_subcolumn_data->column);
-                            dynamic_subcolumn_data->serialization = tmp_subpath[i].creator->create(dynamic_subcolumn_data->serialization, dynamic_subcolumn_data->type);
                         }
 
                         tmp_subpath[i].data = *dynamic_subcolumn_data;
