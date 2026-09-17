@@ -287,7 +287,9 @@ public:
         throwNotImplemented("truncate");
     }
 
-    virtual void drop(ContextPtr) { }
+    /// `delete_data` is what `StorageObjectStorage::drop` resolved from `data_lake_delete_data_on_drop`.
+    /// There is no context here: the drop runs in the background.
+    virtual void drop(bool /* delete_data */) { }
 
     virtual ObjectStorageType getObjectStorageType() const { return ObjectStorageType::None; }
 
