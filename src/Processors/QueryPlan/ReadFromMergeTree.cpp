@@ -497,15 +497,10 @@ ReadFromMergeTree::ReadFromMergeTree(
 {
     if (is_parallel_reading_from_replicas)
     {
-        if (all_ranges_callback_.has_value())
-            all_ranges_callback = all_ranges_callback_.value();
-        else
-            all_ranges_callback = context->getMergeTreeAllRangesCallback();
-
-        if (read_task_callback_.has_value())
-            read_task_callback = read_task_callback_.value();
-        else
-            read_task_callback = context->getMergeTreeReadTaskCallback();
+        /// Taken exactly as given: a read marked by `enableParallelReadingFromReplicasForSerialization`
+        /// is coordinated but carries no callbacks, because it is executed on the replicas, not here.
+        all_ranges_callback = std::move(all_ranges_callback_);
+        read_task_callback = std::move(read_task_callback_);
     }
 
     const auto & settings = context->getSettingsRef();
@@ -3765,6 +3760,11 @@ bool ReadFromMergeTree::requestReadingInOrder(size_t prefix_size, int direction,
     if (direction != 1 && query_info.isFinal())
         return false;
 
+    /// The prefix indexes this snapshot's sorting key, and a clone of its expression list is resized
+    /// to `prefix_size`, which appends null `ASTPtr` children when the prefix is longer than the key.
+    if (prefix_size > storage_snapshot->metadata->getSortingKey().column_names.size())
+        return false;
+
     /// Only a later request that WIDENS an already-established prefix (distinct/aggregation-in-order
     /// re-entering after ORDER BY) can strand a too-narrow virtual row conversion. The first,
     /// conversion-building request may legitimately be narrower than prefix_size (fixed middle key,
@@ -6577,11 +6577,10 @@ std::unique_ptr<IQueryPlanStep> ReadFromMergeTree::deserialize(Deserialization &
         num_streams,
         /*max_block_numbers_to_read*/ nullptr,
         /*merge_tree_select_result_ptr*/ nullptr,
-        /// On a replica this rebuilds the read in parallel-reading mode: the ReadFromMergeTree ctor
-        /// resolves the coordinator callbacks from ctx.context (set by TCPHandler) and the replica number
-        /// from client_info. Passing no extension keeps those resolved from the context. This path is
-        /// only reached for a plan that will actually be executed (see the ctx.skipping short-circuit
-        /// above), so the callbacks are always present.
+        /// On a replica this rebuilds the read in parallel-reading mode. Passing no extension makes
+        /// `readFromParts` take the coordinator callbacks from ctx.context (set by TCPHandler) and the
+        /// replica number from client_info. This path is only reached for a plan that will actually be
+        /// executed (see the ctx.skipping short-circuit above), so the callbacks are always present.
         enable_parallel_reading,
         /*extension*/ nullptr);
 
