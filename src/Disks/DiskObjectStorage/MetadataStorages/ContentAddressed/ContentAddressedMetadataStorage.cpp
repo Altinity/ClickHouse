@@ -1163,7 +1163,8 @@ void ContentAddressedMetadataStorage::gcStart()
     /// `start()` is a no-op if already running (idempotent) and re-enters the SAME instance after a stop --
     /// the persistent `gc` observer + `gc_id` are preserved, and leadership is re-acquired only by the next
     /// round's normal `gc/state` acquisition, never restored here. Runs outside `pointer_mutex` for symmetry
-    /// with `stop()` (it spawns threads but joins nothing, so it does not block).
+    /// with `stop()`; it normally only spawns threads, but a worker-start failure joins any worker already
+    /// started during rollback and rethrows.
     snapshot->start();
 }
 
