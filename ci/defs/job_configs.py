@@ -2,6 +2,7 @@ from praktika import Job
 from praktika.utils import Utils
 
 from ci.defs.defs import (
+    ASAN_IT_NUM_BATCHES,
     LLVM_ARTIFACTS_LIST,
     LLVM_FT_NUM_BATCHES,
     LLVM_FT_OLD_S3_DB_REPL_WASM_NUM_BATCHES,
@@ -129,6 +130,7 @@ common_ft_job_config = Job.Config(
         include_paths=[
             "./ci/jobs/functional_tests.py",
             "./ci/jobs/scripts/clickhouse_proc.py",
+            "./ci/jobs/scripts/pick_endpoint.py",
             "./ci/jobs/scripts/server_cleanup.py",
             "./ci/jobs/scripts/functional_tests_results.py",
             "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
@@ -169,6 +171,7 @@ common_stress_job_config = Job.Config(
             "./tests/queries/0_stateless/",
             "./ci/jobs/stress_job.py",
             "./ci/jobs/scripts/clickhouse_proc.py",
+            "./ci/jobs/scripts/pick_endpoint.py",
             "./ci/jobs/scripts/stress/stress.py",
             "./tests/clickhouse-test",
             "./tests/config",
@@ -972,11 +975,14 @@ class JobConfigs:
             for total_batches in (2,)
             for batch in range(1, total_batches + 1)
         ],
+        # One shard can lose worker concurrency mid-suite under MSan and
+        # overrun the shared 3.5h functional-test budget.
         *[
             Job.ParamSet(
                 parameter=f"amd_msan, WasmEdge, parallel, {batch}/{total_batches}",
                 runs_on=RunnerLabels.FUNC_TESTER_AMD,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
+                timeout=3600 * 4,
             )
             for total_batches in (8,)
             for batch in range(1, total_batches + 1)
@@ -1041,6 +1047,8 @@ class JobConfigs:
             for batch in range(1, total_batches + 1)
         ]
     )
+    # Eight batches: shard 2/4 regularly hits the 3.5h Praktika timeout on
+    # ARM ASan + Azure (e.g. runs 34863139502, 35023807366).
     functional_tests_jobs_azure = common_ft_job_config.set_allow_failure(
         True
     ).parametrize(
@@ -1050,7 +1058,7 @@ class JobConfigs:
                 runs_on=RunnerLabels.ARM_LARGE,
                 requires=[ArtifactNames.CH_ARM_ASAN_UBSAN_GH],
             )
-            for total_batches in (4,)
+            for total_batches in (8,)
             for batch in range(1, total_batches + 1)
         ],
         *[
@@ -1269,7 +1277,8 @@ class JobConfigs:
             requires=[ArtifactNames.DEB_AMD_RELEASE],
         ),
     )
-    # why it's master only?
+    # Despite the name, only release_branches.py uses these.
+    # `ASAN_IT_NUM_BATCHES` explains the batch count; keep it in step with the flavor below.
     integration_test_asan_master_jobs = common_integration_test_job_config.parametrize(
         *[
             Job.ParamSet(
@@ -1277,7 +1286,7 @@ class JobConfigs:
                 runs_on=RunnerLabels.AMD_MEDIUM,
                 requires=[ArtifactNames.CH_AMD_ASAN_UBSAN_GH],
             )
-            for total_batches in (6,)
+            for total_batches in (ASAN_IT_NUM_BATCHES,)
             for batch in range(1, total_batches + 1)
         ]
     )
@@ -1288,7 +1297,7 @@ class JobConfigs:
                 runs_on=RunnerLabels.AMD_MEDIUM,
                 requires=[ArtifactNames.CH_AMD_ASAN_UBSAN_GH],
             )
-            for total_batches in (8,)
+            for total_batches in (ASAN_IT_NUM_BATCHES,)
             for batch in range(1, total_batches + 1)
         ],
         *[
@@ -1994,7 +2003,7 @@ class JobConfigs:
 
     sign_macos_binary_jobs = Job.Config(
         name=JobNames.SIGN_MACOS,
-        runs_on=RunnerLabels.STYLE_CHECK_AMD,
+        runs_on=RunnerLabels.RELEASE_RUNNER,
         command="python3 ./ci/jobs/sign_macos_binary.py --build-type {PARAMETER}",
         run_in_docker="altinityinfra/utils+--network=host+root",
         timeout=3600,
