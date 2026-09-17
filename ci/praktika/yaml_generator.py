@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from typing import List
 
 from . import Artifact, Job, Workflow
@@ -154,7 +155,7 @@ jobs:
       data: ${{{{ steps.run.outputs.DATA }}}}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{{{ env.CHECKOUT_REF }}}}
 {JOB_ADDONS}
@@ -180,7 +181,7 @@ jobs:
           else
             python3 -m praktika run '{JOB_NAME}' --workflow "{WORKFLOW_NAME}" --ci |& tee {TEMP_DIR}/job.log
           fi
-{UPLOADS_GITHUB}\
+{UPLOADS_GITHUB}{FAILURE_REPORT_UPLOAD}\
 """
 
         TEMPLATE_SETUP_ENV_SECRETS = """\
@@ -211,7 +212,7 @@ jobs:
 
         TEMPLATE_PY_INSTALL = """
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: {PYTHON_VERSION}
 """
@@ -227,22 +228,41 @@ jobs:
 
         TEMPLATE_GH_UPLOAD = """
       - name: Upload artifact {NAME}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: {NAME}
           path: {PATH}
 """
 
+        TEMPLATE_GH_UPLOAD_FAILURE_REPORT = """
+      - name: Upload failure report artifact
+        if: failure()
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: failure-{JOB_NAME_NORMALIZED}
+          path: |
+            ci/tmp/result_*.json
+            ci/tmp/test_result.txt
+            ci/tmp/pytest*.jsonl
+            ci/tmp/gtest.json
+            ci/tmp/logs.tar.gz
+            ci/tmp/configs.tar.gz
+            ci/tmp/output_dir/**
+          if-no-files-found: ignore
+          retention-days: 14
+"""
+
         TEMPLATE_GH_DOWNLOAD = """
       - name: Download artifact {NAME}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: {NAME}
           path: {PATH}
 """
 
         TEMPLATE_IF_EXPRESSION = """
-    if: ${{{{ !failure() && !cancelled() && !contains(fromJson(needs.{WORKFLOW_CONFIG_JOB_NAME}.outputs.data).cache_success_base64, '{JOB_NAME_BASE64}') }}}}\
+    if: ${{{{ !failure() && !cancelled() && needs.{WORKFLOW_CONFIG_JOB_NAME}.result != 'skipped' && !contains(fromJson(needs.{WORKFLOW_CONFIG_JOB_NAME}.outputs.data).cache_success_base64, '{JOB_NAME_BASE64}') }}}}\
 """
 
         TEMPLATE_IF_EXPRESSION_SKIPPED_OR_SUCCESS = """
@@ -250,7 +270,7 @@ jobs:
 """
 
         TEMPLATE_IF_EXPRESSION_NOT_CANCELLED = """
-    if: ${{ !cancelled() }}\
+    if: ${{ !cancelled() && needs.config_workflow.result != 'skipped' }}\
 """
 
     def __init__(self):
@@ -313,7 +333,8 @@ class PullRequestPushYamlGen:
             for artifact in job.artifacts_gh_provides:
                 uploads_github.append(
                     YamlGenerator.Templates.TEMPLATE_GH_UPLOAD.format(
-                        NAME=artifact.name, PATH=artifact.path
+                        NAME=artifact.name,
+                        PATH=os.path.relpath(artifact.path, os.getcwd()),
                     )
                 )
             downloads_github = []
@@ -329,13 +350,21 @@ class PullRequestPushYamlGen:
             )
 
             if_expression = ""
+            # NOTE (strtgbb): cache skip if is also used for PR-config job filtering
             if (
-                self.workflow_config.config.enable_cache
+                (
+                    self.workflow_config.config.enable_cache
+                    or self.workflow_config.name == "Community PR"
+                )
                 and job_name_normalized != config_job_name_normalized
             ):
                 if_expression = YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION.format(
                     WORKFLOW_CONFIG_JOB_NAME=config_job_name_normalized,
                     JOB_NAME_BASE64=Utils.to_base64(job_name),
+                )
+            elif self.workflow_config.if_condition:
+                if_expression = (
+                    f"\n    if: ${{{{ {self.workflow_config.if_condition} }}}}"
                 )
             if job.run_unless_cancelled:
                 if_expression = (
@@ -371,6 +400,14 @@ class PullRequestPushYamlGen:
                     )
                 )
 
+            failure_report_upload = ""
+            if self.workflow_config.name == "Community PR":
+                failure_report_upload = (
+                    YamlGenerator.Templates.TEMPLATE_GH_UPLOAD_FAILURE_REPORT.format(
+                        JOB_NAME_NORMALIZED=job_name_normalized
+                    )
+                )
+
             job_item = YamlGenerator.Templates.TEMPLATE_JOB_0.format(
                 JOB_NAME_NORMALIZED=job_name_normalized,
                 IF_EXPRESSION=if_expression,
@@ -386,6 +423,7 @@ class PullRequestPushYamlGen:
                 JOB_ADDONS="".join(job_addons),
                 DOWNLOADS_GITHUB="\n".join(downloads_github),
                 UPLOADS_GITHUB="\n".join(uploads_github),
+                FAILURE_REPORT_UPLOAD=failure_report_upload,
                 RUN_LOG=Settings.RUN_LOG,
                 PYTHON=Settings.PYTHON_INTERPRETER,
                 WORKFLOW_STATUS_FILE=Settings.WORKFLOW_STATUS_FILE,
@@ -438,8 +476,8 @@ class PullRequestPushYamlGen:
                 "EVENT": self.workflow_config.event,
                 "GH_TOKEN_PERMISSIONS": (
                     YamlGenerator.Templates.TEMPLATE_GH_TOKEN_PERMISSIONS
-                    # if not Settings.USE_CUSTOM_GH_AUTH
-                    # else ""
+                    if self.parser.config.secrets
+                    else ""
                 ),
                 "TAGS": f"\n    tags: [{tags_formatted}]" if tags_formatted else "",
             }
@@ -490,7 +528,13 @@ class PullRequestPushYamlGen:
                     VAR_NAME=secret.name
                 )
         format_kwargs["ENV_SECRETS"] = GH_VAR_ENVS + SECRET_ENVS
-        format_kwargs["ENV_SECRETS"] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
+        if self.parser.config.secrets:
+            # Only add global env if there are secrets in workflow config
+            format_kwargs[
+                "ENV_SECRETS"
+            ] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
+        else:
+            format_kwargs["ENV_SECRETS"] += "  GH_TOKEN: ${{{{ github.token }}}}\n"
 
         template_1 = base_template.strip().format(
             NAME=self.workflow_config.name,
