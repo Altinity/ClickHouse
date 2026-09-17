@@ -69,6 +69,7 @@ class AltinityJobConfigs:
         runs_on=RunnerLabels.STYLE_CHECK_AMD,
         command="python3 ./ci/jobs/source_upload.py",
         timeout=3600,
+        needs_submodules=True,
     )
     # Stateless tests with a content-addressed disk as the default MergeTree storage.
     cas_functional_tests_jobs = common_ft_job_config.parametrize(

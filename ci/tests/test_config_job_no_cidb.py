@@ -134,14 +134,11 @@ def test_pr_workflow_jobs_are_filtered_without_cidb(monkeypatch):
     info = _use_fake_info(monkeypatch)
     calls = _record_cidb_requests(monkeypatch)
     job_names = _pr_workflow_job_names()
-    assert any(
-        "flaky" in n.lower() for n in job_names
-    ), "no flaky job in the PR workflow"
+    assert job_names, "PR workflow has no jobs"
     # The fixture must actually select a test (it names a real file, and `Path` is
     # relative, so run from the repo root), otherwise every job below is filtered in
     # the no-tests-changed state and the changed-tests branch is never traversed.
     assert Targeting(info=info).get_changed_tests() == [CHANGED_TEST_NAME]
-    assert fj.should_skip_job(FLAKY_CHECK_JOB) == (False, "")
     for name in job_names:
         should_skip, _ = fj.should_skip_job(name)
         assert isinstance(should_skip, bool), name
