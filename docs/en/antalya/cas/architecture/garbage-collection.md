@@ -11,7 +11,10 @@ doc_type: 'reference'
 
 ## GC model {#gc-model}
 
-`GC` is the only place in `CAS` that ever deletes a blob body or a manifest body. It runs as a
+`GC` is the only place in `CAS` that ever deletes a blob body, and the only reachability-driven
+deleter of manifest bodies (a writer may exact-delete its own never-precommitted staged manifests
+when it abandons a transaction, and `SYSTEM CAS DROP POOL MEMBER` sweeps a dead member's manifest
+debris; neither consults in-degree). It runs as a
 background, lease-paced loop per mount (`Gc::runRegularRound`, `Gc/CasGc.cpp`), folding ref-log
 history into blob in-degree, condemning what reaches zero, and deleting only after that
 condemnation has survived a full extra round. Each call to `Gc::runRegularRound` is one round
@@ -40,33 +43,35 @@ follower or a deferred round execution returns before that commit.
 | # | Phase (`GcPhaseTimer` name) | Runs on | What it does |
 |---|---|---|---|
 | 1 | `lease` | always | Create, renew, observe or steal the lease inside `gc/state`. The only phase a `NotALeader` round emits |
-| 2 | `pre_fold_ref_drain` | always | Resolve catalog `Removing` rows whose cleanup evidence the adopted parent already sealed; drop the completed ones before defer or new fold work |
-| 3 | `heartbeat_floor` | always | One `LIST` of `gc/server-roots/`, one `GET` per mount slot, fence-out `PUT` for any mount whose write-token has held stable past the threshold |
-| 4 | `defer_decision` | always | One full `LIST` of `cas/ns/stream/`, build the catalog-keyed ref walk plan; decide `DEFER` (nothing changed, no graduation due) or continue to a full fold |
+| 2 | `pre_fold_ref_drain` | leader | Resolve catalog `Removing` rows whose cleanup evidence the adopted parent already sealed; drop the completed ones before defer or new fold work |
+| 3 | `heartbeat_floor` | leader | One `LIST` of `gc/server-roots/`, one `GET` per mount slot, fence-out `PUT` for any mount whose write-token has held stable past the threshold |
+| 4 | `defer_decision` | leader | One full `LIST` of `cas/ns/stream/`, build the catalog-keyed ref walk plan; decide `DEFER` (fewer changed rows than the fold threshold, no graduation due, defer limit not reached) or continue to a full fold |
 | 5 | `parent_seal_read` | fold | Capture the parent fold seal's run references before the fold mutates the in-memory generation/attempt |
 | 6 | `fold_ref_group` | fold | Regroup the one `LIST` from phase 4 into per-namespace listings — no I/O, the keys are already in hand |
 | 7 | `fold_seal_read` | fold | `GET` and decode the adopted fold seal that anchors this fold's coverage |
 | 8 | `fold_ref_intake` | fold | `GET` every new ref-log record and every referenced manifest, extracting blob source edges |
 | 9 | `fold_reduce` | fold | Merge prior edges, new deltas and the parent's condemned rows: spare, condemn, graduate or redelete each candidate; compute `suppress_destructive` |
 | 10 | `fold_seal_write` | fold | Write the new fold seal once, write-once deterministic, adopting a byte-identical replay instead of rewriting it |
-| 11 | `pending_deletes` | fold | The single content-delete site: exact-token delete of every entry a *previous* round marked `delete_pending`, plus the outcome-log writes |
+| 11 | `pending_deletes` | fold | The single blob-body delete site: exact-token delete of entries a *previous* round marked `delete_pending`, up to the redelete budget, plus the outcome-log writes |
 | 12 | `meta_pool_wait` | fold | Drain the bounded pool of async `.meta` condemn-marker writes queued during the fold |
 | 13 | `round_commit` | fold | Retention-prune old generations, then publish the single `gc/state` `CAS` that adopts the whole round |
-| 14 | `handoff_reclaim` | post-`CAS` | Reclaim a generation a ref moved off during this round, before the ordinary wholesale prune would reach it |
+| 14 | `handoff_reclaim` | post-`CAS` | Reclaim a generation a ref moved off during this round, which the ordinary retention prune already skipped and will not revisit |
 | 15 | `manifest_deletes` | post-`CAS` | Delete manifest bodies whose owner-removal minus-one edge the `CAS` in phase 13 just adopted |
-| 16 | `namespace_cleanup` | fold; suppressed on `DEFER` | One bounded page of the perpetual namespace janitor, reclaiming dead-life debris |
+| 16 | `namespace_cleanup` | leader; suppressed on `DEFER` | One bounded page of the perpetual namespace janitor, reclaiming dead-life debris |
 | 17 | `ref_object_cleanup` | post-`CAS` | Prune ref logs and snapshots once both fold coverage and a live snapshot make them safe to delete |
 | 18 | `orphan_sweep` | post-`CAS` | Exact-token deletion for the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep), after phase 13 adopted each candidate's blob-source retirements and the cursor |
 
-Phases 5 through 18 run only when phase 4 decides to fold. A `DEFER` verdict is not a bare no-op:
-it still runs one bounded namespace-janitor page with `suppress_destructive = true` — cursor
-progress and diagnostics only, no deletes — and then returns, publishing no fold artifact and no
-commit `CAS`. Its lease `CAS` may already have created or renewed the lease in phase 1:
+Phases 2 through 4 run on every leader round; a follower returns after phase 1. Phases 5–15 and
+17–18 run only when phase 4 decides to fold; phase 16 runs after phase 15 on a fold and right after
+phase 4 on a `DEFER`. A `DEFER` verdict is therefore not a bare no-op: it still runs one bounded
+namespace-janitor page with `suppress_destructive = true` — listing and classification only, no
+deletes and no cursor advance — and then returns, publishing no fold artifact and no commit `CAS`.
+Its lease `CAS` may already have created or renewed the lease in phase 1:
 
 ```mermaid
 flowchart LR
-    D4{"4 defer_decision"} -->|"nothing changed, no graduation due"| DEF["DEFER: one suppressed<br/>namespace-janitor page, then return"]
-    D4 -->|"changed shards, or graduation due"| FOLD["phases 5 through 18: full fold and round commit"]
+    D4{"4 defer_decision"} -->|"below the fold threshold,<br/>no graduation due"| DEF["DEFER: one suppressed<br/>namespace-janitor page, then return"]
+    D4 -->|"changed namespace rows, or graduation due"| FOLD["phases 5 through 18: full fold and round commit"]
 ```
 
 Orderings that are load-bearing:
@@ -83,9 +88,14 @@ perpetual namespace janitor, so they cannot desynchronize. Under suppression the
 graduation, no redelete, and no ref or namespace deletion; condemnation and sparing continue,
 because both are non-destructive.
 
-**Fail-closed aborts.** A throw before the commit `CAS` means nothing is adopted: unapplied transactions,
-a cursor/apply mismatch, a missing adopted seal, a table with a snapshot but no surviving log and
-no cursor, a non-total condemned summary, and an observed delete marker (bucket versioning is on).
+**Fail-closed aborts.** A throw before the commit `CAS` means no successor state is adopted (the
+exact-token deletes and prune that earlier phases justified from *previously* published state may
+already have run; they are idempotent): unapplied transactions and a cursor/apply mismatch (both
+`CORRUPTED_DATA`, checked between phases 9 and 10), a missing adopted seal, a table with a snapshot
+but no surviving log and no cursor, a non-total condemned summary (all `CORRUPTED_DATA`), and an
+observed delete marker (`LOGICAL_ERROR`: bucket versioning is on). The per-phase "fails the round
+if" lists below name the protocol checks; an uncaught backend or decode exception fails the round
+execution too.
 
 ## Phase 1 — lease {#phase-1-lease}
 
@@ -95,10 +105,11 @@ that object.
 
 - **Runs on:** always — the only phase a `NotALeader` round emits
 - **Reads:** `gc/state`; `gc/hb` (only when another GC owns the lease)
-- **Writes / deletes:** one `CAS` on `gc/state` (acquire, renew or steal); no deletes
+- **Writes / deletes:** one successful `CAS` on `gc/state` (acquire, renew or steal), with one
+  bounded re-read-and-retry after a conflict; no deletes
 - **Safety:** the lease is *work de-duplication, not mutual exclusion* — see below
-- **Fails the round if:** this `Gc` instance saw `gc/state` before and it has since disappeared
-  (`CORRUPTED_DATA`)
+- **Fails the round if:** this `Gc` instance saw `gc/state` before and it has since disappeared, or
+  the `gc_shards` in `gc/state` disagrees with the pool's `_pool_meta` value (both `CORRUPTED_DATA`)
 - **Observability:** phase row `lease`; metrics `acquired`, `steal_allowed`
 
 ```mermaid
@@ -160,14 +171,14 @@ evidence from the fold running now.
   *same* `incarnation` and that life has no coverage hold; each write is token-guarded and bracketed
   by two `gc/state` re-reads
 - **Fails the round if:** `gc/state` points at a missing parent seal (`CORRUPTED_DATA`); leadership
-  changes mid-drain (retry-later — a write already sent stays safe, authorized by the parent seal
-  and the catalog token)
+  changes mid-drain (`NETWORK_ERROR`, an `Aborted` finish that the next round retries — a write
+  already sent stays safe, authorized by the parent seal and the catalog token)
 - **Observability:** phase row `pre_fold_ref_drain`; metric `deleted` (rows removed)
 
-On a fresh pool (`snap_generation = 0`) phase 2 is a logged no-op; it can first remove a row only in
-a leader round *after* some earlier fold committed a generation. Phase 3 starts only once every
-parent-authorized removal has been resolved — phase 2 is a barrier. Phase 16 later deletes the old
-namespace's physical `_log` / `_snap` / `_ckpt` / `_files` objects.
+On a fresh pool (`snap_generation = 0`) phase 2 is a no-op that still emits its phase row; it can
+first remove a row only in a leader round *after* some earlier fold committed a generation. Phase 3
+starts only once every parent-authorized removal has been resolved — phase 2 is a barrier. Phase 16
+later deletes the old namespace's physical `_log` / `_snap` / `_ckpt` / `_files` objects.
 
 ## Phase 3 — heartbeat floor {#phase-3-heartbeat-floor}
 
@@ -180,7 +191,8 @@ token of each `mount` object.
 - **Writes / deletes:** a token-guarded `PUT` per fenced mount (`gc_fenced = true`, `seq + 1`); no
   deletes
 - **Safety:** fences only after this leader's *own* monotonic clock has watched the mount's
-  write-token hold unchanged for `mount_lease_ttl_ms + 5% + mount_renew_period`; the write is
+  write-token hold unchanged for `cas_mount_lease_ttl_ms + 5% + cas_mount_renew_period_ms`
+  (defaults 30 s and 10 s; every server sharing the pool must run the same values); the write is
   guarded by that exact token. A completed fence-out stays valid even if this GC later loses
   leadership. `expires_at_ms` (another host's wall clock) is never trusted.
 - **Fails the round if:** nothing — per-mount `PUT` conflicts are re-classified (up to four), then
@@ -205,8 +217,8 @@ phase 5 and builds a new in-degree snapshot; `defer` skips generation constructi
 - **Safety:** a missing / invalid / incomplete adopted seal cannot produce a quiet defer — the
   graduation check refuses to defer and the plan read surfaces the bad state
 - **Fails the round if:** the plan-building seal read reports an invalid adopted seal
-- **Observability:** phase row `defer_decision`; metrics `changed_shards`, `namespaces_seen`,
-  `ref_log_keys_listed`
+- **Observability:** phase row `defer_decision`; metrics `changed_shards` (despite the name, the
+  number of changed namespace-life rows), `namespaces_seen`, `ref_log_keys_listed`
 
 The plan has one row per admitted catalog life (`Live` or `Removing`; `Creating` excluded), joining
 its last folded position, its greatest listed `_log` position, and the keys later phases need. A row
@@ -214,9 +226,9 @@ is *changed* when the listed `_log` is newer than the last folded position. Phas
 if any of: changed rows ≥ `gc_fold_threshold` (default 1); an adopted shard has a published pending
 delete; an adopted shard has a condemned blob due to graduate
 (`oldest_nonpending_condemn_round < round + 1`); or `gc_fold_max_defer_rounds` (default 8)
-consecutive defers were reached. On `defer`, one suppressed namespace-janitor page runs (phase 16's
-work) and the round returns without a commit. On `fold`, phase 6 reuses this plan and the same
-`LIST`.
+consecutive defers were reached. Both thresholds are internal `PoolConfig` fields, not disk
+settings. On `defer`, one suppressed namespace-janitor page runs (phase 16's work) and the round
+returns without a commit. On `fold`, phase 6 reuses this plan and the same `LIST`.
 
 ## Phase 5 — parent seal read {#phase-5-parent-seal-read}
 
@@ -238,8 +250,8 @@ generation the parent referenced but the new seal no longer does. Empty on a fre
 
 ## Phase 6 — fold ref group {#phase-6-fold-ref-group}
 
-Regroups phase 4's flat key list into per-namespace listings and freezes the catalog cut. No
-backend I/O.
+Regroups phase 4's flat key list into per-namespace listings against the catalog cut phase 4 read.
+No backend I/O.
 
 - **Runs on:** fold path only
 - **Reads:** nothing (keys already in memory from phase 4)
@@ -261,14 +273,17 @@ Reads the adopted fold seal that anchors this fold's coverage and sets up the fo
 prior coverage view, the mutable successor, the new generation / attempt numbers).
 
 - **Runs on:** fold path only
-- **Reads:** the adopted fold seal, twice at the same address — one read anchors coverage, one loads
-  the parent run references (see [per-phase backend cost](#per-phase-cost))
+- **Reads:** the adopted fold seal, twice at the same address. The first read serves only the
+  missing-seal check below; the second supplies the parent run references and the condemned
+  summary. The second is a known redundant `GET` (same generation, attempt and bytes), counted by
+  the `redundant_reads` metric and left in place until a follow-up removes it (see
+  [per-phase backend cost](#per-phase-cost))
 - **Writes / deletes:** none
 - **Safety:** read-only
 - **Fails the round if:** the adopted seal is absent while `snap_generation > 0` — `gc/state` points
   at a missing artifact; the fix is `SYSTEM CAS GC REBUILD` (`CORRUPTED_DATA`)
 - **Observability:** phase row `fold_seal_read`; metrics `parent_ref_lives`, `parent_runs`,
-  `parent_cleanup_evidence`
+  `parent_cleanup_evidence`, `redundant_reads`
 
 The fold's writes land under `attempt = lease.seq` and `new_generation = snap_generation + 1`, while
 reads of the parent generation keep using `snap_attempt`. On a fresh pool both reads return nothing
@@ -277,7 +292,7 @@ and the fold starts from an empty baseline.
 ## Phase 8 — fold ref intake {#phase-8-fold-ref-intake}
 
 Reads every new ref-log record of every walkable namespace and the manifests it references,
-extracting blob source edges. The heaviest read phase of a folding round.
+extracting blob source edges. Usually the dominant read phase on ref-log- and manifest-heavy rounds.
 
 - **Runs on:** fold path only
 - **Reads:** one `_ckpt` per namespace in the universe; `_log` records from each namespace's cursor
@@ -292,7 +307,8 @@ extracting blob source edges. The heaviest read phase of a folding round.
 - **Fails the round if** (`CORRUPTED_DATA`): a manifest body whose ref / namespace disagrees with its
   key; a table with no sealed cursor whose baseline logs are already gone; a sealed cursor that does
   not close the run the walk produced; a `RemoveNamespace` for a namespace absent from the catalog
-  cut; `logs_accounted ≠ logs_applied`
+  cut. (`logs_accounted` and `logs_applied` are counted here but compared only after phase 9 — see
+  there)
 - **Observability:** phase row `fold_ref_intake`; metrics `frontier_namespaces` / `frontier_proven`
   (universe and its proven part), `tables_held`, `logs_accounted` / `logs_applied`; per-cause hold
   reasons are in [GC anomalies](#gc-anomalies)
@@ -304,6 +320,15 @@ suppressed. **The walk** starts at `cursor + 1` (or the checkpoint's genesis pos
 the committed ceiling; a namespace is *proven* only when it reaches the ceiling exactly. Any other
 exit — a hold, an unusable checkpoint, the probe budget — leaves it unproven, which feeds phase 9's
 gate.
+
+**Read-ahead.** The checkpoint, walk-position, manifest-edge and (in phase 9) zero-candidate `HEAD`
+reads are hinted ahead onto a bounded pool (`cas_gc_read_concurrency`, default 16; `1` disables) and
+taken by the walk at exactly the sites, and in exactly the order, of the inline reads, so every
+decision, decode, counter and event stays on the round thread and the phase's semantic metrics do
+not depend on the setting. Two things do: a request a worker performed lands on that worker's
+`ProfileEvents`, not the phase row's, and a hinted key the walk never takes (a namespace held below
+its lookahead, a `HEAD` candidate that kept an edge) is a wasted request. `CASGCReadAheadHit`,
+`CASGCReadAheadMiss` and `CASGCReadAheadWasted` on the row report the read-ahead's own behaviour.
 
 ## Phase 9 — fold reduce {#phase-9-fold-reduce}
 
@@ -319,18 +344,24 @@ Recomputes the per-shard in-degree snapshot and computes the round's single dest
 - **Safety:** `suppress_destructive` is computed once here and read at every destructive site of the
   round; a *pure carry* shard (no delta, no orphan retirement, no parent condemned rows) copies the
   parent's run references with zero run I/O
-- **Fails the round if** (`CORRUPTED_DATA`, before the phase 10 write): a folded transaction whose
-  deltas reached no shard reducer; a sealed cursor count that disagrees with the walk
+- **Fails the round if** (`CORRUPTED_DATA`): during orphan-sweep planning, a candidate manifest whose
+  decoded identity disagrees with its key. Two invariant checks then run after this phase's timer
+  and before phase 10's: `transactions_unapplied` (a folded transaction whose deltas reached no
+  shard reducer) and `logs_accounted ≠ logs_applied` (the round sealed coverage over more logs than
+  it fully folded); either is `CORRUPTED_DATA`
 - **Observability:** phase row `fold_reduce`; metrics `shards_reduced` / `shards_pure_carry`,
   `condemned`, `graduated`, `spared`, `redelete_pending`, `suppress_destructive`, `frontier_complete`
 
 `suppress_destructive` is true on any recorded anomaly, any hold in the seal about to be made
-durable, or an incomplete frontier (`frontier_proven ≠ frontier_namespaces`, or a universe neither
-non-empty nor proved empty). Under it the round still condemns, spares and carries, but graduation,
-redelete, orphan-sweep planning, retention prune and post-`CAS` deletes do not run. Per candidate
-the merge decides one of: `spare`, `condemn`, `supersede`, `graduate` (→ `delete_pending`, deleted
-by phase 11 of a later round), `redelete` (→ deleted by phase 11 now), `carry`. `GcRoundWorkBudget`
-independently caps graduations and redeletes per round; the overflow is carried unchanged.
+durable, or an incomplete frontier (`frontier_proven ≠ frontier_namespaces`, a universe neither
+non-empty nor proved empty, or a universe policy that is not authoritative). Under it the round
+still condemns, spares and carries, but graduation, redelete, orphan-sweep planning and cursor
+adoption, retention prune, hand-off reclaim, manifest deletes, namespace cleanup and ref-object
+cleanup do not run. Per candidate the merge decides one of: `spare`, `condemn`, `supersede`,
+`graduate` (→ `delete_pending`, deleted by phase 11 of a later round), `redelete` (→ deleted by
+phase 11 now), `carry`. The round-wide `GcRoundWorkBudget` (one struct, fed from the
+`cas_gc_round_*` settings, `0` = unbounded) caps graduations and redeletes here and the other
+destructive work families in phases 11, 13, 14, 17 and 18; the overflow is carried unchanged.
 
 ## Phase 10 — fold seal write {#phase-10-fold-seal-write}
 
@@ -352,14 +383,17 @@ memory* here and made durable only by phase 13's commit `CAS`.
 
 ## Phase 11 — pending deletes {#phase-11-pending-deletes}
 
-The round's single content-delete site, before the commit `CAS`: executes the exact-token blob
-deletes for entries a *previous* round published as `delete_pending`, and writes the forensic
+The round's single blob-body delete site, before the commit `CAS`: executes the exact-token blob
+deletes for entries a *previous* round published as `delete_pending`, up to
+`cas_gc_round_redelete_budget` per round (the excess is carried unchanged), and writes the forensic
 outcome logs.
 
 - **Runs on:** fold path only
-- **Reads:** one `HEAD` only on the token-mismatch path
-- **Writes / deletes:** `deleteExact` of each `redelete` blob body; one write-once outcome log per
-  shard with settled entries
+- **Reads:** one `HEAD` per `redelete` entry — the persisted condemned token cannot itself be a
+  precondition, so the round observes the blob first, which also settles the absent case without
+  spending a conditional delete
+- **Writes / deletes:** a `DELETE` conditional on the observed etag for each `redelete` entry whose
+  live etag matches the condemned token; one write-once outcome log per shard with settled entries
 - **Safety:** an entry is deletable only because a previously committed fold seal published it
   `delete_pending` — durable state from an earlier commit, safe at any leader staleness. Exact token
   means a stale leader cannot delete a fresh incarnation; `NotFound` and `TokenMismatch` are
@@ -369,9 +403,12 @@ outcome logs.
 - **Observability:** phase row `pending_deletes`; metrics `deleted`, `absent`, `redeleted`,
   `graduated`, `replaced`, `spared`, `outcome_logs_written`
 
-Under `suppress_destructive` the `redelete` set is empty by construction, so nothing is deleted; the
-non-destructive bookkeeping (`spared`, `graduated`, `replaced`) and the outcome logs still run. The
-`RoundReport` deletion counters are tallied from the durable outcome logs, not the local decisions.
+Under `suppress_destructive` the `redelete` set is empty by construction, so nothing is deleted, and
+there is no graduation either (would-be graduates are carried unchanged); sparing and superseding
+still happen. An outcome log is written only for a shard that collected at least one budget-admitted
+redelete or spare outcome. The `RoundReport` counters `deleted`, `absent`, `replaced` and `spared`
+are tallied from the durable outcome logs, not the local decisions; `redeleted` counts executed
+delete attempts directly.
 
 ## Phase 12 — meta pool wait {#phase-12-meta-pool-wait}
 
@@ -404,47 +441,68 @@ over `gc/state`. One phase because the prune is only safe as a pre-`CAS` action.
   later). `suppress_destructive` skips the prune entirely. The commit `CAS` uses phase 1's token, so
   a stale leader's commit is rejected.
 - **Fails the round if:** the commit `CAS` is not `Committed` — `ABORTED` ("gc/state moved during
-  the round"); the round publishes nothing
+  the round"); the round publishes nothing and finishes as `Aborted`, keeping leadership (see
+  [round outcomes](#round-outcomes))
 - **Observability:** phase row `round_commit`; metrics `generations_visited`, `pruned_through`,
   `generations_referenced`, `round`, `generation`
 
 Prune bound: keep the last `cas_gc_snapshot_generations_to_keep` generations (default 3; `0` keeps
-everything), at most 64 prefixes a round. After a `Committed` result the round is committed — an
-exception in phases 14–18 does not un-commit it. See [the one-pass commit](#gc-state) for the fold
-seal's role as the coverage record.
+everything), at most 64 prefixes a round. See [the one-pass commit](#gc-state) for the fold seal's
+role as the coverage record.
+
+### Post-commit failures {#post-commit-failures}
+
+After a `Committed` result the round is committed — an exception in phases 14–18 does not un-commit
+it. Those phases tolerate the object outcomes they name (`NotFound`, `TokenMismatch`), but only
+phase 16 is wrapped in a catch-all; a backend or decode exception in phases 14, 15, 17 or 18
+propagates, and `system.cas_gc_log` then records an `Aborted` or `Error` finish (see
+[round outcomes](#round-outcomes)) for a round whose new `gc/state` is already durable. Read such a
+row as "committed round, failed tail": the next round starts from the committed state, and what
+the tail did not delete is picked up later — by the orphan sweep for phase 15's leftovers, by
+phase 17's recomputed plan, by phase 18's next page — or, for phase 14 only, left to `cas-fsck`.
 
 ## Phase 14 — handoff reclaim {#phase-14-handoff-reclaim}
 
-First phase of the post-`CAS` tail (phases 14–18 run only after a successful commit). Wholesale-
-deletes a generation prefix that phase 13 had to skip (still referenced) but the cursor advanced
-past, now that a ref has moved off it this round.
+First phase of the post-`CAS` tail (phases 14–18 run only after a successful commit). Deletes, up to
+its own object budget, a generation prefix that the retention prune already reached and skipped
+(still referenced) while its cursor advanced past it, now that a ref has moved off it this round.
 
 - **Runs on:** post-`CAS` (fold path)
-- **Reads / writes:** one `LIST` + wholesale `DELETE` per handed-off generation prefix
+- **Reads / writes:** paginated `LIST` + one `DELETE` per listed object, per handed-off generation
+  prefix
 - **Safety:** reclaims only when the parent seal referenced the generation, the new seal does not,
   it is already behind `snap_pruned_through`, `suppress_destructive` is false, and the phase's own
   budget (separate from phase 13's) is not exhausted
-- **Fails the round if:** nothing — best-effort
+- **Fails the round if:** no protocol check of its own; a backend `LIST` / `HEAD` / `DELETE`
+  exception propagates (see [post-commit failures](#post-commit-failures))
 - **Observability:** phase row `handoff_reclaim`; metrics `generations_reclaimed`,
   `objects_reclaimed`, `suppressed`
 
 Unlike every other gated site, suppression here *loses* the reclaim rather than postponing it: the
-ref moved off this round, nothing revisits, and the prefix is left to `fsck`. A crash in this window
-leaks the same way.
+ref moved off this round, nothing revisits, and the prefix is left to `cas-fsck`. A crash in this
+window, or a budget that runs out before the prefix is fully drained, leaks the same way
+(`generations_reclaimed` counts the generation even when only part of it was deleted).
 
 ## Phase 15 — manifest deletes {#phase-15-manifest-deletes}
 
 Deletes owner-removed manifest bodies, now that phase 13's `CAS` adopted their minus-one decrements.
 
 - **Runs on:** post-`CAS` (fold path)
-- **Reads / writes:** `deleteExact` per `(manifest_id, token)` collected by phase 8's fold of `-1`
-  owner edges; `NotFound` / `TokenMismatch` tolerated
+- **Reads / writes:** batch `DELETE` of the manifest keys collected by phase 8's fold of `-1` owner
+  edges, in chunks of `cas_gc_bulk_delete_chunk_keys` (default 1000, the backend maximum). A manifest
+  key is write-once, so the delete carries no per-key precondition; an absent key is simply gone. A
+  backend without a batch-delete verb (GCS) falls back to one admitted `DELETE` per key.
 - **Safety:** each body is unreachable from any live ref (its owner-removal was folded and
   committed) and is never re-derived — the intake cursor that found the `-1` edge is now committed,
   so a folded log is never revisited. Hence the phase is unbudgeted by design and drains the whole
   set each run.
-- **Fails the round if:** nothing
-- **Observability:** phase row `manifest_deletes`; metrics `attempted`, `deleted`, `suppressed`
+- **Fails the round if:** no protocol check of its own; a chunk that exhausts its retry policy
+  throws (see [post-commit failures](#post-commit-failures)). Deletion and recording are
+  all-or-nothing per request: the chunks before the failing one are recorded, the failing chunk's
+  keys are not, and a key one of its attempts did delete shows up as already gone in the next fold
+- **Observability:** phase row `manifest_deletes`; metrics `attempted`, `accepted` (keys recorded
+  as deleted or absent), `requests`, `suppressed`; one `ManifestDelete` row per key in
+  `system.cas_log`
 
 Only a crash or `suppress_destructive` leaves an entry — it is then picked up by the orphan-manifest
 sweep (phase 18).
@@ -458,8 +516,8 @@ no longer in the catalog (dead-life debris).
   `suppress_destructive` forced on
 - **Reads:** the durable `janitor_cursor`; one `LIST` page (≤ 1000 keys) of `cas/ns/`; a fresh
   ref-catalog snapshot; `gc/state` per fence re-check
-- **Writes / deletes:** `deleteExact` per dead-life `_log` / `_snap` / `_ckpt` / `_files` object;
-  one `CAS` on the maintenance state when the page is decided
+- **Writes / deletes:** exact-token `DELETE` per dead-life `_log` / `_snap` / `_ckpt` / `_files`
+  object; one `CAS` on the maintenance state when the page is decided
 - **Safety:** each delete is under a GC fence re-check (`lease.owner` / `lease.seq`) before it and
   once at the end; the incarnation segment in every key makes an old life's objects structurally
   unreachable from a reborn same-name namespace, so a missed key can only leak storage, never expose
@@ -479,17 +537,24 @@ checkpoint-named recovery triple make them safe. Distinct from phase 16, which h
 from the catalog.
 
 - **Runs on:** post-`CAS` (fold path)
-- **Reads:** one `HEAD` per candidate; a fresh ref catalog + `gc/state` before *every* delete
-  (authority re-validation)
-- **Writes / deletes:** `deleteExact` per planned `_log` / `_snap` key; the checkpoint-named
-  snapshot is always retained
-- **Safety:** before each `deleteExact`, re-validates: ref-catalog token still equals the fold's
-  catalog cut, same row and life, unchanged GC fence. The first failure stops the whole pass. A
-  per-round `ref_cleanup` cap bounds it; on exhaustion the same candidates are recomputed next
-  round.
-- **Fails the round if:** nothing — `suppress_destructive` returns immediately (a clamp could leave
-  a covered log whose delta is not yet durable)
-- **Observability:** phase row `ref_object_cleanup`; metrics `namespaces_planned`, `suppressed`
+- **Reads:** per namespace, the checkpoint-named recovery triple (same-id `_log`, predecessor seal,
+  `_snap`) to validate deletion authority; then, before *every chunk*, a fresh ref catalog and
+  `gc/state` (authority re-validation). No `HEAD`: `_log` / `_snap` keys are write-once, there is
+  nothing to re-observe
+- **Writes / deletes:** batch `DELETE` of the planned `_log` / `_snap` keys in chunks of
+  `cas_gc_bulk_delete_chunk_keys` (one admitted `DELETE` per key on a backend without batch
+  delete); the checkpoint-named snapshot is always retained
+- **Safety:** before each chunk, re-validates: ref-catalog token still equals the fold's catalog
+  cut, same row and life, unchanged GC fence. The first failure stops the whole pass. The
+  per-round `cas_gc_round_ref_cleanup_budget` cap counts objects and cuts a chunk to what remains;
+  on exhaustion the same candidates are recomputed next round.
+- **Fails the round if:** no protocol check of its own — `suppress_destructive` returns immediately
+  (a clamp could leave a covered log whose delta is not yet durable); an authority re-validation
+  error or a namespace whose recovery triple does not validate stops the pass or skips that
+  namespace, but a chunk delete that exhausts its retry policy propagates (see
+  [post-commit failures](#post-commit-failures))
+- **Observability:** phase row `ref_object_cleanup`; metrics `namespaces_planned`, `suppressed`,
+  `trim_enabled`; `ProfileEvent` `CASRefCleanupObjectsDeleted`
 
 ## Phase 18 — orphan sweep {#phase-18-orphan-sweep}
 
@@ -497,7 +562,7 @@ The last phase: executes the [orphan-manifest sweep](/antalya/cas/architecture/m
 planned in phase 9 and adopted by phase 13's `CAS`.
 
 - **Runs on:** post-`CAS` (fold path)
-- **Reads / writes:** `deleteExact` per nomination (planning `LIST` / `GET` cost was paid in
+- **Reads / writes:** exact-token `DELETE` per nomination (planning `LIST` / `GET` cost was paid in
   phase 9); `NotFound` tolerated
 - **Safety:** phase 9 exact-read and identity-validated each candidate and computed its source-edge
   retirements; phase 13's `CAS` adopted both those retirements and the sweep cursor, so a post-`CAS`
@@ -505,8 +570,12 @@ planned in phase 9 and adopted by phase 13's `CAS`.
   closing seal is consumed and no tail record above the cursor names it; any uncertainty retains.
 - **Fails the round if:** a `TokenMismatch` — an immutable manifest identity must never change token
   (illegal ABA); stricter than every other post-`CAS` delete (`CORRUPTED_DATA`)
-- **Observability:** phase row `orphan_sweep`; metrics `deleted`, `skipped`, `undecodable`,
-  `cursor_advanced`, and `retained_*` broken down by reason
+- **Observability:** phase row `orphan_sweep`; metrics `listed`, `floor_lookups` / `floor_reads`
+  (mount-floor lookups per namespace and the reads they cost), `deleted`, `skipped`,
+  `undecodable`, `cursor_advanced`, `suppressed`, and the retained share of `skipped` by reason:
+  `retained_no_coverage`, `retained_hold`, `retained_unconsumed_seal`, `retained_tail_removal`
+  (candidates retained because the sweep's work budget ran out are reported only in the sweep's
+  retention log line, not in `phase_metrics`)
 
 Under `suppress_destructive` phase 9 planned nothing, so the nomination list is empty and the cursor
 does not move.
@@ -516,29 +585,45 @@ does not move.
 A GC round records *anomalies* and per-namespace *holds* instead of failing, unless a fail-closed
 check fires. Any anomaly or hold in the seal about to be made durable forces `suppress_destructive`
 for the whole round (phase 9); condemnation and sparing still run. A hold clears only when a later
-walk folds through the offending position. `system.cas_log` carries the audit trail, capped per
-round with each row bearing the true total.
+walk folds through the offending position. Each hold is recorded in `system.cas_log` as a
+`GcFoldClamp` event with its reason; the round's aggregate anomaly count rides the `GcFoldEnd` event
+and the `Finish` row of `system.cas_gc_log`. There are no per-anomaly rows.
 
-| Name | Phase | Meaning | Effect |
-|---|---|---|---|
-| `ref_folding_aborted` | 6 | a ref-object key under the stream prefix is unparseable | round-wide: no ref delta, no cursor advance, `suppress_destructive` |
-| `CheckpointUndecodable` / `CheckpointUnusable` | 8 | a live/removing life's `_ckpt` is undecodable, absent, or lacks `life_epoch` | the namespace folds nothing; held at `cursor + 1` if it has a sealed cursor |
-| `CheckpointFrontierEmpty` | 8 | a checkpoint carries no `committed_through` but the namespace has a nonzero sealed cursor | anomaly; namespace unproven |
-| `CommittedBelowCursor` | 8 | the sealed cursor is already above the committed ceiling | anomaly; namespace unproven |
-| `GapBelowWitness` | 8 | a committed record at or below the ceiling is missing | the namespace is held |
-| `UnconsumedSealCrossing` | 8 | an apparent epoch crossing has no consumed `EpochSeal` behind it | the namespace is held |
-| `WitnessDisappeared` | 8 | an epoch-crossing chase resolves back to the absent position | the namespace is held |
-| `ManifestBodyMissing` | 8 | a folded owner edge's manifest body is absent | the namespace is held below that record; re-read next round |
-| `frontier_unprobed_budget` | 8 | `gc_frontier_probe_budget` ran out before every hint-less namespace was walked | round-wide `suppress_destructive` |
-| `transactions_unapplied` | 9 | a folded transaction's deltas reached no shard reducer | **fails the round** (`CORRUPTED_DATA`) |
+**Durable per-namespace holds** — persisted in the fold seal under these wire names and surfaced as
+`GcFoldClamp` reasons; each holds one namespace (all phase 8):
+
+| Hold | Meaning | Effect |
+|---|---|---|
+| `gap_below_witness` | a committed record at or below the ceiling is missing | held |
+| `unconsumed_seal_crossing` | an apparent epoch crossing has no consumed `EpochSeal` behind it | held |
+| `witness_disappeared` | an epoch-crossing chase resolves back to the absent position | held |
+| `body_undecodable` | a ref-log record exists at the walk position but its body cannot be decoded | held at that position |
+| `manifest_body_missing` | a folded owner edge's manifest body is absent | held below that record; re-read next round |
+| `checkpoint_undecodable` | a live/removing life's `_ckpt` is undecodable, absent, or lacks `life_epoch` | folds nothing; held at `cursor + 1` when the life has a sealed cursor |
+
+**Per-round suppression signals** — not persisted; they show up in `phase_metrics` and force
+`suppress_destructive` for the round:
+
+| Signal | Phase | Meaning |
+|---|---|---|
+| `ref_folding_aborted` | 6 | a ref-object key under the stream prefix is unparseable: no ref delta, no cursor advance |
+| `CheckpointUnusable` | 8 | in-memory frontier state for a `_ckpt` that could not be used, recorded even when there is no cursor position to hold at |
+| `CheckpointFrontierEmpty` | 8 | a checkpoint carries no `committed_through` but the namespace has a nonzero sealed cursor: namespace unproven |
+| `CommittedBelowCursor` | 8 | the sealed cursor is already above the committed ceiling: namespace unproven |
+| `frontier_unprobed_budget` | 8 | `gc_frontier_probe_budget` ran out before every hint-less namespace was walked |
+
+**Fatal pre-seal checks** — `CORRUPTED_DATA`, evaluated after phase 9 and before phase 10:
+`transactions_unapplied` (a folded transaction's deltas reached no shard reducer) and
+`logs_accounted ≠ logs_applied` (coverage sealed over more logs than were fully folded).
 
 ## The one-pass commit {#gc-state}
 
 `<pool_prefix>/gc/state` is the durable safety and round-adoption state: `round`, `gc_shards`,
 `snap_generation`, `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, and the lease. A
 folding round publishes it with exactly one commit `CAS` in phase 13, `round_commit`; the fold
-itself performs no `CAS` of its own, and phase 1's lease `CAS` over the same object is the only
-other writer.
+itself performs no `CAS` of its own, and within a round execution phase 1's lease `CAS` over the
+same object is the only other writer. Outside the round, `SYSTEM CAS GC REBUILD` replaces the
+baseline with a `CAS` of its own.
 
 **The fold seal *is* the coverage record**: generation, parent generation, one `ref_lives` row per
 catalog-admitted opaque life (coverage plus optional cleanup evidence), references to the
@@ -559,23 +644,27 @@ size that a future delete will name. A blob merely carried from the parent run p
 full round (`condemn_round < current_round`). The heartbeat floor is liveness only and **never**
 gates graduation.
 
-**The 404 rule.** A body that is present but invalid is `CORRUPTED_DATA`, hard. A body that is
-missing is **never** a throw — the fold records and continues, and the caller decides by position:
-a precommit activation clamps as a barrier; a committed or removal fold clamps only that table.
-Prunes are likewise fail-open on 404.
+**The 404 rule for manifest edges.** When the fold reads a manifest for an owner edge, a body that is
+present but invalid (bad encoding, or a ref / namespace that disagrees with its key) is
+`CORRUPTED_DATA`, hard. A body that is missing is **never** a throw there — the fold records and
+continues, and the caller decides by position: a precommit activation clamps as a barrier; a
+committed or removal fold clamps only that table. Prunes and post-`CAS` deletes are likewise
+fail-open on 404. Other objects have their own policy: an undecodable ref-log body or checkpoint
+holds one namespace (`body_undecodable`, `checkpoint_undecodable`), an undecodable orphan-manifest
+candidate is retained and counted, and a missing adopted fold seal fails the round (phases 2 and 7).
 
 ## Condemnation and deletion {#condemn-delete}
 
 ```mermaid
 flowchart LR
     A["round n: in-degree hits zero<br/>HEAD -- exact token t"] --> B["write .meta = Condemned round n<br/>async, bounded pool, drained pre-CAS"]
-    B --> C["retired with condemn_round = n+1"]
+    B --> C["retired with condemn_round = n"]
     C --> D{"round n+1: re-verify"}
     D -->|"in-degree recovered"| S["SPARED -- recovery wins, even past the floor"]
     D -->|"still zero, confirmed durable Condemned evidence for hash and t"| G["GRADUATED -- delete_pending"]
     D -->|"still zero, evidence unconfirmed"| C2["carried unchanged, retry the marker, never throw"]
     D -->|"current token not equal to t"| SUP["SUPERSEDED -- a writer resurrected, re-condemn the CURRENT token"]
-    G --> E["round n+2, pre-CAS: deleteExact blob, t"]
+    G --> E["round n+2, pre-CAS: exact-token DELETE of blob at t"]
     E -->|"Deleted or Absent"| F["then drop the .meta"]
     E -->|TokenMismatch| H["nothing deleted -- live at a newer token, leave the .meta alone"]
 ```
@@ -584,20 +673,27 @@ The `.meta` sidecar carries **no token** — it is a per-hash hint. The exact in
 in the condemned sentinel row inside the run, together with the condemn round and two flags,
 `delete_pending` and `marker_confirmed`. `GC`'s marker is add-only: `Clean → Condemned` yes, the
 reverse never, not even when sparing — only a writer that has already displaced the body may clear
-it. Minimum two full rounds separate condemnation from deletion, and `delete_pending` is terminal —
-an entry is never un-pended.
+it. A blob whose in-degree reaches zero in round `n` is retired with `condemn_round = n`; it can
+graduate to `delete_pending` in round `n+1` at the earliest and be deleted in round `n+2`, so a
+minimum of two full rounds separate condemnation from deletion. `delete_pending` is never cleared in
+place, but it authorizes a delete only while in-degree stays zero: a fresh edge folded in a later
+round spares the entry and removes it from the retired pipeline (recovery wins, even past the
+floor).
 
 ## Sharding {#sharding}
 
-`cas_gc_shards` is fixed at first lease acquire and immutable; decoders reject `0`. A blob routes by
-the **high** 64 bits of its digest, read big-endian.
+`cas_gc_shards` is fixed at pool creation and stored in `_pool_meta`; the first lease acquire copies
+that authoritative value into `gc/state`, every later lease read throws `CORRUPTED_DATA` if the two
+disagree, and decoders reject `0`. A blob routes by the **high** 64 bits of its digest, read
+big-endian.
 
 The role split is worth internalizing: the **coordinator** — the lease holder — owns discovery,
 round visibility, the single global fence, and the generation advance, because a publish into
 *one* namespace can protect a blob owned by *any* shard, so these span the whole universe and must
 not be sharded. **Reducers** own only their disjoint shard; their run-key namespaces never
-collide, so two servers could reduce different shards concurrently and reducer work needs no
-lease.
+collide, so the design admits reducing different shards on different servers without a lease. The
+current implementation does not do that: all shard reducers run sequentially on the lease holder's
+fold thread, and the transaction-apply ledger relies on it.
 
 A shard with an empty delta bucket, no orphan-sweep retirement routed to it, and no condemned
 entries in the parent summary copies the parent's run references verbatim — zero run I/O, a "pure
@@ -606,9 +702,12 @@ carry" (see [phase 9](#phase-9-fold-reduce)). A missing parent summary entry on 
 
 ## Pruning old objects {#pruning}
 
-- **Current-life ref logs and snapshots** (phase 17) — a log is deletable only when covered by
-  both durable fold coverage and a durable live snapshot; snapshots strictly older than the newest
-  observed one are deletable. There is no batch delete; it is `HEAD` plus `deleteExact` per key.
+- **Current-life ref logs and snapshots** (phase 17) — authority comes from the namespace's
+  checkpoint-named, exact-validated recovery triple. A log is deletable only when covered by the
+  durable fold cursor and older than that checkpoint (and not the retained predecessor seal);
+  snapshots strictly older than the checkpoint-named snapshot are deletable, that snapshot itself is
+  always kept. Keys are write-once, so there is no `HEAD`: the plan is chunked, each chunk is
+  preceded by a catalog and `gc/state` re-validation and sent as one batch `DELETE`.
 - **Generations** (phase 13) — keep the last `cas_gc_snapshot_generations_to_keep` (default 3; `0`
   means keep everything, for forensics). Pruning is wholesale: `LIST` the generation prefix and
   delete everything under it, including deposed-leader debris and attempt-scoped outcome sets. A
@@ -626,36 +725,62 @@ logs:
 |---|---|
 | `LIST cas/ns/stream/` | 1 full enumeration |
 | `LIST gc/server-roots/` | 1, plus 1 `GET` per mount |
-| `GET` the adopted fold seal | 5 on the fold path (phases 4, 5, 7); phase 9 orphan planning adds one more. See [per-phase backend cost](#per-phase-cost) |
-| `GET` ref logs | 1 per new log |
-| `GET` manifests | 1 per emitted edge — no manifest-body cache within a round |
+| `GET` the adopted fold seal | 6 on the fold path of an established pool (phases 2, 4, 5, 7); phase 9 orphan planning adds one more. See [per-phase backend cost](#per-phase-cost) |
+| `GET` ref logs | 1 per new log record, plus `_ckpt` reads and epoch-crossing probes |
+| `GET` manifests | 1 per folded owner (manifest) edge — a manifest emits many blob edges but is read once per edge event; no manifest-body cache within a round |
 | `PUT` run segments | 1 per non-pure-carry shard, plus 1 fold seal |
 | `HEAD` blobs | 1 per newly condemned |
-| `DELETE` | 1 per `redelete` entry — an entry that graduated in an *earlier* round, not the current one |
+| Blob `DELETE` | 1 per `redelete` entry — an entry that graduated in an *earlier* round, not the current one — up to `cas_gc_round_redelete_budget` |
 | Successful lease `CAS gc/state` | 1 |
 | Commit `CAS gc/state` | 1 |
 
-The measured `GET` formula is exact: total `GET`s equal ref-log body `GET`s plus manifest body
-`GET`s, i.e. `1 + edges_per_log`. An idle folding round is one `LIST` sweep, `N` heartbeat `GET`s,
-one successful lease `CAS`, and one commit `CAS`. A deferred round execution is cheaper still: one
-`LIST`, three seal `GET`s, the lease `GET`/`PUT` and the heartbeat floor — no commit `CAS` at all.
+Phase 8's body reads are one ref-log `GET` per consumed record plus one manifest `GET` per owner
+edge; that is the dominant variable term, not the whole-round `GET` total, which also includes the
+state, seal, catalog, checkpoint, mount, parent-run and cleanup reads listed per phase below. An idle
+folding round is one `LIST` of `cas/ns/stream/`, the heartbeat floor (`LIST` plus `N` `GET`s), the
+seal, catalog and `gc/state` reads of phases 2, 4, 5 and 7, one successful lease `CAS`, and one
+commit `CAS`. A deferred round execution is cheaper: the same `LIST`, the heartbeat floor, phase 2's
+seal / catalog / `gc/state` reads, phase 4's two seal reads and catalog read, the lease `GET`/`CAS`,
+and one suppressed namespace-janitor page (its own `LIST` page and reads, no deletes) — no commit
+`CAS` at all.
 
-The round's work is internally self-regulated: anything a pass cannot finish is carried and retried
-by the next round's cursors, never dropped. The internal pacing knobs are deliberately not part of
-the user-facing configuration surface.
+The round's work is self-regulated: what a pass cannot finish within its budgets is carried and
+retried by the next round's cursors — with the one exception of phase 14's hand-off reclaim, which
+is one-shot and leaves its remainder to `cas-fsck`. The per-round budgets are ordinary
+`content_addressed` disk settings, documented under
+[advanced GC pacing settings](/antalya/cas/configuration#advanced-gc-pacing-settings) on the
+configuration page (`cas_gc_meta_pool_size` and `cas_gc_read_concurrency` sit in its main
+[disk-settings table](/antalya/cas/configuration#disk-settings)); `0` means unbounded for each
+budget:
 
 | Setting | Default | Bounds |
-|---|---|---|
-| `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes |
-| `cas_gc_read_concurrency` | 16 | bounded pool for the fold's read-ahead; `1` disables |
+|---|---:|---|
+| `cas_gc_round_graduation_budget` | 5000 | condemned → `delete_pending` graduations per round (phase 9) |
+| `cas_gc_round_redelete_budget` | 5000 | exact-token blob deletes per round (phase 11) |
+| `cas_gc_round_outcome_entry_budget` | 5000 | outcome-log entries per round (phase 11) |
+| `cas_gc_round_prefix_wholesale_budget` | 20000 | objects deleted by the retention prune per round (phase 13) |
+| `cas_gc_round_handoff_prefix_wholesale_budget` | 5000 | objects deleted by the hand-off reclaim per round, reserved separately (phase 14) |
+| `cas_gc_round_ref_cleanup_budget` | 5000 | covered `_log` / `_snap` deletes per round (phase 17) |
+| `cas_manifest_sweep_list_budget_keys` | 1000 | orphan-manifest sweep `LIST` budget in keys per round; `0` disables the sweep (phase 9) |
+| `cas_manifest_sweep_delete_budget_keys` | 100 | orphan-manifest sweep `DELETE` budget per round (phases 9, 18) |
+| `cas_gc_round_sweep_namespace_budget` | 20 | namespaces whose protection view the sweep may build per page (phase 9) |
+| `cas_gc_round_sweep_recovery_op_budget` | 5000 | committed-tail ref-log reads the sweep's recovery walk may spend (phase 9) |
+| `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for write-once families (phases 15, 17); `1` to `1000` |
+| `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes (phase 12) |
+| `cas_gc_read_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 9); `1` disables |
+
+The fold-batching controls `gc_fold_threshold` (default 1), `gc_fold_max_defer_rounds` (default 8)
+and `gc_frontier_probe_budget` (default unbounded) are internal `PoolConfig` fields with no disk
+setting.
 
 ## Per-phase backend cost {#per-phase-cost}
 
-Backend requests each phase issues, by key and operation. These tables track the current
-implementation and are the expansion of [what a round costs](#round-cost); the request *shapes* are
-stable, exact per-round *counts* and any token-conflict retries are not. `N` is the number of items
-the phase acts on without conflicts; `P` is the number of paginated `LIST` requests (up to 1000
-keys each).
+Backend requests each phase issues, by key and operation. These tables describe the current
+implementation and expand [what a round costs](#round-cost). Read every count as a conflict-free
+lower bound: token conflicts add re-reads and retries, backends whose `LIST` returns no token add
+one `HEAD` per key before each exact delete (phases 13, 14, 16), and recovery paths add fan-out.
+`N` is the number of items the phase acts on without conflicts; `P` is the number of paginated
+`LIST` requests (up to 1000 keys each).
 
 ### Phase 1 — lease {#cost-phase-1}
 
@@ -687,7 +812,7 @@ No requests when `snap_generation` is `0`. Otherwise, for `N` removed catalog ro
 |---|---|---:|
 | `<pool_prefix>/gc/server-roots/` | paginated `LIST` | `P` |
 | `<server_root_id>/mount` | `GET` | `M` |
-| `<server_root_id>/mount` | `CAS` | `F` |
+| `<server_root_id>/mount` | token-guarded `PUT` | `F` (a conflicting mount is re-read and re-classified, up to four times) |
 
 ### Phase 4 — defer decision {#cost-phase-4}
 
@@ -717,8 +842,9 @@ No requests. The keys are already in memory from phase 4.
 |---|---|---:|
 | adopted `fold_seal` | `GET` | 2 |
 
-No writes. On the fold path phases 4, 5 and 7 read the adopted seal 5 times in total; when phase 9
-runs orphan planning it reads the same key once more.
+No writes. The second read is the redundant one noted in [phase 7](#phase-7-fold-seal-read). On the
+fold path of an established pool, phases 2, 4, 5 and 7 read the adopted seal 6 times in total; when
+phase 9 runs orphan planning it reads the same key once more.
 
 ### Phase 8 — fold ref intake {#cost-phase-8}
 
@@ -740,9 +866,10 @@ No writes.
 | blob `.meta` | `GET` | one per graduation candidate with no in-process marker confirmation |
 | new run segments | `PUT` | one per written run |
 | `<pool_prefix>/cas/manifests/` | `LIST` | one bounded page, only when orphan planning runs |
-| manifest candidate body | `GET` | one per candidate on the page (≤ `manifest_sweep_delete_budget_keys`), only when orphan planning runs |
+| manifest candidate body | `GET` | one per nominated candidate (≤ `cas_manifest_sweep_delete_budget_keys`), through the read-ahead; keys decided from their name alone are never read; only when orphan planning runs |
 | `gc/state`, adopted `fold_seal`, catalog | `GET` | one each, only when orphan planning runs |
-| `_ckpt` and committed-tail `_log` | `GET` | per namespace on the page, only when orphan planning runs |
+| `<server_root_id>/mount` | `GET` | one memoized mount-floor lookup per namespace per page (`floor_lookups` / `floor_reads`), only when orphan planning runs |
+| `_ckpt`, checkpoint-named `_log`, predecessor seal, `_snap`, committed-tail `_log` | `GET` | per namespace on the page (the recovery triple plus the tail), only when orphan planning runs |
 
 Also schedules the async `.meta` condemn-marker writes drained by phase 12.
 
@@ -750,7 +877,7 @@ Also schedules the async `.meta` condemn-marker writes drained by phase 12.
 
 | Key | Operation | Requests |
 |---|---|---:|
-| new `fold_seal` | `PUT` | 1, or one byte-compare `GET` on a deterministic replay |
+| new `fold_seal` | `PUT` | 1 conditional `PUT`; on a deterministic replay the `PUT` fails its precondition and one byte-compare `GET` follows |
 
 No `CAS`.
 
@@ -758,10 +885,11 @@ No `CAS`.
 
 | Key | Operation | Requests |
 |---|---|---:|
-| blob body | `DELETE` | one per `redelete` entry |
-| per-shard outcome log | `PUT` | one per shard with settled entries |
+| blob body | `HEAD` | one per `redelete` entry (≤ `cas_gc_round_redelete_budget`) |
+| blob body | conditional `DELETE` | one per `redelete` entry that is present at the condemned token |
+| per-shard outcome log | `PUT` | one per shard with at least one budget-admitted redelete or spare outcome; a replay adds one byte-compare `GET` |
 
-Under `suppress_destructive`, `redelete` is empty and nothing is deleted; the outcome logs still run.
+Under `suppress_destructive`, `redelete` is empty and nothing is deleted.
 
 ### Phase 12 — meta pool wait {#cost-phase-12}
 
@@ -772,17 +900,18 @@ default 16).
 
 | Key | Operation | Requests |
 |---|---|---:|
-| pruned generation prefixes | `LIST` + wholesale `DELETE` | bounded per round |
+| pruned generation prefixes | paginated `LIST` + one `DELETE` per listed object | ≤ 64 prefixes and ≤ `cas_gc_round_prefix_wholesale_budget` objects per round |
 | `<pool_prefix>/gc/state` | `CAS` | exactly 1 |
 
 ### Phase 14 — handoff reclaim {#cost-phase-14}
 
-One `LIST` plus a wholesale `DELETE` per handed-off generation prefix, within the hand-off's own
-budget.
+Paginated `LIST` plus one `DELETE` per listed object for each handed-off generation prefix, within
+the hand-off's own budget (`cas_gc_round_handoff_prefix_wholesale_budget`).
 
 ### Phase 15 — manifest deletes {#cost-phase-15}
 
-One `DELETE` per `mf_cleanup` entry. No writes under `suppress_destructive`.
+One batch `DELETE` request per `cas_gc_bulk_delete_chunk_keys` entries of `mf_cleanup` (one
+`DELETE` per key on a backend without batch delete). No writes under `suppress_destructive`.
 
 ### Phase 16 — namespace cleanup {#cost-phase-16}
 
@@ -792,16 +921,16 @@ One `DELETE` per `mf_cleanup` entry. No writes under `suppress_destructive`.
 | `<pool_prefix>/cas/ns/` | `LIST` | one page |
 | `<pool_prefix>/cas/ref_catalog` | `GET` | 1 |
 | `<pool_prefix>/gc/state` | `GET` | one per fence check |
-| dead-life object | `DELETE` | one per object |
+| dead-life object | `DELETE` | one per object (plus one `HEAD` per object whose `LIST` entry carried no token) |
 | `<pool_prefix>/gc/maintenance_state` | `CAS` | 1 when the page is decided |
 
 ### Phase 17 — ref object cleanup {#cost-phase-17}
 
 | Key | Operation | Requests |
 |---|---|---:|
-| `_log` / `_snap` candidate | `HEAD` | one per candidate |
-| `<pool_prefix>/cas/ref_catalog` and `<pool_prefix>/gc/state` | `GET` | one each per delete (authority re-validation) |
-| `_log` / `_snap` key | `DELETE` | one per planned key |
+| checkpoint-named `_log`, predecessor seal, `_snap` | `GET` | per planned namespace (recovery-triple validation before any delete) |
+| `<pool_prefix>/cas/ref_catalog` and `<pool_prefix>/gc/state` | `GET` | one each per chunk (authority re-validation) |
+| `_log` / `_snap` keys | batch `DELETE` | one request per chunk of ≤ `cas_gc_bulk_delete_chunk_keys` keys (one per key on a backend without batch delete) |
 
 ### Phase 18 — orphan sweep {#cost-phase-18}
 
@@ -809,35 +938,52 @@ One `DELETE` per nomination. The planning `LIST` and `GET` cost is paid in phase
 
 ## Observability {#observability}
 
+### Round outcomes {#round-outcomes}
+
+A `Finish` row of `system.cas_gc_log` carries one of: `Success` (folded and committed), `Deferred`
+(phase 4 chose not to fold), `NotALeader` (returned after phase 1), `Aborted` (the round threw a
+*transient* error — `S3_ERROR`, `NETWORK_ERROR`, `TIMEOUT_EXCEEDED`, `SOCKET_TIMEOUT`, `ABORTED`,
+`MEMORY_LIMIT_EXCEEDED` — and this `Gc` keeps its leadership and heartbeat, so the next round simply
+retries), `Stopped` (a transient error while the disk was being torn down), or `Error` (any other
+error code, notably `CORRUPTED_DATA` and `LOGICAL_ERROR`; leadership is dropped). The `error_code`
+column carries the code on every non-success finish; every unrecognised code is `Error` by
+omission, never silently transient.
+
 `system.cas_gc_log` emits `Start`, `Finish` and per-`Phase` rows, correlated by `round_id` — not
-`round`, which is `0` on `Start` and does not exist at all on a not-a-leader round. Phase rows
+`round`, which is `0` on `Start` and stays `0` on a `NotALeader` finish. Phase rows
 carry no verb columns by design: per-phase operation counts ride the row's own `ProfileEvents`
 delta, so grouping by phase over an S3 event attributes the LIST/GET/PUT/DELETE budget without
-inventing schema. `phase_metrics` carries the semantic counts no counter can supply (clamped
-tables, dead precommits skipped, pure-carry shards, generations visited). `Deferred` is kept
-distinct from `Success` precisely so "folded and found nothing" is distinguishable from "never
-folded". Every `GC`-related `ProfileEvent` carries the uppercase `CAS`/`CASGC` prefix — for example
-`CASGCRetiredCondemned`, `CASGCRetiredGraduated`, `CASGCRetiredRedeleted`,
-`CASGCClampSuppressedPasses`, `CASGCHeartbeatFenceOuts`.
+inventing schema (requests performed off the round thread — the `meta_pool` writes and the fold's
+read-ahead — land on the worker's counters instead, see [phase 8](#phase-8-fold-ref-intake)).
+`phase_metrics` carries the semantic counts no counter can supply (clamped tables, dead precommits
+skipped, pure-carry shards, generations visited). `Deferred` is kept distinct from `Success`
+precisely so "folded and found nothing" is distinguishable from "never folded", and `Aborted`
+from `Error` so a flaky backend is distinguishable from a broken pool. Every `GC`-related
+`ProfileEvent` carries the uppercase `CAS`/`CASGC` prefix — for example `CASGCRetiredCondemned`,
+`CASGCRetiredGraduated`, `CASGCRetiredRedeleted`, `CASGCClampSuppressedPasses`,
+`CASGCHeartbeatFenceOuts`.
 
-Alongside it, `system.cas_log` carries the audit trail: the condemn chain, fence-outs, anomalies
-(capped per round, each carrying the true total), and manifest deletes.
+Alongside it, `system.cas_log` carries the audit trail: the condemn chain (`IndegZero`,
+`GcRetireObserve`, `BlobRetire`), fence-outs (`GcFenceOut`), per-namespace holds (`GcFoldClamp`), the
+fold summary (`GcFoldEnd`, with the aggregate anomaly count) and manifest deletes (`ManifestDelete`).
 
-`ca-fsck` distinguishes two classes that are easy to conflate: `dangling` — referenced but missing,
-data loss — versus `unreachable`/`awaiting-gc` — present, unreferenced, and
-simply waiting for graduation.
+`cas-fsck` separates `dangling` — referenced but missing, i.e. data loss — from the
+present-but-unreferenced family. The latter is reported as one `unreachable` total, broken down into
+`pending_gc` (already in the retired pipeline, deletion scheduled), `awaiting_gc` (the drop is not
+folded yet, or `GC` never ran), `unaccounted` (absent from the whole `GC` view) and pre-precommit
+manifest debris. Only `dangling` is a loss; the rest is waiting for `GC`.
 
 ## Operational surface {#operational-surface}
 
 | Command | Effect |
 |---|---|
-| `SYSTEM CAS GC RUN '<disk>'` | One synchronous round on the contacted node; only the lease holder makes progress |
-| `SYSTEM CAS GC STOP` / `SYSTEM CAS GC START` | Stop or resume future rounds on the same scheduler, preserving its identity |
-| `SYSTEM CAS GC REBUILD` (`clickhouse-disks ca-gc-rebuild`) | Fail-closed disaster-recovery path that every "GC refuses to run" error points at; deliberately over-protects — it prefers bounded leaks over risking an under-count. It cannot delete live data directly: deletions it produces still flow through the normal round's condemn, graduate, exact-token path |
-| `clickhouse-disks ca-gc-dryrun` | Opens the disk read-only, constructs a non-leader `GC`, and prints what would be deleted with a reason per entry. Write-free, resolves runs through the seal's references. Documented caveat: it does not fold new owner events, so away from quiescence it can **over-report** — the subset guarantee holds only at quiescence, and its output must never feed a real delete |
+| `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder makes progress. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
+| `SYSTEM CAS GC STOP <disk>` / `SYSTEM CAS GC START <disk>` | Stop or resume future background rounds on that disk's scheduler, preserving its identity. The disk is required |
+| `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Fail-closed disaster-recovery path for a lost or corrupt `GC` baseline — the `CORRUPTED_DATA` errors that name it in their message (missing adopted seal, snapshot without a surviving log, cursor/apply mismatch). An `ABORTED` commit conflict or a `LOGICAL_ERROR` delete marker is not a reason to rebuild. It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's condemn, graduate, exact-token path. The disk is required |
+| `clickhouse-disks cas-gc-dryrun` | Opens the disk read-only, constructs a non-leader `GC`, and prints what would be deleted with a reason per entry. Write-free, resolves runs through the seal's references. Documented caveat: it does not fold new owner events, so away from quiescence it can **over-report** — the subset guarantee holds only at quiescence, and its output must never feed a real delete |
 
 `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — permanent removal of a dead
 replica, distinct from ordinary `GC` — is covered on the
-[mounts-and-leases page](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle). `SYSTEM CAS
-FSCK` and its `dangling`/`unreachable` vocabulary are a read-only diagnostic pass, not part of the
-`GC` protocol itself.
+[mounts-and-leases page](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle).
+`SYSTEM CAS FSCK <disk>` (`clickhouse-disks cas-fsck`) and its `dangling`/`unreachable` vocabulary
+are a read-only diagnostic pass, not part of the `GC` protocol itself.
