@@ -3795,7 +3795,10 @@ class ClickHouseCluster:
 
             common_opts = ["--verbose", "up", "-d"]
 
-            images_pull_cmd = self.base_cmd + ["pull"]
+            # Tolerate pull failures for images that are expected to be present
+            # locally (e.g. CLICKHOUSE_CI_MIN_TESTED_VERSION tags that only exist
+            # in a private registry); `docker compose up` will use the local image.
+            images_pull_cmd = self.base_cmd + ["pull", "--ignore-pull-failures"]
             # sometimes dockerhub/proxy can be flaky
 
             def logging_pulling_images(**kwargs):

@@ -5615,3 +5615,170 @@ def test_delta_kernel_retry_on_stale_token_via_catalog_callback(started_cluster)
         f"Expected the catalog-callback retry log line to fire for query {retry_query_id}, "
         f"found {retry_hits} hits — the stale-token retry path was not exercised."
     )
+
+
+def test_liquid_clustering(started_cluster):
+    """Test reading a Delta Lake table that uses liquid clustering.
+
+    Creates a table with CLUSTER BY via Spark SQL, writes data, runs OPTIMIZE,
+    then reads it from ClickHouse via the delta-kernel-rs path.  Liquid
+    clustering tables require the `v2Checkpoint` and `domainMetadata` reader
+    features, which are only supported by the delta-kernel-rs path.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_liquid_clustering")
+
+    # Create a liquid-clustered Delta table via Spark SQL.
+    # delta-spark 3.3.0 supports CLUSTER BY.
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
+        USING DELTA CLUSTER BY (a)
+    """)
+    spark.sql(f"""
+        INSERT INTO delta.`{delta_path}`
+        SELECT id as a, CAST(id + 1 AS STRING) as b FROM range(100)
+    """)
+    spark.sql(f"OPTIMIZE delta.`{delta_path}`")
+
+    files = default_upload_directory(
+        started_cluster,
+        "s3",
+        delta_path,
+        "",
+    )
+    assert len(files) > 0
+
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    # Verify row count and data.
+    assert int(instance.query(f"SELECT count() FROM {TABLE_NAME}")) == 100
+    assert instance.query(f"SELECT * FROM {TABLE_NAME} ORDER BY a") == instance.query(
+        "SELECT number as a, toString(number + 1) as b FROM numbers(100)"
+    )
+
+    # Verify predicate pushdown on the clustering column.
+    result = instance.query(f"SELECT a FROM {TABLE_NAME} WHERE a = 42")
+    assert result.strip() == "42"
+
+    # Verify aggregation works.
+    assert int(instance.query(f"SELECT sum(a) FROM {TABLE_NAME}")) == sum(range(100))
+
+
+def test_liquid_clustering_data_skipping(started_cluster):
+    """Verify that filtering on a clustering column skips files at the kernel level.
+
+    Creates a liquid-clustered Delta table with multiple batches so that OPTIMIZE
+    produces several output files, then checks that a point-lookup on the
+    clustering column reads fewer files than a full scan.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_liquid_clustering_ds")
+
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
+        USING DELTA CLUSTER BY (a)
+    """)
+
+    # Insert multiple batches to produce several files after OPTIMIZE.
+    for i in range(5):
+        spark.sql(f"""
+            INSERT INTO delta.`{delta_path}`
+            SELECT id + {i * 1000} as a, CAST(id + {i * 1000} AS STRING) as b
+            FROM range(1000)
+        """)
+    spark.sql(f"OPTIMIZE delta.`{delta_path}`")
+
+    files = default_upload_directory(started_cluster, "s3", delta_path, "")
+    assert len(files) > 0
+
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    total_rows = int(instance.query(f"SELECT count() FROM {TABLE_NAME}"))
+    assert total_rows == 5000
+
+    # Full scan — note the total scanned files.
+    full_scan_id = f"{TABLE_NAME}_full_scan"
+    instance.query(f"SELECT count() FROM {TABLE_NAME}", query_id=full_scan_id)
+    instance.query("SYSTEM FLUSH LOGS")
+    full_scan_files = int(
+        instance.query(
+            f"SELECT ProfileEvents['DeltaLakeScannedFiles'] "
+            f"FROM system.query_log WHERE query_id = '{full_scan_id}' AND type = 'QueryFinish'"
+        ).strip()
+    )
+
+    # Point query on the clustering column — should scan fewer files.
+    point_query_id = f"{TABLE_NAME}_point_query"
+    result = instance.query(
+        f"SELECT a FROM {TABLE_NAME} WHERE a = 42", query_id=point_query_id
+    )
+    assert result.strip() == "42"
+    instance.query("SYSTEM FLUSH LOGS")
+    point_scan_files = int(
+        instance.query(
+            f"SELECT ProfileEvents['DeltaLakeScannedFiles'] "
+            f"FROM system.query_log WHERE query_id = '{point_query_id}' AND type = 'QueryFinish'"
+        ).strip()
+    )
+
+    assert point_scan_files < full_scan_files, (
+        f"Expected clustering to enable file skipping: point query scanned {point_scan_files} files "
+        f"but full scan scanned {full_scan_files} files"
+    )
+
+
+def test_liquid_clustering_predicate_fallback(started_cluster):
+    """Verify that the clustering-column predicate fallback fires when the full
+    predicate cannot be translated, and that file skipping still works.
+
+    Uses a filter combining an untranslatable expression with a simple clustering
+    column filter. The fallback should push the clustering filter to the kernel
+    while ClickHouse evaluates the full expression on the remaining rows.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = randomize_table_name("test_liquid_clustering_fb")
+
+    delta_path = f"/{TABLE_NAME}"
+    spark.sql(f"""
+        CREATE TABLE delta.`{delta_path}` (a INT, b STRING)
+        USING DELTA CLUSTER BY (a)
+    """)
+
+    for i in range(5):
+        spark.sql(f"""
+            INSERT INTO delta.`{delta_path}`
+            SELECT id + {i * 1000} as a, CAST(id + {i * 1000} AS STRING) as b
+            FROM range(1000)
+        """)
+    spark.sql(f"OPTIMIZE delta.`{delta_path}`")
+
+    files = default_upload_directory(started_cluster, "s3", delta_path, "")
+    assert len(files) > 0
+
+    create_delta_table(instance, "s3", TABLE_NAME, started_cluster)
+
+    # Query with a clustering filter (a = 42) AND an untranslatable expression
+    # (cityHash64). The full predicate translation should fail, but the fallback
+    # should push the `a = 42` part for file-level skipping.
+    fallback_query_id = f"{TABLE_NAME}_fallback"
+    result = instance.query(
+        f"SELECT a FROM {TABLE_NAME} WHERE a = 42 AND cityHash64(b) != 0",
+        query_id=fallback_query_id,
+    )
+    assert result.strip() == "42"
+
+    instance.query("SYSTEM FLUSH LOGS")
+    fallback_count = int(
+        instance.query(
+            f"SELECT ProfileEvents['DeltaLakeClusteringPredicateFallbacks'] "
+            f"FROM system.query_log WHERE query_id = '{fallback_query_id}' AND type = 'QueryFinish'"
+        ).strip()
+    )
+    assert fallback_count >= 1, (
+        f"Expected the clustering predicate fallback to fire, but got {fallback_count} hits"
+    )
