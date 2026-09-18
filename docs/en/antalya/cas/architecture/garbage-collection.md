@@ -781,7 +781,7 @@ the chunk size reject `0`:
 | `cas_gc_round_sweep_recovery_op_budget` | 5000 | committed-tail ref-log reads the sweep's recovery walk may spend (phase 9) |
 | `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for write-once families (phases 15, 17); `1` to `1000` |
 | `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes (phase 12) |
-| `cas_gc_io_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 9), the orphan-sweep planning reads (phase 9), the rebuild read-ahead and the `pending_deletes` `HEAD` + conditional `DELETE` fan-out (phase 11); other GC requests run on the round thread; `1` runs the covered requests sequentially |
+| `cas_gc_io_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 9), the orphan-sweep planning reads (phase 9), the rebuild read-ahead and the `pending_deletes` `HEAD` + conditional `DELETE` fan-out (phase 11); other GC requests run on the round thread; `1` runs the covered requests sequentially. `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead |
 
 The fold-batching controls `gc_fold_threshold` (default 1), `gc_fold_max_defer_rounds` (default 8)
 and `gc_frontier_probe_budget` (default unbounded) are internal `PoolConfig` fields with no disk

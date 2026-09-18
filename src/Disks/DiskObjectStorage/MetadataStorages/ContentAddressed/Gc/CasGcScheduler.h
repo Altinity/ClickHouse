@@ -56,6 +56,8 @@ struct GcRoundLogRecord
     UInt64 entries_condemned = 0;   /// entries newly condemned into the retired list this round
     UInt64 entries_graduated = 0;   /// entries newly floor-passed (published delete_pending) this round
     UInt64 entries_redeleted = 0;   /// pending exact-token blob deletes executed this round
+    /// Counts one failed `HEAD`, conditional `DELETE`, or refused re-delete enqueue
+    /// per affected `delete_pending` entry.
     UInt64 entries_redelete_failed = 0;
     UInt64 fence_outs = 0;          /// expired mounts fenced-out by the round's heartbeat floor
     UInt64 anomalies = 0;           /// fold clamps surfaced (never wedging) this round

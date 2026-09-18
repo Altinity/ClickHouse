@@ -15,10 +15,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Logger.h>
 #include <atomic>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <utility>
 #include <vector>
@@ -164,6 +166,8 @@ struct RoundReport
     size_t condemned = 0;         /// entries newly condemned into the retired list this round
     size_t graduated = 0;         /// entries newly floor-passed (published delete_pending) this round
     size_t redeleted = 0;         /// pending deletes executed this round (exact-token blob deletes)
+    /// Counts one failed `HEAD`, conditional `DELETE`, or refused re-delete enqueue
+    /// per affected `delete_pending` entry.
     size_t redelete_failed = 0;
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
@@ -733,6 +737,12 @@ private:
         Removal del = Removal::Gone;
     };
 
+    struct IndexedException
+    {
+        size_t index;
+        std::exception_ptr exception;
+    };
+
     struct RedeleteRoundContext
     {
         uint64_t new_round;
@@ -748,7 +758,12 @@ private:
 
     void applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteIo & io);
 
-    void redeleteBlob(RedeleteRoundContext & ctx, const RetiredEntry & entry, const Layout & layout, CasOperation & op);
+    void reportRedeleteFailure(
+        RedeleteRoundContext & ctx,
+        const RetiredEntry & entry,
+        const Layout & layout,
+        std::exception_ptr exception,
+        std::optional<size_t> unsent_count = std::nullopt);
 
     void redeleteBlobs(
         RedeleteRoundContext & ctx,
@@ -1012,6 +1027,7 @@ private:
     /// and the `pending_deletes` fan-out, sized by `gc_io_concurrency`. A `unique_ptr` for the same reason as `meta_writer`: the size comes from
     /// `store->poolConfig()`, which may only be read after the constructor body has validated `store`.
     std::unique_ptr<ThreadPool> io_pool;
+    std::optional<size_t> io_pool_refuse_at_for_test;
 
     /// Probe B1's two numbers for the round: the ref-log POSITIONS the sealed coverage declares covered
     /// (counted arithmetically over each namespace's cut -- not by listed ids, which under arithmetic

@@ -72,6 +72,7 @@ namespace ErrorCodes
 {
     extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
+    extern const int CANNOT_SCHEDULE_TASK;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
@@ -349,10 +350,14 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     /// `scheduleOrThrowOnError`, blocking the round thread instead of the hint loop that already knows
     /// how much it wants in flight.
     const size_t io_concurrency = std::max<size_t>(1, store->poolConfig().gc_io_concurrency);
+    /// Keep `shutdown_on_exception` false: every task on this pool (read-ahead and re-delete) is submitted
+    /// through a callback runner that stores its exception in the task's future, and no caller invokes
+    /// `wait` on this pool.
     io_pool = std::make_unique<ThreadPool>(
         CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled,
         /*max_threads*/ io_concurrency, /*max_free_threads*/ io_concurrency, /*queue_size*/ 0,
         /*shutdown_on_exception*/ false);
+    io_pool_refuse_at_for_test = store->poolConfig().gc_io_pool_refuse_at_for_test;
 }
 
 void Gc::runNamespaceJanitorPage(
@@ -464,24 +469,20 @@ void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & e
     meta_writer->forgetCondemnMarker(entry.ref, entry.token);
 }
 
-void Gc::redeleteBlob(RedeleteRoundContext & ctx, const RetiredEntry & entry, const Layout & layout, CasOperation & op)
+void Gc::reportRedeleteFailure(
+    RedeleteRoundContext & ctx,
+    const RetiredEntry & entry,
+    const Layout & layout,
+    std::exception_ptr exception,
+    std::optional<size_t> unsent_count)
 {
-    RedeleteIo io;
-    try
-    {
-        io = performRedeleteIo(entry, layout, op);
-    }
-    catch (...)
-    {
-        ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
-        LOG_WARNING(logger,
-            "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays delete_pending "
-            "and is retried in the next round: {}",
-            blobIdOf(entry.ref), layout.blobKey(entry.ref), entry.condemn_round, getCurrentExceptionMessage(false));
-        ++ctx.report.redelete_failed;
-        throw;
-    }
-    applyRedeleteOutcome(ctx, entry, io);
+    ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
+    ++ctx.report.redelete_failed;
+    LOG_WARNING(logger,
+        "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays delete_pending "
+        "and is retried in the next round: {}{}",
+        blobIdOf(entry.ref), layout.blobKey(entry.ref), entry.condemn_round, getExceptionMessage(exception, false),
+        unsent_count ? fmt::format("; {} re-delete entries were not submitted", *unsent_count) : String{});
 }
 
 void Gc::redeleteBlobs(
@@ -492,21 +493,29 @@ void Gc::redeleteBlobs(
     const Layout & layout,
     CasOperation & op)
 {
+    std::vector<RedeleteIo> io_results(entries.size());
+    std::vector<std::exception_ptr> io_errors(entries.size());
+    std::optional<IndexedException> schedule_error;
+    size_t scheduled = 0;
     if (concurrency <= 1 || entries.size() <= 1)
     {
-        for (const RetiredEntry & entry : entries)
-            redeleteBlob(ctx, entry, layout, op);
-        return;
+        for (size_t i = 0; i < entries.size(); ++i)
+        {
+            try
+            {
+                io_results[i] = performRedeleteIo(entries[i], layout, op);
+            }
+            catch (...)
+            {
+                io_errors[i] = std::current_exception();
+            }
+        }
+        scheduled = entries.size();
     }
-
-    using RunnerTask = ThreadPoolCallbackRunnerLocal<void>::Task;
-    std::vector<RedeleteIo> io_results(entries.size());
-    std::vector<std::exception_ptr> errors(entries.size());
-    std::exception_ptr first_error;
-    size_t scheduled = 0;
+    else
     {
-        ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::UNKNOWN);
-        std::vector<std::shared_ptr<RunnerTask>> handles;
+        ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::CAS_GC_REDELETE);
+        std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;
         handles.reserve(entries.size());
         SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
 
@@ -515,38 +524,26 @@ void Gc::redeleteBlobs(
         {
             for (; scheduled < entries.size(); ++scheduled)
             {
+                if (io_pool_refuse_at_for_test == scheduled)
+                {
+                    io_pool_refuse_at_for_test.reset();
+                    throw Exception(ErrorCodes::CANNOT_SCHEDULE_TASK, "Injected CAS GC re-delete enqueue refusal at index {}", scheduled);
+                }
                 handles.emplace_back(runner.enqueueAndGiveOwnership(
                     [slot = &io_results[scheduled],
                      entry = entries[scheduled],
                      layout_ptr = &layout,
                      pool_store = store,
-                     gc_logger = logger,
                      admitted_generation]
                     {
-                        try
-                        {
-                            CasOperation job_op = pool_store->openRequests().resume(admitted_generation);
-                            *slot = performRedeleteIo(entry, *layout_ptr, job_op);
-                        }
-                        catch (...)
-                        {
-                            ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
-                            LOG_WARNING(
-                                gc_logger,
-                                "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays "
-                                "delete_pending and is retried in the next round: {}",
-                                blobIdOf(entry.ref),
-                                layout_ptr->blobKey(entry.ref),
-                                entry.condemn_round,
-                                getCurrentExceptionMessage(false));
-                            throw;
-                        }
+                        CasOperation job_op = pool_store->openRequests().resume(admitted_generation);
+                        *slot = performRedeleteIo(entry, *layout_ptr, job_op);
                     }));
             }
         }
         catch (...)
         {
-            first_error = std::current_exception();
+            schedule_error = IndexedException{scheduled, std::current_exception()};
         }
         ctx.jobs_scheduled += handles.size();
 
@@ -559,28 +556,39 @@ void Gc::redeleteBlobs(
             }
             catch (...)
             {
-                errors[i] = std::current_exception();
+                io_errors[i] = std::current_exception();
             }
         }
     }
 
-    /// Every delete of the batch has already run. If `applyRedeleteOutcome` throws, the batch stays deleted
+    std::optional<IndexedException> first_error;
+    for (size_t i = 0; i < scheduled; ++i)
+    {
+        if (!io_errors[i])
+            continue;
+        reportRedeleteFailure(ctx, entries[i], layout, io_errors[i]);
+        if (!first_error)
+            first_error = IndexedException{i, io_errors[i]};
+    }
+    if (schedule_error)
+    {
+        reportRedeleteFailure(
+            ctx, entries[schedule_error->index], layout, schedule_error->exception, entries.size() - schedule_error->index);
+        if (!first_error || schedule_error->index < first_error->index)
+            first_error = schedule_error;
+    }
+
+    /// Every submitted delete of the batch has already run. If `applyRedeleteOutcome` throws, the batch stays deleted
     /// but unrecorded: the round fails before its outcome logs and `gc/state` commit, every entry stays
     /// `delete_pending`, and the next round records the deleted ones as `Absent`.
     for (size_t i = 0; i < scheduled; ++i)
     {
-        if (errors[i])
-        {
-            ++ctx.report.redelete_failed;
-            if (!first_error)
-                first_error = errors[i];
-            continue;
-        }
-        applyRedeleteOutcome(ctx, entries[i], io_results[i]);
+        if (!io_errors[i])
+            applyRedeleteOutcome(ctx, entries[i], io_results[i]);
     }
 
     if (first_error)
-        std::rethrow_exception(first_error);
+        std::rethrow_exception(first_error->exception);
 }
 
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy,

@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -58,9 +59,15 @@ DB::UInt128 blobHash(uint64_t blob)
 class WorkerFaultBackend : public InMemoryBackend
 {
 public:
-    void armRemoveFaults(std::set<String> keys) { arm(remove_keys, std::move(keys)); }
+    void armRemoveFaults(std::set<String> keys, bool workers_only = true)
+    {
+        arm(remove_keys, std::move(keys), workers_only);
+    }
 
-    void armHeadFaults(std::set<String> keys) { arm(head_keys, std::move(keys)); }
+    void armHeadFaults(std::set<String> keys, bool workers_only = true)
+    {
+        arm(head_keys, std::move(keys), workers_only);
+    }
 
     bool allFired() const
     {
@@ -71,33 +78,35 @@ public:
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
         if (takeFault(remove_keys, key))
-            throw std::runtime_error("injected worker remove fault");
+            throw std::runtime_error("injected worker remove fault for key " + key);
         return InMemoryBackend::remove(key, expected_value, access);
     }
 
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (takeFault(head_keys, key))
-            throw std::runtime_error("injected worker head fault");
+            throw std::runtime_error("injected worker head fault for key " + key);
         return InMemoryBackend::head(key, access);
     }
 
 private:
-    void arm(std::set<String> & target, std::set<String> keys)
+    void arm(std::set<String> & target, std::set<String> keys, bool workers_only)
     {
         std::lock_guard lock(mutex);
         owner = std::this_thread::get_id();
+        only_workers = workers_only;
         target = std::move(keys);
     }
 
     bool takeFault(std::set<String> & keys, const String & key)
     {
         std::lock_guard lock(mutex);
-        return std::this_thread::get_id() != owner && keys.erase(key) > 0;
+        return (!only_workers || std::this_thread::get_id() != owner) && keys.erase(key) > 0;
     }
 
     mutable std::mutex mutex;
     std::thread::id owner;
+    bool only_workers = true;
     std::set<String> remove_keys;
     std::set<String> head_keys;
 };
@@ -170,14 +179,19 @@ private:
 
 template <typename BackendT>
 PoolPtr openPoolWithIoConcurrency(
-    std::shared_ptr<BackendT> backend, uint64_t concurrency, uint64_t gc_shards = 1, uint64_t outcome_entry_budget = 0,
-    CasEventSink event_sink = {})
+    std::shared_ptr<BackendT> backend,
+    uint64_t concurrency,
+    uint64_t gc_shards = 1,
+    uint64_t outcome_entry_budget = 0,
+    CasEventSink event_sink = {},
+    std::optional<size_t> refuse_at_for_test = std::nullopt)
 {
     PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.gc_io_concurrency = concurrency;
     config.gc_shards = gc_shards;
     config.gc_round_outcome_entry_budget = outcome_entry_budget;
     config.event_sink = std::move(event_sink);
+    config.gc_io_pool_refuse_at_for_test = refuse_at_for_test;
     return Pool::open(std::move(backend), std::move(config));
 }
 
@@ -299,6 +313,24 @@ GcPhaseSink recordPendingDeletes(std::shared_ptr<PendingDeletesRows> rows, GcPha
     };
 }
 
+std::vector<Gc::PreviewEntry> previewPendingDeletes(Gc & gc)
+{
+    std::vector<Gc::PreviewEntry> result;
+    for (Gc::PreviewEntry entry : gc.previewDeletes())
+        if (entry.reason == "delete_pending")
+            result.push_back(std::move(entry));
+    return result;
+}
+
+}
+
+namespace
+{
+
+void driveUntilAllGraduated(Backend & backend, Gc & gc, const PoolPtr & store, uint64_t marked_blob);
+void expectBodiesPresentOnlyFor(Backend & backend, const Pool & store, const std::set<uint64_t> & present);
+uint64_t failedCounter();
+
 }
 
 TEST(CASGCRedeleteConcurrency, ParallelRedeleteReclaimsEveryBlob)
@@ -380,31 +412,70 @@ TEST(CASGCRedeleteConcurrency, WorkerRemoveFaultKeepsSiblingOutcomesAndPoolAlive
     auto store = openPoolWithIoConcurrency(backend, 4);
     Gc gc(store, kGc);
     publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
 
     backend->armRemoveFaults({blobKeyOf(*store, kFaultedBlob)});
     const auto failed_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed].load();
-    size_t failed_rounds = 0;
-    for (int i = 0; i < 8 && !allBlobsAbsent(*backend, *store); ++i)
-    {
-        RoundReport progress;
-        try
-        {
-            gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress);
-        }
-        catch (const std::exception &)
-        {
-            ++failed_rounds;
-            EXPECT_EQ(progress.redeleted, kBlobs - 1);
-            for (uint64_t b = 1; b <= kBlobs; ++b)
-                EXPECT_EQ(blobAbsent(*backend, store->layout(), blobHash(b)), b != kFaultedBlob) << "blob " << b;
-        }
-        store->renewWatermarkOnce();
-    }
+    std::map<String, std::vector<OutcomeRow>> outcome_logs_before;
+    collectOutcomeLogs(*backend, outcome_logs_before);
+    RoundReport progress;
+    EXPECT_ANY_THROW(gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress));
+    store->renewWatermarkOnce();
+
+    std::map<String, std::vector<OutcomeRow>> outcome_logs_after;
+    collectOutcomeLogs(*backend, outcome_logs_after);
+    EXPECT_EQ(outcome_logs_after.size(), outcome_logs_before.size());
+    for (const auto & log : outcome_logs_after)
+        EXPECT_TRUE(outcome_logs_before.contains(log.first)) << "the failed round wrote outcome log " << log.first;
+    EXPECT_EQ(progress.redeleted, kBlobs - 1);
+    expectBodiesPresentOnlyFor(*backend, *store, {kFaultedBlob});
+
+    const RoundReport next = runRegularRoundReclaiming(gc);
+    store->renewWatermarkOnce();
 
     EXPECT_TRUE(backend->allFired()) << "the faulted blob delete never ran on a pool worker";
-    EXPECT_EQ(failed_rounds, 1u);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed].load() - failed_before, 1u);
+    EXPECT_EQ(next.redeleted, kBlobs);
+    EXPECT_EQ(next.deleted, 1u);
+    EXPECT_EQ(next.absent, kBlobs - 1);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
+}
+
+TEST(CASGCRedeleteConcurrency, SequentialWorkerFailureStillAttemptsLaterEntries)
+{
+    auto backend = std::make_shared<WorkerFaultBackend>();
+    auto store = openPoolWithIoConcurrency(backend, 1);
+    Gc gc(store, kGc);
+    publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
+
+    const auto preview = previewPendingDeletes(gc);
+    ASSERT_GE(preview.size(), 2u);
+    const String first_preview_key = preview.front().key;
+    backend->armRemoveFaults({first_preview_key}, false);
+    const auto failed_before = failedCounter();
+    RoundReport progress;
+    String message;
+    try
+    {
+        gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress);
+    }
+    catch (const std::exception & e)
+    {
+        message = e.what();
+    }
+    store->renewWatermarkOnce();
+
+    EXPECT_NE(message.find(first_preview_key), String::npos);
+    EXPECT_TRUE(backend->allFired());
+    EXPECT_EQ(progress.redeleted, preview.size() - 1);
+    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(failedCounter() - failed_before, 1u);
+    for (size_t i = 1; i < preview.size(); ++i)
+    {
+        OperationForTest op(*backend);
+        EXPECT_FALSE((*op).head(preview[i].key, Retry::standard()).has_value()) << preview[i].key;
+    }
 }
 
 TEST(CASGCRedeleteConcurrency, SameOutcomesAtConcurrencyOneAndFour)
@@ -653,14 +724,38 @@ TEST(CASGCRedeleteConcurrency, TwoWorkerFailuresAreEachCountedAndTheRoundThrowsO
     publishThenDrop(*backend, store, gc);
     ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
 
-    backend->armRemoveFaults({blobKeyOf(*store, kFaultedBlob), blobKeyOf(*store, kReplacedBlob)});
+    const auto preview = previewPendingDeletes(gc);
+    const String faulted_key = blobKeyOf(*store, kFaultedBlob);
+    const String replaced_key = blobKeyOf(*store, kReplacedBlob);
+    const auto faulted_it = std::find_if(preview.begin(), preview.end(), [&](const Gc::PreviewEntry & entry)
+    {
+        return entry.key == faulted_key;
+    });
+    const auto replaced_it = std::find_if(preview.begin(), preview.end(), [&](const Gc::PreviewEntry & entry)
+    {
+        return entry.key == replaced_key;
+    });
+    ASSERT_NE(faulted_it, preview.end());
+    ASSERT_NE(replaced_it, preview.end());
+    const String first_fault_key = faulted_it < replaced_it ? faulted_key : replaced_key;
+
+    backend->armRemoveFaults({faulted_key, replaced_key});
     auto rows = std::make_shared<PendingDeletesRows>();
     gc.setPhaseSink(recordPendingDeletes(rows));
     const auto failed_before = failedCounter();
     RoundReport progress;
-    EXPECT_ANY_THROW(gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress));
+    String message;
+    try
+    {
+        gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress);
+    }
+    catch (const std::exception & e)
+    {
+        message = e.what();
+    }
     store->renewWatermarkOnce();
 
+    EXPECT_NE(message.find(first_fault_key), String::npos);
     EXPECT_TRUE(backend->allFired()) << "both faulted deletes must have run on pool workers";
     EXPECT_EQ(failedCounter() - failed_before, 2u);
     EXPECT_EQ(progress.redeleted, kBlobs - 2);
@@ -752,18 +847,104 @@ TEST(CASGCRedeleteConcurrency, SchedulingFailureAttemptsNothingAndTheNextRoundRe
     ASSERT_TRUE(injected->load()) << "the fault was never armed before pending_deletes";
     EXPECT_EQ(code, DB::ErrorCodes::CANNOT_SCHEDULE_TASK);
     EXPECT_EQ(progress.redeleted, 0u);
-    EXPECT_EQ(progress.redelete_failed, 0u);
-    EXPECT_EQ(failedCounter() - failed_before, 0u) << "an entry that was never submitted is not a failed delete";
+    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(failedCounter() - failed_before, 1u);
     ASSERT_EQ(rows->rows.size(), 1u);
     ASSERT_TRUE(rows->lastRowHas("jobs_scheduled"));
     EXPECT_EQ(rows->total("jobs_scheduled"), 0u);
-    EXPECT_EQ(rows->total("jobs_failed"), 0u);
+    EXPECT_EQ(rows->total("jobs_failed"), 1u);
     expectBodiesPresentOnlyFor(*backend, *store, {1, 2, 3, 4, 5, 6});
 
     const RoundReport next = runRegularRoundReclaiming(gc);
     EXPECT_EQ(next.redeleted, kBlobs);
     EXPECT_EQ(next.deleted, kBlobs);
     EXPECT_TRUE(allBlobsAbsent(*backend, *store));
+}
+
+TEST(CASGCRedeleteConcurrency, EnqueueRefusalYieldsToLowerIndexWorkerFailure)
+{
+    auto backend = std::make_shared<WorkerFaultBackend>();
+    auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, 3);
+    Gc gc(store, kGc);
+    publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
+
+    const auto preview = previewPendingDeletes(gc);
+    ASSERT_EQ(preview.size(), kBlobs);
+    const String first_preview_key = preview.front().key;
+    backend->armRemoveFaults({first_preview_key});
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows));
+    const auto failed_before = failedCounter();
+    RoundReport progress;
+    String message;
+    try
+    {
+        gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress);
+    }
+    catch (const std::exception & e)
+    {
+        message = e.what();
+    }
+    store->renewWatermarkOnce();
+
+    EXPECT_EQ(progress.redelete_failed, 2u);
+    EXPECT_EQ(failedCounter() - failed_before, 2u);
+    EXPECT_EQ(rows->total("jobs_scheduled"), 3u);
+    EXPECT_EQ(rows->total("jobs_failed"), 2u);
+    EXPECT_NE(message.find(first_preview_key), String::npos);
+    EXPECT_EQ(message.find("Injected CAS GC re-delete enqueue refusal"), String::npos);
+    EXPECT_TRUE(backend->allFired());
+    for (size_t i = 0; i < preview.size(); ++i)
+    {
+        OperationForTest op(*backend);
+        const bool body_present = (*op).head(preview[i].key, Retry::standard()).has_value();
+        EXPECT_EQ(body_present, i == 0 || i >= 3) << preview[i].key;
+    }
+
+    const RoundReport next = runRegularRoundReclaiming(gc);
+    store->renewWatermarkOnce();
+    EXPECT_EQ(next.redelete_failed, 0u);
+    EXPECT_EQ(next.redeleted, kBlobs);
+    EXPECT_TRUE(allBlobsAbsent(*backend, *store));
+}
+
+TEST(CASGCRedeleteConcurrency, SingletonWorkerFailureIsCountedWithoutScheduling)
+{
+    auto backend = std::make_shared<WorkerFaultBackend>();
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.gc_io_concurrency = 4;
+    config.gc_round_redelete_budget = 1;
+    auto store = Pool::open(backend, std::move(config));
+    Gc gc(store, kGc);
+    publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
+
+    const auto preview = previewPendingDeletes(gc);
+    ASSERT_FALSE(preview.empty());
+    const String first_preview_key = preview.front().key;
+    backend->armRemoveFaults({first_preview_key}, false);
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows));
+    const auto failed_before = failedCounter();
+    RoundReport progress;
+    String message;
+    try
+    {
+        gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress);
+    }
+    catch (const std::exception & e)
+    {
+        message = e.what();
+    }
+    store->renewWatermarkOnce();
+
+    EXPECT_NE(message.find(first_preview_key), String::npos);
+    EXPECT_TRUE(backend->allFired());
+    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(failedCounter() - failed_before, 1u);
+    EXPECT_EQ(rows->total("jobs_scheduled"), 0u);
+    EXPECT_EQ(rows->total("jobs_failed"), 1u);
 }
 
 TEST(CASGCRedeleteConcurrency, ShardedPoolDeletesEveryShard)

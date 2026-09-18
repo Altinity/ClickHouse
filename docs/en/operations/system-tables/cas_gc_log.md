@@ -81,7 +81,7 @@ The phases, in execution order:
 | `fold_ref_intake` | Read and fold every new ref log and the manifest bodies its edges name. | one `GET` per new log, one `GET` per manifest edge |
 | `fold_reduce` | The per-shard in-degree merge: condemn, spare, graduate. | prior-run streaming `GET`s, one `HEAD` per zero-transition candidate, run `PUT`s |
 | `fold_seal_write` | Publish the new fold seal. | one `PUT` |
-| `pending_deletes` | The single content-delete site: exact-token deletes of previously published `delete_pending` entries, plus the outcome logs. `phase_metrics` carries `jobs_scheduled` (entries sent to the GC I/O pool; `0` when the phase ran sequentially) and `jobs_failed`. | one `HEAD` and at most one `DELETE` per entry, one outcome-log `PUT` per shard with rows |
+| `pending_deletes` | The single content-delete site: exact-token deletes of previously published `delete_pending` entries, plus the outcome logs. `phase_metrics` carries `jobs_scheduled` (entries sent to the GC I/O pool; `0` for no candidates, sequential execution, singleton batches, or refusal before the first submission) and `jobs_failed`. | one `HEAD` and at most one `DELETE` per entry, one outcome-log `PUT` per shard with rows |
 | `meta_pool_wait` | Drain the round's per-hash freshness-meta writes. | none on this thread — see the caveat below |
 | `round_commit` | The generation-retention prune and the round's single `gc/state` compare-and-swap. | prune `LIST`s and deletes, one compare-and-swap |
 | `handoff_reclaim` | Wholesale-reclaim generations a moved run ref stranded below the retention cursor. | prefix `LIST`s and deletes |

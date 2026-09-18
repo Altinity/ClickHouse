@@ -132,6 +132,23 @@ TEST(CASContentAddressedSettings, RemovedCacheSettingsAreRejected)
     }
 }
 
+TEST(CASContentAddressedSettings, RemovedGcReadConcurrencyIsRejected)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_read_concurrency>1</cas_gc_read_concurrency>");
+    ContentAddressedSettings settings;
+    try
+    {
+        settings.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+        FAIL() << "expected the removed setting cas_gc_read_concurrency to be rejected as unknown";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_SETTING);
+    }
+}
+
 /// `cas_part_folder_validate` paced a manifest `HEAD` that no longer exists. A config still asking
 /// for it must fail the disk open, not be quietly accepted and ignored.
 TEST(CASContentAddressedSettings, RetiredPartFolderValidateIsRejected)

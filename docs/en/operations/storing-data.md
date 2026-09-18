@@ -563,6 +563,7 @@ disk-level and server-level settings surface.
   recorded as deleted only if its own `HEAD` and `DELETE` ran; entries whose request failed, or that were
   not submitted, stay pending and are retried in the next round. `1` runs all covered requests
   sequentially on the round thread.
+  `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead.
 - `skip_access_check` — `false` by default. Skips the disk's `CAS` capability probe ("start now,
   fix later"). The server-level `skip_access_check` flag skips the generic disk access check;
   this disk key governs the `CAS` capability probe.
