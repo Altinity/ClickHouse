@@ -208,9 +208,31 @@ class ClickHouseProc:
         # Raise the open-files limit for the same reason start_azurite does: under parallel load
         # the server holds thousands of S3 connections, and at the default soft limit (1024)
         # rustfs runs out of fds and refuses new TCP connections in bursts.
+        # RustFS shares the job container's cgroup with the ClickHouse server, and the server's
+        # MemoryWorker reads the cgroup total, so RustFS memory is charged against
+        # max_server_memory_usage. RustFS 1.0.0-rc.3 grows its tokio blocking-thread pool one
+        # thread per concurrent blocking dispatch (four or more per PUT under the default strict
+        # durability), keeps each idle thread alive for 60 s, and each thread pins about 12 MB of
+        # allocator arena plus a 1 MiB stack: on a three-hour sanitizer shard that reached 1074
+        # threads and 14 GB of anonymous memory. The runtime knobs cap the pool and make it shrink;
+        # the allocator knob returns freed arenas; relaxed durability halves the blocking dispatches
+        # per PUT (no fsync chain, acceptable for an ephemeral CI pool that is wiped per run).
+        # Measured locally on the same workload: 1074 -> 130 threads, 14.4 GB -> 2.5 GB anonymous,
+        # rename_data 44-69 ms -> 0.6 ms, the shard 30% faster.
+        # RUSTFS_OBS_USE_STDOUT routes the RustFS log (error level by default) into rustfs.log, which
+        # is already collected as a job artifact; without it RustFS writes to logs/ under its cwd.
+        rustfs_env = (
+            "RUSTFS_SCANNER_ENABLED=false RUSTFS_HEAL_ENABLED=false "
+            "RUSTFS_RUNTIME_MAX_BLOCKING_THREADS=64 "
+            "RUSTFS_RUNTIME_THREAD_KEEP_ALIVE=5 "
+            "RUSTFS_ALLOCATOR_RECLAIM_ENABLED=true "
+            "RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS=30 "
+            "RUSTFS_DURABILITY_MODE=relaxed "
+            "RUSTFS_OBS_USE_STDOUT=true "
+        )
         command = (
             "(ulimit -n 1048576 2>/dev/null || ulimit -n $(ulimit -Hn)) && "
-            f"RUSTFS_SCANNER_ENABLED=false RUSTFS_HEAL_ENABLED=false "
+            f"{rustfs_env}"
             f"{rustfs_bin} server --address 0.0.0.0:11121 "
             f"--access-key clickhouse --secret-key clickhouse {data_dir}"
         )
@@ -1549,6 +1571,8 @@ if __name__ == "__main__":
             res = ch.start_minio(param)
         elif command == "start_azurite":
             res = ch.start_azurite()
+        elif command == "start_rustfs":
+            res = ch.start_rustfs()
         else:
             raise ValueError(f"Unknown command: {command}")
     except Exception:
