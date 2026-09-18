@@ -825,10 +825,16 @@ void KeyCondition::getAllSpaceFillingCurves(const BuildInfo & info)
             && action.node->children.size() >= 2
             && space_filling_curve_name_to_type.contains(action.node->function_base->getName()))
         {
+            /// A curve is only usable here through its key column position, so a curve that is
+            /// an intermediate value of the key expression rather than a key column is skipped.
+            auto it = key_columns.find(action.node->result_name);
+            if (it == key_columns.end())
+                continue;
+
             SpaceFillingCurveDescription curve;
             curve.function_name = action.node->function_base->getName();
             curve.type = space_filling_curve_name_to_type.at(curve.function_name);
-            curve.key_column_pos = key_columns.at(action.node->result_name);
+            curve.key_column_pos = it->second;
             for (const auto & child : action.node->children)
             {
                 /// All arguments should be regular input columns.
@@ -1424,23 +1430,32 @@ bool applyDeterministicDagToColumn(
             return true;
         }
 
-        if (!target_type->isNullable() && !target_type->canBeInsideNullable())
+        /// `castColumnAccurateOrNull` needs a target that can represent NULLs so a lossy cast is
+        /// observable. `LowCardinality` is only an encoding and is not itself nullable-able, so run
+        /// the accuracy probe against the `LowCardinality`-stripped target; otherwise a key column of
+        /// type `LowCardinality(FixedString)` (and similar) is wrongly rejected here, which silently
+        /// disables partition/key pruning. The requested `target_type` is re-applied afterwards so the
+        /// transform DAG still receives the type it was built against.
+        const DataTypePtr probe_type = removeLowCardinality(target_type);
+
+        if (!probe_type->isNullable() && !probe_type->canBeInsideNullable())
         {
             /// We cannot apply castColumnAccurateOrNull() because it will throw exception
             return false;
         }
 
-        column = castColumnAccurateOrNull({column, type, ""}, target_type);
-        const auto & n = assert_cast<const ColumnNullable &>(*column);
+        ColumnPtr probe_column = castColumnAccurateOrNull({column, type, ""}, probe_type);
+        const auto & n = assert_cast<const ColumnNullable &>(*probe_column);
 
         /// If we have any NULLs after cast, that means cast could not be applied accurately for all values
         for (char8_t b : n.getNullMapData())
             if (b)
                 return false;
 
-        if (!target_type->isNullable())
-            column = n.getNestedColumnPtr();
-
+        /// No NULLs were introduced, so the cast is accurate for every value. Produce the requested
+        /// target_type (which may be LowCardinality and/or Nullable); the accurate cast cannot throw
+        /// here because the probe above already proved every value fits.
+        column = castColumnAccurate({column, type, ""}, target_type);
         type = target_type;
         return true;
     };
