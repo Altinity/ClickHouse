@@ -253,7 +253,7 @@ def test_select(started_cluster):
 
 
 def create_clickhouse_iceberg_database(
-    started_cluster, node, name, additional_settings={}
+    started_cluster, node, name, additional_settings={}, query_id=None
 ):
     settings = {
         "catalog_type": "rest",
@@ -263,13 +263,14 @@ def create_clickhouse_iceberg_database(
 
     settings.update(additional_settings)
 
+    node.query(f"DROP DATABASE IF EXISTS {name}")
     node.query(
         f"""
-DROP DATABASE IF EXISTS {name};
-SET allow_experimental_database_iceberg=true;
 CREATE DATABASE {name} ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', '{minio_secret_key}')
 SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
-    """
+    """,
+        settings={"allow_experimental_database_iceberg": 1},
+        query_id=query_id,
     )
     show_result = node.query(f"SHOW DATABASE {name}")
     assert minio_secret_key not in show_result
@@ -417,15 +418,15 @@ def get_credentials_profile_events(node, query_id):
 
 def get_auth_token_profile_events(node, query_id):
     node.query("SYSTEM FLUSH LOGS")
-    refreshed = int(node.query(
-        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenRefreshed'] "
+    retrieved = int(node.query(
+        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenRetrieve'] "
         f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
     ))
-    cache_hits = int(node.query(
-        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenCacheHits'] "
+    cached_valid = int(node.query(
+        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenCachedValid'] "
         f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
     ))
-    return refreshed, cache_hits
+    return retrieved, cached_valid
 
 
 def test_auth_token_profile_events(started_cluster):
@@ -450,9 +451,11 @@ def test_auth_token_profile_events(started_cluster):
         properties={"write.metadata.compression-codec": "none"},
     )
 
-    # The catalog client is initialized lazily on the first database access,
-    # not during CREATE DATABASE. OAuth credentials must use client_id:client_secret
-    # format; oauth_server_uri points to a mock token endpoint in docker compose.
+    # CREATE DATABASE constructs the catalog client, which loads the catalog
+    # configuration, and that first request is what fetches the access token.
+    # OAuth credentials must use client_id:client_secret format; oauth_server_uri
+    # points to a mock token endpoint in docker compose.
+    qid_create = f"{test_ref}-create-{uuid.uuid4()}"
     create_clickhouse_iceberg_database(
         started_cluster,
         node,
@@ -461,18 +464,22 @@ def test_auth_token_profile_events(started_cluster):
             "catalog_credential": "test:secret",
             "oauth_server_uri": MOCK_OAUTH_URL,
         },
+        query_id=qid_create,
     )
+    retrieved, cached_valid = get_auth_token_profile_events(node, qid_create)
+    assert retrieved >= 1
 
+    # Every later access reuses the token cached by the catalog client.
     qid1 = f"{test_ref}-show-1-{uuid.uuid4()}"
     node.query(f"SHOW TABLES FROM {db_name}", query_id=qid1)
     assert table_name in node.query(f"SHOW TABLES FROM {db_name}")
-    refreshed, cache_hits = get_auth_token_profile_events(node, qid1)
-    assert refreshed >= 1
+    retrieved, cached_valid = get_auth_token_profile_events(node, qid1)
+    assert retrieved == 0 and cached_valid >= 1
 
     qid2 = f"{test_ref}-show-2-{uuid.uuid4()}"
     node.query(f"SHOW TABLES FROM {db_name}", query_id=qid2)
-    refreshed, cache_hits = get_auth_token_profile_events(node, qid2)
-    assert refreshed == 0 and cache_hits >= 1
+    retrieved, cached_valid = get_auth_token_profile_events(node, qid2)
+    assert retrieved == 0 and cached_valid >= 1
 
 
 def test_vended_credentials_cache(started_cluster):

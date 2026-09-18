@@ -81,7 +81,7 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
 
 - **`Primitives/`** — the vocabulary, zero outward dependencies: `CasBlobDigest`
   (`BlobHashAlgo` + `BlobDigest` + `DigestCodec` + `BlobRef` — blob identity),
-  `CasTypes.h` (the other identity types: `RootNamespace`, `Token`,
+  `CasTypes.h` (the other identity types: `RootNamespace`, `Dialect`,
   `ManifestId`, `RefTxnId`), `CasNamespaceLifeId` (`NamespaceLifeId` — one LIFE of
   a namespace's ref layer, the pair every ref key is built from),
   `CasBlobHashingWriteBuffer` (streaming
@@ -92,13 +92,14 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
   text/format files (`CasFormat`, `CasTextFormat`, `CasPartManifestFormat`,
   `CasRefLogFormat`, …) plus `CasLayout` (the object-key schema). See
   `Formats/README.md` for the format registry.
-- **`Backend/`** — the token-aware storage seam: `CasBackend` (the contract:
-  `get`/`putIfAbsent`/`casPut`/`deleteExact` with CAS tokens, plus unconditional
-  transport-only `publishBlob`),
+- **`Backend/`** — the request-contract seam: `CasBackend` (the transport
+  primitives, dealing only in the store's own raw incarnation strings:
+  `read`/`head`/`list`/`remove`/`write`/`stream`/`publish`),
   `CasObjectStorageBackend`, `CasInMemoryBackend`, `CasInstrumentedBackend`,
-  `CasRequestControl` (single-attempt conditional non-blob writes, including create-if-absent
-  artifacts and conditional replacements, with explicit
-  state-aware retries), `CasProbe` (mount-time capability probe).
+  `CasRequests` (the retrying, `Etag`-typed layer above it — `create`/
+  `replace`/`readModifyWrite`/`read`/`remove`/`probeSentinel`/`stream`/
+  `publish`, admitted and budgeted by `Retry` and `CasRequestBudget`),
+  `CasProbe` (mount-time capability probe).
 - **`Pool/`** — the pool engine: `CasPool` (composition root), `CasPartWriteTxn`
   (one-part write transaction), `CasRefLedger` + `CasRefProtocol` (ref-table
   log/snapshot/replay + intake), `CasServerRoot` (mount-claim protocol +
@@ -112,7 +113,7 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
   `CasDecommission`, `CasInspect`.
 - **`Parts/`** — part semantics over the pool: `PartPathParser` (the
   ClickHouse-path classifier), `PartFolderAccess` (`PartRefKey` + `Freshness`
-  + `PartFolderValidate` + `PartFolderView` + `CachedPartFolderAccess`).
+  + `PartFolderView` + `CachedPartFolderAccess`).
 - **Top level (facade)** — the entry points: `ContentAddressedMetadataStorage`
   (the `IMetadataStorage` facade), `ContentAddressedTransaction` (the
   `IMetadataTransaction`, including the write buffers), `ContentAddressedExchange`
@@ -190,6 +191,12 @@ not to multipart-capable blob publication.
   (local object storage) and "`cas s3 storage`" run the whole
   stateless suite with `MergeTree` defaulting to a CAS disk. Tests that
   legitimately cannot run there carry the `no-cas-storage` tag.
+- **Stress**: `Stress test (amd_{debug,asan_ubsan,tsan,msan}, cas s3 storage)`
+  run the same `clickhouse-test --stress-tests` loop as the other stress
+  jobs (stateless tests picked at random, several clients in parallel, no
+  result validation) with `cas_s3` as the default `MergeTree` policy
+  and RustFS backing the pool. One job per AMD sanitizer build plus
+  debug (the non-sanitizer stress package).
 - **Soak / chaos**: `utils/ca-soak/` — multi-replica docker-compose
   harnesses (fault proxies, GC sharding variants, AWS S3/GCS backends) and
   adversarial scenarios.

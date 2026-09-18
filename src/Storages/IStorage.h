@@ -62,6 +62,9 @@ struct StreamLocalLimits;
 class EnabledQuota;
 struct SelectQueryInfo;
 
+/// Declared opaquely (definition in Core/SettingsEnums.h) to keep this widely included header light.
+enum class MergeTreePartExportFileAlreadyExistsPolicy : uint8_t;
+
 using NameDependencies = std::unordered_map<String, std::vector<String>>;
 using DatabaseAndTableName = std::pair<String, String>;
 
@@ -118,6 +121,12 @@ public:
 
     /// Returns true if the storage receives data from a remote server or servers.
     virtual bool isRemote() const { return false; }
+
+    /// Returns true for storages that do not store data themselves but read it from other tables,
+    /// e.g. `Distributed`, `Merge`, `Buffer`, `Alias`. The `_table` and `_database` virtual columns
+    /// of the rows read from such a storage carry the name of the table that actually produced
+    /// each row, which is not necessarily the name of this storage.
+    virtual bool readsFromOtherTables() const { return false; }
 
     /// Returns true if the storage is a view of a table or another view.
     virtual bool isView() const { return false; }
@@ -450,16 +459,43 @@ public:
       return false;
     }
 
+    /// Outcome of `import`. Either the destination expects the part to be written through `sink`,
+    /// or a previous export already wrote the whole part there and `exported_paths` lists the
+    /// files it produced, in which case there is nothing left to write.
+    struct ImportResult
+    {
+    private:
+        ImportResult(SinkToStoragePtr sink_, bool already_exported_, std::vector<String> exported_paths_)
+            : sink(std::move(sink_)), already_exported(already_exported_), exported_paths(std::move(exported_paths_)) {}
+    public:
+
+        static ImportResult createSink(SinkToStoragePtr sink_)
+        {
+            return ImportResult(std::move(sink_), false, {});
+        }
+
+        static ImportResult createAlreadyExported(std::vector<String> exported_paths_)
+        {
+            return ImportResult(nullptr, true, std::move(exported_paths_));
+        }
+
+        /// Null when `already_exported` is set.
+        SinkToStoragePtr sink;
+        bool already_exported = false;
+        /// The complete set of destination files, set only when `already_exported` is true.
+        std::vector<String> exported_paths;
+    };
+
     /*
 It is currently only implemented in StorageObjectStorage.
       It is meant to be used to import merge tree data parts into object storage. It is similar to the write API,
       but it won't re-partition the data and should allow the filename to be set by the caller.
     */
-    virtual SinkToStoragePtr import(
+    virtual ImportResult import(
         const std::string & /* file_name */,
         Block & /* block_with_partition_values */,
         const std::function<void(const std::string &)> & /* new_file_path_callback */,
-        bool /* overwrite_if_exists */,
+        MergeTreePartExportFileAlreadyExistsPolicy /* file_already_exists_policy */,
         std::size_t /* max_bytes_per_file */,
         std::size_t /* max_rows_per_file */,
         const std::optional<std::string> & /* iceberg_metadata_json_string */,
@@ -480,7 +516,7 @@ It is currently only implemented in StorageObjectStorage.
     };
 
     /// Paths produced by the destination storage during commit. Surfaced via
-    /// system.replicated_partition_exports for debugging
+    /// system.partition_exports for debugging
     struct ExportPartitionCommitInfo
     {
       /// Iceberg destinations only.
