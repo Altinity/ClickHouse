@@ -1,6 +1,7 @@
 #include <filesystem>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergPath.h>
 
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Common/Exception.h>
 
 namespace DB::ErrorCodes
@@ -10,6 +11,11 @@ extern const int BAD_ARGUMENTS;
 
 namespace DB::Iceberg
 {
+
+IcebergPathFromMetadata IcebergPathFromMetadata::makeStorageIdentity(const ObjectStoragePtr & storage, const String & key)
+{
+    return IcebergPathFromMetadata(storage->getDescription() + '\0' + storage->getObjectsNamespace() + '\0' + key);
+}
 
 namespace
 {
