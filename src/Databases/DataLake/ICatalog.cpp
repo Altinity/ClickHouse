@@ -320,8 +320,22 @@ std::string TableMetadata::getMetadataLocation(const std::string & iceberg_metad
             metadata_location = metadata_location.substr(storage_type_str.size());
         if (data_location.starts_with(storage_type_str))
             data_location = data_location.substr(storage_type_str.size());
-        else if (!endpoint.empty() && data_location.starts_with(endpoint))
-            data_location = data_location.substr(endpoint.size());
+        else if (!endpoint.empty())
+        {
+            std::string normalized_endpoint = endpoint;
+            if (normalized_endpoint.ends_with('/'))
+                normalized_endpoint.pop_back();
+
+            if (data_location.starts_with(normalized_endpoint))
+            {
+                data_location = data_location.substr(normalized_endpoint.size());
+                /// `metadata_location` is relative to the bucket (the `s3://` prefix is stripped above),
+                /// while `data_location` still has the leading slash left over from the endpoint,
+                /// e.g. "/bucket/table-uuid/". Drop it so that the prefix comparison below works.
+                if (azure_account_with_suffix.empty() && data_location.starts_with('/'))
+                    data_location = data_location.substr(1);
+            }
+        }
 
         if (metadata_location.starts_with(data_location))
         {
