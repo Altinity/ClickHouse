@@ -122,7 +122,7 @@ namespace whose view fails to build is added to an errored set with **all** of i
 skipped — an empty owner set is never substituted for a failed one. A body that cannot be opened
 or decoded is likewise retained: it increments both `skipped` and `undecodable`, advances the page
 decision cursor, logs the exact key, and does not prevent later candidates from being examined. It
-is not repaired or deleted, and remains visible to `ca-fsck` as an unreachable object. A decoded
+is not repaired or deleted, and remains visible to `cas-fsck` as an unreachable object. A decoded
 body whose ref or namespace does not match its key instead fails the round with `CORRUPTED_DATA`.
 
 For every legal nomination, the sweep derives exact source-retirement records for the body's blob
@@ -273,7 +273,7 @@ after the durable install. In-flight precommits are visible only through the pre
 through an ordinary ref resolve.
 
 Two cross-process readers see a different, colder view, but only at the discovery boundary: `GC`
-and `ca-fsck` `LIST` once to discover which namespaces exist, staleness-bounded by whatever was
+and `cas-fsck` `LIST` once to discover which namespaces exist, staleness-bounded by whatever was
 durable at `LIST` time, so a namespace born after that `LIST` is invisible to this pass. Within
 each discovered namespace, the replay itself is not `LIST`-driven — it is the same exact-`GET`,
 `_ckpt`-grounded arithmetic walk described above, just called from a caller-supplied catalog entry

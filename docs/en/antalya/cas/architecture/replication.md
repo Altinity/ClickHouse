@@ -120,7 +120,7 @@ log. That ordering, steps T1 then T2 then T3, is the whole seal.
 This does **not** establish that every subsequent `GC` fold *sees* that `+1` under every listing
 behavior: a configuration with one incomplete listing page can, in principle, let a fold miss a
 freshly published edge. A confirmed relink therefore proves only "the source still holds exactly
-this manifest right now", not "no future fold can ever miss this edge" — `ca-fsck`'s
+this manifest right now", not "no future fold can ever miss this edge" — `cas-fsck`'s
 reachable-but-absent scan is the backstop for that gap, not the relink protocol itself. Relink
 also races `GC` in the ordinary sense any writer does: between the sender encoding its offer and
 the receiver's promote, `GC` on the shared pool may condemn a blob that was live only through the
