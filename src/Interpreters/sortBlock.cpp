@@ -336,6 +336,9 @@ void checkSortedWithPermutation(const Block & block, const SortDescription & des
 void sortBlock(Block & block, const SortDescription & description, UInt64 limit)
 {
     IColumn::Permutation permutation;
+#ifndef NDEBUG
+    block.checkNumberOfRows();
+#endif
     getBlockSortPermutationImpl(block, description, IColumn::PermutationSortStability::Unstable, limit, permutation);
 
 #ifndef NDEBUG
