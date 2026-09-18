@@ -574,6 +574,8 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
             return {"string", true};
         case TypeIndex::UUID:
             return {"uuid", true};
+        case TypeIndex::Nothing:
+            return {"unknown", false};
         case TypeIndex::Decimal32:
         case TypeIndex::Decimal64:
         case TypeIndex::Decimal128:
