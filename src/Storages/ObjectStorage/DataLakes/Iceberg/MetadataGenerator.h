@@ -39,7 +39,8 @@ public:
         Int64 num_deleted_rows,
         std::optional<Int64> user_defined_snapshot_id = std::nullopt,
         std::optional<Int64> user_defined_timestamp = std::nullopt,
-        bool is_truncate = false);
+        bool is_truncate = false,
+        Poco::JSON::Object::Ptr user_defined_summary = nullptr);
 
     /// Create a manifest-only rewrite snapshot (`replace` operation) carrying `total-*` counters forward so `OPTIMIZE ... MANIFEST` is idempotent.
     NextMetadataResult generateManifestOnlySnapshot(

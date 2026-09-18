@@ -268,6 +268,15 @@ public:
         ContextPtr /*context*/,
         const StorageID & /*storage_id*/,
         std::shared_ptr<DataLake::ICatalog> /*catalog*/) { throwNotImplemented("alter"); }
+    virtual bool supportsDropPartition() const { return false; }
+    virtual void dropPartition(
+        const ASTPtr & /* partition */,
+        ContextPtr /* context */,
+        std::shared_ptr<DataLake::ICatalog> /* catalog */,
+        const StorageID & /* storage_id */)
+    {
+        throwNotImplemented("dropPartition");
+    }
 
     virtual Pipe executeCommand(
         const String & command_name,

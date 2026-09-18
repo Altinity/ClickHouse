@@ -139,6 +139,41 @@ struct ManifestListEntryExistingCounts
     Int64 min_sequence_number = 0;
 };
 
+struct ManifestRewriteResult
+{
+    Int32 surviving_entries = 0;
+    Int64 surviving_rows = 0;
+    Int64 removed_entries = 0;
+    Int64 min_sequence_number = 0;
+};
+
+/// Copy a manifest file without the entries whose `data_file.file_path` is in excluded_file_paths
+ManifestRewriteResult rewriteManifestFileExcludingFiles(
+    ReadBuffer & source,
+    const std::unordered_set<String> & excluded_file_paths,
+    Int64 inherited_sequence_number,
+    Int64 inherited_snapshot_id,
+    WriteBuffer & out);
+
+struct PreviousManifestAction
+{
+    enum class Kind : uint8_t
+    {
+        DROP,
+        REPLACE,
+    };
+
+    Kind kind = Kind::DROP;
+
+    Iceberg::IcebergPathFromMetadata new_path;
+    Int64 new_length = 0;
+    Int32 new_existing_files_count = 0;
+    Int64 new_existing_rows_count = 0;
+    Int64 new_min_sequence_number = 0;
+};
+
+using PreviousManifestActions = std::unordered_map<String, PreviousManifestAction>;
+
 void generateManifestList(
     const Iceberg::IcebergPathResolver & path_resolver,
     Poco::JSON::Object::Ptr metadata,
@@ -155,7 +190,8 @@ void generateManifestList(
     const std::vector<ManifestListEntryExistingCounts> & existing_entry_counts = {},
     const std::unordered_set<String> & carry_forward_manifest_paths = {},
     const std::vector<Int64> & entry_partition_spec_ids = {},
-    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {});
+    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {},
+    const PreviousManifestActions & previous_manifest_actions = {});
 
 std::string getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path);
 
