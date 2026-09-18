@@ -6,6 +6,7 @@
 #include <Common/config_version.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
+#include <Common/CurrentThread.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <mutex>
 #include <chrono>
@@ -81,6 +82,28 @@ namespace ProfileEvents
     extern const Event OneLakeAccessTokenRequestFailures;
     extern const Event OneLakeAccessTokenRequestMicroseconds;
     extern const Event OneLakeAccessTokenExpirations;
+    extern const Event DataLakeRestCatalogLoadConfig;
+    extern const Event DataLakeRestCatalogLoadConfigMicroseconds;
+    extern const Event DataLakeRestCatalogGetNamespaces;
+    extern const Event DataLakeRestCatalogGetNamespacesMicroseconds;
+    extern const Event DataLakeRestCatalogGetTables;
+    extern const Event DataLakeRestCatalogGetTablesMicroseconds;
+    extern const Event DataLakeRestCatalogGetTableMetadata;
+    extern const Event DataLakeRestCatalogGetTableMetadataMicroseconds;
+    extern const Event DataLakeRestCatalogGetCredentials;
+    extern const Event DataLakeRestCatalogGetCredentialsMicroseconds;
+    extern const Event DataLakeRestCatalogAuthTokenCachedValid;
+    extern const Event DataLakeRestCatalogAuthTokenRetrieve;
+    extern const Event DataLakeRestCatalogAuthTokenRefreshedMicroseconds;
+    extern const Event DataLakeRestCatalogUnauthorized;
+    extern const Event DataLakeRestCatalogCreateNamespace;
+    extern const Event DataLakeRestCatalogCreateNamespaceMicroseconds;
+    extern const Event DataLakeRestCatalogCreateTable;
+    extern const Event DataLakeRestCatalogCreateTableMicroseconds;
+    extern const Event DataLakeRestCatalogUpdateTable;
+    extern const Event DataLakeRestCatalogUpdateTableMicroseconds;
+    extern const Event DataLakeRestCatalogDropTable;
+    extern const Event DataLakeRestCatalogDropTableMicroseconds;
 }
 
 namespace DB::DatabaseDataLakeSetting
@@ -248,10 +271,15 @@ RestCatalog::RestCatalog(
 RestCatalog::Config RestCatalog::loadConfig(const CatalogState & catalog_state, const std::optional<DB::HTTPHeaderEntries> & auth_headers)
 {
     Poco::URI::QueryParameters params = {{"warehouse", warehouse}};
-    auto buf = createReadBuffer(catalog_state, CONFIG_ENDPOINT, params, /* headers */ {}, auth_headers);
 
     std::string json_str;
-    readJSONObjectPossiblyInvalid(json_str, *buf);
+
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogLoadConfig);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogLoadConfigMicroseconds);
+        auto buf = createReadBuffer(catalog_state, CONFIG_ENDPOINT, params, /* headers */ {}, auth_headers);
+        readJSONObjectPossiblyInvalid(json_str, *buf);
+    }
 
     LOG_DEBUG(log, "Received catalog configuration settings: {}", json_str);
 
@@ -295,12 +323,18 @@ void RestCatalog::validateAuthHeaders(const DB::HTTPHeaderEntry & header) const
     getContext()->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(header_to_check);
 }
 
-DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const CatalogState & catalog_state, bool update_token) const
+DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
+    const CatalogState & catalog_state,
+    bool update_token,
+    bool * used_cached_oauth_token) const
 {
     fiu_do_on(DB::FailPoints::check_database_datalake_negative,
     {
         throw DB::Exception(DB::ErrorCodes::FAULT_INJECTED, "Injecting fault when checking database");
     });
+
+    if (used_cached_oauth_token)
+        *used_cached_oauth_token = false;
 
     /// Option 1: user specified auth header manually.
     /// Header has format: 'Authorization: <scheme> <token>'.
@@ -319,10 +353,14 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const CatalogState & catalog_s
         /// request fails with 401/403 and is retried with `update_token = true`, fetching
         /// a token with the snapshot's credentials.
         auto current = access_token.get();
-        if (!current || update_token)
+        if (!current || update_token || current->isExpired())
         {
             access_token.set(std::make_unique<AccessToken>(retrieveAccessToken(catalog_state.client_id, catalog_state.client_secret)));
             current = access_token.get();
+        }
+        else if (used_cached_oauth_token)
+        {
+            *used_cached_oauth_token = true;
         }
 
         DB::HTTPHeaderEntries headers;
@@ -501,7 +539,10 @@ void RestCatalog::applySettingsChangesToState(
     }
 }
 
-DB::HTTPHeaderEntries OneLakeCatalog::getAuthHeaders(const CatalogState & catalog_state, bool update_token) const
+DB::HTTPHeaderEntries OneLakeCatalog::getAuthHeaders(
+    const CatalogState & catalog_state,
+    bool update_token,
+    bool * used_cached_oauth_token) const
 {
     DB::HTTPHeaderEntries headers;
     if (!catalog_state.refresh_token.empty())
@@ -511,7 +552,7 @@ DB::HTTPHeaderEntries OneLakeCatalog::getAuthHeaders(const CatalogState & catalo
     }
     else
     {
-        headers = RestCatalog::getAuthHeaders(catalog_state, update_token);
+        headers = RestCatalog::getAuthHeaders(catalog_state, update_token, used_cached_oauth_token);
     }
     headers.emplace_back("User-Agent", fmt::format("ClickHouse/{}{} OneLake-Catalog", VERSION_STRING, VERSION_OFFICIAL));
     return headers;
@@ -743,6 +784,9 @@ namespace
 
 AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, const std::string & client_secret) const
 {
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
+
     static constexpr auto oauth_tokens_endpoint = "oauth/tokens";
 
     /// TODO:
@@ -997,7 +1041,10 @@ BigLakeCatalog::BigLakeCatalog(
     state.set(std::make_unique<const CatalogState>(std::move(initial_state)));
 }
 
-DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(const CatalogState & catalog_state, bool update_token) const
+DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
+    const CatalogState & catalog_state,
+    bool update_token,
+    bool * used_cached_oauth_token) const
 {
     /// Google Cloud OAuth2 for BigLake.
     /// Uses GCP metadata service or Application Default Credentials to get access token.
@@ -1005,11 +1052,18 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(const CatalogState & catalo
     /// https://developers.google.com/identity/protocols/oauth2
     if (!google_project_id.empty() || !google_adc_client_id.empty())
     {
+        if (used_cached_oauth_token)
+            *used_cached_oauth_token = false;
+
         auto current = access_token.get();
         if (!current || update_token || current->isExpired())
         {
             access_token.set(std::make_unique<AccessToken>(retrieveGoogleCloudAccessToken()));
             current = access_token.get();
+        }
+        else if (used_cached_oauth_token)
+        {
+            *used_cached_oauth_token = true;
         }
 
         DB::HTTPHeaderEntries headers;
@@ -1029,7 +1083,7 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(const CatalogState & catalo
         return headers;
     }
 
-    return RestCatalog::getAuthHeaders(catalog_state, update_token);
+    return RestCatalog::getAuthHeaders(catalog_state, update_token, used_cached_oauth_token);
 }
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() const
@@ -1051,6 +1105,9 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() con
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 {
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
+
     const auto & context = getContext();
 
     /// An explicit Application Default Credentials triple is a user-supplied credential, so it is honored.
@@ -1182,9 +1239,9 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
     if (!params.empty())
         url.setQueryParameters(params);
 
-    auto create_buffer = [&](bool update_token)
+    auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
     {
-        auto result_headers = auth_headers ? *auth_headers : getAuthHeaders(catalog_state, update_token);
+        auto result_headers = auth_headers ? *auth_headers : getAuthHeaders(catalog_state, update_token, &used_cached_oauth_token);
         std::move(headers.begin(), headers.end(), std::back_inserter(result_headers));
 
         return DB::BuilderRWBufferFromHTTP(url)
@@ -1202,7 +1259,11 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
 
     try
     {
-        return create_buffer(false);
+        bool used_cached_oauth_token = false;
+        auto buf = create_buffer(false, used_cached_oauth_token);
+        if (used_cached_oauth_token)
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCachedValid);
+        return buf;
     }
     catch (const DB::HTTPException & e)
     {
@@ -1211,7 +1272,9 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
             (status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED
              || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN))
         {
-            return create_buffer(true);
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUnauthorized);
+            bool used_cached_oauth_token_on_retry = false;
+            return create_buffer(true, used_cached_oauth_token_on_retry);
         }
         throw;
     }
@@ -1380,6 +1443,8 @@ RestCatalog::Namespaces RestCatalog::listChildNamespaces(const std::string & bas
             if (!page_token.empty())
                 params.push_back({"pageToken", page_token});
 
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetNamespaces);
+            auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetNamespacesMicroseconds);
             auto buf = createReadBuffer(
                 *state_snapshot, state_snapshot->config.prefix / NAMESPACES_ENDPOINT, params, /* headers */ {}, /* auth_headers */ std::nullopt);
             String next_page_token;
@@ -1531,6 +1596,8 @@ DB::Names RestCatalog::listTablesInNamespace(const std::string & base_namespace,
         if (!page_token.empty())
             params.push_back({"pageToken", page_token});
 
+        ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetTables);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetTablesMicroseconds);
         auto buf = createReadBuffer(
             *state_snapshot, state_snapshot->config.prefix / endpoint, params, /* headers */ {}, /* auth_headers */ std::nullopt);
 
@@ -1677,16 +1744,22 @@ bool RestCatalog::getTableMetadataImpl(
 
     const auto state_snapshot = state.get();
     const std::string endpoint = std::filesystem::path(NAMESPACES_ENDPOINT) / encodeNamespaceForURI(namespace_name) / "tables" / table_name;
-    auto buf = createReadBuffer(*state_snapshot, state_snapshot->config.prefix / endpoint, /* params */ {}, headers, /* auth_headers */ std::nullopt);
-
-    if (buf->eof())
-    {
-        LOG_DEBUG(log, "Table doesn't exist (endpoint: {})", endpoint);
-        return false;
-    }
-
     String json_str;
-    readJSONObjectPossiblyInvalid(json_str, *buf);
+
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetTableMetadata);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetTableMetadataMicroseconds);
+        auto buf = createReadBuffer(
+            *state_snapshot, state_snapshot->config.prefix / endpoint, /* params */ {}, headers, /* auth_headers */ std::nullopt);
+
+        if (buf->eof())
+        {
+            LOG_DEBUG(log, "Table doesn't exist (endpoint: {})", endpoint);
+            return false;
+        }
+
+        readJSONObjectPossiblyInvalid(json_str, *buf);
+    }
 
 #ifdef DEBUG_OR_SANITIZER_BUILD
     /// This log message might contain credentials,
@@ -1763,10 +1836,6 @@ void RestCatalog::sendRequest(const CatalogState & catalog_state, const String &
 
     LOG_TEST(log, "REST catalog {} {} body ({} bytes): {}", method, endpoint, body_str.size(), body_str);
 
-    DB::HTTPHeaderEntries headers = getAuthHeaders(catalog_state, /* update_token = */ true);
-    headers.emplace_back("Content-Type", "application/json");
-    headers.emplace_back("X-Iceberg-Access-Delegation", "vended-credentials");
-
     const auto & context = getContext();
 
     DB::ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback;
@@ -1781,25 +1850,62 @@ void RestCatalog::sendRequest(const CatalogState & catalog_state, const String &
     /// enable_url_encoding=false to allow using tables with encoded sequences in names like 'foo%2Fbar'
     Poco::URI url(endpoint, /* enable_url_encoding */ false);
 
-    auto wb = DB::BuilderRWBufferFromHTTP(url)
-        .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
-        .withMethod(method)
-        .withSettings(context->getReadSettings())
-        .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
-        .withHostFilter(&context->getRemoteHostFilter())
-        .withHeaders(headers)
-        .withOutCallback(out_stream_callback)
-        /// Send the JSON body with an explicit Content-Length: Snowflake Horizon rejects
-        /// chunked transfer encoding on catalog commits with HTTP 500 and an empty body.
-        .withOutCallbackFixedContentLength(body_str.size())
-        .withSkipNotFound(false)
-        .create(credentials);
+    auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
+    {
+        DB::HTTPHeaderEntries headers = getAuthHeaders(catalog_state, update_token, &used_cached_oauth_token);
+        headers.emplace_back("Content-Type", "application/json");
+        headers.emplace_back("X-Iceberg-Access-Delegation", "vended-credentials");
+        return DB::BuilderRWBufferFromHTTP(url)
+            .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
+            .withMethod(method)
+            .withSettings(context->getReadSettings())
+            .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
+            .withHostFilter(&context->getRemoteHostFilter())
+            .withHeaders(headers)
+            .withOutCallback(out_stream_callback)
+            /// Send the JSON body with an explicit Content-Length: Snowflake Horizon rejects
+            /// chunked transfer encoding on catalog commits with HTTP 500 and an empty body.
+            .withOutCallbackFixedContentLength(body_str.size())
+            .withSkipNotFound(false)
+            .create(credentials);
+    };
 
-    String response_str;
-    if (!ignore_result)
-        readJSONObjectPossiblyInvalid(response_str, *wb);
-    else
-        wb->ignoreAll();
+    try
+    {
+        bool used_cached_oauth_token = false;
+        auto wb = create_buffer(false, used_cached_oauth_token);
+
+        String response_str;
+        if (!ignore_result)
+            readJSONObjectPossiblyInvalid(response_str, *wb);
+        else
+            wb->ignoreAll();
+
+        if (used_cached_oauth_token)
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCachedValid);
+    }
+    catch (const DB::HTTPException & e)
+    {
+        const auto status = e.getHTTPStatus();
+        if (update_token_if_expired &&
+            (status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED
+             || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN))
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUnauthorized);
+            bool used_cached_oauth_token_on_retry = false;
+            auto wb = create_buffer(true, used_cached_oauth_token_on_retry);
+
+            String response_str;
+            if (!ignore_result)
+                readJSONObjectPossiblyInvalid(response_str, *wb);
+            else
+                wb->ignoreAll();
+        }
+        else
+        {
+            throw;
+        }
+    }
 }
 
 void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, const String & location) const
@@ -1837,6 +1943,8 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
 
     try
     {
+        ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogCreateNamespace);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogCreateNamespaceMicroseconds);
         sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
     }
     catch (const DB::HTTPException & e)
@@ -1881,6 +1989,8 @@ void RestCatalog::createTable(const String & namespace_name, const String & tabl
 
     try
     {
+        ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogCreateTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogCreateTableMicroseconds);
         sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
     }
     catch (const DB::HTTPException & ex)
@@ -1948,6 +2058,8 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
 
     try
     {
+        ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUpdateTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogUpdateTableMicroseconds);
         sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
     }
     catch (const DB::HTTPException & ex)
@@ -2040,6 +2152,8 @@ void RestCatalog::dropTable(const String & namespace_name, const String & table_
     Poco::JSON::Object::Ptr request_body = nullptr;
     try
     {
+        ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogDropTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogDropTableMicroseconds);
         sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_DELETE, true);
     }
     catch (const DB::HTTPException & ex)
@@ -2128,16 +2242,22 @@ ICatalog::CredentialsRefreshCallback RestCatalog::getCredentialsConfigurationCal
         const auto & table = storage_id.getTableName();
         auto [namespace_name, table_name] = DataLake::parseTableName(table);
         const std::string endpoint = std::filesystem::path(NAMESPACES_ENDPOINT) / encodeNamespaceForURI(namespace_name) / "tables" / table_name;
-        auto buf = createReadBuffer(*state_snapshot, state_snapshot->config.prefix / endpoint, /* params */ {}, headers, /* auth_headers */ std::nullopt);
-
-        if (buf->eof())
-        {
-            LOG_DEBUG(log, "Table doesn't exist (endpoint: {})", endpoint);
-            return nullptr;
-        }
-
         String json_str;
-        readJSONObjectPossiblyInvalid(json_str, *buf);
+
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetCredentials);
+            auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetCredentialsMicroseconds);
+            auto buf = createReadBuffer(
+                *state_snapshot, state_snapshot->config.prefix / endpoint, /* params */ {}, headers, /* auth_headers */ std::nullopt);
+
+            if (buf->eof())
+            {
+                LOG_DEBUG(log, "Table doesn't exist (endpoint: {})", endpoint);
+                return nullptr;
+            }
+
+            readJSONObjectPossiblyInvalid(json_str, *buf);
+        }
 
         Poco::JSON::Parser parser;
         Poco::Dynamic::Var json = parser.parse(json_str);

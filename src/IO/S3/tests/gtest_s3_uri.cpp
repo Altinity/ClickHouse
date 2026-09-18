@@ -6,6 +6,8 @@
 
 #if USE_AWS_S3
 
+#include <IO/S3/Client.h>
+
 TEST(IOTestS3URI, PathStyleNoKey)
 {
     using namespace DB;
@@ -36,6 +38,31 @@ TEST(IOTestS3URI, PathStyleWithKey)
 
     ASSERT_EQ(uri_with_no_key_and_with_slash.bucket, "bucket-name");
     ASSERT_EQ(uri_with_no_key_and_with_slash.key, "key/key/key/key");
+}
+
+TEST(IOTestS3URI, ResolveS3Endpoint)
+{
+    using namespace DB;
+
+    /// expandRegionToAmazonPath() goes through the SDK's endpoint provider, which requires
+    /// the AWS SDK (and its CRT allocator) to be initialized. In the server this happens
+    /// implicitly because every S3 client is created through ClientFactory; here the test may
+    /// be the only thing running, so initialize it explicitly.
+    S3::ClientFactory::instance();
+
+    ASSERT_EQ(S3::expandRegionToAmazonPath("us-east-1"),
+              "https://s3.us-east-1.amazonaws.com");
+    ASSERT_EQ(S3::expandRegionToAmazonPath("eu-west-1"),
+              "https://s3.eu-west-1.amazonaws.com");
+
+    auto cn_north = S3::expandRegionToAmazonPath("cn-north-1");
+    ASSERT_TRUE(cn_north.ends_with(".amazonaws.com.cn"))
+        << "China region should resolve to .amazonaws.com.cn suffix, got: " << cn_north;
+    ASSERT_TRUE(cn_north.find("cn-north-1") != std::string::npos)
+        << "Got: " << cn_north;
+
+    ASSERT_EQ(S3::expandRegionToAmazonPath("us-gov-west-1"),
+              "https://s3.us-gov-west-1.amazonaws.com");
 }
 
 #endif
