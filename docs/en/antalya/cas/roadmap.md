@@ -48,7 +48,7 @@ capability probe runs at every writable mount and refuses a backend that does no
 conditions CAS depends on.
 
 **Operability.** `system.cas_log`, `system.cas_gc_log`, and `system.cas_mounts` for introspection;
-`clickhouse-disks` commands `ca-fsck`, `ca-inspect`, `ca-gc-dryrun`, and `ca-gc-rebuild`; the
+`clickhouse-disks` commands `cas-fsck`, `cas-inspect`, `cas-gc-dryrun`, and `cas-gc-rebuild`; the
 `SYSTEM CAS` SQL control surface (`GC RUN`/`STOP`/`START`/`REBUILD`, `FSCK`, `FORGET`, `DROP POOL
 MEMBER`).
 

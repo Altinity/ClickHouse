@@ -78,7 +78,7 @@ temporary part is never mistaken for a real, resolvable part.
 
 ## Diagnostic and read-only access {#read-only-access}
 
-A read-only or diagnostic opener of a `CAS` disk (`ca-fsck`, `ca-gc-dryrun`, and similar tools)
+A read-only or diagnostic opener of a `CAS` disk (`cas-fsck`, `cas-gc-dryrun`, and similar tools)
 must not claim mount ownership, schedule `GC`, or mint writer state — read-only enforcement sits
 below the ordinary facade checks, at the backend layer itself. A mounted `Pool` caches its ref
 table and does not re-recover it on every read; a diagnostic tool that deliberately performs a
