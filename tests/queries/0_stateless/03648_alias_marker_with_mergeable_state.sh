@@ -4,6 +4,11 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
+# `--query_kind secondary_query` goes with every `--stage` below, because the point is to print the
+# header a shard leg produces. A query marked as secondary skips AST-level optimizations
+# (`PlannerContext.cpp`, `is_ast_level_optimization_allowed`) and changes how aggregation is split,
+# neither of which a real shard leg would have applied. Inherited unchanged from Altinity#1844.
+
 echo "---- stage: with_mergeable_state (analyzer=1, setting=enable_alias_marker=1) ----"
 $CLICKHOUSE_CLIENT --enable_analyzer=1 --query_kind secondary_query --stage with_mergeable_state --multiquery 2>&1 <<'EOF' | sed -n '/^Header:/,/^  [^ ]/p' | sed '$d'
 SET enable_alias_marker=1;
