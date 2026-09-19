@@ -10,8 +10,6 @@
 #include <Interpreters/ActionsDAG.h>
 
 #include <Analyzer/HashUtils.h>
-
-#include <string_view>
 #include <Analyzer/IQueryTreeNode.h>
 
 #include <Processors/QueryPlan/QueryPlan.h>
@@ -125,25 +123,5 @@ bool optimizePlanForExists(QueryPlan & query_plan);
 QueryPlanStepPtr projectOnlyUsedColumns(
     const SharedHeader & stream_header,
     const ColumnIdentifiers & used_column_identifiers);
-
-/** Build converting actions from `source_columns` to `result_columns`, matching by name when the names make that
-  * unambiguous and falling back to matching by position otherwise.
-  *
-  * Name matching is used only when both sides hold the same set of names with no duplicates, which makes the rename a
-  * pure reordering. Anything else -- a differing count, a repeated name, a source column the result does not mention --
-  * goes to position matching, because the caller may be renaming columns rather than reordering them. The position
-  * branch is load-bearing, not a safety net: a source header can legitimately carry names the result never uses, such
-  * as the synthetic aggregate-state column behind an optimized trivial `count()`.
-  *
-  * `location` names the call site in the trace log emitted when the helper falls back to position.
-  */
-ActionsDAG makeConvertingActionsPreferNameThenPosition(
-    const ColumnsWithTypeAndName & source_columns,
-    const ColumnsWithTypeAndName & result_columns,
-    const ContextPtr & context,
-    std::string_view location,
-    bool ignore_constant_values,
-    bool add_cast_columns,
-    NameToNameMap * new_names = nullptr);
 
 }

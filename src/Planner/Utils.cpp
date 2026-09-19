@@ -1,8 +1,5 @@
 #include <Planner/Utils.h>
 
-#include <Common/logger_useful.h>
-#include <Core/Block.h>
-
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSubquery.h>
@@ -848,64 +845,6 @@ QueryPlanStepPtr projectOnlyUsedColumns(
     auto step = std::make_unique<ExpressionStep>(stream_header, std::move(project_only_used_columns_actions));
     step->setStepDescription("Project only used columns");
     return step;
-}
-
-namespace
-{
-
-/// True when both sides hold the same set of names and neither repeats one, so matching by name is a pure reordering.
-bool canMatchByNameWithoutAmbiguity(const ColumnsWithTypeAndName & source, const ColumnsWithTypeAndName & result)
-{
-    if (source.size() != result.size())
-        return false;
-
-    NameSet source_names;
-    NameSet result_names;
-
-    for (const auto & source_column : source)
-        if (!source_names.insert(source_column.name).second)
-            return false;
-
-    for (const auto & result_column : result)
-        if (!result_names.insert(result_column.name).second)
-            return false;
-
-    return source_names == result_names;
-}
-
-}
-
-ActionsDAG makeConvertingActionsPreferNameThenPosition(
-    const ColumnsWithTypeAndName & source_columns,
-    const ColumnsWithTypeAndName & result_columns,
-    const ContextPtr & context,
-    std::string_view location,
-    bool ignore_constant_values,
-    bool add_cast_columns,
-    NameToNameMap * new_names)
-{
-    const bool match_by_name = canMatchByNameWithoutAmbiguity(source_columns, result_columns);
-
-    if (!match_by_name)
-    {
-        /// `LOG_IMPL` checks the level before formatting, so the two `dumpNames` calls stay off the hot path.
-        static const auto log = getLogger("Planner");
-        LOG_TEST(
-            log,
-            "Matching by position at {}, because the names do not line up as a set: source=[{}] result=[{}]",
-            location,
-            Block(source_columns).dumpNames(),
-            Block(result_columns).dumpNames());
-    }
-
-    return ActionsDAG::makeConvertingActions(
-        source_columns,
-        result_columns,
-        match_by_name ? ActionsDAG::MatchColumnsMode::Name : ActionsDAG::MatchColumnsMode::Position,
-        context,
-        ignore_constant_values,
-        add_cast_columns,
-        new_names);
 }
 
 }

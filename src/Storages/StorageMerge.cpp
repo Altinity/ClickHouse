@@ -1711,18 +1711,26 @@ void ReadFromMerge::convertAndFilterSourceStream(
                 /// matching no declared name are skipped; they are intermediate outputs of the child plan. Branches
                 /// differ in how they quote a dotted name -- some emit ``__tableN.`n.a` ``, others `__tableN.n.a` -- so
                 /// accept both.
+                ///
+                /// Take the longest matching name rather than the first. A table declaring both `b` and `` `a.b` ``
+                /// makes `__table1.a.b` end with `.b` as well, so a first match in schema order could hand `b` the
+                /// wrong column. Nothing reaches that state today -- an analyzer identifier backquotes a dotted name,
+                /// so the raw form only arrives from a child that never emits a dotted identifier at all -- and the
+                /// longest match is what keeps the mapping from depending on that.
+                const String * best_match = nullptr;
                 for (const auto & merge_column : all_merge_columns)
                 {
                     const bool dotted = merge_column.name.find('.') != String::npos;
                     const String want_raw = "." + merge_column.name;
                     const String want_quoted = dotted ? ("." + backQuote(merge_column.name)) : want_raw;
-                    if (column.name.ends_with(want_quoted) || (dotted && column.name.ends_with(want_raw)))
-                    {
-                        if (!plain_to_identifier.emplace(merge_column.name, column.name).second)
-                            ambiguous.insert(merge_column.name);
-                        break;
-                    }
+                    if (!column.name.ends_with(want_quoted) && !(dotted && column.name.ends_with(want_raw)))
+                        continue;
+                    if (!best_match || best_match->size() < merge_column.name.size())
+                        best_match = &merge_column.name;
                 }
+
+                if (best_match && !plain_to_identifier.emplace(*best_match, column.name).second)
+                    ambiguous.insert(*best_match);
             }
             for (const auto & ambiguous_name : ambiguous)
                 plain_to_identifier.erase(ambiguous_name);
@@ -1769,6 +1777,12 @@ void ReadFromMerge::convertAndFilterSourceStream(
             collectSets(query_tree, *modified_query_info.planner_context);
 
             ColumnNodePtrWithHashSet empty_correlated_columns_set;
+            /// `true` not for the naming it implies -- no column identifiers are registered for this table expression,
+            /// so `calculateActionNodeName` falls back to the plain column name either way -- but for what `false`
+            /// does to an `ALIAS` column: it replaces the column node with a visit of its defining expression. An
+            /// `ALIAS` defined over another one (`b ALIAS a + 1` over `a ALIAS x + 1`) would then expand `a` again
+            /// rather than read the value the child stream already carries, and the physical columns underneath it
+            /// need not be in that stream at all. The plain-name aliases added above are what the lookup then hits.
             PlannerActionsVisitor actions_visitor(modified_query_info.planner_context, empty_correlated_columns_set, true /*use_column_identifier_as_action_node_name*/);
             const auto & [nodes, _] = actions_visitor.visit(actions_dag, query_tree);
 
@@ -1854,18 +1868,13 @@ void ReadFromMerge::convertAndFilterSourceStream(
         }
     }
 
-    /// Prefer matching by name. A `Distributed` child inlines ALIAS expressions on the shard and returns them in
-    /// whatever order the shard's `ActionsDAG` produced, so position matching here can pair an alias column with the
-    /// wrong source and silently swap values. Position still handles the cases name matching cannot, such as a virtual
-    /// column that the child names differently.
-    auto convert_actions_dag = makeConvertingActionsPreferNameThenPosition(
+    /// Position, because the loop above builds `converted_columns[i]` out of `current_step_columns[i]`: the pairing is
+    /// fixed by that construction rather than by the names, and one of the branches deliberately renames a column.
+    auto convert_actions_dag = ActionsDAG::makeConvertingActions(
         current_step_columns,
         converted_columns,
-        local_context,
-        "StorageMerge",
-        false /*ignore_constant_values*/,
-        false /*add_cast_columns*/,
-        nullptr /*new_names*/);
+        ActionsDAG::MatchColumnsMode::Position,
+        local_context);
 
     auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(convert_actions_dag));
     child.plan.addStep(std::move(expression_step));

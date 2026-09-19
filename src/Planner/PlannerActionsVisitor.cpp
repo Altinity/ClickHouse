@@ -216,7 +216,9 @@ public:
 
                     /// No finalized id: either the marker has not reached its serialization boundary yet, or a user
                     /// wrote one by hand. Name the node after the expression it wraps, which is what the name would
-                    /// have been without a marker at all.
+                    /// have been without a marker at all. The two cases are not distinguishable here -- a hand-written
+                    /// `__aliasMarker(x, x)` looks exactly like an injected one whose id is still a `ColumnNode` -- so
+                    /// this cannot be turned into an assertion without rejecting valid SQL (03933).
                     if (result.empty())
                         result = calculateActionNodeName(function_argument_nodes.at(0));
 

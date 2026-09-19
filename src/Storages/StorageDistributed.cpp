@@ -1103,14 +1103,9 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         rewriteJoinToGlobalJoinIfNeeded(query_node.getJoinTree());
     }
 
-    auto shard_query_tree = buildQueryTreeForShard(query_info.planner_context, query_tree_to_modify, /*allow_global_join_for_right_table*/ false);
-
-    /// `buildQueryTreeForShard` runs `createUniqueAliasesIfNecessary`, which is what settles the `__tableN` aliases the
-    /// marker ids are built from. Materialize the ids only now, so each one names the table alias the shard will
-    /// actually use rather than the one the initiator happened to assign before the renumbering.
-    finalizeAliasMarkersForDistributedSerialization(shard_query_tree, query_context);
-
-    return shard_query_tree;
+    /// `buildQueryTreeForShard` materializes the marker ids on the way out, after the `__tableN` renumbering they are
+    /// built from.
+    return buildQueryTreeForShard(query_info.planner_context, query_tree_to_modify, /*allow_global_join_for_right_table*/ false);
 }
 
 std::optional<std::pair<String, String>> tryGetParamTypeAndName(const ASTPtr & node)

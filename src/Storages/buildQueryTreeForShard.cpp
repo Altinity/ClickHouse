@@ -165,7 +165,12 @@ struct AliasColumnInliner
 
         /// An `ALIAS` column may be defined over another one, so keep unwrapping. With markers on the loop stops after
         /// the first step, because the wrapper is a function node; the column it wrapped is reached through the
-        /// children below and gets its own marker there, which is what preserves a nested marker chain.
+        /// children below and gets its own marker there.
+        ///
+        /// A marker that ends up nested inside the payload expression -- `computed ALIAS inner * 2` -- is kept as it
+        /// is. One that ends up as the payload itself -- `computed ALIAS inner` -- is collapsed by
+        /// `NormalizeAliasMarkerVisitor` when the tree is rendered to SQL, and nothing is lost by that: the inner id
+        /// names an intermediate action node, while the name the initiator matches against comes from the outer id.
         while (inlineOnce(node))
         {
         }
@@ -1133,6 +1138,12 @@ QueryTreeNodePtr buildQueryTreeForShard(
         ReplaceLongConstWithScalarVisitor scalar_visitor(planner_context->getQueryContext(), max_const_name_size);
         scalar_visitor.visit(query_tree_to_modify);
     }
+
+    /// Last, because `createUniqueAliasesIfNecessary` above is what settles the `__tableN` aliases the marker ids are
+    /// built from: an id materialized any earlier would name the table alias the initiator happened to assign before
+    /// the renumbering rather than the one the shard will use. Here rather than in the callers, so that every path
+    /// that ships a query tree finalizes whatever markers it carries.
+    finalizeAliasMarkersForDistributedSerialization(query_tree_to_modify, planner_context->getQueryContext());
 
     return query_tree_to_modify;
 }

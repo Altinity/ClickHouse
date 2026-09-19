@@ -1028,14 +1028,6 @@ public:
     /// Visit children first, so a nested marker chain is materialized from the inside out.
     bool shouldTraverseTopToBottom() const { return false; }
 
-    static bool needChildVisit(const QueryTreeNodePtr & parent, const QueryTreeNodePtr &)
-    {
-        /// Do not descend into a lambda body. A marker there -- `arrayMap(x -> __aliasMarker(x, x), ...)` -- is a
-        /// per-row identity the user wrote, not a transport marker, and its column argument resolves to the lambda
-        /// parameter, which has no table source to build an id from.
-        return !parent || parent->getNodeType() != QueryTreeNodeType::LAMBDA;
-    }
-
     void visitImpl(QueryTreeNodePtr & node)
     {
         auto * function_node = node->as<FunctionNode>();
@@ -1055,7 +1047,14 @@ public:
             return;
 
         const auto & column_source = column_node->getColumnSourceOrNull();
-        if (!column_source || !column_source->hasAlias())
+        if (!column_source)
+            return;
+
+        /// A lambda parameter -- `arrayMap(x -> __aliasMarker(x, x), ...)` written by hand -- has the `LambdaNode` as
+        /// its source. There is no table alias to build an id from, and the marker is a per-row identity rather than a
+        /// transport marker, so leave it as it is. A marker this pass injected inside a lambda body does not land here:
+        /// its id names an `ALIAS` column of a table, and the table expression is its source.
+        if (column_source->getNodeType() == QueryTreeNodeType::LAMBDA || !column_source->hasAlias())
             return;
 
         auto alias_id = column_source->getAlias() + "." + column_node->getColumnName();
