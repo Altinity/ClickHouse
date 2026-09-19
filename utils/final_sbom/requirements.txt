@@ -1,0 +1,2 @@
+spdx-tools==0.8.5
+rpmfile==2.2.1
