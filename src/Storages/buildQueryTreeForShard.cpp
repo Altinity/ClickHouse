@@ -317,8 +317,24 @@ public:
 
     void visitImpl(QueryTreeNodePtr & node)
     {
+        /// The second argument of `__aliasMarker` records which `ALIAS` column an inlined expression came from, so
+        /// that the shard can name the result. It is not a column the query reads. Collecting it would put that
+        /// `ALIAS` column into the subquery `getSubqueryFromTableExpression` builds for a `GLOBAL JOIN` -- or for a
+        /// `CROSS JOIN` under `find_cross_join` -- and that subquery is rebuilt from names and types alone. The alias
+        /// body is dropped on the way, so the column ends up being asked of a storage that does not declare it.
+        ///
+        /// Traversal is top-down, so the marker is always seen before the argument it is recording.
+        if (const auto * function_node = node->as<FunctionNode>();
+            function_node && function_node->getFunctionName() == "__aliasMarker")
+        {
+            const auto & marker_arguments = function_node->getArguments().getNodes();
+            if (marker_arguments.size() == 2 && marker_arguments[1])
+                marker_id_nodes.insert(marker_arguments[1].get());
+            return;
+        }
+
         auto * column_node = node->as<ColumnNode>();
-        if (!column_node)
+        if (!column_node || marker_id_nodes.contains(node.get()))
             return;
 
         auto column_source = column_node->getColumnSourceOrNull();
@@ -337,6 +353,7 @@ public:
 
 private:
     std::unordered_map<QueryTreeNodePtr, Columns> column_source_to_columns;
+    std::unordered_set<const IQueryTreeNode *> marker_id_nodes;
 };
 
 /** Visitor that rewrites IN and JOINs in query and all subqueries according to distributed_product_mode and
