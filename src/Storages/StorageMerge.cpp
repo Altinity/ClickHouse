@@ -1,5 +1,6 @@
 #include <functional>
 #include <iterator>
+#include <unordered_set>
 #include <Access/ContextAccess.h>
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/ColumnNode.h>
@@ -942,7 +943,16 @@ std::vector<ReadFromMerge::ChildPlan> ReadFromMerge::createChildrenPlans(SelectQ
             {
                 /// Source tables could have different but convertible types, like numeric types of different width.
                 /// We must return streams with structure equals to structure of Merge table.
-                convertAndFilterSourceStream(*common_header, modified_query_info, nested_storage_snapshot, aliases, row_policy_data_opt, context, child, is_smallest_column_requested);
+                convertAndFilterSourceStream(
+                    *common_header,
+                    modified_query_info,
+                    nested_storage_snapshot,
+                    merge_storage_snapshot->metadata->getColumns(),
+                    aliases,
+                    row_policy_data_opt,
+                    context,
+                    child,
+                    is_smallest_column_requested);
 
                 for (const auto & filter_info : pushed_down_filters)
                 {
@@ -1627,6 +1637,7 @@ void ReadFromMerge::convertAndFilterSourceStream(
     const Block & header,
     SelectQueryInfo & modified_query_info,
     const StorageSnapshotPtr & snapshot,
+    const ColumnsDescription & merge_columns,
     const Aliases & aliases,
     const RowPolicyDataOpt & row_policy_data_opt,
     ContextPtr local_context,
@@ -1637,11 +1648,118 @@ void ReadFromMerge::convertAndFilterSourceStream(
 
     auto pipe_columns = before_block_header->getNamesAndTypesList();
 
+    /// TODO(storage-merge-alias): the analyzer branch below recomputes by hand what the analyzer's own column-alias
+    /// resolution would produce if it ran end to end on the child plan. It exists because the work is split in two:
+    ///
+    ///   Step 1, in `getModifiedQueryInfo`: rewrite the query going to the child storage. `replaceColumns` swaps every
+    ///     reference to a Merge-level ALIAS column for its resolved expression, so the child storage is asked for the
+    ///     PHYSICAL columns those expressions need and never sees the alias names.
+    ///
+    ///   Step 2, here: recompute the alias VALUES at the Merge level from those physical columns, by building a fresh
+    ///     `ActionsDAG`, running `QueryAnalysisPass` over each alias expression and visiting it with
+    ///     `PlannerActionsVisitor`. Each alias output is emitted under its analyzer identifier so the Merge target
+    ///     header, which also uses analyzer identifiers, can pick it up by name.
+    ///
+    /// The awkward part is that alias values are computed AFTER the child's read, not inside it. A predicate over an
+    /// ALIAS column can still use the underlying physical column for index analysis, but only because Step 1 happens
+    /// to inline the alias expression into the predicate as well, so `KeyCondition` sees `col * 2 > 10` rather than
+    /// `alias > 10`. Output-side aliases are recomputed here even when the child already produced the same value --
+    /// a `Distributed` child, for instance, evaluates alias expressions on the shard and returns them as
+    /// expression-named columns, which this then computes a second time.
+    ///
+    /// The unification would be to have Step 1 emit `__aliasMarker(<resolved expr>, '<analyzer identifier>')` instead
+    /// of a bare resolved expression. `PlannerActionsVisitor` resolves the marker at plan-build time and the call
+    /// disappears from the resulting `ActionsDAG`, leaving an ordinary action node that computes `<resolved expr>`
+    /// under `<identifier>`. Predicate and `KeyCondition` analysis would be unaffected, because the marker is a
+    /// planner-time naming device rather than a runtime expression. Step 2 would then be deletable outright:
+    /// `pipe_columns` would already carry the alias values under the right names.
+    ///
+    /// Left as future work. What is here is correct -- Step 1 and Step 2 together produce the right values -- just not
+    /// minimal.
     if (local_context->getSettingsRef()[Setting::allow_experimental_analyzer])
     {
+        /// The Merge table wants its columns under analyzer identifiers (`__table1.a`, ``__table1.`n.a` ``), while alias
+        /// expressions and `alias.name` speak in plain logical names (`a`, `n.a`).
+        ///
+        /// The planner's `TableExpressionData` for the Merge node is not populated yet at this point -- column
+        /// collection happens later, in `CollectTableExpressionData` -- so the mapping cannot be looked up through
+        /// `PlannerContext`. Build it here instead, by matching each Merge-declared column name against the suffixes of
+        /// the identifier names in `header` / `pipe_columns`: a column named `<prefix>.<C>` or ``<prefix>.`<C>` ``
+        /// belongs to the Merge column `C`.
+        ///
+        /// Driving the match from the declared Merge schema rather than from a pattern over the analyzer's naming
+        /// convention is what makes dotted names work, `Nested` subcolumns and backtick-quoted names included.
+
+        /// `getAll` builds a fresh list on every call, so take it once rather than per candidate column.
+        const auto all_merge_columns = merge_columns.getAll();
+
+        auto build_plain_to_identifier = [&merge_columns, &all_merge_columns](const auto & candidate_names)
+        {
+            std::unordered_map<String, String> plain_to_identifier;
+            std::unordered_set<String> ambiguous;
+            for (const auto & column : candidate_names)
+            {
+                /// An exact match means the column carries no analyzer prefix at all.
+                if (merge_columns.has(column.name))
+                {
+                    if (!plain_to_identifier.emplace(column.name, column.name).second)
+                        ambiguous.insert(column.name);
+                    continue;
+                }
+
+                /// Otherwise look for `<prefix>.<C>` or ``<prefix>.`<C>` `` where C is a declared Merge column. Columns
+                /// matching no declared name are skipped; they are intermediate outputs of the child plan.
+                ///
+                /// The unquoted form of a dotted name is accepted defensively. No producer of it is known:
+                /// `buildColumnIdentifier` always backquotes a dotted column name, so an analyzer identifier for `n.a`
+                /// is always ``__tableN.`n.a` ``.
+                for (const auto & merge_column : all_merge_columns)
+                {
+                    const bool dotted = merge_column.name.find('.') != String::npos;
+                    const String want_raw = "." + merge_column.name;
+                    const String want_quoted = dotted ? ("." + backQuote(merge_column.name)) : want_raw;
+                    if (column.name.ends_with(want_quoted) || (dotted && column.name.ends_with(want_raw)))
+                    {
+                        if (!plain_to_identifier.emplace(merge_column.name, column.name).second)
+                            ambiguous.insert(merge_column.name);
+                        break;
+                    }
+                }
+            }
+            for (const auto & ambiguous_name : ambiguous)
+                plain_to_identifier.erase(ambiguous_name);
+            return plain_to_identifier;
+        };
+
+        const auto header_plain_to_identifier = build_plain_to_identifier(header);
+        const auto pipe_plain_to_identifier = build_plain_to_identifier(pipe_columns);
+
         for (const auto & alias : aliases)
         {
             ActionsDAG actions_dag(pipe_columns);
+
+            /// Alias expressions name their inputs in plain logical names, but the child stream's inputs carry analyzer
+            /// identifiers. Expose every mapped column under its plain name as well, so that `buildQueryTree` below
+            /// resolves a reference like `a` or `n.a` against an input named `__table1.a` or ``__table1.`n.a` ``. An
+            /// alias defined over another alias needs this.
+            for (const auto & [plain, identifier] : pipe_plain_to_identifier)
+            {
+                if (plain == identifier)
+                    continue;
+
+                const ActionsDAG::Node * input_node = nullptr;
+                for (const auto * candidate : actions_dag.getInputs())
+                {
+                    if (candidate->result_name == identifier)
+                    {
+                        input_node = candidate;
+                        break;
+                    }
+                }
+
+                if (input_node)
+                    actions_dag.addAlias(*input_node, plain);
+            }
 
             QueryTreeNodePtr query_tree = buildQueryTree(alias.expression, local_context);
             query_tree->setAlias(alias.name);
@@ -1659,7 +1777,12 @@ void ReadFromMerge::convertAndFilterSourceStream(
             if (nodes.size() != 1)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected to have 1 output but got {}", nodes.size());
 
-            actions_dag.addOrReplaceInOutputs(actions_dag.addAlias(*nodes.front(), alias.name));
+            /// Emit the alias output under its analyzer identifier, so the `addMissingDefaults` step further down
+            /// matches it by name. Emitted under the plain name it would miss, and the expected
+            /// ``__tableN.`alias.name` `` column would be filled with type defaults instead.
+            const auto identifier_it = header_plain_to_identifier.find(alias.name);
+            const String & output_name = identifier_it != header_plain_to_identifier.end() ? identifier_it->second : alias.name;
+            actions_dag.addOrReplaceInOutputs(actions_dag.addAlias(*nodes.front(), output_name));
             auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(actions_dag));
             child.plan.addStep(std::move(expression_step));
         }
@@ -1733,6 +1856,8 @@ void ReadFromMerge::convertAndFilterSourceStream(
         }
     }
 
+    /// Position, because the loop above builds `converted_columns[i]` out of `current_step_columns[i]`: the pairing is
+    /// fixed by that construction rather than by the names, and one of the branches deliberately renames a column.
     auto convert_actions_dag = ActionsDAG::makeConvertingActions(
         current_step_columns,
         converted_columns,

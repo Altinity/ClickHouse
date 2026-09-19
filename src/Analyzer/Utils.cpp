@@ -1017,6 +1017,63 @@ void resolveAggregateFunctionNodeByName(FunctionNode & function_node, const Stri
     function_node.resolveAsAggregateFunction(std::move(aggregate_function));
 }
 
+namespace
+{
+
+class FinalizeAliasMarkersVisitor : public InDepthQueryTreeVisitor<FinalizeAliasMarkersVisitor>
+{
+public:
+    explicit FinalizeAliasMarkersVisitor(ContextPtr context_) : context(std::move(context_)) {}
+
+    /// Visit children first, so a nested marker chain is materialized from the inside out.
+    bool shouldTraverseTopToBottom() const { return false; }
+
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        auto * function_node = node->as<FunctionNode>();
+        if (!function_node || function_node->getFunctionName() != "__aliasMarker")
+            return;
+
+        auto & arguments = function_node->getArguments().getNodes();
+        if (arguments.size() != 2 || !arguments[0] || !arguments[1])
+            return;
+
+        /// Already materialized on an earlier hop.
+        if (const auto * id_node = arguments[1]->as<ConstantNode>(); id_node && isString(id_node->getResultType()))
+            return;
+
+        const auto * column_node = arguments[1]->as<ColumnNode>();
+        if (!column_node)
+            return;
+
+        const auto & column_source = column_node->getColumnSourceOrNull();
+        if (!column_source)
+            return;
+
+        /// A lambda parameter -- `arrayMap(x -> __aliasMarker(x, x), ...)` written by hand -- has the `LambdaNode` as
+        /// its source. There is no table alias to build an id from, and the marker is a per-row identity rather than a
+        /// transport marker, so leave it as it is. A marker this pass injected inside a lambda body does not land here:
+        /// its id names an `ALIAS` column of a table, and the table expression is its source.
+        if (column_source->getNodeType() == QueryTreeNodeType::LAMBDA || !column_source->hasAlias())
+            return;
+
+        auto alias_id = column_source->getAlias() + "." + column_node->getColumnName();
+        arguments[1] = std::make_shared<ConstantNode>(std::move(alias_id), std::make_shared<DataTypeString>());
+        resolveOrdinaryFunctionNodeByName(*function_node, "__aliasMarker", context);
+    }
+
+private:
+    ContextPtr context;
+};
+
+}
+
+void finalizeAliasMarkersForDistributedSerialization(QueryTreeNodePtr & node, const ContextPtr & context)
+{
+    FinalizeAliasMarkersVisitor visitor(context);
+    visitor.visit(node);
+}
+
 std::pair<QueryTreeNodePtr, bool> getExpressionSource(const QueryTreeNodePtr & node)
 {
     if (const auto * column = node->as<ColumnNode>())

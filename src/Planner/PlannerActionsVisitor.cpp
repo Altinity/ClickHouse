@@ -95,6 +95,16 @@ String calculateActionNodeNameWithCastIfNeeded(const ConstantNode & constant_nod
     return buffer.str();
 }
 
+/// Return a `__aliasMarker`'s finalized id, or an empty string when it has none yet. Between injection and
+/// serialization the id is a `ColumnNode`, and a user-written marker can hold anything at all.
+String tryExtractAliasMarkerId(const QueryTreeNodePtr & id_argument)
+{
+    if (const auto * id_node = id_argument->as<ConstantNode>(); id_node && isString(id_node->getResultType()))
+        return id_node->getValue().safeGet<String>();
+
+    return {};
+}
+
 class ActionNodeNameHelper
 {
 public:
@@ -198,18 +208,21 @@ public:
                 const auto & function_node = node->as<FunctionNode &>();
                 if (function_node.getFunctionName() == "__aliasMarker")
                 {
-                    /// Perform sanity check, because user may call this function with unexpected arguments
                     const auto & function_argument_nodes = function_node.getArguments().getNodes();
-                    if (function_argument_nodes.size() == 2)
-                    {
-                        if (const auto * second_argument = function_argument_nodes.at(1)->as<ConstantNode>())
-                        {
-                            if (isString(second_argument->getResultType()))
-                                result = second_argument->getValue().safeGet<String>();
-                        }
-                    }
+                    if (function_argument_nodes.size() != 2)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 arguments");
 
-                    /// Empty node name is not allowed and leads to logical errors
+                    result = tryExtractAliasMarkerId(function_argument_nodes.at(1));
+
+                    /// No finalized id: either the marker has not reached its serialization boundary yet, or a user
+                    /// wrote one by hand. Name the node after the expression it wraps, which is what the name would
+                    /// have been without a marker at all. The two cases are not distinguishable here -- a hand-written
+                    /// `__aliasMarker(x, x)` looks exactly like an injected one whose id is still a `ColumnNode` -- so
+                    /// this cannot be turned into an assertion without rejecting valid SQL (03933).
+                    if (result.empty())
+                        result = calculateActionNodeName(function_argument_nodes.at(0));
+
+                    /// An empty node name is not allowed and leads to logical errors.
                     if (result.empty())
                         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker is internal and should not be used directly");
                     break;
@@ -1259,15 +1272,14 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
         if (function_arguments.size() != 2)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 arguments");
 
-        const auto * alias_id_node = function_arguments.at(1)->as<ConstantNode>();
-        if (!alias_id_node || !isString(alias_id_node->getResultType()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker is internal and should not be used directly");
-
-        const auto & alias_id = alias_id_node->getValue().safeGet<String>();
-        if (alias_id.empty())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker is internal and should not be used directly");
-
         auto [child_name, levels] = visitImpl(function_arguments.at(0));
+
+        /// Without a finalized id the marker adds no identity of its own, so it resolves to its payload. That happens
+        /// for a marker the user wrote by hand, and for one that has not reached a serialization boundary yet.
+        auto alias_id = tryExtractAliasMarkerId(function_arguments.at(1));
+        if (alias_id.empty())
+            alias_id = child_name;
+
         if (alias_id == child_name)
             return {child_name, levels};
 

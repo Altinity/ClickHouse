@@ -62,6 +62,7 @@ namespace Setting
     extern const SettingsBool parallel_replicas_prefer_local_join;
     extern const SettingsBool prefer_global_in_and_join;
     extern const SettingsBool enable_add_distinct_to_in_subqueries;
+    extern const SettingsBool enable_alias_marker;
     extern const SettingsInt64 optimize_const_name_size;
     extern const SettingsOverflowMode transfer_overflow_mode;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
@@ -77,6 +78,218 @@ namespace ErrorCodes
 
 namespace
 {
+
+/// Return a clone of the defining expression of an inlineable `ALIAS` column node, or nullptr otherwise.
+/// A JOIN / CROSS_JOIN / ARRAY_JOIN source puts a `ListNode` of the joined sides in the expression child, which is not
+/// an alias body. The expression is cloned so each occurrence gets its own copy: that lets one occurrence be aliased
+/// (a projection output) without mutating another (a reference in `ORDER BY`).
+QueryTreeNodePtr getInlineableAliasColumnExpression(const QueryTreeNodePtr & node)
+{
+    const auto * column_node = node->as<ColumnNode>();
+    if (!column_node || !column_node->hasExpression())
+        return nullptr;
+
+    const auto & column_source = column_node->getColumnSourceOrNull();
+    if (!column_source || column_source->getNodeType() == QueryTreeNodeType::JOIN
+                       || column_source->getNodeType() == QueryTreeNodeType::CROSS_JOIN
+                       || column_source->getNodeType() == QueryTreeNodeType::ARRAY_JOIN)
+        return nullptr;
+
+    return column_node->getExpression()->clone();
+}
+
+/// Wrap an inlined `ALIAS` expression in `__aliasMarker` so it carries the identity of the column it came from.
+///
+/// The id goes in as a live `ColumnNode`, not as a finished string. Later analyzer passes still have to run --
+/// `createUniqueAliasesIfNecessary` in particular, which assigns the `__tableN` aliases the id is built from -- and a
+/// `ColumnNode` is transformed by those passes exactly as the rest of the tree is.
+/// `finalizeAliasMarkersForDistributedSerialization` turns it into a `String` constant at the serialization boundary.
+///
+/// An expression that is already a marker has its id replaced rather than gaining a second wrapper.
+QueryTreeNodePtr wrapInAliasMarker(QueryTreeNodePtr expression, const ColumnNode & column_node, const ContextPtr & context)
+{
+    auto marker_id = std::make_shared<ColumnNode>(column_node.getColumn(), column_node.getColumnSourceOrNull());
+
+    if (auto * function_node = expression->as<FunctionNode>();
+        function_node && function_node->getFunctionName() == "__aliasMarker")
+    {
+        auto & marker_arguments = function_node->getArguments().getNodes();
+        if (marker_arguments.size() == 2)
+            marker_arguments[1] = std::move(marker_id);
+        return expression;
+    }
+
+    QueryTreeNodes arguments;
+    arguments.reserve(2);
+    arguments.emplace_back(std::move(expression));
+    arguments.emplace_back(std::move(marker_id));
+
+    auto marker_node = std::make_shared<FunctionNode>("__aliasMarker");
+    marker_node->getArguments().getNodes() = std::move(arguments);
+    resolveOrdinaryFunctionNodeByName(*marker_node, "__aliasMarker", context);
+
+    return marker_node;
+}
+
+/// Inlines `ALIAS` columns into their defining expressions across a query tree that is about to be shipped.
+/// See `inlineAliasColumns` in the header for what the pass guarantees and why.
+struct AliasColumnInliner
+{
+    ContextPtr context;
+    bool use_alias_marker;
+
+    /// Replace one inlineable `ALIAS` column node with its body, marking the body when markers are on.
+    /// Returns false when `node` is not an inlineable `ALIAS` column, leaving it untouched.
+    bool inlineOnce(QueryTreeNodePtr & node) const
+    {
+        auto expression = getInlineableAliasColumnExpression(node);
+        if (!expression)
+            return false;
+
+        if (use_alias_marker)
+            expression = wrapInAliasMarker(std::move(expression), node->as<ColumnNode &>(), context);
+
+        node = std::move(expression);
+        return true;
+    }
+
+    /// Inline `ALIAS` columns inside an expression subtree without assigning any alias. A nested subquery goes back
+    /// through `inlineQuery` so its own projection columns keep their names.
+    void inlineExpression(QueryTreeNodePtr & node) const
+    {
+        if (node->as<QueryNode>() || node->as<UnionNode>())
+        {
+            inlineQuery(node);
+            return;
+        }
+
+        /// An `ALIAS` column may be defined over another one, so keep unwrapping. With markers on the loop stops after
+        /// the first step, because the wrapper is a function node; the column it wrapped is reached through the
+        /// children below and gets its own marker there.
+        ///
+        /// A marker that ends up nested inside the payload expression -- `computed ALIAS inner * 2` -- is kept as it
+        /// is. One that ends up as the payload itself -- `computed ALIAS inner` -- is collapsed by
+        /// `NormalizeAliasMarkerVisitor` when the tree is rendered to SQL, and nothing is lost by that: the inner id
+        /// names an intermediate action node, while the name the initiator matches against comes from the outer id.
+        while (inlineOnce(node))
+        {
+        }
+
+        if (auto * marker_node = node->as<FunctionNode>();
+            marker_node && marker_node->getFunctionName() == "__aliasMarker")
+        {
+            auto & marker_arguments = marker_node->getArguments().getNodes();
+            if (marker_arguments.size() == 2)
+            {
+                /// Descend into the payload only. The second argument is the column reference the marker exists to
+                /// record, and inlining it would expand the very `ALIAS` column whose identity it carries. It has to
+                /// reach `finalizeAliasMarkersForDistributedSerialization` as a `ColumnNode`.
+                inlineExpression(marker_arguments[0]);
+                return;
+            }
+        }
+
+        auto * join_node = node->as<JoinNode>();
+        const bool using_join = join_node && join_node->isUsingJoinExpression();
+
+        for (auto & child : node->getChildren())
+        {
+            if (!child)
+                continue;
+
+            if (using_join && child == join_node->getJoinExpression())
+                inlineJoinUsingKeys(child);
+            else
+                inlineExpression(child);
+        }
+    }
+
+    /// A `JOIN USING` key is a `ColumnNode` whose expression is a `ListNode` recording how the key resolves on each
+    /// side, and a side's entry can itself be an `ALIAS` column. Such an entry keeps the key's name as an alias when
+    /// inlined, because the shipped SQL renders the entry rather than the key: `USING (x AS a)` is what lets a remote
+    /// server resolve a key that exists only as an `ALIAS` column of the initiator's table. `rejectUnshippableJoinUsingKeys`
+    /// reads the same shape to decide which keys no remote server can resolve.
+    void inlineJoinUsingKeys(QueryTreeNodePtr & join_expression) const
+    {
+        auto * using_list = join_expression->as<ListNode>();
+        if (!using_list)
+            return;
+
+        for (auto & using_node : using_list->getNodes())
+        {
+            auto * using_column = using_node->as<ColumnNode>();
+            if (!using_column || !using_column->hasExpression())
+                continue;
+
+            auto * key_sides = using_column->getExpression()->as<ListNode>();
+            if (!key_sides)
+                continue;
+
+            for (auto & side : key_sides->getNodes())
+            {
+                const auto * side_column = side->as<ColumnNode>();
+                auto expression = getInlineableAliasColumnExpression(side);
+                if (!expression)
+                    continue;
+
+                const String key_name = side_column->getColumnName();
+                if (use_alias_marker)
+                    expression = wrapInAliasMarker(std::move(expression), *side_column, context);
+
+                inlineExpression(expression);
+                expression->setAlias(key_name);
+                side = std::move(expression);
+            }
+        }
+    }
+
+    /// Inline `ALIAS` columns into their defining expressions, so the expression is evaluated on the shard that reads
+    /// the real table instead of the column being resolved there as if it were physical.
+    ///
+    /// A top-level projection item keeps the column's logical name as an alias, so the mergeable-state output column
+    /// keeps its name. Inside expression clauses no alias is set: otherwise two same-named `ALIAS` columns from
+    /// different `JOIN` sources land in one scope carrying different bodies, and the shard throws
+    /// `MULTIPLE_EXPRESSIONS_FOR_ALIAS` (https://github.com/ClickHouse/ClickHouse/issues/107990).
+    void inlineQuery(QueryTreeNodePtr & node) const
+    {
+        if (auto * union_node = node->as<UnionNode>())
+        {
+            for (auto & query : union_node->getQueries().getNodes())
+                inlineQuery(query);
+            return;
+        }
+
+        auto * query_node = node->as<QueryNode>();
+        if (!query_node)
+        {
+            inlineExpression(node);
+            return;
+        }
+
+        for (auto & projection_item : query_node->getProjection().getNodes())
+        {
+            const auto * column_node = projection_item->as<ColumnNode>();
+            auto expression = getInlineableAliasColumnExpression(projection_item);
+            if (!expression)
+            {
+                inlineExpression(projection_item);
+                continue;
+            }
+
+            const String output_alias = column_node->getColumnName();
+            if (use_alias_marker)
+                expression = wrapInAliasMarker(std::move(expression), *column_node, context);
+
+            inlineExpression(expression);
+            expression->setAlias(output_alias);
+            projection_item = std::move(expression);
+        }
+
+        for (auto & child : query_node->getChildren())
+            if (child && child != query_node->getProjectionNode())
+                inlineExpression(child);
+    }
+};
 
 /// Visitor that collect column source to columns mapping from query and all subqueries
 class CollectColumnSourceToColumnsVisitor : public InDepthQueryTreeVisitor<CollectColumnSourceToColumnsVisitor>
@@ -104,8 +317,24 @@ public:
 
     void visitImpl(QueryTreeNodePtr & node)
     {
+        /// The second argument of `__aliasMarker` records which `ALIAS` column an inlined expression came from, so
+        /// that the shard can name the result. It is not a column the query reads. Collecting it would put that
+        /// `ALIAS` column into the subquery `getSubqueryFromTableExpression` builds for a `GLOBAL JOIN` -- or for a
+        /// `CROSS JOIN` under `find_cross_join` -- and that subquery is rebuilt from names and types alone. The alias
+        /// body is dropped on the way, so the column ends up being asked of a storage that does not declare it.
+        ///
+        /// Traversal is top-down, so the marker is always seen before the argument it is recording.
+        if (const auto * function_node = node->as<FunctionNode>();
+            function_node && function_node->getFunctionName() == "__aliasMarker")
+        {
+            const auto & marker_arguments = function_node->getArguments().getNodes();
+            if (marker_arguments.size() == 2 && marker_arguments[1])
+                marker_id_nodes.insert(marker_arguments[1].get());
+            return;
+        }
+
         auto * column_node = node->as<ColumnNode>();
-        if (!column_node)
+        if (!column_node || marker_id_nodes.contains(node.get()))
             return;
 
         auto column_source = column_node->getColumnSourceOrNull();
@@ -124,6 +353,7 @@ public:
 
 private:
     std::unordered_map<QueryTreeNodePtr, Columns> column_source_to_columns;
+    std::unordered_set<const IQueryTreeNode *> marker_id_nodes;
 };
 
 /** Visitor that rewrites IN and JOINs in query and all subqueries according to distributed_product_mode and
@@ -434,7 +664,14 @@ TableNodePtr executeSubqueryNode(const QueryTreeNodePtr & subquery_node,
     ContextMutablePtr & mutable_context,
     size_t subquery_depth)
 {
-    const auto subquery_hash = subquery_node->getTreeHash();
+    /// A `GLOBAL IN` / `GLOBAL JOIN` subquery is materialized here and shipped as a temporary table, so this is a
+    /// serialization boundary too and the marker ids have to be finalized before the subquery runs. Finalizing also
+    /// makes the tree hash below stable: an unmaterialized marker hashes its `ColumnNode`, whose identifier can still
+    /// change, which would key the same subquery under two different temporary table names.
+    auto subquery_node_to_execute = subquery_node->clone();
+    finalizeAliasMarkersForDistributedSerialization(subquery_node_to_execute, mutable_context);
+
+    const auto subquery_hash = subquery_node_to_execute->getTreeHash();
     const auto temporary_table_name = fmt::format("_data_{}", toString(subquery_hash));
 
     const auto & external_tables = mutable_context->getExternalTables();
@@ -452,7 +689,7 @@ TableNodePtr executeSubqueryNode(const QueryTreeNodePtr & subquery_node,
     auto context_copy = Context::createCopy(mutable_context);
     updateContextForSubqueryExecution(context_copy);
 
-    InterpreterSelectQueryAnalyzer interpreter(subquery_node, context_copy, subquery_options);
+    InterpreterSelectQueryAnalyzer interpreter(subquery_node_to_execute, context_copy, subquery_options);
     auto & query_plan = interpreter.getQueryPlan();
 
     auto sample_block_with_unique_names = *query_plan.getCurrentHeader();
@@ -738,6 +975,12 @@ void rejectUnshippableJoinUsingKeys(const QueryTreeNodePtr & root)
 
 }
 
+void inlineAliasColumns(QueryTreeNodePtr & query_tree_to_modify, const ContextPtr & context)
+{
+    const AliasColumnInliner inliner{context, context->getSettingsRef()[Setting::enable_alias_marker]};
+    inliner.inlineQuery(query_tree_to_modify);
+}
+
 QueryTreeNodePtr buildQueryTreeForShard(
     const PlannerContextPtr & planner_context,
     QueryTreeNodePtr query_tree_to_modify,
@@ -912,6 +1155,12 @@ QueryTreeNodePtr buildQueryTreeForShard(
         ReplaceLongConstWithScalarVisitor scalar_visitor(planner_context->getQueryContext(), max_const_name_size);
         scalar_visitor.visit(query_tree_to_modify);
     }
+
+    /// Last, because `createUniqueAliasesIfNecessary` above is what settles the `__tableN` aliases the marker ids are
+    /// built from: an id materialized any earlier would name the table alias the initiator happened to assign before
+    /// the renumbering rather than the one the shard will use. Here rather than in the callers, so that every path
+    /// that ships a query tree finalizes whatever markers it carries.
+    finalizeAliasMarkersForDistributedSerialization(query_tree_to_modify, planner_context->getQueryContext());
 
     return query_tree_to_modify;
 }
