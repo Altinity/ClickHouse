@@ -45,6 +45,7 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
+    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
 }
 
 namespace ErrorCodes
@@ -745,6 +746,18 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
     /// When it is empty, non-cluster realization is used.
 
     if (!isClusterSupported())
+        return "";
+
+    /// A worker executing a whole-query dispatch (object_storage_cluster_join_mode='distributed') reads every
+    /// table it resolves locally: the one table meant to be distributed is the driver, and that arrives as an
+    /// explicit `*Cluster()` table function which never reaches this method. Without this, a partner table would
+    /// fan out again from each worker. The driver is detected the same way TableFunctionObjectStorageCluster
+    /// detects a worker.
+    const auto & client_info = context->getClientInfo();
+    if (client_info.query_kind == ClientInfo::QueryKind::SECONDARY_QUERY
+        && client_info.collaborate_with_initiator
+        && context->hasClusterFunctionReadTaskCallback()
+        && context->getSettingsRef()[Setting::object_storage_cluster_join_mode] == ObjectStorageClusterJoinMode::DISTRIBUTED)
         return "";
 
     auto cluster_name_from_settings = context->getSettingsRef()[Setting::object_storage_cluster].value;

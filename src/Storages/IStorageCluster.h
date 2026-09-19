@@ -53,6 +53,26 @@ public:
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 
+    /// Reads a query the caller has already prepared (see Planner/buildDistributedObjectStorageQueryPlan.h),
+    /// through the same ReadFromCluster/task-iterator protocol read() uses. Unlike read(), does no query
+    /// preparation of its own: `query_to_send` is already self-contained and `sample_block` already computed.
+    void readPreparedClusterQuery(
+        QueryPlan & query_plan,
+        const Names & column_names,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        QueryProcessingStage::Enum processed_stage,
+        ASTPtr query_to_send,
+        SharedHeader sample_block);
+
+    /// Builds a standalone, resolved `*Cluster(cluster_name, ...)` table-function call for this storage. Generic
+    /// across engines because the per-engine rewrite is done by the virtual updateQueryToSendIfNeeded, which
+    /// also supplies credentials, structure and format arguments. Works on a throwaway single-table SELECT of
+    /// its own, so no query in flight is touched.
+    ASTPtr buildClusterTableFunctionAST(
+        const String & dispatch_cluster_name, const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context);
+
     bool isRemote() const final { return true; }
     bool supportsSubcolumns() const override  { return true; }
     bool supportsOptimizationToSubcolumns() const override { return false; }
@@ -149,7 +169,8 @@ public:
         QueryProcessingStage::Enum processed_stage_,
         ClusterPtr cluster_,
         LoggerPtr log_,
-        std::optional<Tables> external_tables_)
+        std::optional<Tables> external_tables_,
+        bool is_whole_query_dispatch_ = false)
         : SourceStepWithFilter(
             std::move(sample_block),
             column_names_,
@@ -162,6 +183,7 @@ public:
         , cluster(std::move(cluster_))
         , log(log_)
         , external_tables(external_tables_)
+        , is_whole_query_dispatch(is_whole_query_dispatch_)
     {
     }
 
@@ -175,6 +197,10 @@ private:
     std::optional<RemoteQueryExecutor::Extension> extension;
     std::shared_ptr<const ActionsDAG> listing_filter_dag;
     std::optional<Tables> external_tables;
+
+    /// Set only by readPreparedClusterQuery. This step's output is then the whole dispatched query's result
+    /// rather than one table's rows, which changes how filters may be used (see applyFilters, createExtension).
+    bool is_whole_query_dispatch = false;
 
     void createExtension();
     ContextPtr updateSettings(const Settings & settings);

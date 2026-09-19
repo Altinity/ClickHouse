@@ -1064,6 +1064,248 @@ def test_cluster_select(started_cluster):
     assert node2.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`", settings={"parallel_replicas_for_cluster_engines": 1, "enable_parallel_replicas": 2, "cluster_for_parallel_replicas": "cluster_simple"}) == 'pablo\n'
 
 
+def _setup_distributed_join_tables(started_cluster, nodes, test_ref):
+    """Three DataLake-catalog tables: a driver and two dimensions, so a query can have a nested JOIN
+    on the right-hand side rather than a single partner table."""
+    root_namespace = f"{test_ref}_namespace"
+    fact_table = f"{test_ref}_fact"
+    dim_table = f"{test_ref}_dim"
+    weight_table = f"{test_ref}_weight"
+
+    load_catalog_impl(started_cluster)
+    for node in nodes:
+        create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    node = nodes[0]
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, fact_table, "(tag Int32, name String)"
+    )
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, dim_table, "(id Int32, city String)"
+    )
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, weight_table, "(city String, weight Int32)"
+    )
+
+    insert_settings = {"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{fact_table}` VALUES (1, 'john'), (2, 'jack'), (3, 'jill');",
+        settings=insert_settings,
+    )
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{dim_table}` VALUES (1, 'berlin'), (2, 'paris'), (3, 'berlin');",
+        settings=insert_settings,
+    )
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{weight_table}` VALUES ('berlin', 10), ('paris', 20), ('berlin', 5);",
+        settings=insert_settings,
+    )
+
+    return (
+        f"{CATALOG_NAME}.`{root_namespace}.{fact_table}`",
+        f"{CATALOG_NAME}.`{root_namespace}.{dim_table}`",
+        f"{CATALOG_NAME}.`{root_namespace}.{weight_table}`",
+    )
+
+
+def _assert_dispatched_whole(nodes, query_id):
+    """Checks the three runtime invariants of a whole-query dispatch, from system.query_log:
+
+    1. the whole query -- JOIN and GROUP BY included -- reached a worker as a secondary query;
+    2. exactly one table in it is a cluster function, i.e. only the driver was rewritten;
+    3. no secondary query is a bare single-table cluster read, which is what a partner table
+       fanning out again from a worker would look like.
+    """
+    for node in nodes:
+        node.query("SYSTEM FLUSH LOGS system.query_log")
+
+    secondary_with_join = 0
+    for node in nodes:
+        secondary_with_join += int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND positionCaseInsensitive(query, 'icebergs3cluster') != 0
+                  AND positionCaseInsensitive(query, 'join') != 0
+                  AND positionCaseInsensitive(query, 'group by') != 0
+                """
+            ).strip()
+        )
+    assert secondary_with_join > 0, f"query {query_id} was not dispatched whole to the cluster"
+
+    for node in nodes:
+        multi_driver = int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND countSubstringsCaseInsensitive(query, 'icebergs3cluster') > 1
+                """
+            ).strip()
+        )
+        assert multi_driver == 0, (
+            f"query {query_id}: more than one cluster function in a dispatched query on {node.name} -- "
+            "a partner table was rewritten as a driver"
+        )
+
+        partner_fanout = int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND positionCaseInsensitive(query, 'icebergs3cluster') != 0
+                  AND positionCaseInsensitive(query, 'join') = 0
+                """
+            ).strip()
+        )
+        assert partner_fanout == 0, (
+            f"query {query_id}: a single-table cluster read was issued on {node.name} -- "
+            "a partner table fanned out again instead of being read locally"
+        )
+
+
+def test_distributed_join_dispatch(started_cluster):
+    """object_storage_cluster_join_mode='distributed': a JOIN whose driving table is a DataLake-catalog
+    table is dispatched whole to the driver's cluster and finalized on the initiator.
+
+    Correctness is checked against the same queries under join_mode='allow' (ordinary local planning),
+    which is the oracle -- dispatch must not change results, only where the work happens.
+    """
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, weight = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_{uuid.uuid4()}"
+    )
+
+    def run(query, join_mode, query_id=None):
+        return node1.query(
+            query,
+            query_id=query_id,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "object_storage_cluster_join_mode": join_mode,
+            },
+        )
+
+    # The driver is the immediate leftmost table of the JOIN.
+    direct_driver = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag < 10
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    # The driver is buried in a see-through subquery on the JOIN's left, the aggregation sits on the
+    # enclosing query, and the right-hand side is itself a JOIN over a grouped subquery -- all of which
+    # every worker recomputes in full.
+    buried_driver = f"""
+        SELECT dims.city, count() AS c
+        FROM
+        (
+            SELECT tag, name
+            FROM {fact}
+            WHERE tag < 10
+        ) AS f
+        LEFT JOIN
+        (
+            SELECT d.id AS id, d.city AS city
+            FROM {dim} AS d
+            LEFT JOIN
+            (
+                SELECT city, sum(weight) AS w
+                FROM {weight}
+                GROUP BY city
+            ) AS p ON d.city = p.city
+        ) AS dims ON f.tag = dims.id
+        GROUP BY dims.city
+        ORDER BY ALL
+    """
+
+    # The same shape written with CTEs rather than derived tables. The setting documents CTE support,
+    # and the analyzer represents a CTE as a QueryNode just like a derived table, but the serializer has to
+    # inline the CTE body for the worker to resolve it -- so this is worth exercising directly.
+    buried_driver_cte = f"""
+        WITH
+            f AS
+            (
+                SELECT tag, name
+                FROM {fact}
+                WHERE tag < 10
+            ),
+            p AS
+            (
+                SELECT city, sum(weight) AS w
+                FROM {weight}
+                GROUP BY city
+            ),
+            dims AS
+            (
+                SELECT d.id AS id, d.city AS city
+                FROM {dim} AS d
+                LEFT JOIN p ON d.city = p.city
+            )
+        SELECT dims.city, count() AS c
+        FROM f
+        LEFT JOIN dims ON f.tag = dims.id
+        GROUP BY dims.city
+        ORDER BY ALL
+    """
+
+    for name, query in (
+        ("direct driver", direct_driver),
+        ("buried driver", buried_driver),
+        ("buried driver via CTE", buried_driver_cte),
+    ):
+        expected = run(query, "allow")
+        assert expected == "berlin\t2\nparis\t1\n", f"{name} oracle result changed: {expected!r}"
+
+        query_id = uuid.uuid4().hex
+        assert run(query, "distributed", query_id=query_id) == expected, f"{name} differs under dispatch"
+        _assert_dispatched_whole(nodes, query_id)
+
+
+def test_distributed_join_dispatch_falls_back(started_cluster):
+    """Tables the dispatch cannot prove safe fall back to ordinary planning instead of failing: a local
+    Memory JOIN partner is not resolvable on a worker, so the candidate must be rejected."""
+    node1 = started_cluster.instances["node1"]
+
+    test_ref = f"test_distributed_join_fallback_{uuid.uuid4()}"
+    fact, _, _ = _setup_distributed_join_tables(started_cluster, [node1], test_ref)
+
+    local_table = f"{test_ref}_local"
+    node1.query(f"CREATE TABLE {local_table} (id Int32, city String) ENGINE = Memory()")
+    node1.query(f"INSERT INTO {local_table} VALUES (1, 'berlin'), (2, 'paris'), (3, 'berlin')")
+
+    query = f"""
+        SELECT l.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {local_table} AS l ON f.tag = l.id
+        GROUP BY l.city
+        ORDER BY ALL
+    """
+
+    def run(join_mode):
+        return node1.query(
+            query,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "object_storage_cluster_join_mode": join_mode,
+            },
+        )
+
+    assert run("distributed") == run("allow")
+
 def test_used_storages_in_query_log(started_cluster):
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
