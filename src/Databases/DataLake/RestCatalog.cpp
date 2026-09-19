@@ -1994,6 +1994,13 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     }
     catch (const DB::HTTPException & e)
     {
+        if (e.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_CONFLICT)
+            LOG_DEBUG(log, "Namespace {} already exists", namespace_name);
+        else
+            DB::tryLogCurrentException(log);
+    }
+    catch (...)
+    {
         /// Lost the race to a concurrent creator.
         if (e.getHTTPStatus() != Poco::Net::HTTPResponse::HTTPStatus::HTTP_CONFLICT)
             throw;
