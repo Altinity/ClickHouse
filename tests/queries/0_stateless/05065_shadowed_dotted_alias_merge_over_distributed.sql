@@ -1,19 +1,6 @@
--- End-to-end guard for a `Merge` over `Distributed` whose schema declares both a plain column and a
--- dotted column whose tail is that plain name (`b` and `` `a.b` ``), read as `ALIAS` columns.
---
--- What this does NOT do: reproduce the first-match bug in the name mapping of
--- `ReadFromMerge::convertAndFilterSourceStream`. That mapping matches declared Merge column names
--- against the suffixes of the child stream's column names, and `__table1.a.b` ends with `.b`, so a
--- first match in schema order would hand `b` the wrong column. No input can put it in that state:
--- the Merge target header carries analyzer identifiers, which backquote a dotted name
--- (`__table1.`a.b``, `PlannerContext.cpp` `buildColumnIdentifier`), and the child stream carries the
--- alias values under the alias name or the expression name, never a dotted analyzer identifier,
--- because the query reaching the child has every Merge-level `ALIAS` reference already replaced by
--- its expression. Verified by reintroducing the first-match behaviour and observing this test still
--- pass.
---
--- So it asserts the values are right for a schema shape nothing else covers. 05059 covers dotted
--- names on their own.
+-- Values guard for a `Merge` over `Distributed` whose schema declares both a plain column and a
+-- dotted column whose tail is that plain name (`b` and `` `a.b` ``), both read as `ALIAS` columns.
+-- 05059 covers dotted names on their own; this shape is covered nowhere else.
 --
 -- `test_cluster_two_shards` reads the local table twice, so every query groups to dedup.
 
