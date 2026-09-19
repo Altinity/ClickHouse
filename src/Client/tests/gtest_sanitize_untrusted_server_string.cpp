@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <Client/sanitizeUntrustedServerString.h>
+#include <Core/AntalyaProtocol.h>
 #include <Core/ProtocolDefines.h>
 
 using namespace DB;
@@ -154,4 +155,22 @@ TEST(SanitizeUntrustedServerString, MaxPasswordComplexityRulesCapIsTight)
     /// (TCPHandler::sendHello) and client (Connection::receiveHello).
     EXPECT_LE(DBMS_MAX_PASSWORD_COMPLEXITY_RULES, 4096u);
     EXPECT_GE(DBMS_MAX_PASSWORD_COMPLEXITY_RULES, 16u);
+}
+
+TEST(SanitizeUntrustedServerString, PreservesAnAntalyaProtocolMarker)
+{
+    /// The client parses the marker only after sanitizing, so it must pass through byte for byte.
+    String name = AntalyaProtocol::appendMarker("ClickHouse");
+    const String before = name;
+    sanitizeUntrustedServerString(name);
+    EXPECT_EQ(name, before);
+    EXPECT_EQ(AntalyaProtocol::parseMarker(name), static_cast<UInt64>(DBMS_ANTALYA_PROTOCOL_VERSION));
+}
+
+TEST(SanitizeUntrustedServerString, CannotForgeAnAntalyaProtocolMarker)
+{
+    /// Control bytes are replaced, never deleted, so a hostile name cannot collapse into a marker.
+    String hostile = "ClickHouse\x01 (antalya:\x02" "1)";
+    sanitizeUntrustedServerString(hostile);
+    EXPECT_EQ(AntalyaProtocol::parseMarker(hostile), 0u);
 }
