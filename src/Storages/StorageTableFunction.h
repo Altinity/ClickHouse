@@ -85,6 +85,13 @@ public:
             nested->drop();
     }
 
+    void prepareForDrop(ContextPtr query_context) override
+    {
+        std::lock_guard lock{nested_mutex};
+        if (nested)
+            nested->prepareForDrop(query_context);
+    }
+
     void read(
             QueryPlan & query_plan,
             const Names & column_names,
