@@ -1,5 +1,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MultipleFileWriter.h>
 
+#include <DataTypes/DataTypeNothing.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <Formats/FormatFactory.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Processors/Formats/IOutputFormat.h>
@@ -39,6 +41,33 @@ MultipleFileWriter::MultipleFileWriter(
     , new_file_path_callback(std::move(new_file_path_callback_))
 {
     column_mapper->setStorageColumnEncoding(Iceberg::IcebergSchemaProcessor::traverseSchema(schema_));
+
+    /// Iceberg `unknown` type maps to Nullable(Nothing) in ClickHouse.  No
+    /// serialisation format (Parquet, ORC, Avro) can represent the Nothing type,
+    /// and the column is guaranteed to contain only NULLs, so we strip it from the
+    /// block that is passed to the format writer.  The column still appears in the
+    /// Iceberg schema metadata and is read back as NULLs on the read path.
+    for (size_t i = 0; i < sample_block->columns(); ++i)
+    {
+        auto inner_type = removeNullable(sample_block->getByPosition(i).type);
+        if (isNothing(inner_type))
+            nothing_column_indices.push_back(i);
+    }
+
+    if (nothing_column_indices.empty())
+    {
+        filtered_sample_block = sample_block;
+    }
+    else
+    {
+        Block filtered;
+        for (size_t i = 0; i < sample_block->columns(); ++i)
+        {
+            if (std::find(nothing_column_indices.begin(), nothing_column_indices.end(), i) == nothing_column_indices.end())
+                filtered.insert(sample_block->getByPosition(i));
+        }
+        filtered_sample_block = std::make_shared<const Block>(std::move(filtered));
+    }
 }
 
 void MultipleFileWriter::startNewFile()
@@ -69,7 +98,7 @@ void MultipleFileWriter::startNewFile()
     }
     FormatFilterInfoPtr format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr);
     output_format = FormatFactory::instance().getOutputFormatParallelIfPossible(
-        write_format, *buffer, *sample_block, context, format_settings, format_filter_info);
+        write_format, *buffer, *filtered_sample_block, context, format_settings, format_filter_info);
 }
 
 void MultipleFileWriter::consume(const Chunk & chunk)
@@ -78,7 +107,25 @@ void MultipleFileWriter::consume(const Chunk & chunk)
     {
         startNewFile();
     }
-    output_format->write(sample_block->cloneWithColumns(chunk.getColumns()));
+
+    if (nothing_column_indices.empty())
+    {
+        output_format->write(sample_block->cloneWithColumns(chunk.getColumns()));
+    }
+    else
+    {
+        /// Strip Nullable(Nothing) columns before passing to the format writer.
+        auto columns = chunk.getColumns();
+        Columns filtered_columns;
+        filtered_columns.reserve(columns.size() - nothing_column_indices.size());
+        for (size_t i = 0; i < columns.size(); ++i)
+        {
+            if (std::find(nothing_column_indices.begin(), nothing_column_indices.end(), i) == nothing_column_indices.end())
+                filtered_columns.push_back(columns[i]);
+        }
+        output_format->write(filtered_sample_block->cloneWithColumns(std::move(filtered_columns)));
+    }
+
     output_format->flush();
     *current_file_num_rows += chunk.getNumRows();
     *current_file_num_bytes += chunk.bytes();

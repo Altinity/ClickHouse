@@ -92,6 +92,13 @@ private:
     std::optional<FormatSettings> format_settings;
     const String& write_format;
     SharedHeader sample_block;
+    /// Indices of Nullable(Nothing) columns (Iceberg `unknown` type) that must be
+    /// stripped before the data reaches the Parquet/format writer, because no
+    /// serialisation format supports the Nothing type.  The columns exist only in
+    /// the Iceberg schema metadata and are always read back as NULLs.
+    std::vector<size_t> nothing_column_indices;
+    /// `sample_block` with the Nothing columns removed; used by the format writer.
+    SharedHeader filtered_sample_block;
     UInt64 total_bytes = 0;
     std::function<void(const std::string &)> new_file_path_callback;
 };
