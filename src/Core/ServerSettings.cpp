@@ -968,6 +968,15 @@ Non authentication create/alter queries will succeed.
 A value of `0` means unlimited.
 :::
 )", 0) \
+    DECLARE(Bool, enable_token_auth, true, R"(
+Controls whether token-based (JWT) authentication is enabled.
+When disabled:
+- Token processors from the `token_processors` section are not parsed.
+- `TokenAccessStorage` (token user directory) is not added.
+- Authentication via tokens (`--jwt` option in clickhouse-client or `Authorization: Bearer` HTTP header) is rejected.
+
+Default value: `true` (token authentication is enabled).
+)", 0) \
     DECLARE(UInt64, concurrent_threads_soft_limit_num, 0, R"(
 The maximum number of query processing threads, excluding threads for retrieving data from remote servers, allowed to run all queries. This is not a hard limit. In case if the limit is reached the query will still get at least one thread to run. Query can upscale to desired number of threads during execution if more threads become available.
 
@@ -2139,6 +2148,7 @@ void ServerSettings::checkUnknownSettings(const Poco::Util::AbstractConfiguratio
         "kerberos",
         "jwt",
         "jwt_authenticators",
+        "token_processors",
         "http_authentication_servers",
         "connections_credentials",
         "custom_settings_prefixes",
