@@ -15,10 +15,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Logger.h>
 #include <atomic>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <utility>
 #include <vector>
@@ -164,6 +166,9 @@ struct RoundReport
     size_t condemned = 0;         /// entries newly condemned into the retired list this round
     size_t graduated = 0;         /// entries newly floor-passed (published delete_pending) this round
     size_t redeleted = 0;         /// pending deletes executed this round (exact-token blob deletes)
+    /// Counts one failed `HEAD`, conditional `DELETE`, or refused re-delete enqueue
+    /// per affected `delete_pending` entry.
+    size_t redelete_failed = 0;
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
 
@@ -726,6 +731,48 @@ private:
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
                     GcRoundWorkBudget & work_budget);
 
+    struct RedeleteIo
+    {
+        String blob_key;
+        Removal del = Removal::Gone;
+    };
+
+    struct IndexedException
+    {
+        size_t index;
+        std::exception_ptr exception;
+    };
+
+    struct RedeleteRoundContext
+    {
+        uint64_t new_round;
+        uint64_t snap_generation;
+        uint64_t shard;
+        GcRoundWorkBudget & round_work_budget;
+        RoundReport & report;
+        std::map<uint64_t, OutcomeLog> & outcomes;
+        uint64_t & jobs_scheduled;
+    };
+
+    static RedeleteIo performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op);
+
+    void applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteIo & io);
+
+    void reportRedeleteFailure(
+        RedeleteRoundContext & ctx,
+        const RetiredEntry & entry,
+        const Layout & layout,
+        std::exception_ptr exception,
+        std::optional<size_t> unsent_count = std::nullopt);
+
+    void redeleteBlobs(
+        RedeleteRoundContext & ctx,
+        const std::vector<RetiredEntry> & entries,
+        ThreadPool & pool,
+        size_t concurrency,
+        const Layout & layout,
+        CasOperation & op);
+
     /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
     /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
     ///
@@ -976,10 +1023,11 @@ private:
     /// initialized before that check.
     std::unique_ptr<GcMetaWriter> meta_writer;
 
-    /// The fold's read-ahead pool, sized by `gc_read_concurrency`. A `unique_ptr` for the same reason
-    /// as `meta_writer`: the size comes from `store->poolConfig()`, which may only be read after the
-    /// constructor body has validated `store`.
-    std::unique_ptr<ThreadPool> read_pool;
+    /// The GC I/O pool: the fold's and rebuild's read-ahead, the orphan-manifest sweep planning reads,
+    /// and the `pending_deletes` fan-out, sized by `gc_io_concurrency`. A `unique_ptr` for the same reason as `meta_writer`: the size comes from
+    /// `store->poolConfig()`, which may only be read after the constructor body has validated `store`.
+    std::unique_ptr<ThreadPool> io_pool;
+    std::optional<size_t> io_pool_refuse_at_for_test;
 
     /// Probe B1's two numbers for the round: the ref-log POSITIONS the sealed coverage declares covered
     /// (counted arithmetically over each namespace's cut -- not by listed ids, which under arithmetic
