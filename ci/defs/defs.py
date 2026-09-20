@@ -26,8 +26,8 @@ class RunnerLabels:
     ]
     AMD_LARGE = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
     ARM_LARGE = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64"]
-    AMD_MEDIUM = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
-    ARM_MEDIUM = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64"]
+    AMD_MEDIUM = ["self-hosted", "altinity-on-demand", "altinity-func-tester", "16c"]
+    ARM_MEDIUM = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64", "16c"]
     AMD_MEDIUM_CPU = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
     ARM_MEDIUM_CPU = [
         "self-hosted",
