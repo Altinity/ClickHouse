@@ -374,16 +374,17 @@ class CI:
         ),
         JobNames.INTEGRATION_TEST_ASAN: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
+            timeout=4 * 3600,
             num_batches=8,
         ),
         JobNames.INTEGRATION_TEST_ASAN_OLD_ANALYZER: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
-            timeout=3 * 3600,
+            timeout=4 * 3600,
             num_batches=8,
         ),
         JobNames.INTEGRATION_TEST_TSAN: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_TSAN],
-            timeout=3 * 3600,
+            timeout=4 * 3600,
             num_batches=8,
         ),
         JobNames.INTEGRATION_TEST_AARCH64: CommonJobConfigs.INTEGRATION_TEST.with_properties(
@@ -393,6 +394,7 @@ class CI:
         ),
         JobNames.INTEGRATION_TEST: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_RELEASE],
+            timeout=3 * 3600,
             num_batches=8,
             # release_only=True,
         ),
