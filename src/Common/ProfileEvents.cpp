@@ -128,6 +128,11 @@
     M(OneLakeAccessTokenRequestFailures, "Number of failed access token requests issued by the OneLake catalog via the Entra ID refresh token grant (including expired or revoked refresh tokens).", ValueType::Number) \
     M(OneLakeAccessTokenRequestMicroseconds, "Total time spent requesting access tokens via the Entra ID refresh token grant in the OneLake catalog.", ValueType::Microseconds) \
     M(OneLakeAccessTokenExpirations, "Number of times the cached OneLake access token was found expired and renewed transparently.", ValueType::Number) \
+    M(PuffinFilesRead, "Number of Puffin files read (footer or deletion vector blob).", ValueType::Number) \
+    M(PuffinFileReadMicroseconds, "Total time spent reading Puffin files.", ValueType::Microseconds) \
+    M(PuffinFilesCacheHits, "Number of times parsed Puffin file content has been found in the cache.", ValueType::Number) \
+    M(PuffinFilesCacheMisses, "Number of times parsed Puffin file content has not been found in the cache and had to be read from disk.", ValueType::Number) \
+    M(PuffinFilesCacheWeightLost, "Approximate number of bytes evicted from the Puffin files cache.", ValueType::Number) \
     M(VectorSimilarityIndexCacheHits, "Number of times an index granule has been found in the vector index cache.", ValueType::Number) \
     M(VectorSimilarityIndexCacheMisses, "Number of times an index granule has not been found in the vector index cache and had to be read from disk.", ValueType::Number) \
     M(VectorSimilarityIndexCacheWeightLost, "Approximate number of bytes evicted from the vector index cache.", ValueType::Number) \
@@ -1760,6 +1765,56 @@ The server successfully detected this situation and will download merged part fr
     M(ObjectStorageClusterSentToNonMatchedReplica, "Number of tasks in ObjectStorageCluster request sent to non-matched replica.", ValueType::Number) \
     M(ObjectStorageClusterProcessedTasks, "Number of processed tasks in ObjectStorageCluster request.", ValueType::Number) \
     M(ObjectStorageClusterWaitingMicroseconds, "Time of waiting for tasks in ObjectStorageCluster request.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogLoadConfig, "Number of 'load config' requests to Iceberg REST catalog.", ValueType::Number) \
+    M(DataLakeRestCatalogLoadConfigMicroseconds, "Total time of 'load config' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogGetNamespaces, "Number of 'get namespaces' requests to Iceberg REST catalog.", ValueType::Number) \
+    M(DataLakeRestCatalogGetNamespacesMicroseconds, "Total time of 'get namespaces' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogGetTables, "Number of 'get tables' requests to Iceberg REST catalog.", ValueType::Number) \
+    M(DataLakeRestCatalogGetTablesMicroseconds, "Total time of 'get tables' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogGetTableMetadata, "Number of 'get table metadata' requests to Iceberg REST catalog.", ValueType::Number) \
+    M(DataLakeRestCatalogGetTableMetadataMicroseconds, "Total time of 'get table metadata' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogGetCredentials, "Number of 'get credentials' requests to Iceberg REST catalog.", ValueType::Number) \
+    M(DataLakeRestCatalogGetCredentialsMicroseconds, "Total time of 'get credentials' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogAuthTokenCachedValid, "Number of requests to Iceberg REST catalog that reused a cached access token and did not fetch a new one.", ValueType::Number) \
+    M(DataLakeRestCatalogAuthTokenRetrieve, "Number of new access tokens fetched for Iceberg REST catalog (OAuth client-credentials or GCP metadata/ADC).", ValueType::Number) \
+    M(DataLakeRestCatalogAuthTokenRefreshedMicroseconds, "Total time spent fetching access tokens for Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogUnauthorized, "Number of Iceberg REST catalog HTTP requests retried with a new access token after HTTP 401 or 403.", ValueType::Number) \
+    M(DataLakeRestCatalogCreateNamespace, "Number of 'create namespace' requests to Iceberg REST catalog.", ValueType::Number) \
+    M(DataLakeRestCatalogCreateNamespaceMicroseconds, "Total time of 'create namespace' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogCreateTable, "Number of 'create table' requests to Iceberg REST catalog.", ValueType::Number) \
+    M(DataLakeRestCatalogCreateTableMicroseconds, "Total time of 'create table' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogUpdateTable, "Number of 'update table' requests to Iceberg REST catalog.", ValueType::Number) \
+    M(DataLakeRestCatalogUpdateTableMicroseconds, "Total time of 'update table' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogDropTable, "Number of 'drop table' requests to Iceberg REST catalog.", ValueType::Number) \
+    M(DataLakeRestCatalogDropTableMicroseconds, "Total time of 'drop table' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    \
+    M(DataLakeGlueCatalogGetDatabases, "Number of 'get databases' requests to Iceberg Glue catalog.", ValueType::Number) \
+    M(DataLakeGlueCatalogGetDatabasesMicroseconds, "Total time of 'get databases' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogGetTables, "Number of 'get tables' requests to Iceberg Glue catalog.", ValueType::Number) \
+    M(DataLakeGlueCatalogGetTablesMicroseconds, "Total time of 'get tables' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogGetTable, "Number of 'get table' requests to Iceberg Glue catalog.", ValueType::Number) \
+    M(DataLakeGlueCatalogGetTableMicroseconds, "Total time of 'get table' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogCreateDatabase, "Number of 'create database' requests to Iceberg Glue catalog.", ValueType::Number) \
+    M(DataLakeGlueCatalogCreateDatabaseMicroseconds, "Total time of 'create database' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogCreateTable, "Number of 'create table' requests to Iceberg Glue catalog.", ValueType::Number) \
+    M(DataLakeGlueCatalogCreateTableMicroseconds, "Total time of 'create table' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogUpdateTable, "Number of 'update table' requests to Iceberg Glue catalog.", ValueType::Number) \
+    M(DataLakeGlueCatalogUpdateTableMicroseconds, "Total time of 'update table' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogDropTable, "Number of 'drop table' requests to Iceberg Glue catalog.", ValueType::Number) \
+    M(DataLakeGlueCatalogDropTableMicroseconds, "Total time of 'drop table' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
+    \
+    M(DataLakeUnityCatalogGetTables, "Number of 'get tables' requests to Iceberg Unity catalog.", ValueType::Number) \
+    M(DataLakeUnityCatalogGetTablesMicroseconds, "Total time of 'get tables' requests to Iceberg Unity catalog.", ValueType::Microseconds) \
+    M(DataLakeUnityCatalogGetTable, "Number of 'get table' requests to Iceberg Unity catalog.", ValueType::Number) \
+    M(DataLakeUnityCatalogGetTableMicroseconds, "Total time of 'get table' requests to Iceberg Unity catalog.", ValueType::Microseconds) \
+    M(DataLakeUnityCatalogGetTableMetadata, "Number of 'get table metadata' requests to Iceberg Unity catalog.", ValueType::Number) \
+    M(DataLakeUnityCatalogGetTableMetadataMicroseconds, "Total time of 'get table metadata' requests to Iceberg Unity catalog.", ValueType::Microseconds) \
+    M(DataLakeUnityCatalogGetSchemas, "Number of 'get schemas' requests to Iceberg Unity catalog.", ValueType::Number) \
+    M(DataLakeUnityCatalogGetSchemasMicroseconds, "Total time of 'get schemas' requests to Iceberg Unity catalog.", ValueType::Microseconds) \
+    M(DataLakeUnityCatalogGetCredentials, "Number of 'get credentials' requests to Iceberg Unity catalog.", ValueType::Number) \
+    M(DataLakeUnityCatalogGetCredentialsMicroseconds, "Total time of 'get credentials' requests to Iceberg Unity catalog.", ValueType::Microseconds) \
+    \
+
 
 #ifdef APPLY_FOR_EXTERNAL_EVENTS
     #define APPLY_FOR_EVENTS(M) APPLY_FOR_BUILTIN_EVENTS(M) APPLY_FOR_EXTERNAL_EVENTS(M)

@@ -59,6 +59,10 @@ struct ObjectInfo
     /// Sorted absolute row indexes within the file, see FormatFilterInfo::rows_to_read.
     std::shared_ptr<const PaddedPODArray<UInt64>> rows_to_read;
 
+    /// Polymorphic copy: preserves the dynamic type (e.g. `IcebergDataObjectInfo` with equality /
+    /// position deletes, resolved storage, and metadata path) where a plain copy would slice it.
+    virtual std::shared_ptr<ObjectInfo> clone() const { return std::make_shared<ObjectInfo>(*this); }
+
     String getIdentifier(bool include_file_bucket_info = true) const;
     String getIdentifierForPath(const String & path, bool include_file_bucket_info = true) const;
 };

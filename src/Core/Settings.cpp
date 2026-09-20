@@ -6059,6 +6059,14 @@ how long already merged files stay unpublished while compaction keeps finding ne
 of publishing only when compaction runs out of candidates - a state that is never reached while the table keeps
 receiving new data files, so every merged output is then written to object storage and never referenced by a snapshot.
 )", 0) \
+    DECLARE(Bool, use_puffin_files_cache, true, R"(
+If turned on, Iceberg reads may utilize the Puffin files cache for parsed puffin file content such as deletion vectors.
+
+Possible values:
+
+- 0 - Disabled
+- 1 - Enabled
+)", 0) \
     DECLARE(Bool, use_query_cache, false, R"(
 If turned on, `SELECT` queries may utilize the [query cache](/concepts/features/performance/caches/query-cache). Parameters [enable_reads_from_query_cache](#enable_reads_from_query_cache)
 and [enable_writes_to_query_cache](#enable_writes_to_query_cache) control in more detail how the cache is used.
@@ -9292,6 +9300,9 @@ Multiple algorithms can be specified as a comma-separated list, e.g. `dphyp,gree
 )", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_database_paimon_rest_catalog, false, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'paimon_rest'
+)", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_database_s3_tables, false, R"(
+Allow experimental database engine DataLakeCatalog with catalog_type = 's3tables' (Amazon S3 Tables Iceberg REST with SigV4)
 )", EXPERIMENTAL) \
     DECLARE(UInt64, webassembly_udf_max_fuel, 100'000, R"(
 Fuel limit per WebAssembly UDF instance execution. Each WebAssembly instruction consumes some amount of fuel. The value is scaled by 1024 before being passed to the runtime, so `webassembly_udf_max_fuel = 1` corresponds to approximately 1024 fuel units. Set to 0 for no finite limit. Applies only to functions whose per-function setting `webassembly_udf_enable_fuel` is true, which is the default.

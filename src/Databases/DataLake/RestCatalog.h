@@ -232,9 +232,13 @@ protected:
 
     /// Load catalog config (special http handler) utilizing information from catalog_state and auth_headers.
     Config loadConfig(const CatalogState & catalog_state, const std::optional<DB::HTTPHeaderEntries> & auth_headers = std::nullopt);
-    virtual DB::HTTPHeaderEntries getAuthHeaders(const CatalogState & catalog_state, bool update_token) const;
+    virtual DB::HTTPHeaderEntries getAuthHeaders(
+        const CatalogState & catalog_state,
+        bool update_token,
+        bool * used_cached_oauth_token) const;
 
     void validateAuthHeaders(const DB::HTTPHeaderEntry & header) const;
+
     static void parseCatalogConfigurationSettings(const Poco::JSON::Object::Ptr & object, Config & result);
 
     virtual void sendRequest(
@@ -304,7 +308,10 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_ONELAKE;
     }
 
-    DB::HTTPHeaderEntries getAuthHeaders(const CatalogState & catalog_state, bool update_token) const override;
+    DB::HTTPHeaderEntries getAuthHeaders(
+        const CatalogState & catalog_state,
+        bool update_token,
+        bool * used_cached_oauth_token) const override;
 
     static void validateSettingsChanges(const DB::SettingsChanges & changes, AuthMode auth_mode);
 
@@ -352,7 +359,10 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE;
     }
 
-    DB::HTTPHeaderEntries getAuthHeaders(const CatalogState & catalog_state, bool update_token) const override;
+    DB::HTTPHeaderEntries getAuthHeaders(
+        const CatalogState & catalog_state,
+        bool update_token,
+        bool * used_cached_oauth_token) const override;
 
     const std::string & getGoogleADCClientId() const { return google_adc_client_id; }
     const std::string & getGoogleADCClientSecret() const { return google_adc_client_secret; }

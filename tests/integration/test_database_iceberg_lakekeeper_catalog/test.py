@@ -9,6 +9,7 @@ from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.schema import Schema
 from pyiceberg.types import (
     DoubleType,
+    IntegerType,
     NestedField,
     StringType,
 )
@@ -19,6 +20,7 @@ from helpers.config_cluster import minio_secret_key, minio_access_key
 from helpers.test_tools import TSV, csv_compare
 
 BASE_URL = "http://lakekeeper:8181/catalog"
+MOCK_OAUTH_URL = "http://mock-oauth:9999/token"
 CATALOG_NAME = "demo"
 WAREHOUSE_NAME = "demo"
 
@@ -473,4 +475,75 @@ def test_invalid_auth_header_format(started_cluster):
             """
         )
     assert "Invalid auth header format" in str(err.value)
+
+
+def get_auth_token_profile_events(node, query_id):
+    node.query("SYSTEM FLUSH LOGS")
+    refreshed = int(node.query(
+        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenRetrieve'] "
+        f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+    ))
+    cache_hits = int(node.query(
+        f"SELECT ProfileEvents['DataLakeRestCatalogAuthTokenCachedValid'] "
+        f"FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+    ))
+    return refreshed, cache_hits
+
+
+def test_auth_token_profile_events(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_auth_token_profile_events_{uuid.uuid4().hex[:8]}"
+    db_name = f"{test_ref}_database"
+    namespace = (f"{test_ref}_namespace",)
+    table_name = f"{test_ref}_table"
+
+    catalog = load_catalog_impl(started_cluster)
+    if namespace not in catalog.list_namespaces():
+        catalog.create_namespace(namespace)
+
+    schema = Schema(
+        NestedField(field_id=1, name="id", field_type=IntegerType(), required=False),
+        NestedField(field_id=2, name="data", field_type=StringType(), required=False),
+    )
+    catalog.create_table(
+        namespace + (table_name,),
+        schema=schema,
+        properties={"write.metadata.compression-codec": "none"},
+    )
+
+    # The catalog client is built eagerly by CREATE DATABASE (only ATTACH defers it),
+    # so the first access token is fetched by that query. OAuth credentials must use
+    # client_id:client_secret format; oauth_server_uri points to a mock token endpoint
+    # in docker compose.
+    node.query(f"DROP DATABASE IF EXISTS {db_name}")
+    qid_create = f"{test_ref}-create-{uuid.uuid4()}"
+    node.query(
+        f"""
+        CREATE DATABASE {db_name}
+        ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', '{minio_secret_key}')
+        SETTINGS
+            catalog_type = 'rest',
+            warehouse = 'demo',
+            storage_endpoint = 'http://minio1:9001/warehouse-rest',
+            catalog_credential = 'test:secret',
+            oauth_server_uri = '{MOCK_OAUTH_URL}'
+        """,
+        query_id=qid_create,
+        settings={"allow_experimental_database_iceberg": 1},
+    )
+    refreshed, _ = get_auth_token_profile_events(node, qid_create)
+    assert refreshed >= 1
+
+    # Every later catalog request reuses the cached token instead of fetching a new one.
+    qid1 = f"{test_ref}-show-1-{uuid.uuid4()}"
+    node.query(f"SHOW TABLES FROM {db_name}", query_id=qid1)
+    assert table_name in node.query(f"SHOW TABLES FROM {db_name}")
+    refreshed, cache_hits = get_auth_token_profile_events(node, qid1)
+    assert refreshed == 0 and cache_hits >= 1
+
+    qid2 = f"{test_ref}-show-2-{uuid.uuid4()}"
+    node.query(f"SHOW TABLES FROM {db_name}", query_id=qid2)
+    refreshed, cache_hits = get_auth_token_profile_events(node, qid2)
+    assert refreshed == 0 and cache_hits >= 1
 

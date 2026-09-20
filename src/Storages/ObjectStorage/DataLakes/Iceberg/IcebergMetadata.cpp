@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <base/arithmeticOverflow.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnSet.h>
 #include <Core/UUID.h>
@@ -470,6 +471,7 @@ IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSO
     std::optional<size_t> total_rows;
     std::optional<size_t> total_bytes;
     std::optional<size_t> total_position_deletes;
+    std::optional<size_t> total_equality_deletes;
 
     if (snapshot_object->has(f_summary))
     {
@@ -484,6 +486,9 @@ IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSO
         {
             total_position_deletes = summary_object->getValue<Int64>(f_total_position_deletes);
         }
+
+        if (summary_object->has(f_total_equality_deletes))
+            total_equality_deletes = summary_object->getValue<Int64>(f_total_equality_deletes);
     }
 
     if (!snapshot_object->has(f_schema_id))
@@ -497,7 +502,8 @@ IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSO
         schema_id,
         total_rows,
         total_bytes,
-        total_position_deletes);
+        total_position_deletes,
+        total_equality_deletes);
 }
 
 IcebergDataSnapshotPtr
@@ -1297,6 +1303,12 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
         return 0;
     }
 
+    /// Equality deletes remove data rows by value match; summary `total-equality-deletes` counts
+    /// rows in delete files, not deleted data rows. Fail closed when the field is present and > 0.
+    /// If the field is absent, skip to manifests for EQUALITY_DELETE files.
+    if (actual_data_snapshot->total_equality_delete_rows.has_value()
+        && *actual_data_snapshot->total_equality_delete_rows > 0)
+        return {};
 
     /// Row counts stored in the metadata layers above the manifest files are not used as
     /// data sources, because writers derive them instead of measuring them against the data:
@@ -1337,7 +1349,9 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
         auto manifest_rows = manifest_file_ptr.getRowsCountInAllFilesExcludingDeleted(FileContentType::DATA);
         if (!manifest_rows.has_value())
             return {};
-        result += *manifest_rows;
+        /// Per-manifest sums are capped at Int64::max; still guard the cross-manifest total.
+        if (common::addOverflow(result, static_cast<UInt64>(*manifest_rows), result))
+            return {};
     }
 
     const auto summary_total_rows = actual_data_snapshot->getTotalRows();
@@ -1352,7 +1366,7 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
             result);
 
     ProfileEvents::increment(ProfileEvents::IcebergTrivialCountOptimizationApplied);
-    return result;
+    return static_cast<size_t>(result);
 }
 
 std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) const
@@ -1367,7 +1381,9 @@ std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) cons
     if (actual_data_snapshot->total_bytes.has_value())
         return actual_data_snapshot->total_bytes;
 
-    Int64 result = 0;
+    /// Per-manifest sums are capped at Int64::max; still guard the cross-manifest total
+    /// (same fail-closed contract as `totalRows`).
+    UInt64 result = 0;
     for (const auto & manifest_list_entry : actual_data_snapshot->manifest_list_entries)
     {
         auto manifest_file_ptr = getManifestFileEntriesHandle(
@@ -1376,10 +1392,11 @@ std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) cons
         if (!count.has_value())
             return {};
 
-        result += count.value();
+        if (common::addOverflow(result, static_cast<UInt64>(*count), result))
+            return {};
     }
 
-    return result;
+    return static_cast<size_t>(result);
 }
 
 std::optional<String> IcebergMetadata::partitionKey(ContextPtr context) const
