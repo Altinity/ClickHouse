@@ -5,7 +5,11 @@ import pytest
 
 import helpers.kafka.common as k
 from helpers.client import QueryRuntimeException
-from helpers.cluster import ClickHouseCluster
+from helpers.cluster import ClickHouseCluster, is_arm
+
+# Skip on ARM due to Confluent/Kafka
+if is_arm():
+    pytestmark = pytest.mark.skip
 
 cluster = ClickHouseCluster(__file__)
 instance = cluster.add_instance(
