@@ -8,7 +8,6 @@
 
 #include <Common/Base64.h>
 #include <Common/Exception.h>
-#include <Common/FormUrlEncode.h>
 #include <Common/OpenSSLHelpers.h>
 
 #include <Poco/AutoPtr.h>
@@ -357,6 +356,13 @@ void copyStreamWithLimit(std::istream & in, std::string & out, std::size_t max_b
     }
 }
 
+std::string urlEncodeOAuth(const std::string & value)
+{
+    std::string result;
+    Poco::URI::encode(value, "", result);
+    return result;
+}
+
 Poco::JSON::Object::Ptr postOAuthForm(const std::string & url, const std::string & body)
 {
     Poco::URI uri(url);
@@ -461,11 +467,11 @@ std::string runOAuthAuthCodeFlow(const OAuthCredentials & creds)
     std::string auth_url
         = creds.auth_uri
         + "?response_type=code"
-          "&client_id=" + formUrlEncode(creds.client_id)
-        + "&redirect_uri=" + formUrlEncode(redirect_uri)
+          "&client_id=" + urlEncodeOAuth(creds.client_id)
+        + "&redirect_uri=" + urlEncodeOAuth(redirect_uri)
         + "&code_challenge=" + pkce.challenge
         + "&code_challenge_method=S256"
-        + "&scope=" + formUrlEncode(provider_policy->getAuthCodeScope())
+        + "&scope=" + urlEncodeOAuth(provider_policy->getAuthCodeScope())
         + "&state=" + csrf_state;
     if (provider_policy->useAccessTypeOfflineForAuthCode())
         auth_url += "&access_type=offline";
@@ -531,15 +537,15 @@ std::string runOAuthAuthCodeFlow(const OAuthCredentials & creds)
 
     std::string body
         = "grant_type=authorization_code"
-          "&code=" + formUrlEncode(received_code)
-        + "&redirect_uri=" + formUrlEncode(redirect_uri)
-        + "&client_id=" + formUrlEncode(creds.client_id)
-        + "&code_verifier=" + formUrlEncode(pkce.verifier);
+          "&code=" + urlEncodeOAuth(received_code)
+        + "&redirect_uri=" + urlEncodeOAuth(redirect_uri)
+        + "&client_id=" + urlEncodeOAuth(creds.client_id)
+        + "&code_verifier=" + urlEncodeOAuth(pkce.verifier);
     /// Confidential clients append the registered secret; public clients
     /// (PKCE-only) must omit the parameter entirely. An empty value is not
     /// equivalent to omission and is rejected by several IdPs as invalid_client.
     if (!creds.client_secret.empty())
-        body += "&client_secret=" + formUrlEncode(creds.client_secret);
+        body += "&client_secret=" + urlEncodeOAuth(creds.client_secret);
 
     auto resp = postOAuthForm(creds.token_uri, body);
     if (resp->has("error"))
@@ -562,14 +568,14 @@ std::string runOAuthAuthCodeFlow(const OAuthCredentials & creds)
 std::string buildDeviceAuthorizationRequestBody(const OAuthCredentials & creds, const std::string & scope)
 {
     std::string body
-        = "client_id=" + formUrlEncode(creds.client_id)
-        + "&scope=" + formUrlEncode(scope);
+        = "client_id=" + urlEncodeOAuth(creds.client_id)
+        + "&scope=" + urlEncodeOAuth(scope);
     /// Per RFC 8628 §3.1 a confidential client must authenticate on the
     /// device authorization request the same way as on the token endpoint.
     /// See runOAuthAuthCodeFlow() above: omit the parameter for public
     /// clients, do not send an empty value.
     if (!creds.client_secret.empty())
-        body += "&client_secret=" + formUrlEncode(creds.client_secret);
+        body += "&client_secret=" + urlEncodeOAuth(creds.client_secret);
     return body;
 }
 
@@ -664,11 +670,11 @@ std::string runOAuthDeviceFlow(OAuthCredentials creds)
 
         std::string poll_body
             = "grant_type=urn:ietf:params:oauth:grant-type:device_code"
-              "&device_code=" + formUrlEncode(device_code)
-            + "&client_id=" + formUrlEncode(creds.client_id);
+              "&device_code=" + urlEncodeOAuth(device_code)
+            + "&client_id=" + urlEncodeOAuth(creds.client_id);
         /// See runOAuthAuthCodeFlow() above: omit, do not send empty.
         if (!creds.client_secret.empty())
-            poll_body += "&client_secret=" + formUrlEncode(creds.client_secret);
+            poll_body += "&client_secret=" + urlEncodeOAuth(creds.client_secret);
 
         auto resp = postOAuthForm(creds.token_uri, poll_body);
         if (resp->has("error"))

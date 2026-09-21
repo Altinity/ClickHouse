@@ -161,9 +161,6 @@ ClickHouse obtains the actor token through a `client_credentials` grant using `c
 at `oauth_server_uri`, or the catalog's `/v1/oauth/tokens` endpoint if that setting is empty.
 The token is cached until expiry and used only for exchanges. If obtaining it fails, the query fails.
 
-With delegation enabled, `DataLakeRestCatalogAuthTokenRetrieve` counts actor-token requests.
-Otherwise, this event should remain zero while forwarding.
-
 ### Glue {#user-token-forwarding-glue}
 
 For Glue, ClickHouse exchanges the user's token through AWS STS `AssumeRoleWithWebIdentity`
@@ -199,15 +196,10 @@ to accept the users' tokens, including their `aud` and `sub` claims.
   depending on `database_datalake_require_metadata_access`.
 - With `object_storage_cluster`, workers receive table-scoped storage credentials over the
   interserver channel. Configure `interserver_https_port` or a cluster `<secret>` for cluster reads.
-- HTTP token rotation takes effect on the next request. Native TCP sessions must reconnect with
-  the new token.
 - For Iceberg REST, rotate `catalog_credential` with `ALTER DATABASE ... MODIFY SETTING`,
   authenticated with a user token. ClickHouse validates the new credentials and reloads the catalog
   configuration before applying the change, then invalidates cached session and storage credentials.
   Glue settings cannot be altered.
-
-Forwarding settings contain no secrets and are shown by `SHOW CREATE DATABASE` and
-`system.databases.engine_full`.
 
 ## Namespace filter {#namespace}
 

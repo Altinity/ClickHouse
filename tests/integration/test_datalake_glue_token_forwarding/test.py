@@ -17,7 +17,6 @@ STS_CONTAINER = "sts.us-east-1.amazonaws.com"
 DATABASE_SETTINGS = {
     "catalog_type": "glue",
     "warehouse": "test",
-    "storage_endpoint": "http://minio1:9001/warehouse-glue",
     "region": "us-east-1",
     "aws_role_arn": ROLE_ARN,
     "oauth_forward_user_token": "1",
@@ -26,14 +25,6 @@ DATABASE_SETTINGS = {
 
 def make_token(user):
     return jwt.encode({"sub": user}, SECRET, algorithm="HS256")
-
-
-def run_sts_mock(cluster):
-    start_mock_servers(
-        cluster,
-        os.path.join(os.path.dirname(__file__), "s3_mocks"),
-        [("mock_sts.py", STS_CONTAINER, "80")],
-    )
 
 
 @pytest.fixture(scope="module")
@@ -59,7 +50,11 @@ def started_cluster():
 
         logging.info("Starting cluster...")
         cluster.start()
-        run_sts_mock(cluster)
+        start_mock_servers(
+            cluster,
+            os.path.join(os.path.dirname(__file__), "s3_mocks"),
+            [("mock_sts.py", STS_CONTAINER, "80")],
+        )
 
         node = cluster.instances["node1"]
         node.query("CREATE ROLE IF NOT EXISTS token_users")
@@ -83,7 +78,8 @@ def sts_requests(started_cluster):
     return json.loads(output)
 
 
-def reset_sts(started_cluster):
+@pytest.fixture(autouse=True)
+def clean_sts_log(started_cluster):
     started_cluster.exec_in_container(
         started_cluster.get_container_id(STS_CONTAINER),
         [
@@ -92,12 +88,6 @@ def reset_sts(started_cluster):
             "import urllib.request; urllib.request.urlopen('http://localhost:80/_reset').read()",
         ],
     )
-
-
-@pytest.fixture(autouse=True)
-def clean_sts_log(started_cluster):
-    reset_sts(started_cluster)
-    yield
 
 
 def create_database(node, name):
@@ -109,22 +99,11 @@ def create_database(node, name):
     )
 
 
-def query_with_token(node, token, sql, **kwargs):
+def query_with_token(node, token, sql):
     response = node.http_request(
-        "", method="POST", data=sql, headers={"Authorization": f"Bearer {token}"}, **kwargs
+        "", method="POST", data=sql, headers={"Authorization": f"Bearer {token}"}
     )
     response.raise_for_status()
-    return response.text
-
-
-def profile_event(node, query_id, event):
-    node.query("SYSTEM FLUSH LOGS")
-    return int(
-        node.query(
-            f"SELECT sum(ProfileEvents['{event}']) FROM system.query_log "
-            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
-        ).strip()
-    )
 
 
 def test_user_tokens_are_exchanged_into_separate_sts_sessions(started_cluster):
@@ -133,10 +112,7 @@ def test_user_tokens_are_exchanged_into_separate_sts_sessions(started_cluster):
     create_database(node, db)
 
     token = make_token("alice")
-    query_id = str(uuid.uuid4())
-    query_with_token(node, token, f"SHOW TABLES FROM {db}", params={"query_id": query_id})
-
-    assert profile_event(node, query_id, "DataLakeGlueCatalogServiceIdentityRequests") == 0
+    query_with_token(node, token, f"SHOW TABLES FROM {db}")
 
     query_with_token(node, make_token("bob"), f"SHOW TABLES FROM {db}")
     sessions = sts_requests(started_cluster)

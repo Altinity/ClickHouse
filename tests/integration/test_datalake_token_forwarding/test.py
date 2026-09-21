@@ -76,15 +76,15 @@ def query_with_token(node, token, sql, **kwargs):
     return response.text
 
 
-def create_database(node, name, settings, storage_credentials=False):
+def create_database(node, storage_credentials=False):
     arguments = f"'{BASE_URL}'"
     if storage_credentials:
         arguments += f", '{minio_access_key}', '{minio_secret_key}'"
-    node.query(f"DROP DATABASE IF EXISTS {name}")
+    node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
     node.query(
         f"SET allow_experimental_database_iceberg=true;"
-        f"CREATE DATABASE {name} ENGINE = DataLakeCatalog({arguments}) "
-        f"SETTINGS {','.join(k + '=' + repr(v) for k, v in settings.items())}"
+        f"CREATE DATABASE {CATALOG_NAME} ENGINE = DataLakeCatalog({arguments}) "
+        f"SETTINGS {','.join(k + '=' + repr(v) for k, v in DATABASE_SETTINGS.items())}"
     )
 
 
@@ -125,7 +125,7 @@ def profile_event(node, query_id, event):
 
 def test_password_user_is_denied(started_cluster):
     node = started_cluster.instances["node1"]
-    create_database(node, CATALOG_NAME, DATABASE_SETTINGS)
+    create_database(node)
 
     response = node.http_request(
         "",
@@ -138,7 +138,7 @@ def test_password_user_is_denied(started_cluster):
 
 def test_native_protocol_forwards_jwt(started_cluster):
     node = started_cluster.instances["node1"]
-    create_database(node, CATALOG_NAME, DATABASE_SETTINGS)
+    create_database(node)
 
     node.exec_in_container(
         ["clickhouse", "client", "--jwt", make_token("alice"), "--query", f"CHECK DATABASE {CATALOG_NAME}"]
@@ -148,7 +148,7 @@ def test_native_protocol_forwards_jwt(started_cluster):
 def test_no_forwarding_without_the_server_setting(started_cluster):
     node = started_cluster.instances["node1"]
 
-    create_database(node, CATALOG_NAME, DATABASE_SETTINGS)
+    create_database(node)
 
     node.replace_in_config(
         "/etc/clickhouse-server/config.d/token_forwarding.xml",
@@ -178,7 +178,7 @@ def write_fixture(started_cluster, node):
     table = f"t_{uuid.uuid4().hex[:8]}"
     create_namespace(started_cluster, namespace)
     create_table_in_catalog(started_cluster, namespace, table)
-    create_database(node, CATALOG_NAME, DATABASE_SETTINGS, storage_credentials=True)
+    create_database(node, storage_credentials=True)
     return namespace, table
 
 

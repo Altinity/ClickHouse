@@ -1299,25 +1299,18 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
                 return std::any_of(changed.begin(), changed.end(), [&](const auto & change) { return std::string_view(change.name) == name; });
             };
 
-            if (!forwarding)
+            for (const auto & name : exchange_only_settings)
             {
-                for (const auto & name : exchange_only_settings)
-                    if (is_changed(name))
-                        throw Exception(
-                            ErrorCodes::BAD_ARGUMENTS,
-                            "`{}` has no effect without `oauth_forward_user_token = 1`", name);
-            }
-            else if (database_settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value.empty())
-            {
-                for (const auto & name : exchange_only_settings)
-                {
-                    if (name == "oauth_token_exchange_uri")
-                        continue;
-                    if (is_changed(name))
-                        throw Exception(
-                            ErrorCodes::BAD_ARGUMENTS,
-                            "`{}` has no effect without `oauth_token_exchange_uri`", name);
-                }
+                if (!is_changed(name))
+                    continue;
+                if (!forwarding)
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "`{}` has no effect without `oauth_forward_user_token = 1`", name);
+                if (name != "oauth_token_exchange_uri" && database_settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value.empty())
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "`{}` has no effect without `oauth_token_exchange_uri`", name);
             }
         }
 

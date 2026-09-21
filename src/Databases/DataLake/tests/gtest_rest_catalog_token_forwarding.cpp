@@ -76,9 +76,9 @@ std::string loadTableResponse()
         expires_at_ms);
 }
 
-void installTokenEndpoint(ServerState & state, const std::string & path)
+void installTokenEndpoint(ServerState & state)
 {
-    state.setStaticRoute(path, R"({"access_token":"session_token","expires_in":3600})");
+    state.setStaticRoute(IDP_TOKEN_PATH, R"({"access_token":"session_token","expires_in":3600})");
 }
 
 TokenForwardingConfig exchangeAt(const std::string & uri)
@@ -210,7 +210,7 @@ TEST_F(RestCatalogTokenForwarding, ExchangesAndCachesEachUserTokenSeparately)
 TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAndCredentials)
 {
     TestServer server;
-    installTokenEndpoint(*server, IDP_TOKEN_PATH);
+    installTokenEndpoint(*server);
     server->setStaticRoute(TABLE_PATH, loadTableResponse());
 
     auto alice = makeToken();
@@ -311,7 +311,7 @@ TEST_F(RestCatalogTokenForwarding, InFlightVendedCredentialsDoNotOutliveTheirGen
 {
     ParkedRoute parked;
     TestServer server;
-    installTokenEndpoint(*server, IDP_TOKEN_PATH);
+    installTokenEndpoint(*server);
     server->setRoute(TABLE_PATH, parked.handler([](const RecordedRequest &) { return json(loadTableResponse()); }));
 
     auto alice = makeToken();
@@ -346,7 +346,7 @@ TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentia
     ParkedRoute parked;
     TestServer server;
     installCatalogShape(*server);
-    installTokenEndpoint(*server, IDP_TOKEN_PATH);
+    installTokenEndpoint(*server);
     server->setRoute("/v1/config", parked.handler([](const RecordedRequest &) { return json(R"({"defaults":{},"overrides":{}})"); }));
 
     auto alice = makeToken();

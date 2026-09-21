@@ -105,7 +105,6 @@ namespace ProfileEvents
     extern const Event DataLakeGlueCatalogDropTable;
     extern const Event DataLakeGlueCatalogDropTableMicroseconds;
     extern const Event DataLakeGlueCatalogUserClientCacheHits;
-    extern const Event DataLakeGlueCatalogServiceIdentityRequests;
     extern const Event DataLakeGlueCatalogAssumeRoleWithWebIdentity;
     extern const Event DataLakeGlueCatalogAssumeRoleWithWebIdentityMicroseconds;
     extern const Event DataLakeGlueCatalogAssumeRoleWithWebIdentityFailures;
@@ -371,10 +370,7 @@ GlueCatalog::GlueCatalog(
 GlueCatalog::AuthenticatedClient GlueCatalog::getClient(const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     if (!make_user_client)
-    {
-        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogServiceIdentityRequests);
         return service_client;
-    }
 
     validateForwardedToken(getContext(), auth_token, fmt::format("Glue({})", region));
 

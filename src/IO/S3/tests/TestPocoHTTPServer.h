@@ -117,11 +117,10 @@ class MockStsRequestHandler : public Poco::Net::HTTPRequestHandler
 {
 public:
     explicit MockStsRequestHandler(
-        std::optional<StsRequestInfo> & last_request_info_, std::string role_access_key_, std::string role_secret_key_, bool reject_)
+        std::optional<StsRequestInfo> & last_request_info_, std::string role_access_key_, std::string role_secret_key_)
         : last_request_info(last_request_info_)
         , role_access_key(std::move(role_access_key_))
         , role_secret_key(std::move(role_secret_key_))
-        , reject(reject_)
     {
     }
 
@@ -136,21 +135,6 @@ public:
 
         const bool web_identity = last_request_info->body.find("Action=AssumeRoleWithWebIdentity") != std::string::npos;
         const std::string_view action = web_identity ? "AssumeRoleWithWebIdentity" : "AssumeRole";
-
-        if (reject)
-        {
-            response.setStatus(Poco::Net::HTTPResponse::HTTP_FORBIDDEN);
-            auto & error_out = response.send();
-            error_out << R"(<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
-<Error>
-    <Type>Sender</Type>
-    <Code>InvalidIdentityToken</Code>
-    <Message>Incorrect token audience</Message>
-</Error>
-</ErrorResponse>)";
-            error_out.flush();
-            return;
-        }
 
         response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
         auto & out = response.send();
@@ -172,7 +156,6 @@ private:
     std::optional<StsRequestInfo> & last_request_info;
     std::string role_access_key;
     std::string role_secret_key;
-    bool reject;
 };
 
 class StsHTTPRequestHandlerFactory : public Poco::Net::HTTPRequestHandlerFactory
@@ -180,19 +163,17 @@ class StsHTTPRequestHandlerFactory : public Poco::Net::HTTPRequestHandlerFactory
     std::optional<StsRequestInfo> & last_request_info;
     std::string role_access_key;
     std::string role_secret_key;
-    bool reject;
 
     Poco::Net::HTTPRequestHandler * createRequestHandler(const Poco::Net::HTTPServerRequest &) override
     {
-        return new MockStsRequestHandler(last_request_info, role_access_key, role_secret_key, reject);
+        return new MockStsRequestHandler(last_request_info, role_access_key, role_secret_key);
     }
 public:
     explicit StsHTTPRequestHandlerFactory(
-        std::optional<StsRequestInfo> & last_request_info_, std::string role_access_key_, std::string role_secret_key_, bool reject_)
+        std::optional<StsRequestInfo> & last_request_info_, std::string role_access_key_, std::string role_secret_key_)
         : last_request_info(last_request_info_)
         , role_access_key(std::move(role_access_key_))
         , role_secret_key(std::move(role_secret_key_))
-        , reject(reject_)
     {
     }
 
@@ -213,9 +194,9 @@ class TestPocoHTTPStsServer
     std::optional<StsRequestInfo> last_request_info;
 
 public:
-    TestPocoHTTPStsServer(std::string role_access_key, std::string role_secret_key, bool reject = false):
+    TestPocoHTTPStsServer(std::string role_access_key, std::string role_secret_key):
         server_socket(std::make_unique<Poco::Net::ServerSocket>(0)),
-        handler_factory(new StsHTTPRequestHandlerFactory(last_request_info, std::move(role_access_key), std::move(role_secret_key), reject)),
+        handler_factory(new StsHTTPRequestHandlerFactory(last_request_info, std::move(role_access_key), std::move(role_secret_key))),
         server_params(new Poco::Net::HTTPServerParams()),
         thread_pool("TestPocoHTTPStsServer"),
         server(std::make_unique<Poco::Net::HTTPServer>(handler_factory, thread_pool, *server_socket, server_params))

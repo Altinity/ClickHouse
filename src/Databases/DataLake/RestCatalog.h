@@ -80,7 +80,6 @@ struct TokenRequest
     String subject_token_type;
     String requested_token_type;
     String actor_token;
-    String actor_token_type;
 };
 
 struct CredentialsCacheKey

@@ -88,21 +88,4 @@ TEST(STSAssumeRoleWithWebIdentity, SendsTokenInTheBody)
     EXPECT_EQ(credentials.GetSessionToken(), "session_token");
 }
 
-TEST(STSAssumeRoleWithWebIdentity, RejectedTokenYieldsNoCredentials)
-{
-    TestPocoHTTPStsServer sts_http(std::string{role_access_key}, std::string{role_secret_key}, /* reject = */ true);
-
-    DB::RemoteHostFilter remote_host_filter;
-    auto client_configuration = makeClientConfiguration(remote_host_filter);
-
-    auto client = std::make_shared<DB::S3::AWSAssumeRoleClient>(
-        std::make_shared<Aws::Auth::AnonymousAWSCredentialsProvider>(), client_configuration, sts_http.getUrl());
-
-    DB::S3::AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider provider(
-        "arn:aws:iam::123456789012:role/r", "alice", "token", /* expiration_window_seconds = */ 0, client);
-
-    EXPECT_TRUE(provider.GetAWSCredentials().IsEmpty());
-    EXPECT_FALSE(provider.getLastError().empty());
-}
-
 #endif

@@ -694,16 +694,13 @@ String RestCatalog::getForwardedToken(
     if (!token_forwarding.exchangeEnabled())
         return auth_token->token;
 
-    const auto ttl = std::chrono::seconds(token_forwarding.user_token_cache_ttl);
-    const bool caching_enabled = ttl > std::chrono::seconds::zero();
+    if (token_forwarding.user_token_cache_ttl == 0)
+        return exchangeUserToken(catalog_state, generation, *auth_token).token;
 
     auto exchange = [&]
     {
         return std::make_shared<AccessToken>(exchangeUserToken(catalog_state, generation, *auth_token));
     };
-
-    if (!caching_enabled)
-        return exchange()->token;
 
     const String cache_key = fmt::format("{}:{}", generation, auth_token->fingerprint);
 
@@ -739,10 +736,7 @@ AccessToken RestCatalog::exchangeUserToken(
     request.requested_token_type = token_forwarding.requested_token_type;
 
     if (token_forwarding.forward_actor_token)
-    {
         request.actor_token = prepared_actor_token ? prepared_actor_token->token : getServicePrincipalToken(catalog_state, generation);
-        request.actor_token_type = "urn:ietf:params:oauth:token-type:access_token";
-    }
 
     ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogTokenExchange);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogTokenExchangeMicroseconds);
@@ -1047,12 +1041,10 @@ namespace
 AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
 {
     Poco::URI url = token_request.url;
-    DB::ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback;
-    size_t body_size = 0;
     String body;
 
     /// Do not also send bearer authentication: strict OAuth servers reject multiple client-authentication methods.
-    std::vector<std::pair<String, String>> params;
+    Poco::URI::QueryParameters params;
     if (token_request.grant == TokenRequest::Grant::ClientCredentials)
     {
         params.emplace_back("grant_type", "client_credentials");
@@ -1070,7 +1062,7 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
         if (!token_request.actor_token.empty())
         {
             params.emplace_back("actor_token", token_request.actor_token);
-            params.emplace_back("actor_token_type", token_request.actor_token_type);
+            params.emplace_back("actor_token_type", "urn:ietf:params:oauth:token-type:access_token");
         }
     }
 
@@ -1078,10 +1070,7 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
     params.emplace_back("client_secret", token_request.client_secret);
 
     if (token_request.use_query_parameters)
-    {
-        Poco::URI::QueryParameters query_params(params.begin(), params.end());
-        url.setQueryParameters(query_params);
-    }
+        url.setQueryParameters(params);
     else
     {
         DB::WriteBufferFromOwnString wb;
@@ -1094,11 +1083,6 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
             wb << name << "=" << DB::formUrlEncode(value);
         }
         body = wb.str();
-        body_size = body.size();
-        out_stream_callback = [&](std::ostream & os)
-        {
-            os << body;
-        };
     }
 
     const auto & context = getContext();
@@ -1109,13 +1093,10 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
     Poco::Net::HTTPRequest request(Poco::Net::HTTPRequest::HTTP_POST, url.getPathAndQuery(),
                                 Poco::Net::HTTPMessage::HTTP_1_1);
     request.setContentType("application/x-www-form-urlencoded");
-    request.setContentLength(body_size);
+    request.setContentLength(body.size());
     request.set("Accept", "application/json");
 
-    std::ostream & os = session->sendRequest(request);
-    /// The query-parameters flavor of the request has no body.
-    if (out_stream_callback)
-        out_stream_callback(os);
+    session->sendRequest(request) << body;
 
     Poco::Net::HTTPResponse response;
     std::istream & rs = session->receiveResponse(response);
@@ -1167,7 +1148,6 @@ AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, cons
     static constexpr auto oauth_tokens_endpoint = "oauth/tokens";
 
     TokenRequest request;
-    request.grant = TokenRequest::Grant::ClientCredentials;
     request.scope = auth_scope;
     request.client_id = client_id;
     request.client_secret = client_secret;
