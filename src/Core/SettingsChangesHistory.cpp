@@ -271,7 +271,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_part_schema_mismatch_mode", "strict", "strict", "New setting to allow EXPORT PART/EXPORT PARTITION when the source table has more columns than the destination"},
             {"export_merge_tree_partition_retry_initial_backoff_seconds", 5, 5, "New setting for exponential back-off between failed part export retries in an export partition task"},
             {"export_merge_tree_partition_retry_max_backoff_seconds", 300, 300, "New setting capping the exponential back-off between failed part export retries in an export partition task"},
-            {"export_merge_tree_partition_max_retries", 3, 3, "Obsolete and ignored: export partition tasks now retry retryable failures until the task timeout and fail immediately on non-retryable errors, instead of using a fixed retry budget"},
             {"allow_experimental_database_s3_tables", false, false, "New setting to enable experimental database S3 tables (AWS Iceberg REST catalog)."},
             {"statistics_max_set_size_for_exact_selectivity_estimation", 10000, 10000, "The bound on the cost of estimating the selectivity of `IN` with a large set is kept under `compatibility` with an earlier version: the previous value is deliberately equal to the new one, so that the uncapped estimation, which could add hundreds of milliseconds to the planning of a single query, is not restored."},
         });
@@ -685,7 +684,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
             {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
             {"export_merge_tree_partition_all_on_error", "throw_first", "throw_first", "New setting."},
-            {"", "", "", "Antalya: New setting"},
+            {"object_storage_cluster", "", "", "Antalya: New setting"},
             {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
             {"use_object_storage_list_objects_cache", false, false, "New setting."},
         });
