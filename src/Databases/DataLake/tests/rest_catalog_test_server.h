@@ -5,7 +5,6 @@
 #if USE_AVRO
 
 #include <Common/HTTPConnectionPool.h>
-#include <Databases/DataLake/RestCatalog.h>
 
 #include <Poco/AutoPtr.h>
 #include <Poco/Net/HTTPRequestHandler.h>
@@ -18,7 +17,6 @@
 #include <Poco/Net/SocketAddress.h>
 #include <Poco/SharedPtr.h>
 #include <Poco/StreamCopier.h>
-#include <Poco/URI.h>
 
 #include <functional>
 #include <map>
@@ -78,16 +76,11 @@ public:
         setRoute(path, [body](const RecordedRequest &) { return json(body); });
     }
 
-    std::vector<RecordedRequest> requests() const
-    {
-        std::lock_guard lock(mutex);
-        return recorded;
-    }
-
     std::vector<RecordedRequest> requestsTo(const std::string & path) const
     {
+        std::lock_guard lock(mutex);
         std::vector<RecordedRequest> result;
-        for (const auto & request : requests())
+        for (const auto & request : recorded)
             if (request.path == path)
                 result.push_back(request);
         return result;
