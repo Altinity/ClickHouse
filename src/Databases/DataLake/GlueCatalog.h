@@ -12,6 +12,8 @@
 
 #include <Common/CacheBase.h>
 #include <Databases/DataLake/DatabaseDataLakeSettings.h>
+
+#include <functional>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage_fwd.h>
 
 namespace Aws::Glue
@@ -38,17 +40,21 @@ public:
 
     ~GlueCatalog() override;
 
-    bool empty() const override;
+    bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    DB::Names getTables() const override;
+    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool existsTable(const std::string & database_name, const std::string & table_name) const override;
+    bool existsTable(const std::string & database_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void getTableMetadata(
         const std::string & database_name,
         const std::string & table_name,
         DB::ContextPtr context_,
         TableMetadata & result) const override;
+
+    bool supportsUserTokenForwarding() const override { return true; }
+
+    void onTokenForwardingDisabled() const override { user_clients.clear(); }
 
     bool tryGetTableMetadata(
         const std::string & database_name,
@@ -67,11 +73,11 @@ public:
         return DB::DatabaseDataLakeCatalogType::GLUE;
     }
 
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
+    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    void createNamespaceIfNotExists(const String & namespace_name, const String & location) const override;
+    void createNamespaceIfNotExists(const String & namespace_name, const String & location, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const override;
+    bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     bool updateSchema(
         const String & namespace_name,
@@ -80,15 +86,17 @@ public:
         Poco::JSON::Object::Ptr new_schema,
         Int32 previous_schema_id,
         Int32 new_last_column_id,
-        Poco::JSON::Object::Ptr metadata = nullptr) const override;
+        Poco::JSON::Object::Ptr metadata,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    void dropTable(const String & namespace_name, const String & table_name) const override;
+    void dropTable(const String & namespace_name, const String & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     /// Returns a callback that re-vends fresh AWS credentials from the configured
     /// credentials provider chain. Invoked by `ReadBufferFromS3` when an S3 call
     /// fails with `ExpiredToken`, so that a long-running read can recover without
     /// the user having to restart the query.
-    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
+    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
 
     /// Resolves the precise Iceberg timestamp type for `column_name` by searching the current schema
     /// in the Iceberg `metadata_object`. Falls back to `"timestamp_ns"` when `glue_column_type` is
@@ -99,9 +107,23 @@ public:
         const String & glue_column_type);
 
 private:
-    std::unique_ptr<Aws::Glue::GlueClient> glue_client;
+    struct AuthenticatedClient
+    {
+        std::shared_ptr<Aws::Glue::GlueClient> client;
+        std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider;
+    };
+
+    /// Exactly one of the two is set, depending on `oauth_forward_user_token`.
+    AuthenticatedClient service_client;
+    std::function<AuthenticatedClient(const DB::ForwardedAuthToken &)> make_user_client;
+
+    /// Keyed on the token fingerprint.
+    static constexpr size_t user_client_cache_max_entries = 1024;
+    mutable DB::CacheBase<String, AuthenticatedClient> user_clients;
+
+    AuthenticatedClient getClient(const DB::ForwardedAuthTokenPtr & auth_token) const;
+
     const LoggerPtr log;
-    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider;
     std::string region;
     CatalogSettings settings;
     DB::ASTPtr table_engine_definition;
@@ -109,16 +131,21 @@ private:
 
     bool isNamespaceAllowed(const std::string & namespace_) const;
 
-    DataLake::ICatalog::Namespaces getDatabases(const std::string & prefix, size_t limit = 0) const;
-    DB::Names getTablesForDatabase(const std::string & db_name, size_t limit = 0) const;
-    void setCredentials(TableMetadata & metadata) const;
+    DataLake::ICatalog::Namespaces getDatabases(const AuthenticatedClient & client, const std::string & prefix, size_t limit = 0) const;
+    DB::Names getTablesForDatabase(const AuthenticatedClient & client, const std::string & db_name, size_t limit = 0) const;
+    void setCredentials(const AuthenticatedClient & client, TableMetadata & metadata) const;
 
     /// The Glue catalog does not store detailed information about the types of timestamp columns, such as whether the column is timestamp or timestamptz.
     /// This method allows to clarify the actual type of the timestamp column.
     /// `glue_column_type` is the raw Glue type (`"timestamp"` or `"timestamp_nano"`) used as a fallback when the column is not found in Iceberg metadata.
-    String getActualTimestampType(const String & column_name, const TableMetadata & table_metadata, const String & glue_column_type) const;
+    String getActualTimestampType(
+        const AuthenticatedClient & client,
+        const String & column_name,
+        const TableMetadata & table_metadata,
+        const String & glue_column_type) const;
 
-    String resolveMetadataPathFromTableLocation(const String & table_location, const TableMetadata & table_metadata) const;
+    String resolveMetadataPathFromTableLocation(
+        const AuthenticatedClient & client, const String & table_location, const TableMetadata & table_metadata) const;
 
     struct ObjectStorageWithPath
     {
@@ -127,11 +154,13 @@ private:
         String table_path;  /// Path within bucket
     };
 
-    ObjectStorageWithPath createObjectStorageForEarlyTableAccess(const String & s3_location, const TableMetadata & table_metadata) const;
+    ObjectStorageWithPath createObjectStorageForEarlyTableAccess(
+        const AuthenticatedClient & client, const String & s3_location, const TableMetadata & table_metadata) const;
 
     /// Fetches and caches the parsed Iceberg metadata JSON for `metadata_uri`.
     /// Returns the cached object on subsequent calls for the same URI.
-    Poco::JSON::Object::Ptr getOrFetchMetadataObject(const String & metadata_uri, const TableMetadata & table_metadata) const;
+    Poco::JSON::Object::Ptr getOrFetchMetadataObject(
+        const AuthenticatedClient & client, const String & metadata_uri, const TableMetadata & table_metadata) const;
 
     /// Shared implementation for updateMetadata / updateSchema that optionally
     /// sets StorageDescriptor columns in the Glue UpdateTable call.
@@ -139,6 +168,7 @@ private:
         const String & namespace_name,
         const String & table_name,
         const String & new_metadata_path,
+        const DB::ForwardedAuthTokenPtr & auth_token,
         const std::vector<Aws::Glue::Model::Column> & columns = {}) const;
 
     mutable DB::CacheBase<String, Poco::JSON::Object::Ptr> metadata_objects;

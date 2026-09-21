@@ -256,11 +256,32 @@ private:
     std::string role_session_name;
     std::string external_id;
 };
+class AssumeRoleWithWebIdentityRequest : public Aws::AmazonSerializableWebServiceRequest
+{
+public:
+    AssumeRoleWithWebIdentityRequest(std::string role_arn_, std::string role_session_name_, std::string web_identity_token_);
+
+    Aws::Http::HeaderValueCollection GetHeaders() const override;
+
+    const char * GetServiceRequestName() const override { return "AssumeRoleWithWebIdentity"; }
+
+    Aws::String SerializePayload() const override;
+
+private:
+    std::string role_arn;
+    std::string role_session_name;
+    std::string web_identity_token;
+};
+
 class AssumeRoleResult
 {
 public:
+    AssumeRoleResult() = default;
+
     /// NOLINTNEXTLINE
-    AssumeRoleResult(Aws::AmazonWebServiceResult<Aws::Utils::Xml::XmlDocument> result);
+    AssumeRoleResult(
+        Aws::AmazonWebServiceResult<Aws::Utils::Xml::XmlDocument> result,
+        const char * result_node_name = "AssumeRoleResult");
 
     const std::string & getAccessKeyID() const { return access_key_id; }
 
@@ -291,10 +312,14 @@ public:
 
     AssumeRoleOutcome assumeRole(const AssumeRoleRequest & request) const;
 
+    AssumeRoleOutcome assumeRoleWithWebIdentity(const AssumeRoleWithWebIdentityRequest & request) const;
+
     const auto & getEndpoint() const { return endpoint; }
 
 private:
     Aws::Endpoint::AWSEndpoint endpoint;
+    /// Same host as `endpoint` without the query string: the action travels in the request body.
+    Aws::Endpoint::AWSEndpoint web_identity_endpoint;
 };
 
 class AwsAuthSTSAssumeRoleCredentialsProvider : public Aws::Auth::AWSCredentialsProvider
@@ -340,6 +365,37 @@ private:
     uint64_t expiration_window_seconds;
     std::shared_ptr<AWSAssumeRoleClient> client;
     Aws::Auth::AWSCredentials credentials;
+    LoggerPtr logger;
+};
+
+/// Takes the web identity token in memory, unlike `AwsAuthSTSAssumeRoleWebIdentityCredentialsProvider`,
+/// which reads it from the file named by `AWS_WEB_IDENTITY_TOKEN_FILE`.
+class AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider : public Aws::Auth::AWSCredentialsProvider
+{
+public:
+    AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider(
+        std::string role_arn_,
+        std::string session_name_,
+        std::string web_identity_token_,
+        uint64_t expiration_window_seconds_,
+        std::shared_ptr<AWSAssumeRoleClient> client_);
+
+    Aws::Auth::AWSCredentials GetAWSCredentials() override;
+
+    /// Empty after a successful call.
+    std::string getLastError() const;
+
+protected:
+    void Reload() override;
+
+private:
+    std::string role_arn;
+    std::string session_name;
+    std::string web_identity_token;
+    uint64_t expiration_window_seconds;
+    std::shared_ptr<AWSAssumeRoleClient> client;
+    Aws::Auth::AWSCredentials credentials;
+    std::string last_error;
     LoggerPtr logger;
 };
 

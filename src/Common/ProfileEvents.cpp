@@ -1734,6 +1734,10 @@ The server successfully detected this situation and will download merged part fr
     M(ObjectStorageListObjectsCachePrefixMatchHits, "Number of times object storage list objects operation miss the cache using prefix matching.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsVended, "Number of table metadata requests to REST catalog asking to vend storage credentials.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsCacheHits, "Number of table metadata requests to REST catalog reusing cached storage credentials.", ValueType::Number) \
+    M(DataLakeRestCatalogTokenExchange, "Number of RFC 8693 token exchanges performed to obtain a session token for the querying user.", ValueType::Number) \
+    M(DataLakeRestCatalogTokenExchangeMicroseconds, "Total time of RFC 8693 token exchanges.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogTokenExchangeFailures, "Number of RFC 8693 token exchanges that failed.", ValueType::Number) \
+    M(DataLakeRestCatalogUserTokenCacheHits, "Number of times a previously exchanged per-user session token was reused.", ValueType::Number) \
     \
     M(DataLakeRestCatalogLoadConfig, "Number of 'load config' requests to Iceberg REST catalog.", ValueType::Number) \
     M(DataLakeRestCatalogLoadConfigMicroseconds, "Total time of 'load config' requests to Iceberg REST catalog.", ValueType::Microseconds) \
@@ -1772,6 +1776,11 @@ The server successfully detected this situation and will download merged part fr
     M(DataLakeGlueCatalogUpdateTableMicroseconds, "Total time of 'update table' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
     M(DataLakeGlueCatalogDropTable, "Number of 'drop table' requests to Iceberg Glue catalog.", ValueType::Number) \
     M(DataLakeGlueCatalogDropTableMicroseconds, "Total time of 'drop table' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogAssumeRoleWithWebIdentity, "Number of AWS STS `AssumeRoleWithWebIdentity` calls made to turn a forwarded user token into credentials for the Glue catalog.", ValueType::Number) \
+    M(DataLakeGlueCatalogAssumeRoleWithWebIdentityMicroseconds, "Total time of AWS STS `AssumeRoleWithWebIdentity` calls made for forwarded user tokens.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogAssumeRoleWithWebIdentityFailures, "Number of AWS STS `AssumeRoleWithWebIdentity` calls that returned no credentials.", ValueType::Number) \
+    M(DataLakeGlueCatalogUserClientCacheHits, "Number of times a Glue client built for a forwarded user token was reused.", ValueType::Number) \
+    M(DataLakeGlueCatalogServiceIdentityRequests, "Number of Glue requests served by the identity configured on the database rather than by the querying user. Must stay at zero while `oauth_forward_user_token` is enabled: a non-zero value means a request fell back to the shared identity.", ValueType::Number) \
     \
     M(DataLakeUnityCatalogGetTables, "Number of 'get tables' requests to Iceberg Unity catalog.", ValueType::Number) \
     M(DataLakeUnityCatalogGetTablesMicroseconds, "Total time of 'get tables' requests to Iceberg Unity catalog.", ValueType::Microseconds) \

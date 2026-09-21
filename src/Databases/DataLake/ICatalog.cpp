@@ -9,11 +9,15 @@
 #include <Common/FailPoint.h>
 #include <Poco/URI.h>
 
+#include <Access/AccessControl.h>
+#include <Interpreters/Context.h>
+
 namespace DB::ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
+    extern const int CATALOG_USER_TOKEN_NOT_AVAILABLE;
 }
 
 namespace DB::DatabaseDataLakeSetting
@@ -341,17 +345,47 @@ DB::SettingsChanges CatalogSettings::allChanged() const
     return changes;
 }
 
-void ICatalog::createTable(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*metadata_content*/) const
+void ICatalog::validateForwardedToken(
+    const DB::ContextPtr & context, const DB::ForwardedAuthTokenPtr & auth_token, const std::string & catalog_description) const
+{
+    /// `enable_token_forwarding` is hot-reloadable, so re-read it per request rather than trust
+    /// the decision `Session::authenticate` made: otherwise an operator turning it off would keep
+    /// forwarding the token of every already-authenticated session until the server restarts.
+    /// Checked before the token itself, because the switch is why a session has no token.
+    if (!context->getGlobalContext()->getAccessControl().isTokenForwardingEnabled())
+    {
+        onTokenForwardingDisabled();
+
+        throw DB::Exception(
+            DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE,
+            "Catalog `{}` is configured with `oauth_forward_user_token = 1`, but the server-level "
+            "`enable_token_forwarding` setting is off, so the querying user's token cannot be "
+            "presented to the catalog. Set it to `1` and reconnect, or recreate the database "
+            "without `oauth_forward_user_token`.",
+            catalog_description);
+    }
+
+    if (!auth_token || auth_token->token.empty())
+        throw DB::Exception(
+            DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE,
+            "Catalog `{}` is configured with `oauth_forward_user_token = 1`, but this session "
+            "carries no bearer token. Authenticate with a token (an `Authorization: Bearer` HTTP "
+            "header, or `--jwt` for the native protocol), or recreate the database without "
+            "`oauth_forward_user_token`.",
+            catalog_description);
+}
+
+void ICatalog::createTable(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*metadata_content*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "createTable is not implemented");
 }
 
-void ICatalog::createNamespaceIfNotExists(const String & /*namespace_name*/, const String & /*location*/) const
+void ICatalog::createNamespaceIfNotExists(const String & /*namespace_name*/, const String & /*location*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "createNamespaceIfNotExists is not implemented");
 }
 
-bool ICatalog::updateMetadata(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*new_snapshot*/) const
+bool ICatalog::updateMetadata(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*new_snapshot*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "updateMetadata is not implemented");
 }
@@ -363,17 +397,19 @@ bool ICatalog::updateSchema(
     Poco::JSON::Object::Ptr /*new_schema*/,
     Int32 /*previous_schema_id*/,
     Int32 /*new_last_column_id*/,
-    Poco::JSON::Object::Ptr /*metadata*/) const
+    Poco::JSON::Object::Ptr /*metadata*/,
+    const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "updateSchema is not implemented");
 }
 
-void ICatalog::dropTable(const String & /*namespace_name*/, const String & /*table_name*/) const
+void ICatalog::dropTable(const String & /*namespace_name*/, const String & /*table_name*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "dropTable is not implemented");
 }
 
-ICatalog::PreparedSettingsChangesPtr ICatalog::prepareSettingsChanges(const DB::SettingsChanges & /*changes*/)
+ICatalog::PreparedSettingsChangesPtr ICatalog::prepareSettingsChanges(
+    const DB::SettingsChanges & /*changes*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "Settings of a catalog of this type cannot be altered");
 }

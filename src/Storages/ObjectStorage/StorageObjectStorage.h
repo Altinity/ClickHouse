@@ -1,4 +1,5 @@
 #pragma once
+#include <Access/ForwardedAuthToken.h>
 #include <Core/SchemaInferenceMode.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Parsers/IAST_fwd.h>
@@ -270,6 +271,8 @@ protected:
     LoggerPtr log;
 
     std::shared_ptr<DataLake::ICatalog> catalog;
+    /// The token of the user who resolved this table, for `drop()`, which has no context of its own.
+    DB::ForwardedAuthTokenPtr catalog_auth_token;
     StorageID storage_id;
     BackgroundJobsAssignee background_operations_assignee;
 };

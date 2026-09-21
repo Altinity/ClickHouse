@@ -64,6 +64,11 @@ namespace
 
         context->setUser(context->getAccessControl().getID<User>(target_user_name));
 
+        /// The bearer token (see `ForwardedAuthToken`) authenticates the original user, not
+        /// `target_user_name`, and this switches the session context in place, so it outlives the
+        /// current query.
+        context->setForwardedAuthToken(nullptr);
+
         /// We need to update the client info to make currentUser() return `target_user_name`.
         context->setCurrentUserName(target_user_name);
         context->setInitialUserName(target_user_name);

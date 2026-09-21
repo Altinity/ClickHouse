@@ -34,7 +34,6 @@ constexpr int OAUTH_HTTP_TIMEOUT_SECONDS = 30;
 /// untrusted OAuth/OIDC endpoints.
 void copyStreamWithLimit(std::istream & in, std::string & out, std::size_t max_bytes);
 
-std::string urlEncodeOAuth(const std::string & value);
 Poco::JSON::Object::Ptr postOAuthForm(const std::string & url, const std::string & body);
 
 /// Build the form body of the RFC 8628 device authorization request. Exposed

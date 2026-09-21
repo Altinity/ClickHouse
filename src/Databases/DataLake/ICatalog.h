@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>
+#include <Access/ForwardedAuthToken.h>
 #include <optional>
 #include <Core/Types.h>
 #include <Core/NamesAndTypes.h>
@@ -162,6 +163,7 @@ struct CatalogSettings
     String aws_role_arn;
     String aws_role_session_name;
     String aws_external_id;
+    bool forward_user_token = false;
 
     DB::SettingsChanges allChanged() const;
 };
@@ -179,17 +181,24 @@ public:
     virtual DB::DatabaseDataLakeCatalogType getCatalogType() const = 0;
     virtual ~ICatalog() = default;
 
+    /// Every method takes the token of the user on whose behalf the catalog is contacted, so that
+    /// a catalog which forwards it (currently only `RestCatalog`) authenticates as that user
+    /// instead of as the shared service principal. Mandatory rather than defaulted: a default
+    /// argument on a virtual resolves by static type. `getTableMetadata`/`tryGetTableMetadata`
+    /// take the token from their `ContextPtr` instead. Catalogs that cannot forward ignore it.
+
     /// Does catalog have any tables?
-    virtual bool empty() const = 0;
+    virtual bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
     /// Fetch tables' names list.
     /// Contains full namespaces in names.
-    virtual DB::Names getTables() const = 0;
+    virtual DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
     /// Check that a table exists in a given namespace.
     virtual bool existsTable(
         const std::string & namespace_naem,
-        const std::string & table_name) const = 0;
+        const std::string & table_name,
+        const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
     /// Get table metadata in the given namespace.
     /// Throw exception if table does not exist.
@@ -214,13 +223,13 @@ public:
     /// Creates new table in catalog. Callers must ensure the namespace exists before
     /// writing any table files to storage: a catalog that shares its storage view with
     /// the data refuses to create a namespace over a plain directory those files create.
-    virtual void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const;
+    virtual void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Creates the namespace unless it already exists.
-    virtual void createNamespaceIfNotExists(const String & namespace_name, const String & location) const;
+    virtual void createNamespaceIfNotExists(const String & namespace_name, const String & location, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Updates metadata in catalog.
-    virtual bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const;
+    virtual bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Commit a schema evolution (ADD/DROP/MODIFY/RENAME COLUMN) to the catalog.
     /// `new_metadata_path` is the path of the freshly written `vN.metadata.json`; it is used by
@@ -236,10 +245,11 @@ public:
         Poco::JSON::Object::Ptr new_schema,
         Int32 previous_schema_id,
         Int32 new_last_column_id,
-        Poco::JSON::Object::Ptr metadata = nullptr) const;
+        Poco::JSON::Object::Ptr metadata,
+        const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Drop table from catalog.
-    virtual void dropTable(const String & namespace_name, const String & table_name) const;
+    virtual void dropTable(const String & namespace_name, const String & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Does the catalog support transactions or anything like that?
     /// For example, the Iceberg REST catalog supports atomic operations "compare if snapshot X is equal to" and "add new snapshot Y".
@@ -247,10 +257,21 @@ public:
     /// The Glue catalog does not support such operation.
     virtual bool isTransactional() const { return false; }
 
-    virtual CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & /*storage_id*/)
+    /// The returned lambda is stored inside the object storage and invoked long after the query
+    /// context is gone, so it takes the token rather than a `ContextPtr`.
+    virtual CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & /*storage_id*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
     {
         return std::nullopt;
     }
+
+    /// Whether this catalog can authenticate as the querying user rather than as the configured
+    /// service principal. The Iceberg REST catalog and Glue can.
+    virtual bool supportsUserTokenForwarding() const { return false; }
+
+    /// Called by `validateForwardedToken` before it throws, to drop artifacts minted from user
+    /// tokens.
+    virtual void onTokenForwardingDisabled() const {}
 
     virtual void setVendedCredentialsCacheTTL(std::chrono::seconds /*ttl*/) {}
 
@@ -266,17 +287,25 @@ public:
     /// state without publishing anything (may throw, may do network I/O). The state
     /// becomes visible only after `commitSettingsChanges`, so the caller can persist
     /// the changes in between and abandon the prepared state on failure.
-    virtual PreparedSettingsChangesPtr prepareSettingsChanges(const DB::SettingsChanges & changes);
+    virtual PreparedSettingsChangesPtr prepareSettingsChanges(
+        const DB::SettingsChanges & changes, const DB::ForwardedAuthTokenPtr & auth_token = {});
 
     /// Publish the state built by `prepareSettingsChanges`. Must not fail.
     virtual void commitSettingsChanges(PreparedSettingsChangesPtr prepared);
 
-    void applySettingsChanges(const DB::SettingsChanges & changes)
+    void applySettingsChanges(const DB::SettingsChanges & changes, const DB::ForwardedAuthTokenPtr & auth_token = {})
     {
-        commitSettingsChanges(prepareSettingsChanges(changes));
+        commitSettingsChanges(prepareSettingsChanges(changes, auth_token));
     }
 
 protected:
+    /// Throws `CATALOG_USER_TOKEN_NOT_AVAILABLE` unless `enable_token_forwarding` is on and the
+    /// session carries a token. `catalog_description` only names the catalog in the message.
+    void validateForwardedToken(
+        const DB::ContextPtr & context,
+        const DB::ForwardedAuthTokenPtr & auth_token,
+        const std::string & catalog_description) const;
+
     /// Name of the warehouse,
     /// which is sometimes also called "catalog name".
     const std::string warehouse;

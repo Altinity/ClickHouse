@@ -4,6 +4,7 @@
 #if USE_JWT_CPP && USE_SSL
 
 #include <Client/OAuthFlowRunner.h>
+#include <Common/FormUrlEncode.h>
 
 #include <Common/Exception.h>
 #include <Common/OpenSSLHelpers.h>
@@ -310,12 +311,12 @@ std::string tryRefreshToken(const OAuthCredentials & creds, const std::string & 
     {
         std::string body
             = "grant_type=refresh_token"
-              "&client_id=" + urlEncodeOAuth(creds.client_id)
-            + "&refresh_token=" + urlEncodeOAuth(refresh_token);
+              "&client_id=" + formUrlEncode(creds.client_id)
+            + "&refresh_token=" + formUrlEncode(refresh_token);
         /// Public clients (no registered secret) must omit the parameter
         /// entirely; see loadOAuthCredentials() for the rationale.
         if (!creds.client_secret.empty())
-            body += "&client_secret=" + urlEncodeOAuth(creds.client_secret);
+            body += "&client_secret=" + formUrlEncode(creds.client_secret);
 
         auto resp = postOAuthForm(creds.token_uri, body);
         if (resp->has("error"))
