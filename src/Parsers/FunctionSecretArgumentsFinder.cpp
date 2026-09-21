@@ -7,8 +7,10 @@
 #include <Common/StringUtils.h>
 #include <Common/quoteString.h>
 #include <Common/maskURIPassword.h>
+#if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
 #include <Common/NamedCollections/NamedCollections.h>
 #include <Common/NamedCollections/NamedCollectionsFactory.h>
+#endif
 #include <Core/QualifiedTableName.h>
 #include <base/defines.h>
 #include <Poco/String.h>
@@ -538,6 +540,9 @@ std::string FunctionSecretArgumentsFinder::findIcebergStorageType(bool is_cluste
         storage_type = Poco::toLower(storage_type);
         function->arguments->skipArgument(storage_type_idx);
     }
+    /// The standalone parser links no named collection registry, so there is nothing to look up
+    /// there and the storage type stays at its default.
+#if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
     else if (isNamedCollectionName(is_cluster_function ? 1 : 0))
     {
         std::string collection_name;
@@ -550,6 +555,7 @@ std::string FunctionSecretArgumentsFinder::findIcebergStorageType(bool is_cluste
             }
         }
     }
+#endif
 
     return storage_type;
 }
