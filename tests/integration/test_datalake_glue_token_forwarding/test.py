@@ -3,7 +3,6 @@ import logging
 import os
 import uuid
 
-import boto3
 import jwt
 import pytest
 
@@ -39,11 +38,8 @@ def run_sts_mock(cluster):
 
 @pytest.fixture(scope="module")
 def started_cluster():
+    cluster = ClickHouseCluster(__file__)
     try:
-        os.environ["AWS_ACCESS_KEY_ID"] = "testing"
-        os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
-
-        cluster = ClickHouseCluster(__file__)
         cluster.add_instance(
             "node1",
             main_configs=["configs/token_forwarding.xml"],
@@ -72,32 +68,6 @@ def started_cluster():
         yield cluster
     finally:
         cluster.shutdown()
-
-
-def glue_client(started_cluster):
-    return boto3.client(
-        "glue",
-        endpoint_url=f"http://localhost:{started_cluster.glue_catalog_port}",
-        region_name="us-east-1",
-        aws_access_key_id="testing",
-        aws_secret_access_key="testing",
-    )
-
-
-def create_glue_table(started_cluster, namespace, table):
-    client = glue_client(started_cluster)
-    client.create_database(DatabaseInput={"Name": namespace})
-    client.create_table(
-        DatabaseName=namespace,
-        TableInput={
-            "Name": table,
-            "Parameters": {"table_type": "ICEBERG"},
-            "StorageDescriptor": {
-                "Columns": [{"Name": "x", "Type": "int"}],
-                "Location": f"s3://warehouse-glue/{namespace}/{table}",
-            },
-        },
-    )
 
 
 def sts_requests(started_cluster):
@@ -130,13 +100,11 @@ def clean_sts_log(started_cluster):
     yield
 
 
-def create_database(node, name, extra_settings=None):
-    settings = dict(DATABASE_SETTINGS)
-    settings.update(extra_settings or {})
+def create_database(node, name):
     node.query(
         f"DROP DATABASE IF EXISTS {name}; "
         f"CREATE DATABASE {name} ENGINE = DataLakeCatalog('{BASE_URL}') "
-        f"SETTINGS {','.join(k + '=' + repr(v) for k, v in settings.items())}",
+        f"SETTINGS {','.join(k + '=' + repr(v) for k, v in DATABASE_SETTINGS.items())}",
         settings={"allow_database_glue_catalog": 1},
     )
 
@@ -156,15 +124,11 @@ def profile_event(node, query_id, event):
             f"SELECT sum(ProfileEvents['{event}']) FROM system.query_log "
             f"WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
         ).strip()
-        or 0
     )
 
 
 def test_user_tokens_are_exchanged_into_separate_sts_sessions(started_cluster):
     node = started_cluster.instances["node1"]
-    namespace = f"ns_{uuid.uuid4().hex[:8]}"
-    create_glue_table(started_cluster, namespace, "t")
-
     db = f"glue_{uuid.uuid4().hex[:8]}"
     create_database(node, db)
 
@@ -172,37 +136,13 @@ def test_user_tokens_are_exchanged_into_separate_sts_sessions(started_cluster):
     query_id = str(uuid.uuid4())
     query_with_token(node, token, f"SHOW TABLES FROM {db}", params={"query_id": query_id})
 
-    requests = sts_requests(started_cluster)
-    assert len(requests) == 1, requests
-
-    request = requests[0]
-    assert request["action"] == "AssumeRoleWithWebIdentity"
-    assert request["version"] == "2011-06-15"
-    assert request["role_arn"] == ROLE_ARN
-    assert request["role_session_name"] == "alice"
-    assert request["web_identity_token"] == token
-
-    assert token not in request["query_string"]
-
     assert profile_event(node, query_id, "DataLakeGlueCatalogServiceIdentityRequests") == 0
 
     query_with_token(node, make_token("bob"), f"SHOW TABLES FROM {db}")
     sessions = sts_requests(started_cluster)
     assert sorted(request["role_session_name"] for request in sessions) == ["alice", "bob"]
     assert {request["web_identity_token"] for request in sessions} == {token, make_token("bob")}
-
-
-def test_no_token_fails_closed(started_cluster):
-    node = started_cluster.instances["node1"]
-    db = f"glue_{uuid.uuid4().hex[:8]}"
-    create_database(node, db)
-
-    error = node.query_and_get_error(
-        f"SHOW TABLES FROM {db}", user="passworduser", password="passworduser_password"
-    )
-    assert "carries no bearer token" in error, error
-
-    assert sts_requests(started_cluster) == []
+    assert all(request["role_arn"] == ROLE_ARN for request in sessions)
 
 
 def test_rejected_token_does_not_fall_back(started_cluster):

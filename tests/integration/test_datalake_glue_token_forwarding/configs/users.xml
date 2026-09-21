@@ -7,10 +7,5 @@
             <access_management>1</access_management>
             <named_collection_control>1</named_collection_control>
         </default>
-        <passworduser>
-            <password>passworduser_password</password>
-            <profile>default</profile>
-            <networks><ip>::/0</ip></networks>
-        </passworduser>
     </users>
 </clickhouse>

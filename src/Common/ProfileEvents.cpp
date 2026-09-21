@@ -1780,7 +1780,7 @@ The server successfully detected this situation and will download merged part fr
     M(DataLakeGlueCatalogAssumeRoleWithWebIdentityMicroseconds, "Total time of AWS STS `AssumeRoleWithWebIdentity` calls made for forwarded user tokens.", ValueType::Microseconds) \
     M(DataLakeGlueCatalogAssumeRoleWithWebIdentityFailures, "Number of AWS STS `AssumeRoleWithWebIdentity` calls that returned no credentials.", ValueType::Number) \
     M(DataLakeGlueCatalogUserClientCacheHits, "Number of times a Glue client built for a forwarded user token was reused.", ValueType::Number) \
-    M(DataLakeGlueCatalogServiceIdentityRequests, "Number of Glue requests served by the identity configured on the database rather than by the querying user. Must stay at zero while `oauth_forward_user_token` is enabled: a non-zero value means a request fell back to the shared identity.", ValueType::Number) \
+    M(DataLakeGlueCatalogServiceIdentityRequests, "Number of Glue requests using the database's service identity.", ValueType::Number) \
     \
     M(DataLakeUnityCatalogGetTables, "Number of 'get tables' requests to Iceberg Unity catalog.", ValueType::Number) \
     M(DataLakeUnityCatalogGetTablesMicroseconds, "Total time of 'get tables' requests to Iceberg Unity catalog.", ValueType::Microseconds) \

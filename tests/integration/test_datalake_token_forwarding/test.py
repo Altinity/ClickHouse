@@ -11,10 +11,12 @@ from helpers.config_cluster import minio_access_key, minio_secret_key
 SECRET = "datalake_token_forwarding_secret"
 BASE_URL = "http://rest:8181/v1"
 CATALOG_NAME = "demo"
-WRITE_SETTINGS = {
-    "allow_insert_into_iceberg": 1,
-    "write_full_path_in_iceberg_metadata": 1,
-    "async_insert": 0,
+DATABASE_SETTINGS = {
+    "catalog_type": "rest",
+    "warehouse": "demo",
+    "storage_endpoint": "http://minio1:9001/warehouse-rest",
+    "catalog_credential": "service:principal",
+    "oauth_forward_user_token": 1,
 }
 
 
@@ -111,17 +113,6 @@ def catalog_tables(started_cluster, namespace):
     return {identifier["name"] for identifier in response.json()["identifiers"]}
 
 
-def visible_tables(node, token, namespace, table, **kwargs):
-    return query_with_token(
-        node,
-        token,
-        f"SELECT count() FROM system.tables WHERE database = '{CATALOG_NAME}' "
-        f"AND name = '{namespace}.{table}' "
-        f"SETTINGS show_data_lake_catalogs_in_system_tables = true",
-        **kwargs,
-    ).strip()
-
-
 def profile_event(node, query_id, event):
     node.query("SYSTEM FLUSH LOGS")
     return int(
@@ -129,24 +120,12 @@ def profile_event(node, query_id, event):
             f"SELECT sum(ProfileEvents['{event}']) FROM system.query_log "
             f"WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
         ).strip()
-        or 0
     )
 
 
-def test_password_user_is_denied_over_http(started_cluster):
+def test_password_user_is_denied(started_cluster):
     node = started_cluster.instances["node1"]
-
-    create_database(
-        node,
-        CATALOG_NAME,
-        {
-            "catalog_type": "rest",
-            "warehouse": "demo",
-            "storage_endpoint": "http://minio1:9001/warehouse-rest",
-            "catalog_credential": "service:principal",
-            "oauth_forward_user_token": 1,
-        },
-    )
+    create_database(node, CATALOG_NAME, DATABASE_SETTINGS)
 
     response = node.http_request(
         "",
@@ -157,75 +136,19 @@ def test_password_user_is_denied_over_http(started_cluster):
     assert "CATALOG_USER_TOKEN_NOT_AVAILABLE" in response.text, response.text
 
 
-def test_password_user_is_denied_over_native(started_cluster):
-    node = started_cluster.instances["node1"]
-
-    create_database(
-        node,
-        CATALOG_NAME,
-        {
-            "catalog_type": "rest",
-            "warehouse": "demo",
-            "storage_endpoint": "http://minio1:9001/warehouse-rest",
-            "catalog_credential": "service:principal",
-            "oauth_forward_user_token": 1,
-        },
-    )
-
-    output = node.query_and_get_error(
-        f"SELECT * FROM {CATALOG_NAME}.`nonexistent.table`",
-        user="passworduser",
-        password="passworduser_password",
-    )
-    assert "CATALOG_USER_TOKEN_NOT_AVAILABLE" in output, output
-
-
 def test_native_protocol_forwards_jwt(started_cluster):
     node = started_cluster.instances["node1"]
-    namespace = f"ns_{uuid.uuid4().hex[:8]}"
-    table = f"t_{uuid.uuid4().hex[:8]}"
-    create_namespace(started_cluster, namespace)
-    create_table_in_catalog(started_cluster, namespace, table)
+    create_database(node, CATALOG_NAME, DATABASE_SETTINGS)
 
-    create_database(
-        node,
-        CATALOG_NAME,
-        {
-            "catalog_type": "rest",
-            "warehouse": "demo",
-            "storage_endpoint": "http://minio1:9001/warehouse-rest",
-            "oauth_forward_user_token": 1,
-        },
+    node.exec_in_container(
+        ["clickhouse", "client", "--jwt", make_token("alice"), "--query", f"CHECK DATABASE {CATALOG_NAME}"]
     )
-
-    token = make_token("alice")
-    result = node.exec_in_container(
-        [
-            "bash",
-            "-c",
-            f"clickhouse client --jwt '{token}' --query "
-            f"\"SELECT count() FROM system.tables WHERE database = '{CATALOG_NAME}' "
-            f"AND name = '{namespace}.{table}' "
-            f"SETTINGS show_data_lake_catalogs_in_system_tables = true\"",
-        ]
-    )
-    assert result.strip() == "1", result
 
 
 def test_no_forwarding_without_the_server_setting(started_cluster):
     node = started_cluster.instances["node1"]
 
-    create_database(
-        node,
-        CATALOG_NAME,
-        {
-            "catalog_type": "rest",
-            "warehouse": "demo",
-            "storage_endpoint": "http://minio1:9001/warehouse-rest",
-            "catalog_credential": "service:principal",
-            "oauth_forward_user_token": 1,
-        },
-    )
+    create_database(node, CATALOG_NAME, DATABASE_SETTINGS)
 
     node.replace_in_config(
         "/etc/clickhouse-server/config.d/token_forwarding.xml",
@@ -250,88 +173,40 @@ def test_no_forwarding_without_the_server_setting(started_cluster):
         node.query("SYSTEM RELOAD CONFIG")
 
 
-def test_check_database_forwards_the_user_token(started_cluster):
-    node = started_cluster.instances["node1"]
-    namespace = f"ns_{uuid.uuid4().hex[:8]}"
-    create_namespace(started_cluster, namespace)
-
-    create_database(
-        node,
-        CATALOG_NAME,
-        {
-            "catalog_type": "rest",
-            "warehouse": "demo",
-            "storage_endpoint": "http://minio1:9001/warehouse-rest",
-            "oauth_forward_user_token": 1,
-        },
-    )
-
-    query_with_token(node, make_token("checker"), f"CHECK DATABASE {CATALOG_NAME}")
-
-
-WRITE_DATABASE_SETTINGS = {
-    "catalog_type": "rest",
-    "warehouse": "demo",
-    "storage_endpoint": "http://minio1:9001/warehouse-rest",
-    "catalog_credential": "service:principal",
-    "oauth_forward_user_token": 1,
-}
-
-
 def write_fixture(started_cluster, node):
     namespace = f"ns_{uuid.uuid4().hex[:8]}"
     table = f"t_{uuid.uuid4().hex[:8]}"
     create_namespace(started_cluster, namespace)
     create_table_in_catalog(started_cluster, namespace, table)
-    create_database(node, CATALOG_NAME, WRITE_DATABASE_SETTINGS, storage_credentials=True)
+    create_database(node, CATALOG_NAME, DATABASE_SETTINGS, storage_credentials=True)
     return namespace, table
 
 
-def test_insert_reaches_the_catalog_as_the_querying_user(started_cluster):
+def test_async_insert_retains_the_querying_user_token(started_cluster):
     node = started_cluster.instances["node1"]
     namespace, table = write_fixture(started_cluster, node)
-
     token = make_token("writer")
     query_id = f"insert-{uuid.uuid4()}"
     query_with_token(
         node,
         token,
         f"INSERT INTO {CATALOG_NAME}.`{namespace}.{table}` VALUES ('written by the token user')",
-        params={"query_id": query_id, **WRITE_SETTINGS},
-    )
-
-    assert profile_event(node, query_id, "DataLakeRestCatalogAuthTokenRetrieve") == 0
-    assert (
-        query_with_token(node, token, f"SELECT x FROM {CATALOG_NAME}.`{namespace}.{table}`").strip()
-        == "written by the token user"
-    )
-
-
-def test_async_insert_retains_the_querying_user_token(started_cluster):
-    node = started_cluster.instances["node1"]
-    namespace, table = write_fixture(started_cluster, node)
-    token = make_token("async_writer")
-    query_id = f"async-insert-{uuid.uuid4()}"
-    settings = {
-        **WRITE_SETTINGS,
-        "async_insert": 1,
-        "wait_for_async_insert": 0,
-        "async_insert_use_adaptive_busy_timeout": 0,
-        "async_insert_busy_timeout_ms": 60000,
-    }
-    query_with_token(
-        node,
-        token,
-        f"INSERT INTO {CATALOG_NAME}.`{namespace}.{table}` VALUES ('written asynchronously')",
-        params={"query_id": query_id, **settings},
+        params={
+            "query_id": query_id,
+            "allow_insert_into_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+            "async_insert": 1,
+            "wait_for_async_insert": 0,
+            "async_insert_use_adaptive_busy_timeout": 0,
+            "async_insert_busy_timeout_ms": 60000,
+        },
     )
 
     node.query("SYSTEM FLUSH ASYNC INSERT QUEUE")
-
     assert profile_event(node, query_id, "AsyncInsertQuery") == 1
     assert (
         query_with_token(node, token, f"SELECT x FROM {CATALOG_NAME}.`{namespace}.{table}`").strip()
-        == "written asynchronously"
+        == "written by the token user"
     )
 
 

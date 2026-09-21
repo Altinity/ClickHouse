@@ -35,12 +35,9 @@ def sts():
 
     recorded.append(
         {
-            "action": params.get("Action", ""),
-            "version": params.get("Version", ""),
             "role_arn": params.get("RoleArn", ""),
             "role_session_name": params.get("RoleSessionName", ""),
             "web_identity_token": params.get("WebIdentityToken", ""),
-            "query_string": request.query_string,
         }
     )
 

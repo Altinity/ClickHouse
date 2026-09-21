@@ -891,20 +891,14 @@ namespace
     Default value: `true` (token authentication is enabled).
     )", 0) \
     DECLARE(Bool, enable_token_forwarding, false, R"(
-    Controls whether the bearer token a user authenticated with is retained for the lifetime of
-    their session so that it can be forwarded to external services on their behalf -- currently
-    an Iceberg REST catalog, and AWS STS on the way to a Glue catalog, via the
-    `oauth_forward_user_token` database setting.
+    Retain authenticated bearer tokens for forwarding through the `DataLakeCatalog`
+    setting `oauth_forward_user_token`. Supports Iceberg REST and AWS STS for Glue.
+    When disabled, tokens are not retained in sessions for forwarding.
 
-    When disabled (the default) the token is destroyed right after authentication, exactly as
-    before, and no database can forward it.
+    Database creators choose the endpoints that receive users' tokens. Grant `CREATE DATABASE`
+    only to trusted users and restrict `remote_url_allow_hosts`.
 
-    Enabling this is a privileged decision: the token is sent to a URL that whoever ran
-    `CREATE DATABASE ... ENGINE = DataLakeCatalog(<url>)` chose, so `CREATE DATABASE` becomes an
-    operation that can harvest the bearer tokens of every user who queries that database. Grant
-    it accordingly, and keep `remote_url_allow_hosts` restrictive.
-
-    Default value: `false` (the token is not retained).
+    Default value: `false`.
     )", 0) \
     DECLARE(UInt64, concurrent_threads_soft_limit_num, 0, R"(
     The maximum number of query processing threads, excluding threads for retrieving data from remote servers, allowed to run all queries. This is not a hard limit. In case if the limit is reached the query will still get at least one thread to run. Query can upscale to desired number of threads during execution if more threads become available.

@@ -355,20 +355,15 @@ void ICatalog::validateForwardedToken(
 
         throw DB::Exception(
             DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE,
-            "Catalog `{}` is configured with `oauth_forward_user_token = 1`, but the server-level "
-            "`enable_token_forwarding` setting is off, so the querying user's token cannot be "
-            "presented to the catalog. Set it to `1` and reconnect, or recreate the database "
-            "without `oauth_forward_user_token`.",
+            "Catalog `{}` requires token forwarding. Set `enable_token_forwarding = 1` and reconnect.",
             catalog_description);
     }
 
     if (!auth_token || auth_token->token.empty())
         throw DB::Exception(
             DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE,
-            "Catalog `{}` is configured with `oauth_forward_user_token = 1`, but this session "
-            "carries no bearer token. Authenticate with a token (an `Authorization: Bearer` HTTP "
-            "header, or `--jwt` for the native protocol), or recreate the database without "
-            "`oauth_forward_user_token`.",
+            "Cannot authenticate to catalog `{}`: this session carries no bearer token. "
+            "Authenticate with an `Authorization: Bearer` HTTP header or `--jwt` for the native protocol.",
             catalog_description);
 }
 

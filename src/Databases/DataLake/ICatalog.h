@@ -258,8 +258,6 @@ public:
         return std::nullopt;
     }
 
-    virtual bool supportsUserTokenForwarding() const { return false; }
-
     virtual void onTokenForwardingDisabled() const {}
 
     virtual void setVendedCredentialsCacheTTL(std::chrono::seconds /*ttl*/) {}

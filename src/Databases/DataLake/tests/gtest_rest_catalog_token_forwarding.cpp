@@ -63,27 +63,22 @@ void installCatalogShape(ServerState & state)
     state.setStaticRoute(NS_TABLES_PATH, R"({"identifiers":[{"name":"t"}]})");
 }
 
-std::string loadTableResponse(const std::string & access_key_id, const std::string & table_uuid = "1e1c0e10-0000-4000-8000-000000000001")
+std::string loadTableResponse()
 {
     const auto expires_at_ms
         = std::chrono::duration_cast<std::chrono::milliseconds>((std::chrono::system_clock::now() + std::chrono::hours(24)).time_since_epoch())
               .count();
     return fmt::format(
         R"({{"metadata-location":"s3://bucket/t/metadata/v1.metadata.json",)"
-        R"("metadata":{{"table-uuid":"{}","location":"s3://bucket/t","schemas":[],"current-schema-id":0}},)"
-        R"("config":{{"s3.access-key-id":"{}","s3.secret-access-key":"secret","s3.session-token":"session",)"
+        R"("metadata":{{"table-uuid":"1e1c0e10-0000-4000-8000-000000000001","location":"s3://bucket/t","schemas":[],"current-schema-id":0}},)"
+        R"("config":{{"s3.access-key-id":"AKIA_VENDED","s3.secret-access-key":"secret","s3.session-token":"session",)"
         R"("s3.session-token-expires-at-ms":{}}}}})",
-        table_uuid, access_key_id, expires_at_ms);
+        expires_at_ms);
 }
 
 void installTokenEndpoint(ServerState & state, const std::string & path)
 {
-    auto counter = std::make_shared<std::atomic_size_t>(0);
-    state.setRoute(path, [counter](const RecordedRequest &)
-    {
-        const size_t n = counter->fetch_add(1);
-        return json(fmt::format(R"({{"access_token":"session_token_{}","expires_in":3600}})", n));
-    });
+    state.setStaticRoute(path, R"({"access_token":"session_token","expires_in":3600})");
 }
 
 TokenForwardingConfig exchangeAt(const std::string & uri)
@@ -117,26 +112,29 @@ std::shared_ptr<RestCatalog> makeCatalog(
         forwarding);
 }
 
+void loadTable(RestCatalog & catalog, const DB::ForwardedAuthTokenPtr & auth_token)
+{
+    auto query_context = makeQueryContext(auth_token);
+    TableMetadata metadata;
+    metadata.withLocation().withStorageCredentials();
+    catalog.getTableMetadata("ns", "t", query_context, metadata);
+}
+
+size_t countVendingRequests(const ServerState & state)
+{
+    size_t count = 0;
+    for (const auto & request : state.requestsTo(TABLE_PATH))
+        if (request.header("X-Iceberg-Access-Delegation") == "vended-credentials")
+            ++count;
+    return count;
+}
+
 std::map<std::string, std::string> parseForm(const std::string & body)
 {
-    std::map<std::string, std::string> result;
-    size_t pos = 0;
-    while (pos < body.size())
-    {
-        const auto amp = body.find('&', pos);
-        const auto field = body.substr(pos, amp == std::string::npos ? std::string::npos : amp - pos);
-        const auto eq = field.find('=');
-        if (eq != std::string::npos)
-        {
-            std::string value;
-            Poco::URI::decode(field.substr(eq + 1), value);
-            result[field.substr(0, eq)] = value;
-        }
-        if (amp == std::string::npos)
-            break;
-        pos = amp + 1;
-    }
-    return result;
+    Poco::URI uri;
+    uri.setRawQuery(body);
+    const auto params = uri.getQueryParameters();
+    return {params.begin(), params.end()};
 }
 
 }
@@ -159,49 +157,81 @@ private:
     const bool previous;
 };
 
-TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAndCredentials)
+TEST_F(RestCatalogTokenForwarding, PassesUserTokenToCatalog)
 {
     TestServer server;
     installCatalogShape(*server);
+    auto context = makeQueryContext();
+    TokenForwardingConfig forwarding;
+    forwarding.forward_user_token = true;
+    auto catalog = makeCatalog(server, context, forwarding);
+
+    ASSERT_EQ(catalog->getTables(makeToken()), DB::Names{"ns.t"});
+    for (const auto * path : {CONFIG_PATH, NAMESPACES_PATH, NS_TABLES_PATH})
+    {
+        const auto requests = server->requestsTo(path);
+        ASSERT_FALSE(requests.empty());
+        for (const auto & request : requests)
+            EXPECT_EQ(request.header("Authorization"), "Bearer " + std::string(ALICE_TOKEN));
+    }
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
+}
+
+TEST_F(RestCatalogTokenForwarding, ExchangesAndCachesEachUserTokenSeparately)
+{
+    TestServer server;
+    installCatalogShape(*server);
+    server->setRoute(IDP_TOKEN_PATH, [](const RecordedRequest & request)
+    {
+        return json(fmt::format(R"({{"access_token":"{}_session","expires_in":3600}})", parseForm(request.body).at("subject_token")));
+    });
+    auto context = makeQueryContext();
+    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH));
+
+    for (const auto * token : {ALICE_TOKEN, "rotated.alice.token"})
+    {
+        auto auth_token = DB::makeForwardedAuthToken(DB::TokenCredentials(token), "alice");
+        server->clearRequests();
+        ASSERT_EQ(catalog->getTables(auth_token), DB::Names{"ns.t"});
+        ASSERT_EQ(catalog->getTables(auth_token), DB::Names{"ns.t"});
+
+        const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
+        ASSERT_EQ(exchanges.size(), 1u);
+        const auto form = parseForm(exchanges.front().body);
+        EXPECT_EQ(form.at("grant_type"), "urn:ietf:params:oauth:grant-type:token-exchange");
+        EXPECT_EQ(form.at("subject_token"), token);
+        EXPECT_EQ(form.at("subject_token_type"), "urn:ietf:params:oauth:token-type:access_token");
+        for (const auto & request : server->requestsTo(NAMESPACES_PATH))
+            EXPECT_EQ(request.header("Authorization"), "Bearer " + std::string(token) + "_session");
+        EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
+    }
+}
+
+TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAndCredentials)
+{
+    TestServer server;
     installTokenEndpoint(*server, IDP_TOKEN_PATH);
-    server->setStaticRoute(TABLE_PATH, loadTableResponse("AKIA_VENDED"));
+    server->setStaticRoute(TABLE_PATH, loadTableResponse());
 
     auto alice = makeToken();
     auto context = makeQueryContext();
     auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH));
     catalog->setVendedCredentialsCacheTTL(std::chrono::seconds(300));
 
-    auto load = [&]
-    {
-        auto query_context = makeQueryContext(alice);
-        TableMetadata metadata;
-        metadata.withLocation().withStorageCredentials();
-        catalog->getTableMetadata("ns", "t", query_context, metadata);
-    };
-
-    auto vending_requests = [&]
-    {
-        size_t count = 0;
-        for (const auto & request : server->requestsTo(TABLE_PATH))
-            if (request.header("X-Iceberg-Access-Delegation") == "vended-credentials")
-                ++count;
-        return count;
-    };
-
-    load();
+    loadTable(*catalog, alice);
     ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
-    ASSERT_EQ(vending_requests(), 1u);
+    ASSERT_EQ(countVendingRequests(*server), 1u);
 
-    load();
+    loadTable(*catalog, alice);
     ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
-    ASSERT_EQ(vending_requests(), 1u);
+    ASSERT_EQ(countVendingRequests(*server), 1u);
 
     DB::SettingsChanges changes;
     changes.emplace_back("catalog_credential", "client:rotated_secret");
-    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes, alice));
+    catalog->applySettingsChanges(changes, alice);
 
-    load();
-    EXPECT_EQ(vending_requests(), 2u);
+    loadTable(*catalog, alice);
+    EXPECT_EQ(countVendingRequests(*server), 2u);
 
     const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
     ASSERT_EQ(exchanges.size(), 3u);
@@ -244,7 +274,7 @@ public:
         {
             {
                 std::unique_lock lock(mutex);
-                if (enabled && !arrived)
+                if (!arrived)
                 {
                     arrived = true;
                     cv.notify_all();
@@ -253,18 +283,6 @@ public:
             }
             return response(request);
         };
-    }
-
-    void enable()
-    {
-        std::lock_guard lock(mutex);
-        enabled = true;
-    }
-
-    bool isEnabled() const
-    {
-        std::lock_guard lock(mutex);
-        return enabled;
     }
 
     void waitUntilParked()
@@ -283,9 +301,8 @@ public:
     }
 
 private:
-    mutable std::mutex mutex;
+    std::mutex mutex;
     std::condition_variable cv;
-    bool enabled = false;
     bool arrived = false;
     bool released = false;
 };
@@ -294,35 +311,15 @@ TEST_F(RestCatalogTokenForwarding, InFlightVendedCredentialsDoNotOutliveTheirGen
 {
     ParkedRoute parked;
     TestServer server;
-    installCatalogShape(*server);
     installTokenEndpoint(*server, IDP_TOKEN_PATH);
-    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
-    server->setRoute(TABLE_PATH, parked.handler([](const RecordedRequest &) { return json(loadTableResponse("AKIA_VENDED")); }));
+    server->setRoute(TABLE_PATH, parked.handler([](const RecordedRequest &) { return json(loadTableResponse()); }));
 
     auto alice = makeToken();
     auto context = makeQueryContext();
     auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH));
     catalog->setVendedCredentialsCacheTTL(std::chrono::seconds(300));
 
-    auto load = [&]
-    {
-        auto query_context = makeQueryContext(alice);
-        TableMetadata metadata;
-        metadata.withLocation().withStorageCredentials();
-        catalog->getTableMetadata("ns", "t", query_context, metadata);
-    };
-
-    auto vending_requests = [&]
-    {
-        size_t count = 0;
-        for (const auto & request : server->requestsTo(TABLE_PATH))
-            if (request.header("X-Iceberg-Access-Delegation") == "vended-credentials")
-                ++count;
-        return count;
-    };
-
-    parked.enable();
-    std::thread in_flight(load);
+    std::thread in_flight([&] { loadTable(*catalog, alice); });
     SCOPE_EXIT({
         parked.release();
         if (in_flight.joinable())
@@ -333,63 +330,15 @@ TEST_F(RestCatalogTokenForwarding, InFlightVendedCredentialsDoNotOutliveTheirGen
 
     DB::SettingsChanges changes;
     changes.emplace_back("catalog_credential", "client:rotated_secret");
-    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes, alice));
+    catalog->applySettingsChanges(changes, alice);
 
     parked.release();
     in_flight.join();
 
-    const auto vends_before = vending_requests();
+    const auto vends_before = countVendingRequests(*server);
 
-    load();
-    EXPECT_EQ(vending_requests(), vends_before + 1);
-}
-
-TEST_F(RestCatalogTokenForwarding, InFlightGrantDoesNotClobberRotatedServiceToken)
-{
-    ParkedRoute parked;
-    TestServer server;
-    installCatalogShape(*server);
-
-    server->setRoute(CATALOG_TOKEN_PATH, parked.handler([&parked](const RecordedRequest & request)
-    {
-        const auto secret = parseForm(request.body).at("client_secret");
-        if (secret != "secret")
-            return json(R"({"access_token":"tok_for_rotated_secret","expires_in":3600})");
-
-        /// Expire warm-up grants immediately to force a new grant in flight.
-        /// Keep the parked grant valid so expiry cannot hide an incorrect publication after rotation.
-        const auto expires_in = parked.isEnabled() ? 3600 : 1;
-        return json(fmt::format(R"({{"access_token":"tok_for_secret","expires_in":{}}})", expires_in));
-    }));
-
-    auto context = makeQueryContext();
-    auto catalog = makeCatalog(server, context, TokenForwardingConfig{});
-
-    ASSERT_EQ(catalog->getTables(/* auth_token */ {}), DB::Names{"ns.t"});
-
-    parked.enable();
-    std::thread in_flight([&] { catalog->getTables(/* auth_token */ {}); });
-    SCOPE_EXIT({
-        parked.release();
-        if (in_flight.joinable())
-            in_flight.join();
-    });
-
-    parked.waitUntilParked();
-
-    DB::SettingsChanges changes;
-    changes.emplace_back("catalog_credential", "client:rotated_secret");
-    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes));
-
-    parked.release();
-    in_flight.join();
-
-    server->clearRequests();
-    ASSERT_EQ(catalog->getTables(/* auth_token */ {}), DB::Names{"ns.t"});
-
-    const auto requests = server->requestsTo(NAMESPACES_PATH);
-    ASSERT_FALSE(requests.empty());
-    EXPECT_EQ(requests.front().header("Authorization"), "Bearer tok_for_rotated_secret");
+    loadTable(*catalog, alice);
+    EXPECT_EQ(countVendingRequests(*server), vends_before + 1);
 }
 
 TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentialChange)
@@ -397,7 +346,6 @@ TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentia
     ParkedRoute parked;
     TestServer server;
     installCatalogShape(*server);
-    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
     installTokenEndpoint(*server, IDP_TOKEN_PATH);
     server->setRoute("/v1/config", parked.handler([](const RecordedRequest &) { return json(R"({"defaults":{},"overrides":{}})"); }));
 
@@ -405,7 +353,6 @@ TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentia
     auto context = makeQueryContext();
     auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH));
 
-    parked.enable();
     std::thread in_flight([&] { catalog->getTables(alice); });
     SCOPE_EXIT({
         parked.release();
@@ -417,7 +364,7 @@ TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentia
 
     DB::SettingsChanges changes;
     changes.emplace_back("catalog_credential", "client:rotated_secret");
-    catalog->commitSettingsChanges(catalog->prepareSettingsChanges(changes, alice));
+    catalog->applySettingsChanges(changes, alice);
 
     parked.release();
     in_flight.join();

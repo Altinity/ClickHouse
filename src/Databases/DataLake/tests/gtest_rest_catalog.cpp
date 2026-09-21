@@ -149,7 +149,6 @@ TEST(RestCatalog, EmptyReturnsTrueWhenNoTablesExist)
 TEST(RestCatalog, ApplySettingsChangesWithoutAuthenticationRejected)
 {
     TestServer server;
-    installShape(*server, CatalogShape::Empty);
 
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
@@ -173,7 +172,6 @@ TEST(RestCatalog, ApplySettingsChangesWithoutAuthenticationRejected)
 TEST(RestCatalog, ApplySettingsChangesCredentialMode)
 {
     TestServer server;
-    installShape(*server, CatalogShape::Empty);
     installTokenEndpoint(*server);
 
     auto context = DB::Context::createCopy(getContext().context);
@@ -218,7 +216,6 @@ TEST(RestCatalog, ApplySettingsChangesCredentialMode)
 TEST(RestCatalog, ApplySettingsChangesAuthHeaderMode)
 {
     TestServer server;
-    installShape(*server, CatalogShape::Empty);
 
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
@@ -250,7 +247,6 @@ TEST(RestCatalog, ApplySettingsChangesAuthHeaderMode)
 TEST(RestCatalog, OneLakeApplySettingsChangesBearerMode)
 {
     TestServer server;
-    installShape(*server, CatalogShape::Empty);
 
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
@@ -306,7 +302,6 @@ TEST(RestCatalog, OneLakeApplySettingsChangesBearerMode)
 TEST(RestCatalog, TryGetTableMetadataDistinguishesMissingTableFromOtherErrors)
 {
     TestServer server;
-    installShape(*server, CatalogShape::TopLevelTable);
     installTableRoutes(*server);
 
     auto context = DB::Context::createCopy(getContext().context);

@@ -52,8 +52,6 @@ public:
         DB::ContextPtr context_,
         TableMetadata & result) const override;
 
-    bool supportsUserTokenForwarding() const override { return true; }
-
     void onTokenForwardingDisabled() const override { user_clients.clear(); }
 
     bool tryGetTableMetadata(

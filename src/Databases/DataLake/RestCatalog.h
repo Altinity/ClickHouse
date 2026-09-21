@@ -156,8 +156,6 @@ public:
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
         const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
 
-    bool supportsUserTokenForwarding() const override { return true; }
-
     void onTokenForwardingDisabled() const override { user_token_cache.clear(); }
 
     void loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & auth_token) const;

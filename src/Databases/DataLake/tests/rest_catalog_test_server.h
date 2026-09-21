@@ -104,7 +104,7 @@ public:
                 route = it->second;
         }
 
-        /// Return an error instead of throwing out of a Poco worker thread, which would terminate the test process.
+        /// Report unexpected requests to the client.
         if (!route)
             return Response{
                 .status = 599,

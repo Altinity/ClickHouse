@@ -350,9 +350,8 @@ GlueCatalog::GlueCatalog(
                 ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogAssumeRoleWithWebIdentityFailures);
                 throw DB::Exception(
                     DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE,
-                    "Could not assume role `{}` with the token of user `{}`: {}. Check that the "
-                    "role trusts the identity provider that issued the token and that its trust "
-                    "policy accepts this token's `sub` and `aud` claims",
+                    "Could not assume role `{}` with the token of user `{}`: {}. "
+                    "Check the role's trust policy for the token's issuer, `sub`, and `aud`.",
                     role_arn,
                     auth_token.principal,
                     provider->getLastError());

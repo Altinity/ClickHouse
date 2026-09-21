@@ -215,7 +215,7 @@ void DatabaseDataLake::validateTokenForwardingSettings() const
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "`oauth_forward_user_token` is only supported for `catalog_type = 'rest'` and "
-            "`catalog_type = 'glue'`; no other catalog type can authenticate as the querying user");
+            "`catalog_type = 'glue'`");
 
     if (catalog_type == DB::DatabaseDataLakeCatalogType::GLUE)
     {
@@ -226,16 +226,13 @@ void DatabaseDataLake::validateTokenForwardingSettings() const
     if (!settings[DatabaseDataLakeSetting::auth_header].value.empty())
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
-            "`oauth_forward_user_token` cannot be combined with `auth_header`: a static "
-            "authorization header takes precedence and would silently defeat forwarding");
+            "`oauth_forward_user_token` cannot be combined with `auth_header`");
 
     const auto & exchange_uri = settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value;
     if (!exchange_uri.empty() && settings[DatabaseDataLakeSetting::catalog_credential].value.empty())
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
-            "`oauth_token_exchange_uri` requires a non-empty `catalog_credential`: the token "
-            "exchange request has to authenticate itself with client credentials. Passthrough "
-            "(the default, with `oauth_token_exchange_uri` unset) needs none");
+            "`oauth_token_exchange_uri` requires a non-empty `catalog_credential`");
 
     static const std::array<std::string_view, 6> valid_token_types = {
         "urn:ietf:params:oauth:token-type:access_token",
@@ -270,23 +267,19 @@ void DatabaseDataLake::validateGlueTokenForwardingSettings(const DatabaseDataLak
     if (settings[DatabaseDataLakeSetting::aws_role_arn].value.empty())
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
-            "`oauth_forward_user_token` requires a non-empty `aws_role_arn` for a Glue catalog: "
-            "the querying user's token is exchanged for credentials of that role with AWS STS "
-            "`AssumeRoleWithWebIdentity`");
+            "`oauth_forward_user_token` requires a non-empty `aws_role_arn` for a Glue catalog");
 
     if (!settings[DatabaseDataLakeSetting::aws_access_key_id].value.empty()
         || !settings[DatabaseDataLakeSetting::aws_secret_access_key].value.empty())
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "`oauth_forward_user_token` cannot be combined with `aws_access_key_id` / "
-            "`aws_secret_access_key` for a Glue catalog: static keys are a second identity and "
-            "would be used instead of the one assumed for the querying user");
+            "`aws_secret_access_key` for a Glue catalog");
 
     if (!settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value.empty())
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
-            "`oauth_token_exchange_uri` is only supported for `catalog_type = 'rest'`: a Glue "
-            "catalog exchanges the user's token at AWS STS, not at an OAuth token endpoint");
+            "`oauth_token_exchange_uri` is only supported for `catalog_type = 'rest'`");
 }
 
 void DatabaseDataLake::initialize() const
@@ -1323,8 +1316,7 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
                     if (is_changed(name))
                         throw Exception(
                             ErrorCodes::BAD_ARGUMENTS,
-                            "`{}` has no effect without `oauth_token_exchange_uri`: without it the "
-                            "user's token is forwarded unchanged and no token exchange happens", name);
+                            "`{}` has no effect without `oauth_token_exchange_uri`", name);
                 }
             }
         }

@@ -1057,8 +1057,6 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
     {
         params.emplace_back("grant_type", "client_credentials");
         params.emplace_back("scope", token_request.scope);
-        params.emplace_back("client_id", token_request.client_id);
-        params.emplace_back("client_secret", token_request.client_secret);
     }
     else
     {
@@ -1074,9 +1072,10 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
             params.emplace_back("actor_token", token_request.actor_token);
             params.emplace_back("actor_token_type", token_request.actor_token_type);
         }
-        params.emplace_back("client_id", token_request.client_id);
-        params.emplace_back("client_secret", token_request.client_secret);
     }
+
+    params.emplace_back("client_id", token_request.client_id);
+    params.emplace_back("client_secret", token_request.client_secret);
 
     if (token_request.use_query_parameters)
     {
@@ -1173,15 +1172,8 @@ AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, cons
     request.client_id = client_id;
     request.client_secret = client_secret;
 
-    if (oauth_server_uri.empty() && !oauth_server_use_request_body)
-    {
-        request.url = Poco::URI(base_url / oauth_tokens_endpoint);
-        request.use_query_parameters = true;
-    }
-    else
-    {
-        request.url = oauth_server_uri.empty() ? Poco::URI(base_url / oauth_tokens_endpoint) : Poco::URI(oauth_server_uri);
-    }
+    request.url = oauth_server_uri.empty() ? Poco::URI(base_url / oauth_tokens_endpoint) : Poco::URI(oauth_server_uri);
+    request.use_query_parameters = oauth_server_uri.empty() && !oauth_server_use_request_body;
 
     ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
@@ -1879,7 +1871,6 @@ DB::Names RestCatalog::parseTables(DB::ReadBuffer & buf, const std::string & bas
 bool RestCatalog::existsTable(const std::string & namespace_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     TableMetadata table_metadata;
-    /// This metadata request needs neither schema nor credentials from the context; identity travels in `auth_token`.
     return tryGetTableMetadataImpl(namespace_name, table_name, getContext(), table_metadata, auth_token);
 }
 
@@ -2648,8 +2639,6 @@ void RestCatalog::cacheCredentials(const CredentialsCacheKey & key, const Vended
             credentials_cache.begin(),
             credentials_cache.end(),
             [](const auto & lhs, const auto & rhs) { return lhs.second.expires_at.value() < rhs.second.expires_at.value(); });
-        if (oldest == credentials_cache.end())
-            break;
         credentials_cache.erase(oldest);
     }
 
@@ -2660,7 +2649,6 @@ void RestCatalog::cacheCredentials(const CredentialsCacheKey & key, const Vended
 ICatalog::CredentialsRefreshCallback RestCatalog::getCredentialsConfigurationCallback(
     const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token)
 {
-    /// The refresher outlives the query context and must continue vending as the same user.
     return [this, storage_id, auth_token] () -> std::shared_ptr<IStorageCredentials>
     {
         LOG_DEBUG(log, "Update credentials in the catalog");
