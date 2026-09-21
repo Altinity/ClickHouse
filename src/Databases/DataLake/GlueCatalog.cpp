@@ -206,7 +206,6 @@ namespace DataLake
 namespace
 {
 
-/// STS accepts `[\w+=,.@-]{2,64}` for `RoleSessionName`.
 std::string makeRoleSessionName(const std::string & principal)
 {
     std::string result;
@@ -311,7 +310,7 @@ GlueCatalog::GlueCatalog(
 
     boost::split(allowed_namespaces, settings.namespaces, boost::is_any_of(", "), boost::token_compress_on);
 
-    /// One endpoint provider per client: `GlueClient` takes ownership of the resolver state.
+    /// Each `GlueClient` owns its endpoint resolver state.
     auto build_glue_client = [client_configuration, endpoint](const std::shared_ptr<Aws::Auth::AWSCredentialsProvider> & provider)
     {
         auto client_endpoint_provider = std::make_shared<Aws::Glue::GlueEndpointProvider>();
@@ -720,7 +719,6 @@ ICatalog::CredentialsRefreshCallback GlueCatalog::getCredentialsConfigurationCal
     /// S3 client is pinned to a snapshot that goes stale on long reads. This
     /// callback re-asks the same provider for current credentials each time
     /// `ReadBufferFromS3` reports an `ExpiredToken`, letting the read recover.
-    /// Resolved now, because the callback outlives the query context.
     auto credentials_provider = getClient(auth_token).credentials_provider;
 
     return [this, storage_id, credentials_provider]() -> std::shared_ptr<IStorageCredentials>

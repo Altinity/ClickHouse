@@ -497,8 +497,7 @@ RestCatalog::RestCatalog(
         validateAuthHeaders(initial_state.auth_header.value());
     }
 
-    /// With forwarding there may be no service credential at all, so an unauthenticated
-    /// `GET /v1/config` would be rejected by a secured catalog. Defer it to the first user query.
+    /// Defer `/v1/config` until a query supplies the user token needed to authenticate it.
     if (!token_forwarding.forward_user_token)
     {
         initial_state.config = loadConfig(initial_state, /* generation */ 0, /* auth_token */ {});
@@ -545,10 +544,8 @@ void RestCatalog::loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & auth_toke
     new_state->config = loadConfig(*old_state, old_state.generation, auth_token);
     new_state->config_loaded = true;
 
-    /// `config_mutex` does not exclude `commitSettingsChanges`, which publishes without it, so
-    /// publishing a state built before an `ALTER ... MODIFY SETTING catalog_credential` would
-    /// carry the old credentials back with it. Drop the config instead of merging it: it was read
-    /// with credentials no longer in force, which may resolve the warehouse differently.
+    /// `commitSettingsChanges` can publish during the config request. Discard a stale result
+    /// so it cannot restore old credentials or a warehouse resolved with them.
     std::lock_guard publish_lock(auth_publish_mutex);
     if (auth_generation.load(std::memory_order_acquire) != old_state.generation)
     {
@@ -631,15 +628,11 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const AuthContext & auth_conte
 
     /// Option 1: user specified auth header manually.
     /// Header has format: 'Authorization: <scheme> <token>'.
-    /// Mutually exclusive with forwarding, which `validateSettings` rejects: a static header
-    /// short-circuits everything below.
     if (catalog_state.auth_header.has_value())
     {
         return DB::HTTPHeaderEntries{catalog_state.auth_header.value()};
     }
 
-    /// Option 2: forward the querying user's identity, either as-is (passthrough) or as the
-    /// session token obtained by exchanging it. Never falls back to Option 3.
     if (token_forwarding.forward_user_token)
     {
         DB::HTTPHeaderEntries headers;
@@ -650,7 +643,6 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const AuthContext & auth_conte
         return headers;
     }
 
-    /// Option 3: user provided grant_type, client_id and client_secret.
     /// We would make OAuthClientCredentialsRequest
     /// https://github.com/apache/iceberg/blob/3badfe0c1fcf0c0adfc7aa4a10f0b50365c48cf9/open-api/rest-catalog-open-api.yaml#L3498C5-L3498C34
     if (!catalog_state.client_id.empty())
@@ -681,14 +673,11 @@ MultiVersion<AccessToken>::Version RestCatalog::publishServiceToken(AccessToken 
 {
     auto result = std::make_shared<const AccessToken>(std::move(minted));
 
-    /// A grant that started before an `ALTER ... MODIFY SETTING catalog_credential` can only
-    /// finish after it, and would otherwise put the rotated-away credential back in force for the
-    /// lifetime of this token. The lock stops the ALTER from landing between check and publish.
+    /// Check and publish under one lock so a concurrent `ALTER` cannot restore a superseded token.
     std::lock_guard lock(auth_publish_mutex);
     if (auth_generation.load(std::memory_order_acquire) == generation)
         access_token.set(std::make_unique<AccessToken>(*result));
 
-    /// Returned regardless: only sharing the token with later requests is withheld.
     return result;
 }
 
@@ -702,7 +691,6 @@ String RestCatalog::getForwardedToken(
 {
     validateForwardedToken(auth_token);
 
-    /// Passthrough: nothing is cached, the token arrives with every request anyway.
     if (!token_forwarding.exchangeEnabled())
         return auth_token->token;
 
@@ -717,8 +705,6 @@ String RestCatalog::getForwardedToken(
     if (!caching_enabled)
         return exchange()->token;
 
-    /// Scoped to the generation the exchange authenticated in, so that one still in flight when
-    /// the credentials are rotated writes its result under a key nothing reads any more.
     const String cache_key = fmt::format("{}:{}", generation, auth_token->fingerprint);
 
     if (!update_token)
@@ -730,9 +716,7 @@ String RestCatalog::getForwardedToken(
         }
     }
 
-    /// Either the entry expired or the caller asked for a fresh one. Drop it first so that
-    /// `getOrSetWithOutcome` reloads instead of handing back the stale value, while still
-    /// collapsing concurrent re-exchanges.
+    /// Remove stale entries before `getOrSetWithOutcome` so concurrent refreshes share a fresh result.
     user_token_cache.remove(cache_key);
     auto [session_token, outcome] = user_token_cache.getOrSetWithOutcome(cache_key, exchange);
     if (outcome == DB::CacheGetOrSetOutcome::Hit)
@@ -754,9 +738,6 @@ AccessToken RestCatalog::exchangeUserToken(
     request.subject_token_type = token_forwarding.subject_token_type;
     request.requested_token_type = token_forwarding.requested_token_type;
 
-    /// Off by default: an `actor_token` is only meaningful to a server that can validate it,
-    /// which an IdP cannot. If minting it fails the error propagates rather than downgrading the
-    /// exchange from delegation to plain impersonation.
     if (token_forwarding.forward_actor_token)
     {
         request.actor_token = prepared_actor_token ? prepared_actor_token->token : getServicePrincipalToken(catalog_state, generation);
@@ -777,8 +758,7 @@ AccessToken RestCatalog::exchangeUserToken(
         throw;
     }
 
-    /// Cap at the configured TTL, and apply it as the expiry when the response carries no
-    /// `expires_in`: a cached token with no expiry would survive IdP revocation indefinitely.
+    /// Bound cached tokens even when the endpoint omits `expires_in`.
     if (token_forwarding.user_token_cache_ttl > 0)
     {
         const auto ttl_bound = std::chrono::system_clock::now() + std::chrono::seconds(token_forwarding.user_token_cache_ttl);
@@ -876,7 +856,6 @@ void RestCatalog::validateSettingsChanges(const DB::SettingsChanges & changes, b
 struct RestCatalog::PreparedAuthChanges : ICatalog::PreparedSettingsChanges
 {
     std::unique_ptr<const CatalogState> new_state;
-    /// A service token prepared with the proposed credentials, when required for authentication or delegation.
     std::unique_ptr<AccessToken> new_access_token;
 };
 
@@ -894,8 +873,7 @@ ICatalog::PreparedSettingsChangesPtr RestCatalog::prepareSettingsChanges(
 
     if (token_forwarding.forward_user_token)
     {
-        /// Exchange directly, without reading or populating the live user cache: preparation
-        /// may fail or be abandoned, and concurrent queries must keep the committed credentials.
+        /// Preparation may fail or be abandoned; do not publish its tokens in the live cache.
         if (token_forwarding.exchangeEnabled())
         {
             if (token_forwarding.forward_actor_token && !prepared->new_access_token)
@@ -922,22 +900,15 @@ void RestCatalog::commitSettingsChanges(ICatalog::PreparedSettingsChangesPtr pre
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Settings changes to commit were not prepared by this catalog");
 
     {
-        /// Under the lock so that a request cannot check the generation, find it unchanged, and
-        /// only then publish a token minted with the credentials being replaced here.
         std::lock_guard lock(auth_publish_mutex);
         state.set(std::move(prepared_auth->new_state));
         if (prepared_auth->new_access_token)
             access_token.set(std::move(prepared_auth->new_access_token));
 
-        /// After the state, never before: a reader takes the generation first, so this order
-        /// leaves it either correct or one generation behind, which costs a wasted cache fill.
+        /// Publish the state before its generation; readers load them in the opposite order.
         auth_generation.fetch_add(1, std::memory_order_release);
     }
 
-    /// Both caches hold artifacts derived from the credentials that were just replaced, and
-    /// keeping them would let a rotated credential work for the rest of the cache TTL. Cleared
-    /// after the generation is bumped, so that a write slipping past the generation check
-    /// necessarily started before this clear and is wiped by it.
     user_token_cache.clear();
     {
         std::lock_guard lock(credentials_cache_mutex);
@@ -975,8 +946,6 @@ void RestCatalog::applySettingsChangesToState(
     if (credential_mode && (!token_forwarding.forward_user_token || token_forwarding.forward_actor_token)
         && (new_state.client_id != old_state.client_id || new_state.client_secret != old_state.client_secret))
     {
-        /// Validate the proposed credentials without publishing the token. Under forwarding
-        /// it is used only as the exchange actor; otherwise it signs the config reload.
         new_access_token = std::make_unique<AccessToken>(retrieveAccessToken(new_state.client_id, new_state.client_secret));
         new_auth_headers = DB::HTTPHeaderEntries{{"Authorization", "Bearer " + new_access_token->token}};
     }
@@ -1082,10 +1051,7 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
     size_t body_size = 0;
     String body;
 
-    /// Both grants authenticate with `client_id`/`client_secret` in the form body -- standard
-    /// OAuth token-endpoint client authentication. Sending the catalog's bearer token as well,
-    /// as Iceberg's own client does for the exchange, is rejected by strict servers as multiple
-    /// client-authentication methods.
+    /// Do not also send bearer authentication: strict OAuth servers reject multiple client-authentication methods.
     std::vector<std::pair<String, String>> params;
     if (token_request.grant == TokenRequest::Grant::ClientCredentials)
     {
@@ -1099,12 +1065,10 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
         params.emplace_back("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange");
         params.emplace_back("subject_token", token_request.subject_token);
         params.emplace_back("subject_token_type", token_request.subject_token_type);
-        /// An empty `requested_token_type` means "omit the field", per the setting's description.
         if (!token_request.requested_token_type.empty())
             params.emplace_back("requested_token_type", token_request.requested_token_type);
         if (!token_request.scope.empty())
             params.emplace_back("scope", token_request.scope);
-        /// Absent rather than empty when disabled: strict servers reject an empty `actor_token`.
         if (!token_request.actor_token.empty())
         {
             params.emplace_back("actor_token", token_request.actor_token);
@@ -1139,8 +1103,6 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
     }
 
     const auto & context = getContext();
-    /// Checked for the exchange endpoint too: the URL is chosen by whoever created the database,
-    /// and the request carries the querying user's own token.
     context->getRemoteHostFilter().checkHostAndPort(url.getHost(), std::to_string(url.getPort()));
     auto timeouts = DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings());
     auto session = makeHTTPSession(DB::HTTPConnectionGroupType::HTTP, url, timeouts, {});
@@ -1162,8 +1124,7 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
     std::string json_str;
     Poco::StreamCopier::copyToString(rs, json_str);
 
-    /// The failures below name the endpoint and the status but never the response body: an OAuth
-    /// error response may echo the request, which for an exchange carries the user's token.
+    /// OAuth error bodies may echo the subject token, so exclude them from exceptions.
     const auto describe_endpoint = [&url, &response]
     {
         return fmt::format(
@@ -1206,8 +1167,6 @@ AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, cons
 {
     static constexpr auto oauth_tokens_endpoint = "oauth/tokens";
 
-    /// Does not honour the catalog-advertised `oauth2-server-uri` from `/v1/config`; the explicit
-    /// settings cover every deployable case.
     TokenRequest request;
     request.grant = TokenRequest::Grant::ClientCredentials;
     request.scope = auth_scope;
@@ -1231,8 +1190,6 @@ AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, cons
 
 String RestCatalog::getServicePrincipalToken(const CatalogState & catalog_state, UInt64 generation) const
 {
-    /// Same caching rule as the `client_credentials` branch of `getAuthHeaders`: reuse the token
-    /// in `access_token` until it falls outside its validity window, then mint a new one.
     auto current = access_token.get();
     if (!current || current->isExpired())
         current = publishServiceToken(retrieveAccessToken(catalog_state.client_id, catalog_state.client_secret), generation);
@@ -1438,7 +1395,6 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 std::optional<StorageType> RestCatalog::getStorageType() const
 {
     const auto state_snapshot = getStateSnapshot();
-    /// Under forwarding the config is filled in lazily by the first user query.
     if (!state_snapshot->config_loaded || state_snapshot->config.default_base_location.empty())
         return std::nullopt;
     return parseStorageTypeFromLocation(state_snapshot->config.default_base_location);
@@ -1511,9 +1467,6 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
 
 bool RestCatalog::shouldRetryWithFreshToken(Poco::Net::HTTPResponse::HTTPStatus status) const
 {
-    /// Under forwarding the retry must never re-mint as the service principal. Only 401, where
-    /// the token may genuinely have expired mid-query, re-runs that principal's exchange; 403 is
-    /// an authorization decision and is terminal. Passthrough has nothing to re-mint.
     if (token_forwarding.forward_user_token)
         return token_forwarding.exchangeEnabled() && status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED;
 
@@ -1926,9 +1879,7 @@ DB::Names RestCatalog::parseTables(DB::ReadBuffer & buf, const std::string & bas
 bool RestCatalog::existsTable(const std::string & namespace_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     TableMetadata table_metadata;
-    /// The catalog's own (global) context is fine here: `table_metadata` asks for neither a schema
-    /// nor credentials, so the context is never used to interpret a response. The identity that
-    /// matters travels in `auth_token`.
+    /// This metadata request needs neither schema nor credentials from the context; identity travels in `auth_token`.
     return tryGetTableMetadataImpl(namespace_name, table_name, getContext(), table_metadata, auth_token);
 }
 
@@ -2236,8 +2187,6 @@ void RestCatalog::sendRequest(
     DB::HTTPHeaderEntries extra_headers;
     extra_headers.emplace_back("Content-Type", "application/json");
 
-    /// `update_token = false` plus a 401 retry, mirroring `createReadBuffer`: re-minting
-    /// unconditionally would cost a token round trip on every catalog mutation.
     auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
     {
         AuthContext auth_context{
@@ -2643,12 +2592,8 @@ VendedStorageCredentials RestCatalog::getCredentialsAndEndpoint(Poco::JSON::Obje
 
 String RestCatalog::getCredentialsCachePrincipal(const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-    /// Empty when forwarding is off: the catalog vends the same service-principal credentials to
-    /// everyone.
     if (!token_forwarding.forward_user_token || !auth_token)
         return {};
-    /// The fingerprint rather than the user name: rotating a token must not reuse the credentials
-    /// vended for the token it replaced.
     return auth_token->fingerprint;
 }
 
@@ -2697,8 +2642,6 @@ void RestCatalog::cacheCredentials(const CredentialsCacheKey & key, const Vended
     if (credentials_cache.size() >= credentials_cache_cleanup_threshold)
         std::erase_if(credentials_cache, [&now](const auto & entry) { return now >= entry.second.expires_at.value(); });
 
-    /// The sweep above only removes what has already expired, which is not a bound: with
-    /// per-principal keys the cache is O(users x tables). Evict the entries that expire soonest.
     while (credentials_cache.size() >= credentials_cache_max_entries)
     {
         auto oldest = std::min_element(
@@ -2717,9 +2660,7 @@ void RestCatalog::cacheCredentials(const CredentialsCacheKey & key, const Vended
 ICatalog::CredentialsRefreshCallback RestCatalog::getCredentialsConfigurationCallback(
     const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token)
 {
-    /// Captured by value so that a mid-query credential refresh re-vends as the same user. The
-    /// raw token therefore lives in the object storage's credential refresher for the lifetime of
-    /// the per-query storage.
+    /// The refresher outlives the query context and must continue vending as the same user.
     return [this, storage_id, auth_token] () -> std::shared_ptr<IStorageCredentials>
     {
         LOG_DEBUG(log, "Update credentials in the catalog");

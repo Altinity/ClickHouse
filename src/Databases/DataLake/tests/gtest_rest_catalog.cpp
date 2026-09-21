@@ -73,7 +73,6 @@ void installShape(ServerState & state, CatalogShape shape)
     state.setStaticRoute("/v1/namespaces/parent%1Fleaf_with_table/tables", R"({"identifiers":[{"name":"table_a"}]})");
 }
 
-/// The service-principal grant, for the catalogs created with `catalog_credential`.
 void installTokenEndpoint(ServerState & state)
 {
     state.setStaticRoute("/v1/oauth/tokens", R"({"token_type":"Bearer","expires_in":3600,"access_token":"mock-access-token"})");

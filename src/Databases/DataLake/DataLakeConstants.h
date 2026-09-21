@@ -38,7 +38,5 @@ static inline std::unordered_map<String, ValueMaskingFunc> SETTINGS_TO_HIDE =
     /// DLF credentials
     {"dlf_access_key_id", DEFAULT_MASKING_RULE},
     {"dlf_access_key_secret", DEFAULT_MASKING_RULE},
-    /// NOTE: the `oauth_forward_user_token` family carries no secret and is left visible on
-    /// purpose. Any future setting that holds a static token must be added here.
 };
 }

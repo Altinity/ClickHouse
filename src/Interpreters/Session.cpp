@@ -411,8 +411,6 @@ void Session::authenticate(const Credentials & credentials_, const Poco::Net::So
     prepared_client_info->current_address = std::make_shared<Poco::Net::SocketAddress>(address);
     prepared_client_info->connection_address = std::make_shared<Poco::Net::SocketAddress>(connection_address ? *connection_address : address);
 
-    /// After the attempt succeeded, so that a failed one captures nothing, and from the
-    /// credentials that were actually verified here rather than from any username-keyed cache.
     if (const auto * token_credentials = typeid_cast<const TokenCredentials *>(&credentials_))
     {
         if (global_context->getAccessControl().isTokenForwardingEnabled())
@@ -661,10 +659,8 @@ ContextMutablePtr Session::makeSessionContext(const String & session_name_, std:
             max_sessions_for_user = max_session_for_user_field->safeGet<UInt64>();
     }
 
-    /// Overwrites: a named session reuses a previously created context, which may still hold the
-    /// token of the request that created it. Stamped only while the session still runs as the
-    /// user that authenticated -- `EXECUTE AS <user>` switches it to another identity that must
-    /// not be handed this token. After the user is set, so a fresh named session is resolved.
+    /// Refresh reused named sessions only while they still represent the authenticated user.
+    /// An `EXECUTE AS` session must not regain the original token.
     const bool runs_as_authenticated_user = new_session_context->getAccess()->getUserID() == user_id;
     new_session_context->setForwardedAuthToken(runs_as_authenticated_user ? forwarded_auth_token : nullptr);
 
@@ -728,9 +724,7 @@ ContextMutablePtr Session::makeQueryContextImpl(const ClientInfo * client_info_t
     else if (client_info_to_copy && (client_info_to_copy != &getClientInfo()))
         query_context->setClientInfo(*client_info_to_copy);
 
-    /// Only when there is no session context to inherit it from: a query context copied from the
-    /// session context already carries the session's token, and that copy is the authoritative
-    /// one -- `EXECUTE AS <user>` clears it there, and re-stamping would hand it right back.
+    /// A session context may have cleared its token for `EXECUTE AS`; do not restore it in the query copy.
     if (!from_session_context)
         query_context->setForwardedAuthToken(forwarded_auth_token);
 

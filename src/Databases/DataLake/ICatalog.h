@@ -181,12 +181,6 @@ public:
     virtual DB::DatabaseDataLakeCatalogType getCatalogType() const = 0;
     virtual ~ICatalog() = default;
 
-    /// Every method takes the token of the user on whose behalf the catalog is contacted, so that
-    /// a catalog which forwards it (currently only `RestCatalog`) authenticates as that user
-    /// instead of as the shared service principal. Mandatory rather than defaulted: a default
-    /// argument on a virtual resolves by static type. `getTableMetadata`/`tryGetTableMetadata`
-    /// take the token from their `ContextPtr` instead. Catalogs that cannot forward ignore it.
-
     /// Does catalog have any tables?
     virtual bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
@@ -257,20 +251,15 @@ public:
     /// The Glue catalog does not support such operation.
     virtual bool isTransactional() const { return false; }
 
-    /// The returned lambda is stored inside the object storage and invoked long after the query
-    /// context is gone, so it takes the token rather than a `ContextPtr`.
+    /// The callback outlives the query context, so retain the token directly.
     virtual CredentialsRefreshCallback getCredentialsConfigurationCallback(
         const DB::StorageID & /*storage_id*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
     {
         return std::nullopt;
     }
 
-    /// Whether this catalog can authenticate as the querying user rather than as the configured
-    /// service principal. The Iceberg REST catalog and Glue can.
     virtual bool supportsUserTokenForwarding() const { return false; }
 
-    /// Called by `validateForwardedToken` before it throws, to drop artifacts minted from user
-    /// tokens.
     virtual void onTokenForwardingDisabled() const {}
 
     virtual void setVendedCredentialsCacheTTL(std::chrono::seconds /*ttl*/) {}
@@ -299,8 +288,6 @@ public:
     }
 
 protected:
-    /// Throws `CATALOG_USER_TOKEN_NOT_AVAILABLE` unless `enable_token_forwarding` is on and the
-    /// session carries a token. `catalog_description` only names the catalog in the message.
     void validateForwardedToken(
         const DB::ContextPtr & context,
         const DB::ForwardedAuthTokenPtr & auth_token,

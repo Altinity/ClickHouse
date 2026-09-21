@@ -93,8 +93,6 @@ private:
 
     void validateSettings();
 
-    /// Rejects `oauth_forward_user_token` combinations that could not be honoured, or that would
-    /// be ignored. Runs on CREATE and on ATTACH.
     void validateTokenForwardingSettings() const;
 
     static void validateGlueTokenForwardingSettings(const DatabaseDataLakeSettings & settings);

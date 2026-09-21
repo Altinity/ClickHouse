@@ -82,7 +82,6 @@ public:
 
     ~PaimonRestCatalog() override = default;
 
-    /// Paimon REST authenticates with a DLF token of its own; the user's token is ignored.
     bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;

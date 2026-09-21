@@ -348,10 +348,7 @@ DB::SettingsChanges CatalogSettings::allChanged() const
 void ICatalog::validateForwardedToken(
     const DB::ContextPtr & context, const DB::ForwardedAuthTokenPtr & auth_token, const std::string & catalog_description) const
 {
-    /// `enable_token_forwarding` is hot-reloadable, so re-read it per request rather than trust
-    /// the decision `Session::authenticate` made: otherwise an operator turning it off would keep
-    /// forwarding the token of every already-authenticated session until the server restarts.
-    /// Checked before the token itself, because the switch is why a session has no token.
+    /// Recheck the hot-reloadable switch so existing sessions stop forwarding when it is disabled.
     if (!context->getGlobalContext()->getAccessControl().isTokenForwardingEnabled())
     {
         onTokenForwardingDisabled();

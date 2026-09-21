@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
 # Tags: no-fasttest
-# no-fasttest: `DataLakeCatalog` is registered only under `USE_AVRO && USE_PARQUET`.
-
-# `CREATE DATABASE` validation of `oauth_forward_user_token` for Glue. No AWS is contacted.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

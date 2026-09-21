@@ -7,7 +7,6 @@
             <access_management>1</access_management>
             <named_collection_control>1</named_collection_control>
         </default>
-        <!-- Authenticates with a password, so it has no token to forward: the fail-closed case. -->
         <passworduser>
             <password>passworduser_password</password>
             <profile>default</profile>

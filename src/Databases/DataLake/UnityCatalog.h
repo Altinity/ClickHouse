@@ -27,8 +27,6 @@ public:
 
     ~UnityCatalog() override = default;
 
-    /// Unity catalog authenticates with its own configured credential; the user's token is
-    /// accepted and ignored so that "this catalog does not forward" is visible at every call site.
     bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;

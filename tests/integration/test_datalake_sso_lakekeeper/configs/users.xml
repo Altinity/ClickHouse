@@ -1,8 +1,6 @@
 <clickhouse>
     <profiles>
         <default>
-            <!-- Otherwise a catalog error is swallowed and the table list silently comes back empty,
-                 which would make every negative assertion in this suite pass for the wrong reason. -->
             <database_datalake_require_metadata_access>1</database_datalake_require_metadata_access>
         </default>
     </profiles>

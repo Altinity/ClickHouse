@@ -211,8 +211,6 @@ void DatabaseDataLake::validateTokenForwardingSettings() const
 
     const auto catalog_type = settings[DatabaseDataLakeSetting::catalog_type].value;
 
-    /// On the setting rather than on `ICatalog::supportsUserTokenForwarding`, because validation
-    /// runs before the catalog object exists.
     if (catalog_type != DB::DatabaseDataLakeCatalogType::ICEBERG_REST && catalog_type != DB::DatabaseDataLakeCatalogType::GLUE)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
@@ -225,8 +223,6 @@ void DatabaseDataLake::validateTokenForwardingSettings() const
         return;
     }
 
-    /// `auth_header` short-circuits `getAuthHeaders`, so the two together would send the static
-    /// header and never the user's token.
     if (!settings[DatabaseDataLakeSetting::auth_header].value.empty())
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
@@ -241,7 +237,6 @@ void DatabaseDataLake::validateTokenForwardingSettings() const
             "exchange request has to authenticate itself with client credentials. Passthrough "
             "(the default, with `oauth_token_exchange_uri` unset) needs none");
 
-    /// The six token types defined by RFC 8693 and reused by the Iceberg REST `TokenType` schema.
     static const std::array<std::string_view, 6> valid_token_types = {
         "urn:ietf:params:oauth:token-type:access_token",
         "urn:ietf:params:oauth:token-type:refresh_token",
@@ -287,8 +282,6 @@ void DatabaseDataLake::validateGlueTokenForwardingSettings(const DatabaseDataLak
             "`aws_secret_access_key` for a Glue catalog: static keys are a second identity and "
             "would be used instead of the one assumed for the querying user");
 
-    /// The other RFC 8693 settings are already rejected by the rule that they have no effect
-    /// without `oauth_token_exchange_uri`.
     if (!settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value.empty())
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
@@ -689,8 +682,6 @@ std::string DatabaseDataLake::getStorageEndpointForTable(const DataLake::TableMe
 
 bool DatabaseDataLake::empty() const
 {
-    /// `IDatabase::empty()` has no context to take a token from, so with forwarding enabled it
-    /// fails closed.
     return getCatalog()->empty(/* auth_token */ {});
 }
 
@@ -1297,9 +1288,7 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
             }
         }
 
-        /// CREATE-only, so that a database persisted by an older version can never be blocked from
-        /// attaching at startup. Rejects configuration that reads as if forwarding or an exchange
-        /// were happening when it is not.
+        /// Validate only on `CREATE` so older persisted databases can still attach at startup.
         if (!args.create_query.attach)
         {
             const bool forwarding = database_settings[DatabaseDataLakeSetting::oauth_forward_user_token].value;

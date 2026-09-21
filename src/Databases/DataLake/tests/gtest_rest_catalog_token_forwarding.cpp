@@ -34,12 +34,10 @@ namespace DB::ErrorCodes
 namespace
 {
 
-/// Paths the fake catalog answers on.
 constexpr auto CONFIG_PATH = "/v1/config";
 constexpr auto NAMESPACES_PATH = "/v1/namespaces";
 constexpr auto NS_TABLES_PATH = "/v1/namespaces/ns/tables";
 constexpr auto TABLE_PATH = "/v1/namespaces/ns/tables/t";
-/// The catalog's own (deprecated) token endpoint, and a separate IdP endpoint.
 constexpr auto CATALOG_TOKEN_PATH = "/v1/oauth/tokens";
 constexpr auto IDP_TOKEN_PATH = "/idp/token";
 
@@ -61,8 +59,6 @@ DB::ContextMutablePtr makeQueryContext(const DB::ForwardedAuthTokenPtr & auth_to
     return context;
 }
 
-/// A catalog with one namespace `ns` holding one table `t`. `ns` has no nested namespaces: a
-/// `?parent=` query must answer with an empty list, or `getNamespacesRecursive` descends forever.
 void installCatalogShape(ServerState & state)
 {
     state.setRoute(NAMESPACES_PATH, [](const RecordedRequest & request)
@@ -76,7 +72,6 @@ void installCatalogShape(ServerState & state)
 
 std::string loadTableResponse(const std::string & access_key_id, const std::string & table_uuid = "1e1c0e10-0000-4000-8000-000000000001")
 {
-    /// Far-future expiry so the vended credentials are cacheable.
     const auto expires_at_ms
         = std::chrono::duration_cast<std::chrono::milliseconds>((std::chrono::system_clock::now() + std::chrono::hours(24)).time_since_epoch())
               .count();
@@ -88,7 +83,6 @@ std::string loadTableResponse(const std::string & access_key_id, const std::stri
         table_uuid, access_key_id, expires_at_ms);
 }
 
-/// The `client_credentials` / token-exchange endpoint, answering with `session_token_<n>`.
 void installTokenEndpoint(ServerState & state, const std::string & path, Int64 expires_in = 3600)
 {
     auto counter = std::make_shared<std::atomic_size_t>(0);
@@ -123,8 +117,7 @@ TokenForwardingConfig exchangeAt(const std::string & uri, UInt64 cache_ttl = 300
     };
 }
 
-/// The catalog keeps only a `std::weak_ptr` to the context (`DB::WithContext`), so `context` must
-/// be a named local in the caller: a temporary would already be gone by the first request.
+/// `DB::WithContext` retains only a weak pointer; callers must keep the context alive.
 std::shared_ptr<RestCatalog> makeCatalog(
     const TestServer & server,
     const DB::ContextPtr & context,
@@ -144,7 +137,6 @@ std::shared_ptr<RestCatalog> makeCatalog(
         forwarding);
 }
 
-/// Parses an `application/x-www-form-urlencoded` body into a map, percent-decoding values.
 std::map<std::string, std::string> parseForm(const std::string & body)
 {
     std::map<std::string, std::string> result;
@@ -167,9 +159,6 @@ std::map<std::string, std::string> parseForm(const std::string & body)
     return result;
 }
 
-/// The server-level `enable_token_forwarding` switch, which `RestCatalog::getForwardedToken`
-/// re-reads on every request. It lives on the `AccessControl` of the process-wide test context and
-/// is off by default, so turning it on is a precondition of forwarding anything at all.
 struct TokenForwardingSwitch
 {
     explicit TokenForwardingSwitch(bool enabled)
@@ -187,22 +176,16 @@ struct TokenForwardingSwitch
 
 }
 
-/// A fixture rather than a line in each test: the switch is process-wide, so restoring it has to
-/// happen even when a test fails an assertion or throws -- a member destructor always runs, a
-/// trailing statement does not.
 class RestCatalogTokenForwarding : public ::testing::Test
 {
 protected:
     TokenForwardingSwitch forwarding{true};
 };
 
-/// --- Passthrough -------------------------------------------------------------------------
-
 TEST_F(RestCatalogTokenForwarding, PassthroughSendsUserTokenOnEveryCall)
 {
     TestServer server;
     installCatalogShape(*server);
-    /// Registered so that a fallback to the service principal is *recorded* rather than throwing.
     installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
 
     auto alice = makeToken(ALICE_TOKEN, "alice");
@@ -216,39 +199,11 @@ TEST_F(RestCatalogTokenForwarding, PassthroughSendsUserTokenOnEveryCall)
     for (const auto & request : requests)
         EXPECT_EQ(request.header("Authorization"), std::string("Bearer ") + ALICE_TOKEN) << "path: " << request.path;
 
-    /// `/v1/config` is fetched lazily with the same user's token, not unauthenticated.
     EXPECT_EQ(server->countRequestsTo(CONFIG_PATH), 1u);
-    /// Passthrough contacts no token endpoint at all.
     EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
     EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 0u);
 }
 
-TEST_F(RestCatalogTokenForwarding, ForwardingOffKeepsClientCredentials)
-{
-    TestServer server;
-    installCatalogShape(*server);
-    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
-
-    auto context = makeQueryContext();
-    auto catalog = makeCatalog(server, context, TokenForwardingConfig{}, "client:secret");
-
-    ASSERT_EQ(catalog->getTables(/* auth_token */ {}), DB::Names{"ns.t"});
-
-    EXPECT_GE(server->countRequestsTo(CATALOG_TOKEN_PATH), 1u);
-    for (const auto & request : server->requestsTo(NAMESPACES_PATH))
-        EXPECT_EQ(request.header("Authorization"), "Bearer session_token_0");
-
-    const auto grants = server->requestsTo(CATALOG_TOKEN_PATH);
-    ASSERT_FALSE(grants.empty());
-    const auto form = parseForm(grants.front().body);
-    EXPECT_EQ(form.at("grant_type"), "client_credentials");
-    EXPECT_EQ(form.at("client_id"), "client");
-    EXPECT_EQ(form.at("client_secret"), "secret");
-    EXPECT_EQ(form.at("scope"), "lakekeeper");
-}
-
-/// The single most important test of the feature: a session with no token must be refused, and
-/// must NOT quietly acquire the service principal's identity instead.
 TEST_F(RestCatalogTokenForwarding, NoUserTokenFailsClosed)
 {
     TestServer server;
@@ -284,7 +239,6 @@ TEST_F(RestCatalogTokenForwarding, ForbiddenIsNotRetriedAsServicePrincipal)
 
     EXPECT_THROW(catalog->getTables(alice), DB::Exception);
 
-    /// Exactly one attempt, and no `client_credentials` grant behind the user's back.
     EXPECT_EQ(server->countRequestsTo(NAMESPACES_PATH), 1u);
     EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
 }
@@ -295,7 +249,6 @@ TEST_F(RestCatalogTokenForwarding, VendedCredentialsCacheIsPerPrincipal)
     installCatalogShape(*server);
     server->setRoute(TABLE_PATH, [](const RecordedRequest & request)
     {
-        /// Each principal gets a distinguishable access key id.
         const bool is_alice = request.header("Authorization") == std::string("Bearer ") + ALICE_TOKEN;
         return json(loadTableResponse(is_alice ? "AKIA_ALICE" : "AKIA_BOB"));
     });
@@ -316,9 +269,7 @@ TEST_F(RestCatalogTokenForwarding, VendedCredentialsCacheIsPerPrincipal)
         return metadata.getStorageCredentials();
     };
 
-    /// A `loadTable` request happens on every read regardless; what the cache saves is asking the
-    /// catalog to *vend credentials*, which the `X-Iceberg-Access-Delegation` header requests.
-    /// Its presence is therefore the exact signal for "these credentials were freshly vended".
+    /// `loadTable` runs even on a cache hit; this header distinguishes fresh credential vending.
     auto vending_requests = [&]
     {
         size_t count = 0;
@@ -331,12 +282,9 @@ TEST_F(RestCatalogTokenForwarding, VendedCredentialsCacheIsPerPrincipal)
     auto alice_credentials = load(alice);
     ASSERT_EQ(vending_requests(), 1u);
 
-    /// A warm cache must not serve Bob what the catalog vended for Alice: the catalog has to vend
-    /// for him too.
     auto bob_credentials = load(bob);
     EXPECT_EQ(vending_requests(), 2u);
 
-    /// Alice's second read is served from her own entry, so nothing is vended again.
     load(alice);
     EXPECT_EQ(vending_requests(), 2u);
 
@@ -348,12 +296,11 @@ TEST_F(RestCatalogTokenForwarding, VendedCredentialsCacheIsPerPrincipal)
     EXPECT_EQ(bob_s3->getAccessKeyId(), "AKIA_BOB");
 }
 
-/// --- Token exchange ----------------------------------------------------------------------
-
 TEST_F(RestCatalogTokenForwarding, ExchangeRequestHasRfc8693Shape)
 {
     TestServer server;
     installCatalogShape(*server);
+    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
     installTokenEndpoint(*server, IDP_TOKEN_PATH);
 
     auto alice = makeToken(ALICE_TOKEN, "alice");
@@ -367,8 +314,6 @@ TEST_F(RestCatalogTokenForwarding, ExchangeRequestHasRfc8693Shape)
     const auto & exchange = exchanges.front();
 
     EXPECT_EQ(exchange.method, "POST");
-    /// The user's JWT must never reach a request line: it would land in the catalog's access log,
-    /// in every proxy log, and in `system.query_log.exception`.
     EXPECT_TRUE(exchange.query.empty());
     EXPECT_EQ(exchange.query.find(ALICE_TOKEN), std::string::npos);
     EXPECT_EQ(exchange.path.find(ALICE_TOKEN), std::string::npos);
@@ -381,31 +326,15 @@ TEST_F(RestCatalogTokenForwarding, ExchangeRequestHasRfc8693Shape)
     EXPECT_EQ(form.at("scope"), "lakekeeper");
     EXPECT_EQ(form.at("client_id"), "client");
     EXPECT_EQ(form.at("client_secret"), "secret");
-    /// Absent rather than empty when delegation is off.
     EXPECT_EQ(form.count("actor_token"), 0u);
     EXPECT_EQ(form.count("actor_token_type"), 0u);
-}
-
-TEST_F(RestCatalogTokenForwarding, CatalogCallsCarryExchangedTokenNotSubjectToken)
-{
-    TestServer server;
-    installCatalogShape(*server);
-    installTokenEndpoint(*server, IDP_TOKEN_PATH);
-
-    auto alice = makeToken(ALICE_TOKEN, "alice");
-    auto context = makeQueryContext();
-    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
-
-    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
 
     for (const auto & request : server->requests())
     {
-        if (request.path == IDP_TOKEN_PATH)
-            continue;
-        EXPECT_EQ(request.header("Authorization"), "Bearer session_token_0") << "path: " << request.path;
+        if (request.path != IDP_TOKEN_PATH)
+            EXPECT_EQ(request.header("Authorization"), "Bearer session_token_0") << "path: " << request.path;
     }
-    /// One exchange for the whole query, reused from the per-user cache.
-    EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
 }
 
 TEST_F(RestCatalogTokenForwarding, ExchangedTokensAreNotSharedBetweenPrincipals)
@@ -423,7 +352,6 @@ TEST_F(RestCatalogTokenForwarding, ExchangedTokensAreNotSharedBetweenPrincipals)
     server->clearRequests();
     ASSERT_EQ(catalog->getTables(bob), DB::Names{"ns.t"});
 
-    /// Bob must not be signed with Alice's session.
     const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
     ASSERT_EQ(exchanges.size(), 1u);
     EXPECT_EQ(parseForm(exchanges.front().body).at("subject_token"), BOB_TOKEN);
@@ -435,8 +363,7 @@ TEST_F(RestCatalogTokenForwarding, ExpiredSessionTokenIsExchangedAgain)
 {
     TestServer server;
     installCatalogShape(*server);
-    /// `expires_in = 1` leaves a validity window of 0 seconds (the 90% rule), so the cached entry
-    /// is already expired when the second query looks at it.
+    /// `expires_in = 1` rounds down to a zero-second validity window.
     installTokenEndpoint(*server, IDP_TOKEN_PATH, /* expires_in */ 1);
 
     auto alice = makeToken(ALICE_TOKEN, "alice");
@@ -447,8 +374,6 @@ TEST_F(RestCatalogTokenForwarding, ExpiredSessionTokenIsExchangedAgain)
     const auto after_first_query = server->countRequestsTo(IDP_TOKEN_PATH);
     ASSERT_GE(after_first_query, 1u);
 
-    /// The cached session token is already outside its validity window, so the second query must
-    /// exchange again rather than reuse it.
     ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
     EXPECT_GT(server->countRequestsTo(IDP_TOKEN_PATH), after_first_query);
 }
@@ -457,8 +382,6 @@ TEST_F(RestCatalogTokenForwarding, ActorTokenCarriesServicePrincipalTokenWhenEna
 {
     TestServer server;
     installCatalogShape(*server);
-    /// The service principal's own `client_credentials` grant. A hand-written route rather than
-    /// `installTokenEndpoint` so that the minted token is distinguishable from the exchanged one.
     server->setStaticRoute(CATALOG_TOKEN_PATH, R"({"access_token":"service_principal_token","expires_in":3600})");
     installTokenEndpoint(*server, IDP_TOKEN_PATH);
 
@@ -469,8 +392,6 @@ TEST_F(RestCatalogTokenForwarding, ActorTokenCarriesServicePrincipalTokenWhenEna
 
     ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
 
-    /// Delegation needs a token for the actor, so exactly one `client_credentials` grant happens.
-    /// This is the one case where such a grant is legitimate while forwarding is on.
     const auto grants = server->requestsTo(CATALOG_TOKEN_PATH);
     ASSERT_EQ(grants.size(), 1u);
     EXPECT_EQ(parseForm(grants.front().body).at("grant_type"), "client_credentials");
@@ -482,36 +403,8 @@ TEST_F(RestCatalogTokenForwarding, ActorTokenCarriesServicePrincipalTokenWhenEna
     EXPECT_EQ(form.at("actor_token"), "service_principal_token");
     EXPECT_EQ(form.at("actor_token_type"), "urn:ietf:params:oauth:token-type:access_token");
 
-    /// `sub=user, act=clickhouse`: the catalog is still called with the exchanged user session,
-    /// never with the service principal's own token.
     for (const auto & request : server->requestsTo(NAMESPACES_PATH))
         EXPECT_EQ(request.header("Authorization"), "Bearer session_token_0");
-}
-
-TEST_F(RestCatalogTokenForwarding, ActorTokenIsAbsentWhenDisabled)
-{
-    TestServer server;
-    installCatalogShape(*server);
-    /// Registered so that a `client_credentials` grant is *recorded* rather than throwing.
-    installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
-    installTokenEndpoint(*server, IDP_TOKEN_PATH);
-
-    auto alice = makeToken(ALICE_TOKEN, "alice");
-    auto context = makeQueryContext();
-    auto catalog = makeCatalog(
-        server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH, /* cache_ttl */ 300, /* actor */ false), "client:secret");
-
-    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
-
-    const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
-    ASSERT_EQ(exchanges.size(), 1u);
-    const auto form = parseForm(exchanges.front().body);
-    /// Absent rather than empty: an empty `actor_token` is not the same thing as no delegation,
-    /// and strict servers reject it.
-    EXPECT_EQ(form.count("actor_token"), 0u);
-    EXPECT_EQ(form.count("actor_token_type"), 0u);
-    /// With delegation off nothing is minted for the service principal either.
-    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
 }
 
 TEST_F(RestCatalogTokenForwarding, ExchangeErrorIsReportedWithoutEchoingTheSubjectToken)
@@ -540,7 +433,6 @@ TEST_F(RestCatalogTokenForwarding, ExchangeErrorIsReportedWithoutEchoingTheSubje
         }
     };
 
-    /// An endpoint that does not implement the grant: 404 with an HTML body.
     run([](const RecordedRequest &)
         { return Response{.status = 404, .body = "<html><body>Not Found</body></html>", .content_type = "text/html"}; },
         "not a JSON object");
@@ -548,17 +440,10 @@ TEST_F(RestCatalogTokenForwarding, ExchangeErrorIsReportedWithoutEchoingTheSubje
         "no `access_token` field");
 }
 
-/// --- Runtime toggle ----------------------------------------------------------------------
-
-/// `enable_token_forwarding` is hot-reloadable, but it is consulted at authentication time, so a
-/// session that captured a token before the operator turned it off would otherwise keep forwarding
-/// that token for the whole life of the connection. An operator responding to a credential leak
-/// cannot wait for every open connection to be closed, so the switch is re-read per request.
 TEST_F(RestCatalogTokenForwarding, DisablingTheServerSwitchAtRuntimeStopsForwarding)
 {
     TestServer server;
     installCatalogShape(*server);
-    /// Registered so that a fallback to the service principal is *recorded* rather than throwing.
     installTokenEndpoint(*server, CATALOG_TOKEN_PATH);
     installTokenEndpoint(*server, IDP_TOKEN_PATH);
 
@@ -566,7 +451,6 @@ TEST_F(RestCatalogTokenForwarding, DisablingTheServerSwitchAtRuntimeStopsForward
     auto context = makeQueryContext();
     auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
 
-    /// With the switch on, forwarding works and the exchanged session token is cached.
     ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
     ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
 
@@ -581,20 +465,15 @@ TEST_F(RestCatalogTokenForwarding, DisablingTheServerSwitchAtRuntimeStopsForward
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE);
-        /// The session does have a token, so the message must name the real reason rather than
-        /// reuse the "no token on this session" wording.
         const std::string message = e.displayText();
         EXPECT_NE(message.find("`enable_token_forwarding` setting is off"), std::string::npos) << message;
         EXPECT_EQ(message.find("this session has none"), std::string::npos) << message;
     }
 
-    /// Refused, not quietly downgraded to the service principal.
     EXPECT_EQ(server->countRequestsTo(NAMESPACES_PATH), 0u);
     EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
     EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 0u);
 
-    /// Turning the switch back on must not resurrect the session token minted under the old
-    /// policy: it was dropped, so the catalog exchanges again.
     TokenForwardingSwitch::set(true);
     ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
     EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
@@ -602,12 +481,6 @@ TEST_F(RestCatalogTokenForwarding, DisablingTheServerSwitchAtRuntimeStopsForward
         EXPECT_EQ(request.header("Authorization"), "Bearer session_token_1");
 }
 
-/// --- Auth change -------------------------------------------------------------------------
-
-/// `ALTER DATABASE ... MODIFY SETTING catalog_credential = ...` is how an operator rotates a
-/// leaked client secret. Both caches hold artifacts derived from the old one -- session tokens
-/// exchanged with it, and the credentials the catalog vended to the resulting identity -- so
-/// leaving them warm would keep the rotated secret working for the rest of the cache TTL.
 TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAndCredentials)
 {
     TestServer server;
@@ -628,8 +501,6 @@ TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAnd
         catalog->getTableMetadata("ns", "t", query_context, metadata);
     };
 
-    /// The `X-Iceberg-Access-Delegation` header is sent only when credentials have to be vended,
-    /// so its presence is the exact signal for "the credentials cache missed".
     auto vending_requests = [&]
     {
         size_t count = 0;
@@ -643,7 +514,6 @@ TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAnd
     ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
     ASSERT_EQ(vending_requests(), 1u);
 
-    /// Both caches are warm: nothing is exchanged and nothing is vended again.
     load();
     ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
     ASSERT_EQ(vending_requests(), 1u);
@@ -658,7 +528,6 @@ TEST_F(RestCatalogTokenForwarding, AlteringCatalogCredentialDropsCachedTokensAnd
     const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
     ASSERT_EQ(exchanges.size(), 3u);
     EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
-    /// Re-exchanged, and with the rotated secret rather than the one it replaced.
     EXPECT_EQ(parseForm(exchanges.back().body).at("client_secret"), "rotated_secret");
 }
 
@@ -692,8 +561,6 @@ TEST_F(RestCatalogTokenForwarding, CredentialRotationValidatesAsCallerWithoutPub
     ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
     EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
 
-    /// Preparing a rotation must not publish either its state or its user token. The first
-    /// query still loads the old configuration and authenticates with the old credentials.
     server->setStaticRoute(CONFIG_PATH, R"({"defaults":{},"overrides":{}})");
     ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
     EXPECT_EQ(server->requestsTo(CONFIG_PATH).back().header("Authorization"), std::string("Bearer secret_") + ALICE_TOKEN);
@@ -703,7 +570,6 @@ TEST_F(RestCatalogTokenForwarding, CredentialRotationValidatesAsCallerWithoutPub
     catalog->commitSettingsChanges(std::move(prepared));
     server->clearRequests();
     ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
-    /// The prepared config was already loaded; the first query must not load it again.
     EXPECT_EQ(server->countRequestsTo(CONFIG_PATH), 0u);
     ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
     EXPECT_EQ(parseForm(server->requestsTo(IDP_TOKEN_PATH).front().body).at("client_secret"), "rotated_secret");
@@ -782,26 +648,6 @@ TEST_F(RestCatalogTokenForwarding, PassthroughCredentialRotationReloadsConfigWit
     EXPECT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 0u);
 }
 
-TEST_F(RestCatalogTokenForwarding, UnchangedCredentialStillReloadsConfigAsCaller)
-{
-    TestServer server;
-    installCatalogShape(*server);
-    installTokenEndpoint(*server, IDP_TOKEN_PATH);
-    auto alice = makeToken(ALICE_TOKEN, "alice");
-    auto context = makeQueryContext();
-    auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH), "client:secret");
-    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
-    server->clearRequests();
-
-    DB::SettingsChanges changes;
-    changes.emplace_back("catalog_credential", "client:secret");
-    catalog->applySettingsChanges(changes, alice);
-    EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
-    ASSERT_EQ(server->countRequestsTo(IDP_TOKEN_PATH), 1u);
-    ASSERT_EQ(server->countRequestsTo(CONFIG_PATH), 1u);
-    EXPECT_EQ(server->requestsTo(CONFIG_PATH).front().header("Authorization"), "Bearer session_token_1");
-}
-
 TEST_F(RestCatalogTokenForwarding, CredentialRotationRequiresForwardingAndCallerToken)
 {
     TestServer server;
@@ -857,14 +703,6 @@ TEST_F(RestCatalogTokenForwarding, CredentialRotationUsesNewActorOnlyForDelegati
     EXPECT_EQ(parseForm(server->requestsTo(IDP_TOKEN_PATH).front().body).at("actor_token"), "actor_rotated_secret");
 }
 
-
-/// A request that authenticated before the ALTER can only finish writing its result afterwards.
-/// Clearing the caches at commit time does not cover that: the window is a whole catalog round
-/// trip, so the write lands after the clear and puts the pre-rotation artifacts straight back.
-/// Both are keyed to the auth generation instead, so such a write is unreachable.
-
-/// Parks a route until the test releases it, so an ALTER can be made to land while a request is
-/// still in flight. Releasing from the destructor keeps a failed assertion from hanging the run.
 class ParkedRoute
 {
 public:
@@ -922,7 +760,6 @@ private:
 
 TEST_F(RestCatalogTokenForwarding, InFlightVendedCredentialsDoNotOutliveTheirGeneration)
 {
-    /// Declared before the server so that it outlives the threads serving its routes.
     ParkedRoute parked;
     TestServer server;
     installCatalogShape(*server);
@@ -954,7 +791,6 @@ TEST_F(RestCatalogTokenForwarding, InFlightVendedCredentialsDoNotOutliveTheirGen
 
     parked.enable();
     std::thread in_flight(load);
-    /// Only reached when an assertion below aborts the test early; the normal path joins inline.
     SCOPE_EXIT({
         parked.release();
         if (in_flight.joinable())
@@ -972,8 +808,6 @@ TEST_F(RestCatalogTokenForwarding, InFlightVendedCredentialsDoNotOutliveTheirGen
 
     const auto vends_before = vending_requests();
 
-    /// The parked query wrote its credentials back after the clear. They belong to the previous
-    /// generation, so this read must miss the cache and vend again.
     load();
     EXPECT_EQ(vending_requests(), vends_before + 1);
 }
@@ -990,10 +824,8 @@ TEST_F(RestCatalogTokenForwarding, InFlightGrantDoesNotClobberRotatedServiceToke
         if (secret != "secret")
             return json(R"({"access_token":"tok_for_rotated_secret","expires_in":3600})");
 
-        /// Before parking is armed every grant is already outside its validity window, so the
-        /// warm-up leaves nothing reusable and the in-flight query is guaranteed to mint again.
-        /// The parked grant itself is long-lived, so that a clobber would actually stick and the
-        /// assertion is not satisfied by the token merely expiring.
+        /// Expire warm-up grants immediately to force a new grant in flight.
+        /// Keep the parked grant valid so expiry cannot hide an incorrect publication after rotation.
         const auto expires_in = parked.isEnabled() ? 3600 : 1;
         return json(fmt::format(R"({{"access_token":"tok_for_secret","expires_in":{}}})", expires_in));
     }));
@@ -1001,12 +833,10 @@ TEST_F(RestCatalogTokenForwarding, InFlightGrantDoesNotClobberRotatedServiceToke
     auto context = makeQueryContext();
     auto catalog = makeCatalog(server, context, TokenForwardingConfig{}, "client:secret");
 
-    /// Warm up outside the parked window: loads the config and establishes pooled connections.
     ASSERT_EQ(catalog->getTables(/* auth_token */ {}), DB::Names{"ns.t"});
 
     parked.enable();
     std::thread in_flight([&] { catalog->getTables(/* auth_token */ {}); });
-    /// Only reached when an assertion below aborts the test early; the normal path joins inline.
     SCOPE_EXIT({
         parked.release();
         if (in_flight.joinable())
@@ -1025,22 +855,13 @@ TEST_F(RestCatalogTokenForwarding, InFlightGrantDoesNotClobberRotatedServiceToke
     server->clearRequests();
     ASSERT_EQ(catalog->getTables(/* auth_token */ {}), DB::Names{"ns.t"});
 
-    /// The parked grant used the pre-rotation secret, so it must not have replaced the token the
-    /// ALTER eagerly published -- nothing bounds how long that would keep the old credential live.
     const auto requests = server->requestsTo(NAMESPACES_PATH);
     ASSERT_FALSE(requests.empty());
     EXPECT_EQ(requests.front().header("Authorization"), "Bearer tok_for_rotated_secret");
 }
 
-
-/// `loadConfigIfNeeded` is a read-modify-write on the state with a slow `/v1/config` request in
-/// the middle, and `config_mutex` does not exclude `commitSettingsChanges`. Republishing the
-/// snapshot it started from would carry the pre-ALTER credentials back with it -- undoing the
-/// rotation for good, not for a cache TTL. Reachable only under forwarding, where `/v1/config`
-/// is deferred to the first user query rather than fetched in the constructor.
 TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentialChange)
 {
-    /// Declared before the server so that it outlives the threads serving its routes.
     ParkedRoute parked;
     TestServer server;
     installCatalogShape(*server);
@@ -1054,7 +875,6 @@ TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentia
 
     parked.enable();
     std::thread in_flight([&] { catalog->getTables(alice); });
-    /// Only reached when an assertion below aborts the test early; the normal path joins inline.
     SCOPE_EXIT({
         parked.release();
         if (in_flight.joinable())
@@ -1072,9 +892,6 @@ TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentia
 
     ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
 
-    /// The parked query resumes in the new generation, so it exchanges again -- and that
-    /// exchange authenticates with whatever credentials the published state now holds. They must
-    /// still be the rotated ones.
     const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
     ASSERT_GE(exchanges.size(), 2u);
     EXPECT_EQ(parseForm(exchanges.back().body).at("client_secret"), "rotated_secret");

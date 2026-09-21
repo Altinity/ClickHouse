@@ -1,15 +1,5 @@
 <clickhouse>
-    <!--
-        Retain the bearer token a user authenticated with so that it can be exchanged for AWS
-        credentials. Off by default; every test in this suite depends on it.
-    -->
     <enable_token_forwarding>1</enable_token_forwarding>
-
-    <!--
-        HS256 with a static key, so tokens can be minted inline without an IdP. AWS STS would
-        verify the signature against the identity provider's JWKS; the mock does not, which is
-        what makes the token's exact bytes assertable on the wire.
-    -->
     <token_processors>
         <hs256>
             <type>jwt_static_key</type>
@@ -24,11 +14,6 @@
         <token>
             <processor>hs256</processor>
             <default_profile>default</default_profile>
-            <!--
-                Auto-provisioned token users hold no privileges of their own, so `SHOW TABLES`
-                would be refused before ever reaching the catalog. The fixture creates this role
-                and grants it what the tests need.
-            -->
             <common_roles>
                 <token_users />
             </common_roles>

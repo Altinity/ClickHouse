@@ -32,7 +32,6 @@ public:
 
     ~HiveCatalog() override = default;
 
-    /// Thrift Hive Metastore: no bearer token to forward, so the parameter is accepted and ignored.
     bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;

@@ -30,9 +30,6 @@
 namespace RestCatalogTest
 {
 
-/// One request as the fake catalog saw it. Everything a test needs to assert on: the wire format
-/// of a token exchange, that a bearer token reached the catalog, and -- via `query` -- that it
-/// never reached a request line.
 struct RecordedRequest
 {
     std::string method;
@@ -48,7 +45,6 @@ struct RecordedRequest
     }
 };
 
-/// What a route answers with.
 struct Response
 {
     int status = 200;
@@ -66,14 +62,11 @@ inline Response respondWithStatus(int status, const std::string & body = R"({"er
     return Response{.status = status, .body = body, .content_type = "application/json"};
 }
 
-/// Shared, mutex-guarded state between the test and the request handlers. The handler factory
-/// creates a fresh handler per request, so nothing may live in the handler itself.
 class ServerState
 {
 public:
     using Route = std::function<Response(const RecordedRequest &)>;
 
-    /// Routes are matched on the path alone (the query string is recorded, never matched on).
     void setRoute(const std::string & path, Route route)
     {
         std::lock_guard lock(mutex);
@@ -91,7 +84,6 @@ public:
         return recorded;
     }
 
-    /// Every recorded request whose path is exactly `path`.
     std::vector<RecordedRequest> requestsTo(const std::string & path) const
     {
         std::vector<RecordedRequest> result;
@@ -119,10 +111,7 @@ public:
                 route = it->second;
         }
 
-        /// An unexpected path is a test failure, not a 404 -- it is how "no request was made to
-        /// the token endpoint" is proven. Answering 599 rather than throwing keeps the failure
-        /// inside the request: an exception escaping a Poco worker thread aborts the process
-        /// before gtest can report which case failed.
+        /// Return an error instead of throwing out of a Poco worker thread, which would terminate the test process.
         if (!route)
             return Response{
                 .status = 599,
@@ -150,9 +139,7 @@ public:
 
         RecordedRequest recorded;
         recorded.method = request.getMethod();
-        /// The *raw* path, not `Poco::URI::getPath()`: the latter percent-decodes, and Iceberg
-        /// encodes nested namespaces with `%1F` (the unit separator), so decoding would turn
-        /// `a%1Fb` into a path no route key can match.
+        /// Keep `%1F` in nested namespace paths encoded so it matches the route keys.
         recorded.path = query_pos == std::string::npos ? raw_uri : raw_uri.substr(0, query_pos);
         recorded.query = query_pos == std::string::npos ? std::string{} : raw_uri.substr(query_pos + 1);
         Poco::StreamCopier::copyToString(request.stream(), recorded.body);
@@ -185,7 +172,6 @@ private:
     std::shared_ptr<ServerState> state;
 };
 
-/// In-process fake Iceberg REST catalog on an ephemeral port.
 class TestServer
 {
 public:
@@ -196,13 +182,9 @@ public:
         , server_params(new Poco::Net::HTTPServerParams())
         , server(std::make_unique<Poco::Net::HTTPServer>(handler_factory, *server_socket, server_params))
     {
-        /// The HTTP connection pool is a process-wide singleton keyed on host:port, and each test
-        /// gets a fresh ephemeral port that the kernel readily recycles. Without dropping the
-        /// cache, a test can be handed a keep-alive socket left over from a previous test's server
-        /// on the same port and fail with "Connection reset by peer".
+        /// Ephemeral ports can be reused; discard pooled sockets belonging to previous test servers.
         DB::HTTPConnectionPools::instance().dropCache();
 
-        /// Every catalog reads this first.
         state->setStaticRoute("/v1/config", R"({"defaults":{},"overrides":{}})");
         server->start();
     }

@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 # Tags: no-fasttest
 
-# The `oauth_forward_user_token` family carries no secret and must stay visible in
-# `SHOW CREATE DATABASE` and `system.databases.engine_full`, while the credential settings next to
-# it stay masked. No catalog is contacted: forwarding defers `/v1/config` to the first user query.
-
 CLICKHOUSE_CLIENT_SERVER_LOGS_LEVEL=fatal
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

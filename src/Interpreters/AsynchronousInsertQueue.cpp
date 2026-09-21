@@ -163,7 +163,6 @@ AsynchronousInsertQueue::InsertQuery::InsertQuery(
         siphash.update(identity_field);
     }
 
-    /// A rotated token must start a separate batch even when the authenticated user is unchanged.
     siphash.update(forwarded_auth_token_fingerprint.size());
     siphash.update(forwarded_auth_token_fingerprint);
 

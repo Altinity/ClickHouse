@@ -96,7 +96,6 @@ public:
         String current_user;
         String initial_user;
         String authenticated_user;
-        /// Retain the verified credential until the batch is flushed.
         ForwardedAuthTokenPtr forwarded_auth_token;
         std::unique_ptr<Settings> settings;
 

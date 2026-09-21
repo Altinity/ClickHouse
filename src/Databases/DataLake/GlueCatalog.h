@@ -113,11 +113,9 @@ private:
         std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider;
     };
 
-    /// Exactly one of the two is set, depending on `oauth_forward_user_token`.
     AuthenticatedClient service_client;
     std::function<AuthenticatedClient(const DB::ForwardedAuthToken &)> make_user_client;
 
-    /// Keyed on the token fingerprint.
     static constexpr size_t user_client_cache_max_entries = 1024;
     mutable DB::CacheBase<String, AuthenticatedClient> user_clients;
 

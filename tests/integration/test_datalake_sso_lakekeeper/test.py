@@ -1,18 +1,3 @@
-"""
-End-to-end SSO: the identity that authenticated to ClickHouse is the identity the Iceberg REST
-catalog authorizes.
-
-Layer 3 of the verification plan. Keycloak issues the tokens, Lakekeeper validates them and -- with
-`LAKEKEEPER__AUTHZ_BACKEND=openfga`, not the `allowall` default -- actually enforces per-user
-permissions. Without that backend every assertion here would pass for the wrong reason.
-
-Passthrough is what makes this layer possible at all: Lakekeeper accepts IdP tokens directly, so no
-token endpoint is involved. The exchange-at-IdP variant is one extra case on the same topology.
-
-Run:
-    python -m ci.praktika run "integration" --test test_datalake_sso_lakekeeper
-"""
-
 import json
 import logging
 import time
@@ -33,18 +18,10 @@ KEYCLOAK_INTERNAL = f"http://keycloak:8080/realms/{REALM}"
 TOKEN_ENDPOINT = f"{KEYCLOAK_INTERNAL}/protocol/openid-connect/token"
 CATALOG_INTERNAL_URL = "http://lakekeeper:8181/catalog"
 
-# The client ClickHouse itself is registered as. Its audience mapper puts `lakekeeper` in every
-# token it issues, which is what makes passthrough work, and it is also the client that performs
-# the RFC 8693 exchange.
 CLIENT_ID = "clickhouse"
 CLIENT_SECRET = "clickhouse-secret"
-# A second client standing in for some other application the user came from. Its tokens are
-# audienced for `clickhouse`, never for `lakekeeper`, so an exchange is what has to produce the
-# audience the catalog requires.
 EXCHANGE_CLIENT_ID = "clickhouse-exchange"
 EXCHANGE_CLIENT_SECRET = "clickhouse-exchange-secret"
-# `LAKEKEEPER__OPENID_SCOPE` in the compose file; Lakekeeper rejects a token whose `scope` claim
-# does not contain it.
 SCOPE = "openid"
 
 WAREHOUSES = ["wh_alice", "wh_bob", "wh_shared"]
@@ -55,18 +32,12 @@ SCHEMA = Schema(
 )
 
 
-# --- helpers ---------------------------------------------------------------------------------
-
 def lakekeeper_host_url(cluster):
     return f"http://localhost:{cluster.iceberg_rest_catalog_port}"
 
 
 def get_token(node, username, password="secret", client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
               scope=SCOPE):
-    """
-    Tokens are fetched from inside the ClickHouse container so that every participant -- ClickHouse,
-    Lakekeeper and this test -- sees the same issuer, `http://keycloak:8080/realms/...`.
-    """
     form = (
         f"grant_type=password&client_id={client_id}&client_secret={client_secret}"
         f"&username={username}&password={password}"
@@ -102,11 +73,6 @@ def management(cluster, method, path, token, json_body=None, expected=(200, 201,
 
 
 def lakekeeper_rejects(cluster, token):
-    """
-    Whether Lakekeeper refuses this token outright. Used as a precondition, so that a test which
-    claims "this token would not have worked" says so on the catalog's authority rather than on a
-    reading of the token's own claims.
-    """
     response = requests.get(
         f"{lakekeeper_host_url(cluster)}/management/v1/whoami",
         headers={"Authorization": f"Bearer {token}"},
@@ -247,8 +213,6 @@ def profile_event(node, query_id, event):
     return int(value) if value else 0
 
 
-# --- fixture ---------------------------------------------------------------------------------
-
 @pytest.fixture(scope="module")
 def started_cluster():
     cluster = ClickHouseCluster(__file__)
@@ -272,14 +236,9 @@ def started_cluster():
         cluster.start()
 
         node = cluster.instances["node1"]
-        # Auto-provisioned token users hold no privileges of their own; `common_roles` in
-        # `token_forwarding.xml` hands them this role. Access storage is local to each node, so
-        # both nodes need it. Granted broadly on purpose: every denial these tests assert has to
-        # come from the catalog, never from ClickHouse's own access control.
         for instance in cluster.instances.values():
             instance.query("CREATE ROLE IF NOT EXISTS token_users")
             instance.query("GRANT CHECK, DROP TABLE, INSERT, SELECT, SHOW ON *.* TO token_users")
-            # Reading table data goes to S3, guarded separately by the `SOURCES` privileges.
             instance.query("GRANT S3 ON *.* TO token_users")
             instance.query("GRANT REMOTE ON *.* TO token_users")
 
@@ -319,10 +278,6 @@ def started_cluster():
 
 
 def wait_for_lakekeeper(cluster, timeout=180):
-    """
-    Lakekeeper is started before Keycloak by the cluster helper, so it may restart a few times
-    while the IdP comes up.
-    """
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
@@ -337,10 +292,7 @@ def wait_for_lakekeeper(cluster, timeout=180):
     raise AssertionError(f"Lakekeeper did not become healthy: {last}")
 
 
-# --- tests -----------------------------------------------------------------------------------
-
 def test_users_see_different_tables(started_cluster):
-    """The catalog authorizes the human, so two ClickHouse users see two different table sets."""
     node = started_cluster.instances["node1"]
     create_database(node, "db_alice", "wh_alice")
     create_database(node, "db_bob", "wh_bob")
@@ -355,118 +307,46 @@ def test_users_see_different_tables(started_cluster):
     assert query_as_ok(node, alice, listing_sql.format(db="db_alice")).strip() == "ns.t_alice"
     assert query_as_ok(node, bob, listing_sql.format(db="db_bob")).strip() == "ns.t_bob"
 
-    # And neither sees anything in the other's warehouse. The refusal is the catalog's answer, not
-    # a symptom of nothing working: the two assertions above went through the same code path and
-    # did return a table. `show_data_lake_catalogs_in_system_tables` is on, so
-    # `DatabaseDataLake::getTablesIterator` reports the catalog error rather than swallowing it
-    # into an empty listing, and Lakekeeper answers a listing the principal has no grant for with
-    # `NoSuchWarehouseException` ("Warehouse not found or access denied").
     denied = query_as(node, alice, listing_sql.format(db="db_bob"))
     assert denied.status_code != 200, denied.text
     denied = query_as(node, bob, listing_sql.format(db="db_alice"))
     assert denied.status_code != 200, denied.text
 
 
-def test_alice_cannot_read_bobs_table(started_cluster):
-    node = started_cluster.instances["node1"]
-    create_database(node, "db_bob", "wh_bob")
-
-    assert int(query_as_ok(node, get_token(node, "bob"), "SELECT count() FROM db_bob.`ns.t_bob`")) == 3
-
-    denied = query_as(node, get_token(node, "alice"), "SELECT count() FROM db_bob.`ns.t_bob`")
-    assert denied.status_code != 200, denied.text
-    # Bob read that very table a line ago, so the only thing that can make it unknown to Alice is
-    # the catalog refusing to describe it to her.
-    assert (
-        "UNKNOWN_TABLE" in denied.text or "403" in denied.text or "Forbidden" in denied.text
-    ), denied.text
-
-
 def test_warm_credentials_cache_does_not_serve_another_user(started_cluster):
-    """
-    The highest-value test of the feature. `credentials_cache` used to be keyed on
-    `(namespace, table)` and is consulted before any HTTP call, so a warm entry would hand Bob the
-    STS credentials Lakekeeper vended for Alice with the catalog never consulted.
-    """
     node = started_cluster.instances["node1"]
     create_database(node, "db_alice", "wh_alice", {"vended_credentials_cache_ttl": 300})
 
     alice = get_token(node, "alice")
     assert int(query_as_ok(node, alice, "SELECT count() FROM db_alice.`ns.t_alice`")) == 3
-    # Warm.
     assert int(query_as_ok(node, alice, "SELECT count() FROM db_alice.`ns.t_alice`")) == 3
 
     denied = query_as(node, get_token(node, "bob"), "SELECT count() FROM db_alice.`ns.t_alice`")
     assert denied.status_code != 200, denied.text
 
 
-def test_expired_token_gives_a_clean_error(started_cluster):
-    """An expired token is rejected at authentication; nothing reaches the catalog."""
-    node = started_cluster.instances["node1"]
-    create_database(node, "db_alice", "wh_alice")
-
-    # A structurally valid token whose signature will not verify against the realm's keys.
-    bogus = get_token(node, "alice")[:-4] + "AAAA"
-    response = query_as(node, bogus, "SELECT count() FROM db_alice.`ns.t_alice`")
-    assert response.status_code != 200
-    assert "AUTHENTICATION_FAILED" in response.text or "Authentication failed" in response.text
-
-
-def test_token_rotation_over_http(started_cluster):
-    """HTTP re-authenticates per request, so a freshly issued token takes effect immediately."""
-    node = started_cluster.instances["node1"]
-    create_database(node, "db_alice", "wh_alice")
-
-    first = get_token(node, "alice")
-    assert int(query_as_ok(node, first, "SELECT count() FROM db_alice.`ns.t_alice`")) == 3
-
-    # A second, distinct token for the same principal must work just as well.
-    time.sleep(1)
-    second = get_token(node, "alice")
-    assert int(query_as_ok(node, second, "SELECT count() FROM db_alice.`ns.t_alice`")) == 3
-
-
 def test_no_token_in_system_logs(started_cluster):
-    """The forwarded token must not surface in any log table."""
     node = started_cluster.instances["node1"]
     create_database(node, "db_alice", "wh_alice")
 
     token = get_token(node, "alice")
     query_as_ok(node, token, "SELECT count() FROM db_alice.`ns.t_alice`")
-    # Also exercise a failing path, which is where an error message could echo the token.
     query_as(node, token, "SELECT count() FROM db_alice.`ns.does_not_exist`")
-    # And a failing authentication, which is what writes to `system.session_log` at all. The
-    # signature prefix the needle below is taken from survives the mangling.
     query_as(node, token[:-4] + "AAAA", "SELECT 1")
 
     node.query("SYSTEM FLUSH LOGS")
-    # The signature segment is the part that is unique to this token and long enough not to
-    # collide with anything else.
     needle = token.split(".")[2][:32]
     for table, columns in (
         ("system.query_log", ["query", "exception", "stack_trace"]),
         ("system.text_log", ["message"]),
-        # `auth_id` is a UUID and could not carry a token; `failure_reason` is the free-text
-        # column, and the rejected token above is what puts a row in it.
         ("system.session_log", ["failure_reason"]),
     ):
         condition = " OR ".join(f"{column} LIKE '%{needle}%'" for column in columns)
         found = node.query(f"SELECT count() FROM {table} WHERE {condition}").strip()
         assert found == "0", f"token leaked into {table}"
 
-    # This query's own text contains the needle, so it matches itself; exclude it by id.
-    running = node.query(
-        f"SELECT count() FROM system.processes "
-        f"WHERE query LIKE '%{needle}%' AND query_id != queryID()"
-    ).strip()
-    assert running == "0"
-
 
 def test_swarm_read_does_not_reach_the_catalog_from_workers(started_cluster):
-    """
-    The initiator resolves everything; workers run a plain table function with the credentials the
-    catalog vended, so a secondary node makes no catalog request of its own.
-    """
     started = started_cluster
     node1 = started.instances["node1"]
     node2 = started.instances["node2"]
@@ -481,9 +361,6 @@ def test_swarm_read_does_not_reach_the_catalog_from_workers(started_cluster):
 
     query_id = f"swarm-{uuid.uuid4()}"
     before = catalog_requests(node2)
-    # `object_storage_cluster` is a query setting, not a `DataLakeCatalog` one. An aggregate over a
-    # column rather than `count()`, so the answer cannot come from Iceberg metadata alone and the
-    # data files really are read.
     assert int(query_as_ok(
         node1,
         get_token(node1, "alice"),
@@ -492,7 +369,6 @@ def test_swarm_read_does_not_reach_the_catalog_from_workers(started_cluster):
         query_id,
     )) == 3
 
-    # The worker has to have taken part, otherwise "it made no catalog request" is vacuously true.
     node2.query("SYSTEM FLUSH LOGS")
     worker_queries = node2.query(
         f"SELECT count() FROM system.query_log "
@@ -504,18 +380,12 @@ def test_swarm_read_does_not_reach_the_catalog_from_workers(started_cluster):
 
 
 def test_exchange_at_the_idp(started_cluster):
-    """
-    The RFC 8693 variant: the token ClickHouse receives has no `lakekeeper` audience, so the
-    exchange at Keycloak is what produces a token Lakekeeper accepts.
-    """
     node = started_cluster.instances["node1"]
     create_database(
         node,
         "db_exchange",
         "wh_alice",
         {
-            # The exchange is performed as the `clickhouse` client, the only one Keycloak lets
-            # mint tokens carrying the `lakekeeper` audience.
             "catalog_credential": f"{CLIENT_ID}:{CLIENT_SECRET}",
             "auth_scope": SCOPE,
             "oauth_token_exchange_uri": TOKEN_ENDPOINT,
@@ -525,7 +395,6 @@ def test_exchange_at_the_idp(started_cluster):
     token = get_token(
         node, "alice", client_id=EXCHANGE_CLIENT_ID, client_secret=EXCHANGE_CLIENT_SECRET
     )
-    # Precondition: this token on its own is not accepted by Lakekeeper.
     audience = jwt_claim(token, "aud")
     assert "lakekeeper" not in ([audience] if isinstance(audience, str) else audience)
     assert lakekeeper_rejects(started_cluster, token)

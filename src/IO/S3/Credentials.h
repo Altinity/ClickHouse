@@ -318,7 +318,6 @@ public:
 
 private:
     Aws::Endpoint::AWSEndpoint endpoint;
-    /// Same host as `endpoint` without the query string: the action travels in the request body.
     Aws::Endpoint::AWSEndpoint web_identity_endpoint;
 };
 
@@ -368,8 +367,6 @@ private:
     LoggerPtr logger;
 };
 
-/// Takes the web identity token in memory, unlike `AwsAuthSTSAssumeRoleWebIdentityCredentialsProvider`,
-/// which reads it from the file named by `AWS_WEB_IDENTITY_TOKEN_FILE`.
 class AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider : public Aws::Auth::AWSCredentialsProvider
 {
 public:
@@ -382,7 +379,6 @@ public:
 
     Aws::Auth::AWSCredentials GetAWSCredentials() override;
 
-    /// Empty after a successful call.
     std::string getLastError() const;
 
 protected:

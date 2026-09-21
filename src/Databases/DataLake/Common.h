@@ -20,7 +20,6 @@ DB::DataTypePtr getType(const String & type_name, bool nullable, DB::ContextPtr 
 /// `E` is a table name.
 std::pair<std::string, std::string> parseTableName(const std::string & name);
 
-/// The token carried by a query context, or `{}` when there is none (or no context at all).
 DB::ForwardedAuthTokenPtr getForwardedAuthToken(const DB::ContextPtr & context);
 
 }

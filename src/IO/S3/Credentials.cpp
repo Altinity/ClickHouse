@@ -1258,8 +1258,6 @@ AssumeRoleOutcome AWSAssumeRoleClient::assumeRole(const AssumeRoleRequest & requ
 
 AssumeRoleOutcome AWSAssumeRoleClient::assumeRoleWithWebIdentity(const AssumeRoleWithWebIdentityRequest & request) const
 {
-    /// Unsigned: the web identity token is the credential, and signing would need the AWS
-    /// credentials this call exists to obtain.
     auto outcome = MakeRequest(
         request, web_identity_endpoint, Aws::Http::HttpMethod::HTTP_POST, Aws::Auth::NULL_SIGNER);
 

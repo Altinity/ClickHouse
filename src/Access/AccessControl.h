@@ -283,8 +283,6 @@ public:
     void setTokenAuthEnabled(bool enable);
     bool isTokenAuthEnabled() const;
 
-    /// Controls whether the token a user authenticated with is retained on the session so that it
-    /// can be forwarded to external services on that user's behalf. Off by default.
     void setTokenForwardingEnabled(bool enable);
     bool isTokenForwardingEnabled() const;
 

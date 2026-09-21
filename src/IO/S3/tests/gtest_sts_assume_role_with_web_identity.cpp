@@ -38,7 +38,6 @@ DB::S3::PocoHTTPClientConfiguration makeClientConfiguration(DB::RemoteHostFilter
         "http");
 }
 
-/// The body is `application/x-www-form-urlencoded`, parsed like a query string.
 std::string formParameter(const std::string & body, const std::string & name)
 {
     Poco::URI uri;
@@ -76,7 +75,6 @@ TEST(STSAssumeRoleWithWebIdentity, SendsTokenInTheBody)
     EXPECT_EQ(formParameter(body, "RoleSessionName"), "alice");
     EXPECT_EQ(formParameter(body, "WebIdentityToken"), token);
 
-    /// Not in the request line, which gets logged.
     for (const auto & [key, value] : sts_http.getLastQueryParams())
     {
         EXPECT_NE(key, "WebIdentityToken");

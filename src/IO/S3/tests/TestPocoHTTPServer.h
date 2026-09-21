@@ -134,7 +134,6 @@ public:
         last_request_info->query_params = uri.getQueryParameters();
         Poco::StreamCopier::copyToString(request.stream(), last_request_info->body);
 
-        /// Each action names its result element after itself.
         const bool web_identity = last_request_info->body.find("Action=AssumeRoleWithWebIdentity") != std::string::npos;
         const std::string_view action = web_identity ? "AssumeRoleWithWebIdentity" : "AssumeRole";
 
@@ -214,7 +213,6 @@ class TestPocoHTTPStsServer
     std::optional<StsRequestInfo> last_request_info;
 
 public:
-    /// `reject` answers every call with an STS `InvalidIdentityToken` error.
     TestPocoHTTPStsServer(std::string role_access_key, std::string role_secret_key, bool reject = false):
         server_socket(std::make_unique<Poco::Net::ServerSocket>(0)),
         handler_factory(new StsHTTPRequestHandlerFactory(last_request_info, std::move(role_access_key), std::move(role_secret_key), reject)),

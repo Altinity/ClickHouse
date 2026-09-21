@@ -1,14 +1,3 @@
-"""
-A mock AWS STS that answers `AssumeRoleWithWebIdentity` and records what it was asked. It verifies
-no signature and no trust policy.
-
-Routes outside the STS API:
-    GET /_requests   every recorded call, as JSON
-    GET /_reset      forget them
-
-A request whose `RoleSessionName` is `rejected` gets an `InvalidIdentityToken` error.
-"""
-
 import json
 import sys
 from datetime import datetime, timedelta, timezone

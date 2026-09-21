@@ -1,20 +1,3 @@
-"""
-Forwarding the querying user's identity to an AWS Glue catalog.
-
-Glue speaks SigV4, never a bearer token, so nothing about this suite resembles the Iceberg REST
-one: the user's token never reaches the catalog. It reaches AWS STS, which exchanges it for
-temporary credentials of `aws_role_arn`, and those sign every Glue call the query makes.
-
-What can and cannot be asserted here: moto does not implement IAM, so it authorizes nothing and
-"alice cannot see bob's table" is not a statement this topology can make. What it can prove is
-that each user's own token is exchanged for a session of its own, and that a query with no
-usable token fails rather than falling back to the identity configured on the database. Real
-per-user authorization needs a live AWS account with Lake Formation.
-
-Run:
-    python -m ci.praktika run "integration" --test test_datalake_glue_token_forwarding
-"""
-
 import json
 import logging
 import os
@@ -57,7 +40,6 @@ def run_sts_mock(cluster):
 @pytest.fixture(scope="module")
 def started_cluster():
     try:
-        # moto rejects a boto connection that carries no credentials at all.
         os.environ["AWS_ACCESS_KEY_ID"] = "testing"
         os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
 
@@ -70,8 +52,6 @@ def started_cluster():
             with_glue_catalog=True,
         )
 
-        # The STS endpoint the AWS SDK derives from the region, served by a mock through the
-        # cluster's DNS. Same mechanism as `test_database_glue`.
         sts = cluster.add_instance(
             name=STS_CONTAINER,
             hostname=STS_CONTAINER,
@@ -121,7 +101,6 @@ def create_glue_table(started_cluster, namespace, table):
 
 
 def sts_requests(started_cluster):
-    """Everything the mock STS has been asked since the last reset."""
     output = started_cluster.exec_in_container(
         started_cluster.get_container_id(STS_CONTAINER),
         [
@@ -181,13 +160,7 @@ def profile_event(node, query_id, event):
     )
 
 
-def test_user_token_is_exchanged_at_sts(started_cluster):
-    """
-    The token the user authenticated to ClickHouse with is the token STS is asked to exchange,
-    and the session it is exchanged into is named after that user. No Glue call is served by the
-    identity configured on the database: `DataLakeGlueCatalogServiceIdentityRequests` is the
-    fail-open detector.
-    """
+def test_user_tokens_are_exchanged_into_separate_sts_sessions(started_cluster):
     node = started_cluster.instances["node1"]
     namespace = f"ns_{uuid.uuid4().hex[:8]}"
     create_glue_table(started_cluster, namespace, "t")
@@ -209,36 +182,17 @@ def test_user_token_is_exchanged_at_sts(started_cluster):
     assert request["role_session_name"] == "alice"
     assert request["web_identity_token"] == token
 
-    # The token is a credential: it must never appear in a request line.
     assert token not in request["query_string"]
 
     assert profile_event(node, query_id, "DataLakeGlueCatalogServiceIdentityRequests") == 0
 
-
-def test_each_user_gets_its_own_session(started_cluster):
-    """Two users are two exchanges, and neither is handed the other's session."""
-    node = started_cluster.instances["node1"]
-    namespace = f"ns_{uuid.uuid4().hex[:8]}"
-    create_glue_table(started_cluster, namespace, "t")
-
-    db = f"glue_{uuid.uuid4().hex[:8]}"
-    create_database(node, db)
-
-    query_with_token(node, make_token("alice"), f"SHOW TABLES FROM {db}")
     query_with_token(node, make_token("bob"), f"SHOW TABLES FROM {db}")
-
-    sessions = sorted(request["role_session_name"] for request in sts_requests(started_cluster))
-    assert sessions == ["alice", "bob"]
-
-    tokens = {request["web_identity_token"] for request in sts_requests(started_cluster)}
-    assert tokens == {make_token("alice"), make_token("bob")}
+    sessions = sts_requests(started_cluster)
+    assert sorted(request["role_session_name"] for request in sessions) == ["alice", "bob"]
+    assert {request["web_identity_token"] for request in sessions} == {token, make_token("bob")}
 
 
 def test_no_token_fails_closed(started_cluster):
-    """
-    A session with no token cannot borrow the identity configured on the database. The query
-    fails, and nothing is exchanged on its behalf.
-    """
     node = started_cluster.instances["node1"]
     db = f"glue_{uuid.uuid4().hex[:8]}"
     create_database(node, db)
@@ -252,15 +206,10 @@ def test_no_token_fails_closed(started_cluster):
 
 
 def test_rejected_token_does_not_fall_back(started_cluster):
-    """
-    When STS refuses the token, the query fails with what STS said. It does not proceed as the
-    identity configured on the database.
-    """
     node = started_cluster.instances["node1"]
     db = f"glue_{uuid.uuid4().hex[:8]}"
     create_database(node, db)
 
-    # The mock refuses this session name, standing in for a trust policy that rejects the token.
     response = node.http_request(
         "",
         method="POST",

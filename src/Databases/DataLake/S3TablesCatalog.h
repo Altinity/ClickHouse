@@ -46,7 +46,6 @@ public:
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
         const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
 
-    /// SigV4, not OAuth: there is no bearer token to forward.
     bool supportsUserTokenForwarding() const override { return false; }
 
 protected:

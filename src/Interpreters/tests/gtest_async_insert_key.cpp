@@ -116,7 +116,6 @@ TEST(AsyncInsertKey, ForwardedTokenPartitionsBatches)
     auto rotated = make_key(rotated_token);
     auto no_token = make_key({});
 
-    /// Identical credentials captured by different sessions still share a batch.
     EXPECT_EQ(original, same);
     EXPECT_EQ(original.hash, same.hash);
     EXPECT_NE(original, rotated);
