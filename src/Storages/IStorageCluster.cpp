@@ -432,6 +432,8 @@ void IStorageCluster::read(
     size_t max_block_size,
     size_t num_streams)
 {
+    updateBeforeRead(context);
+
     if (!isClusterSupported())
     {
         readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);

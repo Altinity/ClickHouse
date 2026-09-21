@@ -107,6 +107,11 @@ void checkWriteAccessIfFilesAreRenamed(const ContextPtr & context)
 
 }
 
+void StorageFileCluster::updateBeforeRead(const ContextPtr & context)
+{
+    checkWriteAccessIfFilesAreRenamed(context);
+}
+
 void StorageFileCluster::updateQueryToSendIfNeeded(
     DB::ASTPtr & query,
     const StorageSnapshotPtr & storage_snapshot,
