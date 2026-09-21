@@ -6,12 +6,14 @@
 
 #include <Common/Exception.h>
 #include <Common/tests/gtest_global_context.h>
+#include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MetadataGenerator.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
 
@@ -489,6 +491,39 @@ TEST(IcebergMetadataGenerator, ModifyColumnWideningRecordsTheNewTypeInANewSchema
     auto stored_type = findCurrentFieldType(metadata, "x");
     ASSERT_TRUE(stored_type.isString());
     EXPECT_EQ(stored_type.extract<String>(), "long");
+}
+
+
+TEST(IcebergMetadataGenerator, GetIcebergTypeNothingProducesUnknown)
+{
+    Int32 iter = 0;
+    auto [iceberg_type, required] = Iceberg::getIcebergType(std::make_shared<DataTypeNothing>(), iter);
+    ASSERT_TRUE(iceberg_type.isString());
+    EXPECT_EQ(iceberg_type.extract<String>(), "unknown");
+    EXPECT_FALSE(required);
+}
+
+
+TEST(IcebergMetadataGenerator, GetIcebergTypeNullableNothingProducesUnknown)
+{
+    Int32 iter = 0;
+    auto [iceberg_type, required] = Iceberg::getIcebergType(makeNullable(std::make_shared<DataTypeNothing>()), iter);
+    ASSERT_TRUE(iceberg_type.isString());
+    EXPECT_EQ(iceberg_type.extract<String>(), "unknown");
+    EXPECT_FALSE(required);
+}
+
+
+TEST(IcebergMetadataGenerator, AddColumnUnknownTypeRecordsUnknownInSchema)
+{
+    auto metadata = makeMetadataWithGap();
+    MetadataGenerator gen(metadata);
+
+    gen.generateAddColumnMetadata("placeholder", makeNullable(std::make_shared<DataTypeNothing>()));
+
+    auto stored_type = findCurrentFieldType(metadata, "placeholder");
+    ASSERT_TRUE(stored_type.isString());
+    EXPECT_EQ(stored_type.extract<String>(), "unknown");
 }
 
 #endif
