@@ -1312,11 +1312,16 @@ def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cl
 
     On a worker every DataLake-catalog table is resolved fresh through `DatabaseDataLake`, and
     `StorageObjectStorageCluster`'s constructor decides there and then whether its inner plain storage
-    consumes the initiator's file-task queue. That decision is made from `collaborate_with_initiator`
-    plus the parallel-replicas settings alone -- it does not consider which table this is. Under
-    dispatch the driver owns that queue, so a partner answering yes as well would read the driver's
-    files under its own schema. The settings below are exactly the combination that makes the
-    constructor's condition true for every catalog table in the query.
+    consumes the initiator's file-task queue. That decision is made from the cluster name plus the
+    parallel-replicas settings -- it does not consider which table this is. Under dispatch the driver
+    owns that queue, so a partner answering yes as well would read the driver's files under its own
+    schema.
+
+    Two guards currently prevent that, and this test exists to keep them: `tryGetTableImpl` only falls
+    back to the parallel-replicas cluster when `!is_secondary_query`, and a dispatched worker query
+    contains a `*Cluster` table function, which makes the context distributed. Remove either and a
+    partner becomes a queue consumer. The settings below are the combination that makes the rest of the
+    constructor's condition true.
     """
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
