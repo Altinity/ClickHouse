@@ -1981,6 +1981,7 @@ void IcebergImportSink::consume(Chunk & chunk)
     if (isCancelled())
         return;
 
+    consumed_rows = true;
     writer->consume(chunk);
 }
 
@@ -2020,6 +2021,9 @@ void IcebergImportSink::onException(std::exception_ptr /* exception */)
 
 void IcebergImportSink::finalizeBuffers()
 {
+    if (!consumed_rows)
+        return;
+
     writer->finalize();
 }
 
