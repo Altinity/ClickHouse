@@ -1306,6 +1306,67 @@ def test_distributed_join_dispatch_falls_back(started_cluster):
 
     assert run("distributed") == run("allow")
 
+
+def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cluster):
+    """A whole-query dispatch must not let the parallel-replicas settings change what a worker reads.
+
+    On a worker every DataLake-catalog table is resolved fresh through `DatabaseDataLake`, and
+    `StorageObjectStorageCluster`'s constructor decides there and then whether its inner plain storage
+    consumes the initiator's file-task queue. That decision is made from `collaborate_with_initiator`
+    plus the parallel-replicas settings alone -- it does not consider which table this is. Under
+    dispatch the driver owns that queue, so a partner answering yes as well would read the driver's
+    files under its own schema. The settings below are exactly the combination that makes the
+    constructor's condition true for every catalog table in the query.
+    """
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, _ = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_pr_{uuid.uuid4()}"
+    )
+
+    query = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag < 10
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    expected = node1.query(
+        query,
+        settings={
+            "object_storage_cluster": "cluster_simple",
+            "object_storage_cluster_join_mode": "allow",
+        },
+    )
+    assert expected == "berlin\t2\nparis\t1\n", f"oracle result changed: {expected!r}"
+
+    query_id = uuid.uuid4().hex
+    got = node1.query(
+        query,
+        query_id=query_id,
+        settings={
+            "object_storage_cluster": "cluster_simple",
+            "object_storage_cluster_join_mode": "distributed",
+            "parallel_replicas_for_cluster_engines": 1,
+            "enable_parallel_replicas": 1,
+            "cluster_for_parallel_replicas": "cluster_simple",
+            "max_parallel_replicas": 2,
+        },
+    )
+    assert got == expected, (
+        "dispatch with the parallel-replicas settings on returned a different result than ordinary "
+        f"planning: {got!r} != {expected!r} -- a partner table most likely consumed the driver's "
+        "file-task queue"
+    )
+
+    # Without this the test would silently stop covering anything if the candidate were rejected
+    # whenever the parallel-replicas settings are set.
+    _assert_dispatched_whole(nodes, query_id)
+
 def test_used_storages_in_query_log(started_cluster):
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
