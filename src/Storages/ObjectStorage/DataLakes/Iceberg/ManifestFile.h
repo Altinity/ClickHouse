@@ -84,6 +84,7 @@ struct ParsedManifestFileEntry : boost::noncopyable
 
     ManifestEntryStatus status;
     std::optional<Int64> parsed_sequence_number;
+    std::optional<Int64> parsed_file_sequence_number;
     std::optional<Int64> parsed_snapshot_id;
     std::optional<UInt64> parsed_first_row_id;
 
@@ -119,6 +120,7 @@ struct ParsedManifestFileEntry : boost::noncopyable
         Int64 row_number_,
         ManifestEntryStatus status_,
         std::optional<Int64> written_sequence_number_,
+        std::optional<Int64> written_file_sequence_number_,
         std::optional<Int64> written_snapshot_id_,
         std::optional<UInt64> written_first_row_id_,
         DB::Row partition_key_value_,
@@ -138,6 +140,7 @@ struct ParsedManifestFileEntry : boost::noncopyable
         , row_number(row_number_)
         , status(status_)
         , parsed_sequence_number(written_sequence_number_)
+        , parsed_file_sequence_number(written_file_sequence_number_)
         , parsed_snapshot_id(written_snapshot_id_)
         , parsed_first_row_id(written_first_row_id_)
         , partition_key_value(std::move(partition_key_value_))

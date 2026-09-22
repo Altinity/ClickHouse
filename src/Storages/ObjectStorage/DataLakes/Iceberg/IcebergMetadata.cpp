@@ -535,6 +535,44 @@ bool IcebergMetadata::optimize(
     }
 }
 
+bool IcebergMetadata::optimizeManifestFiles(
+       const StorageMetadataPtr & metadata_snapshot,
+       ContextPtr context,
+       std::shared_ptr<DataLake::ICatalog> catalog,
+       const StorageID & storage_id)
+{
+    if (context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
+    {
+        /// Reject manifest compaction on format-version 3: the writer does not yet round-trip the row-lineage `first_row_id`, so a rewrite would drop row ids (fail-close).
+        if (persistent_components.format_version >= 3)
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "OPTIMIZE TABLE ... MANIFEST is not yet supported for Iceberg format-version 3: "
+                "row-lineage 'first_row_id' round-trip is not implemented");
+
+        const auto sample_block = std::make_shared<const Block>(metadata_snapshot->getSampleBlock());
+
+        // Perform manifest-only compaction using the current snapshot from the metadata file
+        compactIcebergManifests(
+            persistent_components,
+            object_storage,
+            *secondary_storages,
+            data_lake_settings,
+            sample_block,
+            context,
+            write_format,
+            catalog,
+            storage_id);
+
+        return true;
+    }
+    else
+    {
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call OPTIMIZE TABLE ... MANIFEST for iceberg tables.");
+    }
+}
+
 std::pair<IcebergDataSnapshotPtr, Int32>
 IcebergMetadata::getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) const
 {
@@ -1796,7 +1834,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
             transaction_id);
         /// Surface a sentinel so the caller treats this as a successful attempt (non-empty
         /// commit info), persists a commit_info znode, and makes the situation visible in
-        /// system.replicated_partition_exports.committed_metadata_file. We do not know the
+        /// system.partition_exports.committed_metadata_file. We do not know the
         /// original committer's paths from here.
         IStorage::ExportPartitionCommitInfo already_committed_info;
         already_committed_info.iceberg_metadata_file = "<committed in a previous run, paths unavailable>";

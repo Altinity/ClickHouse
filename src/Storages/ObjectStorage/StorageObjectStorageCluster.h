@@ -33,7 +33,7 @@ public:
 
     bool supportsImport(ContextPtr context) const override;
 
-    SinkToStoragePtr import(
+    ImportResult import(
         const std::string & file_name,
         Block & block_with_partition_values,
         const std::function<void(const std::string &)> & new_file_path_callback,
@@ -93,6 +93,8 @@ public:
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
     IDataLakeMetadata * getExternalMetadata(ContextPtr query_context);
+
+    std::shared_ptr<DataLake::ICatalog> getCatalog() const;
 
     StorageMetadataHandle getInMemoryMetadataPtr(ContextPtr context, bool bypass_metadata_cache) const override;
 

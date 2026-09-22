@@ -192,6 +192,9 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> pd.DataFram
             f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
             headers=headers,
         )
+        if response.status_code == 404:
+            # NOTE (strtgbb): not in this repo — upstream PR merged from a fork
+            continue
         if response.status_code != 200:
             raise Exception(
                 f"Failed to fetch pull request info: {response.status_code} {response.text}"
@@ -207,6 +210,8 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> pd.DataFram
                 "pr_labels": html.escape(", ".join(sorted(label_names)), quote=True),
             }
         )
+    if not rows:
+        return pd.DataFrame(columns=["pr_number", "pr_name", "pr_labels"])
     return pd.DataFrame(rows)
 
 
