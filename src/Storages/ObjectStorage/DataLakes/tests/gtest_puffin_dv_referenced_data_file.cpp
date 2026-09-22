@@ -87,6 +87,7 @@ std::shared_ptr<ParsedManifestFileEntry> makePositionDeleteEntry(
         /*written_sequence_number=*/std::nullopt,
         /*written_file_sequence_number=*/std::nullopt,
         /*written_snapshot_id=*/std::nullopt,
+        /*written_first_row_id=*/std::nullopt,
         DB::Row{},
         std::unordered_map<Int32, ColumnInfo>{},
         std::unordered_map<Int32, std::pair<Field, Field>>{},

@@ -1,6 +1,8 @@
 #pragma once
 #include "config.h"
 
+#include <optional>
+
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Interpreters/Context_fwd.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
@@ -10,6 +12,7 @@
 
 #include <Core/Field.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergPath.h>
+#include <base/types.h>
 
 #include <string_view>
 
@@ -41,6 +44,7 @@ struct IcebergObjectSerializableInfo
     std::vector<Iceberg::EqualityDeleteObject> equality_deletes_objects;
     std::optional<Int64> record_count;
     std::optional<Int64> file_size_in_bytes;
+    std::optional<UInt64> first_row_id;
 
     /// Set to true by the coordinator when the file is outside of the table location
     bool requires_external_storage = false;
