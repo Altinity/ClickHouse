@@ -48,7 +48,6 @@ public:
         const Iceberg::IcebergPathFromMetadata & metadata_file_path,
         Int64 parent_snapshot_id);
 
-    void generateAddColumnMetadata(const String & column_name, DataTypePtr type);
     void generateDropColumnMetadata(const String & column_name);
     /// Returns false when neither the type nor the position changed (true no-op).
     /// `context` supplies the settings used to map the stored Iceberg type back to a ClickHouse
