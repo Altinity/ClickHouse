@@ -1783,7 +1783,18 @@ SELECT count() from database_name.table_name;
 )DOCS_MD",
         .syntax = "ENGINE = DataLakeCatalog('catalog_url'[, 'user', 'password']) SETTINGS catalog_type = '...'",
         .related = {}});
-    factory.registerDatabase("Iceberg", create_fn, { .supports_arguments = true, .supports_settings = true });
+    factory.registerDatabase("Iceberg", create_fn, {
+        .supports_arguments = true,
+        .supports_settings = true,
+        .is_external = true,
+    }, Documentation{
+        .description = R"DOCS_MD(
+The `Iceberg` database engine is the legacy name of [`DataLakeCatalog`](/engines/database-engines/datalake)
+and is kept for compatibility with databases created before the rename. It accepts the same arguments and
+the same settings, and supports the same catalogs. Use `DataLakeCatalog` for new databases.
+)DOCS_MD",
+        .syntax = "ENGINE = Iceberg('catalog_url'[, 'user', 'password']) SETTINGS catalog_type = '...'",
+        .related = {"DataLakeCatalog"}});
 }
 
 }

@@ -2034,10 +2034,11 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(TableExpressionNodePtr table_
                     /// The filter is built against this table's schema, but read() hands it to wrapper
                     /// storages' children (Merge, Buffer), which re-derive it against their own types.
                     /// Push it down only if every column it consumes is in the PREWHERE contract.
-                    /// A remote storage cannot carry it at all: read() only ships query text to the
-                    /// remote servers and never lowers the filter into it, so pushing would silently
-                    /// drop an access-control filter. Refuse, and let the stage check fail closed.
-                    bool can_push_down_filter = storage->supportsPrewhere() && !storage->isRemote();
+                    /// A storage that ships query text instead of lowering the filter into the read
+                    /// cannot carry it at all, so pushing would silently drop an access-control
+                    /// filter. Refuse, and let the stage check fail closed.
+                    bool can_push_down_filter
+                        = storage->supportsPrewhere() && storage->appliesRowLevelFilterInRead(query_context);
                     if (can_push_down_filter)
                     {
                         if (const auto supported_prewhere_columns = storage->supportedPrewhereColumns())

@@ -179,6 +179,13 @@ public:
     /// Returns true if the storage supports optimization of moving conditions to PREWHERE section.
     virtual bool canMoveConditionsToPrewhere() const { return supportsPrewhere(); }
 
+    /// Returns true if read() lowers `query_info.row_level_filter` into the reading step. A storage
+    /// that instead ships query text to other servers must return false: the filter is a plan-level
+    /// structure that does not travel with the text, so pushing it down would silently drop an
+    /// access-control filter. Wrappers that only delegate to a remote read for some queries decide
+    /// per query, hence the context.
+    virtual bool appliesRowLevelFilterInRead(ContextPtr) const { return !isRemote(); }
+
     /// Returns true if the storage replicates SELECT, INSERT and ALTER commands among replicas.
     virtual bool supportsReplication() const { return false; }
 

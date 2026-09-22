@@ -196,12 +196,30 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     else
         validateSupportedColumns(columns, *configuration);
 
-    if (updated_configuration && sample_path.empty()
-            && context_->getSettingsRef()[Setting::use_hive_partitioning]
-            && !configuration->isDataLakeConfiguration()
-            && !configuration->getPartitionStrategy())
+    const bool need_resolve_sample_path = context_->getSettingsRef()[Setting::use_hive_partitioning]
+        && !configuration->getPartitionStrategy()
+        && !configuration->isDataLakeConfiguration();
+
+    /// Resolving the sample path requires listing the object storage. Defer it to the first use of
+    /// the table, so that CREATE, ATTACH and server startup do not depend on the endpoint.
+    /// `pure_storage` carries the same deferral and performs the resolution, which updates the
+    /// metadata this storage serves through `getInMemoryMetadataPtr`.
+    hive_partitioning_sample_path_deferred = !is_table_function && need_resolve_sample_path && !need_resolve_columns_or_format;
+
+    if (updated_configuration && sample_path.empty() && need_resolve_sample_path && !hive_partitioning_sample_path_deferred)
     {
-        sample_path = getPathSample(context_);
+        try
+        {
+            sample_path = getPathSample(context_);
+        }
+        catch (...)
+        {
+            LOG_WARNING(
+                log,
+                "Failed to list object storage, cannot use hive partitioning. "
+                "Error: {}",
+                getCurrentExceptionMessage(true));
+        }
     }
 
     /// Not grabbing the file_columns because it is not necessary to do it here.
@@ -559,7 +577,19 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 void StorageObjectStorageCluster::updateExternalDynamicMetadataIfExists(ContextPtr query_context)
 {
     if (!configuration->isDataLakeConfiguration())
+    {
+        /// Resolves a deferred hive partitioning sample path. Called before query analysis, so the
+        /// hive virtual columns are visible to the triggering query.
+        if (pure_storage)
+        {
+            pure_storage->updateExternalDynamicMetadataIfExists(query_context);
+            /// A clustered read builds its file iterator from this list, which stayed empty in the
+            /// constructor because the sample path it comes from was resolved only now.
+            if (hive_partitioning_sample_path_deferred)
+                hive_partition_columns_to_read_from_file_path = pure_storage->getHivePartitionColumns();
+        }
         return;
+    }
 
     /// Always force an update to pick up the latest snapshot version.
     /// Using if_not_updated_before=true would leave latest_snapshot_version
@@ -746,17 +776,22 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
     return cluster_name_from_settings;
 }
 
+bool StorageObjectStorageCluster::readsFromPureStorage(ContextPtr context) const
+{
+    if (!isClusterSupported())
+        return true;
+
+    return getClusterName(context).empty()  // Not cluster request
+        && context->getSettingsRef()[Setting::object_storage_remote_initiator_cluster].value.empty(); // Not request with remote initiator
+}
+
 QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr & storage_snapshot, SelectQueryInfo & query_info) const
 {
-    if (!isClusterSupported())
-        return QueryProcessingStage::Enum::FetchColumns;
-
     /// Full query if fall back to pure storage.
-    if (getClusterName(context).empty()  // Not cluster request
-        && context->getSettingsRef()[Setting::object_storage_remote_initiator_cluster].value.empty()) // Not request with remote initiator
+    if (readsFromPureStorage(context))
     {
-        if (context->getSettingsRef()[Setting::object_storage_remote_initiator])
+        if (isClusterSupported() && context->getSettingsRef()[Setting::object_storage_remote_initiator])
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
 
@@ -765,6 +800,13 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
 
     /// Distributed storage.
     return IStorageCluster::getQueryProcessingStage(context, to_stage, storage_snapshot, query_info);
+}
+
+bool StorageObjectStorageCluster::appliesRowLevelFilterInRead(ContextPtr context) const
+{
+    /// A clustered read only ships query text to the swarm nodes, so the filter would be lost.
+    /// A fallback read is served by `pure_storage`, which lowers it into the reading step.
+    return pure_storage && readsFromPureStorage(context);
 }
 
 std::optional<QueryPipeline> StorageObjectStorageCluster::distributedWrite(
@@ -849,7 +891,9 @@ void StorageObjectStorageCluster::alter(const AlterCommands & params, ContextPtr
 
 void StorageObjectStorageCluster::addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const
 {
-    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->getFormat(), context, /*with_structure=*/false);
+    /// `pure_storage` shares this configuration and persists an implicit `partition_strategy = 'none'`,
+    /// which the path shape alone cannot recover on reload.
+    pure_storage->addInferredEngineArgsToCreateQuery(args, context);
 }
 
 StorageMetadataHandle StorageObjectStorageCluster::getInMemoryMetadataPtr(ContextPtr context, bool bypass_metadata_cache) const

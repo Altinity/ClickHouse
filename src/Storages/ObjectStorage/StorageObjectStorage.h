@@ -187,6 +187,9 @@ public:
 
     void updateExternalDynamicMetadataIfExists(ContextPtr query_context) override;
 
+    /// Valid once a deferred hive partitioning sample path has been resolved.
+    const NamesAndTypesList & getHivePartitionColumns() const { return hive_partition_columns_to_read_from_file_path; }
+
     std::shared_ptr<IDataLakeMetadata> getExternalMetadata(ContextPtr query_context);
 
     std::shared_ptr<DataLake::ICatalog> getCatalog() const { return catalog; }

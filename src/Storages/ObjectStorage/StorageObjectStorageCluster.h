@@ -167,6 +167,8 @@ public:
     std::optional<NameSet> supportedPrewhereColumns() const override;
     ColumnSizeByName getColumnSizes() const override;
 
+    bool appliesRowLevelFilterInRead(ContextPtr context) const override;
+
     bool parallelizeOutputAfterReading(ContextPtr context) const override;
 
     bool isObjectStorage() const override { return true; }
@@ -183,6 +185,9 @@ private:
         bool make_cluster_function) override;
 
     bool isClusterSupported() const override;
+
+    /// Whether this query is served by `pure_storage` instead of being distributed over a cluster.
+    bool readsFromPureStorage(ContextPtr context) const;
 
     void readFallBackToPure(
         QueryPlan & query_plan,
@@ -222,6 +227,9 @@ private:
 
     /// non-clustered storage to fall back on pure realisation if needed
     std::shared_ptr<StorageObjectStorage> pure_storage;
+
+    /// Set only in the constructor when hive partitioning detection is deferred to the first use.
+    bool hive_partitioning_sample_path_deferred = false;
 };
 
 }
