@@ -1,10 +1,13 @@
 <!--
     The ClickBench `create.sql` attaches the `hits` table on a cached disk
-    rooted at `/dev/shm/clickhouse/`. The server validates that any
-    filesystem cache path lies inside `filesystem_caches_path` /
-    `custom_cached_disks_base_directory`, so point both at the same root.
+    rooted at `/dev/shm/clickhouse/`, and the server refuses a cache path
+    outside `custom_cached_disks_base_directory`, so point that at the same root.
+
+    Do not also move `filesystem_caches_path`: it is the root for the named
+    caches in `config.d/storage_conf_local.xml`, and relocating those to the
+    tmpfs on /dev/shm makes the server refuse to start, since their 21 GiB
+    `max_size` exceeds the tmpfs capacity.
 -->
 <clickhouse>
-    <filesystem_caches_path replace="replace">/dev/shm/clickhouse/</filesystem_caches_path>
     <custom_cached_disks_base_directory replace="replace">/dev/shm/clickhouse/</custom_cached_disks_base_directory>
 </clickhouse>
