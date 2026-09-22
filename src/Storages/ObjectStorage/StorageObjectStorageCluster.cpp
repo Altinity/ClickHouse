@@ -46,6 +46,37 @@ namespace Setting
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
+    extern const SettingsString object_storage_distributed_driver_database;
+    extern const SettingsString object_storage_distributed_driver_table;
+}
+
+namespace
+{
+
+/// True on a worker executing a query dispatched by `object_storage_cluster_join_mode='distributed'`. The
+/// initiator names the driving table in the settings it sends; their presence is what marks the query, so a
+/// worker never has to infer the mode from the shape of its connection.
+bool isDistributedJoinDispatchWorker(const ContextPtr & context)
+{
+    const auto & client_info = context->getClientInfo();
+    return client_info.query_kind == ClientInfo::QueryKind::SECONDARY_QUERY
+        && client_info.collaborate_with_initiator
+        && !context->getSettingsRef()[Setting::object_storage_distributed_driver_database].value.empty();
+}
+
+/// True for the one table in a dispatched query whose files the initiator hands out. Every other table in the
+/// same query is read in full on every worker, so this must match exactly one table expression -- which the
+/// initiator guarantees by declining to dispatch when the name is ambiguous.
+bool isAnnouncedDistributedJoinDriver(const ContextPtr & context, const StorageID & table_id)
+{
+    if (!isDistributedJoinDispatchWorker(context))
+        return false;
+
+    const auto & settings = context->getSettingsRef();
+    return table_id.getDatabaseName() == settings[Setting::object_storage_distributed_driver_database].value
+        && table_id.getTableName() == settings[Setting::object_storage_distributed_driver_table].value;
+}
+
 }
 
 namespace ErrorCodes
@@ -255,9 +286,12 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         && context_->canUseTaskBasedParallelReplicas()
         && !context_->isDistributed();
 
+    /// Two ways this storage ends up reading from the initiator's file-task queue rather than listing its own
+    /// files: it is the announced driver of a whole-query dispatch, or it is an ordinary cluster read under
+    /// parallel replicas. The first is decided per table, by name; the second by the settings alone.
     bool can_use_distributed_iterator =
-        context_->getClientInfo().collaborate_with_initiator &&
-        can_use_parallel_replicas;
+        isAnnouncedDistributedJoinDriver(context_, table_id_)
+        || (context_->getClientInfo().collaborate_with_initiator && can_use_parallel_replicas);
 
     pure_storage = std::make_shared<StorageObjectStorage>(
         configuration,
@@ -748,16 +782,10 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
     if (!isClusterSupported())
         return "";
 
-    /// A worker executing a whole-query dispatch (object_storage_cluster_join_mode='distributed') reads every
-    /// table it resolves locally: the one table meant to be distributed is the driver, and that arrives as an
-    /// explicit `*Cluster()` table function which never reaches this method. Without this, a partner table would
-    /// fan out again from each worker. The driver is detected the same way TableFunctionObjectStorageCluster
-    /// detects a worker.
-    const auto & client_info = context->getClientInfo();
-    if (client_info.query_kind == ClientInfo::QueryKind::SECONDARY_QUERY
-        && client_info.collaborate_with_initiator
-        && context->hasClusterFunctionReadTaskCallback()
-        && context->getSettingsRef()[Setting::object_storage_cluster_join_mode] == ObjectStorageClusterJoinMode::DISTRIBUTED)
+    /// A worker executing a whole-query dispatch reads every table it resolves locally, including the driver:
+    /// nothing here may fan out again. The driver still differs from the rest, but by reading the initiator's
+    /// file-task queue instead of listing its own files -- decided at construction, see the constructor.
+    if (isDistributedJoinDispatchWorker(context))
         return "";
 
     auto cluster_name_from_settings = context->getSettingsRef()[Setting::object_storage_cluster].value;

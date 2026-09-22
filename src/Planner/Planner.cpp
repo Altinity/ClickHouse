@@ -2319,9 +2319,14 @@ void Planner::buildPlanForQueryNode()
         && query_context->getClientInfo().query_kind == ClientInfo::QueryKind::INITIAL_QUERY)
         distributed_object_storage_candidate = findDistributedObjectStorageCandidate(query_tree, query_context);
 
+    /// Dispatch can still decline here: the driver has to be nameable unambiguously in the serialized query.
+    std::optional<JoinTreeQueryPlan> dispatched_query_plan;
     if (distributed_object_storage_candidate)
+        dispatched_query_plan = buildDistributedObjectStorageQueryPlan(query_tree, *distributed_object_storage_candidate, select_query_info, planner_context);
+
+    if (dispatched_query_plan)
     {
-        join_tree_query_plan = buildDistributedObjectStorageQueryPlan(query_tree, *distributed_object_storage_candidate, select_query_info, planner_context);
+        join_tree_query_plan = std::move(*dispatched_query_plan);
     }
     else if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
         && planner_context->getGlobalPlannerContext()->parallel_replicas_node == &query_node)
