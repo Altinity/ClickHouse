@@ -97,7 +97,9 @@ if [ "$cache_policy" = "SLRU" ]; then
     sed -i.tmp "s|<cache_policy>LRU</cache_policy>|<cache_policy>SLRU</cache_policy>|" /etc/clickhouse-server/config.d/storage_conf*.xml
 fi
 
-start_server || { echo "Failed to start server"; exit 1; }
+# Preload writes system logs the restart must load before port 9000 opens.
+# The default wait (~70s) expires first on some ARM runners.
+start_server 10 || { echo "Failed to start server"; exit 1; }
 
 clickhouse-client --query "SYSTEM STOP THREAD FUZZER"
 
