@@ -6733,7 +6733,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suffix: ['', '-alpine']
+        suffix: ['', '-alpine', '-ubi9']
     uses: ./.github/workflows/grype_scan.yml
     secrets: inherit
     with:
@@ -6743,11 +6743,16 @@ jobs:
   GrypeScanKeeper:
       needs: [config_workflow, docker_keeper_image]
       if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
+      strategy:
+        fail-fast: false
+        matrix:
+          suffix: ['', '-ubi9']
       uses: ./.github/workflows/grype_scan.yml
       secrets: inherit
       with:
         docker_image: altinityinfra/clickhouse-keeper
         version: ${{ fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.version.string }}
+        tag-suffix: ${{ matrix.suffix }}
 
   RegressionTestsRelease:
     needs: [config_workflow, build_amd_binary]
