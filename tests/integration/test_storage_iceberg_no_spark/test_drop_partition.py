@@ -19,6 +19,7 @@ from pyiceberg.types import (
 
 from helpers.config_cluster import minio_access_key, minio_secret_key
 from helpers.iceberg_utils import create_iceberg_table, get_uuid_str
+from helpers.s3_tools import list_s3_objects
 
 CATALOG_NAME = "demo"
 
@@ -683,5 +684,69 @@ def test_drop_partition_after_partition_spec_evolution(started_cluster_iceberg_n
     assert operation == "DELETE"
     assert summary["deleted-data-files"] == "3"
     assert summary["deleted-records"] == "3"
+
+    instance.query(f"DROP DATABASE {namespace}")
+
+
+def data_files_in_storage(started_cluster, namespace, table_name):
+    return sorted(
+        name
+        for name in list_s3_objects(
+            started_cluster.minio_client,
+            "warehouse-rest",
+            prefix=f"{namespace}/{table_name}/",
+        )
+        if name.endswith(".parquet")
+    )
+
+
+def test_drop_partition_purges_data_files(started_cluster_iceberg_no_spark):
+    """`iceberg_delete_data_on_drop` decides whether the dropped files leave object storage.
+    """
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+
+    table_name = "purge_data_files"
+    namespace, ch_table = setup(
+        instance, table_name, "event_date Date, id Int64", "event_date"
+    )
+
+    instance.query(
+        f"INSERT INTO {ch_table} VALUES "
+        f"('2024-01-15', 1), ('2024-01-15', 2), ('2024-01-16', 3), ('2024-01-17', 4)",
+        settings=WRITE_SETTINGS,
+    )
+
+    after_insert = data_files_in_storage(
+        started_cluster_iceberg_no_spark, namespace, table_name
+    )
+    assert len(after_insert) == 3
+
+    instance.query(
+        f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-16'",
+        settings=dict(WRITE_SETTINGS, iceberg_delete_data_on_drop=0),
+    )
+
+    assert instance.query(f"SELECT id FROM {ch_table} ORDER BY id FORMAT TSV") == "1\n2\n4\n"
+    assert (
+        data_files_in_storage(started_cluster_iceberg_no_spark, namespace, table_name)
+        == after_insert
+    )
+
+    instance.query(
+        f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15'",
+        settings=dict(WRITE_SETTINGS, iceberg_delete_data_on_drop=1),
+    )
+
+    assert instance.query(f"SELECT id FROM {ch_table} ORDER BY id FORMAT TSV") == "4\n"
+
+    after_purge = data_files_in_storage(
+        started_cluster_iceberg_no_spark, namespace, table_name
+    )
+    assert len(after_purge) == 2
+    assert set(after_purge) < set(after_insert)
+
+    operation, summary = current_snapshot_history(instance, namespace, table_name)
+    assert operation == "DELETE"
+    assert summary["deleted-data-files"] == "1"
 
     instance.query(f"DROP DATABASE {namespace}")

@@ -1039,9 +1039,11 @@ void IcebergMetadata::dropPartition(
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "DROP PARTITION for Iceberg requires partition values, not a partition ID");
 
+    bool purge = context->getSettingsRef()[Setting::iceberg_delete_data_on_drop];
+
     for (size_t attempt = 0; attempt < MAX_TRANSACTION_RETRIES; ++attempt)
     {
-        if (tryDropPartitionOnce(*partition_ast, context, catalog, storage_id))
+        if (tryDropPartitionOnce(*partition_ast, context, catalog, storage_id, purge))
             return;
 
         LOG_DEBUG(log, "Iceberg DROP PARTITION lost a commit race, retrying (attempt {})", attempt + 1);
@@ -1052,11 +1054,141 @@ void IcebergMetadata::dropPartition(
         MAX_TRANSACTION_RETRIES);
 }
 
+IcebergMetadata::DropPartitionScan IcebergMetadata::scanManifestsForPartition(
+    const IcebergDataSnapshotPtr & data_snapshot,
+    const Poco::JSON::Array::Ptr & spec_fields,
+    const Row & target_partition_key,
+    Int64 partition_spec_id,
+    Int32 schema_id,
+    const ContextPtr & context,
+    bool purge) const
+{
+    const auto spec_signature = getPartitionSpecSignature(spec_fields);
+
+    std::unordered_map<const PartitionSpecification *, std::vector<size_t>> spec_field_positions;
+
+    auto entry_is_in_target_partition = [&](const ProcessedManifestFileEntryPtr & entry)
+    {
+        const auto & entry_spec = entry->common_partition_specification;
+        if (!entry_spec)
+            throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "File {} has no partition specification", entry->parsed_entry->file_path_key.serialize());
+
+        const auto & partition_key_value = entry->parsed_entry->partition_key_value;
+        if (partition_key_value.size() != entry_spec->size())
+            throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "File {} has {} partition values, but its partition spec has {} fields",
+                entry->parsed_entry->file_path_key.serialize(), partition_key_value.size(), entry_spec->size());
+
+        auto [it, inserted] = spec_field_positions.try_emplace(entry_spec.get());
+        if (inserted)
+            it->second = mapTargetFieldsToSpecPositions(*entry_spec, spec_signature);
+
+        bool constrains_every_target_field = true;
+        for (size_t i = 0; i < spec_signature.size(); ++i)
+        {
+            const auto position = it->second[i];
+            if (position == PARTITION_FIELD_NOT_IN_SPEC)
+            {
+                constrains_every_target_field = false;
+                continue;
+            }
+            if (!accurateEquals(partition_key_value[position], target_partition_key[i]))
+                return false;
+        }
+
+        if (!constrains_every_target_field)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "DROP PARTITION is not supported for Iceberg table {}: file {} was written under a partition spec "
+                "that does not contain every field of the current spec ({}), so it spans more than the dropped partition",
+                persistent_components.table_path, entry->parsed_entry->file_path_key.serialize(), partition_spec_id);
+
+        return true;
+    };
+
+    DropPartitionScan scan;
+
+    for (const auto & manifest_list_entry : data_snapshot->manifest_list_entries)
+    {
+        auto entries_handle = getManifestFileEntriesHandle(
+            object_storage, persistent_components, context, log,
+            manifest_list_entry, schema_id, *secondary_storages);
+
+        const auto & data_entries = entries_handle.getFilesWithoutDeleted(FileContentType::DATA);
+        const auto & position_delete_entries = entries_handle.getFilesWithoutDeleted(FileContentType::POSITION_DELETE);
+        const auto & equality_delete_entries = entries_handle.getFilesWithoutDeleted(FileContentType::EQUALITY_DELETE);
+
+        std::unordered_set<String> matched_paths_in_manifest;
+
+        auto match_entries = [&](const std::vector<ProcessedManifestFileEntryPtr> & entries)
+        {
+            for (const auto & entry : entries)
+            {
+                ++scan.total_files;
+                if (!entry_is_in_target_partition(entry))
+                    continue;
+
+                const auto & parsed = *entry->parsed_entry;
+                matched_paths_in_manifest.insert(parsed.file_path_key.serialize());
+                scan.matched_bytes += parsed.file_size_in_bytes;
+
+                switch (parsed.content_type)
+                {
+                    case FileContentType::DATA:
+                        ++scan.matched_data_files;
+                        scan.matched_records += parsed.record_count;
+                        break;
+                    case FileContentType::POSITION_DELETE:
+                        ++scan.matched_position_delete_files;
+                        scan.matched_position_deletes += parsed.record_count;
+                        break;
+                    case FileContentType::EQUALITY_DELETE:
+                        ++scan.matched_equality_delete_files;
+                        scan.matched_equality_deletes += parsed.record_count;
+                        break;
+                }
+
+                if (purge)
+                {
+                    scan.files_to_be_purged.push_back(parsed.file_path_key);
+                }
+
+                LOG_TRACE(log, "Matched {} file: {} ({} records)",
+                    FileContentTypeToString(parsed.content_type), parsed.file_path_key.serialize(), parsed.record_count);
+            }
+        };
+
+        match_entries(data_entries);
+        match_entries(position_delete_entries);
+        match_entries(equality_delete_entries);
+
+        if (matched_paths_in_manifest.empty())
+        {
+            ++scan.kept_manifests;
+            continue;
+        }
+
+        const size_t live_entries_in_manifest
+            = data_entries.size() + position_delete_entries.size() + equality_delete_entries.size();
+        const size_t matched_in_manifest = matched_paths_in_manifest.size();
+
+        if (matched_in_manifest == live_entries_in_manifest)
+            scan.fully_matched_manifests.push_back(manifest_list_entry.manifest_file_path.serialize());
+        else
+            scan.manifests_to_rewrite.emplace_back(manifest_list_entry, std::move(matched_paths_in_manifest));
+
+        scan.matched_files += matched_in_manifest;
+    }
+
+    return scan;
+}
+
 bool IcebergMetadata::tryDropPartitionOnce(
     const ASTPartition & partition_ast,
     const ContextPtr & context,
     const std::shared_ptr<DataLake::ICatalog> & catalog,
-    const StorageID & storage_id)
+    const StorageID & storage_id,
+    bool purge) const
 {
     auto [last_version, metadata_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
@@ -1102,8 +1234,6 @@ bool IcebergMetadata::tryDropPartitionOnce(
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "Cannot drop a partition of Iceberg table {}: the table is not partitioned", persistent_components.table_path);
 
-    const auto spec_signature = getPartitionSpecSignature(spec_fields);
-
     const auto partition_source_header = getPartitionSourceHeader(
         spec_fields,
         current_schema->getArray(f_fields),
@@ -1120,145 +1250,29 @@ bool IcebergMetadata::tryDropPartitionOnce(
     LOG_INFO(log, "Iceberg DROP PARTITION requested for partition {} of spec {}",
         dumpPartitionTuple(target_partition_key), partition_spec_id);
 
-    std::unordered_map<const PartitionSpecification *, std::vector<size_t>> spec_field_positions;
+    const auto scan = scanManifestsForPartition(
+        data_snapshot, spec_fields, target_partition_key, partition_spec_id, schema_id, context, purge);
 
-    auto entry_is_in_target_partition = [&](const ProcessedManifestFileEntryPtr & entry)
-    {
-        const auto & entry_spec = entry->common_partition_specification;
-        if (!entry_spec)
-            throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
-                "File {} has no partition specification", entry->parsed_entry->file_path_key.serialize());
-
-        const auto & partition_key_value = entry->parsed_entry->partition_key_value;
-        if (partition_key_value.size() != entry_spec->size())
-            throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
-                "File {} has {} partition values, but its partition spec has {} fields",
-                entry->parsed_entry->file_path_key.serialize(), partition_key_value.size(), entry_spec->size());
-
-        auto [it, inserted] = spec_field_positions.try_emplace(entry_spec.get());
-        if (inserted)
-            it->second = mapTargetFieldsToSpecPositions(*entry_spec, spec_signature);
-
-        bool constrains_every_target_field = true;
-        for (size_t i = 0; i < spec_signature.size(); ++i)
-        {
-            const auto position = it->second[i];
-            if (position == PARTITION_FIELD_NOT_IN_SPEC)
-            {
-                constrains_every_target_field = false;
-                continue;
-            }
-            if (!accurateEquals(partition_key_value[position], target_partition_key[i]))
-                return false;
-        }
-
-        if (!constrains_every_target_field)
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "DROP PARTITION is not supported for Iceberg table {}: file {} was written under a partition spec "
-                "that does not contain every field of the current spec ({}), so it spans more than the dropped partition",
-                persistent_components.table_path, entry->parsed_entry->file_path_key.serialize(), partition_spec_id);
-
-        return true;
-    };
-
-    PreviousManifestActions manifest_actions;
-    std::vector<std::pair<ManifestFileCacheKey, std::unordered_set<String>>> manifests_to_rewrite;
-    size_t kept_manifests = 0;
-    size_t matched_files = 0;
-    size_t matched_data_files = 0;
-    size_t matched_records = 0;
-    size_t matched_bytes = 0;
-    size_t matched_position_delete_files = 0;
-    size_t matched_position_deletes = 0;
-    size_t matched_equality_delete_files = 0;
-    size_t matched_equality_deletes = 0;
-    size_t total_files = 0;
-
-    for (const auto & manifest_list_entry : data_snapshot->manifest_list_entries)
-    {
-        auto entries_handle = getManifestFileEntriesHandle(
-            object_storage, persistent_components, context, log,
-            manifest_list_entry, schema_id, *secondary_storages);
-
-        const auto & data_entries = entries_handle.getFilesWithoutDeleted(FileContentType::DATA);
-        const auto & position_delete_entries = entries_handle.getFilesWithoutDeleted(FileContentType::POSITION_DELETE);
-        const auto & equality_delete_entries = entries_handle.getFilesWithoutDeleted(FileContentType::EQUALITY_DELETE);
-
-        std::unordered_set<String> matched_paths_in_manifest;
-
-        auto match_entries = [&](const std::vector<ProcessedManifestFileEntryPtr> & entries)
-        {
-            for (const auto & entry : entries)
-            {
-                ++total_files;
-                if (!entry_is_in_target_partition(entry))
-                    continue;
-
-                const auto & parsed = *entry->parsed_entry;
-                matched_paths_in_manifest.insert(parsed.file_path_key.serialize());
-                matched_bytes += parsed.file_size_in_bytes;
-
-                switch (parsed.content_type)
-                {
-                    case FileContentType::DATA:
-                        ++matched_data_files;
-                        matched_records += parsed.record_count;
-                        break;
-                    case FileContentType::POSITION_DELETE:
-                        ++matched_position_delete_files;
-                        matched_position_deletes += parsed.record_count;
-                        break;
-                    case FileContentType::EQUALITY_DELETE:
-                        ++matched_equality_delete_files;
-                        matched_equality_deletes += parsed.record_count;
-                        break;
-                }
-
-                LOG_TRACE(log, "Matched {} file: {} ({} records)",
-                    FileContentTypeToString(parsed.content_type), parsed.file_path_key.serialize(), parsed.record_count);
-            }
-        };
-
-        match_entries(data_entries);
-        match_entries(position_delete_entries);
-        match_entries(equality_delete_entries);
-
-        if (matched_paths_in_manifest.empty())
-        {
-            ++kept_manifests;
-            continue;
-        }
-
-        const size_t live_entries_in_manifest
-            = data_entries.size() + position_delete_entries.size() + equality_delete_entries.size();
-        const size_t matched_in_manifest = matched_paths_in_manifest.size();
-
-        if (matched_in_manifest == live_entries_in_manifest)
-        {
-            PreviousManifestAction drop_action;
-            drop_action.kind = PreviousManifestAction::Kind::DROP;
-            manifest_actions.emplace(manifest_list_entry.manifest_file_path.serialize(), drop_action);
-        }
-        else
-        {
-            manifests_to_rewrite.emplace_back(manifest_list_entry, std::move(matched_paths_in_manifest));
-        }
-
-        matched_files += matched_in_manifest;
-    }
-
-    if (matched_files == 0)
+    if (scan.matched_files == 0)
     {
         LOG_INFO(log, "No files belong to partition {} (scanned {} files), nothing to drop",
-            dumpPartitionTuple(target_partition_key), total_files);
+            dumpPartitionTuple(target_partition_key), scan.total_files);
         return true;
+    }
+
+    PreviousManifestActions manifest_actions;
+    for (const auto & manifest_path : scan.fully_matched_manifests)
+    {
+        PreviousManifestAction drop_action;
+        drop_action.kind = PreviousManifestAction::Kind::DROP;
+        manifest_actions.emplace(manifest_path, drop_action);
     }
 
     LOG_INFO(log, "Dropping partition {}: {} data files ({} records), {} position delete files, {} equality delete "
         "files, {} bytes; {} manifests dropped, {} rewritten, {} kept unchanged",
-        dumpPartitionTuple(target_partition_key), matched_data_files, matched_records,
-        matched_position_delete_files, matched_equality_delete_files, matched_bytes,
-        manifest_actions.size(), manifests_to_rewrite.size(), kept_manifests);
+        dumpPartitionTuple(target_partition_key), scan.matched_data_files, scan.matched_records,
+        scan.matched_position_delete_files, scan.matched_equality_delete_files, scan.matched_bytes,
+        manifest_actions.size(), scan.manifests_to_rewrite.size(), scan.kept_manifests);
 
     std::optional<SnapshotSummaryTotals> parent_totals;
     {
@@ -1283,13 +1297,13 @@ bool IcebergMetadata::tryDropPartitionOnce(
 
     SnapshotSummary new_summary(
         SnapshotSummaryUpdateDelete{
-            .deleted_data_files = matched_data_files,
-            .removed_records = matched_records,
-            .removed_files_size = matched_bytes,
-            .removed_position_delete_files = matched_position_delete_files,
-            .removed_position_deletes = matched_position_deletes,
-            .removed_equality_delete_files = matched_equality_delete_files,
-            .removed_equality_deletes = matched_equality_deletes,
+            .deleted_data_files = scan.matched_data_files,
+            .removed_records = scan.matched_records,
+            .removed_files_size = scan.matched_bytes,
+            .removed_position_delete_files = scan.matched_position_delete_files,
+            .removed_position_deletes = scan.matched_position_deletes,
+            .removed_equality_delete_files = scan.matched_equality_delete_files,
+            .removed_equality_deletes = scan.matched_equality_deletes,
             .num_partitions = 1,
         },
         parent_totals);
@@ -1320,7 +1334,7 @@ bool IcebergMetadata::tryDropPartitionOnce(
 
     try
     {
-        for (const auto & [source_manifest, excluded_file_paths] : manifests_to_rewrite)
+        for (const auto & [source_manifest, excluded_file_paths] : scan.manifests_to_rewrite)
         {
             auto [source_storage, source_key] = resolveObjectStorageForPath(
                 persistent_components.table_location,
@@ -1408,7 +1422,7 @@ bool IcebergMetadata::tryDropPartitionOnce(
                 resolver, metadata_object, object_storage, *secondary_storages, context,
                 /* manifest_entry_names */ {}, new_snapshot, /* manifest_entry_sizes */ {},
                 *buf, FileContentType::DATA,
-                /* use_previous_snapshots */ kept_manifests > 0 || !manifests_to_rewrite.empty(),
+                /* use_previous_snapshots */ scan.kept_manifests > 0 || !scan.manifests_to_rewrite.empty(),
                 /* per_entry_content_types */ {},
                 /* existing_entry_counts */ {},
                 /* carry_forward_manifest_paths */ {},
@@ -1447,8 +1461,36 @@ bool IcebergMetadata::tryDropPartitionOnce(
         throw;
     }
 
-    LOG_INFO(log, "Dropped partition {} in snapshot {}",
-        dumpPartitionTuple(target_partition_key), new_snapshot->getValue<Int64>(f_metadata_snapshot_id));
+    if (purge)
+    {
+        std::unordered_map<std::shared_ptr<IObjectStorage>, StoredObjects> batches;
+        for (const auto& file_to_purge : scan.files_to_be_purged)
+        {
+            auto [storage, key] = resolveObjectStorageForPath(
+                persistent_components.table_location,
+                file_to_purge.serialize(),
+                object_storage,
+                *secondary_storages,
+                context,
+                resolver);
+
+            batches[storage].emplace_back(key);
+        }
+
+        for (auto & [storage, batch] : batches)
+        {
+            try
+            {
+                storage->removeObjectsIfExist(batch);
+            } catch (...)
+            {
+                tryLogCurrentException(log, "Failed to purge data files after DROP PARTITION");
+            }
+        }
+    }
+
+    LOG_INFO(log, "Dropped partition {} in snapshot {} (purge={})",
+        dumpPartitionTuple(target_partition_key), new_snapshot->getValue<Int64>(f_metadata_snapshot_id), purge);
     return true;
 }
 

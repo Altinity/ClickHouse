@@ -240,11 +240,41 @@ public:
     std::optional<String> sortingKey(ContextPtr) const override;
 
 private:
+    /// What the manifests of a snapshot hold of one partition
+    struct DropPartitionScan
+    {
+        /// Manifests whose every live entry is in the partition, so the whole manifest can be dropped
+        std::vector<String> fully_matched_manifests;
+        /// Manifests holding only part of the partition, with the file paths their rewritten copy must omit
+        std::vector<std::pair<ManifestFileCacheKey, std::unordered_set<String>>> manifests_to_rewrite;
+        std::vector<Iceberg::IcebergPathFromMetadata> files_to_be_purged;
+        size_t kept_manifests = 0;
+        size_t matched_files = 0;
+        size_t matched_data_files = 0;
+        size_t matched_records = 0;
+        size_t matched_bytes = 0;
+        size_t matched_position_delete_files = 0;
+        size_t matched_position_deletes = 0;
+        size_t matched_equality_delete_files = 0;
+        size_t matched_equality_deletes = 0;
+        size_t total_files = 0;
+    };
+
+    DropPartitionScan scanManifestsForPartition(
+        const Iceberg::IcebergDataSnapshotPtr & data_snapshot,
+        const Poco::JSON::Array::Ptr & spec_fields,
+        const Row & target_partition_key,
+        Int64 partition_spec_id,
+        Int32 schema_id,
+        const ContextPtr & context,
+        bool purge) const;
+
     bool tryDropPartitionOnce(
         const ASTPartition & partition_ast,
         const ContextPtr & context,
         const std::shared_ptr<DataLake::ICatalog> & catalog,
-        const StorageID & storage_id);
+        const StorageID & storage_id,
+        bool purge) const;
 
     static Iceberg::PersistentTableComponents initializePersistentTableComponents(
         ObjectStoragePtr object_storage,
