@@ -303,6 +303,18 @@ ReadFromCluster * findReadFromCluster(QueryPlan::Node * node)
     return nullptr;
 }
 
+ReadFromClusterQuery * findReadFromClusterQuery(QueryPlan::Node * node)
+{
+    if (!node)
+        return nullptr;
+    if (auto * read_from_cluster_query = dynamic_cast<ReadFromClusterQuery *>(node->step.get()))
+        return read_from_cluster_query;
+    for (auto * child : node->children)
+        if (auto * found = findReadFromClusterQuery(child))
+            return found;
+    return nullptr;
+}
+
 }
 
 /// Core case: the driver is the JOIN's leftmost table, and the whole query dispatches as one
@@ -541,11 +553,11 @@ TEST(DistributedObjectStorageJoinDispatch, BuriedDriverWithCommonTableExpression
     EXPECT_NE(plan_text.find("dim2"), String::npos) << plan_text;
 }
 
-/// SourceStepWithFilter::required_source_columns is checked against the driver's own StorageSnapshot
-/// (updatePrewhereInfo() calls storage_snapshot->getSampleBlockForColumns(required_source_columns)) -- it must
-/// be the driver's physical columns, never the whole dispatched query's own output projection (that's a
-/// separate concept, carried by ReadFromCluster's header/sample_block instead).
-TEST(DistributedObjectStorageJoinDispatch, RequiredSourceColumnsAreDriverColumnsNotOuterProjection)
+/// Whole-query dispatch gets its own source step rather than reusing the single-table one. That is what makes
+/// a whole class of mismatch unrepresentable: ReadFromCluster carries a StorageSnapshot and required columns
+/// describing one table, which for a dispatched query would describe the driver while the step's output is the
+/// query's result. ReadFromClusterQuery has neither, so there is nothing to disagree.
+TEST(DistributedObjectStorageJoinDispatch, DispatchUsesItsOwnSourceStepNotATableRead)
 {
     auto & state = State::instance();
     state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
@@ -567,10 +579,10 @@ TEST(DistributedObjectStorageJoinDispatch, RequiredSourceColumnsAreDriverColumns
     InterpreterSelectQueryAnalyzer interpreter(query_tree, state.context, options);
     auto & plan = interpreter.getQueryPlan();
 
-    auto * read_from_cluster = findReadFromCluster(plan.getRootNode());
-    ASSERT_NE(read_from_cluster, nullptr);
-    EXPECT_EQ(read_from_cluster->requiredSourceColumns(), Names{"id"})
-        << "expected the driver's own physical columns, not the outer query's projection (dst_city, c)";
+    EXPECT_NE(findReadFromClusterQuery(plan.getRootNode()), nullptr)
+        << "expected the dispatch to use its own source step";
+    EXPECT_EQ(findReadFromCluster(plan.getRootNode()), nullptr)
+        << "expected no single-table cluster read: the dispatched query is not one table's rows";
 }
 
 /// The mode can also arrive via a query-level SETTINGS clause rather than context->setSetting(); the header's

@@ -140,56 +140,62 @@ ActionsDAG andListingFilterDAGs(ActionsDAG first, ActionsDAG second)
 namespace
 {
 
-/// Applies the same normalization as ReadFromCluster::updateSettings, but to the query's own SETTINGS clause,
-/// which the worker would otherwise apply on top of the context settings and undo it.
-void sanitizeObjectStorageClusterQuerySettings(ASTPtr & query, bool is_whole_query_dispatch)
+/// The worker applies a query's own SETTINGS clause on top of the context settings, so a normalization made
+/// only in updateSettings would be undone. These two apply the same change to the query text.
+ASTSetQuery * getQuerySettings(ASTPtr & query)
 {
     auto * select_query = query->as<ASTSelectQuery>();
     if (!select_query)
-        return;
+        return nullptr;
 
     auto settings_ast = select_query->settings();
-    if (!settings_ast)
+    return settings_ast ? &settings_ast->as<ASTSetQuery &>() : nullptr;
+}
+
+void dropEmptySettings(ASTPtr & query, bool changed)
+{
+    auto * select_query = query->as<ASTSelectQuery>();
+    if (changed && select_query && select_query->settings()
+        && select_query->settings()->as<ASTSetQuery &>().changes.empty())
+        select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
+}
+
+/// A ReadFromCluster reached after whole-query dispatch was declined must behave exactly like `allow`.
+void downgradeJoinModeInQuerySettings(ASTPtr & query)
+{
+    auto * settings = getQuerySettings(query);
+    if (!settings)
         return;
 
-    auto & changes = settings_ast->as<ASTSetQuery &>().changes;
     bool changed = false;
-
-    if (is_whole_query_dispatch)
+    for (auto & change : settings->changes)
     {
-        changed = changes.removeSetting("object_storage_cluster");
-    }
-    else
-    {
-        for (auto & change : changes)
-        {
-            if (change.name != "object_storage_cluster_join_mode")
-                continue;
-            if (change.value.safeGet<String>() != "distributed")
-                continue;
-            change.value = Field(String("allow"));
-            changed = true;
-        }
+        if (change.name != "object_storage_cluster_join_mode")
+            continue;
+        if (change.value.safeGet<String>() != "distributed")
+            continue;
+        change.value = Field(String("allow"));
+        changed = true;
     }
 
-    if (changed && changes.empty())
-        select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
+    dropEmptySettings(query, changed);
+}
+
+/// `object_storage_cluster` outranks a table's own cluster in getClusterName, so leaving it set would make
+/// every table in a dispatched query fan out again from each worker.
+void dropClusterFromQuerySettings(ASTPtr & query)
+{
+    auto * settings = getQuerySettings(query);
+    if (!settings)
+        return;
+
+    dropEmptySettings(query, settings->changes.removeSetting("object_storage_cluster"));
 }
 
 }
 
 void ReadFromCluster::applyFilters(ActionDAGNodes added_filter_nodes)
 {
-    if (is_whole_query_dispatch)
-    {
-        /// query_info here describes the whole dispatched query, not one table expression, so the per-table
-        /// mapping SourceStepWithFilter::applyFilters builds (query_info.buildNodeNameToInputNodeColumn) does
-        /// not apply and throws. Use the base implementation, which skips it. Nothing downstream needs the
-        /// result either: createExtension passes no predicate in this mode.
-        SourceStepWithFilterBase::applyFilters(std::move(added_filter_nodes));
-        return;
-    }
-
     SourceStepWithFilter::applyFilters(std::move(added_filter_nodes));
     /// Empty later `applyFilters` (optimizer walk stops at JOIN) wipes
     /// `filter_actions_dag` and must not drop wrap `WHERE`.
@@ -214,11 +220,8 @@ void ReadFromCluster::createExtension()
     if (extension)
         return;
 
-    /// In whole-query dispatch this step's output is the dispatched query's result, not the driver's rows, so a
-    /// filter over it is not a predicate over the driver's columns and must not drive file-level pruning.
-    const ActionsDAG * filter = is_whole_query_dispatch
-        ? nullptr
-        : (listing_filter_dag ? listing_filter_dag.get() : (filter_actions_dag ? filter_actions_dag.get() : query_info.filter_actions_dag.get()));
+    const ActionsDAG * filter
+        = listing_filter_dag ? listing_filter_dag.get() : (filter_actions_dag ? filter_actions_dag.get() : query_info.filter_actions_dag.get());
     const ActionsDAG::Node * predicate = filter ? filter->getOutputs().at(0) : nullptr;
     extension = storage->getTaskIteratorExtension(
         predicate,
@@ -613,7 +616,6 @@ void IStorageCluster::read(
 /// no sample-block computation, and no RestoreQualifiedNamesVisitor (which assumes position 0).
 void IStorageCluster::readPreparedClusterQuery(
     QueryPlan & query_plan,
-    const Names & column_names,
     const StorageSnapshotPtr & storage_snapshot,
     SelectQueryInfo & query_info,
     ContextPtr context,
@@ -630,69 +632,24 @@ void IStorageCluster::readPreparedClusterQuery(
                                       /* only_replace_in_join_= */true);
     visitor.visit(query_to_send);
 
-    auto this_ptr = std::static_pointer_cast<IStorageCluster>(shared_from_this());
-
     std::optional<Tables> external_tables = std::nullopt;
     if (query_info.planner_context && query_info.planner_context->getMutableQueryContext())
         external_tables = query_info.planner_context->getMutableQueryContext()->getExternalTables();
 
-    auto reading = std::make_unique<ReadFromCluster>(
-        column_names,
-        query_info,
+    auto reading = std::make_unique<ReadFromClusterQuery>(
+        sample_block,
+        std::static_pointer_cast<IStorageCluster>(shared_from_this()),
         storage_snapshot,
         context,
-        sample_block,
-        std::move(this_ptr),
         std::move(query_to_send),
         processed_stage,
         cluster,
         log,
-        external_tables,
-        /*is_whole_query_dispatch_*/ true);
+        std::move(external_tables));
 
     query_plan.addStep(std::move(reading));
 }
 
-ASTPtr IStorageCluster::buildClusterTableFunctionAST(
-    const String & dispatch_cluster_name, const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context)
-{
-    const auto & storage_id = getStorageID();
-    ASTPtr identifier = storage_id.hasDatabase()
-        ? make_intrusive<ASTTableIdentifier>(storage_id.getDatabaseName(), storage_id.getTableName())
-        : make_intrusive<ASTTableIdentifier>(storage_id.getTableName());
-
-    auto table_expression = make_intrusive<ASTTableExpression>();
-    table_expression->database_and_table_name = identifier;
-    table_expression->children.push_back(identifier);
-
-    auto tables_element = make_intrusive<ASTTablesInSelectQueryElement>();
-    tables_element->table_expression = table_expression;
-    tables_element->children.push_back(table_expression);
-
-    auto tables = make_intrusive<ASTTablesInSelectQuery>();
-    tables->children.push_back(tables_element);
-
-    auto select_query = make_intrusive<ASTSelectQuery>();
-    select_query->setExpression(ASTSelectQuery::Expression::TABLES, tables);
-
-    ASTPtr query = select_query;
-
-    /// updateQueryToSendIfNeeded resolves the cluster through getClusterName, which prefers the query-level
-    /// `object_storage_cluster` setting. Scope the intended cluster on a throwaway context copy so the result
-    /// does not depend on whatever the initiator's ambient settings happen to carry.
-    auto scoped_context = Context::createCopy(context);
-    scoped_context->setSetting("object_storage_cluster", dispatch_cluster_name);
-
-    updateQueryToSendIfNeeded(query, storage_snapshot, scoped_context, /*make_cluster_function*/ true);
-
-    auto * table_function = extractTableFunctionFromSelectQuery(query);
-    if (!table_function)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Distributed object-storage dispatch: failed to build an explicit cluster table function for {}",
-            storage_id.getNameForLogs());
-
-    return ASTPtr(table_function);
-}
 
 IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     ClusterPtr cluster,
@@ -793,18 +750,26 @@ SinkToStoragePtr IStorageCluster::write(
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method write is not supported by storage {}", getName());
 }
 
-void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+namespace
 {
-    const Scalars & scalars = context->hasQueryContext() ? context->getQueryContext()->getScalars() : Scalars{};
-    const bool add_agg_info = processed_stage == QueryProcessingStage::WithMergeableState;
 
-    Pipes pipes;
-    auto new_context = updateSettings(context->getSettingsRef());
+/// The cluster-function transport, shared by ReadFromCluster and ReadFromClusterQuery: every replica is taken
+/// as a shard, each gets one connection, and all of them pull work from the same task iterator. What differs
+/// between the two callers is only what the query is and where the tasks come from.
+Pipe buildClusterFunctionRemotePipe(
+    const ASTPtr & query_to_send,
+    const SharedHeader & output_header,
+    const ContextPtr & new_context,
+    const ClusterPtr & cluster,
+    QueryProcessingStage::Enum processed_stage,
+    const RemoteQueryExecutor::Extension & extension,
+    const std::optional<Tables> & external_tables,
+    LoggerPtr log)
+{
+    const Scalars & scalars = new_context->hasQueryContext() ? new_context->getQueryContext()->getScalars() : Scalars{};
+    const bool add_agg_info = processed_stage == QueryProcessingStage::WithMergeableState;
     const auto & current_settings = new_context->getSettingsRef();
 
-    /// Mirrors the context-level normalization in updateSettings() onto query_to_send's own query-level
-    /// SETTINGS clause, which would otherwise re-override it on the worker (see that function's comment).
-    sanitizeObjectStorageClusterQuerySettings(query_to_send, is_whole_query_dispatch);
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(current_settings);
 
     size_t replica_index = 0;
@@ -812,10 +777,9 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     if (current_settings[Setting::max_parallel_replicas] > 1)
         max_replicas_to_use = std::min(max_replicas_to_use, current_settings[Setting::max_parallel_replicas].value);
 
-    createExtension();
-
     ProfileEvents::increment(ProfileEvents::Shards, max_replicas_to_use);
 
+    Pipes pipes;
     for (const auto & shard_info : cluster->getShardsInfo())
     {
         if (pipes.size() >= max_replicas_to_use)
@@ -838,14 +802,14 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
         auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
             std::vector<IConnectionPool::Entry>{try_results.front()},
             query_to_send->formatWithSecretsOneLine(),
-            getOutputHeader(),
+            output_header,
             new_context,
             /*throttler=*/nullptr,
             scalars,
             external_tables.has_value() ? *external_tables : Tables(),
             processed_stage,
             nullptr,
-            RemoteQueryExecutor::Extension{.task_iterator = extension->task_iterator, .replica_info = std::move(replica_info)},
+            RemoteQueryExecutor::Extension{.task_iterator = extension.task_iterator, .replica_info = std::move(replica_info)},
             shard_info.pool);
 
         remote_query_executor->setLogger(log);
@@ -861,11 +825,72 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     if (pipes.empty())
         throw Exception(ErrorCodes::ALL_CONNECTION_TRIES_FAILED, "Cannot connect to any replica for query execution");
 
-    auto pipe = Pipe::unitePipes(std::move(pipes));
+    return Pipe::unitePipes(std::move(pipes));
+}
+
+}
+
+void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+{
+    auto new_context = updateSettings(context->getSettingsRef());
+
+    /// Mirrors the context-level normalization in updateSettings() onto query_to_send's own query-level
+    /// SETTINGS clause, which would otherwise re-override it on the worker (see that function's comment).
+    downgradeJoinModeInQuerySettings(query_to_send);
+
+    createExtension();
+
+    auto pipe = buildClusterFunctionRemotePipe(
+        query_to_send, getOutputHeader(), new_context, cluster, processed_stage, *extension, external_tables, log);
+
     for (const auto & processor : pipe.getProcessors())
         processors.emplace_back(processor);
 
     pipeline.init(std::move(pipe));
+}
+
+ContextPtr ReadFromClusterQuery::updateSettings() const
+{
+    Settings new_settings{context->getSettingsRef()};
+
+    /// Cluster table functions should always skip unavailable shards.
+    new_settings[Setting::skip_unavailable_shards] = true;
+
+    /// Every table in the dispatched query, driver included, must be read locally on the worker. Which one
+    /// takes its files from this step's task iterator is announced separately, per table, by name.
+    new_settings[Setting::object_storage_cluster] = "";
+
+    auto new_context = Context::createCopy(context);
+    new_context->setSettings(new_settings);
+    return new_context;
+}
+
+void ReadFromClusterQuery::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+{
+    auto new_context = updateSettings();
+    dropClusterFromQuerySettings(query_to_send);
+
+    /// No predicate: this step's output is the whole query's result, so a filter over it says nothing about
+    /// which of the driver's files are needed. Recovering driver-only pruning means extracting the conjuncts
+    /// whose columns all come from the driver, which is not done yet -- every file of the driver is listed.
+    auto extension = driver_storage->getTaskIteratorExtension(
+        /*predicate=*/nullptr, /*filter=*/nullptr, new_context, cluster, driver_snapshot->metadata);
+
+    auto pipe = buildClusterFunctionRemotePipe(
+        query_to_send, getOutputHeader(), new_context, cluster, processed_stage, extension, external_tables, log);
+
+    for (const auto & processor : pipe.getProcessors())
+        processors.emplace_back(processor);
+
+    pipeline.init(std::move(pipe));
+}
+
+void ReadFromClusterQuery::describeActions(FormatSettings & format_settings) const
+{
+    std::string prefix(format_settings.offset, format_settings.indent_char);
+    format_settings.out << prefix << "Cluster: " << cluster->getName() << '\n';
+    format_settings.out << prefix << "File tasks from: " << driver_storage->getStorageID().getNameForLogs() << '\n';
+    format_settings.out << prefix << "Query: " << query_to_send->formatForLogging() << '\n';
 }
 
 IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context)
@@ -954,13 +979,8 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     /// Cluster table functions should always skip unavailable shards.
     new_settings[Setting::skip_unavailable_shards] = true;
 
-    /// The dispatched driver carries its cluster as an explicit table-function argument, so workers must not
-    /// also inherit `object_storage_cluster` -- it outranks a table's own cluster in getClusterName and would
-    /// make every partner table fan out again. Conversely, a ReadFromCluster reached after the candidate was
-    /// rejected must behave exactly like `allow`.
-    if (is_whole_query_dispatch)
-        new_settings[Setting::object_storage_cluster] = "";
-    else if (new_settings[Setting::object_storage_cluster_join_mode] == ObjectStorageClusterJoinMode::DISTRIBUTED)
+    /// A ReadFromCluster reached after whole-query dispatch was declined must behave exactly like `allow`.
+    if (new_settings[Setting::object_storage_cluster_join_mode] == ObjectStorageClusterJoinMode::DISTRIBUTED)
         new_settings[Setting::object_storage_cluster_join_mode] = ObjectStorageClusterJoinMode::ALLOW;
 
     auto new_context = Context::createCopy(context);

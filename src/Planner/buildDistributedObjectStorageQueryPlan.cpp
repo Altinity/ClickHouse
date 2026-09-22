@@ -12,7 +12,6 @@
 #include <Parsers/ASTSelectQuery.h>
 #include <Planner/PlannerContext.h>
 #include <Planner/Utils.h>
-#include <Storages/ColumnsDescription.h>
 #include <Storages/IStorageCluster.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/StorageSnapshot.h>
@@ -98,10 +97,6 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     dispatch_context->setSetting("object_storage_distributed_driver_database", driver_storage_id.getDatabaseName());
     dispatch_context->setSetting("object_storage_distributed_driver_table", driver_storage_id.getTableName());
 
-    /// SourceStepWithFilter checks required_source_columns against storage_snapshot, which here is the driver's.
-    /// Pass the driver's own physical columns, exactly as an ordinary per-table read would.
-    Names column_names = driver_storage_snapshot->getColumns(GetColumnsOptions(GetColumnsOptions::AllPhysical)).getNames();
-
     SelectQueryInfo query_info = select_query_info;
     query_info.query = query_to_send;
     query_info.query_tree = dispatch_boundary_node;
@@ -112,7 +107,6 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
 
     driver_storage->readPreparedClusterQuery(
         result.query_plan,
-        column_names,
         driver_storage_snapshot,
         query_info,
         dispatch_context,
