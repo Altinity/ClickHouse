@@ -29,13 +29,13 @@ To use token-based authentication, add `token_processors` section to `config.xml
 Its contents are different for different token processor types.
 
 **Common parameters**
-- `type` -- type of token processor. Supported values: `jwt_static_key`, `jwt_static_jwks`, `jwt_dynamic_jwks`, `entra` (`azure` is accepted as a back-compat alias and resolves to the same `entra` processor — see the [Entra](#entra) section), `openid`. Mandatory. Case-insensitive.
-- `token_cache_lifetime` -- maximum lifetime of cached token (in seconds). Optional, default: 3600.
+- `type` -- type of token processor. Supported values: `jwt_static_key`, `jwt_static_jwks`, `jwt_dynamic_jwks`, `aws_sso`, `entra` (`azure` is accepted as a back-compat alias and resolves to the same `entra` processor — see the [Entra](#entra) section), `openid`. Mandatory. Case-insensitive.
+- `token_cache_lifetime` -- maximum lifetime of cached token (in seconds). Optional, default: 3600 (60 for `aws_sso`).
 - `username_claim` -- name of claim (field) that will be treated as ClickHouse username. Optional, default: "sub".
 - `groups_claim` -- name of claim (field) that contains list of groups user belongs to. This claim will be looked up in the token itself (in case token is a valid JWT, e.g. in Keycloak) or in response from `/userinfo`. Optional, default: "groups".
 
 For each type, there are additional specific parameters (some of them are mandatory).
-If some parameters that are not required for current processor type are specified, they are ignored. 
+Unsupported parameters may be rejected; see the rules for each processor type.
 
 ## JWT (JSON Web Token)
 
@@ -131,11 +131,42 @@ For JWKS-based validators (`jwt_static_jwks` and `jwt_dynamic_jwks`), RS* and ES
 
 ## IdP-specific presets and generic external providers
 
-This section covers two related kinds of processor: per-IdP convenience presets built on top of the generic JWT processors (currently `entra`), and the generic `openid` processor that talks to an arbitrary OIDC-compliant identity provider.
+This section covers per-IdP presets built on the generic JWT processors (`entra`), direct AWS IAM Identity Center validation (`aws_sso`), and the generic `openid` processor for OIDC-compliant identity providers.
 
 :::note
 If the IdP issues access tokens that follow [RFC 9068](https://datatracker.ietf.org/doc/html/rfc9068) (the *JSON Web Token Profile for OAuth 2.0 Access Tokens*), the access token is itself a verifiable JWT and is best handled by one of the JWT processors above (typically `jwt_dynamic_jwks`) — no `/userinfo` or `/tokeninfo` round-trip is needed. The processors in this section exist for IdPs whose access tokens are opaque (e.g. Google), or whose JWT access tokens you prefer to validate by asking the IdP rather than locally.
 :::
+
+### AWS IAM Identity Center (AWS SSO) {#aws-sso}
+
+`<type>aws_sso</type>` validates IAM Identity Center access tokens through AWS `GetRoleCredentials`, then signs an STS `GetCallerIdentity` request with the returned temporary credentials. It checks the account and permission-set role and uses the full STS assumed-role ARN as the ClickHouse username. The server does not require its own AWS credentials.
+
+```xml
+<clickhouse>
+    <token_processors>
+        <aws_workforce>
+            <type>aws_sso</type>
+            <region>eu-central-1</region>
+            <account_id>123456789012</account_id>
+            <role_name>ClickHouseAccess</role_name>
+            <token_cache_lifetime>60</token_cache_lifetime>
+        </aws_workforce>
+    </token_processors>
+</clickhouse>
+```
+
+**Parameters:**
+
+- `region` — Region hosting IAM Identity Center, such as `eu-central-1`. Mandatory.
+- `account_id` — The 12-digit AWS account assigned to the user. Mandatory.
+- `role_name` — Assigned permission-set name, such as `ClickHouseAccess`. Use the name reported by AWS `ListAccountRoles`, not the generated `AWSReservedSSO_...` IAM role name or an ARN. Mandatory.
+- `token_cache_lifetime` — Maximum validation-cache and authenticated-session lifetime in seconds, capped by the returned role-credential expiry. Optional, default: 60. Range: 1–3600. Cached validations can remain usable until this deadline after access-token expiry, revocation, or assignment removal.
+
+The processor rejects `username_claim`, `groups_claim`, JWT claim restrictions, issuer/audience settings, and OIDC/JWKS endpoint settings. AWS responses provide no directory groups; use `common_roles` in the [external user directory](#idp-external-user-directory) to assign ClickHouse permissions.
+
+Obtain an IAM Identity Center access token with the `sso:account:access` scope for the configured region and an AWS account assignment. Pass it using `Authorization: Bearer` or `clickhouse-client --jwt`; the caller handles acquisition and refresh. Such tokens can obtain credentials for the user's AWS account assignments and cannot be restricted to a ClickHouse-specific audience by this processor; send them only to trusted servers over TLS.
+
+If `remote_url_allow_hosts` is configured, allow both `portal.sso.<region>.amazonaws.com` and `sts.<region>.amazonaws.com` (use `amazonaws.com.cn` for China regions). Endpoints are derived from the region. The build requires JWT, SSL, and AWS SDK support.
 
 ### Entra (Microsoft Entra ID, pure OIDC) {#entra}
 
