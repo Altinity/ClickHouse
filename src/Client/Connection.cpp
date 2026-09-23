@@ -627,7 +627,7 @@ void Connection::receiveHello()
     {
         readStringBinary(server_name, *in, DBMS_MAX_HELLO_STRING_SIZE);
         sanitizeUntrustedServerString(server_name);
-        server_antalya_protocol_version = AntalyaProtocol::negotiate(AntalyaProtocol::stripMarker(server_name));
+        server_antalya_protocol_version = AntalyaProtocol::stripMarker(server_name);
         readVarUInt(server_version_major, *in);
         readVarUInt(server_version_minor, *in);
         readVarUInt(server_revision, *in);

@@ -1,4 +1,3 @@
-#include <Core/Protocol.h>
 #include <Core/Settings.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
@@ -517,7 +516,7 @@ Cluster::Cluster(const Poco::Util::AbstractConfiguration & config,
                 address.quota_key,
                 address.cluster,
                 address.cluster_secret,
-                String(SERVER_CLIENT_NAME),
+                "server",
                 address.compression,
                 address.secure,
                 address.bind_host,
@@ -677,7 +676,7 @@ void Cluster::addShard(
             replica.quota_key,
             replica.cluster,
             replica.cluster_secret,
-            String(SERVER_CLIENT_NAME),
+            "server",
             replica.compression,
             replica.secure,
             replica.bind_host,
@@ -846,7 +845,7 @@ Cluster::Cluster(Cluster::ReplicasAsShardsTag, const Cluster & from, const Setti
                     address.quota_key,
                     address.cluster,
                     address.cluster_secret,
-                    String(SERVER_CLIENT_NAME),
+                    "server",
                     address.compression,
                     address.secure,
                     address.bind_host,
