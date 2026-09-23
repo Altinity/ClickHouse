@@ -26,6 +26,8 @@ struct IcebergDataSnapshot
     /// Rows in equality-delete files (snapshot summary). Not a count of deleted data rows;
     /// used only to fail closed early when present and > 0.
     std::optional<size_t> total_equality_delete_rows;
+    std::optional<String> partition_key;
+    std::optional<String> sorting_key;
 
     std::optional<size_t> getTotalRows() const
     {

@@ -28,6 +28,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Interpreters/AsynchronousInsertQueue.h>
+#include <Interpreters/ClusterFunctionReadTask.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/InternalTextLogsQueue.h>
 #include <Interpreters/Session.h>
@@ -38,7 +39,6 @@
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTInsertQuery.h>
 #include <Server/TCPServer.h>
-#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <base/defines.h>
 #include <base/scope_guard.h>

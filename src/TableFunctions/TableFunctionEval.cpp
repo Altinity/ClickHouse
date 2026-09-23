@@ -66,7 +66,10 @@ public:
     /// would be re-evaluated on every `ATTACH`, so such a table could fail to attach after a restart
     /// (the experimental setting might be disabled) or silently change if the expression depends on
     /// parameters, settings, or time. There is no stable persisted representation, so forbid it.
-    bool canBeUsedToCreateTable() const override { return false; }
+    void validateUseToCreateTable() const override
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table function '{}' cannot be used to create a table", getName());
+    }
 
 private:
     StoragePtr executeImpl(

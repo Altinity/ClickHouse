@@ -97,6 +97,7 @@ class InterserverIOHandler;
 class AsynchronousMetrics;
 class MergeList;
 class MovesList;
+class ExportsList;
 class ReplicatedFetchList;
 class RefreshSet;
 class Cluster;
@@ -1422,6 +1423,7 @@ public:
     void makeQueryContext();
     void makeQueryContextForMerge(const MergeTreeSettings & merge_tree_settings);
     void makeQueryContextForMutate(const MergeTreeSettings & merge_tree_settings);
+    void makeQueryContextForExportPart();
     void makeSessionContext();
     void makeGlobalContext();
     void makeBackgroundContext(const Poco::Util::AbstractConfiguration & config);
@@ -1462,6 +1464,9 @@ public:
 
     MovesList & getMovesList();
     const MovesList & getMovesList() const;
+
+    ExportsList & getExportsList();
+    const ExportsList & getExportsList() const;
 
     ReplicatedFetchList & getReplicatedFetchList();
     const ReplicatedFetchList & getReplicatedFetchList() const;
@@ -1706,6 +1711,8 @@ public:
     size_t getClustersVersion() const;
 
     void startClusterDiscovery();
+    void registerInAutodiscoveryClusters();
+    void unregisterInAutodiscoveryClusters();
 
     /// Sets custom cluster, but doesn't update configuration
     void setCluster(const String & cluster_name, const std::shared_ptr<Cluster> & cluster);
@@ -1841,6 +1848,15 @@ public:
     void setStopIntrospectionServersCallback(StopIntrospectionServersCallback && callback);
 
     void shutdown();
+
+    /// Stop some works to allow graceful shutdown later.
+    /// Returns true if stop successful.
+    bool stopSwarmMode();
+    /// Resume some works if we change our mind.
+    /// Returns true if start successful.
+    bool startSwarmMode();
+    /// Return current swarm mode state.
+    bool isSwarmModeEnabled() const;
 
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }
@@ -2129,6 +2145,7 @@ public:
 
     ThrottlerPtr getMutationsThrottler() const;
     ThrottlerPtr getMergesThrottler() const;
+    ThrottlerPtr getExportsThrottler() const;
 
     ThrottlerPtr getDistributedCacheReadThrottler() const;
     ThrottlerPtr getDistributedCacheWriteThrottler() const;

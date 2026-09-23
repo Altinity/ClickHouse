@@ -315,6 +315,7 @@ IcebergIterator::IcebergIterator(
           persistent_components_)
     , blocking_queue(100)
     , callback(std::move(callback_))
+    , table_schema_id(table_snapshot_->schema_id)
 {
     /// Decoding any manifest reads settings from the context, so a missing one is fatal either way.
     if (!local_context)
@@ -609,6 +610,12 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                 object_info->info.data_object_file_path_key);
         }
 
+        object_info->relative_path_with_metadata.setFileMetaInfo(std::make_shared<DataFileMetaInfo>(
+                                    *persistent_components.schema_processor,
+                                    table_schema_id, /// current schema id to use current column names
+                                    manifest_file_entry->resolved_schema_id, /// file's schema id to interpret value_bounds bytes
+                                    manifest_file_entry->parsed_entry->columns_infos,
+                                    manifest_file_entry->parsed_entry->value_bounds));
         ProfileEvents::increment(ProfileEvents::IcebergMetadataReturnedObjectInfos);
 
         if (callback)
