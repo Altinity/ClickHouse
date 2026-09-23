@@ -56,13 +56,13 @@ jobs:
     timeout-minutes: 150
     env:
       GITHUB_JOB_OVERRIDDEN: Build-${{inputs.build_name}}
-      # Abort a submodule fetch stalled below 1 KB/s for 60 s, so .github/retry.sh can retry it.
+      # Abort a submodule fetch stalled below 1 KB/s for 60 s.
       GIT_HTTP_LOW_SPEED_LIMIT: 1000
       GIT_HTTP_LOW_SPEED_TIME: 60
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     steps:
       - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        uses: Altinity/checkout@a6535ac1d2a2cb11b80968b640bcc3a36945892a
         with:
           clear-repository: true
           ref: ${{ fromJson(inputs.data).git_ref }}
