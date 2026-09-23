@@ -400,7 +400,13 @@ def install_thread_pool_fault_injection() -> None:
 
     logging.info("Installing thread-pool fault-injection config: %s -> %s", src, dst)
     subprocess.run(["ln", "-sf", src, dst], check=True)
-    if not call_with_retry(make_query_command("SYSTEM RELOAD CONFIG"), timeout=30, retry_count=5):
+    # NOTE (strtgbb): ARM debug + ThreadFuzzer config reload is ~18-23s; the
+    # default 15s receive_timeout loses the race and fails the job.
+    if not call_with_retry(
+        make_query_command("SYSTEM RELOAD CONFIG", receive_timeout=60),
+        timeout=90,
+        retry_count=5,
+    ):
         # Fail-close before the verify query: a stale non-zero probability left
         # over from an earlier reload would otherwise mask the reload failure.
         raise RuntimeError(
@@ -655,9 +661,9 @@ def execute_bash(full_command, timeout=120):
         raise
 
 
-def make_query_command(query: str) -> str:
+def make_query_command(query: str, receive_timeout: int = 15) -> str:
     return (
-        f'clickhouse client -q "{query}" --receive_timeout=15 --max_untracked_memory=1Gi '
+        f'clickhouse client -q "{query}" --receive_timeout={receive_timeout} --max_untracked_memory=1Gi '
         "--memory_profiler_step=1Gi --max_memory_usage_for_user=0 --max_memory_usage_in_client=1000000000 "
         "--enable-progress-table-toggle=0 "
         "--ast_fuzzer_runs=0",
