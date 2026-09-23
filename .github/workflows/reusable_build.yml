@@ -59,6 +59,9 @@ jobs:
       # Abort a submodule fetch stalled below 1 KB/s for 60 s.
       GIT_HTTP_LOW_SPEED_LIMIT: 1000
       GIT_HTTP_LOW_SPEED_TIME: 60
+      # GitHub answers 401 to some of the parallel anonymous submodule clones. Fail
+      # instead of prompting for a password on /dev/tty, so retry.sh can retry.
+      GIT_TERMINAL_PROMPT: 0
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     steps:
       - name: Check out repository code
