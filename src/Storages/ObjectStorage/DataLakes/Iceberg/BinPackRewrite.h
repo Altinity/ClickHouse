@@ -15,6 +15,11 @@ namespace DataLake
 class ICatalog;
 }
 
+namespace DB
+{
+struct SecondaryStorages;
+}
+
 namespace DB::Iceberg
 {
 
