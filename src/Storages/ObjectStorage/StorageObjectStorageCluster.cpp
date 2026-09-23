@@ -809,6 +809,15 @@ bool StorageObjectStorageCluster::appliesRowLevelFilterInRead(ContextPtr context
     return pure_storage && readsFromPureStorage(context);
 }
 
+SinkToStoragePtr StorageObjectStorageCluster::write(
+    const ASTPtr & query,
+    const StorageMetadataPtr & metadata_snapshot,
+    ContextPtr context,
+    bool async_insert)
+{
+    return pure_storage->write(query, metadata_snapshot, context, async_insert);
+}
+
 std::optional<QueryPipeline> StorageObjectStorageCluster::distributedWrite(
     const ASTInsertQuery & query,
     ContextPtr context)

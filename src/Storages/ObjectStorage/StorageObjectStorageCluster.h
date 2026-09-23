@@ -68,6 +68,14 @@ public:
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 
+    /// Direct inserts (e.g. `INSERT ... VALUES`) are written from the initiator even when a cluster is set;
+    /// only `INSERT ... SELECT` is distributed, see `distributedWrite`.
+    SinkToStoragePtr write(
+        const ASTPtr & query,
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        bool async_insert) override;
+
     std::optional<QueryPipeline> distributedWrite(
         const ASTInsertQuery & query,
         ContextPtr context) override;
