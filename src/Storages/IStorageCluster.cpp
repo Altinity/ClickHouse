@@ -75,6 +75,8 @@ namespace Setting
     extern const SettingsBool object_storage_remote_initiator;
     extern const SettingsString object_storage_remote_initiator_cluster;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
+    extern const SettingsString object_storage_distributed_driver_database;
+    extern const SettingsString object_storage_distributed_driver_table;
     extern const SettingsString object_storage_cluster;
 }
 
@@ -178,6 +180,20 @@ void downgradeJoinModeInQuerySettings(ASTPtr & query)
         changed = true;
     }
 
+    dropEmptySettings(query, changed);
+}
+
+/// A worker applies the query's own SETTINGS clause on top of the context settings, so a driver name written
+/// into the query text by hand survives the clearing `ReadFromCluster::updateSettings` does -- see there for
+/// why it must not reach a worker of this read.
+void dropDriverAnnouncementFromQuerySettings(ASTPtr & query)
+{
+    auto * settings = getQuerySettings(query);
+    if (!settings)
+        return;
+
+    bool changed = settings->changes.removeSetting("object_storage_distributed_driver_database");
+    changed |= settings->changes.removeSetting("object_storage_distributed_driver_table");
     dropEmptySettings(query, changed);
 }
 
@@ -837,6 +853,7 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     /// Mirrors the context-level normalization in updateSettings() onto query_to_send's own query-level
     /// SETTINGS clause, which would otherwise re-override it on the worker (see that function's comment).
     downgradeJoinModeInQuerySettings(query_to_send);
+    dropDriverAnnouncementFromQuerySettings(query_to_send);
 
     createExtension();
 
@@ -982,6 +999,13 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     /// A ReadFromCluster reached after whole-query dispatch was declined must behave exactly like `allow`.
     if (new_settings[Setting::object_storage_cluster_join_mode] == ObjectStorageClusterJoinMode::DISTRIBUTED)
         new_settings[Setting::object_storage_cluster_join_mode] = ObjectStorageClusterJoinMode::ALLOW;
+
+    /// Only whole-query dispatch may name a driver, and it sends that name from its own step. This read
+    /// supplies a task iterator too, so its workers see `collaborate_with_initiator` and would act on a name
+    /// that reached them: the table so named would read this step's file-task queue instead of listing its
+    /// own files. Nothing marks these settings internal, so clear them rather than trust no one set them.
+    new_settings[Setting::object_storage_distributed_driver_database] = "";
+    new_settings[Setting::object_storage_distributed_driver_table] = "";
 
     auto new_context = Context::createCopy(context);
     new_context->setSettings(new_settings);
