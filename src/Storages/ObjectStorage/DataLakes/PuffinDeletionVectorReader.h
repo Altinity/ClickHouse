@@ -4,18 +4,11 @@
 #include <Processors/Formats/Impl/PuffinBlockInputFormat.h>
 #include <base/types.h>
 
-<<<<<<< HEAD
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <string_view>
 #include <vector>
-=======
-#include <limits>
-#include <string_view>
-#include <vector>
-#include <optional>
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 
 namespace DB
 {
@@ -52,7 +45,6 @@ void validatePuffinBlobBounds(Int64 offset, Int64 length, size_t file_size, std:
 /// Iceberg deletion-vector-v1 envelope magic (`0xD1D33964`), shared with SQL `Puffin` decode.
 inline constexpr UInt8 DELETION_VECTOR_MAGIC[4] = {0xD1, 0xD3, 0x39, 0x64};
 
-<<<<<<< HEAD
 /// Puffin file magic (`PFA1`), shared with SQL `Puffin` decode.
 inline constexpr UInt8 PUFFIN_FILE_MAGIC[4] = {0x50, 0x46, 0x41, 0x31};
 
@@ -81,8 +73,6 @@ IcebergDeletionVectorContainer detectIcebergDeletionVectorContainer(
     Int64 content_size_in_bytes,
     std::string_view path);
 
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 /// Fail closed before envelope peek / full allocate. Shared by SQL `Puffin` and Iceberg loaders.
 /// Order: cardinality ceiling, then length bounds (`length < 0`, absolute blob cap, min envelope).
 void checkDeletionVectorBlobReadLimits(Int64 length, std::optional<UInt64> expected_cardinality);

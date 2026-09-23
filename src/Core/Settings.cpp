@@ -6051,7 +6051,6 @@ Minimum time of delay between 2 background compaction operations.
     DECLARE(Seconds, iceberg_compaction_data_cleanup, 60 * 60 * 3, R"(
 The time after which the data will be deleted.
 )", 0) \
-<<<<<<< HEAD
     DECLARE(UInt64, iceberg_compaction_commit_batch_size, 100, R"(
 Number of merged data files that background Iceberg compaction accumulates before publishing them in a new snapshot.
 
@@ -6060,8 +6059,6 @@ how long already merged files stay unpublished while compaction keeps finding ne
 of publishing only when compaction runs out of candidates - a state that is never reached while the table keeps
 receiving new data files, so every merged output is then written to object storage and never referenced by a snapshot.
 )", 0) \
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     DECLARE(Bool, use_puffin_files_cache, true, R"(
 If turned on, Iceberg reads may utilize the Puffin files cache for parsed puffin file content such as deletion vectors.
 

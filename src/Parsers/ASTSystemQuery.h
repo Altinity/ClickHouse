@@ -49,10 +49,7 @@ public:
         CLEAR_ICEBERG_METADATA_CACHE,
         CLEAR_PAIMON_METADATA_CACHE,
         CLEAR_PARQUET_METADATA_CACHE,
-<<<<<<< HEAD
         CLEAR_POINT_IN_POLYGON_CACHE,
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         CLEAR_PUFFIN_FILES_CACHE,
         CLEAR_FILESYSTEM_CACHE,
         CLEAR_DISTRIBUTED_CACHE,

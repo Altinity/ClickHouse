@@ -88,7 +88,6 @@ bool ManifestFileIterator::ManifestFileEntriesHandle::areAllDataFilesSortedBySor
 
 bool ManifestFileIterator::ManifestFileEntriesHandle::areAllDataFilesEligibleForLazyMaterialization(Int32 table_schema_id) const
 {
-<<<<<<< HEAD
     /// Equality deletes force reading all physical columns of the data files they apply to
     /// (see IcebergMetadata::getInitialSchemaByPath), so the pruned main read is impossible.
     if (!equality_delete_files->empty())
@@ -118,8 +117,6 @@ std::optional<UInt64> ManifestFileIterator::ManifestFileEntriesHandle::getRowsCo
     /// silently produce a wrong -- or, after the conversion to size_t, absurdly huge --
     /// count) and rather than rejected (the count is only an optimization, a malformed
     /// value must not make the table unreadable).
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     return getRecordCountInAllFilesExcludingDeleted(getFilesWithoutDeleted(content));
 }
 

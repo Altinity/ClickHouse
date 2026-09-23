@@ -124,13 +124,10 @@
     M(IcebergMetadataReturnedObjectInfos, "Total number of returned object infos from iceberg iterator.", ValueType::Number) \
     M(IcebergMinMaxNonPrunedDeleteFiles, "Total number of accepted data files-position delete file pairs by minmax analysis from pairs suitable by partitioning and sequence number.", ValueType::Number) \
     M(IcebergMinMaxPrunedDeleteFiles, "Total number of accepted data files-position delete file pairs by minmax analysis from pairs suitable by partitioning and sequence number.", ValueType::Number) \
-<<<<<<< HEAD
     M(OneLakeAccessTokenRequests, "Number of access token requests issued by the OneLake catalog via the Entra ID refresh token grant.", ValueType::Number) \
     M(OneLakeAccessTokenRequestFailures, "Number of failed access token requests issued by the OneLake catalog via the Entra ID refresh token grant (including expired or revoked refresh tokens).", ValueType::Number) \
     M(OneLakeAccessTokenRequestMicroseconds, "Total time spent requesting access tokens via the Entra ID refresh token grant in the OneLake catalog.", ValueType::Microseconds) \
     M(OneLakeAccessTokenExpirations, "Number of times the cached OneLake access token was found expired and renewed transparently.", ValueType::Number) \
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     M(PuffinFilesRead, "Number of Puffin files read (footer or deletion vector blob).", ValueType::Number) \
     M(PuffinFileReadMicroseconds, "Total time spent reading Puffin files.", ValueType::Microseconds) \
     M(PuffinFilesCacheHits, "Number of times parsed Puffin file content has been found in the cache.", ValueType::Number) \

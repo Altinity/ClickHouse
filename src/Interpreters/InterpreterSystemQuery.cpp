@@ -505,13 +505,10 @@ BlockIO InterpreterSystemQuery::execute()
 #else
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "The server was compiled without the support for Parquet");
 #endif
-<<<<<<< HEAD
         case Type::CLEAR_POINT_IN_POLYGON_CACHE:
             getContext()->checkAccess(AccessType::SYSTEM_DROP_POINT_IN_POLYGON_CACHE);
             clearPointInPolygonCache();
             break;
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         case Type::CLEAR_PUFFIN_FILES_CACHE:
             getContext()->checkAccess(AccessType::SYSTEM_DROP_PUFFIN_FILES_CACHE);
             system_context->clearPuffinFilesCache();
@@ -2829,7 +2826,6 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
             required_access.emplace_back(AccessType::SYSTEM_DROP_AVRO_SCHEMA_CACHE);
             break;
         case Type::CLEAR_PARQUET_METADATA_CACHE:
-<<<<<<< HEAD
             required_access.emplace_back(AccessType::SYSTEM_DROP_PARQUET_METADATA_CACHE);
             break;
         case Type::CLEAR_POINT_IN_POLYGON_CACHE:
@@ -2838,9 +2834,6 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CLEAR_PUFFIN_FILES_CACHE:
             required_access.emplace_back(AccessType::SYSTEM_DROP_PUFFIN_FILES_CACHE);
             break;
-=======
-        case Type::CLEAR_PUFFIN_FILES_CACHE:
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         case Type::CLEAR_PRIMARY_INDEX_CACHE:
             required_access.emplace_back(AccessType::SYSTEM_DROP_PRIMARY_INDEX_CACHE);
             break;

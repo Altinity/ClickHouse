@@ -100,15 +100,6 @@ struct IcebergDataObjectInfo : public ObjectInfo, std::enable_shared_from_this<I
 
     std::shared_ptr<ObjectInfo> clone() const override { return std::make_shared<IcebergDataObjectInfo>(*this); }
 
-<<<<<<< HEAD
-=======
-    ObjectStoragePtr getResolvedStorage() const { return resolved_storage; }
-
-    void setResolvedStorage(ObjectStoragePtr storage) { resolved_storage = std::move(storage); }
-
-    void addEqualityDeleteObject(const Iceberg::ProcessedManifestFileEntryPtr & equality_delete_object, const String & resolved_storage_path);
-
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     Iceberg::IcebergObjectSerializableInfo info;
 };
 

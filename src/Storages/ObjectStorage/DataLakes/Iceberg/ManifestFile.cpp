@@ -92,11 +92,7 @@ void requireDirectReferencedDataFileForPuffinDeletionVector(
     {
         throw DB::Exception(
             DB::ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
-<<<<<<< HEAD
             "Deletion vector entry in manifest file '{}' is missing referenced_data_file",
-=======
-            "Puffin deletion vector entry in manifest file '{}' is missing referenced_data_file",
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
             manifest_file_path);
     }
 }

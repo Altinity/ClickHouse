@@ -673,12 +673,7 @@ public:
     }
 
     /**
-<<<<<<< HEAD
      * Return new set of the smallest `limit` values (as UnsignedT) which are no less than `range_start`.
-=======
-     * Return new set of the smallest `limit` values in set which is no less than `range_start`.
-     * It's used in subset and currently only support UInt32
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
      */
     UInt64 rb_limit(UInt64 range_start, UInt64 limit, RoaringBitmapWithSmallSet & r1) const /// NOLINT
     {

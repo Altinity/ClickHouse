@@ -55,13 +55,10 @@ struct ObjectInfo
 
     FileBucketInfoPtr file_bucket_info;
 
-<<<<<<< HEAD
     /// Lazy materialization: if set, read only these rows of the file.
     /// Sorted absolute row indexes within the file, see FormatFilterInfo::rows_to_read.
     std::shared_ptr<const PaddedPODArray<UInt64>> rows_to_read;
 
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     /// Polymorphic copy: preserves the dynamic type (e.g. `IcebergDataObjectInfo` with equality /
     /// position deletes, resolved storage, and metadata path) where a plain copy would slice it.
     virtual std::shared_ptr<ObjectInfo> clone() const { return std::make_shared<ObjectInfo>(*this); }

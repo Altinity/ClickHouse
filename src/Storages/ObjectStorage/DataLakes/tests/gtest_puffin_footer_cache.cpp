@@ -84,11 +84,7 @@ TEST(PuffinFooterMemo, CoalescedSlicesShareOneFooterParse)
     ASSERT_TRUE(key_b.has_value());
 
     auto & counters = ProfileEvents::global_counters;
-<<<<<<< HEAD
     const auto files_read_before = counters[ProfileEvents::PuffinFilesRead];
-=======
-    const auto files_read_before = counters[ProfileEvents::PuffinFilesRead].load();
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 
     size_t footer_loads = 0;
     auto load_footer = [&]()
@@ -126,11 +122,7 @@ TEST(PuffinFooterMemo, CoalescedSlicesShareOneFooterParse)
 
     EXPECT_EQ(footer_loads, 1u);
     /// One footer parse (`PuffinFilesRead` in readPuffinFooter) plus two blob reads.
-<<<<<<< HEAD
     EXPECT_EQ(counters[ProfileEvents::PuffinFilesRead] - files_read_before, 3u);
-=======
-    EXPECT_EQ(counters[ProfileEvents::PuffinFilesRead].load() - files_read_before, 3u);
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 }
 
 TEST(PuffinFooterMemo, ClearDropsFooterEntries)

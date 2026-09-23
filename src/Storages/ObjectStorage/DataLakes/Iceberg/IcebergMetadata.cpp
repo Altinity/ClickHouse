@@ -10,10 +10,6 @@
 #include <limits>
 #include <memory>
 #include <optional>
-<<<<<<< HEAD
-=======
-#include <sstream>
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 #include <base/arithmeticOverflow.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnSet.h>
@@ -1314,7 +1310,6 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
         && *actual_data_snapshot->total_equality_delete_rows > 0)
         return {};
 
-<<<<<<< HEAD
     /// Row counts stored in the metadata layers above the manifest files are not used as
     /// data sources, because writers derive them instead of measuring them against the data:
     /// - the snapshot summary's `total-records` is maintained incrementally (parent total
@@ -1330,22 +1325,10 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
     /// required field in every format version, so summing it over the live data files is
     /// exact, at the cost of opening the manifest files (served from the Iceberg metadata
     /// cache on repeated queries).
-=======
-    /// Do not trust snapshot-summary `total-records` for the answer. Those totals are optional,
-    /// writer-maintained incrementally, and a single bad commit can poison every later snapshot.
-    /// Sum required per-data-file `record_count` from manifests when there are no live delete
-    /// files; otherwise fail closed to a real scan. Summary is compared only for a mismatch warning.
-    ///
-    /// Manifest-list `added_rows_count`/`existing_rows_count` are not used (some writers stamp them
-    /// from snapshot summary and can report 0 after compaction). Subtracting live position-delete /
-    /// deletion-vector `record_count` from data-file totals is also unsafe (duplicates, stale
-    /// references, DV supersession of parquet position deletes).
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     UInt64 result = 0;
     for (const auto & manifest_list_entry : actual_data_snapshot->manifest_list_entries)
     {
         auto manifest_file_ptr = getManifestFileEntriesHandle(
-<<<<<<< HEAD
             object_storage, persistent_components, local_context, log, manifest_list_entry, actual_table_state_snapshot.schema_id);
 
         /// Live delete files make an exact metadata-only count impossible:
@@ -1363,38 +1346,12 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
 
         /// nullopt means a corrupted manifest file with a negative `record_count`: fail
         /// closed to a real scan instead of returning a wrong count.
-=======
-            object_storage, persistent_components, local_context, log, manifest_list_entry, actual_table_state_snapshot.schema_id, *secondary_storages);
-
-        if (!manifest_file_ptr.getFilesWithoutDeleted(FileContentType::EQUALITY_DELETE).empty()
-            || !manifest_file_ptr.getFilesWithoutDeleted(FileContentType::POSITION_DELETE).empty())
-            return {};
-        /// nullopt means a negative / overflowing per-file `record_count`: fail closed to a
-        /// real scan instead of returning a wrong count. Do not use optional column
-        /// `value_counts` here — nested fields can report element counts larger than rows.
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         auto manifest_rows = manifest_file_ptr.getRowsCountInAllFilesExcludingDeleted(FileContentType::DATA);
         if (!manifest_rows.has_value())
             return {};
         /// Per-manifest sums are capped at Int64::max; still guard the cross-manifest total.
         if (common::addOverflow(result, static_cast<UInt64>(*manifest_rows), result))
             return {};
-<<<<<<< HEAD
-=======
-    }
-
-    if (auto summary_total_rows = actual_data_snapshot->getTotalRows();
-        summary_total_rows.has_value() && *summary_total_rows != result)
-    {
-        LOG_WARNING(
-            log,
-            "Iceberg snapshot summary of table {} claims {} total rows, but its manifest files describe {} rows. "
-            "The snapshot summary is inconsistent with the table data (possibly a corrupted commit in the table "
-            "history), using the row count from the manifest files",
-            persistent_components.table_location,
-            *summary_total_rows,
-            result);
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     }
 
     const auto summary_total_rows = actual_data_snapshot->getTotalRows();

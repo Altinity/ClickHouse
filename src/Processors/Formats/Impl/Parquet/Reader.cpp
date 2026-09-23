@@ -13,10 +13,7 @@
 #include <DataTypes/DataTypeNullable.h>
 #include <Common/FieldAccurateComparison.h>
 #include <Common/checkStackSize.h>
-<<<<<<< HEAD
 #include <Common/HashTable/HashSet.h>
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 #include <base/arithmeticOverflow.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Interpreters/castColumn.h>
@@ -364,7 +361,6 @@ void Reader::getHyperrectangleForRowGroup(const parq::RowGroup * meta, Hyperrect
     }
 }
 
-<<<<<<< HEAD
 bool Reader::spatialBboxStatsHaveNoNulls(const parq::RowGroup & meta, size_t spatial_key_condition_idx) const
 {
     for (size_t bbox_pc_idx : spatial_key_condition_bbox_col_indices.at(spatial_key_condition_idx))
@@ -378,8 +374,6 @@ bool Reader::spatialBboxStatsHaveNoNulls(const parq::RowGroup & meta, size_t spa
     return true;
 }
 
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 std::vector<size_t> buildRowGroupGlobalOffsets(const parq::FileMetaData & file_metadata)
 {
     if (file_metadata.num_rows < 0)
@@ -749,7 +743,6 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         if (meta->columns.size() != total_primitive_columns_in_file)
             throw Exception(ErrorCodes::INCORRECT_DATA, "Row group {} has unexpected number of columns: {} != {}", row_group_idx, meta->columns.size(), total_primitive_columns_in_file);
 
-<<<<<<< HEAD
         /// Lazy materialization: skip row groups that contain none of the requested rows.
         std::pair<size_t, size_t> requested_rows_slice {0, 0};
         if (rows_to_read)
@@ -762,8 +755,6 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
             requested_rows_slice = {size_t(begin_it - rows_to_read->begin()), size_t(end_it - rows_to_read->begin())};
         }
 
-=======
->>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         Hyperrectangle hyperrectangle(extended_sample_block.columns(), Range::createWholeUniverse());
         if ((options.format.parquet.filter_push_down && format_filter_info->key_condition)
             || !spatial_key_conditions.empty())
