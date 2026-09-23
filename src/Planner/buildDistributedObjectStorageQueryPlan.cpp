@@ -3,11 +3,9 @@
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/TableNode.h>
 #include <Common/Exception.h>
-#include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/SelectQueryOptions.h>
-#include <Processors/QueryPlan/ExpressionStep.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Planner/PlannerContext.h>
@@ -114,21 +112,10 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
         query_to_send,
         remote_header);
 
-    /// Kept from the parallel-replicas shape. With the query no longer rewritten the two headers are built from
-    /// the same tree and should already agree, so this is normally an identity; it stays as the one place that
-    /// would catch a divergence rather than let it reach the caller's finalization.
-    auto converting_actions = ActionsDAG::makeConvertingActions(
-        result.query_plan.getCurrentHeader()->getColumnsWithTypeAndName(),
-        remote_header->getColumnsWithTypeAndName(),
-        ActionsDAG::MatchColumnsMode::Position,
-        context,
-        false,
-        false,
-        nullptr);
-
-    auto converting_step = std::make_unique<ExpressionStep>(result.query_plan.getCurrentHeader(), std::move(converting_actions));
-    converting_step->setStepDescription("Convert columns to the original query's header");
-    result.query_plan.addStep(std::move(converting_step));
+    /// No converting step, unlike buildQueryPlanForParallelReplicas: that one rewrites the table expression
+    /// before serializing, so its two headers are built from different trees and can diverge. Here the query
+    /// is sent as written and `readPreparedClusterQuery` is given `remote_header` as the source step's own
+    /// output header, so the plan's current header is that same block.
 
     return result;
 }
