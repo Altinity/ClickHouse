@@ -723,9 +723,14 @@ void generateManifestFile(
         const DataFileEntryLineage * entry_lineage
             = per_file_entry_lineage.empty() ? nullptr : &per_file_entry_lineage[file_idx];
 
-        manifest.field(Iceberg::f_status)
-            = avro::GenericDatum(entry_lineage ? static_cast<Int32>(ManifestEntryStatus::EXISTING)
-                                               : static_cast<Int32>(ManifestEntryStatus::ADDED));
+        ManifestEntryStatus entry_status;
+        if (entry_lineage && entry_lineage->status_override)
+            entry_status = *entry_lineage->status_override;
+        else if (entry_lineage)
+            entry_status = ManifestEntryStatus::EXISTING;
+        else
+            entry_status = ManifestEntryStatus::ADDED;
+        manifest.field(Iceberg::f_status) = avro::GenericDatum(static_cast<Int32>(entry_status));
         Int64 snapshot_id = (entry_lineage && entry_lineage->added_snapshot_id)
             ? *entry_lineage->added_snapshot_id
             : new_snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);

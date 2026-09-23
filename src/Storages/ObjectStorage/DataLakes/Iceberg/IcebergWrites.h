@@ -61,11 +61,14 @@ struct DataFileColumnStatistics
 };
 
 /// Per-file manifest-entry lineage (`added_snapshot_id`, data `sequence_number` and `file_sequence_number`) carried over for a manifest-only rewrite.
+/// When `status_override` is set, the entry is written with that status instead of the default
+/// EXISTING/ADDED logic.  Used by bin-packing compaction to produce DELETED entries.
 struct DataFileEntryLineage
 {
     std::optional<Int64> added_snapshot_id;
     std::optional<Int64> sequence_number;
     std::optional<Int64> file_sequence_number;
+    std::optional<Iceberg::ManifestEntryStatus> status_override;
 };
 
 /// Read a data-file sidecar and return its contents in Iceberg wire format.
