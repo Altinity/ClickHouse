@@ -684,6 +684,12 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
     ClusterPtr cluster,
     StorageMetadataPtr storage_metadata_snapshot) const
 {
+    /// A catalog table is built with lazy_init, so nothing has resolved the configuration -- and with it the
+    /// path this listing walks -- by the time we get here. `read` reaches it through StorageObjectStorage,
+    /// which does its own lazy init; whole-query dispatch calls this directly and would otherwise list no
+    /// files at all, handing every worker an empty queue and silently returning no rows. Idempotent.
+    configuration->lazyInitializeIfNeeded(object_storage, local_context);
+
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
         configuration->getQuerySettings(local_context),
