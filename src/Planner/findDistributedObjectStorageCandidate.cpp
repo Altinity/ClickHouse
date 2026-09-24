@@ -116,7 +116,11 @@ struct DriverPathResult
 {
     bool unusable = false;
     const TableNode * driver = nullptr;
+    QueryTreeNodePtr driver_table_expression;
     IStorageCluster * driver_storage = nullptr;
+
+    /// Innermost first; the caller reverses and prepends the dispatch boundary.
+    std::vector<const QueryNode *> query_nodes_on_driver_path;
 
     /// No JOIN on the path means there is nothing here for this mode to optimize; stock `IStorageCluster::read`
     /// already handles a plain single-table cluster read.
@@ -143,6 +147,7 @@ DriverPathResult findDriverOnLeftSpine(const QueryTreeNodePtr & node, const Cont
 
         DriverPathResult result;
         result.driver = table_node;
+        result.driver_table_expression = node;
         result.driver_storage = storage;
         return result;
     }
@@ -162,6 +167,7 @@ DriverPathResult findDriverOnLeftSpine(const QueryTreeNodePtr & node, const Cont
         if (!isSafeIntermediateSubquery(*query_node))
             return unusableDriverPath();
 
+        result.query_nodes_on_driver_path.push_back(query_node);
         return result;
     }
 
@@ -245,7 +251,15 @@ std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCan
 
     DistributedObjectStorageCandidate candidate;
     candidate.driver = driver_path.driver;
+    candidate.driver_table_expression = driver_path.driver_table_expression;
     candidate.driver_storage = driver_path.driver_storage;
+
+    candidate.query_nodes_on_driver_path.push_back(query_node_typed);
+    candidate.query_nodes_on_driver_path.insert(
+        candidate.query_nodes_on_driver_path.end(),
+        driver_path.query_nodes_on_driver_path.rbegin(),
+        driver_path.query_nodes_on_driver_path.rend());
+
     return candidate;
 }
 

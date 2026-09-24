@@ -1,8 +1,12 @@
 #include <Planner/buildDistributedObjectStorageQueryPlan.h>
 
+#include <Analyzer/ColumnNode.h>
+#include <Analyzer/FunctionNode.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/TableNode.h>
+#include <Analyzer/UnionNode.h>
 #include <Common/Exception.h>
+#include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/SelectQueryOptions.h>
@@ -13,6 +17,7 @@
 #include <Storages/IStorageCluster.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/StorageSnapshot.h>
+#include <Storages/VirtualColumnUtils.h>
 #include <Storages/removeGroupingFunctionSpecializations.h>
 
 namespace DB
@@ -45,6 +50,83 @@ size_t countTableReferences(const ASTPtr & ast, const StorageID & storage_id)
         count += countTableReferences(child, storage_id);
 
     return count;
+}
+
+
+/// Splits a condition into its top-level `and` operands. Anything that is not an `and` is one atom.
+void collectConjunctionAtoms(const QueryTreeNodePtr & node, QueryTreeNodes & atoms)
+{
+    if (const auto * function_node = node->as<FunctionNode>(); function_node && function_node->getFunctionName() == "and")
+    {
+        for (const auto & argument : function_node->getArguments().getNodes())
+            collectConjunctionAtoms(argument, atoms);
+        return;
+    }
+
+    atoms.push_back(node);
+}
+
+/// True when every column this condition reads comes from `driver` and nothing in it has to be executed to be
+/// understood. A subquery is rejected outright: this condition is evaluated while listing the driver's files,
+/// long before there is a pipeline to run one in.
+bool readsOnlyDriverColumns(const QueryTreeNodePtr & node, const TableNode * driver)
+{
+    if (node->as<QueryNode>() || node->as<UnionNode>())
+        return false;
+
+    if (const auto * column_node = node->as<ColumnNode>())
+        return column_node->getColumnSource().get() == driver;
+
+    for (const auto & child : node->getChildren())
+        if (child && !readsOnlyDriverColumns(child, driver))
+            return false;
+
+    return true;
+}
+
+/// The predicate over the driver's own columns, as an ActionsDAG the file listing can prune with.
+///
+/// Correctness rests on two restrictions `findDistributedObjectStorageCandidate` already enforces, and would
+/// break if either were relaxed: the driver sits on the left spine of INNER ALL / LEFT joins only, so a driver
+/// row dropped here cannot have produced a result row; and every QueryNode crossed to reach it is
+/// partition-preserving (`isSafeIntermediateSubquery` -- no GROUP BY, DISTINCT, LIMIT, window), so dropping a
+/// row cannot change what the surviving rows compute.
+///
+/// Returns nothing when no atom qualifies, which simply means every file is listed.
+std::optional<ActionsDAG> buildDriverOnlyFilter(
+    const DistributedObjectStorageCandidate & candidate, const PlannerContextPtr & planner_context)
+{
+    QueryTreeNodes atoms;
+    for (const auto * query_node : candidate.query_nodes_on_driver_path)
+    {
+        if (query_node->hasPrewhere())
+            collectConjunctionAtoms(query_node->getPrewhere(), atoms);
+        if (query_node->hasWhere())
+            collectConjunctionAtoms(query_node->getWhere(), atoms);
+    }
+
+    QueryTreeNodes driver_atoms;
+    for (const auto & atom : atoms)
+        if (readsOnlyDriverColumns(atom, candidate.driver))
+            driver_atoms.push_back(atom->clone());
+
+    if (driver_atoms.empty())
+        return {};
+
+    const auto context = planner_context->getQueryContext();
+    /// mergeConditionNodes always builds an `and`, which needs at least two arguments.
+    auto condition = driver_atoms.size() == 1 ? driver_atoms.front() : mergeConditionNodes(driver_atoms, context);
+
+    /// Passed explicitly so buildFilterInfo does not go looking for this table expression in the planner
+    /// context: the dispatch boundary is planned as one unit and never registers the driver on its own.
+    const auto driver_columns = candidate.driver->getStorageSnapshot()->metadata->getColumns().getNamesOfPhysical();
+    NameSet required_names(driver_columns.begin(), driver_columns.end());
+
+    auto mutable_planner_context = planner_context;
+    auto filter_info = buildFilterInfo(
+        std::move(condition), candidate.driver_table_expression, mutable_planner_context, std::move(required_names));
+
+    return std::move(filter_info.actions);
 }
 
 }
@@ -103,6 +185,15 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     JoinTreeQueryPlan result;
     result.stage = processed_stage;
 
+    /// Prunes the driver's file listing. Without it every file of the driver is handed out and each worker
+    /// opens the ones its partitions cannot match only to discard them.
+    std::shared_ptr<const ActionsDAG> driver_filter;
+    if (auto filter_dag = buildDriverOnlyFilter(candidate, planner_context))
+    {
+        VirtualColumnUtils::buildSetsForDAGExcludingGlobalIn(*filter_dag, context);
+        driver_filter = std::make_shared<const ActionsDAG>(std::move(*filter_dag));
+    }
+
     driver_storage->readPreparedClusterQuery(
         result.query_plan,
         driver_storage_snapshot,
@@ -110,7 +201,8 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
         dispatch_context,
         processed_stage,
         query_to_send,
-        remote_header);
+        remote_header,
+        std::move(driver_filter));
 
     /// No converting step, unlike buildQueryPlanForParallelReplicas: that one rewrites the table expression
     /// before serializing, so its two headers are built from different trees and can diverge. Here the query

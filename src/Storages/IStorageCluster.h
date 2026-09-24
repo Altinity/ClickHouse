@@ -66,7 +66,8 @@ public:
         ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
         ASTPtr query_to_send,
-        SharedHeader sample_block);
+        SharedHeader sample_block,
+        std::shared_ptr<const ActionsDAG> driver_filter);
 
     bool isRemote() const final { return true; }
     bool supportsSubcolumns() const override  { return true; }
@@ -217,7 +218,8 @@ public:
         QueryProcessingStage::Enum processed_stage_,
         ClusterPtr cluster_,
         LoggerPtr log_,
-        std::optional<Tables> external_tables_)
+        std::optional<Tables> external_tables_,
+        std::shared_ptr<const ActionsDAG> driver_filter_)
         : ISourceStep(std::move(output_header_))
         , driver_storage(std::move(driver_storage_))
         , driver_snapshot(std::move(driver_snapshot_))
@@ -227,6 +229,7 @@ public:
         , cluster(std::move(cluster_))
         , log(log_)
         , external_tables(std::move(external_tables_))
+        , driver_filter(std::move(driver_filter_))
     {
     }
 
@@ -239,6 +242,8 @@ private:
     ClusterPtr cluster;
     LoggerPtr log;
     std::optional<Tables> external_tables;
+    /// Predicate over the driver's own columns, used to prune its file listing. Null means list everything.
+    std::shared_ptr<const ActionsDAG> driver_filter;
 
     ContextPtr updateSettings() const;
 };

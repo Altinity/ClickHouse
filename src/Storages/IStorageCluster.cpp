@@ -653,7 +653,8 @@ void IStorageCluster::readPreparedClusterQuery(
     ContextPtr context,
     QueryProcessingStage::Enum processed_stage,
     ASTPtr query_to_send,
-    SharedHeader sample_block)
+    SharedHeader sample_block,
+    std::shared_ptr<const ActionsDAG> driver_filter)
 {
     auto cluster_name_from_settings = getClusterName(context);
     const auto & settings = context->getSettingsRef();
@@ -677,7 +678,8 @@ void IStorageCluster::readPreparedClusterQuery(
         processed_stage,
         cluster,
         log,
-        std::move(external_tables));
+        std::move(external_tables),
+        std::move(driver_filter));
 
     query_plan.addStep(std::move(reading));
 }
@@ -900,11 +902,12 @@ void ReadFromClusterQuery::initializePipeline(QueryPipelineBuilder & pipeline, c
     auto new_context = updateSettings();
     prepareWholeQueryDispatchForRemoteExecution(query_to_send);
 
-    /// No predicate: this step's output is the whole query's result, so a filter over it says nothing about
-    /// which of the driver's files are needed. Recovering driver-only pruning means extracting the conjuncts
-    /// whose columns all come from the driver, which is not done yet -- every file of the driver is listed.
+    /// Not this step's own filter: its output is the whole query's result, so a predicate over that says
+    /// nothing about which of the driver's files are needed. The planner extracts the driver's own predicate
+    /// from the query tree instead and hands it over -- see buildDistributedObjectStorageQueryPlan.
+    const ActionsDAG::Node * predicate = driver_filter ? driver_filter->getOutputs().front() : nullptr;
     auto extension = driver_storage->getTaskIteratorExtension(
-        /*predicate=*/nullptr, /*filter=*/nullptr, new_context, cluster, driver_snapshot->metadata);
+        predicate, driver_filter.get(), new_context, cluster, driver_snapshot->metadata);
 
     auto pipe = buildClusterFunctionRemotePipe(
         query_to_send, getOutputHeader(), new_context, cluster, processed_stage, extension, external_tables, log);

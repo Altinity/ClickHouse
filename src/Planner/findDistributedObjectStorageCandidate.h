@@ -1,12 +1,14 @@
 #pragma once
 #include <memory>
 #include <optional>
+#include <vector>
 #include <base/types.h>
 
 namespace DB
 {
 
 class TableNode;
+class QueryNode;
 class IStorageCluster;
 
 class IQueryTreeNode;
@@ -23,7 +25,16 @@ struct DistributedObjectStorageCandidate
     /// crossing.
     const TableNode * driver = nullptr;
 
+    /// The same node, kept as a pointer the planner can hand to APIs that take a table expression.
+    QueryTreeNodePtr driver_table_expression;
+
     IStorageCluster * driver_storage = nullptr;
+
+    /// Every QueryNode crossed on the way down to the driver, outermost first, including the dispatch
+    /// boundary itself. Their `WHERE`/`PREWHERE` are the only places a predicate over the driver's own
+    /// columns can appear such that a driver row failing it cannot reach the result -- which is what makes
+    /// it safe to prune the driver's files by it. See buildDistributedObjectStorageQueryPlan.
+    std::vector<const QueryNode *> query_nodes_on_driver_path;
 };
 
 /// Decides whether `query_node` as a whole can be executed on a single DataLake-catalog driver's cluster.
