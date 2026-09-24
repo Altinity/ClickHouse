@@ -51,29 +51,6 @@ NamesAndTypesList lookupColumns()
 
 struct State;
 
-/// The builder resolves its driver replacement via QueryAnalysisPass, which -- like any table function
-/// reference -- looks `fakeDriverFunction` up in the real TableFunctionFactory (QueryAnalyzer::resolveTableFunction()).
-/// Registers a minimal stand-in that just returns the test's own driver storage, so the resolved
-/// TableFunctionNode carries the same columns real production code would get back from e.g. icebergS3Cluster().
-/// executeImpl() is defined out-of-line, after State, since it needs State to be a complete type.
-class FakeDriverTableFunction : public ITableFunction
-{
-public:
-    static constexpr auto name = "fakeDriverFunction";
-    std::string getName() const override { return name; }
-    bool hasStaticStructure() const override { return true; }
-    ColumnsDescription getActualTableStructure(ContextPtr, bool) const override { return ColumnsDescription{driverColumns()}; }
-
-protected:
-    /// The default implementation looks getStorageEngineName() up in StorageFactory for source-access checking,
-    /// which "FakeDriverStorage" (a test-only stand-in, never registered there) doesn't have.
-    std::optional<AccessTypeObjects::Source> getSourceAccessObject() const override { return std::nullopt; }
-
-private:
-    StoragePtr executeImpl(const ASTPtr &, ContextPtr, const std::string &, ColumnsDescription, bool) const override;
-    const char * getStorageEngineName() const override { return "FakeDriverStorage"; }
-};
-
 /// A DatabaseMemory that reports itself as a DataLake catalog: that is what makes the tables inside it eligible
 /// for dispatch (findDistributedObjectStorageCandidate asks DatabaseCatalog::isDatalakeCatalog).
 class FakeDataLakeDatabase : public DatabaseWithOwnTablesBase
@@ -112,33 +89,15 @@ public:
         return {};
     }
 
-protected:
-    /// Mirrors StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded()'s alias handling
-    /// closely enough to exercise buildDistributedObjectStorageQueryPlan.cpp's own fallback-alias fix:
-    /// transfers whatever alias the driver's table identifier already had (empty if none) onto the
-    /// replacement table function, exactly like the real rewrite.
-    void updateQueryToSendIfNeeded(ASTPtr & query, const StorageSnapshotPtr &, const ContextPtr &, bool make_cluster_function) override
+    /// Whole-query dispatch must never ask a storage to rewrite itself into a cluster table function --
+    /// that was the previous design, and the driver now travels as a plain table name announced in the
+    /// settings. Trips if anything on the dispatch path calls the rewrite hook again.
+    void updateQueryToSendIfNeeded(ASTPtr &, const StorageSnapshotPtr &, const ContextPtr &, bool) override
     {
-        if (!make_cluster_function)
-            return;
-
-        auto * select_query = query->as<ASTSelectQuery>();
-        if (!select_query || !select_query->tables())
-            return;
-
-        auto * tables = select_query->tables()->as<ASTTablesInSelectQuery>();
-        auto * table_expression = tables->children.at(0)->as<ASTTablesInSelectQueryElement>()->table_expression->as<ASTTableExpression>();
-        if (!table_expression || !table_expression->database_and_table_name)
-            return;
-
-        auto table_alias = table_expression->database_and_table_name->tryGetAlias();
-        auto function_ast = makeASTFunction("fakeDriverFunction");
-        function_ast->setAlias(table_alias);
-
-        table_expression->database_and_table_name = nullptr;
-        table_expression->table_function = function_ast;
-        table_expression->children[0] = function_ast;
+        rewrite_hook_called = true;
     }
+
+    mutable bool rewrite_hook_called = false;
 };
 
 /// Stand-in for a second table from the same DataLake catalog, e.g. ice.geo_location_lookup.
@@ -217,12 +176,9 @@ private:
         client_info.query_kind = ClientInfo::QueryKind::INITIAL_QUERY;
         context->setClientInfo(client_info);
 
-        /// The driver rewrite resolves its replacement TableFunctionNode via QueryAnalysisPass, which (like any
-        /// table function resolution -- QueryAnalyzer::resolveTableFunction()) requires a real query context
-        /// (context->getQueryContext() throws THERE_IS_NO_QUERY otherwise); every real query already has one.
+        /// Table resolution during analysis requires a real query context (context->getQueryContext() throws
+        /// THERE_IS_NO_QUERY otherwise); every real query already has one.
         context->makeQueryContext();
-
-        TableFunctionFactory::instance().registerFunction<FakeDriverTableFunction>(FunctionDocumentation{});
 
         static constexpr auto database_name = "distributed_object_storage_join_dispatch_test_db";
         static constexpr auto cluster_name = "vig-test";
@@ -242,14 +198,13 @@ private:
     }
 };
 
-StoragePtr FakeDriverTableFunction::executeImpl(const ASTPtr &, ContextPtr, const std::string &, ColumnsDescription, bool) const
-{
-    return State::instance().driver;
-}
-
 /// getQueryPlan() returns a reference into the interpreter's own move-only plan, so build+explain in one scope.
 String planAndExplain(const String & query, const ContextMutablePtr & context)
 {
+    /// Scope the tripwire to this plan: the driver storage is shared across tests, and a query that falls back
+    /// to an ordinary cluster read is *supposed* to call the rewrite hook.
+    State::instance().driver->rewrite_hook_called = false;
+
     ParserSelectQuery parser;
     ASTPtr ast = parseQuery(parser, query, 1000, 1000, 1000000);
     auto query_tree = buildQueryTree(ast, context);
@@ -346,8 +301,8 @@ TEST(DistributedObjectStorageJoinDispatch, DriverCrossesTheWireUnrewrittenAndNam
 
     ASSERT_NE(plan_text.find("ReadFromCluster"), String::npos) << plan_text;
 
-    EXPECT_EQ(plan_text.find("fakeDriverFunction("), String::npos)
-        << "expected the driver to stay an ordinary catalog table, not be rewritten to a cluster function, got:\n" << plan_text;
+    EXPECT_FALSE(State::instance().driver->rewrite_hook_called)
+        << "dispatch rewrote the driver into a cluster table function; it must be sent as a plain table name";
 
     size_t driver_mentions = 0;
     for (size_t pos = plan_text.find("driver"); pos != String::npos; pos = plan_text.find("driver", pos + 1))
@@ -512,8 +467,8 @@ TEST(DistributedObjectStorageJoinDispatch, DispatchesBuriedDriverWithoutRewritin
         "GROUP BY transaction_event.id",
         state.context);
 
-    EXPECT_EQ(plan_text.find("fakeDriverFunction("), String::npos)
-        << "expected no table to be rewritten into a cluster function, got:\n" << plan_text;
+    EXPECT_FALSE(State::instance().driver->rewrite_hook_called)
+        << "dispatch rewrote the driver into a cluster table function; it must be sent as a plain table name";
 
     EXPECT_NE(plan_text.find("safe_lookup"), String::npos) << "expected safe_lookup to remain an ordinary catalog identifier, got:\n" << plan_text;
     EXPECT_NE(plan_text.find("dim2"), String::npos) << "expected dim2 to remain an ordinary catalog identifier, got:\n" << plan_text;
@@ -546,8 +501,8 @@ TEST(DistributedObjectStorageJoinDispatch, BuriedDriverWithCommonTableExpression
         << "expected stock final-merge aggregation on top of the dispatched read, got:\n" << plan_text;
 
     /// No dangling CTE name: every CTE body must appear inlined in the forwarded query, and nothing is rewritten.
-    EXPECT_EQ(plan_text.find("fakeDriverFunction("), String::npos)
-        << "expected no table to be rewritten into a cluster function, got:\n" << plan_text;
+    EXPECT_FALSE(State::instance().driver->rewrite_hook_called)
+        << "dispatch rewrote the driver into a cluster table function; it must be sent as a plain table name";
 
     EXPECT_NE(plan_text.find("safe_lookup"), String::npos) << plan_text;
     EXPECT_NE(plan_text.find("dim2"), String::npos) << plan_text;

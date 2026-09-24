@@ -28,8 +28,9 @@ namespace Setting
 namespace
 {
 
-/// Dispatch drops the initiator's row policies: the driver is rewritten into an explicit `*Cluster()` call and
-/// every partner is re-resolved independently by each worker, so neither carries the policy across. Reject.
+/// Dispatch drops the initiator's row policies: every table in the dispatched query, driver included, is
+/// re-resolved independently by each worker, and a policy the initiator would have applied does not travel
+/// with the query text. Reject.
 bool hasEffectiveRowPolicy(const TableNode & table_node, const ContextPtr & context)
 {
     const auto & storage_id = table_node.getStorageID();

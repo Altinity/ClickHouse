@@ -1108,20 +1108,49 @@ def _setup_distributed_join_tables(started_cluster, nodes, test_ref):
     )
 
 
-def _assert_dispatched_whole(nodes, query_id):
-    """Checks the three runtime invariants of a whole-query dispatch, from system.query_log:
+def _driver_announcement(qualified_name):
+    """Splits ``catalog.`ns.table` `` into the database/table pair the initiator announces, which is
+    what `DatabaseDataLake` builds the driver's StorageID from."""
+    database, table = qualified_name.split(".", 1)
+    return database, table.strip("`")
 
-    1. the whole query -- JOIN and GROUP BY included -- reached a worker as a secondary query;
-    2. exactly one table in it is a cluster function, i.e. only the driver was rewritten;
-    3. no secondary query is a bare single-table cluster read, which is what a partner table
-       fanning out again from a worker would look like.
+
+def _assert_dispatched_whole(nodes, query_id, driver_database, driver_table):
+    """Checks the runtime invariants of a whole-query dispatch, from system.query_log:
+
+    1. the whole query -- JOIN and GROUP BY included -- reached a worker as a secondary query, carrying
+       the driver announcement the initiator chose;
+    2. the driver crossed the wire as the plain catalog table the user wrote. Nothing is rewritten into a
+       `*Cluster` table function; an earlier design did that, and this pins that it is not coming back;
+    3. every secondary query of this dispatch is that whole query. A partner table fanning out again from
+       a worker would show up as a further secondary query without the JOIN in it.
     """
     for node in nodes:
         node.query("SYSTEM FLUSH LOGS system.query_log")
 
-    secondary_with_join = 0
+    announced_whole_query = 0
     for node in nodes:
-        secondary_with_join += int(
+        announced_whole_query += int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND positionCaseInsensitive(query, 'join') != 0
+                  AND positionCaseInsensitive(query, 'group by') != 0
+                  AND Settings['object_storage_distributed_driver_database'] = '{driver_database}'
+                  AND Settings['object_storage_distributed_driver_table'] = '{driver_table}'
+                """
+            ).strip()
+        )
+    assert announced_whole_query > 0, (
+        f"query {query_id} was not dispatched whole to the cluster, or reached a worker without the "
+        f"driver announcement naming {driver_database}.{driver_table}"
+    )
+
+    for node in nodes:
+        rewritten = int(
             node.query(
                 f"""
                 SELECT count()
@@ -1129,28 +1158,12 @@ def _assert_dispatched_whole(nodes, query_id):
                 WHERE type = 'QueryStart' AND NOT is_initial_query
                   AND initial_query_id = '{query_id}'
                   AND positionCaseInsensitive(query, 'icebergs3cluster') != 0
-                  AND positionCaseInsensitive(query, 'join') != 0
-                  AND positionCaseInsensitive(query, 'group by') != 0
                 """
             ).strip()
         )
-    assert secondary_with_join > 0, f"query {query_id} was not dispatched whole to the cluster"
-
-    for node in nodes:
-        multi_driver = int(
-            node.query(
-                f"""
-                SELECT count()
-                FROM system.query_log
-                WHERE type = 'QueryStart' AND NOT is_initial_query
-                  AND initial_query_id = '{query_id}'
-                  AND countSubstringsCaseInsensitive(query, 'icebergs3cluster') > 1
-                """
-            ).strip()
-        )
-        assert multi_driver == 0, (
-            f"query {query_id}: more than one cluster function in a dispatched query on {node.name} -- "
-            "a partner table was rewritten as a driver"
+        assert rewritten == 0, (
+            f"query {query_id}: a dispatched query on {node.name} contains a cluster table function -- "
+            "the driver must travel as the catalog table the user wrote, named in the settings"
         )
 
         partner_fanout = int(
@@ -1160,14 +1173,13 @@ def _assert_dispatched_whole(nodes, query_id):
                 FROM system.query_log
                 WHERE type = 'QueryStart' AND NOT is_initial_query
                   AND initial_query_id = '{query_id}'
-                  AND positionCaseInsensitive(query, 'icebergs3cluster') != 0
                   AND positionCaseInsensitive(query, 'join') = 0
                 """
             ).strip()
         )
         assert partner_fanout == 0, (
-            f"query {query_id}: a single-table cluster read was issued on {node.name} -- "
-            "a partner table fanned out again instead of being read locally"
+            f"query {query_id}: a secondary query without the JOIN was issued on {node.name} -- "
+            "a table fanned out again instead of being read locally"
         )
 
 
@@ -1272,7 +1284,7 @@ def test_distributed_join_dispatch(started_cluster):
 
         query_id = uuid.uuid4().hex
         assert run(query, "distributed", query_id=query_id) == expected, f"{name} differs under dispatch"
-        _assert_dispatched_whole(nodes, query_id)
+        _assert_dispatched_whole(nodes, query_id, *_driver_announcement(fact))
 
 
 def test_distributed_join_dispatch_falls_back(started_cluster):
@@ -1317,11 +1329,10 @@ def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cl
     owns that queue, so a partner answering yes as well would read the driver's files under its own
     schema.
 
-    Two guards currently prevent that, and this test exists to keep them: `tryGetTableImpl` only falls
-    back to the parallel-replicas cluster when `!is_secondary_query`, and a dispatched worker query
-    contains a `*Cluster` table function, which makes the context distributed. Remove either and a
-    partner becomes a queue consumer. The settings below are the combination that makes the rest of the
-    constructor's condition true.
+    What prevents that is the constructor asking, first, whether this is a dispatched worker at all: if it
+    is, only the announced driver consumes the queue and the parallel-replica settings get no say. Make
+    those two conditions independent again -- the earlier `||` -- and a partner becomes a queue consumer.
+    The settings below are the combination that makes the parallel-replica half true.
     """
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
@@ -1370,7 +1381,7 @@ def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cl
 
     # Without this the test would silently stop covering anything if the candidate were rejected
     # whenever the parallel-replicas settings are set.
-    _assert_dispatched_whole(nodes, query_id)
+    _assert_dispatched_whole(nodes, query_id, *_driver_announcement(fact))
 
 def test_used_storages_in_query_log(started_cluster):
     node1 = started_cluster.instances["node1"]

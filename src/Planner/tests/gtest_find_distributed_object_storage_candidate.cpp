@@ -290,8 +290,8 @@ TEST(FindDistributedObjectStorageCandidate, RejectsBuriedDriverWithoutSelectAcce
     EXPECT_FALSE(findDistributedObjectStorageCandidate(query_tree, context).has_value());
 }
 
-/// A row policy on the driver itself: the driver is rewritten to its explicit *Cluster() form and no longer
-/// resolves via its catalog identity, so the policy can never be reattached on the worker.
+/// A row policy on the driver itself: a worker re-resolves the driver from its own catalog and the initiator's
+/// policy does not travel with the query text, so it could never be reapplied there.
 TEST(FindDistributedObjectStorageCandidate, RejectsDriverWithRowPolicy)
 {
     const auto & state = State::instance();
