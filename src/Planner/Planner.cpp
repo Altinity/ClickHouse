@@ -48,6 +48,7 @@
 #include <Processors/QueryPlan/WindowStep.h>
 #include <Processors/QueryPlan/ReadFromRecursiveCTEStep.h>
 #include <Processors/QueryPlan/ReadFromQueryResultCacheStep.h>
+#include <Processors/QueryPlan/ObjectFilterStep.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 
 #include <Interpreters/ClusterProxy/executeQuery.h>
@@ -66,6 +67,7 @@
 #include <Storages/StorageMerge.h>
 #include <Storages/StorageView.h>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
+#include <Storages/IStorageCluster.h>
 
 #include <AggregateFunctions/IAggregateFunction.h>
 
@@ -187,6 +189,7 @@ namespace Setting
     extern const SettingsBool make_distributed_plan;
     extern const SettingsBool query_plan_enable_optimizations;
     extern const SettingsUInt64 query_plan_max_limit_for_top_k_optimization;
+    extern const SettingsBool use_hive_partitioning;
 }
 
 namespace ServerSetting
@@ -236,6 +239,11 @@ void checkStoragesSupportTransactions(const PlannerContextPtr & planner_context)
                 storage->getStorageID().getNameForLogs());
     }
 }
+
+}
+
+namespace
+{
 
 /** Storages can rely that filters that for storage will be available for analysis before
   * getQueryProcessingStage method will be called.
@@ -416,6 +424,8 @@ FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & 
     return res;
 }
 
+}
+
 FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & query_tree_node, const SelectQueryOptions & select_query_options, const ActionsDAG * post_filter)
 {
     if (select_query_options.only_analyze)
@@ -436,6 +446,9 @@ FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & 
 
     return collectFiltersForAnalysis(query_tree_node, table_expressions_nodes, context, post_filter);
 }
+
+namespace
+{
 
 /// Extend lifetime of query context, storages, and table locks
 void extendQueryContextAndStoragesLifetime(QueryPlan & query_plan, const PlannerContextPtr & planner_context)
@@ -642,6 +655,21 @@ ALWAYS_INLINE void addFilterStep(
         filter_analysis_result.filter_column_name,
         filter_analysis_result.remove_filter_column);
     appendSetsFromActionsDAG(where_step->getExpression(), useful_sets);
+    where_step->setStepDescription(step_description);
+    query_plan.addStep(std::move(where_step));
+}
+
+template <size_t size>
+ALWAYS_INLINE void addObjectFilterStep(
+    QueryPlan & query_plan,
+    FilterAnalysisResult & filter_analysis_result,
+    const char (&step_description)[size])
+{
+    auto actions = std::move(filter_analysis_result.filter_actions->dag);
+
+    auto where_step = std::make_unique<ObjectFilterStep>(query_plan.getCurrentHeader(),
+        std::move(actions),
+        filter_analysis_result.filter_column_name);
     where_step->setStepDescription(step_description);
     query_plan.addStep(std::move(where_step));
 }
@@ -2839,6 +2867,16 @@ void Planner::buildPlanForQueryNode()
 
     if (query_processing_info.isSecondStage() || query_processing_info.isFromAggregationState())
     {
+        if (settings[Setting::use_hive_partitioning]
+            && !query_processing_info.isFirstStage()
+            && expression_analysis_result.hasWhere())
+        {
+            if (typeid_cast<ReadFromCluster *>(query_plan.getRootNode()->step.get()))
+            {
+                addObjectFilterStep(query_plan, expression_analysis_result.getWhere(), "WHERE");
+            }
+        }
+
         if (query_processing_info.isFromAggregationState())
         {
             /// Aggregation was performed on remote shards

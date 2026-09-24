@@ -54,12 +54,13 @@ CREATE DATABASE db2_${DB};
 CREATE TABLE ${DB}.t (x UInt32) ENGINE = Memory;
 CREATE TABLE ${DB}.secret (x UInt32) ENGINE = Memory AS SELECT 111;
 CREATE VIEW ${DB}.sv DEFINER=default SQL SECURITY DEFINER AS SELECT x FROM ${DB}.secret;
+CREATE VIEW ${DB}.dv AS SELECT currentHandler() = '${HDIST}' AS h_ok, currentRequestURL() = '${P}/dist' AS u_ok;
 GRANT SELECT ON ${DB}.sv TO \`$RUSER\`;
 CREATE HANDLER \`$HA\` URL '${P}/exact' AS SELECT 1 AS a, 'hello' AS b FORMAT TSV;
 CREATE HANDLER \`$HP\` URL PREFIX '${P}/prefix/' AS SELECT 'prefixed' AS r FORMAT TSV;
 CREATE HANDLER \`$HB\` URL '${P}/introspect' AS SELECT currentHandler() = '${HB}' AS h_ok, currentRequestURL() = '${P}/introspect?max_block_size=100' AS u_ok FORMAT TSV;
 CREATE HANDLER \`$HBRANCH\` URL '${P}/branch' AS SELECT if(currentHandler() = '${HBRANCH}', 'matched', 'no') AS r FORMAT TSV;
-CREATE HANDLER \`$HDIST\` URL '${P}/dist' AS SELECT * FROM remote('127.0.0.2', view(SELECT currentHandler() = '${HDIST}' AS h_ok, currentRequestURL() = '${P}/dist' AS u_ok)) FORMAT TSV;
+CREATE HANDLER \`$HDIST\` URL '${P}/dist' AS SELECT * FROM remote('127.0.0.2', ${DB}, dv) FORMAT TSV;
 CREATE HANDLER \`$HC\` URL REGEXP '${P}/item/(?P<id>[0-9]+)' AS SELECT {id:UInt32} AS id FORMAT TSV;
 CREATE HANDLER \`$HPOST\` URL '${P}/param' METHODS (GET, POST) AS SELECT {n:UInt32} * 2 AS doubled FORMAT TSV;
 CREATE HANDLER \`$HHDR\` URL '${P}/rheaders' AS SELECT 1 SETTINGS http_response_headers = {'X-Custom':'yes'};
@@ -95,8 +96,8 @@ ${CLICKHOUSE_CURL} -sS "${BASE}${P}/branch"
 
 echo "=== currentHandler() and currentRequestURL() are visible on remote shards of a distributed query ==="
 # The handler name and request URL live in ClientInfo, so they are serialized on distributed fan-out.
-# The handler evaluates them on a remote shard via remote(view(...)) and compares them with the values
-# seen locally.
+# The handler reads a view on a remote shard through remote(), and the view compares the values the
+# shard sees with the ones the handler was invoked with.
 ${CLICKHOUSE_CURL} -sS "${BASE}${P}/dist"
 
 echo "=== parameterized query via regexp URL capture ==="

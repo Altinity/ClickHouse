@@ -4,7 +4,11 @@
 #include <cctype>
 #include <limits>
 
+#include <base/arithmeticOverflow.h>
+#include <Columns/IColumn.h>
 #include <Common/Exception.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypesDecimal.h>
 #include <Parsers/Prometheus/parseTimeSeriesTypes.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
 
@@ -95,6 +99,97 @@ std::vector<Int64> fieldToInt64Array(const Field & value, std::string_view conte
     result.reserve(src.size());
     for (const auto & elem : src)
         result.push_back(fieldToInt64(elem, context, arg_name));
+    return result;
+}
+
+namespace
+{
+    /// Iceberg store decimal values as unscaled value with two's-complement big-endian binary
+    /// using the minimum number of bytes for the value
+    /// Our decimal binary representation is little endian
+    /// so we cannot reuse our default code for parsing it.
+    ///
+    /// NOTE: It's very weird, but Decimal values for lower bound and upper bound
+    /// are stored rounded, without fractional part. What is more strange
+    /// the integer part is rounded mathematically correctly according to fractional part.
+    /// Example: 17.22 -> 17, 8888.999 -> 8889, 1423.77 -> 1424.
+    /// I've checked two implementations: Spark and Amazon Athena and both of them
+    /// do this.
+    ///
+    /// The problem is -- we cannot use rounded values for lower bounds and upper bounds.
+    /// Example: upper_bound(x) = 17.22, but it's rounded 17.00, now condition WHERE x >= 17.21 will
+    /// check rounded value and say: "Oh largest value is 17, so values bigger than 17.21 cannot be in this file,
+    /// let's skip it". But it will produce incorrect result since actual value (17.22 >= 17.21) is stored in this file.
+    ///
+    /// To handle this issue we subtract 1 from the integral part for lower_bound and add 1 to integral
+    /// part of upper_bound. This produces: 17.22 -> [16.0, 18.0]. So this is more rough boundary,
+    /// but at least it doesn't lead to incorrect results.
+    /// `compensate_rounding` widens the bound as described above; pass false to read the value exactly
+    /// as the manifest declares it.
+    template <typename DecimalType>
+    std::optional<Field> deserializeDecimalBound(const std::string & str, UInt32 scale, bool lower_bound, bool compensate_rounding = true)
+    {
+        using NativeType = typename DecimalType::NativeType;
+        using UnsignedType = make_unsigned_t<NativeType>;
+
+        if (str.size() > sizeof(NativeType))
+            return std::nullopt;
+
+        /// Accumulate into the unsigned counterpart, pre-filled with the sign bits,
+        /// so that the sign extension comes out of the shifts themselves.
+        UnsignedType unscaled = (str[0] & 0x80) ? ~UnsignedType(0) : UnsignedType(0);
+        for (const auto byte : str)
+            unscaled = (unscaled << 8) | static_cast<UInt8>(byte);
+
+        NativeType unscaled_value = static_cast<NativeType>(unscaled);
+
+        if (compensate_rounding && scale)
+        {
+            NativeType scaler = lower_bound ? -10 : 10;
+            for (UInt32 i = 1; i < scale; ++i)
+                scaler *= 10;
+
+            /// The bound is stored as raw bytes and is never checked against the declared precision, so
+            /// widening it can leave the type. A value that has no widened form is not a usable bound.
+            if (common::addOverflow(unscaled_value, scaler, unscaled_value))
+                return std::nullopt;
+        }
+
+        return DecimalField<DecimalType>(unscaled_value, scale);
+    }
+
+}
+
+std::optional<Field>
+deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_type, bool lower_bound, bool compensate_rounding)
+{
+    auto non_nullable_type = removeNullable(expected_type);
+    auto column = non_nullable_type->createColumn();
+    if (WhichDataType(non_nullable_type).isDecimal())
+    {
+        if (str.empty())
+            return std::nullopt;
+
+        const UInt32 scale = getDecimalScale(*non_nullable_type);
+        if (checkDecimal<Decimal32>(*non_nullable_type))
+            return deserializeDecimalBound<Decimal32>(str, scale, lower_bound, compensate_rounding);
+        if (checkDecimal<Decimal64>(*non_nullable_type))
+            return deserializeDecimalBound<Decimal64>(str, scale, lower_bound, compensate_rounding);
+        if (checkDecimal<Decimal128>(*non_nullable_type))
+            return deserializeDecimalBound<Decimal128>(str, scale, lower_bound, compensate_rounding);
+        if (checkDecimal<Decimal256>(*non_nullable_type))
+            return deserializeDecimalBound<Decimal256>(str, scale, lower_bound, compensate_rounding);
+        return std::nullopt;
+    }
+
+    if (non_nullable_type->getTypeId() == TypeIndex::Variant)
+        return std::nullopt;
+
+    /// For all other types except decimal binary representation
+    /// matches our internal representation
+    column->insertData(str.data(), str.length());
+    Field result;
+    column->get(0, result);
     return result;
 }
 
