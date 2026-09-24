@@ -886,7 +886,7 @@ PruningMemoryReservation ReadManager::pruningMemoryReservation(const MemoryUsage
     /// per-reader - each reserve the entire watermark, breaking its documented "total across those files"
     /// contract and overshooting the cap before scheduler throttling has a chance to help.
     size_t watermark = SharedResourcesExt::getLimitsPerReader(
-        *parser_shared_resources, stages[idx].memory_target_fraction).memory_high_watermark;
+        *parser_shared_resources, stages[idx].memory_target_fraction, stages[idx].thread_target_fraction).memory_high_watermark;
     /// Never let a tiny per-reader budget round down to 0, which `PruningMemoryReservation` reads as
     /// "unbounded"; a near-zero budget must instead mean "reserve nothing", i.e. skip pruning (full scan).
     watermark = std::max(watermark, size_t(1));
