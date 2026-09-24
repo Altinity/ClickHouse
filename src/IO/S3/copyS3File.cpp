@@ -640,8 +640,27 @@ namespace
         void performCopy()
         {
             LOG_TEST(log, "Copy object {} to {} using native copy", src_key, dest_key);
-            bool use_single_operation_copy = !supports_multipart_copy || !request_settings[S3RequestSetting::allow_multipart_copy]
-                || (size <= request_settings[S3RequestSetting::max_single_operation_copy_size]);
+
+            const bool ranged = offset != 0;
+            const bool multipart_copy_available
+                = supports_multipart_copy && request_settings[S3RequestSetting::allow_multipart_copy];
+
+            if (ranged && !multipart_copy_available)
+            {
+                if (!allow_fallback)
+                    throw Exception(
+                        ErrorCodes::NOT_IMPLEMENTED,
+                        "Native copy of a byte range requires multipart copy, which is unavailable for {}",
+                        src_key);
+
+                LOG_TRACE(log, "Ranged native copy needs multipart copy, falling back for {}", src_key);
+                fallback_method();
+                return;
+            }
+
+            const bool use_single_operation_copy = !ranged
+                && (!multipart_copy_available
+                    || (size <= request_settings[S3RequestSetting::max_single_operation_copy_size]));
 
             if (use_single_operation_copy)
                 performSingleOperationCopy();
@@ -863,6 +882,7 @@ void copyS3File(
     const String & src_key,
     size_t src_offset,
     size_t src_size,
+    size_t src_object_offset,
     std::shared_ptr<const S3::Client> dest_s3_client,
     const String & dest_bucket,
     const String & dest_key,
@@ -908,7 +928,7 @@ void copyS3File(
         src_s3_client,
         src_bucket,
         src_key,
-        src_offset,
+        src_offset + src_object_offset,
         src_size,
         dest_bucket,
         dest_key,

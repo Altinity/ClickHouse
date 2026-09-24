@@ -2103,10 +2103,10 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
     /// `partAccess()` then `store()` pair (each an independent `pointer_mutex` acquisition) -- see
     /// `poolAccess()`.
     const auto snap = poolAccess();
-    auto view = snap.part_access->getView(r->refKey(), Cas::Freshness::CachedForLoad);
-    if (!view)
+    const auto manifest_view = snap.part_access->getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    if (!manifest_view)
         return std::nullopt;
-    if (const auto * entry = view->findFile(r->file))
+    if (const auto * entry = manifest_view->findFile(r->file))
     {
         const auto location = snap.pool->locate(*entry);
         BlobViewPlan plan;

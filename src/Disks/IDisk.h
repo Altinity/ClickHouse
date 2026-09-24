@@ -318,6 +318,9 @@ public:
     /// StoredObject::remote_path for each stored object combined with the name of the objects' namespace.
     virtual Strings getBlobPath(const String & path) const = 0;
 
+    /// Where the file's bytes begin inside the object `getBlobPath` names.
+    virtual size_t getObjectPayloadOffset(const String & path) const = 0;
+
     /// Returns whether the blob paths this disk uses are randomly generated.
     virtual bool areBlobPathsRandom() const = 0;
 
