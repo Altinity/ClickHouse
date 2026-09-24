@@ -149,6 +149,7 @@ If the IdP issues access tokens that follow [RFC 9068](https://datatracker.ietf.
             <region>eu-central-1</region>
             <account_id>123456789012</account_id>
             <role_name>ClickHouseAccess</role_name>
+            <identity_store_id>d-1234567890</identity_store_id>
             <token_cache_lifetime>60</token_cache_lifetime>
         </aws_workforce>
     </token_processors>
@@ -160,13 +161,25 @@ If the IdP issues access tokens that follow [RFC 9068](https://datatracker.ietf.
 - `region` — Region hosting IAM Identity Center, such as `eu-central-1`. Mandatory.
 - `account_id` — The 12-digit AWS account assigned to the user. Mandatory.
 - `role_name` — Assigned permission-set name, such as `ClickHouseAccess`. Use the name reported by AWS `ListAccountRoles`, not the generated `AWSReservedSSO_...` IAM role name or an ARN. Mandatory.
+- `identity_store_id` — IAM Identity Center Identity Store ID, such as `d-1234567890`. When set, the processor resolves the AWS-issued role-session name with Identity Store `GetUserId`, loads all direct memberships with `ListGroupMembershipsForMember`, and exposes their stable `GroupId` values to the external user directory. Optional.
 - `token_cache_lifetime` — Maximum validation-cache and authenticated-session lifetime in seconds, capped by the returned role-credential expiry. Optional, default: 60. Range: 1–3600. Cached validations can remain usable until this deadline after access-token expiry, revocation, or assignment removal.
 
-The processor rejects `username_claim`, `groups_claim`, JWT claim restrictions, issuer/audience settings, and OIDC/JWKS endpoint settings. AWS responses provide no directory groups; use `common_roles` in the [external user directory](#idp-external-user-directory) to assign ClickHouse permissions.
+The processor rejects `username_claim`, `groups_claim`, JWT claim restrictions, issuer/audience settings, and OIDC/JWKS endpoint settings. Without `identity_store_id`, no external groups are returned; use `common_roles` in the [external user directory](#idp-external-user-directory) to assign ClickHouse permissions.
+
+With `identity_store_id`, grant the configured permission set `identitystore:GetUserId` and `identitystore:ListGroupMembershipsForMember`. The lookup is signed with the user's short-lived role credentials, so the ClickHouse server still needs no AWS credentials of its own. Group lookup fails closed: an Identity Store error rejects authentication rather than creating a session without roles. Use the returned group IDs as the `from` values in [`roles_mapping`](#idp-external-user-directory), for example:
+
+```xml
+<roles_mapping>
+    <map>
+        <from>1234567890-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee</from>
+        <to>ch_analyst</to>
+    </map>
+</roles_mapping>
+```
 
 Obtain an IAM Identity Center access token with the `sso:account:access` scope for the configured region and an AWS account assignment. Pass it using `Authorization: Bearer` or `clickhouse-client --jwt`; the caller handles acquisition and refresh. Such tokens can obtain credentials for the user's AWS account assignments and cannot be restricted to a ClickHouse-specific audience by this processor; send them only to trusted servers over TLS.
 
-If `remote_url_allow_hosts` is configured, allow both `portal.sso.<region>.amazonaws.com` and `sts.<region>.amazonaws.com` (use `amazonaws.com.cn` for China regions). Endpoints are derived from the region. The build requires JWT, SSL, and AWS SDK support.
+If `remote_url_allow_hosts` is configured, allow `portal.sso.<region>.amazonaws.com`, `sts.<region>.amazonaws.com`, and, when `identity_store_id` is set, `identitystore.<region>.amazonaws.com` (use `amazonaws.com.cn` for China regions). Endpoints are derived from the region. The build requires JWT, SSL, and AWS SDK support.
 
 ### Entra (Microsoft Entra ID, pure OIDC) {#entra}
 

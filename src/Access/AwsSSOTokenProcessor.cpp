@@ -13,11 +13,13 @@
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/signer/AWSAuthV4Signer.h>
 #include <aws/core/http/standard/StandardHttpRequest.h>
+#include <aws/core/utils/json/JsonSerializer.h>
 #include <aws/core/utils/xml/XmlSerializer.h>
 #include <openssl/ssl.h>
 
 #include <algorithm>
 #include <array>
+#include <sstream>
 
 namespace DB
 {
@@ -30,6 +32,7 @@ namespace ErrorCodes
 namespace
 {
 constexpr size_t max_response_size = 64 * 1024;
+constexpr size_t max_group_pages = 100;
 
 bool isSafeHeader(const String & value)
 {
@@ -65,15 +68,77 @@ String xmlField(const Aws::Utils::Xml::XmlNode & parent, const char * name)
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "AWS STS response has an empty or invalid '{}' field", name);
     return value;
 }
+
+bool isHex(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+}
+
+bool isValidIdentityStoreId(const String & value)
+{
+    if (value.size() == 12 && value.starts_with("d-"))
+        return std::ranges::all_of(value.begin() + 2, value.end(), isHex);
+    if (value.size() != 36)
+        return false;
+    for (size_t i = 0; i < value.size(); ++i)
+    {
+        if (i == 8 || i == 13 || i == 18 || i == 23)
+        {
+            if (value[i] != '-')
+                return false;
+        }
+        else if (!isHex(value[i]))
+            return false;
+    }
+    return true;
+}
+}
+
+namespace AwsSSO
+{
+
+String parseUserId(const String & response)
+{
+    picojson::value json;
+    if (!parseWholeJSON(json, response).empty())
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid AWS Identity Store JSON response");
+    return requiredString(json, "UserId");
+}
+
+GroupMembershipsPage parseGroupMemberships(const String & response)
+{
+    picojson::value json;
+    if (!parseWholeJSON(json, response).empty())
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid AWS Identity Store JSON response");
+
+    const auto & memberships = requiredField(json, "GroupMemberships");
+    if (!memberships.is<picojson::array>())
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "AWS Identity Store response has an invalid 'GroupMemberships' field");
+
+    GroupMembershipsPage page;
+    for (const auto & membership : memberships.get<picojson::array>())
+        page.group_ids.insert(requiredString(membership, "GroupId"));
+
+    if (json.contains("NextToken"))
+    {
+        const auto & next_token = json.get("NextToken");
+        if (!next_token.is<String>() || (!next_token.get<String>().empty() && !isSafeHeader(next_token.get<String>())))
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "AWS Identity Store response has an invalid 'NextToken' field");
+        page.next_token = next_token.get<String>();
+    }
+    return page;
+}
+
 }
 
 AwsSSOTokenProcessor::AwsSSOTokenProcessor(
     const String & name, UInt64 cache_lifetime, const String & region_, const String & account_id_,
-    const String & role_name_, const ConnectionTimeouts & timeouts_)
+    const String & role_name_, const String & identity_store_id_, const ConnectionTimeouts & timeouts_)
     : ITokenProcessor(name, cache_lifetime)
     , region(region_)
     , account_id(account_id_)
     , role_name(role_name_)
+    , identity_store_id(identity_store_id_)
     , partition(region.starts_with("cn-") ? "aws-cn" : region.starts_with("us-gov-") ? "aws-us-gov" : "aws")
     , domain(region.starts_with("cn-") ? "amazonaws.com.cn" : "amazonaws.com")
     , timeouts(timeouts_)
@@ -95,6 +160,8 @@ AwsSSOTokenProcessor::AwsSSOTokenProcessor(
             return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || std::string_view("_+=,.@-").contains(c);
         }))
         throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "AWS SSO requires a permission-set role_name (1 to 32 characters)");
+    if (!identity_store_id.empty() && !isValidIdentityStoreId(identity_store_id))
+        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "AWS SSO requires a valid identity_store_id");
     if (cache_lifetime == 0 || cache_lifetime > 3600)
         throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "AWS SSO token_cache_lifetime must be between 1 and 3600 seconds");
 }
@@ -109,7 +176,13 @@ String AwsSSOTokenProcessor::getSTSEndpoint() const
     return "https://sts." + region + "." + domain + "/?Action=GetCallerIdentity&Version=2011-06-15";
 }
 
-AwsSSOTokenProcessor::Response AwsSSOTokenProcessor::request(const String & url, const Headers & headers) const
+String AwsSSOTokenProcessor::getIdentityStoreEndpoint() const
+{
+    return "https://identitystore." + region + "." + domain + "/";
+}
+
+AwsSSOTokenProcessor::Response AwsSSOTokenProcessor::request(
+    const String & method, const String & url, const Headers & headers, const String & request_body) const
 {
     Response result;
     const Poco::URI uri(url);
@@ -120,10 +193,17 @@ AwsSSOTokenProcessor::Response AwsSSOTokenProcessor::request(const String & url,
     SSL_CTX_set_verify(tls_context->sslContext(), SSL_VERIFY_PEER, nullptr);
     Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort(), tls_context);
     setTimeouts(session, timeouts);
-    Poco::Net::HTTPRequest http_request(Poco::Net::HTTPRequest::HTTP_GET, uri.getPathAndQuery());
+    Poco::Net::HTTPRequest http_request(method, uri.getPathAndQuery());
     for (const auto & [name, value] : headers)
         http_request.set(name, value);
-    session.sendRequest(http_request);
+    if (!request_body.empty())
+        http_request.setContentLength(request_body.size());
+    auto & output = session.sendRequest(http_request);
+    if (!request_body.empty())
+    {
+        output.write(request_body.data(), request_body.size());
+        output.flush();
+    }
     Poco::Net::HTTPResponse response;
     auto & body = session.receiveResponse(response);
     result.status = response.getStatus();
@@ -147,6 +227,72 @@ AwsSSOTokenProcessor::Response AwsSSOTokenProcessor::request(const String & url,
     return result;
 }
 
+String AwsSSOTokenProcessor::identityStoreRequest(
+    const String & target, const String & body, const std::shared_ptr<Aws::Auth::AWSCredentialsProvider> & provider) const
+{
+    Aws::Client::AWSAuthV4Signer signer(provider, "identitystore", region);
+    Aws::Http::Standard::StandardHttpRequest aws_request(
+        Aws::Http::URI(getIdentityStoreEndpoint()), Aws::Http::HttpMethod::HTTP_POST);
+    aws_request.SetHeaderValue("content-type", "application/x-amz-json-1.1");
+    aws_request.SetHeaderValue("x-amz-target", target.c_str());
+    auto body_stream = Aws::MakeShared<std::stringstream>("AwsSSOTokenProcessor");
+    body_stream->write(body.data(), body.size());
+    body_stream->seekg(0);
+    aws_request.AddContentBody(body_stream);
+    if (!signer.SignRequest(aws_request, region.c_str(), "identitystore", true))
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Cannot sign AWS Identity Store request");
+
+    Headers headers;
+    for (const auto & [name, value] : aws_request.GetHeaders())
+        headers.emplace_back(name, value);
+    const auto response = request(Poco::Net::HTTPRequest::HTTP_POST, getIdentityStoreEndpoint(), headers, body);
+    if (response.status != 200)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "AWS Identity Store request failed with HTTP status {}", response.status);
+    return response.body;
+}
+
+std::set<String> AwsSSOTokenProcessor::getGroupIds(
+    const String & user_name, const std::shared_ptr<Aws::Auth::AWSCredentialsProvider> & provider) const
+{
+    Aws::Utils::Json::JsonValue unique_attribute;
+    unique_attribute.WithString("AttributePath", "userName");
+    unique_attribute.WithString("AttributeValue", user_name.c_str());
+    Aws::Utils::Json::JsonValue alternate_identifier;
+    alternate_identifier.WithObject("UniqueAttribute", std::move(unique_attribute));
+    Aws::Utils::Json::JsonValue user_request;
+    user_request.WithString("IdentityStoreId", identity_store_id.c_str());
+    user_request.WithObject("AlternateIdentifier", std::move(alternate_identifier));
+    const auto user_request_body = user_request.View().WriteCompact();
+    const auto user_id = AwsSSO::parseUserId(
+        identityStoreRequest("AWSIdentityStore.GetUserId", String(user_request_body.c_str(), user_request_body.size()), provider));
+
+    std::set<String> group_ids;
+    String next_token;
+    for (size_t page_number = 0; page_number < max_group_pages; ++page_number)
+    {
+        Aws::Utils::Json::JsonValue member_id;
+        member_id.WithString("UserId", user_id.c_str());
+        Aws::Utils::Json::JsonValue groups_request;
+        groups_request.WithString("IdentityStoreId", identity_store_id.c_str());
+        groups_request.WithObject("MemberId", std::move(member_id));
+        groups_request.WithInteger("MaxResults", 100);
+        if (!next_token.empty())
+            groups_request.WithString("NextToken", next_token.c_str());
+
+        const auto groups_request_body = groups_request.View().WriteCompact();
+        auto page = AwsSSO::parseGroupMemberships(identityStoreRequest(
+            "AWSIdentityStore.ListGroupMembershipsForMember",
+            String(groups_request_body.c_str(), groups_request_body.size()), provider));
+        group_ids.insert(page.group_ids.begin(), page.group_ids.end());
+        if (page.next_token.empty())
+            return group_ids;
+        if (page.next_token == next_token)
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "AWS Identity Store returned a repeated pagination token");
+        next_token = std::move(page.next_token);
+    }
+    throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "AWS Identity Store group membership exceeds {} pages", max_group_pages);
+}
+
 bool AwsSSOTokenProcessor::resolveAndValidate(TokenCredentials & credentials) const
 {
     /// Auto-discovery stops on exceptions, so AWS and transport failures must deny only this processor.
@@ -158,7 +304,9 @@ bool AwsSSOTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
         Poco::URI portal(getPortalEndpoint() + "/federation/credentials");
         portal.addQueryParameter("account_id", account_id);
         portal.addQueryParameter("role_name", role_name);
-        const auto role_response = request(portal.toString(), {{"x-amz-sso_bearer_token", credentials.getToken()}, {"Accept", "application/json"}});
+        const auto role_response = request(
+            Poco::Net::HTTPRequest::HTTP_GET, portal.toString(),
+            {{"x-amz-sso_bearer_token", credentials.getToken()}, {"Accept", "application/json"}});
         if (role_response.status != 200)
             return false;
 
@@ -188,7 +336,7 @@ bool AwsSSOTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
         Headers headers;
         for (const auto & [name, value] : sts_request.GetHeaders())
             headers.emplace_back(name, value);
-        const auto identity_response = request(getSTSEndpoint(), headers);
+        const auto identity_response = request(Poco::Net::HTTPRequest::HTTP_GET, getSTSEndpoint(), headers);
         if (identity_response.status != 200)
             return false;
 
@@ -227,7 +375,7 @@ bool AwsSSOTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
         if (expires_at <= std::chrono::system_clock::now())
             return false;
         credentials.setUserName(arn);
-        credentials.setGroups({});
+        credentials.setGroups(identity_store_id.empty() ? std::set<String>{} : getGroupIds(session_name, provider));
         credentials.setExpiresAt(expires_at);
         return true;
     }

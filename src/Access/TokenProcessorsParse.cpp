@@ -105,12 +105,18 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
                 throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
                                 "Token processor '{}': '{}' is not supported by aws_sso", processor_name, key);
         }
+        const auto identity_store_id = config.getString(prefix + ".identity_store_id", "");
+        if (config.hasProperty(prefix + ".identity_store_id") && identity_store_id.empty())
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                            "Token processor '{}': 'identity_store_id' must not be empty", processor_name);
         auto processor = std::make_unique<AwsSSOTokenProcessor>(
             processor_name, config.getUInt64(prefix + ".token_cache_lifetime", 60),
             config.getString(prefix + ".region"), config.getString(prefix + ".account_id"),
-            config.getString(prefix + ".role_name"), timeouts);
+            config.getString(prefix + ".role_name"), identity_store_id, timeouts);
         require_allowed_url(processor->getPortalEndpoint(), "region");
         require_allowed_url(processor->getSTSEndpoint(), "region");
+        if (!identity_store_id.empty())
+            require_allowed_url(processor->getIdentityStoreEndpoint(), "region");
         return processor;
 #else
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "AWS SSO requires AWS SDK and SSL support");
