@@ -182,6 +182,7 @@ namespace DB
     M(DISK_OBJECT_STORAGE_COPY, "DiskObjStCopy") \
     M(DISTRIBUTED_CACHE, "DistribCache") \
     M(DISTRIBUTED_CACHE_DROP, "DropDistCache") \
+    M(EXPORT_PART, "ExportPart") \
 
 
 enum class ThreadName : uint8_t

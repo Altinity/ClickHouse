@@ -135,7 +135,7 @@ private:
     /// recording `reason` when it is dropped because it could not be built (empty otherwise).
     void resetCatalog(String reason) const TSA_REQUIRES(catalog_mutex);
 
-    std::shared_ptr<StorageObjectStorageConfiguration> getConfiguration(
+    StorageObjectStorageConfigurationPtr getConfiguration(
         DatabaseDataLakeStorageType type,
         DataLakeStorageSettingsPtr storage_settings) const;
 

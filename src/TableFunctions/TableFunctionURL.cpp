@@ -362,7 +362,7 @@ StoragePtr TableFunctionURL::getStorage(
         auto object_storage_configuration = std::make_shared<StorageWebConfiguration>();
 
         auto engine_args = makeWebObjectStorageEngineArgs(source, format_, structure, compression_method_, configuration.headers);
-        StorageObjectStorageConfiguration::initialize(*object_storage_configuration, engine_args, context, /* with_table_structure */ true);
+        object_storage_configuration->initialize(engine_args, context, /* with_table_structure */ true);
 
         ObjectStoragePtr object_storage = object_storage_configuration->createObjectStorage(context, /* is_readonly */ true, std::nullopt);
 
@@ -418,9 +418,12 @@ ColumnsDescription TableFunctionURL::getActualTableStructure(ContextPtr context,
         {
             checkExperimentalURLWildcardFromIndexPages(context);
 
-            auto object_storage_configuration = std::make_shared<StorageWebConfiguration>();
+            /// Note: the base-class pointer type is required because
+            /// StorageObjectStorage::resolveSchemaAndFormatFromData() takes a non-const
+            /// reference to StorageObjectStorageConfigurationPtr.
+            StorageObjectStorageConfigurationPtr object_storage_configuration = std::make_shared<StorageWebConfiguration>();
             auto engine_args = makeWebObjectStorageEngineArgs(filename, format, structure, compression_method, configuration.headers);
-            StorageObjectStorageConfiguration::initialize(*object_storage_configuration, engine_args, context, /* with_table_structure */ true);
+            object_storage_configuration->initialize(engine_args, context, /* with_table_structure */ true);
             object_storage_configuration->check(context);
 
             auto object_storage = object_storage_configuration->createObjectStorage(context, /* is_readonly */ true, std::nullopt);

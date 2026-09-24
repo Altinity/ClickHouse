@@ -386,35 +386,39 @@ void Clusters::updateClusters(const Poco::Util::AbstractConfiguration & new_conf
 
     std::lock_guard lock(mutex);
 
-    /// If old config is set, remove deleted clusters from impl, otherwise just clear it.
+    /// If old config is set, remove deleted clusters; otherwise rebuild ownership from scratch
+    /// while preserving non-automatic entries (e.g. clusters added via setCluster).
     if (old_config)
     {
         for (const auto & key : deleted_keys)
         {
-            if (!automatic_clusters.contains(key))
-                impl.erase(key);
+            automatic_clusters.erase(key);
+            impl.erase(key);
         }
     }
     else
     {
-        if (!automatic_clusters.empty())
-            std::erase_if(impl, [this](const auto & e) { return automatic_clusters.contains(e.first); });
-        else
-            impl.clear();
+        for (const auto & name : automatic_clusters)
+            impl.erase(name);
+        automatic_clusters.clear();
     }
-
 
     for (const auto & key : new_config_keys)
     {
         if (new_config.has(config_prefix + "." + key + ".discovery"))
         {
-            /// Handled in ClusterDiscovery
+            /// Handled in ClusterDiscovery — must not leave a prior static Cluster in impl,
+            /// or Context::getCluster / getClusters would prefer the stale static entry.
             automatic_clusters.insert(key);
+            impl.erase(key);
             continue;
         }
 
         if (key.contains('.'))
             throw Exception(ErrorCodes::SYNTAX_ERROR, "Cluster names with dots are not supported: '{}'", key);
+
+        /// Leaving discovery (or never was discovery): drop automatic ownership for this name.
+        automatic_clusters.erase(key);
 
         /// If old config is set and cluster config wasn't changed, don't update this cluster.
         if (!old_config || !isSameConfiguration(new_config, *old_config, config_prefix + "." + key))
@@ -754,9 +758,9 @@ void Cluster::initMisc()
     }
 }
 
-std::unique_ptr<Cluster> Cluster::getClusterWithReplicasAsShards(const Settings & settings, size_t max_replicas_from_shard) const
+std::unique_ptr<Cluster> Cluster::getClusterWithReplicasAsShards(const Settings & settings, size_t max_replicas_from_shard, size_t max_hosts) const
 {
-    return std::unique_ptr<Cluster>{ new Cluster(ReplicasAsShardsTag{}, *this, settings, max_replicas_from_shard)};
+    return std::unique_ptr<Cluster>{ new Cluster(ReplicasAsShardsTag{}, *this, settings, max_replicas_from_shard, max_hosts)};
 }
 
 std::unique_ptr<Cluster> Cluster::getClusterWithSingleShard(size_t index) const
@@ -805,7 +809,7 @@ void shuffleReplicas(std::vector<Cluster::Address> & replicas, const Settings & 
 
 }
 
-Cluster::Cluster(Cluster::ReplicasAsShardsTag, const Cluster & from, const Settings & settings, size_t max_replicas_from_shard)
+Cluster::Cluster(Cluster::ReplicasAsShardsTag, const Cluster & from, const Settings & settings, size_t max_replicas_from_shard, size_t max_hosts)
 {
     if (from.addresses_with_failover.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Cluster is empty");
@@ -827,6 +831,7 @@ Cluster::Cluster(Cluster::ReplicasAsShardsTag, const Cluster & from, const Setti
 
                 if (address.is_local)
                     info.local_addresses.push_back(address);
+                addresses_with_failover.emplace_back(Addresses({address}));
 
                 auto pool = ConnectionPoolFactory::instance().get(
                     static_cast<unsigned>(settings[Setting::distributed_connections_pool_size]),
@@ -850,9 +855,6 @@ Cluster::Cluster(Cluster::ReplicasAsShardsTag, const Cluster & from, const Setti
                 info.per_replica_pools = {std::move(pool)};
                 info.default_database = address.default_database;
 
-                addresses_with_failover.emplace_back(Addresses{address});
-
-                slot_to_shard.insert(std::end(slot_to_shard), info.weight, shards_info.size());
                 shards_info.emplace_back(std::move(info));
             }
         };
@@ -874,7 +876,34 @@ Cluster::Cluster(Cluster::ReplicasAsShardsTag, const Cluster & from, const Setti
     secret = from.secret;
     name = from.name;
 
+    constrainShardInfoAndAddressesToMaxHosts(max_hosts);
+
+    for (size_t i = 0; i < shards_info.size(); ++i)
+        slot_to_shard.insert(std::end(slot_to_shard), shards_info[i].weight, i);
+
     initMisc();
+}
+
+
+void Cluster::constrainShardInfoAndAddressesToMaxHosts(size_t max_hosts)
+{
+    if (max_hosts == 0 || shards_info.size() <= max_hosts)
+        return;
+
+    pcg64_fast gen{randomSeed()};
+    std::shuffle(shards_info.begin(), shards_info.end(), gen);
+    shards_info.resize(max_hosts);
+
+    AddressesWithFailover addresses_with_failover_;
+
+    UInt32 shard_num = 0;
+    for (auto & shard_info : shards_info)
+    {
+        addresses_with_failover_.push_back(addresses_with_failover[shard_info.shard_num - 1]);
+        shard_info.shard_num = ++shard_num;
+    }
+
+    addresses_with_failover.swap(addresses_with_failover_);
 }
 
 
