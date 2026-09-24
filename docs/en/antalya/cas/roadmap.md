@@ -91,6 +91,10 @@ positioning.
 
 ## Backups {#backups}
 
+Ordinary `BACKUP` and `RESTORE` already work for a table on a `CAS` disk — see
+[backup](/antalya/cas/operations/backup) for how they behave and what the limits are. What follows is
+about the `CAS`-native model, which is a different thing.
+
 A `snapshot` / `mirror` / `fetch` / `restore` design is **approved but not implemented**. The
 model is deliberately git-shaped: `snapshot` is instant and free (like `git tag` — it references
 existing manifests, copies nothing); `mirror` is a continuous pull from a production pool into a
