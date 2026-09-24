@@ -8362,10 +8362,13 @@ Internal. Set by the initiator on a query dispatched by `object_storage_cluster_
 database of the one table whose files are distributed across the cluster. Together with
 `object_storage_distributed_driver_table` it tells a worker which table reads from the initiator's file-task queue;
 every other table in the same query is read in full, locally. Not meant to be set by hand.
-)", EXPERIMENTAL) \
+
+`IMPORTANT` because a worker that silently ignored it would find no driver, read every file of every table, and
+return each row once per node. A server too old to know the setting must refuse the query instead.
+)", EXPERIMENTAL | IMPORTANT) \
     DECLARE(String, object_storage_distributed_driver_table, "", R"(
 Internal. The table name counterpart of `object_storage_distributed_driver_database`. Not meant to be set by hand.
-)", EXPERIMENTAL) \
+)", EXPERIMENTAL | IMPORTANT) \
     DECLARE(UInt64, object_storage_max_nodes, 0, R"(
 Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
 Possible values:
