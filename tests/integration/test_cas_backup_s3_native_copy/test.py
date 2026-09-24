@@ -30,8 +30,6 @@ COLUMNS = ["k", "s", "n", "arr"]
 
 RUN_TOKEN = uuid.uuid4().hex
 
-FORCE_SINGLE_OPERATION_COPY = {"s3_max_single_operation_copy_size": 5 * 1024**3}
-
 
 @pytest.fixture(scope="module", autouse=True)
 def start_cluster():
@@ -96,15 +94,13 @@ def test_native_copy_round_trip(allow_native_copy):
 
     node.query(
         f"BACKUP TABLE {table} TO {destination} "
-        f"SETTINGS allow_s3_native_copy = {int(allow_native_copy)}",
-        settings=FORCE_SINGLE_OPERATION_COPY,
+        f"SETTINGS allow_s3_native_copy = {int(allow_native_copy)}"
     )
 
     node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
     node.query(
         f"RESTORE TABLE {table} AS {restored} FROM {destination} "
-        f"SETTINGS allow_s3_native_copy = {int(allow_native_copy)}",
-        settings=FORCE_SINGLE_OPERATION_COPY,
+        f"SETTINGS allow_s3_native_copy = {int(allow_native_copy)}"
     )
 
     actual = column_fingerprints(node, restored)
