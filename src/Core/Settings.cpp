@@ -1211,6 +1211,14 @@ Allows or restricts using [Variant](/reference/data-types/variant) and [Dynamic]
     DECLARE(Bool, allow_suspicious_types_in_order_by, false, R"(
 Allows or restricts using [Variant](/reference/data-types/variant) and [Dynamic](/reference/data-types/dynamic) types in ORDER BY keys.
 )", 0) \
+    DECLARE(Bool, validate_group_by_all_key_types, true, R"(
+Controls whether the grouping keys that `GROUP BY ALL` expands the `SELECT` expressions into are checked against [allow_suspicious_types_in_group_by](#allow_suspicious_types_in_group_by). Disable it to restore the behavior of versions before 26.7, which accepted a [Variant](/reference/data-types/variant) or [Dynamic](/reference/data-types/dynamic) key written as `GROUP BY ALL`, for example a grouping key that is an untyped JSON subpath. Takes effect only when the analyzer is enabled (`enable_analyzer = 1`, the default); with the old analyzer such a key was rejected before 26.7 as well, so there is nothing to restore there. An explicit `GROUP BY` is unaffected and keeps rejecting such a key either way, so this is narrower than setting `allow_suspicious_types_in_group_by`, which also permits them in an explicit `GROUP BY`.
+
+Possible values:
+
+- 0 - The key types `GROUP BY ALL` expands into are not validated.
+- 1 - They are validated, as an explicit `GROUP BY` validates its own keys.
+)", 0) \
     DECLARE(Bool, use_variant_default_implementation_for_comparisons, true, R"(
 Enables or disables default implementation for Variant type in comparison functions.
 )", 0) \
@@ -6028,14 +6036,21 @@ Possible values:
     DECLARE(UInt64, iceberg_metadata_staleness_ms, 0, R"(
 If non-zero, skip fetching iceberg metadata from remote catalog if there is a cached metadata snapshot, more recent than the given staleness window. Zero means to always fetch the latest metadata version from the remote catalog. Setting this a non-zero trades staleness to a lower latency of read operations.
 )", 0) \
-    DECLARE(NonZeroUInt64, iceberg_delete_manifest_decode_concurrency, 4, R"(
-Maximum number of Iceberg delete manifest files decoded concurrently during query execution before any data file is read.
+    DECLARE_WITH_ALIAS(NonZeroUInt64, iceberg_manifest_decode_concurrency, 4, R"(
+Maximum number of Iceberg manifest files decoded concurrently while reading a table.
 
-All delete manifests must be decoded before any data file is read, so this work sits on the critical path before the first row is returned. Decoding several at a time overlaps both the object storage round-trips and the per-row pruning work.
+Delete manifests are all decoded before any data file is read; data manifests are decoded while the list of data files for the query is produced, and new ones are decoded only as the query consumes already decoded entries. Decoding several manifests at a time overlaps the object storage round-trips and the per-entry pruning work.
 
-Higher values raise peak memory during query initialization when the Iceberg metadata files cache is disabled or full, since each in-flight manifest then holds its own decoded contents.
+Higher values raise peak memory when the Iceberg metadata files cache is disabled or full, since each in-flight manifest then holds its own decoded contents.
 
 Must be greater than zero; `1` decodes the manifests one at a time.
+)", 0, iceberg_delete_manifest_decode_concurrency) \
+    DECLARE(NonZeroUInt64, iceberg_file_entries_queue_size, 100, R"(
+Capacity of the queue between the Iceberg data manifest decode tasks and the query, in data file entries.
+
+The decode tasks pause once the queue is full and the query is not consuming, so this also bounds the read-ahead.
+
+Must be greater than zero.
 )", 0) \
     DECLARE(Bool, use_parquet_metadata_cache, true, R"(
 If turned on, parquet format may utilize the parquet metadata cache.
@@ -7261,7 +7276,7 @@ Maximum time to wait for a file segment which is being downloaded to the filesys
 Prefer bigger buffer size if filesystem cache is enabled to avoid writing small file segments which deteriorate cache performance. On the other hand, enabling this setting might increase memory usage.
 )", 0) \
     DECLARE(UInt64, filesystem_cache_boundary_alignment, 0, R"(
-Filesystem cache boundary alignment. This setting is applied only for non-disk read (e.g. for cache of remote table engines / table functions, but not for storage configuration of MergeTree tables). Value 0 means no alignment.
+Filesystem cache boundary alignment. For non-disk read (e.g. for cache of remote table engines / table functions) value 0 means no alignment. For disk read (e.g. for MergeTree tables on a disk with cache) value 0 means that `boundary_alignment` from the cache configuration is used.
 )", 0) \
     DECLARE(UInt64, temporary_data_in_cache_reserve_space_wait_lock_timeout_milliseconds, (10 * 60 * 1000), R"(
 Wait time to lock cache for space reservation for temporary data in filesystem cache
@@ -9203,6 +9218,7 @@ Experimental dictionary source for integration with YTsaurus.
 )", EXPERIMENTAL) \
     DECLARE(Bool, distributed_plan_force_shuffle_aggregation, false, R"(
 Use Shuffle aggregation strategy instead of PartialAggregation + Merge in distributed query plan.
+Ignored where the Shuffle strategy cannot produce a correct result, for example for `GROUPING SETS` or when the aggregation must produce results in bucket order.
 )", EXPERIMENTAL) \
     DECLARE(Bool, enable_cascades_optimizer, false, R"(
 Enable the Cascades cost-based optimizer for distributed query plans.

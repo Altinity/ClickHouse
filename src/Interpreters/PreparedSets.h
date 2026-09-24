@@ -7,6 +7,7 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <mutex>
 #include <future>
 #include <Common/callOnce.h>
 #include <Storages/IStorage_fwd.h>

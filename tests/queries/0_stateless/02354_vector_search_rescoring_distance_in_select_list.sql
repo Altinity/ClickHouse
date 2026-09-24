@@ -1,6 +1,8 @@
 -- Tags: no-fasttest, no-ordinary-database, no-parallel-replicas
 --- no-parallel-replicas: Because the test records and verifies
 --- _distance values returned from the rescoring optimization.
+--- Distances are rounded to 1 decimal: USearch's SimSIMD kernels and its scalar
+--- fallback disagree in the last bits (0.203125 vs 0.1875 for id 7).
 
 -- Issue #85514
 --
@@ -65,21 +67,21 @@ SELECT 'Column: Array(Float32)';
 
 SELECT '-- Search vector: Array(Float64)';
 WITH CAST([0.0, 2.0] AS Array(Float64)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_f32
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;
 
 SELECT '-- Search vector: Array(Float32)';
 WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_f32
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;
 
 SELECT '-- Search vector: Array(BFloat16)';
 WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_f32
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;
@@ -88,21 +90,21 @@ SELECT 'Column: Array(BFloat16)';
 
 SELECT '-- Search vector: Array(Float64)';
 WITH [0.0, 2.0] AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_bf16
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;
 
 SELECT '-- Search vector: Array(Float32)';
 WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_bf16
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;
 
 SELECT '-- Search vector: Array(BFloat16)';
 WITH CAST([0.0, 2.0] AS Array(Float32)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_bf16
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;

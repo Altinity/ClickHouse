@@ -184,6 +184,17 @@ A value of `0` means unlimited.
     DECLARE(UInt64, max_format_parsing_thread_pool_size, 100, R"(
 Maximum total number of threads to use for parsing input.
 )", 0) \
+    DECLARE(UInt64, max_iceberg_manifest_decode_thread_pool_size, 100, R"(
+Maximum total number of threads to use for decoding Iceberg data manifest files.
+
+The pool is separate from the IO pool on purpose: a decode task can block until the query consumes the entries it has produced, while the delete manifest decode waits for its tasks on the IO pool before any entry is consumed - sharing one pool could deadlock.
+)", 0) \
+    DECLARE(UInt64, max_iceberg_manifest_decode_thread_pool_free_size, 0, R"(
+Maximum number of idle standby threads to keep in the thread pool for decoding Iceberg data manifest files.
+)", 0) \
+    DECLARE(UInt64, iceberg_manifest_decode_thread_pool_queue_size, 10000, R"(
+The maximum number of jobs that can be scheduled on the thread pool for decoding Iceberg data manifest files.
+)", 0) \
     DECLARE(UInt64, max_format_parsing_thread_pool_free_size, 0, R"(
 Maximum number of idle standby threads to keep in the thread pool for parsing input.
 )", 0) \
@@ -1920,7 +1931,7 @@ Configured as `named_collections_storage.type` (`<named_collections_storage><typ
     DECLARE(Bool, openssl_client_load_default_ca_file, true, R"(Determines whether built-in CA certificates for OpenSSL will be used. ClickHouse assumes that builtin CA certificates are in the file `</etc/ssl/cert.pem>` (resp. the directory `</etc/ssl/certs>`) or in file (resp. directory) specified by the environment variable `<SSL_CERT_FILE>` (resp. `<SSL_CERT_DIR>`).)", 0, "openSSL.client.loadDefaultCAFile") \
     DECLARE(String, openssl_client_chipher_list, "ALL:!ADH:!LOW:!EXP:!MD5:!3DES:@STRENGTH", R"(Supported OpenSSL encryptions.)", 0, "openSSL.client.cipherList") \
     DECLARE(Bool, openssl_client_cache_sessions, false, R"(Enables or disables caching sessions. Must be used in combination with `<sessionIdContext>`. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.cacheSessions") \
-    DECLARE(Bool, openssl_client_extended_verification, false, R"(If enabled, verify that the certificate CN or SAN matches the peer hostname.)", 0, "openSSL.client.extendedVerification") \
+    DECLARE(Bool, openssl_client_extended_verification, true, R"(If enabled, verify that the certificate CN or SAN matches the peer hostname.)", 0, "openSSL.client.extendedVerification") \
     DECLARE(Bool, openssl_client_required_tls_v1, false, R"(Require a TLSv1 connection. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.requireTLSv1") \
     DECLARE(Bool, openssl_client_required_tls_v1_1, false, R"(Require a TLSv1.1 connection. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.requireTLSv1_1") \
     DECLARE(Bool, openssl_client_required_tls_v1_2, false, R"(Require a TLSv1.2 connection. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.requireTLSv1_2") \
@@ -3665,6 +3676,12 @@ ChangeableSettingsMap collectChangeableServerSettings(ContextPtr context)
              {getFormatParsingThreadPool().isInitialized() ? std::to_string(getFormatParsingThreadPool().get().getMaxFreeThreads()) : "0", ChangeableWithoutRestart::Yes}},
             {"format_parsing_thread_pool_queue_size",
              {getFormatParsingThreadPool().isInitialized() ? std::to_string(getFormatParsingThreadPool().get().getQueueSize()) : "0", ChangeableWithoutRestart::Yes}},
+            {"max_iceberg_manifest_decode_thread_pool_size",
+             {getIcebergManifestDecodeThreadPool().isInitialized() ? std::to_string(getIcebergManifestDecodeThreadPool().get().getMaxThreads()) : "0", ChangeableWithoutRestart::Yes}},
+            {"max_iceberg_manifest_decode_thread_pool_free_size",
+             {getIcebergManifestDecodeThreadPool().isInitialized() ? std::to_string(getIcebergManifestDecodeThreadPool().get().getMaxFreeThreads()) : "0", ChangeableWithoutRestart::Yes}},
+            {"iceberg_manifest_decode_thread_pool_queue_size",
+             {getIcebergManifestDecodeThreadPool().isInitialized() ? std::to_string(getIcebergManifestDecodeThreadPool().get().getQueueSize()) : "0", ChangeableWithoutRestart::Yes}},
 
             {"abort_on_logical_error", {std::to_string(DB::abort_on_logical_error), ChangeableWithoutRestart::Yes}},
 

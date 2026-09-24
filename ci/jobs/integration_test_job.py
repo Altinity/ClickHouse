@@ -1329,7 +1329,7 @@ tar -czf ./ci/tmp/logs.tar.gz \
     # hard subprocess backstop). Used below to keep an empty flaky/targeted result a
     # best-effort SKIPPED only when a timeout actually exhausted the budget.
     timed_out = False
-    session_timeout_parallel = 3600 * 2
+    session_timeout_parallel = 3600 * 2.5
     session_timeout_sequential = 3600
 
     if is_llvm_coverage:

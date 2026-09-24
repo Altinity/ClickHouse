@@ -97,7 +97,9 @@ if [ "$cache_policy" = "SLRU" ]; then
     sed -i.tmp "s|<cache_policy>LRU</cache_policy>|<cache_policy>SLRU</cache_policy>|" /etc/clickhouse-server/config.d/storage_conf*.xml
 fi
 
-start_server || { echo "Failed to start server"; exit 1; }
+# Preload writes system logs the restart must load before port 9000 opens.
+# The default wait (~70s) expires first on some ARM runners.
+start_server 10 || { echo "Failed to start server"; exit 1; }
 
 clickhouse-client --query "SYSTEM STOP THREAD FUZZER"
 
@@ -302,7 +304,9 @@ fi
 # hang the server under sanitizers and trip the hung check.
 cp -av --dereference /repo/ci/jobs/scripts/fuzzer/limit-recursion-settings.xml /etc/clickhouse-server/users.d/
 
-start_server || { echo "Failed to start server"; exit 1; }
+# Same wait as the other restarts: ARM sanitizer + S3 + async_load_databases=false
+# can miss the default ~70s window before port 9000 opens.
+start_server 10 || { echo "Failed to start server"; exit 1; }
 
 # clickhouse-test must know which storage backend the server actually uses, or its storage skip
 # tags are inert and incompatible tests run on an unsupported backend. Both variables are already

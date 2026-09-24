@@ -43,6 +43,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// Note: please check if the key already exists to prevent duplicate entries.
         addSettingsChanges(settings_changes_history, "26.8",
         {
+            {"validate_group_by_all_key_types", true, true, "The validation of the key types that `GROUP BY ALL` expands the `SELECT` expressions into is kept under `compatibility` with 26.7: the previous value is deliberately equal to the new one, because 26.7 already rejected such a key and only a version before 26.7 restores the earlier acceptance."},
             {"allow_experimental_ai_functions", false, false, "The setting is obsolete, AI functions are beta now and enabled by default."},
             {"ai_function_max_retries", 0, 1, "Retry a transient API error once by default, so a single 429 or 5xx from the provider does not fail the query."},
             {"adaptive_aggregator_freeze_threshold_bytes", 4194304, 4194304, "New setting bounding the adaptive aggregator's frozen local tables in bytes, whichever of it and the key-count threshold is reached first; 0 disables the byte bound."},
@@ -139,6 +140,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"output_format_arrow_use_native_writer", true, true, "Obsolete setting, the native ClickHouse writer is now always used for the `Arrow` and `ArrowStream` formats (the Apache Arrow library-based writer has been removed)."},
             {"distributed_cache_min_inflight_bytes_to_discard_connection_on_seek", 0, 4 * 1024 * 1024, "New setting to drop and reopen a distributed cache connection on a seek when too many in-flight bytes would otherwise be discarded. Defaults to 4 MiB; 0 restores the previous behavior (always reuse the connection via the read range id)."},
             {"iceberg_delete_manifest_decode_concurrency", 2, 4, "New setting bounding how many Iceberg delete manifest files are decoded concurrently before the first row is read. Before 26.8 one manifest was decoded at a time with the next one's fetch already in flight, so `2` is the closest equivalent of the previous behavior, which put the sum of their object storage round-trips on the critical path before the first row."},
+            {"iceberg_file_entries_queue_size", 100, 100, "New setting for the previously hardcoded capacity of the queue between the Iceberg data manifest decode tasks and the query."},
+            {"iceberg_manifest_decode_concurrency", 2, 4, "New setting bounding how many Iceberg manifest files are decoded concurrently, for delete and data manifests alike. It replaces `iceberg_delete_manifest_decode_concurrency` (kept as an alias). `2` approximates the data path before this change, which decoded one manifest at a time with the next one's fetch already in flight."},
             {"run_query_in_background", false, false, "New setting to run a query in the background, detached from the connection that submitted it, discarding the result."},
             {"enable_cascades_optimizer", false, false, "New experimental setting."},
             {"merge_tree_min_bytes_per_read_stream", 0, (64 * 1024), "New setting to cap the number of streams for ordinary local unordered `MergeTree` narrow-column scans using a sqrt cost model, reducing per-stream overhead on high-core-count machines. previous_value=0 (disabled) so `compatibility` with versions before 26.8 restores the pre-existing stream count."},
@@ -152,9 +155,12 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"enable_function_early_short_circuit", false, false, "New setting"},
             {"merge_tree_prefetch_json_shared_data_substreams", true, true, "New setting to control prefetching of JSON shared data substreams that are read by seeking to a mark in Wide parts."},
             {"iceberg_compaction_commit_batch_size", 100, 100, "New setting"},
+            {"output_format_arrow_record_batch_size", 0, 0, "New setting to combine small blocks in `Arrow` and `ArrowStream` output using a target row count. The default `0` preserves one record batch per block."},
+            {"output_format_arrow_record_batch_size_bytes", 0, 0, "New setting to combine small blocks in `Arrow` and `ArrowStream` output using a target size in bytes of accumulated data. The default `0` preserves one record batch per block."},
         });
         addSettingsChanges(settings_changes_history, "26.7",
         {
+            {"validate_group_by_all_key_types", false, true, "New setting gating the validation of the key types that `GROUP BY ALL` expands the `SELECT` expressions into. 26.7 started rejecting a `Variant`/`Dynamic` key there, which earlier versions accepted with the analyzer enabled (`enable_analyzer = 1`, the default; the old analyzer rejected such a key before 26.7 as well), so the previous value is `false` and `compatibility` with a version before 26.7 restores the earlier acceptance."},
             {"analyzer_compatibility_allow_non_aggregate_in_having", false, false, "New compatibility setting. When enabled, the analyzer mimics the legacy `HAVING`-to-`WHERE` rewrite for non-aggregate AND-conjuncts instead of raising `NOT_AN_AGGREGATE`."},
             {"query_plan_optimize_lazy_materialization_for_object_storage", false, true, "New setting to use lazy materialization for `ORDER BY ... LIMIT n` queries reading Parquet files from object storage (including Iceberg tables)."},
             {"iceberg_compaction_max_rows_in_data_file", std::numeric_limits<UInt64>::max(), std::numeric_limits<UInt64>::max(), "New setting for the max rows of an iceberg data file produced by compaction, separate from the insert-time limit."},
