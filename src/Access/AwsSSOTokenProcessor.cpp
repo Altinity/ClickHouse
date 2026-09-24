@@ -69,7 +69,7 @@ String xmlField(const Aws::Utils::Xml::XmlNode & parent, const char * name)
 
 AwsSSOTokenProcessor::AwsSSOTokenProcessor(
     const String & name, UInt64 cache_lifetime, const String & region_, const String & account_id_,
-    const String & role_name_, const ConnectionTimeouts & timeouts_, Transport transport_)
+    const String & role_name_, const ConnectionTimeouts & timeouts_)
     : ITokenProcessor(name, cache_lifetime)
     , region(region_)
     , account_id(account_id_)
@@ -77,7 +77,6 @@ AwsSSOTokenProcessor::AwsSSOTokenProcessor(
     , partition(region.starts_with("cn-") ? "aws-cn" : region.starts_with("us-gov-") ? "aws-us-gov" : "aws")
     , domain(region.starts_with("cn-") ? "amazonaws.com.cn" : "amazonaws.com")
     , timeouts(timeouts_)
-    , transport(std::move(transport_))
 {
     if (region.empty() || region.size() > 32 || region.front() == '-' || region.back() < '0' || region.back() > '9'
         || !std::ranges::all_of(region, [](char c)
@@ -113,37 +112,32 @@ String AwsSSOTokenProcessor::getSTSEndpoint() const
 AwsSSOTokenProcessor::Response AwsSSOTokenProcessor::request(const String & url, const Headers & headers) const
 {
     Response result;
-    if (transport)
-        result = transport(url, headers);
-    else
+    const Poco::URI uri(url);
+    /// Authentication must not inherit permissive server TLS settings.
+    Poco::Net::Context::Ptr tls_context = new Poco::Net::Context(
+        Poco::Net::Context::CLIENT_USE, "", Poco::Net::Context::VERIFY_STRICT, 9, true);
+    tls_context->enableExtendedCertificateVerification();
+    SSL_CTX_set_verify(tls_context->sslContext(), SSL_VERIFY_PEER, nullptr);
+    Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort(), tls_context);
+    setTimeouts(session, timeouts);
+    Poco::Net::HTTPRequest http_request(Poco::Net::HTTPRequest::HTTP_GET, uri.getPathAndQuery());
+    for (const auto & [name, value] : headers)
+        http_request.set(name, value);
+    session.sendRequest(http_request);
+    Poco::Net::HTTPResponse response;
+    auto & body = session.receiveResponse(response);
+    result.status = response.getStatus();
+    if (result.status == 200)
     {
-        const Poco::URI uri(url);
-        /// Authentication must not inherit permissive server TLS settings.
-        Poco::Net::Context::Ptr tls_context = new Poco::Net::Context(
-            Poco::Net::Context::CLIENT_USE, "", Poco::Net::Context::VERIFY_STRICT, 9, true);
-        tls_context->enableExtendedCertificateVerification();
-        SSL_CTX_set_verify(tls_context->sslContext(), SSL_VERIFY_PEER, nullptr);
-        Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort(), tls_context);
-        setTimeouts(session, timeouts);
-        Poco::Net::HTTPRequest http_request(Poco::Net::HTTPRequest::HTTP_GET, uri.getPathAndQuery());
-        for (const auto & [name, value] : headers)
-            http_request.set(name, value);
-        session.sendRequest(http_request);
-        Poco::Net::HTTPResponse response;
-        auto & body = session.receiveResponse(response);
-        result.status = response.getStatus();
-        if (result.status == 200)
+        std::array<char, 4096> buffer;
+        while (body.read(buffer.data(), buffer.size()) || body.gcount())
         {
-            std::array<char, 4096> buffer;
-            while (body.read(buffer.data(), buffer.size()) || body.gcount())
-            {
-                if (result.body.size() + body.gcount() > max_response_size)
-                    throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "AWS SSO response exceeds size limit");
-                result.body.append(buffer.data(), body.gcount());
-            }
-            if (body.bad())
-                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Cannot read AWS SSO response");
+            if (result.body.size() + body.gcount() > max_response_size)
+                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "AWS SSO response exceeds size limit");
+            result.body.append(buffer.data(), body.gcount());
         }
+        if (body.bad())
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Cannot read AWS SSO response");
     }
     if (result.body.size() > max_response_size)
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "AWS SSO response exceeds size limit");
@@ -155,8 +149,7 @@ AwsSSOTokenProcessor::Response AwsSSOTokenProcessor::request(const String & url,
 
 bool AwsSSOTokenProcessor::resolveAndValidate(TokenCredentials & credentials) const
 {
-    /// Auto-discovery in `ExternalAuthenticators::checkTokenCredentials` tries processors in turn,
-    /// and an exception out of one aborts the loop, so AWS and transport failures must deny only this processor.
+    /// Auto-discovery stops on exceptions, so AWS and transport failures must deny only this processor.
     try
     {
         if (!isSafeHeader(credentials.getToken()))
