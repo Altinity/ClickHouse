@@ -142,8 +142,10 @@ ActionsDAG andListingFilterDAGs(ActionsDAG first, ActionsDAG second)
 namespace
 {
 
-/// The worker applies a query's own SETTINGS clause on top of the context settings, so a normalization made
-/// only in updateSettings would be undone. These two apply the same change to the query text.
+/// A worker applies the query's own SETTINGS clause on top of the settings it received, so anything
+/// normalized only in the context is undone by a value written into the query text. Every such normalization
+/// therefore comes in a pair, and the two `prepare...ForRemoteExecution` functions below are the query-text
+/// half -- one per kind of remote read, so neither can be given a subset of the other's by accident.
 ASTSetQuery * getQuerySettings(ASTPtr & query)
 {
     auto * select_query = query->as<ASTSelectQuery>();
@@ -162,7 +164,6 @@ void dropEmptySettings(ASTPtr & query, bool changed)
         select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
 }
 
-/// A ReadFromCluster reached after whole-query dispatch was declined must behave exactly like `allow`.
 void downgradeJoinModeInQuerySettings(ASTPtr & query)
 {
     auto * settings = getQuerySettings(query);
@@ -183,9 +184,6 @@ void downgradeJoinModeInQuerySettings(ASTPtr & query)
     dropEmptySettings(query, changed);
 }
 
-/// A worker applies the query's own SETTINGS clause on top of the context settings, so a driver name written
-/// into the query text by hand survives the clearing `ReadFromCluster::updateSettings` does -- see there for
-/// why it must not reach a worker of this read.
 void dropDriverAnnouncementFromQuerySettings(ASTPtr & query)
 {
     auto * settings = getQuerySettings(query);
@@ -197,8 +195,6 @@ void dropDriverAnnouncementFromQuerySettings(ASTPtr & query)
     dropEmptySettings(query, changed);
 }
 
-/// `object_storage_cluster` outranks a table's own cluster in getClusterName, so leaving it set would make
-/// every table in a dispatched query fan out again from each worker.
 void dropClusterFromQuerySettings(ASTPtr & query)
 {
     auto * settings = getQuerySettings(query);
@@ -206,6 +202,26 @@ void dropClusterFromQuerySettings(ASTPtr & query)
         return;
 
     dropEmptySettings(query, settings->changes.removeSetting("object_storage_cluster"));
+}
+
+/// An ordinary cluster read, including one reached after whole-query dispatch was declined. It must behave
+/// exactly like `allow`, and it must not carry a driver name: this read supplies a task iterator, so its
+/// workers see `collaborate_with_initiator` and a table matching that name would read this step's file-task
+/// queue instead of listing its own files.
+void prepareOrdinaryClusterQueryForRemoteExecution(ASTPtr & query)
+{
+    downgradeJoinModeInQuerySettings(query);
+    dropDriverAnnouncementFromQuerySettings(query);
+}
+
+/// A whole-query dispatch. `object_storage_cluster` outranks a table's own cluster in getClusterName, so
+/// leaving it set would make every table in the dispatched query fan out again from each worker. The driver
+/// name goes too: the initiator puts the one it chose in the settings it sends, and a value in the query text
+/// would override it on the worker and hand the queue to a table the planner did not pick.
+void prepareWholeQueryDispatchForRemoteExecution(ASTPtr & query)
+{
+    dropClusterFromQuerySettings(query);
+    dropDriverAnnouncementFromQuerySettings(query);
 }
 
 }
@@ -850,10 +866,7 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
 {
     auto new_context = updateSettings(context->getSettingsRef());
 
-    /// Mirrors the context-level normalization in updateSettings() onto query_to_send's own query-level
-    /// SETTINGS clause, which would otherwise re-override it on the worker (see that function's comment).
-    downgradeJoinModeInQuerySettings(query_to_send);
-    dropDriverAnnouncementFromQuerySettings(query_to_send);
+    prepareOrdinaryClusterQueryForRemoteExecution(query_to_send);
 
     createExtension();
 
@@ -885,7 +898,7 @@ ContextPtr ReadFromClusterQuery::updateSettings() const
 void ReadFromClusterQuery::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
     auto new_context = updateSettings();
-    dropClusterFromQuerySettings(query_to_send);
+    prepareWholeQueryDispatchForRemoteExecution(query_to_send);
 
     /// No predicate: this step's output is the whole query's result, so a filter over it says nothing about
     /// which of the driver's files are needed. Recovering driver-only pruning means extracting the conjuncts
