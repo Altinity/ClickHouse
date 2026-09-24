@@ -102,10 +102,10 @@ TEST(IcebergBinPackRewrite, ReplaceSnapshotSummaryCounters)
         /*removed_files_size=*/35000,
         /*num_partitions=*/3);
 
-    ASSERT_NE(result.snapshot, nullptr);
+    ASSERT_NE(result.snapshot.get(), nullptr);
 
     auto summary = result.snapshot->getObject(f_summary);
-    ASSERT_NE(summary, nullptr);
+    ASSERT_NE(summary.get(), nullptr);
 
     /// Operation must be `replace`.
     EXPECT_EQ(summary->getValue<String>(f_operation), f_replace);
