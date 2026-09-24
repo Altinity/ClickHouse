@@ -7,4 +7,4 @@ Per project:
 * `pcg-random/`: External library to generate random numbers.
 * `poco/`: A set of C++ libraries to build programs. This is forked and modified from the original. We aim to slowly remove it from the project completely with our own code or STD when possible, not update it or add new features to it.
 * `readpassphrase/`: External library to read passwords via terminal prompt.
-* `widechar_width/`: External library to implement `wcwidth` which measures the width of unicode strings.
+* `widechar_width/`: External library to implement `wcwidth` which measures the width of Unicode strings.
