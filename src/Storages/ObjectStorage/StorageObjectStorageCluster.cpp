@@ -286,12 +286,14 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         && context_->canUseTaskBasedParallelReplicas()
         && !context_->isDistributed();
 
-    /// Two ways this storage ends up reading from the initiator's file-task queue rather than listing its own
-    /// files: it is the announced driver of a whole-query dispatch, or it is an ordinary cluster read under
-    /// parallel replicas. The first is decided per table, by name; the second by the settings alone.
-    bool can_use_distributed_iterator =
-        isAnnouncedDistributedJoinDriver(context_, table_id_)
-        || (context_->getClientInfo().collaborate_with_initiator && can_use_parallel_replicas);
+    /// Two mechanisms can put a storage on an initiator's file-task queue: being the announced driver of a
+    /// whole-query dispatch, or being an ordinary cluster read under parallel replicas. They must not both
+    /// get a say, because there is one queue and it holds one table's files. A dispatch owns the decision
+    /// outright while it is in effect: its announced driver consumes the queue and every other table in that
+    /// query lists its own files, whatever the parallel-replica settings would otherwise allow.
+    bool can_use_distributed_iterator = isDistributedJoinDispatchWorker(context_)
+        ? isAnnouncedDistributedJoinDriver(context_, table_id_)
+        : (context_->getClientInfo().collaborate_with_initiator && can_use_parallel_replicas);
 
     pure_storage = std::make_shared<StorageObjectStorage>(
         configuration,
