@@ -3859,7 +3859,11 @@ void registerStorageHybrid(StorageFactory & factory)
         {
             return name.starts_with(StorageDistributed::HYBRID_WATERMARK_PREFIX);
         },
-    });
+    },
+    Documentation{
+        .description = R"DOCS_MD(
+`Hybrid` unions multiple data sources behind per-segment predicates so queries behave like a single table while data is migrated or tiered. It builds on top of the `Distributed` table engine.
+)DOCS_MD"});
 }
 
 bool StorageDistributed::initializeDiskOnConfigChange(const std::set<String> & new_added_disks)
