@@ -434,7 +434,7 @@ void StorageMergeTreeTextIndex::checkAccess(const ContextPtr & context, const St
     /// initiator confirms by pushing its roles (it does not when it rewrote the initial user to the connection user).
     const auto & client_info = context->getClientInfo();
     const bool same_user = client_info.initial_user == client_info.current_user && client_info.current_roles.has_value();
-    if (client_info.query_kind == ClientInfo::QueryKind::SECONDARY_QUERY
+    if ((client_info.query_kind == ClientInfo::QueryKind::SECONDARY_QUERY || client_info.distributed_depth > 0)
         && client_info.interface != ClientInfo::Interface::TCP_INTERSERVER && !same_user)
         throw Exception(ErrorCodes::ACCESS_DENIED,
             "Table function `mergeTreeTextIndex` checks the access of the user who runs the query, so a shard of a "
