@@ -3200,7 +3200,15 @@ void InterpreterSelectQuery::initSettings()
 {
     auto & query = getSelectQuery();
     if (query.settings())
+    {
         InterpreterSetQuery(query.settings(), context).executeForCurrentContext(options.ignore_setting_constraints);
+
+        /// The old interpreter disabled the analyzer in IInterpreterUnionOrSelectQuery, but a SELECT
+        /// stored in a VIEW may enable it again here. Storages must not use analyzer-only query tree
+        /// paths (for example, StorageDistributed::read) when this interpreter built the query.
+        if (context->getSettingsRef().allow_experimental_analyzer)
+            context->setSetting("allow_experimental_analyzer", false);
+    }
 
     const auto & client_info = context->getClientInfo();
     auto min_major = DBMS_MIN_MAJOR_VERSION_WITH_CURRENT_AGGREGATION_VARIANT_SELECTION_METHOD;
