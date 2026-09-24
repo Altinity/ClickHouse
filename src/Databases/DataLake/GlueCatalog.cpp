@@ -20,6 +20,7 @@
 
 #include <Common/Exception.h>
 #include <Common/CurrentMetrics.h>
+#include <Common/CurrentThread.h>
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
 
@@ -54,11 +55,15 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/ProxyConfigurationResolverProvider.h>
 
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
+
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int DATALAKE_DATABASE_ERROR;
     extern const int FAULT_INJECTED;
+    extern const int CATALOG_NAMESPACE_DISABLED;
 }
 
 namespace DB::FailPoints
@@ -81,6 +86,24 @@ namespace DB::ServerSetting
 {
     extern const ServerSettingsUInt64 s3_max_redirects;
     extern const ServerSettingsUInt64 s3_retry_attempts;
+}
+
+namespace ProfileEvents
+{
+    extern const Event DataLakeGlueCatalogGetDatabases;
+    extern const Event DataLakeGlueCatalogGetDatabasesMicroseconds;
+    extern const Event DataLakeGlueCatalogGetTables;
+    extern const Event DataLakeGlueCatalogGetTablesMicroseconds;
+    extern const Event DataLakeGlueCatalogGetTable;
+    extern const Event DataLakeGlueCatalogGetTableMicroseconds;
+    extern const Event DataLakeGlueCatalogCreateDatabase;
+    extern const Event DataLakeGlueCatalogCreateDatabaseMicroseconds;
+    extern const Event DataLakeGlueCatalogCreateTable;
+    extern const Event DataLakeGlueCatalogCreateTableMicroseconds;
+    extern const Event DataLakeGlueCatalogUpdateTable;
+    extern const Event DataLakeGlueCatalogUpdateTableMicroseconds;
+    extern const Event DataLakeGlueCatalogDropTable;
+    extern const Event DataLakeGlueCatalogDropTableMicroseconds;
 }
 
 namespace CurrentMetrics
@@ -193,9 +216,9 @@ GlueCatalog::GlueCatalog(
         LOG_TRACE(log, "Creating AWS glue client with credentials empty {}, region '{}', endpoint '{}'", credentials.IsEmpty(), region, endpoint);
     }
 
+    boost::split(allowed_namespaces, settings.namespaces, boost::is_any_of(", "), boost::token_compress_on);
     credentials_provider = DB::S3::getCredentialsProvider(poco_config, credentials, creds_config);
     glue_client = std::make_unique<Aws::Glue::GlueClient>(credentials_provider, endpoint_provider, client_configuration);
-
 }
 
 GlueCatalog::~GlueCatalog() = default;
@@ -212,7 +235,14 @@ DataLake::ICatalog::Namespaces GlueCatalog::getDatabases(const std::string & pre
     do
     {
         request.SetNextToken(next_token);
-        auto outcome = glue_client->GetDatabases(request);
+
+        Aws::Glue::Model::GetDatabasesOutcome outcome;
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetDatabases);
+            auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetDatabasesMicroseconds);
+            outcome = glue_client->GetDatabases(request);
+        }
+
         if (outcome.IsSuccess())
         {
             const auto & databases_result = outcome.GetResult();
@@ -221,8 +251,9 @@ DataLake::ICatalog::Namespaces GlueCatalog::getDatabases(const std::string & pre
             for (const auto & db : dbs)
             {
                 const auto & db_name = db.GetName();
-                if (!db_name.starts_with(prefix))
+                if (!isNamespaceAllowed(db_name) || !db_name.starts_with(prefix))
                     continue;
+
                 result.push_back(db_name);
                 if (limit != 0 && result.size() >= limit)
                     break;
@@ -261,7 +292,12 @@ CatalogTables GlueCatalog::getTablesForDatabase(const std::string & db_name, siz
     do
     {
         request.SetNextToken(next_token);
-        auto outcome = glue_client->GetTables(request);
+        Aws::Glue::Model::GetTablesOutcome outcome;
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTables);
+            auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTablesMicroseconds);
+            outcome = glue_client->GetTables(request);
+        }
         if (outcome.IsSuccess())
         {
             const auto & tables_result = outcome.GetResult();
@@ -326,20 +362,32 @@ CatalogTables GlueCatalog::listTablesInNamespaceDirect(const std::string & names
 
 bool GlueCatalog::existsTable(const std::string & database_name, const std::string & table_name) const
 {
+    if (!isNamespaceAllowed(database_name))
+        throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", database_name);
+
     TableMetadata metadata;
-    return tryGetTableMetadata(database_name, table_name, metadata);
+    return tryGetTableMetadata(database_name, table_name, getContext(), metadata);
 }
 
 bool GlueCatalog::tryGetTableMetadata(
     const std::string & database_name,
     const std::string & table_name,
+    DB::ContextPtr /* context_ */,
     TableMetadata & result) const
 {
+    if (!isNamespaceAllowed(database_name))
+        throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", database_name);
+
     Aws::Glue::Model::GetTableRequest request;
     request.SetDatabaseName(database_name);
     request.SetName(table_name);
 
-    auto outcome = glue_client->GetTable(request);
+    Aws::Glue::Model::GetTableOutcome outcome;
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTableMicroseconds);
+        outcome = glue_client->GetTable(request);
+    }
     if (outcome.IsSuccess())
     {
         const auto & table_outcome = outcome.GetResult().GetTable();
@@ -425,7 +473,7 @@ bool GlueCatalog::tryGetTableMetadata(
                     column_type = getActualTimestampType(column.GetName(), result, column_type);
                 }
 
-                schema.push_back({column.GetName(), getType(column_type, can_be_nullable)});
+                schema.push_back({column.GetName(), getType(column_type, can_be_nullable, getContext())});
             }
             result.setSchema(schema);
         }
@@ -447,9 +495,10 @@ bool GlueCatalog::tryGetTableMetadata(
 void GlueCatalog::getTableMetadata(
     const std::string & database_name,
     const std::string & table_name,
+    DB::ContextPtr context_,
     TableMetadata & result) const
 {
-    if (!tryGetTableMetadata(database_name, table_name, result))
+    if (!tryGetTableMetadata(database_name, table_name, context_, result))
     {
         throw DB::Exception(
             DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
@@ -579,8 +628,8 @@ GlueCatalog::ObjectStorageWithPath GlueCatalog::createObjectStorageForEarlyTable
 
     auto storage_settings = std::make_shared<DB::DataLakeStorageSettings>();
     storage_settings->loadFromSettingsChanges(settings.allChanged());
-    auto configuration = std::make_shared<DB::StorageS3IcebergConfiguration>(storage_settings);
-    DB::StorageObjectStorageConfiguration::initialize(*configuration, args, getContext(), false);
+    auto configuration = std::make_shared<DB::StorageS3IcebergConfiguration>(storage_settings, settings.namespaces);
+    configuration->initialize(args, getContext(), false);
 
     auto object_storage = configuration->createObjectStorage(getContext(), true, {});
 
@@ -635,6 +684,8 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     db_input.SetName(namespace_name);
     create_request.SetDatabaseInput(db_input);
 
+    ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogCreateDatabase);
+    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogCreateDatabaseMicroseconds);
     auto outcome = glue_client->CreateDatabase(create_request);
     if (!outcome.IsSuccess() && outcome.GetError().GetErrorType() != Aws::Glue::GlueErrors::ALREADY_EXISTS)
     {
@@ -647,6 +698,11 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
 
 void GlueCatalog::createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*metadata_content*/) const
 {
+    if (!isNamespaceAllowed(namespace_name))
+        throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
+            "Failed to create table {}, namespace {} is filtered by `namespaces` database parameter",
+            table_name, namespace_name);
+
     Aws::Glue::Model::CreateTableRequest request;
     request.SetDatabaseName(namespace_name);
 
@@ -672,7 +728,13 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
 
     request.SetTableInput(table_input);
 
-    auto response = glue_client->CreateTable(request);
+    Aws::Glue::Model::CreateTableOutcome response;
+
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogCreateTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogCreateTableMicroseconds);
+        response = glue_client->CreateTable(request);
+    }
 
     if (!response.IsSuccess())
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not create metadata in glue catalog: {}", response.GetError().GetMessage());
@@ -707,7 +769,13 @@ bool GlueCatalog::updateMetadata(const String & namespace_name, const String & t
 
     request.SetTableInput(table_input);
 
-    auto response = glue_client->UpdateTable(request);
+    Aws::Glue::Model::UpdateTableOutcome response;
+
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogUpdateTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogUpdateTableMicroseconds);
+        response = glue_client->UpdateTable(request);
+    }
 
     if (!response.IsSuccess())
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not update metadata in glue catalog {}", response.GetError().GetMessage());
@@ -727,17 +795,33 @@ bool GlueCatalog::updateSchema(
 
 void GlueCatalog::dropTable(const String & namespace_name, const String & table_name, bool /*delete_data*/) const
 {
+    if (!isNamespaceAllowed(namespace_name))
+        throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
+            "Failed to drop table {}, namespace {} is filtered by `namespaces` database parameter",
+            table_name, namespace_name);
+
     Aws::Glue::Model::DeleteTableRequest request;
     request.SetDatabaseName(namespace_name);
     request.SetName(table_name);
 
-    auto response = glue_client->DeleteTable(request);
+    Aws::Glue::Model::DeleteTableOutcome response;
+
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogDropTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogDropTableMicroseconds);
+        response = glue_client->DeleteTable(request);
+    }
 
     if (!response.IsSuccess())
         throw DB::Exception(
             DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
             "Can not delete table from glue catalog: {}",
             response.GetError().GetMessage());
+}
+
+bool GlueCatalog::isNamespaceAllowed(const std::string & namespace_) const
+{
+    return allowed_namespaces.contains("*") || allowed_namespaces.contains(namespace_);
 }
 
 }

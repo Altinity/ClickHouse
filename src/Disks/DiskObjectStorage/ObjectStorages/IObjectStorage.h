@@ -157,10 +157,51 @@ struct ObjectMetadata
     bool isEtagUsableAsCacheKey() const { return !etag.empty() && etag_is_strong; }
 };
 
+
+struct DataFileInfo;
+class DataFileMetaInfo;
+using DataFileMetaInfoPtr = std::shared_ptr<DataFileMetaInfo>;
+
 struct DataLakeObjectMetadata;
 
 struct RelativePathWithMetadata
 {
+    class CommandInTaskResponse
+    {
+    public:
+        CommandInTaskResponse() = default;
+        explicit CommandInTaskResponse(const std::string & task);
+
+        bool isValid() const { return is_valid; }
+        void setFilePath(const std::string & file_path_ )
+        {
+            file_path = file_path_;
+            is_valid = true;
+        }
+        void setRetryAfterUs(Poco::Timestamp::TimeDiff time_us)
+        {
+            retry_after_us = time_us;
+            is_valid = true;
+        }
+        void setFileMetaInfo(DataFileMetaInfoPtr file_meta_info_ )
+        {
+            file_meta_info = file_meta_info_;
+            is_valid = true;
+        }
+
+        std::string toString() const;
+
+        std::optional<std::string> getFilePath() const { return file_path; }
+        std::optional<Poco::Timestamp::TimeDiff> getRetryAfterUs() const { return retry_after_us; }
+        std::optional<DataFileMetaInfoPtr> getFileMetaInfo() const { return file_meta_info; }
+
+    private:
+        bool is_valid = false;
+        std::optional<std::string> file_path;
+        std::optional<Poco::Timestamp::TimeDiff> retry_after_us;
+        std::optional<DataFileMetaInfoPtr> file_meta_info;
+    };
+
     String relative_path;
     std::optional<size_t> read_source_index;
     std::optional<String> path_for_glob_matching;
@@ -168,13 +209,26 @@ struct RelativePathWithMetadata
     bool derive_file_name_from_url_path = false;
     /// Object metadata: size, modification time, etc.
     std::optional<ObjectMetadata> metadata;
+    /// Information about columns
+    std::optional<DataFileMetaInfoPtr> file_meta_info;
+    /// Retry request after short pause
+    CommandInTaskResponse command;
 
     RelativePathWithMetadata() = default;
 
-    explicit RelativePathWithMetadata(String relative_path_, std::optional<ObjectMetadata> metadata_ = std::nullopt)
-        : relative_path(std::move(relative_path_))
+    explicit RelativePathWithMetadata(String command_or_path, std::optional<ObjectMetadata> metadata_ = std::nullopt)
+        : relative_path(std::move(command_or_path))
         , metadata(std::move(metadata_))
-    {}
+        , command(relative_path)
+    {
+        if (command.isValid())
+        {
+            relative_path = command.getFilePath().value_or("");
+            file_meta_info = command.getFileMetaInfo();
+        }
+    }
+
+    explicit RelativePathWithMetadata(const DataFileInfo & info, std::optional<ObjectMetadata> metadata_ = std::nullopt);
 
     RelativePathWithMetadata(String relative_path_, std::optional<size_t> read_source_index_, std::optional<ObjectMetadata> metadata_ = std::nullopt)
         : relative_path(std::move(relative_path_))
@@ -201,6 +255,12 @@ struct RelativePathWithMetadata
     }
     std::string getPath() const { return relative_path; }
     std::string getPathForGlobMatching() const { return path_for_glob_matching.value_or(relative_path); }
+
+    void setFileMetaInfo(std::optional<DataFileMetaInfoPtr> file_meta_info_ ) { file_meta_info = file_meta_info_; }
+    std::optional<DataFileMetaInfoPtr> getFileMetaInfo() const { return file_meta_info; }
+
+    const CommandInTaskResponse & getCommand() const { return command; }
+    std::string getFileNameWithoutExtension() const { return std::filesystem::path(relative_path).stem(); }
 };
 
 struct ObjectKeyWithMetadata
@@ -462,6 +522,8 @@ public:
     /// Returns the inner (unwrapped) object storage for decorator types such as `CachedObjectStorage`.
     /// Returns nullptr for non-decorator types, meaning this storage is already the base.
     virtual ObjectStoragePtr getUnderlying() { return nullptr; }
+
+    virtual bool supportsListObjectsCache() { return false; }
 };
 
 using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;

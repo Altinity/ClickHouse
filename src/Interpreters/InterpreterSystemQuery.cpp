@@ -59,6 +59,7 @@
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <QueryPipeline/QueryPipeline.h>
+#include <Storages/Cache/ObjectStorageListObjectsCache.h>
 #include <Storages/Freeze.h>
 #include <Storages/MaterializedView/RefreshTask.h>
 #include <Storages/ObjectStorage/Azure/Configuration.h>
@@ -508,6 +509,10 @@ BlockIO InterpreterSystemQuery::execute()
             getContext()->checkAccess(AccessType::SYSTEM_DROP_POINT_IN_POLYGON_CACHE);
             clearPointInPolygonCache();
             break;
+        case Type::CLEAR_PUFFIN_FILES_CACHE:
+            getContext()->checkAccess(AccessType::SYSTEM_DROP_PUFFIN_FILES_CACHE);
+            system_context->clearPuffinFilesCache();
+            break;
         case Type::CLEAR_PRIMARY_INDEX_CACHE:
             getContext()->checkAccess(AccessType::SYSTEM_DROP_PRIMARY_INDEX_CACHE);
             system_context->clearPrimaryIndexCache();
@@ -602,7 +607,12 @@ BlockIO InterpreterSystemQuery::execute()
 #else
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "The server was compiled without the support for AWS S3");
 #endif
-
+        case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE);
+            ObjectStorageListObjectsCache::instance().clear();
+            break;
+        }
         case Type::CLEAR_FILESYSTEM_CACHE:
         {
             getContext()->checkAccess(AccessType::SYSTEM_DROP_FILESYSTEM_CACHE);
@@ -922,6 +932,20 @@ BlockIO InterpreterSystemQuery::execute()
         case Type::START_MOVES:
             startStopAction(ActionLocks::PartsMove, true);
             break;
+        case Type::STOP_SWARM_MODE:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_SWARM);
+            if (getContext()->stopSwarmMode())
+                getContext()->unregisterInAutodiscoveryClusters();
+            break;
+        }
+        case Type::START_SWARM_MODE:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_SWARM);
+            if (getContext()->startSwarmMode())
+                getContext()->registerInAutodiscoveryClusters();
+            break;
+        }
         case Type::STOP_FETCHES:
             startStopAction(ActionLocks::PartsFetch, false);
             break;
@@ -2807,6 +2831,9 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CLEAR_POINT_IN_POLYGON_CACHE:
             required_access.emplace_back(AccessType::SYSTEM_DROP_POINT_IN_POLYGON_CACHE);
             break;
+        case Type::CLEAR_PUFFIN_FILES_CACHE:
+            required_access.emplace_back(AccessType::SYSTEM_DROP_PUFFIN_FILES_CACHE);
+            break;
         case Type::CLEAR_PRIMARY_INDEX_CACHE:
             required_access.emplace_back(AccessType::SYSTEM_DROP_PRIMARY_INDEX_CACHE);
             break;
@@ -2866,6 +2893,9 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
             break;
         case Type::CLEAR_S3_CLIENT_CACHE:
             required_access.emplace_back(AccessType::SYSTEM_DROP_S3_CLIENT_CACHE);
+            break;
+        case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
+            required_access.emplace_back(AccessType::SYSTEM_DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE);
             break;
         case Type::CLEAR_DISTRIBUTED_CACHE:
         {
@@ -2951,6 +2981,12 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
                 required_access.emplace_back(AccessType::SYSTEM_MOVES);
             else
                 required_access.emplace_back(AccessType::SYSTEM_MOVES, query.getDatabase(), query.getTable());
+            break;
+        }
+        case Type::STOP_SWARM_MODE:
+        case Type::START_SWARM_MODE:
+        {
+            required_access.emplace_back(AccessType::SYSTEM_SWARM);
             break;
         }
         case Type::STOP_PULLING_REPLICATION_LOG:

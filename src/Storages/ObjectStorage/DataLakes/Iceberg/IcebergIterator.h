@@ -98,7 +98,7 @@ public:
         IDataLakeMetadata::FileProgressCallback callback_,
         Iceberg::TableStateSnapshotPtr table_snapshot_,
         Iceberg::IcebergDataSnapshotPtr data_snapshot_,
-        Iceberg::PersistentTableComponents persistent_components);
+        Iceberg::PersistentTableComponents persistent_components_);
 
     ObjectInfoPtr next(size_t) override;
 
@@ -122,11 +122,13 @@ private:
     IDataLakeMetadata::FileProgressCallback callback;
     /// Filled once under `deletes_mutex` and never mutated afterwards, so `next` may read them
     /// unguarded once it has gone through `ensureDeletesReady`.
-    std::vector<Iceberg::ProcessedManifestFileEntryPtr> position_deletes_files;
+    std::vector<Iceberg::ProcessedManifestFileEntryPtr> deletion_vector_files;
+    std::vector<Iceberg::ProcessedManifestFileEntryPtr> parquet_position_deletes_files;
     std::vector<Iceberg::ProcessedManifestFileEntryPtr> equality_deletes_files;
     std::mutex deletes_mutex;
     bool deletes_ready TSA_GUARDED_BY(deletes_mutex) = false;
     std::exception_ptr deletes_exception TSA_GUARDED_BY(deletes_mutex);
+    Int32 table_schema_id;
     /// Declared last: its tasks call back into `createManifestIterator`, so it must be destroyed
     /// (producer joined, tasks drained) before any other member.
     std::unique_ptr<Iceberg::DataFileEntriesStream> data_files_stream;

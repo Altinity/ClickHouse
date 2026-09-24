@@ -68,6 +68,10 @@ public:
 
         size_t pipe_capacity = 0;
 
+        /// Put the child in its own process group, so that a single `kill(-pid, ...)`
+        /// from the parent terminates the entire subprocess tree.
+        bool new_process_group = false;
+
         DestructorStrategy terminate_in_destructor_strategy = DestructorStrategy(false, 0);
 
         /// When true, `tryWaitImpl` reaps with `wait4` and captures the child's

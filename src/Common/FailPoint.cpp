@@ -46,6 +46,8 @@ static struct InitFiu
     PAUSEABLE_ONCE(remote_query_executor_finish_drain_pause) \
     ONCE(connection_stale_on_establish) \
     REGULAR(cluster_discovery_faults) \
+    REGULAR(cluster_discovery_unregister_fail) \
+    ONCE(cluster_discovery_retry_signal_fail) \
     REGULAR(stripe_log_sink_write_fallpoint) \
     REGULAR(file_checker_update_and_save_fail_reading_sizes) \
     REGULAR(file_checker_update_and_save_fail_persisting) \
@@ -239,6 +241,14 @@ static struct InitFiu
     ONCE(iceberg_writes_cleanup) \
     REGULAR(iceberg_slow_manifest_read) \
     REGULAR(storage_cluster_read_sleep) \
+    ONCE(iceberg_writes_non_retry_cleanup) \
+    ONCE(iceberg_writes_post_publish_throw) \
+    ONCE(iceberg_export_after_commit_before_zk_completed) \
+    REGULAR(export_partition_commit_always_throw) \
+    ONCE(export_partition_status_change_throw) \
+    REGULAR(export_partition_processed_paths_sync_fail) \
+    REGULAR(export_part_non_retryable_throw) \
+    REGULAR(export_part_retryable_throw) \
     ONCE(backup_add_empty_memory_table) \
     ONCE(backup_from_snapshot_fail_after_batch) \
     ONCE(backup_from_snapshot_fail_after_lock_file_creation) \

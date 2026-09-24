@@ -7,16 +7,17 @@
 #include <optional>
 #include <unordered_set>
 
-#include <base/arithmeticOverflow.h>
-
+#include <Interpreters/Context.h>
 #include <Interpreters/IcebergMetadataLog.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFileIterator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
+#include <Core/Settings.h>
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <Poco/JSON/Parser.h>
@@ -39,6 +40,11 @@ namespace DB::ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
+namespace DB::Setting
+{
+    extern const SettingsTimezone iceberg_partition_timezone;
+}
+
 namespace ProfileEvents
 {
 extern const Event IcebergPartitionPrunedFiles;
@@ -49,103 +55,6 @@ namespace DB::Iceberg
 {
 
 using namespace DB;
-
-namespace
-{
-    /// Iceberg store decimal values as unscaled value with two's-complement big-endian binary
-    /// using the minimum number of bytes for the value
-    /// Our decimal binary representation is little endian
-    /// so we cannot reuse our default code for parsing it.
-    ///
-    /// NOTE: It's very weird, but Decimal values for lower bound and upper bound
-    /// are stored rounded, without fractional part. What is more strange
-    /// the integer part is rounded mathematically correctly according to fractional part.
-    /// Example: 17.22 -> 17, 8888.999 -> 8889, 1423.77 -> 1424.
-    /// I've checked two implementations: Spark and Amazon Athena and both of them
-    /// do this.
-    ///
-    /// The problem is -- we cannot use rounded values for lower bounds and upper bounds.
-    /// Example: upper_bound(x) = 17.22, but it's rounded 17.00, now condition WHERE x >= 17.21 will
-    /// check rounded value and say: "Oh largest value is 17, so values bigger than 17.21 cannot be in this file,
-    /// let's skip it". But it will produce incorrect result since actual value (17.22 >= 17.21) is stored in this file.
-    ///
-    /// To handle this issue we subtract 1 from the integral part for lower_bound and add 1 to integral
-    /// part of upper_bound. This produces: 17.22 -> [16.0, 18.0]. So this is more rough boundary,
-    /// but at least it doesn't lead to incorrect results.
-    /// `compensate_rounding` widens the bound as described above; pass false to read the value exactly
-    /// as the manifest declares it.
-    template <typename DecimalType>
-    std::optional<DB::Field>
-    deserializeDecimalBound(const std::string & str, UInt32 scale, bool lower_bound, bool compensate_rounding = true)
-    {
-        using NativeType = typename DecimalType::NativeType;
-        using UnsignedType = make_unsigned_t<NativeType>;
-
-        if (str.size() > sizeof(NativeType))
-            return std::nullopt;
-
-        /// Accumulate into the unsigned counterpart, pre-filled with the sign bits,
-        /// so that the sign extension comes out of the shifts themselves.
-        UnsignedType unscaled = (str[0] & 0x80) ? ~UnsignedType(0) : UnsignedType(0);
-        for (const auto byte : str)
-            unscaled = (unscaled << 8) | static_cast<UInt8>(byte);
-
-        NativeType unscaled_value = static_cast<NativeType>(unscaled);
-
-        if (compensate_rounding && scale)
-        {
-            NativeType scaler = lower_bound ? -10 : 10;
-            for (UInt32 i = 1; i < scale; ++i)
-                scaler *= 10;
-
-            /// The bound is stored as raw bytes and is never checked against the declared precision, so
-            /// widening it can leave the type. A value that has no widened form is not a usable bound.
-            if (common::addOverflow(unscaled_value, scaler, unscaled_value))
-                return std::nullopt;
-        }
-
-        return DB::DecimalField<DecimalType>(unscaled_value, scale);
-    }
-
-    /// Iceberg stores lower_bounds and upper_bounds serialized with some custom deserialization as bytes array
-    /// https://iceberg.apache.org/spec/#appendix-d-single-value-serialization
-    std::optional<DB::Field> deserializeFieldFromBinaryRepr(
-        std::string str, DB::DataTypePtr expected_type, bool lower_bound, bool compensate_rounding = true)
-    {
-        auto non_nullable_type = DB::removeNullable(expected_type);
-        auto column = non_nullable_type->createColumn();
-        if (DB::WhichDataType(non_nullable_type).isDecimal())
-        {
-            if (str.empty())
-                return std::nullopt;
-
-            const UInt32 scale = DB::getDecimalScale(*non_nullable_type);
-            if (DB::checkDecimal<DB::Decimal32>(*non_nullable_type))
-                return deserializeDecimalBound<DB::Decimal32>(str, scale, lower_bound, compensate_rounding);
-            if (DB::checkDecimal<DB::Decimal64>(*non_nullable_type))
-                return deserializeDecimalBound<DB::Decimal64>(str, scale, lower_bound, compensate_rounding);
-            if (DB::checkDecimal<DB::Decimal128>(*non_nullable_type))
-                return deserializeDecimalBound<DB::Decimal128>(str, scale, lower_bound, compensate_rounding);
-            if (DB::checkDecimal<DB::Decimal256>(*non_nullable_type))
-                return deserializeDecimalBound<DB::Decimal256>(str, scale, lower_bound, compensate_rounding);
-            return std::nullopt;
-        }
-        else if (non_nullable_type->getTypeId() == DB::TypeIndex::Variant)
-        {
-            return std::nullopt;
-        }
-        else
-        {
-            /// For all other types except decimal binary representation
-            /// matches our internal representation
-            column->insertData(str.data(), str.length());
-            DB::Field result;
-            column->get(0, result);
-            return result;
-        }
-    }
-
-}
 
 const std::vector<ProcessedManifestFileEntryPtr> &
 ManifestFileIterator::ManifestFileEntriesHandle::getFilesWithoutDeleted(FileContentType content_type) const
@@ -201,7 +110,6 @@ bool ManifestFileIterator::ManifestFileEntriesHandle::areAllDataFilesEligibleFor
 
 std::optional<UInt64> ManifestFileIterator::ManifestFileEntriesHandle::getRowsCountInAllFilesExcludingDeleted(FileContentType content) const
 {
-    UInt64 result = 0;
     /// `record_count` is a required file-level field in all format versions, so the sum is
     /// exact: no fallback to optional per-column statistics is needed. The field is parsed
     /// as a raw Int64 though, so a corrupted manifest file may carry a negative value; it
@@ -209,36 +117,12 @@ std::optional<UInt64> ManifestFileIterator::ManifestFileEntriesHandle::getRowsCo
     /// silently produce a wrong -- or, after the conversion to size_t, absurdly huge --
     /// count) and rather than rejected (the count is only an optimization, a malformed
     /// value must not make the table unreadable).
-    for (const auto & file : getFilesWithoutDeleted(content))
-    {
-        if (file->parsed_entry->record_count < 0)
-            return std::nullopt;
-        result += static_cast<UInt64>(file->parsed_entry->record_count);
-    }
-    return result;
+    return getRecordCountInAllFilesExcludingDeleted(getFilesWithoutDeleted(content));
 }
 
 std::optional<Int64> ManifestFileIterator::ManifestFileEntriesHandle::getBytesCountInAllDataFilesExcludingDeleted() const
 {
-    size_t result = 0;
-    for (const auto & file : getFilesWithoutDeleted(FileContentType::DATA))
-    {
-        /// Have at least one column with bytes count
-        bool found = false;
-        for (const auto & [column, column_info] : file->parsed_entry->columns_infos)
-        {
-            if (column_info.bytes_size.has_value())
-            {
-                result += *column_info.bytes_size;
-                found = true;
-                break;
-            }
-        }
-
-        if (!found)
-            return std::nullopt;
-    }
-    return result;
+    return getBytesSizeInAllDataFilesExcludingDeleted(getFilesWithoutDeleted(FileContentType::DATA));
 }
 
 ManifestFileIterator::ManifestFileEntriesHandle ManifestFileIterator::getFilesWithoutDeletedHandle() const
@@ -270,9 +154,10 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     Int32 table_snapshot_schema_id_,
     const std::atomic<bool> * stop_flag_)
 {
+    auto dump_metadata = [&]()->String { return manifest_file_deserializer_->getMetadataContent(); };
     insertRowToLogTable(
         context_,
-        [&] { return manifest_file_deserializer_->getMetadataContent(); },
+        dump_metadata,
         DB::IcebergMetadataLogLevel::ManifestFileMetadata,
         path_resolver_.getTableRoot(),
         path_to_manifest_file_,
@@ -319,7 +204,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     const Poco::JSON::Object::Ptr & schema_object = json.extract<Poco::JSON::Object::Ptr>();
     Int32 manifest_schema_id = schema_object->getValue<int>(f_schema_id);
 
-    schema_processor.addIcebergTableSchema(schema_object);
+    schema_processor.addIcebergTableSchema(schema_object, context_);
 
     PartitionSpecification partition_spec_vec;
     for (size_t i = 0; i != partition_specification->size(); ++i)
@@ -337,7 +222,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
         auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
         auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
         partition_spec_vec.emplace_back(source_id, transform_name, partition_name, static_cast<Int32>(i));
-        auto partition_ast = getASTFromTransform(transform_name, numeric_column_name);
+        auto partition_ast = getASTFromTransform(transform_name, numeric_column_name, context_->getSettingsRef()[Setting::iceberg_partition_timezone]);
         /// Unsupported partition key expression
         if (partition_ast == nullptr)
             continue;
@@ -425,9 +310,10 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
 
     if (parsed_entry->status == ManifestEntryStatus::DELETED)
     {
+        auto dump_metadata = [&]()->String { return manifest_file_deserializer->getContent(row_index); };
         insertRowToLogTable(
             context,
-            [&] { return manifest_file_deserializer->getContent(row_index); },
+            dump_metadata,
             DB::IcebergMetadataLogLevel::ManifestFileEntry,
             path_resolver.getTableRoot(),
             path_to_manifest_file,
@@ -578,9 +464,10 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
         const ManifestFilesPruner * current_pruner = getOrCreatePruner(entry->resolved_schema_id);
         pruning_status = current_pruner->canBePruned(entry, hyperrectangles);
     }
+    auto dump_metadata = [&]()->String { return manifest_file_deserializer->getContent(row_index); };
     insertRowToLogTable(
         context,
-        [&] { return manifest_file_deserializer->getContent(row_index); },
+        dump_metadata,
         DB::IcebergMetadataLogLevel::ManifestFileEntry,
         path_resolver.getTableRoot(),
         path_to_manifest_file,
@@ -692,28 +579,14 @@ bool ManifestFileIterator::areAllDataFilesSortedBySortOrderID(Int32 sort_order_i
     return true;
 }
 
+std::optional<Int64> ManifestFileIterator::getRowsCountInAllFilesExcludingDeleted(FileContentType content) const
+{
+    return getFilesWithoutDeletedHandle().getRowsCountInAllFilesExcludingDeleted(content);
+}
+
 std::optional<Int64> ManifestFileIterator::getBytesCountInAllDataFilesExcludingDeleted() const
 {
-    Int64 result = 0;
-    auto handle = getFilesWithoutDeletedHandle();
-    for (const auto & file : handle.getFilesWithoutDeleted(FileContentType::DATA))
-    {
-        /// Have at least one column with bytes count
-        bool found = false;
-        for (const auto & [column, column_info] : file->parsed_entry->columns_infos)
-        {
-            if (column_info.bytes_size.has_value())
-            {
-                result += *column_info.bytes_size;
-                found = true;
-                break;
-            }
-        }
-
-        if (!found)
-            return std::nullopt;
-    }
-    return result;
+    return getFilesWithoutDeletedHandle().getBytesCountInAllDataFilesExcludingDeleted();
 }
 
 }

@@ -64,7 +64,7 @@ S3TablesCatalog::S3TablesCatalog(
     const CatalogSettings & catalog_settings_,
     DB::ContextPtr context_,
     bool allow_server_credentials_in_user_queries_)
-    : RestCatalog(warehouse_, base_url_, "", "", false, /* flat_namespaces */false, context_)
+    : RestCatalog(warehouse_, base_url_, "", "", false, /* flat_namespaces */false, catalog_settings_.namespaces, context_)
     , region(region_)
     , storage_endpoint(catalog_settings_.storage_endpoint)
     , signing_service("s3tables")
@@ -170,9 +170,10 @@ CatalogTables S3TablesCatalog::getTables() const
 bool S3TablesCatalog::tryGetTableMetadata(
     const std::string & namespace_name,
     const std::string & table_name,
+    DB::ContextPtr context_,
     TableMetadata & result) const
 {
-    if (!RestCatalog::tryGetTableMetadata(namespace_name, table_name, result))
+    if (!RestCatalog::tryGetTableMetadata(namespace_name, table_name, context_, result))
         return false;
 
     /// For S3 Tables the catalog and the underlying data live in AWS S3 under the same

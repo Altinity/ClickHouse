@@ -101,6 +101,7 @@
 #include <Storages/System/attachSystemTables.h>
 #include <Storages/System/attachInformationSchemaTables.h>
 #include <Storages/Cache/registerRemoteFileMetadatas.h>
+#include <Storages/Cache/ObjectStorageListObjectsCache.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <Functions/UserDefined/IUserDefinedSQLObjectsStorage.h>
 #include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
@@ -304,6 +305,10 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 parquet_metadata_cache_size;
     extern const ServerSettingsUInt64 parquet_metadata_cache_max_entries;
     extern const ServerSettingsDouble parquet_metadata_cache_size_ratio;
+    extern const ServerSettingsString puffin_files_cache_policy;
+    extern const ServerSettingsUInt64 puffin_files_cache_size;
+    extern const ServerSettingsUInt64 puffin_files_cache_max_entries;
+    extern const ServerSettingsDouble puffin_files_cache_size_ratio;
     extern const ServerSettingsUInt64 io_thread_pool_queue_size;
     extern const ServerSettingsBool jemalloc_enable_global_profiler;
     extern const ServerSettingsBool jemalloc_collect_global_profile_samples_in_trace_log;
@@ -497,6 +502,9 @@ namespace ServerSetting
     extern const ServerSettingsString hdfs_libhdfs3_conf;
     extern const ServerSettingsString config_file;
     extern const ServerSettingsString users_to_ignore_early_memory_limit_check;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_ttl;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_size;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_max_entries;
 }
 
 namespace ErrorCodes
@@ -507,6 +515,9 @@ namespace ErrorCodes
 namespace FileCacheSetting
 {
     extern const FileCacheSettingsBool load_metadata_asynchronously;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_size;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_max_entries;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_ttl;
 }
 
 }
@@ -2594,6 +2605,16 @@ try
     }
     global_context->setParquetMetadataCache(parquet_metadata_cache_policy, parquet_metadata_cache_size, parquet_metadata_cache_max_entries, parquet_metadata_cache_size_ratio);
 #endif
+    String puffin_files_cache_policy = server_settings[ServerSetting::puffin_files_cache_policy];
+    size_t puffin_files_cache_size = server_settings[ServerSetting::puffin_files_cache_size];
+    size_t puffin_files_cache_max_entries = server_settings[ServerSetting::puffin_files_cache_max_entries];
+    double puffin_files_cache_size_ratio = server_settings[ServerSetting::puffin_files_cache_size_ratio];
+    if (puffin_files_cache_size > max_cache_size)
+    {
+        puffin_files_cache_size = max_cache_size;
+        LOG_INFO(log, "Lowered Puffin files cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(puffin_files_cache_size));
+    }
+    global_context->setPuffinFilesCache(puffin_files_cache_policy, puffin_files_cache_size, puffin_files_cache_max_entries, puffin_files_cache_size_ratio);
 
     Names allowed_disks_table_engines;
     splitInto<','>(allowed_disks_table_engines, server_settings[ServerSetting::allowed_disks_for_table_engines].value);
@@ -3117,6 +3138,7 @@ try
 #if USE_PARQUET
                 global_context->updateParquetMetadataCacheConfiguration(config(), max_cache_size_in_bytes);
 #endif
+                global_context->updatePuffinFilesCacheConfiguration(config(), max_cache_size_in_bytes);
             }
 
 #if USE_SSL
@@ -3342,6 +3364,8 @@ try
 
     }
 
+    global_context->startSwarmMode();
+
     {
         std::lock_guard lock(servers_lock);
         /// We should start interserver communications before (and more important shutdown after) tables.
@@ -3537,6 +3561,10 @@ try
     }
     /// try set up encryption. There are some errors in config, error will be printed and server wouldn't start.
     CompressionCodecEncrypted::Configuration::instance().load(config(), "encryption_codecs");
+
+    ObjectStorageListObjectsCache::instance().setMaxSizeInBytes(server_settings[ServerSetting::object_storage_list_objects_cache_size]);
+    ObjectStorageListObjectsCache::instance().setMaxCount(server_settings[ServerSetting::object_storage_list_objects_cache_max_entries]);
+    ObjectStorageListObjectsCache::instance().setTTL(server_settings[ServerSetting::object_storage_list_objects_cache_ttl]);
 
     auto replicas_reconnector = ReplicasReconnector::init(global_context);
 
@@ -3910,6 +3938,8 @@ try
             stop_acme_instance();
 
             is_cancelled = true;
+
+            global_context->stopSwarmMode();
 
             LOG_DEBUG(log, "Waiting for current connections to close.");
 

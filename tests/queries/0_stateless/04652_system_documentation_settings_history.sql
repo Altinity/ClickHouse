@@ -136,7 +136,7 @@ WHERE d.type = 'Setting'
 SELECT count() FROM system.documentation AS d
 INNER JOIN
 (
-    SELECT name, argMax(version, arrayMap(x -> toUInt32(x), splitByChar('.', version))) AS newest
+    SELECT name, argMax(version, arrayMap(x -> toUInt32OrZero(x), splitByChar('.', version))) AS newest
     FROM session_changes GROUP BY name
 ) AS c USING (name)
 WHERE d.type = 'Setting' AND position(d.description, '**History**\n\n- **' || c.newest || '** ') = 0;
@@ -152,8 +152,8 @@ INNER JOIN
 (
     SELECT
         name,
-        argMin(version, arrayMap(x -> toUInt32(x), splitByChar('.', version))) AS oldest,
-        argMin(has_unchanged_default, arrayMap(x -> toUInt32(x), splitByChar('.', version))) AS oldest_has_unchanged_default
+        argMin(version, arrayMap(x -> toUInt32OrZero(x), splitByChar('.', version))) AS oldest,
+        argMin(has_unchanged_default, arrayMap(x -> toUInt32OrZero(x), splitByChar('.', version))) AS oldest_has_unchanged_default
     FROM
     (
         SELECT name, version, max(previous_value = new_value) AS has_unchanged_default
@@ -162,7 +162,7 @@ INNER JOIN
     GROUP BY name
 ) AS c USING (name)
 WHERE d.type = 'Setting' AND position(d.description, '**Introduced in:** v') > 0
-  AND (extract(d.description, '\\*\\*Introduced in:\\*\\* v([0-9.]+)') != c.oldest OR NOT c.oldest_has_unchanged_default);
+  AND (extract(d.description, '\\*\\*Introduced in:\\*\\* v(\\S+)') != c.oldest OR NOT c.oldest_has_unchanged_default);
 
 -- A record that does not change the default value is not necessarily an introduction: it is also how the history
 -- notes something else about a setting that already exists. The oldest record of `page_cache_block_size` says that
