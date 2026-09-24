@@ -8371,6 +8371,16 @@ Minimum number of manifest files required to trigger manifest-only compaction vi
 If the current number of manifest files is less than or equal to this threshold, compaction is skipped.
 Requires allow_experimental_iceberg_compaction to be enabled.
 )", EXPERIMENTAL) \
+    DECLARE(UInt64, iceberg_target_data_file_size_bytes, 536870912, R"(
+Target data file size in bytes for Iceberg bin-packing compaction via OPTIMIZE TABLE.
+Small files are merged until the result approaches this size.  Default is 512 MiB.
+Requires allow_experimental_iceberg_compaction to be enabled.
+)", EXPERIMENTAL) \
+    DECLARE(UInt64, iceberg_min_data_file_size_bytes, 402653184, R"(
+Data files smaller than this threshold are candidates for bin-packing compaction via OPTIMIZE TABLE.
+Default is 384 MiB (75% of iceberg_target_data_file_size_bytes).
+Requires allow_experimental_iceberg_compaction to be enabled.
+)", EXPERIMENTAL) \
     DECLARE(Bool, allow_iceberg_remove_orphan_files, false, R"(
 Allow to use 'ALTER TABLE ... EXECUTE remove_orphan_files()' for iceberg tables.
 )", EXPERIMENTAL) \

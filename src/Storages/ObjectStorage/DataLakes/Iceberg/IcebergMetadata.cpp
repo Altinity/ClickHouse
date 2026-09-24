@@ -68,6 +68,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/Common/AvroForIcebergDeserializer.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/BinPackRewrite.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Compaction.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ExpireSnapshotsExecute.h>
@@ -510,29 +511,44 @@ IcebergMetadata::getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object,
 }
 
 bool IcebergMetadata::optimize(
-    const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings)
+    const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & /*format_settings*/)
 {
-    if (context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
-    {
-        const auto sample_block = std::make_shared<const Block>(metadata_snapshot->getSampleBlock());
-        auto snapshots_info = getHistory(context);
-        compactIcebergTable(
-            snapshots_info,
-            persistent_components,
-            object_storage,
-            secondary_storages,
-            data_lake_settings,
-            format_settings,
-            sample_block,
-            context,
-            write_format);
-        return true;
-    }
-    else
-    {
+    if (!context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call optimize for iceberg tables.");
+
+    static constexpr size_t MAX_BIN_PACK_RETRIES = 100;
+
+    const auto sample_block = std::make_shared<const Block>(metadata_snapshot->getSampleBlock());
+
+    for (size_t attempt = 0; attempt < MAX_BIN_PACK_RETRIES; ++attempt)
+    {
+        if (attempt > 0)
+            LOG_INFO(log, "Retrying bin-pack compaction (attempt {}/{})", attempt + 1, MAX_BIN_PACK_RETRIES);
+
+        if (Iceberg::executeBinPackCompaction(
+                persistent_components,
+                object_storage,
+                *secondary_storages,
+                data_lake_settings,
+                sample_block,
+                context,
+                write_format,
+                /* catalog */ nullptr,
+                /* table_id */ StorageID::createEmpty()))
+        {
+            if (persistent_components.metadata_cache)
+            {
+                persistent_components.metadata_cache->remove(persistent_components.table_path);
+                if (persistent_components.table_uuid)
+                    persistent_components.metadata_cache->remove(*persistent_components.table_uuid);
+            }
+            return true;
+        }
     }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR,
+        "Bin-pack compaction failed to commit after {} attempts", MAX_BIN_PACK_RETRIES);
 }
 
 bool IcebergMetadata::optimizeManifestFiles(
