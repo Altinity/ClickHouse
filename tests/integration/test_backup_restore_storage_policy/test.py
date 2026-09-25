@@ -9,6 +9,7 @@ cluster = ClickHouseCluster(__file__)
 instance = cluster.add_instance(
     "instance",
     main_configs=["configs/storage_config.xml"],
+    with_rustfs=True,
 )
 
 
@@ -42,6 +43,12 @@ def create_table_backup(backup_name, storage_policy=None):
         create_query += f" SETTINGS storage_policy = '{storage_policy}'"
     instance.query(create_query)
     instance.query("INSERT INTO test.table SELECT number FROM numbers(10)")
+    assert instance.query("SELECT count(), sum(x) FROM test.table") == "10\t45\n"
+    if storage_policy is not None:
+        assert (
+            instance.query("SELECT storage_policy FROM system.tables WHERE name='table'")
+            == f"{storage_policy}\n"
+        )
     instance.query(f"BACKUP TABLE test.table TO {backup_name}")
     instance.query("DROP TABLE test.table SYNC")
 
@@ -63,6 +70,11 @@ def restore_table(backup_name, storage_policy=None):
         ("policy1", "policy2", "policy2"),
         ("policy1", "", "default"),
         ("policy1", None, "policy1"),
+        ("cas_policy", None, "cas_policy"),
+        ("cas_policy", "policy1", "policy1"),
+        (None, "cas_policy", "cas_policy"),
+        ("policy1", "cas_policy", "cas_policy"),
+        ("cas_policy", "cas_policy", "cas_policy"),
     ],
 )
 def test_storage_policies(origin_policy, restore_policy, expected_policy):
@@ -73,4 +85,15 @@ def test_storage_policies(origin_policy, restore_policy, expected_policy):
     assert (
         instance.query("SELECT storage_policy FROM system.tables WHERE name='table'")
         == f"{expected_policy}\n"
+    )
+    assert instance.query("SELECT count(), sum(x) FROM test.table") == "10\t45\n"
+    assert (
+        instance.query(
+            "SELECT sum(rows) FROM system.parts WHERE database = 'test' AND table = 'table' AND active"
+        )
+        == "10\n"
+    )
+    assert (
+        instance.query("CHECK TABLE test.table SETTINGS check_query_single_value_result = 1")
+        == "1\n"
     )

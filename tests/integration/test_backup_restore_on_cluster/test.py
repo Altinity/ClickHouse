@@ -19,6 +19,8 @@ main_configs = [
     "configs/lesser_timeouts.xml",  # Default timeouts are quite big (a few minutes), the tests don't need them to be that big.
 ]
 
+cas_configs = ["configs/cas_storage.xml"]
+
 user_configs = [
     "configs/allow_database_types.xml",
     "configs/zookeeper_retries.xml",
@@ -26,30 +28,33 @@ user_configs = [
 
 node1 = cluster.add_instance(
     "node1",
-    main_configs=main_configs,
+    main_configs=main_configs + cas_configs + ["configs/cas_server_root_node1.xml"],
     user_configs=user_configs,
     external_dirs=["/backups/"],
     macros={"replica": "node1", "shard": "shard1"},
     with_zookeeper=True,
+    with_rustfs=True,
 )
 
 node2 = cluster.add_instance(
     "node2",
-    main_configs=main_configs,
+    main_configs=main_configs + cas_configs + ["configs/cas_server_root_node2.xml"],
     user_configs=user_configs,
     external_dirs=["/backups/"],
     macros={"replica": "node2", "shard": "shard1"},
     with_zookeeper=True,
+    with_rustfs=True,
     stay_alive=True,  # Necessary for the "test_stop_other_host_while_backup" test
 )
 
 node3 = cluster.add_instance(
     "node3",
-    main_configs=main_configs,
+    main_configs=main_configs + cas_configs + ["configs/cas_server_root_node3.xml"],
     user_configs=user_configs,
     external_dirs=["/backups/"],
     macros={"replica": "node3", "shard": "shard1"},
     with_zookeeper=True,
+    with_rustfs=True,
 )
 
 
@@ -123,6 +128,46 @@ def test_replicated_table():
     assert node1.query("SELECT * FROM tbl ORDER BY x") == TSV(
         [[1, "Don\\'t"], [2, "count"], [3, "your"], [4, "chickens"]]
     )
+
+
+def test_replicated_table_on_cas_disk():
+    expected = TSV([[1, "Don\\'t"], [2, "count"], [3, "your"], [4, "chickens"]])
+    node1.query(
+        "CREATE TABLE tbl ON CLUSTER 'cluster' ("
+        "x UInt8, y String"
+        ") ENGINE=ReplicatedMergeTree('/clickhouse/tables/tbl/', '{replica}')"
+        "ORDER BY x SETTINGS storage_policy = 'cas_policy'"
+    )
+
+    node1.query("INSERT INTO tbl VALUES (1, 'Don''t')")
+    node2.query("INSERT INTO tbl VALUES (2, 'count')")
+    node1.query("INSERT INTO tbl SETTINGS async_insert=true VALUES (3, 'your')")
+    node2.query("INSERT INTO tbl SETTINGS async_insert=true VALUES (4, 'chickens')")
+    node1.query("SYSTEM SYNC REPLICA ON CLUSTER 'cluster' tbl")
+
+    assert node1.query("SELECT * FROM tbl ORDER BY x") == expected
+    assert node2.query("SELECT * FROM tbl ORDER BY x") == expected
+    for node in [node1, node2]:
+        assert (
+            node.query("SELECT storage_policy FROM system.tables WHERE name = 'tbl'")
+            == "cas_policy\n"
+        )
+
+    backup_name = new_backup_name()
+    node1.query(
+        f"BACKUP TABLE tbl ON CLUSTER 'cluster' TO {backup_name} SETTINGS replica_num=1"
+    )
+    node1.query("DROP TABLE tbl ON CLUSTER 'cluster' SYNC")
+    node2.query(f"RESTORE TABLE tbl ON CLUSTER 'cluster' FROM {backup_name}")
+    node1.query("SYSTEM SYNC REPLICA ON CLUSTER 'cluster' tbl")
+
+    assert node1.query("SELECT * FROM tbl ORDER BY x") == expected
+    assert node2.query("SELECT * FROM tbl ORDER BY x") == expected
+    for node in [node1, node2]:
+        assert (
+            node.query("SELECT storage_policy FROM system.tables WHERE name = 'tbl'")
+            == "cas_policy\n"
+        )
 
 
 def test_empty_replicated_table():

@@ -19,6 +19,7 @@ main_configs = [
     "configs/lesser_timeouts.xml",  # Default timeouts are quite big (a few minutes), the tests don't need them to be that big.
     "configs/slow_backups.xml",
     "configs/shutdown_cancel_backups.xml",
+    "configs/cas_storage.xml",
 ]
 
 user_configs = [
@@ -27,21 +28,23 @@ user_configs = [
 
 node1 = cluster.add_instance(
     "node1",
-    main_configs=main_configs,
+    main_configs=main_configs + ["configs/cas_server_root_node1.xml"],
     user_configs=user_configs,
     external_dirs=["/backups/"],
     macros={"replica": "node1", "shard": "shard1"},
     with_zookeeper=True,
+    with_rustfs=True,
     stay_alive=True,  # Necessary for "test_shutdown_cancel_backup"
 )
 
 node2 = cluster.add_instance(
     "node2",
-    main_configs=main_configs,
+    main_configs=main_configs + ["configs/cas_server_root_node2.xml"],
     user_configs=user_configs,
     external_dirs=["/backups/"],
     macros={"replica": "node2", "shard": "shard1"},
     with_zookeeper=True,
+    with_rustfs=True,
     stay_alive=True,  # Necessary for "test_shutdown_cancel_backup"
 )
 
@@ -79,7 +82,7 @@ def random_node():
 
 
 # Makes table "tbl" and fill it with data.
-def create_and_fill_table(node, num_parts=10, on_cluster=True):
+def create_and_fill_table(node, num_parts=10, on_cluster=True, storage_policy=None):
     # We use partitioning to make sure there will be more files in a backup.
     partition_by_clause = " PARTITION BY x%" + str(num_parts) if num_parts > 1 else ""
     node.query(
@@ -88,6 +91,7 @@ def create_and_fill_table(node, num_parts=10, on_cluster=True):
         + "(x UInt64) ENGINE=ReplicatedMergeTree('/clickhouse/tables/tbl/', '{replica}') "
         + "ORDER BY tuple()"
         + partition_by_clause
+        + (f" SETTINGS storage_policy = '{storage_policy}'" if storage_policy else "")
     )
     if num_parts > 0:
         node.query(f"INSERT INTO tbl SELECT number FROM numbers({num_parts})")
@@ -406,18 +410,17 @@ def wait_for_backups_to_finish():
     )
 
 
-__backup_id_of_successful_backup = None
+__backup_id_of_successful_backup = {}
 
 
 # Generates a backup which will be used to test RESTORE.
-def get_backup_id_of_successful_backup():
-    global __backup_id_of_successful_backup
-    if __backup_id_of_successful_backup is None:
-        __backup_id_of_successful_backup = random_id()
+def get_backup_id_of_successful_backup(storage_policy=None):
+    if storage_policy not in __backup_id_of_successful_backup:
+        __backup_id_of_successful_backup[storage_policy] = random_id()
         with NoTrashChecker() as no_trash_checker:
             print("Will make backup successfully")
-            backup_id = __backup_id_of_successful_backup
-            create_and_fill_table(random_node())
+            backup_id = __backup_id_of_successful_backup[storage_policy]
+            create_and_fill_table(random_node(), storage_policy=storage_policy)
             initiator = random_node()
             print(f"Using {get_node_name(initiator)} as initiator")
             initiator.query(
@@ -430,7 +433,7 @@ def get_backup_id_of_successful_backup():
             # Dropping the table before restoring.
             node1.query("DROP TABLE tbl ON CLUSTER 'cluster' SYNC")
 
-    return __backup_id_of_successful_backup
+    return __backup_id_of_successful_backup[storage_policy]
 
 
 # Actual tests
@@ -489,9 +492,10 @@ def test_cancel_backup():
 
 
 # Test that a RESTORE operation can be cancelled with KILL QUERY.
-def test_cancel_restore():
+@pytest.mark.parametrize("storage_policy", [None, "cas_policy"])
+def test_cancel_restore(storage_policy):
     # Make backup.
-    backup_id = get_backup_id_of_successful_backup()
+    backup_id = get_backup_id_of_successful_backup(storage_policy)
 
     # Cancel restoring.
     with NoTrashChecker() as no_trash_checker:
@@ -555,6 +559,19 @@ def test_cancel_restore():
 
         wait_status(initiator, "RESTORED", restore_id=restore_id)
         assert get_num_system_processes(nodes, restore_id=restore_id) == 0
+
+    if storage_policy is not None:
+        node1.query("SYSTEM SYNC REPLICA ON CLUSTER 'cluster' tbl")
+        for node in nodes:
+            assert (
+                node.query("SELECT storage_policy FROM system.tables WHERE name = 'tbl'")
+                == f"{storage_policy}\n"
+            )
+            assert node.query("SELECT count(), sum(x) FROM tbl") == "10\t45\n"
+            assert (
+                node.query("CHECK TABLE tbl SETTINGS check_query_single_value_result = 1")
+                == "1\n"
+            )
 
 
 # Test that shutdown cancels a running backup and doesn't wait until it finishes.
