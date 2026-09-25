@@ -1997,6 +1997,21 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in manifest of {}", r->file, path);
 }
 
+std::string ContentAddressedMetadataStorage::readInlineDataToString(const std::string & path) const
+{
+    checkOpAdmitted(CasOpClass::ContentRead);
+    if (auto bytes = tryGetInManifestBytes(path))
+        return std::move(*bytes);
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: {} is not an in-manifest file", path);
+}
+
+size_t ContentAddressedMetadataStorage::getObjectPayloadOffset(const std::string & path) const
+{
+    if (auto plan = getBlobViewPlan(path))
+        return plan->payload_offset;
+    return 0;
+}
+
 std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsIfExist(const std::string & path) const
 {
     /// A Vanished disk answers absent (truth). Probe first so the non-part `getStorageObjects` fallback

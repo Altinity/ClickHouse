@@ -964,20 +964,7 @@ Strings DiskObjectStorage::getBlobPath(const String & path) const
 
 size_t DiskObjectStorage::getObjectPayloadOffset(const String & path) const
 {
-    if (!metadata_storage->isContentAddressed())
-        return 0;
-
-    const auto * ca = dynamic_cast<const IContentAddressedExchange *>(metadata_storage.get());
-    if (!ca)
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Metadata storage of disk {} reports itself content-addressed but does not implement "
-            "IContentAddressedExchange, so the payload offset of {} cannot be resolved",
-            getName(), path);
-
-    if (auto plan = ca->getBlobViewPlan(path))
-        return plan->payload_offset;
-    return 0;
+    return metadata_storage->getObjectPayloadOffset(path);
 }
 
 bool DiskObjectStorage::areBlobPathsRandom() const

@@ -1,5 +1,5 @@
 ---
-description: 'How BACKUP and RESTORE work for a table on a content-addressed disk: what holds the data during a backup, when the copy runs inside S3, and what is not supported yet.'
+description: 'How BACKUP and RESTORE work for a table on a content-addressed disk: what holds the data during a backup, when the copy runs inside S3 for S3 and Disk destinations, and what is not supported yet.'
 sidebar_label: 'Backup'
 sidebar_position: 5
 slug: /antalya/cas/operations/backup
@@ -55,17 +55,40 @@ what was one blob shared by several replicas becomes ordinary files in the backu
 
 **A destination on the same `S3` endpoint as the pool** — the copy then runs inside the `S3` store
 itself: the ClickHouse server issues one "copy these bytes" command, and `S3` moves the bytes
-internally without sending them through ClickHouse. The files of a part fall into two categories:
+internally without sending them through ClickHouse. This works for both kinds of destination:
 
-| Category | Example | How it is copied |
-|---|---|---|
-| Blob | `data.bin`, marks, `primary.idx` | an `UploadPartCopy` naming a byte range — only the payload moves, without the blob's internal header |
-| Inside the manifest | `checksums.txt`, `count.txt`, `columns.txt` | through ClickHouse's buffers: they have no object of their own |
+```sql
+BACKUP TABLE t TO S3('http://s3.example.com/bucket/backups/b1', 'key', 'secret');
+BACKUP TABLE t TO Disk('backups_s3', 'b1');
+```
+
+Here the pool is under `http://s3.example.com/bucket/pool/`, and the disk `backups_s3` is an `s3`
+or `s3_plain` disk under `http://s3.example.com/bucket/backups/`.
+
+The files of a part fall into two categories:
+
+| Category | Example | `BACKUP ... TO S3(...)` | `BACKUP ... TO Disk(...)` |
+|---|---|---|---|
+| Blob | `data.bin`, marks, `primary.idx` | an `UploadPartCopy` naming a byte range — only the payload moves, without the blob's internal header | the same |
+| Inside the manifest | `checksums.txt`, `count.txt`, `columns.txt` | read through the `CAS` read path and written through ClickHouse's buffers | the bytes are taken from the manifest and written as a new object on the destination disk |
+
+A blob object is `[header][payload]`, so a file never starts at the beginning of its object. Every
+copy of a blob therefore names the payload range. A copy of the whole object would put the header
+into the backup, and a later restore would read wrong data.
 
 If the destination cannot copy a byte range, `CAS` does not fall back to copying the whole object —
-the file is read and written through ClickHouse instead. That is slower, but correct.
+the file is read and written through ClickHouse instead. That is slower, but correct. This happens
+when multipart copy is off, and when the destination is not an `S3` store.
 
-Copying inside `S3` can be turned off:
+Which settings control the copy depends on the destination:
+
+| Destination | Turn off the copy inside `S3` | Turn off the range copy |
+|---|---|---|
+| `S3(...)` | `SETTINGS allow_s3_native_copy = 0` in the `BACKUP` query | the query setting `s3_allow_multipart_copy = 0` |
+| `Disk(...)` | `<s3_allow_native_copy>0</s3_allow_native_copy>` in the `CAS` disk config | `<s3_allow_multipart_copy>0</s3_allow_multipart_copy>` in the `CAS` disk config |
+
+For a `Disk(...)` destination the copy uses the request settings of the source `CAS` disk, not the
+settings of the query.
 
 ```sql
 BACKUP TABLE t TO S3(...) SETTINGS allow_s3_native_copy = 0;
@@ -76,6 +99,11 @@ BACKUP TABLE t TO S3(...) SETTINGS allow_s3_native_copy = 0;
 Each part is materialized in **one disk transaction** and published as one manifest and one ref. A
 partially restored part can never appear in the pool: either the whole part is published or nothing
 is.
+
+Restore onto a `CAS` disk never copies objects inside `S3`, even when the backup is on the same
+endpoint as the pool. Each file of the part is read from the backup and written through the `CAS`
+write path, because only that path can build the manifest and the blobs. A restore onto a plain disk
+works as usual and can copy inside `S3`.
 
 Restored data is packed afresh — on a `CAS` disk it gets new blobs and new refs. Deduplication
 against data already in the pool works as usual: identical content hashes to the same blob and is
@@ -97,3 +125,11 @@ It is a useful building block, not a replacement for `BACKUP`.
 - The `Ordinary` database engine is not supported.
 - Pool deduplication is lost in the backup: its size follows the logical files, not the unique blobs.
 - Pointer holding does not survive a server restart.
+- The copy inside the store works only for `S3` and `S3`-compatible stores, and only when the
+  destination is on the same endpoint as the pool. Other destinations get the copy through
+  ClickHouse's buffers.
+- A blob is copied inside `S3` only with multipart copy (`UploadPartCopy`), because only it can name a
+  byte range. Without multipart copy every blob goes through ClickHouse's buffers.
+- Restore onto a `CAS` disk always writes through ClickHouse, see [restore](#restore).
+- A disk-level copy of a single file onto a `CAS` disk, outside of `RESTORE`, is rejected with
+  `NOT_IMPLEMENTED`: a `CAS` disk accepts part files only as a whole part in one transaction.

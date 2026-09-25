@@ -50,13 +50,13 @@ def backup_destination(name):
     return f"S3('{S3_AUTHORITY}/test/backups/{RUN_TOKEN}/{name}', {S3_CREDENTIALS})"
 
 
-def create_and_fill(node, table):
+def create_and_fill(node, table, storage_policy=STORAGE_POLICY):
     node.query(f"DROP TABLE IF EXISTS {table} SYNC")
     node.query(
         f"""
         CREATE TABLE {table} (k UInt64, s String, n Nullable(Int64), arr Array(UInt32))
         ENGINE = MergeTree ORDER BY k
-        SETTINGS storage_policy = '{STORAGE_POLICY}', min_bytes_for_wide_part = 0
+        SETTINGS storage_policy = '{storage_policy}', min_bytes_for_wide_part = 0
         """
     )
     node.query(
@@ -101,6 +101,85 @@ def test_native_copy_round_trip(allow_native_copy):
     node.query(
         f"RESTORE TABLE {table} AS {restored} FROM {destination} "
         f"SETTINGS allow_s3_native_copy = {int(allow_native_copy)}"
+    )
+
+    actual = column_fingerprints(node, restored)
+
+    assert actual["count"] == expected["count"]
+    differing = [c for c in COLUMNS if actual[c] != expected[c]]
+    assert not differing, f"columns differ after restore: {differing}"
+
+    assert (
+        node.query(
+            f"CHECK TABLE {restored} SETTINGS check_query_single_value_result = 1"
+        ).strip()
+        == "1"
+    )
+
+    node.query(f"DROP TABLE {table} SYNC")
+    node.query(f"DROP TABLE {restored} SYNC")
+
+
+def copy_events(node, query_id):
+    node.query("SYSTEM FLUSH LOGS query_log")
+    events = node.query(
+        f"""
+        SELECT ProfileEvents['S3UploadPartCopy'], ProfileEvents['S3CopyObject']
+        FROM system.query_log
+        WHERE type = 'QueryFinish' AND query_id = '{query_id}'
+        ORDER BY event_time DESC LIMIT 1
+        """
+    ).strip()
+    assert events, f"no query_log row for {query_id}"
+    upload_part_copy, copy_object = (int(value) for value in events.split("\t"))
+    return upload_part_copy, copy_object
+
+
+@pytest.mark.parametrize(
+    "storage_policy, multipart_copy",
+    [
+        pytest.param(STORAGE_POLICY, True, id="multipart_copy"),
+        pytest.param("cas_backup_s3_no_multipart", False, id="no_multipart_copy"),
+    ],
+)
+@pytest.mark.parametrize("backup_disk", ["backup_disk_s3_plain", "backup_disk_s3"])
+def test_backup_to_disk_on_same_authority(backup_disk, storage_policy, multipart_copy):
+    node = cluster.instances["node"]
+    table = f"cas_backup_to_{backup_disk}_{storage_policy}"
+    restored = f"{table}_restored"
+    destination = f"Disk('{backup_disk}', '{RUN_TOKEN}/{table}')"
+    backup_query_id = f"{table}_backup_{RUN_TOKEN}"
+    restore_query_id = f"{table}_restore_{RUN_TOKEN}"
+
+    create_and_fill(node, table, storage_policy)
+    expected = column_fingerprints(node, table)
+
+    node.query(f"BACKUP TABLE {table} TO {destination}", query_id=backup_query_id)
+
+    upload_part_copy, copy_object = copy_events(node, backup_query_id)
+    assert copy_object == 0, "CopyObject has no range: the envelope would land in the backup"
+    if multipart_copy:
+        assert upload_part_copy > 0, "blobs were not copied with a ranged server-side copy"
+    else:
+        assert upload_part_copy == 0, "multipart copy is disabled but UploadPartCopy still ran"
+
+    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node.query(
+        f"RESTORE TABLE {table} AS {restored} FROM {destination}",
+        query_id=restore_query_id,
+    )
+
+    upload_part_copy, copy_object = copy_events(node, restore_query_id)
+    assert (upload_part_copy, copy_object) == (
+        0,
+        0,
+    ), "RESTORE onto a CAS disk must write through the CAS path, not copy objects into the pool"
+
+    assert (
+        node.query(
+            f"SELECT storage_policy FROM system.tables WHERE name = '{restored}'"
+        ).strip()
+        == storage_policy
     )
 
     actual = column_fingerprints(node, restored)

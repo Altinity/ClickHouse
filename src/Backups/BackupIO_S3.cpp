@@ -394,7 +394,7 @@ void BackupWriterS3::copyFileFromDisk(
         {
             LOG_TRACE(log, "Copying file {} from disk {} to S3", src_path, src_disk->getName());
 
-            if (blob_path[0].empty())
+            if (src_disk->isContentAddressed() && blob_path[0].empty())
             {
                 LOG_TRACE(log, "File {} has no object of its own, copying through buffers", src_path);
                 BackupWriterDefault::copyFileFromDisk(path_in_backup, src_disk, src_path, copy_encrypted, start_pos, length);
