@@ -62,6 +62,7 @@ StorageInMemoryMetadata::StorageInMemoryMetadata(const StorageInMemoryMetadata &
     , comment(other.comment)
     , metadata_version(other.metadata_version)
     , datalake_table_state(other.datalake_table_state)
+    , identity_partition_columns(other.identity_partition_columns)
 {
 }
 
@@ -99,6 +100,7 @@ StorageInMemoryMetadata & StorageInMemoryMetadata::operator=(const StorageInMemo
     comment = other.comment;
     metadata_version = other.metadata_version;
     datalake_table_state = other.datalake_table_state;
+    identity_partition_columns = other.identity_partition_columns;
 
     return *this;
 }
@@ -243,6 +245,11 @@ void StorageInMemoryMetadata::setMetadataVersion(int32_t metadata_version_)
 void StorageInMemoryMetadata::setDataLakeTableState(const DataLakeTableStateSnapshot & datalake_table_state_)
 {
     datalake_table_state = datalake_table_state_;
+}
+
+void StorageInMemoryMetadata::setIdentityPartitionColumns(const Names & identity_partition_columns_)
+{
+    identity_partition_columns = identity_partition_columns_;
 }
 
 StorageInMemoryMetadata StorageInMemoryMetadata::withMetadataVersion(int32_t metadata_version_) const

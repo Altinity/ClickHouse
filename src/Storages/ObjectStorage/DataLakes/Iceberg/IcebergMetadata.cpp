@@ -134,6 +134,7 @@ extern const SettingsBool allow_insert_into_iceberg;
 extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_expire_snapshots;
 extern const SettingsBool iceberg_delete_data_on_drop;
+extern const SettingsBool allow_experimental_iceberg_read_optimization;
 }
 
 static constexpr size_t MAX_TRANSACTION_RETRIES = 100;
@@ -1236,7 +1237,21 @@ std::unique_ptr<StorageInMemoryMetadata> IcebergMetadata::buildStorageMetadataFr
     result->setColumns(
         ColumnsDescription{*persistent_components.schema_processor->getClickhouseTableSchemaById(iceberg_state.schema_id)});
     result->setDataLakeTableState(state);
-    result->sorting_key = getSortingKey(local_context, iceberg_state);
+
+    auto metadata_object = getMetadataJSONObject(
+        iceberg_state.metadata_file_path,
+        object_storage,
+        persistent_components.metadata_cache,
+        local_context,
+        log,
+        persistent_components.metadata_compression_method,
+        persistent_components.table_uuid);
+
+    result->sorting_key = getSortingKeyFromMetadata(metadata_object, local_context);
+
+    if (local_context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization])
+        result->setIdentityPartitionColumns(getIdentityPartitionColumnsFromMetadata(metadata_object));
+
     return result;
 }
 
@@ -1464,10 +1479,14 @@ KeyDescription IcebergMetadata::getSortingKey(ContextPtr local_context, TableSta
         persistent_components.metadata_compression_method,
         persistent_components.table_uuid);
 
+    return getSortingKeyFromMetadata(metadata_object, local_context);
+}
+
+KeyDescription IcebergMetadata::getSortingKeyFromMetadata(const Poco::JSON::Object::Ptr & metadata_object, ContextPtr local_context) const
+{
     auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
     auto result = getSortingKeyDescriptionFromMetadata(metadata_object, *persistent_components.schema_processor->getClickhouseTableSchemaById(current_schema_id), local_context);
-    auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
-    result.sort_order_id = sort_order_id;
+    result.sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
     return result;
 }
 
