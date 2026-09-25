@@ -12,6 +12,7 @@
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeTime64.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/IDataType.h>
 #include <Databases/DataLake/Common.h>
@@ -132,6 +133,8 @@ bool canDumpIcebergStats(const Field & field, DataTypePtr type)
         case TypeIndex::Date32:
         case TypeIndex::Int64:
         case TypeIndex::DateTime64:
+        case TypeIndex::Time:
+        case TypeIndex::Time64:
         case TypeIndex::String:
         case TypeIndex::Decimal32:
         case TypeIndex::Decimal64:
@@ -245,6 +248,46 @@ avro::GenericDatum makeDecimalFixedDatum(const Field & field, const avro::NodePt
     return datum;
 }
 
+DataTypePtr getTimeTypeOrNull(DataTypePtr type)
+{
+    if (type->isNullable())
+        return getTimeTypeOrNull(assert_cast<const DataTypeNullable *>(type.get())->getNestedType());
+
+    const WhichDataType which(type);
+    if (which.isTime() || which.isTime64())
+        return type;
+
+    return nullptr;
+}
+
+Int64 getTimeValueInMicroseconds(const Field & field, DataTypePtr type)
+{
+    if (type->isNullable())
+        return getTimeValueInMicroseconds(field, assert_cast<const DataTypeNullable *>(type.get())->getNestedType());
+
+    const WhichDataType which(type);
+    if (which.isTime())
+    {
+        if (field.getType() == Field::Types::Int64)
+            return field.safeGet<Int64>() * 1'000'000;
+        if (field.getType() == Field::Types::UInt64)
+            return static_cast<Int64>(field.safeGet<UInt64>()) * 1'000'000;
+        return static_cast<Int64>(field.safeGet<Int32>()) * 1'000'000;
+    }
+
+    if (which.isTime64())
+    {
+        const auto scale = getDecimalScale(*type);
+        if (scale > 6)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+
+        const auto value = field.safeGet<Decimal64>().getValue().value;
+        return value * DataTypeTime64::getScaleMultiplier(6 - scale).value;
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected Time or Time64, got {}", type->getName());
+}
+
 std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
 {
     switch (type->getTypeId())
@@ -265,6 +308,8 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
             /// Iceberg writes `int` and `date` as 4 bytes, while a `Field` keeps them in its 8-byte
             /// slot; `dumpValue` takes the width from its argument type, so narrow before dumping.
             return dumpValue(static_cast<Int32>(field.safeGet<Int32>()));
+        case TypeIndex::Time:
+            return dumpValue(getTimeValueInMicroseconds(field, type));
         case TypeIndex::Int64:
             return dumpValue(field.safeGet<Int64>());
         case TypeIndex::UInt8:
@@ -275,6 +320,8 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
             return dumpValue(static_cast<Int32>(applyVisitor(FieldVisitorConvertToNumber<Int64>(), field)));
         case TypeIndex::UInt64:
             return dumpValue(applyVisitor(FieldVisitorConvertToNumber<Int64>(), field));
+        case TypeIndex::Time64:
+            return dumpValue(getTimeValueInMicroseconds(field, type));
         case TypeIndex::DateTime64:
             return dumpValue(field.safeGet<Decimal64>().getValue().value);
         case TypeIndex::String:
@@ -315,6 +362,16 @@ bool canWriteStatistics(
 
 }
 
+String getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path)
+{
+    static constexpr auto postfix = "_clickhouse_export_part_sidecar.avro";
+    auto dot_pos = data_file_storage_path.rfind('.');
+    auto slash_pos = data_file_storage_path.rfind('/');
+    if (dot_pos != String::npos && (slash_pos == String::npos || dot_pos > slash_pos))
+        return data_file_storage_path.substr(0, dot_pos) + postfix;
+    return data_file_storage_path + postfix;
+}
+
 String removeEscapedSlashes(const String & json_str)
 {
     size_t pos = json_str.find("\\/");
@@ -345,6 +402,160 @@ String stringifyJSON(const Poco::Dynamic::Var & json, unsigned indent)
     return removeEscapedSlashes(oss.str());
 }
 
+IcebergSerializedFileStats readDataFileSidecar(
+    const String & sidecar_storage_path,
+    const ObjectStoragePtr & object_storage,
+    const ContextPtr & context)
+{
+    auto buf = object_storage->readObject(StoredObject(sidecar_storage_path), context->getReadSettings());
+    auto input_stream = std::make_unique<AvroInputStreamReadBufferAdapter>(*buf);
+    avro::DataFileReader<avro::GenericDatum> reader(std::move(input_stream));
+
+    avro::GenericDatum datum(reader.readerSchema());
+    if (!reader.read(datum))
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Data file sidecar '{}' contains no records",
+            sidecar_storage_path);
+
+    const auto & record = datum.value<avro::GenericRecord>();
+    IcebergSerializedFileStats result;
+    result.record_count = record.field("record_count").value<Int64>();
+    result.file_size_in_bytes = record.field("file_size_in_bytes").value<Int64>();
+
+    auto read_long_map = [&](const std::string & name, std::vector<std::pair<Int32, Int64>> & out)
+    {
+        const auto & arr = record.field(name).value<avro::GenericArray>().value();
+        for (const auto & item : arr)
+        {
+            const auto & r = item.value<avro::GenericRecord>();
+            out.emplace_back(r.field("key").value<Int32>(), r.field("value").value<Int64>());
+        }
+    };
+
+    auto read_bytes_map = [&](const std::string & name, std::vector<std::pair<Int32, std::vector<uint8_t>>> & out)
+    {
+        const auto & arr = record.field(name).value<avro::GenericArray>().value();
+        for (const auto & item : arr)
+        {
+            const auto & r = item.value<avro::GenericRecord>();
+            out.emplace_back(r.field("key").value<Int32>(), r.field("value").value<std::vector<uint8_t>>());
+        }
+    };
+
+    read_long_map("column_sizes",      result.column_sizes);
+    read_long_map("null_value_counts", result.null_value_counts);
+    read_bytes_map("lower_bounds",     result.lower_bounds);
+    read_bytes_map("upper_bounds",     result.upper_bounds);
+
+    return result;
+}
+
+void writeDataFileSidecar(
+    const String & data_file_storage_path,
+    const IcebergSerializedFileStats & stats,
+    const ObjectStoragePtr & object_storage,
+    const ContextPtr & context)
+{
+    const String sidecar_path = getIcebergExportPartSidecarStoragePath(data_file_storage_path);
+    auto buf = object_storage->writeObject(
+        StoredObject(sidecar_path), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+
+    {
+        auto schema = avro::compileJsonSchemaFromString(data_file_sidecar_schema);
+        auto adapter = std::make_unique<OutputStreamWriteBufferAdapter>(*buf);
+        avro::DataFileWriter<avro::GenericDatum> writer(std::move(adapter), schema);
+
+        avro::GenericDatum datum(schema.root());
+        avro::GenericRecord & rec = datum.value<avro::GenericRecord>();
+        rec.field("record_count") = avro::GenericDatum(stats.record_count);
+        rec.field("file_size_in_bytes") = avro::GenericDatum(stats.file_size_in_bytes);
+
+        auto write_long_map = [&](const std::string & name, const std::vector<std::pair<Int32, Int64>> & entries)
+        {
+            auto & field = rec.field(name);
+            auto & arr = field.value<avro::GenericArray>();
+            auto schema_element = arr.schema()->leafAt(0);
+            for (const auto & [k, v] : entries)
+            {
+                avro::GenericDatum item(schema_element);
+                auto & item_rec = item.value<avro::GenericRecord>();
+                item_rec.field("key") = avro::GenericDatum(k);
+                item_rec.field("value") = avro::GenericDatum(v);
+                arr.value().push_back(item);
+            }
+        };
+
+        auto write_bytes_map = [&](const std::string & name, const std::vector<std::pair<Int32, std::vector<uint8_t>>> & entries)
+        {
+            auto & field = rec.field(name);
+            auto & arr = field.value<avro::GenericArray>();
+            auto schema_element = arr.schema()->leafAt(0);
+            for (const auto & [k, v] : entries)
+            {
+                avro::GenericDatum item(schema_element);
+                auto & item_rec = item.value<avro::GenericRecord>();
+                item_rec.field("key") = avro::GenericDatum(k);
+                item_rec.field("value") = avro::GenericDatum(v);
+                arr.value().push_back(item);
+            }
+        };
+
+        write_long_map("column_sizes",      stats.column_sizes);
+        write_long_map("null_value_counts",  stats.null_value_counts);
+        write_bytes_map("lower_bounds",      stats.lower_bounds);
+        write_bytes_map("upper_bounds",      stats.upper_bounds);
+
+        writer.write(datum);
+        writer.flush();
+        // writer destructor writes the Avro end-of-file sync marker
+    }
+
+    buf->finalize();
+}
+
+/// vibe coded - needs extra attention
+IcebergSerializedFileStats serializeDataFileStats(
+    const DataFileStatistics & stats,
+    SharedHeader sample_block,
+    Int64 record_count,
+    Int64 file_size_in_bytes)
+{
+    IcebergSerializedFileStats result;
+    result.record_count = record_count;
+    result.file_size_in_bytes = file_size_in_bytes;
+
+    for (const auto & [field_id, sz] : stats.getColumnSizes())
+        result.column_sizes.emplace_back(static_cast<Int32>(field_id), static_cast<Int64>(sz));
+
+    for (const auto & [field_id, cnt] : stats.getNullCounts())
+        result.null_value_counts.emplace_back(static_cast<Int32>(field_id), static_cast<Int64>(cnt));
+
+    std::unordered_map<size_t, size_t> field_id_to_col_idx;
+    {
+        auto field_ids = stats.getFieldIds();
+        for (size_t i = 0; i < field_ids.size(); ++i)
+            field_id_to_col_idx[field_ids[i]] = i;
+    }
+
+    auto serialize_bounds = [&](const std::vector<std::pair<size_t, Field>> & bounds,
+                                std::vector<std::pair<Int32, std::vector<uint8_t>>> & out)
+    {
+        if (!canWriteStatistics(bounds, field_id_to_col_idx, sample_block))
+            return;
+        for (const auto & [field_id, value] : bounds)
+        {
+            auto bytes = dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_col_idx.at(field_id)]);
+            out.emplace_back(static_cast<Int32>(field_id), std::move(bytes));
+        }
+    };
+
+    serialize_bounds(stats.getLowerBounds(), result.lower_bounds);
+    serialize_bounds(stats.getUpperBounds(), result.upper_bounds);
+
+    return result;
+}
+
 static void extendSchemaForPartitions(
     String & schema,
     const std::vector<String> & partition_columns,
@@ -368,6 +579,24 @@ static void extendSchemaForPartitions(
     }
 
     Poco::JSON::Array::Ptr partition_fields = new Poco::JSON::Array;
+
+    /// Types that need a `logicalType` annotation (Time/Time64 -> "time-micros") are
+    /// written as `{"type": T, "logicalType": ...}`. The annotation must decorate the
+    /// concrete Avro type, so for a Nullable partition column it goes inside the
+    /// `["null", T]` union branch, not on the union itself (an annotated union is not
+    /// a valid Avro schema and makes the manifest schema fail to compile).
+    auto make_annotated_type = [](DataTypePtr type, Int32 type_field_id) -> Poco::Dynamic::Var
+    {
+        auto logical_type = getAvroLogicalType(type);
+        if (logical_type.isEmpty())
+            return getAvroType(type, type_field_id);
+
+        Poco::JSON::Object::Ptr type_field = new Poco::JSON::Object;
+        type_field->set(Iceberg::f_type, getAvroType(type, type_field_id));
+        type_field->set(Iceberg::f_logicalType, logical_type);
+        return type_field;
+    };
+
     for (size_t i = 0; i < partition_columns.size(); ++i)
     {
         Int32 field_id = spec_has_all_ids
@@ -377,7 +606,15 @@ static void extendSchemaForPartitions(
         Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
         field->set(Iceberg::f_field_id, field_id);
         field->set(Iceberg::f_name, partition_columns[i]);
-        field->set(Iceberg::f_type, getAvroType(partition_types[i], field_id));
+        if (partition_types[i]->isNullable())
+        {
+            Poco::JSON::Array::Ptr union_array = new Poco::JSON::Array;
+            union_array->add("null");
+            union_array->add(make_annotated_type(removeNullable(partition_types[i]), field_id));
+            field->set(Iceberg::f_type, union_array);
+        }
+        else
+            field->set(Iceberg::f_type, make_annotated_type(partition_types[i], field_id));
         partition_fields->add(field);
     }
 
@@ -451,7 +688,8 @@ void generateManifestFile(
     const std::vector<std::optional<Int32>> & data_file_sort_order_ids,
     const std::vector<DataFileEntryLineage> & per_file_entry_lineage,
     Poco::JSON::Object::Ptr schema_to_serialize,
-    const std::vector<const DataFileStatistics *> * per_file_fresh_statistics)
+    const std::vector<const DataFileStatistics *> * per_file_fresh_statistics,
+    const std::vector<IcebergSerializedFileStats> & per_file_stats)
 {
     /// A throw, not a `chassert`: mis-pairing statistics with data files publishes metadata that is
     /// wrong in the unsafe direction for external readers, and `chassert` compiles out of release builds.
@@ -581,48 +819,102 @@ void generateManifestFile(
             }
         };
 
-        if (!per_file_statistics.empty())
+        /// Export path: per-file serialized stats override everything (record count, file size,
+        /// and all column statistics).  Existing insert/mutation paths use the branches below.
+        if (!per_file_stats.empty() && file_idx < per_file_stats.size())
         {
-            /// Manifest-only rewrite: carry over the source file's column stats verbatim.
-            const auto & stats = per_file_statistics[file_idx];
-            /// Bounds are raw bytes; convert to std::vector<uint8_t> to produce an Avro `bytes` datum.
-            auto to_bytes = [](Int32, const String & value)
-            { return std::vector<uint8_t>(value.begin(), value.end()); };
-            set_fields(stats.column_sizes, Iceberg::f_column_sizes, [](Int32, Int64 value) { return value; });
-            set_fields(stats.value_counts, Iceberg::f_value_counts, [](Int32, Int64 value) { return value; });
-            set_fields(stats.null_value_counts, Iceberg::f_null_value_counts, [](Int32, Int64 value) { return value; });
-            set_fields(stats.lower_bounds, Iceberg::f_lower_bounds, to_bytes);
-            set_fields(stats.upper_bounds, Iceberg::f_upper_bounds, to_bytes);
+            const auto & pf = per_file_stats[file_idx];
+
+            auto write_long_map = [&](const std::vector<std::pair<Int32, Int64>> & entries, const String & field_name)
+            {
+                if (entries.empty())
+                    return;
+                auto & field = data_file.field(field_name);
+                field.selectBranch(1);
+                auto & arr = field.value<avro::GenericArray>();
+                auto schema_element = arr.schema()->leafAt(0);
+                for (const auto & [k, v] : entries)
+                {
+                    avro::GenericDatum item(schema_element);
+                    auto & item_rec = item.value<avro::GenericRecord>();
+                    item_rec.field(Iceberg::f_key) = avro::GenericDatum(k);
+                    item_rec.field(Iceberg::f_value) = avro::GenericDatum(v);
+                    arr.value().push_back(item);
+                }
+            };
+
+            auto write_bytes_map = [&](const std::vector<std::pair<Int32, std::vector<uint8_t>>> & entries, const String & field_name)
+            {
+                if (entries.empty())
+                    return;
+                auto & field = data_file.field(field_name);
+                field.selectBranch(1);
+                auto & arr = field.value<avro::GenericArray>();
+                auto schema_element = arr.schema()->leafAt(0);
+                for (const auto & [k, v] : entries)
+                {
+                    avro::GenericDatum item(schema_element);
+                    auto & item_rec = item.value<avro::GenericRecord>();
+                    item_rec.field(Iceberg::f_key) = avro::GenericDatum(k);
+                    item_rec.field(Iceberg::f_value) = avro::GenericDatum(v);
+                    arr.value().push_back(item);
+                }
+            };
+
+            write_long_map(pf.column_sizes, Iceberg::f_column_sizes);
+            write_long_map(pf.null_value_counts, Iceberg::f_null_value_counts);
+            write_bytes_map(pf.lower_bounds, Iceberg::f_lower_bounds);
+            write_bytes_map(pf.upper_bounds, Iceberg::f_upper_bounds);
+
+            data_file.field(Iceberg::f_record_count) = avro::GenericDatum(pf.record_count);
+            data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(pf.file_size_in_bytes);
         }
-        else if (effective_statistics)
+        else
         {
-            auto statistics = effective_statistics->getColumnSizes();
-            set_fields(statistics, Iceberg::f_column_sizes, [](size_t, size_t value) { return static_cast<Int64>(value); });
-
-            statistics = effective_statistics->getNullCounts();
-            set_fields(statistics, Iceberg::f_null_value_counts, [](size_t, size_t value) { return static_cast<Int64>(value); });
-
-            std::unordered_map<size_t, size_t> field_id_to_column_index;
-            auto field_ids = effective_statistics->getFieldIds();
-            for (size_t i = 0; i < field_ids.size(); ++i)
-                field_id_to_column_index[field_ids[i]] = i;
-
-            auto dump_fields = [&](size_t field_id, Field value)
-            { return dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_column_index.at(field_id)]); };
-
-            auto lower_statistics = effective_statistics->getLowerBounds();
-            if (canWriteStatistics(lower_statistics, field_id_to_column_index, sample_block))
+            if (!per_file_statistics.empty())
             {
-                set_fields(lower_statistics, Iceberg::f_lower_bounds, dump_fields);
+                /// Manifest-only rewrite: carry over the source file's column stats verbatim.
+                const auto & stats = per_file_statistics[file_idx];
+                /// Bounds are raw bytes; convert to std::vector<uint8_t> to produce an Avro `bytes` datum.
+                auto to_bytes = [](Int32, const String & value)
+                { return std::vector<uint8_t>(value.begin(), value.end()); };
+                set_fields(stats.column_sizes, Iceberg::f_column_sizes, [](Int32, Int64 value) { return value; });
+                set_fields(stats.value_counts, Iceberg::f_value_counts, [](Int32, Int64 value) { return value; });
+                set_fields(stats.null_value_counts, Iceberg::f_null_value_counts, [](Int32, Int64 value) { return value; });
+                set_fields(stats.lower_bounds, Iceberg::f_lower_bounds, to_bytes);
+                set_fields(stats.upper_bounds, Iceberg::f_upper_bounds, to_bytes);
             }
-            auto upper_statistics = effective_statistics->getUpperBounds();
-            if (canWriteStatistics(upper_statistics, field_id_to_column_index, sample_block))
+            else if (effective_statistics)
             {
-                set_fields(upper_statistics, Iceberg::f_upper_bounds, dump_fields);
+                auto statistics = effective_statistics->getColumnSizes();
+                set_fields(statistics, Iceberg::f_column_sizes, [](size_t, size_t value) { return static_cast<Int64>(value); });
+
+                statistics = effective_statistics->getNullCounts();
+                set_fields(statistics, Iceberg::f_null_value_counts, [](size_t, size_t value) { return static_cast<Int64>(value); });
+
+                std::unordered_map<size_t, size_t> field_id_to_column_index;
+                auto field_ids = effective_statistics->getFieldIds();
+                for (size_t i = 0; i < field_ids.size(); ++i)
+                    field_id_to_column_index[field_ids[i]] = i;
+
+                auto dump_fields = [&](size_t field_id, Field value)
+                { return dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_column_index.at(field_id)]); };
+
+                auto lower_statistics = effective_statistics->getLowerBounds();
+                if (canWriteStatistics(lower_statistics, field_id_to_column_index, sample_block))
+                {
+                    set_fields(lower_statistics, Iceberg::f_lower_bounds, dump_fields);
+                }
+                auto upper_statistics = effective_statistics->getUpperBounds();
+                if (canWriteStatistics(upper_statistics, field_id_to_column_index, sample_block))
+                {
+                    set_fields(upper_statistics, Iceberg::f_upper_bounds, dump_fields);
+                }
             }
+
+            data_file.field(Iceberg::f_record_count) = avro::GenericDatum(static_cast<Int64>(data_file_row_counts[file_idx]));
+            data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(static_cast<Int64>(data_file_byte_counts[file_idx]));
         }
-        data_file.field(Iceberg::f_record_count) = avro::GenericDatum(static_cast<Int64>(data_file_row_counts[file_idx]));
-        data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(static_cast<Int64>(data_file_byte_counts[file_idx]));
 
         /// Preserve the source file's sort_order_id.
         if (!data_file_sort_order_ids.empty() && data_file_sort_order_ids[file_idx].has_value())
@@ -647,6 +939,10 @@ void generateManifestFile(
             /// Build the Avro datum holding the partition value; throws on an unsupported type.
             auto make_value_datum = [&](const avro::NodePtr & value_schema) -> avro::GenericDatum
             {
+                auto partition_time_type = getTimeTypeOrNull(partition_types[i]);
+                if (partition_time_type)
+                    return avro::GenericDatum(getTimeValueInMicroseconds(partition_values[i], partition_types[i]));
+
                 /// Decimals are dispatched on the column type rather than on the `Field` type, because
                 /// `DateTime64` also lives in a `DecimalField` while Iceberg writes it as a plain `long`.
                 switch (removeNullable(partition_types[i])->getTypeId())
@@ -1068,7 +1364,7 @@ IcebergStorageSink::IcebergStorageSink(
     , table_id(table_id_)
     , persistent_table_components(persistent_table_components_)
     , data_lake_settings(configuration_->getDataLakeSettings())
-    , write_format(configuration_->format)
+    , write_format(configuration_->getFormat())
 {
     auto [last_version, metadata_path, compression_method] = getLatestMetadataFileAndVersionWithCatalog(
         object_storage,
@@ -1578,6 +1874,142 @@ bool IcebergStorageSink::initializeMetadata()
         throw;
     }
     return true;
+}
+
+IcebergImportSink::IcebergImportSink(
+    std::shared_ptr<DataLake::ICatalog> catalog_,
+    const Iceberg::PersistentTableComponents & persistent_table_components_,
+    Poco::JSON::Object::Ptr metadata_json_,
+    ObjectStoragePtr object_storage_,
+    ContextPtr context_,
+    std::optional<FormatSettings> format_settings_,
+    const String & write_format_,
+    SharedHeader sample_block_,
+    const DataLakeStorageSettings & data_lake_settings_,
+    std::function<void(const std::string &)> new_file_path_callback_)
+    : SinkToStorage(sample_block_)
+    , catalog(catalog_)
+    , persistent_table_components(persistent_table_components_)
+    , metadata_json(metadata_json_)
+    , object_storage(object_storage_)
+    , context(context_)
+    , format_settings(format_settings_)
+    , write_format(write_format_)
+    , sample_block(sample_block_)
+    , data_lake_settings(data_lake_settings_)
+    , new_file_path_callback(std::move(new_file_path_callback_))
+{
+    const auto current_schema_id = metadata_json->getValue<Int64>(Iceberg::f_current_schema_id);
+    const auto schemas = metadata_json->getArray(Iceberg::f_schemas);
+
+    for (size_t i = 0; i < schemas->size(); ++i)
+    {
+        if (schemas->getObject(static_cast<UInt32>(i))->getValue<Int32>(Iceberg::f_schema_id) == current_schema_id)
+        {
+            current_schema = schemas->getObject(static_cast<UInt32>(i));
+            break;
+        }
+    }
+
+    const auto metadata_compression_method = persistent_table_components.metadata_compression_method;
+
+    /// Paths written into Iceberg metadata are always built from the table location,
+    /// the conversion to the actual storage path is done by the path resolver.
+    filename_generator = FileNamesGenerator(
+        persistent_table_components.path_resolver.getTableLocation(),
+        (catalog != nullptr && catalog->isTransactional()),
+        metadata_compression_method,
+        write_format);
+
+    const auto [last_version, unused_meta_path, unused_compression] = getLatestOrExplicitMetadataFileAndVersion(
+        object_storage,
+        persistent_table_components.table_path,
+        data_lake_settings,
+        persistent_table_components.metadata_cache,
+        context_,
+        getLogger("IcebergWrites").get(),
+        persistent_table_components.table_uuid,
+        metadata_compression_method,
+        true);
+    (void)unused_meta_path;
+    (void)unused_compression;
+
+    filename_generator.setVersion(last_version + 1);
+
+    writer = std::make_unique<MultipleFileWriter>(
+        context->getSettingsRef()[Setting::iceberg_insert_max_rows_in_data_file],
+        context->getSettingsRef()[Setting::iceberg_insert_max_bytes_in_data_file],
+        current_schema->getArray(Iceberg::f_fields),
+        filename_generator,
+        persistent_table_components.path_resolver,
+        object_storage,
+        context,
+        format_settings,
+        write_format,
+        sample_block,
+        new_file_path_callback);
+}
+
+IcebergImportSink::~IcebergImportSink()
+{
+    cancelBuffers();
+}
+
+void IcebergImportSink::consume(Chunk & chunk)
+{
+    if (isCancelled())
+        return;
+
+    writer->consume(chunk);
+}
+
+void IcebergImportSink::onFinish()
+{
+    if (isCancelled())
+    {
+        cancelBuffers();
+        return;
+    }
+
+    finalizeBuffers();
+
+    for (const auto & entry : writer->getDataFileEntries())
+    {
+        IcebergSerializedFileStats serialized_stats;
+        if (entry.statistics)
+        {
+            serialized_stats = serializeDataFileStats(*entry.statistics, sample_block, entry.record_count, entry.file_size_in_bytes);
+        }
+        else
+        {
+            serialized_stats.record_count = entry.record_count;
+            serialized_stats.file_size_in_bytes = entry.file_size_in_bytes;
+        }
+
+        writeDataFileSidecar(entry.path, serialized_stats, object_storage, context);
+    }
+
+    releaseBuffers();
+}
+
+void IcebergImportSink::onException(std::exception_ptr /* exception */)
+{
+    cancelBuffers();
+}
+
+void IcebergImportSink::finalizeBuffers()
+{
+    writer->finalize();
+}
+
+void IcebergImportSink::releaseBuffers()
+{
+    writer->release();
+}
+
+void IcebergImportSink::cancelBuffers()
+{
+    writer->cancel();
 }
 
 }

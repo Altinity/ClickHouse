@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Core/Field.h>
 #include <Core/Names.h>
 #include <Core/QueryProcessingStage.h>
 #include <Databases/IDatabase.h>
@@ -19,6 +20,7 @@
 #include <Common/RWLock.h>
 #include <Common/TypePromotion.h>
 #include <DataTypes/Serializations/SerializationInfo.h>
+#include <Poco/JSON/Object.h>
 
 #include <expected>
 #include <optional>
@@ -60,6 +62,9 @@ struct StreamLocalLimits;
 class EnabledQuota;
 struct SelectQueryInfo;
 
+/// Declared opaquely (definition in Core/SettingsEnums.h) to keep this widely included header light.
+enum class MergeTreePartExportFileAlreadyExistsPolicy : uint8_t;
+
 using NameDependencies = std::unordered_map<String, std::vector<String>>;
 using DatabaseAndTableName = std::pair<String, String>;
 
@@ -70,6 +75,9 @@ class ConditionSelectivityEstimator;
 using ConditionSelectivityEstimatorPtr = std::shared_ptr<ConditionSelectivityEstimator>;
 
 struct RangesInDataParts;
+
+class IObjectStorage;
+using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;
 
 class ActionsDAG;
 
@@ -170,6 +178,13 @@ public:
 
     /// Returns true if the storage supports optimization of moving conditions to PREWHERE section.
     virtual bool canMoveConditionsToPrewhere() const { return supportsPrewhere(); }
+
+    /// Returns true if read() lowers `query_info.row_level_filter` into the reading step. A storage
+    /// that instead ships query text to other servers must return false: the filter is a plan-level
+    /// structure that does not travel with the text, so pushing it down would silently drop an
+    /// access-control filter. Wrappers that only delegate to a remote read for some queries decide
+    /// per query, hence the context.
+    virtual bool appliesRowLevelFilterInRead(ContextPtr) const { return !isRemote(); }
 
     /// Returns true if the storage replicates SELECT, INSERT and ALTER commands among replicas.
     virtual bool supportsReplication() const { return false; }
@@ -444,6 +459,7 @@ private:
         size_t /*max_block_size*/,
         size_t /*num_streams*/);
 
+public:
     /// Should we process blocks of data returned by the storage in parallel
     /// even when the storage returned only one stream of data for reading?
     /// It is beneficial, for example, when you read from a file quickly,
@@ -454,7 +470,6 @@ private:
     /// useless).
     virtual bool parallelizeOutputAfterReading(ContextPtr) const { return !isSystemStorage(); }
 
-public:
     /// Other version of read which adds reading step to query plan.
     /// Default implementation creates ReadFromStorageStep and uses usual read.
     /// Can be called after `shutdown`, but not after `drop`.
@@ -496,6 +511,64 @@ public:
       * the privileges the user had when the query was issued.
       */
     virtual void checkInsertIsAllowed(ContextPtr /*context*/) const {}
+
+    virtual bool supportsImport(ContextPtr) const
+    {
+      return false;
+    }
+
+    /*
+It is currently only implemented in StorageObjectStorage.
+      It is meant to be used to import merge tree data parts into object storage. It is similar to the write API,
+      but it won't re-partition the data and should allow the filename to be set by the caller.
+    */
+    virtual SinkToStoragePtr import(
+        const std::string & /* file_name */,
+        Block & /* block_with_partition_values */,
+        const std::function<void(const std::string &)> & /* new_file_path_callback */,
+        MergeTreePartExportFileAlreadyExistsPolicy /* file_already_exists_policy */,
+        std::size_t /* max_bytes_per_file */,
+        std::size_t /* max_rows_per_file */,
+        const std::optional<std::string> & /* iceberg_metadata_json_string */,
+        const std::optional<FormatSettings> & /* format_settings */,
+        ContextPtr /* context */)
+    {
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
+    }
+
+    struct IcebergCommitExportPartitionArguments
+    {
+      std::string metadata_json_string;
+      /// Representative source partition-key columns from one exported part (the part's
+      /// minmax block). The destination derives the Iceberg partition tuple from a row of
+      /// this block by casting to the destination column types and applying the partition
+      /// transform, so the metadata partition value matches the exported data files.
+      Block partition_source_block;
+    };
+
+    /// Paths produced by the destination storage during commit. Surfaced via
+    /// system.replicated_partition_exports for debugging
+    struct ExportPartitionCommitInfo
+    {
+      /// Iceberg destinations only.
+      String iceberg_metadata_file;
+      String iceberg_manifest_list;
+      String iceberg_manifest_file;
+
+      /// Plain object storage destinations only: path of the commit marker file
+      /// written/observed by StorageObjectStorage::commitExportPartitionTransaction.
+      String commit_marker_file;
+    };
+
+    virtual ExportPartitionCommitInfo commitExportPartitionTransaction(
+      const String & /* transaction_id */,
+      const String & /* partition_id */,
+      const Strings & /* exported_paths */,
+      const IcebergCommitExportPartitionArguments & /* iceberg_commit_export_partition_arguments */,
+      ContextPtr /* local_context */)
+  {
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "commitExportPartitionTransaction is not implemented for storage type {}", getName());
+  }
 
     /** Writes the data to a table in distributed manner.
       * It is supposed that implementation looks into SELECT part of the query and executes distributed
@@ -608,6 +681,9 @@ public:
     virtual void waitForMutation(const String & /*mutation_id*/, bool /*wait_for_another_mutation*/);
 
     virtual void setMutationCSN(const String & /*mutation_id*/, UInt64 /*csn*/);
+
+    /// Cancel a replicated partition export by transaction id.
+    virtual CancellationCode killExportPartition(const String & /*transaction_id*/);
 
     /// Cancel a part move to shard.
     virtual CancellationCode killPartMoveToShard(const UUID & /*task_uuid*/);
