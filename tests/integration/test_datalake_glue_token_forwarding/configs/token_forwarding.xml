@@ -1,5 +1,8 @@
 <clickhouse>
     <enable_token_forwarding>1</enable_token_forwarding>
+    <remote_url_allow_hosts>
+        <host>sts</host>
+    </remote_url_allow_hosts>
     <token_processors>
         <hs256>
             <type>jwt_static_key</type>

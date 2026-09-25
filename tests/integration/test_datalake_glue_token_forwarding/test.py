@@ -12,13 +12,14 @@ from helpers.mock_servers import start_mock_servers
 SECRET = "glue_token_forwarding_secret"
 BASE_URL = "http://glue:3000"
 ROLE_ARN = "arn:aws:iam::123456789012:role/data-lake-reader"
-STS_CONTAINER = "sts.us-east-1.amazonaws.com"
+STS_CONTAINER = "sts"
 
 DATABASE_SETTINGS = {
     "catalog_type": "glue",
     "warehouse": "test",
     "region": "us-east-1",
     "aws_role_arn": ROLE_ARN,
+    "aws_sts_endpoint": f"http://{STS_CONTAINER}:80",
     "oauth_forward_user_token": "1",
 }
 
@@ -90,13 +91,17 @@ def clean_sts_log(started_cluster):
     )
 
 
-def create_database(node, name):
-    node.query(
+def create_database_query(name, **overrides):
+    settings = {**DATABASE_SETTINGS, **overrides}
+    return (
         f"DROP DATABASE IF EXISTS {name}; "
         f"CREATE DATABASE {name} ENGINE = DataLakeCatalog('{BASE_URL}') "
-        f"SETTINGS {','.join(k + '=' + repr(v) for k, v in DATABASE_SETTINGS.items())}",
-        settings={"allow_database_glue_catalog": 1},
+        f"SETTINGS {','.join(k + '=' + repr(v) for k, v in settings.items())}"
     )
+
+
+def create_database(node, name):
+    node.query(create_database_query(name), settings={"allow_database_glue_catalog": 1})
 
 
 def query_with_token(node, token, sql):
@@ -137,3 +142,14 @@ def test_rejected_token_does_not_fall_back(started_cluster):
     assert "InvalidIdentityToken" in response.text, response.text
 
     assert len(sts_requests(started_cluster)) == 1
+
+
+def test_sts_endpoint_checked_against_remote_host_filter(started_cluster):
+    node = started_cluster.instances["node1"]
+    error = node.query_and_get_error(
+        create_database_query(
+            f"glue_{uuid.uuid4().hex[:8]}", aws_sts_endpoint="http://not_allowed:80"
+        ),
+        settings={"allow_database_glue_catalog": 1},
+    )
+    assert "UNACCEPTABLE_URL" in error, error

@@ -247,6 +247,7 @@ GlueCatalog::GlueCatalog(
     creds_config.role_arn = settings.aws_role_arn;
     creds_config.role_session_name = settings.aws_role_session_name;
     creds_config.external_id = settings.aws_external_id;
+    creds_config.sts_endpoint_override = settings.aws_sts_endpoint;
 
     const auto & server_settings = getContext()->getGlobalContext()->getServerSettings();
     const DB::Settings & global_settings = getContext()->getGlobalContext()->getSettingsRef();
@@ -307,6 +308,14 @@ GlueCatalog::GlueCatalog(
         LOG_TRACE(log, "Creating AWS glue client with credentials empty {}, region '{}', endpoint '{}'", credentials.IsEmpty(), region, endpoint);
     }
 
+    if (!settings.aws_sts_endpoint.empty())
+    {
+        Poco::URI uri(settings.aws_sts_endpoint);
+        getContext()->getRemoteHostFilter().checkHostAndPort(uri.getHost(), std::to_string(uri.getPort()));
+        if (uri.getScheme() == "http")
+            poco_config.scheme = Aws::Http::Scheme::HTTP;
+    }
+
     boost::split(allowed_namespaces, settings.namespaces, boost::is_any_of(", "), boost::token_compress_on);
 
     /// Each `GlueClient` owns its endpoint resolver state.
@@ -323,11 +332,12 @@ GlueCatalog::GlueCatalog(
         make_user_client = [build_glue_client,
                             poco_config,
                             role_arn = settings.aws_role_arn,
+                            sts_endpoint = settings.aws_sts_endpoint,
                             expiration_window_seconds = creds_config.expiration_window_seconds,
                             logger = log](const DB::ForwardedAuthToken & auth_token)
         {
             auto sts_client = std::make_shared<DB::S3::AWSAssumeRoleClient>(
-                std::make_shared<Aws::Auth::AnonymousAWSCredentialsProvider>(), poco_config);
+                std::make_shared<Aws::Auth::AnonymousAWSCredentialsProvider>(), poco_config, sts_endpoint);
 
             auto provider = std::make_shared<DB::S3::AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider>(
                 role_arn,

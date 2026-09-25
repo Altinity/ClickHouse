@@ -58,6 +58,7 @@ The following settings are supported:
 | `aws_access_key_id`     | AWS access key ID for S3/Glue access (if not using vended credentials)                        |
 | `aws_secret_access_key` | AWS secret access key for S3/Glue access (if not using vended credentials)                    |
 | `region`                | AWS region for the service (e.g., `us-east-1`)                                                |
+| `aws_sts_endpoint`      | Custom AWS STS endpoint for Glue role assumption                                               |
 | `dlf_access_key_id`     | Access key ID for DLF access                                                                  |
 | `dlf_access_key_secret` | Access key Secret for DLF access                                                              |
 | `namespaces`            | Comma-separated list of namespaces, implemented for catalog types: `rest`, `glue` and `unity` |
@@ -174,6 +175,7 @@ SETTINGS
     catalog_type = 'glue',
     region = 'us-east-1',
     aws_role_arn = 'arn:aws:iam::123456789012:role/data-lake-reader',
+    aws_sts_endpoint = 'https://sts.us-east-1.amazonaws.com',
     oauth_forward_user_token = 1;
 ```
 
@@ -182,7 +184,7 @@ to accept the users' tokens, including their `aud` and `sub` claims.
 
 - `aws_role_arn` is required.
 - `aws_access_key_id`, `aws_secret_access_key`, and RFC 8693 exchange settings are rejected.
-- The AWS STS endpoint is determined by `region`.
+- `aws_sts_endpoint` overrides the regional AWS STS endpoint. Use HTTPS in production; an HTTP endpoint is suitable only for local testing.
 - Users receive the assumed role's permissions. Use separate roles or session-tag policies to
   distinguish access. ClickHouse does not implement IAM Identity Center trusted identity propagation.
 

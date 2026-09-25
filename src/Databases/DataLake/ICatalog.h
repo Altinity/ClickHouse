@@ -163,6 +163,7 @@ struct CatalogSettings
     String aws_role_arn;
     String aws_role_session_name;
     String aws_external_id;
+    String aws_sts_endpoint;
     bool forward_user_token = false;
 
     DB::SettingsChanges allChanged() const;
