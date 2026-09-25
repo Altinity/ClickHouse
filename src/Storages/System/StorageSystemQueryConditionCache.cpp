@@ -19,7 +19,9 @@ ColumnsDescription StorageSystemQueryConditionCache::getColumnsDescription()
         {"condition", std::make_shared<DataTypeString>(), "The hashed filter condition. Only set if setting query_condition_cache_store_conditions_as_plaintext = true."},
         {"condition_hash", std::make_shared<DataTypeUInt64>(), "The hash of the filter condition."},
         {"entry_size", std::make_shared<DataTypeUInt64>(), "The size of the entry in bytes."},
-        {"matching_marks", std::make_shared<DataTypeString>(), "Matching marks."}
+        {"matching_marks", std::make_shared<DataTypeString>(), "Matching marks."},
+        {"marks_count", std::make_shared<DataTypeUInt64>(), "The number of marks in the part this entry was cached for."},
+        {"has_final_mark", std::make_shared<DataTypeUInt8>(), "Whether the part this entry was cached for has a final mark."}
     };
 }
 
@@ -55,6 +57,8 @@ void StorageSystemQueryConditionCache::fillData(MutableColumns & res_columns, Co
 
         std::shared_lock lock(entry->mutex);
         res_columns[5]->insert(to_string(entry->matching_marks));
+        res_columns[6]->insert(key.marks_count);
+        res_columns[7]->insert(key.has_final_mark);
     }
 }
 

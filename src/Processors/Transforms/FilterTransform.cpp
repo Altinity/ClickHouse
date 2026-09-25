@@ -296,10 +296,17 @@ void FilterTransform::writeIntoQueryConditionCache(const MarkRangesInfoPtr & mar
     }
     else
     {
-        /// If the current and the buffer mark range info are from the same table/part, append to the buffer.
-        /// Otherwise write to the query condition cache and reset the buffer.
+        /// If the current and the buffer mark range info are from the same table/part and have the
+        /// same mark layout, append to the buffer. Otherwise write to the query condition cache and
+        /// reset the buffer. Comparing only table_uuid/part_name is not enough: a part_name can be
+        /// reused with a different mark layout (marks_count/has_final_mark), and appending ranges
+        /// computed against a different layout into the same buffer would corrupt it (see
+        /// Altinity/ClickHouse#2342).
 
-        if (buffered_mark_ranges_info->table_uuid != mark_ranges_info->table_uuid || buffered_mark_ranges_info->part_name != mark_ranges_info->part_name)
+        if (buffered_mark_ranges_info->table_uuid != mark_ranges_info->table_uuid
+            || buffered_mark_ranges_info->part_name != mark_ranges_info->part_name
+            || buffered_mark_ranges_info->marks_count != mark_ranges_info->marks_count
+            || buffered_mark_ranges_info->has_final_mark != mark_ranges_info->has_final_mark)
         {
             query_condition_cache->write(
                 buffered_mark_ranges_info->table_uuid,
