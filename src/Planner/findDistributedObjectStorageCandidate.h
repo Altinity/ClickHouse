@@ -1,7 +1,6 @@
 #pragma once
 #include <memory>
 #include <optional>
-#include <vector>
 #include <base/types.h>
 
 namespace DB
@@ -17,24 +16,23 @@ using QueryTreeNodePtr = std::shared_ptr<IQueryTreeNode>;
 class Context;
 using ContextPtr = std::shared_ptr<const Context>;
 
+struct SelectQueryOptions;
+
 /// A whole-query JOIN-pushdown candidate for `object_storage_cluster_join_mode='distributed'`. The entire query
 /// passed to findDistributedObjectStorageCandidate is dispatched to `driver`'s cluster as one unit.
 struct DistributedObjectStorageCandidate
 {
+    /// The query dispatched as a whole. The Planner building this node's plan is the one that dispatches.
+    const QueryNode * dispatch_boundary = nullptr;
+
     /// The driving table, reachable from the dispatch boundary only via the left path of every JOIN/subquery
     /// crossing.
     const TableNode * driver = nullptr;
 
-    /// The same node, kept as a pointer the planner can hand to APIs that take a table expression.
+    /// The same node as a shared pointer, the key of `GlobalPlannerContext::filters_for_table_expressions`.
     QueryTreeNodePtr driver_table_expression;
 
     IStorageCluster * driver_storage = nullptr;
-
-    /// Every QueryNode crossed on the way down to the driver, outermost first, including the dispatch
-    /// boundary itself. Their `WHERE`/`PREWHERE` are the only places a predicate over the driver's own
-    /// columns can appear such that a driver row failing it cannot reach the result -- which is what makes
-    /// it safe to prune the driver's files by it. See buildDistributedObjectStorageQueryPlan.
-    std::vector<const QueryNode *> query_nodes_on_driver_path;
 };
 
 /// Decides whether `query_node` as a whole can be executed on a single DataLake-catalog driver's cluster.
@@ -52,5 +50,13 @@ struct DistributedObjectStorageCandidate
 /// SELECT access, unsupported shape). The caller then falls back to ordinary planning.
 std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCandidate(
     const QueryTreeNodePtr & query_node, const ContextPtr & context);
+
+/// The same decision, made once per query in the same place and with the same signature as
+/// findQueryForParallelReplicas, and stored in GlobalPlannerContext. Nested Planners share that context, so a
+/// nested query can only ever be dispatched as part of the outermost one, never on its own. Nothing is
+/// dispatched for an analyze-only Planner, a subquery interpreted on its own, a `UNION` at the top level, or a
+/// query a worker received.
+std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCandidate(
+    const QueryTreeNodePtr & query_tree_node, const SelectQueryOptions & select_query_options);
 
 }

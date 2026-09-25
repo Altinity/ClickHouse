@@ -11,7 +11,7 @@ using PlannerContextPtr = std::shared_ptr<PlannerContext>;
 struct SelectQueryInfo;
 
 /// Builds the whole-query dispatch plan for `candidate`: serializes the query unchanged, announces which table
-/// drives it, and reads the result back through a single ReadFromCluster step at WithMergeableState, so the
+/// drives it, and reads the result back through a single ReadFromClusterQuery step at WithMergeableState, so the
 /// caller's normal finalization (MergingAggregated and the rest) applies on top.
 ///
 /// No table expression is rewritten. The driving table is named to the workers by database and table, through
@@ -21,8 +21,7 @@ struct SelectQueryInfo;
 /// Returns nullopt when the driver cannot be named unambiguously in the serialized query -- it must appear
 /// exactly once. The caller then falls back to ordinary planning.
 ///
-/// Structurally the same as buildQueryPlanForParallelReplicas in Planner/findParallelReplicasQuery.cpp,
-/// including the position-based conversion back to the query's header.
+/// Structurally the same as buildQueryPlanForParallelReplicas in Planner/findParallelReplicasQuery.cpp.
 std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     const QueryTreeNodePtr & dispatch_boundary_node,
     const DistributedObjectStorageCandidate & candidate,

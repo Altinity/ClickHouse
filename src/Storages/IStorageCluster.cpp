@@ -142,10 +142,10 @@ ActionsDAG andListingFilterDAGs(ActionsDAG first, ActionsDAG second)
 namespace
 {
 
-/// A worker applies the query's own SETTINGS clause on top of the settings it received, so anything
-/// normalized only in the context is undone by a value written into the query text. Every such normalization
-/// therefore comes in a pair, and the two `prepare...ForRemoteExecution` functions below are the query-text
-/// half -- one per kind of remote read, so neither can be given a subset of the other's by accident.
+/// A worker applies the query's own SETTINGS clause on top of the settings it received, so anything an ordinary
+/// cluster read normalizes in its context (ReadFromCluster::updateSettings) is undone by a value written into
+/// the query text. prepareOrdinaryClusterQueryForRemoteExecution is the query-text half. A whole-query dispatch
+/// needs no such half: it drops the clause altogether, see buildDistributedObjectStorageQueryPlan.
 ASTSetQuery * getQuerySettings(ASTPtr & query)
 {
     auto * select_query = query->as<ASTSelectQuery>();
@@ -195,15 +195,6 @@ void dropDriverAnnouncementFromQuerySettings(ASTPtr & query)
     dropEmptySettings(query, changed);
 }
 
-void dropClusterFromQuerySettings(ASTPtr & query)
-{
-    auto * settings = getQuerySettings(query);
-    if (!settings)
-        return;
-
-    dropEmptySettings(query, settings->changes.removeSetting("object_storage_cluster"));
-}
-
 /// An ordinary cluster read, including one reached after whole-query dispatch was declined. It must behave
 /// exactly like `allow`, and it must not carry a driver name: this read supplies a task iterator, so its
 /// workers see `collaborate_with_initiator` and a table matching that name would read this step's file-task
@@ -211,16 +202,6 @@ void dropClusterFromQuerySettings(ASTPtr & query)
 void prepareOrdinaryClusterQueryForRemoteExecution(ASTPtr & query)
 {
     downgradeJoinModeInQuerySettings(query);
-    dropDriverAnnouncementFromQuerySettings(query);
-}
-
-/// A whole-query dispatch. `object_storage_cluster` outranks a table's own cluster in getClusterName, so
-/// leaving it set would make every table in the dispatched query fan out again from each worker. The driver
-/// name goes too: the initiator puts the one it chose in the settings it sends, and a value in the query text
-/// would override it on the worker and hand the queue to a table the planner did not pick.
-void prepareWholeQueryDispatchForRemoteExecution(ASTPtr & query)
-{
-    dropClusterFromQuerySettings(query);
     dropDriverAnnouncementFromQuerySettings(query);
 }
 
@@ -900,7 +881,6 @@ ContextPtr ReadFromClusterQuery::updateSettings() const
 void ReadFromClusterQuery::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
     auto new_context = updateSettings();
-    prepareWholeQueryDispatchForRemoteExecution(query_to_send);
 
     /// Not this step's own filter: its output is the whole query's result, so a predicate over that says
     /// nothing about which of the driver's files are needed. The planner extracts the driver's own predicate

@@ -1929,7 +1929,8 @@ Planner::Planner(const QueryTreeNodePtr & query_tree_,
             findQueryForParallelReplicas(query_tree, select_query_options),
             findTableForParallelReplicas(query_tree, select_query_options),
             findTableUnionForParallelReplicas(query_tree, select_query_options),
-            collectFiltersForAnalysis(query_tree, select_query_options, post_filter_))))
+            collectFiltersForAnalysis(query_tree, select_query_options, post_filter_),
+            findDistributedObjectStorageCandidate(query_tree, select_query_options))))
 {
 }
 
@@ -2304,24 +2305,11 @@ void Planner::buildPlanForQueryNode()
     }
 
     JoinTreeQueryPlan join_tree_query_plan;
-    /// object_storage_cluster_join_mode='distributed': only the outermost, initial-query Planner may dispatch.
-    /// All three guards below are load-bearing; each was added after a live failure:
-    ///   - only_analyze: buildDistributedObjectStorageQueryPlan calls getSampleBlock, which starts its own
-    ///     analyze-only Planner over the same query. Without this guard that Planner dispatches again, and so on
-    ///     -- `Code: 306. TOO_DEEP_RECURSION`.
-    ///   - is_subquery: a nested query dispatched on its own gets its `__tableN` identifiers renumbered locally,
-    ///     which no longer match what the enclosing scope resolved against -- `Not found column
-    ///     __table7.appinfo_ccl in block. There are only columns: __table2.appinfo_ccl, ...`.
-    ///   - INITIAL_QUERY: a worker must execute what it was sent, not dispatch it onwards.
-    /// Whole-or-nothing for the outermost query: on rejection, ordinary planning handles everything.
-    std::optional<DistributedObjectStorageCandidate> distributed_object_storage_candidate;
-    if (!select_query_options.only_analyze && !select_query_options.is_subquery
-        && query_context->getClientInfo().query_kind == ClientInfo::QueryKind::INITIAL_QUERY)
-        distributed_object_storage_candidate = findDistributedObjectStorageCandidate(query_tree, query_context);
-
     /// Dispatch can still decline here: the driver has to be nameable unambiguously in the serialized query.
+    /// Whole-or-nothing for the dispatch boundary: on rejection, ordinary planning handles everything.
     std::optional<JoinTreeQueryPlan> dispatched_query_plan;
-    if (distributed_object_storage_candidate)
+    const auto & distributed_object_storage_candidate = planner_context->getGlobalPlannerContext()->distributed_object_storage_candidate;
+    if (distributed_object_storage_candidate && distributed_object_storage_candidate->dispatch_boundary == &query_node)
         dispatched_query_plan = buildDistributedObjectStorageQueryPlan(query_tree, *distributed_object_storage_candidate, select_query_info, planner_context);
 
     if (dispatched_query_plan)

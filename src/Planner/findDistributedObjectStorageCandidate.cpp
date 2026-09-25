@@ -14,6 +14,7 @@
 #include <Core/SettingsEnums.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/SelectQueryOptions.h>
 #include <Storages/IStorageCluster.h>
 
 namespace DB
@@ -119,9 +120,6 @@ struct DriverPathResult
     QueryTreeNodePtr driver_table_expression;
     IStorageCluster * driver_storage = nullptr;
 
-    /// Innermost first; the caller reverses and prepends the dispatch boundary.
-    std::vector<const QueryNode *> query_nodes_on_driver_path;
-
     /// No JOIN on the path means there is nothing here for this mode to optimize; stock `IStorageCluster::read`
     /// already handles a plain single-table cluster read.
     bool has_join = false;
@@ -167,7 +165,6 @@ DriverPathResult findDriverOnLeftSpine(const QueryTreeNodePtr & node, const Cont
         if (!isSafeIntermediateSubquery(*query_node))
             return unusableDriverPath();
 
-        result.query_nodes_on_driver_path.push_back(query_node);
         return result;
     }
 
@@ -250,17 +247,37 @@ std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCan
         return {};
 
     DistributedObjectStorageCandidate candidate;
+    candidate.dispatch_boundary = query_node_typed;
     candidate.driver = driver_path.driver;
     candidate.driver_table_expression = driver_path.driver_table_expression;
     candidate.driver_storage = driver_path.driver_storage;
-
-    candidate.query_nodes_on_driver_path.push_back(query_node_typed);
-    candidate.query_nodes_on_driver_path.insert(
-        candidate.query_nodes_on_driver_path.end(),
-        driver_path.query_nodes_on_driver_path.rbegin(),
-        driver_path.query_nodes_on_driver_path.rend());
-
     return candidate;
+}
+
+std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCandidate(
+    const QueryTreeNodePtr & query_tree_node, const SelectQueryOptions & select_query_options)
+{
+    /// buildDistributedObjectStorageQueryPlan takes the query's header from an analyze-only Planner over the
+    /// same tree. Dispatching from that one too would recurse until `TOO_DEEP_RECURSION`.
+    if (select_query_options.only_analyze)
+        return {};
+
+    /// A subquery interpreted on its own, rather than planned through the enclosing GlobalPlannerContext, has
+    /// its `__tableN` identifiers numbered locally, so a result dispatched from it would not match the names
+    /// the enclosing query resolved against.
+    if (select_query_options.is_subquery)
+        return {};
+
+    const auto * query_node = query_tree_node->as<QueryNode>();
+    if (!query_node)
+        return {};
+
+    /// A worker executes what it was sent; it never dispatches onwards.
+    const auto & context = query_node->getContext();
+    if (context->getClientInfo().query_kind != ClientInfo::QueryKind::INITIAL_QUERY)
+        return {};
+
+    return findDistributedObjectStorageCandidate(query_tree_node, context);
 }
 
 }
