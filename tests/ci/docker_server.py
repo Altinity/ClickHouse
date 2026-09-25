@@ -292,7 +292,16 @@ def build_and_push_image(
         )
         with open(metadata_path, "rb") as m:
             metadata = json.load(m)
-            digests.append(metadata["containerimage.digest"])
+            digest = metadata["containerimage.digest"]
+            logging.info(
+                "Built image %s:%s-%s digest from metadata file %s: %s",
+                image.repo,
+                tag,
+                arch,
+                metadata_path,
+                digest,
+            )
+            digests.append(digest)
     if push:
         cmd = (
             "docker buildx imagetools create "
