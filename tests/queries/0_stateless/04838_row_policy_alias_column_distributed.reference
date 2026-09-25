@@ -1,0 +1,36 @@
+local
+2
+local, optimize_respect_aliases = 0
+2
+local, alias columns selected, optimize_respect_aliases = 0
+2	20	y20
+local, alias columns selected, PREWHERE, optimize_respect_aliases = 0
+2	20	y20
+remote, prefer_localhost_replica = 0
+2
+2
+remote, prefer_localhost_replica = 1
+2
+2
+remote, aggregation
+2	2	1
+remote, alias columns selected
+2	20	y20
+2	20	y20
+remote, new analyzer
+2
+2
+distributed, prefer_localhost_replica = 0
+2
+distributed, prefer_localhost_replica = 1
+2
+distributed, alias columns selected, PREWHERE, optimize_respect_aliases = 0
+2	20	y20
+distributed, policy with only an ALIAS predicate
+1	2
+distributed, policy with inline expressions
+2
+local, additional_table_filters on alias, optimize_respect_aliases = 0
+2
+3
+4

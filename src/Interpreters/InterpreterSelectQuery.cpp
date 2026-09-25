@@ -154,7 +154,12 @@ FilterDAGInfoPtr generateFilterActions(
     /// The first column is our filter expression.
     /// the row_policy_filter_expression should be cloned, because it may be changed by TreeRewriter.
     /// which make it possible an invalid expression, although it may be valid in whole select.
-    expr_list->children.push_back(row_policy_filter_expression->clone());
+    auto filter_expression = row_policy_filter_expression->clone();
+
+    /// ALIAS columns are not computed before the row-level filter, and TreeRewriter expands them only on the initiator.
+    replaceAliasColumnsInQuery(filter_expression, metadata_snapshot->getColumns(), /*array_join_result_to_source=*/ {}, context);
+
+    expr_list->children.push_back(std::move(filter_expression));
 
     /// Keep columns that are required after the filter actions.
     for (const auto & column_str : prerequisite_columns)
@@ -2127,7 +2132,7 @@ void InterpreterSelectQuery::addPrewhereAliasActions()
     }
 
     /// Set of all (including ALIAS) required columns for PREWHERE
-    auto get_prewhere_columns = [&]()
+    auto get_prewhere_columns = [&](bool with_row_level_filter)
     {
         NameSet columns;
 
@@ -2138,7 +2143,7 @@ void InterpreterSelectQuery::addPrewhereAliasActions()
             columns.insert(prewhere_required_columns.begin(), prewhere_required_columns.end());
         }
 
-        if (row_level_filter)
+        if (row_level_filter && with_row_level_filter)
         {
             auto row_level_required_columns = row_level_filter->actions.getRequiredColumns().getNames();
             columns.insert(row_level_required_columns.begin(), row_level_required_columns.end());
@@ -2156,14 +2161,12 @@ void InterpreterSelectQuery::addPrewhereAliasActions()
     /// before any other executions.
     if (alias_columns_required)
     {
-        NameSet required_columns_from_prewhere = get_prewhere_columns();
+        /// The row-level filter keeps its inputs, so they must also pass through `alias_actions`.
+        NameSet required_columns_from_prewhere = get_prewhere_columns(/*with_row_level_filter=*/ false);
         NameSet required_aliases_from_prewhere; /// Set of ALIAS required columns for PREWHERE
 
         /// Expression, that contains all raw required columns
         ASTPtr required_columns_all_expr = std::make_shared<ASTExpressionList>();
-
-        /// Expression, that contains raw required columns for PREWHERE
-        ASTPtr required_columns_from_prewhere_expr = std::make_shared<ASTExpressionList>();
 
         /// Sort out already known required columns between expressions,
         /// also populate `required_aliases_from_prewhere`.
@@ -2189,8 +2192,6 @@ void InterpreterSelectQuery::addPrewhereAliasActions()
 
             if (required_columns_from_prewhere.contains(column))
             {
-                required_columns_from_prewhere_expr->children.emplace_back(std::move(column_expr));
-
                 if (is_alias)
                     required_aliases_from_prewhere.insert(column);
             }
@@ -2258,7 +2259,7 @@ void InterpreterSelectQuery::addPrewhereAliasActions()
     const auto & supported_prewhere_columns = storage->supportedPrewhereColumns();
     if (supported_prewhere_columns.has_value())
     {
-        NameSet required_columns_from_prewhere = get_prewhere_columns();
+        NameSet required_columns_from_prewhere = get_prewhere_columns(/*with_row_level_filter=*/ true);
 
         for (const auto & column_name : required_columns_from_prewhere)
         {
