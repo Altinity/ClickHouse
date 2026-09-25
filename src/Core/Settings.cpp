@@ -2285,6 +2285,22 @@ Possible values:
 - `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.`
 - `allow` — Allows the use of these types of subqueries.
 )", IMPORTANT) \
+    DECLARE(ObjectStorageClusterJoinMode, object_storage_cluster_join_mode, ObjectStorageClusterJoinMode::ALLOW, R"(
+Changes the behaviour of object storage cluster function or table.
+
+ClickHouse applies this setting when the query contains the product of object storage cluster function or table, i.e. when the query for a object storage cluster function or table contains a non-GLOBAL subquery for the object storage cluster function or table.
+
+Restrictions:
+
+- Only applied for JOIN subqueries.
+- Only if the FROM section uses a object storage cluster function or table.
+
+Possible values:
+
+- `local` — Replaces the database and table in the subquery with local ones for the destination server (shard), leaving the normal `IN`/`JOIN.`
+- `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.` Right table executes first and is added to the secondary query as temporay table.
+- `allow` — Default value. Allows the use of these types of subqueries.
+)", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.
@@ -2757,6 +2773,11 @@ Set to `false` to restore the pre-26.8 one-record-per-line output, or set `compa
     \
     DECLARE(UInt64, query_plan_max_step_description_length, 500, R"(
 Maximum length of step description in EXPLAIN PLAN.
+)", 0) \
+    \
+    DECLARE(Bool, enable_alias_marker, true, R"(
+Enable __aliasMarker injection for ALIAS column expressions when using the analyzer.
+This stabilizes action node names across planner/analyzer stages without changing query semantics.
 )", 0) \
     \
     DECLARE(UInt64, preferred_block_size_bytes, 1000000, R"(
@@ -6043,6 +6064,14 @@ how long already merged files stay unpublished while compaction keeps finding ne
 of publishing only when compaction runs out of candidates - a state that is never reached while the table keeps
 receiving new data files, so every merged output is then written to object storage and never referenced by a snapshot.
 )", 0) \
+    DECLARE(Bool, use_puffin_files_cache, true, R"(
+If turned on, Iceberg reads may utilize the Puffin files cache for parsed puffin file content such as deletion vectors.
+
+Possible values:
+
+- 0 - Disabled
+- 1 - Enabled
+)", 0) \
     DECLARE(Bool, use_query_cache, false, R"(
 If turned on, `SELECT` queries may utilize the [query cache](/concepts/features/performance/caches/query-cache). Parameters [enable_reads_from_query_cache](#enable_reads_from_query_cache)
 and [enable_writes_to_query_cache](#enable_writes_to_query_cache) control in more detail how the cache is used.
@@ -8255,17 +8284,17 @@ but makes distributed index analysis less efficient if large tables are used in 
     DECLARE(Bool, distributed_index_analysis_for_non_shared_merge_tree, false, R"(
 Enable distributed index analysis even for non SharedMergeTree (cloud only engine).
 )", 0) \
-    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_iceberg, false, R"(
+    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_iceberg, true, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'iceberg'
 
 Cloud default value: `1`.
 )", BETA, allow_database_iceberg) \
-    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_unity_catalog, false, R"(
+    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_unity_catalog, true, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'unity'
 
 Cloud default value: `1`.
 )", BETA, allow_database_unity_catalog) \
-    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_glue_catalog, false, R"(
+    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_glue_catalog, true, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'glue'
 
 Cloud default value: `1`.
@@ -8705,6 +8734,94 @@ Enable converting the hash table to a flat array for joins when the key is a sin
     DECLARE(UInt64, query_plan_min_columns_for_join_lazy_indexing, 3, R"(
 Control the minimum number of payload columns from the left side required for enabling lazy indexing optimization in JOIN. 0 means the optimization is disabled.
 )", 0) \
+    DECLARE(Timezone, iceberg_timezone_for_timestamptz, "UTC", R"(
+Timezone for Iceberg timestamptz field.
+
+Possible values:
+
+- Any valid timezone, e.g. `Europe/Berlin`, `UTC` or `Zulu`
+- `` (empty value) - use session timezone
+
+Default value is `UTC`.
+)", 0) \
+    DECLARE(Timezone, iceberg_partition_timezone, "", R"(
+Time zone by which partitioning of Iceberg tables was performed.
+Possible values:
+
+- Any valid timezone, e.g. `Europe/Berlin`, `UTC` or `Zulu`
+- `` (empty value) - use server or session timezone
+
+Default value is empty.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_overwrite_file_if_exists, false, R"(
+Overwrite file if it already exists when exporting a merge tree part
+)", 0) \
+    DECLARE(Bool, export_merge_tree_partition_force_export, false, R"(
+Ignore existing partition export and overwrite the zookeeper entry
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_retry_initial_backoff_seconds, 5, R"(
+Initial delay (in seconds) before retrying a failed part export in an export partition task.
+The delay grows exponentially with the per-replica retry count (capped doubling): `delay = min(initial << (attempts - 1), max)`, where `max` is `export_merge_tree_partition_retry_max_backoff_seconds`.
+The back-off is per-replica in-memory state: it only spaces this replica's retries out in time and never prevents another replica from attempting the same part. Retryable failures are retried until the task succeeds or `export_merge_tree_partition_task_timeout_seconds` elapses.
+To survive a long transient outage (e.g. object storage downtime), raise `export_merge_tree_partition_task_timeout_seconds`.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_retry_max_backoff_seconds, 300, R"(
+Maximum delay (in seconds) between retries of a failed part export in an export partition task. Caps the exponential growth controlled by `export_merge_tree_partition_retry_initial_backoff_seconds`.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 86400, R"(
+Maximum wall-clock duration (in seconds) an export partition task is allowed to remain in the PENDING state before it is auto-killed by the background cleanup loop.
+The timeout is measured from the manifest's create_time. Set to 0 to disable the timeout.
+When the timeout is exceeded the task transitions to KILLED (same terminal state as `KILL QUERY ... EXPORT PARTITION`), and `last_exception` is populated with a timeout reason.
+
+IMPORTANT: In case the storage is managed by a 3rd party application that cleans up old manifest files, it is important that the TTL of such files are greater than the timeout of export partition tasks.
+If it is not configured in such a way, it is possible to accidentally duplicate data in the extremely rare case a ClickHouse node is the only node working on a given export task, commits the data to Iceberg, crashes before marking the task as done and only boots up after the manifest cleanup has deleted the commit manifest.
+In such scenario, ClickHouse would attempt to commit those files again producing duplicates. 
+
+Notes:
+- Enforcement is best-effort: actual kill latency is bounded by one manifest-updater poll cycle (~30s) plus ZooKeeper watch propagation.
+)", 0) \
+    DECLARE(MergeTreePartExportFileAlreadyExistsPolicy, export_merge_tree_part_file_already_exists_policy, MergeTreePartExportFileAlreadyExistsPolicy::skip, R"(
+Possible values:
+- skip - Skip the file if it already exists.
+- error - Throw an error if the file already exists.
+- overwrite - Overwrite the file.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_part_max_bytes_per_file, 0, R"(
+Maximum number of bytes to write to a single file when exporting a merge tree part. 0 means no limit.
+This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_part_max_rows_per_file, 0, R"(
+Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit.
+This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_throw_on_pending_mutations, true, R"(
+Throw an error if there are pending mutations when exporting a merge tree part.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
+Throw an error if there are pending patch parts when exporting a merge tree part.
+)", 0) \
+    DECLARE(ExportPartitionAllOnError, export_merge_tree_partition_all_on_error, ExportPartitionAllOnError::throw_first, R"(
+Failure handling for `ALTER TABLE ... EXPORT PARTITION ALL ...`.
+Possible values:
+- `throw_first` (default) - stop at the first failed partition; partitions already scheduled remain scheduled.
+- `collect` - try every partition and throw a single aggregated exception at the end if any failed; partitions that succeeded remain scheduled.
+- `skip_conflicts` - silently skip partitions that are already exported / being exported (errors with code EXPORT_PARTITION_ALREADY_EXPORTED); fail-fast on every other error.
+Has no effect on `EXPORT PARTITION <id>` (single-partition export).
+)", 0) \
+    DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
+Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_allow_lossy_cast, false, R"(
+Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) casts when the source and destination column types differ. When disabled, an export that would require a lossy cast throws instead.
+
+When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use, so the metadata stays consistent with the data. A lossy cast on a partition column remains semantically truncating: both the data files and the metadata contain the truncated value, and such casts require this setting to be enabled.
+)", 0) \
+    DECLARE(MergeTreePartExportSchemaMismatchMode, export_merge_tree_part_schema_mismatch_mode, MergeTreePartExportSchemaMismatchMode::strict, R"(
+Controls whether `EXPORT PART`/`EXPORT PARTITION` allows a column-count mismatch between the source `MergeTree` table and the destination table. Columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`.
+Possible values:
+- `strict` (default) - the source and destination must have the same number of columns. A mismatch in either direction throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+- `ignore_extra_source_columns_by_position` - the source may have more columns than the destination. The extra trailing source columns (by position) are dropped and not exported. The destination having more columns than the source is still rejected in this mode.
+)", 0) \
     \
     /* ####################################################### */ \
     /* AI function settings */ \
@@ -8788,6 +8905,12 @@ implementation.
     DECLARE(Bool, allow_experimental_unique_key, false, R"(
 Allows creation of tables with the `UNIQUE KEY` clause on MergeTree-family engines.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_hybrid_table, false, R"(
+Allows creation of tables with the [Hybrid](../../engines/table-engines/special/hybrid.md) table engine.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, hybrid_table_auto_cast_columns, true, R"(
+Automatically cast columns to the schema defined in Hybrid tables when remote segments expose different physical types. Works only with analyzer. Enabled by default, does nothing if (experimental) Hybrid tables are disabled; disable it if it causes issues. Segment schemas are cached when the Hybrid table is created or attached; if a segment schema changes later, detach/attach or recreate the Hybrid table so the cached headers stay in sync.
+)", 0) \
     DECLARE(Bool, allow_experimental_codecs, false, R"(
 If it is set to true, allow to specify any experimental compression codec.
 )", EXPERIMENTAL) \
@@ -8977,6 +9100,15 @@ Source SQL dialect for the polyglot transpiler (e.g. 'sqlite', 'mysql', 'postgre
     DECLARE(Bool, enable_adaptive_memory_spill_scheduler, false, R"(
 Trigger processor to spill data into external storage adpatively. grace join is supported at present.
 )", EXPERIMENTAL) \
+    DECLARE(String, object_storage_cluster, "", R"(
+Cluster to make distributed requests to object storages with alternative syntax.
+)", EXPERIMENTAL) \
+    DECLARE(UInt64, object_storage_max_nodes, 0, R"(
+Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
+Possible values:
+- Positive integer.
+- 0 — All hosts in cluster.
+)", EXPERIMENTAL) \
     DECLARE_WITH_ALIAS(Bool, allow_delta_kernel_rs, true, R"(
 Allow the `delta-kernel-rs` implementation for reading Delta Lake tables.
 )", BETA, allow_experimental_delta_kernel_rs) \
@@ -9009,6 +9141,9 @@ Write full paths (including s3://) into iceberg metadata files.
     DECLARE(String, iceberg_metadata_compression_method, "", R"(
 Method to compress `.metadata.json` file.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, use_object_storage_list_objects_cache, false, R"(
+Cache the list of objects returned by list objects calls in object storage
+)", EXPERIMENTAL) \
     DECLARE(Bool, make_distributed_plan, false, R"(
 Make distributed query plan.
 
@@ -9038,6 +9173,19 @@ How many stateless workers will be used to execute this query. Zero disables sta
 )", EXPERIMENTAL) \
     DECLARE(UInt64, distributed_plan_workers_provisioning_timeout_ms, 10000, R"(
 Total wall-clock time, in milliseconds, a query may spend provisioning stateless workers before execution: leasing them from the discovery service and verifying they are reachable. The query blocks up to this budget for the leased workers to become ready; when it elapses the query proceeds with the workers verified so far, or fails if none became available. Zero waits only for the initial lease-and-verify pass (no retries).
+)", EXPERIMENTAL) \
+    DECLARE(UInt64, lock_object_storage_task_distribution_ms, 500, R"(
+In object storage distribution queries do not distribute tasks on non-prefetched nodes until prefetched node is active.
+Determines how long the free executor node (one that finished processing all of it assigned tasks) should wait before "stealing" tasks from queue of currently busy executor nodes.
+
+Possible values:
+
+- 0  - steal tasks immediately after freeing up.
+- >0 - wait for specified period of time before stealing tasks.
+
+Having this `>0` helps with cache reuse and might improve overall query time.
+Because busy node might have warmed-up caches for this specific task, while free node needs to fetch lots of data from S3.
+Which might take longer than just waiting for the busy node and generate extra traffic.
 )", EXPERIMENTAL) \
     DECLARE(String, distributed_plan_force_exchange_kind, "", R"(
 Force specified kind of Exchange operators between distributed query stages.
@@ -9107,11 +9255,23 @@ Use hash table size statistics collected from previous executions to size the JO
     DECLARE(Bool, rewrite_in_to_join, false, R"(
 Rewrite expressions like 'x IN subquery' to JOIN. This might be useful for optimizing the whole query with join reordering.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, object_storage_remote_initiator, false, R"(
+Execute request to object storage as remote on one of object_storage_cluster nodes.
+)", EXPERIMENTAL) \
+    DECLARE(String, object_storage_remote_initiator_cluster, "", R"(
+Cluster to choose remote initiator, when `object_storage_remote_initiator` is true. When empty, `object_storage_cluster` is used.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
+Allow Iceberg read optimization based on Iceberg metadata.
+)", EXPERIMENTAL) \
     \
     /** Experimental timeSeries* aggregate functions. */ \
     DECLARE_WITH_ALIAS(Bool, allow_experimental_time_series_aggregate_functions, false, R"(
 Experimental timeSeries* aggregate functions for Prometheus-like timeseries resampling, rate, delta calculation.
 )", EXPERIMENTAL, allow_experimental_ts_to_grid_aggregate_function) \
+    DECLARE(Bool, allow_experimental_export_merge_tree_part, true, R"(
+Experimental export merge tree part.
+)", EXPERIMENTAL) \
     \
     DECLARE(String, promql_database, "", R"(
 Specifies the database name used by the 'promql' dialect. Empty string means the current database.
@@ -9152,6 +9312,9 @@ Multiple algorithms can be specified as a comma-separated list, e.g. `dphyp,gree
     DECLARE(Bool, allow_experimental_database_paimon_rest_catalog, false, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'paimon_rest'
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_database_s3_tables, false, R"(
+Allow experimental database engine DataLakeCatalog with catalog_type = 's3tables' (Amazon S3 Tables Iceberg REST with SigV4)
+)", EXPERIMENTAL) \
     DECLARE(UInt64, webassembly_udf_max_fuel, 100'000, R"(
 Fuel limit per WebAssembly UDF instance execution. Each WebAssembly instruction consumes some amount of fuel. The value is scaled by 1024 before being passed to the runtime, so `webassembly_udf_max_fuel = 1` corresponds to approximately 1024 fuel units. Set to 0 for no finite limit. Applies only to functions whose per-function setting `webassembly_udf_enable_fuel` is true, which is the default.
 )", EXPERIMENTAL) \
@@ -9178,6 +9341,8 @@ Enable experimental table function `eval`.
 #define OBSOLETE_SETTINGS(M, ALIAS) \
     /** Obsolete settings which are kept around for compatibility reasons. They have no effect anymore. */ \
     MAKE_OBSOLETE(M, Bool, distributed_cache_use_clients_cache_for_write, false) \
+    MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_manifest_ttl, 86400) \
+    MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_max_retries, 3) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_query_deduplication, false) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_ai_functions, false) \
     MAKE_OBSOLETE(M, Bool, query_condition_cache_store_conditions_as_plaintext, false) \
@@ -9298,7 +9463,8 @@ Enable experimental table function `eval`.
     MAKE_OBSOLETE(M, Bool, use_text_index_dictionary_cache, false) \
     MAKE_OBSOLETE(M, Bool, query_plan_use_logical_join_step, true) \
     MAKE_OBSOLETE(M, Bool, query_plan_use_new_logical_join_step, true) \
-    MAKE_OBSOLETE(M, UInt64, cloud_mode_database_engine, 1)
+    MAKE_OBSOLETE(M, UInt64, cloud_mode_database_engine, 1) \
+    MAKE_OBSOLETE(M, Bool, allow_retries_in_cluster_requests, false)
     /** The section above is for obsolete settings. Do not add anything there. */
 #endif /// __CLION_IDE__
 

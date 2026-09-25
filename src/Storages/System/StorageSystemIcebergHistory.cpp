@@ -23,7 +23,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SnapshotSummary.h>
-#include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/System/StorageSystemIcebergHistory.h>
 #include <Storages/System/SystemTableSourceRegistry.h>
@@ -94,7 +94,7 @@ void StorageSystemIcebergHistory::fillData(
     if (!access->isGranted(AccessType::SHOW_TABLES))
         return;
 
-    auto add_history_record = [&](const String & database_name, const String & table_name, StorageObjectStorage * object_storage)
+    auto add_history_record = [&](const String & database_name, const String & table_name, StorageObjectStorageCluster * object_storage)
     {
         if (!access->isGranted(AccessType::SHOW_TABLES, database_name, table_name))
             return;
@@ -202,7 +202,7 @@ void StorageSystemIcebergHistory::fillData(
             // Table was dropped while acquiring the lock, skipping table
             continue;
 
-        if (auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(storage.get()))
+        if (auto * object_storage_table = dynamic_cast<StorageObjectStorageCluster *>(storage.get()))
         {
             add_history_record(database_name, table_name, object_storage_table);
         }

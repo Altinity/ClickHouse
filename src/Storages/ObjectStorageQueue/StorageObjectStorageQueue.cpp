@@ -375,7 +375,7 @@ StorageObjectStorageQueue::StorageObjectStorageQueue(
 
     ColumnsDescription columns{columns_};
     std::string sample_path;
-    resolveSchemaAndFormat(columns, configuration->format, object_storage, configuration, format_settings, sample_path, context_);
+    resolveSchemaAndFormat(columns, object_storage, configuration, format_settings, sample_path, context_);
     configuration->check(context_);
 
     bool is_path_with_hive_partitioning = false;
@@ -432,7 +432,7 @@ StorageObjectStorageQueue::StorageObjectStorageQueue(
         zk_path,
         *queue_settings_,
         storage_metadata.getColumns(),
-        configuration_->format,
+        configuration_->getFormat(),
         context_,
         is_attach,
         log);
@@ -613,7 +613,7 @@ void StorageObjectStorageQueue::renameInMemory(const StorageID & new_table_id)
 
 bool StorageObjectStorageQueue::supportsSubsetOfColumns(const ContextPtr & context_) const
 {
-    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->format, context_, format_settings);
+    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->getFormat(), context_, format_settings);
 }
 
 class ReadFromObjectStorageQueue : public SourceStepWithFilter

@@ -158,6 +158,7 @@ add_headers_and_sources(dbms Storages/ObjectStorage/S3)
 add_headers_and_sources(dbms Storages/ObjectStorage/HDFS)
 add_headers_and_sources(dbms Storages/ObjectStorage/Local)
 add_headers_and_sources(dbms Storages/ObjectStorage/Web)
+add_headers_and_sources(dbms Storages/ObjectStorage/MergeTree)
 add_headers_and_sources(dbms Storages/ObjectStorage/DataLakes)
 add_headers_and_sources(dbms Storages/ObjectStorage/DataLakes/Common)
 add_headers_and_sources(dbms Storages/ObjectStorage/DataLakes/Iceberg)
@@ -661,10 +662,6 @@ target_link_libraries(
         Poco::Redis
 )
 
-if (TARGET ch_contrib::jwt-cpp)
-    target_link_libraries(clickhouse_common_io PUBLIC ch_contrib::jwt-cpp)
-endif()
-
 if (TARGET ch_contrib::mongocxx)
     target_link_libraries(
         dbms
@@ -1011,6 +1008,3 @@ if (ENABLE_TESTS)
     endif()
 endif ()
 
-if (TARGET ch_contrib::jwt-cpp)
-    add_object_library(clickhouse_client_jwt Client/jwt)
-endif()

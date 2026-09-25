@@ -14,6 +14,7 @@
 #include <Common/FieldAccurateComparison.h>
 #include <Common/checkStackSize.h>
 #include <Common/HashTable/HashSet.h>
+#include <base/arithmeticOverflow.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Interpreters/castColumn.h>
 #include <IO/CompressionMethod.h>
@@ -373,6 +374,42 @@ bool Reader::spatialBboxStatsHaveNoNulls(const parq::RowGroup & meta, size_t spa
     return true;
 }
 
+std::vector<size_t> buildRowGroupGlobalOffsets(const parq::FileMetaData & file_metadata)
+{
+    if (file_metadata.num_rows < 0)
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Parquet file has negative row count: {}", file_metadata.num_rows);
+
+    const size_t num_row_groups = file_metadata.row_groups.size();
+    std::vector<size_t> global_offsets(num_row_groups + 1, 0);
+    UInt64 total_rows = 0;
+
+    for (size_t i = 0; i < num_row_groups; ++i)
+    {
+        const Int64 num_rows = file_metadata.row_groups[i].num_rows;
+        if (num_rows < 0)
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Parquet row group {} has negative row count: {}", i, num_rows);
+
+        UInt64 next_total = 0;
+        if (common::addOverflow(total_rows, static_cast<UInt64>(num_rows), next_total))
+        {
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "Parquet row group row counts overflow when computing global offsets (at row group {})",
+                i);
+        }
+
+        total_rows = next_total;
+        global_offsets[i + 1] = static_cast<size_t>(total_rows);
+    }
+
+    /// Do not require the row-group sum to equal `FileMetaData.num_rows`. Some writers leave a
+    /// stale or inconsistent file-level count; global offsets and deletion-vector positions are
+    /// defined by the row-group layout. This helper runs on every ParquetV3 read, so rejecting
+    /// mismatches would break previously readable files.
+
+    return global_offsets;
+}
+
 void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UInt64>> & row_groups_to_read)
 {
     extended_sample_block = *sample_block;
@@ -697,26 +734,22 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     }
 
     /// Populate row_groups. Skip row groups based on column chunk min/max statistics.
-    size_t total_rows = 0;
+    const std::vector<size_t> global_offsets = buildRowGroupGlobalOffsets(file_metadata);
     for (size_t row_group_idx = 0; row_group_idx < file_metadata.row_groups.size(); ++row_group_idx)
     {
         const auto * meta = &file_metadata.row_groups[row_group_idx];
-        if (meta->num_rows < 0)
-            throw Exception(ErrorCodes::INCORRECT_DATA, "Row group {} has negative row count: {}", row_group_idx, meta->num_rows);
         if (meta->num_rows == 0)
             continue; /// Empty row groups are valid in Parquet; skip them.
         if (meta->columns.size() != total_primitive_columns_in_file)
             throw Exception(ErrorCodes::INCORRECT_DATA, "Row group {} has unexpected number of columns: {} != {}", row_group_idx, meta->columns.size(), total_primitive_columns_in_file);
 
-        total_rows += size_t(meta->num_rows); // before potentially skipping the row group
-
         /// Lazy materialization: skip row groups that contain none of the requested rows.
         std::pair<size_t, size_t> requested_rows_slice {0, 0};
         if (rows_to_read)
         {
-            size_t group_start_row = total_rows - size_t(meta->num_rows);
+            size_t group_start_row = global_offsets[row_group_idx];
             const auto * begin_it = std::lower_bound(rows_to_read->begin(), rows_to_read->end(), group_start_row);
-            const auto * end_it = std::lower_bound(begin_it, rows_to_read->end(), total_rows);
+            const auto * end_it = std::lower_bound(begin_it, rows_to_read->end(), global_offsets[row_group_idx + 1]);
             if (begin_it == end_it)
                 continue;
             requested_rows_slice = {size_t(begin_it - rows_to_read->begin()), size_t(end_it - rows_to_read->begin())};
@@ -773,7 +806,7 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         row_group.need_to_process = !row_groups_to_read.has_value() || row_groups_to_read->contains(row_group_idx);
         row_group.requested_rows_slice = requested_rows_slice;
         row_group.row_group_idx = row_group_idx;
-        row_group.start_global_row_idx = total_rows - size_t(meta->num_rows);
+        row_group.start_global_row_idx = global_offsets[row_group_idx];
         row_group.columns.resize(primitive_columns.size());
         row_group.hyperrectangle = std::move(hyperrectangle);
 
@@ -797,9 +830,9 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         }
     }
 
-    if (rows_to_read && !rows_to_read->empty() && rows_to_read->back() >= total_rows)
+    if (rows_to_read && !rows_to_read->empty() && rows_to_read->back() >= global_offsets.back())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Requested to read row {} of a parquet file that has only {} rows", rows_to_read->back(), total_rows);
+            "Requested to read row {} of a parquet file that has only {} rows", rows_to_read->back(), global_offsets.back());
 
     if (row_groups.empty())
         return; // all row groups were skipped
