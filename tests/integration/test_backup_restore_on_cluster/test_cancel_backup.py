@@ -363,6 +363,7 @@ class NoTrashChecker:
                 + start_time
                 + "') "
                 + "AND NOT ((name == 'KEEPER_EXCEPTION') AND (last_error_message LIKE '%Fault injection%')) "
+                + "AND NOT ((name == 'S3_ERROR') AND (last_error_message LIKE '%This error is expected for S3 disk%')) "
                 + "AND NOT (name == 'NO_ELEMENTS_IN_CONFIG')"
             )
             errors = errors_query_result.splitlines()
