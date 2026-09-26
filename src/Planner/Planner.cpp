@@ -82,6 +82,8 @@
 #include <Planner/CollectSets.h>
 #include <Planner/CollectTableExpressionData.h>
 #include <Planner/findQueryForParallelReplicas.h>
+#include <Planner/findDistributedObjectStorageCandidate.h>
+#include <Planner/buildDistributedObjectStorageQueryPlan.h>
 #include <Planner/PlannerActionsVisitor.h>
 #include <Planner/PlannerContext.h>
 #include <Planner/PlannerCorrelatedSubqueries.h>
@@ -1927,7 +1929,8 @@ Planner::Planner(const QueryTreeNodePtr & query_tree_,
             findQueryForParallelReplicas(query_tree, select_query_options),
             findTableForParallelReplicas(query_tree, select_query_options),
             findTableUnionForParallelReplicas(query_tree, select_query_options),
-            collectFiltersForAnalysis(query_tree, select_query_options, post_filter_))))
+            collectFiltersForAnalysis(query_tree, select_query_options, post_filter_),
+            findDistributedObjectStorageCandidate(query_tree, select_query_options))))
 {
 }
 
@@ -2302,7 +2305,18 @@ void Planner::buildPlanForQueryNode()
     }
 
     JoinTreeQueryPlan join_tree_query_plan;
-    if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
+    /// Dispatch can still decline here: the driver has to be nameable unambiguously in the serialized query.
+    /// Whole-or-nothing for the dispatch boundary: on rejection, ordinary planning handles everything.
+    std::optional<JoinTreeQueryPlan> dispatched_query_plan;
+    const auto & distributed_object_storage_candidate = planner_context->getGlobalPlannerContext()->distributed_object_storage_candidate;
+    if (distributed_object_storage_candidate && distributed_object_storage_candidate->dispatch_boundary == &query_node)
+        dispatched_query_plan = buildDistributedObjectStorageQueryPlan(query_tree, *distributed_object_storage_candidate, select_query_info, planner_context);
+
+    if (dispatched_query_plan)
+    {
+        join_tree_query_plan = std::move(*dispatched_query_plan);
+    }
+    else if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
         && planner_context->getGlobalPlannerContext()->parallel_replicas_node == &query_node)
     {
         join_tree_query_plan = buildQueryPlanForParallelReplicas(query_node, planner_context, select_query_info.storage_limits);

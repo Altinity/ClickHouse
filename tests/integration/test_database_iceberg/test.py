@@ -1064,6 +1064,325 @@ def test_cluster_select(started_cluster):
     assert node2.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`", settings={"parallel_replicas_for_cluster_engines": 1, "enable_parallel_replicas": 2, "cluster_for_parallel_replicas": "cluster_simple"}) == 'pablo\n'
 
 
+def _setup_distributed_join_tables(started_cluster, nodes, test_ref):
+    """Three DataLake-catalog tables: a driver and two dimensions, so a query can have a nested JOIN
+    on the right-hand side rather than a single partner table."""
+    root_namespace = f"{test_ref}_namespace"
+    fact_table = f"{test_ref}_fact"
+    dim_table = f"{test_ref}_dim"
+    weight_table = f"{test_ref}_weight"
+
+    load_catalog_impl(started_cluster)
+    for node in nodes:
+        create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    node = nodes[0]
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, fact_table, "(tag Int32, name String)"
+    )
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, dim_table, "(id Int32, city String)"
+    )
+    create_clickhouse_iceberg_table(
+        started_cluster, node, root_namespace, weight_table, "(city String, weight Int32)"
+    )
+
+    insert_settings = {"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{fact_table}` VALUES (1, 'john'), (2, 'jack'), (3, 'jill');",
+        settings=insert_settings,
+    )
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{dim_table}` VALUES (1, 'berlin'), (2, 'paris'), (3, 'berlin');",
+        settings=insert_settings,
+    )
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{weight_table}` VALUES ('berlin', 10), ('paris', 20), ('berlin', 5);",
+        settings=insert_settings,
+    )
+
+    return (
+        f"{CATALOG_NAME}.`{root_namespace}.{fact_table}`",
+        f"{CATALOG_NAME}.`{root_namespace}.{dim_table}`",
+        f"{CATALOG_NAME}.`{root_namespace}.{weight_table}`",
+    )
+
+
+def _driver_announcement(qualified_name):
+    """Splits ``catalog.`ns.table` `` into the database/table pair the initiator announces, which is
+    what `DatabaseDataLake` builds the driver's StorageID from."""
+    database, table = qualified_name.split(".", 1)
+    return database, table.strip("`")
+
+
+def _assert_dispatched_whole(nodes, query_id, driver_database, driver_table):
+    """Checks the runtime invariants of a whole-query dispatch, from system.query_log:
+
+    1. the whole query -- JOIN and GROUP BY included -- reached a worker as a secondary query, carrying
+       the driver announcement the initiator chose;
+    2. the driver crossed the wire as the plain catalog table the user wrote. Nothing is rewritten into a
+       `*Cluster` table function; an earlier design did that, and this pins that it is not coming back;
+    3. every secondary query of this dispatch is that whole query. A partner table fanning out again from
+       a worker would show up as a further secondary query without the JOIN in it.
+    """
+    for node in nodes:
+        node.query("SYSTEM FLUSH LOGS system.query_log")
+
+    announced_whole_query = 0
+    for node in nodes:
+        announced_whole_query += int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND positionCaseInsensitive(query, 'join') != 0
+                  AND positionCaseInsensitive(query, 'group by') != 0
+                  AND Settings['object_storage_distributed_driver_database'] = '{driver_database}'
+                  AND Settings['object_storage_distributed_driver_table'] = '{driver_table}'
+                """
+            ).strip()
+        )
+    assert announced_whole_query > 0, (
+        f"query {query_id} was not dispatched whole to the cluster, or reached a worker without the "
+        f"driver announcement naming {driver_database}.{driver_table}"
+    )
+
+    for node in nodes:
+        rewritten = int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND positionCaseInsensitive(query, 'icebergs3cluster') != 0
+                """
+            ).strip()
+        )
+        assert rewritten == 0, (
+            f"query {query_id}: a dispatched query on {node.name} contains a cluster table function -- "
+            "the driver must travel as the catalog table the user wrote, named in the settings"
+        )
+
+        partner_fanout = int(
+            node.query(
+                f"""
+                SELECT count()
+                FROM system.query_log
+                WHERE type = 'QueryStart' AND NOT is_initial_query
+                  AND initial_query_id = '{query_id}'
+                  AND positionCaseInsensitive(query, 'join') = 0
+                """
+            ).strip()
+        )
+        assert partner_fanout == 0, (
+            f"query {query_id}: a secondary query without the JOIN was issued on {node.name} -- "
+            "a table fanned out again instead of being read locally"
+        )
+
+
+def test_distributed_join_dispatch(started_cluster):
+    """object_storage_cluster_join_mode='distributed': a JOIN whose driving table is a DataLake-catalog
+    table is dispatched whole to the driver's cluster and finalized on the initiator.
+
+    Correctness is checked against the same queries under join_mode='allow' (ordinary local planning),
+    which is the oracle -- dispatch must not change results, only where the work happens.
+    """
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, weight = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_{uuid.uuid4()}"
+    )
+
+    def run(query, join_mode, query_id=None):
+        return node1.query(
+            query,
+            query_id=query_id,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "object_storage_cluster_join_mode": join_mode,
+            },
+        )
+
+    # The driver is the immediate leftmost table of the JOIN.
+    direct_driver = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag < 10
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    # The driver is buried in a see-through subquery on the JOIN's left, the aggregation sits on the
+    # enclosing query, and the right-hand side is itself a JOIN over a grouped subquery -- all of which
+    # every worker recomputes in full.
+    buried_driver = f"""
+        SELECT dims.city, count() AS c
+        FROM
+        (
+            SELECT tag, name
+            FROM {fact}
+            WHERE tag < 10
+        ) AS f
+        LEFT JOIN
+        (
+            SELECT d.id AS id, d.city AS city
+            FROM {dim} AS d
+            LEFT JOIN
+            (
+                SELECT city, sum(weight) AS w
+                FROM {weight}
+                GROUP BY city
+            ) AS p ON d.city = p.city
+        ) AS dims ON f.tag = dims.id
+        GROUP BY dims.city
+        ORDER BY ALL
+    """
+
+    # The same shape written with CTEs rather than derived tables. The setting documents CTE support,
+    # and the analyzer represents a CTE as a QueryNode just like a derived table, but the serializer has to
+    # inline the CTE body for the worker to resolve it -- so this is worth exercising directly.
+    buried_driver_cte = f"""
+        WITH
+            f AS
+            (
+                SELECT tag, name
+                FROM {fact}
+                WHERE tag < 10
+            ),
+            p AS
+            (
+                SELECT city, sum(weight) AS w
+                FROM {weight}
+                GROUP BY city
+            ),
+            dims AS
+            (
+                SELECT d.id AS id, d.city AS city
+                FROM {dim} AS d
+                LEFT JOIN p ON d.city = p.city
+            )
+        SELECT dims.city, count() AS c
+        FROM f
+        LEFT JOIN dims ON f.tag = dims.id
+        GROUP BY dims.city
+        ORDER BY ALL
+    """
+
+    for name, query in (
+        ("direct driver", direct_driver),
+        ("buried driver", buried_driver),
+        ("buried driver via CTE", buried_driver_cte),
+    ):
+        expected = run(query, "allow")
+        assert expected == "berlin\t2\nparis\t1\n", f"{name} oracle result changed: {expected!r}"
+
+        query_id = uuid.uuid4().hex
+        assert run(query, "distributed", query_id=query_id) == expected, f"{name} differs under dispatch"
+        _assert_dispatched_whole(nodes, query_id, *_driver_announcement(fact))
+
+
+def test_distributed_join_dispatch_falls_back(started_cluster):
+    """Tables the dispatch cannot prove safe fall back to ordinary planning instead of failing: a local
+    Memory JOIN partner is not resolvable on a worker, so the candidate must be rejected."""
+    node1 = started_cluster.instances["node1"]
+
+    test_ref = f"test_distributed_join_fallback_{uuid.uuid4()}"
+    fact, _, _ = _setup_distributed_join_tables(started_cluster, [node1], test_ref)
+
+    local_table = f"{test_ref}_local"
+    node1.query(f"CREATE TABLE {local_table} (id Int32, city String) ENGINE = Memory()")
+    node1.query(f"INSERT INTO {local_table} VALUES (1, 'berlin'), (2, 'paris'), (3, 'berlin')")
+
+    query = f"""
+        SELECT l.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {local_table} AS l ON f.tag = l.id
+        GROUP BY l.city
+        ORDER BY ALL
+    """
+
+    def run(join_mode):
+        return node1.query(
+            query,
+            settings={
+                "object_storage_cluster": "cluster_simple",
+                "object_storage_cluster_join_mode": join_mode,
+            },
+        )
+
+    assert run("distributed") == run("allow")
+
+
+def test_distributed_join_dispatch_ignores_parallel_replicas_settings(started_cluster):
+    """A whole-query dispatch must not let the parallel-replicas settings change what a worker reads.
+
+    On a worker every DataLake-catalog table is resolved fresh through `DatabaseDataLake`, and
+    `StorageObjectStorageCluster`'s constructor decides there and then whether its inner plain storage
+    consumes the initiator's file-task queue. That decision is made from the cluster name plus the
+    parallel-replicas settings -- it does not consider which table this is. Under dispatch the driver
+    owns that queue, so a partner answering yes as well would read the driver's files under its own
+    schema.
+
+    What prevents that is the constructor asking, first, whether this is a dispatched worker at all: if it
+    is, only the announced driver consumes the queue and the parallel-replica settings get no say. Make
+    those two conditions independent again -- the earlier `||` -- and a partner becomes a queue consumer.
+    The settings below are the combination that makes the parallel-replica half true.
+    """
+    node1 = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
+    nodes = [node1, node2]
+
+    fact, dim, _ = _setup_distributed_join_tables(
+        started_cluster, nodes, f"test_distributed_join_pr_{uuid.uuid4()}"
+    )
+
+    query = f"""
+        SELECT d.city, count() AS c
+        FROM {fact} AS f
+        INNER JOIN {dim} AS d ON f.tag = d.id
+        WHERE f.tag < 10
+        GROUP BY d.city
+        ORDER BY ALL
+    """
+
+    expected = node1.query(
+        query,
+        settings={
+            "object_storage_cluster": "cluster_simple",
+            "object_storage_cluster_join_mode": "allow",
+        },
+    )
+    assert expected == "berlin\t2\nparis\t1\n", f"oracle result changed: {expected!r}"
+
+    query_id = uuid.uuid4().hex
+    got = node1.query(
+        query,
+        query_id=query_id,
+        settings={
+            "object_storage_cluster": "cluster_simple",
+            "object_storage_cluster_join_mode": "distributed",
+            "parallel_replicas_for_cluster_engines": 1,
+            "enable_parallel_replicas": 1,
+            "cluster_for_parallel_replicas": "cluster_simple",
+            "max_parallel_replicas": 2,
+        },
+    )
+    assert got == expected, (
+        "dispatch with the parallel-replicas settings on returned a different result than ordinary "
+        f"planning: {got!r} != {expected!r} -- a partner table most likely consumed the driver's "
+        "file-task queue"
+    )
+
+    # Without this the test would silently stop covering anything if the candidate were rejected
+    # whenever the parallel-replicas settings are set.
+    _assert_dispatched_whole(nodes, query_id, *_driver_announcement(fact))
+
 def test_used_storages_in_query_log(started_cluster):
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]

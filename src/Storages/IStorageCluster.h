@@ -3,6 +3,7 @@
 #include <Storages/IStorage.h>
 #include <Interpreters/ActionsDAG.h>
 #include <QueryPipeline/RemoteQueryExecutor.h>
+#include <Processors/QueryPlan/ISourceStep.h>
 #include <Processors/QueryPlan/SourceStepWithFilter.h>
 
 namespace DB
@@ -52,6 +53,21 @@ public:
         = 0;
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
+
+    /// Dispatches a whole query the caller has already prepared (see
+    /// Planner/buildDistributedObjectStorageQueryPlan.h) to this storage's cluster, over the same
+    /// task-iterator transport read() uses. This storage acts only as the cluster handle and the source of
+    /// file tasks; `query_to_send` is self-contained and its result is not this table's rows, so the read
+    /// goes through ReadFromClusterQuery rather than ReadFromCluster.
+    void readPreparedClusterQuery(
+        QueryPlan & query_plan,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        QueryProcessingStage::Enum processed_stage,
+        ASTPtr query_to_send,
+        SharedHeader sample_block,
+        std::shared_ptr<const ActionsDAG> driver_filter);
 
     bool isRemote() const final { return true; }
     bool supportsSubcolumns() const override  { return true; }
@@ -178,6 +194,58 @@ private:
 
     void createExtension();
     ContextPtr updateSettings(const Settings & settings);
+};
+
+
+/// Dispatches one already-prepared query to a cluster, giving every node a share of one table's files.
+///
+/// Distinct from ReadFromCluster, which reads a single table: here the output is a whole query's result, so
+/// there is no table expression to push filters into and no per-table column mapping. `driver_storage` and
+/// `driver_snapshot` describe only the table whose files are handed out, never the step's output.
+class ReadFromClusterQuery : public ISourceStep
+{
+public:
+    std::string getName() const override { return "ReadFromClusterQuery"; }
+    void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
+    void describeActions(FormatSettings & format_settings) const override;
+
+    ReadFromClusterQuery(
+        SharedHeader output_header_,
+        std::shared_ptr<IStorageCluster> driver_storage_,
+        StorageSnapshotPtr driver_snapshot_,
+        ContextPtr context_,
+        ASTPtr query_to_send_,
+        QueryProcessingStage::Enum processed_stage_,
+        ClusterPtr cluster_,
+        LoggerPtr log_,
+        std::optional<Tables> external_tables_,
+        std::shared_ptr<const ActionsDAG> driver_filter_)
+        : ISourceStep(std::move(output_header_))
+        , driver_storage(std::move(driver_storage_))
+        , driver_snapshot(std::move(driver_snapshot_))
+        , context(std::move(context_))
+        , query_to_send(std::move(query_to_send_))
+        , processed_stage(processed_stage_)
+        , cluster(std::move(cluster_))
+        , log(log_)
+        , external_tables(std::move(external_tables_))
+        , driver_filter(std::move(driver_filter_))
+    {
+    }
+
+private:
+    std::shared_ptr<IStorageCluster> driver_storage;
+    StorageSnapshotPtr driver_snapshot;
+    ContextPtr context;
+    ASTPtr query_to_send;
+    QueryProcessingStage::Enum processed_stage;
+    ClusterPtr cluster;
+    LoggerPtr log;
+    std::optional<Tables> external_tables;
+    /// Predicate over the driver's own columns, used to prune its file listing. Null means list everything.
+    std::shared_ptr<const ActionsDAG> driver_filter;
+
+    ContextPtr updateSettings() const;
 };
 
 }

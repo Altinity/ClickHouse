@@ -682,7 +682,12 @@ Chunk StorageObjectStorageSource::generate()
                             auto query_condition_cache = Context::getGlobalContextInstance()->getQueryConditionCache();
                             query_condition_cache->write(
                                 storage_id.uuid,
-                                object_info->getFileName(),
+                                /// Full path, not the file name: object storage paths are hierarchical and a
+                                /// Hive-partitioned dataset repeats the same file name in every partition
+                                /// (`day=.../part-00000.parquet`). Keying by name alone makes those files share
+                                /// one cache entry, so a partition that matched nothing marks its namesakes as
+                                /// having no matching row groups and they are skipped unread.
+                                object_info->getPath(),
                                 *format_filter_info->condition_hash,
                                 format_filter_info->filter_actions_dag->dumpNames(),
                                 unmatched_ranges,
@@ -827,7 +832,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (query_condition_cache && !object_info->file_bucket_info)
         {
             auto matching_marks = query_condition_cache->read(
-                storage_id.uuid, object_info->getFileName(), *format_filter_info->condition_hash);
+                storage_id.uuid, object_info->getPath(), *format_filter_info->condition_hash);
             if (matching_marks.has_value())
             {
                 const auto & marks = *matching_marks;
