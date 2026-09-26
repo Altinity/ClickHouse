@@ -1,3 +1,4 @@
+#include <Access/Credentials.h>
 #include <Core/Settings.h>
 #include <Interpreters/AsynchronousInsertQueue.h>
 #include <Parsers/ParserInsertQuery.h>
@@ -37,10 +38,10 @@ TEST(AsyncInsertKey, SettingsChanges)
 
     auto kind = AsynchronousInsertQueueDataKind::Parsed;
 
-    AsynchronousInsertQueue::InsertQuery key1(query, {}, {}, {}, {}, {}, settings1, kind);
-    AsynchronousInsertQueue::InsertQuery key2(query, {}, {}, {}, {}, {}, settings2, kind);
-    AsynchronousInsertQueue::InsertQuery key3(query, {}, {}, {}, {}, {}, settings3, kind);
-    AsynchronousInsertQueue::InsertQuery key4(query, {}, {}, {}, {}, {}, settings4, kind);
+    AsynchronousInsertQueue::InsertQuery key1(query, {}, {}, {}, {}, {}, {}, settings1, kind);
+    AsynchronousInsertQueue::InsertQuery key2(query, {}, {}, {}, {}, {}, {}, settings2, kind);
+    AsynchronousInsertQueue::InsertQuery key3(query, {}, {}, {}, {}, {}, {}, settings3, kind);
+    AsynchronousInsertQueue::InsertQuery key4(query, {}, {}, {}, {}, {}, {}, settings4, kind);
 
     EXPECT_EQ(key1, key2);
     EXPECT_NE(key1, key3);
@@ -62,7 +63,7 @@ TEST(AsyncInsertKey, IdentityHashIsNotAmbiguous)
     auto make_key = [&](const String & current_user, const String & initial_user, const String & authenticated_user)
     {
         return AsynchronousInsertQueue::InsertQuery(
-            query, {}, {}, current_user, initial_user, authenticated_user, settings, kind);
+            query, {}, {}, current_user, initial_user, authenticated_user, {}, settings, kind);
     };
 
     /// The three identity fields are variable-length strings folded into the queue key hash,
@@ -92,4 +93,33 @@ TEST(AsyncInsertKey, IdentityHashIsNotAmbiguous)
     auto key_h = make_key("bob", "bob", "bob");
     EXPECT_NE(key_g.hash, key_h.hash);
     EXPECT_NE(key_g, key_h);
+}
+
+TEST(AsyncInsertKey, ForwardedTokenPartitionsBatches)
+{
+    String query_str = "INSERT INTO test (a) VALUES (1)";
+    ParserInsertQuery parser(query_str.data() + query_str.size(), false);
+    ASTPtr query = parseQuery(parser, query_str, DBMS_DEFAULT_MAX_QUERY_SIZE, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+    Settings settings;
+
+    auto make_key = [&](const ForwardedAuthTokenPtr & token)
+    {
+        return AsynchronousInsertQueue::InsertQuery(
+            query, {}, {}, "alice", "alice", "alice", token, settings, AsynchronousInsertQueueDataKind::Parsed);
+    };
+    auto token = makeForwardedAuthToken(TokenCredentials("alice-token"), "alice");
+    auto same_token = makeForwardedAuthToken(TokenCredentials("alice-token"), "alice");
+    auto rotated_token = makeForwardedAuthToken(TokenCredentials("alice-rotated-token"), "alice");
+
+    auto original = make_key(token);
+    auto same = make_key(same_token);
+    auto rotated = make_key(rotated_token);
+    auto no_token = make_key({});
+
+    EXPECT_EQ(original, same);
+    EXPECT_EQ(original.hash, same.hash);
+    EXPECT_NE(original, rotated);
+    EXPECT_NE(original.hash, rotated.hash);
+    EXPECT_NE(original, no_token);
+    EXPECT_NE(original.hash, no_token.hash);
 }

@@ -2,8 +2,11 @@
 #include "config.h"
 
 #if USE_AVRO
+#include <Access/ForwardedAuthToken.h>
 #include <Databases/DataLake/ICatalog.h>
 #include <Poco/Net/HTTPBasicCredentials.h>
+#include <Poco/Net/HTTPResponse.h>
+#include <Common/CacheBase.h>
 #include <Common/MultiVersion.h>
 #include <IO/ReadWriteBufferFromHTTP.h>
 #include <IO/HTTPHeaderEntries.h>
@@ -47,6 +50,48 @@ struct VendedStorageCredentials
     std::string table_uuid = {};
 };
 
+struct TokenForwardingConfig
+{
+    bool forward_user_token = false;
+    String token_exchange_uri;
+    String subject_token_type;
+    String requested_token_type;
+    bool forward_actor_token = false;
+    UInt64 user_token_cache_ttl = 0;
+
+    bool exchangeEnabled() const { return forward_user_token && !token_exchange_uri.empty(); }
+};
+
+struct TokenRequest
+{
+    enum class Grant
+    {
+        ClientCredentials,
+        TokenExchange,
+    };
+
+    Grant grant = Grant::ClientCredentials;
+    Poco::URI url;
+    bool use_query_parameters = false;
+    String scope;
+    String client_id;
+    String client_secret;
+    String subject_token;
+    String subject_token_type;
+    String requested_token_type;
+    String actor_token;
+};
+
+struct CredentialsCacheKey
+{
+    UInt64 generation = 0;
+    std::string principal;
+    std::string namespace_name;
+    std::string table_name;
+
+    auto operator<=>(const CredentialsCacheKey &) const = default;
+};
+
 class RestCatalog : public ICatalog, public DB::WithContext
 {
 public:
@@ -59,15 +104,16 @@ public:
         const std::string & oauth_server_uri_,
         bool oauth_server_use_request_body_,
         const std::string & namespaces_,
-        DB::ContextPtr context_);
+        DB::ContextPtr context_,
+        const TokenForwardingConfig & token_forwarding_ = {});
 
     ~RestCatalog() override = default;
 
-    bool empty() const override;
+    bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    DB::Names getTables() const override;
+    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool existsTable(const std::string & namespace_name, const std::string & table_name) const override;
+    bool existsTable(const std::string & namespace_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void getTableMetadata(
         const std::string & namespace_name,
@@ -88,9 +134,9 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_REST;
     }
 
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
+    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const override;
+    bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     bool updateSchema(
         const String & namespace_name,
@@ -99,13 +145,19 @@ public:
         Poco::JSON::Object::Ptr new_schema,
         Int32 previous_schema_id,
         Int32 new_last_column_id,
-        Poco::JSON::Object::Ptr metadata = nullptr) const override;
+        Poco::JSON::Object::Ptr metadata,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     bool isTransactional() const override { return true; }
 
-    void dropTable(const String & namespace_name, const String & table_name) const override;
+    void dropTable(const String & namespace_name, const String & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
+    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
+
+    void onTokenForwardingDisabled() const override { user_token_cache.clear(); }
+
+    void loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     void setVendedCredentialsCacheTTL(std::chrono::seconds ttl) override { vended_credentials_cache_ttl.store(ttl, std::memory_order_relaxed); }
 
@@ -132,12 +184,43 @@ public:
         std::string tenant_id;
         std::string bearer_token;
         Config config;
+        bool config_loaded = false;
     };
     using CatalogStateVersion = MultiVersion<CatalogState>::Version;
 
-    CatalogStateVersion getStateSnapshot() const { return state.get(); }
+    struct AuthContext
+    {
+        /// Keep the endpoint and authentication from the same state snapshot.
+        const CatalogState & catalog_state;
+        UInt64 generation = 0;
+        bool update_token = false;
+        String method;
+        Poco::URI url;
+        DB::HTTPHeaderEntries extra_headers;
+        String body;
+        DB::ForwardedAuthTokenPtr auth_token;
+        /// The caller records cache hits only after the catalog request succeeds.
+        bool * used_cached_oauth_token = nullptr;
+    };
 
-    ICatalog::PreparedSettingsChangesPtr prepareSettingsChanges(const DB::SettingsChanges & changes) override;
+    struct StateSnapshot
+    {
+        UInt64 generation = 0;
+        CatalogStateVersion state;
+
+        const CatalogState & operator*() const { return *state; }
+        const CatalogState * operator->() const { return state.get(); }
+    };
+
+    /// Read the generation first so an old state cannot cache credentials under a new generation.
+    StateSnapshot getStateSnapshot() const
+    {
+        const UInt64 generation = auth_generation.load(std::memory_order_acquire);
+        return StateSnapshot{generation, state.get()};
+    }
+
+    ICatalog::PreparedSettingsChangesPtr prepareSettingsChanges(
+        const DB::SettingsChanges & changes, const DB::ForwardedAuthTokenPtr & auth_token = {}) override;
 
     void commitSettingsChanges(ICatalog::PreparedSettingsChangesPtr prepared) override;
 
@@ -161,19 +244,34 @@ protected:
         const std::string & namespaces_,
         DB::ContextPtr context_);
 
-    void createNamespaceIfNotExists(const String & namespace_name, const String & location) const override;
+    void createNamespaceIfNotExists(const String & namespace_name, const String & location, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     const std::filesystem::path base_url;
     const LoggerPtr log;
 
-    MultiVersion<CatalogState> state{std::make_unique<const CatalogState>()};
+    mutable MultiVersion<CatalogState> state{std::make_unique<const CatalogState>()};
+    mutable std::mutex config_mutex;
 
     /// Parameters for OAuth (common for REST catalog).
     bool update_token_if_expired = false;
     std::string auth_scope;
     std::string oauth_server_uri;
     bool oauth_server_use_request_body;
+    /// Shared service or actor token; never store a user token here.
     mutable MultiVersion<AccessToken> access_token;
+
+    TokenForwardingConfig token_forwarding;
+
+    static constexpr size_t user_token_cache_max_entries = 1024;
+    mutable DB::CacheBase<String, AccessToken> user_token_cache;
+
+    /// Separate from `CatalogState`, which can be republished without an auth change.
+    /// Old requests retain their generation so their cache writes become unreachable after rotation.
+    std::atomic<UInt64> auth_generation{0};
+
+    /// Keep generation checks and token publication atomic with credential rotation.
+    /// Never hold this across a network request.
+    mutable std::mutex auth_publish_mutex;
 
     /// TTL for caching vended credentials per table (0 means no caching).
     std::atomic<std::chrono::seconds> vended_credentials_cache_ttl{std::chrono::seconds::zero()};
@@ -181,10 +279,12 @@ protected:
     /// Sweep trigger threshold, not capacity!
     static constexpr size_t credentials_cache_cleanup_threshold = 1000;
 
+    static constexpr size_t credentials_cache_max_entries = 10000;
+
     static constexpr std::chrono::seconds credentials_expiry_safety_window{60};
     mutable std::mutex credentials_cache_mutex;
 
-    mutable std::map<std::pair<std::string, std::string>, VendedStorageCredentials> credentials_cache
+    mutable std::map<CredentialsCacheKey, VendedStorageCredentials> credentials_cache
         TSA_GUARDED_BY(credentials_cache_mutex);
 
 public:
@@ -213,7 +313,9 @@ protected:
     /// request never mixes the endpoint of one state version with the auth of another.
     DB::ReadWriteBufferFromHTTPPtr createReadBuffer(
         const CatalogState & catalog_state,
+        UInt64 generation,
         const std::string & endpoint,
+        const DB::ForwardedAuthTokenPtr & auth_token,
         const Poco::URI::QueryParameters & params = {},
         const DB::HTTPHeaderEntries & headers = {},
         const std::optional<DB::HTTPHeaderEntries> & auth_headers = std::nullopt) const;
@@ -227,13 +329,14 @@ protected:
         const std::string & base_namespace,
         Namespaces & result,
         StopCondition stop_condition,
-        ExecuteFunc func) const;
+        ExecuteFunc func,
+        const DB::ForwardedAuthTokenPtr & auth_token) const;
 
-    Namespaces getNamespaces(const std::string & base_namespace) const;
+    Namespaces getNamespaces(const std::string & base_namespace, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     Namespaces parseNamespaces(DB::ReadBuffer & buf, const std::string & base_namespace, String & next_page_token) const;
 
-    DB::Names getTables(const std::string & base_namespace, size_t limit = 0) const;
+    DB::Names getTablesInNamespace(const std::string & base_namespace, const DB::ForwardedAuthTokenPtr & auth_token, size_t limit = 0) const;
 
     DB::Names parseTables(DB::ReadBuffer & buf, const std::string & base_namespace, size_t limit, String & next_page_token) const;
 
@@ -242,21 +345,31 @@ protected:
         const std::string & table_name,
         DB::ContextPtr context_,
         TableMetadata & result,
+        const DB::ForwardedAuthTokenPtr & auth_token,
         bool allow_credentials_cache = true) const;
 
+    bool tryGetTableMetadataImpl(
+        const std::string & namespace_name,
+        const std::string & table_name,
+        DB::ContextPtr context_,
+        TableMetadata & result,
+        const DB::ForwardedAuthTokenPtr & auth_token) const;
+
     /// Load catalog config (special http handler) utilizing information from catalog_state and auth_headers.
-    Config loadConfig(const CatalogState & catalog_state, const std::optional<DB::HTTPHeaderEntries> & auth_headers = std::nullopt);
-    /// `method`, `url`, `extra_headers` and `body` describe the request being authenticated. They are
-    /// used by catalogs that sign the request itself (AWS SigV4 in `S3TablesCatalog`); catalogs that
-    /// authenticate with a token or a static header ignore them.
-    virtual DB::HTTPHeaderEntries getAuthHeaders(
+    Config loadConfig(
         const CatalogState & catalog_state,
-        bool update_token,
-        const String & method = {},
-        const Poco::URI & url = {},
-        const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {},
-        bool * used_cached_oauth_token = nullptr) const;
+        UInt64 generation,
+        const DB::ForwardedAuthTokenPtr & auth_token,
+        const std::optional<DB::HTTPHeaderEntries> & auth_headers = std::nullopt) const;
+
+    virtual DB::HTTPHeaderEntries getAuthHeaders(const AuthContext & auth_context) const;
+
+    void validateForwardedToken(const DB::ForwardedAuthTokenPtr & auth_token) const;
+
+    String getForwardedToken(
+        const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthTokenPtr & auth_token, bool update_token) const;
+
+    bool shouldRetryWithFreshToken(Poco::Net::HTTPResponse::HTTPStatus status) const;
 
     void validateAuthHeaders(const DB::HTTPHeaderEntry & header) const;
 
@@ -264,30 +377,35 @@ protected:
 
     void sendRequest(
         const CatalogState & catalog_state,
+        UInt64 generation,
         const String & endpoint,
         Poco::JSON::Object::Ptr request_body,
+        const DB::ForwardedAuthTokenPtr & auth_token,
         const String & method = Poco::Net::HTTPRequest::HTTP_POST,
         bool ignore_result = false) const;
 
     VendedStorageCredentials getCredentialsAndEndpoint(Poco::JSON::Object::Ptr object, const String & location) const;
 
-    std::optional<VendedStorageCredentials> tryGetCachedCredentials(
-        const std::string & namespace_name, const std::string & table_name) const;
+    String getCredentialsCachePrincipal(const DB::ForwardedAuthTokenPtr & auth_token) const;
 
-    void cacheCredentials(
-        const std::string & namespace_name,
-        const std::string & table_name,
-        const VendedStorageCredentials & parsed) const;
+    std::optional<VendedStorageCredentials> tryGetCachedCredentials(const CredentialsCacheKey & key) const;
+
+    void cacheCredentials(const CredentialsCacheKey & key, const VendedStorageCredentials & parsed) const;
+
+    MultiVersion<AccessToken>::Version publishServiceToken(AccessToken minted, UInt64 generation) const;
+
+    AccessToken requestToken(const TokenRequest & request) const;
+
+    AccessToken exchangeUserToken(
+        const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthToken & auth_token,
+        const AccessToken * prepared_actor_token = nullptr) const;
 
     AccessToken retrieveAccessToken(const std::string & client_id, const std::string & client_secret) const;
 
+    String getServicePrincipalToken(const CatalogState & catalog_state, UInt64 generation) const;
+
     struct PreparedAuthChanges;
 
-    /// Hook for `prepareSettingsChanges`: validate `changes` and apply them to `new_state`,
-    /// building the new auth artifacts, without publishing anything. When the OAuth
-    /// credentials change, the eagerly fetched token goes into `new_access_token` and
-    /// `new_auth_headers`, so that wrong credentials fail the ALTER right here and the
-    /// config reload authenticates with the new token instead of the cached one.
     virtual void applySettingsChangesToState(
         const DB::SettingsChanges & changes,
         const CatalogState & old_state,
@@ -317,14 +435,7 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_ONELAKE;
     }
 
-    DB::HTTPHeaderEntries getAuthHeaders(
-        const CatalogState & catalog_state,
-        bool update_token,
-        const String & method = {},
-        const Poco::URI & url = {},
-        const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {},
-        bool * used_cached_oauth_token = nullptr) const override;
+    DB::HTTPHeaderEntries getAuthHeaders(const AuthContext & auth_context) const override;
 
     /// `bearer_mode` means the catalog authenticates with `onelake_bearer_token`,
     /// otherwise with the `onelake_client_id` + `onelake_client_secret` pair.
@@ -361,14 +472,7 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE;
     }
 
-    DB::HTTPHeaderEntries getAuthHeaders(
-        const CatalogState & catalog_state,
-        bool update_token,
-        const String & method = {},
-        const Poco::URI & url = {},
-        const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {},
-        bool * used_cached_oauth_token = nullptr) const override;
+    DB::HTTPHeaderEntries getAuthHeaders(const AuthContext & auth_context) const override;
 
     const std::string & getGoogleADCClientId() const { return google_adc_client_id; }
     const std::string & getGoogleADCClientSecret() const { return google_adc_client_secret; }

@@ -849,7 +849,7 @@ ExpireSnapshotsResult expireSnapshots(
         {
             auto catalog_filename = persistent_table_components.path_resolver.resolveForCatalog(metadata_info.path);
             const auto & [namespace_name, parsed_table_name] = DataLake::parseTableName(table_name);
-            if (!catalog->updateMetadata(namespace_name, parsed_table_name, catalog_filename, nullptr))
+            if (!catalog->updateMetadata(namespace_name, parsed_table_name, catalog_filename, nullptr, context->getForwardedAuthToken()))
             {
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR,

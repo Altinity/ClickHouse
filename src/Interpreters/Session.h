@@ -2,6 +2,7 @@
 
 #include <Common/SettingsChanges.h>
 #include <Access/AuthenticationData.h>
+#include <Access/ForwardedAuthToken.h>
 #include <Interpreters/ClientCertificateInfo.h>
 #include <Interpreters/ClientInfo.h>
 #include <Interpreters/Context_fwd.h>
@@ -121,6 +122,8 @@ private:
 
     /// ClientInfo that will be copied to a session context when it's created.
     std::optional<ClientInfo> prepared_client_info;
+
+    ForwardedAuthTokenPtr forwarded_auth_token;
 
     mutable UserPtr user;
     std::optional<UUID> user_id;

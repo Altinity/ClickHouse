@@ -17,6 +17,7 @@
 #include <Poco/URI.h>
 #include <Poco/AutoPtr.h>
 #include <Poco/SharedPtr.h>
+#include <Poco/StreamCopier.h>
 #include <Poco/ThreadPool.h>
 #include <fmt/format.h>
 
@@ -109,12 +110,14 @@ struct StsRequestInfo
 {
     Poco::Net::MessageHeader headers;
     Poco::URI::QueryParameters query_params;
+    std::string body;
 };
 
 class MockStsRequestHandler : public Poco::Net::HTTPRequestHandler
 {
 public:
-    explicit MockStsRequestHandler(std::optional<StsRequestInfo> & last_request_info_, std::string role_access_key_, std::string role_secret_key_)
+    explicit MockStsRequestHandler(
+        std::optional<StsRequestInfo> & last_request_info_, std::string role_access_key_, std::string role_secret_key_)
         : last_request_info(last_request_info_)
         , role_access_key(std::move(role_access_key_))
         , role_secret_key(std::move(role_secret_key_))
@@ -128,20 +131,24 @@ public:
 
         Poco::URI uri(request.getURI());
         last_request_info->query_params = uri.getQueryParameters();
+        Poco::StreamCopier::copyToString(request.stream(), last_request_info->body);
+
+        const bool web_identity = last_request_info->body.find("Action=AssumeRoleWithWebIdentity") != std::string::npos;
+        const std::string_view action = web_identity ? "AssumeRoleWithWebIdentity" : "AssumeRole";
 
         response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
         auto & out = response.send();
 
         std::string result_xml = fmt::format(R"(
-<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
-<AssumeRoleResult>
+<{0}Response xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+<{0}Result>
     <Credentials>
-        <AccessKeyId>{}</AccessKeyId>
-        <SecretAccessKey>{}</SecretAccessKey>
+        <AccessKeyId>{1}</AccessKeyId>
+        <SecretAccessKey>{2}</SecretAccessKey>
         <SessionToken>session_token</SessionToken>
     </Credentials>
-</AssumeRoleResult>
-</AssumeRoleResponse>)", role_access_key, role_secret_key);
+</{0}Result>
+</{0}Response>)", action, role_access_key, role_secret_key);
         out << result_xml;
         out.flush();
     }
@@ -162,7 +169,8 @@ class StsHTTPRequestHandlerFactory : public Poco::Net::HTTPRequestHandlerFactory
         return new MockStsRequestHandler(last_request_info, role_access_key, role_secret_key);
     }
 public:
-    explicit StsHTTPRequestHandlerFactory(std::optional<StsRequestInfo> & last_request_info_, std::string role_access_key_, std::string role_secret_key_)
+    explicit StsHTTPRequestHandlerFactory(
+        std::optional<StsRequestInfo> & last_request_info_, std::string role_access_key_, std::string role_secret_key_)
         : last_request_info(last_request_info_)
         , role_access_key(std::move(role_access_key_))
         , role_secret_key(std::move(role_secret_key_))
@@ -229,5 +237,10 @@ public:
     const auto & getLastQueryParams() const
     {
         return last_request_info->query_params;
+    }
+
+    const std::string & getLastBody() const
+    {
+        return last_request_info->body;
     }
 };
