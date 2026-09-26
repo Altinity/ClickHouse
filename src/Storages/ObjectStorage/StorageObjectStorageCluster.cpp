@@ -793,6 +793,16 @@ void StorageObjectStorageCluster::drop()
     IStorageCluster::drop();
 }
 
+void StorageObjectStorageCluster::prepareForDrop(ContextPtr query_context)
+{
+    if (pure_storage)
+    {
+        pure_storage->prepareForDrop(query_context);
+        return;
+    }
+    IStorageCluster::prepareForDrop(query_context);
+}
+
 void StorageObjectStorageCluster::dropInnerTableIfAny(bool sync, ContextPtr context)
 {
     if (getClusterName(context).empty())
