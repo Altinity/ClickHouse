@@ -1,9 +1,20 @@
 local
 10	11	12
 20	21	22
+dist_plan
+10	11	12
+20	21	22
 pr_ast
 10	11	12
 20	21	22
-pr_plan
+pr_query_ast
+1	1
 10	11	12
 20	21	22
+pr_query_plan
+1	1
+10	11	12
+20	21	22
+03931_dist_ast	1	1
+03931_query_ast	1	1
+03931_query_plan	1	1
