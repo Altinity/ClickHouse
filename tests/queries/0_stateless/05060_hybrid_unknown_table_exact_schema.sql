@@ -1,3 +1,4 @@
+-- Tags: no-fasttest
 -- Hybrid table joined against a MergeTree and an Iceberg table, covering Altinity#1208, #1209 and
 -- #1422. Both `object_storage_cluster_join_mode` values must return the same rows: `'local'` used
 -- to raise UNKNOWN_IDENTIFIER here, and no longer does, so it is held to the `'allow'` result.
@@ -6,8 +7,6 @@
 -- 127.0.0.1 and 127.0.0.2, because `icebergCluster` below reads through
 -- `test_cluster_one_shard_three_replicas_localhost`. Without the third address the query still
 -- returns the right rows by failing over, but the connection warnings on stderr fail the test.
--- Run with `enable_parallel_blocks_marshalling = 0` until the DISTINCT-over-ColumnBLOB abort is
--- fixed.
 SET allow_experimental_hybrid_table = 1,
     enable_analyzer = 1,
     prefer_localhost_replica = 0,
