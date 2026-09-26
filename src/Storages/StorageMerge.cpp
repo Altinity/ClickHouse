@@ -1456,10 +1456,49 @@ void ReadFromMerge::RowPolicyData::addStorageFilter(SourceStepWithFilter * step)
     step->addFilter(actions_dag.clone(), filter_column_name);
 }
 
-void ReadFromMerge::RowPolicyData::addFilterTransform(QueryPlan & plan) const
+void ReadFromMerge::RowPolicyData::addFilterTransform(QueryPlan & plan, const String & table_alias) const
 {
+    const auto original_header = plan.getCurrentHeader();
+    const auto & header = *original_header;
+    ActionsDAG naming_actions(header.getColumnsWithTypeAndName());
+    bool added_aliases = false;
+    /// The policy was analyzed against the child's plain column names. Expose the same values
+    /// under those names when the analyzer qualified them in the child stream.
+    for (const auto & column_name : filter_actions->getRequiredColumns())
+    {
+        if (header.has(column_name))
+            continue;
+
+        const String identifier = table_alias.empty() ? column_name : backQuoteIfNeed(table_alias) + "." + backQuoteIfNeed(column_name);
+        if (!header.has(identifier))
+            continue;
+
+        naming_actions.addOrReplaceInOutputs(naming_actions.addAlias(naming_actions.findInOutputs(identifier), column_name));
+        added_aliases = true;
+    }
+
+    if (added_aliases)
+    {
+        auto naming_step = std::make_unique<ExpressionStep>(plan.getCurrentHeader(), std::move(naming_actions));
+        plan.addStep(std::move(naming_step));
+    }
+
     auto filter_step = std::make_unique<FilterStep>(plan.getCurrentHeader(), actions_dag.clone(), filter_column_name, true /* remove filter column */);
     plan.addStep(std::move(filter_step));
+
+    if (added_aliases)
+    {
+        /// Do not let policy-only names change the column count or order used for the later
+        /// positional reconciliation with the Merge table's expected header.
+        ActionsDAG projection_actions(plan.getCurrentHeader()->getColumnsWithTypeAndName());
+        NamesWithAliases original_names;
+        original_names.reserve(header.columns());
+        for (const auto & column : header)
+            original_names.emplace_back(column.name, "");
+        projection_actions.project(original_names);
+        auto projection_step = std::make_unique<ExpressionStep>(plan.getCurrentHeader(), std::move(projection_actions));
+        plan.addStep(std::move(projection_step));
+    }
 }
 
 StorageMerge::StorageListWithLocks ReadFromMerge::getSelectedTables(
@@ -1688,12 +1727,12 @@ void ReadFromMerge::convertAndFilterSourceStream(
         ///
         /// The planner's `TableExpressionData` for the Merge node is not populated yet at this point -- column
         /// collection happens later, in `CollectTableExpressionData` -- so the mapping cannot be looked up through
-        /// `PlannerContext`. Build it here instead, by matching each Merge-declared column name against the suffixes of
-        /// the identifier names in `header` / `pipe_columns`: a column named `<prefix>.<C>` or ``<prefix>.`<C>` ``
-        /// belongs to the Merge column `C`.
+        /// `PlannerContext`. For inputs, match each Merge-declared column name against the suffixes of
+        /// the identifier names in `pipe_columns`: a column named
+        /// `<prefix>.<backQuoteIfNeed(C)>` belongs to the Merge column `C`.
         ///
-        /// Driving the match from the declared Merge schema rather than from a pattern over the analyzer's naming
-        /// convention is what makes dotted names work, `Nested` subcolumns and backtick-quoted names included.
+        /// Matching declared Merge names with the planner's quoting rule also handles dotted names,
+        /// `Nested` subcolumns, and names requiring backticks.
 
         /// `getAll` builds a fresh list on every call, so take it once rather than per candidate column.
         const auto all_merge_columns = merge_columns.getAll();
@@ -1712,18 +1751,12 @@ void ReadFromMerge::convertAndFilterSourceStream(
                     continue;
                 }
 
-                /// Otherwise look for `<prefix>.<C>` or ``<prefix>.`<C>` `` where C is a declared Merge column. Columns
-                /// matching no declared name are skipped; they are intermediate outputs of the child plan.
-                ///
-                /// The unquoted form of a dotted name is accepted defensively. No producer of it is known:
-                /// `buildColumnIdentifier` always backquotes a dotted column name, so an analyzer identifier for `n.a`
-                /// is always ``__tableN.`n.a` ``.
+                /// Otherwise match the quoted identifier component emitted by `buildColumnIdentifier`.
+                /// Columns matching no declared name are intermediate outputs of the child plan.
                 for (const auto & merge_column : all_merge_columns)
                 {
-                    const bool dotted = merge_column.name.find('.') != String::npos;
-                    const String want_raw = "." + merge_column.name;
-                    const String want_quoted = dotted ? ("." + backQuote(merge_column.name)) : want_raw;
-                    if (column.name.ends_with(want_quoted) || (dotted && column.name.ends_with(want_raw)))
+                    const String qualified_suffix = "." + backQuoteIfNeed(merge_column.name);
+                    if (column.name.ends_with(qualified_suffix))
                     {
                         if (!plain_to_identifier.emplace(merge_column.name, column.name).second)
                             ambiguous.insert(merge_column.name);
@@ -1736,7 +1769,6 @@ void ReadFromMerge::convertAndFilterSourceStream(
             return plain_to_identifier;
         };
 
-        const auto header_plain_to_identifier = build_plain_to_identifier(header);
         const auto pipe_plain_to_identifier = build_plain_to_identifier(pipe_columns);
 
         for (const auto & alias : aliases)
@@ -1782,11 +1814,12 @@ void ReadFromMerge::convertAndFilterSourceStream(
             if (nodes.size() != 1)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected to have 1 output but got {}", nodes.size());
 
-            /// Emit the alias output under its analyzer identifier, so the `addMissingDefaults` step further down
-            /// matches it by name. Emitted under the plain name it would miss, and the expected
-            /// ``__tableN.`alias.name` `` column would be filled with type defaults instead.
-            const auto identifier_it = header_plain_to_identifier.find(alias.name);
-            const String & output_name = identifier_it != header_plain_to_identifier.end() ? identifier_it->second : alias.name;
+            /// Emit an alias needed by the output header under its analyzer identifier. An alias
+            /// needed only as an input to another alias keeps its plain logical name.
+            const auto & source_alias = modified_query_info.table_expression->getAlias();
+            const String expected_identifier = source_alias.empty()
+                ? alias.name : backQuoteIfNeed(source_alias) + "." + backQuoteIfNeed(alias.name);
+            const String & output_name = header.has(expected_identifier) ? expected_identifier : alias.name;
             actions_dag.addOrReplaceInOutputs(actions_dag.addAlias(*nodes.front(), output_name));
             auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(actions_dag));
             child.plan.addStep(std::move(expression_step));
@@ -1810,7 +1843,8 @@ void ReadFromMerge::convertAndFilterSourceStream(
 
     /// This is the filter for the individual source table, that's why filtering has to be done before all structure adaptations.
     if (row_policy_data_opt)
-        row_policy_data_opt->addFilterTransform(child.plan);
+        row_policy_data_opt->addFilterTransform(
+            child.plan, modified_query_info.table_expression ? modified_query_info.table_expression->getAlias() : "");
 
     /** Output headers may differ from what StorageMerge expects in some cases.
       * When the child table engine produces a query plan for the stage after FetchColumns,

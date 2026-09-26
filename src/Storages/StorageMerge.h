@@ -258,7 +258,7 @@ private:
 
         /// Create explicit filter transform to exclude
         /// rows that are not conform to row level policy
-        void addFilterTransform(QueryPlan &) const;
+        void addFilterTransform(QueryPlan &, const String & table_alias) const;
 
     private:
         std::string filter_column_name; // complex filter, may contain logic operations
