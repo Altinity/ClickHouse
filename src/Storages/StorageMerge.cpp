@@ -1422,14 +1422,23 @@ ReadFromMerge::RowPolicyData::RowPolicyData(RowPolicyFilterPtr row_policy_filter
     NamesAndTypesList added;
     NamesAndTypesList deleted;
     sample_block_columns.getDifference(required_columns, added, deleted);
-    if (!deleted.empty() || added.size() != 1)
+    if (deleted.empty() && added.empty() && expr->as<ASTIdentifier>()
+        && actions_dag.findInOutputs(expr->getColumnName()).type == ActionsDAG::ActionType::INPUT)
+    {
+        /// A bare column policy filters on an existing input, which must remain available after filtering.
+        filter_column_name = expr->getColumnName();
+        remove_filter_column = false;
+    }
+    else if (deleted.empty() && added.size() == 1)
+    {
+        filter_column_name = added.getNames().front();
+    }
+    else
     {
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "Cannot determine row level filter; {} columns deleted, {} columns added",
             deleted.size(), added.size());
     }
-
-    filter_column_name = added.getNames().front();
 }
 
 void ReadFromMerge::RowPolicyData::extendNames(Names & names) const
@@ -1483,7 +1492,7 @@ void ReadFromMerge::RowPolicyData::addFilterTransform(QueryPlan & plan, const St
         plan.addStep(std::move(naming_step));
     }
 
-    auto filter_step = std::make_unique<FilterStep>(plan.getCurrentHeader(), actions_dag.clone(), filter_column_name, true /* remove filter column */);
+    auto filter_step = std::make_unique<FilterStep>(plan.getCurrentHeader(), actions_dag.clone(), filter_column_name, remove_filter_column);
     plan.addStep(std::move(filter_step));
 
     if (added_aliases)

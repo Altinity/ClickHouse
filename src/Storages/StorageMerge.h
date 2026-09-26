@@ -262,6 +262,7 @@ private:
 
     private:
         std::string filter_column_name; // complex filter, may contain logic operations
+        bool remove_filter_column = true;
         ActionsDAG actions_dag;
         ExpressionActionsPtr filter_actions;
         StorageMetadataPtr storage_metadata_snapshot;
