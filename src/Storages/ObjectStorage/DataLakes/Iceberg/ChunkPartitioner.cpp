@@ -49,6 +49,14 @@ ChunkPartitioner::ChunkPartitioner(
 
         FunctionOverloadResolverPtr transform;
 
+        /// Iceberg V3: multi-argument transforms use `source-ids` instead of `source-id`.
+        /// Writing with multi-arg transforms is not supported yet (hash semantics not finalized upstream).
+        if (partition_specification_field->has(Iceberg::f_source_ids))
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Multi-argument partition transforms (source-ids) are not supported for writes. "
+                "Multi-argument transform evaluation is not yet implemented");
+
         auto source_id = partition_specification_field->getValue<Int32>(Iceberg::f_source_id);
         auto column_name = id_to_column[source_id];
 
