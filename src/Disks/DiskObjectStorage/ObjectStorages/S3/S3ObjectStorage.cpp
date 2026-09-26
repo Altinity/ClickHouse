@@ -969,14 +969,21 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
     const ReadSettings & read_settings,
     const WriteSettings & write_settings,
     IObjectStorage & object_storage_to,
-    std::optional<ObjectAttributes> object_to_attributes)
+    std::optional<ObjectAttributes> object_to_attributes,
+    size_t object_from_offset)
 {
+    if (object_from.remote_path.empty())
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Cannot copy {}: it has no object of its own, its bytes must be taken from the metadata",
+            object_from.local_path);
+
     /// Shortcut for S3
     if (auto * dest_s3 = dynamic_cast<S3ObjectStorage * >(&object_storage_to); dest_s3 != nullptr)
     {
         auto current_client = dest_s3->client.get();
         auto settings_ptr = s3_settings.get();
-        auto size = S3::getObjectSize(*client.get(), uri.bucket, object_from.remote_path, {});
+        auto size = object_from_offset ? object_from.bytes_size : S3::getObjectSize(*client.get(), uri.bucket, object_from.remote_path, {});
         auto scheduler = threadPoolCallbackRunnerUnsafe<void>(getThreadPoolWriter(), ThreadName::S3_COPY_POOL);
         const auto read_settings_to_use = patchSettings(read_settings);
 
@@ -986,8 +993,10 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
                 /*src_s3_client=*/current_client,
                 /*src_bucket=*/uri.bucket,
                 /*src_key=*/object_from.remote_path,
-                /*src_offset=*/0,
+                // @todo
+                /*src_offset=*/object_from_offset,
                 /*src_size=*/size,
+                /*src_object_offset=*/0,
                 /*dest_s3_client=*/current_client,
                 /*dest_bucket=*/dest_s3->uri.bucket,
                 /*dest_key=*/object_to.remote_path,
@@ -1033,7 +1042,8 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
             ErrorCodes::NOT_IMPLEMENTED,
             "Native-only object copy requires both object storages to use the native S3 copy path");
 
-    IObjectStorage::copyObjectToAnotherObjectStorage(object_from, object_to, read_settings, write_settings, object_storage_to, object_to_attributes);
+    IObjectStorage::copyObjectToAnotherObjectStorage(
+        object_from, object_to, read_settings, write_settings, object_storage_to, object_to_attributes, object_from_offset);
 }
 
 void S3ObjectStorage::copyObject( // NOLINT
@@ -1062,6 +1072,7 @@ void S3ObjectStorage::copyObject( // NOLINT
         /*src_key=*/object_from.remote_path,
         /*src_offset=*/0,
         /*src_size=*/size,
+        /*src_object_offset=*/0,
         /*dest_s3_client=*/current_client,
         /*dest_bucket=*/uri.bucket,
         /*dest_key=*/object_to.remote_path,

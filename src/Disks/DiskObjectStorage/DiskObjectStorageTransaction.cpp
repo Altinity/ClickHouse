@@ -544,12 +544,52 @@ void DiskObjectStorageTransaction::copyFileImpl(
     {
         for (const auto [src_blob, dst_blob] : std::views::zip(blobs_to_copy, blobs_to_create))
         {
-            runner.enqueueAndKeepTrack(
-                [this, src_object_storages, src_blob, dst_blob, location, src_local_location, enriched_read_settings, enriched_write_settings]
-                {
-                    src_object_storages->takePointingTo(src_local_location)->copyObjectToAnotherObjectStorage(
-                        src_blob, dst_blob, *enriched_read_settings, *enriched_write_settings, *object_storages->takePointingTo(location));
-                });
+            if (src_metadata_storage->isContentAddressed() && src_blob.remote_path.empty())
+            {
+                runner.enqueueAndKeepTrack(
+                    [this, src_metadata_storage, from_file_path, src_blob, dst_blob, location, enriched_write_settings]
+                    {
+                        const String bytes = src_metadata_storage->readInlineDataToString(from_file_path);
+                        if (bytes.size() != src_blob.bytes_size)
+                            throw Exception(
+                                ErrorCodes::LOGICAL_ERROR,
+                                "Inline data of {} has {} bytes, but its metadata reports {}",
+                                from_file_path,
+                                bytes.size(),
+                                src_blob.bytes_size);
+
+                        auto out = object_storages->takePointingTo(location)->writeObject(
+                            dst_blob, WriteMode::Rewrite, {}, DBMS_DEFAULT_BUFFER_SIZE, *enriched_write_settings);
+                        out->write(bytes.data(), bytes.size());
+                        out->finalize();
+                    });
+            }
+            else
+            {
+                const size_t src_object_offset = src_metadata_storage->getObjectPayloadOffset(from_file_path);
+                
+                runner.enqueueAndKeepTrack(
+                    [this,
+                     src_object_storages,
+                     src_blob,
+                     dst_blob,
+                     location,
+                     src_local_location,
+                     src_object_offset,
+                     enriched_read_settings,
+                     enriched_write_settings]
+                    {
+                        src_object_storages->takePointingTo(src_local_location)
+                            ->copyObjectToAnotherObjectStorage(
+                                src_blob,
+                                dst_blob,
+                                *enriched_read_settings,
+                                *enriched_write_settings,
+                                *object_storages->takePointingTo(location),
+                                std::nullopt,
+                                src_object_offset);
+                    });
+            }
         }
     }
 

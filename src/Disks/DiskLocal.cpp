@@ -447,6 +447,11 @@ std::vector<String> DiskLocal::getBlobPath(const String & path) const
     return {fs_path};
 }
 
+size_t DiskLocal::getObjectPayloadOffset(const String &) const
+{
+    return 0;
+}
+
 void DiskLocal::writeFileUsingBlobWritingFunction(const String & path, WriteMode mode, WriteBlobFunction && write_blob_function)
 {
     auto fs_path = fs::path(disk_path) / path;

@@ -1,0 +1,67 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <disk_cas_backup_s3>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+                <cas_server_root_id>itest-cas-backup-s3-native-copy</cas_server_root_id>
+                <!-- Same RustFS authority as the backup destination below, so
+                     DataSourceDescription::sameKind matches and BackupWriterS3 takes its
+                     native-copy branch. MinIO is not usable: the CAS mount capability probe
+                     requires enforced conditional DELETE. -->
+                <endpoint>http://rustfs1:11121/test/cas_backup_data/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+            </disk_cas_backup_s3>
+            <disk_cas_backup_s3_no_multipart>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+                <cas_server_root_id>itest-cas-backup-s3-native-copy-no-multipart</cas_server_root_id>
+                <endpoint>http://rustfs1:11121/test/cas_backup_data_no_multipart/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <s3_allow_multipart_copy>0</s3_allow_multipart_copy>
+            </disk_cas_backup_s3_no_multipart>
+            <backup_disk_s3_plain>
+                <type>s3_plain</type>
+                <endpoint>http://rustfs1:11121/test/backup_disk_s3_plain/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+            </backup_disk_s3_plain>
+            <backup_disk_s3>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>local</metadata_type>
+                <endpoint>http://rustfs1:11121/test/backup_disk_s3/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+            </backup_disk_s3>
+        </disks>
+        <policies>
+            <cas_backup_s3>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_backup_s3</disk>
+                    </main>
+                </volumes>
+            </cas_backup_s3>
+            <cas_backup_s3_no_multipart>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_backup_s3_no_multipart</disk>
+                    </main>
+                </volumes>
+            </cas_backup_s3_no_multipart>
+        </policies>
+    </storage_configuration>
+    <backups>
+        <allowed_disk>backup_disk_s3_plain</allowed_disk>
+        <allowed_disk>backup_disk_s3</allowed_disk>
+    </backups>
+</clickhouse>

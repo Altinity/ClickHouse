@@ -54,6 +54,7 @@ namespace ErrorCodes
 {
     extern const int INCORRECT_DISK_INDEX;
     extern const int CANNOT_RMDIR;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace
@@ -824,12 +825,16 @@ void DiskObjectStorage::prepareRead(
     if (metadata_storage->isContentAddressed())
     {
         const auto * ca = dynamic_cast<const IContentAddressedExchange *>(metadata_storage.get());
-        if (ca)
-        {
-            if (ca->prepareInManifestRead(path, settings, pipeline))
-                return;
-            ca_blob_view = ca->getBlobViewPlan(path);
-        }
+        if (!ca)
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Metadata storage of disk {} reports itself content-addressed but does not implement "
+                "IContentAddressedExchange, so the payload window of {} cannot be resolved",
+                getName(), path);
+
+        if (ca->prepareInManifestRead(path, settings, pipeline))
+            return;
+        ca_blob_view = ca->getBlobViewPlan(path);
     }
 
     const auto storage_objects = ca_blob_view
@@ -955,6 +960,11 @@ Strings DiskObjectStorage::getBlobPath(const String & path) const
     if (!objects_namespace.empty())
         res.emplace_back(objects_namespace);
     return res;
+}
+
+size_t DiskObjectStorage::getObjectPayloadOffset(const String & path) const
+{
+    return metadata_storage->getObjectPayloadOffset(path);
 }
 
 bool DiskObjectStorage::areBlobPathsRandom() const

@@ -40,6 +40,7 @@ void copyS3File(
     const String & src_key,
     size_t src_offset,
     size_t src_size,
+    size_t src_object_offset,
     std::shared_ptr<const S3::Client> dest_s3_client,
     const String & dest_bucket,
     const String & dest_key,

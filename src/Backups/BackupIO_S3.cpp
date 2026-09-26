@@ -317,6 +317,7 @@ void BackupReaderS3::copyFileToDisk(const String & path_in_backup, size_t file_s
                 fs::path(s3_uri.key) / path_in_backup,
                 0,
                 file_size,
+                /* src_object_offset= */ 0,
                 /* dest_s3_client= */ destination_disk->getS3StorageClient(),
                 /* dest_bucket= */ blob_path[1],
                 /* dest_key= */ blob_path[0],
@@ -392,12 +393,23 @@ void BackupWriterS3::copyFileFromDisk(
         if (auto blob_path = src_disk->getBlobPath(src_path); blob_path.size() == 2)
         {
             LOG_TRACE(log, "Copying file {} from disk {} to S3", src_path, src_disk->getName());
+
+            if (src_disk->isContentAddressed() && blob_path[0].empty())
+            {
+                LOG_TRACE(log, "File {} has no object of its own, copying through buffers", src_path);
+                BackupWriterDefault::copyFileFromDisk(path_in_backup, src_disk, src_path, copy_encrypted, start_pos, length);
+                return;
+            }
+
+            const size_t src_object_offset = src_disk->getObjectPayloadOffset(src_path);
+
             copyS3File(
                 /* src_s3_client */ disk_client_factory.getOrCreate(src_disk),
                 /* src_bucket */ blob_path[1],
                 /* src_key */ blob_path[0],
                 start_pos,
                 length,
+                src_object_offset,
                 /* dest_s3_client */ client,
                 /* dest_bucket */ s3_uri.bucket,
                 /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
@@ -433,6 +445,7 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
         /* src_key= */ source_key,
         0,
         size,
+        /* src_object_offset= */ 0,
         /* dest_s3_client= */ client,
         /* dest_bucket= */ s3_uri.bucket,
         /* dest_key= */ fs::path(s3_uri.key) / destination,

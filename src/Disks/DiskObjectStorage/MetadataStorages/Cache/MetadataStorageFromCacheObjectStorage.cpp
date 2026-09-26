@@ -176,6 +176,11 @@ bool MetadataStorageFromCacheObjectStorage::isContentAddressed() const
     return underlying->isContentAddressed();
 }
 
+size_t MetadataStorageFromCacheObjectStorage::getObjectPayloadOffset(const std::string & path) const
+{
+    return underlying->getObjectPayloadOffset(path);
+}
+
 bool MetadataStorageFromCacheObjectStorage::isTransactional() const
 {
     return underlying->isTransactional();

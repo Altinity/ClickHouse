@@ -323,6 +323,8 @@ public:
     /// disk transaction delegates writes to the metadata transaction's content-addressed buffer.
     virtual bool isContentAddressed() const { return false; }
 
+    virtual size_t getObjectPayloadOffset(const std::string & /* path */) const { return 0; }
+
     /// [TXN-ONE-PIPELINE] True when a transaction from this storage stages every mutation into a
     /// transaction-private overlay at call time (eager) rather than queuing effects for FIFO replay in
     /// commit. When true, DiskObjectStorageTransaction routes every mutating method straight to the

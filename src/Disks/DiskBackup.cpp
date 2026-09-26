@@ -170,6 +170,11 @@ std::vector<String> DiskBackup::getBlobPath(const String &) const
     throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "DiskBackup does not support getBlobPath method");
 }
 
+size_t DiskBackup::getObjectPayloadOffset(const String &) const
+{
+    throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "DiskBackup does not support getObjectPayloadOffset method");
+}
+
 void DiskBackup::writeFileUsingBlobWritingFunction(const String &, WriteMode, WriteBlobFunction &&)
 {
     throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "DiskBackup does not support writeFileUsingBlobWritingFunction method");

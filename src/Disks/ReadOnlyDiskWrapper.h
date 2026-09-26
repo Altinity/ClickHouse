@@ -29,6 +29,7 @@ public:
     size_t getFileSize(const String & path) const override { return delegate->getFileSize(path); }
 
     Strings getBlobPath(const String & path) const override { return delegate->getBlobPath(path); }
+    size_t getObjectPayloadOffset(const String & path) const override { return delegate->getObjectPayloadOffset(path); }
     bool areBlobPathsRandom() const override { return delegate->areBlobPathsRandom(); }
     void writeFileUsingBlobWritingFunction(const String & path, WriteMode mode, WriteBlobFunction && write_blob_function) override
     {

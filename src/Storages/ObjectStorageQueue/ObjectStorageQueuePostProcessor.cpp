@@ -331,6 +331,7 @@ void ObjectStorageQueuePostProcessor::moveS3Objects(const StoredObjects & object
                             /*src_key=*/ object_from.remote_path,
                             /*src_offset=*/ 0,
                             /*src_size=*/ object_size,
+                            /*src_object_offset=*/ 0,
                             /*dest_s3_client=*/ dst_client,
                             /*dest_bucket=*/ dst_uri.bucket,
                             /*dest_key=*/ object_to.remote_path,

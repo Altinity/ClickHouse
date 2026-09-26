@@ -117,14 +117,23 @@ void IObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
     const ReadSettings & read_settings,
     const WriteSettings & write_settings,
     IObjectStorage & object_storage_to,
-    std::optional<ObjectAttributes> object_to_attributes)
+    std::optional<ObjectAttributes> object_to_attributes,
+    size_t object_from_offset)
 {
-    if (&object_storage_to == this)
+    if (&object_storage_to == this && object_from_offset == 0)
         copyObject(object_from, object_to, read_settings, write_settings, object_to_attributes);
 
     auto in = readObject(object_from, read_settings);
     auto out = object_storage_to.writeObject(object_to, WriteMode::Rewrite, /* attributes= */ {}, /* buf_size= */ DBMS_DEFAULT_BUFFER_SIZE, write_settings);
-    copyData(*in, *out);
+    if (object_from_offset)
+    {
+        in->seek(object_from_offset, SEEK_SET);
+        copyData(*in, *out, object_from.bytes_size);
+    }
+    else
+    {
+        copyData(*in, *out);
+    }
     out->finalize();
 }
 
