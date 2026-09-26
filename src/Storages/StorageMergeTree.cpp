@@ -1128,7 +1128,13 @@ void StorageMergeTree::setMutationCSN(const String & mutation_id, CSN csn)
     std::lock_guard lock(currently_processing_in_background_mutex);
     auto it = current_mutations_by_version.find(version);
     if (it == current_mutations_by_version.end())
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot find mutation {}", mutation_id);
+    {
+        /// `KILL MUTATION` erases the entry before the committing transaction stores the CSN,
+        /// and cannot roll that transaction back any more. The parts are already mutated; the
+        /// file, if its deletion is still pending or failed, is resolved at the next load.
+        LOG_WARNING(log, "Mutation {} was killed before its CSN {} could be stored", mutation_id, csn);
+        return;
+    }
     it->second.writeCSN(csn);
 }
 
@@ -1567,7 +1573,9 @@ void StorageMergeTree::loadMutations()
             }
             else if (startsWith(it->name(), "tmp_mutation_"))
             {
-                disk->removeFile(it->path());
+                /// A CSN write of an entry loaded earlier in this pass may have consumed a
+                /// temporary file the iterator still lists, so a missing file is not an error.
+                disk->removeFileIfExists(it->path());
             }
         }
     }
