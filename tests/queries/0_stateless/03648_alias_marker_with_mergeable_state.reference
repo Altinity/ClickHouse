@@ -2,6 +2,8 @@
 Header: sum(foo) AggregateFunction(sum, Int64)
 ---- stage: with_mergeable_state (analyzer=0) ----
 Expected error: Function __aliasMarker is internal and supported only with the analyzer
+---- explicit __aliasMarker in user query (analyzer=1) ----
+Explicit __aliasMarker call is allowed
 ---- stage: complete (analyzer=1) ----
 Header: x Int64
 ---- stage: fetch_columns (analyzer=1) ----

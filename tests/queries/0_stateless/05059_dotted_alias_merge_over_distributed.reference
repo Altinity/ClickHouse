@@ -1,0 +1,9 @@
+local
+1	10	100
+2	20	200
+merge_prefer0
+1	10	100
+2	20	200
+merge_prefer1
+1	10	100
+2	20	200

@@ -1,4 +1,5 @@
 #pragma once
+#include <Columns/ColumnConst.h>
 #include <DataTypes/IDataType.h>
 #include <Functions/IFunction.h>
 #include <Interpreters/Context_fwd.h>
@@ -106,8 +107,36 @@ public:
 struct AliasMarkerName
 {
     static constexpr auto name = "__aliasMarker";
+    static constexpr auto pending_token = "__aliasMarker_pending_v1";
 };
 
+/** `__aliasMarker(expr, id)` is an internal pass-through identity. It returns `expr` untouched; `id` exists only to
+  * give the expression a stable name in the planner's `ActionsDAG`.
+  *
+  * It is injected when an `ALIAS` column is inlined into its defining expression for transport to a shard. The
+  * initiator still sees the un-inlined column, so without the marker the shard would name the output after the
+  * expression (`multiply(__table1.value, 2)`) while the initiator expects the column (`__table1.computed`), and the
+  * two headers could not be matched by name.
+  *
+  * The marker carries the low-level column identity, not the user's SQL alias. A SQL alias cannot do this job: it
+  * participates in user-visible query semantics, it can collide with names the user chose, and in the
+  * mergeable-state path the projection step that would normally apply it is skipped.
+  *
+  * This is also why the marker is not `__actionName`. `__actionName` survives into the `ActionsDAG` as a function node
+  * with a forced result name; `__aliasMarker` is consumed into an alias on top of its child, which is what keeps the
+  * expression behaving like a distinct logical column.
+  *
+  * An injected marker has a third, constant token argument until it is shipped. The second argument is a `ColumnNode`
+  * so analyzer passes, in particular `createUniqueAliasesIfNecessary`, can assign the final `__tableN` alias.
+  * `finalizeAliasMarkersForDistributedSerialization` replaces it with a `String` id and removes the token before shipping.
+  * The token distinguishes this pending form from a hand-written two-argument call; it is not authentication.
+  *
+  * A hand-written two-argument `__aliasMarker(x, x)` is not finalized. An explicitly supplied `String` id still
+  * controls action naming, so direct use of this internal function is not guaranteed to be harmless.
+  *
+  * This is a bridge for as long as distributed transport still goes through SQL text. Once query plan serialization
+  * replaces that boundary, the marker should become unnecessary.
+  */
 class FunctionAliasMarker : public IFunction
 {
 public:
@@ -115,20 +144,29 @@ public:
     static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionAliasMarker>(); }
 
     String getName() const override { return name; }
-    size_t getNumberOfArguments() const override { return 2; }
-    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1}; }
+    size_t getNumberOfArguments() const override { return 0; }
+    bool isVariadic() const override { return true; }
+    /// Index 2 exists only on the pending form; the executable and DAG builder ignore absent constant arguments.
+    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {2}; }
     bool isSuitableForConstantFolding() const override { return false; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+    /// Validate the token even if an argument is `NULL` or has type `Nothing`.
+    bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForNothing() const override { return false; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
-        if (arguments.size() != 2)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 arguments");
+        if (arguments.size() != 2 && arguments.size() != 3)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 arguments, or 3 for its internal pending form");
 
-        if (!WhichDataType(arguments[1]).isString())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker is internal and should not be used directly");
+        if (arguments.size() == 3)
+        {
+            const auto * token = arguments[2].column ? checkAndGetColumn<ColumnConst>(arguments[2].column.get()) : nullptr;
+            if (!WhichDataType(arguments[2].type).isString() || !token || token->getValue<String>() != AliasMarkerName::pending_token)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid internal pending __aliasMarker token");
+        }
 
-        return arguments.front();
+        return arguments.front().type;
     }
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t /*input_rows_count*/) const override
