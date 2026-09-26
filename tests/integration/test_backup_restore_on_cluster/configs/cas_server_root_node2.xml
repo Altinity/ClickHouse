@@ -1,0 +1,9 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <cas>
+                <cas_server_root_id>itest-backup-restore-on-cluster-node2</cas_server_root_id>
+            </cas>
+        </disks>
+    </storage_configuration>
+</clickhouse>
