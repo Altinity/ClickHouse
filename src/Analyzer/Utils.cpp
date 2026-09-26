@@ -31,6 +31,7 @@
 
 #include <Functions/FunctionHelpers.h>
 #include <Functions/FunctionFactory.h>
+#include <Functions/identity.h>
 
 #include <Storages/IStorage.h>
 
@@ -55,6 +56,7 @@
 
 #include <functional>
 #include <ranges>
+#include <vector>
 
 namespace DB
 {
@@ -1035,30 +1037,27 @@ public:
             return;
 
         auto & arguments = function_node->getArguments().getNodes();
-        if (arguments.size() != 2 || !arguments[0] || !arguments[1])
+        if (arguments.size() != 3)
             return;
 
-        /// Already materialized on an earlier hop.
-        if (const auto * id_node = arguments[1]->as<ConstantNode>(); id_node && isString(id_node->getResultType()))
-            return;
+        if (!arguments[0] || !arguments[1] || !arguments[2])
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid internal pending __aliasMarker arguments");
+
+        const auto * token = arguments[2]->as<ConstantNode>();
+        if (!token || !isString(token->getResultType()) || token->getValue().safeGet<String>() != AliasMarkerName::pending_token)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid internal pending __aliasMarker token");
 
         const auto * column_node = arguments[1]->as<ColumnNode>();
         if (!column_node)
-            return;
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Internal pending __aliasMarker requires a column id");
 
         const auto & column_source = column_node->getColumnSourceOrNull();
-        if (!column_source)
-            return;
-
-        /// A lambda parameter -- `arrayMap(x -> __aliasMarker(x, x), ...)` written by hand -- has the `LambdaNode` as
-        /// its source. There is no table alias to build an id from, and the marker is a per-row identity rather than a
-        /// transport marker, so leave it as it is. A marker this pass injected inside a lambda body does not land here:
-        /// its id names an `ALIAS` column of a table, and the table expression is its source.
-        if (column_source->getNodeType() == QueryTreeNodeType::LAMBDA || !column_source->hasAlias())
-            return;
+        if (!column_source || column_source->getNodeType() == QueryTreeNodeType::LAMBDA || !column_source->hasAlias())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Internal pending __aliasMarker id has no table source alias");
 
         auto alias_id = column_source->getAlias() + "." + column_node->getColumnName();
         arguments[1] = std::make_shared<ConstantNode>(std::move(alias_id), std::make_shared<DataTypeString>());
+        arguments.pop_back();
         resolveOrdinaryFunctionNodeByName(*function_node, "__aliasMarker", context);
     }
 
@@ -1072,6 +1071,27 @@ void finalizeAliasMarkersForDistributedSerialization(QueryTreeNodePtr & node, co
 {
     FinalizeAliasMarkersVisitor visitor(context);
     visitor.visit(node);
+}
+
+void assertNoPendingAliasMarkersForDistributedSerialization(const QueryTreeNodePtr & node)
+{
+    if (!node)
+        return;
+
+    std::vector<const IQueryTreeNode *> nodes_to_visit{node.get()};
+    while (!nodes_to_visit.empty())
+    {
+        const auto * current = nodes_to_visit.back();
+        nodes_to_visit.pop_back();
+
+        if (const auto * function_node = current->as<FunctionNode>();
+            function_node && function_node->getFunctionName() == "__aliasMarker" && function_node->getArguments().getNodes().size() == 3)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Internal pending __aliasMarker cannot be shipped before finalization");
+
+        for (const auto & child : current->getChildren())
+            if (child)
+                nodes_to_visit.push_back(child.get());
+    }
 }
 
 std::pair<QueryTreeNodePtr, bool> getExpressionSource(const QueryTreeNodePtr & node)

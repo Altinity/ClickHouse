@@ -95,8 +95,8 @@ String calculateActionNodeNameWithCastIfNeeded(const ConstantNode & constant_nod
     return buffer.str();
 }
 
-/// Return a `__aliasMarker`'s finalized id, or an empty string when it has none yet. Between injection and
-/// serialization the id is a `ColumnNode`, and a user-written marker can hold anything at all.
+/// Return a two-argument `__aliasMarker`'s string id, or an empty string when it has none.
+/// A three-argument pending marker always resolves to its payload in an intermediate plan.
 String tryExtractAliasMarkerId(const QueryTreeNodePtr & id_argument)
 {
     if (const auto * id_node = id_argument->as<ConstantNode>(); id_node && isString(id_node->getResultType()))
@@ -209,16 +209,14 @@ public:
                 if (function_node.getFunctionName() == "__aliasMarker")
                 {
                     const auto & function_argument_nodes = function_node.getArguments().getNodes();
-                    if (function_argument_nodes.size() != 2)
-                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 arguments");
+                    if (function_argument_nodes.size() != 2 && function_argument_nodes.size() != 3)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 or 3 arguments");
 
-                    result = tryExtractAliasMarkerId(function_argument_nodes.at(1));
+                    if (function_argument_nodes.size() == 2)
+                        result = tryExtractAliasMarkerId(function_argument_nodes.at(1));
 
-                    /// No finalized id: either the marker has not reached its serialization boundary yet, or a user
-                    /// wrote one by hand. Name the node after the expression it wraps, which is what the name would
-                    /// have been without a marker at all. The two cases are not distinguishable here -- a hand-written
-                    /// `__aliasMarker(x, x)` looks exactly like an injected one whose id is still a `ColumnNode` -- so
-                    /// this cannot be turned into an assertion without rejecting valid SQL (03933).
+                    /// A pending marker, or a hand-written one without a string id, is named after its payload.
+                    /// The pending form can reach an intermediate planner, but must be finalized before shipping.
                     if (result.empty())
                         result = calculateActionNodeName(function_argument_nodes.at(0));
 
@@ -1269,14 +1267,15 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
     if (function_node.getFunctionName() == "__aliasMarker")
     {
         const auto & function_arguments = function_node.getArguments().getNodes();
-        if (function_arguments.size() != 2)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 arguments");
+        if (function_arguments.size() != 2 && function_arguments.size() != 3)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 or 3 arguments");
 
         auto [child_name, levels] = visitImpl(function_arguments.at(0));
 
-        /// Without a finalized id the marker adds no identity of its own, so it resolves to its payload. That happens
-        /// for a marker the user wrote by hand, and for one that has not reached a serialization boundary yet.
-        auto alias_id = tryExtractAliasMarkerId(function_arguments.at(1));
+        /// An intermediate pending marker and a hand-written marker without a string id resolve to their payload.
+        String alias_id;
+        if (function_arguments.size() == 2)
+            alias_id = tryExtractAliasMarkerId(function_arguments.at(1));
         if (alias_id.empty())
             alias_id = child_name;
 

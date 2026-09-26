@@ -27,6 +27,7 @@
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionFactory.h>
+#include <Functions/identity.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/PreparedSets.h>
@@ -109,20 +110,27 @@ QueryTreeNodePtr getInlineableAliasColumnExpression(const QueryTreeNodePtr & nod
 QueryTreeNodePtr wrapInAliasMarker(QueryTreeNodePtr expression, const ColumnNode & column_node, const ContextPtr & context)
 {
     auto marker_id = std::make_shared<ColumnNode>(column_node.getColumn(), column_node.getColumnSourceOrNull());
+    auto token = std::make_shared<ConstantNode>(String(AliasMarkerName::pending_token), std::make_shared<DataTypeString>());
 
     if (auto * function_node = expression->as<FunctionNode>();
         function_node && function_node->getFunctionName() == "__aliasMarker")
     {
         auto & marker_arguments = function_node->getArguments().getNodes();
-        if (marker_arguments.size() == 2)
+        if (marker_arguments.size() == 2 || marker_arguments.size() == 3)
+        {
             marker_arguments[1] = std::move(marker_id);
-        return expression;
+            marker_arguments.resize(2);
+            marker_arguments.emplace_back(std::move(token));
+            resolveOrdinaryFunctionNodeByName(*function_node, "__aliasMarker", context);
+            return expression;
+        }
     }
 
     QueryTreeNodes arguments;
-    arguments.reserve(2);
+    arguments.reserve(3);
     arguments.emplace_back(std::move(expression));
     arguments.emplace_back(std::move(marker_id));
+    arguments.emplace_back(std::move(token));
 
     auto marker_node = std::make_shared<FunctionNode>("__aliasMarker");
     marker_node->getArguments().getNodes() = std::move(arguments);
@@ -179,11 +187,10 @@ struct AliasColumnInliner
             marker_node && marker_node->getFunctionName() == "__aliasMarker")
         {
             auto & marker_arguments = marker_node->getArguments().getNodes();
-            if (marker_arguments.size() == 2)
+            if (marker_arguments.size() == 3)
             {
-                /// Descend into the payload only. The second argument is the column reference the marker exists to
-                /// record, and inlining it would expand the very `ALIAS` column whose identity it carries. It has to
-                /// reach `finalizeAliasMarkersForDistributedSerialization` as a `ColumnNode`.
+                /// The pending form's second argument is an injected column identity, not a column read by the query.
+                /// A hand-written two-argument marker is traversed normally: its id must resolve in the shipped SQL.
                 inlineExpression(marker_arguments[0]);
                 return;
             }
@@ -317,18 +324,16 @@ public:
 
     void visitImpl(QueryTreeNodePtr & node)
     {
-        /// The second argument of `__aliasMarker` records which `ALIAS` column an inlined expression came from, so
-        /// that the shard can name the result. It is not a column the query reads. Collecting it would put that
-        /// `ALIAS` column into the subquery `getSubqueryFromTableExpression` builds for a `GLOBAL JOIN` -- or for a
-        /// `CROSS JOIN` under `find_cross_join` -- and that subquery is rebuilt from names and types alone. The alias
-        /// body is dropped on the way, so the column ends up being asked of a storage that does not declare it.
+        /// Only a pending marker has an injected id that is not a column read by the query. Collecting that id would
+        /// put an `ALIAS` column into a `GLOBAL JOIN` temporary table after its defining expression was dropped.
+        /// A hand-written two-argument marker keeps its id in the shipped SQL, so collect that reference normally.
         ///
         /// Traversal is top-down, so the marker is always seen before the argument it is recording.
         if (const auto * function_node = node->as<FunctionNode>();
             function_node && function_node->getFunctionName() == "__aliasMarker")
         {
             const auto & marker_arguments = function_node->getArguments().getNodes();
-            if (marker_arguments.size() == 2 && marker_arguments[1])
+            if (marker_arguments.size() == 3 && marker_arguments[1])
                 marker_id_nodes.insert(marker_arguments[1].get());
             return;
         }
@@ -575,6 +580,14 @@ public:
 
     void enterImpl(QueryTreeNodePtr & node)
     {
+        if (const auto * function_node = node->as<FunctionNode>();
+            function_node && function_node->getFunctionName() == "__aliasMarker")
+        {
+            const auto & arguments = function_node->getArguments().getNodes();
+            if (arguments.size() == 3 && arguments[2])
+                pending_marker_tokens.insert(arguments[2].get());
+        }
+
         // Do not visit second argument of "in" functions
         if (!in_second_argument.empty() && in_second_argument.top() == node)
         {
@@ -590,7 +603,8 @@ public:
 
         auto * constant_node = node->as<ConstantNode>();
 
-        if (!constant_node)
+        /// Keep pending tokens literal until the finalizer validates and removes them.
+        if (!constant_node || pending_marker_tokens.contains(node.get()))
             return;
 
         const auto * col_const = typeid_cast<const ColumnConst *>(constant_node->getColumn().get());
@@ -632,6 +646,7 @@ public:
 private:
     Int64 max_size = 0;
     std::stack<QueryTreeNodePtr> in_second_argument;
+    std::unordered_set<const IQueryTreeNode *> pending_marker_tokens;
 };
 
 // Helper function to add DISTINCT to all QueryNode objects inside a query/union subtree

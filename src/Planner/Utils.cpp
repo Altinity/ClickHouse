@@ -317,6 +317,9 @@ void normalizeAliasMarkersInQueryTree(QueryTreeNodePtr & node)
 
 ASTPtr queryNodeToDistributedSelectQuery(const QueryTreeNodePtr & query_node)
 {
+    /// Check before normalization: it can discard a nested marker and hide an unfinalized pending id.
+    assertNoPendingAliasMarkersForDistributedSerialization(query_node);
+
     /// Remove CTEs information from distributed queries.
     /// Now, if cte_name is set for subquery node, AST -> String serialization will only print cte name.
     /// But CTE is defined only for top-level query part, so may not be sent.

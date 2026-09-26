@@ -5,6 +5,7 @@
 #include <Common/FailPoint.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/UnionNode.h>
+#include <Analyzer/Utils.h>
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/IJoin.h>
@@ -115,6 +116,9 @@ std::shared_ptr<const QueryPlan> createRemotePlanForParallelReplicas(
     QueryProcessingStage::Enum processed_stage)
 {
     checkStackSize();
+
+    /// A pending marker planned here would resolve to its payload and disappear before the plan was shipped.
+    assertNoPendingAliasMarkersForDistributedSerialization(query_tree);
 
     auto new_context = Context::createCopy(context);
 

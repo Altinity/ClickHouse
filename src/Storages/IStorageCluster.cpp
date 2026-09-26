@@ -437,6 +437,11 @@ void IStorageCluster::read(
 
     auto cluster_name_from_settings = getClusterName(context);
     const auto & settings = context->getSettingsRef();
+    /// The ALLOW path can forward the original AST without calling `queryNodeToDistributedSelectQuery`.
+    if (settings[Setting::allow_experimental_analyzer]
+        && (!cluster_name_from_settings.empty() || settings[Setting::object_storage_remote_initiator]))
+        assertNoPendingAliasMarkersForDistributedSerialization(query_info.query_tree);
+
     ASTPtr query_to_send = query_info.query;
 
     if (cluster_name_from_settings.empty())

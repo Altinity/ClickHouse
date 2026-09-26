@@ -40,7 +40,7 @@ REGISTER_FUNCTION(AliasMarker)
         .description = R"(
 Internal function. Returns its first argument unchanged. The second argument records which ALIAS column the
 expression was inlined from, so that a shard names the result the way the initiator expects. Not intended for
-direct use, but harmless when used directly.
+direct use: an explicitly supplied string id controls the planner's action name.
 )",
         .syntax = {"__aliasMarker(expr, alias_id)"},
         .arguments = {
