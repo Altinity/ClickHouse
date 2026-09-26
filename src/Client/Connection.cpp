@@ -26,7 +26,9 @@
 #include <Common/OpenSSLHelpers.h>
 #include <Common/formatReadable.h>
 #include <Common/randomSeed.h>
+#include <Core/AntalyaProtocol.h>
 #include <Core/Block.h>
+#include <Core/Protocol.h>
 #include <Core/ProtocolDefines.h>
 #include <Interpreters/ClientInfo.h>
 #include <Interpreters/OpenTelemetrySpanLog.h>
@@ -369,8 +371,11 @@ retry_handshake_with_fresh_jwt:
         if (proto_recv_chunked == "chunked")
             in->enableChunked();
 
-        LOG_TRACE(log_wrapper.get(), "Connected to {} server version {}.{}.{}.",
-            server_name, server_version_major, server_version_minor, server_version_patch);
+        LOG_TRACE(log_wrapper.get(), "Connected to {} server version {}.{}.{}{}.",
+            server_name, server_version_major, server_version_minor, server_version_patch,
+            (server_antalya_protocol_version > 0
+                ? ", Antalya protocol: " + std::to_string(server_antalya_protocol_version)
+                : ""));
 
         /// Now that the handshake is complete, use the regular timeouts
         socket->setReceiveTimeout(timeouts.receive_timeout);
@@ -622,6 +627,7 @@ void Connection::receiveHello()
     {
         readStringBinary(server_name, *in, DBMS_MAX_HELLO_STRING_SIZE);
         sanitizeUntrustedServerString(server_name);
+        server_antalya_protocol_version = AntalyaProtocol::stripMarker(server_name);
         readVarUInt(server_version_major, *in);
         readVarUInt(server_version_minor, *in);
         readVarUInt(server_revision, *in);
