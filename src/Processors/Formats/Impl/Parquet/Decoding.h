@@ -4,6 +4,11 @@
 #include <Processors/Formats/Impl/Parquet/ReadCommon.h>
 #include <Processors/Formats/Impl/Parquet/ThriftUtil.h>
 
+namespace DB
+{
+class ISerialization;
+}
+
 namespace DB::ErrorCodes
 {
     extern const int INCORRECT_DATA;
@@ -316,6 +321,17 @@ struct GeoConverter : public StringConverter
     GeoColumnMetadata geo_metadata;
 
     explicit GeoConverter(const GeoColumnMetadata & geo_metadata_) : geo_metadata(geo_metadata_) {}
+
+    void convertColumn(std::span<const char> chars, const UInt64 * offsets, size_t separator_bytes, size_t num_values, IColumn & col) const override;
+};
+
+/// Decodes serialized aggregate-function states from Parquet BYTE_ARRAY values.
+struct AggregateFunctionStateConverter : public StringConverter
+{
+    std::shared_ptr<const ISerialization> serialization;
+
+    explicit AggregateFunctionStateConverter(std::shared_ptr<const ISerialization> serialization_)
+        : serialization(std::move(serialization_)) {}
 
     void convertColumn(std::span<const char> chars, const UInt64 * offsets, size_t separator_bytes, size_t num_values, IColumn & col) const override;
 };

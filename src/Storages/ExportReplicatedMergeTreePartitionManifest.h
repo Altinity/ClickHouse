@@ -174,6 +174,8 @@ struct ExportReplicatedMergeTreePartitionManifest
     String filename_pattern;
     bool write_full_path_in_iceberg_metadata = false;
     bool allow_lossy_cast = false;
+    bool allow_aggregate_function_states_in_parquet = false;
+    bool allow_aggregate_function_states_in_iceberg = false;
     String iceberg_metadata_json;
 
     /// Optional because of backwards compatibility
@@ -222,6 +224,8 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("task_timeout_seconds", task_timeout_seconds);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
         json.set("allow_lossy_cast", allow_lossy_cast);
+        json.set("allow_aggregate_function_states_in_parquet", allow_aggregate_function_states_in_parquet);
+        json.set("allow_aggregate_function_states_in_iceberg", allow_aggregate_function_states_in_iceberg);
         if (parquet_compression_method)
             json.set("parquet_compression_method", *parquet_compression_method);
         if (output_format_compression_level)
@@ -302,6 +306,16 @@ struct ExportReplicatedMergeTreePartitionManifest
         /// export scheduled with the old permissive worker behavior is not wrongly rejected
         /// on upgrade. New tasks always persist the initiator's actual choice.
         manifest.allow_lossy_cast = json->has("allow_lossy_cast") ? json->getValue<bool>("allow_lossy_cast") : true;
+
+        if (json->has("allow_aggregate_function_states_in_parquet"))
+        {
+            manifest.allow_aggregate_function_states_in_parquet = json->getValue<bool>("allow_aggregate_function_states_in_parquet");
+        }
+
+        if (json->has("allow_aggregate_function_states_in_iceberg"))
+        {
+            manifest.allow_aggregate_function_states_in_iceberg = json->getValue<bool>("allow_aggregate_function_states_in_iceberg");
+        }
 
         /// Left unset (nullopt) for tasks created before these fields existed - such tasks were
         /// always scheduled under the old, strict column-matching check (a mismatch could never

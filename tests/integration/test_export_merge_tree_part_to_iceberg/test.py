@@ -16,6 +16,7 @@ Coverage:
     test_export_part_multi_column_partition_key_success                     – composite (a, b, c) partition key round-trips
     test_export_part_partition_key_mismatch_variants_are_rejected (parametrized) – partition key column reordering,
         cardinality mismatches, and transform-expression reordering between src/dst are all rejected synchronously
+    test_export_part_aggregate_function_states       – AggregateFunction / SimpleAggregateFunction states survive the export
 """
 
 import logging
@@ -1402,6 +1403,57 @@ def test_export_part_tuple_subcolumn_partition_key_iceberg_rejected(cluster):
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
     assert count == 0, f"Expected 0 rows in Iceberg table after rejected export, got {count}"
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_aggregate_function_states(cluster):
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_agg_states_{sfx}"
+    iceberg = f"iceberg_agg_states_{sfx}"
+
+    columns = (
+        "k Int32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64)"
+    )
+
+    make_mt(node, mt, columns, "k", order_by="k", engine="AggregatingMergeTree()")
+    make_iceberg_s3(
+        node,
+        iceberg,
+        columns,
+        "k",
+        extra_settings="allow_experimental_aggregate_function_states_in_iceberg = 1",
+    )
+
+    node.query(
+        f"INSERT INTO {mt} "
+        f"SELECT toInt32(number % 2), uniqState(toUInt64(number % 23)), sumSimpleState(number) "
+        f"FROM numbers(200) GROUP BY number % 2"
+    )
+
+    part = get_part(node, mt, "0")
+    export_part(
+        node,
+        mt,
+        part,
+        iceberg,
+        extra_settings=(
+            "allow_experimental_aggregate_function_states_in_parquet = 1, "
+            "allow_experimental_aggregate_function_states_in_iceberg = 1"
+        ),
+    )
+    wait_for_export_part(node, mt, part)
+    assert_part_log(node, mt, part)
+
+    exported = node.query(
+        f"SELECT k, uniqMerge(u), sum(s) FROM {iceberg} GROUP BY k ORDER BY k "
+        f"SETTINGS allow_experimental_aggregate_function_states_in_iceberg = 1"
+    )
+    assert exported == node.query(
+        f"SELECT k, uniqMerge(u), sum(s) FROM {mt} WHERE k = 0 GROUP BY k ORDER BY k"
+    ), f"Exported states do not match the source table:\n{exported}"
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")

@@ -25,6 +25,9 @@
 #include <DataTypes/DataTypeCustom.h>
 #include <Columns/ColumnVariant.h>
 #include <DataTypes/DataTypeVariant.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
+#include <DataTypes/Serializations/ISerialization.h>
+#include <IO/WriteBufferFromVector.h>
 
 /// This file deals with schema conversion and with repetition and definition levels.
 
@@ -810,6 +813,28 @@ void validateIcebergFieldIds(
     }
 }
 
+void convertAggregateFunctionColumnToString(ColumnPtr & column, DataTypePtr & type)
+{
+    auto serialization = type->getDefaultSerialization();
+    auto result = ColumnString::create();
+    auto & chars = result->getChars();
+    auto & offsets = result->getOffsets();
+    offsets.reserve(column->size());
+    {
+        WriteBufferFromVector<ColumnString::Chars> buffer(chars);
+        const FormatSettings format_settings;
+        for (size_t i = 0; i < column->size(); ++i)
+        {
+            serialization->serializeBinary(*column, i, buffer, format_settings);
+            offsets.push_back(buffer.count());
+        }
+        buffer.finalize();
+    }
+
+    column = std::move(result);
+    type = std::make_shared<DataTypeString>();
+}
+
 void prepareColumnRecursive(
     ColumnPtr column, DataTypePtr type, const std::string & name, const WriteOptions & options,
     ColumnChunkWriteStates & states, SchemaElements & schemas, const std::optional<std::unordered_map<String, Int64>> & column_field_ids)
@@ -817,6 +842,25 @@ void prepareColumnRecursive(
     /// Remove const and sparse but leave LowCardinality as the encoder can directly use it for
     /// parquet dictionary-encoding.
     column = column->convertToFullColumnIfReplicated()->convertToFullColumnIfSparse()->convertToFullColumnIfConst();
+
+    if (type->getTypeId() == TypeIndex::AggregateFunction)
+    {
+        if (!options.allow_aggregate_function_states)
+            throw Exception(
+                ErrorCodes::UNKNOWN_TYPE,
+                "Internal type '{}' of column '{}' is not supported for conversion into Parquet data format. "
+                "Enable setting allow_experimental_aggregate_function_states_in_parquet to write the "
+                "serialized states",
+                type->getFamilyName(), name);
+
+        convertAggregateFunctionColumnToString(column, type);
+        /// Serialized states are binary even when Parquet strings use the UTF8 logical type.
+        WriteOptions binary_options = options;
+        binary_options.output_string_as_string = false;
+        preparePrimitiveColumn(
+            column, type, name, binary_options, states, schemas, lookupLeafFieldId(column_field_ids, name));
+        return;
+    }
 
     switch (type->getTypeId())
     {
