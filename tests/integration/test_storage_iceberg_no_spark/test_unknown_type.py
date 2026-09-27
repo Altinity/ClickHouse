@@ -231,3 +231,112 @@ def test_unknown_type_write(started_cluster_iceberg_no_spark):
     placeholder_row = [row for row in lines if row[0] == "placeholder"]
     assert len(placeholder_row) == 1
     assert placeholder_row[0][1] == "Nullable(Nothing)"
+
+
+def _patch_table_with_nested_unknown_column(instance, table_name):
+    """Like `_patch_table_with_unknown_column`, but adds a struct column whose
+    subfield has the unknown type, so Nothing appears nested inside a Tuple."""
+    meta, prev_path = _read_latest_metadata(instance, table_name)
+    meta["format-version"] = 3
+
+    current_schema_id = meta.get("current-schema-id", 0)
+    current_schema = None
+    for schema in meta.get("schemas", []):
+        if schema.get("schema-id", 0) == current_schema_id:
+            current_schema = schema
+            break
+    assert current_schema is not None
+
+    last_column_id = meta.get("last-column-id", 0)
+    struct_field_id = last_column_id + 1
+    known_subfield_id = last_column_id + 2
+    unknown_subfield_id = last_column_id + 3
+    new_schema_id = max(s.get("schema-id", 0) for s in meta.get("schemas", [])) + 1
+
+    new_schema = {
+        "type": "struct",
+        "schema-id": new_schema_id,
+        "fields": current_schema["fields"]
+        + [
+            {
+                "id": struct_field_id,
+                "name": "nested",
+                "required": False,
+                "type": {
+                    "type": "struct",
+                    "fields": [
+                        {
+                            "id": known_subfield_id,
+                            "name": "a",
+                            "required": False,
+                            "type": "long",
+                        },
+                        {
+                            "id": unknown_subfield_id,
+                            "name": "u",
+                            "required": False,
+                            "type": "unknown",
+                        },
+                    ],
+                },
+            }
+        ],
+    }
+    meta.setdefault("schemas", []).append(new_schema)
+    meta["current-schema-id"] = new_schema_id
+    meta["last-column-id"] = unknown_subfield_id
+
+    _write_next_metadata(instance, table_name, meta, prev_path)
+
+
+def test_unknown_type_nested_write(started_cluster_iceberg_no_spark):
+    """Verify that inserting into a table whose struct column contains an
+    unknown-typed subfield succeeds: Nothing nested inside a Tuple must not
+    reach the Parquet writer, which cannot represent it (`UNKNOWN_TYPE`)."""
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    table_name = "test_unknown_type_nested_write_" + get_uuid_str()
+
+    create_iceberg_table(
+        "local",
+        instance,
+        table_name,
+        started_cluster_iceberg_no_spark,
+        "(id Int64, name Nullable(String))",
+        format_version=2,
+    )
+    instance.query(
+        f"INSERT INTO {table_name} VALUES (1, 'alice'), (2, 'bob')"
+    )
+    _patch_table_with_nested_unknown_column(instance, table_name)
+
+    instance.query(f"DROP TABLE IF EXISTS {table_name}")
+    create_iceberg_table(
+        "local",
+        instance,
+        table_name,
+        started_cluster_iceberg_no_spark,
+        settings={"allow_insert_into_iceberg": 1},
+    )
+
+    describe = instance.query(f"DESCRIBE TABLE {table_name}")
+    lines = [line.split("\t") for line in describe.strip().split("\n")]
+    nested_row = [row for row in lines if row[0] == "nested"]
+    assert len(nested_row) == 1
+    assert "Nothing" in nested_row[0][1], nested_row
+
+    # This must NOT fail with UNKNOWN_TYPE.
+    instance.query(
+        f"INSERT INTO {table_name} (id, name) VALUES (3, 'charlie'), (4, 'dave')",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+
+    result = instance.query(
+        f"SELECT id, name FROM {table_name} ORDER BY id"
+    ).strip()
+    expected = (
+        "1\talice\n"
+        "2\tbob\n"
+        "3\tcharlie\n"
+        "4\tdave"
+    )
+    assert result == expected

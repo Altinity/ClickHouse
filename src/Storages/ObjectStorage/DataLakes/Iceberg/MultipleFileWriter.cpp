@@ -1,7 +1,10 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MultipleFileWriter.h>
 
+#include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <Formats/FormatFactory.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Processors/Formats/IOutputFormat.h>
@@ -13,6 +16,36 @@ namespace DB
 {
 
 #if USE_AVRO
+
+namespace
+{
+
+/// Iceberg `unknown` is a primitive type, so it can also appear nested inside
+/// structs, lists, and maps. No serialisation format (Parquet, ORC, Avro) can
+/// represent Nothing at any nesting level (the Parquet writer throws
+/// `UNKNOWN_TYPE`), so such columns must be stripped from the writer's block.
+bool containsNothing(const DataTypePtr & type)
+{
+    auto inner_type = removeNullable(type);
+    if (isNothing(inner_type))
+        return true;
+    if (const auto * tuple_type = typeid_cast<const DataTypeTuple *>(inner_type.get()))
+    {
+        for (const auto & elem : tuple_type->getElements())
+        {
+            if (containsNothing(elem))
+                return true;
+        }
+        return false;
+    }
+    if (const auto * array_type = typeid_cast<const DataTypeArray *>(inner_type.get()))
+        return containsNothing(array_type->getNestedType());
+    if (const auto * map_type = typeid_cast<const DataTypeMap *>(inner_type.get()))
+        return containsNothing(map_type->getKeyType()) || containsNothing(map_type->getValueType());
+    return false;
+}
+
+}
 
 MultipleFileWriter::MultipleFileWriter(
     UInt64 max_data_file_num_rows_,
@@ -49,23 +82,19 @@ MultipleFileWriter::MultipleFileWriter(
     /// Iceberg schema metadata and is read back as NULLs on the read path.
     for (size_t i = 0; i < sample_block->columns(); ++i)
     {
-        auto inner_type = removeNullable(sample_block->getByPosition(i).type);
-        if (isNothing(inner_type))
-            nothing_column_indices.push_back(i);
+        if (!containsNothing(sample_block->getByPosition(i).type))
+            kept_column_indices.push_back(i);
     }
 
-    if (nothing_column_indices.empty())
+    if (kept_column_indices.size() == sample_block->columns())
     {
         filtered_sample_block = sample_block;
     }
     else
     {
         Block filtered;
-        for (size_t i = 0; i < sample_block->columns(); ++i)
-        {
-            if (std::find(nothing_column_indices.begin(), nothing_column_indices.end(), i) == nothing_column_indices.end())
-                filtered.insert(sample_block->getByPosition(i));
-        }
+        for (size_t i : kept_column_indices)
+            filtered.insert(sample_block->getByPosition(i));
         filtered_sample_block = std::make_shared<const Block>(std::move(filtered));
     }
 }
@@ -108,21 +137,18 @@ void MultipleFileWriter::consume(const Chunk & chunk)
         startNewFile();
     }
 
-    if (nothing_column_indices.empty())
+    if (kept_column_indices.size() == sample_block->columns())
     {
         output_format->write(sample_block->cloneWithColumns(chunk.getColumns()));
     }
     else
     {
-        /// Strip Nullable(Nothing) columns before passing to the format writer.
-        auto columns = chunk.getColumns();
+        /// Strip columns containing Nothing before passing to the format writer.
+        const auto & columns = chunk.getColumns();
         Columns filtered_columns;
-        filtered_columns.reserve(columns.size() - nothing_column_indices.size());
-        for (size_t i = 0; i < columns.size(); ++i)
-        {
-            if (std::find(nothing_column_indices.begin(), nothing_column_indices.end(), i) == nothing_column_indices.end())
-                filtered_columns.push_back(columns[i]);
-        }
+        filtered_columns.reserve(kept_column_indices.size());
+        for (size_t i : kept_column_indices)
+            filtered_columns.push_back(columns[i]);
         output_format->write(filtered_sample_block->cloneWithColumns(std::move(filtered_columns)));
     }
 
