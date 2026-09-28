@@ -48,7 +48,7 @@ replicas against one shared pool under a seeded workload and a seeded fault inje
 idealized model necessarily abstracts away: the dangling-manifest hazard and the condemned-body replacement orphan were
 both first observed live in `system.cas_log` during soak runs, before either got a focused model. Each
 quiesced soak checkpoint cross-checks `SQL` results against a model oracle and runs
-`clickhouse-disks ca-fsck` plus `ca-gc-dryrun`, asserting `dangling=0`.
+`clickhouse-disks cas-fsck` plus `cas-gc-dryrun`, asserting `dangling=0`.
 
 The relationship runs in both directions: the historical resurrect-reupload orphan (`utils/ca-soak` scenario
 S30, root-caused via `system.cas_log`) got a focused `TLA+` reproduction that proved the fix and
