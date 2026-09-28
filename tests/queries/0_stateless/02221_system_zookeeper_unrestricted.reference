@@ -20,6 +20,10 @@ creator_info
 creator_info
 deduplication_hashes
 deduplication_hashes
+export_features
+export_features
+export_fence
+export_fence
 exports
 exports
 failed_parts

@@ -9,6 +9,8 @@ columns
 columns
 creator_info
 deduplication_hashes
+export_features
+export_fence
 exports
 failed_parts
 flags
@@ -52,6 +54,8 @@ columns
 columns
 creator_info
 deduplication_hashes
+export_features
+export_fence
 exports
 failed_parts
 flags
