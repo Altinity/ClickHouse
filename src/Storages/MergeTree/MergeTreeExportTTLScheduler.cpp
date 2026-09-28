@@ -195,6 +195,7 @@ ExportTTLScheduler::TaskState MergeTreeExportTTLScheduler::getTaskState(const St
         case MergeTreeExportTask::Status::FAILED: state.status = TaskStatus::FAILED; break;
         case MergeTreeExportTask::Status::KILLED: state.status = TaskStatus::KILLED; break;
     }
+    state.reached_commit = task->allPartsDone();
     state.retry_of = task->retry_of;
     return state;
 }

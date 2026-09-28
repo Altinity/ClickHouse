@@ -25,8 +25,9 @@ from .common import (
 CLUSTER_INSTANCES = ["replica1"]
 
 # Failures of the tasks of the `EXPORT` TTL to an Iceberg destination: a failed group is retried as a
-# new task that lists the failed ones in `retry_of`, only the task that completes commits a snapshot,
-# and no row lands twice, whatever fails and when.
+# new task, which lists in `retry_of` the failed ones that exported all their parts, since only those
+# may have committed. Only the task that completes commits a snapshot, and no row lands twice,
+# whatever fails and when.
 
 
 def make_tables(node, engine, settings=None, columns=COLUMNS, source_partition_by="year", spec="year"):
@@ -65,6 +66,7 @@ def test_retryable_part_error_is_retried_by_the_same_task(cluster, source_engine
 
 
 def test_non_retryable_part_error_is_retried_as_a_new_task(cluster, source_engine):
+    """The failed task did not export its part, so it did not commit: the retry does not check it."""
     node = cluster.instances["replica1"]
     mt_table, iceberg_table = make_tables(node, source_engine)
 
@@ -83,7 +85,7 @@ def test_non_retryable_part_error_is_retried_as_a_new_task(cluster, source_engin
     failed = {task["transaction_id"] for task in tasks if task["status"] == "FAILED"}
     completed = completed_ttl_tasks(node, mt_table)
     assert failed and len(completed) == 1, tasks
-    assert set(completed[0]["retry_of"]) == failed, (completed, failed)
+    assert completed[0]["retry_of"] == [], (completed, failed)
     assert_exactly_once(iceberg_ids(node, iceberg_table), [1])
     assert_one_snapshot_per_task(node, mt_table, iceberg_table)
 
@@ -135,7 +137,8 @@ def test_commit_that_landed_is_not_committed_again(cluster):
 
 
 def test_killed_task_is_retried(cluster, source_engine):
-    """The killed task never commits; the file its part export writes afterwards is not in the table."""
+    """The killed task never commits; the file its part export writes afterwards is not in the table.
+    It was killed before exporting its part, so the retry does not check it."""
     node = cluster.instances["replica1"]
     mt_table, iceberg_table = make_tables(node, source_engine)
 
@@ -145,10 +148,12 @@ def test_killed_task_is_retried(cluster, source_engine):
         killed = ttl_tasks(node, mt_table)[0]["transaction_id"]
         node.query(f"KILL EXPORT WHERE transaction_id = '{killed}'")
         wait_until(lambda: ttl_tasks(node, mt_table)[0]["status"] == "KILLED", 60, "The task was not killed")
+        # The retry starts while the part export of the killed task is still paused.
+        wait_until(lambda: len(ttl_tasks(node, mt_table)) == 2, 60, "The killed task was not retried")
 
     wait_for_partitions_exported(node, mt_table, ["2020"])
     completed = completed_ttl_tasks(node, mt_table)
-    assert len(completed) == 1 and completed[0]["retry_of"] == [killed], ttl_tasks(node, mt_table)
+    assert len(completed) == 1 and completed[0]["retry_of"] == [], (killed, ttl_tasks(node, mt_table))
     assert_exactly_once(iceberg_ids(node, iceberg_table), [1])
     assert_one_snapshot_per_task(node, mt_table, iceberg_table)
 

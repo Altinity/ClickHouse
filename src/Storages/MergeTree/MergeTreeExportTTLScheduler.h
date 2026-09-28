@@ -61,11 +61,11 @@ protected:
     bool isPaused() override;
     ExportTTLIndexSnapshotPtr getIndexSnapshot() override { return index.getSnapshot(); }
     bool identifiesDestinationByUUID() const override { return true; }
-    /// A single replica keeps its state in memory.
-    std::optional<ExportTTLSchedulerState> readSchedulerState(const String &) override { return std::nullopt; }
-    void writeSchedulerState(const String &, const ExportTTLSchedulerState &) override {}
     String getReplicaName() const override { return {}; }
+    String getSchedulerReplica() override { return {}; }
     TaskState getTaskState(const String & transaction_id) override;
+    /// A task is not marked failed or killed while it commits, and a restart ends every commit.
+    bool isCommitInProgress(const String &) override { return false; }
     bool updateIndexEntry(const String & destination_key, const ExportTTLVersionedEntry & entry) override { return index.update(destination_key, entry); }
     bool startGroup(const GroupToStart & group, const ContextPtr & context) override;
     bool isPartBeingMerged(const MergeTreeDataPartPtr & part) override;

@@ -143,7 +143,7 @@ std::vector<ExportTaskInfo> MergeTreeExportTaskScheduler::getInfo() const
             ? ""
             : ExportTaskUtils::getPartitionIdOfParts(descriptor.partNames(), storage.format_version);
         info.source = String(magic_enum::enum_name(descriptor.source));
-        info.retry_of = descriptor.retry_of;
+        info.retry_of = ExportRetriedTaskUtils::transactionIds(descriptor.retry_of);
         info.transaction_id = descriptor.transaction_id;
         info.query_id = descriptor.query_id;
         info.parts = descriptor.partNames();
@@ -591,13 +591,7 @@ void MergeTreeExportTaskScheduler::tryCommit(const String & transaction_id)
             const auto committed_ranges = ExportTaskUtils::getRangesCommittedByRetriedTasks(
                 descriptor_copy.retry_of,
                 destination_storage,
-                [this](const String & retried_transaction_id) -> std::optional<std::vector<String>>
-                {
-                    if (const auto task = getTask(retried_transaction_id))
-                        return task->partNames();
-                    return std::nullopt;
-                },
-                storage.format_version,
+                ExportTaskUtils::getPartitionIdOfParts(descriptor_copy.partNames(), storage.format_version),
                 *context);
 
             if (!committed_ranges.empty())

@@ -27,10 +27,10 @@ protected:
     bool isPaused() override;
     ExportTTLIndexSnapshotPtr getIndexSnapshot() override;
     bool identifiesDestinationByUUID() const override { return false; }
-    std::optional<ExportTTLSchedulerState> readSchedulerState(const String & destination_key) override;
-    void writeSchedulerState(const String & destination_key, const ExportTTLSchedulerState & state) override;
     String getReplicaName() const override;
+    String getSchedulerReplica() override;
     TaskState getTaskState(const String & transaction_id) override;
+    bool isCommitInProgress(const String & transaction_id) override;
     bool updateIndexEntry(const String & destination_key, const ExportTTLVersionedEntry & entry) override;
     bool startGroup(const GroupToStart & group, const ContextPtr & context) override;
     bool isPartBeingMerged(const MergeTreeDataPartPtr & part) override;

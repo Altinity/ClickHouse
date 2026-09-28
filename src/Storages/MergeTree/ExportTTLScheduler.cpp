@@ -40,6 +40,10 @@ namespace MergeTreeSetting
 namespace
 {
 
+/// How long after its task failed a commit may still land: a destination may apply a request after
+/// its sender gave up waiting for it.
+constexpr time_t late_commit_window_seconds = 600;
+
 /// The rule of move TTL: a part is eligible once the maximum TTL value of its rows is due. A part
 /// without the TTL info (written before the TTL was added and not materialized) is never eligible.
 bool isEligible(const IMergeTreeDataPart & part, const TTLDescriptions & export_ttls, time_t now)
@@ -153,8 +157,6 @@ UInt64 ExportTTLScheduler::run()
             batches.clear();
             last_errors.clear();
             info_by_partition.clear();
-            written_state.reset();
-            was_scheduler = false;
             current_destination_key = destination_key;
         }
         current_destination_error = destination_error;
@@ -198,43 +200,8 @@ UInt64 ExportTTLScheduler::run()
         return period * 1000;
     }
 
-    /// The replica that schedules owns the batching windows; the others show what it stored.
-    ExportTTLSchedulerState stored_state;
-    bool resume_stored_state = false;
-    {
-        bool was = false;
-        {
-            std::lock_guard lock(mutex);
-            was = was_scheduler;
-            was_scheduler = is_scheduler;
-        }
-
-        if (!is_scheduler || !was)
-        {
-            if (auto state = readSchedulerState(destination_key))
-            {
-                stored_state = std::move(*state);
-                resume_stored_state = is_scheduler;
-            }
-        }
-    }
-
-    if (resume_stored_state)
-    {
-        std::lock_guard lock(mutex);
-        for (const auto & [partition_id, partition] : stored_state.partitions)
-        {
-            auto & batch = batches[partition_id];
-            batch.first_eligible_time = partition.first_eligible_time;
-            batch.last_new_part_time = partition.last_new_part_time;
-            if (!partition.last_error.empty())
-                last_errors[partition_id] = partition.last_error;
-        }
-        LOG_INFO(log, "This replica schedules the EXPORT TTL now, resuming the state stored by {}", stored_state.scheduler_replica);
-    }
-
     const bool act = is_scheduler && !isPaused();
-    const String scheduler_replica = is_scheduler ? getReplicaName() : stored_state.scheduler_replica;
+    const String scheduler_replica = is_scheduler ? getReplicaName() : getSchedulerReplica();
 
     const time_t now = time(nullptr);
 
@@ -278,32 +245,27 @@ UInt64 ExportTTLScheduler::run()
 
         PartitionBatch batch;
         String last_error;
-        if (is_scheduler)
         {
             std::lock_guard lock(mutex);
             batch = batches[partition_id];
             if (const auto it = last_errors.find(partition_id); it != last_errors.end())
                 last_error = it->second;
         }
-        else if (const auto it = stored_state.partitions.find(partition_id); it != stored_state.partitions.end())
-        {
-            batch.first_eligible_time = it->second.first_eligible_time;
-            batch.last_new_part_time = it->second.last_new_part_time;
-            last_error = it->second.last_error;
-        }
 
         PartitionView view;
         try
         {
-            view = observePartition(versioned.entry, parts, export_ttls, now, std::move(batch), is_scheduler, task_states);
-            view.info.last_error = last_error;
+            view = observePartition(versioned.entry, parts, export_ttls, now, std::move(batch), task_states);
+
+            /// The error of acting on the partition is shown until the scheduler acts on it again.
+            if (is_scheduler && !act)
+                view.info.last_error = last_error;
 
             if (act)
             {
                 /// Shown as it is after acting, e.g. with the parts of a recorded commit as exported.
                 if (const auto updated_entry = actOnPartition(destination_key, destination, std::move(versioned), view, now, in_flight, task_states, context))
-                    view = observePartition(*updated_entry, parts, export_ttls, now, std::move(view.batch), is_scheduler, task_states);
-                view.info.last_error.clear();
+                    view = observePartition(*updated_entry, parts, export_ttls, now, std::move(view.batch), task_states);
             }
         }
         catch (...)
@@ -323,19 +285,14 @@ UInt64 ExportTTLScheduler::run()
             next_tick = std::min(next_tick, view.next_eligible_time);
 
         std::lock_guard lock(mutex);
-        if (is_scheduler)
-        {
-            batches[partition_id] = std::move(view.batch);
-            if (view.info.last_error.empty())
-                last_errors.erase(partition_id);
-            else
-                last_errors[partition_id] = view.info.last_error;
-        }
+        batches[partition_id] = std::move(view.batch);
+        if (view.info.last_error.empty())
+            last_errors.erase(partition_id);
+        else
+            last_errors[partition_id] = view.info.last_error;
         info_by_partition[partition_id] = std::move(view.info);
     }
 
-    ExportTTLSchedulerState state_to_write;
-    bool write_state = false;
     {
         std::lock_guard lock(mutex);
         std::erase_if(info_by_partition, [&](const auto & item) { return !partition_ids.contains(item.first); });
@@ -346,39 +303,6 @@ UInt64 ExportTTLScheduler::run()
         for (const auto & [_, info] : info_by_partition)
             held += info.parts_held_by_delete_gate;
         parts_held_by_delete_gate.changeTo(held);
-
-        if (is_scheduler)
-        {
-            state_to_write.scheduler_replica = scheduler_replica;
-            for (const auto & partition_id : partition_ids)
-            {
-                ExportTTLSchedulerState::Partition partition;
-                if (const auto it = batches.find(partition_id); it != batches.end())
-                {
-                    partition.first_eligible_time = it->second.first_eligible_time;
-                    partition.last_new_part_time = it->second.last_new_part_time;
-                }
-                if (const auto it = last_errors.find(partition_id); it != last_errors.end())
-                    partition.last_error = it->second;
-                if (partition != ExportTTLSchedulerState::Partition{})
-                    state_to_write.partitions[partition_id] = std::move(partition);
-            }
-            write_state = !written_state || *written_state != state_to_write;
-        }
-    }
-
-    if (write_state)
-    {
-        try
-        {
-            writeSchedulerState(destination_key, state_to_write);
-            std::lock_guard lock(mutex);
-            written_state = std::move(state_to_write);
-        }
-        catch (...)
-        {
-            tryLogCurrentException(log, "While storing the state of the TTL export scheduler");
-        }
     }
 
     return static_cast<UInt64>(std::max<time_t>(1, next_tick - now)) * 1000;
@@ -412,7 +336,7 @@ ExportTTLScheduler::ResolvedClaims ExportTTLScheduler::resolveClaims(
             case TaskStatus::KILLED:
             case TaskStatus::MISSING:
                 /// E.g. a commit that landed and then the task timed out before it was marked completed.
-                if (destination->isExportTransactionCommitted(transaction_id, context))
+                if (state.reached_commit && destination->isExportTransactionCommitted(transaction_id, context))
                 {
                     LOG_INFO(log, "Export task {} of partition {} did not complete, but it committed to the destination",
                         transaction_id, entry.partition_id);
@@ -422,8 +346,56 @@ ExportTTLScheduler::ResolvedClaims ExportTTLScheduler::resolveClaims(
                 }
 
                 result.failed.push_back(transaction_id);
-                result.retry_of.insert(result.retry_of.end(), state.retry_of.begin(), state.retry_of.end());
                 break;
+        }
+    }
+
+    return result;
+}
+
+ExportRetriedTasks ExportTTLScheduler::collectRetriedTasks(
+    const ExportTTLIndexEntry & entry,
+    const std::vector<String> & failed,
+    const StoragePtr & destination,
+    time_t now,
+    TaskStates & task_states,
+    const ContextPtr & context)
+{
+    ExportRetriedTasks result;
+    std::unordered_set<String> added;
+
+    for (const auto & transaction_id : failed)
+    {
+        const auto & state = getCachedTaskState(task_states, transaction_id);
+
+        /// A task that did not export all its parts never committed, and a missing one was either
+        /// never created or checked when it went missing.
+        if (state.status != TaskStatus::MISSING && state.reached_commit && added.insert(transaction_id).second)
+            result.push_back(ExportRetriedTask{
+                .transaction_id = transaction_id,
+                .block_ranges = ExportTTLUtils::toBlockRanges(entry.claimed.at(transaction_id)),
+                .failed_time = now,
+            });
+
+        for (const auto & retried : state.retry_of)
+        {
+            if (added.contains(retried.transaction_id))
+                continue;
+
+            /// Past the window, and with no commit of it in progress, the task is checked once more,
+            /// and not retried by the next groups if it did not land.
+            const bool may_land = now < retried.failed_time + late_commit_window_seconds
+                || isCommitInProgress(retried.transaction_id)
+                || destination->isExportTransactionCommitted(retried.transaction_id, context);
+
+            if (!may_land)
+            {
+                LOG_DEBUG(log, "Export task {} of partition {} did not commit, it is no longer checked", retried.transaction_id, entry.partition_id);
+                continue;
+            }
+
+            added.insert(retried.transaction_id);
+            result.push_back(retried);
         }
     }
 
@@ -436,7 +408,6 @@ ExportTTLScheduler::PartitionView ExportTTLScheduler::observePartition(
     const TTLDescriptions & export_ttls,
     time_t now,
     PartitionBatch batch,
-    bool update_batch,
     TaskStates & task_states)
 {
     const auto settings = storage.getSettings();
@@ -489,26 +460,19 @@ ExportTTLScheduler::PartitionView ExportTTLScheduler::observePartition(
     }
     eligible_ranges = ExportFenceUtils::compactRanges(std::move(eligible_ranges));
 
-    if (update_batch)
+    for (const auto & part : eligible)
     {
-        /// Resumed from the stored state: the parts seen by the previous scheduler are not new.
-        if (batch.seen_ranges.empty() && batch.first_eligible_time)
-            batch.seen_ranges = eligible_ranges;
-
-        for (const auto & part : eligible)
+        if (!ExportFenceUtils::isCoveredByUnion(part->info, batch.seen_ranges))
         {
-            if (!ExportFenceUtils::isCoveredByUnion(part->info, batch.seen_ranges))
-            {
-                batch.last_new_part_time = now;
-                if (!batch.first_eligible_time)
-                    batch.first_eligible_time = now;
-            }
+            batch.last_new_part_time = now;
+            if (!batch.first_eligible_time)
+                batch.first_eligible_time = now;
         }
-
-        batch.seen_ranges = std::move(eligible_ranges);
-        if (eligible.empty())
-            batch = PartitionBatch{};
     }
+
+    batch.seen_ranges = std::move(eligible_ranges);
+    if (eligible.empty())
+        batch = PartitionBatch{};
 
     info.eligible_parts = eligible.size();
     info.first_eligible_time = eligible.empty() ? 0 : batch.first_eligible_time;
@@ -614,12 +578,11 @@ std::optional<ExportTTLIndexEntry> ExportTTLScheduler::actOnPartition(
         for (const auto & part : group.parts)
             group_bytes += part->getBytesOnDisk();
 
+        std::vector<String> retried;
         for (const auto & transaction_id : resolved.failed)
             if (failed_with_parts.contains(transaction_id))
-                group.retry_of.push_back(transaction_id);
-        group.retry_of.insert(group.retry_of.end(), resolved.retry_of.begin(), resolved.retry_of.end());
-        std::sort(group.retry_of.begin(), group.retry_of.end());
-        group.retry_of.erase(std::unique(group.retry_of.begin(), group.retry_of.end()), group.retry_of.end());
+                retried.push_back(transaction_id);
+        group.retry_of = collectRetriedTasks(entry, retried, destination, now, task_states, context);
 
         for (const auto & part : view.shippable)
         {
@@ -646,10 +609,10 @@ std::optional<ExportTTLIndexEntry> ExportTTLScheduler::actOnPartition(
             if (startGroup(group, context))
             {
                 ++in_flight;
-                task_states.insert_or_assign(group.transaction_id, TaskState{TaskStatus::PENDING, group.retry_of});
+                task_states.insert_or_assign(group.transaction_id, TaskState{.status = TaskStatus::PENDING, .reached_commit = false, .retry_of = group.retry_of});
                 LOG_INFO(log, "Started export task {} of {} part(s) of partition {} to {}{}",
                     group.transaction_id, group.parts.size(), partition_id, destination->getStorageID().getNameForLogs(),
-                    group.retry_of.empty() ? "" : fmt::format(", retrying {}", fmt::join(group.retry_of, ", ")));
+                    retried.empty() ? "" : fmt::format(", retrying {}", fmt::join(retried, ", ")));
                 return std::move(group.entry.entry);
             }
 

@@ -422,7 +422,7 @@ std::vector<ExportTaskInfo> ReplicatedExportTaskUpdater::getExportTasksInfo() co
         info.destination_table = manifest.destination_table;
         info.partition_id = ExportTaskUtils::getPartitionIdOfParts(manifest.parts, storage.format_version);
         info.source = String(magic_enum::enum_name(manifest.source));
-        info.retry_of = manifest.retry_of;
+        info.retry_of = ExportRetriedTaskUtils::transactionIds(manifest.retry_of);
         info.transaction_id = manifest.transaction_id;
         info.query_id = manifest.query_id;
         info.create_time = manifest.create_time;

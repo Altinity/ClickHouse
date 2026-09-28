@@ -4,9 +4,9 @@
 #include <Storages/MergeTree/ExportFence.h>
 #include <base/types.h>
 
-#include <ctime>
 #include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace DB
@@ -89,30 +89,6 @@ struct ExportTTLIndexSnapshot
 
 using ExportTTLIndexSnapshotPtr = std::shared_ptr<const ExportTTLIndexSnapshot>;
 
-/// What the replica that schedules the `EXPORT` TTL of a table knows beyond the index: stored with
-/// the index of the destination whenever it changes, so every replica shows it, and a replica that
-/// takes over the scheduling resumes the batching windows.
-struct ExportTTLSchedulerState
-{
-    struct Partition
-    {
-        String last_error;
-        time_t first_eligible_time = 0;
-        time_t last_new_part_time = 0;
-
-        bool operator==(const Partition &) const = default;
-    };
-
-    String scheduler_replica;
-    /// By partition id. A partition without an error and waiting for nothing is omitted.
-    std::map<String, Partition> partitions;
-
-    bool operator==(const ExportTTLSchedulerState &) const = default;
-
-    String toJSONString() const;
-    static ExportTTLSchedulerState fromJSONString(const String & json_string);
-};
-
 namespace ExportTTLUtils
 {
     /// Identifies a destination in the export index. The UUID, if not empty, tells apart a table that
@@ -121,6 +97,10 @@ namespace ExportTTLUtils
 
     /// Ranges of the parts named `part_names`, compacted.
     std::vector<MergeTreePartInfo> rangesOfParts(const std::vector<String> & part_names, MergeTreeDataFormatVersion format_version);
+
+    /// `[min_block, max_block]` of `ranges`, as recorded for a retried task (see `ExportRetriedTask`).
+    std::vector<std::pair<Int64, Int64>> toBlockRanges(const std::vector<MergeTreePartInfo> & ranges);
+    std::vector<MergeTreePartInfo> fromBlockRanges(const String & partition_id, const std::vector<std::pair<Int64, Int64>> & block_ranges);
 }
 
 }

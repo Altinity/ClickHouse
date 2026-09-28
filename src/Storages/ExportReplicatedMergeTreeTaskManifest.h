@@ -7,6 +7,7 @@
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Parser.h>
 #include <Storages/ExportCommitInfoEntry.h>
+#include <Storages/ExportRetriedTask.h>
 #include <Storages/ExportTaskSource.h>
 #include <Storages/MergeTree/MergeTreePartExportManifest.h>
 #include <optional>
@@ -169,9 +170,9 @@ struct ExportReplicatedMergeTreeTaskManifest
     String destination_table;
     /// UUID of the destination table when the task was created, empty if it has none.
     String destination_uuid;
-    /// TTL export only: transaction ids of earlier tasks that failed to export some of these parts.
-    /// The commit checks whether any of them landed at the destination after all.
-    std::vector<String> retry_of;
+    /// TTL export only: earlier tasks that failed to export some of these parts and whose commit may
+    /// still land. The commit checks whether any of them landed at the destination after all.
+    ExportRetriedTasks retry_of;
     String source_replica;
     size_t number_of_parts;
     std::vector<String> parts;
@@ -214,12 +215,7 @@ struct ExportReplicatedMergeTreeTaskManifest
         if (!destination_uuid.empty())
             json.set("destination_uuid", destination_uuid);
         if (!retry_of.empty())
-        {
-            Poco::JSON::Array::Ptr retry_of_array = new Poco::JSON::Array();
-            for (const auto & transaction : retry_of)
-                retry_of_array->add(transaction);
-            json.set("retry_of", retry_of_array);
-        }
+            json.set("retry_of", ExportRetriedTaskUtils::toJSON(retry_of));
         json.set("source_replica", source_replica);
         json.set("number_of_parts", number_of_parts);
 
@@ -286,11 +282,7 @@ struct ExportReplicatedMergeTreeTaskManifest
         if (json->has("destination_uuid"))
             manifest.destination_uuid = json->getValue<String>("destination_uuid");
         if (json->has("retry_of"))
-        {
-            const auto retry_of_array = json->getArray("retry_of");
-            for (size_t i = 0; i < retry_of_array->size(); ++i)
-                manifest.retry_of.push_back(retry_of_array->getElement<String>(static_cast<unsigned int>(i)));
-        }
+            manifest.retry_of = ExportRetriedTaskUtils::fromJSON(json->getArray("retry_of"));
         manifest.source_replica = json->getValue<String>("source_replica");
         manifest.number_of_parts = json->getValue<size_t>("number_of_parts");
 

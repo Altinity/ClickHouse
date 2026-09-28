@@ -185,59 +185,6 @@ std::unique_ptr<const ExportTTLIndexSnapshot> ExportTTLIndexSnapshot::build(
     return snapshot;
 }
 
-String ExportTTLSchedulerState::toJSONString() const
-{
-    Poco::JSON::Object json;
-    json.set("scheduler_replica", scheduler_replica);
-
-    Poco::JSON::Object::Ptr partitions_object = new Poco::JSON::Object();
-    for (const auto & [partition_id, partition] : partitions)
-    {
-        Poco::JSON::Object::Ptr partition_object = new Poco::JSON::Object();
-        partition_object->set("last_error", partition.last_error);
-        partition_object->set("first_eligible_time", static_cast<Int64>(partition.first_eligible_time));
-        partition_object->set("last_new_part_time", static_cast<Int64>(partition.last_new_part_time));
-        partitions_object->set(partition_id, partition_object);
-    }
-    json.set("partitions", partitions_object);
-
-    std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    oss.exceptions(std::ios::failbit);
-    Poco::JSON::Stringifier::stringify(json, oss);
-    return oss.str();
-}
-
-ExportTTLSchedulerState ExportTTLSchedulerState::fromJSONString(const String & json_string)
-{
-    ExportTTLSchedulerState state;
-    if (json_string.empty())
-        return state;
-
-    Poco::JSON::Parser parser;
-    const auto json = parser.parse(json_string).extract<Poco::JSON::Object::Ptr>();
-    if (!json)
-        throw Exception(ErrorCodes::INCORRECT_DATA, "The state of the TTL export scheduler is not a JSON object");
-
-    if (json->has("scheduler_replica"))
-        state.scheduler_replica = json->getValue<String>("scheduler_replica");
-
-    if (const auto partitions_object = json->getObject("partitions"))
-    {
-        for (const auto & partition_id : partitions_object->getNames())
-        {
-            const auto partition_object = partitions_object->getObject(partition_id);
-            if (!partition_object)
-                continue;
-            auto & partition = state.partitions[partition_id];
-            partition.last_error = partition_object->optValue<String>("last_error", "");
-            partition.first_eligible_time = static_cast<time_t>(partition_object->optValue<Int64>("first_eligible_time", 0));
-            partition.last_new_part_time = static_cast<time_t>(partition_object->optValue<Int64>("last_new_part_time", 0));
-        }
-    }
-
-    return state;
-}
-
 namespace ExportTTLUtils
 {
 
@@ -255,6 +202,24 @@ std::vector<MergeTreePartInfo> rangesOfParts(const std::vector<String> & part_na
         const auto info = MergeTreePartInfo::fromPartName(name, format_version);
         ranges.emplace_back(info.getPartitionId(), info.min_block, info.max_block, 0, 0);
     }
+    return ExportFenceUtils::compactRanges(std::move(ranges));
+}
+
+std::vector<std::pair<Int64, Int64>> toBlockRanges(const std::vector<MergeTreePartInfo> & ranges)
+{
+    std::vector<std::pair<Int64, Int64>> result;
+    result.reserve(ranges.size());
+    for (const auto & range : ranges)
+        result.emplace_back(range.min_block, range.max_block);
+    return result;
+}
+
+std::vector<MergeTreePartInfo> fromBlockRanges(const String & partition_id, const std::vector<std::pair<Int64, Int64>> & block_ranges)
+{
+    std::vector<MergeTreePartInfo> ranges;
+    ranges.reserve(block_ranges.size());
+    for (const auto & [min_block, max_block] : block_ranges)
+        ranges.emplace_back(partition_id, min_block, max_block, /* level */ 0, /* mutation */ 0);
     return ExportFenceUtils::compactRanges(std::move(ranges));
 }
 

@@ -839,7 +839,7 @@ Possible values:
     Maximum number of parts exported together by one task of the `EXPORT` TTL. Parts of a failed task
     are always retried together, even if there are more of them.
     )", EXPERIMENTAL) \
-    DECLARE(UInt64, ttl_export_max_bytes_per_group, 10_GiB, R"(
+    DECLARE(UInt64, ttl_export_max_bytes_per_group, 100_GiB, R"(
     Maximum size on disk of the parts exported together by one task of the `EXPORT` TTL. A single part
     bigger than this is exported on its own. 0 means unlimited.
     )", EXPERIMENTAL) \

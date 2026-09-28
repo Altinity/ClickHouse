@@ -6,6 +6,7 @@ from .common import (
     COLUMNS,
     DUE,
     NOT_DUE,
+    TTL_STATE_COLUMNS,
     assert_exactly_once,
     assert_one_snapshot_per_task,
     completed_ttl_tasks,
@@ -18,6 +19,7 @@ from .common import (
     snapshot_refreshes,
     ttl_rows,
     ttl_tasks,
+    wait_for_last_error,
     wait_for_partitions_exported,
     wait_for_same_ttl_rows,
     wait_until,
@@ -25,9 +27,10 @@ from .common import (
 
 CLUSTER_INSTANCES = ["replica1", "replica2"]
 
-# One replica of a `ReplicatedMergeTree` table schedules the groups of the `EXPORT` TTL, and stores
-# its state in Keeper; every replica shows the same `system.ttl_exports`, and another replica takes
-# over where the previous one left off. Every replica has the same Iceberg destination.
+# One replica of a `ReplicatedMergeTree` table schedules the groups of the `EXPORT` TTL. Every
+# replica tracks the batching windows of its parts and shows the same `system.ttl_exports`, except
+# for the error of acting on a partition, and another replica takes over where the previous one left
+# off. Every replica has the same Iceberg destination.
 
 
 def make_replicated_tables(replicas, columns=COLUMNS, partition_by="year", spec="year", settings=None):
@@ -77,14 +80,15 @@ def test_replicas_export_once(cluster):
     assert_one_snapshot_per_task(replicas[0], mt_table, iceberg_table)
 
 
-def test_state_is_the_same_on_every_replica(cluster):
-    """`system.ttl_exports` has the same rows on every replica, including the error of a group, which
+def test_rows_are_the_same_on_every_replica(cluster):
+    """`system.ttl_exports` has the same rows on every replica, except the error of a group, which
     only the replica that schedules sees. A day-partitioned Iceberg destination of a monthly source is
     accepted, and a group whose rows are on two days fails when it is exported."""
     replicas = [cluster.instances["replica1"], cluster.instances["replica2"]]
     mt_table, iceberg_table = make_replicated_tables(
         replicas, columns="id Int64, t DateTime", partition_by="toYYYYMM(t)", spec="toRelativeDayNum(t)"
     )
+    holder, other = holder_and_other(replicas, mt_table)
 
     replicas[0].query(f"INSERT INTO {mt_table} VALUES (1, '2020-01-01 10:00:00'), (2, '2020-01-02 10:00:00')")
     replicas[0].query(f"INSERT INTO {mt_table} VALUES (3, '2020-02-01 10:00:00')")
@@ -93,16 +97,18 @@ def test_state_is_the_same_on_every_replica(cluster):
     def settled(rows):
         return (
             "202001" in rows and "202002" in rows
-            and rows["202001"]["last_error"] != "" and rows["202001"]["eligible_parts"] == 1
+            and rows["202001"]["eligible_parts"] == 1
             and rows["202002"]["exported_parts"] == 1 and rows["202002"]["eligible_parts"] == 0
         )
 
-    rows = wait_for_same_ttl_rows(replicas, mt_table, settled)
-    assert "multiple destination partitions" in rows["202001"]["last_error"], rows
+    columns = [column for column in TTL_STATE_COLUMNS if column != "last_error"]
+    rows = wait_for_same_ttl_rows(replicas, mt_table, settled, columns=columns)
     assert rows["202001"]["claimed_parts"] == 0 and rows["202001"]["current_transaction_id"] == "", rows
-    assert rows["202002"]["last_error"] == "", rows
-    assert rows["202001"]["scheduler_replica"] in ("replica1", "replica2"), rows
-    assert rows["202002"]["scheduler_replica"] == rows["202001"]["scheduler_replica"], rows
+    assert rows["202001"]["scheduler_replica"] == holder.name and rows["202002"]["scheduler_replica"] == holder.name, rows
+
+    wait_for_last_error(holder, mt_table, "202001", "multiple destination partitions")
+    assert ttl_rows(holder, mt_table)["202002"]["last_error"] == ""
+    assert all(row["last_error"] == "" for row in ttl_rows(other, mt_table).values()), ttl_rows(other, mt_table)
     for replica in replicas:
         assert_exactly_once(iceberg_ids(replica, iceberg_table), [3])
     assert_one_snapshot_per_task(replicas[0], mt_table, iceberg_table)
@@ -136,8 +142,8 @@ def test_index_snapshot_is_cached(cluster):
 
 
 def test_failover_resumes_the_batch(cluster):
-    """The replica that takes over resumes the batching window where the previous one left off, and
-    nothing is exported twice."""
+    """Every replica tracks the batching window of the parts it has, so the replica that takes over
+    continues it instead of starting it again, and nothing is exported twice."""
     replicas = [cluster.instances["replica1"], cluster.instances["replica2"]]
     mt_table, iceberg_table = make_replicated_tables(
         replicas, settings={"ttl_export_batch_window_seconds": 60, "ttl_export_batch_max_delay_seconds": 600}
@@ -146,8 +152,9 @@ def test_failover_resumes_the_batch(cluster):
 
     holder.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE})")
     sync(replicas, mt_table)
-    first_eligible = wait_until(lambda: first_eligible_time(other, mt_table, "2020"), 60, "The batch was not stored")
-    assert first_eligible == first_eligible_time(holder, mt_table, "2020")
+    first_eligible = wait_until(lambda: first_eligible_time(other, mt_table, "2020"), 60, "The other replica does not track the batch")
+    # The replicas saw the part at their own checks, after it was fetched.
+    assert abs(first_eligible - first_eligible_time(holder, mt_table, "2020")) <= 5
 
     holder.stop_clickhouse(kill=True)
     try:

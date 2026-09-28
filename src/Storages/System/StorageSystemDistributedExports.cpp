@@ -70,7 +70,7 @@ ColumnsDescription StorageSystemDistributedExports::getColumnsDescription()
         {"source", std::make_shared<DataTypeString>(),
             "What created the task: `query` for `ALTER TABLE ... EXPORT PARTITION`, `ttl` for the table's `TTL ... EXPORT TO TABLE` expression."},
         {"retry_of", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()),
-            "For a TTL export task: transaction ids of earlier tasks that failed to export some of this task's parts. Its commit checks whether any of them landed at the destination after all. Empty otherwise."},
+            "For a TTL export task: transaction ids of earlier tasks that failed to export some of this task's parts after exporting all of theirs, so their commit may still land. Its commit checks whether any of them landed at the destination after all. Empty otherwise."},
     };
 }
 

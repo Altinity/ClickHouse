@@ -9,6 +9,7 @@
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Parser.h>
 #include <Storages/ExportCommitInfoEntry.h>
+#include <Storages/ExportRetriedTask.h>
 #include <Storages/ExportTaskSource.h>
 #include <Storages/MergeTree/MergeTreePartExportManifest.h>
 
@@ -62,9 +63,9 @@ struct MergeTreeExportTask
     String destination_uuid;
     time_t create_time = 0;
     ExportTaskSource source = ExportTaskSource::query;
-    /// TTL tasks whose parts this task exports again because they failed. Their commits may still
+    /// TTL tasks whose parts this task exports again because they failed, and whose commits may still
     /// land, which the commit of this task checks.
-    std::vector<String> retry_of;
+    ExportRetriedTasks retry_of;
 
     /// Work + progress
     std::vector<PartProgress> parts;
@@ -161,12 +162,7 @@ struct MergeTreeExportTask
         json.set("create_time", create_time);
         json.set("source", String(magic_enum::enum_name(source)));
         if (!retry_of.empty())
-        {
-            Poco::JSON::Array::Ptr retry_of_array = new Poco::JSON::Array();
-            for (const auto & transaction : retry_of)
-                retry_of_array->add(transaction);
-            json.set("retry_of", retry_of_array);
-        }
+            json.set("retry_of", ExportRetriedTaskUtils::toJSON(retry_of));
         json.set("status", String(magic_enum::enum_name(status)));
 
         Poco::JSON::Array::Ptr parts_array = new Poco::JSON::Array();
@@ -253,9 +249,7 @@ struct MergeTreeExportTask
                 throw Exception(ErrorCodes::INCORRECT_DATA, "Unknown source '{}' in export task descriptor", source_str);
         }
 
-        if (const auto retry_of_array = json->getArray("retry_of"))
-            for (size_t i = 0; i < retry_of_array->size(); ++i)
-                task.retry_of.push_back(retry_of_array->getElement<String>(static_cast<unsigned int>(i)));
+        task.retry_of = ExportRetriedTaskUtils::fromJSON(json->getArray("retry_of"));
 
         const auto status_str = json->getValue<String>("status");
         if (const auto status = magic_enum::enum_cast<Status>(status_str))

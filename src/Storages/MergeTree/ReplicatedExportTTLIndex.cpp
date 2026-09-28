@@ -49,11 +49,6 @@ String ReplicatedExportTTLIndex::getIndexEntryPath(const String & destination_ke
     return fs::path(getDestinationPath(destination_key)) / "partitions" / partition_id;
 }
 
-String ReplicatedExportTTLIndex::getSchedulerStatePath(const String & destination_key) const
-{
-    return fs::path(getDestinationPath(destination_key)) / "state";
-}
-
 int32_t ReplicatedExportTTLIndex::readFenceVersion(const zkutil::ZooKeeperPtr & zookeeper) const
 {
     const auto path = getFencePath();

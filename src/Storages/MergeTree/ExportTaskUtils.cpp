@@ -489,26 +489,18 @@ namespace
     }
 
     std::vector<MergeTreePartInfo> getRangesCommittedByRetriedTasks(
-        const std::vector<String> & retry_of,
+        const ExportRetriedTasks & retry_of,
         const StoragePtr & destination_storage,
-        const std::function<std::optional<std::vector<String>>(const String &)> & get_task_parts,
-        MergeTreeDataFormatVersion format_version,
+        const String & partition_id,
         const ContextPtr & context)
     {
         std::vector<MergeTreePartInfo> ranges;
-        for (const auto & transaction_id : retry_of)
+        for (const auto & retried : retry_of)
         {
-            if (!destination_storage->isExportTransactionCommitted(transaction_id, context))
+            if (!destination_storage->isExportTransactionCommitted(retried.transaction_id, context))
                 continue;
 
-            const auto parts = get_task_parts(transaction_id);
-            if (!parts)
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "Export task {} committed to the destination, but its description is lost, so it is not known which parts it exported. "
-                    "Refusing to commit the task that retries it, which could export them again",
-                    transaction_id);
-
-            const auto task_ranges = ExportTTLUtils::rangesOfParts(*parts, format_version);
+            const auto task_ranges = ExportTTLUtils::fromBlockRanges(partition_id, retried.block_ranges);
             ranges.insert(ranges.end(), task_ranges.begin(), task_ranges.end());
         }
         return ExportFenceUtils::compactRanges(std::move(ranges));
@@ -585,19 +577,8 @@ namespace
         std::vector<std::string> paths_to_commit = exported.paths;
         if (!manifest.retry_of.empty())
         {
-            const auto exports_path = fs::path(entry_path).parent_path();
             const auto committed_ranges = getRangesCommittedByRetriedTasks(
-                manifest.retry_of,
-                destination_storage,
-                [&](const String & transaction_id) -> std::optional<std::vector<String>>
-                {
-                    String metadata_json;
-                    if (!zk->tryGet(exports_path / transaction_id / "metadata.json", metadata_json))
-                        return std::nullopt;
-                    return ExportReplicatedMergeTreeTaskManifest::fromJsonString(metadata_json).parts;
-                },
-                source_storage.format_version,
-                context_in);
+                manifest.retry_of, destination_storage, partition_id, context_in);
 
             if (!committed_ranges.empty())
             {
@@ -678,8 +659,8 @@ namespace
                     export_fence.ensureDestination(zk, destination_key, fmt::format("{}.{}", manifest.destination_database, manifest.destination_table));
 
                 versioned.entry.commitClaim(manifest.transaction_id, ExportTTLUtils::rangesOfParts(manifest.parts, source_storage.format_version));
-                for (const auto & transaction_id : manifest.retry_of)
-                    versioned.entry.releaseClaim(transaction_id);
+                for (const auto & retried : manifest.retry_of)
+                    versioned.entry.releaseClaim(retried.transaction_id);
                 export_fence.appendUpdateEntryOps(ops, destination_key, versioned.entry, versioned.version);
             }
 

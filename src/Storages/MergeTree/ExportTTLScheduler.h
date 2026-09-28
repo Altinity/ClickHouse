@@ -2,6 +2,7 @@
 
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>
+#include <Storages/ExportRetriedTask.h>
 #include <Storages/MergeTree/ExportTTLIndex.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Common/CurrentMetrics.h>
@@ -31,7 +32,7 @@ struct ExportTTLPartitionInfo
     size_t eligible_bytes = 0;
     /// Parts held back from the delete TTL because they are not exported yet.
     size_t parts_held_by_delete_gate = 0;
-    /// When the scheduler first saw an eligible part that is not exported, 0 if there is none.
+    /// When this replica first saw an eligible part that is not exported, 0 if there is none.
     time_t first_eligible_time = 0;
     /// When the next group can start at the latest, 0 if nothing waits.
     time_t next_group_time = 0;
@@ -52,11 +53,12 @@ struct ExportTTLPartitionInfo
 /// Eligible parts of a partition are shipped once no new eligible part appeared for the batching
 /// window, once the first of them waited for the maximum delay, or once they reach the size
 /// threshold. A task that failed without committing keeps its parts claimed, and they are retried
-/// first by the next group, which records the failed tasks in `retry_of`.
+/// first by the next group, which records in `retry_of` the failed tasks whose commit may still land.
 ///
-/// Every replica observes the state of every partition, which `system.ttl_exports` shows. Only
-/// the replica holding the scheduler lock acts on it: it resolves finished tasks, starts groups and
-/// stores its state (`ExportTTLSchedulerState`) for the other replicas.
+/// Every replica observes the state of every partition, which `system.ttl_exports` shows, and
+/// tracks the batching windows of the parts it has, so a replica that takes over the scheduling
+/// continues them. Only the replica holding the scheduler lock acts: it resolves finished tasks and
+/// starts groups.
 ///
 /// Engines implement access to the index and to their export tasks.
 class ExportTTLScheduler
@@ -87,7 +89,10 @@ protected:
     struct TaskState
     {
         TaskStatus status = TaskStatus::MISSING;
-        std::vector<String> retry_of;
+        /// Whether it exported all its parts, which it does before committing: a task that did not
+        /// cannot have committed. Unknown counts as reached.
+        bool reached_commit = true;
+        ExportRetriedTasks retry_of;
     };
 
     struct GroupToStart
@@ -97,7 +102,7 @@ protected:
         StoragePtr destination;
         String partition_id;
         std::vector<MergeTreeDataPartPtr> parts;
-        std::vector<String> retry_of;
+        ExportRetriedTasks retry_of;
         /// The index entry with the claim of the group, to be stored with a check of its version.
         ExportTTLVersionedEntry entry;
     };
@@ -116,12 +121,15 @@ protected:
     /// unless its database is `Replicated`, so they identify it by name only.
     virtual bool identifiesDestinationByUUID() const = 0;
 
-    /// The state stored by the replica that schedules, nothing if there is none.
-    virtual std::optional<ExportTTLSchedulerState> readSchedulerState(const String & destination_key) = 0;
-    virtual void writeSchedulerState(const String & destination_key, const ExportTTLSchedulerState & state) = 0;
     virtual String getReplicaName() const = 0;
 
+    /// The replica holding the scheduler lock, empty if there is none.
+    virtual String getSchedulerReplica() = 0;
+
     virtual TaskState getTaskState(const String & transaction_id) = 0;
+
+    /// Whether a replica is in the commit of the task, e.g. one that started before the task failed.
+    virtual bool isCommitInProgress(const String & transaction_id) = 0;
 
     /// Stores `entry` with a check of its version. Returns false on a conflict.
     virtual bool updateIndexEntry(const String & destination_key, const ExportTTLVersionedEntry & entry) = 0;
@@ -164,16 +172,12 @@ private:
     using TaskStates = std::unordered_map<String, TaskState>;
 
     mutable std::mutex mutex;
-    /// By partition id, for the current destination. Kept by the replica that schedules.
+    /// By partition id, for the current destination.
     std::map<String, PartitionBatch> batches;
     std::map<String, String> last_errors;
     std::map<String, ExportTTLPartitionInfo> info_by_partition;
     String current_destination_key;
     String current_destination_error;
-
-    /// Whether the previous tick scheduled, so a replica that takes over resumes the stored state.
-    bool was_scheduler = false;
-    std::optional<ExportTTLSchedulerState> written_state;
 
     /// False once there is neither an `EXPORT` TTL nor an index left, so ticks do no Keeper reads.
     bool may_have_index = true;
@@ -183,15 +187,24 @@ private:
     ContextPtr makeContext() const;
 
     /// Resolves the claims of the index entry that do not belong to a task in flight. Returns the
-    /// failed tasks whose parts are still claimed, with their own `retry_of`, and the task in flight.
+    /// failed tasks whose parts are still claimed, and the task in flight.
     struct ResolvedClaims
     {
         std::vector<String> failed;
-        std::vector<String> retry_of;
         String in_flight;
         bool changed = false;
     };
     ResolvedClaims resolveClaims(ExportTTLIndexEntry & entry, const StoragePtr & destination, TaskStates & task_states, const ContextPtr & context);
+
+    /// The failed tasks among `failed` and the ones they retried whose commit may still land, for
+    /// the `retry_of` of the group that retries the parts of `failed`.
+    ExportRetriedTasks collectRetriedTasks(
+        const ExportTTLIndexEntry & entry,
+        const std::vector<String> & failed,
+        const StoragePtr & destination,
+        time_t now,
+        TaskStates & task_states,
+        const ContextPtr & context);
 
     const TaskState & getCachedTaskState(TaskStates & task_states, const String & transaction_id);
 
@@ -199,14 +212,13 @@ private:
     /// removes its index once none of them holds a claim.
     void cleanupDestination(const String & destination_key, const std::map<String, ExportTTLVersionedEntry> & index);
 
-    /// Read-only. `update_batch` is set on the replica that schedules, which owns the batching windows.
+    /// Read-only, except for the batching window of the partition, which it returns in the view.
     PartitionView observePartition(
         const ExportTTLIndexEntry & entry,
         const std::vector<MergeTreeDataPartPtr> & parts,
         const TTLDescriptions & export_ttls,
         time_t now,
         PartitionBatch batch,
-        bool update_batch,
         TaskStates & task_states);
 
     /// On the replica that schedules: resolves finished tasks and starts a group if one is due.

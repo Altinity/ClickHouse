@@ -4,6 +4,7 @@
 #include <Storages/ExportReplicatedMergeTreeTaskEntry.h>
 #include <Storages/MergeTree/ExportTaskUtils.h>
 #include <Storages/MergeTree/ExportTTLIndex.h>
+#include <Storages/MergeTree/MergeTreeExportTask.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Settings.h>
 #include <Poco/JSON/Object.h>
@@ -236,17 +237,36 @@ TEST_F(ExportTaskManifestBackCompatTest, TaskSourceAndRetryOfRoundTrip)
     auto manifest = makeValidManifest();
     manifest.source = ExportTaskSource::ttl;
     manifest.destination_uuid = "00000000-0000-0000-0000-000000000001";
-    manifest.retry_of = {"tx0", "tx00"};
+    manifest.retry_of = {
+        ExportRetriedTask{.transaction_id = "tx0", .block_ranges = {{1, 3}, {7, 7}}, .failed_time = 1700000000},
+        ExportRetriedTask{.transaction_id = "tx00", .block_ranges = {{1, 1}}, .failed_time = 1600000000},
+    };
 
     const auto parsed = ExportReplicatedMergeTreeTaskManifest::fromJsonString(manifest.toJsonString());
     EXPECT_EQ(parsed.source, ExportTaskSource::ttl);
     EXPECT_EQ(parsed.destination_uuid, manifest.destination_uuid);
     EXPECT_EQ(parsed.retry_of, manifest.retry_of);
+    EXPECT_EQ(ExportRetriedTaskUtils::transactionIds(parsed.retry_of), (std::vector<String>{"tx0", "tx00"}));
 
     /// A task of `EXPORT PARTITION` records neither.
     const auto query_task = ExportReplicatedMergeTreeTaskManifest::fromJsonString(makeValidManifest().toJsonString());
     EXPECT_EQ(query_task.source, ExportTaskSource::query);
     EXPECT_TRUE(query_task.retry_of.empty());
+}
+
+TEST(ExportTaskUtils, PlainTaskRetryOfRoundTrip)
+{
+    MergeTreeExportTask task;
+    task.transaction_id = "tx1";
+    task.source = ExportTaskSource::ttl;
+    task.parts.push_back({.part_name = "p_1_3_1", .done = true, .paths_in_destination = {"a.parquet"}});
+    task.retry_of = {ExportRetriedTask{.transaction_id = "tx0", .block_ranges = {{1, 3}}, .failed_time = 1700000000}};
+
+    const auto parsed = MergeTreeExportTask::fromJsonString(task.toJsonString());
+    EXPECT_EQ(parsed.retry_of, task.retry_of);
+
+    task.retry_of.clear();
+    EXPECT_TRUE(MergeTreeExportTask::fromJsonString(task.toJsonString()).retry_of.empty());
 }
 
 TEST(ExportTaskUtils, PartitionIdIsDerivedFromParts)

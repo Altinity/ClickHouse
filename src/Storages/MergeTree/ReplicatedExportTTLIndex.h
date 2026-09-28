@@ -20,8 +20,7 @@ namespace DB
 /// Layout under `<zookeeper_path>`:
 ///  - `export_ttl/<destination_key>`: holds `ExportTTLDestination` of one destination;
 ///  - `export_ttl/<destination_key>/partitions/<partition_id>`: an `ExportTTLIndexEntry`;
-///  - `export_ttl/<destination_key>/state`: the `ExportTTLSchedulerState` of the replica that schedules;
-///  - `export_ttl/scheduler_lock`: ephemeral, held by the replica that schedules TTL exports;
+///  - `export_ttl/scheduler_lock`: ephemeral, held by the replica that schedules TTL exports, whose name it holds;
 ///  - `export_fence`: bumped in every transaction that changes an index entry. A merge is assigned
 ///    with a check of the version its predicate read the index at, so no merge is assigned from a
 ///    stale view of the export states.
@@ -35,7 +34,6 @@ public:
     String getSchedulerLockPath() const;
     String getDestinationPath(const String & destination_key) const;
     String getIndexEntryPath(const String & destination_key, const String & partition_id) const;
-    String getSchedulerStatePath(const String & destination_key) const;
 
     /// Destination keys that have an index.
     std::vector<String> listDestinations(const zkutil::ZooKeeperPtr & zookeeper) const;

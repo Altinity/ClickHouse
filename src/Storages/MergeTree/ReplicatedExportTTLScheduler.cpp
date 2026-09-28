@@ -82,37 +82,25 @@ ExportTTLIndexSnapshotPtr ReplicatedExportTTLScheduler::getIndexSnapshot()
     return replicated_storage.export_fence->getSnapshot(replicated_storage.getZooKeeper());
 }
 
-std::optional<ExportTTLSchedulerState> ReplicatedExportTTLScheduler::readSchedulerState(const String & destination_key)
-{
-    String data;
-    if (!replicated_storage.getZooKeeper()->tryGet(replicated_storage.export_fence->getSchedulerStatePath(destination_key), data))
-        return std::nullopt;
-    return ExportTTLSchedulerState::fromJSONString(data);
-}
-
-void ReplicatedExportTTLScheduler::writeSchedulerState(const String & destination_key, const ExportTTLSchedulerState & state)
-{
-    const auto zookeeper = replicated_storage.getZooKeeper();
-    const auto & fence = *replicated_storage.export_fence;
-    const auto path = fence.getSchedulerStatePath(destination_key);
-    const auto data = state.toJSONString();
-
-    auto code = zookeeper->trySet(path, data);
-    if (code == Coordination::Error::ZNONODE)
-    {
-        fence.ensureDestination(zookeeper, destination_key, destination_key);
-        code = zookeeper->tryCreate(path, data, zkutil::CreateMode::Persistent);
-        if (code == Coordination::Error::ZNODEEXISTS)
-            code = zookeeper->trySet(path, data);
-    }
-
-    if (code != Coordination::Error::ZOK)
-        throw zkutil::KeeperException::fromPath(code, path);
-}
-
 String ReplicatedExportTTLScheduler::getReplicaName() const
 {
     return replicated_storage.getReplicaName();
+}
+
+String ReplicatedExportTTLScheduler::getSchedulerReplica()
+{
+    const auto zookeeper = replicated_storage.tryGetZooKeeper();
+    if (!zookeeper || zookeeper->expired())
+        return {};
+
+    String replica;
+    zookeeper->tryGet(replicated_storage.export_fence->getSchedulerLockPath(), replica);
+    return replica;
+}
+
+bool ReplicatedExportTTLScheduler::isCommitInProgress(const String & transaction_id)
+{
+    return replicated_storage.getZooKeeper()->exists(fs::path(replicated_storage.zookeeper_path) / "exports" / transaction_id / "commit_lock");
 }
 
 ExportTTLScheduler::TaskState ReplicatedExportTTLScheduler::getTaskState(const String & transaction_id)
@@ -130,43 +118,74 @@ ExportTTLScheduler::TaskState ReplicatedExportTTLScheduler::getTaskState(const S
         UNREACHABLE();
     };
 
+    const auto zookeeper = replicated_storage.getZooKeeper();
+    const fs::path task_path = fs::path(replicated_storage.zookeeper_path) / "exports" / transaction_id;
+
+    /// Read from Keeper rather than from the mirror of the tasks, which may lag behind the parts
+    /// the task exported. Unknown counts as reached.
+    const auto all_parts_processed = [&](size_t parts_count)
+    {
+        Coordination::Stat stat;
+        if (!zookeeper->exists(task_path / "processed", &stat))
+            return true;
+        return static_cast<size_t>(stat.numChildren) >= parts_count;
+    };
+
+    TaskState state;
+    std::optional<size_t> parts_count;
+
     /// The in-memory mirror of the tasks may lag behind Keeper, which only delays a retry. A task it
     /// does not know yet, e.g. just created, is read from Keeper, so it is never taken for missing.
+    bool found_in_mirror = false;
     if (const auto tasks = replicated_storage.export_partition_manifests.get())
     {
         const auto & by_transaction_id = tasks->get<ExportTaskEntryTagByTransactionId>();
         if (const auto it = by_transaction_id.find(transaction_id); it != by_transaction_id.end())
-            return TaskState{.status = to_task_status(it->status), .retry_of = it->manifest.retry_of};
+        {
+            state.status = to_task_status(it->status);
+            state.retry_of = it->manifest.retry_of;
+            parts_count = it->manifest.parts.size();
+            found_in_mirror = true;
+        }
     }
 
-    const auto zookeeper = replicated_storage.getZooKeeper();
-    const fs::path task_path = fs::path(replicated_storage.zookeeper_path) / "exports" / transaction_id;
-    const Strings paths{task_path / "status", task_path / "metadata.json"};
-
-    auto responses = zookeeper->tryGet(paths);
-    responses.waitForResponses();
-
-    TaskState state;
-    if (responses[0].error == Coordination::Error::ZNONODE)
-        return state;
-    if (responses[0].error != Coordination::Error::ZOK)
-        throw zkutil::KeeperException::fromPath(responses[0].error, paths[0]);
-
-    if (const auto status = magic_enum::enum_cast<Status>(responses[0].data))
+    if (!found_in_mirror)
     {
-        state.status = to_task_status(*status);
-    }
-    else
-    {
-        /// Treated as failed: the recovery check still decides whether it committed.
-        LOG_WARNING(log, "Export task {} has an unknown status {}", transaction_id, responses[0].data);
-        state.status = TaskStatus::FAILED;
+        const Strings paths{task_path / "status", task_path / "metadata.json"};
+
+        auto responses = zookeeper->tryGet(paths);
+        responses.waitForResponses();
+
+        if (responses[0].error == Coordination::Error::ZNONODE)
+            return state;
+        if (responses[0].error != Coordination::Error::ZOK)
+            throw zkutil::KeeperException::fromPath(responses[0].error, paths[0]);
+
+        if (const auto status = magic_enum::enum_cast<Status>(responses[0].data))
+        {
+            state.status = to_task_status(*status);
+        }
+        else
+        {
+            /// Treated as failed: the recovery check still decides whether it committed.
+            LOG_WARNING(log, "Export task {} has an unknown status {}", transaction_id, responses[0].data);
+            state.status = TaskStatus::FAILED;
+        }
+
+        if (responses[1].error == Coordination::Error::ZOK)
+        {
+            auto manifest = ExportReplicatedMergeTreeTaskManifest::fromJsonString(responses[1].data);
+            state.retry_of = std::move(manifest.retry_of);
+            parts_count = manifest.parts.size();
+        }
+        else if (responses[1].error != Coordination::Error::ZNONODE)
+        {
+            throw zkutil::KeeperException::fromPath(responses[1].error, paths[1]);
+        }
     }
 
-    if (responses[1].error == Coordination::Error::ZOK)
-        state.retry_of = ExportReplicatedMergeTreeTaskManifest::fromJsonString(responses[1].data).retry_of;
-    else if (responses[1].error != Coordination::Error::ZNONODE)
-        throw zkutil::KeeperException::fromPath(responses[1].error, paths[1]);
+    if (parts_count && (state.status == TaskStatus::FAILED || state.status == TaskStatus::KILLED))
+        state.reached_commit = all_parts_processed(*parts_count);
 
     return state;
 }

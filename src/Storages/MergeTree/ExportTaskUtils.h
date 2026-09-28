@@ -13,6 +13,7 @@
 #include <Common/Logger.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include "Storages/IStorage.h"
+#include <Storages/ExportRetriedTask.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <config.h>
@@ -58,14 +59,12 @@ namespace ExportTaskUtils
     /// Appends the ops that create the nodes of a new export task at `task_path` (`<zookeeper_path>/exports/<transaction_id>`).
     void appendCreateExportTaskOps(Coordination::Requests & ops, const std::string & task_path, const ExportReplicatedMergeTreeTaskManifest & manifest);
 
-    /// Block ranges committed to `destination_storage` by the tasks in `retry_of` that landed, e.g. a
-    /// commit that the destination applied after the task was considered failed. `get_task_parts`
-    /// returns the parts of a task, or nothing if it is unknown.
+    /// Block ranges of `partition_id` committed to `destination_storage` by the tasks in `retry_of`
+    /// that landed, e.g. a commit that the destination applied after the task was considered failed.
     std::vector<MergeTreePartInfo> getRangesCommittedByRetriedTasks(
-        const std::vector<String> & retry_of,
+        const ExportRetriedTasks & retry_of,
         const StoragePtr & destination_storage,
-        const std::function<std::optional<std::vector<String>>(const String &)> & get_task_parts,
-        MergeTreeDataFormatVersion format_version,
+        const String & partition_id,
         const ContextPtr & context);
 
     /// Parts of `part_names` whose rows are not in `committed_ranges`.

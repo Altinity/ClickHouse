@@ -110,12 +110,12 @@ def ttl_rows(node, table, columns=None):
     return {row[0]: dict(zip(columns, row)) for row in rows}
 
 
-def wait_for_same_ttl_rows(replicas, table, settled, timeout=90):
+def wait_for_same_ttl_rows(replicas, table, settled, timeout=90, columns=None):
     """Wait until every replica shows the same rows of `system.ttl_exports` for *table*, and they
     satisfy *settled*."""
     start = time.time()
     while True:
-        rows = [ttl_rows(replica, table) for replica in replicas]
+        rows = [ttl_rows(replica, table, columns) for replica in replicas]
         if all(replica_rows == rows[0] for replica_rows in rows) and settled(rows[0]):
             return rows[0]
         assert time.time() - start < timeout, f"The rows of system.ttl_exports did not settle: {rows}"

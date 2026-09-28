@@ -110,6 +110,17 @@ TEST(ExportTTLIndex, RangesOfParts)
     EXPECT_EQ(blocks(ranges), (Blocks{{1, 3}, {5, 5}}));
 }
 
+TEST(ExportTTLIndex, BlockRangesOfRetriedTasks)
+{
+    const std::vector<MergeTreePartInfo> ranges{part(1, 3), part(7, 7)};
+    const auto block_ranges = ExportTTLUtils::toBlockRanges(ranges);
+    EXPECT_EQ(block_ranges, (Blocks{{1, 3}, {7, 7}}));
+
+    const auto restored = ExportTTLUtils::fromBlockRanges("p", {{4, 5}, {1, 3}});
+    EXPECT_EQ(blocks(restored), (Blocks{{1, 5}}));
+    EXPECT_EQ(restored.front().getPartitionId(), "p");
+}
+
 TEST(ExportTTLIndex, EligibleOnceTheMaximumIsDue)
 {
     TTLDescription description;
