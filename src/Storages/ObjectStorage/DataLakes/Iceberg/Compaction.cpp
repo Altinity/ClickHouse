@@ -203,8 +203,11 @@ static Plan getPlan(
     Poco::JSON::Object::Ptr initial_metadata_object
         = getMetadataJSONObject(metadata_file_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
 
-    if (initial_metadata_object->getValue<Int32>(Iceberg::f_format_version) < 2)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Compaction is supported only for format_version 2.");
+    /// The metadata is regenerated as format version 2 and row lineage is not carried over.
+    const Int32 format_version = initial_metadata_object->getValue<Int32>(Iceberg::f_format_version);
+    if (format_version != 2)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS, "Compaction is supported only for Iceberg format_version 2, got {}", format_version);
 
     auto current_schema_id = initial_metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
     auto schemas = initial_metadata_object->getArray(Iceberg::f_schemas);

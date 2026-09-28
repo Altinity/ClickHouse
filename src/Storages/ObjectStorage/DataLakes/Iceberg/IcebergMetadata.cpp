@@ -521,7 +521,8 @@ bool IcebergMetadata::optimize(
             ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call optimize for iceberg tables.");
 
     /// Format version 3 requires row lineage to be carried into rewritten files, which neither
-    /// compaction path does yet.
+    /// compaction path does yet. The cached version may be stale, so both paths check the latest
+    /// metadata again; this only rejects early.
     if (persistent_components.format_version != 2)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,

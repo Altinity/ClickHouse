@@ -744,3 +744,68 @@ def test_bin_pack_rejects_format_version_3(started_cluster_iceberg_no_spark):
     )
     assert "BAD_ARGUMENTS" in error
     assert "format_version 2" in error
+
+
+def test_optimize_rejects_table_upgraded_to_v3(started_cluster_iceberg_no_spark):
+    """A table upgraded to v3 by another engine after the table object was created must not be
+    compacted: the table object still caches format version 2, and the full compaction would
+    rewrite the metadata as version 2 and drop row lineage."""
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    table_name = "test_optimize_upgraded_v3_" + get_uuid_str()
+    table_dir = f"/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}"
+
+    create_iceberg_table(
+        "local",
+        instance,
+        table_name,
+        started_cluster_iceberg_no_spark,
+        "(id Int64, value String)",
+        format_version=2,
+    )
+
+    for batch in range(2):
+        values = ", ".join(f"({batch * 100 + i}, 'row_{batch * 100 + i}')" for i in range(100))
+        instance.query(
+            f"INSERT INTO {table_name} VALUES {values}",
+            settings={"allow_insert_into_iceberg": 1},
+        )
+
+    # A position delete routes OPTIMIZE to the full compaction.
+    instance.query(
+        f"DELETE FROM {table_name} WHERE id < 10",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+
+    data_before = instance.query(f"SELECT id, value FROM {table_name} ORDER BY id").strip()
+    list_data_files = f"ls -1 {table_dir}/data | sort"
+    data_files_before = instance.exec_in_container(["bash", "-c", list_data_files])
+
+    # Simulate an external upgrade: publish the next metadata version with format version 3.
+    fake_metadata = instance.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"cd {table_dir}/metadata"
+            " && latest=$(ls -1 v*.metadata.json | sort -V | tail -n 1)"
+            " && next=$(( $(echo \"$latest\" | sed -E 's/^v([0-9]+).*/\\1/') + 1 ))"
+            " && sed -E 's/\"format-version\" *: *2/\"format-version\" : 3/' \"$latest\" > v$next.metadata.json"
+            " && grep -q '\"format-version\" : 3' v$next.metadata.json"
+            " && echo v$next.metadata.json",
+        ]
+    ).strip()
+    assert fake_metadata, "Failed to publish the upgraded metadata file"
+
+    error = instance.query_and_get_error(
+        f"OPTIMIZE TABLE {table_name}",
+        settings={"allow_experimental_iceberg_compaction": 1},
+    )
+    assert "BAD_ARGUMENTS" in error
+    assert "format_version 2" in error
+
+    # Nothing may have been rewritten or removed.
+    assert instance.exec_in_container(["bash", "-c", list_data_files]) == data_files_before
+
+    instance.exec_in_container(["bash", "-c", f"rm {table_dir}/metadata/{fake_metadata}"])
+    instance.query(f"DROP TABLE IF EXISTS {table_name}")
+    create_iceberg_table("local", instance, table_name, started_cluster_iceberg_no_spark)
+    assert instance.query(f"SELECT id, value FROM {table_name} ORDER BY id").strip() == data_before
