@@ -27,6 +27,7 @@
 #include <Core/Settings.h>
 #include <Common/BlobStorageLogWriter.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/LimitSeekableReadBuffer.h>
 #include <IO/copyData.h>
 
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/diskSettings.h>
@@ -970,7 +971,7 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
     const WriteSettings & write_settings,
     IObjectStorage & object_storage_to,
     std::optional<ObjectAttributes> object_to_attributes,
-    size_t object_from_offset)
+    const size_t object_from_offset)
 {
     if (object_from.remote_path.empty())
         throw Exception(
@@ -993,10 +994,9 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
                 /*src_s3_client=*/current_client,
                 /*src_bucket=*/uri.bucket,
                 /*src_key=*/object_from.remote_path,
-                // @todo
-                /*src_offset=*/object_from_offset,
+                /*src_offset=*/0,
                 /*src_size=*/size,
-                /*src_object_offset=*/0,
+                /*src_object_offset=*/object_from_offset,
                 /*dest_s3_client=*/current_client,
                 /*dest_bucket=*/dest_s3->uri.bucket,
                 /*dest_key=*/object_to.remote_path,
@@ -1004,7 +1004,13 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
                 read_settings_to_use,
                 BlobStorageLogWriter::create(disk_name),
                 scheduler,
-                [&, this]{ return readObject(object_from, read_settings_to_use);},
+                [&, this]() -> std::unique_ptr<SeekableReadBuffer>
+                {
+                    auto object = readObject(object_from, read_settings_to_use);
+                    if (!object_from_offset)
+                        return object;
+                    return std::make_unique<LimitSeekableReadBuffer>(std::move(object), object_from_offset, size);
+                },
                 object_to_attributes,
                 write_settings.object_storage_copy_mode);
             return;

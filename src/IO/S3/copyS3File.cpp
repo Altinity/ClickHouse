@@ -894,6 +894,12 @@ void copyS3File(
     const std::optional<ObjectAttributes> & object_metadata,
     ObjectStorageCopyMode copy_mode)
 {
+    if (src_key.empty())
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Cannot copy an S3 object with an empty source key from bucket {} to {}/{}",
+            src_bucket, dest_bucket, dest_key);
+
     if (!dest_s3_client)
         dest_s3_client = src_s3_client;
 

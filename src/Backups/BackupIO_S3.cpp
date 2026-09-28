@@ -409,7 +409,7 @@ void BackupWriterS3::copyFileFromDisk(
                 /* src_key */ blob_path[0],
                 start_pos,
                 length,
-                src_object_offset,
+                /* src_object_offset */ src_object_offset,
                 /* dest_s3_client */ client,
                 /* dest_bucket */ s3_uri.bucket,
                 /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
