@@ -958,20 +958,34 @@ namespace
             /// current compaction (OPTIME TABLE my_iceberg) supports only overwrites wich has only position delete files
             if (update.added_files == 0 && (update.added_position_deletes == update.added_delete_files) && update.added_position_deletes != 0)
                 return std::nullopt;
-            [[fallthrough]];
-        }
-        case SnapshotSummaryOperation::REPLACE:
             throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "Unsupported snapshot's operation type {}", summary->getOperation());
+        }
+        case SnapshotSummaryOperation::REPLACE: {
+            /// A `replace` can only be the first snapshot of the compacted history (see `compactIcebergTable`),
+            /// so it is regenerated as an append of all its live data files.
+            const auto totals = summary->getTotals();
+            return SnapshotSummaryUpdateAppend{
+                .added_files = totals.data_files,
+                .added_records = totals.records,
+                .added_files_size = totals.files_size,
+                .num_partitions = summary->getUpdate<Iceberg::SnapshotSummaryUpdateReplace>().num_partitions};
+        }
     }
 };
 
 
-/// Current experimental compact implementation expects snapshots to be either appends or overwrites which has only position deletes
-/// Lets force this invariant
+/// Current experimental compact implementation expects snapshots to be either appends or overwrites which has only position deletes,
+/// optionally preceded by a single `replace`. Lets force this invariant
 void checkIfIcebergHistorySupported(const IcebergHistory & history)
 {
-    for (const auto & history_record : history)
+    for (size_t i = 0; i < history.size(); ++i)
     {
+        const auto & history_record = history[i];
+        if (i != 0 && history_record.snapshot_summary
+            && history_record.snapshot_summary->getOperation() == SnapshotSummaryOperation::REPLACE)
+            throw DB::Exception(
+                ErrorCodes::LOGICAL_ERROR, "A replace snapshot must start the compacted history, snapshot={}", history_record.snapshot_id);
+
         auto append = tryGetAppendUpdate(history_record);
         if (append && append->added_files == 0)
             throw DB::Exception(
@@ -1367,6 +1381,16 @@ void compactIcebergTable(
     ContextPtr context_,
     const String & write_format)
 {
+    /// Snapshots before the latest `replace` reference data files it removed. Compaction regenerates the
+    /// history from that snapshot on, which expires the older snapshots.
+    auto last_replace = std::find_if(
+        snapshots_info.rbegin(),
+        snapshots_info.rend(),
+        [](const Iceberg::IcebergHistoryRecord & record)
+        { return record.snapshot_summary && record.snapshot_summary->getOperation() == SnapshotSummaryOperation::REPLACE; });
+    if (last_replace != snapshots_info.rend())
+        snapshots_info.erase(snapshots_info.begin(), std::prev(last_replace.base()));
+
     checkIfIcebergHistorySupported(snapshots_info);
 
     auto plan = getPlan(

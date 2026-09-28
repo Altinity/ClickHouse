@@ -38,6 +38,7 @@ bool hasLivePositionDeletes(
 /// larger ones, producing a `replace` snapshot that atomically swaps the old files
 /// for the merged results.  Only data files smaller than `iceberg_min_data_file_size_bytes`
 /// are candidates; each bin targets `iceberg_target_data_file_size_bytes`.
+/// Files are rewritten in the current schema of the latest metadata.
 ///
 /// Leaves all other files, manifests, and snapshot history untouched.
 ///
@@ -47,7 +48,6 @@ BinPackCommitResult executeBinPackCompaction(
     ObjectStoragePtr object_storage,
     SecondaryStorages & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
-    SharedHeader sample_block,
     ContextPtr context,
     const String & write_format);
 

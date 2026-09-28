@@ -9,6 +9,8 @@
 #include <Formats/FormatParserSharedResources.h>
 #include <IO/CompressionMethod.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ExpressionActions.h>
+#include <Interpreters/ProcessList.h>
 #include <Storages/ObjectStorage/DataLakes/Common/Common.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ChunkPartitioner.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Compaction.h>
@@ -34,6 +36,7 @@ namespace DB::ErrorCodes
     extern const int CANNOT_WRITE_TO_FILE_BUFFER;
     extern const int LOGICAL_ERROR;
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
+    extern const int QUERY_WAS_CANCELLED;
 }
 
 namespace DB::Setting
@@ -52,6 +55,14 @@ namespace DB::Iceberg
 
 namespace
 {
+
+SharedHeader makeHeaderFromSchema(IcebergSchemaProcessor & schema_processor, Int32 schema_id)
+{
+    Block header;
+    for (const auto & column : *schema_processor.getClickhouseTableSchemaById(schema_id))
+        header.insert(ColumnWithTypeAndName(column.type->createColumn(), column.type, column.name));
+    return std::make_shared<const Block>(std::move(header));
+}
 
 /// A single live data file recorded from a data manifest.
 struct DataFileRecord
@@ -270,7 +281,6 @@ BinPackPlan buildBinPackPlan(
     /// Live delete entries, used to keep the rewrite away from files they can apply to.
     std::vector<DeleteRecord> delete_records;
     size_t small_files_total = 0;
-    size_t excluded_by_schema = 0;
 
     for (const auto & manifest_file : manifest_list)
     {
@@ -356,22 +366,11 @@ BinPackPlan buildBinPackPlan(
 
             record.source_manifest_path = manifest_file.manifest_file_path.serialize();
             record.is_candidate = static_cast<UInt64>(entry->file_size_in_bytes) < min_file_size;
-            /// Only Parquet columns are resolved by field id; other formats are read by name,
-            /// which is wrong for a file written with a different schema (e.g. before a rename).
-            if (record.is_candidate && record.schema_id != current_schema_id && Poco::toLower(record.file_format) != "parquet")
-            {
-                record.is_candidate = false;
-                ++excluded_by_schema;
-            }
             if (record.is_candidate)
                 ++small_files_total;
             manifest_records.push_back(std::move(record));
         }
     }
-
-    if (excluded_by_schema > 0)
-        LOG_INFO(log, "Excluded {} small non-Parquet files from bin-packing because they were written with an older schema",
-            excluded_by_schema);
 
     /// Exclude from the rewrite every small file that a live delete could still apply to,
     /// following the Iceberg scan-planning rules: a position delete applies to data files with
@@ -675,7 +674,6 @@ BinPackCommitResult executeBinPackCompaction(
     ObjectStoragePtr object_storage,
     SecondaryStorages & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
-    SharedHeader sample_block,
     ContextPtr context,
     const String & write_format)
 {
@@ -760,8 +758,12 @@ BinPackCommitResult executeBinPackCompaction(
             throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                 "Missing schema for current-schema-id {}", current_schema_id);
 
-        /// Source files are read into the current schema; Parquet columns are matched by field id,
-        /// so renamed columns are found and dropped-then-re-added ones read as missing.
+        auto & schema_processor = *persistent_table_components.schema_processor;
+        const Int32 current_schema_id_int = static_cast<Int32>(current_schema_id);
+
+        /// The rewrite reads and writes the schema of the metadata it commits against, not the
+        /// storage's in-memory columns, which may be older than that metadata.
+        const SharedHeader sample_block = makeHeaderFromSchema(schema_processor, current_schema_id_int);
         const ColumnMapperPtr current_schema_column_mapper = createColumnMapper(current_schema);
 
         /// Phase 1: Read small files and write merged data files.
@@ -828,13 +830,26 @@ BinPackCommitResult executeBinPackCompaction(
                     settings, /*num_streams_=*/1);
 
                 const String source_format = file_entry.file_format.empty() ? write_format : file_entry.file_format;
-                const ColumnMapperPtr column_mapper
-                    = Poco::toLower(source_format) == "parquet" ? current_schema_column_mapper : nullptr;
+                const bool is_parquet = Poco::toLower(source_format) == "parquet";
+
+                /// Like `SELECT`, read a file with the schema it was written with (Parquet columns are
+                /// matched by field id when present, by name otherwise) and then evolve it to the
+                /// current schema, so renamed, retyped, added and dropped columns are handled.
+                SharedHeader read_header = sample_block;
+                ColumnMapperPtr column_mapper = is_parquet ? current_schema_column_mapper : nullptr;
+                std::shared_ptr<ExpressionActions> schema_transform;
+                if (file_entry.schema_id != current_schema_id_int)
+                {
+                    read_header = makeHeaderFromSchema(schema_processor, file_entry.schema_id);
+                    column_mapper = is_parquet ? schema_processor.getColumnMapperById(file_entry.schema_id) : nullptr;
+                    auto dag = schema_processor.getSchemaTransformationDagByIds(context, file_entry.schema_id, current_schema_id_int);
+                    schema_transform = std::make_shared<ExpressionActions>(dag->clone());
+                }
 
                 auto input_format = FormatFactory::instance().getInput(
                     source_format,
                     *read_buffer,
-                    *sample_block,
+                    *read_header,
                     context,
                     8192,
                     std::nullopt, /// format_settings
@@ -846,9 +861,26 @@ BinPackCommitResult executeBinPackCompaction(
 
                 while (true)
                 {
+                    if (auto elem = context->getProcessListElement(); elem && elem->isKilled())
+                        throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "OPTIMIZE TABLE cancelled during bin-pack rewrite");
+
                     auto chunk = input_format->read();
                     if (chunk.empty())
                         break;
+
+                    if (schema_transform)
+                    {
+                        size_t num_rows = chunk.getNumRows();
+                        Block block = read_header->cloneWithColumns(chunk.detachColumns());
+                        schema_transform->execute(block, num_rows);
+
+                        Columns columns;
+                        columns.reserve(sample_block->columns());
+                        for (const auto & column : *sample_block)
+                            columns.push_back(block.getByName(column.name).column->convertToFullColumnIfConst());
+                        chunk = Chunk(std::move(columns), num_rows);
+                    }
+
                     writer.consume(chunk);
                 }
 

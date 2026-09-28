@@ -520,7 +520,13 @@ bool IcebergMetadata::optimize(
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS, "Enable 'allow_experimental_iceberg_compaction' setting to call optimize for iceberg tables.");
 
-    const auto sample_block = std::make_shared<const Block>(metadata_snapshot->getSampleBlock());
+    /// Format version 3 requires row lineage to be carried into rewritten files, which neither
+    /// compaction path does yet.
+    if (persistent_components.format_version != 2)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "OPTIMIZE TABLE is supported only for Iceberg format_version 2, got {}",
+            persistent_components.format_version);
 
     auto invalidate_metadata_cache = [&]()
     {
@@ -543,7 +549,7 @@ bool IcebergMetadata::optimize(
             secondary_storages,
             data_lake_settings,
             format_settings,
-            sample_block,
+            std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
             context,
             write_format);
         invalidate_metadata_cache();
@@ -566,7 +572,6 @@ bool IcebergMetadata::optimize(
             object_storage,
             *secondary_storages,
             data_lake_settings,
-            sample_block,
             context,
             write_format);
 
