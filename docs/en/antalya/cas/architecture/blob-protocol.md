@@ -186,7 +186,7 @@ in RAM at a time. Native object storage streams and can use multipart.
 `.meta` has exactly two states: `Clean` (body present, may be referenced) and `Condemned`
 (`GC` observed zero in-degree; the body is still present and a writer may replace it). An
 *absent* `.meta` reads exactly like `Clean` — there is no third "unaccounted" state in the
-stored format; `unaccounted` is an `ca-fsck` classification, not something `GC` ever writes.
+stored format; `unaccounted` is a `cas-fsck` classification, not something `GC` ever writes.
 
 The record carries `state`, `condemn_round`, and `size`, and deliberately carries **no token**:
 it is a per-hash hint, not a per-incarnation fact. All safety comes from the body's in-envelope
