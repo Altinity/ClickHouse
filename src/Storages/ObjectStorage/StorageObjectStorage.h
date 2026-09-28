@@ -17,8 +17,10 @@
 #include <Databases/DataLake/ICatalog.h>
 #include <Storages/MutationCommands.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include <Storages/IPartitionStrategy.h>
 namespace DB
@@ -95,6 +97,7 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         const ContextPtr & context);
 
+<<<<<<< HEAD
     bool supportsImport(ContextPtr) const override;
 
     SinkToStoragePtr import(
@@ -114,6 +117,16 @@ public:
         const Strings & exported_paths,
         const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
+=======
+    /// Shared `drop` implementation: removes the table from `catalog` (if any) and drops `configuration`,
+    /// deleting the data only if `delete_data_on_drop` was captured as `true` by `prepareForDrop`.
+    static void dropImpl(
+        const std::optional<bool> & delete_data_on_drop,
+        const std::shared_ptr<DataLake::ICatalog> & catalog,
+        const StorageObjectStorageConfigurationPtr & configuration,
+        const StorageID & storage_id,
+        const LoggerPtr & log);
+>>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     void truncate(
         const ASTPtr & query,
@@ -122,6 +135,8 @@ public:
         TableExclusiveLockHolder &) override;
 
     void drop() override;
+
+    void prepareForDrop(ContextPtr query_context) override;
 
     bool supportsPartitionBy() const override { return true; }
 
@@ -290,6 +305,8 @@ protected:
     std::shared_ptr<DataLake::ICatalog> catalog;
     StorageID storage_id;
     BackgroundJobsAssignee background_operations_assignee;
+
+    std::atomic<std::optional<bool>> delete_data_on_drop;
 };
 
 }

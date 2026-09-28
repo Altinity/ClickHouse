@@ -22,6 +22,10 @@
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTOrderByElement.h>
+#include <Parsers/ExpressionListParsers.h>
+#include <Parsers/ParserCreateQuery.h>
+#include <Parsers/parseQuery.h>
+#include <fmt/ranges.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergTableStateSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
@@ -427,7 +431,17 @@ bool writeMetadataFileAndVersionHint(
         }
         else
         {
-            break;
+            /// Remove the metadata file written above, otherwise version-hint resolution could later
+            /// pick this uncommitted file as the latest version.
+            LOG_INFO(
+                getLogger("IcebergMetadataFileWriter"),
+                "Removing the uncommitted Iceberg metadata file {}: the version hint is already at version {}, "
+                "at or past version {} this commit tried to write, so the write did not commit",
+                storage_metadata_path,
+                old_version,
+                metadata_file_info.version);
+            object_storage->removeObjectIfExists(StoredObject(storage_metadata_path));
+            return false;
         }
         ++i;
     }
@@ -881,6 +895,8 @@ static Poco::JSON::Object::Ptr getPartitionField(
     {
         if (!param.has_value())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "TRUNCATE function for iceberg partitioning requires one integer parameter");
+        if (*param <= 0)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "TRUNCATE function for iceberg partitioning requires a positive width, got {}", *param);
         result->set(Iceberg::f_transform, fmt::format("truncate[{}]", *param));
         return result;
     }
@@ -888,6 +904,8 @@ static Poco::JSON::Object::Ptr getPartitionField(
     {
         if (!param.has_value())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "BUCKET function for iceberg partitioning requires one integer parameter");
+        if (*param <= 0)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "BUCKET function for iceberg partitioning requires a positive number of buckets, got {}", *param);
         result->set(Iceberg::f_transform, fmt::format("bucket[{}]", *param));
         return result;
     }
@@ -1606,6 +1624,7 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
     return KeyDescription::parse(order_by_str, column_description, {}, local_context, true);
 }
 
+<<<<<<< HEAD
 /// Format one partition field for display in Iceberg/Spark style, e.g. "day(ts)" or "bucket(16, id)".
 static String formatPartitionFieldDisplay(const String & iceberg_transform_name, const String & column_name)
 {
@@ -1722,6 +1741,126 @@ std::optional<String> getSortingKeyDisplayStringFromMetadata(Poco::JSON::Object:
         return result.empty() ? std::nullopt : std::optional<String>(result);
     }
     return std::nullopt;
+=======
+static String formatIcebergTransformExpression(
+    Poco::JSON::Object::Ptr field, const std::unordered_map<Int32, String> & source_id_to_column_name)
+{
+    const auto transform_name = Poco::toLower(field->getValue<String>(f_transform));
+    const auto transform = parseTransformAndArgument(transform_name);
+    if (!transform)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg transform '{}' cannot be represented in `CREATE TABLE`", transform_name);
+
+    if (transform->transform_name == "tuple")
+        return {};
+
+    const auto source_id = field->getValue<Int32>(f_source_id);
+    const auto it = source_id_to_column_name.find(source_id);
+    if (it == source_id_to_column_name.end())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Iceberg field with source id {} is not a top-level column of the current schema, so it cannot be represented in `CREATE TABLE`",
+            source_id);
+
+    auto column_name = backQuoteIfNeed(it->second);
+    if (transform->transform_name == "identity")
+        return column_name;
+    if (transform->argument)
+        return fmt::format("{}({}, {})", transform->transform_name, *transform->argument, column_name);
+    return fmt::format("{}({})", transform->transform_name, column_name);
+}
+
+std::pair<ASTPtr, ASTPtr> getPartitionAndSortingKeyASTsFromMetadata(const Poco::JSON::Object::Ptr & metadata_object)
+{
+    const auto schema = metadata_object->has(f_schemas) && metadata_object->has(f_current_schema_id)
+        ? parseTableSchemaV2Method(metadata_object).first
+        : parseTableSchemaV1Method(metadata_object).first;
+
+    std::unordered_map<Int32, String> source_id_to_column_name;
+    const auto schema_fields = schema->getArray(f_fields);
+    for (UInt32 i = 0; i < schema_fields->size(); ++i)
+    {
+        const auto field = schema_fields->getObject(i);
+        source_id_to_column_name[field->getValue<Int32>(f_id)] = field->getValue<String>(f_name);
+    }
+
+    Poco::JSON::Array::Ptr partition_fields;
+    if (metadata_object->has(f_partition_specs))
+    {
+        const auto default_spec_id = metadata_object->getValue<Int64>(f_default_spec_id);
+        const auto partition_specs = metadata_object->getArray(f_partition_specs);
+        for (UInt32 i = 0; i < partition_specs->size(); ++i)
+        {
+            const auto partition_spec = partition_specs->getObject(i);
+            if (partition_spec->getValue<Int64>(f_spec_id) == default_spec_id)
+            {
+                partition_fields = partition_spec->getArray(f_fields);
+                break;
+            }
+        }
+    }
+    else if (metadata_object->has(f_partition_spec))
+    {
+        partition_fields = metadata_object->getArray(f_partition_spec);
+    }
+
+    ASTPtr partition_by;
+    if (partition_fields)
+    {
+        std::vector<String> expressions;
+        for (UInt32 i = 0; i < partition_fields->size(); ++i)
+        {
+            if (auto expression = formatIcebergTransformExpression(partition_fields->getObject(i), source_id_to_column_name); !expression.empty())
+                expressions.push_back(std::move(expression));
+        }
+
+        if (!expressions.empty())
+        {
+            String partition_by_str = fmt::format("{}", fmt::join(expressions, ", "));
+            if (expressions.size() > 1)
+                partition_by_str = "(" + partition_by_str + ")";
+            ParserExpression parser;
+            partition_by = parseQuery(parser, partition_by_str, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+        }
+    }
+
+    ASTPtr order_by;
+    if (metadata_object->has(f_sort_orders))
+    {
+        const auto default_sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
+        const auto sort_orders = metadata_object->getArray(f_sort_orders);
+        for (UInt32 i = 0; i < sort_orders->size(); ++i)
+        {
+            const auto sort_order = sort_orders->getObject(i);
+            if (sort_order->getValue<Int64>(f_order_id) != default_sort_order_id)
+                continue;
+
+            std::vector<String> expressions;
+            const auto sort_fields = sort_order->getArray(f_fields);
+            for (UInt32 field_index = 0; field_index < sort_fields->size(); ++field_index)
+            {
+                const auto sort_field = sort_fields->getObject(field_index);
+                auto expression = formatIcebergTransformExpression(sort_field, source_id_to_column_name);
+                if (expression.empty())
+                    continue;
+                if (Poco::toLower(sort_field->getValue<String>(f_direction)) == "desc")
+                    expression += " DESC";
+                expressions.push_back(std::move(expression));
+            }
+
+            if (!expressions.empty())
+            {
+                String order_by_str = fmt::format("{}", fmt::join(expressions, ", "));
+                if (expressions.size() > 1)
+                    order_by_str = "(" + order_by_str + ")";
+                ParserStorageOrderByClause parser(/*allow_order_=*/ true);
+                order_by = parseQuery(parser, order_by_str, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+            }
+            break;
+        }
+    }
+
+    return {partition_by, order_by};
+>>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 }
 
 DataTypePtr getFunctionResultType(const String & iceberg_transform_name, DataTypePtr source_type)

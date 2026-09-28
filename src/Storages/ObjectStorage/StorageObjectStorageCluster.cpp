@@ -41,7 +41,7 @@ namespace DB
 {
 namespace Setting
 {
-    extern const SettingsBool iceberg_delete_data_on_drop;
+    extern const SettingsBool data_lake_delete_data_on_drop;
     extern const SettingsBool use_hive_partitioning;
     extern const SettingsBool cluster_function_process_archive_on_multiple_nodes;
     extern const SettingsObjectStorageGranularityLevel cluster_table_function_split_granularity;
@@ -305,6 +305,110 @@ std::string StorageObjectStorageCluster::getName() const
     return configuration->getEngineName();
 }
 
+<<<<<<< HEAD
+=======
+SinkToStoragePtr StorageObjectStorageCluster::write(
+    const ASTPtr &,
+    const StorageMetadataPtr & metadata_snapshot,
+    ContextPtr local_context,
+    bool /* async_insert */)
+{
+    if (!configuration->isDataLakeConfiguration())
+        configuration->update(object_storage, local_context);
+
+    return StorageObjectStorage::createSink(
+        configuration, object_storage, getStorageID(), format_settings, catalog, metadata_snapshot, local_context);
+}
+
+bool StorageObjectStorageCluster::supportsParallelInsert() const
+{
+    if (configuration->isDataLakeConfiguration())
+        configuration->lazyInitializeIfNeeded(object_storage, CurrentThread::tryGetQueryContext());
+    return configuration->supportsParallelInsert();
+}
+
+bool StorageObjectStorageCluster::supportsDelete() const
+{
+    if (configuration->isDataLakeConfiguration())
+        configuration->lazyInitializeIfNeeded(object_storage, CurrentThread::tryGetQueryContext());
+    return configuration->supportsDelete();
+}
+
+bool StorageObjectStorageCluster::optimize(
+    const ASTPtr & /*query*/,
+    const StorageMetadataPtr & metadata_snapshot,
+    const ASTPtr & /*partition*/,
+    bool /*final*/,
+    bool /*deduplicate*/,
+    const Names & /*deduplicate_by_columns*/,
+    bool /*cleanup*/,
+    ContextPtr context)
+{
+    return configuration->optimize(object_storage, metadata_snapshot, context, format_settings);
+}
+
+void StorageObjectStorageCluster::mutate(const MutationCommands & commands, ContextPtr context)
+{
+    updateExternalDynamicMetadataIfExists(context);
+    auto metadata_snapshot = getInMemoryMetadataPtr(context, false);
+    configuration->mutate(commands, context, shared_from_this(), getStorageID(), metadata_snapshot, catalog, format_settings);
+}
+
+void StorageObjectStorageCluster::checkMutationIsPossible(const MutationCommands & commands, const Settings & /*settings*/) const
+{
+    configuration->checkMutationIsPossible(object_storage, CurrentThread::tryGetQueryContext(), commands);
+}
+
+void StorageObjectStorageCluster::alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & /*alter_lock_holder*/, DDLGuardPtr & /*ddl_guard*/)
+{
+    auto metadata_snapshot = getInMemoryMetadataPtr(context, false);
+    StorageInMemoryMetadata new_metadata = *metadata_snapshot;
+    params.apply(new_metadata, context);
+
+    checkMetadataDoesNotExceedMaxQuerySize(getStorageID(), new_metadata, context);
+
+    configuration->alter(object_storage, params, context, getStorageID(), catalog);
+
+    if (catalog)
+        return;
+
+    const auto storage_id = getStorageID();
+    DatabaseCatalog::instance()
+        .getDatabase(storage_id.database_name)
+        ->alterTable(context, storage_id, new_metadata, /*validate_new_create_query=*/true);
+    setInMemoryMetadata(new_metadata);
+}
+
+void StorageObjectStorageCluster::checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const
+{
+    configuration->checkAlterIsPossible(object_storage, context, commands);
+}
+
+Pipe StorageObjectStorageCluster::executeCommand(const String & command_name, const ASTPtr & args, ContextPtr context)
+{
+    if (!configuration->isDataLakeConfiguration())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXECUTE command '{}' is not supported by this storage", command_name);
+
+    configuration->update(object_storage, context);
+    auto metadata = configuration->getExternalMetadata();
+    if (!metadata)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXECUTE command '{}' is not supported by this storage", command_name);
+
+    return metadata->executeCommand(command_name, args, object_storage, configuration, catalog, context, getStorageID());
+}
+
+void StorageObjectStorageCluster::prepareForDrop(ContextPtr query_context)
+{
+    delete_data_on_drop = query_context->getSettingsRef()[Setting::data_lake_delete_data_on_drop];
+}
+
+void StorageObjectStorageCluster::drop()
+{
+    StorageObjectStorage::dropImpl(
+        delete_data_on_drop.load(), catalog, configuration, getStorageID(), getLogger("StorageObjectStorageCluster"));
+}
+
+>>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 std::optional<UInt64> StorageObjectStorageCluster::totalRows(ContextPtr query_context) const
 {
     if (pure_storage)

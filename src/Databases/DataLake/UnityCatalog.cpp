@@ -350,6 +350,44 @@ bool UnityCatalog::tryGetTableMetadata(
     }
 }
 
+<<<<<<< HEAD
+=======
+bool UnityCatalog::createTable(
+    const String & namespace_name,
+    const String & table_name,
+    const String & table_location,
+    Poco::JSON::Object::Ptr metadata_content,
+    DB::CompressionMethod /*metadata_compression_method*/,
+    bool /*if_not_exists*/) const
+{
+    auto fields = metadata_content->getArray("fields");
+    if (!fields)
+        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Delta schema fields are missing for Unity createTable");
+
+    auto body = buildUnityCreateTableBody(
+        warehouse, namespace_name, table_name, table_location, buildUnityColumnsFromDeltaSchema(fields));
+
+    LOG_DEBUG(log, "Creating table {}.{}.{} at `{}` in Unity catalog", warehouse, namespace_name, table_name, table_location);
+
+    try
+    {
+        auto response = postJSONRequest(
+            TABLES_ENDPOINT,
+            [&](std::ostream & os) { body->stringify(os); });
+        LOG_TEST(log, "Unity createTable response: {}", response.second);
+    }
+    catch (...)
+    {
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+            "Failed to create table {}.{} in Unity catalog: {}",
+            namespace_name, table_name, DB::getCurrentExceptionMessage(/* with_stacktrace */ false));
+    }
+
+    return true;
+}
+
+>>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 bool UnityCatalog::existsTable(const std::string & schema_name, const std::string & table_name) const
 {
     if (!isNamespaceAllowed(schema_name))

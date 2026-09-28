@@ -5991,9 +5991,16 @@ Possible values:
 - manifest_file_entry - Everything above + traversed avro manifest files entries.
 )", 0) \
     \
+<<<<<<< HEAD
     DECLARE(Bool, iceberg_delete_data_on_drop, false, R"(
 Whether to delete all iceberg files on drop or not.
 )", 0) \
+=======
+    DECLARE_WITH_ALIAS(Bool, data_lake_delete_data_on_drop, false, R"(
+Whether to delete the underlying data files when dropping a data lake table. For catalog databases the catalog is asked to purge the data (`purgeRequested=true`); for self-managed tables ClickHouse removes the files directly.
+)", 0, iceberg_delete_data_on_drop, \
+        {"26.10", false, false, "New setting that unifies dropping of data lake data; the released `iceberg_delete_data_on_drop` is kept as an alias for it."}) \
+>>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
     DECLARE(Int64, iceberg_expire_default_min_snapshots_to_keep, 1, R"(
 Default value for Iceberg table property `history.expire.min-snapshots-to-keep` used by `expire_snapshots` when that property is absent.
 )", 0) \
@@ -8288,9 +8295,21 @@ Enable distributed index analysis even for non SharedMergeTree (cloud only engin
 Allow experimental database engine DataLakeCatalog with catalog_type = 'iceberg'
 
 Cloud default value: `1`.
+<<<<<<< HEAD
 )", BETA, allow_database_iceberg) \
     DECLARE_WITH_ALIAS(Bool, allow_experimental_database_unity_catalog, true, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'unity'
+=======
+)", BETA, allow_experimental_database_iceberg, \
+        {"25.8", false, false, "Added an alias for setting `allow_experimental_database_iceberg`"}, \
+        {"24.12", false, false, "New setting. At the time the setting was named `allow_experimental_database_iceberg`, which is now an alias of it."}) \
+    DECLARE(Bool, datalake_create_table_as_ignore_unsupported_source_properties, false, R"(
+Allow `CREATE TABLE ... AS` in a `DataLakeCatalog` database to ignore table properties inherited from the source that the destination cannot represent. Properties written explicitly in the destination `CREATE TABLE` query are still rejected.
+)", BETA, \
+        {"26.10", false, false, "New setting: allow `CREATE TABLE ... AS` in a `DataLakeCatalog` to ignore unsupported properties inherited from the source."}) \
+    DECLARE_WITH_ALIAS(Bool, allow_database_unity_catalog, false, R"(
+Allow database engine `DataLakeCatalog` with `catalog_type = 'unity'`
+>>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
 Cloud default value: `1`.
 )", BETA, allow_database_unity_catalog) \

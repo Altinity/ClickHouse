@@ -54,6 +54,21 @@ public:
         return DB::DatabaseDataLakeCatalogType::UNITY;
     }
 
+<<<<<<< HEAD
+=======
+    DataLakeTableFormat getTableFormat(const TableMetadata &) const override { return DataLakeTableFormat::DELTA; }
+
+    /// Register a freshly created external DELTA table with Unity; `metadata_content` holds the Delta schema from `createInitial`.
+    /// The shared `ICatalog` parameter (a `vN.metadata.json` path for Iceberg) is the table's storage location for DeltaLake/Unity.
+    bool createTable(
+        const String & namespace_name,
+        const String & table_name,
+        const String & table_location,
+        Poco::JSON::Object::Ptr metadata_content,
+        DB::CompressionMethod metadata_compression_method,
+        bool if_not_exists) const override;
+
+>>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 private:
     const std::filesystem::path base_url;
     const LoggerPtr log;
