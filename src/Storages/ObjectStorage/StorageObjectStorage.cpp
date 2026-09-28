@@ -904,45 +904,58 @@ IStorage::ImportResult StorageObjectStorage::import(
         local_context));
 }
 
-IStorage::ExportPartitionCommitInfo StorageObjectStorage::commitExportPartitionTransaction(
+/// The commit file is in the directory of the table: for a path with wildcards, such as
+/// `table/{_partition_id}/{_file}.parquet`, the directory before the first of them.
+static String getExportCommitMarkerPath(const StorageObjectStorageConfiguration & configuration, const String & transaction_id)
+{
+    String directory = configuration.getRawPath().path;
+    if (const auto wildcard = directory.find('{'); wildcard != String::npos)
+    {
+        const auto slash = directory.rfind('/', wildcard);
+        directory = slash == String::npos ? "" : directory.substr(0, slash);
+    }
+    return directory.empty() ? "commit_" + transaction_id : directory + "/commit_" + transaction_id;
+}
+
+IStorage::ExportCommitInfo StorageObjectStorage::commitExportTransaction(
     const String & transaction_id,
-    const String & partition_id,
+    const String & /* partition_id */,
     const Strings & exported_paths,
-    const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
+    const IcebergCommitExportArguments & iceberg_commit_export_arguments,
     ContextPtr local_context)
 {
     if (isDataLake())
     {
         /// Parse the Iceberg metadata snapshot (stored in ZooKeeper at export-start time) only to
         /// extract the schema-id and partition-spec-id that were current when the export began.
-        /// partition_columns and partition_types are derived inside commitExportPartitionTransaction
+        /// partition_columns and partition_types are derived inside commitExportTransaction
         /// from the same JSON; the representative source partition columns are carried here so the
         /// partition tuple can be recomputed through the destination transform.
         Poco::JSON::Parser iceberg_parser;
         Poco::JSON::Object::Ptr iceberg_metadata =
-            iceberg_parser.parse(iceberg_commit_export_partition_arguments.metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+            iceberg_parser.parse(iceberg_commit_export_arguments.metadata_json_string).extract<Poco::JSON::Object::Ptr>();
 
         const auto original_schema_id = iceberg_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
         const auto partition_spec_id   = iceberg_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
 
         configuration->lazyInitializeIfNeeded(object_storage, local_context);
         auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
-        return configuration->getExternalMetadata()->commitExportPartitionTransaction(
+        return configuration->getExternalMetadata()->commitExportTransaction(
             catalog,
             storage_id,
             transaction_id,
             original_schema_id,
             partition_spec_id,
-            iceberg_commit_export_partition_arguments.partition_source_block,
+            iceberg_commit_export_arguments.partition_source_block,
             std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
             exported_paths,
             configuration,
             local_context);
     }
 
-    const String commit_object = configuration->getRawPath().path + "/commit_" + partition_id + "_" + transaction_id;
+    const String commit_object = getExportCommitMarkerPath(*configuration, transaction_id);
 
-    ExportPartitionCommitInfo result;
+    ExportCommitInfo result;
     result.commit_marker_file = commit_object;
 
     /// if file already exists, nothing to be done
@@ -962,6 +975,19 @@ IStorage::ExportPartitionCommitInfo StorageObjectStorage::commitExportPartitionT
     }
     out->finalize();
     return result;
+}
+
+bool StorageObjectStorage::isExportTransactionCommitted(
+    const String & transaction_id,
+    ContextPtr local_context)
+{
+    if (isDataLake())
+    {
+        configuration->lazyInitializeIfNeeded(object_storage, local_context);
+        return configuration->getExternalMetadata()->isExportTransactionCommitted(transaction_id, local_context);
+    }
+
+    return object_storage->exists(StoredObject(getExportCommitMarkerPath(*configuration, transaction_id)));
 }
 
 void StorageObjectStorage::truncate(

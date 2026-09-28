@@ -17,6 +17,7 @@
 #include <Storages/MergeTree/BackgroundJobsAssignee.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
+#include <Storages/MergeTree/ExportTTLDeleteGate.h>
 #include <Storages/MergeTree/MergeTreeMutationStatus.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/ExportList.h>
@@ -41,7 +42,7 @@
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
 #include <Storages/MergeTree/MergeTreePartExportStatus.h>
 #include <Storages/MergeTree/MergeTreePartExportManifest.h>
-#include <Storages/MergeTree/PartitionExportInfo.h>
+#include <Storages/MergeTree/ExportTaskInfo.h>
 
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/ordered_index.hpp>
@@ -50,6 +51,9 @@
 
 namespace DB
 {
+
+class ExportTTLScheduler;
+struct ExportTTLPartitionInfo;
 
 /// Number of streams is not number parts, but number or parts*files, hence 100.
 const size_t DEFAULT_DELAYED_STREAMS_FOR_PARALLEL_WRITE = 100;
@@ -1112,9 +1116,9 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXPORT PARTITION is not implemented for engine {}", getName());
     }
 
-    /// Snapshot of this table's partition-export tasks for `system.partition_exports`, taken from
+    /// Snapshot of this table's partition-export tasks for `system.distributed_exports`, taken from
     /// an in-memory mirror: no disk or ZooKeeper I/O, so it is safe to call from query threads.
-    virtual std::vector<PartitionExportInfo> getPartitionExportsInfo() const { return {}; }
+    virtual std::vector<ExportTaskInfo> getExportTasksInfo() const { return {}; }
 
     /// Checks that Partition could be dropped right now
     /// Otherwise - throws an exception with detailed information.
@@ -1519,6 +1523,7 @@ protected:
     friend class VersionMetadataOnKeeper; // for access to log
     friend class MutationsState; // for access to log
     friend class ExportPartTask;
+    friend class ExportTTLScheduler;
 
     bool require_part_metadata;
 
@@ -1757,6 +1762,33 @@ protected:
     void checkPartitionKeyAndInitMinMax(const KeyDescription & new_partition_key);
 
     void checkTTLExpressions(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata) const;
+
+    /// Validates the `TTL ... EXPORT TO TABLE` expression of an ALTER, if it changes it.
+    void checkExportTTL(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, ContextPtr local_context) const;
+
+public:
+    /// Validates the `TTL ... EXPORT TO TABLE` expression of the table `table_id` being created or
+    /// altered. The partition key of the destination is checked against the parts of every group
+    /// when it is exported.
+    static void validateExportTTL(
+        const StorageID & table_id, const StorageInMemoryMetadata & new_metadata, const MergeTreeSettingsPtr & settings, ContextPtr local_context);
+
+    /// The destination of an `EXPORT` TTL: an unqualified table name refers to this table's database.
+    StorageID getExportTTLDestination(const TTLDescription & export_ttl) const;
+    static StorageID getExportTTLDestination(const StorageID & table_id, const TTLDescription & export_ttl);
+
+    ExportTTLDeleteGate getExportTTLDeleteGate() const;
+
+    /// The export states of parts as last seen, without reading Keeper. May be older than the
+    /// index, which only makes the delete gate hold more parts.
+    virtual ExportFencePtr getLatestExportFence() const { return nullptr; }
+
+    /// For `system.ttl_exports`, empty if the table has no `EXPORT` TTL scheduler.
+    std::vector<ExportTTLPartitionInfo> getExportTTLInfo() const;
+
+protected:
+    /// Created by the engines that support `TTL ... EXPORT`.
+    std::shared_ptr<ExportTTLScheduler> export_ttl_scheduler;
 
     void checkStoragePolicy(const StoragePolicyPtr & new_storage_policy) const;
 

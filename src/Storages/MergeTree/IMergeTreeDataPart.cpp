@@ -3021,6 +3021,12 @@ bool IMergeTreeDataPart::checkAllTTLCalculated(const StorageMetadataPtr & metada
             return false;
     }
 
+    for (const auto & export_desc : metadata_snapshot->getExportTTLs())
+    {
+        if (!ttl_infos.export_ttl.contains(export_desc.result_column))
+            return false;
+    }
+
     for (const auto & group_by_desc : metadata_snapshot->getGroupByTTLs())
     {
         if (!ttl_infos.group_by_ttl.contains(group_by_desc.result_column))

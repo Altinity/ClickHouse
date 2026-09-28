@@ -27,7 +27,7 @@ CLUSTER_INSTANCES = ["replica1", "replica2"]
 def test_failure_is_logged_in_system_table(cluster, source_engine):
     """
     When a part export fails with a non-retryable error the export must be marked
-    FAILED in system.partition_exports with a non-zero exception_count.
+    FAILED in system.distributed_exports with a non-zero exception_count.
 
     Uses the export_part_non_retryable_throw failpoint (throws BAD_ARGUMENTS, a
     denylisted code) so the task fails fast without consuming any timeout budget.
@@ -54,7 +54,7 @@ def test_failure_is_logged_in_system_table(cluster, source_engine):
 
     status = node.query(
         f"""
-        SELECT status FROM system.partition_exports
+        SELECT status FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{iceberg_table}'
           AND partition_id = '2020'
@@ -64,13 +64,13 @@ def test_failure_is_logged_in_system_table(cluster, source_engine):
 
     exception_count = int(node.query(
         f"""
-        SELECT any(exception_count) FROM system.partition_exports
+        SELECT any(exception_count) FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{iceberg_table}'
           AND partition_id = '2020'
         """
     ).strip())
-    assert exception_count > 0, "Expected non-zero exception_count in system.partition_exports"
+    assert exception_count > 0, "Expected non-zero exception_count in system.distributed_exports"
 
     count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
     assert count == 0, f"Expected 0 rows in Iceberg table after a failed export, got {count}"
@@ -124,7 +124,7 @@ def test_inject_short_living_failures(cluster):
 
     status = node.query(
         f"""
-        SELECT status FROM system.partition_exports
+        SELECT status FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{iceberg_table}'
           AND partition_id = '2020'
@@ -134,7 +134,7 @@ def test_inject_short_living_failures(cluster):
 
     exception_count = int(node.query(
         f"""
-        SELECT exception_count FROM system.partition_exports
+        SELECT exception_count FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{iceberg_table}'
           AND partition_id = '2020'
@@ -163,7 +163,7 @@ def test_export_partition_retryable_error_killed_on_timeout(cluster, source_engi
         # first retry. With the new model there is no budget and only the 5s timeout fails it.
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-            f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5,"
+            f" SETTINGS export_merge_tree_task_timeout_seconds = 5,"
             f"          allow_insert_into_iceberg = 1"
         )
 
@@ -171,7 +171,7 @@ def test_export_partition_retryable_error_killed_on_timeout(cluster, source_engi
         # budget would already have transitioned the task to FAILED by now.
         time.sleep(15)
         status = node.query(
-            f"SELECT status FROM system.partition_exports"
+            f"SELECT status FROM system.distributed_exports"
             f" WHERE source_table = '{mt_table}'"
             f"   AND destination_table = '{iceberg_table}'"
             f"   AND partition_id = '2020'"
@@ -188,7 +188,7 @@ def test_export_partition_retryable_error_killed_on_timeout(cluster, source_engi
         node.query("SYSTEM DISABLE FAILPOINT export_part_retryable_throw")
 
     exception_count = int(node.query(
-        f"SELECT any(exception_count) FROM system.partition_exports"
+        f"SELECT any(exception_count) FROM system.distributed_exports"
         f" WHERE source_table = '{mt_table}'"
         f"   AND destination_table = '{iceberg_table}'"
         f"   AND partition_id = '2020'"
@@ -218,8 +218,8 @@ def test_export_partition_retryable_error_recovers_after_failpoint_cleared(clust
     try:
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-            f" SETTINGS export_merge_tree_partition_retry_initial_backoff_seconds = 1,"
-            f"          export_merge_tree_partition_retry_max_backoff_seconds = 2,"
+            f" SETTINGS export_merge_tree_retry_initial_backoff_seconds = 1,"
+            f"          export_merge_tree_retry_max_backoff_seconds = 2,"
             f"          allow_insert_into_iceberg = 1"
         )
 
@@ -228,7 +228,7 @@ def test_export_partition_retryable_error_recovers_after_failpoint_cleared(clust
         wait_for_exception_count(node, mt_table, iceberg_table, "2020",
                                  min_exception_count=1, timeout=60)
         status = node.query(
-            f"SELECT status FROM system.partition_exports"
+            f"SELECT status FROM system.distributed_exports"
             f" WHERE source_table = '{mt_table}'"
             f"   AND destination_table = '{iceberg_table}'"
             f"   AND partition_id = '2020'"
@@ -277,8 +277,8 @@ def test_export_partition_local_backoff_does_not_block_other_replica(cluster):
     try:
         replica1.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-            f" SETTINGS export_merge_tree_partition_retry_initial_backoff_seconds = 1,"
-            f"          export_merge_tree_partition_retry_max_backoff_seconds = 2,"
+            f" SETTINGS export_merge_tree_retry_initial_backoff_seconds = 1,"
+            f"          export_merge_tree_retry_max_backoff_seconds = 2,"
             f"          allow_insert_into_iceberg = 1"
         )
 
@@ -294,7 +294,7 @@ def test_export_partition_local_backoff_does_not_block_other_replica(cluster):
         backoff_replica1 = "0"
         while time.time() < deadline:
             backoff_replica1 = replica1.query(
-                f"SELECT length(local_backoff_per_part) FROM system.partition_exports"
+                f"SELECT length(local_backoff_per_part) FROM system.distributed_exports"
                 f" WHERE source_table = '{mt_table}'"
                 f"   AND destination_table = '{iceberg_table}'"
                 f"   AND partition_id = '2020'"
@@ -310,7 +310,7 @@ def test_export_partition_local_backoff_does_not_block_other_replica(cluster):
         # ... and it must NOT have leaked to replica2, which never attempted the part.
         # This is the core assertion: local back-off state is not shared across replicas.
         backoff_replica2 = replica2.query(
-            f"SELECT length(local_backoff_per_part) FROM system.partition_exports"
+            f"SELECT length(local_backoff_per_part) FROM system.distributed_exports"
             f" WHERE source_table = '{mt_table}'"
             f"   AND destination_table = '{iceberg_table}'"
             f"   AND partition_id = '2020'"
@@ -364,7 +364,7 @@ def test_export_partition_scheduler_skipped_when_moves_stopped(cluster, source_e
     time.sleep(12)
 
     status = node.query(
-        f"SELECT status FROM system.partition_exports"
+        f"SELECT status FROM system.distributed_exports"
         f" WHERE source_table = '{mt_table}' AND destination_table = '{iceberg_table}'"
         f" AND partition_id = '2020'"
     ).strip()
@@ -414,7 +414,7 @@ def test_export_partition_resumes_after_stop_moves(cluster, source_engine):
     time.sleep(5)
 
     status = node.query(
-        f"SELECT status FROM system.partition_exports"
+        f"SELECT status FROM system.distributed_exports"
         f" WHERE source_table = '{mt_table}' AND destination_table = '{iceberg_table}'"
         f" AND partition_id = '2020'"
     ).strip()
@@ -475,7 +475,7 @@ def test_export_partition_resumes_after_stop_moves_during_export(cluster, source
         time.sleep(3)
 
         status = node.query(
-            f"SELECT status FROM system.partition_exports"
+            f"SELECT status FROM system.distributed_exports"
             f" WHERE source_table = '{mt_table}' AND destination_table = '{iceberg_table}'"
             f" AND partition_id = '2020'"
         ).strip()
@@ -588,11 +588,11 @@ def test_post_publish_exception_preserves_snapshot(cluster):
 
     # After a post-publish exception the catch handler with published==true returns
     # the populated commit info (real metadata / manifest list / manifest file paths).
-    # ExportPartitionUtils::commit persists it to the commit_info znode, so the system
+    # ExportTaskUtils::commit persists it to the commit_info znode, so the system
     # table should show a real metadata path here, not the already-committed sentinel.
     committed_metadata_file = node.query(
         f"""
-        SELECT committed_metadata_file FROM system.partition_exports
+        SELECT committed_metadata_file FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{iceberg_table}'
           AND partition_id = '2020'
@@ -611,7 +611,7 @@ def test_post_publish_exception_preserves_snapshot(cluster):
 
 def test_export_task_timeout_kills_stuck_pending_task(cluster):
     """
-    Verify that export_merge_tree_partition_task_timeout_seconds auto-kills a task
+    Verify that export_merge_tree_task_timeout_seconds auto-kills a task
     that remains PENDING past the deadline, transitioning it to KILLED with a
     descriptive last_exception.
 
@@ -620,9 +620,9 @@ def test_export_task_timeout_kills_stuck_pending_task(cluster):
     retryable error, so the task never fails on its own and the timeout branch in
     tryCleanup is the actual mechanism under test.
 
-    Replicated-only: the failpoint lives in `ExportPartitionUtils::commit`, the
+    Replicated-only: the failpoint lives in `ExportTaskUtils::commit`, the
     ZooKeeper-coordinated commit routine. A plain MergeTree commits through
-    `MergeTreePartitionExportScheduler::tryCommit`, which the failpoint does not reach, so the
+    `MergeTreeExportTaskScheduler::tryCommit`, which the failpoint does not reach, so the
     export simply completes and there is nothing for the timeout to kill.
     """
     node = cluster.instances["replica1"]
@@ -636,7 +636,7 @@ def test_export_task_timeout_kills_stuck_pending_task(cluster):
     try:
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-            f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5,"
+            f" SETTINGS export_merge_tree_task_timeout_seconds = 5,"
             f"          allow_insert_into_iceberg = 1"
         )
 
@@ -662,7 +662,7 @@ def test_export_task_timeout_kills_stuck_pending_task(cluster):
                     arrayMap(x -> x.message, last_exception_per_replica),
                     '\\n'
                 )
-                FROM system.partition_exports
+                FROM system.distributed_exports
                 WHERE source_table = '{mt_table}'
                   AND destination_table = '{iceberg_table}'
                   AND partition_id = '2020'

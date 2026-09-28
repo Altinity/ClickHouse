@@ -13,6 +13,7 @@
     M(MergeParts, "Number of source parts participating in current background merges") \
     M(Move, "Number of currently executing moves") \
     M(Export, "Number of currently executing exports") \
+    M(ExportTTLPartsHeldByDeleteGate, "Number of parts whose TTL is due but that are kept from merges until the EXPORT TTL exports them") \
     M(PartMutation, "Number of mutations (ALTER DELETE/UPDATE)") \
     M(ReplicatedFetch, "Number of data parts being fetched from replica") \
     M(ReplicatedSend, "Number of data parts being sent to replicas") \

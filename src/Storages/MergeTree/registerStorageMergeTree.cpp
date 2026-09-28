@@ -1051,6 +1051,11 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         merging_params.allow_tuple_element_aggregation = false;
     }
 
+    /// Before the table is created, e.g. in Keeper.
+    if (args.mode <= LoadingStrictnessLevel::CREATE)
+        MergeTreeData::validateExportTTL(
+            args.table_id, metadata, std::make_shared<const MergeTreeSettings>(*storage_settings), args.getLocalContext());
+
     if (replicated)
     {
         bool need_check_table_structure = true;

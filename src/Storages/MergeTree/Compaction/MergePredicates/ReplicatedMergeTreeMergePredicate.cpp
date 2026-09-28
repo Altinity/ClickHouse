@@ -43,6 +43,9 @@ std::expected<void, PreformattedMessage> ReplicatedMergeTreeBaseMergePredicate::
     if (inprogress_quorum_part_ptr && *inprogress_quorum_part_ptr == part->name)
         return std::unexpected(PreformattedMessage::create("Quorum insert for part {} is currently in progress", part->name));
 
+    if (auto reason = delete_gate.check(part->name, part->info, part->ttl_infos, export_fence.get()))
+        return std::unexpected(PreformattedMessage::create("{}", *reason));
+
     /// FIXME: remove lock here
     std::lock_guard lock(queue.state_mutex);
     return MergeCore::canUsePartInMerges(part->name, part->info);
@@ -65,6 +68,9 @@ ReplicatedMergeTreeLocalMergePredicate::ReplicatedMergeTreeLocalMergePredicate(R
         std::lock_guard lock(queue_.state_mutex);
         patches_by_partition = getPatchPartsByPartition(virtual_parts_ptr->getPatchPartInfos(), {});
     }
+
+    /// Export states are not checked here: a stale copy could keep a partition from ever reaching
+    /// the ZooKeeper predicate, which checks them against Keeper.
 }
 
 ReplicatedMergeTreeZooKeeperMergePredicate::ReplicatedMergeTreeZooKeeperMergePredicate(
@@ -119,6 +125,16 @@ ReplicatedMergeTreeZooKeeperMergePredicate::ReplicatedMergeTreeZooKeeperMergePre
     /// Initialize ReplicatedMergeTree Merge preconditions
     pinned_part_uuids_ptr = pinned_part_uuids.get();
     inprogress_quorum_part_ptr = inprogress_quorum_part.get();
+}
+
+void ReplicatedMergeTreeZooKeeperMergePredicate::loadExportFence(zkutil::ZooKeeperPtr & zookeeper)
+{
+    if (const auto export_ttl_index = queue.storage.getExportFence())
+    {
+        std::tie(export_fence, export_fence_version) = export_ttl_index->getForMergeAssignment(zookeeper);
+        export_fence_ptr = export_fence.get();
+    }
+    delete_gate = queue.storage.getExportTTLDeleteGate();
 }
 
 bool ReplicatedMergeTreeZooKeeperMergePredicate::partParticipatesInReplaceRange(const MergeTreeData::DataPartPtr & part, PreformattedMessage & out_reason) const

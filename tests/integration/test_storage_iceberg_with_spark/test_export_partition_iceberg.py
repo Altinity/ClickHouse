@@ -686,10 +686,10 @@ def test_idempotency_after_commit_crash(export_cluster):
     # The already-committed early-exit in commitExportPartitionTransaction surfaces
     # a sentinel note in committed_metadata_file (the original committer's paths
     # are not recoverable from inside the call). The sentinel makes the situation
-    # visible in system.replicated_partition_exports rather than leaving the
+    # visible in system.distributed_exports rather than leaving the
     # commit_info columns empty.
     committed_metadata_file = node.query(
-        f"SELECT committed_metadata_file FROM system.replicated_partition_exports "
+        f"SELECT committed_metadata_file FROM system.distributed_exports "
         f"WHERE source_table = '{source}' AND partition_id = '{pid}'"
     ).strip()
     assert committed_metadata_file == "<committed in a previous run, paths unavailable>", (

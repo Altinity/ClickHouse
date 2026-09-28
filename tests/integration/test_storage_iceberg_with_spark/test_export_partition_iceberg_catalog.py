@@ -374,7 +374,7 @@ def test_catalog_idempotent_retry(catalog_export_cluster):
     )
 
     committed_metadata_file = node.query(
-        f"SELECT committed_metadata_file FROM system.replicated_partition_exports "
+        f"SELECT committed_metadata_file FROM system.distributed_exports "
         f"WHERE source_table = '{source}' AND partition_id = '{pid}'"
     ).strip()
     assert committed_metadata_file == "<committed in a previous run, paths unavailable>", (

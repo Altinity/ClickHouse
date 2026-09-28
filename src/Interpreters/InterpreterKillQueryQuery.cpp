@@ -257,7 +257,7 @@ BlockIO InterpreterKillQueryQuery::execute()
 
         break;
     }
-    case ASTKillQueryQuery::Type::ExportPartition:
+    case ASTKillQueryQuery::Type::Export:
     {
         if (!getContext()->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
         {
@@ -267,7 +267,7 @@ BlockIO InterpreterKillQueryQuery::execute()
 
         Block exports_block = getSelectResult(
             "source_database, source_table, transaction_id, destination_database, destination_table, partition_id",
-            "system.partition_exports");
+            "system.distributed_exports");
 
         if (exports_block.empty())
             return res_io;
@@ -319,7 +319,7 @@ BlockIO InterpreterKillQueryQuery::execute()
                         access_denied = true;
                         continue;
                     }
-                    code = storage->killExportPartition(std::string{transaction_id});
+                    code = storage->killExportTask(std::string{transaction_id});
                 }
             }
 
@@ -327,7 +327,7 @@ BlockIO InterpreterKillQueryQuery::execute()
         }
 
         if (res_columns[0]->empty() && access_denied)
-            throw Exception(ErrorCodes::ACCESS_DENIED, "Not allowed to kill export partition. "
+            throw Exception(ErrorCodes::ACCESS_DENIED, "Not allowed to kill export. "
                 "To execute this query, it's necessary to have the grant {}", required_access_rights.toString());
 
         res_io.pipeline = QueryPipeline(Pipe(std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(header.cloneWithColumns(std::move(res_columns))))));
@@ -559,7 +559,7 @@ AccessRightsElements InterpreterKillQueryQuery::getRequiredAccessForDDLOnCluster
                 | AccessType::ALTER_REWRITE_PARTS
             );
     /// todo arthur think about this
-    else if (query.type == ASTKillQueryQuery::Type::ExportPartition)
+    else if (query.type == ASTKillQueryQuery::Type::Export)
         required_access.emplace_back(AccessType::ALTER_EXPORT_PARTITION);
     return required_access;
 }

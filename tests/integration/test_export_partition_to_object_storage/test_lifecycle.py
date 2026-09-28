@@ -37,10 +37,10 @@ def test_export_partition_file_already_exists_policy(cluster, source_engine):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}",
     )
 
-    # check system.partition_exports for the export
+    # check system.distributed_exports for the export
     assert node.query(
         f"""
-        SELECT status FROM system.partition_exports
+        SELECT status FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
@@ -51,20 +51,21 @@ def test_export_partition_file_already_exists_policy(cluster, source_engine):
     wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
 
     # plain object storage destinations surface the commit marker file path via
-    # system.partition_exports.committed_marker_file
+    # system.distributed_exports.committed_marker_file
     committed_marker_file = node.query(
         f"""
-        SELECT committed_marker_file FROM system.partition_exports
+        SELECT committed_marker_file FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
         """
     ).strip()
+    transaction_id = export_transaction_id(node, mt_table, s3_table, "2020")
     # `committed_marker_file` is the absolute key in the bucket (same convention as
     # `destination_file_paths`); it may carry the s3_conn URL's in-bucket prefix on
     # top of the table's `filename` argument, so use a "contains" check that does
     # not depend on knowing that prefix.
-    assert f"{s3_table}/commit_2020_" in committed_marker_file, \
+    assert f"{s3_table}/commit_{transaction_id}" in committed_marker_file, \
         f"Expected committed_marker_file under {s3_table}/, got: {committed_marker_file!r}"
     # Path relative to the `s3_conn` URL, derived from the absolute key without
     # assuming a particular URL prefix.
@@ -73,64 +74,41 @@ def test_export_partition_file_already_exists_policy(cluster, source_engine):
         f"SELECT count() FROM s3(s3_conn, filename='{marker_relative_path}', format=LineAsString)"
     ) == '1\n', f"Commit marker file does not exist at {committed_marker_file!r}"
 
-    # try to export the partition
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_force_export=1"
-    )
+    def completed_tasks():
+        return int(node.query(
+            f"""
+            SELECT count() FROM system.distributed_exports
+            WHERE source_table = '{mt_table}'
+              AND destination_table = '{s3_table}'
+              AND partition_id = '2020'
+              AND status = 'COMPLETED'
+            """
+        ))
 
+    # Exporting the partition again is allowed, and creates a new task.
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
+    transaction_id = wait_for_new_export_transaction(node, mt_table, s3_table, "2020", transaction_id)
     wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
-
-    assert node.query(
-        f"""
-        SELECT count() FROM system.partition_exports
-        WHERE source_table = '{mt_table}'
-          AND destination_table = '{s3_table}'
-          AND partition_id = '2020'
-          AND status = 'COMPLETED'
-        """
-    ) == '1\n', "Expected the export to be marked as COMPLETED"
+    assert completed_tasks() == 2, "Expected both exports to be marked as COMPLETED"
 
     # overwrite policy
     node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='overwrite'"
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_part_file_already_exists_policy='overwrite'"
     )
-
-    # wait for the export to finish
+    transaction_id = wait_for_new_export_transaction(node, mt_table, s3_table, "2020", transaction_id)
     wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
-
-    # check system.partition_exports for the export
-    # ideally we would make sure the transaction id is different, but I do not have the time to do that now
-    assert node.query(
-        f"""
-        SELECT count() FROM system.partition_exports
-        WHERE source_table = '{mt_table}'
-          AND destination_table = '{s3_table}'
-          AND partition_id = '2020'
-          AND status = 'COMPLETED'
-        """
-    ) == '1\n', "Expected the export to be marked as COMPLETED"
+    assert completed_tasks() == 3, "Expected every export to be marked as COMPLETED"
 
     # last but not least, the error policy. The `overwrite` export above finished every part and
     # left a per-part commit marker proving it, so there is nothing for this export to write and
     # it completes by reusing those files. `error` only refuses destination files that no commit
     # marker covers -- see test_export_partition_error_policy_rejects_incomplete_part.
     node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='error'",
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_part_file_already_exists_policy='error'",
     )
-
-    # wait for the export to finish
+    wait_for_new_export_transaction(node, mt_table, s3_table, "2020", transaction_id)
     wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
-
-    # check system.partition_exports for the export
-    assert node.query(
-        f"""
-        SELECT count() FROM system.partition_exports
-        WHERE source_table = '{mt_table}'
-          AND destination_table = '{s3_table}'
-          AND partition_id = '2020'
-          AND status = 'COMPLETED'
-        """
-    ) == '1\n', "Expected the export to be marked as COMPLETED"
+    assert completed_tasks() == 4, "Expected every export to be marked as COMPLETED"
 
 
 def create_split_export_tables(node, mt_table, s3_table, replica_name, engine):
@@ -154,7 +132,7 @@ def create_split_export_tables(node, mt_table, s3_table, replica_name, engine):
 
 
 def export_partition_split_into_files(
-    node, mt_table, s3_table, force=False, policy=None, previous_transaction_id=None,
+    node, mt_table, s3_table, policy=None, previous_transaction_id=None,
     expected_status="COMPLETED",
 ):
     """Export partition 2020 with one row per destination file and wait for *expected_status*.
@@ -162,8 +140,6 @@ def export_partition_split_into_files(
     Only splits per row for a table built by `create_split_export_tables`.
     """
     settings = ["export_merge_tree_part_max_rows_per_file = 1"]
-    if force:
-        settings.append("export_merge_tree_partition_force_export = 1")
     if policy:
         settings.append(f"export_merge_tree_part_file_already_exists_policy = '{policy}'")
 
@@ -179,34 +155,33 @@ def export_partition_split_into_files(
 
 
 def recorded_export_paths(node, mt_table, s3_table):
-    """Destination file paths recorded for the exported parts, in the order the sink wrote them.
+    """Destination file paths recorded for the exported parts by the newest export of partition
+    2020, in the order the sink wrote them.
 
-    This is what the commit phase turns into the partition commit marker.
+    This is what the commit phase turns into the commit marker.
     """
+    transaction_id = export_transaction_id(node, mt_table, s3_table, "2020")
     paths = node.query(
         f"""
         SELECT arrayJoin(arrayFlatten(mapValues(destination_file_paths)))
-        FROM system.partition_exports
-        WHERE source_table = '{mt_table}'
-          AND destination_table = '{s3_table}'
-          AND partition_id = '2020'
+        FROM system.distributed_exports
+        WHERE transaction_id = '{transaction_id}'
         """
     )
     return [path for path in paths.splitlines() if path]
 
 
 def partition_commit_marker_lines(node, mt_table, s3_table):
-    """Data-file paths listed inside the partition-level commit marker."""
+    """Data-file paths listed inside the commit marker of the newest export of partition 2020."""
+    transaction_id = export_transaction_id(node, mt_table, s3_table, "2020")
     committed_marker_file = node.query(
         f"""
-        SELECT committed_marker_file FROM system.partition_exports
-        WHERE source_table = '{mt_table}'
-          AND destination_table = '{s3_table}'
-          AND partition_id = '2020'
+        SELECT committed_marker_file FROM system.distributed_exports
+        WHERE transaction_id = '{transaction_id}'
         """
     ).strip()
 
-    assert f"{s3_table}/commit_2020_" in committed_marker_file, \
+    assert f"{s3_table}/commit_{transaction_id}" in committed_marker_file, \
         f"Expected committed_marker_file under {s3_table}/, got: {committed_marker_file!r}"
     marker_relative_path = committed_marker_file[committed_marker_file.index(f"{s3_table}/"):]
 
@@ -264,7 +239,7 @@ def test_export_partition_skip_policy_reports_every_split_file(cluster, source_e
     # Re-export. Every destination file is already there, so `skip` short-circuits the part --
     # but it must do so with the complete file list.
     export_partition_split_into_files(
-        node, mt_table, s3_table, force=True, policy="skip",
+        node, mt_table, s3_table, policy="skip",
         previous_transaction_id=first_transaction_id,
     )
 
@@ -320,7 +295,7 @@ def test_export_partition_skip_policy_reexports_incomplete_part(cluster, source_
         f"Expected the per-part commit marker to be gone, got {surviving_markers}"
 
     export_partition_split_into_files(
-        node, mt_table, s3_table, force=True, policy="skip",
+        node, mt_table, s3_table, policy="skip",
         previous_transaction_id=first_transaction_id,
     )
 
@@ -366,7 +341,7 @@ def test_export_partition_error_policy_adopts_completed_part(cluster, source_eng
     # Stands in for the retry of a part whose success was never recorded: same part, same
     # destination paths, same commit marker, `error` policy.
     export_partition_split_into_files(
-        node, mt_table, s3_table, force=True, policy="error",
+        node, mt_table, s3_table, policy="error",
         previous_transaction_id=first_transaction_id,
     )
 
@@ -417,7 +392,7 @@ def test_export_partition_error_policy_rejects_incomplete_part(cluster, source_e
         cluster.minio_client.remove_object(cluster.minio_bucket, key)
 
     export_partition_split_into_files(
-        node, mt_table, s3_table, force=True, policy="error",
+        node, mt_table, s3_table, policy="error",
         previous_transaction_id=first_transaction_id,
         expected_status="FAILED",
     )
@@ -442,7 +417,7 @@ def test_export_partition_feature_is_disabled(cluster, source_engine):
     assert "experimental" in error, "Expected error about disabled feature"
 
     # make sure kill operation also throws
-    error = replica_with_export_disabled.query_and_get_error(f"KILL EXPORT PARTITION WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
+    error = replica_with_export_disabled.query_and_get_error(f"KILL EXPORT WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
     assert "experimental" in error, "Expected error about disabled feature"
 
 
@@ -511,7 +486,7 @@ def test_export_partition_permissions(cluster, source_engine):
     # Verify system table shows COMPLETED status
     status = node.query(
         f"""
-        SELECT status FROM system.partition_exports
+        SELECT status FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
             AND destination_table = '{s3_table}'
             AND partition_id = '2020'
@@ -540,10 +515,10 @@ def test_multiple_exports_within_a_single_query(cluster, source_engine):
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '3\n', "Export did not succeed"
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2021") == '1\n', "Export did not succeed"
 
-    # check system.partition_exports for the exports
+    # check system.distributed_exports for the exports
     assert node.query(
         f"""
-        SELECT status FROM system.partition_exports
+        SELECT status FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
@@ -552,7 +527,7 @@ def test_multiple_exports_within_a_single_query(cluster, source_engine):
 
     assert node.query(
         f"""
-        SELECT status FROM system.partition_exports
+        SELECT status FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2021'
@@ -762,7 +737,7 @@ def test_export_partition_with_mixed_computed_columns(cluster, source_engine):
     assert dest_result == expected, f"Exported data mismatch. Expected:\n{expected}\nGot:\n{dest_result}"
 
     status = node.query(f"""
-        SELECT status FROM system.partition_exports
+        SELECT status FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
             AND destination_table = '{s3_table}'
             AND partition_id = '1'
@@ -803,7 +778,8 @@ def test_export_partition_all_failure_modes(cluster, source_engine):
     """Cover the three values of `export_merge_tree_partition_all_on_error`.
 
     Set up an already-fully-exported source table, then re-run EXPORT PARTITION ALL
-    with each failure mode and assert the documented behavior.
+    with each failure mode. A partition that was exported before is exported again, so only a
+    partition that cannot be exported at all fails.
     """
     node = cluster.instances["replica1"]
 
@@ -838,32 +814,47 @@ def test_export_partition_all_failure_modes(cluster, source_engine):
         f"Expected 'no active partitions' error, got: {error}"
     )
 
-    # throw_first (default): re-run aborts on the first conflicting partition.
+    def tasks_of(partition_id):
+        return int(node.query(
+            f"SELECT count() FROM system.distributed_exports"
+            f" WHERE source_table = '{mt_table}' AND destination_table = '{s3_table}' AND partition_id = '{partition_id}'"
+        ))
+
+    # Every mode exports every partition again, as a new task: there are no conflicts to skip.
+    for expected_tasks, mode in enumerate(("throw_first", "collect", "skip_conflicts"), start=2):
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
+            f" SETTINGS export_merge_tree_partition_all_on_error = '{mode}'"
+        )
+        for partition_id in ("2020", "2021", "2022"):
+            assert tasks_of(partition_id) == expected_tasks, (
+                f"Expected {expected_tasks} tasks of partition {partition_id} after '{mode}'"
+            )
+            wait_for_export_status(node, mt_table, s3_table, partition_id, "COMPLETED", timeout=60)
+
+    # A partition whose rows map to several partitions of the destination cannot be exported.
+    bad_s3 = f"export_all_modes_bad_s3_{uid}"
+    node.query(
+        f"CREATE TABLE {bad_s3} (id UInt64, year UInt16)"
+        f" ENGINE = S3(s3_conn, filename='{bad_s3}', format=Parquet, partition_strategy='hive')"
+        f" PARTITION BY id"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (4, 2023), (5, 2023)")
+
+    # throw_first (default): aborts on the first partition that fails.
     error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {bad_s3}"
         f" SETTINGS export_merge_tree_partition_all_on_error = 'throw_first'"
     )
-    assert "EXPORT_PARTITION_ALREADY_EXPORTED" in error, (
-        f"Expected EXPORT_PARTITION_ALREADY_EXPORTED in error, got: {error}"
-    )
+    assert error, "Expected the export of an incompatible partition to fail"
 
-    # collect: aggregated PARTITION_EXPORT_FAILED message lists every conflicting partition.
+    # collect: the aggregated PARTITION_EXPORT_FAILED message lists the failing partition.
     error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {bad_s3}"
         f" SETTINGS export_merge_tree_partition_all_on_error = 'collect'"
     )
-    assert "PARTITION_EXPORT_FAILED" in error, (
-        f"Expected PARTITION_EXPORT_FAILED in error, got: {error}"
-    )
-    for partition_id in ("2020", "2021", "2022"):
-        assert partition_id in error, (
-            f"Expected aggregated error to mention partition {partition_id}, got: {error}"
-        )
-
-    # skip_conflicts: succeeds silently because every partition conflicts and is skipped.
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
-        f" SETTINGS export_merge_tree_partition_all_on_error = 'skip_conflicts'"
+    assert "PARTITION_EXPORT_FAILED" in error and "2023" in error, (
+        f"Expected PARTITION_EXPORT_FAILED mentioning partition 2023, got: {error}"
     )
 
 
@@ -900,7 +891,7 @@ def test_export_partition_with_a_fully_deleted_part(cluster, source_engine):
     exported_files = node.query(
         f"""
         SELECT length(arrayFlatten(mapValues(destination_file_paths)))
-        FROM system.partition_exports
+        FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
@@ -943,7 +934,7 @@ def test_export_partition_where_every_row_is_deleted(cluster, source_engine):
     exported_files = node.query(
         f"""
         SELECT length(arrayFlatten(mapValues(destination_file_paths)))
-        FROM system.partition_exports
+        FROM system.distributed_exports
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'

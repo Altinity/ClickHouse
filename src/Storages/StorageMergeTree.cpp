@@ -52,9 +52,10 @@
 #include <Storages/MergeTree/MergeTreeSink.h>
 #include <Storages/MergeTree/MergeTreeSinkPatch.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
-#include <Storages/MergeTree/ExportPartitionUtils.h>
-#include <Storages/MergeTree/MergeTreePartitionExportScheduler.h>
-#include <Storages/MergeTree/MergeTreePartitionExportTask.h>
+#include <Storages/MergeTree/ExportTaskUtils.h>
+#include <Storages/MergeTree/MergeTreeExportTaskScheduler.h>
+#include <Storages/MergeTree/MergeTreeExportTTLScheduler.h>
+#include <Storages/MergeTree/MergeTreeExportTask.h>
 #include <Storages/MergeTree/checkDataPart.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/buildQueryTreeForShard.h>
@@ -113,10 +114,9 @@ namespace Setting
     extern const SettingsBool throw_on_unsupported_query_inside_transaction;
     extern const SettingsUInt64 max_parts_to_move;
     extern const SettingsUpdateParallelMode update_parallel_mode;
-    extern const SettingsBool export_merge_tree_partition_force_export;
-    extern const SettingsUInt64 export_merge_tree_partition_retry_initial_backoff_seconds;
-    extern const SettingsUInt64 export_merge_tree_partition_retry_max_backoff_seconds;
-    extern const SettingsUInt64 export_merge_tree_partition_task_timeout_seconds;
+    extern const SettingsUInt64 export_merge_tree_retry_initial_backoff_seconds;
+    extern const SettingsUInt64 export_merge_tree_retry_max_backoff_seconds;
+    extern const SettingsUInt64 export_merge_tree_task_timeout_seconds;
     extern const SettingsBool output_format_parallel_formatting;
     extern const SettingsBool output_format_parquet_parallel_encoding;
     extern const SettingsParquetCompression output_format_parquet_compression_method;
@@ -273,15 +273,29 @@ StorageMergeTree::StorageMergeTree(
 
     if (getContext()->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
     {
-        partition_export_scheduler = std::make_shared<MergeTreePartitionExportScheduler>(*this);
+        export_task_scheduler = std::make_shared<MergeTreeExportTaskScheduler>(*this);
 
-        partition_export_task = getContext()->getSchedulePool().createTask(
+        export_task_scheduling_task = getContext()->getSchedulePool().createTask(
             getStorageID(),
-            getStorageID().getFullTableName() + " (StorageMergeTree::partition_export_task)",
-            [this] { partitionExportTask(); });
+            getStorageID().getFullTableName() + " (StorageMergeTree::export_task_scheduling_task)",
+            [this] { exportTaskSchedulingTask(); });
 
         /// Activated in startup(); deactivated during shutdown.
-        partition_export_task->deactivate();
+        export_task_scheduling_task->deactivate();
+
+        export_ttl_index = std::make_shared<MergeTreeExportTTLIndex>(*this);
+        export_ttl_index->load();
+
+        /// Block numbers of parts exported by the `EXPORT` TTL must not be reused, even if the
+        /// parts no longer exist, or new parts would look exported.
+        increment.set(std::max<UInt64>(increment.value.load(), static_cast<UInt64>(export_ttl_index->maxBlock())));
+
+        export_ttl_scheduler = std::make_shared<MergeTreeExportTTLScheduler>(*this, *export_ttl_index);
+        export_ttl_task = getContext()->getSchedulePool().createTask(
+            getStorageID(),
+            getStorageID().getFullTableName() + " (StorageMergeTree::export_ttl_task)",
+            [this] { exportTTLTask(); });
+        export_ttl_task->deactivate();
     }
 }
 
@@ -304,10 +318,11 @@ void StorageMergeTree::startup()
     {
         /// Reload persisted partition-export tasks (and re-pin their parts) before background merges
         /// can start removing parts, then activate the scheduler task so PENDING tasks resume.
-        if (partition_export_scheduler)
+        if (export_task_scheduler)
         {
-            partition_export_scheduler->load();
-            partition_export_task->activateAndSchedule();
+            export_task_scheduler->load();
+            export_task_scheduling_task->activateAndSchedule();
+            export_ttl_task->activateAndSchedule();
         }
 
         cleanup_thread.start();
@@ -346,8 +361,10 @@ void StorageMergeTree::flushAndPrepareForShutdown()
     merger_mutator.merges_blocker.cancelForever();
     parts_mover.moves_blocker.cancelForever();
 
-    if (partition_export_task)
-        partition_export_task->deactivate();
+    if (export_task_scheduling_task)
+        export_task_scheduling_task->deactivate();
+    if (export_ttl_task)
+        export_ttl_task->deactivate();
 
     background_operations_assignee.finish();
     background_moves_assignee.finish();
@@ -3726,7 +3743,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
 
     /// The scheduler is created in the constructor whenever the server setting above is enabled, so
     /// this should always hold here.
-    if (!partition_export_scheduler)
+    if (!export_task_scheduler)
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
             "Partition export is not initialized for table {}", getStorageID().getNameForLogs());
 
@@ -3818,12 +3835,10 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     auto destination_snapshot = dest_storage->getInMemoryMetadataPtr(query_context, false);
 
     /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
-    ExportPartitionUtils::verifyExportSchemaCastable(
+    ExportTaskUtils::verifyExportSchemaCastable(
         src_snapshot, destination_snapshot, dest_storage->getStorageID(), query_context);
 
     const String partition_id = getPartitionIDFromQuery(command.partition, query_context);
-
-    const bool force = query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export];
 
     DataPartsVector parts;
     {
@@ -3834,6 +3849,25 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     if (parts.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} doesn't exist", partition_id);
 
+    /// Every `EXPORT PARTITION` is a new task, even if the partition was exported before.
+    auto descriptor = buildExportTask(dest_storage_id, dest_storage, src_snapshot, destination_snapshot, parts, partition_id, query_context);
+    descriptor.transaction_id = toString(UUIDHelpers::generateV4());
+    descriptor.query_id = query_context->getCurrentQueryId();
+    descriptor.source = ExportTaskSource::query;
+
+    std::vector<MergeTreeData::DataPartPtr> part_references(parts.begin(), parts.end());
+    export_task_scheduler->addTask(std::move(descriptor), std::move(part_references));
+}
+
+MergeTreeExportTask StorageMergeTree::buildExportTask(
+    const StorageID & dest_storage_id,
+    const StoragePtr & dest_storage,
+    const StorageMetadataPtr & src_snapshot,
+    const StorageMetadataPtr & destination_snapshot,
+    const DataPartsVector & parts,
+    const String & partition_id,
+    ContextPtr query_context) const
+{
     const bool throw_on_pending_mutations = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_mutations];
     const bool throw_on_pending_patch_parts = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_patch_parts];
 
@@ -3858,29 +3892,28 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
                 "Partition {} can not be exported because the part {} has pending mutations. Either wait for the mutations to be applied or set `export_merge_tree_part_throw_on_pending_mutations` to false",
                 partition_id, part->name);
 
-        if (alter_conversions->hasPatches())
+        if (alter_conversions->hasPatches() && throw_on_pending_patch_parts)
             throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
                 "Partition {} can not be exported because the part {} has pending patch parts. Either wait for the patch parts to be applied or set `export_merge_tree_part_throw_on_pending_patch_parts` to false",
                 partition_id, part->name);
     }
 
-    MergeTreePartitionExportTask descriptor;
-    descriptor.transaction_id = toString(UUIDHelpers::generateV4());
-    descriptor.query_id = query_context->getCurrentQueryId();
-    descriptor.partition_id = partition_id;
+    MergeTreeExportTask descriptor;
     descriptor.source_database = getStorageID().database_name;
     descriptor.source_table = getStorageID().table_name;
-    descriptor.destination_database = dest_database;
-    descriptor.destination_table = dest_table;
+    descriptor.destination_database = dest_storage_id.database_name;
+    descriptor.destination_table = dest_storage_id.table_name;
+    if (const auto uuid = dest_storage->getStorageID().uuid; uuid != UUIDHelpers::Nil)
+        descriptor.destination_uuid = toString(uuid);
     descriptor.create_time = time(nullptr);
-    descriptor.status = MergeTreePartitionExportTask::Status::PENDING;
+    descriptor.status = MergeTreeExportTask::Status::PENDING;
 
     for (const auto & part : parts)
         descriptor.parts.push_back({part->name, /*done*/ false, /*paths*/ {}});
 
-    descriptor.retry_initial_backoff_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_retry_initial_backoff_seconds];
-    descriptor.retry_max_backoff_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_retry_max_backoff_seconds];
-    descriptor.task_timeout_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_task_timeout_seconds];
+    descriptor.retry_initial_backoff_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_retry_initial_backoff_seconds];
+    descriptor.retry_max_backoff_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_retry_max_backoff_seconds];
+    descriptor.task_timeout_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_task_timeout_seconds];
     descriptor.max_threads = query_context->getSettingsRef()[Setting::max_threads];
     descriptor.parallel_formatting = query_context->getSettingsRef()[Setting::output_format_parallel_formatting];
     descriptor.parquet_parallel_encoding = query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding];
@@ -3901,7 +3934,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     if (dest_storage->isDataLake())
     {
 #if USE_AVRO
-        descriptor.iceberg_metadata_json = ExportPartitionUtils::verifyAndExtractDestinationIcebergMetadataJson(
+        descriptor.iceberg_metadata_json = ExportTaskUtils::verifyAndExtractDestinationIcebergMetadataJson(
             src_snapshot,
             destination_snapshot,
             dest_storage,
@@ -3917,37 +3950,36 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     }
     else
     {
-        ExportPartitionUtils::verifyPlainPartitionCompatibility(
+        ExportTaskUtils::verifyPlainPartitionCompatibility(
             src_snapshot, destination_snapshot, parts, partition_id, query_context);
     }
 
-    std::vector<MergeTreeData::DataPartPtr> part_references(parts.begin(), parts.end());
-    partition_export_scheduler->addTask(std::move(descriptor), std::move(part_references), force);
+    return descriptor;
 }
 
-CancellationCode StorageMergeTree::killExportPartition(const String & transaction_id)
+CancellationCode StorageMergeTree::killExportTask(const String & transaction_id)
 {
-    if (!partition_export_scheduler)
+    if (!export_task_scheduler)
         return CancellationCode::NotFound;
-    return partition_export_scheduler->kill(transaction_id);
+    return export_task_scheduler->kill(transaction_id);
 }
 
-std::vector<PartitionExportInfo> StorageMergeTree::getPartitionExportsInfo() const
+std::vector<ExportTaskInfo> StorageMergeTree::getExportTasksInfo() const
 {
-    if (!partition_export_scheduler)
+    if (!export_task_scheduler)
         return {};
-    return partition_export_scheduler->getInfo();
+    return export_task_scheduler->getInfo();
 }
 
-void StorageMergeTree::partitionExportTask()
+void StorageMergeTree::exportTaskSchedulingTask()
 {
     /// Reschedule only while there is pending export work. When the scheduler reports no pending
     /// tasks the schedule-pool task goes idle (no periodic wakeups per table); it is re-armed by
-    /// triggerPartitionExportTask() on a new EXPORT PARTITION and by load() at startup.
+    /// triggerExportTaskScheduling() on a new EXPORT PARTITION and by load() at startup.
     bool has_pending_work = true;
     try
     {
-        has_pending_work = partition_export_scheduler->run();
+        has_pending_work = export_task_scheduler->run();
     }
     catch (...)
     {
@@ -3957,12 +3989,37 @@ void StorageMergeTree::partitionExportTask()
     }
 
     if (has_pending_work)
-        partition_export_task->scheduleAfter(5000);
+        export_task_scheduling_task->scheduleAfter(5000);
 }
 
-void StorageMergeTree::triggerPartitionExportTask()
+void StorageMergeTree::wakeUpExportTTL()
 {
-    if (partition_export_task)
-        partition_export_task->schedule();
+    if (export_ttl_task)
+        export_ttl_task->schedule();
+}
+
+void StorageMergeTree::exportTTLTask()
+{
+    UInt64 next_run_ms = 10000;
+    try
+    {
+        next_run_ms = export_ttl_scheduler->run();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+    }
+    export_ttl_task->scheduleAfter(next_run_ms);
+}
+
+ExportFencePtr StorageMergeTree::getExportFence() const
+{
+    return export_ttl_index ? export_ttl_index->getFence() : nullptr;
+}
+
+void StorageMergeTree::triggerExportTaskScheduling()
+{
+    if (export_task_scheduling_task)
+        export_task_scheduling_task->schedule();
 }
 }

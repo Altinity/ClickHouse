@@ -820,6 +820,37 @@ Possible values:
     - [load_existing_rows_count_for_old_parts](#load_existing_rows_count_for_old_parts)
       setting
     )", 0) \
+    DECLARE(UInt64, ttl_export_check_period_seconds, 10, R"(
+    How often the `TTL ... EXPORT TO TABLE` scheduler of the table looks for parts to export, in seconds.
+    )", EXPERIMENTAL) \
+    DECLARE(UInt64, ttl_export_batch_window_seconds, 60, R"(
+    The eligible parts of a partition are exported once no new eligible part appeared for this many
+    seconds, so that parts which become eligible together are exported together.
+    )", EXPERIMENTAL) \
+    DECLARE(UInt64, ttl_export_batch_max_delay_seconds, 600, R"(
+    The eligible parts of a partition are exported at the latest this many seconds after the first of
+    them was seen, even if new eligible parts keep appearing.
+    )", EXPERIMENTAL) \
+    DECLARE(UInt64, ttl_export_batch_min_bytes, 256_MiB, R"(
+    The eligible parts of a partition are exported as soon as their size on disk reaches this many
+    bytes. 0 disables the threshold.
+    )", EXPERIMENTAL) \
+    DECLARE(UInt64, ttl_export_max_parts_per_group, 100, R"(
+    Maximum number of parts exported together by one task of the `EXPORT` TTL. Parts of a failed task
+    are always retried together, even if there are more of them.
+    )", EXPERIMENTAL) \
+    DECLARE(UInt64, ttl_export_max_bytes_per_group, 10_GiB, R"(
+    Maximum size on disk of the parts exported together by one task of the `EXPORT` TTL. A single part
+    bigger than this is exported on its own. 0 means unlimited.
+    )", EXPERIMENTAL) \
+    DECLARE(UInt64, ttl_export_max_concurrent_groups, 4, R"(
+    Maximum number of tasks of the `EXPORT` TTL of the table that run at the same time. There is at
+    most one per partition.
+    )", EXPERIMENTAL) \
+    DECLARE(String, ttl_export_settings_profile, "", R"(
+    Settings profile whose settings the tasks of the `EXPORT` TTL run with, e.g. the output format
+    settings and `export_merge_tree_task_timeout_seconds`. If empty, the default profile is used.
+    )", EXPERIMENTAL) \
     DECLARE(String, merge_workload, "", R"(
     Used to regulate how resources are utilized and shared between merges and
     other workloads. Specified value is used as `workload` setting value for

@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+
+# Shared body of the `TTL ... EXPORT TO TABLE` tests, invoked once per source engine. The wrappers
+# share the reference file, so the output must not depend on the engine.
+
+# Poll until the table has the given number of completed TTL export tasks and nothing of the
+# partition is claimed or waiting to be exported (or timeout).
+# $1 source table, $2 partition id, $3 number of completed tasks.
+function wait_for_export_ttl()
+{
+    local source_table="$1"
+    local partition_id="$2"
+    local expected="$3"
+
+    local state
+    local i=0
+    while [ "$i" -lt 120 ]
+    do
+        state=$(${CLICKHOUSE_CLIENT} --query "
+            SELECT
+                (SELECT countIf(status = 'COMPLETED') FROM system.distributed_exports
+                 WHERE source_database = currentDatabase() AND source_table = '$source_table' AND source = 'ttl'),
+                (SELECT count() FROM system.ttl_exports
+                 WHERE database = currentDatabase() AND table = '$source_table' AND partition_id = '$partition_id'
+                   AND claimed_parts = 0 AND eligible_parts = 0)")
+        if [ "$state" = "$(echo -e "$expected\t1")" ]
+        then
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+
+    echo "TIMEOUT waiting for $expected completed TTL export task(s) of $source_table (last: '$state')"
+    return 1
+}
+
+# $1 is the engine clause of the source table.
+function run_export_ttl_test()
+{
+    local source_engine="$1"
+
+    local mt_table="export_ttl_mt"
+    local s3_table="export_ttl_s3"
+
+    ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS $mt_table"
+    ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS $s3_table"
+
+    ${CLICKHOUSE_CLIENT} --query "CREATE TABLE $s3_table (id UInt64, year UInt16, t DateTime) ENGINE = S3(s3_conn, filename='export_ttl_${CLICKHOUSE_DATABASE}', format=Parquet, partition_strategy='hive') PARTITION BY year"
+    ${CLICKHOUSE_CLIENT} --allow_experimental_export_ttl 1 --query "
+        CREATE TABLE $mt_table (id UInt64, year UInt16, t DateTime) ENGINE = $source_engine
+        PARTITION BY year ORDER BY id
+        TTL t + INTERVAL 1 DAY EXPORT TO TABLE $s3_table
+        SETTINGS ttl_export_check_period_seconds = 1, ttl_export_batch_window_seconds = 0, ttl_export_batch_max_delay_seconds = 0"
+
+    # Paused, so both parts of 2020 are exported in one group, and not merged before.
+    ${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MOVES $mt_table"
+    ${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES $mt_table"
+
+    ${CLICKHOUSE_CLIENT} --query "INSERT INTO $mt_table VALUES (1, 2020, now() - INTERVAL 10 DAY), (2, 2020, now() - INTERVAL 10 DAY)"
+    ${CLICKHOUSE_CLIENT} --query "INSERT INTO $mt_table VALUES (3, 2020, now() - INTERVAL 10 DAY)"
+    ${CLICKHOUSE_CLIENT} --query "INSERT INTO $mt_table VALUES (4, 2021, now())"
+
+    ${CLICKHOUSE_CLIENT} --query "SYSTEM START MOVES $mt_table"
+    wait_for_export_ttl "$mt_table" "2020" 1
+
+    echo "Destination after the first group"
+    ${CLICKHOUSE_CLIENT} --query "SELECT id, year FROM $s3_table ORDER BY id"
+
+    echo "Tasks"
+    ${CLICKHOUSE_CLIENT} --query "SELECT source, status, parts_count, partition_id FROM system.distributed_exports WHERE source_database = currentDatabase() AND source_table = '$mt_table'"
+
+    echo "Partition 2021 is not due"
+    ${CLICKHOUSE_CLIENT} --query "SELECT eligible_parts, exported_parts FROM system.ttl_exports WHERE database = currentDatabase() AND table = '$mt_table' AND partition_id = '2021'"
+
+    echo "Parts in different export states are not merged"
+    ${CLICKHOUSE_CLIENT} --query "INSERT INTO $mt_table VALUES (5, 2020, now())"
+    ${CLICKHOUSE_CLIENT} --query "SYSTEM START MERGES $mt_table"
+    ${CLICKHOUSE_CLIENT} --query "OPTIMIZE TABLE $mt_table PARTITION ID '2020' FINAL SETTINGS optimize_throw_if_noop = 1" 2>&1 | grep -q "different export states" && echo "refused"
+    ${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES $mt_table"
+
+    echo "A part that becomes due later is exported on its own"
+    ${CLICKHOUSE_CLIENT} --query "INSERT INTO $mt_table VALUES (6, 2020, now() - INTERVAL 10 DAY)"
+    wait_for_export_ttl "$mt_table" "2020" 2
+    ${CLICKHOUSE_CLIENT} --query "SELECT id, year FROM $s3_table ORDER BY id"
+    ${CLICKHOUSE_CLIENT} --query "SELECT count(), countIf(status = 'COMPLETED'), sum(parts_count) FROM system.distributed_exports WHERE source_database = currentDatabase() AND source_table = '$mt_table'"
+
+    echo "Removing the TTL forgets what was exported"
+    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $mt_table REMOVE TTL"
+    local i=0
+    while [ "$i" -lt 120 ] && [ "$(${CLICKHOUSE_CLIENT} --query "SELECT count() FROM system.ttl_exports WHERE database = currentDatabase() AND table = '$mt_table'")" != "0" ]
+    do
+        sleep 0.5
+        i=$((i + 1))
+    done
+    ${CLICKHOUSE_CLIENT} --query "SELECT count() FROM system.ttl_exports WHERE database = currentDatabase() AND table = '$mt_table'"
+
+    ${CLICKHOUSE_CLIENT} --query "DROP TABLE $mt_table"
+    ${CLICKHOUSE_CLIENT} --query "DROP TABLE $s3_table"
+}
+
+# vi: ft=bash

@@ -191,9 +191,10 @@ bool ReplicatedMergeTreeRestartingThread::runImpl()
 
     if (storage.getContext()->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
     {
-        storage.export_merge_tree_partition_updating_task->activateAndSchedule();
-        storage.export_merge_tree_partition_select_task->activateAndSchedule();
-        storage.export_merge_tree_partition_status_handling_task->activateAndSchedule();
+        storage.export_task_updating_task->activateAndSchedule();
+        storage.export_task_select_task->activateAndSchedule();
+        storage.export_task_status_handling_task->activateAndSchedule();
+        storage.export_ttl_task->activateAndSchedule();
     }
 
     storage.cleanup_thread.start();
@@ -262,6 +263,11 @@ bool ReplicatedMergeTreeRestartingThread::tryStartup()
         storage.last_queue_update_finish_time.store(time(nullptr));
 
         updateQuorumIfWeHavePart();
+
+        /// Before this replica assigns merges: the `EXPORT` TTL starts tasks only if every replica
+        /// advertises that its merges respect the export states, so a stale marker must not outlive a
+        /// restart with partition export disabled.
+        storage.advertiseExportFeatures(zookeeper);
 
         /// Anything above can throw a KeeperException if something is wrong with ZK.
         /// Anything below should not throw exceptions.

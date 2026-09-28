@@ -1,6 +1,6 @@
 #include <mutex>
 #include <Storages/MergeTree/ExportPartTask.h>
-#include <Storages/MergeTree/ExportPartitionUtils.h>
+#include <Storages/MergeTree/ExportTaskUtils.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Interpreters/Context.h>
@@ -118,13 +118,9 @@ namespace
 
     void addExportConvertingActions(
         QueryPlan & plan_for_part,
-        const IStorage & destination_storage,
+        const Block & destination_header,
         const ContextPtr & local_context)
     {
-        FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
-
-        const auto destination_metadata = destination_storage.getInMemoryMetadataPtr(local_context, false);
-        const auto destination_header = destination_metadata->getSampleBlockNonMaterialized();
         const auto & destination_columns = destination_header.getColumnsWithTypeAndName();
 
         const auto schema_match_mode =
@@ -135,7 +131,7 @@ namespace
         auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
-        ExportPartitionUtils::checkExportSchemaColumnsCount(
+        ExportTaskUtils::checkExportSchemaColumnsCount(
             source_columns.size(),
             destination_columns.size(),
             ignore_extra_source_columns);
@@ -311,6 +307,8 @@ bool ExportPartTask::executeStep()
 
         const auto filename = buildDestinationFilename(manifest, storage.getStorageID(), local_context);
 
+        FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
+
         auto import_result = destination_storage->import(
             filename,
             block_with_partition_values,
@@ -378,7 +376,9 @@ bool ExportPartTask::executeStep()
             /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
             materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
 
-            addExportConvertingActions(plan_for_part, *destination_storage, local_context);
+            /// The destination schema may change after `import` read it, for example when a query reloads it
+            /// from Iceberg metadata, so convert to the header of the sink rather than to the current schema.
+            addExportConvertingActions(plan_for_part, sink->getHeader(), local_context);
 
             QueryPlanOptimizationSettings optimization_settings(local_context);
             auto pipeline_settings = BuildQueryPipelineSettings(local_context);
@@ -421,11 +421,11 @@ bool ExportPartTask::executeStep()
         /// Commit the Iceberg metadata inline here so the rows become visible immediately.
         if (destination_storage->isDataLake() && !manifest.completion_callback)
         {
-            IStorage::IcebergCommitExportPartitionArguments iceberg_args;
+            IStorage::IcebergCommitExportArguments iceberg_args;
             iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
             iceberg_args.partition_source_block = block_with_partition_values;
 
-            destination_storage->commitExportPartitionTransaction(
+            destination_storage->commitExportTransaction(
                 manifest.transaction_id,
                 manifest.data_part->info.getPartitionId(),
                 (*exports_list_entry)->destination_file_paths,

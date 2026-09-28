@@ -88,8 +88,12 @@ struct TTLDescription
     /// For example DISK or VOLUME
     DataDestinationType destination_type{};
 
-    /// Name of destination disk or volume
+    /// Name of destination disk or volume, or of the table for `EXPORT TO TABLE`.
     String destination_name;
+
+    /// `EXPORT TO TABLE` only: database of the destination table. Empty means the database of the
+    /// table the TTL belongs to.
+    String destination_database;
 
     /// If true, do nothing if DISK or VOLUME doesn't exist .
     /// Only valid for table MOVE TTLs.
@@ -130,6 +134,9 @@ struct TTLTableDescription
     TTLDescriptions recompression_ttl;
 
     TTLDescriptions group_by_ttl;
+
+    /// `EXPORT TO TABLE` TTL. At most one per table.
+    TTLDescriptions export_ttl;
 
     TTLTableDescription() = default;
     TTLTableDescription(const TTLTableDescription & other);

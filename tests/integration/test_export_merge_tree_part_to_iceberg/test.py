@@ -1220,6 +1220,39 @@ def test_export_part_with_castable_widening(cluster):
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
+def test_export_part_date_and_time_after_the_destination_schema_is_reloaded(cluster):
+    """
+    Iceberg stores `Date` and `DateTime` as `date` and `timestamp`, so once a query reloads the
+    destination schema from its metadata it declares `Date32` and `DateTime64(6)` columns. Every
+    value fits in them, so the export must not be refused as a lossy cast.
+    """
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_time_reload_{sfx}"
+    iceberg = f"iceberg_time_reload_{sfx}"
+
+    make_mt(node, mt, "id Int32, year Int32, d Date, t DateTime", "year")
+    make_iceberg_s3(node, iceberg, "id Int32, year Int32, d Date, t DateTime", "year")
+    node.query(f"SELECT * FROM {iceberg}")
+    types = node.query(
+        f"SELECT type FROM system.columns WHERE database = currentDatabase() AND table = '{iceberg}' "
+        f"AND name IN ('d', 't') ORDER BY name"
+    ).split("\n")
+    assert "Date32" in types[0] and "DateTime64(6)" in types[1], f"The destination schema was not reloaded: {types}"
+
+    node.query(f"INSERT INTO {mt} VALUES (1, 2020, '2020-05-01', '2020-05-01 10:20:30')")
+    part_2020 = get_part(node, mt, "2020")
+
+    export_part(node, mt, part_2020, iceberg)
+    wait_for_export_part(node, mt, part_2020)
+
+    result = node.query(f"SELECT id, d, t FROM {iceberg} ORDER BY id").strip()
+    assert result == "1\t2020-05-01\t2020-05-01 10:20:30.000000", f"Unexpected exported data:\n{result}"
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
 def test_export_part_with_castable_narrowing_values_fit(cluster):
     """A lossy narrowing (id Int64 -> Int32) succeeds once the user opts in via
     export_merge_tree_part_allow_lossy_cast."""

@@ -505,7 +505,7 @@ It is currently only implemented in StorageObjectStorage.
       throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
     }
 
-    struct IcebergCommitExportPartitionArguments
+    struct IcebergCommitExportArguments
     {
       std::string metadata_json_string;
       /// Representative source partition-key columns from one exported part (the part's
@@ -516,8 +516,8 @@ It is currently only implemented in StorageObjectStorage.
     };
 
     /// Paths produced by the destination storage during commit. Surfaced via
-    /// system.partition_exports for debugging
-    struct ExportPartitionCommitInfo
+    /// system.distributed_exports for debugging
+    struct ExportCommitInfo
     {
       /// Iceberg destinations only.
       String iceberg_metadata_file;
@@ -525,20 +525,30 @@ It is currently only implemented in StorageObjectStorage.
       String iceberg_manifest_file;
 
       /// Plain object storage destinations only: path of the commit marker file
-      /// written/observed by StorageObjectStorage::commitExportPartitionTransaction.
+      /// written/observed by StorageObjectStorage::commitExportTransaction.
       String commit_marker_file;
     };
 
-    virtual ExportPartitionCommitInfo commitExportPartitionTransaction(
+    /// Makes the files exported by the transaction visible in this storage. All of them belong to
+    /// one source partition, `partition_id`.
+    virtual ExportCommitInfo commitExportTransaction(
       const String & /* transaction_id */,
       const String & /* partition_id */,
       const Strings & /* exported_paths */,
-      const IcebergCommitExportPartitionArguments & /* iceberg_commit_export_partition_arguments */,
+      const IcebergCommitExportArguments & /* iceberg_commit_export_arguments */,
       ContextPtr /* local_context */)
   {
-      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "commitExportPartitionTransaction is not implemented for storage type {}", getName());
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "commitExportTransaction is not implemented for storage type {}", getName());
   }
-    
+
+    /// Whether `commitExportTransaction` already made `transaction_id` visible in this storage.
+    /// Resolves an export whose outcome is unknown, e.g. one killed or timed out after its commit may have landed.
+    virtual bool isExportTransactionCommitted(
+      const String & /* transaction_id */,
+      ContextPtr /* local_context */)
+  {
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "isExportTransactionCommitted is not implemented for storage type {}", getName());
+  }
 
     /** Writes the data to a table in distributed manner.
       * It is supposed that implementation looks into SELECT part of the query and executes distributed
@@ -653,7 +663,7 @@ It is currently only implemented in StorageObjectStorage.
     virtual void setMutationCSN(const String & /*mutation_id*/, UInt64 /*csn*/);
 
     /// Cancel a replicated partition export by transaction id.
-    virtual CancellationCode killExportPartition(const String & /*transaction_id*/);
+    virtual CancellationCode killExportTask(const String & /*transaction_id*/);
 
     /// Cancel a part move to shard.
     virtual CancellationCode killPartMoveToShard(const UUID & /*task_uuid*/);
