@@ -394,26 +394,24 @@ void BackupWriterS3::copyFileFromDisk(
             if (!source)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "No CAS copy source for {} on disk {}", src_path, src_disk->getName());
 
-            if (std::holds_alternative<ContentAddressedInlineFileCopySource>(*source))
+            const auto window = getContentAddressedObjectWindow(*source, src_path);
+            if (!window)
             {
                 LOG_TRACE(log, "File {} has no object of its own, copying through buffers", src_path);
                 BackupWriterDefault::copyFileFromDisk(path_in_backup, src_disk, src_path, copy_encrypted, start_pos, length);
                 return;
             }
 
-            const auto * blob_source = std::get_if<ContentAddressedBlobFileCopySource>(&*source);
-            const auto & source_object = blob_source
-                ? blob_source->object
-                : std::get<ContentAddressedPlainFileCopySource>(*source).object;
-            const UInt64 source_offset = blob_source ? blob_source->payload_offset : 0;
-            if (blob_source && (start_pos > blob_source->payload_size || length > blob_source->payload_size - start_pos))
+            const auto & source_object = window->object;
+            const UInt64 source_offset = window->offset;
+            if (start_pos > source_object.bytes_size || length > source_object.bytes_size - start_pos)
             {
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR,
                     "Requested range with offset {} and length {} is outside CAS payload of {} bytes for {}",
                     start_pos,
                     length,
-                    blob_source->payload_size,
+                    source_object.bytes_size,
                     src_path);
             }
             const auto blob_path = src_disk->getBlobPath(src_path);

@@ -539,6 +539,7 @@ void DiskObjectStorageTransaction::copyFileImpl(
             },
             *content_addressed_source)
         : src_metadata_storage->getStorageObjects(from_file_path);
+
     const auto blobs_to_create = blobs_to_copy
                         | std::views::transform([&](const auto & from) { return StoredObject(metadata_transaction->generateObjectKeyForPath(to_file_path).serialize(), to_file_path, from.bytes_size); })
                         | std::ranges::to<StoredObjects>();
@@ -578,18 +579,11 @@ void DiskObjectStorageTransaction::copyFileImpl(
                 }
                 else
                 {
-                    const auto * blob_source = std::get_if<ContentAddressedBlobFileCopySource>(&*content_addressed_source);
-                    const auto & source_object = blob_source
-                        ? blob_source->object
-                        : std::get<ContentAddressedPlainFileCopySource>(*content_addressed_source).object;
-                    const UInt64 source_offset = blob_source ? blob_source->payload_offset : 0;
-
-                    if (src_blob != source_object
-                        || source_object.remote_path.empty()
-                        || (blob_source && (blob_source->payload_offset == 0 || blob_source->payload_size != source_object.bytes_size)))
-                    {
+                    const auto window = getContentAddressedObjectWindow(*content_addressed_source, from_file_path);
+                    if (!window || src_blob != window->object)
                         throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid CAS copy source for {}", from_file_path);
-                    }
+
+                    const UInt64 source_offset = window->offset;
 
                     runner.enqueueAndKeepTrack(
                         [this,
