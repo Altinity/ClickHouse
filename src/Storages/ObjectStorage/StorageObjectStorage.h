@@ -97,7 +97,6 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         const ContextPtr & context);
 
-<<<<<<< HEAD
     bool supportsImport(ContextPtr) const override;
 
     SinkToStoragePtr import(
@@ -117,7 +116,7 @@ public:
         const Strings & exported_paths,
         const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
-=======
+
     /// Shared `drop` implementation: removes the table from `catalog` (if any) and drops `configuration`,
     /// deleting the data only if `delete_data_on_drop` was captured as `true` by `prepareForDrop`.
     static void dropImpl(
@@ -126,7 +125,6 @@ public:
         const StorageObjectStorageConfigurationPtr & configuration,
         const StorageID & storage_id,
         const LoggerPtr & log);
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     void truncate(
         const ASTPtr & query,

@@ -67,12 +67,9 @@ namespace DB::ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int DATALAKE_DATABASE_ERROR;
     extern const int FAULT_INJECTED;
-<<<<<<< HEAD
     extern const int CATALOG_NAMESPACE_DISABLED;
-=======
     extern const int NOT_IMPLEMENTED;
     extern const int S3_ERROR;
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 }
 
 namespace DB::FailPoints
@@ -743,12 +740,11 @@ bool GlueCatalog::createTable(
     DB::CompressionMethod metadata_compression_method,
     bool if_not_exists) const
 {
-<<<<<<< HEAD
     if (!isNamespaceAllowed(namespace_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to create table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
-=======
+
     String effective_metadata_path = new_metadata_path;
 
     DB::ObjectStoragePtr written_metadata_storage;
@@ -840,7 +836,6 @@ bool GlueCatalog::createTable(
 
         effective_metadata_path = "s3://" + bucket_name + "/" + metadata_filename;
     }
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     Aws::Glue::Model::CreateTableRequest request;
     request.SetDatabaseName(namespace_name);
@@ -945,12 +940,11 @@ bool GlueCatalog::updateSchema(
 
 void GlueCatalog::dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const
 {
-<<<<<<< HEAD
     if (!isNamespaceAllowed(namespace_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to drop table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
-=======
+
     /// Glue's `DeleteTable` removes only the catalog entry; the client-side purge of the data files is
     /// not implemented.
     /// TODO: implement the client-side purge so `data_lake_delete_data_on_drop` can be honored for Glue.
@@ -964,7 +958,6 @@ void GlueCatalog::dropTable(const String & namespace_name, const String & table_
             "data_lake_delete_data_on_drop is not supported for the Glue catalog: dropping only removes the Glue "
             "catalog entry and does not delete the underlying data files");
     }
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     Aws::Glue::Model::DeleteTableRequest request;
     request.SetDatabaseName(namespace_name);

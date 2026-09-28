@@ -37,11 +37,7 @@
 #include <Parsers/ASTColumnDeclaration.h>
 #include <Parsers/ASTColumnsMatcher.h>
 #include <Parsers/ASTCreateQuery.h>
-<<<<<<< HEAD
-=======
 #include <Parsers/ASTDataType.h>
-#include <Parsers/ASTFunction.h>
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTInsertQuery.h>
@@ -1504,18 +1500,7 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
                 return;
             }
         }
-<<<<<<< HEAD
-        else if (as_create.storage)
-=======
-        else if (as_create.is_time_series_table)
-        {
-            /// Only the engine is inherited here: the settings and the inner tables are copied by normalizeTimeSeriesDefinition.
-            storage_def = make_intrusive<ASTStorage>();
-            storage_def->set(storage_def->engine, as_create.storage->engine->clone());
-            create.is_time_series_table = true;
-        }
         else if (as_create.storage && as_create.storage->engine)
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
         {
             storage_def = boost::static_pointer_cast<ASTStorage>(as_create.storage->ptr());
             create.is_time_series_table = as_create.is_time_series_table;
@@ -1936,17 +1921,6 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
     if (!UserDefinedSQLFunctionFactory::instance().empty())
         UserDefinedSQLFunctionVisitor::visit(query_ptr, getContext());
 
-<<<<<<< HEAD
-=======
-    /// SQL UDF expansion can introduce unqualified table names into persisted metadata. Resolve
-    /// them in the query's current database without revisiting scalar aliases generated during
-    /// query normalization.
-    AddDefaultDatabaseVisitor visitor(getContext(), current_database);
-    if (create.select && create.isView())
-        visitor.visitTableExpressions(*create.select);
-    if (create.columns_list)
-        visitor.visitTableExpressions(*create.columns_list);
-
     const bool engine_user_specified = create.storage && create.storage->engine;
     const bool columns_user_specified = create.columns_list;
     const bool comment_user_specified = create.comment;
@@ -1955,7 +1929,6 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
     if (create.storage)
         datalake_unsupported_storage_clause = findUnsupportedDatalakeStorageClause(*create.storage, engine_user_specified);
 
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
     /// Set and retrieve list of columns, indices and constraints. Set table engine if needed. Rewrite query in canonical way.
     TableProperties properties = getTablePropertiesAndNormalizeCreateQuery(create, mode);
 

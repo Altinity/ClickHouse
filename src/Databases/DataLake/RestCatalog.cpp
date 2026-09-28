@@ -188,8 +188,6 @@ String encodeNamespaceForURI(const String & namespace_name)
     return encoded;
 }
 
-<<<<<<< HEAD
-=======
 /// Per Iceberg REST spec, `namespace` is a JSON array of segments. Split `ns.a.b` on dots.
 Poco::JSON::Array::Ptr namespaceToJSONArray(const String & namespace_name)
 {
@@ -206,28 +204,6 @@ Poco::JSON::Array::Ptr namespaceToJSONArray(const String & namespace_name)
     return segments;
 }
 
-/// A 404 status alone does not separate a namespace that is gone from an endpoint the catalog does
-/// not serve: both answer the same status. Only the Iceberg REST error `type` names the cause, so a
-/// body that is absent, unparseable or typed as anything else is not a vanished namespace.
-bool isNamespaceNotFound(const DB::HTTPException & e)
-{
-    if (e.getHTTPStatus() != Poco::Net::HTTPResponse::HTTPStatus::HTTP_NOT_FOUND)
-        return false;
-
-    try
-    {
-        Poco::JSON::Parser parser;
-        const auto response = parser.parse(e.getResponseBody()).extract<Poco::JSON::Object::Ptr>();
-        const auto error = response->getObject("error");
-        return error && error->getValue<String>("type") == "NoSuchNamespaceException";
-    }
-    catch (...) /// Ok: `false` leaves the 404 to be reported by the caller.
-    {
-        return false;
-    }
-}
-
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 std::unordered_set<std::string> getAllowedBigLakeMetadataServiceHosts(
     const Poco::Util::AbstractConfiguration & config)
 {
@@ -2059,13 +2035,11 @@ bool RestCatalog::createTable(
     DB::CompressionMethod /*metadata_compression_method*/,
     bool if_not_exists) const
 {
-<<<<<<< HEAD
     if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to create table {}, namespace {} is filtered by `namespaces` database parameter", table_name, namespace_name);
-=======
+
     const String location = metadata_content->getValue<String>("location");
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     const auto state_snapshot = state.get();
     const std::string endpoint = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables").generic_string();

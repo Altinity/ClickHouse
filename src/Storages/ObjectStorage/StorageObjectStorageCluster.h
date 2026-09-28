@@ -4,8 +4,6 @@
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Interpreters/Context_fwd.h>
 
-#include <atomic>
-
 namespace DB
 {
 
@@ -235,7 +233,6 @@ private:
     const String engine_name;
     StorageObjectStorageConfigurationPtr configuration;
     const ObjectStoragePtr object_storage;
-<<<<<<< HEAD
     bool cluster_name_in_settings;
 
     /// non-clustered storage to fall back on pure realisation if needed
@@ -243,13 +240,6 @@ private:
 
     /// Set only in the constructor when hive partitioning detection is deferred to the first use.
     bool hive_partitioning_sample_path_deferred = false;
-=======
-    const std::optional<FormatSettings> format_settings;
-    const std::shared_ptr<DataLake::ICatalog> catalog;
-    NamesAndTypesList hive_partition_columns_to_read_from_file_path;
-
-    std::atomic<std::optional<bool>> delete_data_on_drop;
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 };
 
 }

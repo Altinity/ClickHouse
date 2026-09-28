@@ -283,18 +283,14 @@ public:
         throwNotImplemented(fmt::format("EXECUTE {}", command_name));
     }
 
-<<<<<<< HEAD
     virtual bool supportsTruncate() const { return false; }
     virtual void truncate(ContextPtr /*context*/, std::shared_ptr<DataLake::ICatalog> /*catalog*/, const StorageID & /*storage_id*/)
     {
         throwNotImplemented("truncate");
     }
 
-    virtual void drop(ContextPtr) { }
-=======
     /// `delete_data` is what `StorageObjectStorage::drop` resolved from `data_lake_delete_data_on_drop`.
     virtual void drop(bool /* delete_data */) { }
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     virtual ObjectStorageType getObjectStorageType() const { return ObjectStorageType::None; }
 

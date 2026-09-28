@@ -1624,7 +1624,6 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
     return KeyDescription::parse(order_by_str, column_description, {}, local_context, true);
 }
 
-<<<<<<< HEAD
 /// Format one partition field for display in Iceberg/Spark style, e.g. "day(ts)" or "bucket(16, id)".
 static String formatPartitionFieldDisplay(const String & iceberg_transform_name, const String & column_name)
 {
@@ -1741,12 +1740,13 @@ std::optional<String> getSortingKeyDisplayStringFromMetadata(Poco::JSON::Object:
         return result.empty() ? std::nullopt : std::optional<String>(result);
     }
     return std::nullopt;
-=======
+}
+
 static String formatIcebergTransformExpression(
     Poco::JSON::Object::Ptr field, const std::unordered_map<Int32, String> & source_id_to_column_name)
 {
     const auto transform_name = Poco::toLower(field->getValue<String>(f_transform));
-    const auto transform = parseTransformAndArgument(transform_name);
+    const auto transform = parseTransformAndArgument(transform_name, /* time_zone */ "");
     if (!transform)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg transform '{}' cannot be represented in `CREATE TABLE`", transform_name);
 
@@ -1860,7 +1860,6 @@ std::pair<ASTPtr, ASTPtr> getPartitionAndSortingKeyASTsFromMetadata(const Poco::
     }
 
     return {partition_by, order_by};
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 }
 
 DataTypePtr getFunctionResultType(const String & iceberg_transform_name, DataTypePtr source_type)

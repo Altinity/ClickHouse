@@ -878,13 +878,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
         {
             metadata_location = table_metadata.getMetadataLocation(metadata_location);
             (*storage_settings)[DB::DataLakeStorageSetting::iceberg_metadata_file_path] = metadata_location;
-            explicit_metadata_location = metadata_location;
         }
-<<<<<<< HEAD
-
-        (*storage_settings)[DB::DataLakeStorageSetting::iceberg_metadata_file_path] = metadata_location;
-=======
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
     }
 
     const auto configuration = getConfiguration(storage_type, storage_settings);
@@ -1012,21 +1006,7 @@ void DatabaseDataLake::validateCreateTableEngine(const ASTFunction & engine) con
 {
     const auto catalog = getCatalog();
 
-    String family_name;
-    if (dynamic_cast<const DataLake::UnityV2Catalog *>(catalog.get()))
-    {
-        if (engine.name.starts_with("Iceberg"))
-            family_name = "Iceberg";
-        else if (engine.name.starts_with("DeltaLake"))
-            family_name = "DeltaLake";
-        else
-            throw Exception(
-                ErrorCodes::BAD_ARGUMENTS,
-                "A mixed-format Unity DataLakeCatalog supports only `Iceberg`- and `DeltaLake`-family table engines, got '{}'",
-                engine.name);
-    }
-    else
-        family_name = String(catalog->getTableEngineName(DataLake::TableMetadata{}));
+    const String family_name = table_engine_definition->as<ASTStorage &>().engine->name;
 
     if (!engine.name.starts_with(family_name))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -1127,13 +1107,7 @@ void DatabaseDataLake::createTable(
 
     auto catalog = getCatalog();
 
-    if (dynamic_cast<const DataLake::UnityV2Catalog *>(catalog.get()))
-        throw Exception(
-            ErrorCodes::NOT_IMPLEMENTED,
-            "CREATE TABLE without a table engine is not implemented for a mixed-format Unity DataLakeCatalog; "
-            "use an explicit `Iceberg`- or `DeltaLake`-family table engine");
-
-    const String family_name = String(catalog->getTableEngineName(DataLake::TableMetadata{}));
+    const String family_name = table_engine_definition->as<ASTStorage &>().engine->name;
     if (family_name != "Iceberg")
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "CREATE TABLE without a table engine is not implemented for a {} DataLakeCatalog; "
@@ -1239,15 +1213,6 @@ void DatabaseDataLake::dropTable( /// NOLINT
     bool /*sync*/,
     bool if_exists)
 {
-<<<<<<< HEAD
-    auto table = tryGetTable(name, context_);
-    if (table)
-        table->drop();
-    else
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot drop table {} because it does not exist", name);
-=======
-    evictStatefulTable(name);
-
     auto catalog = getCatalog();
     const auto [namespace_name, table_name] = DataLake::parseTableName(name);
 
@@ -1255,7 +1220,6 @@ void DatabaseDataLake::dropTable( /// NOLINT
     catalog->dropTable(namespace_name, table_name, purge, if_exists);
 
     LOG_INFO(log, "Dropped table {}.{} from DataLakeCatalog (purge={})", namespace_name, table_name, purge);
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 }
 
 DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIterator(
@@ -1625,19 +1589,6 @@ ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
     }
 
     auto create_table_query = make_intrusive<ASTCreateQuery>();
-<<<<<<< HEAD
-    auto table_storage_define = table_engine_definition->clone();
-
-    auto * storage = table_storage_define->as<ASTStorage>();
-    storage->engine->setKind(ASTFunction::Kind::TABLE_ENGINE);
-    if (!table_metadata.isDefaultReadableTable())
-        storage->engine->name = DataLake::FAKE_TABLE_ENGINE_NAME_FOR_UNREADABLE_TABLES;
-
-    storage->settings = {};
-
-    create_table_query->set(create_table_query->storage, table_storage_define);
-=======
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     auto columns_declare_list = make_intrusive<ASTColumns>();
     auto columns_expression_list = make_intrusive<ASTExpressionList>();
@@ -1680,7 +1631,8 @@ ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
 
     auto * storage = table_storage_define->as<ASTStorage>();
     storage->engine->setKind(ASTFunction::Kind::TABLE_ENGINE);
-    storage->engine->name = String(catalog->getTableEngineName(table_metadata));
+    if (!table_metadata.isDefaultReadableTable())
+        storage->engine->name = DataLake::FAKE_TABLE_ENGINE_NAME_FOR_UNREADABLE_TABLES;
 
     storage->settings = {};
     if (partition_by)

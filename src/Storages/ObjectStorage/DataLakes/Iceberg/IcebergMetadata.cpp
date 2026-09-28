@@ -993,19 +993,9 @@ void IcebergMetadata::createInitial(
     if (catalog_manages_location)
     {
         DataLake::TableMetadata existing_table;
-<<<<<<< HEAD
         if (catalog->tryGetTableMetadata(namespace_name, table_name, local_context, existing_table))
-        {
-            if (if_not_exists)
-                return;
-            throw Exception(
-                ErrorCodes::TABLE_ALREADY_EXISTS, "Table {}.{} already exists in the catalog", namespace_name, table_name);
-        }
-=======
-        if (catalog->tryGetTableMetadata(namespace_name, table_name, existing_table))
             throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS,
                 "Table {}.{} already exists in the catalog", namespace_name, table_name);
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
     }
     else
     {
@@ -1123,13 +1113,8 @@ void IcebergMetadata::createInitial(
 
     if (catalog)
     {
-<<<<<<< HEAD
-        auto catalog_filename = configuration_ptr->getTypeName() + "://" + configuration_ptr->getNamespace() + "/"
-            + configuration_ptr->getRawPath().path + fmt::format("metadata/v1{}.metadata.json", compression_suffix);
-        catalog->createTable(namespace_name, table_name, catalog_filename, metadata_content_object);
-=======
-        auto catalog_filename = Iceberg::makeIcebergLocationURI(
-            configuration_ptr->getTypeName(), configuration_ptr->getNamespace(), filename);
+        auto catalog_filename
+            = configuration_ptr->getTypeName() + "://" + configuration_ptr->getNamespace() + "/" + filename;
 
         if (!catalog->createTable(namespace_name, table_name, catalog_filename, metadata_content_object, compression_method, if_not_exists))
         {
@@ -1149,7 +1134,6 @@ void IcebergMetadata::createInitial(
             throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS,
                 "Table {}.{} already exists in the catalog", namespace_name, table_name);
         }
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
     }
 }
 

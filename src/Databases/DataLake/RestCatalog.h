@@ -78,12 +78,6 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_REST;
     }
 
-<<<<<<< HEAD
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
-=======
-    /// Inherited by every catalog based on the Iceberg REST protocol.
-    DataLakeTableFormat getTableFormat(const TableMetadata &) const override { return DataLakeTableFormat::ICEBERG; }
-
     bool createTable(
         const String & namespace_name,
         const String & table_name,
@@ -91,7 +85,6 @@ public:
         Poco::JSON::Object::Ptr metadata_content,
         DB::CompressionMethod metadata_compression_method,
         bool if_not_exists) const override;
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const override;
 
@@ -323,17 +316,13 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_ONELAKE;
     }
 
-<<<<<<< HEAD
+    /// OneLake keeps data in Azure Data Lake Storage, whatever the catalog reports.
+    std::optional<StorageType> getStorageType() const override { return StorageType::Azure; }
+
     DB::HTTPHeaderEntries getAuthHeaders(
         const CatalogState & catalog_state,
         bool update_token,
         bool * used_cached_oauth_token) const override;
-=======
-    /// OneLake keeps data in Azure Data Lake Storage, whatever the catalog reports.
-    std::optional<StorageType> getStorageType() const override { return StorageType::Azure; }
-
-    DB::HTTPHeaderEntries getAuthHeaders(const CatalogState & catalog_state, bool update_token) const override;
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     static void validateSettingsChanges(const DB::SettingsChanges & changes, AuthMode auth_mode);
 
@@ -381,17 +370,13 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE;
     }
 
-<<<<<<< HEAD
+    /// BigLake keeps data in Google Cloud Storage, which is accessed through the S3 API.
+    std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
+
     DB::HTTPHeaderEntries getAuthHeaders(
         const CatalogState & catalog_state,
         bool update_token,
         bool * used_cached_oauth_token) const override;
-=======
-    /// BigLake keeps data in Google Cloud Storage, which is accessed through the S3 API.
-    std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
-
-    DB::HTTPHeaderEntries getAuthHeaders(const CatalogState & catalog_state, bool update_token) const override;
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     const std::string & getGoogleADCClientId() const { return google_adc_client_id; }
     const std::string & getGoogleADCClientSecret() const { return google_adc_client_secret; }

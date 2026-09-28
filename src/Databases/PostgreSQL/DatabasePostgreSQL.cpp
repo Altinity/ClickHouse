@@ -333,51 +333,7 @@ void DatabasePostgreSQL::createTable(ContextPtr local_context, const String & ta
 }
 
 
-<<<<<<< HEAD
-void DatabasePostgreSQL::dropTable(ContextPtr, const String & table_name, bool /* sync */)
-=======
-void DatabasePostgreSQL::detachTablePermanently(ContextPtr local_context, const String & table_name)
-{
-    if (!persistent)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DETACH TABLE PERMANENTLY is not supported for non-persistent PostgreSQL database");
-
-    auto db_disk = getDisk();
-    std::lock_guard lock{mutex};
-
-    if (!checkPostgresTable(table_name))
-        throw Exception(ErrorCodes::UNKNOWN_TABLE, "Cannot detach table {} because it does not exist", getTableNameForLogs(table_name));
-
-    if (detached_or_dropped.contains(table_name))
-        throw Exception(ErrorCodes::TABLE_IS_DROPPED, "Table {} is already dropped/detached", getTableNameForLogs(table_name));
-
-    fs::path mark_table_removed = fs::path(getMetadataPath()) / (escapeForFileName(table_name) + suffix);
-
-    /// Insert before writing the marker and roll back on failure: inserting allocates, so doing it
-    /// afterwards could throw with the marker already durable and not retryable.
-    detached_or_dropped.emplace(table_name);
-
-    try
-    {
-        /// fsync the parent directory so the marker survives a power loss, else the table silently
-        /// re-appears on restart. The marker is an empty file, so only its directory entry matters.
-        SyncGuardPtr dir_sync_guard;
-        if (local_context->getSettingsRef()[Setting::fsync_metadata])
-            dir_sync_guard = db_disk->getDirectorySyncGuard(getMetadataPath());
-
-        db_disk->createFile(mark_table_removed);
-    }
-    catch (...)
-    {
-        detached_or_dropped.erase(table_name);
-        throw;
-    }
-
-    if (cache_tables)
-        cached_tables.erase(table_name);
-}
-
-void DatabasePostgreSQL::dropTable(ContextPtr local_context, const String & table_name, bool /* sync */, bool /* if_exists */)
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
+void DatabasePostgreSQL::dropTable(ContextPtr, const String & table_name, bool /* sync */, bool /* if_exists */)
 {
     if (!persistent)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DROP TABLE is not supported for non-persistent MySQL database");

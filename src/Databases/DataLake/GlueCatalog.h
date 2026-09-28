@@ -69,11 +69,6 @@ public:
         return DB::DatabaseDataLakeCatalogType::GLUE;
     }
 
-<<<<<<< HEAD
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
-=======
-    DataLakeTableFormat getTableFormat(const TableMetadata &) const override { return DataLakeTableFormat::ICEBERG; }
-
     bool createTable(
         const String & namespace_name,
         const String & table_name,
@@ -81,7 +76,6 @@ public:
         Poco::JSON::Object::Ptr metadata_content,
         DB::CompressionMethod metadata_compression_method,
         bool if_not_exists) const override;
->>>>>>> a6b0bb27957 (Merge 370491a822df9f355a9b013228b7810df559ef1b into 1e5291bf9d4309dcad43e79e15f2213891e3086e)
 
     void createNamespaceIfNotExists(const String & namespace_name, const String & location) const override;
 
