@@ -534,8 +534,10 @@ void DiskObjectStorageTransaction::copyFileImpl(
                 using Source = std::decay_t<decltype(source)>;
                 if constexpr (std::is_same_v<Source, ContentAddressedInlineFileCopySource>)
                     return {StoredObject("", from_file_path, source.data.size())};
-                else
+                else if constexpr (std::is_same_v<Source, ContentAddressedBlobFileCopySource>)
                     return {source.object};
+                else
+                    static_assert(std::is_same_v<Source, void>);
             },
             *content_addressed_source)
         : src_metadata_storage->getStorageObjects(from_file_path);
@@ -566,47 +568,59 @@ void DiskObjectStorageTransaction::copyFileImpl(
         {
             if (content_addressed_source)
             {
-                if (const auto * inline_source = std::get_if<ContentAddressedInlineFileCopySource>(&*content_addressed_source))
-                {
-                    runner.enqueueAndKeepTrack(
-                        [this, bytes = inline_source->data, dst_blob, location, enriched_write_settings]
+                std::visit(
+                    [&](const auto & copy_source)
+                    {
+                        using Source = std::decay_t<decltype(copy_source)>;
+                        if constexpr (std::is_same_v<Source, ContentAddressedInlineFileCopySource>)
                         {
-                            auto out = object_storages->takePointingTo(location)->writeObject(
-                                dst_blob, WriteMode::Rewrite, {}, DBMS_DEFAULT_BUFFER_SIZE, *enriched_write_settings);
-                            out->write(bytes.data(), bytes.size());
-                            out->finalize();
-                        });
-                }
-                else
-                {
-                    const auto window = getContentAddressedObjectWindow(*content_addressed_source, from_file_path);
-                    if (!window || src_blob != window->object)
-                        throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid CAS copy source for {}", from_file_path);
-
-                    const UInt64 source_offset = window->offset;
-
-                    runner.enqueueAndKeepTrack(
-                        [this,
-                         src_object_storages,
-                         src_blob,
-                         dst_blob,
-                         location,
-                         src_local_location,
-                         src_object_offset = source_offset,
-                         enriched_read_settings,
-                         enriched_write_settings]
+                            runner.enqueueAndKeepTrack(
+                                [this, bytes = copy_source.data, dst_blob, location, enriched_write_settings]
+                                {
+                                    auto out = object_storages->takePointingTo(location)->writeObject(
+                                        dst_blob, WriteMode::Rewrite, {}, DBMS_DEFAULT_BUFFER_SIZE, *enriched_write_settings);
+                                    out->write(bytes.data(), bytes.size());
+                                    out->finalize();
+                                });
+                        }
+                        else if constexpr (std::is_same_v<Source, ContentAddressedBlobFileCopySource>)
                         {
-                            src_object_storages->takePointingTo(src_local_location)
-                                ->copyObjectToAnotherObjectStorage(
-                                    src_blob,
-                                    dst_blob,
-                                    *enriched_read_settings,
-                                    *enriched_write_settings,
-                                    *object_storages->takePointingTo(location),
-                                    std::nullopt,
-                                    src_object_offset);
-                        });
-                }
+                            if (src_blob != copy_source.object
+                                || copy_source.object.remote_path.empty()
+                                || copy_source.payload_offset == 0
+                                || copy_source.payload_size != copy_source.object.bytes_size)
+                            {
+                                throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid CAS copy source for {}", from_file_path);
+                            }
+
+                            runner.enqueueAndKeepTrack(
+                                [this,
+                                 src_object_storages,
+                                 src_blob,
+                                 dst_blob,
+                                 location,
+                                 src_local_location,
+                                 src_object_offset = copy_source.payload_offset,
+                                 enriched_read_settings,
+                                 enriched_write_settings]
+                                {
+                                    src_object_storages->takePointingTo(src_local_location)
+                                        ->copyObjectToAnotherObjectStorage(
+                                            src_blob,
+                                            dst_blob,
+                                            *enriched_read_settings,
+                                            *enriched_write_settings,
+                                            *object_storages->takePointingTo(location),
+                                            std::nullopt,
+                                            src_object_offset);
+                                });
+                        }
+                        else
+                        {
+                            static_assert(std::is_same_v<Source, void>);
+                        }
+                    },
+                    *content_addressed_source);
             }
             else
             {

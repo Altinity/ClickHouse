@@ -21,6 +21,7 @@
 #include <aws/core/auth/AWSCredentials.h>
 
 #include <filesystem>
+#include <type_traits>
 
 
 namespace fs = std::filesystem;
@@ -394,16 +395,34 @@ void BackupWriterS3::copyFileFromDisk(
             if (!source)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "No CAS copy source for {} on disk {}", src_path, src_disk->getName());
 
-            const auto window = getContentAddressedObjectWindow(*source, src_path);
-            if (!window)
+            const auto * blob_source = std::visit(
+                []<typename Source>(const Source & copy_source) -> const ContentAddressedBlobFileCopySource *
+                {
+                    if constexpr (std::is_same_v<Source, ContentAddressedInlineFileCopySource>)
+                        return nullptr;
+                    else if constexpr (std::is_same_v<Source, ContentAddressedBlobFileCopySource>)
+                        return &copy_source;
+                    else
+                        static_assert(std::is_same_v<Source, void>);
+                },
+                *source);
+
+            if (!blob_source)
             {
                 LOG_TRACE(log, "File {} has no object of its own, copying through buffers", src_path);
                 BackupWriterDefault::copyFileFromDisk(path_in_backup, src_disk, src_path, copy_encrypted, start_pos, length);
                 return;
             }
 
-            const auto & source_object = window->object;
-            const UInt64 source_offset = window->offset;
+            if (blob_source->object.remote_path.empty()
+                || blob_source->payload_offset == 0
+                || blob_source->payload_size != blob_source->object.bytes_size)
+            {
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid CAS blob copy source for {}", src_path);
+            }
+
+            const auto & source_object = blob_source->object;
+            const UInt64 source_offset = blob_source->payload_offset;
             if (start_pos > source_object.bytes_size || length > source_object.bytes_size - start_pos)
             {
                 throw Exception(
@@ -411,7 +430,7 @@ void BackupWriterS3::copyFileFromDisk(
                     "Requested range with offset {} and length {} is outside CAS payload of {} bytes for {}",
                     start_pos,
                     length,
-                    source_object.bytes_size,
+                    blob_source->payload_size,
                     src_path);
             }
             const auto blob_path = src_disk->getBlobPath(src_path);

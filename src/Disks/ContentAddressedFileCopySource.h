@@ -2,7 +2,6 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 
-#include <optional>
 #include <variant>
 
 namespace DB
@@ -20,23 +19,8 @@ struct ContentAddressedBlobFileCopySource
     UInt64 payload_size = 0;
 };
 
-struct ContentAddressedPlainFileCopySource
-{
-    StoredObject object;
-};
-
 using ContentAddressedFileCopySource = std::variant<
     ContentAddressedInlineFileCopySource,
-    ContentAddressedBlobFileCopySource,
-    ContentAddressedPlainFileCopySource>;
-
-struct ContentAddressedObjectWindow
-{
-    StoredObject object;
-    UInt64 offset = 0;
-};
-
-std::optional<ContentAddressedObjectWindow> getContentAddressedObjectWindow(
-    const ContentAddressedFileCopySource & source, const String & path);
+    ContentAddressedBlobFileCopySource>;
 
 }

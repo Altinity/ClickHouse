@@ -2022,12 +2022,7 @@ std::optional<ContentAddressedFileCopySource> ContentAddressedMetadataStorage::g
 
     const auto plan = getBlobViewPlan(path);
     if (!plan)
-    {
-        const auto objects = getStorageObjects(path);
-        if (objects.size() != 1 || objects.front().remote_path.empty())
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid non-blob CAS copy source for {}", path);
-        return ContentAddressedPlainFileCopySource{.object = objects.front()};
-    }
+        return std::nullopt;
 
     const UInt64 payload_offset = plan->payload_offset;
     const UInt64 expected_payload_offset = store()->poolMeta().blob_header_len;
