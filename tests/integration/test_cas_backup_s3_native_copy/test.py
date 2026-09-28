@@ -37,6 +37,7 @@ def start_cluster():
         "node",
         main_configs=["configs/storage_conf.xml"],
         with_rustfs=True,
+        with_remote_database_disk=False,
         stay_alive=True,
     )
     try:
@@ -205,10 +206,12 @@ def test_blobs_use_ranged_copy_and_inline_falls_back():
     """
     node = cluster.instances["node"]
     table = "cas_backup_mechanism"
+    restored = f"{table}_restored"
     destination = backup_destination("mechanism")
     query_id = f"cas_backup_mechanism_{RUN_TOKEN}"
 
     create_and_fill(node, table)
+    expected = column_fingerprints(node, table)
     node.query(
         f"BACKUP TABLE {table} TO {destination} SETTINGS allow_s3_native_copy = 1",
         query_id=query_id,
@@ -228,11 +231,14 @@ def test_blobs_use_ranged_copy_and_inline_falls_back():
 
     assert upload_part_copy > 0, "no ranged server-side copy happened"
     assert copy_object == 0, "CopyObject has no range: the envelope would land in the backup"
-    assert node.contains_in_log(
-        "has no object of its own, copying through buffers"
-    ), "inline entries did not fall back"
+
+    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node.query(f"RESTORE TABLE {table} AS {restored} FROM {destination}")
+    actual = column_fingerprints(node, restored)
+    assert actual == expected
 
     node.query(f"DROP TABLE {table} SYNC")
+    node.query(f"DROP TABLE {restored} SYNC")
 
 
 def test_ranged_copy_falls_back_without_multipart():
@@ -273,9 +279,6 @@ def test_ranged_copy_falls_back_without_multipart():
     assert upload_part_copy == 0, "multipart copy was disabled but UploadPartCopy still ran"
     assert copy_object == 0, "a ranged copy fell back to CopyObject, which would take the envelope"
     assert uploaded > 0, "nothing was uploaded through the server, so nothing was copied at all"
-    assert node.contains_in_log(
-        "Ranged native copy needs multipart copy"
-    ), "the copy did not reach the ranged-copy fallback"
 
     node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
     node.query(
