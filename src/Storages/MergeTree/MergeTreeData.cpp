@@ -1337,6 +1337,10 @@ void MergeTreeData::validateExportTTL(
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
             "`TTL ... EXPORT TO TABLE` requires the server setting `allow_experimental_export_merge_tree_partition`");
 
+    /// It decides when rows are copied elsewhere once and for all, so it must be a deterministic
+    /// function of the rows even when suspicious TTL expressions are allowed.
+    export_ttls.front().checkExpressionIsStrict(local_context);
+
     const auto destination_id = getExportTTLDestination(table_id, export_ttls.front());
     if (destination_id.database_name == table_id.database_name && destination_id.table_name == table_id.table_name)
         throw Exception(ErrorCodes::BAD_TTL_EXPRESSION, "A table cannot be the destination of its own EXPORT TTL");

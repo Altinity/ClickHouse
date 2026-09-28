@@ -1237,6 +1237,11 @@ ExpressionAndSets TTLDescription::buildExpression(const ContextPtr & context) co
     return buildExpressionAndSets(ast, expression_columns, context);
 }
 
+void TTLDescription::checkExpressionIsStrict(const ContextPtr & context) const
+{
+    checkTTLExpression(buildExpression(context).expression, result_column, /*allow_suspicious=*/ false);
+}
+
 ExpressionAndSets TTLDescription::buildWhereExpression(const ContextPtr & context) const
 {
     if (where_expression_ast)
@@ -1385,10 +1390,7 @@ TTLDescription TTLDescription::getTTLFromAST(
         }
     }
 
-    /// An export TTL decides when rows are copied elsewhere once and for all, so it must be a
-    /// deterministic function of the rows even when suspicious TTL expressions are allowed.
-    const bool allow_suspicious = result.mode != TTLMode::EXPORT && context->getSettingsRef()[Setting::allow_suspicious_ttl_expressions];
-    checkTTLExpression(expression, result.result_column, is_attach || allow_suspicious);
+    checkTTLExpression(expression, result.result_column, is_attach || context->getSettingsRef()[Setting::allow_suspicious_ttl_expressions]);
 
     if (where_expression && !is_attach && !context->getSettingsRef()[Setting::allow_suspicious_ttl_expressions])
         checkTTLExpressionForAggregateFunctions(where_expression, /*expression_kind=*/ "WHERE ");

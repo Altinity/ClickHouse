@@ -60,6 +60,11 @@ struct TTLDescription
     /// Expression actions evaluated from AST
     ExpressionAndSets buildExpression(const ContextPtr & context) const;
 
+    /// Throws unless the expression is a deterministic function of the columns with a date or time
+    /// result, whatever `allow_suspicious_ttl_expressions` is. The callers of `getTTLFromAST` pass that
+    /// setting as `is_attach`, so the checks there cannot tell it from an `ATTACH`.
+    void checkExpressionIsStrict(const ContextPtr & context) const;
+
     /// Result column of this TTL expression
     String result_column;
 

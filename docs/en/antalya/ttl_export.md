@@ -54,7 +54,7 @@ A destination that is compatible only for some groups is accepted. With a source
 
 ## How parts are exported {#how-parts-are-exported}
 
-A part becomes eligible once the maximum TTL value of its rows is due, the same rule move TTL uses, so a part is exported as a whole. The TTL does not have to be aligned with the partition key. A part written before the expression was added becomes eligible after `ALTER TABLE ... MATERIALIZE TTL`, which `ALTER TABLE ... MODIFY TTL` runs by default.
+A part becomes eligible once the maximum TTL value of its rows is due, the same rule move TTL uses, so a part is exported as a whole. The TTL does not have to be aligned with the partition key. When it is not, a part may hold rows that are due at different times, and is exported once the last of them is due. A due part that no group has claimed yet may also merge with a part of its partition that is not due, and its rows then wait for the rows of that part. A part written before the expression was added becomes eligible after `ALTER TABLE ... MATERIALIZE TTL`, which `ALTER TABLE ... MODIFY TTL` runs by default.
 
 The eligible parts of a partition are collected into a group and exported together, when any of the following holds:
 

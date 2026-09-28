@@ -24,6 +24,7 @@
 #include <Core/Block.h>
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -1242,9 +1243,10 @@ namespace
             return true;
         }
 
-        /// `canBeSafelyCast` only widens numbers, but every `Date` fits in a `Date32` and every `DateTime` in a
-        /// `DateTime64` of any scale. Iceberg stores them as `date` and `timestamp`, so an Iceberg table declares
-        /// `Date32` and `DateTime64(6)` columns once it reloads its schema from its metadata.
+        /// `canBeSafelyCast` only widens numbers, but every `Date` fits in a `Date32`, every `DateTime` in a
+        /// `DateTime64` of any scale, and every `DateTime64` in one of a larger scale unless that scale is 9,
+        /// whose range ends in 2262. Iceberg stores them as `date` and `timestamp`, so an Iceberg table
+        /// declares `Date32` and `DateTime64(6)` columns once it reloads its schema from its metadata.
         bool isDateOrTimeWidening(const DataTypePtr & source_type, const DataTypePtr & destination_type)
         {
             if (isNullableOrLowCardinalityNullable(source_type) && !isNullableOrLowCardinalityNullable(destination_type))
@@ -1252,6 +1254,13 @@ namespace
 
             const auto source = removeNullable(removeLowCardinality(source_type));
             const auto destination = removeNullable(removeLowCardinality(destination_type));
+            if (isDateTime64(source) && isDateTime64(destination))
+            {
+                const auto source_scale = assert_cast<const DataTypeDateTime64 &>(*source).getScale();
+                const auto destination_scale = assert_cast<const DataTypeDateTime64 &>(*destination).getScale();
+                return destination_scale >= source_scale && (destination_scale < 9 || source_scale == 9);
+            }
+
             return (isDate(source) && isDate32(destination)) || (isDateTime(source) && isDateTime64(destination));
         }
 
