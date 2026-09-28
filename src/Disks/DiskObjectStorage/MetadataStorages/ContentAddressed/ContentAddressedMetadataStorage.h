@@ -356,6 +356,7 @@ public:
     std::optional<StoredObjects> getStorageObjectsIfExist(const std::string & path) const override;
     std::string readInlineDataToString(const std::string & path) const override;
     size_t getObjectPayloadOffset(const std::string & path) const override;
+    std::optional<ContentAddressedFileCopySource> getContentAddressedFileCopySource(const std::string & path) const override;
 
     /// ==== `IContentAddressedExchange` (interserver relinking facade) ====
     const String & getPoolUUID() const override { return pool_uuid; }

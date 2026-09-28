@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <memory>
 #include <ranges>
+#include <type_traits>
 #include <vector>
 
 namespace ProfileEvents
@@ -519,7 +520,25 @@ void DiskObjectStorageTransaction::copyFileImpl(
     const auto enriched_write_settings = std::make_shared<const WriteSettings>(
         updateIOSchedulingSettings(write_settings, read_resource_name, write_resource_name));
 
-    const auto blobs_to_copy = src_metadata_storage->getStorageObjects(from_file_path);
+    const auto content_addressed_source = src_metadata_storage->isContentAddressed()
+        ? src_metadata_storage->getContentAddressedFileCopySource(from_file_path)
+        : std::nullopt;
+
+    if (src_metadata_storage->isContentAddressed() && !content_addressed_source)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "No CAS copy source for {}", from_file_path);
+
+    const auto blobs_to_copy = content_addressed_source
+        ? std::visit(
+            [&](const auto & source) -> StoredObjects
+            {
+                using Source = std::decay_t<decltype(source)>;
+                if constexpr (std::is_same_v<Source, ContentAddressedInlineFileCopySource>)
+                    return {StoredObject("", from_file_path, source.data.size())};
+                else
+                    return {source.object};
+            },
+            *content_addressed_source)
+        : src_metadata_storage->getStorageObjects(from_file_path);
     const auto blobs_to_create = blobs_to_copy
                         | std::views::transform([&](const auto & from) { return StoredObject(metadata_transaction->generateObjectKeyForPath(to_file_path).serialize(), to_file_path, from.bytes_size); })
                         | std::ranges::to<StoredObjects>();
@@ -544,30 +563,61 @@ void DiskObjectStorageTransaction::copyFileImpl(
     {
         for (const auto [src_blob, dst_blob] : std::views::zip(blobs_to_copy, blobs_to_create))
         {
-            if (src_metadata_storage->isContentAddressed() && src_blob.remote_path.empty())
+            if (content_addressed_source)
             {
-                runner.enqueueAndKeepTrack(
-                    [this, src_metadata_storage, from_file_path, src_blob, dst_blob, location, enriched_write_settings]
-                    {
-                        const String bytes = src_metadata_storage->readInlineDataToString(from_file_path);
-                        if (bytes.size() != src_blob.bytes_size)
-                            throw Exception(
-                                ErrorCodes::LOGICAL_ERROR,
-                                "Inline data of {} has {} bytes, but its metadata reports {}",
-                                from_file_path,
-                                bytes.size(),
-                                src_blob.bytes_size);
+                if (const auto * inline_source = std::get_if<ContentAddressedInlineFileCopySource>(&*content_addressed_source))
+                {
+                    runner.enqueueAndKeepTrack(
+                        [this, bytes = inline_source->data, dst_blob, location, enriched_write_settings]
+                        {
+                            auto out = object_storages->takePointingTo(location)->writeObject(
+                                dst_blob, WriteMode::Rewrite, {}, DBMS_DEFAULT_BUFFER_SIZE, *enriched_write_settings);
+                            out->write(bytes.data(), bytes.size());
+                            out->finalize();
+                        });
+                }
+                else
+                {
+                    const auto * blob_source = std::get_if<ContentAddressedBlobFileCopySource>(&*content_addressed_source);
+                    const auto & source_object = blob_source
+                        ? blob_source->object
+                        : std::get<ContentAddressedPlainFileCopySource>(*content_addressed_source).object;
+                    const UInt64 source_offset = blob_source ? blob_source->payload_offset : 0;
 
-                        auto out = object_storages->takePointingTo(location)->writeObject(
-                            dst_blob, WriteMode::Rewrite, {}, DBMS_DEFAULT_BUFFER_SIZE, *enriched_write_settings);
-                        out->write(bytes.data(), bytes.size());
-                        out->finalize();
-                    });
+                    if (src_blob != source_object
+                        || source_object.remote_path.empty()
+                        || (blob_source && (blob_source->payload_offset == 0 || blob_source->payload_size != source_object.bytes_size)))
+                    {
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid CAS copy source for {}", from_file_path);
+                    }
+
+                    runner.enqueueAndKeepTrack(
+                        [this,
+                         src_object_storages,
+                         src_blob,
+                         dst_blob,
+                         location,
+                         src_local_location,
+                         src_object_offset = source_offset,
+                         enriched_read_settings,
+                         enriched_write_settings]
+                        {
+                            src_object_storages->takePointingTo(src_local_location)
+                                ->copyObjectToAnotherObjectStorage(
+                                    src_blob,
+                                    dst_blob,
+                                    *enriched_read_settings,
+                                    *enriched_write_settings,
+                                    *object_storages->takePointingTo(location),
+                                    std::nullopt,
+                                    src_object_offset);
+                        });
+                }
             }
             else
             {
                 const size_t src_object_offset = src_metadata_storage->getObjectPayloadOffset(from_file_path);
-                
+
                 runner.enqueueAndKeepTrack(
                     [this,
                      src_object_storages,

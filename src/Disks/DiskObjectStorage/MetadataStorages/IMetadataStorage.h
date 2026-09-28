@@ -13,6 +13,7 @@
 #include <Disks/WriteMode.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <Disks/ContentAddressedFileCopySource.h>
 #include <Disks/DiskObjectStorage/Replication/ClusterConfiguration.h>
 #include <Disks/DiskObjectStorage/Replication/Location.h>
 #include <Disks/DiskCommitTransactionOptions.h>
@@ -324,6 +325,11 @@ public:
     virtual bool isContentAddressed() const { return false; }
 
     virtual size_t getObjectPayloadOffset(const std::string & /* path */) const { return 0; }
+
+    virtual std::optional<ContentAddressedFileCopySource> getContentAddressedFileCopySource(const std::string & /* path */) const
+    {
+        return std::nullopt;
+    }
 
     /// [TXN-ONE-PIPELINE] True when a transaction from this storage stages every mutation into a
     /// transaction-private overlay at call time (eager) rather than queuing effects for FIFO replay in

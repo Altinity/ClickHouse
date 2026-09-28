@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <Disks/ContentAddressedFileCopySource.h>
 #include <Interpreters/Context_fwd.h>
 #include <Core/Defines.h>
 #include <Core/Names.h>
@@ -320,6 +321,11 @@ public:
 
     /// Where the file's bytes begin inside the object `getBlobPath` names.
     virtual size_t getObjectPayloadOffset(const String & path) const = 0;
+
+    virtual std::optional<ContentAddressedFileCopySource> getContentAddressedFileCopySource(const String & /* path */) const
+    {
+        return std::nullopt;
+    }
 
     /// Returns whether the blob paths this disk uses are randomly generated.
     virtual bool areBlobPathsRandom() const = 0;

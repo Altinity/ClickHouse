@@ -65,6 +65,7 @@ public:
     bool isReadOnly() const override;
     bool isContentAddressed() const override;
     size_t getObjectPayloadOffset(const std::string & path) const override;
+    std::optional<ContentAddressedFileCopySource> getContentAddressedFileCopySource(const std::string & path) const override;
     bool isTransactional() const override;
     bool isPlain() const override;
     bool isWriteOnce() const override;

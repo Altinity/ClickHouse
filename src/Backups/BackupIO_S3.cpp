@@ -388,18 +388,70 @@ void BackupWriterS3::copyFileFromDisk(
     auto source_data_source_description = src_disk->getDataSourceDescription();
     if (source_data_source_description.sameKind(data_source_description) && (source_data_source_description.is_encrypted == copy_encrypted))
     {
-        /// getBlobPath() can return more than 2 elements if the file is stored as multiple objects in S3 bucket.
-        /// In this case we can't use the native copy.
-        if (auto blob_path = src_disk->getBlobPath(src_path); blob_path.size() == 2)
+        if (src_disk->isContentAddressed())
         {
-            LOG_TRACE(log, "Copying file {} from disk {} to S3", src_path, src_disk->getName());
+            const auto source = src_disk->getContentAddressedFileCopySource(src_path);
+            if (!source)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "No CAS copy source for {} on disk {}", src_path, src_disk->getName());
 
-            if (src_disk->isContentAddressed() && blob_path[0].empty())
+            if (std::holds_alternative<ContentAddressedInlineFileCopySource>(*source))
             {
                 LOG_TRACE(log, "File {} has no object of its own, copying through buffers", src_path);
                 BackupWriterDefault::copyFileFromDisk(path_in_backup, src_disk, src_path, copy_encrypted, start_pos, length);
                 return;
             }
+
+            const auto * blob_source = std::get_if<ContentAddressedBlobFileCopySource>(&*source);
+            const auto & source_object = blob_source
+                ? blob_source->object
+                : std::get<ContentAddressedPlainFileCopySource>(*source).object;
+            const UInt64 source_offset = blob_source ? blob_source->payload_offset : 0;
+            if (blob_source && (start_pos > blob_source->payload_size || length > blob_source->payload_size - start_pos))
+            {
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Requested range with offset {} and length {} is outside CAS payload of {} bytes for {}",
+                    start_pos,
+                    length,
+                    blob_source->payload_size,
+                    src_path);
+            }
+            const auto blob_path = src_disk->getBlobPath(src_path);
+            if (blob_path.size() != 2 || blob_path[0] != source_object.remote_path)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS copy source for {} does not match its blob path on disk {}", src_path, src_disk->getName());
+
+            LOG_TRACE(log, "Copying file {} from disk {} to S3", src_path, src_disk->getName());
+            copyS3File(
+                disk_client_factory.getOrCreate(src_disk),
+                blob_path[1],
+                source_object.remote_path,
+                start_pos,
+                length,
+                source_offset,
+                client,
+                s3_uri.bucket,
+                fs::path(s3_uri.key) / path_in_backup,
+                s3_settings.request_settings,
+                read_settings,
+                blob_storage_log,
+                threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER),
+                [&, this]
+                {
+                    LOG_TRACE(log, "Falling back to copy file {} from disk {} to S3 through buffers", src_path, src_disk->getName());
+
+                    if (copy_encrypted)
+                        return src_disk->readEncryptedFile(src_path, read_settings);
+
+                    return src_disk->readFile(src_path, read_settings);
+                });
+            return;
+        }
+
+        /// getBlobPath() can return more than 2 elements if the file is stored as multiple objects in S3 bucket.
+        /// In this case we can't use the native copy.
+        if (auto blob_path = src_disk->getBlobPath(src_path); blob_path.size() == 2)
+        {
+            LOG_TRACE(log, "Copying file {} from disk {} to S3", src_path, src_disk->getName());
 
             const size_t src_object_offset = src_disk->getObjectPayloadOffset(src_path);
 

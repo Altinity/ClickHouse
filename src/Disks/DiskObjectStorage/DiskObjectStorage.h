@@ -181,6 +181,7 @@ public:
     Strings getBlobPath(const String & path) const override;
 
     size_t getObjectPayloadOffset(const String & path) const override;
+    std::optional<ContentAddressedFileCopySource> getContentAddressedFileCopySource(const String & path) const override;
     bool areBlobPathsRandom() const override;
     void writeFileUsingBlobWritingFunction(const String & path, WriteMode mode, WriteBlobFunction && write_blob_function) override;
 

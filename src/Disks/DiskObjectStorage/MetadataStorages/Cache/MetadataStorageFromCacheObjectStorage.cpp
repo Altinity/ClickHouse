@@ -181,6 +181,11 @@ size_t MetadataStorageFromCacheObjectStorage::getObjectPayloadOffset(const std::
     return underlying->getObjectPayloadOffset(path);
 }
 
+std::optional<ContentAddressedFileCopySource> MetadataStorageFromCacheObjectStorage::getContentAddressedFileCopySource(const std::string & path) const
+{
+    return underlying->getContentAddressedFileCopySource(path);
+}
+
 bool MetadataStorageFromCacheObjectStorage::isTransactional() const
 {
     return underlying->isTransactional();
