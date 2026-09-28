@@ -188,6 +188,23 @@ def test_datetime64_column(cluster):
     assert_one_snapshot_per_task(node, mt_table, iceberg_table)
 
 
+def test_unsigned_columns_are_exported_to_signed_ones(cluster):
+    """Iceberg has no unsigned types, so a `UInt32` column is exported to an `int`, read back as
+    `Int32`. The TTL allows the lossy cast, which changes the values that do not fit."""
+    node = cluster.instances["replica1"]
+    mt_table, iceberg_table = make_tables(
+        node, "MergeTree", "id UInt32, retention UInt16, eventDate Date",
+        "(eventDate, retention)", "", "eventDate + toIntervalDay(retention)",
+        destination_columns="id Int32, retention Int32, eventDate Date",
+    )
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 5, today() - 10), (4000000000, 5, today() - 10)")
+    wait_for_partitions_exported(node, mt_table, partitions_where(node, mt_table, "1"))
+
+    assert node.query(f"SELECT id, retention FROM {iceberg_table} ORDER BY id") == "-294967296\t5\n1\t5\n"
+    assert_one_snapshot_per_task(node, mt_table, iceberg_table)
+
+
 def test_ttl_of_a_materialized_column(cluster):
     """The TTL and the partition key use a `MATERIALIZED` column, which is exported as an ordinary one."""
     node = cluster.instances["replica1"]

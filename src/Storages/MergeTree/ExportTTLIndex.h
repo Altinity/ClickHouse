@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Interpreters/Context_fwd.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 #include <Storages/MergeTree/ExportFence.h>
 #include <base/types.h>
@@ -91,6 +92,10 @@ using ExportTTLIndexSnapshotPtr = std::shared_ptr<const ExportTTLIndexSnapshot>;
 
 namespace ExportTTLUtils
 {
+    /// The `EXPORT` TTL always allows lossy casts: its tasks run in the background, so a session
+    /// that opted in at `CREATE` or `ALTER` would not reach them, and Iceberg has no unsigned types.
+    void allowLossyCasts(Context & context);
+
     /// Identifies a destination in the export index. The UUID, if not empty, tells apart a table that
     /// was dropped and created again under the same name, which holds none of the exported rows.
     String destinationKey(const String & database, const String & table, const String & uuid);

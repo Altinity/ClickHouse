@@ -53,15 +53,17 @@ SET allow_suspicious_ttl_expressions = 0;
 DROP TABLE export_ttl_expressions_source;
 DROP TABLE export_ttl_expressions_destination;
 
--- A `DateTime64` column may be exported to one of a larger scale, e.g. to the microseconds of an
--- Iceberg `timestamp`, unless that scale is 9, whose range ends in 2262.
+-- The `EXPORT` TTL allows lossy casts, whatever `export_merge_tree_part_allow_lossy_cast` is, e.g.
+-- nanoseconds to the microseconds of an Iceberg `timestamp`, or an unsigned column to a signed one.
 DROP TABLE IF EXISTS export_ttl_expressions_micros;
 DROP TABLE IF EXISTS export_ttl_expressions_nanos;
+DROP TABLE IF EXISTS export_ttl_expressions_signed;
 DROP TABLE IF EXISTS export_ttl_expressions_millis_to_micros;
-DROP TABLE IF EXISTS export_ttl_expressions_micros_to_micros;
-DROP TABLE IF EXISTS export_ttl_expressions_seconds_to_nanos;
 DROP TABLE IF EXISTS export_ttl_expressions_nanos_to_micros;
 DROP TABLE IF EXISTS export_ttl_expressions_millis_to_nanos;
+DROP TABLE IF EXISTS export_ttl_expressions_unsigned_to_signed;
+
+SET export_merge_tree_part_allow_lossy_cast = 0;
 
 CREATE TABLE export_ttl_expressions_micros (id UInt64, d Date, ts DateTime64(6))
 ENGINE = S3(s3_conn, filename = 'export_ttl_expressions_micros', format = Parquet, partition_strategy = 'hive')
@@ -71,25 +73,28 @@ CREATE TABLE export_ttl_expressions_nanos (id UInt64, d Date, ts DateTime64(9))
 ENGINE = S3(s3_conn, filename = 'export_ttl_expressions_nanos', format = Parquet, partition_strategy = 'hive')
 PARTITION BY d;
 
+CREATE TABLE export_ttl_expressions_signed (id Int32, d Date, ts DateTime)
+ENGINE = S3(s3_conn, filename = 'export_ttl_expressions_signed', format = Parquet, partition_strategy = 'hive')
+PARTITION BY d;
+
 CREATE TABLE export_ttl_expressions_millis_to_micros (id UInt64, d Date, ts DateTime64(3)) ENGINE = MergeTree PARTITION BY d ORDER BY id
 TTL ts + INTERVAL 1 DAY EXPORT TO TABLE export_ttl_expressions_micros;
 
-CREATE TABLE export_ttl_expressions_micros_to_micros (id UInt64, d Date, ts DateTime64(6)) ENGINE = MergeTree PARTITION BY d ORDER BY id
+CREATE TABLE export_ttl_expressions_nanos_to_micros (id UInt64, d Date, ts DateTime64(9)) ENGINE = MergeTree PARTITION BY d ORDER BY id
 TTL ts + INTERVAL 1 DAY EXPORT TO TABLE export_ttl_expressions_micros;
 
-CREATE TABLE export_ttl_expressions_seconds_to_nanos (id UInt64, d Date, ts DateTime) ENGINE = MergeTree PARTITION BY d ORDER BY id
+CREATE TABLE export_ttl_expressions_millis_to_nanos (id UInt64, d Date, ts DateTime64(3)) ENGINE = MergeTree PARTITION BY d ORDER BY id
 TTL ts + INTERVAL 1 DAY EXPORT TO TABLE export_ttl_expressions_nanos;
 
-CREATE TABLE export_ttl_expressions_nanos_to_micros (id UInt64, d Date, ts DateTime64(9)) ENGINE = MergeTree PARTITION BY d ORDER BY id
-TTL ts + INTERVAL 1 DAY EXPORT TO TABLE export_ttl_expressions_micros; -- { serverError INCOMPATIBLE_COLUMNS }
-
-CREATE TABLE export_ttl_expressions_millis_to_nanos (id UInt64, d Date, ts DateTime64(3)) ENGINE = MergeTree PARTITION BY d ORDER BY id
-TTL ts + INTERVAL 1 DAY EXPORT TO TABLE export_ttl_expressions_nanos; -- { serverError INCOMPATIBLE_COLUMNS }
+CREATE TABLE export_ttl_expressions_unsigned_to_signed (id UInt32, d Date, ts DateTime) ENGINE = MergeTree PARTITION BY d ORDER BY id
+TTL ts + INTERVAL 1 DAY EXPORT TO TABLE export_ttl_expressions_signed;
 
 SELECT name FROM system.tables WHERE database = currentDatabase() AND match(name, '_to_') ORDER BY name;
 
 DROP TABLE export_ttl_expressions_millis_to_micros;
-DROP TABLE export_ttl_expressions_micros_to_micros;
-DROP TABLE export_ttl_expressions_seconds_to_nanos;
+DROP TABLE export_ttl_expressions_nanos_to_micros;
+DROP TABLE export_ttl_expressions_millis_to_nanos;
+DROP TABLE export_ttl_expressions_unsigned_to_signed;
 DROP TABLE export_ttl_expressions_micros;
 DROP TABLE export_ttl_expressions_nanos;
+DROP TABLE export_ttl_expressions_signed;

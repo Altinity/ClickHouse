@@ -3,6 +3,7 @@ TTL toStartOfMonth(d) + toIntervalMonth(1) EXPORT TO TABLE export_ttl_expression
 TTL greatest(t, toDateTime(d)) + toIntervalDay(1) EXPORT TO TABLE export_ttl_expressions_destination SETTINGS
 TTL ifNull(nd, d) + toIntervalDay(1) EXPORT TO TABLE export_ttl_expressions_destination SETTINGS
 TTL ifNull(nd, d) + toIntervalDay(1) EXPORT TO TABLE export_ttl_expressions_destination, t + toIntervalSecond(rand() % 10) SETTINGS
-export_ttl_expressions_micros_to_micros
 export_ttl_expressions_millis_to_micros
-export_ttl_expressions_seconds_to_nanos
+export_ttl_expressions_millis_to_nanos
+export_ttl_expressions_nanos_to_micros
+export_ttl_expressions_unsigned_to_signed

@@ -6,7 +6,9 @@
 #include <Storages/MergeTree/ExportTTLIndex.h>
 #include <Storages/MergeTree/MergeTreeExportTask.h>
 #include <Common/tests/gtest_global_context.h>
+#include <Common/tests/gtest_global_register.h>
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Stringifier.h>
@@ -26,6 +28,7 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
     extern const int BAD_ARGUMENTS;
     extern const int NETWORK_ERROR;
+    extern const int INCOMPATIBLE_COLUMNS;
 }
 
 namespace
@@ -267,6 +270,49 @@ TEST(ExportTaskUtils, PlainTaskRetryOfRoundTrip)
 
     task.retry_of.clear();
     EXPECT_TRUE(MergeTreeExportTask::fromJsonString(task.toJsonString()).retry_of.empty());
+}
+
+namespace
+{
+    /// Whether a manual export, which does not allow lossy casts by default, may export a column of
+    /// type `from` to a column of type `to`.
+    bool isCastAllowedByDefault(const String & from, const String & to)
+    {
+        tryRegisterFunctions();
+        const auto metadata_with_column_of_type = [](const String & type)
+        {
+            auto metadata = std::make_shared<StorageInMemoryMetadata>();
+            metadata->setColumns(ColumnsDescription(NamesAndTypesList{{"ts", DataTypeFactory::instance().get(type)}}));
+            return metadata;
+        };
+
+        try
+        {
+            ExportTaskUtils::verifyExportSchemaCastable(
+                metadata_with_column_of_type(from), metadata_with_column_of_type(to), StorageID("db", "destination"), getContext().context);
+            return true;
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::INCOMPATIBLE_COLUMNS)
+                return false;
+            throw;
+        }
+    }
+}
+
+TEST(ExportTaskUtils, DateAndTimeWideningIsNotLossy)
+{
+    EXPECT_TRUE(isCastAllowedByDefault("Date", "Date32"));
+    EXPECT_TRUE(isCastAllowedByDefault("DateTime", "DateTime64(6)"));
+    EXPECT_TRUE(isCastAllowedByDefault("DateTime", "DateTime64(9)"));
+    EXPECT_TRUE(isCastAllowedByDefault("DateTime64(3)", "DateTime64(6)"));
+    EXPECT_TRUE(isCastAllowedByDefault("DateTime64(9)", "DateTime64(9)"));
+
+    EXPECT_FALSE(isCastAllowedByDefault("DateTime64(9)", "DateTime64(6)"));
+    /// The range of scale 9 ends in 2262.
+    EXPECT_FALSE(isCastAllowedByDefault("DateTime64(3)", "DateTime64(9)"));
+    EXPECT_FALSE(isCastAllowedByDefault("DateTime64(6)", "DateTime"));
 }
 
 TEST(ExportTaskUtils, PartitionIdIsDerivedFromParts)

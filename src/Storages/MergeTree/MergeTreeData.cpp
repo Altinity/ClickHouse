@@ -23,6 +23,7 @@
 #include <Compression/CompressedReadBuffer.h>
 #include <Storages/MergeTree/ExportPartTask.h>
 #include <Storages/MergeTree/ExportTaskUtils.h>
+#include <Storages/MergeTree/ExportTTLIndex.h>
 #include <Storages/MergeTree/ExportTTLScheduler.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
@@ -1359,7 +1360,9 @@ void MergeTreeData::validateExportTTL(
 
     const auto source_metadata = std::make_shared<StorageInMemoryMetadata>(new_metadata);
     const auto destination_metadata = destination->getInMemoryMetadataPtr(local_context, false);
-    ExportTaskUtils::verifyExportSchemaCastable(source_metadata, destination_metadata, destination->getStorageID(), local_context);
+    auto schema_context = Context::createCopy(local_context);
+    ExportTTLUtils::allowLossyCasts(*schema_context);
+    ExportTaskUtils::verifyExportSchemaCastable(source_metadata, destination_metadata, destination->getStorageID(), schema_context);
 
     /// Whether the rows of a group of parts land in a single destination partition can only be proven
     /// from the parts, which is done when the group is exported. What can never be proven is refused here.

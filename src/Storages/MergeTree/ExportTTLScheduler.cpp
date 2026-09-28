@@ -95,6 +95,8 @@ ContextPtr ExportTTLScheduler::makeContext() const
     context->setSetting("export_merge_tree_part_throw_on_pending_mutations", false);
     context->setSetting("export_merge_tree_part_throw_on_pending_patch_parts", false);
 
+    ExportTTLUtils::allowLossyCasts(*context);
+
     return context;
 }
 

@@ -1,5 +1,6 @@
 #include <Storages/MergeTree/ExportTTLIndex.h>
 
+#include <Interpreters/Context.h>
 #include <Common/Exception.h>
 #include <Common/escapeForFileName.h>
 #include <Poco/JSON/Array.h>
@@ -187,6 +188,11 @@ std::unique_ptr<const ExportTTLIndexSnapshot> ExportTTLIndexSnapshot::build(
 
 namespace ExportTTLUtils
 {
+
+void allowLossyCasts(Context & context)
+{
+    context.setSetting("export_merge_tree_part_allow_lossy_cast", true);
+}
 
 String destinationKey(const String & database, const String & table, const String & uuid)
 {
