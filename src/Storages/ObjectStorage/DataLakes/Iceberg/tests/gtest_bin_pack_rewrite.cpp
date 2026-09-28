@@ -5,7 +5,14 @@
 #include <gtest/gtest.h>
 
 #include <Common/Exception.h>
+#include <Common/tests/gtest_global_context.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromString.h>
+#include <Processors/Formats/Impl/AvroRowInputFormat.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergPath.h>
+#include <Storages/ObjectStorage/Utils.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MetadataGenerator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SnapshotSummary.h>
@@ -75,6 +82,29 @@ Poco::JSON::Object::Ptr makeMetadataForReplace()
     metadata->set(f_current_snapshot_id, Int64(100));
 
     return metadata;
+}
+
+Poco::JSON::Object::Ptr makeReplaceSnapshot(Poco::JSON::Object::Ptr metadata)
+{
+    MetadataGenerator gen(metadata);
+    FileNamesGenerator file_gen("s3://bucket/table/", false, CompressionMethod::None, "Parquet");
+    file_gen.setVersion(2);
+    auto metadata_path = file_gen.generateMetadataPathWithInfo();
+    return gen.generateReplaceSnapshot(file_gen, metadata_path.path, 100, 1, 30, 300, 3, 30, 300, 1).snapshot;
+}
+
+std::vector<avro::GenericDatum> readAvroRecords(const String & data)
+{
+    ReadBufferFromString in(data);
+    auto reader_base = std::make_unique<avro::DataFileReaderBase>(
+        std::make_unique<AvroInputStreamReadBufferAdapter>(in), MAX_AVRO_SCHEMA_DEPTH);
+    avro::DataFileReader<avro::GenericDatum> reader(std::move(reader_base));
+
+    std::vector<avro::GenericDatum> records;
+    avro::GenericDatum datum(reader.readerSchema());
+    while (reader.read(datum))
+        records.push_back(datum);
+    return records;
 }
 
 }
@@ -163,29 +193,145 @@ TEST(IcebergBinPackRewrite, ReplaceSnapshotSequenceNumberIncremented)
 }
 
 
-TEST(IcebergBinPackRewrite, DataFileEntryLineageStatusOverride)
+TEST(IcebergBinPackRewrite, ReplaceSnapshotRejectsFormatVersion3)
 {
-    /// When status_override is set, the entry should use that status.
-    DataFileEntryLineage lineage;
-    lineage.added_snapshot_id = 42;
-    lineage.sequence_number = 1;
-    lineage.file_sequence_number = 1;
-    lineage.status_override = ManifestEntryStatus::DELETED;
+    auto metadata = makeMetadataForReplace();
+    metadata->set(f_format_version, 3);
+    MetadataGenerator gen(metadata);
 
-    EXPECT_EQ(lineage.status_override.value(), ManifestEntryStatus::DELETED);
+    FileNamesGenerator file_gen("s3://bucket/table/", false, CompressionMethod::None, "Parquet");
+    file_gen.setVersion(2);
+    auto metadata_path = file_gen.generateMetadataPathWithInfo();
+
+    EXPECT_THROW(
+        gen.generateReplaceSnapshot(file_gen, metadata_path.path, 100, 1, 10, 100, 2, 10, 100, 1),
+        DB::Exception);
 }
 
 
-TEST(IcebergBinPackRewrite, DataFileEntryLineageNoOverrideDefaultsToExisting)
+TEST(IcebergBinPackRewrite, ManifestEntriesStatusAndSnapshotId)
 {
-    /// When status_override is not set but lineage is present, the entry status
-    /// should be EXISTING (handled by generateManifestFile logic, but we test the struct).
-    DataFileEntryLineage lineage;
-    lineage.added_snapshot_id = 42;
-    lineage.sequence_number = 1;
-    lineage.file_sequence_number = 1;
+    auto metadata = makeMetadataForReplace();
+    auto snapshot = makeReplaceSnapshot(metadata);
+    const Int64 new_snapshot_id = snapshot->getValue<Int64>(f_metadata_snapshot_id);
+    const Int64 new_sequence_number = snapshot->getValue<Int64>(f_metadata_sequence_number);
 
-    EXPECT_FALSE(lineage.status_override.has_value());
+    DataFileEntryLineage deleted;
+    deleted.added_snapshot_id = 42;
+    deleted.sequence_number = 1;
+    deleted.file_sequence_number = 1;
+    deleted.status_override = ManifestEntryStatus::DELETED;
+
+    DataFileEntryLineage existing;
+    existing.added_snapshot_id = 42;
+    existing.sequence_number = 1;
+    existing.file_sequence_number = 1;
+
+    auto sample_block = std::make_shared<const Block>(
+        Block{ColumnWithTypeAndName(std::make_shared<DataTypeInt32>(), "x")});
+
+    WriteBufferFromOwnString buf;
+    generateManifestFile(
+        metadata,
+        {},
+        {},
+        {},
+        {IcebergPathFromMetadata::deserialize("s3://bucket/table/data/a.parquet"),
+         IcebergPathFromMetadata::deserialize("s3://bucket/table/data/b.parquet")},
+        {10, 20},
+        {100, 200},
+        std::nullopt,
+        sample_block,
+        snapshot,
+        "PARQUET",
+        metadata->getArray(f_partition_specs)->getObject(0),
+        0,
+        buf,
+        FileContentType::DATA,
+        std::nullopt,
+        {},
+        {},
+        {},
+        {},
+        {deleted, existing});
+    buf.finalize();
+
+    auto entries = readAvroRecords(buf.str());
+    ASSERT_EQ(entries.size(), 2);
+
+    /// The spec defines `snapshot_id` of a DELETED entry as the snapshot that deleted the file.
+    const auto & deleted_entry = entries[0].value<avro::GenericRecord>();
+    EXPECT_EQ(deleted_entry.field(f_status).value<Int32>(), static_cast<Int32>(ManifestEntryStatus::DELETED));
+    EXPECT_EQ(deleted_entry.field(f_snapshot_id).value<Int64>(), new_snapshot_id);
+    EXPECT_EQ(deleted_entry.field(f_sequence_number).value<Int64>(), 1);
+
+    /// An EXISTING entry keeps the snapshot that added the file.
+    const auto & existing_entry = entries[1].value<avro::GenericRecord>();
+    EXPECT_EQ(existing_entry.field(f_status).value<Int32>(), static_cast<Int32>(ManifestEntryStatus::EXISTING));
+    EXPECT_EQ(existing_entry.field(f_snapshot_id).value<Int64>(), 42);
+    EXPECT_EQ(existing_entry.field(f_sequence_number).value<Int64>(), 1);
+    EXPECT_NE(new_sequence_number, 1);
+}
+
+
+TEST(IcebergBinPackRewrite, ManifestListCountsMatchEntryStatuses)
+{
+    auto metadata = makeMetadataForReplace();
+    auto snapshot = makeReplaceSnapshot(metadata);
+    const Int64 new_sequence_number = snapshot->getValue<Int64>(f_metadata_sequence_number);
+
+    ManifestListEntryExistingCounts deleted_counts;
+    deleted_counts.min_sequence_number = 1;
+    deleted_counts.deleted_files_count = 3;
+    deleted_counts.deleted_rows_count = 30;
+
+    ManifestListEntryExistingCounts added_counts;
+    added_counts.min_sequence_number = new_sequence_number;
+    added_counts.added_files_count = 1;
+    added_counts.added_rows_count = 30;
+
+    ManifestListEntryExistingCounts kept_counts;
+    kept_counts.min_sequence_number = 1;
+    kept_counts.existing_files_count = 2;
+    kept_counts.existing_rows_count = 50;
+
+    IcebergPathResolver path_resolver("s3://bucket/table", "table");
+    SecondaryStorages secondary_storages;
+    WriteBufferFromOwnString buf;
+    generateManifestList(
+        path_resolver,
+        metadata,
+        /* object_storage */ nullptr,
+        secondary_storages,
+        getContext().context,
+        {IcebergPathFromMetadata::deserialize("s3://bucket/table/metadata/deleted.avro"),
+         IcebergPathFromMetadata::deserialize("s3://bucket/table/metadata/added.avro"),
+         IcebergPathFromMetadata::deserialize("s3://bucket/table/metadata/kept.avro")},
+        snapshot,
+        {1000, 1000, 1000},
+        buf,
+        FileContentType::DATA,
+        /* use_previous_snapshots */ false,
+        {},
+        {deleted_counts, added_counts, kept_counts});
+
+    auto entries = readAvroRecords(buf.str());
+    ASSERT_EQ(entries.size(), 3);
+
+    auto check = [](const avro::GenericDatum & datum, const ManifestListEntryExistingCounts & expected)
+    {
+        const auto & entry = datum.value<avro::GenericRecord>();
+        EXPECT_EQ(entry.field(f_added_files_count).value<Int32>(), expected.added_files_count);
+        EXPECT_EQ(entry.field(f_existing_files_count).value<Int32>(), expected.existing_files_count);
+        EXPECT_EQ(entry.field(f_deleted_files_count).value<Int32>(), expected.deleted_files_count);
+        EXPECT_EQ(entry.field(f_added_rows_count).value<Int64>(), expected.added_rows_count);
+        EXPECT_EQ(entry.field(f_existing_rows_count).value<Int64>(), expected.existing_rows_count);
+        EXPECT_EQ(entry.field(f_deleted_rows_count).value<Int64>(), expected.deleted_rows_count);
+        EXPECT_EQ(entry.field(f_min_sequence_number).value<Int64>(), expected.min_sequence_number);
+    };
+    check(entries[0], deleted_counts);
+    check(entries[1], added_counts);
+    check(entries[2], kept_counts);
 }
 
 

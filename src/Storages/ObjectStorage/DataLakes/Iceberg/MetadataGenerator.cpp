@@ -652,7 +652,13 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateReplaceSnapshot
     Int64 removed_files_size,
     Int64 num_partitions)
 {
-    int format_version = metadata_object->getValue<Int32>(Iceberg::f_format_version);
+    /// A v3 `replace` must preserve row lineage of the rewritten rows, which is not implemented.
+    const Int32 format_version = metadata_object->getValue<Int32>(Iceberg::f_format_version);
+    if (format_version != 2)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "A `replace` snapshot for bin-packing can be generated only for Iceberg format_version 2, got {}",
+            format_version);
 
     for (const auto * field : {Iceberg::f_metadata_log, Iceberg::f_snapshot_log})
         if (!metadata_object->has(field))
@@ -710,16 +716,6 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateReplaceSnapshot
 
     new_snapshot->set(Iceberg::f_schema_id, metadata_object->getValue<Int32>(Iceberg::f_current_schema_id));
     new_snapshot->set(Iceberg::f_manifest_list, manifest_list_path.serialize());
-
-    if (format_version >= 3)
-    {
-        Int64 next_row_id = metadata_object->has(Iceberg::f_next_row_id) && !metadata_object->isNull(Iceberg::f_next_row_id)
-            ? metadata_object->getValue<Int64>(Iceberg::f_next_row_id)
-            : 0;
-        new_snapshot->set(Iceberg::f_first_row_id, next_row_id);
-        new_snapshot->set(Iceberg::f_added_rows, added_records);
-        metadata_object->set(Iceberg::f_next_row_id, next_row_id + added_records);
-    }
 
     getOrCreateArray(metadata_object, Iceberg::f_snapshots)->add(new_snapshot);
     metadata_object->set(Iceberg::f_current_snapshot_id, snapshot_id);

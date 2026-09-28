@@ -133,13 +133,17 @@ void generateManifestFile(
     /// Optional schema to serialize into the manifest's Avro `schema` header; when null the table's current schema is used.
     Poco::JSON::Object::Ptr schema_to_serialize = nullptr);
 
-/// Per manifest-list entry existing-file/existing-row counts for a manifest-only rewrite, where every referenced data file already existed.
+/// Per manifest-list entry file/row counts for a rewrite whose manifests carry explicit entry statuses.
 struct ManifestListEntryExistingCounts
 {
     Int64 existing_files_count = 0;
     Int64 existing_rows_count = 0;
     /// Minimum data sequence number across the entries in this manifest, used as the manifest-list `min_sequence_number`.
     Int64 min_sequence_number = 0;
+    Int64 added_files_count = 0;
+    Int64 added_rows_count = 0;
+    Int64 deleted_files_count = 0;
+    Int64 deleted_rows_count = 0;
 };
 
 void generateManifestList(

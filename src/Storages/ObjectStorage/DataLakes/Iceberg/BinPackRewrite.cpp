@@ -5,7 +5,6 @@
 #include <unordered_set>
 
 #include <Core/Settings.h>
-#include <Databases/DataLake/Common.h>
 #include <Formats/FormatFactory.h>
 #include <Formats/FormatParserSharedResources.h>
 #include <IO/CompressionMethod.h>
@@ -23,6 +22,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <Poco/JSON/Stringifier.h>
+#include <Poco/String.h>
 #include <Common/FieldVisitorDump.h>
 #include <Common/Logger.h>
 
@@ -31,6 +31,7 @@
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int CANNOT_WRITE_TO_FILE_BUFFER;
     extern const int LOGICAL_ERROR;
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
 }
@@ -59,6 +60,8 @@ struct DataFileRecord
     Int64 record_count;
     Int64 file_size_in_bytes;
     String file_format;
+    /// The schema the file was written with.
+    Int32 schema_id = 0;
     Row partition_key;
     std::optional<Int32> sort_order_id;
     /// Lineage from the source manifest entry.
@@ -267,6 +270,7 @@ BinPackPlan buildBinPackPlan(
     /// Live delete entries, used to keep the rewrite away from files they can apply to.
     std::vector<DeleteRecord> delete_records;
     size_t small_files_total = 0;
+    size_t excluded_by_schema = 0;
 
     for (const auto & manifest_file : manifest_list)
     {
@@ -319,6 +323,7 @@ BinPackPlan buildBinPackPlan(
             record.record_count = entry->record_count;
             record.file_size_in_bytes = entry->file_size_in_bytes;
             record.file_format = entry->file_format;
+            record.schema_id = data_file->resolved_schema_id;
             record.partition_key = entry->partition_key_value;
             record.sort_order_id = entry->sort_order_id;
             record.snapshot_id = entry->parsed_snapshot_id;
@@ -351,11 +356,22 @@ BinPackPlan buildBinPackPlan(
 
             record.source_manifest_path = manifest_file.manifest_file_path.serialize();
             record.is_candidate = static_cast<UInt64>(entry->file_size_in_bytes) < min_file_size;
+            /// Only Parquet columns are resolved by field id; other formats are read by name,
+            /// which is wrong for a file written with a different schema (e.g. before a rename).
+            if (record.is_candidate && record.schema_id != current_schema_id && Poco::toLower(record.file_format) != "parquet")
+            {
+                record.is_candidate = false;
+                ++excluded_by_schema;
+            }
             if (record.is_candidate)
                 ++small_files_total;
             manifest_records.push_back(std::move(record));
         }
     }
+
+    if (excluded_by_schema > 0)
+        LOG_INFO(log, "Excluded {} small non-Parquet files from bin-packing because they were written with an older schema",
+            excluded_by_schema);
 
     /// Exclude from the rewrite every small file that a live delete could still apply to,
     /// following the Iceberg scan-planning rules: a position delete applies to data files with
@@ -440,27 +456,38 @@ BinPackPlan buildBinPackPlan(
         if (files.size() < 2)
             continue;
 
+        std::sort(files.begin(), files.end(), [](const DataFileRecord * lhs, const DataFileRecord * rhs)
+        {
+            if (lhs->file_size_in_bytes != rhs->file_size_in_bytes)
+                return lhs->file_size_in_bytes < rhs->file_size_in_bytes;
+            return lhs->file_path.serialize() < rhs->file_path.serialize();
+        });
+
         BinPointers current_bin;
         current_bin.partition_key = partition_key;
+
+        /// Rewriting a single file only copies it to a new file of the same size, which would stay
+        /// a candidate and be rewritten again by every subsequent OPTIMIZE. Such a file stays as is.
+        auto flush_bin = [&]
+        {
+            if (current_bin.files.size() >= 2)
+                bin_ptrs.push_back(std::move(current_bin));
+            current_bin = BinPointers{};
+            current_bin.partition_key = partition_key;
+        };
 
         for (const auto * entry : files)
         {
             if (current_bin.total_bytes + entry->file_size_in_bytes > static_cast<Int64>(target_file_size)
                 && !current_bin.files.empty())
-            {
-                bin_ptrs.push_back(std::move(current_bin));
-                current_bin = BinPointers{};
-                current_bin.partition_key = partition_key;
-            }
+                flush_bin();
 
             current_bin.total_bytes += entry->file_size_in_bytes;
             current_bin.total_records += entry->record_count;
             current_bin.files.push_back(entry);
         }
 
-        /// A bin with a single file is not worth merging; the file stays in the snapshot.
-        if (current_bin.files.size() >= 2)
-            bin_ptrs.push_back(std::move(current_bin));
+        flush_bin();
     }
 
     /// Materialize the plan: move binned records into bins, carry forward manifests with no
@@ -521,26 +548,19 @@ BinPackPlan buildBinPackPlan(
     return plan;
 }
 
-} // anonymous namespace
+struct LatestMetadata
+{
+    Int32 version;
+    Poco::JSON::Object::Ptr object;
+};
 
-
-bool executeBinPackCompaction(
+LatestMetadata readLatestMetadata(
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
-    SecondaryStorages & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
-    SharedHeader sample_block,
     ContextPtr context,
-    const String & write_format,
-    std::shared_ptr<DataLake::ICatalog> catalog,
-    const StorageID & table_id)
+    LoggerPtr log)
 {
-    LoggerPtr log = getLogger("IcebergBinPack");
-
-    const auto & settings = context->getSettingsRef();
-    UInt64 target_size = settings[Setting::iceberg_target_data_file_size_bytes];
-    UInt64 min_size = settings[Setting::iceberg_min_data_file_size_bytes];
-
     const auto [metadata_version, metadata_file_path, _] = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
         persistent_table_components.table_path,
@@ -562,9 +582,120 @@ bool executeBinPackCompaction(
         persistent_table_components.metadata_compression_method,
         persistent_table_components.table_uuid);
 
+    return {metadata_version, metadata_object};
+}
+
+enum class MetadataFileOwner : uint8_t
+{
+    Absent,
+    Ours,
+    Other,
+};
+
+/// Who wrote the metadata file at `metadata_path`, judged by its current snapshot id.
+MetadataFileOwner getMetadataFileOwner(
+    const IcebergPathFromMetadata & metadata_path,
+    CompressionMethod compression_method,
+    Int64 snapshot_id,
+    const PersistentTableComponents & persistent_table_components,
+    ObjectStoragePtr object_storage,
+    ContextPtr context,
+    LoggerPtr log)
+{
+    const auto storage_path = persistent_table_components.path_resolver.resolve(metadata_path);
+    if (!object_storage->exists(StoredObject(storage_path)))
+        return MetadataFileOwner::Absent;
+
+    /// Bypass the metadata cache: the outcome of our own write is what is being checked.
+    auto metadata_object = getMetadataJSONObject(
+        storage_path, object_storage, /* metadata_cache */ nullptr, context, log, compression_method, std::nullopt);
+    const bool ours
+        = metadata_object->has(f_current_snapshot_id) && metadata_object->getValue<Int64>(f_current_snapshot_id) == snapshot_id;
+    return ours ? MetadataFileOwner::Ours : MetadataFileOwner::Other;
+}
+
+} // anonymous namespace
+
+
+bool hasLivePositionDeletes(
+    const PersistentTableComponents & persistent_table_components,
+    ObjectStoragePtr object_storage,
+    SecondaryStorages & secondary_storages,
+    const DataLakeStorageSettings & data_lake_settings,
+    ContextPtr context)
+{
+    LoggerPtr log = getLogger("IcebergBinPack");
+    const auto metadata_object = readLatestMetadata(persistent_table_components, object_storage, data_lake_settings, context, log).object;
+
+    if (!metadata_object->has(f_current_snapshot_id))
+        return false;
+    const Int64 current_snapshot_id = metadata_object->getValue<Int64>(f_current_snapshot_id);
+    if (current_snapshot_id < 0)
+        return false;
+
+    String current_manifest_list_path;
+    auto snapshots = metadata_object->get(f_snapshots).extract<Poco::JSON::Array::Ptr>();
+    for (size_t i = 0; i < snapshots->size(); ++i)
+    {
+        const auto snapshot = snapshots->getObject(static_cast<UInt32>(i));
+        if (snapshot->getValue<Int64>(f_metadata_snapshot_id) == current_snapshot_id)
+        {
+            current_manifest_list_path = snapshot->getValue<String>(f_manifest_list);
+            break;
+        }
+    }
+    if (current_manifest_list_path.empty())
+        return false;
+
+    const auto current_schema_id = metadata_object->getValue<Int32>(f_current_schema_id);
+    auto schemas = metadata_object->getArray(f_schemas);
+    for (UInt32 i = 0; i < schemas->size(); ++i)
+        persistent_table_components.schema_processor->addIcebergTableSchema(schemas->getObject(i), context);
+
+    auto manifest_list = getManifestList(
+        object_storage, persistent_table_components, context,
+        IcebergPathFromMetadata::deserialize(current_manifest_list_path),
+        log, secondary_storages);
+
+    for (const auto & manifest_file : manifest_list)
+    {
+        if (manifest_file.content_type != ManifestFileContentType::DELETE)
+            continue;
+        auto deletes_handle = getManifestFileEntriesHandle(
+            object_storage, persistent_table_components, context, log,
+            manifest_file, current_schema_id, secondary_storages);
+        if (!deletes_handle.getFilesWithoutDeleted(FileContentType::POSITION_DELETE).empty())
+            return true;
+    }
+    return false;
+}
+
+BinPackCommitResult executeBinPackCompaction(
+    const PersistentTableComponents & persistent_table_components,
+    ObjectStoragePtr object_storage,
+    SecondaryStorages & secondary_storages,
+    const DataLakeStorageSettings & data_lake_settings,
+    SharedHeader sample_block,
+    ContextPtr context,
+    const String & write_format)
+{
+    LoggerPtr log = getLogger("IcebergBinPack");
+
+    const auto & settings = context->getSettingsRef();
+    UInt64 target_size = settings[Setting::iceberg_target_data_file_size_bytes];
+    UInt64 min_size = settings[Setting::iceberg_min_data_file_size_bytes];
+
+    const auto [metadata_version, metadata_object]
+        = readLatestMetadata(persistent_table_components, object_storage, data_lake_settings, context, log);
+
+    /// Format version 3 requires row lineage (`_row_id`, `_last_updated_sequence_number`) to be carried
+    /// into rewritten files, which the rewrite does not do yet.
     const Int32 format_version = metadata_object->getValue<Int32>(f_format_version);
-    if (format_version < 2)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Bin-packing compaction is supported only for Iceberg format_version >= 2");
+    if (format_version != 2)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Bin-packing compaction is supported only for Iceberg format_version 2, got {}",
+            format_version);
 
     /// Build the plan.
     auto plan = buildBinPackPlan(
@@ -574,7 +705,7 @@ bool executeBinPackCompaction(
     if (plan.bins.empty())
     {
         LOG_INFO(log, "No bins to compact; table is already optimally packed");
-        return true;
+        return BinPackCommitResult::Committed;
     }
 
     const auto & path_resolver = persistent_table_components.path_resolver;
@@ -590,6 +721,7 @@ bool executeBinPackCompaction(
     std::vector<IcebergPathFromMetadata> new_data_file_paths;
     std::vector<IcebergPathFromMetadata> new_manifest_paths;
     IcebergPathFromMetadata manifest_list_path;
+    bool keep_files_on_error = false;
 
     auto cleanup = [&]()
     {
@@ -628,6 +760,10 @@ bool executeBinPackCompaction(
             throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                 "Missing schema for current-schema-id {}", current_schema_id);
 
+        /// Source files are read into the current schema; Parquet columns are matched by field id,
+        /// so renamed columns are found and dropped-then-re-added ones read as missing.
+        const ColumnMapperPtr current_schema_column_mapper = createColumnMapper(current_schema);
+
         /// Phase 1: Read small files and write merged data files.
         /// For each bin, read all source files and write a merged file via MultipleFileWriter.
         Int64 total_added_files = 0;
@@ -641,6 +777,7 @@ bool executeBinPackCompaction(
             std::vector<IcebergPathFromMetadata> merged_file_paths;
             std::vector<UInt64> merged_file_row_counts;
             std::vector<UInt64> merged_file_byte_counts;
+            std::vector<DataFileStatisticsPtr> merged_file_stats;
             /// The old files that were replaced.
             std::vector<IcebergPathFromMetadata> old_file_paths;
             std::vector<UInt64> old_file_row_counts;
@@ -690,15 +827,19 @@ bool executeBinPackCompaction(
                 auto parser_shared_resources = std::make_shared<FormatParserSharedResources>(
                     settings, /*num_streams_=*/1);
 
+                const String source_format = file_entry.file_format.empty() ? write_format : file_entry.file_format;
+                const ColumnMapperPtr column_mapper
+                    = Poco::toLower(source_format) == "parquet" ? current_schema_column_mapper : nullptr;
+
                 auto input_format = FormatFactory::instance().getInput(
-                    file_entry.file_format.empty() ? write_format : file_entry.file_format,
+                    source_format,
                     *read_buffer,
                     *sample_block,
                     context,
                     8192,
                     std::nullopt, /// format_settings
                     parser_shared_resources,
-                    std::make_shared<FormatFilterInfo>(nullptr, context, nullptr, nullptr, nullptr),
+                    std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr),
                     true, /// is_remote_fs
                     CompressionMethod::None,
                     false);
@@ -719,8 +860,9 @@ bool executeBinPackCompaction(
                 result.old_file_sort_order_ids.push_back(file_entry.sort_order_id);
                 result.old_file_stats.push_back(std::move(file_entry.column_stats));
 
+                /// Per the spec, the `snapshot_id` of a DELETED entry is the snapshot that deleted the file,
+                /// so `added_snapshot_id` stays unset and the new `replace` snapshot id is written.
                 DataFileEntryLineage lineage;
-                lineage.added_snapshot_id = file_entry.snapshot_id;
                 lineage.sequence_number = file_entry.sequence_number;
                 lineage.file_sequence_number = file_entry.file_sequence_number;
                 lineage.status_override = ManifestEntryStatus::DELETED;
@@ -732,6 +874,12 @@ bool executeBinPackCompaction(
             result.merged_file_paths = writer.getDataFiles();
             result.merged_file_row_counts = writer.getDataFileRowCounts();
             result.merged_file_byte_counts = writer.getDataFileByteCounts();
+            result.merged_file_stats = writer.getPerFileStatistics();
+            if (result.merged_file_stats.size() != result.merged_file_paths.size())
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Bin-pack writer returned {} statistics for {} merged files",
+                    result.merged_file_stats.size(), result.merged_file_paths.size());
 
             for (size_t i = 0; i < result.merged_file_paths.size(); ++i)
             {
@@ -768,8 +916,7 @@ bool executeBinPackCompaction(
         std::vector<Int64> all_entry_partition_spec_ids;
 
         /// Write one data manifest for a set of entries sharing a partition key and record it
-        /// for the manifest list. `existing_counts` describes entries that already existed
-        /// (EXISTING or DELETED status); pass {0, 0, 0} for manifests of newly added files.
+        /// for the manifest list. `existing_counts` must match the statuses of the written entries.
         auto write_manifest_for_entries = [&](
             const Row & partition_key,
             const std::vector<IcebergPathFromMetadata> & paths,
@@ -779,6 +926,7 @@ bool executeBinPackCompaction(
             const std::vector<DataFileColumnStatistics> & stats,
             const std::vector<std::optional<Int32>> & sort_order_ids,
             const std::vector<DataFileEntryLineage> & lineage,
+            const std::optional<DataFileStatistics> & data_file_statistics,
             ManifestListEntryExistingCounts existing_counts)
         {
             auto manifest_path = generator.generateManifestEntryName();
@@ -797,7 +945,7 @@ bool executeBinPackCompaction(
                 paths,
                 row_counts,
                 byte_counts,
-                std::nullopt, /// data_file_statistics
+                data_file_statistics,
                 sample_block,
                 snapshot_result.snapshot,
                 write_format,
@@ -823,13 +971,20 @@ bool executeBinPackCompaction(
             all_entry_partition_spec_ids.push_back(plan.partition_spec_id);
         };
 
+        const Int64 new_sequence_number = snapshot_result.snapshot->getValue<Int64>(f_metadata_sequence_number);
+
         for (auto & bin_result : bin_results)
         {
             /// Delete manifest: old files marked DELETED.
-            /// The DELETED manifest has existing (really: deleted) file counts for manifest-list accounting.
             Int64 deleted_min_seq = std::numeric_limits<Int64>::max();
             for (const auto & lineage : bin_result.old_file_lineage)
                 deleted_min_seq = std::min(deleted_min_seq, lineage.sequence_number.value_or(0));
+
+            ManifestListEntryExistingCounts deleted_counts;
+            deleted_counts.min_sequence_number = deleted_min_seq;
+            deleted_counts.deleted_files_count = static_cast<Int64>(bin_result.old_file_paths.size());
+            deleted_counts.deleted_rows_count = static_cast<Int64>(
+                std::accumulate(bin_result.old_file_row_counts.begin(), bin_result.old_file_row_counts.end(), UInt64{0}));
 
             write_manifest_for_entries(
                 bin_result.partition_key,
@@ -840,21 +995,34 @@ bool executeBinPackCompaction(
                 bin_result.old_file_stats,
                 bin_result.old_file_sort_order_ids,
                 bin_result.old_file_lineage,
-                {static_cast<Int64>(bin_result.old_file_paths.size()),
-                 static_cast<Int64>(std::accumulate(bin_result.old_file_row_counts.begin(), bin_result.old_file_row_counts.end(), 0UL)),
-                 deleted_min_seq});
+                std::nullopt,
+                deleted_counts);
 
-            /// Add manifest: new merged files.
-            write_manifest_for_entries(
-                bin_result.partition_key,
-                bin_result.merged_file_paths,
-                bin_result.merged_file_row_counts,
-                bin_result.merged_file_byte_counts,
-                {}, /// formats
-                {}, /// stats
-                {}, /// sort_order_ids
-                {}, /// lineage
-                {0, 0, 0});
+            /// Add manifests: one per merged file, because `generateManifestFile` applies a single
+            /// statistics object to every entry of a manifest.
+            for (size_t i = 0; i < bin_result.merged_file_paths.size(); ++i)
+            {
+                std::optional<DataFileStatistics> merged_stats;
+                if (bin_result.merged_file_stats[i])
+                    merged_stats = *bin_result.merged_file_stats[i];
+
+                ManifestListEntryExistingCounts added_counts;
+                added_counts.min_sequence_number = new_sequence_number;
+                added_counts.added_files_count = 1;
+                added_counts.added_rows_count = static_cast<Int64>(bin_result.merged_file_row_counts[i]);
+
+                write_manifest_for_entries(
+                    bin_result.partition_key,
+                    {bin_result.merged_file_paths[i]},
+                    {bin_result.merged_file_row_counts[i]},
+                    {bin_result.merged_file_byte_counts[i]},
+                    {}, /// formats
+                    {}, /// stats
+                    {}, /// sort_order_ids
+                    {}, /// lineage
+                    merged_stats,
+                    added_counts);
+            }
         }
 
         /// Kept manifests: live data files from touched manifests that were not merged (large
@@ -907,6 +1075,7 @@ bool executeBinPackCompaction(
                 kept_stats,
                 kept_sort_order_ids,
                 kept_lineage,
+                std::nullopt,
                 {static_cast<Int64>(kept_files.size()), kept_total_rows, kept_min_seq});
         }
 
@@ -947,32 +1116,58 @@ bool executeBinPackCompaction(
 
             auto hint_path = generator.generateVersionHint();
 
-            const bool catalog_writes_metadata_file = catalog && catalog->isTransactional();
-            if (!catalog_writes_metadata_file
-                && !writeMetadataFileAndVersionHint(
-                    path_resolver,
-                    generated_metadata_info,
-                    json_representation,
-                    hint_path,
-                    object_storage,
-                    context,
-                    data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+            const auto commit_result = tryWriteMetadataFileAndVersionHint(
+                path_resolver,
+                generated_metadata_info,
+                json_representation,
+                hint_path,
+                object_storage,
+                context,
+                data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]);
+
+            if (commit_result == MetadataCommitResult::Conflict)
             {
                 LOG_INFO(log, "Bin-pack commit conflict detected, cleaning up");
                 cleanup();
-                return false;
+                return BinPackCommitResult::Conflict;
             }
 
-            if (catalog)
+            if (commit_result == MetadataCommitResult::Unknown)
             {
-                auto catalog_filename = path_resolver.resolveForCatalog(generated_metadata_info.path);
-                const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, snapshot_result.snapshot))
+                /// From here on the new metadata may be live and reference the new files,
+                /// so they are removed only once another writer is known to own this version.
+                keep_files_on_error = true;
+
+                const Int64 new_snapshot_id = snapshot_result.snapshot->getValue<Int64>(f_metadata_snapshot_id);
+                MetadataFileOwner owner = MetadataFileOwner::Absent;
+                String verification_error;
+                try
                 {
-                    LOG_INFO(log, "Bin-pack commit conflict via catalog, cleaning up");
-                    cleanup();
-                    return false;
+                    owner = getMetadataFileOwner(
+                        generated_metadata_info.path, generated_metadata_info.compression_method, new_snapshot_id,
+                        persistent_table_components, object_storage, context, log);
                 }
+                catch (...)
+                {
+                    verification_error = getCurrentExceptionMessage(false);
+                }
+
+                if (!verification_error.empty() || owner == MetadataFileOwner::Absent)
+                    throw Exception(
+                        ErrorCodes::CANNOT_WRITE_TO_FILE_BUFFER,
+                        "Outcome of writing Iceberg metadata file {} for bin-pack snapshot {} is unknown{}. "
+                        "Files written by this attempt were left in place",
+                        generated_metadata_info.path.serialize(), new_snapshot_id,
+                        verification_error.empty() ? "" : fmt::format(" and could not be verified: {}", verification_error));
+
+                if (owner == MetadataFileOwner::Other)
+                {
+                    LOG_INFO(log, "Bin-pack commit conflict detected after a failed metadata write, cleaning up");
+                    keep_files_on_error = false;
+                    cleanup();
+                    return BinPackCommitResult::Conflict;
+                }
+                LOG_INFO(log, "Bin-pack metadata write reported an error, but snapshot {} is committed", new_snapshot_id);
             }
         }
 
@@ -980,11 +1175,12 @@ bool executeBinPackCompaction(
                  "{} old files removed ({} records, {} bytes)",
                  plan.bins.size(), total_added_files, total_added_records, total_added_files_size,
                  plan.removed_data_files, plan.removed_records, plan.removed_files_size);
-        return true;
+        return BinPackCommitResult::Committed;
     }
     catch (...)
     {
-        cleanup();
+        if (!keep_files_on_error)
+            cleanup();
         throw;
     }
 }

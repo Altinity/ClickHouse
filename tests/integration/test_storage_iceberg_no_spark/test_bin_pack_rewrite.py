@@ -424,3 +424,149 @@ def test_bin_pack_preserves_position_deletes(
         f"SELECT id, value FROM {table_name} ORDER BY id"
     ).strip()
     assert data_after == data_before, "Data mismatch after compaction"
+
+    # With live position deletes OPTIMIZE runs the full compaction, which applies them.
+    delete_files_after = int(
+        instance.query(
+            f"SELECT count() FROM system.iceberg_files "
+            f"WHERE database = 'default' AND table = '{table_name}' AND content = 'POSITION_DELETE'"
+        ).strip()
+    )
+    assert delete_files_after == 0, (
+        f"Expected position deletes to be applied by OPTIMIZE, {delete_files_after} delete files remain"
+    )
+
+
+def _count_snapshots(instance, table_name):
+    return int(
+        instance.query(
+            f"SELECT count() FROM system.iceberg_history "
+            f"WHERE database = 'default' AND table = '{table_name}'"
+        ).strip()
+    )
+
+
+@pytest.mark.parametrize("format_version", [2])
+def test_bin_pack_converges(started_cluster_iceberg_no_spark, format_version):
+    """A second OPTIMIZE with the same settings must not rewrite anything: files that
+    cannot be combined with another file within the target size are left alone."""
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    table_name = "test_bin_pack_converges_" + get_uuid_str()
+
+    create_iceberg_table(
+        "local",
+        instance,
+        table_name,
+        started_cluster_iceberg_no_spark,
+        "(id Int64, value String)",
+        format_version=format_version,
+    )
+
+    num_batches = 5
+    rows_per_batch = 100
+    for batch in range(num_batches):
+        values = ", ".join(
+            f"({batch * rows_per_batch + i}, 'row_{batch * rows_per_batch + i}')"
+            for i in range(rows_per_batch)
+        )
+        instance.query(
+            f"INSERT INTO {table_name} VALUES {values}",
+            settings={"allow_insert_into_iceberg": 1},
+        )
+
+    sizes = _get_data_file_sizes(instance, table_name)
+    target = 2 * sizes[-1] + 1
+    optimize_settings = {
+        "allow_experimental_iceberg_compaction": 1,
+        "iceberg_target_data_file_size_bytes": target,
+        "iceberg_min_data_file_size_bytes": target,
+    }
+
+    instance.query(f"OPTIMIZE TABLE {table_name}", settings=optimize_settings)
+
+    instance.query(f"DROP TABLE IF EXISTS {table_name}")
+    create_iceberg_table("local", instance, table_name, started_cluster_iceberg_no_spark)
+    snapshots_after_first = _count_snapshots(instance, table_name)
+    data_after_first = instance.query(f"SELECT id, value FROM {table_name} ORDER BY id").strip()
+
+    instance.query(f"OPTIMIZE TABLE {table_name}", settings=optimize_settings)
+
+    instance.query(f"DROP TABLE IF EXISTS {table_name}")
+    create_iceberg_table("local", instance, table_name, started_cluster_iceberg_no_spark)
+    assert _count_snapshots(instance, table_name) == snapshots_after_first, (
+        "A repeated OPTIMIZE must not create a new snapshot"
+    )
+    assert instance.query(f"SELECT id, value FROM {table_name} ORDER BY id").strip() == data_after_first
+
+
+@pytest.mark.parametrize("format_version", [2])
+def test_bin_pack_after_column_rename(started_cluster_iceberg_no_spark, format_version):
+    """Files written before a column rename must be read by field id, not by name,
+    otherwise the renamed column comes back empty in the merged file."""
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    table_name = "test_bin_pack_rename_" + get_uuid_str()
+
+    create_iceberg_table(
+        "local",
+        instance,
+        table_name,
+        started_cluster_iceberg_no_spark,
+        "(id Int64, value Nullable(String))",
+        format_version=format_version,
+    )
+
+    for batch in range(3):
+        values = ", ".join(f"({batch * 100 + i}, 'row_{batch * 100 + i}')" for i in range(100))
+        instance.query(
+            f"INSERT INTO {table_name} VALUES {values}",
+            settings={"allow_insert_into_iceberg": 1},
+        )
+
+    instance.query(f"ALTER TABLE {table_name} RENAME COLUMN value TO label")
+
+    values = ", ".join(f"({300 + i}, 'row_{300 + i}')" for i in range(100))
+    instance.query(
+        f"INSERT INTO {table_name} VALUES {values}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+
+    data_before = instance.query(f"SELECT id, label FROM {table_name} ORDER BY id").strip()
+    assert "\\N" not in data_before
+
+    instance.query(
+        f"OPTIMIZE TABLE {table_name}",
+        settings={
+            "allow_experimental_iceberg_compaction": 1,
+            "iceberg_target_data_file_size_bytes": 10 * 1024 * 1024,
+            "iceberg_min_data_file_size_bytes": 10 * 1024 * 1024,
+        },
+    )
+
+    instance.query(f"DROP TABLE IF EXISTS {table_name}")
+    create_iceberg_table("local", instance, table_name, started_cluster_iceberg_no_spark)
+
+    assert _count_data_files(instance, table_name) == 1
+    data_after = instance.query(f"SELECT id, label FROM {table_name} ORDER BY id").strip()
+    assert data_after == data_before, "Renamed column lost data after compaction"
+
+
+def test_bin_pack_rejects_format_version_3(started_cluster_iceberg_no_spark):
+    """Bin-packing does not carry row lineage into rewritten files, so v3 tables are rejected."""
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    table_name = "test_bin_pack_v3_" + get_uuid_str()
+
+    create_iceberg_table(
+        "local",
+        instance,
+        table_name,
+        started_cluster_iceberg_no_spark,
+        "(id Int64)",
+        format_version=3,
+    )
+
+    error = instance.query_and_get_error(
+        f"OPTIMIZE TABLE {table_name}",
+        settings={"allow_experimental_iceberg_compaction": 1},
+    )
+    assert "BAD_ARGUMENTS" in error
+    assert "format_version 2" in error
