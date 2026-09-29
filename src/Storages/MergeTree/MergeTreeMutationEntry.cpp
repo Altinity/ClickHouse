@@ -121,7 +121,6 @@ void MergeTreeMutationEntry::removeFile()
 
 void MergeTreeMutationEntry::writeCSN(CSN csn_)
 {
-    csn = csn_;
     /// Fault injection for tests: fail before any I/O, so the old file stays intact.
     fiu_do_on(FailPoints::transaction_mutation_csn_store_fail,
     {
@@ -137,10 +136,11 @@ void MergeTreeMutationEntry::writeCSN(CSN csn_)
     String tmp_file_name = "tmp_mutation_csn_" + toString(block_number) + ".txt";
     auto out = disk->writeFile(path_prefix + tmp_file_name, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite);
     writeRecord(*out);
-    *out << "csn: " << csn << "\n";
+    *out << "csn: " << csn_ << "\n";
     out->finalize();
     out->sync();
     disk->replaceFile(path_prefix + tmp_file_name, path_prefix + file_name);
+    csn = csn_;
 }
 
 MergeTreeMutationEntry::MergeTreeMutationEntry(DiskPtr disk_, const String & path_prefix_, const String & file_name_)

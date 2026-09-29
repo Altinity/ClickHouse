@@ -42,18 +42,19 @@ namespace
 /// the write is retried for a bounded time. `LOGICAL_ERROR` and `NOT_IMPLEMENTED` are invariant
 /// violations and are rethrown at once. When the budget is exhausted, or the server is
 /// shutting down, the error is rethrown too: this keeps the old behaviour rather than
-/// hiding a write that did not happen. The budget is per object; a write that hangs
-/// inside the storage is not interrupted.
+/// hiding a write that did not happen. One budget covers the whole callback, so a commit
+/// of many parts cannot wait for a multiple of it; a write that hangs inside the storage
+/// is not interrupted.
 constexpr UInt64 TRANSACTION_METADATA_STORE_RETRY_TIMEOUT_SECONDS = 60;
 constexpr UInt64 TRANSACTION_METADATA_STORE_RETRY_BACKOFF_MS = 100;
 constexpr UInt64 TRANSACTION_METADATA_STORE_RETRY_MAX_BACKOFF_MS = 2000;
 
+/// `watch` runs from the start of the callback and is shared by all its writes.
 /// `describe` is called only when a log line is written, so a callback that never fails
 /// formats nothing.
 template <typename Describe, typename F>
-void retryMetadataStore(LoggerPtr log, Describe && describe, F && store)
+void retryMetadataStore(LoggerPtr log, const Stopwatch & watch, Describe && describe, F && store)
 {
-    Stopwatch watch;
     UInt64 backoff_ms = TRANSACTION_METADATA_STORE_RETRY_BACKOFF_MS;
     size_t attempts = 0;
     while (true)
@@ -349,6 +350,7 @@ void MergeTreeTransaction::afterCommit(CSN assigned_csn) noexcept
     }
 
     auto log = getLogger("MergeTreeTransaction");
+    Stopwatch retry_watch;
 
     /// Persist per-part version metadata BEFORE flipping `csn` below.
     /// `csn.exchange(assigned_csn)` is the signal that `MergeTreeTransaction::waitStateChange`
@@ -363,13 +365,13 @@ void MergeTreeTransaction::afterCommit(CSN assigned_csn) noexcept
     /// `setAndStore...CSN` did not complete; `TransactionLog::getCSN(tid)` returns the right
     /// answer after restart.
     for (const auto & part : created_parts)
-        retryMetadataStore(log, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreCreationCSN(assigned_csn); });
+        retryMetadataStore(log, retry_watch, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreCreationCSN(assigned_csn); });
 
     for (const auto & part : removed_parts)
-        retryMetadataStore(log, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreRemovalCSN(assigned_csn); });
+        retryMetadataStore(log, retry_watch, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreRemovalCSN(assigned_csn); });
 
     for (const auto & storage_and_mutation : committed_mutations)
-        retryMetadataStore(log, [&] { return mutationDescription(*storage_and_mutation.first, storage_and_mutation.second); },
+        retryMetadataStore(log, retry_watch, [&] { return mutationDescription(*storage_and_mutation.first, storage_and_mutation.second); },
             [&] { storage_and_mutation.first->setMutationCSN(storage_and_mutation.second, assigned_csn); });
 
     /// Test-only pause point. With this failpoint enabled, a regression test can verify that
@@ -410,14 +412,27 @@ bool MergeTreeTransaction::rollback() noexcept
     }
 
     auto log = getLogger("MergeTreeTransaction");
+    Stopwatch retry_watch;
 
     /// Forcefully stop related mutations if any. killMutation erases the mutation from the
-    /// table's map before deleting its file, so a repeated call after a failed deletion is a
-    /// no-op; a file left behind is removed at the next load, because its transaction has
-    /// no CSN.
+    /// table's map before deleting its file, so a retry after a failure could not delete the
+    /// file anyway; a file left behind is ignored while the server runs and removed at the
+    /// next load, because its transaction has no CSN. Invariant violations still propagate.
     for (const auto & table_and_mutation : mutations_to_kill)
-        retryMetadataStore(log, [&] { return mutationDescription(*table_and_mutation.first, table_and_mutation.second); },
-            [&] { table_and_mutation.first->killMutation(table_and_mutation.second); });
+    {
+        try
+        {
+            table_and_mutation.first->killMutation(table_and_mutation.second);
+        }
+        catch (...)
+        {
+            int code = getCurrentExceptionCode();
+            if (code == ErrorCodes::LOGICAL_ERROR || code == ErrorCodes::NOT_IMPLEMENTED)
+                throw;
+            LOG_WARNING(log, "Cannot kill {} on rollback, its file is removed at the next load: {}",
+                mutationDescription(*table_and_mutation.first, table_and_mutation.second), getCurrentExceptionMessage(false));
+        }
+    }
 
     /// Discard changes in active parts set
     /// Remove parts that were created, restore parts that were removed (except parts that were created by this transaction too)
@@ -426,7 +441,7 @@ bool MergeTreeTransaction::rollback() noexcept
     for (const auto & part : parts_to_remove)
     {
         /// Write special RolledBackCSN, so we will be able to cleanup transaction log
-        retryMetadataStore(log, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreCreationCSN(Tx::RolledBackCSN); });
+        retryMetadataStore(log, retry_watch, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreCreationCSN(Tx::RolledBackCSN); });
     }
 
     for (const auto & part : parts_to_remove)
@@ -445,7 +460,7 @@ bool MergeTreeTransaction::rollback() noexcept
     {
         /// Clear removal_tid from version metadata file, so we will not need to distinguish TIDs that were not committed
         /// and TIDs that were committed long time ago and were removed from the log on log cleanup.
-        retryMetadataStore(log, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreRemovalTID(Tx::EmptyTID); });
+        retryMetadataStore(log, retry_watch, [&] { return partDescription(*part); }, [&] { part->version->setAndStoreRemovalTID(Tx::EmptyTID); });
         part->version->unlockRemovalTID(tid, TransactionInfoContext{part->storage.getStorageID(), part->name});
     }
 
