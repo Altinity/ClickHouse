@@ -1,19 +1,30 @@
 accuracy
 1
 1
-1
-1
+1	1
 empty and single
 0
 1
-argument types
-1
-1
-1
-1
-state/merge roundtrip is native
-1
+state and merge
 1
 1
 AggregateFunction(uniqApacheHLL(14, \'HLL_8\'), UInt64)
 parameter validation
+argument types
+20
+20
+20
+20
+20
+20
+20
+20
+20
+20
+20
+3
+nullable and low cardinality
+20
+20
+unsupported types
+one argument only

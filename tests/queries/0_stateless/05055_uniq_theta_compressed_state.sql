@@ -1,17 +1,9 @@
 -- Tags: no-fasttest
 -- - no-fasttest -- compiled w/o datasketches
 
--- Apache DataSketches can serialize a Theta sketch in a compressed form (serialization
--- version 4) that packs the retained values at a variable number of bits per entry.
--- ClickHouse always writes the uncompressed form, but it has to read the compressed one,
--- because an `AggregateFunction(uniqTheta, ...)` state can come from another
--- implementation of the library. Two of the unpacking routines decoded it incorrectly,
--- and the result was a silently too low estimate rather than an error.
-
--- Both states below are canonical compressed encodings of a sketch that retains 16 values
--- with theta = 1, so the estimate is exact. The first packs its values at 33 bits per
--- entry and the second at 35; the two widths are decoded by separate routines. The two
--- sketches have exactly two values in common, so their union retains 30.
+-- Compressed Theta states (serialization version 4) exercise separate 33- and 35-bit
+-- unpacking routines that previously underestimated cardinality. Each retains 16 values
+-- with theta = 1; two shared values give a union of 30.
 
 WITH
     CAST(unhex('4B01040321011ACC9310000001F4000000FA0000007D0000003E8000001F4000000FA0000007D180000000000001F4000000FA0000007D0000003E8000001F4000000FA0000007D0000003E8') AS AggregateFunction(uniqTheta, UInt64)) AS state_33_bits,

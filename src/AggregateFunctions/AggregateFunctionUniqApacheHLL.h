@@ -25,7 +25,6 @@
 #include <IO/WriteHelpers.h>
 
 #include <hll.hpp>
-#include <boost/noncopyable.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -41,18 +40,11 @@ namespace ErrorCodes
 }
 
 
-/** An Apache DataSketches HLL sketch as an aggregate function state, serialized in the
-  * DataSketches HLL format so that `-State`/`-Merge` interoperate with external services.
-  *
-  * `lg_config_k` and the target type are owned by the aggregate function and passed in, so the
-  * state stores the sketch alone.
-  */
-class HllSketchData : private boost::noncopyable
+/// Keeps insertion and union states separate to preserve the estimator used before merging.
+class HllSketchData
 {
 private:
-    /// Used for insertions.
     std::unique_ptr<datasketches::hll_sketch> sk_update;
-    /// Used for merging.
     std::unique_ptr<datasketches::hll_union> sk_union;
 
     datasketches::hll_sketch * getSkUpdate(uint8_t lg_config_k, datasketches::target_hll_type tgt_type)
@@ -66,31 +58,22 @@ private:
     {
         if (!sk_union)
         {
-            /// `hll_union` takes `lg_max_k` in [7, 21] while a sketch may use [4, 21], hence the
-            /// floor of 7. It does not inflate the result: `get_result` downsamples to the smallest
-            /// `lg_config_k` the union has seen. So the resolution of a merged state is the minimum
-            /// over its inputs, not the `lg_config_k` of the type, and merging a coarser sketch from
-            /// elsewhere lowers both the estimate and the state written back. Merged from empty
-            /// states only there is no minimum, and it serializes as `lg_config_k = 7`.
+            /// `hll_union` requires at least 7, but preserves the lower resolution of its inputs.
             sk_union = std::make_unique<datasketches::hll_union>(std::max<uint8_t>(lg_config_k, 7));
         }
         return sk_union.get();
     }
 
-    /// Fold a sketch updated after the union was allocated into it, so merges see one state.
     void foldUpdateIntoUnionIfNeeded()
     {
         if (sk_union && sk_update)
         {
             sk_union->update(*sk_update);
-            sk_update.reset(nullptr);
+            sk_update.reset();
         }
     }
 
 public:
-    HllSketchData() = default;
-    ~HllSketchData() = default;
-
     template <typename T>
     void insert(T value, uint8_t lg_config_k, datasketches::target_hll_type tgt_type)
     {
@@ -106,8 +89,7 @@ public:
 
     UInt64 size(datasketches::target_hll_type tgt_type) const
     {
-        /// Round rather than truncate: `get_estimate` returns a `double`, and `999.9999` for an
-        /// exactly-known cardinality must not become `999`.
+        /// Rounding preserves exact cardinalities despite floating-point error.
         if (sk_union)
             return static_cast<UInt64>(std::llround(sk_union->get_result(tgt_type).get_estimate()));
         if (sk_update)
@@ -119,11 +101,7 @@ public:
     {
         datasketches::hll_union * u = getSkUnion(lg_config_k);
 
-        if (sk_update)
-        {
-            u->update(*sk_update);
-            sk_update.reset(nullptr);
-        }
+        foldUpdateIntoUnionIfNeeded();
 
         if (rhs.sk_update)
             u->update(*rhs.sk_update);
@@ -150,47 +128,27 @@ public:
         }
         catch (const std::bad_alloc &)
         {
-            /// Memory pressure, not corrupted data.
             throw;
         }
         catch (const std::exception & e)
         {
-            /// `datasketches` reports malformed input as `std::invalid_argument` / `std::out_of_range`.
-            /// Not being `DB::Exception`, those escape `SerializationAggregateFunction`'s
-            /// `catch (...)` and abort as a logical error, so translate them here.
+            /// Translate malformed input to avoid a logical exception in `SerializationAggregateFunction`.
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Cannot deserialize HLL sketch state: {}", e.what());
         }
     }
 
     void write(WriteBuffer & out, datasketches::target_hll_type tgt_type) const
     {
+        datasketches::hll_sketch::vector_bytes bytes;
         if (sk_update)
-        {
-            auto bytes = sk_update->serialize_compact();
-            writeVectorBinary(bytes, out);
-        }
+            bytes = sk_update->serialize_compact();
         else if (sk_union)
-        {
-            auto bytes = sk_union->get_result(tgt_type).serialize_compact();
-            writeVectorBinary(bytes, out);
-        }
-        else
-        {
-            datasketches::hll_sketch::vector_bytes bytes;
-            writeVectorBinary(bytes, out);
-        }
+            bytes = sk_union->get_result(tgt_type).serialize_compact();
+        writeVectorBinary(bytes, out);
     }
 };
 
 
-/** `uniqApacheHLL` over a single column of a type the sketch can hash directly.
-  *
-  * The value takes one of the three shapes the DataSketches API accepts - an 8-byte integer, an
-  * IEEE-754 double, or raw bytes - so that an external producer reaches the same sketch.
-  *
-  * `lg_config_k` and the target type live here rather than in the state, which is what lets states
-  * of different parameterisations share one binary representation.
-  */
 template <typename T>
 class AggregateFunctionUniqApacheHLL final : public IAggregateFunctionDataHelper<HllSketchData, AggregateFunctionUniqApacheHLL<T>>
 {
@@ -230,8 +188,7 @@ public:
 
             if constexpr (std::is_same_v<T, UUID>)
             {
-                /// ClickHouse holds a UUID as two 64-bit halves in host order, so its bytes in
-                /// memory are not the canonical 16 an external producer works from.
+                /// Convert the two host-order halves of a `UUID` to canonical bytes.
                 const UInt64 halves[2] = {
                     std::byteswap(UUIDHelpers::getHighBytes(value)),
                     std::byteswap(UUIDHelpers::getLowBytes(value)),
@@ -242,8 +199,7 @@ public:
                 /// Already held in network order, which is the canonical form.
                 data.insertData(reinterpret_cast<const char *>(&value), sizeof(value), lg_config_k, target_type);
             else if constexpr (is_decimal<T>)
-                /// `DateTime64(3)` holds the epoch milliseconds a caller elsewhere passes to
-                /// `update(long)`. The scale belongs to the type, so both sides must agree on it.
+                /// Hash `DateTime64` as epoch ticks; external producers must use the same scale.
                 data.insert(static_cast<Int64>(value.value), lg_config_k, target_type);
             else if constexpr (std::is_same_v<T, IPv4>)
                 data.insert(static_cast<UInt64>(value.toUnderType()), lg_config_k, target_type);
@@ -255,8 +211,8 @@ public:
                 data.insert(static_cast<UInt64>(value), lg_config_k, target_type);
         }
     }
-    /// A serialized sketch describes its own configuration, so states of different parameterisations
-    /// are interchangeable. Merging across them takes the resolution of the coarsest input.
+
+    /// Serialized sketches carry their configuration, so parameters need not match.
     bool haveSameStateRepresentationImpl(const IAggregateFunction & rhs) const override
     {
         return getName() == rhs.getName() && this->haveEqualArgumentTypes(rhs);
@@ -283,12 +239,6 @@ public:
     }
 
 };
-
-
-/// `uniqApacheHLL([lg_k, [type]])(x)`, with `lg_k` in [4, 21] (default 12) and `type` one of
-/// 'HLL_4', 'HLL_6', 'HLL_8' (default 'HLL_4').
-AggregateFunctionPtr createAggregateFunctionUniqApacheHLL(
-    const std::string & name, const DataTypes & argument_types, const Array & params, const Settings *);
 
 }
 
