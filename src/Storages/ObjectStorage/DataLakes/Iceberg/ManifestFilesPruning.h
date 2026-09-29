@@ -1,7 +1,10 @@
 #pragma once
 #include "config.h"
 
+#include <optional>
+#include <unordered_map>
 
+#include <Core/NamesAndTypes.h>
 #include <Parsers/IAST_fwd.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
@@ -45,11 +48,18 @@ private:
     std::optional<DB::KeyCondition> partition_key_condition;
 
     std::unordered_map<Int32, DB::KeyCondition> min_max_key_conditions;
+<<<<<<< HEAD
     std::unordered_map<Int32, DB::DataTypePtr> min_max_column_types;
+=======
+    std::unordered_map<Int32, DB::NameAndTypePair> row_lineage_columns;
+>>>>>>> bfd4b9b13ca5 (Merge pull request #2308 from Altinity/backports/antalya-26.6/115603)
     /// NOTE: tricky part to support RENAME column.
     /// Takes ActionDAG representation of user's WHERE expression and
     /// rename columns to the their origina numeric ID's in iceberg
-    std::unique_ptr<DB::ActionsDAG> transformFilterDagForManifest(const DB::ActionsDAG * source_dag, std::vector<Int32> & used_columns_in_filter) const;
+    std::unique_ptr<DB::ActionsDAG> transformFilterDagForManifest(
+        const DB::ActionsDAG * source_dag,
+        std::vector<Int32> & used_columns_in_filter,
+        std::unordered_map<Int32, DB::NameAndTypePair> & row_lineage_columns_in_filter) const;
 
 public:
     ManifestFilesPruner(

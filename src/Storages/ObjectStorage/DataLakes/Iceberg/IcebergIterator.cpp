@@ -217,12 +217,51 @@ DataFileEntriesStream::DataFileEntriesStream(
         });
 }
 
+<<<<<<< HEAD
 DataFileEntriesStream::~DataFileEntriesStream()
 {
     stop();
     if (producer)
     {
         producer->join();
+=======
+            /// next() returned nullptr, meaning the manifest file is fully exhausted.
+            current_manifest_file_iterator = nullptr;
+        }
+
+        /// Find the next manifest file with matching content type.
+        while (manifest_file_index < data_snapshot->manifest_list_entries.size())
+        {
+            const auto & manifest_list_entry = data_snapshot->manifest_list_entries[manifest_file_index++];
+            if (manifest_list_entry.content_type != manifest_file_content_type)
+                continue;
+
+            auto manifest_file_cacheable_part = Iceberg::getManifestFile(
+                object_storage,
+                persistent_components,
+                local_context,
+                log,
+                manifest_list_entry.manifest_file_path,
+                manifest_list_entry.manifest_file_byte_size,
+                *secondary_storages);
+
+            current_manifest_file_iterator = Iceberg::ManifestFileIterator::create(
+                manifest_file_cacheable_part.deserializer,
+                manifest_list_entry.manifest_file_path,
+                persistent_components.path_resolver,
+                *persistent_components.schema_processor,
+                manifest_list_entry.added_sequence_number,
+                manifest_list_entry.added_snapshot_id,
+                manifest_list_entry.first_row_id,
+                local_context,
+                filter_dag,
+                table_snapshot->schema_id);
+            break;
+        }
+
+        if (!current_manifest_file_iterator)
+            return std::nullopt;
+>>>>>>> bfd4b9b13ca5 (Merge pull request #2308 from Altinity/backports/antalya-26.6/115603)
     }
 }
 
