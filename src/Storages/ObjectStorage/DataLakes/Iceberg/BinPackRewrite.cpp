@@ -33,10 +33,10 @@
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
-    extern const int CANNOT_WRITE_TO_FILE_BUFFER;
     extern const int LOGICAL_ERROR;
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int QUERY_WAS_CANCELLED;
+    extern const int UNFINISHED;
 }
 
 namespace DB::Setting
@@ -1186,7 +1186,7 @@ BinPackCommitResult executeBinPackCompaction(
 
                 if (!verification_error.empty() || owner == MetadataFileOwner::Absent)
                     throw Exception(
-                        ErrorCodes::CANNOT_WRITE_TO_FILE_BUFFER,
+                        ErrorCodes::UNFINISHED,
                         "Outcome of writing Iceberg metadata file {} for bin-pack snapshot {} is unknown{}. "
                         "Files written by this attempt were left in place",
                         generated_metadata_info.path.serialize(), new_snapshot_id,
