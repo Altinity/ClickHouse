@@ -42,6 +42,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.6.2.20001.altinityantalya",
         {
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
+            {"data_lake_delete_data_on_drop", false, false, "New setting that unifies dropping of data lake data; the released `iceberg_delete_data_on_drop` is kept as an alias for it."},
+            {"datalake_create_table_as_ignore_unsupported_source_properties", false, false, "New setting: allow `CREATE TABLE ... AS` in a `DataLakeCatalog` to ignore unsupported properties inherited from the source."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",
