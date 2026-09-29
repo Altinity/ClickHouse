@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-shared-merge-tree
+# Tags: no-fasttest, no-shared-merge-tree, no-cas-storage
 # no-fasttest: requires S3 / MinIO.
 # no-shared-merge-tree: this test exercises the EXPORT TTL of a plain (non-replicated) MergeTree.
+# no-cas-storage: the EXPORT TTL of a plain MergeTree is not supported on a content-addressed disk.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

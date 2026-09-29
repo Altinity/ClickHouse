@@ -1766,6 +1766,10 @@ protected:
     /// Validates the `TTL ... EXPORT TO TABLE` expression of an ALTER, if it changes it.
     void checkExportTTL(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, ContextPtr local_context) const;
 
+    /// A plain `MergeTree` keeps its export index and tasks in files on its first disk, which are
+    /// written and then renamed: a content-addressed disk cannot rename a file written before.
+    void checkExportTTLIsSupportedByDisk(const StorageInMemoryMetadata & metadata) const;
+
 public:
     /// Validates the `TTL ... EXPORT TO TABLE` expression of the table `table_id` being created or
     /// altered. The partition key of the destination is checked against the parts of every group

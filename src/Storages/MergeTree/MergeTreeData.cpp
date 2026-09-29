@@ -1320,7 +1320,20 @@ void MergeTreeData::checkExportTTL(
     if (describe(export_ttls) == describe(old_metadata.getExportTTLs()))
         return;
 
+    checkExportTTLIsSupportedByDisk(new_metadata);
     validateExportTTL(getStorageID(), new_metadata, getSettings(), local_context);
+}
+
+void MergeTreeData::checkExportTTLIsSupportedByDisk(const StorageInMemoryMetadata & metadata) const
+{
+    if (supportsReplication() || !metadata.hasAnyExportTTL())
+        return;
+
+    const auto disk = getDisks().front();
+    if (disk->isContentAddressed())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "`TTL ... EXPORT TO TABLE` is not supported for a MergeTree table on the content-addressed disk {}",
+            disk->getName());
 }
 
 void MergeTreeData::validateExportTTL(

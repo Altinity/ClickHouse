@@ -1,5 +1,6 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-cas-storage
 -- no-fasttest: the destinations are S3 tables.
+-- no-cas-storage: the EXPORT TTL of a plain MergeTree is not supported on a content-addressed disk.
 
 -- The expressions an `EXPORT` TTL accepts, and the date and time columns it may widen when exporting.
 

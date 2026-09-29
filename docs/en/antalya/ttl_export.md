@@ -36,8 +36,8 @@ Here rows are exported to `events_archive` 30 days after `event_time`, and delet
 
 ## Requirements {#requirements}
 
-- The server setting `allow_experimental_export_merge_tree_partition` must be enabled on every replica, and the query setting `allow_experimental_export_ttl` must be enabled for the `CREATE` or `ALTER` that adds the expression.
-- The destination must exist when the expression is added. It must be an Apache Iceberg or object storage table that `EXPORT PARTITION` can export to, and its schema must be castable from the source schema, see [`EXPORT PARTITION` requirements](/docs/en/antalya/partition_export.md#requirements). An unqualified table name refers to the database of the source table.
+- The server setting `allow_experimental_export_merge_tree_partition` must be enabled on every replica, and the query setting `allow_experimental_export_ttl` must be enabled for the `CREATE` or `ALTER` that adds the expression. A table with the expression is not loaded, e.g. at a restart or by `ATTACH TABLE`, while the server setting is disabled: without it, merges would not keep the exported parts apart from the others.
+- The destination must exist when the expression is added. It must be an Apache Iceberg or object storage table that `EXPORT PARTITION` can export to, and its schema must be castable from the source schema, see [`EXPORT PARTITION` requirements](/docs/en/antalya/partition_export.md#requirements). Unlike `EXPORT PARTITION`, the TTL allows lossy casts, as if `export_merge_tree_part_allow_lossy_cast` were enabled: e.g. a `UInt32` column is exported to the `int` of an Iceberg table, which is read back as `Int32`, and values that do not fit change. An unqualified table name refers to the database of the source table.
 - A table can have at most one `EXPORT` TTL expression, without `WHERE` or `GROUP BY`. The expression must be deterministic and return a `Date` or `DateTime`.
 - The rows of a group must land in a single partition of the destination, see [Partition key of the destination](#destination-partition-key).
 
@@ -66,13 +66,13 @@ A group has at most `ttl_export_max_parts_per_group` parts and `ttl_export_max_b
 
 To keep exported rows apart from the others, parts that are exported, parts that are being exported and parts that are not exported are never merged together. Parts that are being exported are not merged at all until their group commits. On a `Replicated*MergeTree` table, every replica enforces this, which is why a replica advertises that it supports it, and groups are only started while every replica does.
 
-One replica of a `Replicated*MergeTree` table schedules the groups; the others take part in exporting them like in `EXPORT PARTITION`. The state of the scheduling, i.e. the batch timers and the last errors, is kept in Keeper, so when another replica takes over, it continues where the previous one left off.
+One replica of a `Replicated*MergeTree` table schedules the groups; the others take part in exporting them like in `EXPORT PARTITION`. Every replica tracks the batch timers of the parts it has, so when another replica takes over, it continues them, give or take how much later it got the parts.
 
 ## Failures and retries {#failures-and-retries}
 
-A group that fails, is killed or times out is retried on the next check as a new task, with a new transaction id. The retry contains every part of the failed group, plus any part that became eligible meanwhile. Its `retry_of` column lists the failed tasks. Throttling comes from the export tasks themselves: per-part retry back-off, `export_merge_tree_task_timeout_seconds` and the commit attempts.
+A group that fails, is killed or times out is retried on the next check as a new task, with a new transaction id. The retry contains every part of the failed group, plus any part that became eligible meanwhile. Throttling comes from the export tasks themselves: per-part retry back-off, `export_merge_tree_task_timeout_seconds` and the commit attempts.
 
-Before a failed task is retried, the destination is checked for its commit, in case it committed but was not marked as completed. A failed task may also land at the destination after that check, e.g. a request that completes late. The commit of the retry therefore checks each task in `retry_of` again, and leaves out the files of the parts a landed task exported.
+A task commits only once it exported all its parts, so a task that failed before that cannot have committed, and nothing checks it. A task that failed after that is checked at the destination before it is retried, in case it committed but was not marked as completed. It may also land after that check, e.g. a request that the destination applies late, so the retry lists it in its `retry_of` column, with the blocks of its parts. The commit of the retry checks each task in `retry_of` again, and leaves out the files of the parts a landed task exported. A task stays in the `retry_of` of later retries for 10 minutes after it failed, or longer while a replica is still in its commit; it is then checked a last time, and kept only if it landed.
 
 `KILL EXPORT` of a task of the TTL makes it retry. To stop exporting, use `SYSTEM STOP MOVES`, which pauses the TTL export of the table, or remove the expression. On a `Replicated*MergeTree` table, `SYSTEM STOP MOVES` pauses it only on the replica that schedules the groups, shown in the `scheduler_replica` column of `system.ttl_exports`, so run it on every replica, e.g. with `ON CLUSTER`.
 
@@ -96,7 +96,7 @@ While the destination does not exist, e.g. it was dropped or is not loaded yet, 
 
 - `allow_experimental_export_ttl` — allows adding a `TTL ... EXPORT TO TABLE` expression.
 
-The settings of the export tasks, e.g. the output format settings, `export_merge_tree_part_file_already_exists_policy` and `export_merge_tree_task_timeout_seconds`, are taken from the settings profile named by `ttl_export_settings_profile`, or the default profile.
+The settings of the export tasks, e.g. the output format settings, `export_merge_tree_part_file_already_exists_policy` and `export_merge_tree_task_timeout_seconds`, are taken from the settings profile named by `ttl_export_settings_profile`, or the default profile. The settings of the session that adds the expression do not apply to them. `export_merge_tree_part_allow_lossy_cast` is always enabled.
 
 ### MergeTree settings {#merge-tree-settings}
 
@@ -107,13 +107,13 @@ The settings of the export tasks, e.g. the output format settings, `export_merge
 | `ttl_export_batch_max_delay_seconds` | `600` | A group is exported at the latest this long after its first part became eligible. |
 | `ttl_export_batch_min_bytes` | `256 MiB` | A group is exported as soon as its parts reach this size. `0` disables it. |
 | `ttl_export_max_parts_per_group` | `100` | Maximum number of parts of a group. Parts of a failed group are always retried together. |
-| `ttl_export_max_bytes_per_group` | `10 GiB` | Maximum size of a group. A bigger part is exported on its own. `0` means unlimited. |
+| `ttl_export_max_bytes_per_group` | `100 GiB` | Maximum size of a group. A bigger part is exported on its own. `0` means unlimited. |
 | `ttl_export_max_concurrent_groups` | `4` | Maximum number of groups of the table being exported at the same time. |
 | `ttl_export_settings_profile` | `''` | Settings profile of the export tasks. |
 
 ## Monitoring {#monitoring}
 
-`system.ttl_exports` has one row per partition of a table with an `EXPORT` TTL expression, as of the last check. For a `Replicated*MergeTree` table, every replica has the same rows: the batch timers, the task being exported and the last error come from Keeper, and are those of the replica that schedules the groups, shown in `scheduler_replica`. The part counts are those of the parts of the replica, so they differ while a replica is fetching parts.
+`system.ttl_exports` has one row per partition of a table with an `EXPORT` TTL expression, as of the last check. For a `Replicated*MergeTree` table, every replica shows what was exported and the task being exported, which come from Keeper. The part counts and the batch timers are those of the parts of the replica, so they differ while a replica is fetching parts. The error of starting a group, e.g. because its rows would land in several destination partitions, is shown by the replica that schedules the groups, shown in `scheduler_replica`.
 
 ```sql
 SELECT partition_id, exported_parts, claimed_parts, eligible_parts, parts_held_by_delete_gate,
@@ -134,3 +134,4 @@ What was exported is read from Keeper again only when it changes, i.e. when a gr
 - Export tasks are not removed, so they accumulate in Keeper (or in the data directory of a plain `MergeTree` table), and in `system.distributed_exports`.
 - On a plain object storage destination, files that no commit file references may remain, e.g. when a part of a failed group is mutated before its retry, its new name gives a new file, and the file of the failed attempt is left. Readers must follow the commit files, see [`EXPORT PARTITION`](/docs/en/antalya/partition_export.md).
 - Parts that are attached again, e.g. by `ALTER TABLE ... ATTACH PARTITION`, get new block numbers and are exported again.
+- A plain `MergeTree` table whose first disk is content-addressed cannot have the expression: it keeps what was exported and its export tasks in files on that disk, which does not support how they are written. A `Replicated*MergeTree` table keeps them in Keeper, so it can.

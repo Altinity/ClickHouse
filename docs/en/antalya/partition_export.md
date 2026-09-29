@@ -299,7 +299,7 @@ Status values include:
 ### Source columns {#source-columns}
 
 - `source` — `query` for a task of `EXPORT PARTITION`, `ttl` for a task of the table's `TTL ... EXPORT TO TABLE` expression.
-- `retry_of` — for a task of the `EXPORT` TTL: transaction ids of earlier tasks that failed to export some of its parts. Its commit checks whether any of them landed at the destination after all.
+- `retry_of` — for a task of the `EXPORT` TTL: transaction ids of earlier tasks that failed to export some of its parts after exporting all of theirs, so their commit may still land. Its commit checks whether any of them landed at the destination after all.
 
 To pick the latest exception across replicas:
 

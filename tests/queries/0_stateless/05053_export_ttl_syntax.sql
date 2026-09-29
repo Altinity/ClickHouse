@@ -1,5 +1,6 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-cas-storage
 -- no-fasttest: the destination is an S3 table.
+-- no-cas-storage: the EXPORT TTL of a plain MergeTree is not supported on a content-addressed disk.
 
 SELECT formatQuery('CREATE TABLE t (d DateTime) ENGINE = MergeTree ORDER BY d TTL d + INTERVAL 1 DAY EXPORT TO TABLE dst, d + INTERVAL 2 DAY DELETE');
 SELECT formatQuery('ALTER TABLE t MODIFY TTL d + INTERVAL 1 DAY EXPORT TO TABLE db.dst');

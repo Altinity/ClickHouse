@@ -1,5 +1,6 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-cas-storage
 -- no-fasttest: the destinations are S3 tables.
+-- no-cas-storage: the EXPORT TTL of a plain MergeTree is not supported on a content-addressed disk.
 
 -- The partition key of the destination of an EXPORT TTL is checked when the expression is added:
 -- a key that is a function of the source partition key (structural) or monotonic in a single column
