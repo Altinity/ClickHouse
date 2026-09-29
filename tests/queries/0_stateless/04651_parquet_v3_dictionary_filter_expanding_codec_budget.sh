@@ -186,7 +186,7 @@ echo "generous memory budget: the dictionary filter prunes the row group, 0 rows
 run 4000000000 "no_such_value"
 
 echo "moderate memory budget: the ~16 MB padded frame is charged once, by the prefetch, and the ~2.9 MB decoded dictionary fits on top of it, so pruning must still happen; charging the frame a second time demanded ~32 MB more and fell back to a full scan"
-run 170000000 "no_such_value"
+run 340000000 "no_such_value"
 
 echo "extreme memory budget (1 byte): pruning is skipped, result is still correct"
 run 1 "no_such_value"
