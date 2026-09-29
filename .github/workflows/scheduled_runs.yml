@@ -2,7 +2,18 @@ name: Scheduled Altinity Builds
 
 on:
   schedule:
-    - cron: '0 0 * * 6' #Weekly run for stable versions 
+    - cron: '0 0 * * *'
+  workflow_run:
+    workflows: ["MasterCI", "ReleaseBranchCI"]
+    types:
+      - completed
+    branches:
+      - antalya-26.6
+      - antalya-26.3
+      - antalya-25.8
+      - stable-26.3
+      - stable-25.8
+      - releases/24.8.14
   # Make sure that any changes to this file is actually tested with PRs
   pull_request:
     types:
@@ -11,46 +22,163 @@ on:
       - opened
     paths:
       - '**/scheduled_runs.yml'
+      - 'ci/jobs/scheduled_run_summary.py'
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
-  DailyRuns:
+  ScheduledRuns:
+    if: github.event_name != 'workflow_run'
     strategy:
       fail-fast: false
       matrix:
-        branch: 
-          - antalya-26.6
-          - antalya-26.3
-          - antalya-25.8
+        include:
+          - branch: antalya-26.6
+            workflow: master.yml
+          - branch: antalya-26.3
+            workflow: master.yml
+          - branch: antalya-25.8
+            workflow: master.yml
+          - branch: stable-26.3
+            workflow: master.yml
+          - branch: stable-25.8
+            workflow: master.yml
+          - branch: releases/24.8.14
+            workflow: release_branches.yml
     name: ${{ matrix.branch }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
-     - name: Run ${{ matrix.branch }} workflow
-       run: |
-          curl -L \
-          -X POST \
-          -H "Accept: application/vnd.github+json" \
-          -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-          -H "X-GitHub-Api-Version: 2022-11-28" \
-          https://api.github.com/repos/Altinity/ClickHouse/actions/workflows/release_branches.yml/dispatches \
-          -d '{"ref":"${{ matrix.branch }}"}'
+      - name: Compare branch tip to the latest workflow run
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ matrix.branch }}
+          WORKFLOW: ${{ matrix.workflow }}
+        run: |
+          set -euo pipefail
 
-  WeeklyRuns:
-    strategy:
-      fail-fast: false
-      matrix:
-        branch: 
-          - stable-26.3
-          - stable-25.8
-          - releases/24.8.14
-    name: ${{ matrix.branch }}
-    runs-on: ubuntu-latest
+          tip=$(gh api -X GET \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -f sha="$BRANCH" \
+            -F per_page=1 \
+            /repos/Altinity/ClickHouse/commits \
+            --jq '.[0].sha')
+          echo "Tip of ${BRANCH}: ${tip}"
+
+          runs=$(gh api -X GET \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -f branch="$BRANCH" \
+            -F per_page=10 \
+            "/repos/Altinity/ClickHouse/actions/workflows/${WORKFLOW}/runs")
+
+          active=$(jq '
+            [.workflow_runs[]
+              | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "requested" or .status == "pending")]
+            | length' <<<"$runs")
+          latest_sha=$(jq -r '.workflow_runs[0].head_sha // empty' <<<"$runs")
+          latest_id=$(jq -r '.workflow_runs[0].id // empty' <<<"$runs")
+          latest_status=$(jq -r '.workflow_runs[0].status // empty' <<<"$runs")
+          latest_conclusion=$(jq -r '.workflow_runs[0].conclusion // empty' <<<"$runs")
+
+          dispatch=false
+          previous_run_id=""
+          if [ "$active" -gt 0 ]; then
+            echo "${WORKFLOW} already has an unfinished run on ${BRANCH}"
+          elif [ -z "$latest_sha" ]; then
+            echo "No previous ${WORKFLOW} run on ${BRANCH}"
+            dispatch=true
+          elif [ "$latest_sha" = "$tip" ]; then
+            echo "No recent changes on ${BRANCH} (${latest_status}/${latest_conclusion})"
+          else
+            echo "Tip ${tip} differs from latest run ${latest_sha} (${latest_status}/${latest_conclusion})"
+            dispatch=true
+            previous_run_id="${latest_id}"
+          fi
+          {
+            echo "dispatch=${dispatch}"
+            echo "sha=${tip}"
+            echo "previous_run_id=${previous_run_id}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Run ${{ matrix.workflow }} on ${{ matrix.branch }}
+        id: dispatch
+        if: steps.check.outputs.dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ matrix.branch }}
+          WORKFLOW: ${{ matrix.workflow }}
+          SHA: ${{ steps.check.outputs.sha }}
+          PREVIOUS_RUN_ID: ${{ steps.check.outputs.previous_run_id }}
+        run: |
+          set -euo pipefail
+          before=$(date -u -d '30 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
+          http=$(curl -sS -o /tmp/dispatch_body -w '%{http_code}' -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW}/dispatches" \
+            -d "{\"ref\":\"${BRANCH}\"}")
+          if [ "$http" != "204" ]; then
+            echo "Dispatch failed: HTTP ${http}"
+            cat /tmp/dispatch_body
+            exit 1
+          fi
+
+          run_id=""
+          for _ in $(seq 1 24); do
+            sleep 5
+            listed=$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow "$WORKFLOW" \
+              --branch "$BRANCH" \
+              --event workflow_dispatch \
+              --limit 5 \
+              --json databaseId,headSha,createdAt)
+            run_id=$(jq -r --arg sha "$SHA" --arg before "$before" '
+              [ .[] | select(.headSha == $sha and .createdAt >= $before) ]
+              | sort_by(.createdAt) | last | .databaseId // empty
+            ' <<<"$listed")
+            if [ -n "$run_id" ]; then
+              echo "Found run ${run_id}"
+              break
+            fi
+          done
+          if [ -z "$run_id" ]; then
+            echo "Dispatched ${WORKFLOW} on ${BRANCH} but no run id appeared within 2 minutes"
+            exit 1
+          fi
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          jq -n \
+            --arg previous_run_id "$PREVIOUS_RUN_ID" \
+            '{previous_run_id: (if $previous_run_id == "" then null else ($previous_run_id | tonumber) end)}' \
+            > entry.json
+      - name: Upload batch entry
+        if: steps.dispatch.outputs.run_id != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: batch-entry-${{ steps.dispatch.outputs.run_id }}
+          path: entry.json
+          retention-days: 5
+
+  ReportScheduledRuns:
+    if: github.event_name == 'workflow_run'
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
-     - name: Run ${{ matrix.branch }} workflow
-       run: |
-          curl -L \
-          -X POST \
-          -H "Accept: application/vnd.github+json" \
-          -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-          -H "X-GitHub-Api-Version: 2022-11-28" \
-          https://api.github.com/repos/Altinity/ClickHouse/actions/workflows/release_branches.yml/dispatches \
-          -d '{"ref":"${{ matrix.branch }}"}'
+      - name: Checkout summary script
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: ci/jobs/scheduled_run_summary.py
+          sparse-checkout-cone-mode: false
+      - name: Post Slack summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || '' }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: python3 ci/jobs/scheduled_run_summary.py
