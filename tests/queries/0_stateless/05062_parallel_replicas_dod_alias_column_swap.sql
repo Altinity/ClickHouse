@@ -55,6 +55,8 @@ SETTINGS
     cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost'
 FORMAT TSVWithNames;
 
+-- Serialized `Distributed` plans bypass parallel replicas; automatic mode 2 collects statistics only.
+-- Pin both for queries whose replica participation is checked below.
 SELECT 'pr_uint64';
 SELECT x, a_num, inner_c
 FROM test_pr_dod_alias_swap_outer
@@ -67,7 +69,9 @@ SETTINGS
     parallel_replicas_local_plan = 1,
     parallel_replicas_for_non_replicated_merge_tree = 1,
     parallel_replicas_min_number_of_rows_per_replica = 0,
+    automatic_parallel_replicas_mode = 0,
     cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost',
+    serialize_query_plan = 0,
     log_queries = 1,
     log_comment = '05062_pr_uint64'
 FORMAT TSVWithNames;
@@ -84,7 +88,9 @@ SETTINGS
     parallel_replicas_local_plan = 1,
     parallel_replicas_for_non_replicated_merge_tree = 1,
     parallel_replicas_min_number_of_rows_per_replica = 0,
+    automatic_parallel_replicas_mode = 0,
     cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost',
+    serialize_query_plan = 0,
     log_queries = 1,
     log_comment = '05062_pr_string'
 FORMAT TSVWithNames;
