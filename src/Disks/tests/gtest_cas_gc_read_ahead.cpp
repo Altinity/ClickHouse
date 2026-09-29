@@ -316,7 +316,7 @@ void runFolds(uint64_t concurrency, size_t rounds, FoldRun & out)
     auto backend = std::make_shared<CountingBackend>();
     auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .gc_fold_max_defer_rounds = 0, .gc_read_concurrency = concurrency});
+                   .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = concurrency});
     populate(store);
 
     CasRequests requests = openRequestsForTest(backend);
@@ -521,7 +521,7 @@ TEST(CASGCReadAhead, TheFoldsReadsActuallyOverlap)
     auto backend = std::make_shared<OverlapWitnessBackend>(/*k_overlap*/ 2);
     auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .gc_fold_max_defer_rounds = 0, .gc_read_concurrency = 8});
+                   .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 8});
     populate(store);
 
     Gc gc(store, kGc);
@@ -539,7 +539,7 @@ TEST(CASGCReadAhead, WorkerReadFaultFailsTheRoundAndTheNextRoundRecovers)
     auto backend = std::make_shared<WorkerReadFaultBackend>();
     auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .gc_fold_max_defer_rounds = 0, .gc_read_concurrency = 8});
+                   .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = 8});
     populate(store);
 
     Gc gc(store, kGc);

@@ -56,7 +56,7 @@ SELECT server_root_id, is_leader, state, last_success_age_seconds, pending_recla
 FROM system.cas_mounts WHERE disk = 'cas';
 
 SELECT event_time, outcome, candidates_marked, entries_condemned, entries_graduated,
-       entries_redeleted, anomalies
+       entries_redeleted, entries_redelete_failed, anomalies
 FROM system.cas_gc_log
 WHERE event_type = 'Finish' AND disk_name = 'cas'
 ORDER BY event_time DESC LIMIT 10;
@@ -193,8 +193,8 @@ SYSTEM CAS GC RUN cas;
 
 One row per disk it ran on: `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`,
 `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`,
-`entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, `anomalies`,
-`pending_candidates`, `pending_condemned`, `pending_retired`. Omitting
+`entries_condemned`, `entries_graduated`, `entries_redeleted`, `entries_redelete_failed`, `fence_outs`,
+`anomalies`, `pending_candidates`, `pending_condemned`, `pending_retired`. Omitting
 the disk name runs one round on every content-addressed disk on the node. A manual run executes
 regardless of `SYSTEM CAS GC STOP` — `STOP` pauses only the background scheduler.
 
