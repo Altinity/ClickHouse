@@ -10,7 +10,8 @@ CREATE TABLE t_dist_05070 AS t_local_05070
 ENGINE = Distributed(test_shard_localhost, currentDatabase(), t_local_05070);
 
 SELECT 'local_pending';
-SELECT __aliasMarker(1, 1, '__aliasMarker_pending_v1') FROM t_local_05070 ORDER BY x;
+SELECT __aliasMarker(1, 1, '__aliasMarker_pending_v1') FROM t_local_05070 ORDER BY x
+SETTINGS enable_parallel_replicas = 0;
 
 SELECT 'bad_token';
 SELECT __aliasMarker(1, 1, 'wrong_token') FROM t_local_05070; -- { serverError BAD_ARGUMENTS }
