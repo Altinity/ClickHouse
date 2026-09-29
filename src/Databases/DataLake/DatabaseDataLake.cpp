@@ -1295,15 +1295,10 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
                 "oauth_user_token_cache_ttl",
             };
 
-            const SettingsChanges changed = database_settings.allChanged();
-            auto is_changed = [&](std::string_view name)
+            for (const auto & change : database_settings.allChanged())
             {
-                return std::any_of(changed.begin(), changed.end(), [&](const auto & change) { return std::string_view(change.name) == name; });
-            };
-
-            for (const auto & name : exchange_only_settings)
-            {
-                if (!is_changed(name))
+                const auto & name = change.name;
+                if (std::find(exchange_only_settings.begin(), exchange_only_settings.end(), name) == exchange_only_settings.end())
                     continue;
                 if (!forwarding)
                     throw Exception(

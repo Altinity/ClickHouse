@@ -1,7 +1,6 @@
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/Net/HTTPRequest.h>
-#include <Access/AccessControl.h>
 #include <Access/ForwardedAuthToken.h>
 #include <Databases/DataLake/Common.h>
 #include <Common/CurrentMetrics.h>
@@ -75,7 +74,6 @@ namespace DB::ErrorCodes
     extern const int FAULT_INJECTED;
     extern const int NOT_IMPLEMENTED;
     extern const int CATALOG_NAMESPACE_DISABLED;
-    extern const int CATALOG_USER_TOKEN_NOT_AVAILABLE;
 }
 
 namespace DB::Setting
@@ -725,18 +723,27 @@ AccessToken RestCatalog::exchangeUserToken(
     const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthToken & auth_token,
     const AccessToken * prepared_actor_token) const
 {
-    TokenRequest request;
-    request.grant = TokenRequest::Grant::TokenExchange;
-    request.url = Poco::URI(token_forwarding.token_exchange_uri);
-    request.scope = auth_scope;
-    request.client_id = catalog_state.client_id;
-    request.client_secret = catalog_state.client_secret;
-    request.subject_token = auth_token.token;
-    request.subject_token_type = token_forwarding.subject_token_type;
-    request.requested_token_type = token_forwarding.requested_token_type;
-
+    const Poco::URI url(token_forwarding.token_exchange_uri);
+    Poco::URI::QueryParameters params = {
+        {"grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"},
+        {"subject_token", auth_token.token},
+        {"subject_token_type", token_forwarding.subject_token_type},
+    };
+    if (!token_forwarding.requested_token_type.empty())
+        params.emplace_back("requested_token_type", token_forwarding.requested_token_type);
+    if (!auth_scope.empty())
+        params.emplace_back("scope", auth_scope);
     if (token_forwarding.forward_actor_token)
-        request.actor_token = prepared_actor_token ? prepared_actor_token->token : getServicePrincipalToken(catalog_state, generation);
+    {
+        const auto actor_token = prepared_actor_token ? prepared_actor_token->token : getServicePrincipalToken(catalog_state, generation);
+        if (!actor_token.empty())
+        {
+            params.emplace_back("actor_token", actor_token);
+            params.emplace_back("actor_token_type", "urn:ietf:params:oauth:token-type:access_token");
+        }
+    }
+    params.emplace_back("client_id", catalog_state.client_id);
+    params.emplace_back("client_secret", catalog_state.client_secret);
 
     ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogTokenExchange);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogTokenExchangeMicroseconds);
@@ -744,7 +751,7 @@ AccessToken RestCatalog::exchangeUserToken(
     AccessToken exchanged;
     try
     {
-        exchanged = requestToken(request);
+        exchanged = requestToken(url, params);
     }
     catch (...)
     {
@@ -1038,38 +1045,11 @@ namespace
 
 }
 
-AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
+AccessToken RestCatalog::requestToken(Poco::URI url, const Poco::URI::QueryParameters & params, bool use_query_parameters) const
 {
-    Poco::URI url = token_request.url;
     String body;
 
-    /// Do not also send bearer authentication: strict OAuth servers reject multiple client-authentication methods.
-    Poco::URI::QueryParameters params;
-    if (token_request.grant == TokenRequest::Grant::ClientCredentials)
-    {
-        params.emplace_back("grant_type", "client_credentials");
-        params.emplace_back("scope", token_request.scope);
-    }
-    else
-    {
-        params.emplace_back("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange");
-        params.emplace_back("subject_token", token_request.subject_token);
-        params.emplace_back("subject_token_type", token_request.subject_token_type);
-        if (!token_request.requested_token_type.empty())
-            params.emplace_back("requested_token_type", token_request.requested_token_type);
-        if (!token_request.scope.empty())
-            params.emplace_back("scope", token_request.scope);
-        if (!token_request.actor_token.empty())
-        {
-            params.emplace_back("actor_token", token_request.actor_token);
-            params.emplace_back("actor_token_type", "urn:ietf:params:oauth:token-type:access_token");
-        }
-    }
-
-    params.emplace_back("client_id", token_request.client_id);
-    params.emplace_back("client_secret", token_request.client_secret);
-
-    if (token_request.use_query_parameters)
+    if (use_query_parameters)
         url.setQueryParameters(params);
     else
     {
@@ -1096,6 +1076,7 @@ AccessToken RestCatalog::requestToken(const TokenRequest & token_request) const
     request.setContentLength(body.size());
     request.set("Accept", "application/json");
 
+    /// Strict OAuth servers reject bearer authentication alongside client credentials in the form.
     session->sendRequest(request) << body;
 
     Poco::Net::HTTPResponse response;
@@ -1147,17 +1128,17 @@ AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, cons
 {
     static constexpr auto oauth_tokens_endpoint = "oauth/tokens";
 
-    TokenRequest request;
-    request.scope = auth_scope;
-    request.client_id = client_id;
-    request.client_secret = client_secret;
-
-    request.url = oauth_server_uri.empty() ? Poco::URI(base_url / oauth_tokens_endpoint) : Poco::URI(oauth_server_uri);
-    request.use_query_parameters = oauth_server_uri.empty() && !oauth_server_use_request_body;
+    const Poco::URI::QueryParameters params = {
+        {"grant_type", "client_credentials"},
+        {"scope", auth_scope},
+        {"client_id", client_id},
+        {"client_secret", client_secret},
+    };
+    const auto url = oauth_server_uri.empty() ? Poco::URI(base_url / oauth_tokens_endpoint) : Poco::URI(oauth_server_uri);
 
     ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
-    return requestToken(request);
+    return requestToken(url, params, oauth_server_uri.empty() && !oauth_server_use_request_body);
 }
 
 String RestCatalog::getServicePrincipalToken(const CatalogState & catalog_state, UInt64 generation) const

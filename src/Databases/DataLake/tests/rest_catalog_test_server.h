@@ -6,7 +6,6 @@
 
 #include <Common/HTTPConnectionPool.h>
 
-#include <Poco/AutoPtr.h>
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
 #include <Poco/Net/HTTPServer.h>
@@ -15,7 +14,6 @@
 #include <Poco/Net/HTTPServerResponse.h>
 #include <Poco/Net/ServerSocket.h>
 #include <Poco/Net/SocketAddress.h>
-#include <Poco/SharedPtr.h>
 #include <Poco/StreamCopier.h>
 
 #include <functional>
@@ -52,12 +50,12 @@ struct Response
 
 inline Response json(const std::string & body)
 {
-    return Response{.status = 200, .body = body, .content_type = "application/json"};
+    return Response{.body = body};
 }
 
 inline Response respondWithStatus(int status, const std::string & body = R"({"error":{"message":"denied"}})")
 {
-    return Response{.status = status, .body = body, .content_type = "application/json"};
+    return Response{.status = status, .body = body};
 }
 
 class ServerState
@@ -104,7 +102,6 @@ public:
                 route = it->second;
         }
 
-        /// Report unexpected requests to the client.
         if (!route)
             return Response{
                 .status = 599,
@@ -170,35 +167,31 @@ class TestServer
 public:
     TestServer()
         : state(std::make_shared<ServerState>())
-        , server_socket(std::make_unique<Poco::Net::ServerSocket>(Poco::Net::SocketAddress("127.0.0.1", 0)))
-        , handler_factory(new RequestHandlerFactory(state))
-        , server_params(new Poco::Net::HTTPServerParams())
-        , server(std::make_unique<Poco::Net::HTTPServer>(handler_factory, *server_socket, server_params))
+        , server_socket(Poco::Net::SocketAddress("127.0.0.1", 0))
+        , server(new RequestHandlerFactory(state), server_socket, new Poco::Net::HTTPServerParams())
     {
         /// Ephemeral ports can be reused; discard pooled sockets belonging to previous test servers.
         DB::HTTPConnectionPools::instance().dropCache();
 
         state->setStaticRoute("/v1/config", R"({"defaults":{},"overrides":{}})");
-        server->start();
+        server.start();
     }
 
     ~TestServer()
     {
-        server->stop();
+        server.stop();
         DB::HTTPConnectionPools::instance().dropCache();
     }
 
-    std::string getUrl() const { return "http://" + server_socket->address().toString(); }
+    std::string getUrl() const { return "http://" + server_socket.address().toString(); }
 
     ServerState & operator*() const { return *state; }
     ServerState * operator->() const { return state.get(); }
 
 private:
     std::shared_ptr<ServerState> state;
-    std::unique_ptr<Poco::Net::ServerSocket> server_socket;
-    Poco::SharedPtr<RequestHandlerFactory> handler_factory;
-    Poco::AutoPtr<Poco::Net::HTTPServerParams> server_params;
-    std::unique_ptr<Poco::Net::HTTPServer> server;
+    Poco::Net::ServerSocket server_socket;
+    Poco::Net::HTTPServer server;
 };
 
 }

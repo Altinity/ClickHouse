@@ -62,26 +62,6 @@ struct TokenForwardingConfig
     bool exchangeEnabled() const { return forward_user_token && !token_exchange_uri.empty(); }
 };
 
-struct TokenRequest
-{
-    enum class Grant
-    {
-        ClientCredentials,
-        TokenExchange,
-    };
-
-    Grant grant = Grant::ClientCredentials;
-    Poco::URI url;
-    bool use_query_parameters = false;
-    String scope;
-    String client_id;
-    String client_secret;
-    String subject_token;
-    String subject_token_type;
-    String requested_token_type;
-    String actor_token;
-};
-
 struct CredentialsCacheKey
 {
     UInt64 generation = 0;
@@ -394,7 +374,7 @@ protected:
 
     MultiVersion<AccessToken>::Version publishServiceToken(AccessToken minted, UInt64 generation) const;
 
-    AccessToken requestToken(const TokenRequest & request) const;
+    AccessToken requestToken(Poco::URI url, const Poco::URI::QueryParameters & params, bool use_query_parameters = false) const;
 
     AccessToken exchangeUserToken(
         const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthToken & auth_token,
