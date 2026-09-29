@@ -54,3 +54,17 @@ x	a_str	inner_c
 10	aaaa	11
 10	aaaa	11
 10	aaaa	11
+prefer_localhost_replica_0_string_marker_on
+x	a_str	inner_c
+1	aaaa	2
+1	aaaa	2
+1	aaaa	2
+1	aaaa	2
+2	aaaa	3
+2	aaaa	3
+2	aaaa	3
+2	aaaa	3
+10	aaaa	11
+10	aaaa	11
+10	aaaa	11
+10	aaaa	11

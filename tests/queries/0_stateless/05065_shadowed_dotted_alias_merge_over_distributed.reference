@@ -7,3 +7,12 @@ merge_prefer0
 merge_prefer1
 1	10	100
 2	20	200
+multiple dotted local
+1	1000	10000
+2	2000	20000
+multiple dotted merge_prefer0
+1	1000	10000
+2	2000	20000
+multiple dotted merge_prefer1
+1	1000	10000
+2	2000	20000

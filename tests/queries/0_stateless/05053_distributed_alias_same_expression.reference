@@ -1,16 +1,16 @@
 first
-1999-03-29 01:15:33.000		
+1999-03-29 01:15:33.000	nonempty	nonempty
 second
-1999-03-29 01:15:33.000		
+1999-03-29 01:15:33.000	nonempty	nonempty
 third
-1999-03-29 01:15:33.000		
+1999-03-29 01:15:33.000	nonempty	nonempty
 fourth
-1999-03-29 01:15:33.000		
+1999-03-29 01:15:33.000	nonempty	nonempty
 fifth
-1999-03-29 01:15:33.000		
+1999-03-29 01:15:33.000	nonempty	nonempty
 sixth
 query_alias_0	query_alias_1
-	
+nonempty	nonempty
 seventh
 alias_String_7_0	alias_String_7_1
-	
+nonempty	nonempty

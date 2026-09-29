@@ -22,7 +22,7 @@ CREATE TABLE test_alias_same_expr_remote
 ENGINE = MergeTree()
 ORDER BY dt;
 
-INSERT INTO test_alias_same_expr_remote VALUES ('1999-03-29T01:15:33', '');
+INSERT INTO test_alias_same_expr_remote VALUES ('1999-03-29T01:15:33', 'nonempty');
 
 SELECT 'first';
 SELECT dt, alias_String_7_0, alias_String_7_1

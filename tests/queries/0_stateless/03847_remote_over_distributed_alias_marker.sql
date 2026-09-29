@@ -1,5 +1,4 @@
--- Regression coverage for materialized __aliasMarker metadata across
--- remote -> Distributed -> parallel replicas fanout.
+-- Regression coverage for nested `ALIAS` columns across `remote` -> `Distributed` -> `MergeTree`.
 
 DROP TABLE IF EXISTS test_alias_pr_second_hop_dist;
 DROP TABLE IF EXISTS test_alias_pr_second_hop_local;
@@ -21,31 +20,17 @@ INSERT INTO test_alias_pr_second_hop_local VALUES
 CREATE TABLE test_alias_pr_second_hop_dist AS test_alias_pr_second_hop_local
 ENGINE = Distributed(test_cluster_one_shard_three_replicas_localhost, currentDatabase(), test_alias_pr_second_hop_local);
 
-SELECT 'single_replica_second_hop';
+SELECT 'ast_second_hop';
 SELECT dt, alias_base_0, alias_base_1
 FROM remote('127.0.0.2', currentDatabase(), test_alias_pr_second_hop_dist)
 ORDER BY dt
-LIMIT 1
-SETTINGS
-    enable_analyzer = 1,
-    enable_alias_marker = 1,
-    enable_parallel_replicas = 1,
-    max_parallel_replicas = 1,
-    cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost',
-    parallel_replicas_for_non_replicated_merge_tree = 1;
+SETTINGS enable_analyzer = 1, enable_alias_marker = 1, serialize_query_plan = 0;
 
-SELECT 'parallel_replicas_second_hop';
+SELECT 'plan_second_hop';
 SELECT dt, alias_base_0, alias_base_1
 FROM remote('127.0.0.2', currentDatabase(), test_alias_pr_second_hop_dist)
 ORDER BY dt
-LIMIT 1
-SETTINGS
-    enable_analyzer = 1,
-    enable_alias_marker = 1,
-    enable_parallel_replicas = 1,
-    max_parallel_replicas = 3,
-    cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost',
-    parallel_replicas_for_non_replicated_merge_tree = 1;
+SETTINGS enable_analyzer = 1, enable_alias_marker = 1, serialize_query_plan = 1;
 
 DROP TABLE test_alias_pr_second_hop_dist;
 DROP TABLE test_alias_pr_second_hop_local;

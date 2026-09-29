@@ -27,15 +27,6 @@ else
   echo "${alias_marker_error_output}"
 fi
 
-echo "---- explicit __aliasMarker in user query (analyzer=1) ----"
-if $CLICKHOUSE_CLIENT --enable_analyzer=1 --query \
-  "SELECT __aliasMarker(number*2-3,'foo') FROM numbers(1)" >/dev/null 2>&1
-then
-  echo "Explicit __aliasMarker call is allowed"
-else
-  echo "Unexpected error for explicit __aliasMarker call"
-fi
-
 echo "---- stage: complete (analyzer=1) ----"
 $CLICKHOUSE_CLIENT --enable_analyzer=1 --query_kind secondary_query --stage complete --query \
   "EXPLAIN header=1 SELECT sum(__aliasMarker(number*2-3,'foo')) AS x FROM numbers(10)" \

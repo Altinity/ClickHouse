@@ -35,7 +35,6 @@ SETTINGS
     enable_analyzer = 1,
     enable_alias_marker = 0,
     enable_parallel_replicas = 0,
-    allow_experimental_parallel_reading_from_replicas = 0,
     max_parallel_replicas = 1,
     parallel_replicas_local_plan = 0,
     parallel_replicas_for_non_replicated_merge_tree = 1,
@@ -50,7 +49,6 @@ SETTINGS
     enable_analyzer = 1,
     enable_alias_marker = 0,
     enable_parallel_replicas = 0,
-    allow_experimental_parallel_reading_from_replicas = 0,
     max_parallel_replicas = 1,
     parallel_replicas_local_plan = 0,
     parallel_replicas_for_non_replicated_merge_tree = 1,
@@ -65,12 +63,13 @@ SETTINGS
     enable_analyzer = 1,
     enable_alias_marker = 0,
     enable_parallel_replicas = 2,
-    allow_experimental_parallel_reading_from_replicas = 2,
     max_parallel_replicas = 3,
     parallel_replicas_local_plan = 1,
     parallel_replicas_for_non_replicated_merge_tree = 1,
     parallel_replicas_min_number_of_rows_per_replica = 0,
-    cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost'
+    cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost',
+    log_queries = 1,
+    log_comment = '05062_pr_uint64'
 FORMAT TSVWithNames;
 
 SELECT 'pr_string';
@@ -81,13 +80,31 @@ SETTINGS
     enable_analyzer = 1,
     enable_alias_marker = 0,
     enable_parallel_replicas = 2,
-    allow_experimental_parallel_reading_from_replicas = 2,
     max_parallel_replicas = 3,
     parallel_replicas_local_plan = 1,
     parallel_replicas_for_non_replicated_merge_tree = 1,
     parallel_replicas_min_number_of_rows_per_replica = 0,
-    cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost'
+    cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost',
+    log_queries = 1,
+    log_comment = '05062_pr_string'
 FORMAT TSVWithNames;
+
+SYSTEM FLUSH LOGS query_log;
+-- Check the remote legs as well as the initiator: a correct result alone does not prove parallel reading.
+SELECT 'parallel_replicas_used';
+SELECT log_comment,
+       countIf(ProfileEvents['ParallelReplicasQueryCount'] > 0) > 0,
+       countIf(ProfileEvents['ParallelReplicasUsedCount'] > 0) > 0
+FROM system.query_log
+WHERE type = 'QueryFinish' AND is_initial_query = 0
+  AND initial_query_id IN
+  (
+      SELECT query_id FROM system.query_log
+      WHERE type = 'QueryFinish' AND is_initial_query
+        AND current_database = currentDatabase()
+        AND log_comment IN ('05062_pr_uint64', '05062_pr_string')
+  )
+GROUP BY log_comment ORDER BY log_comment;
 
 DROP TABLE test_pr_dod_alias_swap_outer;
 DROP TABLE test_pr_dod_alias_swap_inner;

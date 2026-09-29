@@ -13,3 +13,12 @@ dist_prefer0_plan
 dist_prefer1_plan
 11	12
 21	22
+reordered_local
+12	11	23
+22	21	43
+reordered_dist
+12	11	23
+22	21	43
+reordered_dist_plan
+12	11	23
+22	21	43

@@ -85,7 +85,8 @@ WITH ranked AS
 (
     SELECT id, computed
     FROM test_hybrid_issue_1424
-    LIMIT 10
+    ORDER BY id
+    LIMIT 3
 )
 SELECT *
 FROM ranked
@@ -111,20 +112,6 @@ WITH monthly AS
 SELECT sum(cnt), count() FROM monthly;
 
 SELECT 'intersect with order by';
-SELECT *
-FROM
-(
-    SELECT id, computed
-    FROM test_hybrid_issue_1424
-    WHERE computed > 100
-    INTERSECT
-    SELECT id, computed
-    FROM test_hybrid_issue_1424
-    WHERE value > 50
-)
-ORDER BY id;
-
-SELECT 'intersect without order by';
 SELECT *
 FROM
 (

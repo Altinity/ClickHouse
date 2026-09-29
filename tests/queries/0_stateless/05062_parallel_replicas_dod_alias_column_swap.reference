@@ -18,3 +18,6 @@ x	a_str	inner_c
 1	aaaa	2
 2	aaaa	3
 10	aaaa	11
+parallel_replicas_used
+05062_pr_string	1	1
+05062_pr_uint64	1	1

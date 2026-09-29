@@ -1,3 +1,4 @@
+-- Compare the same `String` alias with the marker on and off; the setting must not change results.
 DROP TABLE IF EXISTS test_dod_alias_swap_no_marker_outer;
 DROP TABLE IF EXISTS test_dod_alias_swap_no_marker_inner;
 DROP TABLE IF EXISTS test_dod_alias_swap_no_marker_local;
@@ -89,6 +90,14 @@ SETTINGS
     enable_parallel_replicas = 0,
     max_parallel_replicas = 1,
     parallel_replicas_local_plan = 0
+FORMAT TSVWithNames;
+
+SELECT 'prefer_localhost_replica_0_string_marker_on';
+SELECT x, a_str, inner_c
+FROM test_dod_alias_swap_no_marker_outer
+ORDER BY x
+SETTINGS enable_analyzer = 1, enable_alias_marker = 1, prefer_localhost_replica = 0,
+    enable_parallel_replicas = 0, max_parallel_replicas = 1, parallel_replicas_local_plan = 0
 FORMAT TSVWithNames;
 
 DROP TABLE test_dod_alias_swap_no_marker_outer;
