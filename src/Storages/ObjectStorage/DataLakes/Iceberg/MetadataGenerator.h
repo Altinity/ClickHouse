@@ -62,7 +62,8 @@ public:
     bool isAddColumnApplied(const String & column_name, DataTypePtr type) const;
     bool isDropColumnApplied(const String & column_name) const;
     bool isRenameColumnApplied(const String & column_name, const String & new_column_name) const;
-    bool isModifyColumnApplied(const String & column_name, DataTypePtr type) const;
+    /// `type` may be null for a position-only `MODIFY COLUMN`; `first` and `after_column` are checked against the field order.
+    bool isModifyColumnApplied(const String & column_name, DataTypePtr type, bool first = false, const String & after_column = {}) const;
 
 private:
     Poco::JSON::Object::Ptr metadata_object;

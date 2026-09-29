@@ -115,7 +115,7 @@ static bool alterAlreadyApplied(const MetadataGenerator & generator, const Alter
         case AlterCommand::Type::RENAME_COLUMN:
             return generator.isRenameColumnApplied(command.column_name, command.rename_to);
         case AlterCommand::Type::MODIFY_COLUMN:
-            return generator.isModifyColumnApplied(command.column_name, command.data_type);
+            return generator.isModifyColumnApplied(command.column_name, command.data_type, command.first, command.after_column);
         default:
             return false;
     }

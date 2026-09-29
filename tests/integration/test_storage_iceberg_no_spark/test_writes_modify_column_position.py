@@ -100,3 +100,61 @@ def test_modify_column_type_and_first(started_cluster_iceberg_no_spark, format_v
     instance.query(f"INSERT INTO {TABLE_NAME} VALUES (3000000000, 2, 'y');", settings=INSERT_SETTINGS)
     result = instance.query(f"SELECT c FROM {TABLE_NAME} ORDER BY c")
     assert "3000000000" in result
+
+
+@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_modify_column_unrecordable_type_with_position_rejected(started_cluster_iceberg_no_spark, format_version, storage_type):
+    """Positioning must not bypass the rejection of a type change Iceberg cannot record."""
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    TABLE_NAME = "test_modify_unrecordable_pos_" + storage_type + "_" + get_uuid_str()
+
+    create_iceberg_table(
+        storage_type,
+        instance,
+        TABLE_NAME,
+        started_cluster_iceberg_no_spark,
+        "(a Int32, b Nullable(String), c Int32)",
+        format_version,
+    )
+
+    for clause in ["FIRST", "AFTER a"]:
+        error = instance.query_and_get_error(
+            f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN c UInt32 {clause};",
+            settings=INSERT_SETTINGS,
+        )
+        assert "BAD_ARGUMENTS" in error, error
+
+    columns = instance.query(
+        f"SELECT name, type FROM system.columns WHERE database = currentDatabase() AND table = '{TABLE_NAME}' ORDER BY position"
+    ).strip()
+    assert columns == "a\tInt32\nb\tNullable(String)\nc\tInt32", columns
+
+
+@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_modify_column_after_itself(started_cluster_iceberg_no_spark, format_version, storage_type):
+    """MODIFY COLUMN ... AFTER the column itself keeps its position."""
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    TABLE_NAME = "test_modify_after_self_" + storage_type + "_" + get_uuid_str()
+
+    create_iceberg_table(
+        storage_type,
+        instance,
+        TABLE_NAME,
+        started_cluster_iceberg_no_spark,
+        "(a Int32, b Nullable(Int32), c Nullable(String))",
+        format_version,
+    )
+
+    instance.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 10, 'x');", settings=INSERT_SETTINGS)
+
+    instance.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN b AFTER b;", settings=INSERT_SETTINGS)
+    instance.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN b Nullable(Int64) AFTER b;", settings=INSERT_SETTINGS)
+
+    columns = instance.query(
+        f"SELECT name, type FROM system.columns WHERE database = currentDatabase() AND table = '{TABLE_NAME}' ORDER BY position"
+    ).strip()
+    assert columns == "a\tInt32\nb\tNullable(Int64)\nc\tNullable(String)", columns
+
+    assert instance.query(f"SELECT * FROM {TABLE_NAME}").strip() == "1\t10\tx"

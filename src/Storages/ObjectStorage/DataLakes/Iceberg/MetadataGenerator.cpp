@@ -357,14 +357,11 @@ bool MetadataGenerator::isRenameColumnApplied(const String & column_name, const 
     return found_new_name;
 }
 
-bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTypePtr type) const
+bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTypePtr type, bool first, const String & after_column) const
 {
     auto current_schema = findCurrentSchema();
     if (!current_schema)
         return false;
-
-    Int32 unused_field_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
-    auto expected_type = Iceberg::getIcebergType(type, unused_field_id);
 
     auto fields = current_schema->getArray(Iceberg::f_fields);
     for (UInt32 i = 0; i < fields->size(); ++i)
@@ -372,8 +369,22 @@ bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTy
         auto field = fields->getObject(i);
         if (field->getValue<String>(Iceberg::f_name) != column_name)
             continue;
-        return field->getValue<bool>(Iceberg::f_required) == expected_type.second
-            && icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first);
+
+        /// A position-only `MODIFY COLUMN c FIRST` carries no type.
+        if (type)
+        {
+            Int32 unused_field_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
+            auto expected_type = Iceberg::getIcebergType(type, unused_field_id);
+            if (field->getValue<bool>(Iceberg::f_required) != expected_type.second
+                || !icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first))
+                return false;
+        }
+
+        if (first)
+            return i == 0;
+        if (!after_column.empty() && after_column != column_name)
+            return i > 0 && fields->getObject(i - 1)->getValue<String>(Iceberg::f_name) == after_column;
+        return true;
     }
     return false;
 }
@@ -791,7 +802,8 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
     auto last_column_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
     auto schema_fields = current_schema->getArray(Iceberg::f_fields);
 
-    bool needs_reposition = first || !after_column.empty();
+    /// `AFTER` the column itself keeps its position, as in `ColumnsDescription::modifyColumnOrder`.
+    bool needs_reposition = first || (!after_column.empty() && after_column != column_name);
     bool type_changed = false;
 
     if (type)
@@ -807,21 +819,17 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
             if (current_field->getValue<bool>(Iceberg::f_required) == new_type.second
                 && icebergTypesEqualIgnoringIds(current_field->get(Iceberg::f_type), new_type.first))
             {
-                if (!needs_reposition)
+                auto existing_iceberg_type = current_field->get(Iceberg::f_type);
+                if (existing_iceberg_type.isString())
                 {
-                    auto existing_iceberg_type = current_field->get(Iceberg::f_type);
-                    if (existing_iceberg_type.isString())
-                    {
-                        auto reconstructed_ch_type = Iceberg::IcebergSchemaProcessor::getSimpleType(
-                            existing_iceberg_type.extract<String>(),
-                            context,
-                            context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
-                        if (!current_field->getValue<bool>(Iceberg::f_required) && reconstructed_ch_type->canBeInsideNullable())
-                            reconstructed_ch_type = makeNullable(reconstructed_ch_type);
+                    auto reconstructed_ch_type = Iceberg::IcebergSchemaProcessor::getSimpleType(
+                        existing_iceberg_type.extract<String>(),
+                        context,
+                        context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
+                    if (!current_field->getValue<bool>(Iceberg::f_required) && reconstructed_ch_type->canBeInsideNullable())
+                        reconstructed_ch_type = makeNullable(reconstructed_ch_type);
 
-                        if (reconstructed_ch_type->equals(*type))
-                            return false;
-
+                    if (!reconstructed_ch_type->equals(*type))
                         throw Exception(
                             ErrorCodes::BAD_ARGUMENTS,
                             "Cannot MODIFY COLUMN '{}' from {} to {}: both map to the same Iceberg type '{}' "
@@ -830,8 +838,14 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
                             reconstructed_ch_type->getName(),
                             type->getName(),
                             existing_iceberg_type.extract<String>());
-                    }
 
+                    if (!needs_reposition)
+                        return false;
+                }
+                else if (!needs_reposition)
+                {
+                    /// The original ClickHouse type of a complex field cannot be reconstructed here, so a
+                    /// restated complex type is allowed only together with a reposition.
                     throw Exception(
                         ErrorCodes::BAD_ARGUMENTS,
                         "Cannot MODIFY COLUMN '{}': the requested and existing types both map to the same "
