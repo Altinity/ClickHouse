@@ -198,6 +198,7 @@ std::optional<ProcessedManifestFileEntryPtr> SingleThreadIcebergKeysIterator::ne
                 *persistent_components.schema_processor,
                 manifest_list_entry.added_sequence_number,
                 manifest_list_entry.added_snapshot_id,
+                manifest_list_entry.first_row_id,
                 local_context,
                 filter_dag,
                 table_snapshot->schema_id);
@@ -398,7 +399,8 @@ ObjectInfoPtr IcebergIterator::next(size_t)
 
             /// For icebergCluster, next() runs on the initiator's task-distribution path: DV
             /// I/O / CRC / roaring materialization happen here, then excluded_rows is sent on
-            /// the wire per task. Workers apply the bitmap and do not re-read the Puffin blob.
+            /// the wire per task. Workers apply the bitmap and do not re-read the deletion-vector
+            /// object (Puffin or Delta `.bin`).
             auto excluded_rows = Iceberg::loadDeletionVector(
                 puffin_storage,
                 puffin_key,
@@ -417,7 +419,7 @@ ObjectInfoPtr IcebergIterator::next(size_t)
             has_deletion_vector = true;
             LOG_DEBUG(
                 logger,
-                "Attached deletion vector from puffin file `{}` to data file `{}`",
+                "Attached deletion vector from file `{}` to data file `{}`",
                 parsed_entry->file_path_key,
                 data_file_path);
         }

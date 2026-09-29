@@ -169,6 +169,27 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
         }
     }
 
+    /// `file_sequence_number` can differ from the data `sequence_number` and, like it, is inherited from the
+    /// manifest's sequence number when null. Keep it raw here; the inherited value is resolved by the caller.
+    std::optional<Int64> file_sequence_number;
+
+    if (format_version > 1 && hasPath(f_file_sequence_number))
+    {
+        const auto file_sequence_number_value = getValueFromRowByName(row_index, f_file_sequence_number);
+        if (!file_sequence_number_value.isNull())
+            file_sequence_number = file_sequence_number_value.safeGet<Int64>();
+    }
+
+    std::optional<UInt64> first_row_id;
+
+    if (format_version > 2 && hasPath(c_data_file_first_row_id))
+    {
+        const auto first_row_id_value = getValueFromRowByName(row_index, c_data_file_first_row_id);
+        if (!first_row_id_value.isNull())
+        {
+            first_row_id = first_row_id_value.safeGet<Int64>();
+        }
+    }
 
     const auto file_path_from_metadata = IcebergPathFromMetadata::deserialize(
         getValueFromRowByName(row_index, c_data_file_file_path, TypeIndex::String).safeGet<String>());
@@ -279,7 +300,9 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                 row_index,
                 status,
                 sequence_number,
+                file_sequence_number,
                 snapshot_id,
+                first_row_id,
                 partition_key_value,
                 columns_infos,
                 value_for_bounds,
@@ -294,6 +317,7 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
         case FileContentType::POSITION_DELETE: {
             /// reference_file_path can be absent in schema for some reason, though it is present in specification: https://iceberg.apache.org/spec/#manifests
             const bool is_puffin = Poco::toLower(file_format) == "puffin";
+            const bool has_dv_offsets = content_offset.has_value() && content_size_in_bytes.has_value();
             std::optional<Iceberg::IcebergPathFromMetadata> lower_reference_data_file_path;
             std::optional<Iceberg::IcebergPathFromMetadata> upper_reference_data_file_path;
             bool bounds_set_by_referenced_data_file = false;
@@ -309,9 +333,9 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                     bounds_set_by_referenced_data_file = true;
                 }
             }
-            /// Parquet position deletes may fall back to file-path column bounds. Puffin deletion
+            /// Parquet position deletes may fall back to file-path column bounds. Deletion
             /// vectors must use the dedicated referenced_data_file field only.
-            if (!bounds_set_by_referenced_data_file && !is_puffin)
+            if (!bounds_set_by_referenced_data_file && !is_puffin && !has_dv_offsets)
             {
                 if (auto it = value_for_bounds.find(IcebergPositionDeleteTransform::data_file_path_column_field_id);
                     it != value_for_bounds.end())
@@ -326,13 +350,17 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
 
             if (is_puffin)
             {
-                if (!content_offset.has_value() || !content_size_in_bytes.has_value())
+                if (!has_dv_offsets)
                 {
                     throw Exception(
                         DB::ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                         "Puffin deletion vector entry in manifest file '{}' is missing content_offset or content_size_in_bytes",
                         manifest_file_path);
                 }
+            }
+
+            if (is_puffin || has_dv_offsets)
+            {
                 requireDirectReferencedDataFileForPuffinDeletionVector(
                     bounds_set_by_referenced_data_file, lower_reference_data_file_path, manifest_file_path);
             }
@@ -343,7 +371,9 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                 row_index,
                 status,
                 sequence_number,
+                file_sequence_number,
                 snapshot_id,
+                first_row_id,
                 partition_key_value,
                 columns_infos,
                 value_for_bounds,
@@ -376,7 +406,9 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                 row_index,
                 status,
                 sequence_number,
+                file_sequence_number,
                 snapshot_id,
+                first_row_id,
                 partition_key_value,
                 columns_infos,
                 value_for_bounds,

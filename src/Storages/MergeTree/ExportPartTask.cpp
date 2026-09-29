@@ -1,5 +1,6 @@
 #include <mutex>
 #include <Storages/MergeTree/ExportPartTask.h>
+#include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Interpreters/Context.h>
@@ -42,7 +43,6 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int UNKNOWN_TABLE;
-    extern const int FILE_ALREADY_EXISTS;
     extern const int LOGICAL_ERROR;
     extern const int QUERY_WAS_CANCELLED;
     extern const int BAD_ARGUMENTS;
@@ -51,6 +51,7 @@ namespace ErrorCodes
 
 namespace FailPoints
 {
+    extern const char export_part_pause_before_schema_validation[];
     /// Throw a non-retryable (denylisted) error from the part-export worker, so the whole
     /// export task transitions to FAILED immediately regardless of any timeout.
     extern const char export_part_non_retryable_throw[];
@@ -66,7 +67,8 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
     extern const SettingsBool allow_experimental_analyzer;
     extern const SettingsString export_merge_tree_part_filename_pattern;
-    extern const SettingsMergeTreePartExportSchemaMismatchMode export_merge_tree_part_schema_mismatch_mode;
+    extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
+    extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
 }
 
 namespace
@@ -114,31 +116,36 @@ namespace
         }
     }
 
-    /// Mirrors `InterpreterInsertQuery::addInsertToSelectPipeline`: positional match,
-    /// destination header = `getSampleBlockNonMaterialized()`, all type bridging is done
-    /// by the CAST inside `makeConvertingActions`. No pre-validation, no per-column
-    /// lossy/non-lossy classification — restrictions are exactly what INSERT SELECT enforces.
-    ///
-    /// Exception: when `export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'`
-    /// and the source has more columns than the destination, the extra trailing source
-    /// columns (by position) are dropped by a preliminary projection step before the
-    /// positional convert, so `makeConvertingActions` always sees equal-sized inputs.
     void addExportConvertingActions(
         QueryPlan & plan_for_part,
         const IStorage & destination_storage,
         const ContextPtr & local_context)
     {
+        FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
+
         const auto destination_metadata = destination_storage.getInMemoryMetadataPtr(local_context, false);
         const auto destination_header = destination_metadata->getSampleBlockNonMaterialized();
         const auto & destination_columns = destination_header.getColumnsWithTypeAndName();
 
-        const bool ignore_extra_source_columns_by_position =
-            local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode]
-                == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
+        const auto schema_match_mode =
+            local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
+        const bool ignore_extra_source_columns =
+            local_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns];
 
         auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
+        const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
-        if (ignore_extra_source_columns_by_position && source_columns.size() > destination_columns.size())
+        ExportPartitionUtils::checkExportSchemaColumnsCount(
+            source_columns.size(),
+            destination_columns.size(),
+            ignore_extra_source_columns);
+
+        const ActionsDAG::MatchColumnsMode mode = schema_match_mode == MergeTreePartExportSchemaMatchMode::NAME
+            ? ActionsDAG::MatchColumnsMode::Name
+            : ActionsDAG::MatchColumnsMode::Position;
+
+        // makeConvertingActions with postitional mode requires equal columns count,
+        if (ActionsDAG::MatchColumnsMode::Position == mode && ignore_extra_source_columns && src_has_extra_columns)
         {
             LOG_DEBUG(getLogger("ExportPartTask"),
                 "Source has {} columns while destination has {} columns, "
@@ -170,7 +177,7 @@ namespace
         auto dag = ActionsDAG::makeConvertingActions(
             source_columns,
             destination_columns,
-            ActionsDAG::MatchColumnsMode::Position,
+            mode,
             local_context);
 
         auto expression_step = std::make_unique<ExpressionStep>(
@@ -304,93 +311,109 @@ bool ExportPartTask::executeStep()
 
         const auto filename = buildDestinationFilename(manifest, storage.getStorageID(), local_context);
 
-        sink = destination_storage->import(
+        auto import_result = destination_storage->import(
             filename,
             block_with_partition_values,
             new_file_path_callback,
-            manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::overwrite,
+            manifest.file_already_exists_policy,
             manifest.settings[Setting::export_merge_tree_part_max_bytes_per_file],
             manifest.settings[Setting::export_merge_tree_part_max_rows_per_file],
             manifest.iceberg_metadata_json,
             getFormatSettings(local_context),
             local_context);
 
-        bool apply_deleted_mask = true;
-        bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
-        bool prefetch = false;
-
-        MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
+        if (import_result.already_exported)
         {
-            .metadata_version = metadata_snapshot->getMetadataVersion(),
-            .min_part_metadata_version = manifest.data_part->getMetadataVersion()
-        };
+            /// An earlier attempt at this part already wrote the whole set of destination files and
+            /// committed it, but died before the result was recorded durably. Adopt those files as
+            /// this attempt's result instead of reading and rewriting the part.
+            ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
 
-        auto mutations_snapshot = storage.getMutationsSnapshot(mutations_snapshot_params);
-        auto alter_conversions = MergeTreeData::getAlterConversionsForPart(
-            manifest.data_part,
-            mutations_snapshot,
-            local_context);
+            LOG_INFO(getLogger("ExportPartTask"), "Part {} was already exported as {} file(s), reusing them",
+                manifest.data_part->name, import_result.exported_paths.size());
 
-        QueryPlan plan_for_part;
-
-        createReadFromPartStep(
-            read_type,
-            plan_for_part,
-            storage,
-            storage.getStorageSnapshot(metadata_snapshot, local_context),
-            RangesInDataPart(manifest.data_part),
-            alter_conversions,
-            nullptr,
-            columns_to_read,
-            nullptr,
-            apply_deleted_mask,
-            std::nullopt,
-            read_with_direct_io,
-            prefetch,
-            local_context,
-            getLogger("ExportPartition"));
-
-        /// We need to support exporting materialized and alias columns to object storage. For some reason, object storage engines don't support them.
-        /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
-        materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
-
-        /// Align the pipeline header with the destination's non-materialized sample block,
-        /// using the same `makeConvertingActions(Position)` call INSERT SELECT performs.
-        addExportConvertingActions(plan_for_part, *destination_storage, local_context);
-
-        QueryPlanOptimizationSettings optimization_settings(local_context);
-        auto pipeline_settings = BuildQueryPipelineSettings(local_context);
-        auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
-
-        builder->setProgressCallback([&exports_list_entry](const Progress & progress)
-        {
-            (*exports_list_entry)->bytes_read_uncompressed += progress.read_bytes;
-            (*exports_list_entry)->rows_read += progress.read_rows;
-        });
-
-        pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
-
-        pipeline.complete(sink);
-
-        CompletedPipelineExecutor exec(pipeline);
-
-        auto is_cancelled_callback = [this]()
-        {
-            return isCancelled();
-        };
-
-        exec.setCancelCallback(is_cancelled_callback, 100);
-
-        if (isCancelled())
-        {
-            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Export part was cancelled");
+            for (const auto & exported_path : import_result.exported_paths)
+                new_file_path_callback(exported_path);
         }
-
-        exec.execute();
-
-        if (isCancelled())
+        else
         {
-            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Export part was cancelled");
+            sink = std::move(import_result.sink);
+
+            bool apply_deleted_mask = true;
+            bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
+            bool prefetch = false;
+
+            MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
+            {
+                .metadata_version = metadata_snapshot->getMetadataVersion(),
+                .min_part_metadata_version = manifest.data_part->getMetadataVersion()
+            };
+
+            auto mutations_snapshot = storage.getMutationsSnapshot(mutations_snapshot_params);
+            auto alter_conversions = MergeTreeData::getAlterConversionsForPart(
+                manifest.data_part,
+                mutations_snapshot,
+                local_context);
+
+            QueryPlan plan_for_part;
+
+            createReadFromPartStep(
+                read_type,
+                plan_for_part,
+                storage,
+                storage.getStorageSnapshot(metadata_snapshot, local_context),
+                RangesInDataPart(manifest.data_part),
+                alter_conversions,
+                nullptr,
+                columns_to_read,
+                nullptr,
+                apply_deleted_mask,
+                std::nullopt,
+                read_with_direct_io,
+                prefetch,
+                local_context,
+                getLogger("ExportPartition"));
+
+            /// We need to support exporting materialized and alias columns to object storage. For some reason, object storage engines don't support them.
+            /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
+            materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
+
+            addExportConvertingActions(plan_for_part, *destination_storage, local_context);
+
+            QueryPlanOptimizationSettings optimization_settings(local_context);
+            auto pipeline_settings = BuildQueryPipelineSettings(local_context);
+            auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
+
+            builder->setProgressCallback([&exports_list_entry](const Progress & progress)
+            {
+                (*exports_list_entry)->bytes_read_uncompressed += progress.read_bytes;
+                (*exports_list_entry)->rows_read += progress.read_rows;
+            });
+
+            pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
+
+            pipeline.complete(sink);
+
+            CompletedPipelineExecutor exec(pipeline);
+
+            auto is_cancelled_callback = [this]()
+            {
+                return isCancelled();
+            };
+
+            exec.setCancelCallback(is_cancelled_callback, 100);
+
+            if (isCancelled())
+            {
+                throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Export part was cancelled");
+            }
+
+            exec.execute();
+
+            if (isCancelled())
+            {
+                throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Export part was cancelled");
+            }
         }
 
         /// For the direct EXPORT PART → Iceberg path there is no deferred-commit callback
@@ -441,41 +464,9 @@ bool ExportPartTask::executeStep()
             sink->cancel();
         }
 
-        if (e.code() == ErrorCodes::FILE_ALREADY_EXISTS)
-        {
-            ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
-
-            /// File already exists and the policy is NO_OP, treat it as success.
-            if (manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::skip)
-            {
-                storage.writePartLog(
-                    PartLogElement::Type::EXPORT_PART,
-                    {},
-                    (*exports_list_entry)->watch.elapsed(),
-                    manifest.data_part->name,
-                    manifest.data_part,
-                    {manifest.data_part},
-                    nullptr,
-                    nullptr,
-                    {},
-                    {},
-                    exports_list_entry.get());
-
-                std::lock_guard inner_lock(storage.export_manifests_mutex);
-                storage.export_manifests.erase(manifest);
-
-                ProfileEvents::increment(ProfileEvents::PartsExports);
-                ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, (*exports_list_entry)->watch.elapsedMilliseconds());
-
-                if (manifest.completion_callback)
-                {
-                    manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_paths));
-                }
-                    
-                return false;
-            }
-        }
-
+        /// A `FILE_ALREADY_EXISTS` reaching here is never a completed export -- `import` resolves
+        /// that case without an exception. It is a data file left behind by an attempt that never
+        /// committed, of unknown completeness, which only `error` refuses to rewrite.
         ProfileEvents::increment(ProfileEvents::PartsExportFailures);
 
         storage.writePartLog(

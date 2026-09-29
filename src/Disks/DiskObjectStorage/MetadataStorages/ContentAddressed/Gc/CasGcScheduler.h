@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Common/ThreadPool.h>
 #include <base/types.h>
+#include <base/defines.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -27,7 +28,15 @@ struct GcRoundLogRecord
     /// -- no fold, no pre-CAS deletes, no `gc/state` CAS. Distinct from `Success` so a reader of
     /// `system.cas_gc_log` (or this scheduler's own log line) can tell a round
     /// that genuinely folded and found nothing apart from one that never folded at all.
-    enum class Outcome { Unknown, Success, NotALeader, Failed, Deferred };
+    /// `Aborted`: the round threw an exception whose code names a transient condition (backend
+    /// unavailability, a lost lease, a concurrent leader) -- the next scheduled round retries it and
+    /// nothing durable is wrong. `Stopped`: the same transient class, observed after the pool's
+    /// teardown began -- a correlation, not a cause: the engine reports a refused teardown fence
+    /// exactly like a lost mount fence, so the flag is the only witness, and the row says so honestly
+    /// rather than reading a clean restart as a backend incident. `Failed` is reserved for everything
+    /// else (a logic error, corrupted data, an unclassified code): fail-closed, an unrecognised
+    /// failure reads as real -- during a teardown too.
+    enum class Outcome { Unknown, Success, NotALeader, Failed, Deferred, Aborted, Stopped };
     enum class Trigger { Scheduled, Manual };
 
     EventType event_type = EventType::Start;
@@ -51,6 +60,9 @@ struct GcRoundLogRecord
     UInt64 anomalies = 0;           /// fold clamps surfaced (never wedging) this round
     UInt64 duration_ms = 0;
     String error;
+    /// `getCurrentExceptionCode()` of the failure on an `Aborted`/`Failed` Finish row; 0 otherwise.
+    /// The structured twin of `error`: oracles and operators key on this, never on message wording.
+    Int32 error_code = 0;
     /// On a `Start`/`Finish` row: the whole round's delta. On a `Phase` row: THAT PHASE's delta.
     std::map<String, UInt64> profile_events;
 
@@ -74,6 +86,12 @@ struct GcRoundLogRecord
 };
 
 using GcRoundLogger = std::function<void(const GcRoundLogRecord &)>;
+
+/// True when an exception code names a condition that clears by itself -- the backend was unreachable
+/// or slow, or another actor legitimately moved shared state -- so the next scheduled round is the
+/// retry. False for everything else, deliberately including any code not on the list: an unrecognised
+/// failure must read as a real one.
+bool isTransientGcRoundError(int code);
 
 /// Paces regular content-addressed garbage-collection rounds for one pool. The scheduler does not
 /// implement the GC protocol: `Cas::Gc` owns lease acquisition, work deduplication, and the
@@ -145,13 +163,19 @@ public:
 
     /// Test seam (rev.7 §3 [C1]): block up to `timeout` for BOTH the pacing and heartbeat loops to have
     /// SELF-EXITED via the terminal-lifecycle check — a `Vanished` pool or a published FORGET intent — as
-    /// opposed to exiting through `stop()`'s `stopping` flag. Returns false on timeout. Predicate-based
+    /// opposed to exiting through `stop()` transitioning `scheduler_state` to `Stopped`. Returns false on timeout. Predicate-based
     /// wait (no sleeps); the loops set their flag under `terminal_exit_mutex` before notifying, so there is
     /// no lost-wakeup window. Lets a test prove the self-exit path fired without relying on any wall-clock
     /// delay.
     bool waitForTerminalSelfExitForTest(std::chrono::milliseconds timeout);
 
 private:
+    enum class SchedulerState
+    {
+        Stopped,
+        Running
+    };
+
     /// Waits for the configured interval, runs scheduled rounds while the scheduler is active, and
     /// logs exceptions before continuing with the next tick. The round lock serializes this worker
     /// with `runOneRoundNow` because the persistent `gc` object is not thread-safe.
@@ -193,15 +217,17 @@ private:
     /// the round so stop()/heartbeatLoop are not blocked, so the round cannot hold `mutex`.
     std::mutex gc_round_mutex;
 
+    std::mutex threads_mutex;
+    ThreadFromGlobalPool thread TSA_GUARDED_BY(threads_mutex);
+    ThreadFromGlobalPool hb_thread TSA_GUARDED_BY(threads_mutex);
+
     std::mutex mutex;
     std::condition_variable wake;
-    bool stopping = false;
-    bool round_requested = false;   /// guarded by `mutex`; coalesced external wake request
-    ThreadFromGlobalPool thread;
+    SchedulerState scheduler_state TSA_GUARDED_BY(mutex) = SchedulerState::Stopped;
+    bool round_requested TSA_GUARDED_BY(mutex) = false;   /// coalesced external wake request
     /// Set by the round worker and read by the heartbeat worker. It is only an in-process hint: the
     /// durable lease remains the authority, and a failed round clears the hint before retrying.
     std::atomic<bool> i_am_leader{false};
-    ThreadFromGlobalPool hb_thread;
 
     /// Set true for the whole body of one round (`runRoundLogged`, held across the `gc_round_mutex`
     /// critical section a scheduled or manual round runs under) and cleared when it returns, on the
@@ -210,7 +236,7 @@ private:
 
     /// rev.7 §3 [C1] test-observation seam: set (under `terminal_exit_mutex`) by `loop`/`heartbeatLoop`
     /// respectively when they SELF-EXIT via the terminal-lifecycle check, NOT when `stop()` flips
-    /// `stopping`. `waitForTerminalSelfExitForTest` waits on `terminal_exit_cv` for BOTH, so a test proves
+    /// `scheduler_state` to `Stopped`. `waitForTerminalSelfExitForTest` waits on `terminal_exit_cv` for BOTH, so a test proves
     /// the self-exit path fired without any sleep. Purely diagnostic; production behavior never reads them.
     std::atomic<bool> loop_exited_on_terminal_for_test{false};
     std::atomic<bool> hb_exited_on_terminal_for_test{false};

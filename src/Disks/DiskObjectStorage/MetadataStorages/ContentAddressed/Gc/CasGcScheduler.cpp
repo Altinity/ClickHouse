@@ -3,17 +3,52 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/CurrentThread.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
 #include <Common/ProfileEventsScope.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
+#include <Common/UniqueLock.h>
 #include <base/scope_guard.h>
 #include <algorithm>
 #include <optional>
 
+namespace DB::ErrorCodes
+{
+    extern const int S3_ERROR;
+    extern const int NETWORK_ERROR;
+    extern const int ABORTED;
+    extern const int TIMEOUT_EXCEEDED;
+    extern const int SOCKET_TIMEOUT;
+    extern const int MEMORY_LIMIT_EXCEEDED;
+    extern const int FAULT_INJECTED;
+}
+
+namespace DB::FailPoints
+{
+    extern const char cas_gc_scheduler_fail_before_heartbeat_worker_start[];
+    extern const char cas_gc_scheduler_fail_before_worker_start[];
+}
+
 namespace DB::Cas
 {
+
+bool isTransientGcRoundError(int code)
+{
+    /// Codes that name a condition which clears without intervention: the backend refused or timed out
+    /// (`S3_ERROR`, `NETWORK_ERROR`, `TIMEOUT_EXCEEDED`, `SOCKET_TIMEOUT`), another actor legitimately
+    /// moved shared state (`ABORTED` -- the round CAS's own "another leader advanced it"), or memory
+    /// pressure hit a manual round running on a budgeted query thread (`MEMORY_LIMIT_EXCEEDED`).
+    /// Everything else -- notably `LOGICAL_ERROR`, `CORRUPTED_DATA`, `BAD_ARGUMENTS` -- stays
+    /// non-transient BY OMISSION: an unrecognised code must read as a real failure, never as noise.
+    return code == ErrorCodes::S3_ERROR
+        || code == ErrorCodes::NETWORK_ERROR
+        || code == ErrorCodes::ABORTED
+        || code == ErrorCodes::TIMEOUT_EXCEEDED
+        || code == ErrorCodes::SOCKET_TIMEOUT
+        || code == ErrorCodes::MEMORY_LIMIT_EXCEEDED;
+}
 
 namespace
 {
@@ -64,19 +99,55 @@ CasGcScheduler::~CasGcScheduler()
 
 void CasGcScheduler::start()
 {
-    std::lock_guard lock(mutex);
-    if (thread.joinable())
-        return;
-    stopping = false;
-    thread = ThreadFromGlobalPool([this] { loop(); });
-    hb_thread = ThreadFromGlobalPool([this] { heartbeatLoop(); });
+    std::lock_guard threads_lock(threads_mutex);
+    {
+        std::lock_guard lock(mutex);
+        if (scheduler_state == SchedulerState::Running)
+            return;
+        scheduler_state = SchedulerState::Running;
+    }
+    try
+    {
+        fiu_do_on(FailPoints::cas_gc_scheduler_fail_before_heartbeat_worker_start,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure before starting CAS GC heartbeat worker");
+        });
+        hb_thread = ThreadFromGlobalPool([this] { heartbeatLoop(); });
+        fiu_do_on(FailPoints::cas_gc_scheduler_fail_before_worker_start,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure before starting CAS GC worker");
+        });
+        thread = ThreadFromGlobalPool([this] { loop(); });
+    }
+    catch (...)
+    {
+        {
+            std::lock_guard lock(mutex);
+            scheduler_state = SchedulerState::Stopped;
+            round_requested = false;
+        }
+        wake.notify_all();
+        if (thread.joinable())
+            thread.join();
+        if (hb_thread.joinable())
+            hb_thread.join();
+        i_am_leader.store(false, std::memory_order_relaxed);
+        throw;
+    }
 }
 
 void CasGcScheduler::stop()
 {
+    std::lock_guard threads_lock(threads_mutex);
     {
         std::lock_guard lock(mutex);
-        stopping = true;
+        if (scheduler_state == SchedulerState::Stopped)
+        {
+            i_am_leader.store(false, std::memory_order_relaxed);
+            return;
+        }
+        scheduler_state = SchedulerState::Stopped;
+        round_requested = false;
     }
     wake.notify_all();
     if (thread.joinable())
@@ -96,7 +167,7 @@ void CasGcScheduler::requestRoundSoon()
 {
     {
         std::lock_guard lock(mutex);
-        if (stopping || !thread.joinable())
+        if (scheduler_state != SchedulerState::Running)
             return;
         round_requested = true;
     }
@@ -192,9 +263,29 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
 
     Rec fin = start;
     fin.event_type = Rec::EventType::Finish;
+    /// Lives OUTSIDE the try and is filled progressively by the round (the `progress` out-parameter of
+    /// `runRegularRound`), so the Finish row of a THROWING round still carries everything the round
+    /// durably did before it died -- `round != 0` on such a row proves the round's `gc/state` CAS
+    /// committed and the failure hit the post-CAS tail.
+    Cas::RoundReport rep;
+    const auto fill_counters = [&fin](const Cas::RoundReport & r)
+    {
+        fin.round = r.round;
+        fin.candidates_marked = r.candidates;
+        fin.objects_deleted = r.deleted;
+        fin.objects_absent = r.absent;
+        fin.objects_replaced = r.replaced;
+        fin.objects_spared = r.spared;
+        fin.manifests_deleted = r.manifests_deleted;
+        fin.entries_condemned = r.condemned;
+        fin.entries_graduated = r.graduated;
+        fin.entries_redeleted = r.redeleted;
+        fin.fence_outs = r.fence_outs;
+        fin.anomalies = r.anomalies.size();
+    };
     try
     {
-        const Cas::RoundReport rep = round_gc.runRegularRound(std::move(on_lease_acquired), allow_steal);
+        (void)round_gc.runRegularRound(std::move(on_lease_acquired), allow_steal, Cas::UniversePolicy::kDefault, &rep);
         if (rep.acquired_lease)
         {
             /// Keep health state per scheduler. Process-global gauges cannot distinguish multiple
@@ -210,18 +301,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.outcome = !rep.acquired_lease ? Rec::Outcome::NotALeader
                     : rep.deferred        ? Rec::Outcome::Deferred
                                            : Rec::Outcome::Success;
-        fin.round = rep.round;
-        fin.candidates_marked = rep.candidates;
-        fin.objects_deleted = rep.deleted;
-        fin.objects_absent = rep.absent;
-        fin.objects_replaced = rep.replaced;
-        fin.objects_spared = rep.spared;
-        fin.manifests_deleted = rep.manifests_deleted;
-        fin.entries_condemned = rep.condemned;
-        fin.entries_graduated = rep.graduated;
-        fin.entries_redeleted = rep.redeleted;
-        fin.fence_outs = rep.fence_outs;
-        fin.anomalies = rep.anomalies.size();
+        fill_counters(rep);
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         fin.profile_events = collect_profile_events();
@@ -230,8 +310,14 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     }
     catch (...)
     {
-        fin.outcome = Rec::Outcome::Failed;
+        fin.error_code = getCurrentExceptionCode();
+        /// Non-transient first, so a bug that coincides with a restart is never masked; then the
+        /// teardown flag, the only witness of a refused teardown fence (see `Outcome::Stopped`).
+        fin.outcome = !isTransientGcRoundError(fin.error_code) ? Rec::Outcome::Failed
+                    : store->teardownBegun()                    ? Rec::Outcome::Stopped
+                                                                : Rec::Outcome::Aborted;
         fin.error = getCurrentExceptionMessage(false);
+        fill_counters(rep);
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         fin.profile_events = collect_profile_events();
@@ -258,9 +344,10 @@ void CasGcScheduler::loop()
     while (true)
     {
         {
-            std::unique_lock lock(mutex);
-            wake.wait_for(lock, interval, [this] { return stopping || round_requested; });
-            if (stopping)
+            UniqueLock lock(mutex);
+            wake.wait_for(lock.getUnderlyingLock(), interval, [this]() TSA_NO_THREAD_SAFETY_ANALYSIS
+                { return scheduler_state == SchedulerState::Stopped || round_requested; });
+            if (scheduler_state == SchedulerState::Stopped)
                 return;
             round_requested = false;
         }
@@ -291,11 +378,18 @@ void CasGcScheduler::loop()
         }
         try
         {
-            /// LOW/benign: if stop() flips `stopping` while we're blocked here (a concurrent manual
+            /// LOW/benign: if stop() flips `scheduler_state` while we're blocked here (a concurrent manual
             /// round holds gc_round_mutex), we still run one more Scheduled round once it unblocks,
-            /// before the next wait_for() observes `stopping` - an accepted extra round, not a
+            /// before the next wait_for() observes `scheduler_state` - an accepted extra round, not a
             /// correctness issue.
             std::lock_guard round_lock(gc_round_mutex);
+
+            /// A round that starts after the pool's teardown began would emit a Start row and be
+            /// refused at its first lease request -- a row that says nothing. Checked here, under the
+            /// round mutex, so it also covers the tick queued behind a manual round; the extra round
+            /// on a plain `stop` (above) is a different race and stays as described.
+            if (store->teardownBegun())
+                return;
 
             /// runRoundLogged emits the Start + Finish table rows (incl. the per-round
             /// ProfileEvents delta) and rethrows on a round exception (after an Aborted Finish).
@@ -341,9 +435,29 @@ void CasGcScheduler::loop()
         }
         catch (...)
         {
+            if (store->teardownBegun() && isTransientGcRoundError(getCurrentExceptionCode()))
+            {
+                /// The disk is being torn down and the round was cut at its next request: expected,
+                /// recorded as `Stopped` by `runRoundLogged`, not an error to raise.
+                LOG_INFO(log, "CA GC round stopped by the disk's teardown: {}", getCurrentExceptionMessage(false));
+                continue;
+            }
             /// Idempotent round - the next tick retries; failures must never kill the pacing thread.
-            /// runRoundLogged already emitted the Aborted Finish row before rethrowing.
-            i_am_leader.store(false, std::memory_order_relaxed);
+            /// runRoundLogged already emitted the classified (Aborted/Failed) Finish row before rethrowing.
+            ///
+            /// Leadership is dropped only on a NON-transient failure. Dropping it on every failure
+            /// silenced the advisory heartbeat for a whole interval (`heartbeatLoop` gates its pulses on
+            /// `i_am_leader`), and when the failure was itself a backend outage the durable lease
+            /// `(owner, seq)` was frozen too -- together exactly the two-of-two dead-leader signature
+            /// `acquireOrRenewLease` steals on. A live leader blocked on a flaky store was then deposed,
+            /// and every handover forces the successor into a full fold: more single-attempt conditional
+            /// writes against the same flaky backend, a self-reinforcing loop. Keeping the flag keeps the
+            /// pulses; the lease protocol stays authoritative -- a mounter that really died stops pulsing
+            /// with or without this flag. A non-transient failure still clears it: a logic-broken leader
+            /// must stay depositable, and with the flag held its heartbeat would keep beating and no
+            /// follower could ever steal a lease whose holder cannot complete a round.
+            if (!isTransientGcRoundError(getCurrentExceptionCode()))
+                i_am_leader.store(false, std::memory_order_relaxed);
             tryLogCurrentException(log, "CA GC round failed (will retry next tick)");
         }
     }
@@ -359,8 +473,9 @@ void CasGcScheduler::heartbeatLoop()
     while (true)
     {
         {
-            std::unique_lock lock(mutex);
-            if (wake.wait_for(lock, hb_interval, [this] { return stopping; }))
+            UniqueLock lock(mutex);
+            if (wake.wait_for(lock.getUnderlyingLock(), hb_interval, [this]() TSA_NO_THREAD_SAFETY_ANALYSIS
+                { return scheduler_state == SchedulerState::Stopped; }))
                 return;
         }
         /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit on ANY terminal (or FORGET-intent) pool, same as
@@ -384,7 +499,16 @@ void CasGcScheduler::heartbeatLoop()
         }
         catch (...)
         {
-            tryLogCurrentException(log, "CA GC heartbeat pulse failed (advisory; will retry)");
+            /// A pulse refused by the open plane during teardown is the expected end of this loop and
+            /// not a failure to report; `stop` joins it moments later. Only a TRANSIENT failure is
+            /// silent, for the same fail-closed reason the round classifier refuses to relabel a
+            /// non-transient one: a corrupt heartbeat that happens to coincide with a restart is an
+            /// incident, and swallowing it would be the one place this teardown path hides a defect.
+            const bool tearing_down = store->teardownBegun();
+            if (!tearing_down || !isTransientGcRoundError(getCurrentExceptionCode()))
+                tryLogCurrentException(log, "CA GC heartbeat pulse failed (advisory; will retry)");
+            if (tearing_down)
+                return;
         }
     }
 }

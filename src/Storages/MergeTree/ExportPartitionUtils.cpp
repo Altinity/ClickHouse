@@ -7,7 +7,14 @@
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreePartitionExportTask.h>
+#if USE_AVRO
+#include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
+#endif
+#include <Parsers/IAST.h>
 #include <algorithm>
+#include <limits>
 #include <filesystem>
 #include <thread>
 #include <unordered_map>
@@ -37,7 +44,9 @@
 
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #endif
 
 namespace ProfileEvents
@@ -58,6 +67,7 @@ namespace ErrorCodes
     extern const int FAULT_INJECTED;
     extern const int BAD_ARGUMENTS;
     extern const int NO_SUCH_DATA_PART;
+    extern const int UNKNOWN_TABLE;
     extern const int CORRUPTED_DATA;
     extern const int NETWORK_ERROR;
     extern const int LOGICAL_ERROR;
@@ -68,6 +78,7 @@ namespace ErrorCodes
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int ILLEGAL_COLUMN;
     extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
+    extern const int THERE_IS_NO_COLUMN;
     extern const int INCOMPATIBLE_COLUMNS;
     extern const int NO_SUCH_COLUMN_IN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
@@ -94,9 +105,11 @@ namespace Setting
 {
     extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
 #if USE_AVRO
+    extern const SettingsBool allow_insert_into_iceberg;
     extern const SettingsTimezone iceberg_partition_timezone;
 #endif
-    extern const SettingsMergeTreePartExportSchemaMismatchMode export_merge_tree_part_schema_mismatch_mode;
+    extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
+    extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
 }
 
 namespace FailPoints
@@ -125,6 +138,7 @@ namespace ExportPartitionUtils
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
             ErrorCodes::ILLEGAL_COLUMN,
             ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+            ErrorCodes::THERE_IS_NO_COLUMN,
             ErrorCodes::INCOMPATIBLE_COLUMNS,
             ErrorCodes::NO_SUCH_COLUMN_IN_TABLE,
             ErrorCodes::NOT_IMPLEMENTED,
@@ -152,6 +166,46 @@ namespace ExportPartitionUtils
         return non_retryable_codes.contains(code);
     }
 
+    bool isNonRetryablePlainExportError(int code)
+    {
+        return isNonRetryableExportError(code)
+            || code == ErrorCodes::UNKNOWN_TABLE
+            || code == ErrorCodes::NO_SUCH_DATA_PART;
+    }
+
+    size_t computeRetryBackoffSeconds(size_t retry_count, size_t initial_backoff_seconds, size_t max_backoff_seconds)
+    {
+        const size_t initial = std::min(initial_backoff_seconds, max_backoff_seconds);
+
+        if (retry_count <= 1 || initial == 0)
+            return initial;
+
+        const size_t shift = retry_count - 1;
+
+        /// If shifting would overflow size_t, the result is certainly clamped to the cap.
+        static constexpr size_t bits = sizeof(size_t) * 8;
+        if (shift >= bits)
+            return max_backoff_seconds;
+
+        const size_t headroom = std::numeric_limits<size_t>::max() >> shift;
+        if (initial > headroom)
+            return max_backoff_seconds;
+
+        return std::min(initial << shift, max_backoff_seconds);
+    }
+
+    bool isExportTaskTimedOut(time_t create_time, size_t timeout_seconds, time_t now)
+    {
+        if (timeout_seconds == 0)
+            return false;
+        if (now <= create_time)
+            return false;
+
+        /// Compare elapsed seconds instead of `create_time + timeout`. A UInt64 timeout that does
+        /// not fit in time_t would wrap to a negative deadline and look expired on the first tick.
+        return static_cast<UInt64>(now) - static_cast<UInt64>(create_time) > timeout_seconds;
+    }
+
     Block getPartitionSourceBlockForIcebergCommit(
         MergeTreeData & storage, const String & partition_id, const std::vector<String> & exported_part_names)
     {
@@ -171,7 +225,7 @@ namespace ExportPartitionUtils
             throw Exception(ErrorCodes::NO_SUCH_DATA_PART,
                 "Cannot find any of the exported parts for partition_id '{}' to derive Iceberg partition "
                 "values. They may have been merged and cleaned up before this commit, or are not present "
-                "on this replica. The commit will be retried.",
+                "on this replica.",
                 partition_id);
 
         const auto metadata_snapshot = storage.getInMemoryMetadataPtr(storage.getContext(), false);
@@ -200,7 +254,8 @@ namespace ExportPartitionUtils
         return block;
     }
 
-    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest)
+    template <typename ManifestT>
+    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ManifestT & manifest)
     {
         auto context_copy = Context::createCopy(context);
         context_copy->makeQueryContextForExportPart();
@@ -217,12 +272,16 @@ namespace ExportPartitionUtils
             context_copy->setSetting("output_format_parquet_row_group_size", *manifest.parquet_row_group_size);
         if (manifest.parquet_row_group_size_bytes)
             context_copy->setSetting("output_format_parquet_row_group_size_bytes", *manifest.parquet_row_group_size_bytes);
-        /// Manifests written before this setting existed have no value here; such tasks were always
-        /// scheduled under the old, strict column-count check, so an absent value must resolve to
-        /// `strict` regardless of the ambient context's setting (which may have since been changed).
+        /// Manifests written before these settings existed have no value here; such tasks were always
+        /// scheduled under the old, strict column-matching check, so an absent value must resolve to
+        /// `POSITION` / `false` regardless of the ambient context's settings (which may have
+        /// since been changed).
         context_copy->setSetting(
-            "export_merge_tree_part_schema_mismatch_mode",
-            String(magic_enum::enum_name(manifest.schema_mismatch_mode.value_or(MergeTreePartExportSchemaMismatchMode::strict))));
+            "export_merge_tree_part_schema_match_mode",
+            String(magic_enum::enum_name(manifest.schema_match_mode.value_or(MergeTreePartExportSchemaMatchMode::POSITION))));
+        context_copy->setSetting(
+            "export_merge_tree_part_ignore_extra_source_columns",
+            manifest.ignore_extra_source_columns.value_or(false));
 
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
@@ -258,13 +317,90 @@ namespace ExportPartitionUtils
         return context_copy;
     }
 
+    template ContextPtr getContextCopyWithTaskSettings<ExportReplicatedMergeTreePartitionManifest>(
+        const ContextPtr &, const ExportReplicatedMergeTreePartitionManifest &);
+    template ContextPtr getContextCopyWithTaskSettings<MergeTreePartitionExportTask>(
+        const ContextPtr &, const MergeTreePartitionExportTask &);
+
+#if USE_AVRO
+    std::string verifyAndExtractDestinationIcebergMetadataJson(
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const StoragePtr & dest_storage,
+        const MergeTreeData::DataPartsVector & parts,
+        const String & partition_id,
+        const ContextPtr & context)
+    {
+        if (!context->getSettingsRef()[Setting::allow_insert_into_iceberg])
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "Iceberg writes are experimental. "
+                "To allow its usage, enable the setting `allow_insert_into_iceberg` on the initiator (query, session or profile) - replicas inherit it from the scheduled task.");
+
+        auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
+        auto * object_storage_cluster = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
+
+        /// in theory this should never happen, but just in case
+        if (!object_storage && !object_storage_cluster)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorage", dest_storage->getName());
+
+        IcebergMetadata * iceberg_metadata = nullptr;
+        if (object_storage)
+            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(context));
+        else if (object_storage_cluster)
+            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage_cluster->getExternalMetadata(context));
+        if (!iceberg_metadata)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is a data lake but not an iceberg table", dest_storage->getName());
+
+        const auto metadata_object = iceberg_metadata->getMetadataJSON(context);
+
+        verifyIcebergPartitionCompatibility(
+            metadata_object, source_metadata, destination_metadata, parts, partition_id, context);
+
+        std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+        oss.exceptions(std::ios::failbit);
+        metadata_object->stringify(oss);
+        return oss.str();
+    }
+#endif
+
+    IStorage::ExportPartitionCommitInfo commitExportOnDestination(
+        const String & transaction_id,
+        const String & partition_id,
+        const String & iceberg_metadata_json,
+        bool write_full_path_in_iceberg_metadata,
+        const std::optional<String> & iceberg_partition_timezone,
+        const std::vector<std::string> & exported_paths,
+        const std::vector<String> & exported_part_names,
+        const StoragePtr & destination_storage,
+        MergeTreeData & source_storage,
+        const ContextPtr & context_in)
+    {
+        auto context = Context::createCopy(context_in);
+        context->setSetting("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
+
+        if (iceberg_partition_timezone)
+            context->setSetting("iceberg_partition_timezone", *iceberg_partition_timezone);
+
+        IStorage::IcebergCommitExportPartitionArguments iceberg_args;
+
+        if (!iceberg_metadata_json.empty())
+        {
+            iceberg_args.metadata_json_string = iceberg_metadata_json;
+            const auto source_metadata = source_storage.getInMemoryMetadataPtr(context, false);
+            if (source_metadata->hasPartitionKey())
+                iceberg_args.partition_source_block =
+                    getPartitionSourceBlockForIcebergCommit(source_storage, partition_id, exported_part_names);
+        }
+
+        return destination_storage->commitExportPartitionTransaction(
+            transaction_id, partition_id, exported_paths, iceberg_args, context);
+    }
+
     /// Collect all the exported paths from the processed parts
     /// If multiRead is supported by the keeper implementation, it is done in a single request
     /// Otherwise, multiple async requests are sent
-    std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path)
+    ExportedPaths getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path)
     {
-        std::vector<std::string> exported_paths;
-
         LOG_DEBUG(log, "ExportPartition: Getting exported paths for {}", export_path);
 
         const auto processed_parts_path = fs::path(export_path) / "processed";
@@ -272,14 +408,11 @@ namespace ExportPartitionUtils
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
         std::vector<std::string> processed_parts;
-        if (Coordination::Error::ZOK != zk->tryGetChildren(processed_parts_path, processed_parts))
-        {
-            /// todo arthur do something here
-            LOG_WARNING(log, "ExportPartition: Failed to get parts children, exiting");
-            return {};
-        }
+        if (const auto code = zk->tryGetChildren(processed_parts_path, processed_parts); code != Coordination::Error::ZOK)
+            throw Coordination::Exception::fromPath(code, processed_parts_path);
 
         std::vector<std::string> get_paths;
+        get_paths.reserve(processed_parts.size());
 
         for (const auto & processed_part : processed_parts)
         {
@@ -292,26 +425,23 @@ namespace ExportPartitionUtils
 
         responses.waitForResponses();
 
+        ExportedPaths result;
+        result.processed_parts_count = processed_parts.size();
+
         for (size_t i = 0; i < responses.size(); ++i)
         {
             if (responses[i].error != Coordination::Error::ZOK)
-            {
-                /// todo arthur what to do in this case?
-                /// It could be that zk is corrupt, in that case we should fail the task
-                /// but it can also be some temporary network issue? not sure
-                LOG_WARNING(log, "ExportPartition: Failed to get exported path, exiting");
-                return {};
-            }
+                throw Coordination::Exception::fromPath(responses[i].error, get_paths[i]);
 
             const auto processed_part_entry = ExportReplicatedMergeTreePartitionProcessedPartEntry::fromJsonString(responses[i].data);
 
             for (const auto & path_in_destination : processed_part_entry.paths_in_destination)
             {
-                exported_paths.emplace_back(path_in_destination);
+                result.paths.emplace_back(path_in_destination);
             }
         }
 
-        return exported_paths;
+        return result;
     }
 
     void commit(
@@ -324,12 +454,6 @@ namespace ExportPartitionUtils
         MergeTreeData & source_storage,
         const String & replica_name)
     {
-        auto context = Context::createCopy(context_in);
-        context->setSetting("write_full_path_in_iceberg_metadata", manifest.write_full_path_in_iceberg_metadata);
-
-        if (manifest.iceberg_partition_timezone)
-            context->setSetting("iceberg_partition_timezone", *manifest.iceberg_partition_timezone);
-
         /// Failpoint used by integration tests to force persistent commit failure and exercise
         /// the commit-attempts budget / FAILED state transition.
         fiu_do_on(FailPoints::export_partition_commit_always_throw,
@@ -363,32 +487,36 @@ namespace ExportPartitionUtils
             return;
         }
 
-        const auto exported_paths = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
+        const auto exported = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
 
-        if (exported_paths.empty())
+        if (exported.processed_parts_count < manifest.parts.size())
         {
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "ExportPartition: No exported paths found, will not commit export. This might be a bug");
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "ExportPartition: Reached the commit phase, but only {} of {} parts are marked as processed, "
+                "will not commit export. This might be a bug",
+                exported.processed_parts_count, manifest.parts.size());
         }
 
-        //// not checking for an exact match because a single part might generate multiple files
-        if (exported_paths.size() < manifest.parts.size())
+        IStorage::ExportPartitionCommitInfo destination_commit_info;
+
+        if (exported.paths.empty())
         {
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "ExportPartition: Reached the commit phase, but exported paths size is less than the number of parts, will not commit export. This might be a bug");
+            LOG_INFO(log, "ExportPartition: {} produced no destination files, nothing to commit", entry_path);
         }
-
-        IStorage::IcebergCommitExportPartitionArguments iceberg_args;
-
-        if (!manifest.iceberg_metadata_json.empty())
+        else
         {
-            iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
-            const auto source_metadata = source_storage.getInMemoryMetadataPtr(context, false);
-            if (source_metadata->hasPartitionKey())
-                iceberg_args.partition_source_block =
-                    getPartitionSourceBlockForIcebergCommit(source_storage, manifest.partition_id, manifest.parts);
+            destination_commit_info = commitExportOnDestination(
+                manifest.transaction_id,
+                manifest.partition_id,
+                manifest.iceberg_metadata_json,
+                manifest.write_full_path_in_iceberg_metadata,
+                manifest.iceberg_partition_timezone,
+                exported.paths,
+                manifest.parts,
+                destination_storage,
+                source_storage,
+                context_in);
         }
-
-        const auto destination_commit_info = destination_storage->commitExportPartitionTransaction(
-            manifest.transaction_id, manifest.partition_id, exported_paths, iceberg_args, context);
 
         /// Failpoint to simulate a crash after the Iceberg commit succeeds but before
         /// ZooKeeper is updated to COMPLETED. Used by idempotency integration tests.
@@ -408,7 +536,7 @@ namespace ExportPartitionUtils
         Coordination::Requests ops;
         ops.emplace_back(zkutil::makeSetRequest(status_path, completed_name, -1));
 
-        ExportReplicatedMergeTreePartitionCommitInfoEntry commit_info_entry {
+        ExportPartitionCommitInfoEntry commit_info_entry {
             destination_commit_info.iceberg_metadata_file,
             destination_commit_info.iceberg_manifest_list,
             destination_commit_info.iceberg_manifest_file,
@@ -920,23 +1048,43 @@ namespace
             return true;
         }
 
+        void verifyExportColumnCastIsSafe(
+            const ColumnWithTypeAndName & source_column,
+            const ColumnWithTypeAndName & destination_column,
+            const StorageID & destination_storage_id)
+        {
+            if (canBeSafelyCast(source_column.type, destination_column.type))
+                return;
+
+            throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
+                "Cannot export to {}: column '{}' requires a lossy cast from {} to {}, "
+                "which may change values. Set `export_merge_tree_part_allow_lossy_cast = 1` "
+                "to allow lossy casts during export.",
+                destination_storage_id.getFullTableName(),
+                destination_column.name,
+                source_column.type->getName(),
+                destination_column.type->getName());
+        }
+
         void verifyPartitionKeyColumn(
             const ColumnWithTypeAndName & source_column,
             const ColumnWithTypeAndName & destination_column,
             size_t position,
-            const StorageID & destination_storage_id)
+            const StorageID & destination_storage_id,
+            bool match_by_name)
         {
             if (source_column.name != destination_column.name)
                 throw Exception(
                     ErrorCodes::BAD_ARGUMENTS,
                     "Cannot export to {}: partition key column '{}' is at position {} in the source "
                     "table, but the destination's column at that position is named '{}'. EXPORT "
-                    "PART/PARTITION matches columns by position, so partition key columns must be "
-                    "declared at the same position in both tables.",
+                    "PART/PARTITION {} so partition key columns must be declared {} in both tables.",
                     destination_storage_id.getFullTableName(),
                     source_column.name,
                     position,
-                    destination_column.name);
+                    destination_column.name,
+                    match_by_name ? "matches columns by name" : "matches columns by position",
+                    match_by_name ? "with the same name" : "at the same position");
 
             if (!haveSameTupleElementLayout(source_column.type, destination_column.type))
                 throw Exception(
@@ -949,6 +1097,28 @@ namespace
                     source_column.type->getName(),
                     destination_column.type->getName());
         }
+    }
+
+    void checkExportSchemaColumnsCount(
+        size_t source_columns_count,
+        size_t destination_columns_count,
+        bool ignore_extra_source_columns)
+    {
+        if (source_columns_count < destination_columns_count)
+            throw Exception(
+                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+                "Number of columns doesn't match (source: {} and result: {}): "
+                "destination cannot have more columns than source",
+                source_columns_count,
+                destination_columns_count);
+
+        if (source_columns_count > destination_columns_count && !ignore_extra_source_columns)
+            throw Exception(
+                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+                "Number of columns doesn't match (source: {} and result: {}): "
+                "source has extra columns and the `export_merge_tree_part_ignore_extra_source_columns` setting is disabled",
+                source_columns_count,
+                destination_columns_count);
     }
 
     void verifyExportSchemaCastable(
@@ -968,31 +1138,31 @@ namespace
         auto source_columns = source_sample_block.getColumnsWithTypeAndName();
         const auto & destination_columns = destination_sample_block.getColumnsWithTypeAndName();
 
-        /// In `ignore_extra_source_columns_by_position` mode a source with more columns than the destination
-        /// is allowed: the extra trailing source columns (by position) are dropped, mirroring
-        /// the trimming `ExportPartTask::addExportConvertingActions` applies to the real data.
-        /// The reverse (destination has more columns than source) is always rejected below by
-        /// `makeConvertingActions`, in both modes.
-        const bool ignore_extra_source_columns_by_position =
-            context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode]
-                == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
+        const auto schema_match_mode = context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
+        const bool ignore_extra_source_columns = context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns];
+        const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
-        if (ignore_extra_source_columns_by_position && source_columns.size() > destination_columns.size())
+        checkExportSchemaColumnsCount(source_columns.size(), destination_columns.size(), ignore_extra_source_columns);
+
+        const ActionsDAG::MatchColumnsMode mode = schema_match_mode == MergeTreePartExportSchemaMatchMode::NAME
+            ? ActionsDAG::MatchColumnsMode::Name
+            : ActionsDAG::MatchColumnsMode::Position;
+
+        // makeConvertingActions with postitional mode requires equal columns count,
+        if (ActionsDAG::MatchColumnsMode::Position == mode && ignore_extra_source_columns && src_has_extra_columns)
         {
-            LOG_DEBUG(getLogger("ExportPartitionUtils"),
+            LOG_DEBUG(
+                getLogger("ExportPartitionUtils"),
                 "Source has {} columns while destination has {} columns, "
                 "the {} extra trailing source column(s) will be ignored",
-                source_columns.size(), destination_columns.size(),
+                source_columns.size(),
+                destination_columns.size(),
                 source_columns.size() - destination_columns.size());
 
             source_columns.resize(destination_columns.size());
         }
 
-        (void) ActionsDAG::makeConvertingActions(
-            source_columns,
-            destination_columns,
-            ActionsDAG::MatchColumnsMode::Position,
-            context);
+        (void)ActionsDAG::makeConvertingActions(source_columns, destination_columns, mode, context);
 
         const auto & source_columns_description = source_metadata->getColumns();
         /// Collect the top-level columns that own columns or subcolumns required by `PARTITION BY`.
@@ -1000,36 +1170,62 @@ namespace
         std::unordered_set<String> partition_key_owner_columns;
         for (const auto & column_or_subcolumn_name : source_metadata->getColumnsRequiredForPartitionKey())
         {
-            auto resolved = source_columns_description.tryGetColumnOrSubcolumn(
-                GetColumnsOptions::All, column_or_subcolumn_name);
+            auto resolved = source_columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::All, column_or_subcolumn_name);
             const auto & column_name = resolved ? resolved->getNameInStorage() : column_or_subcolumn_name;
             partition_key_owner_columns.insert(column_name);
         }
 
         const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
-        const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
-        for (size_t i = 0; i < num_columns; ++i)
+        switch (schema_match_mode)
         {
-            const auto & source_column = source_columns[i];
-            const auto & destination_column = destination_columns[i];
+            case MergeTreePartExportSchemaMatchMode::NAME: {
+                std::unordered_map<String, size_t> source_positions_by_name;
+                source_positions_by_name.reserve(source_columns.size());
+                for (size_t i = 0; i < source_columns.size(); ++i)
+                    source_positions_by_name.emplace(source_columns[i].name, i);
 
-            if (partition_key_owner_columns.contains(source_column.name))
-                verifyPartitionKeyColumn(source_column, destination_column, i, destination_storage_id);
+                for (const auto & destination_column : destination_columns)
+                {
+                    const auto source_it = source_positions_by_name.find(destination_column.name);
+                    if (source_it == source_positions_by_name.end())
+                        throw Exception(
+                            ErrorCodes::THERE_IS_NO_COLUMN, "Cannot find column `{}` in source stream", destination_column.name);
 
-            /// Lossy casts may silently change values, so reject them unless the user opts in.
-            if (allow_lossy_cast)
-                continue;
+                    const auto & source_column = source_columns[source_it->second];
 
-            if (!canBeSafelyCast(source_column.type, destination_column.type))
-                throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
-                    "Cannot export to {}: column '{}' requires a lossy cast from {} to {}, "
-                    "which may change values. Set `export_merge_tree_part_allow_lossy_cast = 1` "
-                    "to allow lossy casts during export.",
-                    destination_storage_id.getFullTableName(),
-                    destination_column.name,
-                    source_column.type->getName(),
-                    destination_column.type->getName());
+                    if (partition_key_owner_columns.contains(destination_column.name))
+                        verifyPartitionKeyColumn(
+                            source_column,
+                            destination_column,
+                            source_it->second,
+                            destination_storage_id,
+                            /*match_by_name=*/true);
+
+                    /// Lossy casts may silently change values, so reject them unless the user opts in.
+                    if (!allow_lossy_cast)
+                        verifyExportColumnCastIsSafe(source_column, destination_column, destination_storage_id);
+                }
+                break;
+            }
+            case MergeTreePartExportSchemaMatchMode::POSITION: {
+                const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
+                for (size_t i = 0; i < num_columns; ++i)
+                {
+                    if (partition_key_owner_columns.contains(source_columns[i].name))
+                        verifyPartitionKeyColumn(
+                            source_columns[i],
+                            destination_columns[i],
+                            i,
+                            destination_storage_id,
+                            /*match_by_name=*/false);
+
+                    /// Lossy casts may silently change values, so reject them unless the user opts in.
+                    if (!allow_lossy_cast)
+                        verifyExportColumnCastIsSafe(source_columns[i], destination_columns[i], destination_storage_id);
+                }
+                break;
+            }
         }
     }
 }

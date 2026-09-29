@@ -221,6 +221,11 @@ void checkStoragesSupportTransactions(const PlannerContextPtr & planner_context)
     }
 }
 
+}
+
+namespace
+{
+
 /** Storages can rely that filters that for storage will be available for analysis before
   * getQueryProcessingStage method will be called.
   *
@@ -390,6 +395,8 @@ FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & 
     return res;
 }
 
+}
+
 FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & query_tree_node, const SelectQueryOptions & select_query_options, const ActionsDAG * post_filter)
 {
     if (select_query_options.only_analyze)
@@ -410,6 +417,9 @@ FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & 
 
     return collectFiltersForAnalysis(query_tree_node, table_expressions_nodes, context, post_filter);
 }
+
+namespace
+{
 
 /// Extend lifetime of query context, storages, and table locks
 void extendQueryContextAndStoragesLifetime(QueryPlan & query_plan, const PlannerContextPtr & planner_context)
@@ -2676,6 +2686,9 @@ void Planner::buildPlanForQueryNode()
         && select_query_options.to_stage != QueryProcessingStage::Complete // Don't do it for INSERT SELECT, for example
         && client_info.distributed_depth <= 1 // Makes sense for higher depths too, just not supported
         && !client_info.is_replicated_database_internal
+        // A local shard/replica plan is united into the parent pipeline in this process, where
+        // nothing unmarshalls the blocks.
+        && !select_query_options.is_local_plan_for_distributed_query
     )
         query_plan.addStep(std::make_unique<BlocksMarshallingStep>(query_plan.getCurrentHeader()));
 

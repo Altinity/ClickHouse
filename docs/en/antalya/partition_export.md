@@ -2,21 +2,28 @@
 
 ## Overview
 
-The `ALTER TABLE EXPORT PARTITION` command exports entire partitions from Replicated*MergeTree tables to object storage (S3, Azure Blob Storage, etc.) or data lakes like Apache Iceberg tables (with and without catalogs), typically in Parquet format. This feature coordinates export part operations across all replicas using ZooKeeper.
+The `ALTER TABLE EXPORT PARTITION` command exports entire partitions from `MergeTree`-family tables to object storage (S3, Azure Blob Storage, etc.) or data lakes like Apache Iceberg tables (with and without catalogs), typically in Parquet format.
 
-The set of parts that are exported is based on the list of parts the replica that received the export command sees. The other replicas will assist in the export process if they have those parts locally. Otherwise they will ignore it.
+- On non replicated `MergeTree` tables the export runs entirely on the single node that received the command.
+- On `Replicated*MergeTree` tables the export is coordinated across all replicas using ZooKeeper.
 
-The partition export tasks can be observed through `system.replicated_partition_exports`. The table is served from each replica's in-memory mirror, so queries do not contact ZooKeeper and are cheap to run. The mirror is refreshed on the manifest-updater poll cycle and on every status change, so a freshly written exception or terminal state may take up to one poll interval to appear. Individual part export progress can be observed as usual through `system.exports`.
+The set of parts that are exported is based on the list of parts the replica that received the export command sees. On `Replicated*MergeTree`, the other replicas will assist in the export process if they have those parts locally. Otherwise they will ignore it.
 
-The same partition can not be exported to the same destination more than once. There are two ways to override this behavior: either by setting the `export_merge_tree_partition_force_export` setting or waiting for the task to expire.
+The partition export tasks of both engines can be observed through `system.partition_exports`.
 
-The export task can be killed by issuing the kill command: `KILL EXPORT PARTITION <where predicate for system.replicated_partition_exports>`.
+`system.replicated_partition_exports` is kept as an alias of `system.partition_exports` for backwards compatibility. It returns exactly the same rows, including exports of plain `MergeTree` tables.
+
+The same partition can not be exported to the same destination more than once. This behavior can be overriden with `export_merge_tree_partition_force_export`.
+
+The export task can be killed by issuing the kill command: `KILL EXPORT PARTITION <where predicate for system.partition_exports>`.
 
 The task is persistent - it should be resumed after crashes, failures and etc.
 
+A part with no surviving rows writes no file. This happens when every row of the part was removed by a lightweight delete: the part is still exported, and counts as done, but it contributes nothing to the destination. If that is true of every part of the partition, the export produces no files at all and there is nothing to commit, so the task reaches `COMPLETED` without touching the destination. Such a part therefore has no entry in the `destination_file_paths` column of `system.partition_exports`.
+
 ### On Apache Iceberg storage exports:
 
-Each MergeTree part will become a separate file (or more depending on `max_bytes` and `max_rows` settings) following the engine naming convention. Once all parts have been exported, new snapshots / manifest files are generated and the data is comitted using the Apache Iceberg commit mechanism.
+Each MergeTree part that has surviving rows will become a separate file (or more depending on `max_bytes` and `max_rows` settings) following the engine naming convention. Once all parts have been exported, new snapshots / manifest files are generated and the data is comitted using the Apache Iceberg commit mechanism.
 
 The manifest file produced by the commit contains a summary field `clickhouse.export-partition-transaction-id` that stores the transaction id. This field is used to implement idempotency and avoid data duplication. Some Apache Iceberg storage managers employ old manifests cleanup, ClickHouse does not.
 
@@ -35,6 +42,14 @@ The source partition must not be split in the destination. This is validated at 
 
 Each MergeTree part will become a separate file with the following name convention: `<table_directory>/<partitioning>/<data_part_name>_<merge_tree_part_checksum>.<format>`. To ensure atomicity, a commit file containing the relative paths of all exported parts is also shipped. A data file should only be considered part of the dataset if a commit file references it. The commit file will be named using the following convention: `<table_directory>/commit_<partition_id>_<transaction_id>`.
 
+## Plain (non-replicated) MergeTree {#plain-non-replicated-mergetree}
+
+The command, its settings, the partition-key compatibility rules and the destination file layout are the same for both engines. Only the coordination differs as it is performed by a single node in the plain MergeTree case.
+
+### Pending mutations {#plain-merge-tree-pending-mutations}
+
+The pending-mutation gate is more conservative than on a `Replicated*MergeTree`. A plain `MergeTree` does not scope its mutation snapshot by partition, so a mutation restricted with `IN PARTITION` still marks the parts of every other partition as having pending mutations, and exporting an unaffected partition is refused with `PENDING_MUTATIONS_NOT_ALLOWED`. The gate fails closed - it never exports data that a pending mutation would have changed - so the effect is that you may have to wait for an unrelated mutation to finish, or set `export_merge_tree_part_throw_on_pending_mutations` to `false`.
+
 ## Syntax
 
 ```sql
@@ -52,9 +67,9 @@ TO TABLE [destination_database.]destination_table
 
 ## Requirements
 
-`EXPORT PARTITION` exports each part via the same mechanism as [`EXPORT PART`](/docs/en/antalya/part_export.md#requirements), so the source and destination tables must satisfy the same compatibility requirements. Column names may differ (columns are matched by position, not by name), and column types may differ as long as they are safely castable (or `export_merge_tree_part_allow_lossy_cast = 1` is set). Beyond that, the following requirements apply:
+`EXPORT PARTITION` exports each part via the same mechanism as [`EXPORT PART`](/docs/en/antalya/part_export.md#requirements), so the source and destination tables must satisfy the same compatibility requirements. Columns are matched by position by default, or by their exact, case-sensitive name if `export_merge_tree_part_schema_match_mode = 'NAME'` is set, and column types may differ as long as they are safely castable (or `export_merge_tree_part_allow_lossy_cast = 1` is set). Beyond that, the following requirements apply:
 
-1. **Column count** - source and destination must have the same number of columns by default. Set `export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'` to allow a source table with extra trailing columns; the destination having more columns than the source is still rejected in this mode.
+1. **Column count** - by default, every source column must have a corresponding destination column, and vice versa; a mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`. Which source column corresponds to which destination column is determined by `export_merge_tree_part_schema_match_mode`. Set `export_merge_tree_part_ignore_extra_source_columns = 1` to relax this in one direction: a source column without a corresponding destination column is dropped and not exported, instead of throwing. The destination having a column absent from the source is always rejected, regardless of this setting.
 2. **`PARTITION BY` expressions** - the whole source partition must land in a single destination partition. Identical expressions always satisfy this; otherwise the destination expression has to be computable from the values the source partition key pins, or be proven single-valued over the partition's min/max range. The same requirement applies to the partition fields and transforms of an Apache Iceberg destination. See [Source partition key compatibility](#source-partition-key-compatibility).
 3. **Partition key column positions and layouts** - every top-level column that provides a column or subcolumn used by the source table's partition key must have the same name at the same position in the destination table's schema. Named `Tuple` elements within such a column must also be declared in the same order, including tuples nested inside `Array` or `Map`. This applies even if both tables' `PARTITION BY` expressions are textually identical. See [`EXPORT PART` requirements](/docs/en/antalya/part_export.md#requirements) for a worked example and the corresponding exception message.
 
@@ -66,7 +81,7 @@ TO TABLE [destination_database.]destination_table
 
 - **Type**: `Bool`
 - **Default**: `false`
-- **Description**: Enable export replicated merge tree partition feature. It is experimental and not yet ready for production use.
+- **Description**: Enable the `EXPORT PARTITION` feature for both `Replicated*MergeTree` and plain `MergeTree` tables. It is experimental and not yet ready for production use.
 
 ### Query Settings
 
@@ -135,15 +150,25 @@ Notes:
 
   **Warning:** A lossy cast on a partition column remains semantically truncating. For example, if a table is partitioned by an `Int64` column and some partition values do not fit into a destination `Int32` partition column, both the data files and the Iceberg metadata will contain the truncated `Int32` value (they agree with each other, but the original `Int64` value is lost). Such casts require `export_merge_tree_part_allow_lossy_cast = 1`.
 
-### `export_merge_tree_part_schema_mismatch_mode` (Optional)
+### `export_merge_tree_part_schema_match_mode` (Optional)
 
-- **Type**: `MergeTreePartExportSchemaMismatchMode`
-- **Default**: `strict`
-- **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` allows a column-count mismatch between the source `MergeTree` table and the destination table. Columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Possible values:
-  - `strict` - the source and destination must have the same number of columns. A mismatch in either direction throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
-  - `ignore_extra_source_columns_by_position` - the source may have more columns than the destination. The extra trailing source columns (by position) are dropped and not exported. The destination having more columns than the source is still rejected in this mode.
+- **Type**: `MergeTreePartExportSchemaMatchMode`
+- **Default**: `POSITION`
+- **Description**: Controls how `EXPORT PART`/`EXPORT PARTITION` matches source `MergeTree` columns to destination columns. Possible values:
+  - `POSITION` (default) - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Column names are not otherwise considered.
+  - `NAME` - every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be declared in a different order than the source. A destination column absent from the source, including when it was renamed, throws `THERE_IS_NO_COLUMN`; there is no positional fallback.
 
-  The extra trailing source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
+  See `export_merge_tree_part_ignore_extra_source_columns` below for how a source column without a corresponding destination column is handled in each mode.
+
+### `export_merge_tree_part_ignore_extra_source_columns` (Optional)
+
+- **Type**: `Bool`
+- **Default**: `false`
+- **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates a source `MergeTree` column that has no corresponding destination column.
+  - `false` (default) - such a source column is rejected: the source and destination must match exactly. A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+  - `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. The destination having a column absent from the source is still always rejected.
+
+  Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion and `export_merge_tree_part_allow_lossy_cast` are applied after columns are matched.
 
 ## Examples
 
@@ -173,19 +198,17 @@ WHERE partition_id = '2020'
   AND destination_table = 's3_table'
 ```
 
-The `WHERE` clause filters exports from the `system.replicated_partition_exports` table. You can use any columns from that table in the filter.
-
 ## Monitoring
 
 ### Active and Completed Exports
 
-Monitor partition exports using the `system.replicated_partition_exports` table:
+Monitor partition exports using the `system.partition_exports` table:
 
 ```sql
-arthur :) select * from system.replicated_partition_exports Format Vertical;
+arthur :) select * from system.partition_exports Format Vertical;
 
 SELECT *
-FROM system.replicated_partition_exports
+FROM system.partition_exports
 FORMAT Vertical
 
 Query id: 9efc271a-a501-44d1-834f-bc4d20156164
@@ -249,16 +272,14 @@ Status values include:
 
 ### Exception columns
 
-- `last_exception_per_replica` is an `Array(Tuple(replica String, message String, part String, time DateTime, count UInt64))`. Each tuple is the most recent exception observed by a single replica plus a best-effort within-replica `count`. Replicas that have never reported an exception are omitted.
+- `last_exception_per_replica` is an `Array(Tuple(replica String, message String, part String, time DateTime, count UInt64))`. Each tuple is the most recent exception observed by a single replica plus a best-effort within-replica `count`. Replicas that have never reported an exception are omitted. A plain `MergeTree` export runs on a single node, so it contributes at most one tuple and its `replica` is empty.
 - `exception_count` is the sum of every `count` in `last_exception_per_replica`. Each replica owns its own counter, so cross-replica updates do not race; the sum is exact w.r.t. the snapshot returned. Within a single replica concurrent failing writers may under-count by one.
 
 ### Per-part destination file paths
 
-- `destination_file_paths` is a `Map(String, Array(String))` keyed by source part name. Each value is the list of file paths written to the destination object storage when that part was exported (a single part can produce multiple files depending on `max_bytes` / `max_rows`). If a refresh cannot read a processed entry from ZooKeeper, the affected key holds the sentinel `<failed to read from zk>` instead of silently under-counting.
+- `destination_file_paths` is a `Map(String, Array(String))` keyed by source part name. Each value is the list of file paths written to the destination object storage when that part was exported (a single part can produce multiple files depending on `max_bytes` / `max_rows`). On a `Replicated*MergeTree` source, if a refresh cannot read a processed entry from ZooKeeper, the affected key holds the sentinel `<failed to read from zk>` instead of silently under-counting.
 
 ### Commit info columns
-
-These columns surface paths produced by the destination storage during commit, so it is possible to inspect what was written without consulting the destination directly:
 
 - `committed_metadata_file` — for Iceberg destinations: path of the new `vN.metadata.json` written by the commit. Empty for non-Iceberg destinations and before the commit lands. If the commit was already finished by a previous run (detected via the transaction id stored in the snapshot summary), this column carries a human-readable sentinel string instead of a path because the original committer's paths are not recoverable from inside the impl.
 - `committed_manifest_list` — for Iceberg destinations: path of the manifest list file (`snap-*.avro`) referenced by the new snapshot. Empty under the same conditions as `committed_metadata_file`.
@@ -270,7 +291,7 @@ To pick the latest exception across replicas:
 ```sql
 SELECT
     arraySort(x -> -x.time, last_exception_per_replica)[1] AS latest_exception
-FROM system.replicated_partition_exports
+FROM system.partition_exports
 WHERE source_table = 'rmt_table' AND destination_table = 's3_table';
 ```
 

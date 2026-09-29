@@ -30,7 +30,6 @@ struct ColumnInfo
 #include <vector>
 
 #include <boost/noncopyable.hpp>
-#include <Poco/String.h>
 
 namespace DB::Iceberg
 {
@@ -85,7 +84,9 @@ struct ParsedManifestFileEntry : boost::noncopyable
 
     ManifestEntryStatus status;
     std::optional<Int64> parsed_sequence_number;
+    std::optional<Int64> parsed_file_sequence_number;
     std::optional<Int64> parsed_snapshot_id;
+    std::optional<UInt64> parsed_first_row_id;
 
     DB::Row partition_key_value;
     std::unordered_map<Int32, ColumnInfo> columns_infos;
@@ -103,15 +104,14 @@ struct ParsedManifestFileEntry : boost::noncopyable
     Int64 record_count;
     Int64 file_size_in_bytes;
 
-    /// Iceberg v3 deletion vector metadata (position delete entries with puffin format)
+    /// Iceberg v3 deletion vector metadata (`content_offset` / `content_size_in_bytes`).
+    /// Present for Puffin containers and for Delta-style `.bin` files that store the same envelope.
     std::optional<Int64> content_offset;
     std::optional<Int64> content_size_in_bytes;
 
     bool isDeletionVector() const
     {
-        return Poco::toLower(file_format) == "puffin"
-            && content_offset.has_value()
-            && content_size_in_bytes.has_value();
+        return content_offset.has_value() && content_size_in_bytes.has_value();
     }
 
     ParsedManifestFileEntry(
@@ -120,7 +120,9 @@ struct ParsedManifestFileEntry : boost::noncopyable
         Int64 row_number_,
         ManifestEntryStatus status_,
         std::optional<Int64> written_sequence_number_,
+        std::optional<Int64> written_file_sequence_number_,
         std::optional<Int64> written_snapshot_id_,
+        std::optional<UInt64> written_first_row_id_,
         DB::Row partition_key_value_,
         std::unordered_map<Int32, ColumnInfo> columns_infos_,
         std::unordered_map<Int32, std::pair<Field, Field>> value_bounds_,
@@ -138,7 +140,9 @@ struct ParsedManifestFileEntry : boost::noncopyable
         , row_number(row_number_)
         , status(status_)
         , parsed_sequence_number(written_sequence_number_)
+        , parsed_file_sequence_number(written_file_sequence_number_)
         , parsed_snapshot_id(written_snapshot_id_)
+        , parsed_first_row_id(written_first_row_id_)
         , partition_key_value(std::move(partition_key_value_))
         , columns_infos(std::move(columns_infos_))
         , value_bounds(std::move(value_bounds_))
@@ -164,6 +168,7 @@ struct ProcessedManifestFileEntry
     Int64 sequence_number;
     Int32 resolved_schema_id;
     String manifest_file_path;
+    std::optional<UInt64> first_row_id;
 
     String dumpDeletesMatchingInfo() const;
 };
@@ -182,8 +187,9 @@ std::optional<Int64> getRecordCountInAllFilesExcludingDeleted(
 std::optional<Int64> getBytesSizeInAllDataFilesExcludingDeleted(
     const std::vector<ProcessedManifestFileEntryPtr> & files);
 
-/// Puffin deletion vectors must identify the data file via the dedicated `referenced_data_file`
-/// manifest field (non-empty). Position-delete lower/upper bounds must not be used as a fallback.
+/// Deletion vectors (Puffin or Delta `.bin`) must identify the data file via the dedicated
+/// `referenced_data_file` manifest field (non-empty). Position-delete lower/upper bounds
+/// must not be used as a fallback.
 void requireDirectReferencedDataFileForPuffinDeletionVector(
     bool set_from_referenced_data_file_field,
     const std::optional<IcebergPathFromMetadata> & referenced_path,
