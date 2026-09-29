@@ -10,7 +10,11 @@
 #include <Compression/CompressedReadBuffer.h>
 #include <Compression/CompressedWriteBuffer.h>
 #include <Compression/CompressionFactory.h>
+<<<<<<< HEAD
 #include <Core/Block.h>
+=======
+#include <Core/AntalyaProtocol.h>
+>>>>>>> b73e7588a4f (Merge pull request #2378 from Altinity/feature/antalya-26.6/antalya-protocol-version)
 #include <Core/ProtocolDefines.h>
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
@@ -2353,7 +2357,7 @@ void TCPHandler::processUnexpectedHello()
 void TCPHandler::sendHello()
 {
     writeVarUInt(Protocol::Server::Hello, *out);
-    writeStringBinary(VERSION_NAME, *out);
+    writeStringBinary(AntalyaProtocol::appendMarker(VERSION_NAME), *out);
     writeVarUInt(VERSION_MAJOR, *out);
     writeVarUInt(VERSION_MINOR, *out);
     writeVarUInt(DBMS_TCP_PROTOCOL_VERSION, *out);
