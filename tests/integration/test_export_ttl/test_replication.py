@@ -23,6 +23,7 @@ from .common import (
     wait_for_partitions_exported,
     wait_for_same_ttl_rows,
     wait_until,
+    zookeeper_path,
 )
 
 CLUSTER_INSTANCES = ["replica1", "replica2"]
@@ -174,6 +175,46 @@ def test_failover_resumes_the_batch(cluster):
     for replica in replicas:
         assert_exactly_once(iceberg_ids(replica, iceberg_table), [1, 2])
     assert_one_snapshot_per_task(other, mt_table, iceberg_table)
+
+
+def test_alter_is_refused_while_a_replica_does_not_support_it(cluster):
+    """The other replicas apply an ALTER from the replication log without validating it. A replica that
+    does not keep exported parts apart from the others when it merges, e.g. because it runs an older
+    version, does not advertise `export_features`, and an ALTER that adds the `EXPORT` TTL is refused
+    while there is one."""
+    replicas = [cluster.instances["replica1"], cluster.instances["replica2"]]
+    suffix = unique_suffix()
+    mt_table, iceberg_table = f"repl_mt_{suffix}", f"repl_iceberg_{suffix}"
+    create_iceberg(replicas, iceberg_table)
+    for replica in replicas:
+        create_source(
+            replica, mt_table, COLUMNS, "year", "t + INTERVAL 10 YEAR DELETE",
+            engine="ReplicatedMergeTree", replica_name=replica.name,
+        )
+    add_export_ttl = f"ALTER TABLE {mt_table} MODIFY TTL t + INTERVAL 1 DAY EXPORT TO TABLE {iceberg_table}"
+
+    export_features = f"{zookeeper_path(mt_table)}/replicas/replica2/export_features"
+    zk = cluster.get_kazoo_client("zoo1")
+    try:
+        zk.delete(export_features)
+        try:
+            error = replicas[0].query_and_get_error(add_export_ttl)
+            assert "SUPPORT_IS_DISABLED" in error and "replica2" in error, error
+        finally:
+            # A replica advertises it when its table starts up.
+            replicas[1].restart_clickhouse()
+        wait_until(lambda: zk.exists(export_features), 60, "replica2 does not advertise export_features again")
+    finally:
+        zk.stop()
+        zk.close()
+
+    replicas[0].query(add_export_ttl)
+    replicas[0].query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE})")
+    sync(replicas, mt_table)
+    wait_for_partitions_exported(replicas[0], mt_table, ["2020"])
+    for replica in replicas:
+        assert_exactly_once(iceberg_ids(replica, iceberg_table), [1])
+    assert_one_snapshot_per_task(replicas[0], mt_table, iceberg_table)
 
 
 def test_detached_scheduler_hands_over(cluster):

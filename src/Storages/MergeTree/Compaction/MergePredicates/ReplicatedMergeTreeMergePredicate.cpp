@@ -129,9 +129,9 @@ ReplicatedMergeTreeZooKeeperMergePredicate::ReplicatedMergeTreeZooKeeperMergePre
 
 void ReplicatedMergeTreeZooKeeperMergePredicate::loadExportFence(zkutil::ZooKeeperPtr & zookeeper)
 {
-    if (const auto export_ttl_index = queue.storage.getExportFence())
+    if (const auto export_ttl_index = queue.storage.getExportTTLIndex())
     {
-        std::tie(export_fence, export_fence_version) = export_ttl_index->getForMergeAssignment(zookeeper);
+        std::tie(export_fence, export_index_version) = export_ttl_index->getForMergeAssignment(zookeeper);
         export_fence_ptr = export_fence.get();
     }
     delete_gate = queue.storage.getExportTTLDeleteGate();

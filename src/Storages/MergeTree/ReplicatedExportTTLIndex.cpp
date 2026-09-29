@@ -24,14 +24,14 @@ ReplicatedExportTTLIndex::ReplicatedExportTTLIndex(String zookeeper_path_, Logge
 {
 }
 
-String ReplicatedExportTTLIndex::getFencePath() const
-{
-    return fs::path(zookeeper_path) / "export_fence";
-}
-
 String ReplicatedExportTTLIndex::getRootPath() const
 {
     return fs::path(zookeeper_path) / "export_ttl";
+}
+
+String ReplicatedExportTTLIndex::getVersionPath() const
+{
+    return fs::path(getRootPath()) / "version";
 }
 
 String ReplicatedExportTTLIndex::getSchedulerLockPath() const
@@ -39,9 +39,14 @@ String ReplicatedExportTTLIndex::getSchedulerLockPath() const
     return fs::path(getRootPath()) / "scheduler_lock";
 }
 
+String ReplicatedExportTTLIndex::getDestinationsPath() const
+{
+    return fs::path(getRootPath()) / "destinations";
+}
+
 String ReplicatedExportTTLIndex::getDestinationPath(const String & destination_key) const
 {
-    return fs::path(getRootPath()) / destination_key;
+    return fs::path(getDestinationsPath()) / destination_key;
 }
 
 String ReplicatedExportTTLIndex::getIndexEntryPath(const String & destination_key, const String & partition_id) const
@@ -49,16 +54,19 @@ String ReplicatedExportTTLIndex::getIndexEntryPath(const String & destination_ke
     return fs::path(getDestinationPath(destination_key)) / "partitions" / partition_id;
 }
 
-int32_t ReplicatedExportTTLIndex::readFenceVersion(const zkutil::ZooKeeperPtr & zookeeper) const
+int32_t ReplicatedExportTTLIndex::readVersion(const zkutil::ZooKeeperPtr & zookeeper) const
 {
-    const auto path = getFencePath();
+    const auto path = getVersionPath();
 
     Coordination::Stat stat;
     if (!zookeeper->exists(path, &stat))
     {
-        const auto code = zookeeper->tryCreate(path, "", zkutil::CreateMode::Persistent);
-        if (code != Coordination::Error::ZOK && code != Coordination::Error::ZNODEEXISTS)
-            throw zkutil::KeeperException::fromPath(code, path);
+        for (const auto & node : {getRootPath(), path})
+        {
+            const auto code = zookeeper->tryCreate(node, "", zkutil::CreateMode::Persistent);
+            if (code != Coordination::Error::ZOK && code != Coordination::Error::ZNODEEXISTS)
+                throw zkutil::KeeperException::fromPath(code, node);
+        }
         zookeeper->exists(path, &stat);
     }
     return stat.version;
@@ -67,13 +75,11 @@ int32_t ReplicatedExportTTLIndex::readFenceVersion(const zkutil::ZooKeeperPtr & 
 std::vector<String> ReplicatedExportTTLIndex::listDestinations(const zkutil::ZooKeeperPtr & zookeeper) const
 {
     Strings children;
-    const auto code = zookeeper->tryGetChildren(getRootPath(), children);
+    const auto code = zookeeper->tryGetChildren(getDestinationsPath(), children);
     if (code == Coordination::Error::ZNONODE)
         return {};
     if (code != Coordination::Error::ZOK)
-        throw zkutil::KeeperException::fromPath(code, getRootPath());
-
-    std::erase_if(children, [](const String & child) { return child == "scheduler_lock"; });
+        throw zkutil::KeeperException::fromPath(code, getDestinationsPath());
     return children;
 }
 
@@ -133,6 +139,7 @@ void ReplicatedExportTTLIndex::ensureDestination(
 {
     const std::vector<std::pair<String, String>> nodes{
         {getRootPath(), ""},
+        {getDestinationsPath(), ""},
         {getDestinationPath(destination_key), description},
         {fs::path(getDestinationPath(destination_key)) / "partitions", ""},
     };
@@ -154,13 +161,13 @@ void ReplicatedExportTTLIndex::appendUpdateEntryOps(
     else
         ops.emplace_back(zkutil::makeSetRequest(path, entry.toJSONString(), version));
 
-    ops.emplace_back(zkutil::makeSetRequest(getFencePath(), "", -1));
+    ops.emplace_back(zkutil::makeSetRequest(getVersionPath(), "", -1));
 }
 
 void ReplicatedExportTTLIndex::removeDestination(const zkutil::ZooKeeperPtr & zookeeper, const String & destination_key) const
 {
     zookeeper->tryRemoveRecursive(getDestinationPath(destination_key));
-    zookeeper->trySet(getFencePath(), "", -1);
+    zookeeper->trySet(getVersionPath(), "", -1);
     LOG_INFO(log, "Removed the TTL export index of destination {}", destination_key);
 }
 
@@ -168,7 +175,7 @@ ExportTTLIndexSnapshotPtr ReplicatedExportTTLIndex::getSnapshot(const zkutil::Zo
 {
     /// Read before the index, so the index is at least as new as the version it is cached for. Every
     /// change of the index bumps the version in the same transaction.
-    const auto version = readFenceVersion(zookeeper);
+    const auto version = readVersion(zookeeper);
 
     if (auto cached = latest.get(); cached->version == version)
         return cached;
@@ -183,7 +190,7 @@ ExportTTLIndexSnapshotPtr ReplicatedExportTTLIndex::getSnapshot(const zkutil::Zo
 
     ProfileEvents::increment(ProfileEvents::ExportTTLIndexSnapshotRefreshes);
     auto snapshot = ExportTTLIndexSnapshot::build(version, std::move(entries));
-    LOG_DEBUG(log, "Read the export index at version {} of the fence: {} partition(s) with exported or claimed parts",
+    LOG_DEBUG(log, "Read the export index at version {}: {} partition(s) with exported or claimed parts",
         version, snapshot->fence->entries_by_partition.size());
 
     latest.set(std::move(snapshot));

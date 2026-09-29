@@ -17,20 +17,20 @@ namespace DB
 
 /// The `TTL ... EXPORT` state of a `ReplicatedMergeTree` table in Keeper, and the merge fence built from it.
 ///
-/// Layout under `<zookeeper_path>`:
-///  - `export_ttl/<destination_key>`: holds `ExportTTLDestination` of one destination;
-///  - `export_ttl/<destination_key>/partitions/<partition_id>`: an `ExportTTLIndexEntry`;
-///  - `export_ttl/scheduler_lock`: ephemeral, held by the replica that schedules TTL exports, whose name it holds;
-///  - `export_fence`: bumped in every transaction that changes an index entry. A merge is assigned
-///    with a check of the version its predicate read the index at, so no merge is assigned from a
-///    stale view of the export states.
+/// Layout under `<zookeeper_path>/export_ttl`:
+///  - `version`: bumped in every transaction that changes an index entry. Replicas cache the index
+///    for its version, and a merge is assigned with a check of the version its predicate read the
+///    index at, so no merge is assigned from a stale view of the export states;
+///  - `scheduler_lock`: ephemeral, held by the replica that schedules TTL exports, whose name it holds;
+///  - `destinations/<destination_key>`: holds the name of one destination;
+///  - `destinations/<destination_key>/partitions/<partition_id>`: an `ExportTTLIndexEntry`.
 class ReplicatedExportTTLIndex
 {
 public:
     ReplicatedExportTTLIndex(String zookeeper_path_, LoggerPtr log_);
 
-    String getFencePath() const;
     String getRootPath() const;
+    String getVersionPath() const;
     String getSchedulerLockPath() const;
     String getDestinationPath(const String & destination_key) const;
     String getIndexEntryPath(const String & destination_key, const String & partition_id) const;
@@ -47,19 +47,19 @@ public:
     /// Creates the nodes of `destination_key`, so entries can be created in a transaction.
     void ensureDestination(const zkutil::ZooKeeperPtr & zookeeper, const String & destination_key, const String & description) const;
 
-    /// Appends the ops that store `entry`, with a check of `version` (see `ExportTTLVersionedEntry`), and bump the fence.
+    /// Appends the ops that store `entry`, with a check of `version` (see `ExportTTLVersionedEntry`), and bump the version of the index.
     void appendUpdateEntryOps(
         Coordination::Requests & ops, const String & destination_key, const ExportTTLIndexEntry & entry, int32_t version) const;
 
-    /// Removes the index of `destination_key` and bumps the fence. Not transactional: an interrupted
-    /// removal leaves fewer entries, which only lifts more of the fence.
+    /// Removes the index of `destination_key` and bumps the version of the index. Not transactional:
+    /// an interrupted removal leaves fewer entries, which only lifts more of the fence.
     void removeDestination(const zkutil::ZooKeeperPtr & zookeeper, const String & destination_key) const;
 
-    /// The whole index as of the current version of the fence node. It is read again only when that
-    /// version changed, so while nothing changes this costs one `exists`.
+    /// The whole index as of the current version of the `version` node. It is read again only when
+    /// that version changed, so while nothing changes this costs one `exists`.
     ExportTTLIndexSnapshotPtr getSnapshot(const zkutil::ZooKeeperPtr & zookeeper);
 
-    /// The export states as of the returned version of the fence node.
+    /// The export states as of the returned version of the `version` node.
     std::pair<ExportFencePtr, int32_t> getForMergeAssignment(const zkutil::ZooKeeperPtr & zookeeper);
 
     /// The export states read by the last `getSnapshot`, without reading Keeper.
@@ -73,7 +73,8 @@ private:
     std::mutex refresh_mutex;
     MultiVersion<ExportTTLIndexSnapshot> latest;
 
-    int32_t readFenceVersion(const zkutil::ZooKeeperPtr & zookeeper) const;
+    String getDestinationsPath() const;
+    int32_t readVersion(const zkutil::ZooKeeperPtr & zookeeper) const;
 };
 
 using ReplicatedExportTTLIndexPtr = std::shared_ptr<ReplicatedExportTTLIndex>;

@@ -10,7 +10,7 @@ columns
 creator_info
 deduplication_hashes
 export_features
-export_fence
+export_ttl
 exports
 failed_parts
 flags
@@ -42,6 +42,7 @@ quorum
 replicas
 table_shared_id
 temp
+version
 -------------------------
 1
 abandonable_lock-insert
@@ -55,7 +56,7 @@ columns
 creator_info
 deduplication_hashes
 export_features
-export_fence
+export_ttl
 exports
 failed_parts
 flags
@@ -87,3 +88,4 @@ quorum
 replicas
 table_shared_id
 temp
+version

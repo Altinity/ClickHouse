@@ -1770,6 +1770,9 @@ protected:
     /// written and then renamed: a content-addressed disk cannot rename a file written before.
     void checkExportTTLIsSupportedByDisk(const StorageInMemoryMetadata & metadata) const;
 
+    /// Throws unless every replica keeps exported parts apart from the others when it assigns merges.
+    virtual void checkReplicasSupportExportTTL() const {}
+
 public:
     /// Validates the `TTL ... EXPORT TO TABLE` expression of the table `table_id` being created or
     /// altered. The partition key of the destination is checked against the parts of every group

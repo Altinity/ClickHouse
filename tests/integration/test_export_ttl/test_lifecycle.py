@@ -152,11 +152,9 @@ def test_forget_partition(cluster):
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE})")
     wait_for_partitions_exported(node, mt_table, ["2020"])
 
-    index_path = f"{zookeeper_path(mt_table)}/export_ttl"
-    destination_key = node.query(
-        f"SELECT name FROM system.zookeeper WHERE path = '{index_path}' AND name != 'scheduler_lock'"
-    ).strip()
-    partitions_path = f"{index_path}/{destination_key}/partitions"
+    destinations_path = f"{zookeeper_path(mt_table)}/export_ttl/destinations"
+    destination_key = node.query(f"SELECT name FROM system.zookeeper WHERE path = '{destinations_path}'").strip()
+    partitions_path = f"{destinations_path}/{destination_key}/partitions"
     assert node.query(f"SELECT name FROM system.zookeeper WHERE path = '{partitions_path}'") == "2020\n"
 
     node.query(f"ALTER TABLE {mt_table} DROP PARTITION ID '2020'")

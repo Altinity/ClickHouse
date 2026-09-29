@@ -57,13 +57,13 @@ bool ReplicatedExportTTLScheduler::acquireSchedulerLock()
     lock_holder.reset();
     lock_zookeeper.reset();
 
-    const auto & fence = *replicated_storage.export_fence;
-    const auto root_path = fence.getRootPath();
+    const auto & export_ttl_index = *replicated_storage.export_ttl_index;
+    const auto root_path = export_ttl_index.getRootPath();
     if (const auto code = zookeeper->tryCreate(root_path, "", zkutil::CreateMode::Persistent);
         code != Coordination::Error::ZOK && code != Coordination::Error::ZNODEEXISTS)
         throw zkutil::KeeperException::fromPath(code, root_path);
 
-    lock_holder = zkutil::EphemeralNodeHolder::tryCreate(fence.getSchedulerLockPath(), *zookeeper, replicated_storage.getReplicaName());
+    lock_holder = zkutil::EphemeralNodeHolder::tryCreate(export_ttl_index.getSchedulerLockPath(), *zookeeper, replicated_storage.getReplicaName());
     if (!lock_holder)
         return false;
 
@@ -79,7 +79,7 @@ bool ReplicatedExportTTLScheduler::isPaused()
 
 ExportTTLIndexSnapshotPtr ReplicatedExportTTLScheduler::getIndexSnapshot()
 {
-    return replicated_storage.export_fence->getSnapshot(replicated_storage.getZooKeeper());
+    return replicated_storage.export_ttl_index->getSnapshot(replicated_storage.getZooKeeper());
 }
 
 String ReplicatedExportTTLScheduler::getReplicaName() const
@@ -94,7 +94,7 @@ String ReplicatedExportTTLScheduler::getSchedulerReplica()
         return {};
 
     String replica;
-    zookeeper->tryGet(replicated_storage.export_fence->getSchedulerLockPath(), replica);
+    zookeeper->tryGet(replicated_storage.export_ttl_index->getSchedulerLockPath(), replica);
     return replica;
 }
 
@@ -193,13 +193,13 @@ ExportTTLScheduler::TaskState ReplicatedExportTTLScheduler::getTaskState(const S
 bool ReplicatedExportTTLScheduler::updateIndexEntry(const String & destination_key, const ExportTTLVersionedEntry & entry)
 {
     const auto zookeeper = replicated_storage.getZooKeeper();
-    const auto & fence = *replicated_storage.export_fence;
+    const auto & export_ttl_index = *replicated_storage.export_ttl_index;
 
     if (entry.version < 0)
-        fence.ensureDestination(zookeeper, destination_key, destination_key);
+        export_ttl_index.ensureDestination(zookeeper, destination_key, destination_key);
 
     Coordination::Requests ops;
-    fence.appendUpdateEntryOps(ops, destination_key, entry.entry, entry.version);
+    export_ttl_index.appendUpdateEntryOps(ops, destination_key, entry.entry, entry.version);
 
     Coordination::Responses responses;
     const auto code = zookeeper->tryMulti(ops, responses);
@@ -241,16 +241,16 @@ bool ReplicatedExportTTLScheduler::startGroup(const GroupToStart & group, const 
     manifest.source = ExportTaskSource::ttl;
     manifest.retry_of = group.retry_of;
 
-    const auto & fence = *replicated_storage.export_fence;
+    const auto & export_ttl_index = *replicated_storage.export_ttl_index;
     if (group.entry.version < 0)
-        fence.ensureDestination(zookeeper, group.destination_key, group.destination->getStorageID().getNameForLogs());
+        export_ttl_index.ensureDestination(zookeeper, group.destination_key, group.destination->getStorageID().getNameForLogs());
 
     const auto task_path = fs::path(replicated_storage.zookeeper_path) / "exports" / group.transaction_id;
 
     Coordination::Requests ops;
     ops.emplace_back(zkutil::makeCheckRequest(fs::path(replicated_storage.zookeeper_path) / "log", merge_predicate->getVersion()));
     ExportTaskUtils::appendCreateExportTaskOps(ops, task_path, manifest);
-    fence.appendUpdateEntryOps(ops, group.destination_key, group.entry.entry, group.entry.version);
+    export_ttl_index.appendUpdateEntryOps(ops, group.destination_key, group.entry.entry, group.entry.version);
 
     ProfileEvents::increment(ProfileEvents::ExportTaskZooKeeperRequests);
     ProfileEvents::increment(ProfileEvents::ExportTaskZooKeeperMulti);
@@ -283,7 +283,7 @@ void ReplicatedExportTTLScheduler::killTask(const String & transaction_id)
 
 void ReplicatedExportTTLScheduler::removeDestination(const String & destination_key)
 {
-    replicated_storage.export_fence->removeDestination(replicated_storage.getZooKeeper(), destination_key);
+    replicated_storage.export_ttl_index->removeDestination(replicated_storage.getZooKeeper(), destination_key);
 }
 
 }

@@ -69,9 +69,9 @@ public:
     /// other users of the predicate do not merge parts and skip the Keeper reads.
     void loadExportFence(zkutil::ZooKeeperPtr & zookeeper);
 
-    /// The version of the "export_fence" node the export states were read at, or -1 if they were not
-    /// loaded. A merge must be assigned with a check of it, so it is not assigned from stale export states.
-    int32_t getExportFenceVersion() const { return export_fence_version; }
+    /// The version of the "export_ttl/version" node the export states were read at, or -1 if they were
+    /// not loaded. A merge must be assigned with a check of it, so it is not assigned from stale export states.
+    int32_t getExportIndexVersion() const { return export_index_version; }
 
     /// Returns true if there's a drop range covering new_drop_range_info
     bool isGoingToBeDropped(const MergeTreePartInfo & new_drop_range_info, MergeTreePartInfo * out_drop_range_info = nullptr) const;
@@ -86,7 +86,7 @@ private:
     std::shared_ptr<String> inprogress_quorum_part;
 
     int32_t merges_version = -1;
-    int32_t export_fence_version = -1;
+    int32_t export_index_version = -1;
 };
 
 using ReplicatedMergeTreeMergePredicatePtr = std::shared_ptr<const ReplicatedMergeTreeBaseMergePredicate>;

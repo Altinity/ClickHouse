@@ -1322,6 +1322,9 @@ void MergeTreeData::checkExportTTL(
 
     checkExportTTLIsSupportedByDisk(new_metadata);
     validateExportTTL(getStorageID(), new_metadata, getSettings(), local_context);
+
+    /// The other replicas apply the ALTER from the replication log without validating it.
+    checkReplicasSupportExportTTL();
 }
 
 void MergeTreeData::checkExportTTLIsSupportedByDisk(const StorageInMemoryMetadata & metadata) const

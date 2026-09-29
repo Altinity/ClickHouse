@@ -591,7 +591,7 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
 
         export_task_select_task->deactivate();
 
-        export_fence = std::make_shared<ReplicatedExportTTLIndex>(zookeeper_path, log.load());
+        export_ttl_index = std::make_shared<ReplicatedExportTTLIndex>(zookeeper_path, log.load());
 
         export_ttl_scheduler = std::make_shared<ReplicatedExportTTLScheduler>(*this);
         export_ttl_task = getContext()->getSchedulePool().createTask(
@@ -1061,7 +1061,8 @@ void StorageReplicatedMergeTree::createNewZooKeeperNodesAttempt() const
     futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/quorum/failed_parts", String(), zkutil::CreateMode::Persistent));
     futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/mutations", String(), zkutil::CreateMode::Persistent));
     futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/exports", String(), zkutil::CreateMode::Persistent));
-    futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/export_fence", String(), zkutil::CreateMode::Persistent));
+    futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/export_ttl", String(), zkutil::CreateMode::Persistent));
+    futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/export_ttl/version", String(), zkutil::CreateMode::Persistent));
 
 
     futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/quorum/parallel", String(), zkutil::CreateMode::Persistent));
@@ -4641,7 +4642,7 @@ void StorageReplicatedMergeTree::mergeSelectingTask()
                     cleanup,
                     nullptr,
                     merge_predicate->getVersion(),
-                    merge_predicate->getExportFenceVersion(),
+                    merge_predicate->getExportIndexVersion(),
                     future_merged_part->merge_type);
 
                 if (create_result == CreateMergeEntryResult::Ok)
@@ -4887,7 +4888,7 @@ StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::c
     bool cleanup,
     ReplicatedMergeTreeLogEntryData * out_log_entry,
     int32_t log_version,
-    int32_t export_fence_version,
+    int32_t export_index_version,
     MergeType merge_type)
 {
     Strings exists_paths;
@@ -4946,8 +4947,8 @@ StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::c
 
     /// The merge was checked against the export states at this version: parts exported, being
     /// exported and not exported by the `EXPORT` TTL must not be merged together.
-    if (export_fence_version >= 0 && export_fence)
-        ops.emplace_back(zkutil::makeCheckRequest(export_fence->getFencePath(), export_fence_version));
+    if (export_index_version >= 0 && export_ttl_index)
+        ops.emplace_back(zkutil::makeCheckRequest(export_ttl_index->getVersionPath(), export_index_version));
 
     Coordination::Error code = zookeeper->tryMulti(ops, responses);
 
@@ -6858,7 +6859,7 @@ bool StorageReplicatedMergeTree::optimize(
                 cleanup,
                 &merge_entry,
                 merge_predicate->getVersion(),
-                merge_predicate->getExportFenceVersion(),
+                merge_predicate->getExportIndexVersion(),
                 select_merge_result.value()->merge_type);
 
             if (create_result == CreateMergeEntryResult::MissingPart)
@@ -8872,8 +8873,8 @@ void StorageReplicatedMergeTree::checkAllReplicasSupportExportTTL(const zkutil::
 
     if (!unsupported.empty())
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-            "Cannot export by TTL: replica(s) {} would merge exported parts with parts that are not exported. "
-            "Every replica must run a version that supports it with the server setting `allow_experimental_export_merge_tree_partition` "
+            "The `EXPORT` TTL is not supported by replica(s) {}, which would merge exported parts with parts that are not exported. "
+            "Every replica must run a version that supports it, with the server setting `allow_experimental_export_merge_tree_partition` "
             "enabled; drop the replicas that are lost",
             fmt::join(unsupported, ", "));
 }
@@ -8882,7 +8883,7 @@ void StorageReplicatedMergeTree::advertiseExportFeatures(const zkutil::ZooKeeper
 {
     const String path = fs::path(replica_path) / "export_features";
 
-    if (export_fence)
+    if (export_ttl_index)
     {
         const auto code = zookeeper->tryCreate(path, "ttl", zkutil::CreateMode::Persistent);
         if (code != Coordination::Error::ZOK && code != Coordination::Error::ZNODEEXISTS)
@@ -8930,11 +8931,11 @@ void StorageReplicatedMergeTree::forgetPartition(const ASTPtr & partition, Conte
 
     /// Block numbers of the partition start over, so a new part could reuse the block range of a part
     /// exported by the `EXPORT` TTL. The partition's index entries go with them, in the same transaction.
-    if (export_fence)
+    if (export_ttl_index)
     {
-        for (const auto & destination_key : export_fence->listDestinations(zookeeper))
+        for (const auto & destination_key : export_ttl_index->listDestinations(zookeeper))
         {
-            const auto versioned = export_fence->readIndexEntry(zookeeper, destination_key, partition_id);
+            const auto versioned = export_ttl_index->readIndexEntry(zookeeper, destination_key, partition_id);
             if (versioned.version < 0)
                 continue;
 
@@ -8943,11 +8944,11 @@ void StorageReplicatedMergeTree::forgetPartition(const ASTPtr & partition, Conte
                     "Partition {} is being exported by the EXPORT TTL (task {}), retry after it finishes",
                     partition_id, versioned.entry.claimed.begin()->first);
 
-            ops.emplace_back(zkutil::makeRemoveRequest(export_fence->getIndexEntryPath(destination_key, partition_id), versioned.version));
+            ops.emplace_back(zkutil::makeRemoveRequest(export_ttl_index->getIndexEntryPath(destination_key, partition_id), versioned.version));
         }
 
         if (ops.size() > 1)
-            ops.emplace_back(zkutil::makeSetRequest(export_fence->getFencePath(), "", -1));
+            ops.emplace_back(zkutil::makeSetRequest(export_ttl_index->getVersionPath(), "", -1));
     }
 
     Coordination::Responses responses;

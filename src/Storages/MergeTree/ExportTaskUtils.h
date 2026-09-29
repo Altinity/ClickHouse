@@ -120,7 +120,7 @@ namespace ExportTaskUtils
         const ContextPtr & context,
         MergeTreeData & source_storage,
         const String & replica_name,
-        const ReplicatedExportTTLIndex & export_fence
+        const ReplicatedExportTTLIndex & export_ttl_index
     );
 
     /// Handles a commit-phase failure for a replicated partition export:

@@ -408,7 +408,7 @@ void ReplicatedExportTaskScheduler::handlePartExportSuccess(
     try
     {
         auto context = ExportTaskUtils::getContextCopyWithTaskSettings(storage.getContext(), manifest);
-        ExportTaskUtils::commit(manifest, destination_storage, zk, storage.log.load(), export_path, context, storage, storage.replica_name, *storage.export_fence);
+        ExportTaskUtils::commit(manifest, destination_storage, zk, storage.log.load(), export_path, context, storage, storage.replica_name, *storage.export_ttl_index);
     }
     catch (const Exception & e)
     {

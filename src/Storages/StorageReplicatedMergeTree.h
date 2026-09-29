@@ -380,8 +380,8 @@ public:
     std::vector<ExportTaskInfo> getExportTasksInfo() const override;
 
     /// nullptr if partition export is disabled.
-    ReplicatedExportTTLIndexPtr getExportFence() const { return export_fence; }
-    ExportFencePtr getLatestExportFence() const override { return export_fence ? export_fence->getLatest() : nullptr; }
+    ReplicatedExportTTLIndexPtr getExportTTLIndex() const { return export_ttl_index; }
+    ExportFencePtr getLatestExportFence() const override { return export_ttl_index ? export_ttl_index->getLatest() : nullptr; }
 
 private:
     std::atomic_bool are_restoring_replica {false};
@@ -541,7 +541,7 @@ private:
     /// The export index of the `EXPORT` TTL and the merge fence built from it. Only created when
     /// partition export is enabled; a replica without it must not assign merges of parts exported by
     /// the TTL, which is why it does not advertise `export_features`.
-    ReplicatedExportTTLIndexPtr export_fence;
+    ReplicatedExportTTLIndexPtr export_ttl_index;
 
     /// Runs `export_ttl_scheduler`.
     BackgroundSchedulePoolTaskHolder export_ttl_task;
@@ -804,7 +804,7 @@ private:
         bool cleanup,
         ReplicatedMergeTreeLogEntryData * out_log_entry,
         int32_t log_version,
-        int32_t export_fence_version,
+        int32_t export_index_version,
         MergeType merge_type);
 
     CreateMergeEntryResult createLogEntryToMutatePart(
@@ -999,6 +999,7 @@ private:
 
     /// Throws unless every replica enforces the export states of parts when assigning merges.
     void checkAllReplicasSupportExportTTL(const zkutil::ZooKeeperPtr & zookeeper) const;
+    void checkReplicasSupportExportTTL() const override { checkAllReplicasSupportExportTTL(getZooKeeper()); }
 
     /// Creates (or removes, if partition export is disabled) `<replica_path>/export_features`.
     void advertiseExportFeatures(const zkutil::ZooKeeperPtr & zookeeper) const;

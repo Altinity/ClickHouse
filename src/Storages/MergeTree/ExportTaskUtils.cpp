@@ -525,7 +525,7 @@ namespace
         const ContextPtr & context_in,
         MergeTreeData & source_storage,
         const String & replica_name,
-        const ReplicatedExportTTLIndex & export_fence)
+        const ReplicatedExportTTLIndex & export_ttl_index)
     {
         /// Failpoint used by integration tests to force persistent commit failure and exercise
         /// the commit-attempts budget / FAILED state transition.
@@ -654,14 +654,14 @@ namespace
 
             if (is_ttl_task)
             {
-                auto versioned = export_fence.readIndexEntry(zk, destination_key, partition_id);
+                auto versioned = export_ttl_index.readIndexEntry(zk, destination_key, partition_id);
                 if (versioned.version < 0)
-                    export_fence.ensureDestination(zk, destination_key, fmt::format("{}.{}", manifest.destination_database, manifest.destination_table));
+                    export_ttl_index.ensureDestination(zk, destination_key, fmt::format("{}.{}", manifest.destination_database, manifest.destination_table));
 
                 versioned.entry.commitClaim(manifest.transaction_id, ExportTTLUtils::rangesOfParts(manifest.parts, source_storage.format_version));
                 for (const auto & retried : manifest.retry_of)
                     versioned.entry.releaseClaim(retried.transaction_id);
-                export_fence.appendUpdateEntryOps(ops, destination_key, versioned.entry, versioned.version);
+                export_ttl_index.appendUpdateEntryOps(ops, destination_key, versioned.entry, versioned.version);
             }
 
             ProfileEvents::increment(ProfileEvents::ExportTaskZooKeeperRequests);

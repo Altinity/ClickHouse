@@ -713,7 +713,7 @@ void ReplicatedExportTaskUpdater::poll()
         /// A replica exported the last part but the commit never landed. Try to fix it.
         try
         {
-            ExportTaskUtils::commit(work.metadata, work.destination_storage, zk, log, work.entry_path, work.context, storage, storage.getReplicaName(), *storage.export_fence);
+            ExportTaskUtils::commit(work.metadata, work.destination_storage, zk, log, work.entry_path, work.context, storage, storage.getReplicaName(), *storage.export_ttl_index);
         }
         catch (const Exception & e)
         {

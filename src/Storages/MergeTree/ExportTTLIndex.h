@@ -75,7 +75,7 @@ struct ExportTTLVersionedEntry
 /// The whole export index of a table as of one version, with the merge fence built from it.
 struct ExportTTLIndexSnapshot
 {
-    /// Version of the `export_fence` node of a `ReplicatedMergeTree` it was read at: every change of
+    /// Version of the `export_ttl/version` node of a `ReplicatedMergeTree` it was read at: every change of
     /// the index bumps it, so the snapshot stays valid while it does not change. -1 for a plain `MergeTree`.
     int32_t version = -1;
 
