@@ -137,11 +137,15 @@ def partition_settled(rows, partition_id, exported=None):
     return exported is None or row["exported_parts"] == exported
 
 
-def wait_for_partitions_exported(node, table, partition_ids, timeout=90):
-    """Wait until nothing of *partition_ids* is claimed or eligible and no TTL task is in flight."""
+def wait_for_partitions_exported(node, table, partition_ids, timeout=90, exported=None):
+    """Wait until nothing of *partition_ids* is claimed or eligible and no TTL task is in flight.
+
+    A check that runs before a part is due already publishes that partition with nothing eligible, so
+    pass *exported* when the wait must see the parts recorded as exported rather than merely not due.
+    """
     def settled():
         rows = ttl_rows(node, table)
-        if any(not partition_settled(rows, partition_id) for partition_id in partition_ids):
+        if any(not partition_settled(rows, partition_id, exported) for partition_id in partition_ids):
             return None
         return pending_ttl_tasks(node, table) == 0 and rows
 

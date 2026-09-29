@@ -82,7 +82,12 @@ def test_part_becoming_due_wakes_the_scheduler(cluster, source_engine):
     """A check computes when the next part becomes due, and the scheduler wakes up then instead of
     waiting for the check period."""
     node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(node, source_engine, settings={"ttl_export_check_period_seconds": 120})
+    # The batch window is disabled so the wake at the due time exports the part. The default window
+    # would hold it for another minute, past the bound that distinguishes this wake from the check period.
+    mt_table, iceberg_table = make_tables(
+        node, source_engine,
+        settings={"ttl_export_check_period_seconds": 120, "ttl_export_batch_window_seconds": 0, "ttl_export_batch_max_delay_seconds": 0},
+    )
 
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {due_in(12)})")
     inserted = time.time()
@@ -94,7 +99,8 @@ def test_part_becoming_due_wakes_the_scheduler(cluster, source_engine):
         assert ttl_tasks(node, mt_table) == [], "The part was exported before it was due"
         time.sleep(1)
 
-    wait_for_partitions_exported(node, mt_table, ["2020"], timeout=40)
+    # That check already shows the partition as idle, so wait until the part is recorded as exported.
+    wait_for_partitions_exported(node, mt_table, ["2020"], timeout=40, exported=1)
     assert time.time() - inserted < 40, "The part was exported only by a periodic check"
     assert_exactly_once(iceberg_ids(node, iceberg_table), [1])
     assert_one_snapshot_per_task(node, mt_table, iceberg_table)
