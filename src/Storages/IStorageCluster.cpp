@@ -794,6 +794,14 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         if (!removeJoin(*select_query, rewriter_result, context))
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to strip JOIN from query sent to cluster nodes");
 
+        /// `removeJoin` drops the ORDER BY and GROUP BY expressions but leaves `order_by_all` and
+        /// `group_by_all` set. The non-join branch below clears both flags. `IStorageCluster::read`
+        /// re-analyzes this AST with `TreeRewriter`, which still honors them: `ORDER BY ALL`
+        /// dereferences a null `orderBy`, and `GROUP BY ALL` aggregates the stripped left columns
+        /// on the shards before the initiator join.
+        select_query->group_by_all = false;
+        select_query->order_by_all = false;
+
         /// `removeJoin` keeps left-table WHERE, including `GLOBAL IN (_subqueryN)`, which remotes cannot resolve.
         if (astContainsInTableIdentifier(select_query->where()) || astContainsInTableIdentifier(select_query->prewhere())
             || astContainsSubquery(select_query->where()) || astContainsSubquery(select_query->prewhere()))
