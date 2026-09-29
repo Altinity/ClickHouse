@@ -1,5 +1,4 @@
 #include <Core/Settings.h>
-#include <DataTypes/DataTypeNullable.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <Interpreters/Context.h>
@@ -819,39 +818,22 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
             if (current_field->getValue<bool>(Iceberg::f_required) == new_type.second
                 && icebergTypesEqualIgnoringIds(current_field->get(Iceberg::f_type), new_type.first))
             {
-                auto existing_iceberg_type = current_field->get(Iceberg::f_type);
-                if (existing_iceberg_type.isString())
-                {
-                    auto reconstructed_ch_type = Iceberg::IcebergSchemaProcessor::getSimpleType(
-                        existing_iceberg_type.extract<String>(),
-                        context,
-                        context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
-                    if (!current_field->getValue<bool>(Iceberg::f_required) && reconstructed_ch_type->canBeInsideNullable())
-                        reconstructed_ch_type = makeNullable(reconstructed_ch_type);
+                Iceberg::IcebergSchemaProcessor schema_processor(
+                    context, context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
+                auto current_ch_type = schema_processor.getClickHouseFieldType(current_field, context);
 
-                    if (!reconstructed_ch_type->equals(*type))
-                        throw Exception(
-                            ErrorCodes::BAD_ARGUMENTS,
-                            "Cannot MODIFY COLUMN '{}' from {} to {}: both map to the same Iceberg type '{}' "
-                            "so the change cannot be recorded in the Iceberg schema",
-                            column_name,
-                            reconstructed_ch_type->getName(),
-                            type->getName(),
-                            existing_iceberg_type.extract<String>());
-
-                    if (!needs_reposition)
-                        return false;
-                }
-                else if (!needs_reposition)
-                {
-                    /// The original ClickHouse type of a complex field cannot be reconstructed here, so a
-                    /// restated complex type is allowed only together with a reposition.
+                if (!current_ch_type->equals(*type))
                     throw Exception(
                         ErrorCodes::BAD_ARGUMENTS,
-                        "Cannot MODIFY COLUMN '{}': the requested and existing types both map to the same "
-                        "Iceberg complex type, and the change cannot be recorded in the Iceberg schema",
-                        column_name);
-                }
+                        "Cannot MODIFY COLUMN '{}' from {} to {}: both map to the same Iceberg type '{}' "
+                        "so the change cannot be recorded in the Iceberg schema",
+                        column_name,
+                        current_ch_type->getName(),
+                        type->getName(),
+                        current_field->get(Iceberg::f_type).toString());
+
+                if (!needs_reposition)
+                    return false;
             }
             else
             {

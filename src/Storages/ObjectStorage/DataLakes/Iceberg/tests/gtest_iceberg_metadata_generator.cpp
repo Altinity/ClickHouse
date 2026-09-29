@@ -6,6 +6,7 @@
 
 #include <Common/Exception.h>
 #include <Common/tests/gtest_global_context.h>
+#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeString.h>
@@ -769,6 +770,88 @@ TEST(IcebergMetadataGenerator, ModifyColumnAfterItselfAppliesTypeAndKeepsPositio
     auto stored_type = findCurrentFieldType(metadata, "x");
     ASSERT_TRUE(stored_type.isString());
     EXPECT_EQ(stored_type.extract<String>(), "long");
+}
+
+namespace
+{
+
+/// Metadata whose current schema holds `x int` followed by `t` of the given complex Iceberg type.
+Poco::JSON::Object::Ptr makeMetadataWithIntAndComplexField(const Poco::JSON::Object::Ptr & complex_type, Int32 last_column_id)
+{
+    auto metadata = makeMetadataWithField("x", "int", /* required */ true, last_column_id);
+    auto field = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    field->set(f_id, 2);
+    field->set(f_name, "t");
+    field->set(f_required, true);
+    field->set(f_type, complex_type);
+    metadata->getArray(f_schemas)->getObject(0)->getArray(f_fields)->add(field);
+    return metadata;
+}
+
+Poco::JSON::Object::Ptr makeListType(const String & element_type, Int32 element_id)
+{
+    auto type = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    type->set(f_type, "list");
+    type->set(f_element_id, element_id);
+    type->set(f_element, element_type);
+    type->set(f_element_required, true);
+    return type;
+}
+
+DataTypePtr makeTupleOf(const DataTypePtr & element_type)
+{
+    return std::make_shared<DataTypeTuple>(DataTypes{element_type}, Names{"a"});
+}
+
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnRejectsIndistinguishableComplexTypeWithFirst)
+{
+    /// Tuple(a Int32) and Tuple(a UInt32) are one Iceberg struct; positioning must not make the change recordable.
+    auto metadata = makeMetadataWithIntAndComplexField(makeStructType("a", "int", 3), /* last_column_id */ 3);
+    expectModifyRejected(metadata, "t", makeTupleOf(std::make_shared<DataTypeUInt32>()), /* first */ true);
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnRejectsIndistinguishableComplexTypeWithAfter)
+{
+    auto metadata = makeMetadataWithIntAndComplexField(makeStructType("a", "int", 3), /* last_column_id */ 3);
+    expectModifyRejected(metadata, "t", makeTupleOf(std::make_shared<DataTypeUInt32>()), /* first */ false, /* after_column */ "x");
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnRejectsIndistinguishableArrayTypeWithFirst)
+{
+    auto metadata = makeMetadataWithIntAndComplexField(makeListType("int", 3), /* last_column_id */ 3);
+    expectModifyRejected(
+        metadata, "t", std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt32>()), /* first */ true);
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnSameComplexTypeWithFirstOnlyRepositions)
+{
+    auto metadata = makeMetadataWithIntAndComplexField(makeStructType("a", "int", 3), /* last_column_id */ 3);
+
+    EXPECT_TRUE(MetadataGenerator(metadata).generateModifyColumnMetadata(
+        "t", makeTupleOf(std::make_shared<DataTypeInt32>()), getContext().context, /* first */ true));
+
+    auto names = getCurrentFieldNames(metadata);
+    ASSERT_EQ(names.size(), 2u);
+    EXPECT_EQ(names[0], "t");
+    EXPECT_EQ(names[1], "x");
+
+    auto stored_type = findCurrentFieldType(metadata, "t");
+    ASSERT_EQ(stored_type.type(), typeid(Poco::JSON::Object::Ptr));
+    auto stored_fields = stored_type.extract<Poco::JSON::Object::Ptr>()->getArray(f_fields);
+    ASSERT_EQ(stored_fields->size(), 1u);
+    EXPECT_EQ(stored_fields->getObject(0)->getValue<String>(f_type), "int");
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnToComplexTypeAlreadyInSchemaAddsNoSchema)
+{
+    auto metadata = makeMetadataWithIntAndComplexField(makeStructType("a", "int", 3), /* last_column_id */ 3);
+    const auto before = readSchemaState(metadata);
+
+    EXPECT_FALSE(MetadataGenerator(metadata).generateModifyColumnMetadata(
+        "t", makeTupleOf(std::make_shared<DataTypeInt32>()), getContext().context));
+    expectSchemaUnchanged(metadata, before);
 }
 
 #endif

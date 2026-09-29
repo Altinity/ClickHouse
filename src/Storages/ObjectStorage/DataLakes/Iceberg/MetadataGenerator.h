@@ -50,6 +50,7 @@ public:
 
     void generateDropColumnMetadata(const String & column_name);
     /// Returns false when neither the type nor the position changed (true no-op).
+    /// Throws when the requested type differs from the current one but maps to the same Iceberg type.
     /// `context` supplies the settings used to map the stored Iceberg type back to a ClickHouse
     /// type (the timestamptz timezone and whether geo types are allowed).
     bool generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context, bool first = false, const String & after_column = {});

@@ -158,3 +158,38 @@ def test_modify_column_after_itself(started_cluster_iceberg_no_spark, format_ver
     assert columns == "a\tInt32\nb\tNullable(Int64)\nc\tNullable(String)", columns
 
     assert instance.query(f"SELECT * FROM {TABLE_NAME}").strip() == "1\t10\tx"
+
+
+@pytest.mark.parametrize("format_version", [1, 2])
+@pytest.mark.parametrize("storage_type", ["local", "s3"])
+def test_modify_column_complex_type_with_position(started_cluster_iceberg_no_spark, format_version, storage_type):
+    """An unrecordable complex type change is rejected with FIRST/AFTER, restating the same type only moves the column."""
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    TABLE_NAME = "test_modify_complex_pos_" + storage_type + "_" + get_uuid_str()
+
+    create_iceberg_table(
+        storage_type,
+        instance,
+        TABLE_NAME,
+        started_cluster_iceberg_no_spark,
+        "(x Int32, t Tuple(a Int32))",
+        format_version,
+    )
+
+    instance.query(f"INSERT INTO {TABLE_NAME} VALUES (1, tuple(10));", settings=INSERT_SETTINGS)
+
+    for clause in ["FIRST", "AFTER x"]:
+        error = instance.query_and_get_error(
+            f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN t Tuple(a UInt32) {clause};",
+            settings=INSERT_SETTINGS,
+        )
+        assert "BAD_ARGUMENTS" in error, error
+
+    instance.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN t Tuple(a Int32) FIRST;", settings=INSERT_SETTINGS)
+
+    columns = instance.query(
+        f"SELECT name, type FROM system.columns WHERE database = currentDatabase() AND table = '{TABLE_NAME}' ORDER BY position"
+    ).strip()
+    assert columns == "t\tTuple(a Int32)\nx\tInt32", columns
+
+    assert instance.query(f"SELECT * FROM {TABLE_NAME}").strip() == "(10)\t1"
