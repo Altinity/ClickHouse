@@ -999,7 +999,7 @@ private:
 
     /// Throws unless every replica enforces the export states of parts when assigning merges.
     void checkAllReplicasSupportExportTTL(const zkutil::ZooKeeperPtr & zookeeper) const;
-    void checkReplicasSupportExportTTL() const override { checkAllReplicasSupportExportTTL(getZooKeeper()); }
+    void checkReplicasSupportExportTTL() const override;
 
     /// Creates (or removes, if partition export is disabled) `<replica_path>/export_features`.
     void advertiseExportFeatures(const zkutil::ZooKeeperPtr & zookeeper) const;

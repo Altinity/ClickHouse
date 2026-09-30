@@ -16,6 +16,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int INCORRECT_DATA;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace
@@ -58,25 +59,16 @@ Int64 ExportTTLIndexEntry::maxBlock() const
     Int64 result = 0;
     for (const auto & range : exported)
         result = std::max(result, range.max_block);
-    for (const auto & [_, ranges] : claimed)
-        for (const auto & range : ranges)
+    if (claim)
+        for (const auto & range : claim->ranges)
             result = std::max(result, range.max_block);
     return result;
 }
 
-std::vector<MergeTreePartInfo> ExportTTLIndexEntry::allClaimed() const
-{
-    std::vector<MergeTreePartInfo> result;
-    for (const auto & [_, ranges] : claimed)
-        result.insert(result.end(), ranges.begin(), ranges.end());
-    return ExportFenceUtils::compactRanges(std::move(result));
-}
-
 PartExportState ExportTTLIndexEntry::classify(const MergeTreePartInfo & part) const
 {
-    for (const auto & [_, ranges] : claimed)
-        if (ExportFenceUtils::intersectsAny(part, ranges))
-            return PartExportState::CLAIMED;
+    if (claim && ExportFenceUtils::intersectsAny(part, claim->ranges))
+        return PartExportState::CLAIMED;
     if (ExportFenceUtils::intersectsAny(part, exported))
         return PartExportState::EXPORTED;
     return PartExportState::NONE;
@@ -87,47 +79,34 @@ ExportFenceEntry ExportTTLIndexEntry::toFenceEntry(const String & destination) c
     ExportFenceEntry entry;
     entry.destination = destination;
     entry.exported = exported;
-    entry.claimed = allClaimed();
+    if (claim)
+        entry.claimed = claim->ranges;
     return entry;
 }
 
-void ExportTTLIndexEntry::claim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts)
+void ExportTTLIndexEntry::startClaim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts)
 {
-    auto & ranges = claimed[transaction_id];
+    if (claim)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Export task {} cannot claim parts of partition {}, which export task {} claimed",
+            transaction_id, partition_id, claim->transaction_id);
+
+    std::vector<MergeTreePartInfo> ranges;
+    ranges.reserve(parts.size());
     for (const auto & part : parts)
         ranges.emplace_back(partition_id, part.min_block, part.max_block, 0, 0);
-    ranges = ExportFenceUtils::compactRanges(std::move(ranges));
-}
-
-void ExportTTLIndexEntry::moveClaims(const std::vector<String> & from, const String & to)
-{
-    auto & target = claimed[to];
-    for (const auto & transaction_id : from)
-    {
-        const auto it = claimed.find(transaction_id);
-        if (it == claimed.end() || transaction_id == to)
-            continue;
-        target.insert(target.end(), it->second.begin(), it->second.end());
-        claimed.erase(it);
-    }
-    target = ExportFenceUtils::compactRanges(std::move(target));
+    claim = Claim{.transaction_id = transaction_id, .ranges = ExportFenceUtils::compactRanges(std::move(ranges))};
 }
 
 void ExportTTLIndexEntry::commitClaim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts)
 {
-    if (const auto it = claimed.find(transaction_id); it != claimed.end())
+    if (claim && claim->transaction_id == transaction_id)
     {
-        exported.insert(exported.end(), it->second.begin(), it->second.end());
-        claimed.erase(it);
+        exported.insert(exported.end(), claim->ranges.begin(), claim->ranges.end());
+        claim.reset();
     }
     for (const auto & part : parts)
         exported.emplace_back(partition_id, part.min_block, part.max_block, 0, 0);
     exported = ExportFenceUtils::compactRanges(std::move(exported));
-}
-
-void ExportTTLIndexEntry::releaseClaim(const String & transaction_id)
-{
-    claimed.erase(transaction_id);
 }
 
 String ExportTTLIndexEntry::toJSONString() const
@@ -135,10 +114,13 @@ String ExportTTLIndexEntry::toJSONString() const
     Poco::JSON::Object json;
     json.set("exported", rangesToJSON(exported));
 
-    Poco::JSON::Object::Ptr claimed_object = new Poco::JSON::Object();
-    for (const auto & [transaction_id, ranges] : claimed)
-        claimed_object->set(transaction_id, rangesToJSON(ranges));
-    json.set("claimed", claimed_object);
+    if (claim)
+    {
+        Poco::JSON::Object::Ptr claim_object = new Poco::JSON::Object();
+        claim_object->set("transaction_id", claim->transaction_id);
+        claim_object->set("ranges", rangesToJSON(claim->ranges));
+        json.set("claim", claim_object);
+    }
 
     std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
     oss.exceptions(std::ios::failbit);
@@ -160,11 +142,12 @@ ExportTTLIndexEntry ExportTTLIndexEntry::fromJSONString(const String & partition
 
     entry.exported = ExportFenceUtils::compactRanges(rangesFromJSON(partition_id, json->getArray("exported")));
 
-    if (const auto claimed_object = json->getObject("claimed"))
+    if (const auto claim_object = json->getObject("claim"))
     {
-        for (const auto & transaction_id : claimed_object->getNames())
-            entry.claimed[transaction_id] = ExportFenceUtils::compactRanges(
-                rangesFromJSON(partition_id, claimed_object->getArray(transaction_id)));
+        entry.claim = Claim{
+            .transaction_id = claim_object->getValue<String>("transaction_id"),
+            .ranges = ExportFenceUtils::compactRanges(rangesFromJSON(partition_id, claim_object->getArray("ranges"))),
+        };
     }
 
     return entry;

@@ -3,6 +3,8 @@
 #include <Storages/MergeTree/ExportTTLIndex.h>
 #include <Storages/MergeTree/MergeTreeDataPartTTLInfo.h>
 #include <Storages/TTLDescription.h>
+#include <Common/Exception.h>
+#include <base/defines.h>
 
 using namespace DB;
 
@@ -31,13 +33,16 @@ TEST(ExportTTLIndex, ClaimThenCommit)
     ExportTTLIndexEntry entry;
     entry.partition_id = "p";
 
-    entry.claim("t1", {part(1, 1), part(2, 2), part(4, 4)});
-    EXPECT_EQ(blocks(entry.claimed.at("t1")), (Blocks{{1, 2}, {4, 4}}));
+    entry.startClaim("t1", {part(1, 1), part(2, 2), part(4, 4)});
+    ASSERT_TRUE(entry.claim);
+    EXPECT_EQ(entry.claim->transaction_id, "t1");
+    EXPECT_EQ(blocks(entry.claim->ranges), (Blocks{{1, 2}, {4, 4}}));
+    EXPECT_EQ(blocks(entry.toFenceEntry("db.t").claimed), (Blocks{{1, 2}, {4, 4}}));
     EXPECT_EQ(entry.classify(part(1, 2, 1)), PartExportState::CLAIMED);
     EXPECT_EQ(entry.classify(part(3, 3)), PartExportState::NONE);
 
     entry.commitClaim("t1", {});
-    EXPECT_TRUE(entry.claimed.empty());
+    EXPECT_FALSE(entry.claim);
     EXPECT_EQ(blocks(entry.exported), (Blocks{{1, 2}, {4, 4}}));
     /// A mutated exported part keeps its block range.
     EXPECT_EQ(entry.classify(part(4, 4, 0, 7)), PartExportState::EXPORTED);
@@ -49,29 +54,41 @@ TEST(ExportTTLIndex, RetryReclaimsExactRanges)
 {
     ExportTTLIndexEntry entry;
     entry.partition_id = "p";
-    entry.claim("t1", {part(1, 1), part(2, 2)});
+    entry.startClaim("t1", {part(1, 1), part(2, 2)});
 
     /// Part 2 was dropped before the retry, part 5 became eligible meanwhile.
-    entry.releaseClaim("t1");
-    entry.claim("t2", {part(1, 1), part(5, 5)});
+    entry.releaseClaim();
+    entry.startClaim("t2", {part(1, 1), part(5, 5)});
 
-    EXPECT_FALSE(entry.claimed.contains("t1"));
-    EXPECT_EQ(blocks(entry.claimed.at("t2")), (Blocks{{1, 1}, {5, 5}}));
+    ASSERT_TRUE(entry.claim);
+    EXPECT_EQ(entry.claim->transaction_id, "t2");
+    EXPECT_EQ(blocks(entry.claim->ranges), (Blocks{{1, 1}, {5, 5}}));
     EXPECT_EQ(entry.classify(part(2, 2)), PartExportState::NONE);
-    EXPECT_EQ(blocks(entry.allClaimed()), (Blocks{{1, 1}, {5, 5}}));
+    EXPECT_EQ(entry.maxBlock(), 5);
 }
 
-TEST(ExportTTLIndex, MoveClaims)
+/// A second claim is a `LOGICAL_ERROR`, which aborts debug and sanitizer builds instead of throwing.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(ExportTTLIndex, OneClaimAtATime)
 {
     ExportTTLIndexEntry entry;
     entry.partition_id = "p";
-    entry.claim("t1", {part(1, 1)});
-    entry.claim("t2", {part(2, 2)});
+    entry.startClaim("t1", {part(1, 1)});
 
-    entry.moveClaims({"t1", "t2", "missing"}, "t3");
-    EXPECT_EQ(entry.claimed.size(), 1);
-    EXPECT_EQ(blocks(entry.claimed.at("t3")), (Blocks{{1, 2}}));
+    EXPECT_THROW(entry.startClaim("t2", {part(2, 2)}), Exception);
+    EXPECT_EQ(entry.claim->transaction_id, "t1");
+    EXPECT_EQ(blocks(entry.claim->ranges), (Blocks{{1, 1}}));
 }
+#else
+TEST(ExportTTLIndexDeathTest, OneClaimAtATime)
+{
+    ExportTTLIndexEntry entry;
+    entry.partition_id = "p";
+    entry.startClaim("t1", {part(1, 1)});
+
+    EXPECT_DEATH(entry.startClaim("t2", {part(2, 2)}), "cannot claim parts of partition p");
+}
+#endif
 
 TEST(ExportTTLIndex, CommitAddsPartsWhoseClaimWasLost)
 {
@@ -79,6 +96,13 @@ TEST(ExportTTLIndex, CommitAddsPartsWhoseClaimWasLost)
     entry.partition_id = "p";
     entry.commitClaim("t1", {part(3, 5)});
     EXPECT_EQ(blocks(entry.exported), (Blocks{{3, 5}}));
+
+    /// The claim of another task is kept.
+    entry.startClaim("t2", {part(7, 7)});
+    entry.commitClaim("t1", {part(6, 6)});
+    EXPECT_EQ(blocks(entry.exported), (Blocks{{3, 6}}));
+    ASSERT_TRUE(entry.claim);
+    EXPECT_EQ(entry.claim->transaction_id, "t2");
 }
 
 TEST(ExportTTLIndex, JsonRoundTrip)
@@ -86,13 +110,18 @@ TEST(ExportTTLIndex, JsonRoundTrip)
     ExportTTLIndexEntry entry;
     entry.partition_id = "p";
     entry.exported = {part(0, 10), part(20, 30)};
-    entry.claim("t1", {part(31, 31)});
 
-    const auto parsed = ExportTTLIndexEntry::fromJSONString("p", entry.toJSONString());
+    auto parsed = ExportTTLIndexEntry::fromJSONString("p", entry.toJSONString());
+    EXPECT_EQ(blocks(parsed.exported), (Blocks{{0, 10}, {20, 30}}));
+    EXPECT_FALSE(parsed.claim);
+
+    entry.startClaim("t1", {part(31, 31)});
+    parsed = ExportTTLIndexEntry::fromJSONString("p", entry.toJSONString());
     EXPECT_EQ(parsed.partition_id, "p");
     EXPECT_EQ(blocks(parsed.exported), (Blocks{{0, 10}, {20, 30}}));
-    ASSERT_TRUE(parsed.claimed.contains("t1"));
-    EXPECT_EQ(blocks(parsed.claimed.at("t1")), (Blocks{{31, 31}}));
+    ASSERT_TRUE(parsed.claim);
+    EXPECT_EQ(parsed.claim->transaction_id, "t1");
+    EXPECT_EQ(blocks(parsed.claim->ranges), (Blocks{{31, 31}}));
 
     EXPECT_TRUE(ExportTTLIndexEntry::fromJSONString("p", "").empty());
     EXPECT_ANY_THROW(ExportTTLIndexEntry::fromJSONString("p", R"({"exported":[[1]]})"));

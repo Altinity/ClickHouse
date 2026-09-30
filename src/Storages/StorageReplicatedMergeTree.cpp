@@ -8879,6 +8879,12 @@ void StorageReplicatedMergeTree::checkAllReplicasSupportExportTTL(const zkutil::
             fmt::join(unsupported, ", "));
 }
 
+void StorageReplicatedMergeTree::checkReplicasSupportExportTTL() const
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::checkReplicasSupportExportTTL");
+    checkAllReplicasSupportExportTTL(getZooKeeper());
+}
+
 void StorageReplicatedMergeTree::advertiseExportFeatures(const zkutil::ZooKeeperPtr & zookeeper) const
 {
     const String path = fs::path(replica_path) / "export_features";
@@ -8939,10 +8945,10 @@ void StorageReplicatedMergeTree::forgetPartition(const ASTPtr & partition, Conte
             if (versioned.version < 0)
                 continue;
 
-            if (!versioned.entry.claimed.empty())
+            if (versioned.entry.claim)
                 throw Exception(ErrorCodes::CANNOT_FORGET_PARTITION,
                     "Partition {} is being exported by the EXPORT TTL (task {}), retry after it finishes",
-                    partition_id, versioned.entry.claimed.begin()->first);
+                    partition_id, versioned.entry.claim->transaction_id);
 
             ops.emplace_back(zkutil::makeRemoveRequest(export_ttl_index->getIndexEntryPath(destination_key, partition_id), versioned.version));
         }

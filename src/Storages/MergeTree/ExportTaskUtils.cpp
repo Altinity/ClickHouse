@@ -659,8 +659,6 @@ namespace
                     export_ttl_index.ensureDestination(zk, destination_key, fmt::format("{}.{}", manifest.destination_database, manifest.destination_table));
 
                 versioned.entry.commitClaim(manifest.transaction_id, ExportTTLUtils::rangesOfParts(manifest.parts, source_storage.format_version));
-                for (const auto & retried : manifest.retry_of)
-                    versioned.entry.releaseClaim(retried.transaction_id);
                 export_ttl_index.appendUpdateEntryOps(ops, destination_key, versioned.entry, versioned.version);
             }
 

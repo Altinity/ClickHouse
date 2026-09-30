@@ -14,9 +14,6 @@
 #include <algorithm>
 #include <set>
 
-#include <fmt/ranges.h>
-#include <unordered_set>
-
 namespace CurrentMetrics
 {
     extern const Metric ExportTTLPartsHeldByDeleteGate;
@@ -221,9 +218,9 @@ UInt64 ExportTTLScheduler::run()
     if (act)
     {
         for (const auto & [_, versioned] : index)
-            for (const auto & [transaction_id, ranges] : versioned.entry.claimed)
-                if (getCachedTaskState(task_states, transaction_id).status == TaskStatus::PENDING)
-                    ++in_flight;
+            if (const auto & claim = versioned.entry.claim;
+                claim && getCachedTaskState(task_states, claim->transaction_id).status == TaskStatus::PENDING)
+                ++in_flight;
     }
 
     std::set<String> partition_ids;
@@ -310,46 +307,42 @@ UInt64 ExportTTLScheduler::run()
     return static_cast<UInt64>(std::max<time_t>(1, next_tick - now)) * 1000;
 }
 
-ExportTTLScheduler::ResolvedClaims ExportTTLScheduler::resolveClaims(
+ExportTTLScheduler::ResolvedClaim ExportTTLScheduler::resolveClaim(
     ExportTTLIndexEntry & entry, const StoragePtr & destination, TaskStates & task_states, const ContextPtr & context)
 {
-    ResolvedClaims result;
+    ResolvedClaim result;
+    if (!entry.claim)
+        return result;
 
-    std::vector<String> transaction_ids;
-    for (const auto & [transaction_id, _] : entry.claimed)
-        transaction_ids.push_back(transaction_id);
-
-    for (const auto & transaction_id : transaction_ids)
+    const auto transaction_id = entry.claim->transaction_id;
+    const auto & state = getCachedTaskState(task_states, transaction_id);
+    switch (state.status)
     {
-        const auto & state = getCachedTaskState(task_states, transaction_id);
-        switch (state.status)
-        {
-            case TaskStatus::PENDING:
-                result.in_flight = transaction_id;
-                break;
+        case TaskStatus::PENDING:
+            result.in_flight = transaction_id;
+            break;
 
-            case TaskStatus::COMPLETED:
-                /// The commit of a plain `MergeTree` records it here, after the task is marked completed.
+        case TaskStatus::COMPLETED:
+            /// The commit of a plain `MergeTree` records it here, after the task is marked completed.
+            entry.commitClaim(transaction_id, {});
+            result.changed = true;
+            break;
+
+        case TaskStatus::FAILED:
+        case TaskStatus::KILLED:
+        case TaskStatus::MISSING:
+            /// E.g. a commit that landed and then the task timed out before it was marked completed.
+            if (state.reached_commit && destination->isExportTransactionCommitted(transaction_id, context))
+            {
+                LOG_INFO(log, "Export task {} of partition {} did not complete, but it committed to the destination",
+                    transaction_id, entry.partition_id);
                 entry.commitClaim(transaction_id, {});
                 result.changed = true;
                 break;
+            }
 
-            case TaskStatus::FAILED:
-            case TaskStatus::KILLED:
-            case TaskStatus::MISSING:
-                /// E.g. a commit that landed and then the task timed out before it was marked completed.
-                if (state.reached_commit && destination->isExportTransactionCommitted(transaction_id, context))
-                {
-                    LOG_INFO(log, "Export task {} of partition {} did not complete, but it committed to the destination",
-                        transaction_id, entry.partition_id);
-                    entry.commitClaim(transaction_id, {});
-                    result.changed = true;
-                    break;
-                }
-
-                result.failed.push_back(transaction_id);
-                break;
-        }
+            result.failed = transaction_id;
+            break;
     }
 
     return result;
@@ -357,48 +350,39 @@ ExportTTLScheduler::ResolvedClaims ExportTTLScheduler::resolveClaims(
 
 ExportRetriedTasks ExportTTLScheduler::collectRetriedTasks(
     const ExportTTLIndexEntry & entry,
-    const std::vector<String> & failed,
+    const String & failed,
     const StoragePtr & destination,
     time_t now,
     TaskStates & task_states,
     const ContextPtr & context)
 {
     ExportRetriedTasks result;
-    std::unordered_set<String> added;
+    const auto & state = getCachedTaskState(task_states, failed);
 
-    for (const auto & transaction_id : failed)
+    /// A task that did not export all its parts never committed, and a missing one was either
+    /// never created or checked when it went missing.
+    if (state.status != TaskStatus::MISSING && state.reached_commit)
+        result.push_back(ExportRetriedTask{
+            .transaction_id = failed,
+            .block_ranges = ExportTTLUtils::toBlockRanges(entry.claim->ranges),
+            .failed_time = now,
+        });
+
+    for (const auto & retried : state.retry_of)
     {
-        const auto & state = getCachedTaskState(task_states, transaction_id);
+        /// Past the window, and with no commit of it in progress, the task is checked once more,
+        /// and not retried by the next groups if it did not land.
+        const bool may_land = now < retried.failed_time + late_commit_window_seconds
+            || isCommitInProgress(retried.transaction_id)
+            || destination->isExportTransactionCommitted(retried.transaction_id, context);
 
-        /// A task that did not export all its parts never committed, and a missing one was either
-        /// never created or checked when it went missing.
-        if (state.status != TaskStatus::MISSING && state.reached_commit && added.insert(transaction_id).second)
-            result.push_back(ExportRetriedTask{
-                .transaction_id = transaction_id,
-                .block_ranges = ExportTTLUtils::toBlockRanges(entry.claimed.at(transaction_id)),
-                .failed_time = now,
-            });
-
-        for (const auto & retried : state.retry_of)
+        if (!may_land)
         {
-            if (added.contains(retried.transaction_id))
-                continue;
-
-            /// Past the window, and with no commit of it in progress, the task is checked once more,
-            /// and not retried by the next groups if it did not land.
-            const bool may_land = now < retried.failed_time + late_commit_window_seconds
-                || isCommitInProgress(retried.transaction_id)
-                || destination->isExportTransactionCommitted(retried.transaction_id, context);
-
-            if (!may_land)
-            {
-                LOG_DEBUG(log, "Export task {} of partition {} did not commit, it is no longer checked", retried.transaction_id, entry.partition_id);
-                continue;
-            }
-
-            added.insert(retried.transaction_id);
-            result.push_back(retried);
+            LOG_DEBUG(log, "Export task {} of partition {} did not commit, it is no longer checked", retried.transaction_id, entry.partition_id);
+            continue;
         }
+
+        result.push_back(retried);
     }
 
     return result;
@@ -496,11 +480,11 @@ ExportTTLScheduler::PartitionView ExportTTLScheduler::observePartition(
     }
 
     bool retry_pending = false;
-    for (const auto & [transaction_id, _] : entry.claimed)
+    if (entry.claim)
     {
-        const auto status = getCachedTaskState(task_states, transaction_id).status;
+        const auto status = getCachedTaskState(task_states, entry.claim->transaction_id).status;
         if (status == TaskStatus::PENDING)
-            info.current_transaction_id = transaction_id;
+            info.current_transaction_id = entry.claim->transaction_id;
         else if (status != TaskStatus::COMPLETED)
             retry_pending = true;
     }
@@ -527,33 +511,21 @@ std::optional<ExportTTLIndexEntry> ExportTTLScheduler::actOnPartition(
     const auto & partition_id = entry.partition_id;
     const auto settings = storage.getSettings();
 
-    auto resolved = resolveClaims(entry, destination, task_states, context);
+    auto resolved = resolveClaim(entry, destination, task_states, context);
     info.current_transaction_id = resolved.in_flight;
 
+    /// The claimed parts are the parts of the failed task that still exist.
     std::vector<MergeTreeDataPartPtr> retry_parts;
-    std::unordered_set<String> failed_with_parts;
-    for (const auto & part : view.claimed_parts)
-    {
-        for (const auto & transaction_id : resolved.failed)
-        {
-            if (ExportFenceUtils::intersectsAny(part->info, entry.claimed.at(transaction_id)))
-            {
-                retry_parts.push_back(part);
-                failed_with_parts.insert(transaction_id);
-                break;
-            }
-        }
-    }
+    if (!resolved.failed.empty())
+        retry_parts = view.claimed_parts;
 
     /// The parts of a failed task that no longer exist, e.g. were dropped, have nothing left to export.
-    for (const auto & transaction_id : resolved.failed)
+    if (!resolved.failed.empty() && retry_parts.empty())
     {
-        if (failed_with_parts.contains(transaction_id))
-            continue;
-
         LOG_INFO(log, "Export task {} of partition {} failed and none of its parts exists anymore, releasing its claim",
-            transaction_id, partition_id);
-        entry.releaseClaim(transaction_id);
+            resolved.failed, partition_id);
+        entry.releaseClaim();
+        resolved.failed.clear();
         resolved.changed = true;
     }
 
@@ -573,18 +545,15 @@ std::optional<ExportTTLIndexEntry> ExportTTLScheduler::actOnPartition(
         group.destination = destination;
         group.partition_id = partition_id;
 
-        /// Every claimed part of a failed task is retried: a part left out would lose its claim and
+        /// Every claimed part of the failed task is retried: a part left out would lose its claim and
         /// could be exported again later although the failed task may still land.
         group.parts = retry_parts;
         size_t group_bytes = 0;
         for (const auto & part : group.parts)
             group_bytes += part->getBytesOnDisk();
 
-        std::vector<String> retried;
-        for (const auto & transaction_id : resolved.failed)
-            if (failed_with_parts.contains(transaction_id))
-                retried.push_back(transaction_id);
-        group.retry_of = collectRetriedTasks(entry, retried, destination, now, task_states, context);
+        if (!resolved.failed.empty())
+            group.retry_of = collectRetriedTasks(entry, resolved.failed, destination, now, task_states, context);
 
         for (const auto & part : view.shippable)
         {
@@ -598,15 +567,15 @@ std::optional<ExportTTLIndexEntry> ExportTTLScheduler::actOnPartition(
 
         if (!group.parts.empty())
         {
+            /// The group takes over the claim of the failed task it retries, if any.
             group.entry = versioned;
-            for (const auto & transaction_id : failed_with_parts)
-                group.entry.entry.releaseClaim(transaction_id);
+            group.entry.entry.releaseClaim();
 
             std::vector<MergeTreePartInfo> infos;
             infos.reserve(group.parts.size());
             for (const auto & part : group.parts)
                 infos.push_back(part->info);
-            group.entry.entry.claim(group.transaction_id, infos);
+            group.entry.entry.startClaim(group.transaction_id, infos);
 
             if (startGroup(group, context))
             {
@@ -614,7 +583,7 @@ std::optional<ExportTTLIndexEntry> ExportTTLScheduler::actOnPartition(
                 task_states.insert_or_assign(group.transaction_id, TaskState{.status = TaskStatus::PENDING, .reached_commit = false, .retry_of = group.retry_of});
                 LOG_INFO(log, "Started export task {} of {} part(s) of partition {} to {}{}",
                     group.transaction_id, group.parts.size(), partition_id, destination->getStorageID().getNameForLogs(),
-                    retried.empty() ? "" : fmt::format(", retrying {}", fmt::join(retried, ", ")));
+                    resolved.failed.empty() ? "" : fmt::format(", retrying {}", resolved.failed));
                 return std::move(group.entry.entry);
             }
 
@@ -639,29 +608,22 @@ void ExportTTLScheduler::cleanupDestination(const String & destination_key, cons
     TaskStates task_states;
     bool claims_left = false;
 
-    for (auto [partition_id, versioned] : index)
+    for (auto [_, versioned] : index)
     {
-        bool changed = false;
+        if (!versioned.entry.claim)
+            continue;
 
-        std::vector<String> transaction_ids;
-        for (const auto & [transaction_id, _] : versioned.entry.claimed)
-            transaction_ids.push_back(transaction_id);
-
-        for (const auto & transaction_id : transaction_ids)
+        const auto transaction_id = versioned.entry.claim->transaction_id;
+        if (getCachedTaskState(task_states, transaction_id).status == TaskStatus::PENDING)
         {
-            if (getCachedTaskState(task_states, transaction_id).status == TaskStatus::PENDING)
-            {
-                LOG_INFO(log, "Killing export task {}: the EXPORT TTL no longer exports to destination {}", transaction_id, destination_key);
-                killTask(transaction_id);
-                claims_left = true;
-                continue;
-            }
-
-            versioned.entry.releaseClaim(transaction_id);
-            changed = true;
+            LOG_INFO(log, "Killing export task {}: the EXPORT TTL no longer exports to destination {}", transaction_id, destination_key);
+            killTask(transaction_id);
+            claims_left = true;
+            continue;
         }
 
-        if (changed && !updateIndexEntry(destination_key, versioned))
+        versioned.entry.releaseClaim();
+        if (!updateIndexEntry(destination_key, versioned))
             claims_left = true;
     }
 

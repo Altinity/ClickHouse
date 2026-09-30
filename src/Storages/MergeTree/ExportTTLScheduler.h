@@ -186,21 +186,22 @@ private:
 
     ContextPtr makeContext() const;
 
-    /// Resolves the claims of the index entry that do not belong to a task in flight. Returns the
-    /// failed tasks whose parts are still claimed, and the task in flight.
-    struct ResolvedClaims
+    /// Resolves the claim of the index entry unless its task is in flight: a task that completed, or
+    /// that failed but committed to the destination, has its claim moved to the exported ranges.
+    struct ResolvedClaim
     {
-        std::vector<String> failed;
+        /// The task in flight, or the failed task whose parts are still claimed; empty if there is none.
         String in_flight;
+        String failed;
         bool changed = false;
     };
-    ResolvedClaims resolveClaims(ExportTTLIndexEntry & entry, const StoragePtr & destination, TaskStates & task_states, const ContextPtr & context);
+    ResolvedClaim resolveClaim(ExportTTLIndexEntry & entry, const StoragePtr & destination, TaskStates & task_states, const ContextPtr & context);
 
-    /// The failed tasks among `failed` and the ones they retried whose commit may still land, for
-    /// the `retry_of` of the group that retries the parts of `failed`.
+    /// The task `failed`, which holds the claim of `entry`, and the ones it retried whose commit may
+    /// still land, for the `retry_of` of the group that retries its parts.
     ExportRetriedTasks collectRetriedTasks(
         const ExportTTLIndexEntry & entry,
-        const std::vector<String> & failed,
+        const String & failed,
         const StoragePtr & destination,
         time_t now,
         TaskStates & task_states,

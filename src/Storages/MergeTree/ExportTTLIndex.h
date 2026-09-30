@@ -7,6 +7,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -24,41 +25,44 @@ namespace DB
 /// committed to the destination:
 ///  - creating a task claims the ranges of its parts;
 ///  - committing a task moves its claim to `exported`;
-///  - retrying failed tasks moves their claims to the new task;
+///  - retrying a failed task moves its claim to the new task;
 ///  - resolving a failed task that does not need a retry releases its claim.
 struct ExportTTLIndexEntry
 {
+    /// Ranges owned by a TTL export task that did not commit: in flight, or failed and waiting to be retried.
+    struct Claim
+    {
+        String transaction_id;
+        /// Compacted.
+        std::vector<MergeTreePartInfo> ranges;
+    };
+
     String partition_id;
 
     /// Ranges committed to the destination, compacted.
     std::vector<MergeTreePartInfo> exported;
 
-    /// Ranges owned by TTL export tasks that did not commit, by transaction id, compacted. A task
-    /// may be in flight, or failed and waiting to be retried.
-    std::map<String, std::vector<MergeTreePartInfo>> claimed;
+    /// A partition has at most one claim: a group starts only while no task of the partition is in
+    /// flight, and takes over the claim of the failed task it retries.
+    std::optional<Claim> claim;
 
-    bool empty() const { return exported.empty() && claimed.empty(); }
+    bool empty() const { return exported.empty() && !claim; }
 
     /// Highest block number of any exported or claimed range, 0 if there is none.
     Int64 maxBlock() const;
-
-    std::vector<MergeTreePartInfo> allClaimed() const;
 
     PartExportState classify(const MergeTreePartInfo & part) const;
 
     ExportFenceEntry toFenceEntry(const String & destination) const;
 
-    /// Adds the ranges of `parts` to the claim of `transaction_id`.
-    void claim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts);
+    /// Claims the ranges of `parts` for `transaction_id`. Throws if the entry has a claim already.
+    void startClaim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts);
 
-    /// Moves the claims of `from` to `to`.
-    void moveClaims(const std::vector<String> & from, const String & to);
-
-    /// Moves the claim of `transaction_id` to the exported ranges, adding `parts` as well: a task
-    /// may commit parts whose claim was lost.
+    /// Moves the claim to the exported ranges if `transaction_id` holds it, adding `parts` as well:
+    /// a task may commit parts whose claim was lost.
     void commitClaim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts);
 
-    void releaseClaim(const String & transaction_id);
+    void releaseClaim() { claim.reset(); }
 
     String toJSONString() const;
     static ExportTTLIndexEntry fromJSONString(const String & partition_id, const String & json_string);
