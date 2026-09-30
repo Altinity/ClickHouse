@@ -340,39 +340,36 @@ TEST(CASRefCheckpoint, CodecRejectsIncoherentCommittedFrontierAndSealEpochs)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(malformed); });
 }
 
-/// STRICT means an unknown key is corruption, not something to skip. A `_ckpt` decides deletions, so a
-/// reader that ignored a field it did not understand would be authorizing them from a body it only
-/// partly read.
-TEST(CASRefCheckpoint, RejectsAnUnknownKey)
+TEST(CASRefCheckpoint, SkipsAnUnknownOrdinaryKey)
 {
-    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1,
-                                              .last_epoch_seal = std::nullopt});
-    String with_unknown = good;
+    const RefCkpt ckpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1,
+                       .last_epoch_seal = std::nullopt};
+    String with_unknown = encodeRefCkpt(ckpt);
     with_unknown.replace(with_unknown.rfind('}'), 1, R"(,"zz":"1"})");
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(with_unknown); });
+    EXPECT_EQ(decodeRefCkpt(with_unknown), ckpt);
+}
 
-    /// A `!`-prefixed key is a REQUIRED extension and reports the version, not corruption -- the
-    /// distinction is what lets an operator tell "this build is too old" from "this object is broken".
-    String with_critical = good;
+/// A `!`-prefixed key is a REQUIRED extension and reports the version, not corruption -- the
+/// distinction is what lets an operator tell "this build is too old" from "this object is broken".
+TEST(CASRefCheckpoint, UnknownCriticalKeyIsUnknownFormatVersion)
+{
+    String with_critical = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1,
+                                                 .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt});
     with_critical.replace(with_critical.rfind('}'), 1, R"(,"!zz":"1"})");
     expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRefCkpt(with_critical); });
 }
 
-/// Replacing the abbreviated key is a format cut, not an alias. Treating it as an optional partial
-/// pair would make an old writer's checkpoint appear to have no committed frontier.
-TEST(CASRefCheckpoint, RejectsOldCommittedEpochKeyRatherThanAliasingIt)
+/// The abbreviated key is a removed spelling, not an alias: it is skipped like any unknown key and
+/// never read as `committed_epoch`.
+TEST(CASRefCheckpoint, OldCommittedEpochKeyIsSkippedNotAliased)
 {
-    /// The values are chosen so ALIASING would be harmless: the spliced `"cte":"9"` re-assigns the
-    /// epoch the object already carries, leaving a valid checkpoint. A reader that honoured the old
-    /// spelling would therefore DECODE, and this test fails; only the strict unknown-key rejection
-    /// makes it throw. Values under which aliasing corrupts the object would let the invariant
-    /// checker throw the same code and hide the alias.
-    String with_old_key = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{9},
-                                                .committed_through = RefTxnId{9, 1},
-                                                .checkpoint_snapshot_id = RefTxnId{9, 1},
-                                                .last_epoch_seal = std::nullopt});
-    with_old_key.replace(with_old_key.rfind('}'), 1, R"(,"cte":"9"})");
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(with_old_key); });
+    /// The spliced value differs from the real `committed_epoch`, so an alias would change the
+    /// decoded frontier (or trip the invariant checker) and the equality below would fail.
+    const RefCkpt ckpt{.life_epoch = std::optional<uint64_t>{9}, .committed_through = RefTxnId{9, 1},
+                       .checkpoint_snapshot_id = RefTxnId{9, 1}, .last_epoch_seal = std::nullopt};
+    String with_old_key = encodeRefCkpt(ckpt);
+    with_old_key.replace(with_old_key.rfind('}'), 1, R"(,"cte":"5"})");
+    EXPECT_EQ(decodeRefCkpt(with_old_key), ckpt);
 }
 
 /// A duplicate key has no single meaning, so it can never be resolved by a reader's preference.
@@ -447,14 +444,12 @@ TEST(CASRefCheckpoint, RejectsInvalidFieldsOnEncodeAndOnDecode)
         [&] { decodeRefCkpt(prefix + R"({"life_epoch":"7","snapshot_epoch":"1","snapshot_seq":"0"})" + "\n"); });
 }
 
-/// The registry row is part of the contract: Control/Strict decides how the decoder treats unknown
-/// keys, and the caps are the first thing that fires if a foreign object ever lands at the key.
-TEST(CASRefCheckpoint, RegistryRowIsControlStrictWithTightCaps)
+/// The caps are the first thing that fires if a foreign object ever lands at the key.
+TEST(CASRefCheckpoint, RegistryRowIsControlWithTightCaps)
 {
     const FormatTraits & traits = traitsFor(FormatId::RefCkpt);
     EXPECT_EQ(traits.type, "cas_ref_ckpt");
     EXPECT_EQ(traits.family, TextFamily::Control);
-    EXPECT_EQ(traits.strictness, KeyStrictness::Strict);
     EXPECT_EQ(traits.object_cap, 64u * 1024u);
     EXPECT_EQ(traits.line_cap, 4u * 1024u);
     EXPECT_EQ(traitsForType("cas_ref_ckpt"), &traits);

@@ -105,11 +105,11 @@ struct RefCkpt
 /// fails. That assertion is the tripwire for this shortcut, not an incidental check of the key shape.
 String encodeRefCkpt(const RefCkpt & ckpt);
 
-/// Decode a complete `cas_ref_ckpt` text object. STRICT (`KeyStrictness::Strict`): an unknown ordinary
-/// key, a duplicate key, a truncated object (a missing body line, or half of an optional
-/// id pair), or trailing bytes all raise `CORRUPTED_DATA` -- never a partially-populated struct. This
-/// object gates destructive cleanup and names recovery's base, so "decoded something" must mean
-/// "decoded exactly what a writer of this format wrote".
+/// Decode a complete `cas_ref_ckpt` text object. A duplicate key, a truncated object (a missing body
+/// line, or half of an optional id pair), or trailing bytes raise `CORRUPTED_DATA` -- never a
+/// partially-populated struct. An unknown `!`-prefixed key raises `UNKNOWN_FORMAT_VERSION`; an unknown
+/// ordinary key is skipped. This object gates destructive cleanup and names recovery's base, so
+/// "decoded something" must mean "decoded everything the writer made decision-relevant".
 RefCkpt decodeRefCkpt(std::string_view data);
 
 /// The shared field-level validity rule, applied on both encode and decode: every PRESENT field is a

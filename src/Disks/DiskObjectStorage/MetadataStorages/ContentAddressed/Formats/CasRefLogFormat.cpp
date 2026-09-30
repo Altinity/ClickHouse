@@ -126,7 +126,7 @@ struct BindingFields
 /// `!`-prefixed: `prev_epoch_seal` is INV-2 chain evidence, not cosmetic metadata -- a decoder that
 /// doesn't understand it must refuse the object rather than silently drop the chain link while
 /// otherwise passing the structural grammar (`JsonObjectReader::skipUnknown` rejects any unrecognized
-/// `!`-key with `UNKNOWN_FORMAT_VERSION`, tolerant or not).
+/// `!`-key with `UNKNOWN_FORMAT_VERSION`).
 void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_id, const std::optional<RefTxnId> & prev_epoch_seal)
 {
     bool first = true;
@@ -308,7 +308,7 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
     {
         const String line = readLine(in, line_cap, "cas_ref_log");
         ReadBufferFromMemory m(line.data(), line.size());
-        JsonObjectReader r(m, KeyStrictness::Tolerant, "cas_ref_log");
+        JsonObjectReader r(m, "cas_ref_log");
         bool saw_ns = false;
         bool saw_txn_epoch = false;
         bool saw_txn_seq = false;
@@ -373,7 +373,7 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
     {
         readLineInto(in, row_line, line_cap, "cas_ref_log");
         ReadBufferFromMemory l(row_line.data(), row_line.size());
-        row_reader.reset(l, KeyStrictness::Tolerant, "cas_ref_log");
+        row_reader.reset(l, "cas_ref_log");
         JsonObjectReader & r = row_reader;
         String key;
         if (!r.nextKey(key))
@@ -455,7 +455,7 @@ std::optional<RefLogMetaPeek> peekRefLogMeta(const String & sealed_bytes)
         readLine(in, line_cap, "cas_ref_log");   /// header line -- skipped, the version is not judged here
         const String meta = readLine(in, line_cap, "cas_ref_log");
         ReadBufferFromMemory m(meta.data(), meta.size());
-        JsonObjectReader r(m, KeyStrictness::Tolerant, "cas_ref_log");
+        JsonObjectReader r(m, "cas_ref_log");
         RefLogMetaPeek peek;
         bool saw_ns = false;
         bool saw_epoch = false;

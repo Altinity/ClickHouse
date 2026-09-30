@@ -60,7 +60,7 @@ GcState decodeGcState(std::string_view data)
     expectHeaderLine(in, FormatId::GcState);
     const String body = readLine(in, traitsFor(FormatId::GcState).line_cap, "gc/state");
     ReadBufferFromMemory body_in(body.data(), body.size());
-    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "gc/state");
+    JsonObjectReader r(body_in, "gc/state");
 
     GcState state;
     bool saw_gcs = false;
@@ -118,7 +118,7 @@ GcHeartbeat decodeGcHeartbeat(std::string_view data)
     expectHeaderLine(in, FormatId::GcHeartbeat);
     const String body = readLine(in, traitsFor(FormatId::GcHeartbeat).line_cap, "gc heartbeat");
     ReadBufferFromMemory body_in(body.data(), body.size());
-    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "gc heartbeat");
+    JsonObjectReader r(body_in, "gc heartbeat");
 
     GcHeartbeat hb;
     bool saw_by = false;

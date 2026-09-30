@@ -15,8 +15,9 @@ control-plane bodies are JSON Lines — one JSON object per line, sorted where t
 or a set of entries (`Formats/README.md`; see [Envelope format](#envelope-format) below for which
 parts are a single JSON object versus JSON Lines versus raw payload bytes). The format is
 deliberately this plain: any object can be fetched and read with ordinary line-oriented tools
-while debugging, and a new field is additive — a tolerant reader skips it — so the format evolves
-without a migration.
+while debugging, and the format evolves without a migration. A new optional field is a plain key,
+and an old reader skips it. A field that changes a reader's decisions is written with the `!`
+prefix, and an old reader fails with `UNKNOWN_FORMAT_VERSION` instead of half-reading the object.
 
 ## Key table {#key-table}
 
@@ -88,30 +89,27 @@ bytes.
 Condensed from the authoritative traits table in `CasFormat.cpp` (`TRAITS`, asserted complete by
 `gtest_cas_text_format.cpp`).
 
-| Type string | Family | Key strictness | Compression |
+| Type string | Family | Compression |
 |---|---|---|---|
-| `cas_blob` | `PayloadHybrid` | tolerant | never (raw, fixed offset) |
-| `cas_blob_meta` | `Control` | tolerant | never |
-| `cas_pool_meta` | `Control` | tolerant | never |
-| `cas_ref_log` | `Control` | tolerant | always (`.zst`) |
-| `cas_ref_snap` | `Control` | tolerant | always (`.zst`) |
-| `cas_ref_ckpt` | `Control` | strict | never |
-| `cas_ref_catalog` | `Control` | strict | never |
-| `cas_part_manifest` | `PayloadHybrid` | tolerant | always (`.zst`) |
-| `cas_run` | `RecordStream` | strict | pinned raw |
-| `cas_fold_seal` | `Control` | strict | pinned raw |
-| `cas_gc_state` | `Control` | tolerant | never |
-| `cas_gc_hb` | `Control` | tolerant | never |
-| `cas_gc_outcomes` | `Control` | tolerant | always (`.zst`) |
-| `cas_gc_maintenance_state` | `Control` | strict | never |
-| `cas_owner` | `Control` | tolerant | never |
-| `cas_epoch` | `Control` | tolerant | never |
-| `cas_mount_lease` | `Control` | tolerant | never |
+| `cas_blob` | `PayloadHybrid` | never (raw, fixed offset) |
+| `cas_blob_meta` | `Control` | never |
+| `cas_pool_meta` | `Control` | never |
+| `cas_ref_log` | `Control` | always (`.zst`) |
+| `cas_ref_snap` | `Control` | always (`.zst`) |
+| `cas_ref_ckpt` | `Control` | never |
+| `cas_ref_catalog` | `Control` | never |
+| `cas_part_manifest` | `PayloadHybrid` | always (`.zst`) |
+| `cas_run` | `RecordStream` | pinned raw |
+| `cas_fold_seal` | `Control` | pinned raw |
+| `cas_gc_state` | `Control` | never |
+| `cas_gc_hb` | `Control` | never |
+| `cas_gc_outcomes` | `Control` | always (`.zst`) |
+| `cas_gc_maintenance_state` | `Control` | never |
+| `cas_owner` | `Control` | never |
+| `cas_epoch` | `Control` | never |
+| `cas_mount_lease` | `Control` | never |
 
-"Strict" means unknown keys are rejected rather than skipped, used for objects where every field
-decides a durability or cleanup decision (`cas_ref_ckpt`, `cas_ref_catalog`, `cas_fold_seal`,
-`cas_run`, `cas_gc_maintenance_state`); a `!`-prefixed key is always critical regardless of the
-kind's strictness. "Pinned raw" objects (`cas_run`, `cas_fold_seal`) need stable bytes across
+"Pinned raw" objects (`cas_run`, `cas_fold_seal`) need stable bytes across
 re-encodes for deterministic-artifact adoption, so their bytes are never recompressed once
 written. `cas_blob` and `cas_part_manifest` are the `PayloadHybrid` family: a text descriptor
 followed by a raw payload zone, rather than a single JSON body.

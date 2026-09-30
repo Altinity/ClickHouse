@@ -110,7 +110,7 @@ PoolMeta decodePoolMeta(std::string_view data)
 
     const String body = readLine(in, traitsFor(FormatId::PoolMeta).line_cap, "pool meta");
     ReadBufferFromMemory body_in(body.data(), body.size());
-    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "pool meta");
+    JsonObjectReader r(body_in, "pool meta");
 
     PoolMeta pm;
     bool saw_pid = false;
