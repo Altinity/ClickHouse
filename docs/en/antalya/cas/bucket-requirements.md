@@ -23,6 +23,7 @@ these conditions is refused rather than trusted.
 | Unconditional complete-object publication | `Backend::publishBlob` | An absent or condemned content-addressed body is replaced atomically; native stores may use multipart |
 | Native same-store copy when `cas_staging_backend = s3` | `IObjectStorage::copyObject` with `ObjectStorageCopyMode::NativeOnly` | The first absent staged publication may copy its complete object without a client-side fallback |
 | Exact-token delete | `Backend::deleteExact` | GC must delete only the incarnation it condemned, never a replacement |
+| Ranged same-store copy, for backups only | `UploadPartCopy` through `copyS3File` | A `BACKUP` to an `S3(...)` destination on the pool's own endpoint copies a blob's payload without its header. Optional: a store that lacks it copies through the ClickHouse server instead, which is slower but correct. `GCS` lacks it by its current XML API, so `Client::supportsMultiPartCopy` reports `false` there |
 | Ranged `GET` | `Backend::get` / `Backend::getStream` with a `Range` | Opening one column file of a part costs one bounded read, not a whole-object fetch |
 | `LIST` with a resumable cursor | `Backend::list` | GC discovery and the orphan-manifest sweep page through the pool without a separate index |
 | No versioning / no delete markers | probed by `runCapabilityProbe`; `created_delete_marker` on `DeleteOutcome` | A delete marker over a live key would break exact-token semantics — GC would archive instead of reclaim |
