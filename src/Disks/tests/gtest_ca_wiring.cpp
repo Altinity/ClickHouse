@@ -870,6 +870,23 @@ TEST(CASWiringRoute, DirShapeDispatchOrderIsStable)
     EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1").shape,            DS::ShadowIntermediate);
     EXPECT_EQ(storage->classifyDirectoryForTest("a11/a11a11a1-1111-4111-8111-111111111111/deduplication_logs").shape, DS::TableSubdir);
     EXPECT_EQ(storage->classifyDirectoryForTest("store").shape,                 DS::GenericIntermediate);
+
+    /// A path INSIDE a part (file or nested directory): its own shape, decided by the ref at answer
+    /// time. Atomic, detached, moving, non-Atomic and a temporary restore part all route here; a
+    /// projection dir, a table-level subdir and a shadow part file keep their shapes.
+    const std::string tbl = "a11/a11a11a1-1111-4111-8111-111111111111";
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/all_1_1_0/columns.txt").shape,            DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/all_1_1_0/sub").shape,                    DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/detached/all_1_1_0/columns.txt").shape,   DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/moving/all_1_1_0/columns.txt").shape,     DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/tmp_restore_all_1_1_0-abcdefgh/columns.txt").shape, DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest("data/db/tbl/all_1_1_0/columns.txt").shape,        DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/all_1_1_0/p.proj").shape,                 DS::ProjectionDir);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/deduplication_logs").shape,               DS::TableSubdir);
+    EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1/store/" + tbl + "/all_1_1_0/columns.txt").shape, DS::ShadowIntermediate);
+    /// The old branch's parse travels with the shape: present on an Atomic path, absent on non-Atomic.
+    EXPECT_TRUE(storage->classifyDirectoryForTest(tbl + "/all_1_1_0/columns.txt").tf.has_value());
+    EXPECT_FALSE(storage->classifyDirectoryForTest("data/db/tbl/all_1_1_0/columns.txt").tf.has_value());
 }
 
 /// ==== M-W Task 3: the write path through IMetadataTransaction ====
