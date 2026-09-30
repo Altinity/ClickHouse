@@ -58,6 +58,16 @@
                     </main>
                 </volumes>
             </cas_backup_s3_no_multipart>
+            <cas_then_plain>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_backup_s3</disk>
+                    </main>
+                    <plain>
+                        <disk>backup_disk_s3</disk>
+                    </plain>
+                </volumes>
+            </cas_then_plain>
         </policies>
     </storage_configuration>
     <backups>

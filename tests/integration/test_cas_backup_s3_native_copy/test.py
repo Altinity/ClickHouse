@@ -291,3 +291,48 @@ def test_ranged_copy_falls_back_without_multipart():
 
     node.query(f"DROP TABLE {table} SYNC")
     node.query(f"DROP TABLE {restored} SYNC")
+
+
+def test_move_partition_out_of_cas_with_empty_arrays():
+    """A zero-size `.bin` still becomes a blob: `partFileMustStayBlob` keys on the file name, not
+    the size. A ranged copy of it reaches `calculatePartSize(0)`, which throws.
+    """
+    node = cluster.instances["node"]
+    table = "cas_move_empty_arrays"
+
+    node.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node.query(
+        f"""
+        CREATE TABLE {table} (k UInt64, s String, empty Array(UInt32))
+        ENGINE = MergeTree ORDER BY k
+        SETTINGS storage_policy = 'cas_then_plain', min_bytes_for_wide_part = 0
+        """
+    )
+    node.query(
+        f"""
+        INSERT INTO {table}
+        SELECT number, randomPrintableASCII(64), []
+        FROM numbers({NUM_ROWS})
+        """
+    )
+
+    expected = node.query(
+        f"SELECT count(), sum(cityHash64(s)), sum(length(empty)) FROM {table}"
+    ).strip()
+
+    node.query(f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'backup_disk_s3'")
+
+    assert (
+        node.query(
+            f"SELECT count(), sum(cityHash64(s)), sum(length(empty)) FROM {table}"
+        ).strip()
+        == expected
+    )
+    assert (
+        node.query(
+            f"CHECK TABLE {table} SETTINGS check_query_single_value_result = 1"
+        ).strip()
+        == "1"
+    )
+
+    node.query(f"DROP TABLE {table} SYNC")
