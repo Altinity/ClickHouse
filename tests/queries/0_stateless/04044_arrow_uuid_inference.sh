@@ -13,7 +13,8 @@ $CLICKHOUSE_LOCAL -q "
     SELECT * FROM export_table INTO OUTFILE '$DATA_FILE' FORMAT Arrow;
 "
 
-# Read without schema
-$CLICKHOUSE_LOCAL -q "SELECT toTypeName(id), id FROM file('$DATA_FILE', 'Arrow');"
+# Read without schema.
+# `auto` follows column nullability. The 25.8 default of 1 would wrap this non-nullable column as Nullable(UUID).
+$CLICKHOUSE_LOCAL -q "SELECT toTypeName(id), id FROM file('$DATA_FILE', 'Arrow') SETTINGS schema_inference_make_columns_nullable = 'auto';"
 
 rm -f $DATA_FILE

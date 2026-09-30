@@ -16,8 +16,9 @@ $CLICKHOUSE_LOCAL -q "
 
 # Read without schema to ensure nested inference works
 $CLICKHOUSE_LOCAL --input_format_parquet_use_native_reader_v3=1 -q "
-    SELECT toTypeName(opt_id), opt_id, toTypeName(arr_id), arr_id 
-    FROM file('$DATA_FILE', 'Parquet') ORDER BY opt_id ASC;
+    SELECT toTypeName(opt_id), opt_id, toTypeName(arr_id), arr_id
+    FROM file('$DATA_FILE', 'Parquet') ORDER BY opt_id ASC
+    SETTINGS schema_inference_make_columns_nullable = 'auto';
 "
 
 rm -f $DATA_FILE

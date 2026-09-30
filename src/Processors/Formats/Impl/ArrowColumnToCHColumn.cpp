@@ -882,19 +882,25 @@ static ColumnWithTypeAndName readColumnWithUUIDFromFixedBinaryData(
     const std::string & column_name,
     DataTypePtr type_hint)
 {
+    validateChunksBeforeReserve(*arrow_column, [&](const arrow::Array & chunk)
+    {
+        const auto & fixed = checkedCastFixedSizeBinary(chunk, column_name);
+        if (fixed.byte_width() != static_cast<int>(sizeof(UUID)))
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "Cannot read UUID from Arrow FixedSizeBinary array with byte_width != {}",
+                sizeof(UUID));
+    });
+
     auto column = type_hint->createColumn();
     auto & column_data = assert_cast<ColumnVector<UUID> &>(*column).getData();
     column_data.reserve(arrow_column->length());
 
     for (int chunk_i = 0, num_chunks = arrow_column->num_chunks(); chunk_i < num_chunks; ++chunk_i)
     {
-        const auto & arrow_chunk = *(arrow_column->chunk(chunk_i));
-        const auto & fixed_binary_array = assert_cast<const arrow::FixedSizeBinaryArray &>(arrow_chunk);
-
-        // Security check: Ensure we actually got 16 bytes per row
-        if (fixed_binary_array.byte_width() != sizeof(UUID))
-            throw Exception(ErrorCodes::INCORRECT_DATA,
-                "Cannot read UUID from Arrow FixedSizeBinary array with byte_width != {}", sizeof(UUID));
+        const auto & fixed_binary_array = checkedCastFixedSizeBinary(*(arrow_column->chunk(chunk_i)), column_name);
+        if (fixed_binary_array.length() == 0)
+            continue;
 
         for (int64_t i = 0; i < fixed_binary_array.length(); ++i)
         {

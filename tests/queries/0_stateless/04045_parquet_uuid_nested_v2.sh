@@ -17,15 +17,17 @@ $CLICKHOUSE_LOCAL -q "
 echo "--- Read without hint ---"
 # The v2 reader successfully infers the primitive Nullable(UUID), but drops the tag for the Array.
 $CLICKHOUSE_LOCAL --input_format_parquet_use_native_reader_v3=0 -q "
-    SELECT toTypeName(opt_id), opt_id, toTypeName(arr_id), length(arr_id) 
-    FROM file('$DATA_FILE', 'Parquet') ORDER BY opt_id ASC;
+    SELECT toTypeName(opt_id), opt_id, toTypeName(arr_id), length(arr_id)
+    FROM file('$DATA_FILE', 'Parquet') ORDER BY opt_id ASC
+    SETTINGS schema_inference_make_columns_nullable = 'auto';
 "
 
 echo "--- Read with schema hint ---"
 # Proves our byte-swapping logic works perfectly in the legacy reader if it knows the type.
 $CLICKHOUSE_LOCAL --input_format_parquet_use_native_reader_v3=0 -q "
-    SELECT toTypeName(opt_id), opt_id, toTypeName(arr_id), arr_id 
-    FROM file('$DATA_FILE', 'Parquet', 'opt_id Nullable(UUID), arr_id Array(UUID)') ORDER BY opt_id ASC;
+    SELECT toTypeName(opt_id), opt_id, toTypeName(arr_id), arr_id
+    FROM file('$DATA_FILE', 'Parquet', 'opt_id Nullable(UUID), arr_id Array(UUID)') ORDER BY opt_id ASC
+    SETTINGS schema_inference_make_columns_nullable = 'auto';
 "
 
 rm -f $DATA_FILE

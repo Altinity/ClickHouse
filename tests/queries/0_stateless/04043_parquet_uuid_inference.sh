@@ -13,7 +13,8 @@ $CLICKHOUSE_LOCAL -q "
     SELECT * FROM export_table INTO OUTFILE '$DATA_FILE' FORMAT Parquet;
 "
 
-# Must infer the schema strictly from the Parquet metadata footer
-$CLICKHOUSE_LOCAL -q "SELECT toTypeName(id), id FROM file('$DATA_FILE', 'Parquet');"
+# Must infer the schema strictly from the Parquet metadata footer.
+# `auto` follows column nullability. The 25.8 default of 1 would wrap this REQUIRED column as Nullable(UUID).
+$CLICKHOUSE_LOCAL -q "SELECT toTypeName(id), id FROM file('$DATA_FILE', 'Parquet') SETTINGS schema_inference_make_columns_nullable = 'auto';"
 
 rm -f $DATA_FILE
