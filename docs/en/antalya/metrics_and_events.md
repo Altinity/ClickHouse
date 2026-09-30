@@ -10,7 +10,7 @@ doc_type: 'reference'
 
 # Antalya profile events and metrics {#antalya-profile-events-and-metrics}
 
-This page lists the 277 profile events and 13 current metrics specific to this Antalya build.
+This page lists profile events and current metrics specific to this Antalya build.
 Each row is the name and the `description` the server returns from
 [`system.events`](/operations/system-tables/events) or
 [`system.metrics`](/operations/system-tables/metrics). The text is the documentation string in
