@@ -129,6 +129,7 @@ DiskObjectStorage::DiskObjectStorage(
         .is_encrypted = false,
         .is_cached = object_storages->takePointingTo(cluster->getLocalLocation())->supportsCache(),
         .zookeeper_name = metadata_storage->getZooKeeperName(),
+        .files_are_whole_objects = !metadata_storage->isContentAddressed(),
     };
     resource_changes_subscription = Context::getGlobalContextInstance()->getWorkloadEntityStoragePtr()->getAllEntitiesAndSubscribe(
         [this] (const std::vector<IWorkloadEntityStorage::Event> & events)
@@ -298,7 +299,7 @@ void DiskObjectStorage::copyFile( /// NOLINT
     const std::function<void()> & cancellation_hook)
 {
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorage::copyFile");
-    if (getDataSourceDescription() == to_disk.getDataSourceDescription())
+    if (getDataSourceDescription().canUseNativeCopyWith(to_disk.getDataSourceDescription()))
     {
         /// It may use s3-server-side copy
         auto & to_disk_object_storage = dynamic_cast<DiskObjectStorage &>(to_disk);
