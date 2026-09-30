@@ -153,6 +153,8 @@ public:
     /// Validate the token even if an argument is `NULL` or has type `Nothing`.
     bool useDefaultImplementationForNulls() const override { return false; }
     bool useDefaultImplementationForNothing() const override { return false; }
+    /// Preserve the payload type: the planner replaces the marker with its child without conversion.
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
