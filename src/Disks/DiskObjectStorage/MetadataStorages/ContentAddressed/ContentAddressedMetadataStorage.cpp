@@ -85,7 +85,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
     extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
     extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
-    extern const ContentAddressedSettingsUInt64 gc_read_concurrency;
+    extern const ContentAddressedSettingsUInt64 gc_io_concurrency;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsUInt64 attempt_timeout_ms;
     extern const ContentAddressedSettingsUInt64 lease_safety_margin_ms;
@@ -309,7 +309,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
     , manifest_decode_cache_bytes(settings_[ContentAddressedSetting::manifest_decode_cache_bytes].value)
     , gc_meta_pool_size(settings_[ContentAddressedSetting::gc_meta_pool_size].value)
-    , gc_read_concurrency(settings_[ContentAddressedSetting::gc_read_concurrency].value)
+    , gc_io_concurrency(settings_[ContentAddressedSetting::gc_io_concurrency].value)
     , gc_bulk_delete_chunk_keys(settings_[ContentAddressedSetting::gc_bulk_delete_chunk_keys].value)
     , cas_attempt_timeout_ms(settings_[ContentAddressedSetting::attempt_timeout_ms].value)
     , cas_lease_safety_margin_ms(settings_[ContentAddressedSetting::lease_safety_margin_ms].value)
@@ -552,6 +552,7 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         e.entries_condemned = r.entries_condemned;
         e.entries_graduated = r.entries_graduated;
         e.entries_redeleted = r.entries_redeleted;
+        e.entries_redelete_failed = r.entries_redelete_failed;
         e.fence_outs = r.fence_outs;
         e.anomalies = r.anomalies;
         e.duration_ms = r.duration_ms;
@@ -800,7 +801,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_round_handoff_prefix_wholesale_budget = gc_round_handoff_prefix_wholesale_budget;
     pool_config.gc_round_outcome_entry_budget = gc_round_outcome_entry_budget;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
-    pool_config.gc_read_concurrency = gc_read_concurrency;
+    pool_config.gc_io_concurrency = gc_io_concurrency;
     pool_config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     pool_config.cas_request_budget.attempt_timeout_ms = cas_attempt_timeout_ms;
     pool_config.cas_request_budget.lease_safety_margin_ms = cas_lease_safety_margin_ms;
@@ -1394,6 +1395,30 @@ bool ContentAddressedMetadataStorage::liveTreeDirHasChildren(const std::string &
     return !store()->listMirroredChildren(scope).empty();
 }
 
+bool ContentAddressedMetadataStorage::tableSubdirExists(const Cas::TableFilePath & tf) const
+{
+    /// At least one verbatim file under it.
+    const auto life = readableNamespaceFilesLife(liveNamespace(tf.table_uuid));
+    if (!life)
+        return false;
+    const std::string prefix = tf.tail + "/";
+    for (const auto & name : store()->listNamespaceFiles(*life))
+        if (name.starts_with(prefix))
+            return true;
+    return false;
+}
+
+std::vector<std::string> ContentAddressedMetadataStorage::tableSubdirChildren(const Cas::TableFilePath & tf) const
+{
+    /// Verbatim files under <subdir>/, first-component collapsed.
+    std::unordered_set<std::string> result;
+    if (const auto life = readableNamespaceFilesLife(liveNamespace(tf.table_uuid)))
+        for (const auto & name : store()->listNamespaceFiles(*life))
+            if (name.starts_with(tf.tail + "/"))
+                addFirstComponent(result, name.substr(tf.tail.size() + 1));
+    return toVector(std::move(result));
+}
+
 Cas::RootNamespace ContentAddressedMetadataStorage::liveNamespace(const std::string & table_uuid) const
 {
     /// Path mirroring: the namespace is the table's canonical disk path with the
@@ -1605,6 +1630,23 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
                 return dr;
             }
         }
+        /// A path with a part-shaped component followed by more components: a file or nested
+        /// directory of a live, detached or moving part IF that ref resolves (shadow is routed
+        /// above). For an Atomic table path, the parser calls every first component after the
+        /// table root except `deduplication_logs` the part component; a non-Atomic table path
+        /// anchors on the rightmost part-shaped component instead. Either way, whether this really
+        /// is a part is decided by the ref at answer time, not by the path:
+        /// `existsDirectory`/`listDirectory` take the old table-subdirectory branch when it does
+        /// not resolve. Classification stays pure path computation, so the parse that branch needs
+        /// travels with the shape.
+        if (r && !r->ref.empty() && !r->file.empty())
+        {
+            dr.shape = DirShape::PartFile;
+            dr.p = std::move(p);
+            dr.r = std::move(r);
+            dr.tf = Cas::parseTableFilePath(path);
+            return dr;
+        }
         /// No sub-shape matched: fall through, identical to today's post-`if (p)` continuation.
     }
 
@@ -1700,16 +1742,18 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             return view && view->hasDirectory(*dr.projection_prefix);
         }
         case DirShape::TableSubdir:
+            return tableSubdirExists(*dr.tf);
+        case DirShape::PartFile:
         {
-            /// At least one verbatim file under it.
-            const auto life = readableNamespaceFilesLife(liveNamespace(dr.tf->table_uuid));
-            if (!life)
-                return false;
-            const std::string prefix = dr.tf->tail + "/";
-            for (const auto & name : store()->listNamespaceFiles(*life))
-                if (name.starts_with(prefix))
-                    return true;
-            return false;
+            /// A resolved part answers from its folder view: a plain file has no entries under
+            /// its own name with a trailing slash, a nested directory has. An unresolved ref is not
+            /// a part we know (a table subdirectory path, or a non-Atomic part-shaped table
+            /// component), so it answers as the table subdirectory or generic directory that the
+            /// same path denotes. A failed resolution or manifest read propagates.
+            auto view = partAccess()->getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
+            if (view)
+                return view->hasDirectory(dr.r->file + "/");
+            return dr.tf ? tableSubdirExists(*dr.tf) : liveTreeDirHasChildren(path);
         }
         case DirShape::GenericIntermediate:
             /// Exists iff a server-root-scoped mirrored LIST finds any object. Keeps `cd`/existence
@@ -1894,14 +1938,13 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             return view ? view->listChildren(*dr.projection_prefix) : std::vector<std::string>{};
         }
         case DirShape::TableSubdir:
+            return tableSubdirChildren(*dr.tf);
+        case DirShape::PartFile:
         {
-            /// Verbatim files under <subdir>/, first-component collapsed.
-            std::unordered_set<std::string> result;
-            if (const auto life = readableNamespaceFilesLife(liveNamespace(dr.tf->table_uuid)))
-                for (const auto & name : store()->listNamespaceFiles(*life))
-                    if (name.starts_with(dr.tf->tail + "/"))
-                        addFirstComponent(result, name.substr(dr.tf->tail.size() + 1));
-            return toVector(std::move(result));
+            auto view = partAccess()->getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
+            if (view)
+                return view->listChildren(dr.r->file + "/");
+            return dr.tf ? tableSubdirChildren(*dr.tf) : listLiveTreeChildren(path);
         }
         case DirShape::GenericIntermediate:
             /// The disk root "", `store`, or any loose-file container above a table dir: a
