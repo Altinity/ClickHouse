@@ -381,6 +381,7 @@ def test_backup_to_s3_with_empty_arrays():
             SELECT count()
             FROM s3('{S3_AUTHORITY}/test/backups/{RUN_TOKEN}/empty_arrays/**', {S3_CREDENTIALS}, 'One')
             WHERE _size = 0
+            SETTINGS s3_skip_empty_files = 0
             """
         ).strip()
     )
