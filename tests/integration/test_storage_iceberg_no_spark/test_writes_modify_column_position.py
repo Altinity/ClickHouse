@@ -149,7 +149,7 @@ def test_modify_column_after_itself(started_cluster_iceberg_no_spark, format_ver
 
     instance.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 10, 'x');", settings=INSERT_SETTINGS)
 
-    instance.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN b AFTER b;", settings=INSERT_SETTINGS)
+    instance.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN b Nullable(Int32) AFTER b;", settings=INSERT_SETTINGS)
     instance.query(f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN b Nullable(Int64) AFTER b;", settings=INSERT_SETTINGS)
 
     columns = instance.query(
