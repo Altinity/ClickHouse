@@ -299,11 +299,14 @@ void DiskObjectStorage::copyFile( /// NOLINT
     const std::function<void()> & cancellation_hook)
 {
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorage::copyFile");
-    if (getDataSourceDescription().canUseNativeCopyWith(to_disk.getDataSourceDescription()))
+    const auto source_description = getDataSourceDescription();
+    const auto destination_description = to_disk.getDataSourceDescription();
+    auto * to_disk_object_storage = dynamic_cast<DiskObjectStorage *>(&to_disk);
+    if (to_disk_object_storage && source_description == destination_description
+        && source_description.canUseNativeCopyWith(destination_description))
     {
         /// It may use s3-server-side copy
-        auto & to_disk_object_storage = dynamic_cast<DiskObjectStorage &>(to_disk);
-        auto transaction = createObjectStorageTransactionToAnotherDisk(to_disk_object_storage);
+        auto transaction = createObjectStorageTransactionToAnotherDisk(*to_disk_object_storage);
         try
         {
             transaction->copyFile(from_file_path, to_file_path, read_settings, write_settings);

@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 
+#include <Disks/IDisk.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 
 #include <array>

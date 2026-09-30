@@ -1,7 +1,6 @@
 #pragma once
 
 #include <base/types.h>
-#include <Disks/IDisk.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <memory>
 #include <optional>
@@ -9,6 +8,9 @@
 
 namespace DB
 {
+
+class IDisk;
+using DiskPtr = std::shared_ptr<IDisk>;
 
 class ReadPipeline;
 struct ReadSettings;

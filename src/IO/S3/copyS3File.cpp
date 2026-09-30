@@ -653,7 +653,7 @@ namespace
                         "range, and multipart copy is unavailable",
                         src_key);
 
-                LOG_INFO(
+                LOG_DEBUG(
                     log,
                     "Multipart copy is unavailable, so the byte range [{}, {}) of {} cannot be copied "
                     "server-side, will copy through the server instead",

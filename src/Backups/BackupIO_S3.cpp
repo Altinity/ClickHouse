@@ -453,7 +453,13 @@ bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
 
     const UInt64 payload_size = plan->payload_end - plan->payload_offset;
     if (start_pos > payload_size || length > payload_size - start_pos)
-        return false;
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Requested range [{}, {}) of content-addressed file {} lies outside its payload of {} bytes",
+            start_pos,
+            start_pos + length,
+            src_path,
+            payload_size);
 
     auto source_data_source_description = src_disk->getDataSourceDescription();
     if (!source_data_source_description.sameKind(data_source_description))

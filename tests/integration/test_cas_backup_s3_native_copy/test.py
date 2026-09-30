@@ -219,17 +219,21 @@ def test_blobs_use_ranged_copy_and_inline_falls_back():
 
     events = node.query(
         f"""
-        SELECT ProfileEvents['S3UploadPartCopy'], ProfileEvents['S3CopyObject']
+        SELECT
+            ProfileEvents['S3UploadPartCopy'],
+            ProfileEvents['S3CopyObject'],
+            ProfileEvents['S3PutObject'] + ProfileEvents['S3UploadPart']
         FROM system.query_log
         WHERE type = 'QueryFinish' AND query_id = '{query_id}'
         ORDER BY event_time DESC LIMIT 1
         """
     ).strip()
     assert events, "no query_log row for the backup query"
-    upload_part_copy, copy_object = (int(value) for value in events.split("\t"))
+    upload_part_copy, copy_object, uploaded = (int(value) for value in events.split("\t"))
 
     assert upload_part_copy > 0, "no ranged server-side copy happened"
     assert copy_object == 0, "CopyObject has no range: the envelope would land in the backup"
+    assert uploaded > 0, "inline entries have no object and must be uploaded through buffers"
 
     node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
     node.query(f"RESTORE TABLE {table} AS {restored} FROM {destination}")
@@ -294,7 +298,7 @@ def test_ranged_copy_falls_back_without_multipart():
 
 def test_move_partition_out_of_cas_with_empty_arrays():
     """A zero-size `.bin` still becomes a blob: `partFileMustStayBlob` keys on the file name, not
-    the size. A ranged copy of it reaches `calculatePartSize(0)`, which throws.
+    the size. Moving it off a CAS disk must copy it through buffers.
     """
     node = cluster.instances["node"]
     table = "cas_move_empty_arrays"
@@ -335,3 +339,95 @@ def test_move_partition_out_of_cas_with_empty_arrays():
     )
 
     node.query(f"DROP TABLE {table} SYNC")
+
+
+def test_backup_to_s3_with_empty_arrays():
+    """A zero-size `.bin` is a blob with an empty payload. A ranged copy of zero bytes reaches
+    `calculatePartSize(0)`, which throws, so it must be copied through buffers.
+    """
+    node = cluster.instances["node"]
+    table = "cas_backup_empty_arrays"
+    restored = f"{table}_restored"
+    destination = backup_destination("empty_arrays")
+    fingerprint = "SELECT count(), sum(cityHash64(s)), sum(length(empty)) FROM {}"
+
+    node.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node.query(
+        f"""
+        CREATE TABLE {table} (k UInt64, s String, empty Array(UInt32))
+        ENGINE = MergeTree ORDER BY k
+        SETTINGS storage_policy = '{STORAGE_POLICY}', min_bytes_for_wide_part = 0
+        """
+    )
+    node.query(
+        f"""
+        INSERT INTO {table}
+        SELECT number, randomPrintableASCII(64), []
+        FROM numbers({NUM_ROWS})
+        """
+    )
+    expected = node.query(fingerprint.format(table)).strip()
+
+    node.query(
+        f"BACKUP TABLE {table} TO {destination} SETTINGS allow_s3_native_copy = 1"
+    )
+
+    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node.query(f"RESTORE TABLE {table} AS {restored} FROM {destination}")
+
+    assert node.query(fingerprint.format(restored)).strip() == expected
+    assert (
+        node.query(
+            f"CHECK TABLE {restored} SETTINGS check_query_single_value_result = 1"
+        ).strip()
+        == "1"
+    )
+
+    node.query(f"DROP TABLE {table} SYNC")
+    node.query(f"DROP TABLE {restored} SYNC")
+
+
+def test_incremental_backup_to_s3():
+    """An incremental backup copies only the files that changed since the base backup, so the
+    ranged copy runs against a subset of the part files and the restore reads from both backups.
+    """
+    node = cluster.instances["node"]
+    table = "cas_backup_incremental"
+    restored = f"{table}_restored"
+    base = backup_destination("incremental_base")
+    incremental = backup_destination("incremental")
+
+    create_and_fill(node, table)
+    node.query(
+        f"BACKUP TABLE {table} TO {base} SETTINGS allow_s3_native_copy = 1"
+    )
+
+    node.query(
+        f"""
+        INSERT INTO {table}
+        SELECT
+            number,
+            randomPrintableASCII(64),
+            if(number % 5 = 0, NULL, toInt64(number)),
+            [toUInt32(number)]
+        FROM numbers({NUM_ROWS}, {NUM_ROWS})
+        """
+    )
+    expected = column_fingerprints(node, table)
+
+    node.query(
+        f"BACKUP TABLE {table} TO {incremental} "
+        f"SETTINGS base_backup = {base}, allow_s3_native_copy = 1"
+    )
+
+    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node.query(f"RESTORE TABLE {table} AS {restored} FROM {incremental}")
+
+    actual = column_fingerprints(node, restored)
+    assert actual["count"] == expected["count"]
+    differing = [c for c in COLUMNS if actual[c] != expected[c]]
+    assert not differing, f"columns differ after restore: {differing}"
+
+    node.query(f"DROP TABLE {table} SYNC")
+    node.query(f"DROP TABLE {restored} SYNC")
+
