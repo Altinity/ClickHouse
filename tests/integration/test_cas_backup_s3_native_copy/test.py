@@ -233,6 +233,18 @@ def test_blobs_use_ranged_copy_and_inline_falls_back():
 
     assert upload_part_copy > 0, "no ranged server-side copy happened"
     assert copy_object == 0, "CopyObject has no range: the envelope would land in the backup"
+
+    uploaded = int(
+        node.query(
+            f"""
+            SELECT ProfileEvents['S3PutObject'] + ProfileEvents['S3UploadPart']
+            FROM system.query_log
+            WHERE type = 'QueryFinish' AND query_id = '{query_id}'
+            ORDER BY event_time DESC LIMIT 1
+            """
+        ).strip()
+    )
+    assert uploaded > 0, "nothing went through buffers, so no inline entry was exercised"
     assert uploaded > 0, "inline entries have no object and must be uploaded through buffers"
 
     node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
@@ -343,7 +355,8 @@ def test_move_partition_out_of_cas_with_empty_arrays():
 
 def test_backup_to_s3_with_empty_arrays():
     """A zero-size `.bin` is a blob with an empty payload. A ranged copy of zero bytes reaches
-    `calculatePartSize(0)`, which throws, so it must be copied through buffers.
+    `calculatePartSize(0)`, which throws, so it must be copied through buffers. Only a backup with
+    `deduplicate_files = 0` passes empty files to the writer; a deduplicated one drops them earlier.
     """
     node = cluster.instances["node"]
     table = "cas_backup_empty_arrays"
@@ -369,8 +382,20 @@ def test_backup_to_s3_with_empty_arrays():
     expected = node.query(fingerprint.format(table)).strip()
 
     node.query(
-        f"BACKUP TABLE {table} TO {destination} SETTINGS allow_s3_native_copy = 1"
+        f"BACKUP TABLE {table} TO {destination} "
+        f"SETTINGS allow_s3_native_copy = 1, deduplicate_files = 0"
     )
+
+    empty_files_in_backup = int(
+        node.query(
+            f"""
+            SELECT count()
+            FROM s3('{S3_AUTHORITY}/test/backups/{RUN_TOKEN}/empty_arrays/**', {S3_CREDENTIALS}, 'One')
+            WHERE _size = 0
+            """
+        ).strip()
+    )
+    assert empty_files_in_backup > 0, "no zero-size file reached the backup writer"
 
     node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
     node.query(f"RESTORE TABLE {table} AS {restored} FROM {destination}")
@@ -431,3 +456,252 @@ def test_incremental_backup_to_s3():
     node.query(f"DROP TABLE {table} SYNC")
     node.query(f"DROP TABLE {restored} SYNC")
 
+
+
+def test_move_between_plain_and_encrypted_s3_disks():
+    """No CAS here. The capability predicate must only narrow: `sameKind` ignores `is_encrypted`, and
+    `DiskEncrypted` reports its delegate's description, so a predicate that replaced `operator==`
+    would let this pair through and the cast to `DiskObjectStorage` would throw.
+    """
+    node = cluster.instances["node"]
+    table = "plain_to_encrypted"
+
+    node.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node.query(
+        f"""
+        CREATE TABLE {table} (k UInt64, s String)
+        ENGINE = MergeTree ORDER BY k
+        SETTINGS storage_policy = 'plain_then_encrypted', min_bytes_for_wide_part = 0
+        """
+    )
+    node.query(
+        f"INSERT INTO {table} SELECT number, randomPrintableASCII(64) FROM numbers({NUM_ROWS})"
+    )
+
+    expected = node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip()
+
+    node.query(
+        f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'disk_plain_s3_encrypted'"
+    )
+    assert (
+        node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip() == expected
+    )
+
+    node.query(f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'backup_disk_s3'")
+    assert (
+        node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip() == expected
+    )
+
+    node.query(f"DROP TABLE {table} SYNC")
+
+
+def test_plain_to_plain_still_copies_server_side():
+    """The capability defaults to false, so a description that forgets to claim it silently loses the
+    server-side copy. Two ordinary s3 disks must keep it.
+    """
+    node = cluster.instances["node"]
+    table = "plain_to_plain"
+    query_id = f"plain_to_plain_move_{RUN_TOKEN}"
+
+    node.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node.query(
+        f"""
+        CREATE TABLE {table} (k UInt64, s String)
+        ENGINE = MergeTree ORDER BY k
+        SETTINGS storage_policy = 'plain_then_plain', min_bytes_for_wide_part = 0
+        """
+    )
+    node.query(
+        f"INSERT INTO {table} SELECT number, randomPrintableASCII(64) FROM numbers({NUM_ROWS})"
+    )
+    expected = node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip()
+
+    node.query(
+        f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'disk_plain_s3_second'",
+        query_id=query_id,
+    )
+
+    upload_part_copy, copy_object = copy_events(node, query_id)
+    assert (
+        upload_part_copy + copy_object > 0
+    ), "a non-CAS disk pair lost its server-side copy"
+    assert (
+        node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip() == expected
+    )
+
+    node.query(f"DROP TABLE {table} SYNC")
+
+
+def test_backup_to_file_keeps_fs_copy():
+    """Both sides take their description from `DiskLocal::getLocalDataSourceDescription`. A forgotten
+    claim there gives `false && false`, and `BackupWriterFile` silently stops using `fs::copy`.
+    """
+    node = cluster.instances["node"]
+    table = "plain_local_to_file"
+    query_id = f"plain_local_backup_{RUN_TOKEN}"
+
+    node.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node.query(
+        f"""
+        CREATE TABLE {table} (k UInt64, s String)
+        ENGINE = MergeTree ORDER BY k
+        SETTINGS min_bytes_for_wide_part = 0
+        """
+    )
+    node.query(
+        f"INSERT INTO {table} SELECT number, randomPrintableASCII(64) FROM numbers({NUM_ROWS})"
+    )
+
+    node.query(
+        f"BACKUP TABLE {table} TO File('{RUN_TOKEN}/file_backup')", query_id=query_id
+    )
+    node.query("SYSTEM FLUSH LOGS query_log")
+
+    read_bytes = int(
+        node.query(
+            f"""
+            SELECT ProfileEvents['ReadBufferFromFileDescriptorReadBytes']
+            FROM system.query_log
+            WHERE type = 'QueryFinish' AND query_id = '{query_id}'
+            ORDER BY event_time DESC LIMIT 1
+            """
+        ).strip()
+    )
+    assert (
+        read_bytes == 0
+    ), "BACKUP TO File(...) read the data through the server instead of using fs::copy"
+
+    node.query(f"DROP TABLE {table} SYNC")
+
+
+def test_cached_cas_disk_is_not_whole_object():
+    """`wrapWithCache` reuses the CAS metadata storage for a CAS disk, so the cache disk must inherit
+    the same answer and stay out of the server-side copy.
+    """
+    node = cluster.instances["node"]
+    table = "cas_cached_move"
+    query_id = f"cas_cached_move_{RUN_TOKEN}"
+
+    create_and_fill(node, table, "cas_cached_then_plain")
+    expected = column_fingerprints(node, table)
+
+    node.query(
+        f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'backup_disk_s3'",
+        query_id=query_id,
+    )
+
+    upload_part_copy, copy_object = copy_events(node, query_id)
+    assert (upload_part_copy, copy_object) == (
+        0,
+        0,
+    ), "a cache disk over CAS reported itself as whole-object"
+    assert column_fingerprints(node, table) == expected
+
+    node.query(f"DROP TABLE {table} SYNC")
+
+
+def test_backup_into_a_cas_disk_succeeds():
+    """A behaviour change, not a goal of this work: the buffered path writes backup files rather than
+    part files, so the autocommit refusal for part files does not apply and the backup goes through.
+    """
+    node = cluster.instances["node"]
+    table = "backup_into_cas"
+    restored = f"{table}_restored"
+    destination = f"Disk('disk_cas_backup_s3', '{RUN_TOKEN}/{table}')"
+
+    node.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node.query(
+        f"""
+        CREATE TABLE {table} (k UInt64, s String)
+        ENGINE = MergeTree ORDER BY k
+        SETTINGS min_bytes_for_wide_part = 0
+        """
+    )
+    node.query(
+        f"INSERT INTO {table} SELECT number, randomPrintableASCII(64) FROM numbers({NUM_ROWS})"
+    )
+    expected = node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip()
+
+    node.query(f"BACKUP TABLE {table} TO {destination}")
+
+    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node.query(f"RESTORE TABLE {table} AS {restored} FROM {destination}")
+    assert (
+        node.query(f"SELECT count(), sum(cityHash64(s)) FROM {restored}").strip()
+        == expected
+    )
+
+    node.query(f"DROP TABLE {table} SYNC")
+    node.query(f"DROP TABLE {restored} SYNC")
+
+
+def test_backup_to_s3_with_empty_array_column():
+    """A zero-size file reaches the CAS branch only when files are not deduplicated: with
+    `deduplicate_files = 1` the coordination drops it and this test would prove nothing.
+    """
+    node = cluster.instances["node"]
+    table = "cas_backup_empty_arrays"
+    restored = f"{table}_restored"
+    destination = backup_destination("empty_arrays")
+
+    node.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node.query(
+        f"""
+        CREATE TABLE {table} (k UInt64, empty Array(UInt32))
+        ENGINE = MergeTree ORDER BY k
+        SETTINGS storage_policy = '{STORAGE_POLICY}', min_bytes_for_wide_part = 0
+        """
+    )
+    node.query(f"INSERT INTO {table} SELECT number, [] FROM numbers({NUM_ROWS})")
+    expected = node.query(f"SELECT count(), sum(length(empty)) FROM {table}").strip()
+
+    node.query(
+        f"BACKUP TABLE {table} TO {destination} "
+        f"SETTINGS allow_s3_native_copy = 1, deduplicate_files = 0"
+    )
+
+    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node.query(f"RESTORE TABLE {table} AS {restored} FROM {destination}")
+    assert (
+        node.query(f"SELECT count(), sum(length(empty)) FROM {restored}").strip()
+        == expected
+    )
+
+    node.query(f"DROP TABLE {table} SYNC")
+    node.query(f"DROP TABLE {restored} SYNC")
+
+
+def test_incremental_backup_of_a_cas_table():
+    """The only path that can make `start_pos` non-zero. The CAS branch computes the physical start as
+    `payload_offset + start_pos`, so a dropped `start_pos` would corrupt the increment.
+    """
+    node = cluster.instances["node"]
+    table = "cas_incremental"
+    restored = f"{table}_restored"
+    base = backup_destination("incremental_base")
+    increment = backup_destination("incremental_delta")
+
+    create_and_fill(node, table)
+    node.query(f"BACKUP TABLE {table} TO {base}")
+
+    node.query(
+        f"""
+        INSERT INTO {table}
+        SELECT
+            number + {NUM_ROWS},
+            randomPrintableASCII(64),
+            if(number % 7 = 0, NULL, toInt64(number)),
+            [toUInt32(number), toUInt32(number + 1)]
+        FROM numbers({NUM_ROWS})
+        """
+    )
+    expected = column_fingerprints(node, table)
+
+    node.query(f"BACKUP TABLE {table} TO {increment} SETTINGS base_backup = {base}")
+
+    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node.query(f"RESTORE TABLE {table} AS {restored} FROM {increment}")
+    assert column_fingerprints(node, restored) == expected
+
+    node.query(f"DROP TABLE {table} SYNC")
+    node.query(f"DROP TABLE {restored} SYNC")
