@@ -115,6 +115,7 @@ namespace Setting
     extern const SettingsString cluster_for_parallel_replicas;
     extern const SettingsBool database_datalake_require_metadata_access;
     extern const SettingsBool data_lake_delete_data_on_drop;
+    extern const SettingsBool datalake_ignore_unsupported_table_properties;
     extern const SettingsBool show_data_lake_catalogs_in_system_tables;
     extern const SettingsString iceberg_metadata_compression_method;
 }
@@ -1041,7 +1042,9 @@ void DatabaseDataLake::createTable(
         columns,
         partition_by,
         order_by,
-        context_).first;
+        context_,
+        /*format_version=*/ 2,
+        /*is_catalog_table=*/ true).first;
 
     const auto compression_method_str = context_->getSettingsRef()[Setting::iceberg_metadata_compression_method].value;
     const auto compression_method = chooseCompressionMethod(compression_method_str, compression_method_str);
@@ -1351,6 +1354,17 @@ ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
         if (throw_on_error)
             throw Exception(ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY, "Table `{}` doesn't exist", name);
         return {};
+    }
+
+    if (!table_metadata.getUnsupportedProperties().empty()
+        && !context_->getSettingsRef()[Setting::datalake_ignore_unsupported_table_properties])
+    {
+        if (!throw_on_error)
+            return {};
+        throw Exception(ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY,
+            "Cannot represent {} of table {}.{} in CREATE TABLE. "
+            "Set datalake_ignore_unsupported_table_properties = 1 to omit unsupported properties",
+            table_metadata.getUnsupportedProperties(), getDatabaseName(), name);
     }
 
     auto create_table_query = make_intrusive<ASTCreateQuery>();
