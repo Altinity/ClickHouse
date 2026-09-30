@@ -567,7 +567,19 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
     String & current_full_name,
     bool is_subfield_of_root)
 {
-    auto derived_type = getDerivedFieldType(field, type_key, context_, required, current_full_name, is_subfield_of_root);
+    DataTypePtr derived_type;
+    if (field->isObject(type_key))
+        derived_type = getComplexTypeFromObject(field->getObject(type_key), current_full_name, context_, is_subfield_of_root);
+    else
+    {
+        auto type = field->get(type_key);
+        if (!type.isString())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unexpected 'type' field: {}", type.toString());
+
+        derived_type = getSimpleType(type.extract<String>(), context_, allow_geo_parser);
+        if (!required && derived_type->canBeInsideNullable())
+            derived_type = makeNullable(derived_type);
+    }
 
     if (!field->has(f_clickhouse_type))
         return derived_type;
@@ -597,28 +609,6 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
             derived_type->getName());
 
     return annotated_type;
-}
-
-DataTypePtr IcebergSchemaProcessor::getDerivedFieldType(
-    const Poco::JSON::Object::Ptr & field,
-    const String & type_key,
-    ContextPtr context_,
-    bool required,
-    String & current_full_name,
-    bool is_subfield_of_root)
-{
-    if (field->isObject(type_key))
-        return getComplexTypeFromObject(field->getObject(type_key), current_full_name, context_, is_subfield_of_root);
-
-    auto type = field->get(type_key);
-    if (type.isString())
-    {
-        const String & type_name = type.extract<String>();
-        auto data_type = getSimpleType(type_name, context_, allow_geo_parser);
-        return required || !data_type->canBeInsideNullable() ? data_type : makeNullable(data_type);
-    }
-
-    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unexpected 'type' field: {}", type.toString());
 }
 
 /**

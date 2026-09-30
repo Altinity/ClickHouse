@@ -77,7 +77,6 @@ ${CLICKHOUSE_CLIENT} --query "
 "
 
 echo '-- a column chunk holding both a dictionary page and a plain page'
-# Exercise both dictionary and plain pages in one column chunk.
 ${CLICKHOUSE_CLIENT} ${STATES} --query "
     INSERT INTO FUNCTION file('${MIXED}', Parquet)
     SELECT uniqState(number) AS u FROM numbers(2000)

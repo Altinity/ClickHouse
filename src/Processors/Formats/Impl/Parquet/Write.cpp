@@ -1577,16 +1577,14 @@ void writeFileFooter(FileWriteState & file,
 
     {
         Poco::JSON::Object::Ptr column_types = new Poco::JSON::Object;
-        bool any = false;
         for (const auto & [column_name, type] : header.getNamesAndTypesList())
         {
             if (!needsClickHouseTypeAnnotation(type))
                 continue;
             column_types->set(column_name, getClickHouseTypeAnnotationName(type));
-            any = true;
         }
 
-        if (any)
+        if (column_types->size())
         {
             std::ostringstream // STYLE_CHECK_ALLOW_STD_STRING_STREAM
                 oss;

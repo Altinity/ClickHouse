@@ -369,8 +369,7 @@ Poco::JSON::Object::Ptr makeMetadataWithField(
     return metadata;
 }
 
-/// The Iceberg type recorded for `name` in the schema `current-schema-id` points at.
-Poco::Dynamic::Var findCurrentFieldType(const Poco::JSON::Object::Ptr & metadata, const String & name)
+Poco::Dynamic::Var findCurrentFieldValue(const Poco::JSON::Object::Ptr & metadata, const String & name, const String & key)
 {
     auto current_schema_id = metadata->getValue<Int32>(f_current_schema_id);
     auto schemas = metadata->getArray(f_schemas);
@@ -384,7 +383,7 @@ Poco::Dynamic::Var findCurrentFieldType(const Poco::JSON::Object::Ptr & metadata
         {
             auto field = fields->getObject(j);
             if (field->getValue<String>(f_name) == name)
-                return field->get(f_type);
+                return field->get(key);
         }
     }
     return {};
@@ -400,25 +399,8 @@ Poco::JSON::Object::Ptr makeMetadataWithAnnotatedField(
 
 std::optional<String> findCurrentFieldAnnotation(const Poco::JSON::Object::Ptr & metadata, const String & name)
 {
-    auto current_schema_id = metadata->getValue<Int32>(f_current_schema_id);
-    auto schemas = metadata->getArray(f_schemas);
-    for (UInt32 i = 0; i < schemas->size(); ++i)
-    {
-        auto schema = schemas->getObject(i);
-        if (schema->getValue<Int32>(f_schema_id) != current_schema_id)
-            continue;
-        auto fields = schema->getArray(f_fields);
-        for (UInt32 j = 0; j < fields->size(); ++j)
-        {
-            auto field = fields->getObject(j);
-            if (field->getValue<String>(f_name) != name)
-                continue;
-            if (!field->has(f_clickhouse_type))
-                return std::nullopt;
-            return field->getValue<String>(f_clickhouse_type);
-        }
-    }
-    return std::nullopt;
+    auto value = findCurrentFieldValue(metadata, name, f_clickhouse_type);
+    return value.isEmpty() ? std::nullopt : std::optional{value.extract<String>()};
 }
 
 void expectModifyRejected(
@@ -519,7 +501,7 @@ TEST(IcebergMetadataGenerator, ModifyColumnWideningRecordsTheNewTypeInANewSchema
     EXPECT_EQ(after.schema_count, before.schema_count + 1);
     EXPECT_NE(after.current_schema_id, before.current_schema_id);
 
-    auto stored_type = findCurrentFieldType(metadata, "x");
+    auto stored_type = findCurrentFieldValue(metadata, "x", f_type);
     ASSERT_TRUE(stored_type.isString());
     EXPECT_EQ(stored_type.extract<String>(), "long");
 }

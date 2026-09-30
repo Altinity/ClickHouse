@@ -519,12 +519,8 @@ bool needsClickHouseTypeAnnotation(const DataTypePtr & type)
     auto result = false;
     auto check = [&](const IDataType & t)
     {
-        if (WhichDataType(t).isAggregateFunction())
-        {
-            result = true;
-            return;
-        }
-        result |= typeid_cast<const DataTypeCustomSimpleAggregateFunction *>(t.getCustomName()) != nullptr;
+        result |= WhichDataType(t).isAggregateFunction()
+            || typeid_cast<const DataTypeCustomSimpleAggregateFunction *>(t.getCustomName()) != nullptr;
     };
 
     check(*type);
@@ -574,11 +570,6 @@ String getClickHouseTypeAnnotationName(const DataTypePtr & type)
 
 namespace
 {
-
-DataTypePtr removeNullableAndLowCardinality(const DataTypePtr & type)
-{
-    return removeNullable(removeLowCardinality(type));
-}
 
 bool isFixedStringOfSize(const DataTypePtr & type, size_t size)
 {
@@ -647,8 +638,8 @@ bool parquetWriterCouldProduce(const DataTypePtr & annotated, const DataTypePtr 
 
 bool annotatedTypeMatchesDerived(const DataTypePtr & annotated_type, const DataTypePtr & derived_type, bool strict)
 {
-    auto annotated = removeNullableAndLowCardinality(annotated_type);
-    auto derived = removeNullableAndLowCardinality(derived_type);
+    auto annotated = removeLowCardinalityAndNullable(annotated_type);
+    auto derived = removeLowCardinalityAndNullable(derived_type);
 
     if (annotated->getTypeId() == TypeIndex::AggregateFunction)
         return isString(derived);

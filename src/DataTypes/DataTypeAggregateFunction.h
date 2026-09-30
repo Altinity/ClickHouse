@@ -100,7 +100,6 @@ bool hasAggregateFunctionType(const DataTypePtr & type);
 /// Checks a parsed type name without resolving aggregate functions through `DataTypeFactory`.
 bool astHasAggregateFunctionType(const ASTPtr & ast);
 
-/// Checks whether a Parquet or Iceberg schema needs a ClickHouse type annotation.
 bool needsClickHouseTypeAnnotation(const DataTypePtr & type);
 
 /// Returns an annotation name that preserves explicit aggregate-state versions.

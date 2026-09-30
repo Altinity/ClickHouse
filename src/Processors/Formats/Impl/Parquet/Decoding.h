@@ -325,7 +325,6 @@ struct GeoConverter : public StringConverter
     void convertColumn(std::span<const char> chars, const UInt64 * offsets, size_t separator_bytes, size_t num_values, IColumn & col) const override;
 };
 
-/// Decodes serialized aggregate-function states from Parquet BYTE_ARRAY values.
 struct AggregateFunctionStateConverter : public StringConverter
 {
     std::shared_ptr<const ISerialization> serialization;
