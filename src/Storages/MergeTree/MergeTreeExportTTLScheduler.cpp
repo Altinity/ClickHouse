@@ -15,6 +15,7 @@
 #include <Common/logger_useful.h>
 
 #include <filesystem>
+#include <optional>
 
 namespace fs = std::filesystem;
 
@@ -202,16 +203,21 @@ ExportTTLScheduler::TaskState MergeTreeExportTTLScheduler::getTaskState(const St
 
 bool MergeTreeExportTTLScheduler::startGroup(const GroupToStart & group, const ContextPtr & context)
 {
-    const auto source_metadata = plain_storage.getInMemoryMetadataPtr(context, false);
-    const auto destination_metadata = group.destination->getInMemoryMetadataPtr(context, false);
-    ExportTaskUtils::verifyExportSchemaCastable(source_metadata, destination_metadata, group.destination->getStorageID(), context);
+    const auto parts_with_rows = group.partsWithRows();
+    std::optional<MergeTreeExportTask> descriptor;
+    if (!parts_with_rows.empty())
+    {
+        const auto source_metadata = plain_storage.getInMemoryMetadataPtr(context, false);
+        const auto destination_metadata = group.destination->getInMemoryMetadataPtr(context, false);
+        ExportTaskUtils::verifyExportSchemaCastable(source_metadata, destination_metadata, group.destination->getStorageID(), context);
 
-    MergeTreeData::DataPartsVector parts(group.parts.begin(), group.parts.end());
-    auto descriptor = plain_storage.buildExportTask(
-        group.destination->getStorageID(), group.destination, source_metadata, destination_metadata, parts, group.partition_id, context);
-    descriptor.transaction_id = group.transaction_id;
-    descriptor.source = ExportTaskSource::ttl;
-    descriptor.retry_of = group.retry_of;
+        MergeTreeData::DataPartsVector parts(parts_with_rows.begin(), parts_with_rows.end());
+        descriptor = plain_storage.buildExportTask(
+            group.destination->getStorageID(), group.destination, source_metadata, destination_metadata, parts, group.partition_id, context);
+        descriptor->transaction_id = group.transaction_id;
+        descriptor->source = ExportTaskSource::ttl;
+        descriptor->retry_of = group.retry_of;
+    }
 
     {
         /// Merge selection holds it while it checks the fence and tags the parts it merges.
@@ -226,7 +232,8 @@ bool MergeTreeExportTTLScheduler::startGroup(const GroupToStart & group, const C
             return false;
     }
 
-    plain_storage.export_task_scheduler->addTask(std::move(descriptor), std::vector<MergeTreeDataPartPtr>(group.parts.begin(), group.parts.end()));
+    if (descriptor)
+        plain_storage.export_task_scheduler->addTask(std::move(*descriptor), parts_with_rows);
     return true;
 }
 

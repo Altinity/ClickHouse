@@ -168,8 +168,6 @@ struct ExportReplicatedMergeTreeTaskManifest
     ExportTaskSource source = ExportTaskSource::query;
     String destination_database;
     String destination_table;
-    /// UUID of the destination table when the task was created, empty if it has none.
-    String destination_uuid;
     /// TTL export only: earlier tasks that failed to export some of these parts and whose commit may
     /// still land. The commit checks whether any of them landed at the destination after all.
     ExportRetriedTasks retry_of;
@@ -212,8 +210,6 @@ struct ExportReplicatedMergeTreeTaskManifest
         json.set("source", String(magic_enum::enum_name(source)));
         json.set("destination_database", destination_database);
         json.set("destination_table", destination_table);
-        if (!destination_uuid.empty())
-            json.set("destination_uuid", destination_uuid);
         if (!retry_of.empty())
             json.set("retry_of", ExportRetriedTaskUtils::toJSON(retry_of));
         json.set("source_replica", source_replica);
@@ -279,8 +275,6 @@ struct ExportReplicatedMergeTreeTaskManifest
         }
         manifest.destination_database = json->getValue<String>("destination_database");
         manifest.destination_table = json->getValue<String>("destination_table");
-        if (json->has("destination_uuid"))
-            manifest.destination_uuid = json->getValue<String>("destination_uuid");
         if (json->has("retry_of"))
             manifest.retry_of = ExportRetriedTaskUtils::fromJSON(json->getArray("retry_of"));
         manifest.source_replica = json->getValue<String>("source_replica");

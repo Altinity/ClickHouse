@@ -101,10 +101,15 @@ protected:
         String destination_key;
         StoragePtr destination;
         String partition_id;
+        /// Every part of the group, including the parts without rows, which have nothing to export.
         std::vector<MergeTreeDataPartPtr> parts;
         ExportRetriedTasks retry_of;
-        /// The index entry with the claim of the group, to be stored with a check of its version.
+        /// The index entry with the claim of the group, to be stored with a check of its version. A
+        /// group of parts without rows only has no task, and its entry records them as exported.
         ExportTTLVersionedEntry entry;
+
+        /// The parts that the task of the group exports.
+        std::vector<MergeTreeDataPartPtr> partsWithRows() const;
     };
 
     /// Only one replica schedules, which keeps the replicas from conflicting on the index. The lock
@@ -115,11 +120,6 @@ protected:
     virtual bool isPaused() = 0;
 
     virtual ExportTTLIndexSnapshotPtr getIndexSnapshot() = 0;
-
-    /// Whether the key of the destination in the index contains its UUID, which tells apart a table
-    /// that was dropped and created again. Replicas have different UUIDs for the same destination
-    /// unless its database is `Replicated`, so they identify it by name only.
-    virtual bool identifiesDestinationByUUID() const = 0;
 
     virtual String getReplicaName() const = 0;
 
@@ -134,8 +134,9 @@ protected:
     /// Stores `entry` with a check of its version. Returns false on a conflict.
     virtual bool updateIndexEntry(const String & destination_key, const ExportTTLVersionedEntry & entry) = 0;
 
-    /// Creates the export task of `group` and stores its index entry. Returns false on a conflict,
-    /// e.g. a merge was assigned or the index changed meanwhile.
+    /// Creates the export task of the parts of `group` that have rows, if any, and stores its index
+    /// entry, provided no part of the group is being merged. Returns false on a conflict, e.g. a merge
+    /// was assigned or the index changed meanwhile.
     virtual bool startGroup(const GroupToStart & group, const ContextPtr & context) = 0;
 
     /// Whether the part is a source of an assigned merge that changes its block range.

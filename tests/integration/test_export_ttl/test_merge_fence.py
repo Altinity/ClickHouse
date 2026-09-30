@@ -220,6 +220,41 @@ def test_mutation_keeps_parts_exported(cluster, source_engine):
     assert_one_snapshot_per_task(node, mt_table, iceberg_table)
 
 
+def test_parts_without_rows_are_recorded_as_exported(cluster, source_engine):
+    """A part that a mutation emptied, kept by `remove_empty_parts = 0`, has nothing to export, but its
+    group records it as exported: otherwise it would stay apart from the exported parts around it, and
+    the partition could never be merged into one part. A group of such parts only has no task."""
+    node = cluster.instances["replica1"]
+    # No merge is assigned until the end, so the emptied part stays between the others.
+    mt_table, iceberg_table = make_tables(
+        node, source_engine, settings={"remove_empty_parts": 0, "max_bytes_to_merge_at_max_space_in_pool": 1}
+    )
+    rows_of_parts = f"SELECT rows FROM system.parts WHERE database = currentDatabase() AND table = '{mt_table}' AND active ORDER BY name"
+
+    node.query(f"SYSTEM STOP MOVES {mt_table}")
+    for row in [f"(1, 2020, {DUE})", f"(2, 2020, {NOT_DUE})", f"(3, 2020, {DUE})"]:
+        node.query(f"INSERT INTO {mt_table} VALUES {row}")
+    node.query(f"ALTER TABLE {mt_table} DELETE WHERE id = 2", settings={"mutations_sync": 2})
+    assert node.query(rows_of_parts).split() == ["1", "0", "1"]
+    node.query(f"SYSTEM START MOVES {mt_table}")
+
+    wait_for_partitions_exported(node, mt_table, ["2020"], exported=3)
+    tasks = ttl_tasks(node, mt_table)
+    assert len(tasks) == 1 and len(tasks[0]["parts"]) == 2, tasks
+    assert_exactly_once(iceberg_ids(node, iceberg_table), [1, 3])
+
+    node.query(f"INSERT INTO {mt_table} VALUES (4, 2020, {NOT_DUE})")
+    node.query(f"ALTER TABLE {mt_table} DELETE WHERE id = 4", settings={"mutations_sync": 2})
+    wait_for_partitions_exported(node, mt_table, ["2020"], exported=4)
+    assert len(ttl_tasks(node, mt_table)) == 1
+
+    node.query(f"ALTER TABLE {mt_table} RESET SETTING max_bytes_to_merge_at_max_space_in_pool")
+    node.query(f"OPTIMIZE TABLE {mt_table} PARTITION ID '2020' FINAL")
+    assert len(active_parts(node, mt_table)) == 1
+    assert_exactly_once(iceberg_ids(node, iceberg_table), [1, 3])
+    assert_one_snapshot_per_task(node, mt_table, iceberg_table)
+
+
 def test_block_numbers_are_not_reused_after_a_restart(cluster):
     """A plain `MergeTree` table allocates block numbers from its parts. The exported blocks of a
     dropped partition must not be allocated again, or a new part would look exported."""

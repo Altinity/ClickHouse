@@ -8798,8 +8798,6 @@ ExportReplicatedMergeTreeTaskManifest StorageReplicatedMergeTree::buildExportTas
     ExportReplicatedMergeTreeTaskManifest manifest;
     manifest.destination_database = dest_storage_id.database_name;
     manifest.destination_table = dest_storage_id.table_name;
-    if (const auto uuid = dest_storage->getStorageID().uuid; uuid != UUIDHelpers::Nil)
-        manifest.destination_uuid = toString(uuid);
     manifest.source_replica = replica_name;
     manifest.number_of_parts = part_names.size();
     manifest.parts = part_names;

@@ -216,8 +216,8 @@ bool ReplicatedExportTTLScheduler::startGroup(const GroupToStart & group, const 
     auto zookeeper = replicated_storage.getZooKeeperAndAssertNotReadonly();
     replicated_storage.checkAllReplicasSupportExportTTL(zookeeper);
 
-    /// Its `/log` version is checked when the task is created, so no merge can be assigned between
-    /// checking the parts below and claiming them.
+    /// Its `/log` version is checked when the index entry is stored, so no merge can be assigned between
+    /// checking the parts below, including the ones without rows, and claiming them.
     const auto merge_predicate = replicated_storage.queue.getMergePredicate(zookeeper, PartitionIdsHint{group.partition_id});
     for (const auto & part : group.parts)
     {
@@ -230,26 +230,29 @@ bool ReplicatedExportTTLScheduler::startGroup(const GroupToStart & group, const 
             return false;
     }
 
-    const auto source_metadata = replicated_storage.getInMemoryMetadataPtr(context, false);
-    const auto destination_metadata = group.destination->getInMemoryMetadataPtr(context, false);
-    ExportTaskUtils::verifyExportSchemaCastable(source_metadata, destination_metadata, group.destination->getStorageID(), context);
+    Coordination::Requests ops;
+    ops.emplace_back(zkutil::makeCheckRequest(fs::path(replicated_storage.zookeeper_path) / "log", merge_predicate->getVersion()));
 
-    MergeTreeData::DataPartsVector parts(group.parts.begin(), group.parts.end());
-    auto manifest = replicated_storage.buildExportTaskManifest(
-        group.destination->getStorageID(), group.destination, source_metadata, destination_metadata, parts, group.partition_id, context);
-    manifest.transaction_id = group.transaction_id;
-    manifest.source = ExportTaskSource::ttl;
-    manifest.retry_of = group.retry_of;
+    const auto parts_with_rows = group.partsWithRows();
+    if (!parts_with_rows.empty())
+    {
+        const auto source_metadata = replicated_storage.getInMemoryMetadataPtr(context, false);
+        const auto destination_metadata = group.destination->getInMemoryMetadataPtr(context, false);
+        ExportTaskUtils::verifyExportSchemaCastable(source_metadata, destination_metadata, group.destination->getStorageID(), context);
+
+        MergeTreeData::DataPartsVector parts(parts_with_rows.begin(), parts_with_rows.end());
+        auto manifest = replicated_storage.buildExportTaskManifest(
+            group.destination->getStorageID(), group.destination, source_metadata, destination_metadata, parts, group.partition_id, context);
+        manifest.transaction_id = group.transaction_id;
+        manifest.source = ExportTaskSource::ttl;
+        manifest.retry_of = group.retry_of;
+
+        ExportTaskUtils::appendCreateExportTaskOps(ops, fs::path(replicated_storage.zookeeper_path) / "exports" / group.transaction_id, manifest);
+    }
 
     const auto & export_ttl_index = *replicated_storage.export_ttl_index;
     if (group.entry.version < 0)
         export_ttl_index.ensureDestination(zookeeper, group.destination_key, group.destination->getStorageID().getNameForLogs());
-
-    const auto task_path = fs::path(replicated_storage.zookeeper_path) / "exports" / group.transaction_id;
-
-    Coordination::Requests ops;
-    ops.emplace_back(zkutil::makeCheckRequest(fs::path(replicated_storage.zookeeper_path) / "log", merge_predicate->getVersion()));
-    ExportTaskUtils::appendCreateExportTaskOps(ops, task_path, manifest);
     export_ttl_index.appendUpdateEntryOps(ops, group.destination_key, group.entry.entry, group.entry.version);
 
     ProfileEvents::increment(ProfileEvents::ExportTaskZooKeeperRequests);
@@ -259,7 +262,7 @@ bool ReplicatedExportTTLScheduler::startGroup(const GroupToStart & group, const 
 
     if (code == Coordination::Error::ZOK)
     {
-        if (replicated_storage.export_task_updating_task)
+        if (!parts_with_rows.empty() && replicated_storage.export_task_updating_task)
             replicated_storage.export_task_updating_task->schedule();
         return true;
     }

@@ -62,6 +62,9 @@ struct ExportTTLIndexEntry
     /// a task may commit parts whose claim was lost.
     void commitClaim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts);
 
+    /// Adds the ranges of `parts` to the exported ranges.
+    void addExported(const std::vector<MergeTreePartInfo> & parts);
+
     void releaseClaim() { claim.reset(); }
 
     String toJSONString() const;
@@ -100,9 +103,9 @@ namespace ExportTTLUtils
     /// that opted in at `CREATE` or `ALTER` would not reach them, and Iceberg has no unsigned types.
     void allowLossyCasts(Context & context);
 
-    /// Identifies a destination in the export index. The UUID, if not empty, tells apart a table that
-    /// was dropped and created again under the same name, which holds none of the exported rows.
-    String destinationKey(const String & database, const String & table, const String & uuid);
+    /// Identifies a destination in the export index, by name: a table dropped and created again under
+    /// the same name is the same destination.
+    String destinationKey(const String & database, const String & table);
 
     /// Ranges of the parts named `part_names`, compacted.
     std::vector<MergeTreePartInfo> rangesOfParts(const std::vector<String> & part_names, MergeTreeDataFormatVersion format_version);

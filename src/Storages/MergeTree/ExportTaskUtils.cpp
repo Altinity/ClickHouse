@@ -640,8 +640,7 @@ namespace
         const std::string commit_info_path = fs::path(entry_path) / "commit_info";
 
         const bool is_ttl_task = manifest.source == ExportTaskSource::ttl;
-        /// Replicas identify the destination by name, see `ReplicatedExportTTLScheduler`.
-        const auto destination_key = ExportTTLUtils::destinationKey(manifest.destination_database, manifest.destination_table, "");
+        const auto destination_key = ExportTTLUtils::destinationKey(manifest.destination_database, manifest.destination_table);
 
         /// The index entry of a TTL task is stored with a check of its version, because the TTL
         /// scheduler may change it meanwhile, e.g. when it resolves another claim of the partition.

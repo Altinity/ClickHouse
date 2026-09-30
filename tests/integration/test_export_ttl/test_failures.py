@@ -188,10 +188,8 @@ def test_restart_before_the_first_check(cluster, source_engine):
 
 
 def test_dropped_destination(cluster, source_engine):
-    """Without its destination the TTL exports nothing and reports why. A plain `MergeTree` table tells
-    apart a destination created again under the same name, and exports everything to it again: an
-    Iceberg table created again over the same data has the rows exported before twice. A replicated
-    table identifies the destination by name, and exports only what it did not export yet."""
+    """Without its destination the TTL exports nothing and reports why. The destination is identified
+    by name, so once it is created again, only what was not exported yet is exported to it."""
     node = cluster.instances["replica1"]
     mt_table, iceberg_table = make_tables(node, source_engine)
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE})")
@@ -210,12 +208,8 @@ def test_dropped_destination(cluster, source_engine):
     assert ttl_rows(node, mt_table)["2020"]["last_error"] == ""
 
     exported_again = ttl_tasks(node, mt_table)[-1]["parts"]
-    if source_engine == "MergeTree":
-        assert len(exported_again) == 2, ttl_tasks(node, mt_table)
-        assert_exactly_once(iceberg_ids(node, iceberg_table), [1, 1, 2])
-    else:
-        assert len(exported_again) == 1, ttl_tasks(node, mt_table)
-        assert_exactly_once(iceberg_ids(node, iceberg_table), [1, 2])
+    assert len(exported_again) == 1, ttl_tasks(node, mt_table)
+    assert_exactly_once(iceberg_ids(node, iceberg_table), [1, 2])
     # One snapshot for the task that exported to the table created again.
     assert iceberg_snapshots(node, iceberg_table) == snapshots + 1
 

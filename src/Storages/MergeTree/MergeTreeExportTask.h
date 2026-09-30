@@ -59,8 +59,6 @@ struct MergeTreeExportTask
     String source_table;
     String destination_database;
     String destination_table;
-    /// Empty if the destination has no UUID.
-    String destination_uuid;
     time_t create_time = 0;
     ExportTaskSource source = ExportTaskSource::query;
     /// TTL tasks whose parts this task exports again because they failed, and whose commits may still
@@ -157,8 +155,6 @@ struct MergeTreeExportTask
         json.set("source_table", source_table);
         json.set("destination_database", destination_database);
         json.set("destination_table", destination_table);
-        if (!destination_uuid.empty())
-            json.set("destination_uuid", destination_uuid);
         json.set("create_time", create_time);
         json.set("source", String(magic_enum::enum_name(source)));
         if (!retry_of.empty())
@@ -236,8 +232,6 @@ struct MergeTreeExportTask
         task.source_table = json->getValue<String>("source_table");
         task.destination_database = json->getValue<String>("destination_database");
         task.destination_table = json->getValue<String>("destination_table");
-        if (json->has("destination_uuid"))
-            task.destination_uuid = json->getValue<String>("destination_uuid");
         task.create_time = json->getValue<time_t>("create_time");
 
         if (json->has("source"))

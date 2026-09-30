@@ -104,6 +104,11 @@ void ExportTTLIndexEntry::commitClaim(const String & transaction_id, const std::
         exported.insert(exported.end(), claim->ranges.begin(), claim->ranges.end());
         claim.reset();
     }
+    addExported(parts);
+}
+
+void ExportTTLIndexEntry::addExported(const std::vector<MergeTreePartInfo> & parts)
+{
     for (const auto & part : parts)
         exported.emplace_back(partition_id, part.min_block, part.max_block, 0, 0);
     exported = ExportFenceUtils::compactRanges(std::move(exported));
@@ -177,9 +182,9 @@ void allowLossyCasts(Context & context)
     context.setSetting("export_merge_tree_part_allow_lossy_cast", true);
 }
 
-String destinationKey(const String & database, const String & table, const String & uuid)
+String destinationKey(const String & database, const String & table)
 {
-    return escapeForFileName(database) + "." + escapeForFileName(table) + "." + (uuid.empty() ? String("none") : escapeForFileName(uuid));
+    return escapeForFileName(database) + "." + escapeForFileName(table);
 }
 
 std::vector<MergeTreePartInfo> rangesOfParts(const std::vector<String> & part_names, MergeTreeDataFormatVersion format_version)

@@ -60,7 +60,6 @@ protected:
     bool acquireSchedulerLock() override { return true; }
     bool isPaused() override;
     ExportTTLIndexSnapshotPtr getIndexSnapshot() override { return index.getSnapshot(); }
-    bool identifiesDestinationByUUID() const override { return true; }
     String getReplicaName() const override { return {}; }
     String getSchedulerReplica() override { return {}; }
     TaskState getTaskState(const String & transaction_id) override;

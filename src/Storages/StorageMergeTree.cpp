@@ -3906,8 +3906,6 @@ MergeTreeExportTask StorageMergeTree::buildExportTask(
     descriptor.source_table = getStorageID().table_name;
     descriptor.destination_database = dest_storage_id.database_name;
     descriptor.destination_table = dest_storage_id.table_name;
-    if (const auto uuid = dest_storage->getStorageID().uuid; uuid != UUIDHelpers::Nil)
-        descriptor.destination_uuid = toString(uuid);
     descriptor.create_time = time(nullptr);
     descriptor.status = MergeTreeExportTask::Status::PENDING;
 

@@ -97,6 +97,15 @@ ContextPtr ExportTTLScheduler::makeContext() const
     return context;
 }
 
+std::vector<MergeTreeDataPartPtr> ExportTTLScheduler::GroupToStart::partsWithRows() const
+{
+    std::vector<MergeTreeDataPartPtr> result;
+    for (const auto & part : parts)
+        if (part->rows_count != 0)
+            result.push_back(part);
+    return result;
+}
+
 const ExportTTLScheduler::TaskState & ExportTTLScheduler::getCachedTaskState(TaskStates & task_states, const String & transaction_id)
 {
     auto it = task_states.find(transaction_id);
@@ -132,17 +141,9 @@ UInt64 ExportTTLScheduler::run()
         const auto destination_id = storage.getExportTTLDestination(export_ttls.front());
         destination = DatabaseCatalog::instance().tryGetTable(destination_id, context);
         if (destination)
-        {
-            const auto uuid = destination->getStorageID().uuid;
-            destination_key = ExportTTLUtils::destinationKey(
-                destination_id.database_name,
-                destination_id.table_name,
-                identifiesDestinationByUUID() && uuid != UUIDHelpers::Nil ? toString(uuid) : "");
-        }
+            destination_key = ExportTTLUtils::destinationKey(destination_id.database_name, destination_id.table_name);
         else
-        {
             destination_error = fmt::format("The destination table {} of the EXPORT TTL does not exist", destination_id.getNameForLogs());
-        }
     }
 
     /// A destination that cannot be resolved may be created again or not loaded yet, so what was
@@ -422,10 +423,9 @@ ExportTTLScheduler::PartitionView ExportTTLScheduler::observePartition(
             continue;
         }
 
-        if (part->rows_count == 0)
-            continue;
-
-        if (!isEligible(*part, export_ttls, now))
+        /// A part without rows, e.g. emptied by a mutation, waits for no row. Nothing of it is exported,
+        /// but its group records it as exported, so that it merges with the exported parts around it.
+        if (part->rows_count != 0 && !isEligible(*part, export_ttls, now))
         {
             for (const auto & [_, ttl_info] : part->ttl_infos.export_ttl)
                 if (ttl_info.max > now && (!view.next_eligible_time || ttl_info.max < view.next_eligible_time))
@@ -552,9 +552,6 @@ std::optional<ExportTTLIndexEntry> ExportTTLScheduler::actOnPartition(
         for (const auto & part : group.parts)
             group_bytes += part->getBytesOnDisk();
 
-        if (!resolved.failed.empty())
-            group.retry_of = collectRetriedTasks(entry, resolved.failed, destination, now, task_states, context);
-
         for (const auto & part : view.shippable)
         {
             if (max_parts && group.parts.size() >= max_parts)
@@ -567,6 +564,12 @@ std::optional<ExportTTLIndexEntry> ExportTTLScheduler::actOnPartition(
 
         if (!group.parts.empty())
         {
+            /// A group of parts without rows only exports nothing, so it has no task: it records them
+            /// as exported when it starts.
+            const size_t parts_with_rows = group.partsWithRows().size();
+            if (parts_with_rows && !resolved.failed.empty())
+                group.retry_of = collectRetriedTasks(entry, resolved.failed, destination, now, task_states, context);
+
             /// The group takes over the claim of the failed task it retries, if any.
             group.entry = versioned;
             group.entry.entry.releaseClaim();
@@ -575,15 +578,27 @@ std::optional<ExportTTLIndexEntry> ExportTTLScheduler::actOnPartition(
             infos.reserve(group.parts.size());
             for (const auto & part : group.parts)
                 infos.push_back(part->info);
-            group.entry.entry.startClaim(group.transaction_id, infos);
+
+            if (parts_with_rows)
+                group.entry.entry.startClaim(group.transaction_id, infos);
+            else
+                group.entry.entry.addExported(infos);
 
             if (startGroup(group, context))
             {
-                ++in_flight;
-                task_states.insert_or_assign(group.transaction_id, TaskState{.status = TaskStatus::PENDING, .reached_commit = false, .retry_of = group.retry_of});
-                LOG_INFO(log, "Started export task {} of {} part(s) of partition {} to {}{}",
-                    group.transaction_id, group.parts.size(), partition_id, destination->getStorageID().getNameForLogs(),
-                    resolved.failed.empty() ? "" : fmt::format(", retrying {}", resolved.failed));
+                if (parts_with_rows)
+                {
+                    ++in_flight;
+                    task_states.insert_or_assign(group.transaction_id, TaskState{.status = TaskStatus::PENDING, .reached_commit = false, .retry_of = group.retry_of});
+                    LOG_INFO(log, "Started export task {} of {} part(s) of partition {} to {}{}",
+                        group.transaction_id, parts_with_rows, partition_id, destination->getStorageID().getNameForLogs(),
+                        resolved.failed.empty() ? "" : fmt::format(", retrying {}", resolved.failed));
+                }
+                else
+                {
+                    LOG_INFO(log, "Recorded {} part(s) of partition {} without rows as exported to {}",
+                        group.parts.size(), partition_id, destination->getStorageID().getNameForLogs());
+                }
                 return std::move(group.entry.entry);
             }
 

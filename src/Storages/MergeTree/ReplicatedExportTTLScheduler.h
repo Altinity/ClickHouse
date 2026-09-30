@@ -26,7 +26,6 @@ protected:
     bool acquireSchedulerLock() override;
     bool isPaused() override;
     ExportTTLIndexSnapshotPtr getIndexSnapshot() override;
-    bool identifiesDestinationByUUID() const override { return false; }
     String getReplicaName() const override;
     String getSchedulerReplica() override;
     TaskState getTaskState(const String & transaction_id) override;

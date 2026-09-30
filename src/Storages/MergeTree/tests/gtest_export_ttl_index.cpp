@@ -129,8 +129,7 @@ TEST(ExportTTLIndex, JsonRoundTrip)
 
 TEST(ExportTTLIndex, DestinationKeysOfDottedNamesDiffer)
 {
-    EXPECT_NE(ExportTTLUtils::destinationKey("db.x", "y", ""), ExportTTLUtils::destinationKey("db", "x.y", ""));
-    EXPECT_NE(ExportTTLUtils::destinationKey("db", "t", ""), ExportTTLUtils::destinationKey("db", "t", "00000000-0000-0000-0000-000000000001"));
+    EXPECT_NE(ExportTTLUtils::destinationKey("db.x", "y"), ExportTTLUtils::destinationKey("db", "x.y"));
 }
 
 TEST(ExportTTLIndex, RangesOfParts)

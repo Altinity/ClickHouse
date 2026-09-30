@@ -239,7 +239,6 @@ TEST_F(ExportTaskManifestBackCompatTest, TaskSourceAndRetryOfRoundTrip)
 {
     auto manifest = makeValidManifest();
     manifest.source = ExportTaskSource::ttl;
-    manifest.destination_uuid = "00000000-0000-0000-0000-000000000001";
     manifest.retry_of = {
         ExportRetriedTask{.transaction_id = "tx0", .block_ranges = {{1, 3}, {7, 7}}, .failed_time = 1700000000},
         ExportRetriedTask{.transaction_id = "tx00", .block_ranges = {{1, 1}}, .failed_time = 1600000000},
@@ -247,7 +246,6 @@ TEST_F(ExportTaskManifestBackCompatTest, TaskSourceAndRetryOfRoundTrip)
 
     const auto parsed = ExportReplicatedMergeTreeTaskManifest::fromJsonString(manifest.toJsonString());
     EXPECT_EQ(parsed.source, ExportTaskSource::ttl);
-    EXPECT_EQ(parsed.destination_uuid, manifest.destination_uuid);
     EXPECT_EQ(parsed.retry_of, manifest.retry_of);
     EXPECT_EQ(ExportRetriedTaskUtils::transactionIds(parsed.retry_of), (std::vector<String>{"tx0", "tx00"}));
 
