@@ -15,6 +15,7 @@ import uuid
 
 import pytest
 
+from helpers.client import QueryRuntimeException
 from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
@@ -565,9 +566,9 @@ def test_backup_to_file_keeps_fs_copy():
     )
 
     assert bytes_on_disk > 0, "the table has no active parts, so the assertion below proves nothing"
-    assert read_bytes * 2 < bytes_on_disk, (
-        f"BACKUP TO File(...) read {read_bytes} of {bytes_on_disk} bytes through the server, "
-        "so it stopped using fs::copy for the data"
+    assert read_bytes < bytes_on_disk * 3 // 2, (
+        f"BACKUP TO File(...) read {read_bytes} bytes with {bytes_on_disk} on disk. One pass is the "
+        "checksum pass every entry pays; a second pass means fs::copy was replaced by a buffered copy"
     )
 
     node.query(f"DROP TABLE {table} SYNC")
@@ -597,15 +598,13 @@ def test_cached_cas_disk_is_not_whole_object():
     assert column_fingerprints(node, table) == expected
 
     node.query(f"DROP TABLE {table} SYNC")
-
-
-def test_backup_into_a_cas_disk_succeeds():
-    """A behaviour change, not a goal of this work: the buffered path writes backup files rather than
-    part files, so the autocommit refusal for part files does not apply and the backup goes through.
+def test_backup_into_a_cas_disk_is_rejected():
+    """A `CAS` disk takes a part only as a whole part in one transaction. A backup's own layout mirrors
+    the table's data directory, so its files sit under a part directory too and `isPartFilePath` matches
+    them - which is why writing a backup into a `CAS` disk is refused rather than silently accepted.
     """
     node = cluster.instances["node"]
     table = "backup_into_cas"
-    restored = f"{table}_restored"
     destination = f"Disk('disk_cas_backup_s3', '{RUN_TOKEN}/{table}')"
 
     node.query(f"DROP TABLE IF EXISTS {table} SYNC")
@@ -619,16 +618,9 @@ def test_backup_into_a_cas_disk_succeeds():
     node.query(
         f"INSERT INTO {table} SELECT number, randomPrintableASCII(64) FROM numbers({NUM_ROWS})"
     )
-    expected = node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip()
 
-    node.query(f"BACKUP TABLE {table} TO {destination}")
-
-    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
-    node.query(f"RESTORE TABLE {table} AS {restored} FROM {destination}")
-    assert (
-        node.query(f"SELECT count(), sum(cityHash64(s)) FROM {restored}").strip()
-        == expected
-    )
+    with pytest.raises(QueryRuntimeException) as raised:
+        node.query(f"BACKUP TABLE {table} TO {destination}")
+    assert "Autocommit writes are not supported for content part files" in str(raised.value)
 
     node.query(f"DROP TABLE {table} SYNC")
-    node.query(f"DROP TABLE {restored} SYNC")

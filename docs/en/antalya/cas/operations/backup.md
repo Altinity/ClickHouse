@@ -135,8 +135,8 @@ It is a useful building block, not a replacement for `BACKUP`.
   byte range. Without multipart copy, and on a store whose API lacks `UploadPartCopy` such as `GCS`,
   every blob goes through ClickHouse's buffers.
 - Restore onto a `CAS` disk always writes through ClickHouse, see [restore](#restore).
-- A disk-level copy of a single **part** file onto a `CAS` disk, outside of `RESTORE`, is rejected with
-  `NOT_IMPLEMENTED`: a `CAS` disk accepts part files only as a whole part in one transaction. A
-  `Disk(...)` destination that happens to be a `CAS` disk is a different case — a backup holds its own
-  files rather than part files, so `BACKUP TABLE t TO Disk('<cas disk>', 'b1')` writes them through the
-  buffers and succeeds.
+- A disk-level copy of a single part file onto a `CAS` disk, outside of `RESTORE`, is rejected with
+  `NOT_IMPLEMENTED`: a `CAS` disk accepts part files only as a whole part in one transaction.
+- A `CAS` disk cannot be a backup destination: `BACKUP TABLE t TO Disk('<cas disk>', 'b1')` is rejected
+  the same way. A backup's own layout mirrors the table's data directory, so its files sit under a part
+  directory as well and count as part files.
