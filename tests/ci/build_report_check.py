@@ -70,6 +70,25 @@ def main():
         for job in builds_for_check:
             assert job in CI.BuildNames, "Builds must be known build job names"
         print("NOTE: builds for check taken from input arguments")
+        if Path(CI_CONFIG_PATH).is_file():
+            # In PRs the CI cache drops builds that no remaining test job needs
+            #   (see CiCache.filter_out_not_affected_jobs), they must not be reported as missing
+            with open(CI_CONFIG_PATH, encoding="utf-8") as jfd:
+                ci_config = json.load(jfd)
+            all_ci_jobs = (
+                ci_config["jobs_data"]["jobs_to_skip"]
+                + ci_config["jobs_data"]["jobs_to_do"]
+            )
+            dropped_builds = [
+                job for job in builds_for_check if job not in all_ci_jobs
+            ]
+            if dropped_builds:
+                print(
+                    f"NOTE: builds not in the current CI workflow, skip: [{dropped_builds}]"
+                )
+                builds_for_check = [
+                    job for job in builds_for_check if job in all_ci_jobs
+                ]
 
     print(f"NOTE: following build reports will be checked: [{builds_for_check}]")
 
