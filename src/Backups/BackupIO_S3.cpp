@@ -451,6 +451,13 @@ bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
     if (!plan)
         return false;
 
+    if (plan->object.remote_path.empty())
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Content-addressed file {} on disk {} resolved to a blob with an empty key",
+            src_path,
+            src_disk->getName());
+
     const UInt64 payload_size = plan->payload_end - plan->payload_offset;
     if (start_pos > payload_size || length > payload_size - start_pos)
         throw Exception(
@@ -465,12 +472,13 @@ bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
     if (!source_data_source_description.sameKind(data_source_description))
         return false;
 
-    if (plan->object.remote_path.empty())
-        return false;
-
     const String src_bucket = src_disk->getObjectStorage()->getObjectsNamespace();
     if (src_bucket.empty())
-        return false;
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Disk {} has the same S3 endpoint as the backup but no bucket for content-addressed file {}",
+            src_disk->getName(),
+            src_path);
 
     auto src_client = disk_client_factory.getOrCreate(src_disk);
     if (!src_client->supportsMultiPartCopy())

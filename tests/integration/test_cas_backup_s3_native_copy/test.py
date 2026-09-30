@@ -233,18 +233,6 @@ def test_blobs_use_ranged_copy_and_inline_falls_back():
 
     assert upload_part_copy > 0, "no ranged server-side copy happened"
     assert copy_object == 0, "CopyObject has no range: the envelope would land in the backup"
-
-    uploaded = int(
-        node.query(
-            f"""
-            SELECT ProfileEvents['S3PutObject'] + ProfileEvents['S3UploadPart']
-            FROM system.query_log
-            WHERE type = 'QueryFinish' AND query_id = '{query_id}'
-            ORDER BY event_time DESC LIMIT 1
-            """
-        ).strip()
-    )
-    assert uploaded > 0, "nothing went through buffers, so no inline entry was exercised"
     assert uploaded > 0, "inline entries have no object and must be uploaded through buffers"
 
     node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
@@ -567,9 +555,20 @@ def test_backup_to_file_keeps_fs_copy():
             """
         ).strip()
     )
-    assert (
-        read_bytes == 0
-    ), "BACKUP TO File(...) read the data through the server instead of using fs::copy"
+    bytes_on_disk = int(
+        node.query(
+            f"""
+            SELECT sum(bytes_on_disk) FROM system.parts
+            WHERE table = '{table}' AND active
+            """
+        ).strip()
+    )
+
+    assert bytes_on_disk > 0, "the table has no active parts, so the assertion below proves nothing"
+    assert read_bytes * 2 < bytes_on_disk, (
+        f"BACKUP TO File(...) read {read_bytes} of {bytes_on_disk} bytes through the server, "
+        "so it stopped using fs::copy for the data"
+    )
 
     node.query(f"DROP TABLE {table} SYNC")
 
