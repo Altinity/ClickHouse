@@ -158,11 +158,10 @@ def test_backup_to_disk_on_same_authority(backup_disk, storage_policy, multipart
     node.query(f"BACKUP TABLE {table} TO {destination}", query_id=backup_query_id)
 
     upload_part_copy, copy_object = copy_events(node, backup_query_id)
-    assert copy_object == 0, "CopyObject has no range: the envelope would land in the backup"
-    if multipart_copy:
-        assert upload_part_copy > 0, "blobs were not copied with a ranged server-side copy"
-    else:
-        assert upload_part_copy == 0, "multipart copy is disabled but UploadPartCopy still ran"
+    assert (upload_part_copy, copy_object) == (
+        0,
+        0,
+    ), "a Disk(...) destination goes through IDisk::copyFile, which no longer copies CAS objects"
 
     node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
     node.query(

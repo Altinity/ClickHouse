@@ -29,7 +29,6 @@
 #include <cstddef>
 #include <memory>
 #include <ranges>
-#include <type_traits>
 #include <vector>
 
 namespace ProfileEvents
@@ -520,28 +519,7 @@ void DiskObjectStorageTransaction::copyFileImpl(
     const auto enriched_write_settings = std::make_shared<const WriteSettings>(
         updateIOSchedulingSettings(write_settings, read_resource_name, write_resource_name));
 
-    const auto content_addressed_source = src_metadata_storage->isContentAddressed()
-        ? src_metadata_storage->getContentAddressedFileCopySource(from_file_path)
-        : std::nullopt;
-
-    if (src_metadata_storage->isContentAddressed() && !content_addressed_source)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "No CAS copy source for {}", from_file_path);
-
-    const auto blobs_to_copy = content_addressed_source
-        ? std::visit(
-            [&](const auto & source) -> StoredObjects
-            {
-                using Source = std::decay_t<decltype(source)>;
-                if constexpr (std::is_same_v<Source, ContentAddressedInlineFileCopySource>)
-                    return {StoredObject("", from_file_path, source.data.size())};
-                else if constexpr (std::is_same_v<Source, ContentAddressedBlobFileCopySource>)
-                    return {source.object};
-                else
-                    static_assert(std::is_same_v<Source, void>);
-            },
-            *content_addressed_source)
-        : src_metadata_storage->getStorageObjects(from_file_path);
-
+    const auto blobs_to_copy = src_metadata_storage->getStorageObjects(from_file_path);
     const auto blobs_to_create = blobs_to_copy
                         | std::views::transform([&](const auto & from) { return StoredObject(metadata_transaction->generateObjectKeyForPath(to_file_path).serialize(), to_file_path, from.bytes_size); })
                         | std::ranges::to<StoredObjects>();
@@ -566,88 +544,12 @@ void DiskObjectStorageTransaction::copyFileImpl(
     {
         for (const auto [src_blob, dst_blob] : std::views::zip(blobs_to_copy, blobs_to_create))
         {
-            if (content_addressed_source)
-            {
-                std::visit(
-                    [&](const auto & copy_source)
-                    {
-                        using Source = std::decay_t<decltype(copy_source)>;
-                        if constexpr (std::is_same_v<Source, ContentAddressedInlineFileCopySource>)
-                        {
-                            runner.enqueueAndKeepTrack(
-                                [this, bytes = copy_source.data, dst_blob, location, enriched_write_settings]
-                                {
-                                    auto out = object_storages->takePointingTo(location)->writeObject(
-                                        dst_blob, WriteMode::Rewrite, {}, DBMS_DEFAULT_BUFFER_SIZE, *enriched_write_settings);
-                                    out->write(bytes.data(), bytes.size());
-                                    out->finalize();
-                                });
-                        }
-                        else if constexpr (std::is_same_v<Source, ContentAddressedBlobFileCopySource>)
-                        {
-                            if (src_blob != copy_source.object
-                                || copy_source.object.remote_path.empty()
-                                || copy_source.payload_offset == 0
-                                || copy_source.payload_size != copy_source.object.bytes_size)
-                            {
-                                throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid CAS copy source for {}", from_file_path);
-                            }
-
-                            runner.enqueueAndKeepTrack(
-                                [this,
-                                 src_object_storages,
-                                 src_blob,
-                                 dst_blob,
-                                 location,
-                                 src_local_location,
-                                 src_object_offset = copy_source.payload_offset,
-                                 enriched_read_settings,
-                                 enriched_write_settings]
-                                {
-                                    src_object_storages->takePointingTo(src_local_location)
-                                        ->copyObjectToAnotherObjectStorage(
-                                            src_blob,
-                                            dst_blob,
-                                            *enriched_read_settings,
-                                            *enriched_write_settings,
-                                            *object_storages->takePointingTo(location),
-                                            std::nullopt,
-                                            src_object_offset);
-                                });
-                        }
-                        else
-                        {
-                            static_assert(std::is_same_v<Source, void>);
-                        }
-                    },
-                    *content_addressed_source);
-            }
-            else
-            {
-                const size_t src_object_offset = src_metadata_storage->getObjectPayloadOffset(from_file_path);
-
-                runner.enqueueAndKeepTrack(
-                    [this,
-                     src_object_storages,
-                     src_blob,
-                     dst_blob,
-                     location,
-                     src_local_location,
-                     src_object_offset,
-                     enriched_read_settings,
-                     enriched_write_settings]
-                    {
-                        src_object_storages->takePointingTo(src_local_location)
-                            ->copyObjectToAnotherObjectStorage(
-                                src_blob,
-                                dst_blob,
-                                *enriched_read_settings,
-                                *enriched_write_settings,
-                                *object_storages->takePointingTo(location),
-                                std::nullopt,
-                                src_object_offset);
-                    });
-            }
+            runner.enqueueAndKeepTrack(
+                [this, src_object_storages, src_blob, dst_blob, location, src_local_location, enriched_read_settings, enriched_write_settings]
+                {
+                    src_object_storages->takePointingTo(src_local_location)->copyObjectToAnotherObjectStorage(
+                        src_blob, dst_blob, *enriched_read_settings, *enriched_write_settings, *object_storages->takePointingTo(location));
+                });
         }
     }
 

@@ -205,18 +205,6 @@ public:
         return delegate->getBlobPath(wrapped_path);
     }
 
-    size_t getObjectPayloadOffset(const String & path) const override
-    {
-        auto wrapped_path = wrappedPath(path);
-        return delegate->getObjectPayloadOffset(wrapped_path);
-    }
-
-    std::optional<ContentAddressedFileCopySource> getContentAddressedFileCopySource(const String & path) const override
-    {
-        auto wrapped_path = wrappedPath(path);
-        return delegate->getContentAddressedFileCopySource(wrapped_path);
-    }
-
     bool areBlobPathsRandom() const override
     {
         return delegate->areBlobPathsRandom();

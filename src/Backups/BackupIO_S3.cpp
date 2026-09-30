@@ -15,13 +15,14 @@
 #include <IO/S3/Credentials.h>
 #include <IO/S3/getObjectInfo.h>
 #include <Disks/IDisk.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 
 #include <Poco/Util/AbstractConfiguration.h>
 
 #include <aws/core/auth/AWSCredentials.h>
 
 #include <filesystem>
-#include <type_traits>
 
 
 namespace fs = std::filesystem;
@@ -318,7 +319,6 @@ void BackupReaderS3::copyFileToDisk(const String & path_in_backup, size_t file_s
                 fs::path(s3_uri.key) / path_in_backup,
                 0,
                 file_size,
-                /* src_object_offset= */ 0,
                 /* dest_s3_client= */ destination_disk->getS3StorageClient(),
                 /* dest_bucket= */ blob_path[1],
                 /* dest_key= */ blob_path[0],
@@ -386,99 +386,32 @@ void BackupWriterS3::copyFileFromDisk(
 {
     /// Use the native copy as a more optimal way to copy a file from S3 to S3 if it's possible.
     /// We don't check for `has_throttling` here because the native copy almost doesn't use network.
+    if (!copy_encrypted)
+    {
+        if (auto * ca = tryGetContentAddressedExchange(src_disk))
+        {
+            if (tryNativeCopyFromContentAddressedDisk(*ca, path_in_backup, src_disk, src_path, start_pos, length))
+                return;
+
+            BackupWriterDefault::copyFileFromDisk(path_in_backup, src_disk, src_path, copy_encrypted, start_pos, length);
+            return;
+        }
+    }
+
     auto source_data_source_description = src_disk->getDataSourceDescription();
     if (source_data_source_description.canUseNativeCopyWith(data_source_description) && (source_data_source_description.is_encrypted == copy_encrypted))
     {
-        if (src_disk->isContentAddressed())
-        {
-            const auto source = src_disk->getContentAddressedFileCopySource(src_path);
-            if (!source)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "No CAS copy source for {} on disk {}", src_path, src_disk->getName());
-
-            const auto * blob_source = std::visit(
-                []<typename Source>(const Source & copy_source) -> const ContentAddressedBlobFileCopySource *
-                {
-                    if constexpr (std::is_same_v<Source, ContentAddressedInlineFileCopySource>)
-                        return nullptr;
-                    else if constexpr (std::is_same_v<Source, ContentAddressedBlobFileCopySource>)
-                        return &copy_source;
-                    else
-                        static_assert(std::is_same_v<Source, void>);
-                },
-                *source);
-
-            if (!blob_source)
-            {
-                LOG_TRACE(log, "File {} has no object of its own, copying through buffers", src_path);
-                BackupWriterDefault::copyFileFromDisk(path_in_backup, src_disk, src_path, copy_encrypted, start_pos, length);
-                return;
-            }
-
-            if (blob_source->object.remote_path.empty()
-                || blob_source->payload_offset == 0
-                || blob_source->payload_size != blob_source->object.bytes_size)
-            {
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid CAS blob copy source for {}", src_path);
-            }
-
-            const auto & source_object = blob_source->object;
-            const UInt64 source_offset = blob_source->payload_offset;
-            if (start_pos > source_object.bytes_size || length > source_object.bytes_size - start_pos)
-            {
-                throw Exception(
-                    ErrorCodes::LOGICAL_ERROR,
-                    "Requested range with offset {} and length {} is outside CAS payload of {} bytes for {}",
-                    start_pos,
-                    length,
-                    blob_source->payload_size,
-                    src_path);
-            }
-            const auto blob_path = src_disk->getBlobPath(src_path);
-            if (blob_path.size() != 2 || blob_path[0] != source_object.remote_path)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS copy source for {} does not match its blob path on disk {}", src_path, src_disk->getName());
-
-            LOG_TRACE(log, "Copying file {} from disk {} to S3", src_path, src_disk->getName());
-            copyS3File(
-                disk_client_factory.getOrCreate(src_disk),
-                blob_path[1],
-                source_object.remote_path,
-                start_pos,
-                length,
-                source_offset,
-                client,
-                s3_uri.bucket,
-                fs::path(s3_uri.key) / path_in_backup,
-                s3_settings.request_settings,
-                read_settings,
-                blob_storage_log,
-                threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER),
-                [&, this]
-                {
-                    LOG_TRACE(log, "Falling back to copy file {} from disk {} to S3 through buffers", src_path, src_disk->getName());
-
-                    if (copy_encrypted)
-                        return src_disk->readEncryptedFile(src_path, read_settings);
-
-                    return src_disk->readFile(src_path, read_settings);
-                });
-            return;
-        }
-
         /// getBlobPath() can return more than 2 elements if the file is stored as multiple objects in S3 bucket.
         /// In this case we can't use the native copy.
         if (auto blob_path = src_disk->getBlobPath(src_path); blob_path.size() == 2)
         {
             LOG_TRACE(log, "Copying file {} from disk {} to S3", src_path, src_disk->getName());
-
-            const size_t src_object_offset = src_disk->getObjectPayloadOffset(src_path);
-
             copyS3File(
                 /* src_s3_client */ disk_client_factory.getOrCreate(src_disk),
                 /* src_bucket */ blob_path[1],
                 /* src_key */ blob_path[0],
                 start_pos,
                 length,
-                /* src_object_offset */ src_object_offset,
                 /* dest_s3_client */ client,
                 /* dest_bucket */ s3_uri.bucket,
                 /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
@@ -503,6 +436,73 @@ void BackupWriterS3::copyFileFromDisk(
     BackupWriterDefault::copyFileFromDisk(path_in_backup, src_disk, src_path, copy_encrypted, start_pos, length);
 }
 
+bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
+    IContentAddressedExchange & ca,
+    const String & path_in_backup,
+    DiskPtr src_disk,
+    const String & src_path,
+    UInt64 start_pos,
+    UInt64 length)
+{
+    if (length == 0)
+        return false;
+
+    const auto plan = ca.getBlobViewPlan(src_path);
+    if (!plan)
+        return false;
+
+    const UInt64 payload_size = plan->payload_end - plan->payload_offset;
+    if (start_pos > payload_size || length > payload_size - start_pos)
+        return false;
+
+    auto source_data_source_description = src_disk->getDataSourceDescription();
+    if (!source_data_source_description.sameKind(data_source_description))
+        return false;
+
+    if (plan->object.remote_path.empty())
+        return false;
+
+    const String src_bucket = src_disk->getObjectStorage()->getObjectsNamespace();
+    if (src_bucket.empty())
+        return false;
+
+    auto src_client = disk_client_factory.getOrCreate(src_disk);
+    if (!src_client->supportsMultiPartCopy())
+        return false;
+
+    LOG_TRACE(
+        log,
+        "Copying the payload of content-addressed file {} from disk {} to S3 as a ranged server-side copy",
+        src_path,
+        src_disk->getName());
+
+    copyS3File(
+        std::move(src_client),
+        src_bucket,
+        /* src_key */ plan->object.remote_path,
+        /* src_offset */ plan->payload_offset + start_pos,
+        length,
+        /* dest_s3_client */ client,
+        /* dest_bucket */ s3_uri.bucket,
+        /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
+        s3_settings.request_settings,
+        read_settings,
+        blob_storage_log,
+        threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::S3_BACKUP_WRITER),
+        [&, this]
+        {
+            LOG_TRACE(
+                log,
+                "Falling back to copy the raw object of content-addressed file {} from disk {} to S3 through buffers",
+                src_path,
+                src_disk->getName());
+
+            return src_disk->getObjectStorage()->readObject(plan->object, read_settings);
+        });
+
+    return true;
+}
+
 void BackupWriterS3::copyFile(const String & destination, const String & source, size_t size)
 {
     LOG_TRACE(log, "Copying file inside backup from {} to {}", source, destination);
@@ -514,7 +514,6 @@ void BackupWriterS3::copyFile(const String & destination, const String & source,
         /* src_key= */ source_key,
         0,
         size,
-        /* src_object_offset= */ 0,
         /* dest_s3_client= */ client,
         /* dest_bucket= */ s3_uri.bucket,
         /* dest_key= */ fs::path(s3_uri.key) / destination,

@@ -2040,59 +2040,6 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in manifest of {}", r->file, path);
 }
 
-std::string ContentAddressedMetadataStorage::readInlineDataToString(const std::string & path) const
-{
-    checkOpAdmitted(CasOpClass::ContentRead);
-    if (auto bytes = tryGetInManifestBytes(path))
-        return std::move(*bytes);
-    throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: {} is not an in-manifest file", path);
-}
-
-size_t ContentAddressedMetadataStorage::getObjectPayloadOffset(const std::string & path) const
-{
-    if (auto plan = getBlobViewPlan(path))
-        return plan->payload_offset;
-    return 0;
-}
-
-std::optional<ContentAddressedFileCopySource> ContentAddressedMetadataStorage::getContentAddressedFileCopySource(
-    const std::string & path) const
-{
-    checkOpAdmitted(CasOpClass::ContentRead);
-
-    if (auto bytes = tryGetInManifestBytes(path))
-        return ContentAddressedInlineFileCopySource{.data = std::move(*bytes)};
-
-    const auto plan = getBlobViewPlan(path);
-    if (!plan)
-        return std::nullopt;
-
-    const UInt64 payload_offset = plan->payload_offset;
-    const UInt64 expected_payload_offset = store()->poolMeta().blob_header_len;
-
-    if (plan->object.remote_path.empty()
-        || payload_offset != expected_payload_offset
-        || plan->payload_end < payload_offset)
-    {
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Invalid CAS copy source for {}: key is {}, payload offset is {}, expected offset is {}, payload end is {}",
-            path,
-            plan->object.remote_path.empty() ? "empty" : "set",
-            payload_offset,
-            expected_payload_offset,
-            plan->payload_end);
-    }
-
-    const UInt64 payload_size = plan->payload_end - payload_offset;
-
-    return ContentAddressedBlobFileCopySource{
-        .object = StoredObject(plan->object.remote_path, path, payload_size),
-        .payload_offset = payload_offset,
-        .payload_size = payload_size,
-    };
-}
-
 std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsIfExist(const std::string & path) const
 {
     /// A Vanished disk answers absent (truth). Probe first so the non-part `getStorageObjects` fallback
@@ -2204,6 +2151,8 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
         return std::nullopt;
     if (const auto * entry = manifest_view->findFile(r->file))
     {
+        if (entry->placement != Cas::EntryPlacement::Blob)
+            return std::nullopt;
         const auto location = snap.pool->locate(*entry);
         BlobViewPlan plan;
         /// bytes_size is the readable extent of THIS file's window, NOT the whole blob: a

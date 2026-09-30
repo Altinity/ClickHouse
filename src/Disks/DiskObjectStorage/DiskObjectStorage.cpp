@@ -963,16 +963,6 @@ Strings DiskObjectStorage::getBlobPath(const String & path) const
     return res;
 }
 
-size_t DiskObjectStorage::getObjectPayloadOffset(const String & path) const
-{
-    return metadata_storage->getObjectPayloadOffset(path);
-}
-
-std::optional<ContentAddressedFileCopySource> DiskObjectStorage::getContentAddressedFileCopySource(const String & path) const
-{
-    return metadata_storage->getContentAddressedFileCopySource(path);
-}
-
 bool DiskObjectStorage::areBlobPathsRandom() const
 {
     return metadata_storage->areBlobPathsRandom();

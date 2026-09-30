@@ -1,7 +1,6 @@
 #pragma once
 
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
-#include <Disks/ContentAddressedFileCopySource.h>
 #include <Interpreters/Context_fwd.h>
 #include <Core/Defines.h>
 #include <Core/Names.h>
@@ -318,14 +317,6 @@ public:
     /// E.g. for DiskLocal it's the absolute path to the file and for DiskObjectStorage it's
     /// StoredObject::remote_path for each stored object combined with the name of the objects' namespace.
     virtual Strings getBlobPath(const String & path) const = 0;
-
-    /// Where the file's bytes begin inside the object `getBlobPath` names.
-    virtual size_t getObjectPayloadOffset(const String & path) const = 0;
-
-    virtual std::optional<ContentAddressedFileCopySource> getContentAddressedFileCopySource(const String & /* path */) const
-    {
-        return std::nullopt;
-    }
 
     /// Returns whether the blob paths this disk uses are randomly generated.
     virtual bool areBlobPathsRandom() const = 0;

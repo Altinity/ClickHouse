@@ -1,6 +1,7 @@
 #pragma once
 
 #include <base/types.h>
+#include <Disks/IDisk.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <memory>
 #include <optional>
@@ -256,5 +257,7 @@ public:
     /// in-manifest, loose, directory, or otherwise unresolved paths.
     virtual std::optional<BlobViewPlan> getBlobViewPlan(const std::string & path) const = 0;
 };
+
+IContentAddressedExchange * tryGetContentAddressedExchange(const DiskPtr & disk);
 
 }

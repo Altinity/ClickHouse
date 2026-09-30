@@ -397,8 +397,7 @@ public:
         const ReadSettings & read_settings,
         const WriteSettings & write_settings,
         IObjectStorage & object_storage_to,
-        std::optional<ObjectAttributes> object_to_attributes = {},
-        size_t object_from_offset = 0);
+        std::optional<ObjectAttributes> object_to_attributes = {});
 
     virtual ~IObjectStorage() = default;
 

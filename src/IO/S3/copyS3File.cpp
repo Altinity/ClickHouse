@@ -641,26 +641,31 @@ namespace
         {
             LOG_TEST(log, "Copy object {} to {} using native copy", src_key, dest_key);
 
-            const bool ranged = offset != 0;
             const bool multipart_copy_available
                 = supports_multipart_copy && request_settings[S3RequestSetting::allow_multipart_copy];
 
-            if (ranged && !multipart_copy_available)
+            if (offset != 0 && !multipart_copy_available)
             {
                 if (!allow_fallback)
                     throw Exception(
                         ErrorCodes::NOT_IMPLEMENTED,
-                        "Native copy of a byte range requires multipart copy, which is unavailable for {}",
+                        "Cannot copy a byte range of object {} server-side: only UploadPartCopy can express a "
+                        "range, and multipart copy is unavailable",
                         src_key);
 
-                LOG_TRACE(log, "Ranged native copy needs multipart copy, falling back for {}", src_key);
+                LOG_INFO(
+                    log,
+                    "Multipart copy is unavailable, so the byte range [{}, {}) of {} cannot be copied "
+                    "server-side, will copy through the server instead",
+                    offset,
+                    offset + size,
+                    src_key);
                 fallback_method();
                 return;
             }
 
-            const bool use_single_operation_copy = !ranged
-                && (!multipart_copy_available
-                    || (size <= request_settings[S3RequestSetting::max_single_operation_copy_size]));
+            const bool use_single_operation_copy = offset == 0
+                && (!multipart_copy_available || (size <= request_settings[S3RequestSetting::max_single_operation_copy_size]));
 
             if (use_single_operation_copy)
                 performSingleOperationCopy();
@@ -882,7 +887,6 @@ void copyS3File(
     const String & src_key,
     size_t src_offset,
     size_t src_size,
-    size_t src_object_offset,
     std::shared_ptr<const S3::Client> dest_s3_client,
     const String & dest_bucket,
     const String & dest_key,
@@ -894,12 +898,6 @@ void copyS3File(
     const std::optional<ObjectAttributes> & object_metadata,
     ObjectStorageCopyMode copy_mode)
 {
-    if (src_key.empty())
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Cannot copy an S3 object with an empty source key from bucket {} to {}/{}",
-            src_bucket, dest_bucket, dest_key);
-
     if (!dest_s3_client)
         dest_s3_client = src_s3_client;
 
@@ -934,7 +932,7 @@ void copyS3File(
         src_s3_client,
         src_bucket,
         src_key,
-        src_offset + src_object_offset,
+        src_offset,
         src_size,
         dest_bucket,
         dest_key,
