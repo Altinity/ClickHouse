@@ -26,7 +26,6 @@
 
 #include <hll.hpp>
 
-#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <type_traits>
@@ -57,10 +56,7 @@ private:
     datasketches::hll_union * getSkUnion(uint8_t lg_config_k)
     {
         if (!sk_union)
-        {
-            /// `hll_union` requires at least 7, but preserves the lower resolution of its inputs.
-            sk_union = std::make_unique<datasketches::hll_union>(std::max<uint8_t>(lg_config_k, 7));
-        }
+            sk_union = std::make_unique<datasketches::hll_union>(lg_config_k);
         return sk_union.get();
     }
 
@@ -137,13 +133,15 @@ public:
         }
     }
 
-    void write(WriteBuffer & out, datasketches::target_hll_type tgt_type) const
+    void write(WriteBuffer & out, uint8_t lg_config_k, datasketches::target_hll_type tgt_type) const
     {
         datasketches::hll_sketch::vector_bytes bytes;
         if (sk_update)
             bytes = sk_update->serialize_compact();
         else if (sk_union)
             bytes = sk_union->get_result(tgt_type).serialize_compact();
+        else
+            bytes = datasketches::hll_sketch(lg_config_k, tgt_type).serialize_compact();
         writeVectorBinary(bytes, out);
     }
 };
@@ -225,7 +223,7 @@ public:
 
     void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> /* version */) const override
     {
-        this->data(place).write(buf, target_type);
+        this->data(place).write(buf, lg_config_k, target_type);
     }
 
     void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /* version */, Arena *) const override
