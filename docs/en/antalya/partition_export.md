@@ -9,13 +9,11 @@ The `ALTER TABLE EXPORT PARTITION` command exports entire partitions from `Merge
 
 The set of parts that are exported is based on the list of parts the replica that received the export command sees. On `Replicated*MergeTree`, the other replicas will assist in the export process if they have those parts locally. Otherwise they will ignore it.
 
-Every `EXPORT PARTITION` creates a new export task, identified by its transaction id, that exports the parts the partition has at that moment. Exporting a partition that was exported before is allowed and exports its parts again; whether that duplicates rows depends on the destination and on `export_merge_tree_part_file_already_exists_policy` (with the default `skip` and file name pattern, files already written to a plain object storage destination are reused). Preventing duplicates is up to the user. The setting `export_merge_tree_partition_force_export` is obsolete and has no effect.
+Exporting a partition that was exported before is allowed and exports its parts again; Preventing duplicates is up to the user.
 
 Export tasks of both engines, including those of a [`TTL ... EXPORT TO TABLE`](/docs/en/antalya/ttl_export.md) expression, can be observed through `system.distributed_exports`, one row per task. Manual exports are independent of the `EXPORT` TTL: they neither read nor update what the TTL has exported.
 
 The export task can be killed by issuing the kill command: `KILL EXPORT <where predicate for system.distributed_exports>`.
-
-Tasks are stored under `<zookeeper_path>/exports/<transaction_id>` for a `Replicated*MergeTree` table, and in `exports/<transaction_id>.json` in the data directory of a plain `MergeTree` table. Tasks stored by earlier versions of this experimental feature, keyed by partition and destination, are neither read nor migrated.
 
 The task is persistent - it should be resumed after crashes, failures and etc.
 

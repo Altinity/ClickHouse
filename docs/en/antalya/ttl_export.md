@@ -13,7 +13,7 @@ doc_type: 'reference'
 
 A `TTL <expression> EXPORT TO TABLE [database.]table` expression exports the rows of a `MergeTree`-family table to an Apache Iceberg or plain object storage table in the background, once their TTL is due. It is meant for tiering: recent data stays in `MergeTree`, older data is kept in the destination.
 
-The TTL never exports a row twice, also across failures, restarts and retries: what was exported is recorded per partition, and parts are exported in groups, each committed to the destination in one transaction. The export uses the same machinery as [`EXPORT PARTITION`](/docs/en/antalya/partition_export.md): each group is an export task shown in `system.distributed_exports` with `source = 'ttl'`.
+The TTL never exports a part twice, also across failures, restarts and retries: what was exported is recorded, and parts are exported in groups, each committed to the destination in one transaction. The export uses the same machinery as [`EXPORT PARTITION`](/docs/en/antalya/partition_export.md): each group is an export task shown in `system.distributed_exports` with `source = 'ttl'`.
 
 Both plain `MergeTree` and `Replicated*MergeTree` tables are supported.
 
@@ -37,17 +37,13 @@ Here rows are exported to `events_archive` 30 days after `event_time`, and delet
 ## Requirements {#requirements}
 
 - The server setting `allow_experimental_export_merge_tree_partition` must be enabled on every replica, and the query setting `allow_experimental_export_ttl` must be enabled for the `CREATE` or `ALTER` that adds the expression. A table with the expression is not loaded, e.g. at a restart or by `ATTACH TABLE`, while the server setting is disabled: without it, merges would not keep the exported parts apart from the others. For the same reason, an `ALTER` that adds or changes the expression of a `Replicated*MergeTree` table is refused while a replica does not support it, e.g. because it runs an older version or has the server setting disabled.
-- The destination must exist when the expression is added. It must be an Apache Iceberg or object storage table that `EXPORT PARTITION` can export to, and its schema must be castable from the source schema, see [`EXPORT PARTITION` requirements](/docs/en/antalya/partition_export.md#requirements). Unlike `EXPORT PARTITION`, the TTL allows lossy casts, as if `export_merge_tree_part_allow_lossy_cast` were enabled: e.g. a `UInt32` column is exported to the `int` of an Iceberg table, which is read back as `Int32`, and values that do not fit change. An unqualified table name refers to the database of the source table.
+- The destination must exist when the expression is added. It must be an Apache Iceberg or object storage table that `EXPORT PARTITION` can export to, and its schema must be castable from the source schema, see [`EXPORT PARTITION` requirements](/docs/en/antalya/partition_export.md#requirements). 
 - A table can have at most one `EXPORT` TTL expression, without `WHERE` or `GROUP BY`. The expression must be deterministic and return a `Date` or `DateTime`.
 - The rows of a group must land in a single partition of the destination, see [Partition key of the destination](#destination-partition-key).
 
 ## Partition key of the destination {#destination-partition-key}
 
-Each partition expression of the destination (or each Iceberg partition transform) must either be a function of the source partition key, e.g. the same expression, or be a monotonic function of a single non-`Nullable` column of the source partition key. In the second case, whether the rows of a group land in a single destination partition depends on the rows, so it is checked when the group is exported, from the minimum and maximum values of the column in its parts.
-
-A destination that can never be compatible is refused by the `CREATE` or `ALTER` that adds the expression, e.g. a destination partitioned by a column that is not in the source partition key, by a function that is not monotonic like `toDayOfWeek(event_time)` or the Iceberg `bucket` transform, or a partitioned destination of an unpartitioned source.
-
-A destination that is compatible only for some groups is accepted. With a source `PARTITION BY toYYYYMM(event_time)`:
+A destination that is compatible only for some groups is accepted, and might fail at runtime. With a source `PARTITION BY toYYYYMM(event_time)`:
 
 - `PARTITION BY toYear(event_time)` is compatible for every group, since a month is within a year;
 - `PARTITION BY toDate(event_time)` is compatible only for a group whose rows are all on the same day. Any other group is not exported: no export task is created, the error is shown in the `last_error` column of `system.ttl_exports`, and the group is tried again on every check.
@@ -72,7 +68,7 @@ One replica of a `Replicated*MergeTree` table schedules the groups; the others t
 
 A group that fails, is killed or times out is retried on the next check as a new task, with a new transaction id. The retry contains every part of the failed group, plus any part that became eligible meanwhile. Throttling comes from the export tasks themselves: per-part retry back-off, `export_merge_tree_task_timeout_seconds` and the commit attempts.
 
-A task commits only once it exported all its parts, so a task that failed before that cannot have committed, and nothing checks it. A task that failed after that is checked at the destination before it is retried, in case it committed but was not marked as completed. It may also land after that check, e.g. a request that the destination applies late, so the retry lists it in its `retry_of` column, with the blocks of its parts. The commit of the retry checks each task in `retry_of` again, and leaves out the files of the parts a landed task exported. A task stays in the `retry_of` of later retries for 10 minutes after it failed, or longer while a replica is still in its commit; it is then checked a last time, and kept only if it landed.
+A task that failed after uploading all parts and before marking it as committed might have committed to the destination. It is retried nevertheless. The retry task will therefore check if the previous task transaction has been completed by asking the destination storage. If it has been completed, it'll only export the delta parts. Otherwise, it'll export it all again.
 
 `KILL EXPORT` of a task of the TTL makes it retry. To stop exporting, use `SYSTEM STOP MOVES`, which pauses the TTL export of the table, or remove the expression. On a `Replicated*MergeTree` table, `SYSTEM STOP MOVES` pauses it only on the replica that schedules the groups, shown in the `scheduler_replica` column of `system.ttl_exports`, so run it on every replica, e.g. with `ON CLUSTER`.
 
