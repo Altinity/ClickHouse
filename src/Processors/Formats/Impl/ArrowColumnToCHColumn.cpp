@@ -1585,7 +1585,6 @@ static ColumnWithTypeAndName readNonNullableColumnFromArrowColumn(
                 dictionary_infos,
                 type_hint,
                 is_map_nested_column,
-                make_nullable_if_low_cardinality,
                 geo_metadata,
                 settings,
                 storage_field,
