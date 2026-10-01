@@ -45,6 +45,38 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
+    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
+    extern const SettingsString object_storage_distributed_driver_database;
+    extern const SettingsString object_storage_distributed_driver_table;
+}
+
+namespace
+{
+
+/// True on a worker executing a query dispatched by `object_storage_cluster_join_mode='distributed'`. The
+/// initiator names the driving table in the settings it sends; their presence is what marks the query, so a
+/// worker never has to infer the mode from the shape of its connection.
+bool isDistributedJoinDispatchWorker(const ContextPtr & context)
+{
+    const auto & client_info = context->getClientInfo();
+    return client_info.query_kind == ClientInfo::QueryKind::SECONDARY_QUERY
+        && client_info.collaborate_with_initiator
+        && !context->getSettingsRef()[Setting::object_storage_distributed_driver_database].value.empty();
+}
+
+/// True for the one table in a dispatched query whose files the initiator hands out. Every other table in the
+/// same query is read in full on every worker, so this must match exactly one table expression -- which the
+/// initiator guarantees by declining to dispatch when the name is ambiguous.
+bool isAnnouncedDistributedJoinDriver(const ContextPtr & context, const StorageID & table_id)
+{
+    if (!isDistributedJoinDispatchWorker(context))
+        return false;
+
+    const auto & settings = context->getSettingsRef();
+    return table_id.getDatabaseName() == settings[Setting::object_storage_distributed_driver_database].value
+        && table_id.getTableName() == settings[Setting::object_storage_distributed_driver_table].value;
+}
+
 }
 
 namespace ErrorCodes
@@ -254,9 +286,14 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         && context_->canUseTaskBasedParallelReplicas()
         && !context_->isDistributed();
 
-    bool can_use_distributed_iterator =
-        context_->getClientInfo().collaborate_with_initiator &&
-        can_use_parallel_replicas;
+    /// Two mechanisms can put a storage on an initiator's file-task queue: being the announced driver of a
+    /// whole-query dispatch, or being an ordinary cluster read under parallel replicas. They must not both
+    /// get a say, because there is one queue and it holds one table's files. A dispatch owns the decision
+    /// outright while it is in effect: its announced driver consumes the queue and every other table in that
+    /// query lists its own files, whatever the parallel-replica settings would otherwise allow.
+    bool can_use_distributed_iterator = isDistributedJoinDispatchWorker(context_)
+        ? isAnnouncedDistributedJoinDriver(context_, table_id_)
+        : (context_->getClientInfo().collaborate_with_initiator && can_use_parallel_replicas);
 
     pure_storage = std::make_shared<StorageObjectStorage>(
         configuration,
@@ -649,6 +686,12 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
     ClusterPtr cluster,
     StorageMetadataPtr storage_metadata_snapshot) const
 {
+    /// A catalog table is built with lazy_init, so nothing has resolved the configuration -- and with it the
+    /// path this listing walks -- by the time we get here. `read` reaches it through StorageObjectStorage,
+    /// which does its own lazy init; whole-query dispatch calls this directly and would otherwise list no
+    /// files at all, handing every worker an empty queue and silently returning no rows. Idempotent.
+    configuration->lazyInitializeIfNeeded(object_storage, local_context);
+
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
         configuration->getQuerySettings(local_context),
@@ -745,6 +788,12 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
     /// When it is empty, non-cluster realization is used.
 
     if (!isClusterSupported())
+        return "";
+
+    /// A worker executing a whole-query dispatch reads every table it resolves locally, including the driver:
+    /// nothing here may fan out again. The driver still differs from the rest, but by reading the initiator's
+    /// file-task queue instead of listing its own files -- decided at construction, see the constructor.
+    if (isDistributedJoinDispatchWorker(context))
         return "";
 
     auto cluster_name_from_settings = context->getSettingsRef()[Setting::object_storage_cluster].value;

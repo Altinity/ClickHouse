@@ -42,6 +42,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.6.2.20001.altinityantalya",
         {
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
+            {"object_storage_distributed_driver_database", "", "", "New internal setting. Names the database of the driving table of an `object_storage_cluster_join_mode='distributed'` dispatch."},
+            {"object_storage_distributed_driver_table", "", "", "New internal setting. Names the driving table of an `object_storage_cluster_join_mode='distributed'` dispatch."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",

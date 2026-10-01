@@ -2138,6 +2138,15 @@ Possible values:
 - `local` — Replaces the database and table in the subquery with local ones for the destination server (shard), leaving the normal `IN`/`JOIN.`
 - `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.` Right table executes first and is added to the secondary query as temporay table.
 - `allow` — Default value. Allows the use of these types of subqueries.
+- `distributed` — Experimental. Dispatches a whole `JOIN` query to the cluster of its driving table, so the `JOIN` and any `GROUP BY` run on the cluster's nodes instead of on the initiator, which then only merges the partial aggregate states. The driving table is found by walking down the left side of the query -- through `INNER ALL`/`LEFT JOIN`s and through a subquery or CTE that does not itself aggregate, deduplicate, sort or limit -- and must be a `DataLake` catalog table distributed via `object_storage_cluster`.
+
+  This is attempted only for the outermost `SELECT` of an initial query, and it is all-or-nothing: either the entire query is eligible and is dispatched as one unit, or ordinary planning handles the entire query. No narrower, nested candidate is attempted, and nothing falls back per level.
+
+  Eligibility requires that every other table reachable anywhere in the query also resolves through a `DataLake` catalog, has no row-level security policy, and is readable by the current user. An explicit `*Cluster()` table function, an ordinary local or `Distributed` table, or any table failing one of those checks makes the whole query ineligible. The combination is disabled outright when `additional_table_filters` is set or `object_storage_remote_initiator` is enabled.
+
+  Performance characteristic to be aware of: only the driving table is partitioned across the cluster. Every other table in the query is read and recomputed **in full on every node**, including any `JOIN` or `GROUP BY` over them. That is a win when those relations are small relative to the driver and a loss when they are not; ClickHouse does not estimate this cost when deciding to dispatch.
+
+  ClickHouse also does not verify that the tables, dictionaries or user-defined functions the query references are configured identically on every node of the driver's cluster -- as with `Distributed`, that consistency is the deployment's responsibility.
 )", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
@@ -8348,6 +8357,18 @@ Trigger processor to spill data into external storage adpatively. grace join is 
     DECLARE(String, object_storage_cluster, "", R"(
 Cluster to make distributed requests to object storages with alternative syntax.
 )", EXPERIMENTAL) \
+    DECLARE(String, object_storage_distributed_driver_database, "", R"(
+Internal. Set by the initiator on a query dispatched by `object_storage_cluster_join_mode='distributed'`, naming the
+database of the one table whose files are distributed across the cluster. Together with
+`object_storage_distributed_driver_table` it tells a worker which table reads from the initiator's file-task queue;
+every other table in the same query is read in full, locally. Not meant to be set by hand.
+
+`IMPORTANT` because a worker that silently ignored it would find no driver, read every file of every table, and
+return each row once per node. A server too old to know the setting must refuse the query instead.
+)", EXPERIMENTAL | IMPORTANT) \
+    DECLARE(String, object_storage_distributed_driver_table, "", R"(
+Internal. The table name counterpart of `object_storage_distributed_driver_database`. Not meant to be set by hand.
+)", EXPERIMENTAL | IMPORTANT) \
     DECLARE(UInt64, object_storage_max_nodes, 0, R"(
 Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
 Possible values:
