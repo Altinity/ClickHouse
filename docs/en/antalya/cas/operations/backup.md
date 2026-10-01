@@ -54,8 +54,9 @@ are read through the `CAS` read path and written to the destination. Pool dedupl
 what was one blob shared by several replicas becomes ordinary files in the backup.
 
 **An `S3(...)` destination on the same `S3` endpoint as the pool** — the copy of a blob then runs
-inside the `S3` store itself: the ClickHouse server issues one "copy these bytes" command, and `S3`
-moves the bytes internally without sending them through ClickHouse.
+inside the `S3` store itself: the ClickHouse server issues "copy these bytes" commands - one per
+upload part, so a payload larger than one part takes several - and `S3` moves the bytes internally
+without sending them through ClickHouse.
 
 ```sql
 BACKUP TABLE t TO S3('http://s3.example.com/bucket/backups/b1', 'key', 'secret');
@@ -100,7 +101,7 @@ BACKUP TABLE t TO Disk('backups_s3', 'b1');
 ```
 
 Every file is read through the `CAS` read path and written through ClickHouse's buffers. The
-`s3_allow_native_copy` and `s3_allow_multipart_copy` settings have no effect on this path.
+`allow_s3_native_copy` and `s3_allow_multipart_copy` settings have no effect on this path.
 
 ## Restore {#restore}
 
@@ -142,8 +143,10 @@ It is a useful building block, not a replacement for `BACKUP`.
   instead. A store that refuses `UploadPartCopy` with another error fails the `BACKUP`; set
   `s3_allow_multipart_copy = 0` there.
 - Restore onto a `CAS` disk always writes through ClickHouse, see [restore](#restore).
-- A disk-level copy of a single part file onto a `CAS` disk, outside of `RESTORE`, is rejected with
-  `NOT_IMPLEMENTED`: a `CAS` disk accepts part files only as a whole part in one transaction.
+- A disk-level write of a part file onto a `CAS` disk outside of a part transaction is rejected with
+  `NOT_IMPLEMENTED` and the message `Autocommit writes are not supported for content part files`: a
+  `CAS` disk publishes a part's manifest and ref at commit, so it has nowhere to put a single
+  autocommitted file.
 - A `CAS` disk cannot be a backup destination: `BACKUP TABLE t TO Disk('<cas disk>', 'b1')` is rejected
   the same way. A backup's own layout mirrors the table's data directory, so its files sit under a part
   directory as well and count as part files.
