@@ -278,6 +278,64 @@ def test_backup_to_s3_falls_back_without_multipart():
     node.query(f"DROP TABLE {restored} SYNC")
 
 
+def test_backup_to_s3_ranged_copy_spans_several_parts():
+    """A payload larger than one upload part makes the ranged copy issue several `UploadPartCopy`
+    requests. Every part but the first carries an offset of its own, so the payload window must be
+    applied to each one and not only to the first.
+    """
+    node = cluster.instances["node"]
+    table = "cas_backup_multipart_range"
+    restored = f"{table}_restored"
+    s3_destination = backup_s3_destination("multipart_range")
+    query_id = f"{table}_backup_{RUN_TOKEN}"
+    small_parts = {"s3_min_upload_part_size": 5 * 1024 * 1024}
+    fingerprint = "SELECT count(), sum(cityHash64(s)) FROM {}"
+
+    node.query(f"DROP TABLE IF EXISTS {table} SYNC")
+    node.query(
+        f"""
+        CREATE TABLE {table} (k UInt64, s String)
+        ENGINE = MergeTree ORDER BY k
+        SETTINGS storage_policy = '{STORAGE_POLICY}', min_bytes_for_wide_part = 0
+        """
+    )
+    node.query(
+        f"""
+        INSERT INTO {table}
+        SELECT number, randomPrintableASCII(128) FROM numbers({NUM_ROWS})
+        """
+    )
+    expected = node.query(fingerprint.format(table)).strip()
+
+    node.query(
+        f"BACKUP TABLE {table} TO {s3_destination}",
+        query_id=query_id,
+        settings=small_parts,
+    )
+
+    events = transfer_events(node, query_id)
+    assert events["server_side_part_copy"] > 1, (
+        "no blob was copied in more than one part, so the per-part offset stayed untested"
+    )
+    assert events["server_side_object_copy"] == 0, (
+        "CopyObject has no range: the envelope would land in the backup"
+    )
+
+    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
+    node.query(f"RESTORE TABLE {table} AS {restored} FROM {s3_destination}")
+
+    assert node.query(fingerprint.format(restored)).strip() == expected
+    assert (
+        node.query(
+            f"CHECK TABLE {restored} SETTINGS check_query_single_value_result = 1"
+        ).strip()
+        == "1"
+    )
+
+    node.query(f"DROP TABLE {table} SYNC")
+    node.query(f"DROP TABLE {restored} SYNC")
+
+
 def test_move_partition_from_cas_to_s3_disk_with_empty_arrays():
     """A zero-size `.bin` still becomes a blob: `partFileMustStayBlob` keys on the file name, not
     the size. Moving it off a CAS disk must copy it through buffers.

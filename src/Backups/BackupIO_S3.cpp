@@ -258,7 +258,12 @@ BackupReaderS3::BackupReaderS3(
     bool is_internal_backup)
     : BackupReaderDefault(read_settings_, write_settings_, getLogger("BackupReaderS3"))
     , s3_uri(s3_uri_)
-    , data_source_description{DataSourceType::ObjectStorage, ObjectStorageType::S3, MetadataStorageType::None, s3_uri.endpoint, false, false, "", true}
+    , data_source_description{
+          .type = DataSourceType::ObjectStorage,
+          .object_storage_type = ObjectStorageType::S3,
+          .metadata_type = MetadataStorageType::None,
+          .description = s3_uri.endpoint,
+          .files_are_whole_objects = true}
 {
     s3_settings.loadFromConfig(context_->getConfigRef(), "s3", context_->getSettingsRef());
 
@@ -355,7 +360,12 @@ BackupWriterS3::BackupWriterS3(
     bool is_internal_backup)
     : BackupWriterDefault(read_settings_, write_settings_, getLogger("BackupWriterS3"))
     , s3_uri(s3_uri_)
-    , data_source_description{DataSourceType::ObjectStorage, ObjectStorageType::S3, MetadataStorageType::None, s3_uri.endpoint, false, false, "", true}
+    , data_source_description{
+          .type = DataSourceType::ObjectStorage,
+          .object_storage_type = ObjectStorageType::S3,
+          .metadata_type = MetadataStorageType::None,
+          .description = s3_uri.endpoint,
+          .files_are_whole_objects = true}
     , s3_capabilities(getCapabilitiesFromConfig(context_->getConfigRef(), "s3"))
     , disk_client_factory(S3BackupClientCreator(context_))
 {
