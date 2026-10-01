@@ -17,11 +17,119 @@ namespace ProfileEvents
 namespace DB
 {
 
-ReplicatedExportTTLIndex::ReplicatedExportTTLIndex(String zookeeper_path_, LoggerPtr log_)
+namespace ErrorCodes
+{
+    extern const int NO_ZOOKEEPER;
+}
+
+ReplicatedExportTTLIndex::ReplicatedExportTTLIndex(
+    String zookeeper_path_,
+    String replica_name_,
+    std::function<zkutil::ZooKeeperPtr()> get_zookeeper_,
+    std::function<bool()> is_readonly_,
+    LoggerPtr log_)
     : zookeeper_path(std::move(zookeeper_path_))
+    , replica_name(std::move(replica_name_))
+    , get_zookeeper(std::move(get_zookeeper_))
+    , is_readonly(std::move(is_readonly_))
     , log(std::move(log_))
     , latest(ExportTTLIndexSnapshot::build(/* version */ -1, {}))
 {
+}
+
+ReplicatedExportTTLIndex::~ReplicatedExportTTLIndex()
+{
+    releaseSchedulerLock();
+}
+
+zkutil::ZooKeeperPtr ReplicatedExportTTLIndex::getZooKeeper() const
+{
+    auto zookeeper = get_zookeeper();
+    if (!zookeeper)
+        throw Exception(ErrorCodes::NO_ZOOKEEPER, "Cannot get ZooKeeper");
+    return zookeeper;
+}
+
+void ReplicatedExportTTLIndex::releaseSchedulerLock()
+{
+    std::lock_guard lock(lock_mutex);
+    lock_holder.reset();
+    lock_zookeeper.reset();
+}
+
+bool ReplicatedExportTTLIndex::tryAcquireSchedulerLock()
+{
+    auto zookeeper = get_zookeeper();
+    if (!zookeeper || zookeeper->expired() || is_readonly())
+    {
+        releaseSchedulerLock();
+        return false;
+    }
+
+    std::lock_guard lock(lock_mutex);
+    if (lock_holder && lock_zookeeper == zookeeper)
+        return true;
+
+    lock_holder.reset();
+    lock_zookeeper.reset();
+
+    const auto root_path = getRootPath();
+    if (const auto code = zookeeper->tryCreate(root_path, "", zkutil::CreateMode::Persistent);
+        code != Coordination::Error::ZOK && code != Coordination::Error::ZNODEEXISTS)
+        throw zkutil::KeeperException::fromPath(code, root_path);
+
+    lock_holder = zkutil::EphemeralNodeHolder::tryCreate(getSchedulerLockPath(), *zookeeper, replica_name);
+    if (!lock_holder)
+        return false;
+
+    lock_zookeeper = zookeeper;
+    LOG_INFO(log, "This replica schedules the EXPORT TTL of the table");
+    return true;
+}
+
+String ReplicatedExportTTLIndex::getSchedulerReplica() const
+{
+    {
+        std::lock_guard lock(lock_mutex);
+        if (lock_holder && !lock_zookeeper->expired())
+            return replica_name;
+    }
+
+    std::lock_guard lock(scheduler_replica_mutex);
+    return scheduler_replica;
+}
+
+void ReplicatedExportTTLIndex::refreshAndWatch(
+    const zkutil::ZooKeeperPtr & zookeeper, const Coordination::WatchCallbackPtr & watch, bool has_export_ttl)
+{
+    if (!has_export_ttl)
+    {
+        Coordination::Stat stat;
+        const int32_t version = zookeeper->exists(getVersionPath(), &stat) ? stat.version : -1;
+        const auto snapshot = refresh(zookeeper, version);
+        loaded = true;
+        if (snapshot->entries.empty())
+        {
+            std::lock_guard lock(scheduler_replica_mutex);
+            scheduler_replica.clear();
+            return;
+        }
+    }
+
+    /// The watches are set before the nodes are read, so a change after a read always calls this again.
+    String replica;
+    if (zookeeper->existsWatch(getSchedulerLockPath(), nullptr, watch))
+        zookeeper->tryGet(getSchedulerLockPath(), replica);
+    {
+        std::lock_guard lock(scheduler_replica_mutex);
+        scheduler_replica = std::move(replica);
+    }
+
+    /// Without the `version` node there is no index yet: it is created before the first entry.
+    Coordination::Stat stat;
+    const int32_t version = zookeeper->existsWatch(getVersionPath(), &stat, watch) ? stat.version : -1;
+    refresh(zookeeper, version);
+    loaded = true;
 }
 
 String ReplicatedExportTTLIndex::getRootPath() const
@@ -164,19 +272,49 @@ void ReplicatedExportTTLIndex::appendUpdateEntryOps(
     ops.emplace_back(zkutil::makeSetRequest(getVersionPath(), "", -1));
 }
 
-void ReplicatedExportTTLIndex::removeDestination(const zkutil::ZooKeeperPtr & zookeeper, const String & destination_key) const
+bool ReplicatedExportTTLIndex::updateEntry(const String & destination_key, const ExportTTLVersionedEntry & versioned)
 {
+    const auto zookeeper = getZooKeeper();
+    if (versioned.version < 0)
+        ensureDestination(zookeeper, destination_key, destination_key);
+
+    Coordination::Requests ops;
+    appendUpdateEntryOps(ops, destination_key, versioned.entry, versioned.version);
+
+    Coordination::Responses responses;
+    const auto code = zookeeper->tryMulti(ops, responses);
+    if (code == Coordination::Error::ZOK)
+        return true;
+    if (code == Coordination::Error::ZBADVERSION || code == Coordination::Error::ZNODEEXISTS || code == Coordination::Error::ZNONODE)
+        return false;
+    zkutil::KeeperMultiException::check(code, ops, responses);
+    return false;
+}
+
+void ReplicatedExportTTLIndex::removeDestination(const String & destination_key)
+{
+    const auto zookeeper = getZooKeeper();
     zookeeper->tryRemoveRecursive(getDestinationPath(destination_key));
     zookeeper->trySet(getVersionPath(), "", -1);
     LOG_INFO(log, "Removed the TTL export index of destination {}", destination_key);
 }
 
+ExportTTLIndexSnapshotPtr ReplicatedExportTTLIndex::getSnapshot()
+{
+    return getSnapshot(getZooKeeper());
+}
+
 ExportTTLIndexSnapshotPtr ReplicatedExportTTLIndex::getSnapshot(const zkutil::ZooKeeperPtr & zookeeper)
 {
-    /// Read before the index, so the index is at least as new as the version it is cached for. Every
-    /// change of the index bumps the version in the same transaction.
-    const auto version = readVersion(zookeeper);
+    auto snapshot = refresh(zookeeper, readVersion(zookeeper));
+    loaded = true;
+    return snapshot;
+}
 
+ExportTTLIndexSnapshotPtr ReplicatedExportTTLIndex::refresh(const zkutil::ZooKeeperPtr & zookeeper, int32_t version)
+{
+    /// `version` is read before the index, so the index is at least as new as the version it is cached
+    /// for. Every change of the index bumps the version in the same transaction.
     if (auto cached = latest.get(); cached->version == version)
         return cached;
 

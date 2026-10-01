@@ -236,8 +236,12 @@ bool ExportPartTask::executeStep()
 
     MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Export;
 
+    /// A part without rows, e.g. emptied by a mutation, has nothing to write, and its min/max index,
+    /// which places the rows in the destination, is not initialized. It is exported as no files.
+    const bool has_rows = manifest.data_part->rows_count != 0;
+
     Block block_with_partition_values;
-    if (metadata_snapshot->hasPartitionKey())
+    if (metadata_snapshot->hasPartitionKey() && has_rows)
     {
         /// todo arthur do I need to init minmax_idx?
         block_with_partition_values = manifest.data_part->getMinMaxIndex()->getBlock(storage);
@@ -309,18 +313,26 @@ bool ExportPartTask::executeStep()
 
         FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
 
-        auto import_result = destination_storage->import(
-            filename,
-            block_with_partition_values,
-            new_file_path_callback,
-            manifest.file_already_exists_policy,
-            manifest.settings[Setting::export_merge_tree_part_max_bytes_per_file],
-            manifest.settings[Setting::export_merge_tree_part_max_rows_per_file],
-            manifest.iceberg_metadata_json,
-            getFormatSettings(local_context),
-            local_context);
+        std::optional<IStorage::ImportResult> import_result;
+        if (has_rows)
+        {
+            import_result = destination_storage->import(
+                filename,
+                block_with_partition_values,
+                new_file_path_callback,
+                manifest.file_already_exists_policy,
+                manifest.settings[Setting::export_merge_tree_part_max_bytes_per_file],
+                manifest.settings[Setting::export_merge_tree_part_max_rows_per_file],
+                manifest.iceberg_metadata_json,
+                getFormatSettings(local_context),
+                local_context);
+        }
 
-        if (import_result.already_exported)
+        if (!import_result)
+        {
+            LOG_INFO(getLogger("ExportPartTask"), "Part {} has no rows, nothing to export", manifest.data_part->name);
+        }
+        else if (import_result->already_exported)
         {
             /// An earlier attempt at this part already wrote the whole set of destination files and
             /// committed it, but died before the result was recorded durably. Adopt those files as
@@ -328,14 +340,14 @@ bool ExportPartTask::executeStep()
             ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
 
             LOG_INFO(getLogger("ExportPartTask"), "Part {} was already exported as {} file(s), reusing them",
-                manifest.data_part->name, import_result.exported_paths.size());
+                manifest.data_part->name, import_result->exported_paths.size());
 
-            for (const auto & exported_path : import_result.exported_paths)
+            for (const auto & exported_path : import_result->exported_paths)
                 new_file_path_callback(exported_path);
         }
         else
         {
-            sink = std::move(import_result.sink);
+            sink = std::move(import_result->sink);
 
             bool apply_deleted_mask = true;
             bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
@@ -419,7 +431,7 @@ bool ExportPartTask::executeStep()
         /// For the direct EXPORT PART → Iceberg path there is no deferred-commit callback
         /// (the partition-export path provides one that writes to ZooKeeper).
         /// Commit the Iceberg metadata inline here so the rows become visible immediately.
-        if (destination_storage->isDataLake() && !manifest.completion_callback)
+        if (import_result && destination_storage->isDataLake() && !manifest.completion_callback)
         {
             IStorage::IcebergCommitExportArguments iceberg_args;
             iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;

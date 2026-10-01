@@ -130,22 +130,28 @@ public:
 
     MergeTreeDeduplicationLog * getDeduplicationLog() { return deduplication_log.get(); }
 
-    /// EXPORT PARTITION for a plain (non-replicated) MergeTree table. Coordinated locally by
-    /// `export_task_scheduler`; the task descriptor is persisted on disk (no ZooKeeper).
-    void exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context) override;
+    /// Coordinated locally by `export_task_scheduler`; the task descriptor is persisted on disk (no
+    /// ZooKeeper). With an index update, the parts are claimed under the lock that merge selection
+    /// holds, before the task is created: a crash in between leaves a claim without a task.
+    bool exportParts(const ExportPartsRequest & request, ContextPtr local_context, const ExportTTLIndexUpdate * index_update) override;
 
     CancellationCode killExportTask(const String & transaction_id) override;
 
     /// Snapshot of local partition-export tasks for `system.distributed_exports`. No disk I/O.
     std::vector<ExportTaskInfo> getExportTasksInfo() const override;
 
-    /// Export states of parts for the `EXPORT` TTL, nullptr if partition export is disabled.
-    ExportFencePtr getExportFence() const;
-    ExportFencePtr getLatestExportFence() const override { return getExportFence(); }
+    /// Nullptr if partition export is disabled.
+    IExportTTLIndex * getExportTTLIndex() const override;
+
+    std::optional<ExportTaskStatus> getExportTaskStatus(const String & transaction_id) const override;
+    std::optional<ExportTaskStatus> getKnownExportTaskStatus(const String & transaction_id) const override
+    {
+        return getExportTaskStatus(transaction_id);
+    }
+    bool isPartBeingMerged(const MergeTreePartInfo & part_info) const override;
 
 private:
     friend class MergeTreeExportTaskScheduler;
-    friend class MergeTreeExportTTLScheduler;
     friend class MergeTreeExportTTLIndex;
 
     /// Builds the descriptor of an export task of `parts` from the settings of `query_context`, and

@@ -457,7 +457,6 @@ namespace
             {
                 result.paths.emplace_back(path_in_destination);
             }
-            result.paths_by_part[processed_parts[i]] = processed_part_entry.paths_in_destination;
         }
 
         return result;
@@ -486,34 +485,6 @@ namespace
         ops.emplace_back(zkutil::makeCreateRequest(path / "processed", "", zkutil::CreateMode::Persistent));
         ops.emplace_back(zkutil::makeCreateRequest(path / "locks", "", zkutil::CreateMode::Persistent));
         ops.emplace_back(zkutil::makeCreateRequest(path / "status", "PENDING", zkutil::CreateMode::Persistent));
-    }
-
-    std::vector<MergeTreePartInfo> getRangesCommittedByRetriedTasks(
-        const ExportRetriedTasks & retry_of,
-        const StoragePtr & destination_storage,
-        const String & partition_id,
-        const ContextPtr & context)
-    {
-        std::vector<MergeTreePartInfo> ranges;
-        for (const auto & retried : retry_of)
-        {
-            if (!destination_storage->isExportTransactionCommitted(retried.transaction_id, context))
-                continue;
-
-            const auto task_ranges = ExportTTLUtils::fromBlockRanges(partition_id, retried.block_ranges);
-            ranges.insert(ranges.end(), task_ranges.begin(), task_ranges.end());
-        }
-        return ExportFenceUtils::compactRanges(std::move(ranges));
-    }
-
-    std::vector<String> getPartsNotCommitted(
-        const std::vector<String> & part_names, const std::vector<MergeTreePartInfo> & committed_ranges, MergeTreeDataFormatVersion format_version)
-    {
-        std::vector<String> result;
-        for (const auto & part_name : part_names)
-            if (!ExportFenceUtils::isCoveredByUnion(MergeTreePartInfo::fromPartName(part_name, format_version), committed_ranges))
-                result.push_back(part_name);
-        return result;
     }
 
     void commit(
@@ -572,44 +543,21 @@ namespace
 
         const auto partition_id = getPartitionIdOfParts(manifest.parts, source_storage.format_version);
 
-        /// A task this one retries may have landed after it was considered failed. Its parts are
-        /// then in the destination already, so only the files of the other parts are committed.
-        std::vector<std::string> paths_to_commit = exported.paths;
-        if (!manifest.retry_of.empty())
-        {
-            const auto committed_ranges = getRangesCommittedByRetriedTasks(
-                manifest.retry_of, destination_storage, partition_id, context_in);
-
-            if (!committed_ranges.empty())
-            {
-                paths_to_commit.clear();
-                for (const auto & part_name : getPartsNotCommitted(manifest.parts, committed_ranges, source_storage.format_version))
-                {
-                    const auto it = exported.paths_by_part.find(part_name);
-                    if (it != exported.paths_by_part.end())
-                        paths_to_commit.insert(paths_to_commit.end(), it->second.begin(), it->second.end());
-                }
-
-                LOG_INFO(log, "Export task: a task retried by {} committed some of its parts, committing {} of {} files",
-                    entry_path, paths_to_commit.size(), exported.paths.size());
-            }
-        }
-
         IStorage::ExportCommitInfo destination_commit_info;
 
-        if (paths_to_commit.empty())
+        if (exported.paths.empty())
         {
             LOG_INFO(log, "Export task: {} has no destination files to commit", entry_path);
         }
         else
         {
             destination_commit_info = commitExportOnDestination(
-                manifest.transaction_id,
+                manifest.commit_id,
                 partition_id,
                 manifest.iceberg_metadata_json,
                 manifest.write_full_path_in_iceberg_metadata,
                 manifest.iceberg_partition_timezone,
-                paths_to_commit,
+                exported.paths,
                 manifest.parts,
                 destination_storage,
                 source_storage,
@@ -657,7 +605,7 @@ namespace
                 if (versioned.version < 0)
                     export_ttl_index.ensureDestination(zk, destination_key, fmt::format("{}.{}", manifest.destination_database, manifest.destination_table));
 
-                versioned.entry.commitClaim(manifest.transaction_id, ExportTTLUtils::rangesOfParts(manifest.parts, source_storage.format_version));
+                versioned.entry.commitClaim(manifest.commit_id, ExportTTLUtils::rangesOfParts(manifest.parts, source_storage.format_version));
                 export_ttl_index.appendUpdateEntryOps(ops, destination_key, versioned.entry, versioned.version);
             }
 
@@ -965,8 +913,8 @@ namespace
     /// A source partition is not split in the destination when every destination partition expression is
     /// single-valued over it. That holds structurally when the expression is a deterministic function of the
     /// source partition key, because rows agreeing on the source key then agree on it as well; the remaining
-    /// expressions have to be proven from the partition's min/max values. Without `parts`, only checks that
-    /// such a proof is possible.
+    /// expressions have to be proven from the partition's min/max values. Without `parts` that have rows,
+    /// only checks that such a proof is possible.
     void verifyPartitionKeyCompatibility(
         const KeyDescription & source_key,
         const KeyDescription & destination_key,
@@ -998,11 +946,18 @@ namespace
         const auto minmax_column_names = minmax_columns.getNames();
         const auto minmax_column_types = minmax_columns.getTypes();
 
-        /// Compute the global min/max index of the parts
+        /// Compute the global min/max index of the parts. A part without rows, e.g. emptied by a
+        /// mutation, has no values to place, and its min/max index is not initialized.
         IMergeTreeDataPart::MinMaxIndex minmax;
+        bool has_rows = false;
         for (const auto & part : parts)
+        {
+            if (part->rows_count == 0)
+                continue;
             minmax.merge(*part->getMinMaxIndex());
-        const auto * minmax_of_parts = parts.empty() ? nullptr : &minmax;
+            has_rows = true;
+        }
+        const auto * minmax_of_parts = has_rows ? &minmax : nullptr;
 
         /*
             1. If there is a structural match between the source and destination key, we accept it

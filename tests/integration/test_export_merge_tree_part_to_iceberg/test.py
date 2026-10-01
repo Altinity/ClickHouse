@@ -11,6 +11,7 @@ Coverage:
     test_export_part_all_iceberg_types                    – schema covering all major Iceberg data types
     test_export_multiple_parts_to_iceberg                 – two parts from different partitions land together
     test_export_part_with_year_transform_partition        – toYearNumSinceEpoch() partition expression
+    test_export_part_without_rows                         – a part emptied by a mutation exports as no files
     test_export_part_with_bucket_partition                – icebergBucket(N, col) partition expression
     test_export_part_partition_key_mismatch_is_rejected   – mismatched partition spec rejected synchronously
     test_export_part_multi_column_partition_key_success                     – composite (a, b, c) partition key round-trips
@@ -394,6 +395,52 @@ def test_export_part_with_year_transform_partition(cluster):
     assert "3\t2023-06-30" in result, f"Row 3 missing or incorrect:\n{result}"
 
     assert_part_log(node, mt, part)
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_without_rows(cluster):
+    """
+    A part that a mutation emptied, kept by `remove_empty_parts = 0`, has no min/max index. Exporting
+    it succeeds without writing or committing anything, although the destination partition, a year,
+    is proven from the min/max index for a source partition, a month, with rows.
+    """
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_no_rows_{sfx}"
+    iceberg = f"iceberg_no_rows_{sfx}"
+
+    cols = "id Int64, event_date Date"
+    make_mt(node, mt, cols, "toYYYYMM(event_date)", order_by="id", extra_settings="remove_empty_parts = 0")
+    make_iceberg_s3(node, iceberg, cols, "toYearNumSinceEpoch(event_date)")
+
+    node.query(f"INSERT INTO {mt} VALUES (1, '2020-01-10')")
+    node.query(f"ALTER TABLE {mt} DELETE WHERE 1", settings={"mutations_sync": 2})
+    part = get_part(node, mt, "202001")
+    rows = node.query(
+        f"SELECT rows FROM system.parts WHERE database = currentDatabase() AND table = '{mt}' AND name = '{part}'"
+    ).strip()
+    assert rows == "0", f"Expected part {part} without rows, got {rows}"
+
+    snapshots = int(node.query(
+        f"SELECT count() FROM system.iceberg_history WHERE database = currentDatabase() AND table = '{iceberg}'"
+    ).strip())
+
+    export_part(node, mt, part, iceberg)
+    wait_for_export_part(node, mt, part)
+
+    errors = node.query(
+        f"SELECT error FROM system.part_log WHERE event_type = 'ExportPart' "
+        f"AND database = currentDatabase() AND table = '{mt}' AND part_name = '{part}'"
+    ).split()
+    assert errors == ["0"], f"Expected one successful export of part {part}, got errors {errors}"
+
+    count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
+    assert count == 0, f"Expected the Iceberg table to stay empty, got {count} rows"
+    assert int(node.query(
+        f"SELECT count() FROM system.iceberg_history WHERE database = currentDatabase() AND table = '{iceberg}'"
+    ).strip()) == snapshots, "An export without files committed a snapshot"
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")

@@ -5,6 +5,7 @@
 #include <ranges>
 #include <chrono>
 
+#include <base/defines.h>
 #include <base/hex.h>
 #include <base/interpolate.h>
 #include "Common/ZooKeeper/IKeeper.h"
@@ -83,7 +84,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeSinkPatch.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsLock.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
-#include <Storages/MergeTree/ReplicatedExportTTLScheduler.h>
+#include <Storages/MergeTree/ExportTTLScheduler.h>
 #include <Storages/MergeTree/ExportTaskUtils.h>
 #include <Interpreters/ActionsDAG.h>
 
@@ -241,7 +242,6 @@ namespace Setting
     extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
     extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
-    extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
     extern const SettingsBool allow_insert_into_iceberg;
@@ -363,8 +363,6 @@ namespace ErrorCodes
     extern const int TIMEOUT_EXCEEDED;
     extern const int INVALID_SETTING_VALUE;
     extern const int PENDING_MUTATIONS_NOT_ALLOWED;
-    extern const int EXPORT_PARTITION_ALREADY_EXPORTED;
-    extern const int PARTITION_EXPORT_FAILED;
 }
 
 namespace ServerSetting
@@ -591,12 +589,17 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
 
         export_task_select_task->deactivate();
 
-        export_ttl_index = std::make_shared<ReplicatedExportTTLIndex>(zookeeper_path, log.load());
+        export_ttl_index = std::make_shared<ReplicatedExportTTLIndex>(
+            zookeeper_path, replica_name, [this] { return tryGetZooKeeper(); }, [this] { return is_readonly.load(); }, log.load());
 
-        export_ttl_scheduler = std::make_shared<ReplicatedExportTTLScheduler>(*this);
+        export_ttl_scheduler = std::make_shared<ExportTTLScheduler>(*this, *export_ttl_index);
         export_ttl_task = getContext()->getSchedulePool().createTask(
             getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_ttl_task)", [this] { exportTTLTask(); });
         export_ttl_task->deactivate();
+        export_ttl_index_updating_task = getContext()->getSchedulePool().createTask(
+            getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_ttl_index_updating_task)",
+            [this] { exportTTLIndexUpdatingTask(); });
+        export_ttl_index_updating_task->deactivate();
     }
 
 
@@ -6289,8 +6292,8 @@ void StorageReplicatedMergeTree::partialShutdown()
         export_task_select_task->deactivate();
         export_task_status_handling_task->deactivate();
         export_ttl_task->deactivate();
-        if (auto * scheduler = dynamic_cast<ReplicatedExportTTLScheduler *>(export_ttl_scheduler.get()))
-            scheduler->releaseSchedulerLock();
+        export_ttl_index_updating_task->deactivate();
+        export_ttl_index->releaseSchedulerLock();
     }
 
     cleanup_thread.stop();
@@ -6994,6 +6997,10 @@ bool StorageReplicatedMergeTree::executeMetadataAlter(const StorageReplicatedMer
         auto parts_lock = lockParts();
         resetSerializationHints(parts_lock);
     }
+
+    /// The index is watched only while the table has an `EXPORT` TTL, which may have been added.
+    if (export_ttl_index_updating_task)
+        export_ttl_index_updating_task->schedule();
 
     return true;
 }
@@ -8600,149 +8607,75 @@ void StorageReplicatedMergeTree::fetchPartition(
     LOG_TRACE(log, "Fetch took {} sec. ({} tries)", watch.elapsedSeconds(), try_no);
 }
 
-void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
+bool StorageReplicatedMergeTree::exportParts(const ExportPartsRequest & request, ContextPtr local_context, const ExportTTLIndexUpdate * index_update)
 {
-    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::exportPartitionToTable");
-    if (!query_context->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
-    {
-        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-            "Exporting merge tree partition is experimental. Set the server setting `allow_experimental_export_merge_tree_partition` to enable it (on all replicas).\n"
-            "If you are exporting to an Apache Iceberg table, you also need to enable the setting `allow_insert_into_iceberg` on the initiator (query, session or profile) - replicas inherit it from the scheduled task.");
-    }
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::exportParts");
 
-    /// EXPORT PARTITION ALL: expand into one sub-call per active partition id.
-    /// Failure handling is controlled by `export_merge_tree_partition_all_on_error`.
-    if (const auto * partition_ast = command.partition->as<ASTPartition>(); partition_ast && partition_ast->all)
-    {
-        auto partition_id_set = getAllPartitionIds();
-        if (partition_id_set.empty())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                            "Table {} has no active partitions to export",
-                            getStorageID().getNameForLogs());
+    const auto & destination = request.destination;
+    if (!destination->supportsImport(local_context))
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", destination->getName());
 
-        /// Sort for deterministic ordering (so failure messages and tests are stable).
-        std::vector<String> partition_ids(partition_id_set.begin(), partition_id_set.end());
-        std::sort(partition_ids.begin(), partition_ids.end());
+    const auto source_metadata = getInMemoryMetadataPtr(local_context, false);
+    const auto destination_metadata = destination->getInMemoryMetadataPtr(local_context, false);
+    ExportTaskUtils::verifyExportSchemaCastable(source_metadata, destination_metadata, destination->getStorageID(), local_context);
 
-        const auto & on_error_setting = query_context->getSettingsRef()[Setting::export_merge_tree_partition_all_on_error];
-        const ExportPartitionAllOnError on_error = on_error_setting.value;
-
-        LOG_INFO(log, "EXPORT PARTITION ALL: scheduling export for {} partitions, on_error={}",
-                 partition_ids.size(), on_error_setting.toString());
-
-        std::vector<std::pair<String, String>> failures; /// (partition_id, message)
-        size_t skipped_conflicts = 0;
-
-        for (const auto & partition_id : partition_ids)
-        {
-            PartitionCommand sub = command;
-            auto synthetic = make_intrusive<ASTPartition>();
-            synthetic->setPartitionID(make_intrusive<ASTLiteral>(partition_id));
-            sub.partition = synthetic;
-
-            try
-            {
-                exportPartitionToTable(sub, query_context);
-            }
-            catch (const Exception & e)
-            {
-                switch (on_error)
-                {
-                    case ExportPartitionAllOnError::throw_first:
-                        throw;
-                    case ExportPartitionAllOnError::skip_conflicts:
-                        if (e.code() == ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED)
-                        {
-                            ++skipped_conflicts;
-                            LOG_INFO(log,
-                                     "EXPORT PARTITION ALL: skipping partition {} (already exported / concurrent): {}",
-                                     partition_id, e.message());
-                            break;
-                        }
-                        throw;
-                    case ExportPartitionAllOnError::collect:
-                        LOG_WARNING(log, "EXPORT PARTITION ALL: partition {} failed: {}",
-                                    partition_id, e.message());
-                        failures.emplace_back(partition_id, e.message());
-                        break;
-                }
-            }
-        }
-
-        if (!failures.empty())
-        {
-            String aggregated = fmt::format(
-                "EXPORT PARTITION ALL: {}/{} partitions failed to schedule. Per-partition errors:",
-                failures.size(), partition_ids.size());
-            for (const auto & [pid, msg] : failures)
-                aggregated += fmt::format("\n  {}: {}", pid, msg);
-            throw Exception(ErrorCodes::PARTITION_EXPORT_FAILED, "{}", aggregated);
-        }
-
-        if (skipped_conflicts > 0)
-            LOG_INFO(log, "EXPORT PARTITION ALL: skipped {} partitions due to existing exports",
-                     skipped_conflicts);
-
-        return;
-    }
-
-    const auto dest_database = query_context->resolveDatabase(command.to_database);
-    const auto dest_table = command.to_table;
-    const auto dest_storage_id = StorageID(dest_database, dest_table);
-    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, dest_table}, query_context);
-
-    if (dest_storage->getStorageID() == this->getStorageID())
-    {
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
-    }
-
-    if (!dest_storage->supportsImport(query_context))
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
-
-    auto src_snapshot = getInMemoryMetadataPtr(query_context, false);
-    auto destination_snapshot = dest_storage->getInMemoryMetadataPtr(query_context, false);
-
-    ExportTaskUtils::verifyExportSchemaCastable(
-        src_snapshot, destination_snapshot, dest_storage->getStorageID(), query_context);
-
-    zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
-
-    const String partition_id = getPartitionIDFromQuery(command.partition, query_context);
-
-    DataPartsVector parts;
-    {
-        auto data_parts_lock = lockParts();
-        parts = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, partition_id, data_parts_lock);
-    }
-
-    if (parts.empty())
-    {
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} doesn't exist", partition_id);
-    }
-
-    /// Every `EXPORT PARTITION` is a new task, even if the partition was exported before.
-    auto manifest = buildExportTaskManifest(dest_storage_id, dest_storage, src_snapshot, destination_snapshot, parts, partition_id, query_context);
-    manifest.transaction_id = toString(UUIDHelpers::generateV4());
-    manifest.query_id = query_context->getCurrentQueryId();
-    manifest.source = ExportTaskSource::query;
-
-    const auto task_path = fs::path(zookeeper_path) / "exports" / manifest.transaction_id;
+    auto zookeeper = getZooKeeperAndAssertNotReadonly();
 
     Coordination::Requests ops;
-    ExportTaskUtils::appendCreateExportTaskOps(ops, task_path, manifest);
+    if (index_update)
+    {
+        checkAllReplicasSupportExportTTL(zookeeper);
+
+        /// Its `/log` version is checked when the index entry is stored, so no merge can be assigned between
+        /// checking the parts below and claiming them.
+        const auto merge_predicate = queue.getMergePredicate(zookeeper, PartitionIdsHint{request.partition_id});
+        for (const auto & part : request.parts)
+        {
+            const auto covering_part = merge_predicate->getCoveringVirtualPart(part->name);
+            if (covering_part.empty())
+                return false;
+
+            const auto covering_info = MergeTreePartInfo::fromPartName(covering_part, format_version);
+            if (covering_info.min_block != part->info.min_block || covering_info.max_block != part->info.max_block)
+                return false;
+        }
+
+        ops.emplace_back(zkutil::makeCheckRequest(fs::path(zookeeper_path) / "log", merge_predicate->getVersion()));
+    }
+
+    auto manifest = buildExportTaskManifest(
+        destination->getStorageID(), destination, source_metadata, destination_metadata, request.parts, request.partition_id, local_context);
+    manifest.transaction_id = request.transaction_id.empty() ? toString(UUIDHelpers::generateV4()) : request.transaction_id;
+    manifest.query_id = request.query_id;
+    manifest.source = request.source;
+    manifest.commit_id = request.commit_id.empty() ? manifest.transaction_id : request.commit_id;
+
+    ExportTaskUtils::appendCreateExportTaskOps(ops, fs::path(zookeeper_path) / "exports" / manifest.transaction_id, manifest);
+
+    if (index_update)
+    {
+        if (index_update->entry.version < 0)
+            export_ttl_index->ensureDestination(zookeeper, index_update->destination_key, destination->getStorageID().getNameForLogs());
+        export_ttl_index->appendUpdateEntryOps(ops, index_update->destination_key, index_update->entry.entry, index_update->entry.version);
+    }
 
     ProfileEvents::increment(ProfileEvents::ExportTaskZooKeeperRequests);
     ProfileEvents::increment(ProfileEvents::ExportTaskZooKeeperMulti);
     Coordination::Responses responses;
     const auto code = zookeeper->tryMulti(ops, responses);
     if (code != Coordination::Error::ZOK)
-        throw zkutil::KeeperException::fromPath(code, task_path);
+    {
+        if (index_update && (code == Coordination::Error::ZBADVERSION || code == Coordination::Error::ZNODEEXISTS))
+            return false;
+        zkutil::KeeperMultiException::check(code, ops, responses);
+    }
 
     LOG_INFO(log, "Created export task {} of partition {} to {}, {} part(s)",
-        manifest.transaction_id, partition_id, dest_storage_id.getNameForLogs(), manifest.parts.size());
+        manifest.transaction_id, request.partition_id, destination->getStorageID().getNameForLogs(), manifest.parts.size());
 
     if (export_task_updating_task)
         export_task_updating_task->schedule();
+    return true;
 }
 
 ExportReplicatedMergeTreeTaskManifest StorageReplicatedMergeTree::buildExportTaskManifest(
@@ -8919,6 +8852,87 @@ void StorageReplicatedMergeTree::exportTTLTask()
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
     }
     export_ttl_task->scheduleAfter(next_run_ms);
+}
+
+void StorageReplicatedMergeTree::exportTTLIndexUpdatingTask()
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::exportTTLIndexUpdatingTask");
+    try
+    {
+        const auto metadata_snapshot = getInMemoryMetadataPtr(getContext(), false);
+        export_ttl_index->refreshAndWatch(
+            getZooKeeper(), export_ttl_index_updating_task->getWatchCallback(), /* has_export_ttl */ !metadata_snapshot->getExportTTLs().empty());
+    }
+    catch (const Coordination::Exception & e)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+        /// The restarting thread schedules this task again once there is a new session.
+        if (e.code == Coordination::Error::ZSESSIONEXPIRED)
+        {
+            restarting_thread.wakeup();
+            return;
+        }
+        export_ttl_index_updating_task->scheduleAfter(QUEUE_UPDATE_ERROR_SLEEP_MS);
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+        export_ttl_index_updating_task->scheduleAfter(QUEUE_UPDATE_ERROR_SLEEP_MS);
+    }
+}
+
+namespace
+{
+
+MergeTreeData::ExportTaskStatus toExportTaskStatus(ExportReplicatedMergeTreeTaskEntry::Status status)
+{
+    using Status = ExportReplicatedMergeTreeTaskEntry::Status;
+    switch (status)
+    {
+        case Status::PENDING: return MergeTreeData::ExportTaskStatus::PENDING;
+        case Status::COMPLETED: return MergeTreeData::ExportTaskStatus::COMPLETED;
+        case Status::FAILED: return MergeTreeData::ExportTaskStatus::FAILED;
+        case Status::KILLED: return MergeTreeData::ExportTaskStatus::KILLED;
+    }
+    UNREACHABLE();
+}
+
+}
+
+std::optional<MergeTreeData::ExportTaskStatus> StorageReplicatedMergeTree::getKnownExportTaskStatus(const String & transaction_id) const
+{
+    if (const auto tasks = export_partition_manifests.get())
+    {
+        const auto & by_transaction_id = tasks->get<ExportTaskEntryTagByTransactionId>();
+        if (const auto it = by_transaction_id.find(transaction_id); it != by_transaction_id.end())
+            return toExportTaskStatus(it->status);
+    }
+    return std::nullopt;
+}
+
+std::optional<MergeTreeData::ExportTaskStatus> StorageReplicatedMergeTree::getExportTaskStatus(const String & transaction_id) const
+{
+    /// The in-memory mirror of the tasks may lag behind Keeper, which only delays a retry. A task it
+    /// does not know yet, e.g. just created, is read from Keeper, so it is never taken for missing.
+    if (const auto status = getKnownExportTaskStatus(transaction_id))
+        return status;
+
+    const auto status_path = fs::path(zookeeper_path) / "exports" / transaction_id / "status";
+    String status_str;
+    if (!getZooKeeper()->tryGet(status_path, status_str))
+        return std::nullopt;
+
+    if (const auto status = magic_enum::enum_cast<ExportReplicatedMergeTreeTaskEntry::Status>(status_str))
+        return toExportTaskStatus(*status);
+
+    /// Treated as failed: the scheduler still checks whether it committed.
+    LOG_WARNING(log, "Export task {} has an unknown status {}", transaction_id, status_str);
+    return ExportTaskStatus::FAILED;
+}
+
+bool StorageReplicatedMergeTree::isPartBeingMerged(const MergeTreePartInfo & part_info) const
+{
+    return queue.isGoingToBeMergedWithOtherParts(part_info);
 }
 
 void StorageReplicatedMergeTree::forgetPartition(const ASTPtr & partition, ContextPtr query_context)

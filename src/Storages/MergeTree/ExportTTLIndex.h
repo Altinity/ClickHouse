@@ -8,7 +8,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <utility>
 #include <vector>
 
 namespace DB
@@ -25,13 +24,18 @@ namespace DB
 /// committed to the destination:
 ///  - creating a task claims the ranges of its parts;
 ///  - committing a task moves its claim to `exported`;
-///  - retrying a failed task moves its claim to the new task;
+///  - retrying a failed task moves its claim to the new task, which commits under the same id;
 ///  - resolving a failed task that does not need a retry releases its claim.
 struct ExportTTLIndexEntry
 {
     /// Ranges owned by a TTL export task that did not commit: in flight, or failed and waiting to be retried.
     struct Claim
     {
+        /// Id the ranges are committed to the destination under. The retries of a failed task commit
+        /// under the id of the first task, so the destination commits the rows once if a failed task
+        /// landed after all.
+        String commit_id;
+        /// The task that exports the ranges now.
         String transaction_id;
         /// Compacted.
         std::vector<MergeTreePartInfo> ranges;
@@ -55,20 +59,25 @@ struct ExportTTLIndexEntry
 
     ExportFenceEntry toFenceEntry(const String & destination) const;
 
-    /// Claims the ranges of `parts` for `transaction_id`. Throws if the entry has a claim already.
-    void startClaim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts);
+    /// Claims the ranges of `parts` for the task `transaction_id`, which commits them under
+    /// `commit_id`. Throws if the entry has a claim already.
+    void startClaim(const String & commit_id, const String & transaction_id, const std::vector<MergeTreePartInfo> & parts);
 
-    /// Moves the claim to the exported ranges if `transaction_id` holds it, adding `parts` as well:
-    /// a task may commit parts whose claim was lost.
-    void commitClaim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts);
+    /// Moves the claim to the task `transaction_id`, which retries the task that holds it.
+    void retryClaim(const String & transaction_id);
 
-    /// Adds the ranges of `parts` to the exported ranges.
-    void addExported(const std::vector<MergeTreePartInfo> & parts);
+    /// Moves the claim to the exported ranges if it is committed under `commit_id`, adding `parts` as
+    /// well: a task may commit parts whose claim was lost.
+    void commitClaim(const String & commit_id, const std::vector<MergeTreePartInfo> & parts);
 
     void releaseClaim() { claim.reset(); }
 
     String toJSONString() const;
     static ExportTTLIndexEntry fromJSONString(const String & partition_id, const String & json_string);
+
+private:
+    /// Adds the ranges of `parts` to the exported ranges.
+    void addExported(const std::vector<MergeTreePartInfo> & parts);
 };
 
 /// An index entry as read, with the version to update it with a check.
@@ -109,10 +118,6 @@ namespace ExportTTLUtils
 
     /// Ranges of the parts named `part_names`, compacted.
     std::vector<MergeTreePartInfo> rangesOfParts(const std::vector<String> & part_names, MergeTreeDataFormatVersion format_version);
-
-    /// `[min_block, max_block]` of `ranges`, as recorded for a retried task (see `ExportRetriedTask`).
-    std::vector<std::pair<Int64, Int64>> toBlockRanges(const std::vector<MergeTreePartInfo> & ranges);
-    std::vector<MergeTreePartInfo> fromBlockRanges(const String & partition_id, const std::vector<std::pair<Int64, Int64>> & block_ranges);
 }
 
 }

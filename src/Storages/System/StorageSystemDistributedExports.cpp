@@ -69,8 +69,8 @@ ColumnsDescription StorageSystemDistributedExports::getColumnsDescription()
             "Per-part retry back-off local to this node: parts currently waiting before their next attempt, with attempt count and the next eligible time. Not shared across replicas; empty if no part is backing off."},
         {"source", std::make_shared<DataTypeString>(),
             "What created the task: `query` for `ALTER TABLE ... EXPORT PARTITION`, `ttl` for the table's `TTL ... EXPORT TO TABLE` expression."},
-        {"retry_of", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()),
-            "For a TTL export task: transaction ids of earlier tasks that failed to export some of this task's parts after exporting all of theirs, so their commit may still land. Its commit checks whether any of them landed at the destination after all. Empty otherwise."},
+        {"commit_id", std::make_shared<DataTypeString>(),
+            "ID the task commits to the destination under. It is the transaction ID, except for a TTL export task that retries a failed one: it commits under the ID of the failed task, so the destination commits the rows once if the failed task landed after all."},
     };
 }
 
@@ -202,12 +202,7 @@ void StorageSystemDistributedExports::fillData(MutableColumns & res_columns, Con
             res_columns[i++]->insert(backoff_array);
 
             res_columns[i++]->insert(info.source);
-
-            Array retry_of_array;
-            retry_of_array.reserve(info.retry_of.size());
-            for (const auto & transaction : info.retry_of)
-                retry_of_array.push_back(transaction);
-            res_columns[i++]->insert(retry_of_array);
+            res_columns[i++]->insert(info.commit_id);
         }
     }
 }

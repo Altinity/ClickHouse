@@ -20,7 +20,6 @@
 #include <base/types.h>
 #include <algorithm>
 #include <limits>
-#include <unordered_set>
 
 #include <filesystem>
 
@@ -143,7 +142,7 @@ std::vector<ExportTaskInfo> MergeTreeExportTaskScheduler::getInfo() const
             ? ""
             : ExportTaskUtils::getPartitionIdOfParts(descriptor.partNames(), storage.format_version);
         info.source = String(magic_enum::enum_name(descriptor.source));
-        info.retry_of = ExportRetriedTaskUtils::transactionIds(descriptor.retry_of);
+        info.commit_id = descriptor.commit_id;
         info.transaction_id = descriptor.transaction_id;
         info.query_id = descriptor.query_id;
         info.parts = descriptor.partNames();
@@ -568,47 +567,7 @@ void MergeTreeExportTaskScheduler::tryCommit(const String & transaction_id)
     IStorage::ExportCommitInfo destination_commit_info;
     try
     {
-        auto exported_paths = descriptor_copy.collectExportedPaths();
-
-        std::optional<ContextPtr> context;
-        StoragePtr destination_storage;
-        const auto get_destination = [&]
-        {
-            if (destination_storage)
-                return;
-            destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, storage.getContext());
-            if (!destination_storage)
-                throw Exception(ErrorCodes::UNKNOWN_TABLE, "Destination table {} not found for export commit",
-                    destination_storage_id.getNameForLogs());
-            context = ExportTaskUtils::getContextCopyWithTaskSettings(storage.getContext(), descriptor_copy);
-        };
-
-        /// A task this one retries may have landed after it was considered failed. Its parts are
-        /// then in the destination already, so only the files of the other parts are committed.
-        if (!descriptor_copy.retry_of.empty())
-        {
-            get_destination();
-            const auto committed_ranges = ExportTaskUtils::getRangesCommittedByRetriedTasks(
-                descriptor_copy.retry_of,
-                destination_storage,
-                ExportTaskUtils::getPartitionIdOfParts(descriptor_copy.partNames(), storage.format_version),
-                *context);
-
-            if (!committed_ranges.empty())
-            {
-                const auto parts_to_commit = ExportTaskUtils::getPartsNotCommitted(
-                    descriptor_copy.partNames(), committed_ranges, storage.format_version);
-                const std::unordered_set<String> parts_to_commit_set(parts_to_commit.begin(), parts_to_commit.end());
-
-                exported_paths.clear();
-                for (const auto & part : descriptor_copy.parts)
-                    if (parts_to_commit_set.contains(part.part_name))
-                        exported_paths.insert(exported_paths.end(), part.paths_in_destination.begin(), part.paths_in_destination.end());
-
-                LOG_INFO(storage.log, "Export task: a task retried by {} committed some of its parts, committing the files of {} of {} parts",
-                    transaction_id, parts_to_commit.size(), descriptor_copy.parts.size());
-            }
-        }
+        const auto exported_paths = descriptor_copy.collectExportedPaths();
 
         /// Every part is done and its paths were recorded durably at completion, so an empty set
         /// here is not a lost-data symptom: an Iceberg destination writes no data file for a part
@@ -621,12 +580,16 @@ void MergeTreeExportTaskScheduler::tryCommit(const String & transaction_id)
         }
         else
         {
-            get_destination();
+            const auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, storage.getContext());
+            if (!destination_storage)
+                throw Exception(ErrorCodes::UNKNOWN_TABLE, "Destination table {} not found for export commit",
+                    destination_storage_id.getNameForLogs());
+            const auto context = ExportTaskUtils::getContextCopyWithTaskSettings(storage.getContext(), descriptor_copy);
 
             LOG_INFO(storage.log, "Export task: all parts exported for task {}, committing", transaction_id);
 
             destination_commit_info = ExportTaskUtils::commitExportOnDestination(
-                descriptor_copy.transaction_id,
+                descriptor_copy.commit_id,
                 ExportTaskUtils::getPartitionIdOfParts(descriptor_copy.partNames(), storage.format_version),
                 descriptor_copy.iceberg_metadata_json,
                 descriptor_copy.write_full_path_in_iceberg_metadata,
@@ -635,7 +598,7 @@ void MergeTreeExportTaskScheduler::tryCommit(const String & transaction_id)
                 descriptor_copy.partNames(),
                 destination_storage,
                 storage,
-                *context);
+                context);
         }
 
         success = true;

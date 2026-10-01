@@ -70,27 +70,9 @@ def test_group_is_one_snapshot(cluster, source_engine):
     assert_exactly_once(iceberg_ids(node, iceberg_table), range(3))
 
 
-def test_groups_limited_in_size_are_separate_snapshots(cluster, source_engine):
-    node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(node, source_engine, settings={"ttl_export_max_parts_per_group": 2})
-    snapshots = iceberg_snapshots(node, iceberg_table)
-
-    node.query(f"SYSTEM STOP MERGES {mt_table}")
-    node.query(f"SYSTEM STOP MOVES {mt_table}")
-    for i in range(5):
-        node.query(f"INSERT INTO {mt_table} VALUES ({i}, 2020, {DUE})")
-    node.query(f"SYSTEM START MOVES {mt_table}")
-
-    wait_until(lambda: len(completed_ttl_tasks(node, mt_table)) == 3, 120, "The partition was not exported in three groups")
-    wait_for_partitions_exported(node, mt_table, ["2020"])
-    assert sorted(len(task["parts"]) for task in ttl_tasks(node, mt_table)) == [1, 2, 2]
-    assert iceberg_snapshots(node, iceberg_table) == snapshots + 3
-    assert_exactly_once(iceberg_ids(node, iceberg_table), range(5))
-
-
 def test_concurrent_groups_commit_to_one_table(cluster, source_engine):
     node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(node, source_engine, settings={"ttl_export_max_concurrent_groups": 4})
+    mt_table, iceberg_table = make_tables(node, source_engine)
     snapshots = iceberg_snapshots(node, iceberg_table)
 
     node.query(f"SYSTEM STOP MOVES {mt_table}")

@@ -30,12 +30,9 @@ PARTITION_IDS = [str(customer) for customer in CUSTOMERS]
 TTL_SECONDS = 10
 INSERT_SECONDS = 60
 # How long after it is due a row may take to be read from the destination when parts are not merged:
-# the maximum batch delay, a group in flight and the next group, with room for sanitizer builds. The
-# rows due in the first `INSERT_SECONDS - MAX_LAG_SECONDS` seconds are thus exported while rows keep
-# coming.
+# the check period, a group in flight and the next group, with room for sanitizer builds. The rows due
+# in the first `INSERT_SECONDS - MAX_LAG_SECONDS` seconds are thus exported while rows keep coming.
 MAX_LAG_SECONDS = 40
-# Parts keep becoming due, so a group is shipped by the window or, while it does not close, by the maximum delay.
-BATCH = {"ttl_export_batch_window_seconds": 3, "ttl_export_batch_max_delay_seconds": 6}
 NO_MERGES = {"max_bytes_to_merge_at_max_space_in_pool": 1}
 
 
@@ -46,7 +43,7 @@ def make_tables(nodes, engine, settings=None):
     for node in nodes:
         create_source(
             node, mt_table, COLUMNS, "customer_id", f"t + INTERVAL {TTL_SECONDS} SECOND EXPORT TO TABLE {iceberg_table}",
-            engine=engine, replica_name=node.name, settings={**BATCH, **(settings or {})},
+            engine=engine, replica_name=node.name, settings=settings,
         )
     return mt_table, iceberg_table
 

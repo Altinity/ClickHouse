@@ -12,12 +12,10 @@ from .common import (
     completed_ttl_tasks,
     create_iceberg,
     create_source,
-    failpoint,
-    first_eligible_time,
+    group_in_flight,
     iceberg_ids,
     iceberg_orphan_files,
     iceberg_snapshots,
-    pending_ttl_tasks,
     snapshot_refreshes,
     ttl_rows,
     ttl_tasks,
@@ -27,9 +25,9 @@ from .common import (
 
 CLUSTER_INSTANCES = ["replica1"]
 
-# When the `EXPORT` TTL ships groups of parts to an Iceberg destination: on the checks after their
-# parts are due, batched by the window, the maximum delay and the size threshold, limited in size and
-# concurrency, one snapshot per group, and never twice however many checks go by.
+# When the `EXPORT` TTL ships groups of parts to an Iceberg destination: every check ships the parts
+# that are due by then, one group per partition, a partition has at most one group being exported,
+# every group is one snapshot, and no part is exported twice however many checks go by.
 
 
 def due_in(seconds):
@@ -75,167 +73,65 @@ def test_exports_due_parts_once(cluster, source_engine):
     # The part that is not due stays in the source only.
     row = ttl_rows(node, mt_table)["2021"]
     assert row["eligible_parts"] == 0 and row["exported_parts"] == 0, row
-    assert [task["retry_of"] for task in ttl_tasks(node, mt_table)] == [[], []]
+    assert all(task["commit_id"] == task["transaction_id"] for task in ttl_tasks(node, mt_table)), ttl_tasks(node, mt_table)
 
 
-def test_part_becoming_due_wakes_the_scheduler(cluster, source_engine):
-    """A check computes when the next part becomes due, and the scheduler wakes up then instead of
-    waiting for the check period."""
+def test_due_parts_ship_on_the_next_check(cluster, source_engine):
+    """The check period is the batch interval: a check ships every part that is due by then, one
+    group per partition, and a part that is not due yet waits for a later check."""
     node = cluster.instances["replica1"]
-    # The batch window is disabled so the wake at the due time exports the part. The default window
-    # would hold it for another minute, past the bound that distinguishes this wake from the check period.
-    mt_table, iceberg_table = make_tables(
-        node, source_engine,
-        settings={"ttl_export_check_period_seconds": 120, "ttl_export_batch_window_seconds": 0, "ttl_export_batch_max_delay_seconds": 0},
-    )
+    period = 5
+    mt_table, iceberg_table = make_tables(node, source_engine, settings={"ttl_export_check_period_seconds": period})
 
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {due_in(12)})")
+    # Paused, so that no check runs between the inserts.
+    node.query(f"SYSTEM STOP MOVES {mt_table}")
+    for i in range(3):
+        node.query(f"INSERT INTO {mt_table} VALUES ({i}, 2020, {DUE})")
+    node.query(f"INSERT INTO {mt_table} VALUES (3, 2021, {DUE})")
+    node.query(f"INSERT INTO {mt_table} VALUES (4, 2020, {due_in(4 * period)})")
     inserted = time.time()
-    # The table starts with a check, which sees the part that is not due yet.
-    node.query(f"DETACH TABLE {mt_table}")
-    node.query(f"ATTACH TABLE {mt_table}")
+    node.query(f"SYSTEM START MOVES {mt_table}")
 
-    while time.time() - inserted < 9:
-        assert ttl_tasks(node, mt_table) == [], "The part was exported before it was due"
+    def started():
+        tasks = ttl_tasks(node, mt_table)
+        return len(tasks) == 2 and tasks
+
+    tasks = wait_until(started, 3 * period, "The due parts were not shipped by the next check")
+    assert sorted((task["partition_id"], len(task["parts"])) for task in tasks) == [("2020", 3), ("2021", 1)], tasks
+
+    while time.time() - inserted < 3 * period:
+        assert len(ttl_tasks(node, mt_table)) == 2, "The part was exported before it was due"
         time.sleep(1)
 
-    # That check already shows the partition as idle, so wait until the part is recorded as exported.
-    wait_for_partitions_exported(node, mt_table, ["2020"], timeout=40, exported=1)
-    assert time.time() - inserted < 40, "The part was exported only by a periodic check"
-    assert_exactly_once(iceberg_ids(node, iceberg_table), [1])
-    assert_one_snapshot_per_task(node, mt_table, iceberg_table)
-
-
-def test_batching_window_spans_checks(cluster, source_engine):
-    """Parts that keep becoming due within the window are collected over several checks into one
-    group, which is committed as one snapshot once no new part came for the window."""
-    node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(
-        node, source_engine,
-        settings={"ttl_export_batch_window_seconds": 45, "ttl_export_batch_max_delay_seconds": 600, "ttl_export_batch_min_bytes": 0},
-    )
-
-    first_eligible = set()
-    for i in range(5):
-        node.query(f"INSERT INTO {mt_table} VALUES ({i}, 2020, {DUE})")
-        assert ttl_tasks(node, mt_table) == [], "A group was shipped while parts kept coming"
-        first_eligible.add(first_eligible_time(node, mt_table, "2020"))
-    first_eligible.discard(0)
-
-    assert len(first_eligible) == 1, f"The first eligible time of the group changed across checks: {first_eligible}"
-
-    wait_for_partitions_exported(node, mt_table, ["2020"], timeout=120)
-    tasks = ttl_tasks(node, mt_table)
-    assert len(tasks) == 1 and len(tasks[0]["parts"]) == 5, tasks
+    wait_until(lambda: len(completed_ttl_tasks(node, mt_table)) == 3, 60, "The part was not exported once it was due")
+    wait_for_partitions_exported(node, mt_table, ["2020", "2021"])
+    assert len(ttl_tasks(node, mt_table)[-1]["parts"]) == 1
     assert_exactly_once(iceberg_ids(node, iceberg_table), range(5))
     assert_one_snapshot_per_task(node, mt_table, iceberg_table)
 
 
-def test_maximum_delay_ships_while_parts_keep_coming(cluster, source_engine):
+def test_one_group_per_partition_at_a_time(cluster, source_engine):
+    """A partition has at most one group being exported: the parts that become due meanwhile wait
+    for it, and the next check after it committed ships them together."""
     node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(
-        node, source_engine,
-        settings={"ttl_export_batch_window_seconds": 15, "ttl_export_batch_max_delay_seconds": 25, "ttl_export_batch_min_bytes": 0},
-    )
+    mt_table, iceberg_table = make_tables(node, source_engine)
 
-    start = time.time()
-    shipped_at = None
-    i = 0
-    while time.time() - start < 45:
-        node.query(f"INSERT INTO {mt_table} VALUES ({i}, 2020, {DUE})")
-        i += 1
-        if shipped_at is None and ttl_tasks(node, mt_table):
-            shipped_at = time.time() - start
+    with group_in_flight(node) as wait_paused:
+        node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE})")
+        wait_paused()
+        node.query(f"INSERT INTO {mt_table} VALUES (2, 2020, {DUE})")
+        node.query(f"INSERT INTO {mt_table} VALUES (3, 2020, {DUE})")
+        # Several checks go by while the group is in flight.
+        time.sleep(4)
+        tasks = ttl_tasks(node, mt_table)
+        assert [(task["status"], len(task["parts"])) for task in tasks] == [("PENDING", 1)], tasks
+        assert ttl_rows(node, mt_table)["2020"]["eligible_parts"] == 2
 
-    assert shipped_at is not None, "No group was shipped although parts waited longer than the maximum delay"
-    assert shipped_at >= 20, f"A group was shipped after {shipped_at:.1f} s, before the maximum delay"
-
-    wait_for_partitions_exported(node, mt_table, ["2020"], timeout=90)
-    assert_exactly_once(iceberg_ids(node, iceberg_table), range(i))
+    wait_until(lambda: len(completed_ttl_tasks(node, mt_table)) == 2, 60, "The parts that became due meanwhile were not exported")
+    wait_for_partitions_exported(node, mt_table, ["2020"])
+    assert [len(task["parts"]) for task in ttl_tasks(node, mt_table)] == [1, 2]
+    assert_exactly_once(iceberg_ids(node, iceberg_table), [1, 2, 3])
     assert_one_snapshot_per_task(node, mt_table, iceberg_table)
-
-
-def test_size_threshold_ships_before_the_window(cluster, source_engine):
-    node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(
-        node, source_engine,
-        settings={"ttl_export_batch_window_seconds": 600, "ttl_export_batch_max_delay_seconds": 600, "ttl_export_batch_min_bytes": 1},
-    )
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE})")
-    wait_for_partitions_exported(node, mt_table, ["2020"], timeout=30)
-    assert_exactly_once(iceberg_ids(node, iceberg_table), [1])
-    assert_one_snapshot_per_task(node, mt_table, iceberg_table)
-
-
-def test_group_size_limits_over_successive_checks(cluster, source_engine):
-    """A group is limited to `ttl_export_max_parts_per_group` parts; the rest of the partition is
-    shipped by the next groups, one at a time, each its own snapshot."""
-    node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(
-        node, source_engine,
-        settings={"ttl_export_batch_window_seconds": 15, "ttl_export_batch_max_delay_seconds": 600,
-                  "ttl_export_batch_min_bytes": 0, "ttl_export_max_parts_per_group": 2},
-    )
-
-    for i in range(3):
-        node.query(f"INSERT INTO {mt_table} VALUES ({i}, 2020, {DUE})")
-
-    # Within the window nothing is exported.
-    time.sleep(4)
-    assert ttl_tasks(node, mt_table) == []
-    assert ttl_rows(node, mt_table)["2020"]["eligible_parts"] == 3
-
-    in_flight = []
-    def settled():
-        in_flight.append(pending_ttl_tasks(node, mt_table))
-        return len(completed_ttl_tasks(node, mt_table)) == 2
-    wait_until(settled, 120, "The partition was not exported in two groups")
-    assert max(in_flight) <= 1, f"Two groups of one partition were in flight at once: {in_flight}"
-
-    assert sorted(len(task["parts"]) for task in ttl_tasks(node, mt_table)) == [1, 2]
-    assert_exactly_once(iceberg_ids(node, iceberg_table), range(3))
-    assert_one_snapshot_per_task(node, mt_table, iceberg_table)
-
-
-def test_group_bytes_limit_ships_parts_one_by_one(cluster, source_engine):
-    node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(node, source_engine, settings={"ttl_export_max_bytes_per_group": 1})
-    node.query(f"SYSTEM STOP MOVES {mt_table}")
-    for i in range(3):
-        node.query(f"INSERT INTO {mt_table} VALUES ({i}, 2020, {DUE})")
-    node.query(f"SYSTEM START MOVES {mt_table}")
-
-    wait_until(lambda: len(completed_ttl_tasks(node, mt_table)) == 3, 120, "The parts were not exported one by one")
-    assert [len(task["parts"]) for task in ttl_tasks(node, mt_table)] == [1, 1, 1]
-    assert_exactly_once(iceberg_ids(node, iceberg_table), range(3))
-    assert_one_snapshot_per_task(node, mt_table, iceberg_table)
-
-
-def test_concurrent_groups_are_capped(cluster, source_engine):
-    """At most `ttl_export_max_concurrent_groups` groups of the table are in flight, whatever the
-    number of partitions, and their commits to the one Iceberg table do not get lost."""
-    node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(
-        node, source_engine,
-        settings={"ttl_export_max_concurrent_groups": 2, "ttl_export_settings_profile": "ttl_export_quick_retry"},
-    )
-
-    with failpoint([node], "export_part_retryable_throw"):
-        node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE}), (2, 2021, {DUE}), (3, 2022, {DUE}), (4, 2023, {DUE})")
-        wait_until(lambda: pending_ttl_tasks(node, mt_table) == 2, 60, "Two groups were not started")
-        samples = []
-        for _ in range(8):
-            samples.append(pending_ttl_tasks(node, mt_table))
-            time.sleep(0.5)
-        assert max(samples) == 2, f"More groups than the limit were in flight: {samples}"
-        assert len(ttl_tasks(node, mt_table)) == 2, "A group was started while the limit was reached"
-        assert iceberg_ids(node, iceberg_table) == []
-
-    wait_for_partitions_exported(node, mt_table, ["2020", "2021", "2022", "2023"], timeout=120)
-    assert len(completed_ttl_tasks(node, mt_table)) == 4
-    assert_exactly_once(iceberg_ids(node, iceberg_table), [1, 2, 3, 4])
-    assert_one_snapshot_per_task(node, mt_table, iceberg_table)
-    assert assert_iceberg_files_partitioned(node, iceberg_table, "year", "year") == {2020, 2021, 2022, 2023}
 
 
 def test_idle_checks_change_nothing(cluster, source_engine):
@@ -270,21 +166,6 @@ def test_stop_moves_pauses_and_start_moves_resumes(cluster, source_engine):
 
     node.query(f"SYSTEM START MOVES {mt_table}")
     wait_for_partitions_exported(node, mt_table, ["2020"])
-    assert_exactly_once(iceberg_ids(node, iceberg_table), [1])
-    assert_one_snapshot_per_task(node, mt_table, iceberg_table)
-
-
-def test_modified_settings_apply_on_the_next_check(cluster, source_engine):
-    node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(
-        node, source_engine, settings={"ttl_export_batch_window_seconds": 600, "ttl_export_batch_max_delay_seconds": 600}
-    )
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE})")
-    time.sleep(4)
-    assert ttl_tasks(node, mt_table) == []
-
-    node.query(f"ALTER TABLE {mt_table} MODIFY SETTING ttl_export_batch_window_seconds = 0, ttl_export_batch_max_delay_seconds = 0")
-    wait_for_partitions_exported(node, mt_table, ["2020"], timeout=30)
     assert_exactly_once(iceberg_ids(node, iceberg_table), [1])
     assert_one_snapshot_per_task(node, mt_table, iceberg_table)
 

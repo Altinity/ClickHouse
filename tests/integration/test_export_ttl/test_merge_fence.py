@@ -11,6 +11,7 @@ from .common import (
     assert_never_merged,
     assert_one_snapshot_per_task,
     completed_ttl_tasks,
+    completed_ttl_tasks_with_files,
     create_iceberg,
     create_source,
     group_in_flight,
@@ -147,9 +148,11 @@ def test_exported_parts_merge_with_each_other(cluster, source_engine):
     assert_one_snapshot_per_task(node, mt_table, iceberg_table)
 
 
-def test_eligible_parts_merge_while_the_group_is_collected(cluster, source_engine):
+def test_eligible_parts_merge_before_they_are_shipped(cluster, source_engine):
+    """Due parts that are not claimed merge as usual, and the merged part is shipped."""
     node = cluster.instances["replica1"]
-    mt_table, iceberg_table = make_tables(node, source_engine, settings={"ttl_export_batch_window_seconds": 8, "ttl_export_batch_max_delay_seconds": 600})
+    mt_table, iceberg_table = make_tables(node, source_engine)
+    node.query(f"SYSTEM STOP MOVES {mt_table}")
     node.query(f"SYSTEM STOP MERGES {mt_table}")
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE})")
     node.query(f"INSERT INTO {mt_table} VALUES (2, 2020, {DUE})")
@@ -158,6 +161,7 @@ def test_eligible_parts_merge_while_the_group_is_collected(cluster, source_engin
     merged = active_parts(node, mt_table)
     assert len(merged) == 1
 
+    node.query(f"SYSTEM START MOVES {mt_table}")
     wait_for_partitions_exported(node, mt_table, ["2020"])
     tasks = ttl_tasks(node, mt_table)
     assert len(tasks) == 1 and tasks[0]["parts"] == merged, tasks
@@ -221,9 +225,10 @@ def test_mutation_keeps_parts_exported(cluster, source_engine):
 
 
 def test_parts_without_rows_are_recorded_as_exported(cluster, source_engine):
-    """A part that a mutation emptied, kept by `remove_empty_parts = 0`, has nothing to export, but its
-    group records it as exported: otherwise it would stay apart from the exported parts around it, and
-    the partition could never be merged into one part. A group of such parts only has no task."""
+    """A part that a mutation emptied, kept by `remove_empty_parts = 0`, has nothing to export, but it
+    is exported with its group, writing nothing, so it is recorded as exported: otherwise it would stay
+    apart from the exported parts around it, and the partition could never be merged into one part.
+    A group of such parts only is a task that commits nothing."""
     node = cluster.instances["replica1"]
     # No merge is assigned until the end, so the emptied part stays between the others.
     mt_table, iceberg_table = make_tables(
@@ -240,13 +245,16 @@ def test_parts_without_rows_are_recorded_as_exported(cluster, source_engine):
 
     wait_for_partitions_exported(node, mt_table, ["2020"], exported=3)
     tasks = ttl_tasks(node, mt_table)
-    assert len(tasks) == 1 and len(tasks[0]["parts"]) == 2, tasks
+    assert len(tasks) == 1 and len(tasks[0]["parts"]) == 3, tasks
     assert_exactly_once(iceberg_ids(node, iceberg_table), [1, 3])
 
     node.query(f"INSERT INTO {mt_table} VALUES (4, 2020, {NOT_DUE})")
     node.query(f"ALTER TABLE {mt_table} DELETE WHERE id = 4", settings={"mutations_sync": 2})
     wait_for_partitions_exported(node, mt_table, ["2020"], exported=4)
-    assert len(ttl_tasks(node, mt_table)) == 1
+    tasks = ttl_tasks(node, mt_table)
+    assert sorted(len(task["parts"]) for task in tasks) == [1, 3], tasks
+    assert all(task["status"] == "COMPLETED" for task in tasks), tasks
+    assert completed_ttl_tasks_with_files(node, mt_table) == [task["transaction_id"] for task in tasks if len(task["parts"]) == 3]
 
     node.query(f"ALTER TABLE {mt_table} RESET SETTING max_bytes_to_merge_at_max_space_in_pool")
     node.query(f"OPTIMIZE TABLE {mt_table} PARTITION ID '2020' FINAL")

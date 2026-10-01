@@ -18,6 +18,8 @@
 #include <Storages/MergeTree/MergeTreeIndices.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 #include <Storages/MergeTree/ExportTTLDeleteGate.h>
+#include <Storages/MergeTree/ExportTTLIndex.h>
+#include <Storages/ExportTaskSource.h>
 #include <Storages/MergeTree/MergeTreeMutationStatus.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/ExportList.h>
@@ -54,6 +56,7 @@ namespace DB
 
 class ExportTTLScheduler;
 struct ExportTTLPartitionInfo;
+class IExportTTLIndex;
 
 /// Number of streams is not number parts, but number or parts*files, hence 100.
 const size_t DEFAULT_DELAYED_STREAMS_FOR_PARALLEL_WRITE = 100;
@@ -1111,10 +1114,36 @@ public:
 
     void killExportPart(const String & transaction_id);
 
-    virtual void exportPartitionToTable(const PartitionCommand &, ContextPtr)
+    /// An export of parts of one partition, by `EXPORT PARTITION` or by the `EXPORT` TTL.
+    struct ExportPartsRequest
     {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXPORT PARTITION is not implemented for engine {}", getName());
-    }
+        StoragePtr destination;
+        String partition_id;
+        /// Parts without rows are exported as no files.
+        DataPartsVector parts;
+        ExportTaskSource source = ExportTaskSource::query;
+        /// Generated if empty.
+        String transaction_id;
+        /// The id the task commits to the destination under, the transaction id if empty. A retry of a
+        /// task of the `EXPORT` TTL commits under the id of the task it retries.
+        String commit_id;
+        String query_id;
+    };
+
+    /// The export index entry of the `EXPORT` TTL to store with an export.
+    struct ExportTTLIndexUpdate
+    {
+        String destination_key;
+        ExportTTLVersionedEntry entry;
+    };
+
+    /// Checks the export and creates its task. With `index_update`, also
+    /// stores that entry in the same step and fails if a part is being merged. Returns false on a conflict.
+    virtual bool exportParts(const ExportPartsRequest & request, ContextPtr local_context, const ExportTTLIndexUpdate * index_update = nullptr) = 0;
+
+    /// `ALTER TABLE ... EXPORT PARTITION`, including `EXPORT PARTITION ALL`: every call is a new task,
+    /// even if the partition was exported before.
+    void exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context);
 
     /// Snapshot of this table's partition-export tasks for `system.distributed_exports`, taken from
     /// an in-memory mirror: no disk or ZooKeeper I/O, so it is safe to call from query threads.
@@ -1786,12 +1815,34 @@ public:
 
     ExportTTLDeleteGate getExportTTLDeleteGate() const;
 
+    /// The export index of the `EXPORT` TTL, nullptr if the table has none.
+    virtual IExportTTLIndex * getExportTTLIndex() const = 0;
+
     /// The export states of parts as last seen, without reading Keeper. May be older than the
     /// index, which only makes the delete gate hold more parts.
-    virtual ExportFencePtr getLatestExportFence() const { return nullptr; }
+    ExportFencePtr getLatestExportFence() const;
 
     /// For `system.ttl_exports`, empty if the table has no `EXPORT` TTL scheduler.
     std::vector<ExportTTLPartitionInfo> getExportTTLInfo() const;
+
+    /// The status of an export task of the table, as the `EXPORT` TTL resolves the claim of the task.
+    enum class ExportTaskStatus : uint8_t
+    {
+        PENDING,
+        COMPLETED,
+        FAILED,
+        KILLED,
+    };
+
+    /// Nullopt if there is no such task, e.g. after a crash between claiming its parts and creating it.
+    virtual std::optional<ExportTaskStatus> getExportTaskStatus(const String & transaction_id) const = 0;
+
+    /// As `getExportTaskStatus`, from what this replica knows without reading Keeper: also nullopt for
+    /// a task that it does not know yet.
+    virtual std::optional<ExportTaskStatus> getKnownExportTaskStatus(const String & transaction_id) const = 0;
+
+    /// Whether the part is a source of an assigned merge that changes its block range.
+    virtual bool isPartBeingMerged(const MergeTreePartInfo & part_info) const = 0;
 
 protected:
     /// Created by the engines that support `TTL ... EXPORT`.

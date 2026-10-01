@@ -5,8 +5,11 @@
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Storages/MergeTree/ExportTTLIndex.h>
 #include <Storages/MergeTree/ExportFence.h>
+#include <Storages/MergeTree/IExportTTLIndex.h>
 #include <base/defines.h>
 
+#include <atomic>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -24,10 +27,42 @@ namespace DB
 ///  - `scheduler_lock`: ephemeral, held by the replica that schedules TTL exports, whose name it holds;
 ///  - `destinations/<destination_key>`: holds the name of one destination;
 ///  - `destinations/<destination_key>/partitions/<partition_id>`: an `ExportTTLIndexEntry`.
-class ReplicatedExportTTLIndex
+///
+/// Every replica of a table with an `EXPORT` TTL, or with an index left to clean up, watches `version`
+/// and `scheduler_lock`, so that its copy of the index and of the lock holder follow Keeper, and
+/// `system.ttl_exports` reads neither from Keeper.
+class ReplicatedExportTTLIndex final : public IExportTTLIndex
 {
 public:
-    ReplicatedExportTTLIndex(String zookeeper_path_, LoggerPtr log_);
+    /// `get_zookeeper` returns the current session of the table, or nullptr if there is none. A
+    /// replica does not schedule while `is_readonly`.
+    ReplicatedExportTTLIndex(
+        String zookeeper_path_,
+        String replica_name_,
+        std::function<zkutil::ZooKeeperPtr()> get_zookeeper_,
+        std::function<bool()> is_readonly_,
+        LoggerPtr log_);
+    ~ReplicatedExportTTLIndex() override;
+
+    /// Reads the index again only when the version of the `version` node changed, so while nothing
+    /// changes this costs one `exists`.
+    ExportTTLIndexSnapshotPtr getSnapshot() override;
+    ExportTTLIndexSnapshotPtr getLatest() const override { return loaded ? latest.get() : nullptr; }
+    bool updateEntry(const String & destination_key, const ExportTTLVersionedEntry & versioned) override;
+    /// Not transactional: an interrupted removal leaves fewer entries, which only lifts more of the fence.
+    void removeDestination(const String & destination_key) override;
+    /// Needs a session that is not expired, and holds the lock while that session lives and the
+    /// replica is not read-only.
+    bool tryAcquireSchedulerLock() override;
+    /// Also e.g. when the replica goes read-only, so another replica can take over.
+    void releaseSchedulerLock() override;
+    String getSchedulerReplica() const override;
+
+    /// Reads the index again if it changed, and the holder of the scheduler lock, with `watch` on the
+    /// nodes they are read from, so that it is called again when they change. Creates no node.
+    /// Without `has_export_ttl`, an empty index is read without watches: the table has nothing to
+    /// follow until an `EXPORT` TTL is added, which calls this again.
+    void refreshAndWatch(const zkutil::ZooKeeperPtr & zookeeper, const Coordination::WatchCallbackPtr & watch, bool has_export_ttl);
 
     String getRootPath() const;
     String getVersionPath() const;
@@ -51,30 +86,39 @@ public:
     void appendUpdateEntryOps(
         Coordination::Requests & ops, const String & destination_key, const ExportTTLIndexEntry & entry, int32_t version) const;
 
-    /// Removes the index of `destination_key` and bumps the version of the index. Not transactional:
-    /// an interrupted removal leaves fewer entries, which only lifts more of the fence.
-    void removeDestination(const zkutil::ZooKeeperPtr & zookeeper, const String & destination_key) const;
-
-    /// The whole index as of the current version of the `version` node. It is read again only when
-    /// that version changed, so while nothing changes this costs one `exists`.
     ExportTTLIndexSnapshotPtr getSnapshot(const zkutil::ZooKeeperPtr & zookeeper);
 
     /// The export states as of the returned version of the `version` node.
     std::pair<ExportFencePtr, int32_t> getForMergeAssignment(const zkutil::ZooKeeperPtr & zookeeper);
 
-    /// The export states read by the last `getSnapshot`, without reading Keeper.
-    ExportFencePtr getLatest() const { return latest.get()->fence; }
-
 private:
     const String zookeeper_path;
+    const String replica_name;
+    const std::function<zkutil::ZooKeeperPtr()> get_zookeeper;
+    const std::function<bool()> is_readonly;
     const LoggerPtr log;
 
     /// Serializes reading the index again, which readers of `latest` do not wait for.
     std::mutex refresh_mutex;
     MultiVersion<ExportTTLIndexSnapshot> latest;
+    /// Whether `latest` was read from Keeper at least once.
+    std::atomic<bool> loaded = false;
+
+    mutable std::mutex scheduler_replica_mutex;
+    /// The holder of the scheduler lock as of the last `refreshAndWatch`.
+    String scheduler_replica;
+
+    mutable std::mutex lock_mutex;
+    /// Keeps the session the lock was created in alive: the holder refers to it.
+    zkutil::ZooKeeperPtr lock_zookeeper;
+    zkutil::EphemeralNodeHolderPtr lock_holder;
 
     String getDestinationsPath() const;
     int32_t readVersion(const zkutil::ZooKeeperPtr & zookeeper) const;
+    zkutil::ZooKeeperPtr getZooKeeper() const;
+
+    /// The index as of `version` of the `version` node, read again unless it is cached for it.
+    ExportTTLIndexSnapshotPtr refresh(const zkutil::ZooKeeperPtr & zookeeper, int32_t version);
 };
 
 using ReplicatedExportTTLIndexPtr = std::shared_ptr<ReplicatedExportTTLIndex>;

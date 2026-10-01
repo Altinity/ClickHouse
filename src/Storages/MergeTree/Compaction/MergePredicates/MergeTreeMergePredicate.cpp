@@ -24,7 +24,7 @@ MergeTreeMergePredicate::MergeTreeMergePredicate(const StorageMergeTree & storag
     , merge_mutate_lock(merge_mutate_lock_)
     , committing_blocks(storage.getCommittingBlocks())
     , min_update_block(getMinUpdateBlockNumber(committing_blocks))
-    , export_fence(storage.getExportFence())
+    , export_fence(storage.getLatestExportFence())
     , delete_gate(storage.getExportTTLDeleteGate())
 {
     auto patches_vector = getPatchPartInfos(storage);

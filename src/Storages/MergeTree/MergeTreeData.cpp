@@ -25,6 +25,7 @@
 #include <Storages/MergeTree/ExportTaskUtils.h>
 #include <Storages/MergeTree/ExportTTLIndex.h>
 #include <Storages/MergeTree/ExportTTLScheduler.h>
+#include <Storages/MergeTree/IExportTTLIndex.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
@@ -272,6 +273,7 @@ namespace Setting
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
     extern const SettingsBool allow_insert_into_iceberg;
+    extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
 }
 
 namespace MergeTreeSetting
@@ -413,6 +415,8 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
     extern const int PENDING_MUTATIONS_NOT_ALLOWED;
+    extern const int EXPORT_PARTITION_ALREADY_EXPORTED;
+    extern const int PARTITION_EXPORT_FAILED;
 }
 
 namespace FailPoints
@@ -1288,11 +1292,22 @@ ExportTTLDeleteGate MergeTreeData::getExportTTLDeleteGate() const
 {
     ExportTTLDeleteGate gate;
     const auto metadata = getInMemoryMetadataPtr(nullptr, false);
-    gate.enabled = metadata->hasAnyExportTTL();
-    if (gate.enabled && export_ttl_scheduler)
-        gate.destination_key = export_ttl_scheduler->getDestinationKey();
+    const auto export_ttls = metadata->getExportTTLs();
+    gate.enabled = !export_ttls.empty();
+    if (gate.enabled)
+    {
+        const auto destination = getExportTTLDestination(export_ttls.front());
+        gate.destination_key = ExportTTLUtils::destinationKey(destination.database_name, destination.table_name);
+    }
     gate.now = time(nullptr);
     return gate;
+}
+
+ExportFencePtr MergeTreeData::getLatestExportFence() const
+{
+    const auto * index = getExportTTLIndex();
+    const auto snapshot = index ? index->getLatest() : nullptr;
+    return snapshot ? snapshot->fence : nullptr;
 }
 
 std::vector<ExportTTLPartitionInfo> MergeTreeData::getExportTTLInfo() const
@@ -7549,6 +7564,107 @@ void MergeTreeData::killExportPart(const String & transaction_id)
         }
         return false;
     });
+}
+
+void MergeTreeData::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
+{
+    if (!query_context->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Exporting merge tree partition is experimental. Set the server setting `allow_experimental_export_merge_tree_partition` to enable it "
+            "(on all replicas of a replicated table).\n"
+            "If you are exporting to an Apache Iceberg table, you also need to enable the setting `allow_insert_into_iceberg` on the initiator "
+            "(query, session or profile) - the export task inherits it.");
+
+    /// EXPORT PARTITION ALL: expand into one sub-call per active partition id.
+    /// Failure handling is controlled by `export_merge_tree_partition_all_on_error`.
+    if (const auto * partition_ast = command.partition->as<ASTPartition>(); partition_ast && partition_ast->all)
+    {
+        auto partition_id_set = getAllPartitionIds();
+        if (partition_id_set.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table {} has no active partitions to export", getStorageID().getNameForLogs());
+
+        /// Sort for deterministic ordering (so failure messages and tests are stable).
+        std::vector<String> partition_ids(partition_id_set.begin(), partition_id_set.end());
+        std::sort(partition_ids.begin(), partition_ids.end());
+
+        const auto & on_error_setting = query_context->getSettingsRef()[Setting::export_merge_tree_partition_all_on_error];
+        const ExportPartitionAllOnError on_error = on_error_setting.value;
+
+        LOG_INFO(log, "EXPORT PARTITION ALL: scheduling export for {} partitions, on_error={}",
+                 partition_ids.size(), on_error_setting.toString());
+
+        std::vector<std::pair<String, String>> failures; /// (partition_id, message)
+        size_t skipped_conflicts = 0;
+
+        for (const auto & partition_id : partition_ids)
+        {
+            PartitionCommand sub = command;
+            auto synthetic = make_intrusive<ASTPartition>();
+            synthetic->setPartitionID(make_intrusive<ASTLiteral>(partition_id));
+            sub.partition = synthetic;
+
+            try
+            {
+                exportPartitionToTable(sub, query_context);
+            }
+            catch (const Exception & e)
+            {
+                switch (on_error)
+                {
+                    case ExportPartitionAllOnError::throw_first:
+                        throw;
+                    case ExportPartitionAllOnError::skip_conflicts:
+                        if (e.code() == ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED)
+                        {
+                            ++skipped_conflicts;
+                            LOG_INFO(log, "EXPORT PARTITION ALL: skipping partition {} (already exported): {}",
+                                     partition_id, e.message());
+                            break;
+                        }
+                        throw;
+                    case ExportPartitionAllOnError::collect:
+                        LOG_WARNING(log, "EXPORT PARTITION ALL: partition {} failed: {}", partition_id, e.message());
+                        failures.emplace_back(partition_id, e.message());
+                        break;
+                }
+            }
+        }
+
+        if (!failures.empty())
+        {
+            String aggregated = fmt::format(
+                "EXPORT PARTITION ALL: {}/{} partitions failed to schedule. Per-partition errors:",
+                failures.size(), partition_ids.size());
+            for (const auto & [pid, msg] : failures)
+                aggregated += fmt::format("\n  {}: {}", pid, msg);
+            throw Exception(ErrorCodes::PARTITION_EXPORT_FAILED, "{}", aggregated);
+        }
+
+        if (skipped_conflicts > 0)
+            LOG_INFO(log, "EXPORT PARTITION ALL: skipped {} partitions due to existing exports", skipped_conflicts);
+
+        return;
+    }
+
+    const auto dest_database = query_context->resolveDatabase(command.to_database);
+    const auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
+    if (dest_storage->getStorageID() == getStorageID())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
+
+    ExportPartsRequest request;
+    request.destination = dest_storage;
+    request.partition_id = getPartitionIDFromQuery(command.partition, query_context);
+    request.source = ExportTaskSource::query;
+    request.query_id = query_context->getCurrentQueryId();
+    {
+        auto data_parts_lock = lockParts();
+        request.parts = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, request.partition_id, data_parts_lock);
+    }
+
+    if (request.parts.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} doesn't exist", request.partition_id);
+
+    exportParts(request, query_context);
 }
 
 void MergeTreeData::movePartitionToShard(const ASTPtr & /*partition*/, bool /*move_part*/, const String & /*to*/, ContextPtr /*query_context*/)

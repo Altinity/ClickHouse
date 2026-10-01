@@ -7,7 +7,6 @@
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Parser.h>
 #include <Storages/ExportCommitInfoEntry.h>
-#include <Storages/ExportRetriedTask.h>
 #include <Storages/ExportTaskSource.h>
 #include <Storages/MergeTree/MergeTreePartExportManifest.h>
 #include <optional>
@@ -168,9 +167,9 @@ struct ExportReplicatedMergeTreeTaskManifest
     ExportTaskSource source = ExportTaskSource::query;
     String destination_database;
     String destination_table;
-    /// TTL export only: earlier tasks that failed to export some of these parts and whose commit may
-    /// still land. The commit checks whether any of them landed at the destination after all.
-    ExportRetriedTasks retry_of;
+    /// Id the task commits to the destination under: its transaction id, or for a task of the `EXPORT`
+    /// TTL that retries a failed one, the commit id of the failed task.
+    String commit_id;
     String source_replica;
     size_t number_of_parts;
     std::vector<String> parts;
@@ -210,8 +209,7 @@ struct ExportReplicatedMergeTreeTaskManifest
         json.set("source", String(magic_enum::enum_name(source)));
         json.set("destination_database", destination_database);
         json.set("destination_table", destination_table);
-        if (!retry_of.empty())
-            json.set("retry_of", ExportRetriedTaskUtils::toJSON(retry_of));
+        json.set("commit_id", commit_id);
         json.set("source_replica", source_replica);
         json.set("number_of_parts", number_of_parts);
 
@@ -275,8 +273,8 @@ struct ExportReplicatedMergeTreeTaskManifest
         }
         manifest.destination_database = json->getValue<String>("destination_database");
         manifest.destination_table = json->getValue<String>("destination_table");
-        if (json->has("retry_of"))
-            manifest.retry_of = ExportRetriedTaskUtils::fromJSON(json->getArray("retry_of"));
+        /// Tasks created before commit ids existed commit under their transaction id.
+        manifest.commit_id = json->optValue<String>("commit_id", manifest.transaction_id);
         manifest.source_replica = json->getValue<String>("source_replica");
         manifest.number_of_parts = json->getValue<size_t>("number_of_parts");
 

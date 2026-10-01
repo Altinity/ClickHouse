@@ -12,7 +12,6 @@ from .common import (
     completed_ttl_tasks,
     create_iceberg,
     create_source,
-    first_eligible_time,
     iceberg_ids,
     pending_ttl_tasks,
     scheduler_holder,
@@ -29,9 +28,9 @@ from .common import (
 CLUSTER_INSTANCES = ["replica1", "replica2"]
 
 # One replica of a `ReplicatedMergeTree` table schedules the groups of the `EXPORT` TTL. Every
-# replica tracks the batching windows of its parts and shows the same `system.ttl_exports`, except
-# for the error of acting on a partition, and another replica takes over where the previous one left
-# off. Every replica has the same Iceberg destination.
+# replica shows the same `system.ttl_exports`, except for the error of acting on a partition, and
+# another replica takes over where the previous one left off. Every replica has the same Iceberg
+# destination.
 
 
 def make_replicated_tables(replicas, columns=COLUMNS, partition_by="year", spec="year", settings=None):
@@ -142,38 +141,75 @@ def test_index_snapshot_is_cached(cluster):
             assert time.time() - start < 60, f"The index snapshot is refreshed while idle: {before} -> {after} on {replica.name}"
 
 
-def test_failover_resumes_the_batch(cluster):
-    """Every replica tracks the batching window of the parts it has, so the replica that takes over
-    continues it instead of starting it again, and nothing is exported twice."""
+def keeper_requests(node, query):
+    """The result of *query* on *node*, and the number of Keeper requests it made."""
+    query_id = f"keeper_requests_{unique_suffix()}"
+    result = node.query(query, query_id=query_id)
+    node.query("SYSTEM FLUSH LOGS query_log")
+    requests = int(node.query(
+        f"SELECT ProfileEvents['ZooKeeperTransactions'] FROM system.query_log"
+        f" WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
+    ).strip())
+    return result, requests
+
+
+def test_rows_are_shown_without_reading_keeper(cluster):
+    """Every replica follows the export index and the scheduler lock with Keeper watches, so
+    `system.ttl_exports` reads nothing from Keeper, on the replica that schedules and on the others,
+    and a table attached again learns the scheduler that took over meanwhile."""
     replicas = [cluster.instances["replica1"], cluster.instances["replica2"]]
-    mt_table, iceberg_table = make_replicated_tables(
-        replicas, settings={"ttl_export_batch_window_seconds": 60, "ttl_export_batch_max_delay_seconds": 600}
-    )
+    mt_table, iceberg_table = make_replicated_tables(replicas)
     holder, other = holder_and_other(replicas, mt_table)
 
     holder.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE})")
     sync(replicas, mt_table)
-    first_eligible = wait_until(lambda: first_eligible_time(other, mt_table, "2020"), 60, "The other replica does not track the batch")
-    # The replicas saw the part at their own checks, after it was fetched.
-    assert abs(first_eligible - first_eligible_time(holder, mt_table, "2020")) <= 5
+    rows = wait_for_same_ttl_rows(replicas, mt_table, lambda rows: rows.get("2020", {}).get("exported_parts") == 1)
+    assert rows["2020"]["scheduler_replica"] == holder.name, rows
+    for replica in replicas:
+        result, requests = keeper_requests(replica, f"SELECT * FROM system.ttl_exports WHERE table = '{mt_table}'")
+        assert result and requests == 0, f"{requests} Keeper requests on {replica.name}"
+
+    holder.query(f"DETACH TABLE {mt_table}")
+    try:
+        wait_until(lambda: scheduler_holder(other, mt_table) == other.name, 60, "The other replica did not take over")
+    finally:
+        holder.query(f"ATTACH TABLE {mt_table}")
+
+    def shows_the_new_scheduler():
+        rows = ttl_rows(holder, mt_table)
+        return rows if rows.get("2020", {}).get("scheduler_replica") == other.name else None
+
+    rows = wait_until(shows_the_new_scheduler, 60, "The attached table does not show the replica that took over")
+    assert rows["2020"]["exported_parts"] == 1, rows
+    _, requests = keeper_requests(holder, f"SELECT * FROM system.ttl_exports WHERE table = '{mt_table}'")
+    assert requests == 0, f"{requests} Keeper requests on {holder.name}"
+    assert_exactly_once(iceberg_ids(holder, iceberg_table), [1])
+
+
+def test_failover_exports_what_the_scheduler_left(cluster):
+    """The replica that takes over exports the due parts that the previous scheduler did not, and
+    nothing is exported twice."""
+    replicas = [cluster.instances["replica1"], cluster.instances["replica2"]]
+    mt_table, iceberg_table = make_replicated_tables(replicas)
+    holder, other = holder_and_other(replicas, mt_table)
+
+    holder.query(f"SYSTEM STOP MOVES {mt_table}")
+    holder.query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE})")
+    sync(replicas, mt_table)
+    time.sleep(3)
+    assert ttl_tasks(other, mt_table) == []
 
     holder.stop_clickhouse(kill=True)
     try:
         wait_until(lambda: scheduler_holder(other, mt_table) == other.name, 120, "The other replica did not take over")
-        wait_until(lambda: ttl_rows(other, mt_table).get("2020", {}).get("scheduler_replica") == other.name, 60,
-                   "The rows do not show the new scheduler")
-        assert first_eligible_time(other, mt_table, "2020") == first_eligible, "The batch was restarted by the new scheduler"
-        assert ttl_tasks(other, mt_table) == []
+        wait_for_partitions_exported(other, mt_table, ["2020"], timeout=120, exported=1)
+        assert len(completed_ttl_tasks(other, mt_table)) == 1
     finally:
         holder.start_clickhouse()
 
-    other.query(f"INSERT INTO {mt_table} VALUES (2, 2020, {DUE})")
-    other.query(f"ALTER TABLE {mt_table} MODIFY SETTING ttl_export_batch_window_seconds = 0")
     sync(replicas, mt_table)
-    wait_for_partitions_exported(other, mt_table, ["2020"], timeout=120)
-    assert len(completed_ttl_tasks(other, mt_table)) == 1
     for replica in replicas:
-        assert_exactly_once(iceberg_ids(replica, iceberg_table), [1, 2])
+        assert_exactly_once(iceberg_ids(replica, iceberg_table), [1])
     assert_one_snapshot_per_task(other, mt_table, iceberg_table)
 
 

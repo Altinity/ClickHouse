@@ -1,4 +1,4 @@
-#include <Storages/MergeTree/MergeTreeExportTTLScheduler.h>
+#include <Storages/MergeTree/MergeTreeExportTTLIndex.h>
 
 #include <Core/Defines.h>
 #include <Disks/IDisk.h>
@@ -7,15 +7,12 @@
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
-#include <Storages/MergeTree/ExportTaskUtils.h>
-#include <Storages/MergeTree/MergeTreeExportTaskScheduler.h>
 #include <Storages/StorageMergeTree.h>
 #include <Common/ProfileEvents.h>
 #include <Common/escapeForFileName.h>
 #include <Common/logger_useful.h>
 
 #include <filesystem>
-#include <optional>
 
 namespace fs = std::filesystem;
 
@@ -110,7 +107,7 @@ void MergeTreeExportTTLIndex::load()
     publishSnapshot();
 }
 
-bool MergeTreeExportTTLIndex::update(const String & destination_key, const ExportTTLVersionedEntry & versioned)
+bool MergeTreeExportTTLIndex::updateEntry(const String & destination_key, const ExportTTLVersionedEntry & versioned)
 {
     std::lock_guard lock(mutex);
 
@@ -168,84 +165,6 @@ void MergeTreeExportTTLIndex::publishSnapshot()
 {
     ProfileEvents::increment(ProfileEvents::ExportTTLIndexSnapshotRefreshes);
     snapshot.set(ExportTTLIndexSnapshot::build(/* version */ -1, entries));
-}
-
-MergeTreeExportTTLScheduler::MergeTreeExportTTLScheduler(StorageMergeTree & storage_, MergeTreeExportTTLIndex & index_)
-    : ExportTTLScheduler(storage_)
-    , plain_storage(storage_)
-    , index(index_)
-{
-}
-
-bool MergeTreeExportTTLScheduler::isPaused()
-{
-    return plain_storage.parts_mover.moves_blocker.isCancelled();
-}
-
-ExportTTLScheduler::TaskState MergeTreeExportTTLScheduler::getTaskState(const String & transaction_id)
-{
-    TaskState state;
-    const auto task = plain_storage.export_task_scheduler->getTask(transaction_id);
-    if (!task)
-        return state;
-
-    switch (task->status)
-    {
-        case MergeTreeExportTask::Status::PENDING: state.status = TaskStatus::PENDING; break;
-        case MergeTreeExportTask::Status::COMPLETED: state.status = TaskStatus::COMPLETED; break;
-        case MergeTreeExportTask::Status::FAILED: state.status = TaskStatus::FAILED; break;
-        case MergeTreeExportTask::Status::KILLED: state.status = TaskStatus::KILLED; break;
-    }
-    state.reached_commit = task->allPartsDone();
-    state.retry_of = task->retry_of;
-    return state;
-}
-
-bool MergeTreeExportTTLScheduler::startGroup(const GroupToStart & group, const ContextPtr & context)
-{
-    const auto parts_with_rows = group.partsWithRows();
-    std::optional<MergeTreeExportTask> descriptor;
-    if (!parts_with_rows.empty())
-    {
-        const auto source_metadata = plain_storage.getInMemoryMetadataPtr(context, false);
-        const auto destination_metadata = group.destination->getInMemoryMetadataPtr(context, false);
-        ExportTaskUtils::verifyExportSchemaCastable(source_metadata, destination_metadata, group.destination->getStorageID(), context);
-
-        MergeTreeData::DataPartsVector parts(parts_with_rows.begin(), parts_with_rows.end());
-        descriptor = plain_storage.buildExportTask(
-            group.destination->getStorageID(), group.destination, source_metadata, destination_metadata, parts, group.partition_id, context);
-        descriptor->transaction_id = group.transaction_id;
-        descriptor->source = ExportTaskSource::ttl;
-        descriptor->retry_of = group.retry_of;
-    }
-
-    {
-        /// Merge selection holds it while it checks the fence and tags the parts it merges.
-        std::lock_guard lock(plain_storage.currently_processing_in_background_mutex);
-        for (const auto & part : group.parts)
-        {
-            if (part->getState() != MergeTreeDataPartState::Active || plain_storage.currently_merging_mutating_parts.contains(part->info))
-                return false;
-        }
-
-        if (!index.update(group.destination_key, group.entry))
-            return false;
-    }
-
-    if (descriptor)
-        plain_storage.export_task_scheduler->addTask(std::move(*descriptor), parts_with_rows);
-    return true;
-}
-
-bool MergeTreeExportTTLScheduler::isPartBeingMerged(const MergeTreeDataPartPtr & part)
-{
-    std::lock_guard lock(plain_storage.currently_processing_in_background_mutex);
-    return plain_storage.currently_merging_mutating_parts.contains(part->info);
-}
-
-void MergeTreeExportTTLScheduler::killTask(const String & transaction_id)
-{
-    plain_storage.export_task_scheduler->kill(transaction_id);
 }
 
 }

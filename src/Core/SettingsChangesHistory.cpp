@@ -1353,13 +1353,7 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
     {
         addSettingsChanges(merge_tree_settings_changes_history, "26.6",
         {
-            {"ttl_export_check_period_seconds", 10, 10, "New setting"},
-            {"ttl_export_batch_window_seconds", 60, 60, "New setting"},
-            {"ttl_export_batch_max_delay_seconds", 600, 600, "New setting"},
-            {"ttl_export_batch_min_bytes", 256_MiB, 256_MiB, "New setting"},
-            {"ttl_export_max_parts_per_group", 100, 100, "New setting"},
-            {"ttl_export_max_bytes_per_group", 100_GiB, 100_GiB, "New setting"},
-            {"ttl_export_max_concurrent_groups", 4, 4, "New setting"},
+            {"ttl_export_check_period_seconds", 60, 60, "New setting"},
             {"ttl_export_settings_profile", "", "", "New setting"},
             {"packed_skip_index_max_bytes", 0, 0, "New setting. Pack any skip-index substream whose serialized on-disk size is at most this many bytes into a single skp_idx.packed archive per part; larger substreams stay in the standalone skp_idx_<name>.idx2 / .mrk2 layout. Decision is made per substream at write time."},
             {"allow_tuple_element_aggregation", false, false, "New setting"},

@@ -84,7 +84,7 @@ ExportFenceEntry ExportTTLIndexEntry::toFenceEntry(const String & destination) c
     return entry;
 }
 
-void ExportTTLIndexEntry::startClaim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts)
+void ExportTTLIndexEntry::startClaim(const String & commit_id, const String & transaction_id, const std::vector<MergeTreePartInfo> & parts)
 {
     if (claim)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Export task {} cannot claim parts of partition {}, which export task {} claimed",
@@ -94,12 +94,20 @@ void ExportTTLIndexEntry::startClaim(const String & transaction_id, const std::v
     ranges.reserve(parts.size());
     for (const auto & part : parts)
         ranges.emplace_back(partition_id, part.min_block, part.max_block, 0, 0);
-    claim = Claim{.transaction_id = transaction_id, .ranges = ExportFenceUtils::compactRanges(std::move(ranges))};
+    claim = Claim{.commit_id = commit_id, .transaction_id = transaction_id, .ranges = ExportFenceUtils::compactRanges(std::move(ranges))};
 }
 
-void ExportTTLIndexEntry::commitClaim(const String & transaction_id, const std::vector<MergeTreePartInfo> & parts)
+void ExportTTLIndexEntry::retryClaim(const String & transaction_id)
 {
-    if (claim && claim->transaction_id == transaction_id)
+    if (!claim)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Export task {} cannot retry a claim of partition {}, which has none",
+            transaction_id, partition_id);
+    claim->transaction_id = transaction_id;
+}
+
+void ExportTTLIndexEntry::commitClaim(const String & commit_id, const std::vector<MergeTreePartInfo> & parts)
+{
+    if (claim && claim->commit_id == commit_id)
     {
         exported.insert(exported.end(), claim->ranges.begin(), claim->ranges.end());
         claim.reset();
@@ -122,6 +130,7 @@ String ExportTTLIndexEntry::toJSONString() const
     if (claim)
     {
         Poco::JSON::Object::Ptr claim_object = new Poco::JSON::Object();
+        claim_object->set("commit_id", claim->commit_id);
         claim_object->set("transaction_id", claim->transaction_id);
         claim_object->set("ranges", rangesToJSON(claim->ranges));
         json.set("claim", claim_object);
@@ -149,8 +158,11 @@ ExportTTLIndexEntry ExportTTLIndexEntry::fromJSONString(const String & partition
 
     if (const auto claim_object = json->getObject("claim"))
     {
+        auto transaction_id = claim_object->getValue<String>("transaction_id");
+        auto commit_id = claim_object->optValue<String>("commit_id", transaction_id);
         entry.claim = Claim{
-            .transaction_id = claim_object->getValue<String>("transaction_id"),
+            .commit_id = std::move(commit_id),
+            .transaction_id = std::move(transaction_id),
             .ranges = ExportFenceUtils::compactRanges(rangesFromJSON(partition_id, claim_object->getArray("ranges"))),
         };
     }
@@ -196,24 +208,6 @@ std::vector<MergeTreePartInfo> rangesOfParts(const std::vector<String> & part_na
         const auto info = MergeTreePartInfo::fromPartName(name, format_version);
         ranges.emplace_back(info.getPartitionId(), info.min_block, info.max_block, 0, 0);
     }
-    return ExportFenceUtils::compactRanges(std::move(ranges));
-}
-
-std::vector<std::pair<Int64, Int64>> toBlockRanges(const std::vector<MergeTreePartInfo> & ranges)
-{
-    std::vector<std::pair<Int64, Int64>> result;
-    result.reserve(ranges.size());
-    for (const auto & range : ranges)
-        result.emplace_back(range.min_block, range.max_block);
-    return result;
-}
-
-std::vector<MergeTreePartInfo> fromBlockRanges(const String & partition_id, const std::vector<std::pair<Int64, Int64>> & block_ranges)
-{
-    std::vector<MergeTreePartInfo> ranges;
-    ranges.reserve(block_ranges.size());
-    for (const auto & [min_block, max_block] : block_ranges)
-        ranges.emplace_back(partition_id, min_block, max_block, /* level */ 0, /* mutation */ 0);
     return ExportFenceUtils::compactRanges(std::move(ranges));
 }
 

@@ -380,8 +380,11 @@ public:
     std::vector<ExportTaskInfo> getExportTasksInfo() const override;
 
     /// nullptr if partition export is disabled.
-    ReplicatedExportTTLIndexPtr getExportTTLIndex() const { return export_ttl_index; }
-    ExportFencePtr getLatestExportFence() const override { return export_ttl_index ? export_ttl_index->getLatest() : nullptr; }
+    ReplicatedExportTTLIndex * getExportTTLIndex() const override { return export_ttl_index.get(); }
+
+    std::optional<ExportTaskStatus> getExportTaskStatus(const String & transaction_id) const override;
+    std::optional<ExportTaskStatus> getKnownExportTaskStatus(const String & transaction_id) const override;
+    bool isPartBeingMerged(const MergeTreePartInfo & part_info) const override;
 
 private:
     std::atomic_bool are_restoring_replica {false};
@@ -409,7 +412,6 @@ private:
     friend class ReplicatedMergeMutateTaskBase;
     friend class ReplicatedExportTaskUpdater;
     friend class ReplicatedExportTaskScheduler;
-    friend class ReplicatedExportTTLScheduler;
 
     using MergeStrategyPicker = ReplicatedMergeTreeMergeStrategyPicker;
     using LogEntry = ReplicatedMergeTreeLogEntry;
@@ -545,6 +547,9 @@ private:
 
     /// Runs `export_ttl_scheduler`.
     BackgroundSchedulePoolTaskHolder export_ttl_task;
+
+    /// Keeps the copy of `export_ttl_index` up to date, woken by its watches.
+    BackgroundSchedulePoolTaskHolder export_ttl_index_updating_task;
 
     /// A thread that removes old parts, log entries, and blocks.
     ReplicatedMergeTreeCleanupThread cleanup_thread;
@@ -983,8 +988,11 @@ private:
         bool fetch_part,
         ContextPtr query_context) override;
     void forgetPartition(const ASTPtr & partition, ContextPtr query_context) override;
-    
-    void exportPartitionToTable(const PartitionCommand &, ContextPtr) override;
+
+    /// Creates the task in one Keeper transaction. With an index update, the same transaction stores
+    /// the entry and checks the version of `/log` that the merge predicate read, so no merge of the
+    /// parts can be assigned between checking them and claiming them.
+    bool exportParts(const ExportPartsRequest & request, ContextPtr local_context, const ExportTTLIndexUpdate * index_update) override;
 
     /// Builds the descriptor of an export task of `parts` from the settings of `query_context`, and
     /// validates the destination for them. The caller sets the transaction id and the source.
@@ -1005,6 +1013,8 @@ private:
     void advertiseExportFeatures(const zkutil::ZooKeeperPtr & zookeeper) const;
 
     void exportTTLTask();
+
+    void exportTTLIndexUpdatingTask();
 
     /// E.g. when a task of the `EXPORT` TTL finished, so the next group does not wait for the next check.
     void wakeUpExportTTL();

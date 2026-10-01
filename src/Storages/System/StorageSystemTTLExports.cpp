@@ -1,7 +1,6 @@
 #include <Storages/System/StorageSystemTTLExports.h>
 
 #include <Access/ContextAccess.h>
-#include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/Context.h>
@@ -27,8 +26,6 @@ ColumnsDescription StorageSystemTTLExports::getColumnsDescription()
         {"eligible_bytes", std::make_shared<DataTypeUInt64>(), "Size on disk of the eligible parts."},
         {"parts_held_by_delete_gate", std::make_shared<DataTypeUInt64>(),
             "Number of parts whose delete or column TTL is due, but that are kept from merges until they are exported."},
-        {"first_eligible_time", std::make_shared<DataTypeDateTime>(), "When the scheduler first saw an eligible part of the partition that is not exported yet, zero if there is none."},
-        {"next_group_time", std::make_shared<DataTypeDateTime>(), "When the eligible parts are exported at the latest, zero if nothing waits."},
         {"current_transaction_id", std::make_shared<DataTypeString>(), "Transaction id of the task exporting the partition now, see `system.distributed_exports`. Empty if there is none."},
         {"last_error", std::make_shared<DataTypeString>(), "Error of the last attempt to export the partition, empty if it succeeded."},
         {"scheduler_replica", std::make_shared<DataTypeString>(),
@@ -71,8 +68,6 @@ void StorageSystemTTLExports::fillData(MutableColumns & res_columns, ContextPtr 
                 res_columns[i++]->insert(info.eligible_parts);
                 res_columns[i++]->insert(info.eligible_bytes);
                 res_columns[i++]->insert(info.parts_held_by_delete_gate);
-                res_columns[i++]->insert(static_cast<UInt32>(info.first_eligible_time));
-                res_columns[i++]->insert(static_cast<UInt32>(info.next_group_time));
                 res_columns[i++]->insert(info.current_transaction_id);
                 res_columns[i++]->insert(info.last_error);
                 res_columns[i++]->insert(info.scheduler_replica);

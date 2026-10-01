@@ -9,7 +9,6 @@
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Parser.h>
 #include <Storages/ExportCommitInfoEntry.h>
-#include <Storages/ExportRetriedTask.h>
 #include <Storages/ExportTaskSource.h>
 #include <Storages/MergeTree/MergeTreePartExportManifest.h>
 
@@ -61,9 +60,9 @@ struct MergeTreeExportTask
     String destination_table;
     time_t create_time = 0;
     ExportTaskSource source = ExportTaskSource::query;
-    /// TTL tasks whose parts this task exports again because they failed, and whose commits may still
-    /// land, which the commit of this task checks.
-    ExportRetriedTasks retry_of;
+    /// Id the task commits to the destination under: its transaction id, or for a task of the `EXPORT`
+    /// TTL that retries a failed one, the commit id of the failed task.
+    String commit_id;
 
     /// Work + progress
     std::vector<PartProgress> parts;
@@ -157,8 +156,7 @@ struct MergeTreeExportTask
         json.set("destination_table", destination_table);
         json.set("create_time", create_time);
         json.set("source", String(magic_enum::enum_name(source)));
-        if (!retry_of.empty())
-            json.set("retry_of", ExportRetriedTaskUtils::toJSON(retry_of));
+        json.set("commit_id", commit_id);
         json.set("status", String(magic_enum::enum_name(status)));
 
         Poco::JSON::Array::Ptr parts_array = new Poco::JSON::Array();
@@ -243,7 +241,8 @@ struct MergeTreeExportTask
                 throw Exception(ErrorCodes::INCORRECT_DATA, "Unknown source '{}' in export task descriptor", source_str);
         }
 
-        task.retry_of = ExportRetriedTaskUtils::fromJSON(json->getArray("retry_of"));
+        /// Descriptors written before commit ids existed commit under their transaction id.
+        task.commit_id = json->optValue<String>("commit_id", task.transaction_id);
 
         const auto status_str = json->getValue<String>("status");
         if (const auto status = magic_enum::enum_cast<Status>(status_str))

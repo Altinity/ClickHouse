@@ -195,6 +195,7 @@ bool ReplicatedMergeTreeRestartingThread::runImpl()
         storage.export_task_select_task->activateAndSchedule();
         storage.export_task_status_handling_task->activateAndSchedule();
         storage.export_ttl_task->activateAndSchedule();
+        storage.export_ttl_index_updating_task->activateAndSchedule();
     }
 
     storage.cleanup_thread.start();

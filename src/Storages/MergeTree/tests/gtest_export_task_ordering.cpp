@@ -3,7 +3,6 @@
 #include <sstream>
 #include <Storages/ExportReplicatedMergeTreeTaskEntry.h>
 #include <Storages/MergeTree/ExportTaskUtils.h>
-#include <Storages/MergeTree/ExportTTLIndex.h>
 #include <Storages/MergeTree/MergeTreeExportTask.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Common/tests/gtest_global_register.h>
@@ -235,39 +234,50 @@ TEST_F(ExportTaskManifestBackCompatTest, IgnoreExtraSourceColumnsAppliedToWorker
     }
 }
 
-TEST_F(ExportTaskManifestBackCompatTest, TaskSourceAndRetryOfRoundTrip)
+TEST_F(ExportTaskManifestBackCompatTest, TaskSourceAndCommitIdRoundTrip)
 {
     auto manifest = makeValidManifest();
     manifest.source = ExportTaskSource::ttl;
-    manifest.retry_of = {
-        ExportRetriedTask{.transaction_id = "tx0", .block_ranges = {{1, 3}, {7, 7}}, .failed_time = 1700000000},
-        ExportRetriedTask{.transaction_id = "tx00", .block_ranges = {{1, 1}}, .failed_time = 1600000000},
-    };
+    manifest.commit_id = "tx0";
 
     const auto parsed = ExportReplicatedMergeTreeTaskManifest::fromJsonString(manifest.toJsonString());
     EXPECT_EQ(parsed.source, ExportTaskSource::ttl);
-    EXPECT_EQ(parsed.retry_of, manifest.retry_of);
-    EXPECT_EQ(ExportRetriedTaskUtils::transactionIds(parsed.retry_of), (std::vector<String>{"tx0", "tx00"}));
-
-    /// A task of `EXPORT PARTITION` records neither.
-    const auto query_task = ExportReplicatedMergeTreeTaskManifest::fromJsonString(makeValidManifest().toJsonString());
-    EXPECT_EQ(query_task.source, ExportTaskSource::query);
-    EXPECT_TRUE(query_task.retry_of.empty());
+    EXPECT_EQ(parsed.commit_id, "tx0");
 }
 
-TEST(ExportTaskUtils, PlainTaskRetryOfRoundTrip)
+TEST_F(ExportTaskManifestBackCompatTest, MissingCommitIdIsTheTransactionId)
+{
+    auto manifest = makeValidManifest();
+    manifest.commit_id = "tx0";
+
+    Poco::JSON::Parser parser;
+    auto json = parser.parse(manifest.toJsonString()).extract<Poco::JSON::Object::Ptr>();
+    json->remove("commit_id");
+    json->set("retry_of", Poco::JSON::Array::Ptr(new Poco::JSON::Array()));
+    std::ostringstream oss;
+    oss.exceptions(std::ios::failbit);
+    Poco::JSON::Stringifier::stringify(json, oss);
+
+    EXPECT_EQ(ExportReplicatedMergeTreeTaskManifest::fromJsonString(oss.str()).commit_id, "tx1");
+}
+
+TEST_F(ExportTaskManifestBackCompatTest, PlainTaskMissingCommitIdIsTheTransactionId)
 {
     MergeTreeExportTask task;
     task.transaction_id = "tx1";
+    task.commit_id = "tx0";
     task.source = ExportTaskSource::ttl;
     task.parts.push_back({.part_name = "p_1_3_1", .done = true, .paths_in_destination = {"a.parquet"}});
-    task.retry_of = {ExportRetriedTask{.transaction_id = "tx0", .block_ranges = {{1, 3}}, .failed_time = 1700000000}};
+    EXPECT_EQ(MergeTreeExportTask::fromJsonString(task.toJsonString()).commit_id, "tx0");
 
-    const auto parsed = MergeTreeExportTask::fromJsonString(task.toJsonString());
-    EXPECT_EQ(parsed.retry_of, task.retry_of);
+    Poco::JSON::Parser parser;
+    auto json = parser.parse(task.toJsonString()).extract<Poco::JSON::Object::Ptr>();
+    json->remove("commit_id");
+    std::ostringstream oss;
+    oss.exceptions(std::ios::failbit);
+    Poco::JSON::Stringifier::stringify(json, oss);
 
-    task.retry_of.clear();
-    EXPECT_TRUE(MergeTreeExportTask::fromJsonString(task.toJsonString()).retry_of.empty());
+    EXPECT_EQ(MergeTreeExportTask::fromJsonString(oss.str()).commit_id, "tx1");
 }
 
 namespace
@@ -317,16 +327,6 @@ TEST(ExportTaskUtils, PartitionIdIsDerivedFromParts)
 {
     EXPECT_EQ(ExportTaskUtils::getPartitionIdOfParts({"2020_1_1_0", "2020_2_5_1"}, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING), "2020");
     EXPECT_EQ(ExportTaskUtils::getPartitionIdOfParts({"all_3_3_0"}, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING), "all");
-}
-
-TEST(ExportTaskUtils, PartsCommittedByRetriedTaskAreLeftOut)
-{
-    const auto committed = ExportTTLUtils::rangesOfParts({"p_1_1_0", "p_2_2_0"}, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING);
-
-    /// A mutated part keeps its block range, so it counts as committed as well.
-    const auto remaining = ExportTaskUtils::getPartsNotCommitted(
-        {"p_1_1_0_7", "p_2_2_0", "p_3_3_0"}, committed, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING);
-    EXPECT_EQ(remaining, std::vector<String>{"p_3_3_0"});
 }
 
 TEST(ExportTaskRetryClassification, MissingPartIsFatalOnlyOnPlainPath)

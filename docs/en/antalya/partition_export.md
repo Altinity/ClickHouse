@@ -17,7 +17,7 @@ The export task can be killed by issuing the kill command: `KILL EXPORT <where p
 
 The task is persistent - it should be resumed after crashes, failures and etc.
 
-A part with no surviving rows writes no file. This happens when every row of the part was removed by a lightweight delete: the part is still exported, and counts as done, but it contributes nothing to the destination. If that is true of every part of the partition, the export produces no files at all and there is nothing to commit, so the task reaches `COMPLETED` without touching the destination. Such a part therefore has no entry in the `destination_file_paths` column of `system.distributed_exports`.
+A part with no surviving rows writes no file. This happens when every row of the part was removed by a lightweight delete, or by a mutation that left the part without rows, e.g. one kept by `remove_empty_parts = 0`: the part is still exported, and counts as done, but it contributes nothing to the destination. If that is true of every part of the partition, the export produces no files at all and there is nothing to commit, so the task reaches `COMPLETED` without touching the destination. Such a part therefore has no entry in the `destination_file_paths` column of `system.distributed_exports`.
 
 ### On Apache Iceberg storage exports:
 
@@ -38,7 +38,7 @@ The source partition must not be split in the destination. This is validated at 
 
 ### On plain object storage exports:
 
-Each MergeTree part will become a separate file with the following name convention: `<table_directory>/<partitioning>/<data_part_name>_<merge_tree_part_checksum>.<format>`. To ensure atomicity, a commit file containing the relative paths of all exported parts is also shipped. A data file should only be considered part of the dataset if a commit file references it. The commit file will be named using the following convention: `<table_directory>/commit_<transaction_id>`.
+Each MergeTree part will become a separate file with the following name convention: `<table_directory>/<partitioning>/<data_part_name>_<merge_tree_part_checksum>.<format>`. To ensure atomicity, a commit file containing the relative paths of all exported parts is also shipped. A data file should only be considered part of the dataset if a commit file references it. The commit file will be named using the following convention: `<table_directory>/commit_<commit_id>`, where the commit id is the transaction id of the export, see [`commit_id`](#source-columns).
 
 ## Plain (non-replicated) MergeTree {#plain-non-replicated-mergetree}
 
@@ -239,7 +239,7 @@ committed_manifest_file:
 committed_marker_file:      data/commit_9b2c1e5a-3f47-4c8e-8a1d-6f0b2d4e7c31
 local_backoff_per_part:     []
 source:                     query
-retry_of:                   []
+commit_id:                  9b2c1e5a-3f47-4c8e-8a1d-6f0b2d4e7c31
 
 Row 2:
 ──────
@@ -265,7 +265,7 @@ committed_manifest_file:    data/metadata/<uuid>-m0.avro
 committed_marker_file:
 local_backoff_per_part:     []
 source:                     query
-retry_of:                   []
+commit_id:                  d0e4f7a2-8c19-4b6d-9e3a-1f5c7b2e9d40
 
 2 rows in set. Elapsed: 0.019 sec. 
 
@@ -289,7 +289,7 @@ Status values include:
 
 ### Commit info columns
 
-- `committed_metadata_file` — for Iceberg destinations: path of the new `vN.metadata.json` written by the commit. Empty for non-Iceberg destinations and before the commit lands. If the commit was already finished by a previous run (detected via the transaction id stored in the snapshot summary), this column carries a human-readable sentinel string instead of a path because the original committer's paths are not recoverable from inside the impl.
+- `committed_metadata_file` — for Iceberg destinations: path of the new `vN.metadata.json` written by the commit. Empty for non-Iceberg destinations and before the commit lands. If the commit was already finished by a previous run (detected via the commit id stored in the snapshot summary), this column carries a human-readable sentinel string instead of a path because the original committer's paths are not recoverable from inside the impl.
 - `committed_manifest_list` — for Iceberg destinations: path of the manifest list file (`snap-*.avro`) referenced by the new snapshot. Empty under the same conditions as `committed_metadata_file`.
 - `committed_manifest_file` — for Iceberg destinations: path of the manifest file referenced by `committed_manifest_list`. Empty under the same conditions as `committed_metadata_file`.
 - `committed_marker_file` — for plain object storage destinations: path of the per-transaction commit marker file written by the destination. Empty for Iceberg destinations and for tasks that have not committed yet.
@@ -297,7 +297,7 @@ Status values include:
 ### Source columns {#source-columns}
 
 - `source` — `query` for a task of `EXPORT PARTITION`, `ttl` for a task of the table's `TTL ... EXPORT TO TABLE` expression.
-- `retry_of` — for a task of the `EXPORT` TTL: transaction ids of earlier tasks that failed to export some of its parts after exporting all of theirs, so their commit may still land. Its commit checks whether any of them landed at the destination after all.
+- `commit_id` — the id the task commits to the destination under, and checks the destination for. It is the transaction id of the task, except for a task of the `EXPORT` TTL that retries a failed one: it keeps the commit id of the failed task, so that the destination commits their parts once.
 
 To pick the latest exception across replicas:
 

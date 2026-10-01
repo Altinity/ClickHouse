@@ -18,8 +18,6 @@ NOT_DUE = "now()"
 # A group is shipped on the first check after its parts are due.
 FAST_TTL_SETTINGS = {
     "ttl_export_check_period_seconds": 1,
-    "ttl_export_batch_window_seconds": 0,
-    "ttl_export_batch_max_delay_seconds": 0,
 }
 
 PAUSE_EXPORT_FAILPOINT = "export_part_pause_before_schema_validation"
@@ -122,13 +120,6 @@ def wait_for_same_ttl_rows(replicas, table, settled, timeout=90, columns=None):
         time.sleep(0.5)
 
 
-def first_eligible_time(node, table, partition_id):
-    """When the scheduler first saw an eligible part of the partition that is not exported, 0 if never."""
-    return int(node.query(
-        f"SELECT toUnixTimestamp(first_eligible_time) FROM system.ttl_exports WHERE table = '{table}' AND partition_id = '{partition_id}'"
-    ).strip() or 0)
-
-
 def partition_settled(rows, partition_id, exported=None):
     """Nothing of the partition is claimed or waiting to be exported."""
     row = rows.get(partition_id)
@@ -140,8 +131,8 @@ def partition_settled(rows, partition_id, exported=None):
 def wait_for_partitions_exported(node, table, partition_ids, timeout=90, exported=None):
     """Wait until nothing of *partition_ids* is claimed or eligible and no TTL task is in flight.
 
-    A check that runs before a part is due already publishes that partition with nothing eligible, so
-    pass *exported* when the wait must see the parts recorded as exported rather than merely not due.
+    Before a part is due its partition already shows nothing eligible, so pass *exported* when the
+    wait must see the parts recorded as exported rather than merely not due.
     """
     def settled():
         rows = ttl_rows(node, table)
@@ -165,10 +156,10 @@ def wait_for_last_error(node, table, partition_id, substring, timeout=90):
 def ttl_tasks(node, table):
     rows = query_json(
         node,
-        f"SELECT transaction_id, partition_id, status, parts, retry_of FROM system.distributed_exports"
+        f"SELECT transaction_id, partition_id, status, parts, commit_id FROM system.distributed_exports"
         f" WHERE source_table = '{table}' AND source = 'ttl' ORDER BY create_time, transaction_id",
     )
-    return [dict(zip(["transaction_id", "partition_id", "status", "parts", "retry_of"], row)) for row in rows]
+    return [dict(zip(["transaction_id", "partition_id", "status", "parts", "commit_id"], row)) for row in rows]
 
 
 def pending_ttl_tasks(node, table):
@@ -234,12 +225,22 @@ def iceberg_snapshots(node, table):
     ).strip())
 
 
+def completed_ttl_tasks_with_files(node, table):
+    """Transaction ids of the completed TTL tasks that wrote files. A task of parts without rows
+    writes none, so it has nothing to commit."""
+    return node.query(
+        f"SELECT transaction_id FROM system.distributed_exports"
+        f" WHERE source_table = '{table}' AND source = 'ttl' AND status = 'COMPLETED'"
+        f" AND arrayExists(paths -> notEmpty(paths), mapValues(destination_file_paths))"
+    ).split()
+
+
 def assert_one_snapshot_per_task(node, mt_table, iceberg_table):
-    """Every completed TTL task committed one snapshot since the destination was created, and no
-    other task committed."""
+    """Every completed TTL task that wrote files committed one snapshot since the destination was
+    created, and no other task committed."""
     snapshots = iceberg_snapshots(node, iceberg_table) - _snapshots_at_creation.get(iceberg_table, 0)
-    completed = completed_ttl_tasks(node, mt_table)
-    assert snapshots == len(completed), f"{snapshots} snapshots for {len(completed)} completed tasks: {ttl_tasks(node, mt_table)}"
+    committing = completed_ttl_tasks_with_files(node, mt_table)
+    assert snapshots == len(committing), f"{snapshots} snapshots for {len(committing)} completed tasks with files: {ttl_tasks(node, mt_table)}"
 
 
 def _partition_scalar(value):

@@ -65,9 +65,9 @@ struct ExportTaskInfo
 
     /// What created the task: `query` for `EXPORT PARTITION`, `ttl` for a `TTL ... EXPORT` expression.
     String source;
-    /// TTL export only: earlier tasks that failed to export some of this task's parts, and whose
-    /// commit may still land.
-    std::vector<String> retry_of;
+    /// Id the task commits to the destination under: its transaction id, or for a TTL export task
+    /// that retries a failed one, the commit id of the failed task.
+    String commit_id;
 };
 
 }

@@ -3,7 +3,6 @@
 #include <ctime>
 #include <filesystem>
 #include <functional>
-#include <map>
 #include <optional>
 #include <vector>
 #include <string>
@@ -13,7 +12,6 @@
 #include <Common/Logger.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include "Storages/IStorage.h"
-#include <Storages/ExportRetriedTask.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <config.h>
@@ -51,25 +49,10 @@ namespace ExportTaskUtils
         /// Destination paths recorded by those leaves, flattened. A leaf may carry none, so this
         /// can legitimately be shorter than `processed_parts_count`.
         std::vector<std::string> paths;
-
-        /// The same paths by the name of the part they were exported from.
-        std::map<std::string, std::vector<std::string>> paths_by_part;
     };
 
     /// Appends the ops that create the nodes of a new export task at `task_path` (`<zookeeper_path>/exports/<transaction_id>`).
     void appendCreateExportTaskOps(Coordination::Requests & ops, const std::string & task_path, const ExportReplicatedMergeTreeTaskManifest & manifest);
-
-    /// Block ranges of `partition_id` committed to `destination_storage` by the tasks in `retry_of`
-    /// that landed, e.g. a commit that the destination applied after the task was considered failed.
-    std::vector<MergeTreePartInfo> getRangesCommittedByRetriedTasks(
-        const ExportRetriedTasks & retry_of,
-        const StoragePtr & destination_storage,
-        const String & partition_id,
-        const ContextPtr & context);
-
-    /// Parts of `part_names` whose rows are not in `committed_ranges`.
-    std::vector<String> getPartsNotCommitted(
-        const std::vector<String> & part_names, const std::vector<MergeTreePartInfo> & committed_ranges, MergeTreeDataFormatVersion format_version);
 
     /// Reads the destination paths recorded under `<export_path>/processed`.
     ExportedPaths getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);

@@ -2,22 +2,21 @@
 
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>
-#include <Storages/ExportRetriedTask.h>
 #include <Storages/MergeTree/ExportTTLIndex.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
+#include <Storages/TTLDescription.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Logger.h>
 #include <base/types.h>
 
 #include <map>
 #include <mutex>
-#include <optional>
-#include <unordered_map>
 #include <vector>
 
 namespace DB
 {
 
+class IExportTTLIndex;
 class MergeTreeData;
 
 /// What `system.ttl_exports` shows about one partition of a table with a `TTL ... EXPORT` expression.
@@ -32,10 +31,6 @@ struct ExportTTLPartitionInfo
     size_t eligible_bytes = 0;
     /// Parts held back from the delete TTL because they are not exported yet.
     size_t parts_held_by_delete_gate = 0;
-    /// When this replica first saw an eligible part that is not exported, 0 if there is none.
-    time_t first_eligible_time = 0;
-    /// When the next group can start at the latest, 0 if nothing waits.
-    time_t next_group_time = 0;
     /// Transaction id of the task exporting the partition now, empty if there is none.
     String current_transaction_id;
     String last_error;
@@ -45,195 +40,62 @@ struct ExportTTLPartitionInfo
 
 /// The background task of a table with a `TTL <expr> EXPORT TO TABLE <destination>` expression.
 ///
-/// On every tick it ships groups of eligible parts (the maximum TTL value of their rows is due) to
-/// the destination as export tasks of the table, one partition per group, and never exports a part
-/// twice: what was exported is recorded in the export index (see `ExportTTLIndexEntry`), and the
-/// merge fence keeps parts in different export states from merging.
+/// Every check ships the eligible parts (the maximum TTL value of their rows is due) of each partition
+/// to the destination as one export task of the table, and never exports a part twice: what was
+/// exported is recorded in the export index (see `ExportTTLIndexEntry`), and the merge fence keeps
+/// parts in different export states from merging. A partition has at most one task in flight, so the
+/// check period is the batch interval. A task that failed without committing keeps its parts claimed,
+/// and a new task retries exactly them under the same commit id, so the destination commits them once
+/// even if the failed task landed after all.
 ///
-/// Eligible parts of a partition are shipped once no new eligible part appeared for the batching
-/// window, once the first of them waited for the maximum delay, or once they reach the size
-/// threshold. A task that failed without committing keeps its parts claimed, and they are retried
-/// first by the next group, which records in `retry_of` the failed tasks whose commit may still land.
-///
-/// Every replica observes the state of every partition, which `system.ttl_exports` shows, and
-/// tracks the batching windows of the parts it has, so a replica that takes over the scheduling
-/// continues them. Only the replica holding the scheduler lock acts: it resolves finished tasks and
-/// starts groups.
-///
-/// Engines implement access to the index and to their export tasks.
-class ExportTTLScheduler
+/// Only the replica holding the scheduler lock checks. `system.ttl_exports` is computed when it is
+/// queried, from the copy of the index that the replica keeps (see `IExportTTLIndex::getLatest`) and
+/// its parts, without reading Keeper.
+class ExportTTLScheduler final
 {
 public:
-    explicit ExportTTLScheduler(MergeTreeData & storage_);
-    virtual ~ExportTTLScheduler() = default;
+    ExportTTLScheduler(MergeTreeData & storage_, IExportTTLIndex & index_);
 
-    /// One tick. Returns the number of milliseconds until the next one.
+    /// One check. Returns the number of milliseconds until the next one.
     UInt64 run();
 
     std::vector<ExportTTLPartitionInfo> getInfo() const;
 
-    /// Key in the export index of the current destination, empty if it is not known yet.
-    String getDestinationKey() const;
-
-protected:
-    enum class TaskStatus : UInt8
-    {
-        PENDING,
-        COMPLETED,
-        FAILED,
-        KILLED,
-        /// No such task, e.g. a crash between claiming its parts and creating it.
-        MISSING,
-    };
-
-    struct TaskState
-    {
-        TaskStatus status = TaskStatus::MISSING;
-        /// Whether it exported all its parts, which it does before committing: a task that did not
-        /// cannot have committed. Unknown counts as reached.
-        bool reached_commit = true;
-        ExportRetriedTasks retry_of;
-    };
-
-    struct GroupToStart
-    {
-        String transaction_id;
-        String destination_key;
-        StoragePtr destination;
-        String partition_id;
-        /// Every part of the group, including the parts without rows, which have nothing to export.
-        std::vector<MergeTreeDataPartPtr> parts;
-        ExportRetriedTasks retry_of;
-        /// The index entry with the claim of the group, to be stored with a check of its version. A
-        /// group of parts without rows only has no task, and its entry records them as exported.
-        ExportTTLVersionedEntry entry;
-
-        /// The parts that the task of the group exports.
-        std::vector<MergeTreeDataPartPtr> partsWithRows() const;
-    };
-
-    /// Only one replica schedules, which keeps the replicas from conflicting on the index. The lock
-    /// is kept until it is lost or the table shuts down. Correctness does not depend on it.
-    virtual bool acquireSchedulerLock() = 0;
-
-    /// E.g. `SYSTEM STOP MOVES`.
-    virtual bool isPaused() = 0;
-
-    virtual ExportTTLIndexSnapshotPtr getIndexSnapshot() = 0;
-
-    virtual String getReplicaName() const = 0;
-
-    /// The replica holding the scheduler lock, empty if there is none.
-    virtual String getSchedulerReplica() = 0;
-
-    virtual TaskState getTaskState(const String & transaction_id) = 0;
-
-    /// Whether a replica is in the commit of the task, e.g. one that started before the task failed.
-    virtual bool isCommitInProgress(const String & transaction_id) = 0;
-
-    /// Stores `entry` with a check of its version. Returns false on a conflict.
-    virtual bool updateIndexEntry(const String & destination_key, const ExportTTLVersionedEntry & entry) = 0;
-
-    /// Creates the export task of the parts of `group` that have rows, if any, and stores its index
-    /// entry, provided no part of the group is being merged. Returns false on a conflict, e.g. a merge
-    /// was assigned or the index changed meanwhile.
-    virtual bool startGroup(const GroupToStart & group, const ContextPtr & context) = 0;
-
-    /// Whether the part is a source of an assigned merge that changes its block range.
-    virtual bool isPartBeingMerged(const MergeTreeDataPartPtr & part) = 0;
-
-    virtual void killTask(const String & transaction_id) = 0;
-    virtual void removeDestination(const String & destination_key) = 0;
-
+private:
     MergeTreeData & storage;
+    IExportTTLIndex & ttl_index;
     const LoggerPtr log;
 
-private:
-    struct PartitionBatch
-    {
-        /// Block ranges of the eligible parts already seen, so a merge of seen parts is not new.
-        std::vector<MergeTreePartInfo> seen_ranges;
-        time_t first_eligible_time = 0;
-        time_t last_new_part_time = 0;
-    };
-
-    /// What every replica can tell about a partition without acting on it.
-    struct PartitionView
-    {
-        ExportTTLPartitionInfo info;
-        PartitionBatch batch;
-        std::vector<MergeTreeDataPartPtr> claimed_parts;
-        /// Eligible parts that are neither exported nor claimed nor being merged, by block number.
-        std::vector<MergeTreeDataPartPtr> shippable;
-        bool batch_ready = false;
-        /// When a part that is not due yet becomes eligible, 0 if there is none.
-        time_t next_eligible_time = 0;
-    };
-
-    using TaskStates = std::unordered_map<String, TaskState>;
-
     mutable std::mutex mutex;
-    /// By partition id, for the current destination.
-    std::map<String, PartitionBatch> batches;
+    /// Kept by the replica that schedules: the error of the last check of each partition, and why the
+    /// table exports nothing.
     std::map<String, String> last_errors;
-    std::map<String, ExportTTLPartitionInfo> info_by_partition;
-    String current_destination_key;
-    String current_destination_error;
-
-    /// False once there is neither an `EXPORT` TTL nor an index left, so ticks do no Keeper reads.
-    bool may_have_index = true;
+    String table_error;
 
     CurrentMetrics::Increment parts_held_by_delete_gate;
 
     ContextPtr makeContext() const;
 
-    /// Resolves the claim of the index entry unless its task is in flight: a task that completed, or
-    /// that failed but committed to the destination, has its claim moved to the exported ranges.
-    struct ResolvedClaim
-    {
-        /// The task in flight, or the failed task whose parts are still claimed; empty if there is none.
-        String in_flight;
-        String failed;
-        bool changed = false;
-    };
-    ResolvedClaim resolveClaim(ExportTTLIndexEntry & entry, const StoragePtr & destination, TaskStates & task_states, const ContextPtr & context);
+    /// E.g. `SYSTEM STOP MOVES`.
+    bool isPaused() const;
 
-    /// The task `failed`, which holds the claim of `entry`, and the ones it retried whose commit may
-    /// still land, for the `retry_of` of the group that retries its parts.
-    ExportRetriedTasks collectRetriedTasks(
-        const ExportTTLIndexEntry & entry,
-        const String & failed,
-        const StoragePtr & destination,
-        time_t now,
-        TaskStates & task_states,
-        const ContextPtr & context);
+    void updatePartsHeldByDeleteGate();
 
-    const TaskState & getCachedTaskState(TaskStates & task_states, const String & transaction_id);
-
-    /// Kills the TTL tasks of a destination that is no longer the destination of the TTL, and
-    /// removes its index once none of them holds a claim.
-    void cleanupDestination(const String & destination_key, const std::map<String, ExportTTLVersionedEntry> & index);
-
-    /// Read-only, except for the batching window of the partition, which it returns in the view.
-    PartitionView observePartition(
-        const ExportTTLIndexEntry & entry,
-        const std::vector<MergeTreeDataPartPtr> & parts,
-        const TTLDescriptions & export_ttls,
-        time_t now,
-        PartitionBatch batch,
-        TaskStates & task_states);
-
-    /// On the replica that schedules: resolves finished tasks and starts a group if one is due.
-    /// Returns the index entry of the partition if it was changed.
-    std::optional<ExportTTLIndexEntry> actOnPartition(
+    /// Resolves the claim of the partition unless its task is in flight. A failed task is retried with
+    /// exactly its claimed parts; otherwise every due part of the partition that is not being merged
+    /// is exported.
+    void schedulePartition(
         const String & destination_key,
         const StoragePtr & destination,
         ExportTTLVersionedEntry versioned,
-        PartitionView & view,
+        const std::vector<MergeTreeDataPartPtr> & parts,
+        const TTLDescriptions & export_ttls,
         time_t now,
-        size_t & in_flight,
-        TaskStates & task_states,
         const ContextPtr & context);
+
+    /// Kills the TTL tasks of a destination that is no longer the destination of the TTL, and
+    /// removes its index once none of them holds a claim.
+    void cleanupDestination(const String & destination_key, const std::map<String, ExportTTLVersionedEntry> & entries);
 };
 
 }
