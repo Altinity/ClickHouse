@@ -607,14 +607,10 @@ Aws::S3::Model::GetObjectResult ReadBufferFromS3::sendRequest(size_t attempt, si
     else if (!expected_etag.empty())
         req.SetIfMatch(expected_etag);
 
-<<<<<<< HEAD
-    S3::setClickHouseAttemptNumber(req, attempt);
-=======
-    S3::setClickhouseAttemptNumber(req, S3::seededAttemptNumber(read_settings.object_storage_attempt_number, attempt));
+    S3::setClickHouseAttemptNumber(req, S3::seededAttemptNumber(read_settings.object_storage_attempt_number, attempt));
 
     if (read_settings.object_storage_request_mode == ObjectStorageRequestMode::NativeConditional)
         req.setNativeConditional();
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
 
     if (range_end_incl)
     {

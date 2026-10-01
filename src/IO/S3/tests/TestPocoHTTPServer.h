@@ -87,25 +87,13 @@ public:
     TestPocoHTTPServer():
         server_socket(std::make_unique<Poco::Net::ServerSocket>(0)),
         handler_factory(new HTTPRequestHandlerFactory(last_request_header)),
-<<<<<<< HEAD
         server_params(makeMockServerParams()),
-        server(std::make_unique<Poco::Net::HTTPServer>(handler_factory, *server_socket, server_params))
-=======
-        server_params(new Poco::Net::HTTPServerParams()),
         thread_pool("TestPocoHTTPServer"),
         server(std::make_unique<Poco::Net::HTTPServer>(handler_factory, thread_pool, *server_socket, server_params))
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
     {
         server->start();
     }
 
-<<<<<<< HEAD
-    ~TestPocoHTTPServer()
-    {
-        server->stop();
-    }
-
-=======
     /// Closing the cached client sockets wakes the server workers without Poco's abort notification,
     /// whose unlocked socket shutdown races the worker's own close. Precondition: callers have released
     /// their sessions, otherwise `joinAll` waits for the server's request timeout.
@@ -118,7 +106,6 @@ public:
 
     /// `server_socket->address()` is the wildcard bind address (`0.0.0.0:PORT`), which is not a usable
     /// connection target. Build the URL from an explicit loopback address plus the bound port instead.
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
     std::string getUrl()
     {
         return "http://127.0.0.1:" + std::to_string(server_socket->address().port());
@@ -214,25 +201,13 @@ public:
     TestPocoHTTPStsServer(std::string role_access_key, std::string role_secret_key):
         server_socket(std::make_unique<Poco::Net::ServerSocket>(0)),
         handler_factory(new StsHTTPRequestHandlerFactory(last_request_info, std::move(role_access_key), std::move(role_secret_key))),
-<<<<<<< HEAD
         server_params(makeMockServerParams()),
-        server(std::make_unique<Poco::Net::HTTPServer>(handler_factory, *server_socket, server_params))
-=======
-        server_params(new Poco::Net::HTTPServerParams()),
         thread_pool("TestPocoHTTPStsServer"),
         server(std::make_unique<Poco::Net::HTTPServer>(handler_factory, thread_pool, *server_socket, server_params))
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
     {
         server->start();
     }
 
-<<<<<<< HEAD
-    ~TestPocoHTTPStsServer()
-    {
-        server->stop();
-    }
-
-=======
     /// See `TestPocoHTTPServer`'s destructor above.
     ~TestPocoHTTPStsServer()
     {
@@ -243,7 +218,6 @@ public:
 
     /// `server_socket->address()` is the wildcard bind address (`0.0.0.0:PORT`), which is not a usable
     /// connection target. Build the URL from an explicit loopback address plus the bound port instead.
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
     std::string getUrl()
     {
         return "http://127.0.0.1:" + std::to_string(server_socket->address().port());

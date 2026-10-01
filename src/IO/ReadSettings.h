@@ -6,12 +6,9 @@
 #include <Core/Types.h>
 #if ENABLE_DISTRIBUTED_CACHE
 #include <IO/DistributedCacheSettings.h>
-<<<<<<< HEAD
 #endif
-=======
 #include <IO/ObjectStorageRequestMode.h>
 #include <IO/ObjectStorageRequestProfile.h>
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
 #include <IO/ReadMethod.h>
 #include <Interpreters/FileCache/FileCache_fwd.h>
 #include <Common/Priority.h>
