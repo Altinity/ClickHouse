@@ -340,6 +340,8 @@ private:
         Observation last_seen = NotObserved{};
         uint32_t reissues = 0;
         bool refresh_attempted = false;
+        /// When the latest attempt was sent; sampled only under `Retry::attempt_spacing_ms`.
+        uint64_t attempt_started_ms = 0;
     };
 
     /// Why a read-class request stopped without an answer. Every give-up below throws the same
@@ -358,7 +360,8 @@ private:
         std::optional<ReadStop> stop;
     };
 
-    /// One read-class request under the policy: admission, attempt, classification, jittered reissue.
+    /// One read-class request under the policy: admission, attempt, classification, then a jittered
+    /// reissue, or a spaced one under `Retry::attempt_spacing_ms`.
     /// Returns whatever `once` returns, or throws -- the read surface reports failure by exception.
     template <typename Fn>
     auto readLoop(std::string_view verb, const String & subject, const Retry & policy,
@@ -405,19 +408,24 @@ private:
     std::optional<WriteResult> gatedPause(uint64_t pause_ms, uint32_t envelopes, WriteState & state,
                                          const Retry::Bound & bound, void (*record)(), bool should_sleep);
     /// Admission, then the jittered sleep. A value means the call ended during it; nullopt means the
-    /// caller may send another attempt.
-    std::optional<WriteResult> pauseAndReissue(WriteState & state, const Retry::Bound & bound);
+    /// caller may send another attempt. This and the two siblings below sleep the spaced pause instead
+    /// under `Retry::attempt_spacing_ms`.
+    std::optional<WriteResult> pauseAndReissue(WriteState & state, const Retry & policy, const Retry::Bound & bound);
     /// The sibling for a clean lost race: the same admission and the same reservation, a flat
     /// `Retry::conflictBackoff` sleep, and `state.reissues` untouched, so a transport fault that follows
     /// starts its own schedule at the beginning.
-    std::optional<WriteResult> pauseForConflict(WriteState & state, const Retry::Bound & bound);
+    std::optional<WriteResult> pauseForConflict(WriteState & state, const Retry & policy, const Retry::Bound & bound);
     /// The sibling for a failure text that named a failed connection. The same admission and the same
     /// reservation, a flat `kConnectHintPauseMs` sleep, and `state.reissues` untouched.
-    std::optional<WriteResult> pauseFlat(WriteState & state, const Retry::Bound & bound);
+    std::optional<WriteResult> pauseFlat(WriteState & state, const Retry & policy, const Retry::Bound & bound);
     /// The sibling for a first-attempt fuse timeout: the same admission and the same reservation, NO
     /// sleep at all, and `state.reissues` untouched -- the fuse is a connection-quality answer about a
     /// fresh connection, not a store fault, so nothing here is paced against it.
     std::optional<WriteResult> reissueAtOnce(WriteState & state, const Retry::Bound & bound);
+
+    /// The pause before a reissue: `unspaced_ms`, or under `Retry::attempt_spacing_ms` what is left of
+    /// a fresh draw since `request_started_ms`.
+    uint64_t reissuePause(const Retry & policy, uint64_t request_started_ms, uint64_t unspaced_ms) const;
 
     /// `sleep_ms` plus `envelopes` attempt reservations, saturating.
     uint64_t reservedFor(uint64_t sleep_ms, uint32_t envelopes) const;
@@ -452,6 +460,7 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
                             const Retry::Bound & bound, Fn && once)
 {
     bool refresh_attempted = false;
+    uint64_t attempt_started_ms = 0;
     /// Two counters, deliberately kept separate: `attempt_no` is the PHYSICAL attempt count handed to
     /// the transport (so a reissue is seen as attempt >= 2); `ordinary_reissues` is the
     /// exponential-backoff index. They advance together on an ordinary failure, but the first-attempt
@@ -469,6 +478,8 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         if (!fits(reservation, bound))
             giveUpReadDeadline(verb, subject, bound, attempt_no - 1);
 
+        if (policy.attempt_spacing_ms)
+            attempt_started_ms = owner.now_ms();
         detail::recordAttempt();
         try
         {
@@ -509,7 +520,7 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
             }
         }
 
-        const uint64_t pause_ms = Retry::backoff(++ordinary_reissues);
+        const uint64_t pause_ms = reissuePause(policy, attempt_started_ms, Retry::backoff(++ordinary_reissues));
         const uint64_t needed = reservedFor(pause_ms, 1);
         switch (gate(needed))
         {

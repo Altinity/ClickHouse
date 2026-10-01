@@ -3063,7 +3063,22 @@ private:
 
 using Verb = TimedFaultBackend::Verb;
 
+/// A transport failure that is neither a connect-failure hint nor a first-attempt fuse.
+std::exception_ptr ordinaryFault()
+{
+    return std::make_exception_ptr(DB::S3Exception(
+        "Poco::Exception. Code: 1000, e.code() = 104, Connection reset by peer", Aws::S3::S3Errors::NETWORK_CONNECTION));
+}
+
 constexpr uint64_t kSpacingMs = 1'000;
+
+/// Creates `k` and forgets the requests that did it.
+Etag seedK(TimedFaultBackend & backend, CasOperation & op)
+{
+    const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "seed");
+    backend.sent.clear();
+    return seen;
+}
 
 }
 
@@ -3094,6 +3109,253 @@ TEST(CASRequestsSpacing, UntilDefinitiveRefusesNothingBeforeTheEndOfTheClock)
     ASSERT_GE(puts.size(), 2u);
     EXPECT_EQ(puts.front(), largest - 20'000);
     EXPECT_LE(puts.back(), largest - 14'000) << "every PUT was admitted with room for its two envelopes";
+}
+
+/// Spec test 10, first case: a hinted PUT is reissued without a read, every reissue starts one draw
+/// after the previous one started, and the call is still retrying after 30 s.
+TEST(CASRequestsSpacing, FastConnectFailuresAreSpacedFromTheirStart)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<TimedFaultBackend>(clock);
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = seedK(*backend, op);
+    const uint64_t t0 = clock.now;
+    backend->fault = [t0](Verb verb, size_t nth, uint64_t started) -> std::exception_ptr
+    {
+        if (verb != Verb::Put)
+            return nullptr;
+        if (nth == 1)
+            return fuseTimeout();
+        return started < t0 + 30'000 ? connectHint() : nullptr;
+    };
+
+    const WriteResult result = op.replace("k", "v2", seen, Retry::untilDefinitive(kSpacingMs));
+
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    const auto puts = backend->startsOf(Verb::Put);
+    ASSERT_GE(puts.size(), 3u);
+    EXPECT_EQ(committed->attempts_sent, puts.size());
+    EXPECT_GE(puts.back(), t0 + 30'000) << "the call must still be retrying after 30 s";
+    /// The fuse: its settle read and its reissue both follow at once.
+    EXPECT_EQ(backend->sent[1].verb, Verb::Get);
+    EXPECT_EQ(backend->sent[1].started_ms, t0);
+    EXPECT_EQ(puts[1], t0);
+    EXPECT_EQ(backend->startsOf(Verb::Get).size(), 1u) << "a hinted PUT is reissued without a read";
+    uint64_t min_gap = std::numeric_limits<uint64_t>::max();
+    uint64_t max_gap = 0;
+    for (size_t i = 2; i < puts.size(); ++i)
+    {
+        min_gap = std::min(min_gap, puts[i] - puts[i - 1]);
+        max_gap = std::max(max_gap, puts[i] - puts[i - 1]);
+    }
+    EXPECT_GE(min_gap, 800u);
+    EXPECT_LE(max_gap, 1'200u);
+    EXPECT_EQ(clock.sleeps.size(), puts.size() - 2) << "one sleep per hinted reissue, none for the fuse";
+}
+
+/// Spec test 10, second case: the read after an unclear PUT is sent at once, the read's own fuse is
+/// reissued at once, and the retries of the read and of the PUT are spaced.
+TEST(CASRequestsSpacing, TheResolveReadFollowsAtOnceAndItsRetriesAreSpaced)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<TimedFaultBackend>(clock);
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = seedK(*backend, op);
+    const uint64_t t0 = clock.now;
+    backend->fault = [t0](Verb verb, size_t nth, uint64_t started) -> std::exception_ptr
+    {
+        if (verb == Verb::Put)
+            return started < t0 + 30'000 ? ordinaryFault() : nullptr;
+        /// Every resolve read: a fuse, an ordinary failure, then the answer.
+        switch (nth % 3)
+        {
+            case 1: return fuseTimeout();
+            case 2: return ordinaryFault();
+            default: return nullptr;
+        }
+    };
+
+    const WriteResult result = op.replace("k", "v2", seen, Retry::untilDefinitive(kSpacingMs));
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    const auto & sent = backend->sent;
+    const auto puts = backend->startsOf(Verb::Put);
+    ASSERT_GE(puts.size(), 2u);
+    EXPECT_GE(puts.back(), t0 + 30'000) << "the call must still be retrying after 30 s";
+    ASSERT_EQ(sent.size(), puts.size() + 3 * (puts.size() - 1)) << "three reads per failed PUT";
+    bool at_once = true;
+    uint64_t min_spaced = std::numeric_limits<uint64_t>::max();
+    uint64_t max_spaced = 0;
+    for (size_t p = 0; p + 1 < puts.size(); ++p)
+    {
+        const size_t i = 4 * p;   /// this PUT, then its three reads, then the next PUT
+        ASSERT_EQ(sent[i].verb, Verb::Put);
+        ASSERT_EQ(sent[i + 1].verb, Verb::Get);
+        ASSERT_EQ(sent[i + 2].verb, Verb::Get);
+        ASSERT_EQ(sent[i + 3].verb, Verb::Get);
+        at_once = at_once && sent[i + 1].started_ms == sent[i].started_ms
+            && sent[i + 2].started_ms == sent[i + 1].started_ms;
+        for (const uint64_t gap : {sent[i + 3].started_ms - sent[i + 2].started_ms, sent[i + 4].started_ms - sent[i].started_ms})
+        {
+            min_spaced = std::min(min_spaced, gap);
+            max_spaced = std::max(max_spaced, gap);
+        }
+    }
+    EXPECT_TRUE(at_once) << "the read follows its PUT at once, and the read's fuse is reissued at once";
+    EXPECT_GE(min_spaced, 800u);
+    EXPECT_LE(max_spaced, 1'200u);
+}
+
+/// Spec test 10, third case: a request that takes 5 s on the injected clock is followed by the next one
+/// with no wait, for the read and for the PUT; the PUT's own fuse reissue does not sleep at all.
+TEST(CASRequestsSpacing, ARequestThatTookLongerThanTheSpacingIsRetriedAtOnce)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<TimedFaultBackend>(clock);
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = seedK(*backend, op);
+    backend->duration_ms = 5'000;
+    const uint64_t t0 = clock.now;
+    backend->fault = [t0](Verb verb, size_t nth, uint64_t started) -> std::exception_ptr
+    {
+        if (verb == Verb::Put)
+        {
+            if (nth == 1)
+                return fuseTimeout();
+            return started < t0 + 60'000 ? ordinaryFault() : nullptr;
+        }
+        return nth % 2 == 1 ? ordinaryFault() : nullptr;
+    };
+
+    const WriteResult result = op.replace("k", "v2", seen, Retry::untilDefinitive(kSpacingMs));
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    const auto & sent = backend->sent;
+    bool back_to_back = true;
+    for (size_t i = 1; i < sent.size(); ++i)
+        back_to_back = back_to_back && sent[i].started_ms == sent[i - 1].started_ms + 5'000;
+    EXPECT_TRUE(back_to_back) << "every request starts when the previous one ends";
+    EXPECT_EQ(backend->startsOf(Verb::Put),
+              (std::vector<uint64_t>{t0, t0 + 15'000, t0 + 30'000, t0 + 45'000, t0 + 60'000}));
+    /// Four read retries and three PUT reissues, each a zero-length sleep; the fuse reissue none.
+    EXPECT_EQ(clock.sleeps, std::vector<uint64_t>(7, 0));
+}
+
+/// The worst case for request rate: every PUT is unclear and every resolve read hits its fuse and then
+/// a failure before it answers. The fuse and the read after a PUT are immediate, so the bound comes from
+/// the spacing alone: at most two PUT periods of 4 requests start in any second.
+TEST(CASRequestsSpacing, AnUnclearPutWithAFailingReadStaysUnderEightRequestsPerSecond)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<TimedFaultBackend>(clock);
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = seedK(*backend, op);
+    const uint64_t t0 = clock.now;
+    constexpr uint64_t outage_ms = 60'000;
+    backend->fault = [t0](Verb verb, size_t nth, uint64_t started) -> std::exception_ptr
+    {
+        if (verb == Verb::Put)
+            return started < t0 + outage_ms ? fuseTimeout() : nullptr;   /// a fuse on attempt 1, an ordinary timeout after
+        switch (nth % 3)
+        {
+            case 1: return fuseTimeout();
+            case 2: return ordinaryFault();
+            default: return nullptr;
+        }
+    };
+
+    const WriteResult result = op.replace("k", "v2", seen, Retry::untilDefinitive(kSpacingMs));
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    const auto & sent = backend->sent;
+    ASSERT_FALSE(sent.empty());
+    EXPECT_GE(sent.back().started_ms, t0 + outage_ms);
+    std::vector<size_t> per_second((sent.back().started_ms - t0) / 1'000 + 1, 0);
+    for (const auto & request : sent)
+        ++per_second[(request.started_ms - t0) / 1'000];
+    EXPECT_LE(*std::max_element(per_second.begin(), per_second.end()), 8u);
+    EXPECT_LE(sent.size(), 4 * (outage_ms / 800 + 2)) << "at most 4 requests per 800 ms period";
+}
+
+TEST(CASRequestsSpacing, ACredentialRefreshReissueIsSpaced)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->setRefreshCredentialsResult(true);
+    backend->failNextWriteWith("k", s3Error(Aws::S3::S3Errors::INVALID_CLIENT_TOKEN_ID, "ExpiredToken"));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+
+    const WriteResult result = op.create("k", "v", Retry::untilDefinitive(kSpacingMs));
+
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 2u);
+    EXPECT_EQ(backend->getTotal(), 0u) << "the credential answer owes no read";
+    EXPECT_EQ(backend->refreshCredentialsCalls(), 1u);
+    ASSERT_EQ(clock.sleeps.size(), 1u);
+    EXPECT_GE(clock.sleeps[0], 800u);
+    EXPECT_LE(clock.sleeps[0], 1'200u);
+}
+
+/// A spaced policy has no window, so the spacing is the only bound on a conflict loop's rate too.
+TEST(CASRequestsSpacing, CleanConflictPausesAreSpacedUnderASpacedPolicy)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    constexpr int K = 3;
+    RaceMaker races(backend, clock, "k", K, /*ambiguous=*/false);
+
+    const WriteResult result = op.readModifyWrite("k", appendX(), Retry::untilDefinitive(kSpacingMs));
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K));
+    for (const uint64_t pause : clock.sleeps)
+    {
+        EXPECT_GE(pause, 800u);
+        EXPECT_LE(pause, 1'200u);
+    }
+}
+
+/// Spacing must not leak into a policy without it: per failed PUT, the read's `backoff(1)` and then the
+/// PUT's growing `backoff(n)`.
+TEST(CASRequestsSpacing, AnUnspacedPolicyKeepsTheGrowingBackoff)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<TimedFaultBackend>(clock);
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = seedK(*backend, op);
+    backend->fault = [](Verb verb, size_t nth, uint64_t) -> std::exception_ptr
+    {
+        if (verb == Verb::Put)
+            return nth <= 3 ? ordinaryFault() : nullptr;
+        return nth % 2 == 1 ? ordinaryFault() : nullptr;
+    };
+
+    const WriteResult result = op.replace("k", "v2", seen, Retry::standard());
+
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 4u);
+    const std::vector<uint64_t> ceilings{200, 200, 200, 400, 200, 800};
+    ASSERT_EQ(clock.sleeps.size(), ceilings.size());
+    uint64_t total = 0;
+    for (size_t i = 0; i < ceilings.size(); ++i)
+    {
+        EXPECT_LE(clock.sleeps[i], ceilings[i]) << "sleep " << i;
+        total += clock.sleeps[i];
+    }
+    /// Six full-jitter draws that are all zero have a probability below 1e-13; a zero-wait leak does not.
+    EXPECT_GT(total, 0u);
 }
 
 #endif
