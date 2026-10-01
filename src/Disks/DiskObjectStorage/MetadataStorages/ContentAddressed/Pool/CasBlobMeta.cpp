@@ -12,13 +12,17 @@ namespace ProfileEvents
 namespace DB::Cas
 {
 
+std::optional<LoadedMeta> decodeLoadedMeta(std::optional<Object> object)
+{
+    if (!object)
+        return std::nullopt;
+    return LoadedMeta{.meta = decodeBlobMeta(object->bytes), .etag = std::move(object->etag)};
+}
+
 std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, const BlobRef & ref,
                                    const Retry & policy)
 {
-    auto got = op.read(layout.blobMetaKey(ref), policy);
-    if (!got)
-        return std::nullopt;
-    return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .etag = std::move(got->etag)};
+    return decodeLoadedMeta(op.read(layout.blobMetaKey(ref), policy));
 }
 
 WriteResult putMetaIfAbsent(CasOperation & op, const Layout & layout, const BlobRef & ref,

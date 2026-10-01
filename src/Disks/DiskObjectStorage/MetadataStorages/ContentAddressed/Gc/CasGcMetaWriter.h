@@ -9,7 +9,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <set>
 
 namespace DB::Cas
 {
@@ -29,15 +28,15 @@ public:
     GcMetaWriter(const GcMetaWriter &) = delete;
     GcMetaWriter & operator=(const GcMetaWriter &) = delete;
 
-    /// Publish durable Condemned evidence for one (blob, exact incarnation) pair. On success the
-    /// pair is recorded in the in-process confirmation registry, which the graduation gate reads. A
-    /// refused write or a thrown error leaves the pair UNCONFIRMED: the gate then carries the entry and
-    /// a later round retries the write.
-    void scheduleCondemnMarkerWrite(const BlobRef & ref, const PersistedEtag & token,
-                                    uint64_t condemn_round, uint64_t size);
+    /// Write `Condemned` at `condemn_round` for one blob: create it over an absent marker, replace `Clean`
+    /// or an older-round `Condemned`, leave one at `condemn_round` or newer. A thrown write is counted and
+    /// logged, a write that lost its condition is dropped silently; either way the graduation gate reads the
+    /// marker itself and schedules the write again.
+    void scheduleCondemnMarkerWrite(const BlobRef & ref, uint64_t condemn_round, uint64_t size);
 
-    /// Drop the freshness meta of a blob whose body is confirmed deleted or absent.
-    void scheduleConfirmedMetaDelete(const BlobRef & ref);
+    /// Drop the marker of a blob whose body is confirmed deleted or absent, but only while it is `Condemned`
+    /// at `condemn_round` or older: a newer marker, or `Clean`, belongs to a later incarnation.
+    void scheduleConfirmedMetaDelete(const BlobRef & ref, uint64_t condemn_round);
 
     /// Successful-path protocol barrier. Wait for every job scheduled so far, propagating any
     /// pool/framework exception recorded by `ThreadPool`; per-hash operation exceptions are caught
@@ -51,15 +50,6 @@ public:
     uint64_t scheduled() const;
     uint64_t completed() const;
 
-    /// The in-process condemn-marker confirmation registry, keyed (blob, rendered incarnation). It is
-    /// keyed by the PERSISTED pair because every entry that consults it arrives from a durable
-    /// condemned row; a live observation enters through `PersistedEtag::capture`. Pool
-    /// completions insert concurrently with the round thread's reads, and the round thread also
-    /// inserts directly when it re-checks a marker synchronously.
-    void noteCondemnMarkerDurable(const BlobRef & ref, const PersistedEtag & token);
-    bool condemnMarkerConfirmedInProcess(const BlobRef & ref, const PersistedEtag & token);
-    void forgetCondemnMarker(const BlobRef & ref, const PersistedEtag & token);
-
 private:
     /// Everything a job reaches. Held by `shared_ptr` and captured by value into every job.
     struct State
@@ -68,12 +58,6 @@ private:
         LoggerPtr logger;
         std::atomic<uint64_t> scheduled{0};
         std::atomic<uint64_t> completed{0};
-        std::mutex condemn_marker_mutex;
-        std::set<std::pair<BlobRef, String>> condemn_markers_confirmed;
-
-        void noteCondemnMarkerDurable(const BlobRef & ref, const PersistedEtag & token);
-        bool condemnMarkerConfirmedInProcess(const BlobRef & ref, const PersistedEtag & token);
-        void forgetCondemnMarker(const BlobRef & ref, const PersistedEtag & token);
     };
 
     /// Catch each meta-operation exception, count the job, and put it on the pool -- running it
