@@ -10,6 +10,23 @@
 namespace DB
 {
 
+namespace Iceberg
+{
+
+/// Iceberg `unknown` maps to `Nullable(Nothing)` and can be nested inside structs, lists and maps.
+/// No serialisation format (Parquet, ORC, Avro) can represent `Nothing`, so only those leaves are
+/// removed before writing; the reader fills a missing struct field with NULL.
+/// Returns `type` itself if it has no `Nothing` leaf, the type without its `Nothing` leaves otherwise,
+/// and `nullptr` if nothing serialisable remains (`unknown` itself, a struct of only `unknown` fields,
+/// or a list or map whose element, key or value strips to nothing).
+DataTypePtr stripNothing(const DataTypePtr & type);
+
+/// Removes from `column` of type `original_type` the parts that `stripNothing` removes from the type.
+/// `stripped_type` must be the non-null result of `stripNothing(original_type)`.
+ColumnPtr stripNothingColumn(const ColumnPtr & column, const DataTypePtr & original_type, const DataTypePtr & stripped_type);
+
+}
+
 #if USE_AVRO
 
 class MultipleFileWriter
@@ -68,6 +85,9 @@ public:
     std::vector<IcebergDataFileEntry> getDataFileEntries() const;
 
 private:
+    /// Strips `Nothing` leaves from `columns` and drops fully `Nothing` columns, throwing if a dropped one holds a non-default row.
+    Columns filterColumns(const Columns & columns) const;
+
     UInt64 max_data_file_num_rows;
     UInt64 max_data_file_num_bytes;
     Poco::JSON::Array::Ptr schema;
@@ -92,13 +112,13 @@ private:
     std::optional<FormatSettings> format_settings;
     const String& write_format;
     SharedHeader sample_block;
-    /// Indices of `sample_block` columns that are passed to the format writer.
-    /// Columns containing Nothing at any nesting level (Iceberg `unknown` type)
-    /// are excluded, because no serialisation format supports the Nothing type.
-    /// Those columns exist only in the Iceberg schema metadata and are always
-    /// read back as NULLs.
-    std::vector<size_t> kept_column_indices;
-    /// `sample_block` with the Nothing columns removed; used by the format writer.
+    /// Per `sample_block` column: the type passed to the format writer, i.e. the result of
+    /// `Iceberg::stripNothing`. It is the original type when the column has no Iceberg `unknown`
+    /// leaf, and nullptr when nothing serialisable remains: such a column is left out of the data
+    /// file and may only hold default values, because anything else would be lost.
+    DataTypes written_column_types;
+    bool has_nothing_leaves = false;
+    /// `sample_block` with `Nothing` leaves stripped and fully `Nothing` columns removed; used by the format writer.
     SharedHeader filtered_sample_block;
     UInt64 total_bytes = 0;
     std::function<void(const std::string &)> new_file_path_callback;

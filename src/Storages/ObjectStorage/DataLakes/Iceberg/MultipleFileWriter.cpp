@@ -1,5 +1,10 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MultipleFileWriter.h>
 
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnMap.h>
+#include <Columns/ColumnNullable.h>
+#include <Columns/ColumnSparse.h>
+#include <Columns/ColumnTuple.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNothing.h>
@@ -15,37 +20,148 @@
 namespace DB
 {
 
-#if USE_AVRO
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
+}
+
+namespace Iceberg
+{
+
+DataTypePtr stripNothing(const DataTypePtr & type)
+{
+    if (isNothing(type))
+        return nullptr;
+
+    if (const auto * nullable_type = typeid_cast<const DataTypeNullable *>(type.get()))
+    {
+        const auto & nested = nullable_type->getNestedType();
+        auto stripped_nested = stripNothing(nested);
+        if (!stripped_nested)
+            return nullptr;
+        return stripped_nested == nested ? type : makeNullable(stripped_nested);
+    }
+
+    if (const auto * tuple_type = typeid_cast<const DataTypeTuple *>(type.get()))
+    {
+        const auto & elements = tuple_type->getElements();
+        DataTypes kept_elements;
+        Strings kept_names;
+        bool changed = false;
+        for (size_t i = 0; i < elements.size(); ++i)
+        {
+            auto stripped_element = stripNothing(elements[i]);
+            if (!stripped_element)
+            {
+                changed = true;
+                continue;
+            }
+            changed |= stripped_element != elements[i];
+            kept_elements.push_back(stripped_element);
+            kept_names.push_back(tuple_type->getNameByPosition(i + 1));
+        }
+        if (!changed)
+            return type;
+        if (kept_elements.empty())
+            return nullptr;
+        if (tuple_type->hasExplicitNames())
+            return std::make_shared<DataTypeTuple>(kept_elements, kept_names);
+        return std::make_shared<DataTypeTuple>(kept_elements);
+    }
+
+    if (const auto * array_type = typeid_cast<const DataTypeArray *>(type.get()))
+    {
+        const auto & nested = array_type->getNestedType();
+        auto stripped_nested = stripNothing(nested);
+        if (!stripped_nested)
+            return nullptr;
+        return stripped_nested == nested ? type : std::make_shared<DataTypeArray>(stripped_nested);
+    }
+
+    if (const auto * map_type = typeid_cast<const DataTypeMap *>(type.get()))
+    {
+        const auto & key = map_type->getKeyType();
+        const auto & value = map_type->getValueType();
+        auto stripped_key = stripNothing(key);
+        auto stripped_value = stripNothing(value);
+        if (!stripped_key || !stripped_value)
+            return nullptr;
+        if (stripped_key == key && stripped_value == value)
+            return type;
+        return std::make_shared<DataTypeMap>(stripped_key, stripped_value);
+    }
+
+    return type;
+}
 
 namespace
 {
 
-/// Iceberg `unknown` is a primitive type, so it can also appear nested inside
-/// structs, lists, and maps. No serialisation format (Parquet, ORC, Avro) can
-/// represent Nothing at any nesting level (the Parquet writer throws
-/// `UNKNOWN_TYPE`), so such columns must be stripped from the writer's block.
-bool containsNothing(const DataTypePtr & type)
+ColumnPtr stripNothingColumnImpl(const ColumnPtr & column, const DataTypePtr & type)
 {
-    auto inner_type = removeNullable(type);
-    if (isNothing(inner_type))
-        return true;
-    if (const auto * tuple_type = typeid_cast<const DataTypeTuple *>(inner_type.get()))
+    auto stripped_type = stripNothing(type);
+    if (!stripped_type)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Column of type {} has nothing left after stripping Nothing", type->getName());
+    if (stripped_type == type)
+        return column;
+
+    auto full_column = removeSpecialRepresentations(column->convertToFullColumnIfConst());
+
+    if (const auto * nullable_type = typeid_cast<const DataTypeNullable *>(type.get()))
     {
-        for (const auto & elem : tuple_type->getElements())
-        {
-            if (containsNothing(elem))
-                return true;
-        }
-        return false;
+        const auto & nullable_column = assert_cast<const ColumnNullable &>(*full_column);
+        return ColumnNullable::create(
+            stripNothingColumnImpl(nullable_column.getNestedColumnPtr(), nullable_type->getNestedType()),
+            nullable_column.getNullMapColumnPtr());
     }
-    if (const auto * array_type = typeid_cast<const DataTypeArray *>(inner_type.get()))
-        return containsNothing(array_type->getNestedType());
-    if (const auto * map_type = typeid_cast<const DataTypeMap *>(inner_type.get()))
-        return containsNothing(map_type->getKeyType()) || containsNothing(map_type->getValueType());
-    return false;
+
+    if (const auto * tuple_type = typeid_cast<const DataTypeTuple *>(type.get()))
+    {
+        const auto & tuple_column = assert_cast<const ColumnTuple &>(*full_column);
+        const auto & elements = tuple_type->getElements();
+        Columns kept_columns;
+        for (size_t i = 0; i < elements.size(); ++i)
+        {
+            if (stripNothing(elements[i]))
+                kept_columns.push_back(stripNothingColumnImpl(tuple_column.getColumnPtr(i), elements[i]));
+        }
+        return ColumnTuple::create(kept_columns);
+    }
+
+    if (const auto * array_type = typeid_cast<const DataTypeArray *>(type.get()))
+    {
+        const auto & array_column = assert_cast<const ColumnArray &>(*full_column);
+        return ColumnArray::create(
+            stripNothingColumnImpl(array_column.getDataPtr(), array_type->getNestedType()),
+            array_column.getOffsetsPtr());
+    }
+
+    if (const auto * map_type = typeid_cast<const DataTypeMap *>(type.get()))
+    {
+        const auto & map_column = assert_cast<const ColumnMap &>(*full_column);
+        const auto & key_value = map_column.getNestedData();
+        return ColumnMap::create(
+            stripNothingColumnImpl(key_value.getColumnPtr(0), map_type->getKeyType()),
+            stripNothingColumnImpl(key_value.getColumnPtr(1), map_type->getValueType()),
+            map_column.getNestedColumn().getOffsetsPtr());
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected type {} while stripping Nothing from a column", type->getName());
 }
 
 }
+
+ColumnPtr stripNothingColumn(const ColumnPtr & column, const DataTypePtr & original_type, const DataTypePtr & stripped_type)
+{
+    auto result = stripNothingColumnImpl(column, original_type);
+    chassert(stripped_type && stripped_type->equals(*stripNothing(original_type)));
+    return result;
+}
+
+}
+
+#if USE_AVRO
 
 MultipleFileWriter::MultipleFileWriter(
     UInt64 max_data_file_num_rows_,
@@ -75,26 +191,27 @@ MultipleFileWriter::MultipleFileWriter(
 {
     column_mapper->setStorageColumnEncoding(Iceberg::IcebergSchemaProcessor::traverseSchema(schema_));
 
-    /// Iceberg `unknown` type maps to Nullable(Nothing) in ClickHouse.  No
-    /// serialisation format (Parquet, ORC, Avro) can represent the Nothing type,
-    /// and the column is guaranteed to contain only NULLs, so we strip it from the
-    /// block that is passed to the format writer.  The column still appears in the
-    /// Iceberg schema metadata and is read back as NULLs on the read path.
-    for (size_t i = 0; i < sample_block->columns(); ++i)
+    written_column_types.reserve(sample_block->columns());
+    for (const auto & column : *sample_block)
     {
-        if (!containsNothing(sample_block->getByPosition(i).type))
-            kept_column_indices.push_back(i);
+        written_column_types.push_back(Iceberg::stripNothing(column.type));
+        has_nothing_leaves |= written_column_types.back() != column.type;
     }
 
-    if (kept_column_indices.size() == sample_block->columns())
+    if (!has_nothing_leaves)
     {
         filtered_sample_block = sample_block;
     }
     else
     {
         Block filtered;
-        for (size_t i : kept_column_indices)
-            filtered.insert(sample_block->getByPosition(i));
+        for (size_t i = 0; i < sample_block->columns(); ++i)
+        {
+            if (!written_column_types[i])
+                continue;
+            const auto & column = sample_block->getByPosition(i);
+            filtered.insert({written_column_types[i]->createColumn(), written_column_types[i], column.name});
+        }
         filtered_sample_block = std::make_shared<const Block>(std::move(filtered));
     }
 }
@@ -130,27 +247,56 @@ void MultipleFileWriter::startNewFile()
         write_format, *buffer, *filtered_sample_block, context, format_settings, format_filter_info);
 }
 
+Columns MultipleFileWriter::filterColumns(const Columns & columns) const
+{
+    Columns filtered_columns;
+    filtered_columns.reserve(filtered_sample_block->columns());
+    for (size_t i = 0; i < columns.size(); ++i)
+    {
+        const auto & original_type = sample_block->getByPosition(i).type;
+        const auto & written_type = written_column_types[i];
+        if (written_type == original_type)
+        {
+            filtered_columns.push_back(columns[i]);
+        }
+        else if (written_type)
+        {
+            filtered_columns.push_back(Iceberg::stripNothingColumn(columns[i], original_type, written_type));
+        }
+        else
+        {
+            for (size_t row = 0; row < columns[i]->size(); ++row)
+            {
+                if (!columns[i]->isDefaultAt(row))
+                    throw Exception(
+                        ErrorCodes::NOT_IMPLEMENTED,
+                        "Cannot write column '{}' of type {} into an Iceberg data file: row {} holds a non-default value, "
+                        "but the column contains an Iceberg `unknown` element that no data file format can store, so the "
+                        "value (for example, list elements or map keys) would be lost. Only NULL, empty lists and empty "
+                        "maps can be inserted into such a column",
+                        sample_block->getByPosition(i).name, original_type->getName(), row);
+            }
+        }
+    }
+    return filtered_columns;
+}
+
 void MultipleFileWriter::consume(const Chunk & chunk)
 {
+    /// Validate before starting a file, so a rejected chunk leaves no empty data file behind.
+    std::optional<Columns> filtered_columns;
+    if (has_nothing_leaves)
+        filtered_columns = filterColumns(chunk.getColumns());
+
     if (!current_file_num_rows || *current_file_num_rows >= max_data_file_num_rows || *current_file_num_bytes >= max_data_file_num_bytes)
     {
         startNewFile();
     }
 
-    if (kept_column_indices.size() == sample_block->columns())
-    {
-        output_format->write(sample_block->cloneWithColumns(chunk.getColumns()));
-    }
+    if (filtered_columns)
+        output_format->write(filtered_sample_block->cloneWithColumns(std::move(*filtered_columns)));
     else
-    {
-        /// Strip columns containing Nothing before passing to the format writer.
-        const auto & columns = chunk.getColumns();
-        Columns filtered_columns;
-        filtered_columns.reserve(kept_column_indices.size());
-        for (size_t i : kept_column_indices)
-            filtered_columns.push_back(columns[i]);
-        output_format->write(filtered_sample_block->cloneWithColumns(std::move(filtered_columns)));
-    }
+        output_format->write(sample_block->cloneWithColumns(chunk.getColumns()));
 
     output_format->flush();
     *current_file_num_rows += chunk.getNumRows();
