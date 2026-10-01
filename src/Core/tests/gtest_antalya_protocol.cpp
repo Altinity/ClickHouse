@@ -28,6 +28,12 @@ TEST(AntalyaProtocol, RejectsInvalidMarkers)
         EXPECT_EQ(parseMarker(name), 0u) << "should not have parsed: " << name;
 }
 
+TEST(AntalyaProtocol, RemoveMarkerRemovesOnlyAValidMarker)
+{
+    EXPECT_EQ(removeMarker(appendMarker("ClickHouse client")), "ClickHouse client");
+    EXPECT_EQ(removeMarker("ClickHouse client (antalya:0)"), "ClickHouse client (antalya:0)");
+}
+
 TEST(AntalyaProtocol, ParsesMarkerAndCapsVersion)
 {
     EXPECT_EQ(parseMarker("ClickHouse server (antalya:999999999)"), static_cast<UInt64>(DBMS_ANTALYA_PROTOCOL_VERSION));
