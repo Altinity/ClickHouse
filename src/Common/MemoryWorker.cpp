@@ -866,8 +866,7 @@ void MemoryWorker::updateResidentMemoryThread()
 
             Stopwatch total_watch;
 
-<<<<<<< HEAD
-            Int64 resident = getMemoryUsage(first_run);
+            const MemoryUsage memory_usage = getMemoryUsage(first_run);
 
             /// Speculatively reserve growth headroom on top of the observed RSS.
             /// `resident - prev_resident` is how much RSS actually grew during the last tick;
@@ -894,7 +893,7 @@ void MemoryWorker::updateResidentMemoryThread()
             /// overhead dominates the `resident - tracked` gap there.
             /// Skip speculation on the very first run: there is no previous interval to
             /// extrapolate from.
-            Int64 speculative_rss = resident;
+            Int64 speculative_rss = memory_usage.resident;
             /// Speculation only influences the global hard-limit check in
             /// `MemoryTracker::allocImpl` (the `will_be_rss > current_hard_limit` branch),
             /// so it is only meaningful when a global hard limit is configured. When the
@@ -912,12 +911,12 @@ void MemoryWorker::updateResidentMemoryThread()
                 /// real resident, triggering false `MEMORY_LIMIT_EXCEEDED` decisions in
                 /// `MemoryTracker::allocImpl`. Clamp `tracked` to `0` first.
                 Int64 tracked = std::max<Int64>(0, total_memory_tracker.get());
-                Int64 delta = std::min(resident - prev_resident, resident - tracked);
+                Int64 delta = std::min(memory_usage.resident - prev_resident, memory_usage.resident - tracked);
                 /// Speculate only while real `resident` is still below the hard limit.
                 /// Once `resident >= current_hard_limit`, any positive allocation already
                 /// trips the `will_be_rss > current_hard_limit` branch in
                 /// `MemoryTracker::allocImpl`, so there is nothing left to reserve.
-                if (delta > 0 && resident < current_hard_limit)
+                if (delta > 0 && memory_usage.resident < current_hard_limit)
                 {
                     /// The reservation can be at most `current_hard_limit - resident`:
                     /// reserving beyond the hard limit gains no early-throw power (any
@@ -925,7 +924,7 @@ void MemoryWorker::updateResidentMemoryThread()
                     /// reaches it). Capping the reservation *before* adding it to `resident`
                     /// also guarantees the signed `Int64` addition cannot overflow, even
                     /// with a very large configured ratio.
-                    const Int64 headroom = current_hard_limit - resident;
+                    const Int64 headroom = current_hard_limit - memory_usage.resident;
                     double reserve_double = static_cast<double>(delta) * rss_speculative_reserve_ratio;
                     Int64 reserve = (reserve_double >= static_cast<double>(headroom))
                         ? headroom
@@ -933,12 +932,8 @@ void MemoryWorker::updateResidentMemoryThread()
                     speculative_rss += reserve;
                 }
             }
-            prev_resident = resident;
+            prev_resident = memory_usage.resident;
             MemoryTracker::updateRSS(speculative_rss);
-=======
-            const MemoryUsage memory_usage = getMemoryUsage(first_run);
-            MemoryTracker::updateRSS(memory_usage.resident);
->>>>>>> 482a836f403 (Merge pull request #2349 from Altinity/cas/memworker-split-allocated-source)
 
             if (page_cache)
                 page_cache->autoResize(std::max(memory_usage.resident, total_memory_tracker.get()), total_memory_tracker.getHardLimit());
