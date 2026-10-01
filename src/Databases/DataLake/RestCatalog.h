@@ -235,15 +235,7 @@ protected:
     virtual DB::HTTPHeaderEntries getAuthHeaders(
         const CatalogState & catalog_state,
         bool update_token,
-<<<<<<< HEAD
         bool * used_cached_oauth_token) const;
-=======
-        const String & method = {},
-        const Poco::URI & url = {},
-        const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {},
-        bool * used_cached_oauth_token = nullptr) const;
->>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 
     void validateAuthHeaders(const DB::HTTPHeaderEntry & header) const;
 
@@ -370,15 +362,7 @@ public:
     DB::HTTPHeaderEntries getAuthHeaders(
         const CatalogState & catalog_state,
         bool update_token,
-<<<<<<< HEAD
         bool * used_cached_oauth_token) const override;
-=======
-        const String & method = {},
-        const Poco::URI & url = {},
-        const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {},
-        bool * used_cached_oauth_token = nullptr) const override;
->>>>>>> a88ca756219 (Merge pull request #2222 from Altinity/feature/antalya-26.6/datalake-catalog-auth-token-profile-events)
 
     const std::string & getGoogleADCClientId() const { return google_adc_client_id; }
     const std::string & getGoogleADCClientSecret() const { return google_adc_client_secret; }
