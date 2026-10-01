@@ -386,7 +386,9 @@ void BackupWriterS3::copyFileFromDisk(
 {
     /// Use the native copy as a more optimal way to copy a file from S3 to S3 if it's possible.
     /// We don't check for `has_throttling` here because the native copy almost doesn't use network.
-    if (!copy_encrypted)
+    auto source_data_source_description = src_disk->getDataSourceDescription();
+
+    if (!copy_encrypted && !source_data_source_description.is_encrypted)
     {
         if (auto * ca = tryGetContentAddressedExchange(src_disk))
         {
@@ -398,7 +400,6 @@ void BackupWriterS3::copyFileFromDisk(
         }
     }
 
-    auto source_data_source_description = src_disk->getDataSourceDescription();
     if (source_data_source_description.canUseNativeCopyWith(data_source_description) && (source_data_source_description.is_encrypted == copy_encrypted))
     {
         /// getBlobPath() can return more than 2 elements if the file is stored as multiple objects in S3 bucket.
@@ -447,9 +448,29 @@ bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
     if (length == 0)
         return false;
 
+    auto source_data_source_description = src_disk->getDataSourceDescription();
+    if (!source_data_source_description.sameKind(data_source_description))
+        return false;
+
+    auto src_client = disk_client_factory.getOrCreate(src_disk);
+    if (!src_client->supportsMultiPartCopy())
+        return false;
+
     const auto plan = ca.getBlobViewPlan(src_path);
     if (!plan)
         return false;
+
+    const UInt64 src_offset = plan->payload_offset + start_pos;
+    if (src_offset == 0)
+        return false;
+
+    const String src_bucket = src_disk->getObjectStorage()->getObjectsNamespace();
+    if (src_bucket.empty())
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Disk {} has the same S3 endpoint as the backup but no bucket for content-addressed file {}",
+            src_disk->getName(),
+            src_path);
 
     if (plan->object.remote_path.empty())
         throw Exception(
@@ -468,22 +489,6 @@ bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
             src_path,
             payload_size);
 
-    auto source_data_source_description = src_disk->getDataSourceDescription();
-    if (!source_data_source_description.sameKind(data_source_description))
-        return false;
-
-    const String src_bucket = src_disk->getObjectStorage()->getObjectsNamespace();
-    if (src_bucket.empty())
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Disk {} has the same S3 endpoint as the backup but no bucket for content-addressed file {}",
-            src_disk->getName(),
-            src_path);
-
-    auto src_client = disk_client_factory.getOrCreate(src_disk);
-    if (!src_client->supportsMultiPartCopy())
-        return false;
-
     LOG_TRACE(
         log,
         "Copying the payload of content-addressed file {} from disk {} to S3 as a ranged server-side copy",
@@ -494,7 +499,7 @@ bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
         std::move(src_client),
         src_bucket,
         /* src_key */ plan->object.remote_path,
-        /* src_offset */ plan->payload_offset + start_pos,
+        src_offset,
         length,
         /* dest_s3_client */ client,
         /* dest_bucket */ s3_uri.bucket,
