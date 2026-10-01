@@ -75,9 +75,14 @@ copy of a blob therefore names the payload range. A copy of the whole object wou
 into the backup, and a later restore would read wrong data.
 
 If a byte range cannot be copied inside `S3`, `CAS` does not fall back to copying the whole object —
-the file is read and written through ClickHouse instead. That is slower, but correct. This happens
-when multipart copy is off, and on a store whose API has no `UploadPartCopy` at all: `GCS` is one, so
-by its current API a blob there always goes through ClickHouse.
+the file is read and written through ClickHouse instead. That is slower, but correct. ClickHouse takes
+that path on its own in three cases: the query sets `s3_allow_multipart_copy = 0`; the store is
+recognized as `GCS`, whose current XML API has no `UploadPartCopy`; or `UploadPartCopy` is refused with
+`AccessDenied`.
+
+A store that refuses `UploadPartCopy` with any other error fails the `BACKUP` instead, because
+ClickHouse cannot tell a missing capability from a transient failure. On such a store, set
+`s3_allow_multipart_copy = 0` on the `BACKUP` query.
 
 | Turn off the copy inside `S3` | Turn off the range copy |
 |---|---|
@@ -132,8 +137,10 @@ It is a useful building block, not a replacement for `BACKUP`.
   store, and only when the destination is on the same endpoint as the pool. Other destinations,
   including `Disk(...)`, get the copy through ClickHouse's buffers.
 - A blob is copied inside `S3` only with multipart copy (`UploadPartCopy`), because only it can name a
-  byte range. Without multipart copy, and on a store whose API lacks `UploadPartCopy` such as `GCS`,
-  every blob goes through ClickHouse's buffers.
+  byte range. With `s3_allow_multipart_copy = 0`, on a store recognized as `GCS`, and when
+  `UploadPartCopy` is refused with `AccessDenied`, every blob goes through ClickHouse's buffers
+  instead. A store that refuses `UploadPartCopy` with another error fails the `BACKUP`; set
+  `s3_allow_multipart_copy = 0` there.
 - Restore onto a `CAS` disk always writes through ClickHouse, see [restore](#restore).
 - A disk-level copy of a single part file onto a `CAS` disk, outside of `RESTORE`, is rejected with
   `NOT_IMPLEMENTED`: a `CAS` disk accepts part files only as a whole part in one transaction.
