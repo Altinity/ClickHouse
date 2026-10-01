@@ -460,10 +460,6 @@ bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
     if (!plan)
         return false;
 
-    const UInt64 src_offset = plan->payload_offset + start_pos;
-    if (src_offset == 0)
-        return false;
-
     const String src_bucket = src_disk->getObjectStorage()->getObjectsNamespace();
     if (src_bucket.empty())
         throw Exception(
@@ -479,6 +475,14 @@ bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
             src_path,
             src_disk->getName());
 
+    if (plan->payload_offset == 0)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Content-addressed file {} on disk {} resolved to a blob whose payload starts at byte 0, but a blob always "
+            "begins with an envelope header",
+            src_path,
+            src_disk->getName());
+
     const UInt64 payload_size = plan->payload_end - plan->payload_offset;
     if (start_pos > payload_size || length > payload_size - start_pos)
         throw Exception(
@@ -488,6 +492,8 @@ bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
             start_pos + length,
             src_path,
             payload_size);
+
+    const UInt64 src_offset = plan->payload_offset + start_pos;
 
     LOG_TRACE(
         log,

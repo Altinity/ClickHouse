@@ -83,6 +83,26 @@ def column_fingerprints(node, table):
     return dict(zip(["count"] + COLUMNS, row))
 
 
+def transfer_events(node, query_id):
+    """Which mechanism moved the bytes: a ranged or whole-object copy inside `S3`, or buffers."""
+    node.query("SYSTEM FLUSH LOGS query_log")
+    row = node.query(
+        f"""
+        SELECT
+            ProfileEvents['S3UploadPartCopy'],
+            ProfileEvents['S3CopyObject'],
+            ProfileEvents['S3PutObject'] + ProfileEvents['S3UploadPart'],
+            ProfileEvents['S3GetObject']
+        FROM system.query_log
+        WHERE type = 'QueryFinish' AND query_id = '{query_id}'
+        ORDER BY event_time DESC LIMIT 1
+        """
+    ).strip()
+    assert row, f"no query_log row for {query_id}"
+    names = ["ranged_copy", "whole_copy", "uploaded", "downloaded"]
+    return dict(zip(names, (int(value) for value in row.split("\t"))))
+
+
 @pytest.mark.parametrize("allow_native_copy", [True, False])
 def test_native_copy_round_trip(allow_native_copy):
     node = cluster.instances["node"]
@@ -90,20 +110,43 @@ def test_native_copy_round_trip(allow_native_copy):
     table = f"cas_backup_{suffix}"
     restored = f"{table}_restored"
     destination = backup_destination(suffix)
+    backup_query_id = f"{table}_backup_{RUN_TOKEN}"
+    restore_query_id = f"{table}_restore_{RUN_TOKEN}"
 
     create_and_fill(node, table)
     expected = column_fingerprints(node, table)
 
     node.query(
         f"BACKUP TABLE {table} TO {destination} "
-        f"SETTINGS allow_s3_native_copy = {int(allow_native_copy)}"
+        f"SETTINGS allow_s3_native_copy = {int(allow_native_copy)}",
+        query_id=backup_query_id,
     )
+
+    backup = transfer_events(node, backup_query_id)
+    assert backup["whole_copy"] == 0, (
+        "CopyObject cannot express a range, so the envelope would land in the backup"
+    )
+    assert backup["uploaded"] > 0, "inline entries have no object and go through buffers"
+    if allow_native_copy:
+        assert backup["ranged_copy"] > 0, "blobs must be copied server-side with a range"
+    else:
+        assert backup["ranged_copy"] == 0, (
+            "allow_s3_native_copy = 0 leaves no copy inside S3, so every file goes through buffers"
+        )
 
     node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
     node.query(
         f"RESTORE TABLE {table} AS {restored} FROM {destination} "
-        f"SETTINGS allow_s3_native_copy = {int(allow_native_copy)}"
+        f"SETTINGS allow_s3_native_copy = {int(allow_native_copy)}",
+        query_id=restore_query_id,
     )
+
+    restore = transfer_events(node, restore_query_id)
+    assert (restore["ranged_copy"], restore["whole_copy"]) == (0, 0), (
+        "a restore onto a CAS disk writes every file through the CAS write path"
+    )
+    assert restore["downloaded"] > 0, "the backup must be read through buffers"
+    assert restore["uploaded"] > 0, "the restored part must be written through buffers"
 
     actual = column_fingerprints(node, restored)
 
