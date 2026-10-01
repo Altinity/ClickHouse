@@ -390,7 +390,8 @@ using MountObservationMap = std::map<String, TokenWatch>;
 /// `now_ms` is WALL clock, used only for the audit/diagnostic log line — it never participates in the
 /// fence decision (mirrors `claimMountAwaitingExpiry`'s `now_ms_fn` vs `mono_ms_fn` split).
 /// `mono_ms_fn` is the OBSERVATION clock: the caller's OWN monotonic clock, never compared against
-/// any other node's clock. `obs` is owned by the caller and threaded across consecutive calls (one GC
+/// any other node's clock. It is sampled once at entry for the stability test and again after the read
+/// for every sighting. `obs` is owned by the caller and threaded across consecutive calls (one GC
 /// leader instance, `Cas::Gc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
 /// fencing one round, never fences early).
 ///

@@ -1545,6 +1545,135 @@ std::function<uint64_t()> frozenClock(uint64_t ms)
 {
     return [ms] { return ms; };
 }
+
+/// Moves the observer clock on every read of a mount slot, so a round spends time between its first
+/// clock sample and the read it decides on. With `renew_before_next_fence` set, the holder renews once
+/// just before the next guarded write of a mount slot lands, so a fence-out is refused and decided
+/// again on the holder's new token.
+class SightingClockBackend : public InMemoryBackend
+{
+public:
+    explicit SightingClockBackend(uint64_t & mono_) : mono(mono_) {}
+
+    uint64_t read_cost_ms = 0;
+    bool renew_before_next_fence = false;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (key.ends_with("/mount"))
+            mono += read_cost_ms;
+        return InMemoryBackend::read(key, access);
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
+    {
+        if (renew_before_next_fence && expected_value && key.ends_with("/mount"))
+        {
+            renew_before_next_fence = false;
+            const auto got = InMemoryBackend::read(key, access);
+            MountLease m = decodeMountLease(got->bytes);
+            m.seq += 1;
+            EXPECT_TRUE(InMemoryBackend::write(key, encodeMountLease(m), got->value, access).has_value());
+        }
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+
+private:
+    uint64_t & mono;
+};
+
+constexpr uint64_t kWalkMs = 4'000;
+
+void firstDecisionCountsFromAfterTheRead()
+{
+    uint64_t mono = 0;
+    auto b = std::make_shared<SightingClockBackend>(mono);
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const auto clock = [&mono] { return mono; };
+    MountObservationMap obs;
+
+    /// The round starts at 0 and reaches the slot at `kWalkMs`.
+    b->read_cost_ms = kWalkMs;
+    ASSERT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 0u);
+    ASSERT_TRUE(obs.contains("s1"));
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kWalkMs);
+
+    /// One threshold after the first round started, less than one after its read.
+    b->read_cost_ms = 0;
+    mono = kStableThresholdMs;
+    const HeartbeatFloor early = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_EQ(early.fenced_now, 0u) << "fenced a token watched for less than the threshold";
+    EXPECT_EQ(early.live, 1u);
+
+    mono = kWalkMs + kStableThresholdMs;
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u);
+}
+
+void reDecisionCountsFromAfterItsRead()
+{
+    uint64_t mono = 0;
+    auto b = std::make_shared<SightingClockBackend>(mono);
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const auto clock = [&mono] { return mono; };
+    MountObservationMap obs;
+
+    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_TRUE(obs.contains("s1"));
+    const Etag first = obs.at("s1").token;
+
+    /// Stable at this round's start, so it tries the fence-out. The holder renews first, the write is
+    /// refused, and the round decides again on the new token after reading it.
+    mono = kStableThresholdMs;
+    b->read_cost_ms = kWalkMs;
+    b->renew_before_next_fence = true;
+    const HeartbeatFloor refused = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_FALSE(b->renew_before_next_fence) << "the round never attempted the fence-out";
+    ASSERT_EQ(refused.fenced_now, 0u);
+    ASSERT_EQ(refused.live, 1u);
+    ASSERT_NE(obs.at("s1").token, first);
+
+    /// Nothing reads after the re-decision, so the clock still holds the value of its last read.
+    const uint64_t reread_at = mono;
+    ASSERT_GT(reread_at, kStableThresholdMs);
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, reread_at);
+
+    /// One threshold after that round started, less than one after its re-read.
+    b->read_cost_ms = 0;
+    mono = kStableThresholdMs + kStableThresholdMs;
+    ASSERT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 0u)
+        << "fenced the renewed token before it was watched for the threshold";
+
+    mono = reread_at + kStableThresholdMs;
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u);
+}
+
+void slowWalkDoesNotMoveTheStabilitySample()
+{
+    uint64_t mono = 0;
+    auto b = std::make_shared<SightingClockBackend>(mono);
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const auto clock = [&mono] { return mono; };
+    MountObservationMap obs;
+
+    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_EQ(obs.at("s1").first_seen_mono_ms, 0u);
+
+    /// The round starts one millisecond short of the threshold; its walk passes the threshold many times.
+    mono = kStableThresholdMs - 1;
+    b->read_cost_ms = 10 * kStableThresholdMs;
+    const HeartbeatFloor slow = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    EXPECT_EQ(slow.fenced_now, 0u);
+    EXPECT_EQ(slow.live, 1u);
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, 0u) << "an unchanged token keeps its first sighting";
+}
 }
 
 TEST(CASTokenWatch, CountsFromAfterTheRead)
@@ -1808,6 +1937,22 @@ TEST(CASHeartbeatFloor, FenceOutLosesTheIncarnationRaceAndReclassifiesLive)
     const auto after = ops.op.read(l.mountKey("s1"), Retry::standard());
     ASSERT_TRUE(after.has_value());
     EXPECT_FALSE(decodeMountLease(after->bytes).gc_fenced);
+}
+
+TEST(CASHeartbeat, GcCountsASightingFromAfterItsRead)
+{
+    {
+        SCOPED_TRACE("first decision");
+        firstDecisionCountsFromAfterTheRead();
+    }
+    {
+        SCOPED_TRACE("re-decision after a refused fence-out");
+        reDecisionCountsFromAfterItsRead();
+    }
+    {
+        SCOPED_TRACE("slow walk");
+        slowWalkDoesNotMoveTheStabilitySample();
+    }
 }
 
 TEST(CASHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
