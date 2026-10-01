@@ -14,18 +14,24 @@
 #include <IO/S3Defines.h>
 #include <IO/S3Settings.h>
 #include <Common/RemoteHostFilter.h>
+#include <Common/CurrentThread.h>
+#include <Common/ProfileEvents.h>
+#include <Common/ThreadPool.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Settings.h>
 #include <base/defines.h>
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -48,6 +54,11 @@
 
 /// The single-attempt client clone must cap its connect timeout at the value the mount froze at open,
 /// never at the disk's (possibly wider, possibly reloaded, possibly unbounded) own connect timeout.
+
+namespace ProfileEvents
+{
+extern const Event S3PutObject;
+}
 
 namespace
 {
@@ -196,7 +207,8 @@ public:
 /// succeeds. No SDK-level retry (`RetryStrategy{.max_retries = 0}`,
 /// `s3_slow_all_threads_after_retryable_error = false`): a retry would blur "the single-attempt clone
 /// made exactly one request" into "the SDK also tried again".
-std::shared_ptr<DB::S3ObjectStorage> makeDispatchStorageForTest(const std::string & endpoint, long base_request_timeout_ms)
+template <typename Storage = DB::S3ObjectStorage>
+std::shared_ptr<Storage> makeDispatchStorageForTest(const std::string & endpoint, long base_request_timeout_ms)
 {
     DB::RemoteHostFilter remote_host_filter;
     DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
@@ -228,7 +240,7 @@ std::shared_ptr<DB::S3ObjectStorage> makeDispatchStorageForTest(const std::strin
     cfg.http_keep_alive_timeout = 0;
     auto client = DB::S3::ClientFactory::instance().create(
         cfg, clientSettingsForTest(), "ACCESS_KEY_ID", "SECRET_ACCESS_KEY", "", {}, {}, DB::S3::CredentialsConfiguration{});
-    return std::make_shared<DB::S3ObjectStorage>(
+    return std::make_shared<Storage>(
         std::move(client), std::make_unique<DB::S3Settings>(),
         DB::S3::URI(endpoint + "/test-bucket/"), DB::S3Capabilities{},
         DB::ObjectStorageKeyGeneratorPtr{}, "disk");
@@ -237,6 +249,43 @@ std::shared_ptr<DB::S3ObjectStorage> makeDispatchStorageForTest(const std::strin
 DB::ContextPtr contextForTest()
 {
     return getContext().context;
+}
+
+/// A genuine `S3ObjectStorage` that remembers the buffer size each `writeObject` was opened with.
+class BufferSizeRecordingS3ObjectStorage final : public DB::S3ObjectStorage
+{
+public:
+    using DB::S3ObjectStorage::S3ObjectStorage;
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object,
+        DB::WriteMode mode,
+        std::optional<DB::ObjectAttributes> attributes,
+        size_t buf_size,
+        const DB::WriteSettings & write_settings) override
+    {
+        opened_buffer_sizes.push_back(buf_size);
+        return DB::S3ObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+
+    std::vector<size_t> opened_buffer_sizes;
+};
+
+/// A server that accepts every `PUT` with a fixed `ETag`.
+void acceptPut(Poco::Net::HTTPServerResponse & response)
+{
+    response.set("ETag", "\"put-etag\"");
+    response.setContentLength(0);
+    response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+    response.send();
+}
+
+/// A writable Native backend as `openPoolView` builds one: conditional writes are single-attempt.
+std::shared_ptr<DB::Cas::ObjectStorageBackend> conditionalBackendForTest(DB::ObjectStoragePtr storage)
+{
+    return std::make_shared<DB::Cas::ObjectStorageBackend>(
+        std::move(storage), DB::Cas::ObjectStorageBackend::Mode::Native,
+        /*single_attempt_control_plane_=*/true, /*attempt_timeout_ms_=*/5000, /*connect_timeout_cap_ms_=*/5000);
 }
 
 }
@@ -726,6 +775,67 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDi
             << "socket-level enforcement of connectTimeoutMs is PocoHTTPClient behaviour upstream of this "
                "class, not re-proved here";
     }
+}
+
+/// A conditional `PUT` is sent by the thread that asked for it, not by the remote-FS writer pool, so a
+/// memory guard the caller holds covers it. `WriteBufferFromS3` counts `S3PutObject` on the thread that
+/// calls `PutObject`, and a pool thread has counters of its own.
+TEST(CASBackend, ConditionalPutRunsOnTheCallingThread)
+{
+    (void)contextForTest();
+
+    DelayedResponseServer server(std::chrono::milliseconds(0), acceptPut);
+    auto backend = conditionalBackendForTest(makeDispatchStorageForTest(server.getUrl(), 10000));
+    EXPECT_FALSE(backend->conditionalWriteSettingsForTest().s3_allow_parallel_part_upload);
+
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+    bool committed = false;
+    uint64_t puts_on_calling_thread = 0;
+    std::exception_ptr failure;
+    ThreadFromGlobalPool caller([&]
+    {
+        try
+        {
+            const uint64_t before = DB::CurrentThread::getProfileEvents()[ProfileEvents::S3PutObject].load();
+            auto op = requests.admit();
+            committed = std::holds_alternative<DB::Cas::Committed>(op.create("put-key", "body", DB::Cas::Retry::once()));
+            puts_on_calling_thread = DB::CurrentThread::getProfileEvents()[ProfileEvents::S3PutObject].load() - before;
+        }
+        catch (...)
+        {
+            failure = std::current_exception();
+        }
+    });
+    caller.join();
+    if (failure)
+        std::rethrow_exception(failure);
+
+    EXPECT_TRUE(committed);
+    EXPECT_EQ(server.requestsSeen(), 1u);
+    EXPECT_EQ(puts_on_calling_thread, 1u) << "the conditional PUT was sent by another thread";
+}
+
+/// A conditional `PUT` opens its buffer at the body size instead of 1 MiB, and an empty body at one
+/// byte, which is what `WriteBuffer::write` needs to accept zero bytes.
+TEST(CASBackend, ConditionalPutBufferStartsAtTheBodySize)
+{
+    (void)contextForTest();
+
+    DelayedResponseServer server(std::chrono::milliseconds(0), acceptPut);
+    auto storage = makeDispatchStorageForTest<BufferSizeRecordingS3ObjectStorage>(server.getUrl(), 10000);
+    auto backend = conditionalBackendForTest(storage);
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+
+    const std::string body(37, 'b');
+    {
+        auto op = requests.admit();
+        EXPECT_TRUE(std::holds_alternative<DB::Cas::Committed>(op.create("small-key", body, DB::Cas::Retry::once())));
+    }
+    {
+        auto op = requests.admit();
+        EXPECT_TRUE(std::holds_alternative<DB::Cas::Committed>(op.create("empty-key", "", DB::Cas::Retry::once())));
+    }
+    EXPECT_EQ(storage->opened_buffer_sizes, (std::vector<size_t>{body.size(), 1}));
 }
 
 #endif

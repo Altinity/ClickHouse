@@ -196,8 +196,8 @@ public:
 
     /// Settings for a Native COMPARE/CREATE write (create-if-absent, compare-and-set): mark the request
     /// conditional, make exactly one attempt at every retry layer, skip the racy post-upload
-    /// existence/size check, and force a single PUT on generation stores because GCS does not
-    /// enforce the condition on multipart completion. `attempt_no` is the engine's own 1-based
+    /// existence/size check, upload on the calling thread, and force a single PUT on generation stores
+    /// because GCS does not enforce the condition on multipart completion. `attempt_no` is the engine's own 1-based
     /// physical-attempt count (see `TransportAccess::attemptNo`), carried into
     /// `object_storage_attempt_number` so the HTTP client sees a reissue as attempt >= 2.
     WriteSettings conditionalWriteSettings(size_t attempt_no) const;
