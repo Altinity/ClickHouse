@@ -204,6 +204,8 @@ MultipleFileWriter::MultipleFileWriter(
     }
     else
     {
+        aggregate_stats.excludeColumns(getStatisticsExcludedColumns());
+
         Block filtered;
         for (size_t i = 0; i < sample_block->columns(); ++i)
         {
@@ -224,6 +226,8 @@ void MultipleFileWriter::startNewFile()
     }
 
     current_file_stats = std::make_shared<DataFileStatistics>(schema);
+    if (has_nothing_leaves)
+        current_file_stats->excludeColumns(getStatisticsExcludedColumns());
     current_file_num_rows = 0;
     current_file_num_bytes = 0;
     auto metadata_path = filename_generator.generateDataFileName();
@@ -245,6 +249,14 @@ void MultipleFileWriter::startNewFile()
     FormatFilterInfoPtr format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr);
     output_format = FormatFactory::instance().getOutputFormatParallelIfPossible(
         write_format, *buffer, *filtered_sample_block, context, format_settings, format_filter_info);
+}
+
+std::vector<bool> MultipleFileWriter::getStatisticsExcludedColumns() const
+{
+    std::vector<bool> excluded(written_column_types.size());
+    for (size_t i = 0; i < written_column_types.size(); ++i)
+        excluded[i] = !written_column_types[i];
+    return excluded;
 }
 
 Columns MultipleFileWriter::filterColumns(const Columns & columns) const
@@ -284,6 +296,12 @@ Columns MultipleFileWriter::filterColumns(const Columns & columns) const
 void MultipleFileWriter::consume(const Chunk & chunk)
 {
     /// Validate before starting a file, so a rejected chunk leaves no empty data file behind.
+    if (filtered_sample_block->columns() == 0 && sample_block->columns() > 0)
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "Cannot write an Iceberg data file: every column contains only the Iceberg `unknown` type, "
+            "which no data file format can store");
+
     std::optional<Columns> filtered_columns;
     if (has_nothing_leaves)
         filtered_columns = filterColumns(chunk.getColumns());

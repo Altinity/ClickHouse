@@ -93,6 +93,11 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
 
 
 std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter);
+
+/// Throws if `type` contains `Nothing` at any depth (the Iceberg `unknown` type) and
+/// `format_version` is below 3, the first format version that defines `unknown`.
+void checkUnknownTypeAllowed(const String & column_name, const DataTypePtr & type, Int64 format_version);
+
 Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id);
 Poco::Dynamic::Var getAvroLogicalType(DataTypePtr type);
 

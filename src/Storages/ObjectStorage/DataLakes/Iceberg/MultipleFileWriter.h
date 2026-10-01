@@ -87,6 +87,8 @@ public:
 private:
     /// Strips `Nothing` leaves from `columns` and drops fully `Nothing` columns, throwing if a dropped one holds a non-default row.
     Columns filterColumns(const Columns & columns) const;
+    /// Per `sample_block` column: whether it is left out of the data file, so statistics must not describe it.
+    std::vector<bool> getStatisticsExcludedColumns() const;
 
     UInt64 max_data_file_num_rows;
     UInt64 max_data_file_num_bytes;

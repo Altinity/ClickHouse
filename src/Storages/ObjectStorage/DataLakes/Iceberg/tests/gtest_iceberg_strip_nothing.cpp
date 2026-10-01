@@ -3,6 +3,9 @@
 #include <Columns/ColumnConst.h>
 #include <Core/Field.h>
 #include <DataTypes/DataTypeFactory.h>
+#include <Processors/Chunk.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/DataFileStatistics.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MultipleFileWriter.h>
 
 using namespace DB;
@@ -113,3 +116,85 @@ TEST(IcebergStripNothing, ArrayAndMapColumnsKeepOffsetsAndKeys)
         EXPECT_EQ((*result)[0], Field(Map{Field(Tuple{Field("k"), Field(Tuple{Field(Int64(5))})})}));
     }
 }
+
+#if USE_AVRO
+
+namespace
+{
+
+/// Schema fields with ids 1, 2, 3 for (id Int64, name Nullable(String), u Nullable(Nothing)).
+Poco::JSON::Array::Ptr statisticsSchema()
+{
+    Poco::JSON::Array::Ptr schema = new Poco::JSON::Array;
+    for (Int32 id = 1; id <= 3; ++id)
+    {
+        Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
+        field->set(Iceberg::f_id, id);
+        schema->add(field);
+    }
+    return schema;
+}
+
+Chunk statisticsChunk()
+{
+    auto id = type("Int64")->createColumn();
+    id->insert(Field(Int64(10)));
+    id->insert(Field(Int64(11)));
+
+    auto name = type("Nullable(String)")->createColumn();
+    name->insert(Field("x"));
+    name->insert(Field("y"));
+
+    auto unknown = type("Nullable(Nothing)")->createColumn();
+    unknown->insertDefault();
+    unknown->insertDefault();
+
+    Columns columns;
+    columns.push_back(std::move(id));
+    columns.push_back(std::move(name));
+    columns.push_back(std::move(unknown));
+    return Chunk(std::move(columns), 2);
+}
+
+template <typename T>
+std::vector<size_t> fieldIdsOf(const std::vector<std::pair<size_t, T>> & stats)
+{
+    std::vector<size_t> ids;
+    for (const auto & [id, _] : stats)
+        ids.push_back(id);
+    return ids;
+}
+
+}
+
+TEST(IcebergStripNothing, ExcludedColumnsHaveNoStatistics)
+{
+    DataFileStatistics stats(statisticsSchema());
+    stats.excludeColumns({false, false, true});
+    stats.update(statisticsChunk());
+
+    const std::vector<size_t> written = {1, 2};
+    EXPECT_EQ(fieldIdsOf(stats.getColumnSizes()), written);
+    EXPECT_EQ(fieldIdsOf(stats.getNullCounts()), written);
+    EXPECT_EQ(fieldIdsOf(stats.getLowerBounds()), written);
+    EXPECT_EQ(fieldIdsOf(stats.getUpperBounds()), written);
+    EXPECT_EQ(stats.getLowerBounds()[0].second, Field(Int64(10)));
+    EXPECT_EQ(stats.getUpperBounds()[0].second, Field(Int64(11)));
+
+    DataFileStatistics merged(statisticsSchema());
+    merged.merge(stats);
+    EXPECT_EQ(fieldIdsOf(merged.getColumnSizes()), written);
+    EXPECT_EQ(fieldIdsOf(merged.getLowerBounds()), written);
+}
+
+TEST(IcebergStripNothing, StatisticsWithoutExclusionCoverEveryColumn)
+{
+    DataFileStatistics stats(statisticsSchema());
+    stats.update(statisticsChunk());
+
+    const std::vector<size_t> all = {1, 2, 3};
+    EXPECT_EQ(fieldIdsOf(stats.getColumnSizes()), all);
+    EXPECT_EQ(fieldIdsOf(stats.getLowerBounds()), all);
+}
+
+#endif
