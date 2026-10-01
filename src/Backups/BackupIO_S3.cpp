@@ -263,6 +263,9 @@ BackupReaderS3::BackupReaderS3(
           .object_storage_type = ObjectStorageType::S3,
           .metadata_type = MetadataStorageType::None,
           .description = s3_uri.endpoint,
+          .is_encrypted = false,
+          .is_cached = false,
+          .zookeeper_name = "",
           .files_are_whole_objects = true}
 {
     s3_settings.loadFromConfig(context_->getConfigRef(), "s3", context_->getSettingsRef());
@@ -365,6 +368,9 @@ BackupWriterS3::BackupWriterS3(
           .object_storage_type = ObjectStorageType::S3,
           .metadata_type = MetadataStorageType::None,
           .description = s3_uri.endpoint,
+          .is_encrypted = false,
+          .is_cached = false,
+          .zookeeper_name = "",
           .files_are_whole_objects = true}
     , s3_capabilities(getCapabilitiesFromConfig(context_->getConfigRef(), "s3"))
     , disk_client_factory(S3BackupClientCreator(context_))

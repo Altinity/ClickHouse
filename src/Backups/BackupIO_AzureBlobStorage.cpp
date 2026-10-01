@@ -42,6 +42,9 @@ BackupReaderAzureBlobStorage::BackupReaderAzureBlobStorage(
           .object_storage_type = ObjectStorageType::Azure,
           .metadata_type = MetadataStorageType::None,
           .description = connection_params_.getConnectionURL(),
+          .is_encrypted = false,
+          .is_cached = false,
+          .zookeeper_name = "",
           .files_are_whole_objects = true}
     , connection_params(connection_params_)
     , blob_path(blob_path_)
@@ -145,6 +148,9 @@ BackupWriterAzureBlobStorage::BackupWriterAzureBlobStorage(
           .object_storage_type = ObjectStorageType::Azure,
           .metadata_type = MetadataStorageType::None,
           .description = connection_params_.getConnectionURL(),
+          .is_encrypted = false,
+          .is_cached = false,
+          .zookeeper_name = "",
           .files_are_whole_objects = true}
     , connection_params(connection_params_)
     , blob_path(blob_path_)
