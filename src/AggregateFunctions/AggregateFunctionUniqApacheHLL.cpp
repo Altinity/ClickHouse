@@ -86,6 +86,10 @@ static AggregateFunctionPtr createAggregateFunctionUniqApacheHLL(
     if (which.isIPv6())
         return std::make_shared<AggregateFunctionUniqApacheHLL<DataTypeIPv6::FieldType>>(lg_config_k, target_type, argument_types, params);
 
+    /// For `Nullable(Nothing)` the `Null` combinator replaces this function with `nothing`, but it must be created first.
+    if (argument_type.onlyNull())
+        return std::make_shared<AggregateFunctionUniqApacheHLL<UInt8>>(lg_config_k, target_type, argument_types, params);
+
     throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
         "Illegal type {} of argument for aggregate function {}. Use uniq, uniqCombined or uniqHLL12 for unsupported types.",
         argument_type.getName(), name);
