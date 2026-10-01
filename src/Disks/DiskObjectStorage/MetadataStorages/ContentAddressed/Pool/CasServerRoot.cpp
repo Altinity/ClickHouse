@@ -932,6 +932,16 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
         srid, identity, srid, srid);
 }
 
+TokenWatch TokenWatch::sighted(Etag token_, uint64_t sample_after_read_ms)
+{
+    return TokenWatch{.token = std::move(token_), .first_seen_mono_ms = sample_after_read_ms};
+}
+
+bool TokenWatch::stableFor(uint64_t threshold_ms, uint64_t sample_before_read_ms) const
+{
+    return sample_before_read_ms >= first_seen_mono_ms && sample_before_read_ms - first_seen_mono_ms >= threshold_ms;
+}
+
 uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms)
 {
     return ttl_ms + ttl_ms / 20 + cadence_ms;
@@ -957,15 +967,15 @@ MountClaimResult claimMountAwaitingExpiry(
     /// threshold, which passes the full renewal period into the same shared helper.
     const uint64_t threshold_ms = mountObservationThresholdMs(ttl_ms, poll);
 
-    std::optional<Etag> observed;
-    uint64_t observed_since = 0;
+    std::optional<TokenWatch> watch;
     size_t restarts = 0;
 
     while (true)
     {
-        const bool threshold_met = observed && mono_ms_fn() - observed_since >= threshold_ms;
+        const bool threshold_met = watch && watch->stableFor(threshold_ms, mono_ms_fn());
         MountClaimResult r = claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms,
-            threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{});
+            threshold_met ? std::optional<Etag>(watch->token) : std::nullopt, sink,
+            /*unsafe_reclaim_authorization=*/{});
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
 
@@ -997,14 +1007,13 @@ MountClaimResult claimMountAwaitingExpiry(
             r.body = decodeMountLease(got->bytes);
         }
 
-        if (!observed || *observed != *current_etag)
+        if (!watch || watch->token != *current_etag)
         {
-            if (observed && ++restarts > kMaxObservationRestarts)
+            if (watch && ++restarts > kMaxObservationRestarts)
                 /// The incarnation kept changing across bounded restarts — the holder is genuinely alive
                 /// (actively renewing), not a dead predecessor. Report it rather than waiting forever.
                 return r;
-            observed = *current_etag;
-            observed_since = mono_ms_fn();
+            watch = TokenWatch::sighted(*current_etag, mono_ms_fn());
             if (on_wait_start && r.body)
                 on_wait_start(*r.body, threshold_ms);
             LOG_INFO(getLogger("CasMountLease"),
@@ -1018,10 +1027,11 @@ MountClaimResult claimMountAwaitingExpiry(
 }
 
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
-                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
+                                     const std::function<uint64_t()> & mono_ms_fn, uint64_t stable_threshold_ms,
                                      MountObservationMap & obs)
 {
     HeartbeatFloor floor;
+    const uint64_t round_start_ms = mono_ms_fn();
 
     /// `obs` is keyed by every srid this leader has EVER observed, but a
     /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CAS
@@ -1082,13 +1092,11 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// raced against our own fence-out attempt) — (re)starts the observation window and
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
-                const bool stable = it != obs.end() && it->second.etag == observed->etag
-                    && mono_now_ms - it->second.first_seen_mono_ms >= stable_threshold_ms;
-
-                if (!stable)
+                const bool watched = it != obs.end() && it->second.token == observed->etag;
+                if (!watched || !it->second.stableFor(stable_threshold_ms, round_start_ms))
                 {
-                    if (it == obs.end() || it->second.etag != observed->etag)
-                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_now_ms});
+                    if (!watched)
+                        obs.insert_or_assign(srid, TokenWatch::sighted(observed->etag, round_start_ms));
                     ++floor.live;
                     return std::nullopt;
                 }

@@ -344,21 +344,25 @@ MountClaimResult claimMountAwaitingExpiry(
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {},
     const CasEventSink & sink = {});
 
-/// One `server_root_id`'s cross-round incarnation-stability observation,
-/// owned by the GC leader instance (`Cas::Gc::mount_obs`) and threaded through consecutive
-/// `computeHeartbeatFloor` calls — one GC round is one observation tick. Mirrors
-/// `claimMountAwaitingExpiry`'s observation loop, but at heartbeat-gate granularity rather than a
-/// tight poll loop.
-struct MountIncarnationObservation
+/// One observed token and the instant it was first seen, on the observer's own monotonic clock.
+struct TokenWatch
 {
-    Etag etag;
+    Etag token;
     uint64_t first_seen_mono_ms = 0;
+
+    /// `sample_after_read_ms` is a clock sample taken after the read that returned `token_`. An earlier
+    /// sample would count the time the read took as time watched.
+    static TokenWatch sighted(Etag token_, uint64_t sample_after_read_ms);
+
+    /// True when the token has been watched for at least `threshold_ms`. `sample_before_read_ms` is a
+    /// clock sample taken before the read that confirmed the token; false when it precedes the sighting.
+    bool stableFor(uint64_t threshold_ms, uint64_t sample_before_read_ms) const;
 };
 
 /// Keyed by `server_root_id`. In-memory only: a fresh leader (after a steal, or a process restart)
 /// starts with an empty map, which only delays fencing an already-dead mount by one extra round while
 /// it (re)establishes the observation — safe (never fences early), never unsafe.
-using MountObservationMap = std::map<String, MountIncarnationObservation>;
+using MountObservationMap = std::map<String, TokenWatch>;
 
 /// GC heartbeat gate (GC round protocol step 1). Run by the GC leader at the top of a round: LIST
 /// `gc/server-roots/` (O(servers), single-digit counts), GET each mount body, and classify + fence out
@@ -371,8 +375,7 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 ///     terminated marker;
 ///   - otherwise, observation-based liveness (the same
 ///     principle `claimMountAwaitingExpiry` uses for a mount's OWN reopen, applied here to the GC's
-///     fence-out): `obs` remembers, per srid, the incarnation last seen and the leader's OWN
-///     monotonic clock reading (`mono_now_ms`) at the moment it first saw it. A body whose
+///     fence-out): `obs` holds, per srid, a `TokenWatch` of the incarnation last seen. A body whose
 ///     CURRENT incarnation differs from (or is absent from) `obs` is (re)started fresh — counted `live`,
 ///     never fenced this call, regardless of what its stamped `expires_at_ms` claims (a bare
 ///     wall-clock stamp is never trusted — see `claimMount`'s "certificate of death" doc). Only once
@@ -386,7 +389,7 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 ///
 /// `now_ms` is WALL clock, used only for the audit/diagnostic log line — it never participates in the
 /// fence decision (mirrors `claimMountAwaitingExpiry`'s `now_ms_fn` vs `mono_ms_fn` split).
-/// `mono_now_ms` is the OBSERVATION clock: the caller's OWN monotonic reading, never compared against
+/// `mono_ms_fn` is the OBSERVATION clock: the caller's OWN monotonic clock, never compared against
 /// any other node's clock. `obs` is owned by the caller and threaded across consecutive calls (one GC
 /// leader instance, `Cas::Gc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
 /// fencing one round, never fences early).
@@ -407,7 +410,7 @@ struct HeartbeatFloor
 };
 
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
-                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
+                                     const std::function<uint64_t()> & mono_ms_fn, uint64_t stable_threshold_ms,
                                      MountObservationMap & obs);
 
 /// One `gc/server-roots/<srid>/mount` slot whose holder is not provably finished with the prefix.

@@ -1501,7 +1501,7 @@ namespace
 /// Rev.6 §token-stability observation removed the wall clock from the fence DECISION; `kNowMs` below
 /// is threaded through only as `computeHeartbeatFloor`'s audit-only `now_ms`.
 constexpr uint64_t kNowMs = 1'000'000;
-/// The fence-out threshold measured on the LEADER's OWN monotonic clock (`mono_now_ms`), independent
+/// The fence-out threshold measured on the LEADER's OWN monotonic clock (`mono_ms_fn`), independent
 /// of any lease's stamped `expires_at_ms`.
 constexpr uint64_t kStableThresholdMs = 10'000;
 
@@ -1539,6 +1539,39 @@ void renewMount(CasOperation & op, const Layout & l, const String & srid)
     mustCommit(op.replace(l.mountKey(srid), encodeMountLease(m), got->etag, Retry::standard()),
                "renewed mount " + srid);
 }
+
+/// An observer clock that does not move during a call: a sighting and the round start read the same value.
+std::function<uint64_t()> frozenClock(uint64_t ms)
+{
+    return [ms] { return ms; };
+}
+}
+
+TEST(CASTokenWatch, CountsFromAfterTheRead)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Ops ops(b);
+    const Etag t1 = std::get<Committed>(ops.op.create("k", "v1", Retry::standard())).etag;
+    const Etag t2 = std::get<Committed>(ops.op.replace("k", "v2", t1, Retry::standard())).etag;
+    constexpr uint64_t threshold_ms = 10'000;
+
+    /// The read that returned `t1` ended at 5000: the watch counts from there.
+    const TokenWatch watch = TokenWatch::sighted(t1, /*sample_after_read_ms=*/ 5'000);
+    EXPECT_EQ(watch.token, t1);
+    EXPECT_EQ(watch.first_seen_mono_ms, 5'000u);
+
+    EXPECT_FALSE(watch.stableFor(threshold_ms, 14'999));
+    EXPECT_TRUE(watch.stableFor(threshold_ms, 15'000));
+
+    /// A sample older than the sighting proves nothing about how long the token held.
+    EXPECT_FALSE(watch.stableFor(threshold_ms, 4'000));
+    EXPECT_FALSE(watch.stableFor(0, 4'000));
+
+    /// A changed token is a new watch, counted from its own read.
+    const TokenWatch renewed = TokenWatch::sighted(t2, 15'000);
+    EXPECT_NE(renewed.token, watch.token);
+    EXPECT_FALSE(renewed.stableFor(threshold_ms, 15'000));
+    EXPECT_TRUE(renewed.stableFor(threshold_ms, 25'000));
 }
 
 TEST(CASHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
@@ -1552,7 +1585,7 @@ TEST(CASHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, /*now_ms*/ kNowMs, /*mono_now_ms*/ 0,
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, /*now_ms*/ kNowMs, frozenClock(0),
                                                          kStableThresholdMs, obs);
 
     EXPECT_EQ(floor.fenced_now, 0u);
@@ -1569,14 +1602,14 @@ TEST(CASHeartbeatFloor, StableIncarnationPastThresholdIsFenced)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     EXPECT_EQ(floor_before.fenced_now, 0u);
 
     const MountLease before = decodeMountLease(ops.op.read(l.mountKey("s1"), Retry::standard())->bytes);
 
     /// No renewal in between: the SAME incarnation, observed since mono 0, is now stable for the full
     /// threshold on the leader's own clock.
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.fenced_now, 1u);
@@ -1594,20 +1627,20 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     ASSERT_TRUE(obs.contains("s1"));
-    const Etag first_etag = obs.at("s1").etag;
+    const Etag first_etag = obs.at("s1").token;
 
     renewMount(ops.op, l, "s1");
     const Etag renewed_etag = currentEtag(ops.op, l.mountKey("s1"));
     EXPECT_NE(renewed_etag, first_etag);
 
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.fenced_now, 0u);
     ASSERT_TRUE(obs.contains("s1"));
-    EXPECT_EQ(obs.at("s1").etag, renewed_etag);
+    EXPECT_EQ(obs.at("s1").token, renewed_etag);
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kStableThresholdMs);
 }
 
@@ -1625,7 +1658,7 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     seedMount(ops.op, l, "s2", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     ASSERT_TRUE(obs.contains("s1"));
     ASSERT_TRUE(obs.contains("s2"));
 
@@ -1637,7 +1670,7 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     renewMount(ops.op, l, "s1");
     ASSERT_EQ(ops.op.removeCurrent(l.mountKey("s2"), Retry::standard()), Removal::Removed);
 
-    computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs), kStableThresholdMs, obs);
     EXPECT_TRUE(obs.contains("s1"));
     EXPECT_FALSE(obs.contains("s2"))
         << "a srid removed from the LIST entirely must be pruned from obs, not linger forever";
@@ -1664,7 +1697,7 @@ TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
     MountObservationMap obs;
 
     /// Round 1 (mono 0): first sight of every non-terminal mount — nothing is fence-eligible yet.
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     EXPECT_EQ(floor_before.live, 3u);            // s1, s2, s3: observation just started
     EXPECT_EQ(floor_before.terminated, 1u);      // s5
     EXPECT_EQ(floor_before.fenced_now, 0u);
@@ -1681,7 +1714,7 @@ TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
 
     /// Round 2 (mono == threshold): s1/s2's renewed incarnations restart their observation (still
     /// live); s3's original incarnation has now held stable for the full threshold -> fenced.
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.live, 2u);            // s1, s2: renewed, observation restarted
@@ -1759,14 +1792,14 @@ TEST(CASHeartbeatFloor, FenceOutLosesTheIncarnationRaceAndReclassifiesLive)
     MountObservationMap obs;
     /// Round 1: first sight, observation starts — never reaches the fence-out path (the race
     /// decorator stays armed for round 2).
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     EXPECT_EQ(floor_before.fenced_now, 0u);
 
     /// Round 2: the incarnation has been stable past threshold, so the function attempts the
     /// fence-out. The decorator renews concurrently under the real incarnation, the write is refused,
     /// and the re-decision reclassifies the slot as live (observation restarted on the new
     /// incarnation) — never fenced.
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.fenced_now, 0u);
@@ -1784,7 +1817,7 @@ TEST(CASHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
 
     Ops ops(b);
     MountObservationMap obs;
-    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
 
     EXPECT_EQ(floor.live, 0u);
     EXPECT_EQ(floor.terminated, 0u);
