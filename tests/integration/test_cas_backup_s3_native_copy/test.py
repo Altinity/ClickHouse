@@ -88,7 +88,12 @@ def column_fingerprints(node, table):
 
 
 def transfer_events(node, query_id):
-    """Which mechanism moved the bytes: a ranged or whole-object copy inside `S3`, or buffers."""
+    """How many S3 operations of each mechanism the query issued.
+
+    `server_side_part_copy` is `UploadPartCopy`, the only copy that can name a byte range.
+    `server_side_object_copy` is `CopyObject`, which always takes the whole object.
+    `buffered_write` and `buffered_read` are the puts and gets a copy through the server pays.
+    """
     node.query("SYSTEM FLUSH LOGS query_log")
     row = node.query(
         f"""
@@ -103,12 +108,16 @@ def transfer_events(node, query_id):
         """
     ).strip()
     assert row, f"no query_log row for {query_id}"
-    names = ["ranged_copy", "whole_copy", "uploaded", "downloaded"]
+    names = ["server_side_part_copy", "server_side_object_copy", "buffered_write", "buffered_read"]
     return dict(zip(names, (int(value) for value in row.split("\t"))))
 
 
 @pytest.mark.parametrize("allow_native_copy", [True, False])
 def test_backup_to_s3_round_trip(allow_native_copy):
+    """A blob is `[envelope][payload]`, so its copy must be ranged: `UploadPartCopy`, never
+    `CopyObject`. Inline entries have no object and go through buffers either way, and a restore onto
+    a CAS disk writes every file through the CAS write path.
+    """
     node = cluster.instances["node"]
     suffix = "native" if allow_native_copy else "buffered"
     table = f"cas_backup_{suffix}"
@@ -127,14 +136,14 @@ def test_backup_to_s3_round_trip(allow_native_copy):
     )
 
     backup = transfer_events(node, backup_query_id)
-    assert backup["whole_copy"] == 0, (
+    assert backup["server_side_object_copy"] == 0, (
         "CopyObject cannot express a range, so the envelope would land in the backup"
     )
-    assert backup["uploaded"] > 0, "inline entries have no object and go through buffers"
+    assert backup["buffered_write"] > 0, "inline entries have no object and go through buffers"
     if allow_native_copy:
-        assert backup["ranged_copy"] > 0, "blobs must be copied server-side with a range"
+        assert backup["server_side_part_copy"] > 0, "blobs must be copied server-side with a range"
     else:
-        assert backup["ranged_copy"] == 0, (
+        assert backup["server_side_part_copy"] == 0, (
             "allow_s3_native_copy = 0 leaves no copy inside S3, so every file goes through buffers"
         )
 
@@ -146,11 +155,11 @@ def test_backup_to_s3_round_trip(allow_native_copy):
     )
 
     restore = transfer_events(node, restore_query_id)
-    assert (restore["ranged_copy"], restore["whole_copy"]) == (0, 0), (
+    assert (restore["server_side_part_copy"], restore["server_side_object_copy"]) == (0, 0), (
         "a restore onto a CAS disk writes every file through the CAS write path"
     )
-    assert restore["downloaded"] > 0, "the backup must be read through buffers"
-    assert restore["uploaded"] > 0, "the restored part must be written through buffers"
+    assert restore["buffered_read"] > 0, "the backup must be read through buffers"
+    assert restore["buffered_write"] > 0, "the restored part must be written through buffers"
 
     actual = column_fingerprints(node, restored)
 
@@ -169,32 +178,25 @@ def test_backup_to_s3_round_trip(allow_native_copy):
     node.query(f"DROP TABLE {restored} SYNC")
 
 
-@pytest.mark.parametrize(
-    "storage_policy, multipart_copy",
-    [
-        pytest.param(STORAGE_POLICY, True, id="multipart_copy"),
-        pytest.param("cas_backup_s3_no_multipart", False, id="no_multipart_copy"),
-    ],
-)
 @pytest.mark.parametrize("backup_disk", ["backup_disk_s3_plain", "backup_disk_s3"])
-def test_backup_to_disk_only_buffers(backup_disk, storage_policy, multipart_copy):
+def test_backup_to_disk_only_buffers(backup_disk):
     node = cluster.instances["node"]
-    table = f"cas_backup_to_{backup_disk}_{storage_policy}"
+    table = f"cas_backup_to_{backup_disk}"
     restored = f"{table}_restored"
     disk_destination = backup_disk_destination(backup_disk, table)
     backup_query_id = f"{table}_backup_{RUN_TOKEN}"
     restore_query_id = f"{table}_restore_{RUN_TOKEN}"
 
-    create_and_fill(node, table, storage_policy)
+    create_and_fill(node, table)
     expected = column_fingerprints(node, table)
 
     node.query(f"BACKUP TABLE {table} TO {disk_destination}", query_id=backup_query_id)
 
     backup = transfer_events(node, backup_query_id)
-    assert (backup["ranged_copy"], backup["whole_copy"]) == (0, 0), (
+    assert (backup["server_side_part_copy"], backup["server_side_object_copy"]) == (0, 0), (
         "a Disk(...) destination goes through IDisk::copyFile, which no longer copies CAS objects"
     )
-    assert backup["uploaded"] > 0, "every file must reach the destination through buffers"
+    assert backup["buffered_write"] > 0, "every file must reach the destination through buffers"
 
     node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
     node.query(
@@ -203,16 +205,16 @@ def test_backup_to_disk_only_buffers(backup_disk, storage_policy, multipart_copy
     )
 
     restore = transfer_events(node, restore_query_id)
-    assert (restore["ranged_copy"], restore["whole_copy"]) == (0, 0), (
+    assert (restore["server_side_part_copy"], restore["server_side_object_copy"]) == (0, 0), (
         "RESTORE onto a CAS disk must write through the CAS path, not copy objects into the pool"
     )
-    assert restore["uploaded"] > 0, "the restored part must be written through buffers"
+    assert restore["buffered_write"] > 0, "the restored part must be written through buffers"
 
     assert (
         node.query(
             f"SELECT storage_policy FROM system.tables WHERE name = '{restored}'"
         ).strip()
-        == storage_policy
+        == STORAGE_POLICY
     )
 
     actual = column_fingerprints(node, restored)
@@ -227,41 +229,6 @@ def test_backup_to_disk_only_buffers(backup_disk, storage_policy, multipart_copy
         ).strip()
         == "1"
     )
-
-    node.query(f"DROP TABLE {table} SYNC")
-    node.query(f"DROP TABLE {restored} SYNC")
-
-
-def test_backup_to_s3_blobs_use_ranged_copy_and_inline_falls_back():
-    """A blob is `[envelope][payload]`, so its copy must be ranged: `UploadPartCopy`, never
-    `CopyObject`. Inline entries have no object and must go through buffers.
-    """
-    node = cluster.instances["node"]
-    table = "cas_backup_mechanism"
-    restored = f"{table}_restored"
-    s3_destination = backup_s3_destination("mechanism")
-    query_id = f"cas_backup_mechanism_{RUN_TOKEN}"
-
-    create_and_fill(node, table)
-    expected = column_fingerprints(node, table)
-    node.query(
-        f"BACKUP TABLE {table} TO {s3_destination} SETTINGS allow_s3_native_copy = 1",
-        query_id=query_id,
-    )
-    events = transfer_events(node, query_id)
-
-    assert events["ranged_copy"] > 0, "no ranged server-side copy happened"
-    assert events["whole_copy"] == 0, (
-        "CopyObject has no range: the envelope would land in the backup"
-    )
-    assert events["uploaded"] > 0, (
-        "inline entries have no object and must be uploaded through buffers"
-    )
-
-    node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
-    node.query(f"RESTORE TABLE {table} AS {restored} FROM {s3_destination}")
-    actual = column_fingerprints(node, restored)
-    assert actual == expected
 
     node.query(f"DROP TABLE {table} SYNC")
     node.query(f"DROP TABLE {restored} SYNC")
@@ -288,13 +255,13 @@ def test_backup_to_s3_falls_back_without_multipart():
     )
     events = transfer_events(node, query_id)
 
-    assert events["ranged_copy"] == 0, (
+    assert events["server_side_part_copy"] == 0, (
         "multipart copy was disabled but UploadPartCopy still ran"
     )
-    assert events["whole_copy"] == 0, (
+    assert events["server_side_object_copy"] == 0, (
         "a ranged copy fell back to CopyObject, which would take the envelope"
     )
-    assert events["uploaded"] > 0, (
+    assert events["buffered_write"] > 0, (
         "nothing was uploaded through the server, so nothing was copied at all"
     )
 
@@ -317,6 +284,7 @@ def test_move_partition_from_cas_to_s3_disk_with_empty_arrays():
     """
     node = cluster.instances["node"]
     table = "cas_move_empty_arrays"
+    query_id = f"{table}_move_{RUN_TOKEN}"
 
     node.query(f"DROP TABLE IF EXISTS {table} SYNC")
     node.query(
@@ -338,7 +306,16 @@ def test_move_partition_from_cas_to_s3_disk_with_empty_arrays():
         f"SELECT count(), sum(cityHash64(s)), sum(length(empty)) FROM {table}"
     ).strip()
 
-    node.query(f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'backup_disk_s3'")
+    node.query(
+        f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'backup_disk_s3'",
+        query_id=query_id,
+    )
+
+    events = transfer_events(node, query_id)
+    assert (events["server_side_part_copy"], events["server_side_object_copy"]) == (0, 0), (
+        "a CAS source is windowed, so no copy may run inside S3"
+    )
+    assert events["buffered_write"] > 0, "every file must be moved through buffers"
 
     assert (
         node.query(
@@ -365,6 +342,7 @@ def test_backup_to_s3_with_empty_arrays():
     table = "cas_backup_empty_arrays"
     restored = f"{table}_restored"
     s3_destination = backup_s3_destination("empty_arrays")
+    query_id = f"{table}_backup_{RUN_TOKEN}"
     fingerprint = "SELECT count(), sum(cityHash64(s)), sum(length(empty)) FROM {}"
 
     node.query(f"DROP TABLE IF EXISTS {table} SYNC")
@@ -385,8 +363,16 @@ def test_backup_to_s3_with_empty_arrays():
     expected = node.query(fingerprint.format(table)).strip()
 
     node.query(
-        f"BACKUP TABLE {table} TO {s3_destination} "
-        f"SETTINGS allow_s3_native_copy = 1, deduplicate_files = 0"
+        f"BACKUP TABLE {table} TO {s3_destination} SETTINGS deduplicate_files = 0",
+        query_id=query_id,
+    )
+
+    events = transfer_events(node, query_id)
+    assert events["server_side_part_copy"] > 0, (
+        "a zero-size blob must not cost the other blobs their ranged copy"
+    )
+    assert events["server_side_object_copy"] == 0, (
+        "CopyObject has no range: the envelope would land in the backup"
     )
 
     empty_files_in_backup = int(
@@ -425,11 +411,10 @@ def test_incremental_backup_to_s3():
     restored = f"{table}_restored"
     base = backup_s3_destination("incremental_base")
     incremental = backup_s3_destination("incremental")
+    query_id = f"{table}_backup_{RUN_TOKEN}"
 
     create_and_fill(node, table)
-    node.query(
-        f"BACKUP TABLE {table} TO {base} SETTINGS allow_s3_native_copy = 1"
-    )
+    node.query(f"BACKUP TABLE {table} TO {base}")
 
     node.query(
         f"""
@@ -445,9 +430,18 @@ def test_incremental_backup_to_s3():
     expected = column_fingerprints(node, table)
 
     node.query(
-        f"BACKUP TABLE {table} TO {incremental} "
-        f"SETTINGS base_backup = {base}, allow_s3_native_copy = 1"
+        f"BACKUP TABLE {table} TO {incremental} SETTINGS base_backup = {base}",
+        query_id=query_id,
     )
+
+    events = transfer_events(node, query_id)
+    assert events["server_side_part_copy"] > 0, (
+        "the files of the new part must still be copied inside S3 with a range"
+    )
+    assert events["server_side_object_copy"] == 0, (
+        "CopyObject has no range: the envelope would land in the backup"
+    )
+    assert events["buffered_write"] > 0, "inline entries have no object and go through buffers"
 
     node.query(f"DROP TABLE IF EXISTS {restored} SYNC")
     node.query(f"RESTORE TABLE {table} AS {restored} FROM {incremental}")
@@ -518,7 +512,7 @@ def test_incremental_backup_to_s3_copies_only_the_tail():
     )
 
     events = transfer_events(node, query_id)
-    assert events["ranged_copy"] > 0, (
+    assert events["server_side_part_copy"] > 0, (
         "the tail reached the backup, but not through a ranged copy inside S3"
     )
 
@@ -538,6 +532,8 @@ def test_move_partition_between_plain_and_encrypted_s3_disks():
     """
     node = cluster.instances["node"]
     table = "plain_to_encrypted"
+    to_encrypted_query_id = f"{table}_to_encrypted_{RUN_TOKEN}"
+    from_encrypted_query_id = f"{table}_from_encrypted_{RUN_TOKEN}"
 
     node.query(f"DROP TABLE IF EXISTS {table} SYNC")
     node.query(
@@ -554,13 +550,25 @@ def test_move_partition_between_plain_and_encrypted_s3_disks():
     expected = node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip()
 
     node.query(
-        f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'disk_plain_s3_encrypted'"
+        f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'disk_plain_s3_encrypted'",
+        query_id=to_encrypted_query_id,
+    )
+    to_encrypted = transfer_events(node, to_encrypted_query_id)
+    assert to_encrypted["buffered_write"] > 0, (
+        "one side encrypts and the other does not, so the bytes must pass through the server"
     )
     assert (
         node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip() == expected
     )
 
-    node.query(f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'backup_disk_s3'")
+    node.query(
+        f"ALTER TABLE {table} MOVE PARTITION tuple() TO DISK 'backup_disk_s3'",
+        query_id=from_encrypted_query_id,
+    )
+    from_encrypted = transfer_events(node, from_encrypted_query_id)
+    assert from_encrypted["buffered_write"] > 0, (
+        "the way back decrypts, so the bytes must pass through the server again"
+    )
     assert (
         node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip() == expected
     )
@@ -595,8 +603,9 @@ def test_move_partition_between_plain_s3_disks_copies_server_side():
     )
 
     events = transfer_events(node, query_id)
-    assert events["ranged_copy"] + events["whole_copy"] > 0, (
-        "a non-CAS disk pair lost its server-side copy"
+    assert events["server_side_object_copy"] > 0, (
+        "a non-CAS disk pair lost its server-side copy: a whole file is a whole object here, so "
+        "CopyObject is the expected operation"
     )
     assert (
         node.query(f"SELECT count(), sum(cityHash64(s)) FROM {table}").strip() == expected
@@ -675,10 +684,10 @@ def test_move_partition_from_cached_cas_to_s3_disk_only_buffers():
     )
 
     events = transfer_events(node, query_id)
-    assert (events["ranged_copy"], events["whole_copy"]) == (0, 0), (
+    assert (events["server_side_part_copy"], events["server_side_object_copy"]) == (0, 0), (
         "a cache disk over CAS reported itself as whole-object"
     )
-    assert events["uploaded"] > 0, "the moved part must be written through buffers"
+    assert events["buffered_write"] > 0, "the moved part must be written through buffers"
     assert column_fingerprints(node, table) == expected
 
     node.query(f"DROP TABLE {table} SYNC")
