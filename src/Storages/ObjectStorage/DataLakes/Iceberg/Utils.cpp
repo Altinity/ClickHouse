@@ -705,12 +705,16 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
         }
         case TypeIndex::DateTime64:
         {
-            if (getDecimalScale(*type) != 6)
+            /// Iceberg `timestamp` is microseconds; `timestamp_ns` is nanoseconds (v3).
+            /// contrib Avro has no `timestamp-nanos` enum, so it stores the logical type
+            /// as `NONE` and the value as `long`; other engines still see the annotation.
+            const auto scale = getDecimalScale(*type);
+            if (scale != 6 && scale != 9)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
 
             Poco::JSON::Object::Ptr timestamp_type = new Poco::JSON::Object;
             timestamp_type->set("type", "long");
-            timestamp_type->set("logicalType", "timestamp-micros");
+            timestamp_type->set("logicalType", scale == 9 ? "timestamp-nanos" : "timestamp-micros");
             timestamp_type->set("adjust-to-utc", assert_cast<const DataTypeDateTime64 &>(*type).hasExplicitTimeZone());
             return timestamp_type;
         }

@@ -109,6 +109,47 @@ def test_writes_datetime64_nanoseconds_with_timezone(started_cluster_iceberg_no_
     assert instance.query(f"SELECT id FROM {table_name}") == "1\n"
 
 
+@pytest.mark.parametrize(
+    "schema, timezone",
+    [
+        ("(ts DateTime64(9), id Int32)", None),
+        ("(ts DateTime64(9, 'UTC'), id Int32)", "UTC"),
+    ],
+    ids=["timestamp_ns", "timestamptz_ns"],
+)
+def test_writes_identity_partitioned_datetime64_nanoseconds_insert(
+    started_cluster_iceberg_no_spark, schema, timezone
+):
+    """INSERT into a v3 Iceberg table partitioned by DateTime64(9) must succeed.
+
+    Manifest partition fields go through `getAvroType`. Scale 6 is encoded as
+    Avro `timestamp-micros`; scale 9 must still be writable as `timestamp_ns`
+    (not rejected as an unsupported Iceberg type).
+    """
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    table_name = "test_writes_part_ns_insert_" + get_uuid_str()
+    create_iceberg_table(
+        "s3",
+        instance,
+        table_name,
+        started_cluster_iceberg_no_spark,
+        schema,
+        format_version=3,
+        partition_by="ts",
+    )
+    _assert_written_as_datetime64_9(instance, table_name, timezone=timezone)
+
+    ts_ns, row_id, _utc = ROWS[0]
+    instance.query(
+        f"INSERT INTO {table_name} VALUES (fromUnixTimestamp64Nano({ts_ns}), {row_id})"
+    )
+    assert instance.query(f"SELECT id FROM {table_name}") == f"{row_id}\n"
+    assert (
+        instance.query(f"SELECT toUnixTimestamp64Nano(ts) FROM {table_name}")
+        == f"{ts_ns}\n"
+    )
+
+
 def _assert_timestamp_ns_requires_v3(error):
     assert "BAD_ARGUMENTS" in error, error
     assert "LOGICAL_ERROR" not in error, error
