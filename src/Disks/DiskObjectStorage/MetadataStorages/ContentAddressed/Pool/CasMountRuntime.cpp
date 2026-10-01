@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Common/Exception.h>
+#include <Common/LockMemoryExceptionInThread.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
@@ -643,6 +644,9 @@ void CasMountRuntime::startBackgroundWorkers(std::chrono::milliseconds period)
 void CasMountRuntime::renewalLoop()
 {
     setThreadName(ThreadName::CAS_LEASE_RENEWER);
+    /// The tracker still counts this thread's allocations but never throws on it: a renewal failed by a
+    /// memory limit costs the mount, and an exception outside the request ends this thread.
+    LockMemoryExceptionInThread memory_exception_lock(VariableContext::Global);
     {
         std::unique_lock lock(driver_mutex);
         driver_cv.wait(lock, [this] { return worker_loops_released; });
