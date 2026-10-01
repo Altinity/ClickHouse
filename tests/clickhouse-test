@@ -1173,75 +1173,6 @@ def get_transactions_list(args):
         return f"Cannot get list of transactions: {e}"
 
 
-<<<<<<< HEAD
-# collect server stacktraces using lldb (used uniformly on Linux and macOS)
-def get_stacktraces_from_lldb(pid):
-    # 30s ceiling: `thread backtrace all` should finish in seconds even on a
-    # debug build with many threads; anything beyond that means lldb itself
-    # is wedged (e.g. signal-handler deadlock on the inferior). Killing lldb
-    # leaves the server process untouched.
-    # macOS restricts task_for_pid(): in --batch mode a non-root lldb cannot
-    # attach to the server on a CI runner (the user is not in the _developer
-    # group and there is no interactive authorization), so it exits 1. The
-    # runner grants passwordless sudo and root holds task_for_pid rights, so
-    # attach as root there. Linux ptrace of a same-uid process needs none of
-    # this. shutil.which resolves the absolute path because sudo resets PATH.
-    lldb = shutil.which("lldb") or "lldb"
-    sudo = "sudo " if platform.system() == "Darwin" else ""
-    # keep_output_on_error: even when lldb exits non-zero it may have printed
-    # backtraces (or an attach error) worth keeping. Returning the output lets
-    # print_c_stacktraces save the full dump to c_stacktraces.log and preview
-    # it, instead of shell_get_output flooding stderr with nothing attached.
-    return shell_get_output(
-        f"{sudo}{lldb} --batch -p {pid} -o 'thread backtrace all' -o 'detach' -o 'quit'",
-        timeout=30,
-        keep_output_on_error=True,
-=======
-_LLDB_INSTALL_ATTEMPTED = False
-
-
-def _ensure_lldb_installed():
-    """Make sure `lldb` is on PATH, installing it on the fly if not.
-
-    TEMPORARY scaffolding: the CI base images currently ship `gdb` (from the
-    `clickhouse/cctools` layer), not `lldb`. While the switch to `lldb` is in
-    flight, install it at runtime so `print_c_stacktraces` keeps working.
-    Once `ci/docker/cctools/Dockerfile` (and the images that copy from it)
-    install `lldb` permanently, this helper and its single call site below
-    should be removed.
-
-    Never raise: `print_c_stacktraces` is a best-effort diagnostic. If the
-    install fails (no sudo, no network, no `brew`, ...), let
-    `shell_get_output` return "" so the surrounding diagnostic flow keeps
-    going instead of crashing during an already-broken run.
-
-    Bounded and idempotent: each subprocess call has a hard timeout so a
-    stalled package mirror cannot wedge stacktrace collection for minutes,
-    and a process-wide flag ensures only the first call attempts the
-    install — `print_c_stacktraces` iterates over every server PID, and we
-    must not pay the install cost (or timeout) for each one if the first
-    attempt already failed.
-    """
-    global _LLDB_INSTALL_ATTEMPTED
-    if shutil.which("lldb"):
-        return
-    if _LLDB_INSTALL_ATTEMPTED:
-        return
-    _LLDB_INSTALL_ATTEMPTED = True
-    try:
-        if platform.system() == "Darwin":
-            subprocess.run(["brew", "install", "llvm"], check=True, timeout=180)
-        else:
-            env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-            subprocess.run(["apt-get", "update"], check=True, env=env, timeout=60)
-            subprocess.run(
-                ["apt-get", "install", "-y", "lldb"],
-                check=True, env=env, timeout=120,
-            )
-    except Exception as e:
-        print(f"Could not install lldb on the fly: {e}", file=sys.stderr)
-
-
 # Per-PID lldb budget: the release value is also the fallback for a caller that
 # cannot tell which flavor the server is.
 LLDB_TIMEOUT = 30
@@ -1257,12 +1188,23 @@ def get_stacktraces_from_lldb(pid, timeout: float = LLDB_TIMEOUT):
     # `__jit_debug_register_code` with other functions, so the `int3` a killed
     # lldb leaves there traps server threads with SIGTRAP, a fatal signal to
     # the server, and it wedges (state S, no logs, ignores SIGTERM).
-    _ensure_lldb_installed()  # TEMPORARY: see _ensure_lldb_installed docstring.
+    # macOS restricts task_for_pid(): in --batch mode a non-root lldb cannot
+    # attach to the server on a CI runner (the user is not in the _developer
+    # group and there is no interactive authorization), so it exits 1. The
+    # runner grants passwordless sudo and root holds task_for_pid rights, so
+    # attach as root there. Linux ptrace of a same-uid process needs none of
+    # this. shutil.which resolves the absolute path because sudo resets PATH.
+    lldb = shutil.which("lldb") or "lldb"
+    sudo = "sudo " if platform.system() == "Darwin" else ""
+    # keep_output_on_error: even when lldb exits non-zero it may have printed
+    # backtraces (or an attach error) worth keeping. Returning the output lets
+    # print_c_stacktraces save the full dump to c_stacktraces.log and preview
+    # it, instead of shell_get_output flooding stderr with nothing attached.
     return shell_get_output(
-        f"lldb --batch -O 'settings set plugin.jit-loader.gdb.enable off' "
+        f"{sudo}{lldb} --batch -O 'settings set plugin.jit-loader.gdb.enable off' "
         f"-p {pid} -o 'thread backtrace all' -o 'detach' -o 'quit'",
         timeout=timeout,
->>>>>>> 907703cf7f8 (Merge pull request #2385 from Altinity/fix/antalya-26.6/lldb-budget-and-sigcont)
+        keep_output_on_error=True,
     )
 
 
@@ -1513,14 +1455,8 @@ def print_c_stacktraces(
     exists and is debuggable, independent of whether SQL is reachable.
 
     Every call site is one of two situations: we're aborting the whole
-<<<<<<< HEAD
     run (SERVER_DIED, liveness check, hung-check, check_server_started)
-    or terminating the one wedged test (timeout_handler).  lldb's "thread
-    backtrace all" pause is on the order of seconds - acceptable in both
-    cases against the diagnostic value.
-=======
-    run (SERVER_DIED, hung-check, check_server_started) or terminating
-    the one wedged test (timeout_handler).
+    or terminating the one wedged test (timeout_handler).
 
     `per_pid_timeout` None means derive it from the build flavor, which on a
     server that never started costs a `clickhouse local` read of the binary.
@@ -1528,7 +1464,6 @@ def print_c_stacktraces(
     processes; it is an independent limit, not a multiple of the per-PID one.
     A caller inside a fired one-shot `signal.alarm` must pass both, because
     that alarm cannot bound work running in its own handler.
->>>>>>> 907703cf7f8 (Merge pull request #2385 from Altinity/fix/antalya-26.6/lldb-budget-and-sigcont)
 
     Skipped under ASan, where attaching a debugger disables
     LeakSanitizer detections.
