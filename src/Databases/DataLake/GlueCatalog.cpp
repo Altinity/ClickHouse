@@ -577,7 +577,7 @@ bool GlueCatalog::tryGetTableMetadata(
                         = getContext()->getSettingsRef()[DB::Setting::allow_experimental_geo_types_in_iceberg].value;
                     auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(context_, allow_geo_parser);
                     auto id = DB::IcebergMetadata::parseTableSchema(metadata_object, schema_processor, context_, log);
-                    auto parsed_schema = schema_processor.getClickhouseTableSchemaById(id);
+                    auto parsed_schema = schema_processor.getClickHouseTableSchemaById(id);
                     if (parsed_schema)
                         schema = *parsed_schema;
                 }
@@ -914,15 +914,8 @@ bool GlueCatalog::updateSchema(
     const String & namespace_name,
     const String & table_name,
     const String & new_metadata_path,
-<<<<<<< HEAD
-    Poco::JSON::Object::Ptr /*new_schema*/,
-    Int32 /*previous_schema_id*/) const
-=======
     Poco::JSON::Object::Ptr new_schema,
-    Int32 /*previous_schema_id*/,
-    Int32 /*new_last_column_id*/,
-    Poco::JSON::Object::Ptr /*metadata*/) const
->>>>>>> 81817b6f1c3 (Merge pull request #2272 from Altinity/2085-glue-datalakecatalog-uses-stale-schema-after-alter-add-column)
+    Int32 /*previous_schema_id*/) const
 {
     std::vector<Aws::Glue::Model::Column> columns;
     if (new_schema)

@@ -844,7 +844,6 @@ def test_create(started_cluster):
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`") == "AAPL\n"
 
 
-<<<<<<< HEAD
 def test_create_gzip_metadata(started_cluster):
     # Regression for issue #109801: a catalog-backed CREATE TABLE from ClickHouse
     # with gzip metadata compression exercises IcebergMetadata::createInitial and
@@ -896,7 +895,8 @@ def test_create_gzip_metadata(started_cluster):
     # Reopen through the catalog (fresh database) and confirm read still works.
     create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`") == "AAPL\n"
-=======
+
+
 def test_schema_evolution_show_create_and_drop(started_cluster):
     """SHOW CREATE TABLE must reflect columns added/dropped via ALTER.
 
@@ -944,7 +944,6 @@ def test_schema_evolution_show_create_and_drop(started_cluster):
 
     result = node.query(f"SELECT name, column_b, column_c FROM {table_ref} ORDER BY name")
     assert result == "Alice\t\\N\t\\N\nBob\t42\thello\n"
->>>>>>> 81817b6f1c3 (Merge pull request #2272 from Altinity/2085-glue-datalakecatalog-uses-stale-schema-after-alter-add-column)
 
 
 def test_schema_evolution(started_cluster):
