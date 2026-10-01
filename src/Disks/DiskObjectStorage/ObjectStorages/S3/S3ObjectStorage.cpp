@@ -675,9 +675,8 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
         return;
 
     /// A batch of exactly one object is a plain `DeleteObject`, never `DeleteObjects` -- the same rule
-    /// `deleteFilesFromS3` applies to a single key. This is what makes the CAS-side per-key fallback
-    /// work on a backend with no `DeleteObjects` at all (GCS): that backend rejects the verb itself, not
-    /// a key count, so a "batch" of one object sent as `DeleteObjects` would fail there too.
+    /// `deleteFilesFromS3` applies to a single key. A storage without `DeleteObjects` (GCS)
+    /// rejects the verb itself, so a one-object `DeleteObjects` would fail there too.
     if (objects.size() == 1)
     {
         const StoredObject & object = objects.front();
@@ -688,11 +687,9 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
     }
 
     /// GCS has no `DeleteObjects`: a capability the config declared false, or that an earlier batch
-    /// attempt on this same storage already learned false, must not be retried here. This storage never
-    /// loops over `objects` itself to work around it -- a CAS caller admits one request per physical
-    /// delete (see `ObjectStorageBackend::removeManyWriteOnce` and its own caller in CasGc.cpp), which an
-    /// internal loop over more than one object, running under a SINGLE admission, cannot be. Report the
-    /// absence of the capability instead, and let that caller decide how to retry.
+    /// attempt on this storage already learned false, is reported rather than retried. This storage never
+    /// loops over `objects` itself: a loop under one admission would delete without the per-request checks
+    /// the caller applies to each request.
     if (auto support_batch_delete = s3_capabilities.isBatchDeleteSupported();
         support_batch_delete.has_value() && !support_batch_delete.value())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support DeleteObjects", getName());
@@ -748,12 +745,15 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support DeleteObjects", getName());
         }
 
-        throw S3Exception(err.GetErrorType(), "{} (Code: {}) while removing {} objects from S3 in one request",
-                          err.GetMessage(), static_cast<size_t>(err.GetErrorType()), objects.size());
+        throw S3Exception(
+            PreformattedMessage::create("{} (Code: {}) while removing {} objects from S3 in one request",
+                err.GetMessage(), static_cast<size_t>(err.GetErrorType()), objects.size()),
+            err.GetErrorType(), err.GetExceptionName());
     }
 
     String failed_keys;
     std::optional<Aws::S3::S3Errors> first_error_type;
+    String first_error_name;
     for (const auto & err : outcome.GetResult().GetErrors())
     {
         const auto error_type = classifyDeleteObjectsErrorCode(err.GetCode());
@@ -763,10 +763,21 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
             failed_keys += ", ";
         failed_keys += err.GetKey() + " (" + err.GetCode() + ": " + err.GetMessage() + ")";
         if (!first_error_type)
+        {
             first_error_type = error_type;
+            first_error_name = err.GetCode();
+        }
     }
     if (first_error_type)
-        throw S3Exception(*first_error_type, "batch removal left objects behind: [{}]", failed_keys);
+        throw S3Exception(
+            PreformattedMessage::create("batch removal left objects behind: [{}]", failed_keys), *first_error_type, first_error_name);
+}
+
+size_t S3ObjectStorage::batchDeleteKeyLimit() const
+{
+    if (const auto supported = s3_capabilities.isBatchDeleteSupported(); supported.has_value() && !*supported)
+        return 1;
+    return std::max<size_t>(1, s3_settings.get()->request_settings[S3RequestSetting::objects_chunk_size_to_delete]);
 }
 
 bool S3ObjectStorage::conditionalOpsUseGenerationTokens() const

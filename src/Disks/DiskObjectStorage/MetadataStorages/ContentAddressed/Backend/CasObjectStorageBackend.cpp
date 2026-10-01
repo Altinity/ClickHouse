@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
@@ -1003,6 +1004,11 @@ void ObjectStorageBackend::emuForgetDeletedToken(const String & key)
     }
 }
 
+size_t ObjectStorageBackend::bulkDeleteKeyLimit() const
+{
+    return mode == Mode::Native ? object_storage->batchDeleteKeyLimit() : kBulkDeleteMaxKeys;
+}
+
 void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access)
 {
     if (keys.empty())
@@ -1013,9 +1019,8 @@ void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> &
         objects.reserve(keys.size());
         for (const WriteOnceKey & key : keys)
             objects.emplace_back(key.str());
-        /// `NOT_IMPLEMENTED` from a storage without a batch delete propagates -- this layer never
-        /// substitutes a per-key loop of its own (that would run under a single admission for up to
-        /// 1000 keys). The caller in CasGc.cpp catches it and retries one key per admitted request.
+        /// `NOT_IMPLEMENTED` from a storage without a batch delete propagates; this layer never loops per
+        /// key, and the GC caller stops the family for the round.
         object_storage->removeObjectsIfExistUnderProfile(objects, controlRequest(access.attemptNo()));
         return;
     }

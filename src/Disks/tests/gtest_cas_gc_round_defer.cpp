@@ -11,7 +11,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ProfileEvents.h>
-#include "cas_test_helpers.h"
+#include "cas_namespace_janitor_test_helpers.h"
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -403,7 +403,7 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     /// Establish real opaque backend progress rather than fabricating a cursor value. One key remains
     /// after this page and the durable cursor must be non-empty.
     const NamespaceJanitorResult first_page
-        = NamespaceJanitor(requests, layout, 1).runOnePage(false, [] { return true; });
+        = DB::Cas::tests::janitor::runOnePage(NamespaceJanitor(requests, layout, 1), false, [] { return true; });
     ASSERT_EQ(first_page.pages, 1u);
     ASSERT_EQ(first_page.deleted, 1u);
     const GcMaintenanceReadResult partial = readGcMaintenanceState(op, layout);
@@ -472,14 +472,14 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     ASSERT_TRUE(folded.acquired_lease);
     ASSERT_FALSE(folded.deferred)
         << "gc_fold_max_defer_rounds=1 forces the round immediately following one DEFER to fold";
-    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
-        << "the authoritative fold must run the janitor exactly once, not once per call site";
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 2u)
+        << "one janitor run, not one per call site: the rest of the stream, then the wrap to the start";
     const auto folded_cleanup = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
     {
         return phase.phase == "namespace_cleanup";
     });
     ASSERT_NE(folded_cleanup, phases.end());
-    EXPECT_EQ(folded_cleanup->metrics.at("janitor_pages"), 1u);
+    EXPECT_EQ(folded_cleanup->metrics.at("janitor_pages"), 2u);
     EXPECT_GE(folded_cleanup->metrics.at("janitor_keys"), 1u);
     EXPECT_EQ(folded_cleanup->metrics.at("janitor_deleted"), 1u);
     EXPECT_EQ(static_cast<uint64_t>(op.head(key_a, Retry::once()).has_value()) + static_cast<uint64_t>(op.head(key_b, Retry::once()).has_value()), 0u)

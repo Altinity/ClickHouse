@@ -1001,67 +1001,115 @@ TEST(CASRefGc, RefObjectCleanupDeletesExactlyThePlannedSet)
                 << "snapshot " << renderRefTxnId(id) << " not in the plan must survive";
 }
 
-/// The same planned set as above, but the object storage rejects the cohort's one bulk
-/// `removeManyWriteOnce` as NOT_IMPLEMENTED (a GCS-backed pool): `cleanupRefObjects`' call site falls
-/// back to one admitted request per key (`removeChunkWriteOnceOrOneByOne`, CasGc.h), and the outcome --
-/// which keys are gone, and the budget/profile-event accounting -- must be identical to the plain
-/// bulk-request path above.
-TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
+namespace
 {
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"00/aa@cas@"};
-    fixture::admitLive(*backend, store->layout(), ns);
 
-    const ManifestRef r1 = mref(1);
-    const ManifestRef r2 = mref(2);
-    writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(1))});
-    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    const uint64_t v1 = publishCommittedTransition(*backend, layout, ns, "t1", std::nullopt, r1);
-    const uint64_t v2 = publishCommittedTransition(*backend, layout, ns, "t2", std::nullopt, r2);
+struct RefCleanupSeed
+{
+    NamespaceLifeId life;
+    RefCleanupPlan plan;
+};
 
-    RefTableSnapshot old_snap = minimalLiveSnapshot(ns.string(), RefTxnId{1, v1},
-        {committedRow("t1", r1)});
-    RefTableSnapshot new_snap = minimalLiveSnapshot(ns.string(), RefTxnId{1, v2},
-        {committedRow("t1", r1), committedRow("t2", r2)});
-    writeRefSnapshotRaw(*backend, layout, old_snap);
-    writeRefSnapshotRaw(*backend, layout, new_snap);
-    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+/// Publishes `logs` committed transitions (`t1`..`tN`), writes the first and the last snapshot, points the
+/// checkpoint at the last one and returns the cleanup plan the GC computes for it.
+RefCleanupSeed seedRefCleanup(Backend & backend, const Layout & layout, const RootNamespace & ns, uint64_t logs)
+{
+    std::vector<ManifestRef> refs;
+    std::vector<uint64_t> versions;
+    for (uint64_t i = 1; i <= logs; ++i)
+    {
+        refs.push_back(mref(i));
+        writeManifestRaw(backend, layout, ns, refs.back(), {blobEntryFor("a" + std::to_string(i), DB::UInt128(i))});
+    }
+    for (uint64_t i = 1; i <= logs; ++i)
+        versions.push_back(publishCommittedTransition(backend, layout, ns, "t" + std::to_string(i), std::nullopt, refs[i - 1]));
+
+    const auto rowsUpTo = [&](uint64_t n)
+    {
+        std::vector<RefCommittedRow> result;
+        for (uint64_t i = 1; i <= n; ++i)
+            result.push_back(committedRow("t" + std::to_string(i), refs[i - 1]));
+        /// A snapshot orders its rows by name, which "t10" breaks against "t9".
+        std::sort(result.begin(), result.end(), [](const RefCommittedRow & lhs, const RefCommittedRow & rhs) { return lhs.ref_name < rhs.ref_name; });
+        return result;
+    };
+    writeRefSnapshotRaw(backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, versions.front()}, rowsUpTo(1)));
+    writeRefSnapshotRaw(backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, versions.back()}, rowsUpTo(logs)));
+    replaceRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
         .life_epoch = 1,
-        .committed_through = RefTxnId{1, v2},
-        .checkpoint_snapshot_id = RefTxnId{1, v2},
+        .committed_through = RefTxnId{1, versions.back()},
+        .checkpoint_snapshot_id = RefTxnId{1, versions.back()},
         .last_epoch_seal = std::nullopt,
     });
 
-    const NamespaceLifeId life = fixture::fixtureLife(ns);
-    const RefTableListing listing{
-        .logs = {RefTxnId{1, v1}, RefTxnId{1, v2}},
-        .snapshots = {RefTxnId{1, v1}, RefTxnId{1, v2}}};
-    const RefTxnId durable_cursor{1, v2};
-    const RefTxnId checkpoint_snapshot_id{1, v2};
-    const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, checkpoint_snapshot_id, std::nullopt);
-    const uint64_t cohort_size = plan.deletable_logs.size() + plan.deletable_snapshots.size();
-    ASSERT_GT(cohort_size, 0u) << "the fixture must actually have something to delete for this test to prove anything";
+    RefTableListing listing;
+    for (const uint64_t version : versions)
+        listing.logs.push_back(RefTxnId{1, version});
+    listing.snapshots = {RefTxnId{1, versions.front()}, RefTxnId{1, versions.back()}};
+    const RefTxnId last{1, versions.back()};
+    return RefCleanupSeed{fixture::fixtureLife(ns), planRefCleanup(listing, last, last, std::nullopt)};
+}
 
-    /// One armed failure: the cohort's own bulk `removeManyWriteOnce` call fails as "batch delete not
-    /// supported"; the fallback's per-key calls that follow are not armed and succeed.
-    backend->failNextBulkRemoveWith(std::make_exception_ptr(
-        DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "no batch delete")));
-    const auto cleaned_before = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
+}
 
-    OperationForTest op(*backend);
+TEST(CASRefGc, RefCleanupContainsCapabilityRejection)
+{
+    std::map<String, UInt64> row;
+    auto backend = std::make_shared<BatchCapabilityBackend>();
+    backend->setStoreRejectsBatches(true);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    fixture::admitLive(*backend, layout, ns);
+    const RefCleanupSeed seeded = seedRefCleanup(*backend, layout, ns, 3);
+    const size_t cohort_size = seeded.plan.deletable_logs.size() + seeded.plan.deletable_snapshots.size();
+    ASSERT_GE(cohort_size, 2u) << "a one-key cohort would not reach the batch rejection";
+
     Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & record) { if (record.phase == "ref_object_cleanup") row = record.metrics; });
+    ASSERT_NO_THROW(ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease));
+    EXPECT_EQ(row["capability_learned"], 1u);
+    EXPECT_EQ(backend->requestSizes(), (std::vector<size_t>{cohort_size})) << "no one-key request that round";
+    OperationForTest op(*backend);
+    for (const RefTxnId & id : seeded.plan.deletable_logs)
+        EXPECT_TRUE((*op).head(layout.refLogKey(seeded.life, id), Retry::once()).has_value());
+
+    store->renewWatermarkOnce();
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    for (const RefTxnId & id : seeded.plan.deletable_logs)
+        EXPECT_FALSE((*op).head(layout.refLogKey(seeded.life, id), Retry::once()).has_value());
+    for (const RefTxnId & id : seeded.plan.deletable_snapshots)
+        EXPECT_FALSE((*op).head(layout.refSnapshotKey(seeded.life, id), Retry::once()).has_value());
+    const std::vector<size_t> requests = backend->requestSizes();
+    EXPECT_TRUE(std::all_of(requests.begin() + 1, requests.end(), [](size_t n) { return n == 1; }))
+        << "the next round cuts one-key requests";
+}
+
+TEST(CASRefGc, RefCleanupReadsAuthorityOncePerCohort)
+{
+    /// Scaled from 2,500 keys in cohorts of 1,000: 11 keys in cohorts of 4 give the same three cohorts.
+    PhaseReads reads;
+    auto backend = std::make_shared<BatchCapabilityBackend>();
+    backend->setBatchDeleteSupported(false);
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0};
+    config.gc_bulk_delete_chunk_keys = 4;
+    auto store = Pool::open(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    fixture::admitLive(*backend, layout, ns);
+    const RefCleanupSeed seeded = seedRefCleanup(*backend, layout, ns, 11);
+    const size_t cohort_size = seeded.plan.deletable_logs.size() + seeded.plan.deletable_snapshots.size();
+    ASSERT_GT(cohort_size, 8u);
+    ASSERT_LE(cohort_size, 12u) << "the assertions below expect exactly three cohorts of at most 4";
+
+    Gc gc(store, kGc);
+    gc.setPhaseSink(phaseReadsSink(reads, *backend, layout, "namespace_cleanup", "ref_object_cleanup"));
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
 
-    for (const RefTxnId & id : plan.deletable_logs)
-        EXPECT_FALSE((*op).head(layout.refLogKey(life, id), Retry::once()).has_value());
-    for (const RefTxnId & id : plan.deletable_snapshots)
-        EXPECT_FALSE((*op).head(layout.refSnapshotKey(life, id), Retry::once()).has_value());
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load() - cleaned_before, cohort_size)
-        << "the budget/profile-event accounting counts objects, unaffected by the fallback";
-    /// 1 failed bulk attempt + one request per key in the cohort.
-    EXPECT_EQ(backend->bulkRemoveCalls(), 1 + cohort_size);
+    EXPECT_EQ(reads.catalog_in_phase, 3u);
+    EXPECT_EQ(reads.state_in_phase, 3u);
+    const std::vector<size_t> calls = backend->callSizes();
+    EXPECT_EQ(calls, std::vector<size_t>(cohort_size, 1)) << "a store without batch delete takes one one-key request per object, the authority read once per cohort of 4 keys";
 }
 
 /// Task 13 (spec §implementation-impact / §GC Budget): one fold+clean round increments every ref-intake

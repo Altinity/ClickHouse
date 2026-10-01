@@ -132,10 +132,12 @@ public:
     /// single physical request per call, so there is nothing here for that capability to say no to).
     /// For more than one object, throws `NOT_IMPLEMENTED` without sending anything once `DeleteObjects`
     /// is known unsupported (a configured or a just-learned `S3Capabilities::isBatchDeleteSupported() ==
-    /// false`) -- this storage never substitutes a per-key loop of its own, since the caller is the one
-    /// that can admit each physical delete as its own request.
+    /// false`) -- this storage never substitutes a per-key loop of its own.
     void removeObjectsIfExistUnderProfile(
         const StoredObjects & objects, const ObjectStorageControlRequest & request) override;
+
+    /// `objects_chunk_size_to_delete`, at least 1, while `DeleteObjects` is not known unsupported; 1 after.
+    size_t batchDeleteKeyLimit() const override;
 
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 

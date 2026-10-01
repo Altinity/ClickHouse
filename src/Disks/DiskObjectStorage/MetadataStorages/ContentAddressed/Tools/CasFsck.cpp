@@ -510,7 +510,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 
     /// Physical life-owned keys carry no logical name. Classify each COMPLETE, canonical key against a
     /// catalog cut taken AFTER this physical listing finishes (observe-then-cut), not the earlier
-    /// `catalog_cut` above: `NamespaceJanitor::runOnePage` (the only real deleter of this debris) uses
+    /// `catalog_cut` above: `NamespaceJanitor::run` (the only real deleter of this debris) uses
     /// the identical ordering, and it is what makes "life absent from a LATER cut" sound -- creation
     /// always admits a `Creating` catalog row before writing any life-owned object (spec §2), so a life
     /// that is absent from a cut taken after the listing cannot be a concurrent birth this listing raced.

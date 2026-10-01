@@ -95,31 +95,96 @@ TEST(CASGCManifestBulkDelete, FiveBodiesInChunksOfTwoAreThreeRequests)
         EXPECT_FALSE((*op).head(store->layout().manifestKey(id), Retry::once()).has_value());
 }
 
-/// The object storage rejects the chunk's one bulk `removeManyWriteOnce` as NOT_IMPLEMENTED (a
-/// GCS-backed pool): the phase's `flush()` falls back to one admitted request per key
-/// (`removeChunkWriteOnceOrOneByOne`, CasGc.h), and every manifest in the chunk is still recorded
-/// deleted -- the per-key event emission this phase does is unaffected by how the deletes were sent.
-TEST(CASGCManifestBulkDelete, NotImplementedFallsBackToOneRequestPerKeyAndStillRecordsAllOfThem)
+TEST(CASGCManifestBulkDelete, ManifestCleanupSendsCohortAsStorageRequests)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                                                .gc_fold_max_defer_rounds = 0});
-    const auto ids = seedDroppedManifests(*backend, store->layout(), 5);
-
-    /// One armed failure: the chunk's own bulk attempt (all 5 land in one chunk under the default
-    /// chunk size) fails as "batch delete not supported"; the 5 single-key fallback calls that follow
-    /// are not armed and succeed.
-    backend->failNextBulkRemoveWith(std::make_exception_ptr(
-        DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "no batch delete")));
+    PhaseReads reads;
+    auto backend = std::make_shared<BatchCapabilityBackend>();
+    backend->setBatchDeleteSupported(false);
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0};
+    config.gc_bulk_delete_chunk_keys = 4;
+    auto store = Pool::open(backend, config);
+    const auto ids = seedDroppedManifests(*backend, store->layout(), 10);
 
     Gc gc(store, kGc);
+    gc.setPhaseSink(phaseReadsSink(reads, *backend, store->layout(), "handoff_reclaim", "manifest_deletes"));
     const uint64_t deleted = reclaim(gc, store, *backend, ids, 16);
+    gc.setPhaseSink({});
 
-    EXPECT_EQ(deleted, 5u) << "the per-key fallback must still record every manifest as deleted";
-    EXPECT_EQ(backend->bulkRemoveCalls(), 6u) << "1 failed bulk attempt + 5 single-key fallback requests";
+    EXPECT_EQ(deleted, 10u);
+    const std::vector<size_t> calls = backend->callSizes();
+    EXPECT_EQ(calls.size(), 10u);
+    EXPECT_TRUE(std::all_of(calls.begin(), calls.end(), [](size_t n) { return n == 1; }));
+    EXPECT_EQ(reads.row["requests"], 10u);
+    EXPECT_EQ(reads.row["accepted"], 10u);
+    EXPECT_EQ(reads.row["unsent"], 0u);
+    EXPECT_EQ(reads.catalog_in_phase, 0u) << "manifest cleanup reads no authority, as before";
+    EXPECT_EQ(reads.state_in_phase, 0u);
+}
+
+TEST(CASGCManifestBulkDelete, ManifestCleanupContainsCapabilityRejection)
+{
+    std::vector<std::map<String, UInt64>> rows;
+    auto backend = std::make_shared<BatchCapabilityBackend>();
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0};
+    config.gc_bulk_delete_chunk_keys = 2;
+    auto store = Pool::open(backend, config);
+    const auto ids = seedDroppedManifests(*backend, store->layout(), 5);
+    /// The first cohort goes through; the store then rejects `DeleteObjects` on the next one.
+    backend->onBeforeBulkRemove([&] { backend->setStoreRejectsBatches(true); });
+
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & record)
+    {
+        if (record.phase == "manifest_deletes" && record.metrics.at("attempted") > 0)
+            rows.push_back(record.metrics);
+    });
+    for (size_t round = 0; round < 16 && rows.empty(); ++round)
+    {
+        ASSERT_NO_THROW((void)runRegularRoundReclaiming(gc)) << "a rejected batch must not escape the round";
+        store->renewWatermarkOnce();
+    }
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0]["capability_learned"], 1u);
+    EXPECT_EQ(rows[0]["accepted"], 2u) << "the cohort before the rejection stays recorded";
+    EXPECT_EQ(rows[0]["unsent"], 3u);
+    EXPECT_EQ(rows[0]["requests"], 2u) << "the rejected request counts as sent";
+    EXPECT_EQ(backend->requestSizes(), (std::vector<size_t>{2, 2})) << "no one-key request for the rejected cohort this round";
+
+    /// The intake cursor that found the bodies is committed, so only the orphan-manifest sweep reclaims
+    /// them. It does so once the namespace cursor is past their writer epoch, and once the mount floor of
+    /// the namespace's server root ("00") has retired their builds.
+    uint64_t swept = 0;
+    uint64_t later_attempted = 0;
+    gc.setPhaseSink([&](const GcPhaseRecord & record)
+    {
+        if (record.phase == "orphan_sweep")
+            swept += record.metrics.at("deleted");
+        else if (record.phase == "manifest_deletes")
+            later_attempted += record.metrics.at("attempted");
+    });
+    const Layout & layout = store->layout();
+    const uint64_t seal_sequence = appendRefLogSeed(*backend, layout, kNs, {epochSealOp()});
+    publishAt(*backend, layout, kNs, RefTxnId{2, 1}, "next", /*build_sequence*/ 50, UInt128(0x7002), /*birth*/ false,
+              /*prev_epoch_seal*/ RefTxnId{1, seal_sequence});
+    replaceRecoverableCkptForRawFixture(*backend, layout, kNs, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, seal_sequence},
+    });
+    setWatermarkMinActive(*backend, layout, "00", /*writer_epoch*/ 1, /*min_active_build_sequence*/ 100);
     OperationForTest op(*backend);
-    for (const ManifestId & id : ids)
-        EXPECT_FALSE((*op).head(store->layout().manifestKey(id), Retry::once()).has_value());
+    bool all_gone = false;
+    for (size_t round = 0; round < 64 && !all_gone; ++round)
+    {
+        (void)runRegularRoundReclaiming(gc);
+        store->renewWatermarkOnce();
+        all_gone = std::none_of(ids.begin(), ids.end(),
+            [&](const ManifestId & id) { return (*op).head(store->layout().manifestKey(id), Retry::once()).has_value(); });
+    }
+    EXPECT_TRUE(all_gone) << "the orphan-manifest sweep deletes the bodies the rejected round left";
+    EXPECT_EQ(swept, 3u) << "the three unsent bodies are deleted by the orphan sweep";
+    EXPECT_EQ(later_attempted, 0u) << "no later fold re-nominates them into manifest_deletes";
 }
 
 TEST(CASGCManifestBulkDelete, AThrowInTheSecondChunkKeepsTheFirstChunksAuditAndAbortsTheRound)

@@ -57,15 +57,15 @@ follower or a deferred round execution returns before that commit.
 | 13 | `round_commit` | fold | Retention-prune old generations, then publish the single `gc/state` `CAS` that adopts the whole round |
 | 14 | `handoff_reclaim` | post-`CAS` | Reclaim a generation a ref moved off during this round, which the ordinary retention prune already skipped and will not revisit |
 | 15 | `manifest_deletes` | post-`CAS` | Delete manifest bodies whose owner-removal minus-one edge the `CAS` in phase 13 just adopted |
-| 16 | `namespace_cleanup` | leader; suppressed on `DEFER` | One bounded page of the perpetual namespace janitor, reclaiming dead-life debris |
+| 16 | `namespace_cleanup` | leader; one suppressed page on `DEFER` | The perpetual namespace janitor: pages of dead-life debris under a 20 s soft budget |
 | 17 | `ref_object_cleanup` | post-`CAS` | Prune ref logs and snapshots once both fold coverage and a live snapshot make them safe to delete |
 | 18 | `orphan_sweep` | post-`CAS` | Exact-token deletion for the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep), after phase 13 adopted each candidate's blob-source retirements and the cursor |
 
 Phases 2 through 4 run on every leader round; a follower returns after phase 1. Phases 5–15 and
 17–18 run only when phase 4 decides to fold; phase 16 runs after phase 15 on a fold and right after
-phase 4 on a `DEFER`. A `DEFER` verdict is therefore not a bare no-op: it still runs one bounded
-namespace-janitor page with `suppress_destructive = true` — listing and classification only, no
-deletes and no cursor advance — and then returns, publishing no fold artifact and no commit `CAS`.
+phase 4 on a `DEFER`. A folding round runs janitor pages until the phase budget ends; a `DEFER`
+verdict is therefore not a bare no-op: it still runs one namespace-janitor page with `suppress_destructive = true` — it lists and parses the keys but never
+classifies them against the catalog, deletes nothing and does not advance the cursor — and then returns, publishing no fold artifact and no commit `CAS`.
 Its lease `CAS` may already have created or renewed the lease in phase 1:
 
 ```mermaid
@@ -229,7 +229,7 @@ if any of: changed rows ≥ `gc_fold_threshold` (default 1); an adopted shard ha
 delete; an adopted shard has a condemned blob due to graduate
 (`oldest_nonpending_condemn_round < round + 1`); or `gc_fold_max_defer_rounds` (default 8)
 consecutive defers were reached. Both thresholds are internal `PoolConfig` fields, not disk
-settings. On `defer`, one suppressed namespace-janitor page runs (phase 16's work) and the round
+settings. On `defer`, one suppressed namespace-janitor page runs (phase 16's work, a single page where a folding round runs several) and the round
 returns without a commit. On `fold`, phase 6 reuses this plan and the same `LIST`.
 
 ## Phase 5 — parent seal read {#phase-5-parent-seal-read}
@@ -500,7 +500,8 @@ Deletes owner-removed manifest bodies, now that phase 13's `CAS` adopted their m
 - **Reads / writes:** batch `DELETE` of the manifest keys collected by phase 8's fold of `-1` owner
   edges, in chunks of `cas_gc_bulk_delete_chunk_keys` (default 1000, the backend maximum). A manifest
   key is write-once, so the delete carries no per-key precondition; an absent key is simply gone. A
-  backend without a batch-delete verb (GCS) falls back to one admitted `DELETE` per key.
+  storage that rejects a batch delete (`NOT_IMPLEMENTED`) stops the family for the round; the remaining
+  bodies are left to the orphan-manifest sweep (phase 18) and later requests carry one key.
 - **Safety:** each body is unreachable from any live ref (its owner-removal was folded and
   committed) and is never re-derived — the intake cursor that found the `-1` edge is now committed,
   so a folded log is never revisited. Hence the phase is unbudgeted by design and drains the whole
@@ -510,34 +511,56 @@ Deletes owner-removed manifest bodies, now that phase 13's `CAS` adopted their m
   all-or-nothing per request: the chunks before the failing one are recorded, the failing chunk's
   keys are not, and a key one of its attempts did delete shows up as already gone in the next fold
 - **Observability:** phase row `manifest_deletes`; metrics `attempted`, `accepted` (keys recorded
-  as deleted or absent), `requests` (one per chunk, or the failed bulk call plus one per key on the
-  fallback), `suppressed`; one `ManifestDelete` row per key in `system.cas_log`
+  as deleted or absent), `requests` (one per chunk), `unsent` (bodies not deleted this round),
+  `capability_learned` (1 when the storage rejected a batch delete), `suppressed`; one `ManifestDelete` row per key in `system.cas_log`
 
-Only a crash, `suppress_destructive` or a chunk that exhausted its retries leaves an entry — it is
-then picked up by the orphan-manifest sweep (phase 18).
+Only a crash, `suppress_destructive`, a rejected batch delete or a chunk that exhausted its retries
+leaves an entry — it is then picked up by the orphan-manifest sweep (phase 18).
 
 ## Phase 16 — namespace cleanup {#phase-16-namespace-cleanup}
 
-One bounded page of the perpetual namespace janitor: deletes the physical objects of namespace lives
-no longer in the catalog (dead-life debris).
+The perpetual namespace janitor deletes the physical objects of namespace lives no longer in the catalog
+(dead-life debris), page by page from the durable `janitor_cursor`.
 
-- **Runs on:** fold path here; also on the deferred path right after phase 4 with
-  `suppress_destructive` forced on
-- **Reads:** the durable `janitor_cursor`; one `LIST` page (≤ 1000 keys) of `cas/ns/`; a fresh
-  ref-catalog snapshot; `gc/state` per fence re-check
-- **Writes / deletes:** exact-token `DELETE` per dead-life `_log` / `_snap` / `_ckpt` / `_files`
-  object; one `CAS` on the maintenance state when the page is decided
-- **Safety:** each delete is under a GC fence re-check (`lease.owner` / `lease.seq`) before it and
-  once at the end; the incarnation segment in every key makes an old life's objects structurally
-  unreachable from a reborn same-name namespace, so a missed key can only leak storage, never expose
-  it
-- **Fails the round if:** nothing — the whole page is wrapped in a catch-all ("namespace janitor
-  skipped this round")
-- **Observability:** phase row `namespace_cleanup`; metrics `janitor_pages`, `janitor_keys`,
-  `janitor_deleted`, `leaked`
+- **Runs on:** the fold path, pages until the budget ends; on the deferred path, one page right after
+  phase 4 with `suppress_destructive` forced on
+- **Per page (round thread):** a `gc/state` read for authority, one `LIST` page (≤ 1000 keys) of `cas/ns/`,
+  one ref-catalog read after the `LIST`, exact-token `DELETE`s of dead `_ckpt` and `_files` objects
+- **Dead `_log` / `_snap` (GC I/O pool):** one batch delete per job of up to `cas_gc_bulk_delete_chunk_keys`
+  keys, capped by the storage's batch-delete limit (the disk key `objects_chunk_size_to_delete` on S3, 1 on other native object storages, 1000 in the emulated mode).
+  With a limit of 1, jobs are per-key. A page's jobs are all enqueued on the GC I/O pool, whose
+  `cas_gc_io_concurrency` threads bound how many run at once; the next page is listed while they run, and
+  they finish before that page is used
+- **Budget:** 20 s, soft. No page starts after it; the page in progress and the jobs in flight finish
+- **Wrap:** a pass that began mid-stream continues once from the start of the stream after the last page. It
+  skips keys past the start cursor, which the pass already handled, and ends at the first page that reaches
+  the start cursor
+- **Stops early when:** a page had no dead-life debris, the pass ended, authority was lost, a job held
+  its page, a later page's read failed, or a page was left undecided (ambiguous catalog, suppression, or
+  an exact delete that lost admission)
+- **Writes:** one `CAS` on the maintenance state at the end, with the cursor after the last complete page
+  (empty once the pass has wrapped); nothing under suppression
+- **Failed jobs:** a batch that fails after its retries is leaked: its keys are retried on the next pass
+  and the page advances. Lost authority, a refused batch delete (`NOT_IMPLEMENTED`) or a local failure
+  holds the page: the cursor stops before it and nothing is published for it. The batch size is fixed
+  per phase, so a refusal ends the phase; the capability is remembered per disk and later rounds use
+  one-key jobs
+- **Safety:** authority is re-read once per page and each job samples the result before its request, so no job
+  sends after the round has observed the loss of authority (a job already past its first request completes);
+  every deleted key belongs to a life absent from a catalog cut taken after its page's `LIST`. The incarnation segment in
+  every key makes an old life's objects unreachable from a re-created same-name table, so a missed key
+  can only leak storage, never expose it
+- **Fails the round if:** nothing; the phase is wrapped in a catch-all ("namespace janitor stopped this
+  round")
+- **Observability:** phase row `namespace_cleanup`, see
+  [`system.cas_gc_log`](/operations/system-tables/cas_gc_log#per-phase-rows); event
+  `CASGCNamespaceCleanupLeaks`
 
-The cursor advances only when the whole page was decided under a held fence and an unambiguous
-catalog; under suppression it lists and classifies but deletes nothing and does not advance.
+### Unversioned buckets {#phase-16-unversioned-buckets}
+
+A batch delete without a token assumes an unversioned bucket, which the mount probe checks. If versioning
+is turned on after mount, the batch reports success while noncurrent versions remain: an empty `LIST`
+then proves the namespace drained, not that storage was reclaimed.
 
 ## Phase 17 — ref object cleanup {#phase-17-ref-object-cleanup}
 
@@ -551,8 +574,9 @@ from the catalog.
   `gc/state` (authority re-validation). No `HEAD`: `_log` / `_snap` keys are write-once, there is
   nothing to re-observe
 - **Writes / deletes:** batch `DELETE` of the planned `_log` / `_snap` keys in chunks of
-  `cas_gc_bulk_delete_chunk_keys` (one admitted `DELETE` per key on a backend without batch
-  delete); the checkpoint-named snapshot is always retained
+  `cas_gc_bulk_delete_chunk_keys`; a storage that rejects a batch
+  delete stops the pass for the round, and the same candidates are recomputed next round. The
+  checkpoint-named snapshot is always retained
 - **Safety:** before each chunk, re-validates: ref-catalog token still equals the fold's catalog
   cut, same row and life, unchanged GC fence. The first failure stops the whole pass. The
   per-round `cas_gc_round_ref_cleanup_budget` cap counts objects and cuts a chunk to what remains;
@@ -563,7 +587,7 @@ from the catalog.
   namespace, but a chunk delete that exhausts its retry policy propagates (see
   [post-commit failures](#post-commit-failures))
 - **Observability:** phase row `ref_object_cleanup`; metrics `namespaces_planned`, `suppressed`,
-  `trim_enabled`; `ProfileEvent` `CASRefCleanupObjectsDeleted`
+  `trim_enabled`, `capability_learned`; `ProfileEvent` `CASRefCleanupObjectsDeleted`
 
 ## Phase 18 — orphan sweep {#phase-18-orphan-sweep}
 
@@ -753,7 +777,7 @@ folding round is one `LIST` of `cas/ns/stream/`, the heartbeat floor (`LIST` plu
 seal, catalog and `gc/state` reads of phases 2, 4, 5 and 7, one successful lease `CAS`, and one
 commit `CAS`. A deferred round execution is cheaper: the same `LIST`, the heartbeat floor, phase 2's
 seal / catalog / `gc/state` reads, phase 4's two seal reads and catalog read, the lease `GET`/`CAS`,
-and one suppressed namespace-janitor page (its own `LIST` page and reads, no deletes) — no commit
+and one suppressed namespace-janitor page (its own `LIST` page and reads, no deletes; a folding round runs pages until the 20 s budget ends) — no commit
 `CAS` at all.
 
 The round's work is self-regulated: what a pass cannot finish within its budgets is carried and
@@ -924,8 +948,9 @@ the hand-off's own budget (`cas_gc_round_handoff_prefix_wholesale_budget`).
 
 ### Phase 15 — manifest deletes {#cost-phase-15}
 
-One batch `DELETE` request per `cas_gc_bulk_delete_chunk_keys` entries of `mf_cleanup` (on a
-backend without batch delete: the refused bulk call plus one `DELETE` per key). No writes under
+One batch `DELETE` request per `min(cas_gc_bulk_delete_chunk_keys, storage limit)` entries of a cohort of
+`mf_cleanup` (a cohort of 1000 keys with a storage limit of 100 is 10 requests; a storage that
+rejects a batch delete ends the family for the round). No writes under
 `suppress_destructive`.
 
 ### Phase 16 — namespace cleanup {#cost-phase-16}
@@ -933,11 +958,12 @@ backend without batch delete: the refused bulk call plus one `DELETE` per key). 
 | Key | Operation | Requests |
 |---|---|---:|
 | `<pool_prefix>/gc/maintenance_state` | `GET` | 1 (durable `janitor_cursor`) |
-| `<pool_prefix>/cas/ns/` | `LIST` | one page |
-| `<pool_prefix>/cas/ref_catalog` | `GET` | 1 |
+| `<pool_prefix>/cas/ns/` | `LIST` | one per page |
+| `<pool_prefix>/cas/ref_catalog` | `GET` | one per page |
 | `<pool_prefix>/gc/state` | `GET` | one per fence check |
-| dead-life object | `DELETE` | one per object (plus one `HEAD` per object whose `LIST` entry carried no token) |
-| `<pool_prefix>/gc/maintenance_state` | `CAS` | 1 when the page is decided |
+| dead `_ckpt` / `_files` object | `DELETE` | one per object (plus one `HEAD` per object whose `LIST` entry carried no token) |
+| dead `_log` / `_snap` keys | batch `DELETE` | one per job of up to `cas_gc_bulk_delete_chunk_keys` keys, capped by the storage's limit; one per key when the limit is 1 |
+| `<pool_prefix>/gc/maintenance_state` | `CAS` | one per phase |
 
 ### Phase 17 — ref object cleanup {#cost-phase-17}
 
@@ -945,7 +971,7 @@ backend without batch delete: the refused bulk call plus one `DELETE` per key). 
 |---|---|---:|
 | checkpoint-named `_log`, predecessor seal, `_snap` | `GET` | per planned namespace (recovery-triple validation before any delete) |
 | `<pool_prefix>/cas/ref_catalog` and `<pool_prefix>/gc/state` | `GET` | one each per chunk (authority re-validation) |
-| `_log` / `_snap` keys | batch `DELETE` | one request per chunk of ≤ `cas_gc_bulk_delete_chunk_keys` keys (the refused bulk call plus one per key on a backend without batch delete) |
+| `_log` / `_snap` keys | batch `DELETE` | one request per ≤ `min(cas_gc_bulk_delete_chunk_keys, storage limit)` keys (a chunk of 1000 keys with a storage limit of 100 is 10 requests; a rejected batch delete ends the pass for the round) |
 
 ### Phase 18 — orphan sweep {#cost-phase-18}
 

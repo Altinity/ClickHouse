@@ -73,27 +73,16 @@ enum class UniversePolicy : uint8_t
 /// decision ever reads them.
 uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len);
 
-/// Deletes `chunk` as one bulk `removeManyWriteOnce` request, falling back to one admitted request per
-/// key when the object storage answers with `NOT_IMPLEMENTED` -- the signal
-/// `S3ObjectStorage::removeObjectsIfExistImpl` gives (without sending anything else itself) once
-/// `DeleteObjects` is known unsupported (a configured GCS backend, or one that just failed a batch
-/// attempt this same call). The fallback is not merely "the same deletes issued more slowly": each
-/// `op.removeManyWriteOnce({key}, policy)` is its OWN admission (fence, budget, deadline checked
-/// afresh), which one bulk call covering up to `kBulkDeleteMaxKeys` physical deletes under a SINGLE
-/// admission cannot be -- exactly the gap a storage-side per-key loop would have left open. Every other
-/// failure propagates unchanged: retry/reissue for it is the engine's own policy, applied to each
-/// admitted attempt -- bulk or single -- the same way it always was.
-///
-/// Returns the number of `op.removeManyWriteOnce` calls THIS HELPER issued: 1 for the bulk path, or
-/// 1 + `chunk.size()` for the fallback -- the failed bulk attempt counted alongside the one call per key
-/// that followed it, since that attempt is a call this helper made whether or not it reached the network
-/// (there is no signal available here to tell "sent and rejected" apart from "refused locally, unsent";
-/// `S3ObjectStorage::removeObjectsIfExistImpl` reports both as the same NOT_IMPLEMENTED). This is call
-/// COUNT, not a distinct network-request count -- the same granularity `CountingBackend::bulkRemoveCalls`
-/// and the `CASBulkDeleteRequests` profile event already use elsewhere for "request".
-/// Declared here (not file-local) so a unit test can drive it directly against a scripted backend,
-/// rather than only through a full GC round.
-uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<WriteOnceKey> & chunk, const Retry & policy);
+/// Deletes `cohort` as consecutive `removeManyWriteOnce` requests of at most `request_keys` keys and calls
+/// `on_request_done(begin, end)` after each one returns. Every failure propagates, `NOT_IMPLEMENTED` included:
+/// re-sending a rejected batch key by key would delete under a decision nobody made for those keys, and the
+/// capability the rejection teaches makes the next round cut one-key requests anyway.
+void removeCohortWriteOnce(
+    CasOperation & op,
+    const std::vector<WriteOnceKey> & cohort,
+    size_t request_keys,
+    const Retry & policy,
+    const std::function<void(size_t begin, size_t end)> & on_request_done);
 
 /// Pure skip-unchanged decision. Returns true iff the current round may be
 /// DEFERRED (re-adopt the sealed generation, no fold/delete). A round MUST fold when: enough shards
@@ -428,7 +417,7 @@ public:
     /// process, injected for tests, defaults to `Pool::bootMs()`, and the ONLY clock the heartbeat
     /// gate's own fence-out threshold is measured against (mirrors `claimMountAwaitingExpiry`'s
     /// `mono_ms_fn`, but at heartbeat-gate granularity — one GC round is one observation tick).
-    /// Everything else in the round stays deterministic/clock-free.
+    /// The namespace janitor also reads `mono_ms_fn`, for its phase budget.
     ///
     /// `log_` is the logger every round-engine log line is emitted through; pass a disk/srid-scoped
     /// logger (e.g. `CasGcScheduler`'s own `log`, built from a `fmt::format("{}::...", storage_path)`
@@ -505,6 +494,10 @@ public:
     /// instance, and the scheduler holds `gc_round_mutex` across both the install and the round.
     void setPhaseSink(GcPhaseSink sink) { phase_sink = std::move(sink); }
 
+    /// Keys per GC write-once delete request: `gc_bulk_delete_chunk_keys` capped by the storage's batch
+    /// limit, clamped to [1, `kBulkDeleteMaxKeys`] because an empty request would never advance.
+    size_t bulkDeleteChunkKeys() const;
+
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
     /// TEST SEAM: disable the round's journal trim so a folded event stays in the journal
@@ -548,11 +541,10 @@ private:
     /// It performs no physical LIST or delete.
     CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state);
 
-    /// Run exactly one independently paced physical namespace-maintenance page. The caller supplies
-    /// the one round-wide destructive verdict when it exists; DEFER passes suppression because it has
-    /// no folded frontier verdict. This helper owns only janitor I/O and phase metrics, never lifecycle
-    /// transitions or the hot stream walk plan.
-    void runNamespaceJanitorPage(
+    /// One namespace-janitor phase: pages from the persisted cursor until the soft budget, a hold, or a page
+    /// without dead-life debris. DEFER passes suppression, which lists one page and deletes nothing. Owns only
+    /// janitor I/O and phase metrics, never lifecycle transitions.
+    void runNamespaceJanitor(
         const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows);
 
     void reportStuckRemovals(const RefPlan & plan, uint64_t current_round);
@@ -871,7 +863,9 @@ private:
     /// same-id `_log` and `_snap` validate through `readCheckpointSnapshotBase` do. Logs and snapshots
     /// are then deletable only strictly BELOW that checkpoint (and logs also at or below the durable
     /// cursor). A namespace with no checkpoint base, or an invalid triple, is leak-only this pass.
-    void cleanupRefObjects(
+    /// Returns true when the storage rejected a batch delete: the family stops for this round and the
+    /// next round's plan recomputes the same candidates.
+    bool cleanupRefObjects(
         const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive,
         GcRoundWorkBudget & work_budget);
 
@@ -987,8 +981,8 @@ private:
     /// The read that sets this flag is therefore made by the round, at the granularity the old
     /// hand-written fence check had (once per drain, once per janitor page), never from inside the
     /// predicate. The staleness that buys is bounded by that granularity and stated where each caller
-    /// refreshes it.
-    bool authority_held = false;
+    /// refreshes it. Atomic because namespace-janitor jobs read it while the round thread refreshes it.
+    std::atomic<bool> authority_held{false};
 
     /// the contender's observation window (steal protocol)
     bool has_observation = false;

@@ -74,6 +74,7 @@ namespace DB::ContentAddressedSetting
 namespace DB::ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace DB::Cas::tests
@@ -1971,6 +1972,106 @@ private:
     uint64_t get_stream_total = 0;
     uint64_t publish_total = 0;
 };
+
+/// The in-memory store with `S3ObjectStorage`'s batch-delete capability. A `removeManyWriteOnce` of more
+/// than one key is refused locally with `NOT_IMPLEMENTED` once the capability is false; a store that rejects
+/// `DeleteObjects` turns an unknown capability false on its first multi-key request. One key always goes.
+class BatchCapabilityBackend : public CountingBackend
+{
+public:
+    size_t bulkDeleteKeyLimit() const override
+    {
+        std::lock_guard lock(capability_mutex);
+        return batch_supported == std::optional<bool>{false} ? 1 : storage_limit;
+    }
+
+    void removeManyWriteOnce(const std::vector<DB::Cas::WriteOnceKey> & keys, DB::Cas::TransportAccess & access) override
+    {
+        {
+            std::lock_guard lock(capability_mutex);
+            call_sizes.push_back(keys.size());
+            if (keys.size() > 1 && batch_supported == std::optional<bool>{false})
+                throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "batch delete is known unsupported");
+            request_sizes.push_back(keys.size());
+            if (keys.size() > 1 && !batch_supported && rejects_batches)
+            {
+                batch_supported = false;
+                throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "the store rejected DeleteObjects");
+            }
+        }
+        CountingBackend::removeManyWriteOnce(keys, access);
+    }
+
+    void setBatchDeleteSupported(std::optional<bool> value)
+    {
+        std::lock_guard lock(capability_mutex);
+        batch_supported = value;
+    }
+
+    void setStoreRejectsBatches(bool value)
+    {
+        std::lock_guard lock(capability_mutex);
+        rejects_batches = value;
+    }
+
+    void setStorageLimit(size_t value)
+    {
+        std::lock_guard lock(capability_mutex);
+        storage_limit = value;
+    }
+
+    /// Every `removeManyWriteOnce` that reached this backend, locally refused ones included.
+    std::vector<size_t> callSizes() const
+    {
+        std::lock_guard lock(capability_mutex);
+        return call_sizes;
+    }
+
+    /// Requests the modeled store received: calls minus local refusals.
+    std::vector<size_t> requestSizes() const
+    {
+        std::lock_guard lock(capability_mutex);
+        return request_sizes;
+    }
+
+private:
+    mutable std::mutex capability_mutex;
+    std::optional<bool> batch_supported;
+    bool rejects_batches = false;
+    size_t storage_limit = DB::Cas::kBulkDeleteMaxKeys;
+    std::vector<size_t> call_sizes;
+    std::vector<size_t> request_sizes;
+};
+
+/// Keeps `row` = the metrics of the last `phase` row, and the catalog and `gc/state` reads made between
+/// the end of `before_phase` and the end of `phase`.
+struct PhaseReads
+{
+    std::map<String, UInt64> row;
+    uint64_t catalog_before = 0;
+    uint64_t state_before = 0;
+    uint64_t catalog_in_phase = 0;
+    uint64_t state_in_phase = 0;
+};
+
+inline DB::Cas::GcPhaseSink phaseReadsSink(PhaseReads & reads, const CountingBackend & backend, const DB::Cas::Layout & layout,
+                                           const String & before_phase, const String & phase)
+{
+    return [&reads, &backend, layout, before_phase, phase](const DB::Cas::GcPhaseRecord & record)
+    {
+        if (record.phase == before_phase)
+        {
+            reads.catalog_before = backend.getCount(layout.refCatalogKey());
+            reads.state_before = backend.getCount(layout.gcStateKey());
+        }
+        else if (record.phase == phase)
+        {
+            reads.row = record.metrics;
+            reads.catalog_in_phase = backend.getCount(layout.refCatalogKey()) - reads.catalog_before;
+            reads.state_in_phase = backend.getCount(layout.gcStateKey()) - reads.state_before;
+        }
+    };
+}
 
 /// Records the ORDER of writes (so a test can compare indices) and lets a test refuse or fail chosen
 /// writes by key. Delegates every request to `CountingBackend` unchanged, so the per-key counters

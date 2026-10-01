@@ -85,6 +85,10 @@ namespace DB::Cas
 namespace
 {
 
+/// Soft limit on one janitor phase: no page starts after it.
+constexpr uint64_t kJanitorPhaseBudgetMs = 20'000;
+constexpr size_t kJanitorPageKeys = 1000;
+
 /// The `on_page_fetched` hook GC passes to every `forEachListedKey`/`recoverRefTable`
 /// call it owns (never passed by fsck/offline-repair callers of those shared helpers) -- one increment
 /// per physical LIST page, never per listed key.
@@ -360,51 +364,68 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     io_pool_refuse_at_for_test = store->poolConfig().gc_io_pool_refuse_at_for_test;
 }
 
-void Gc::runNamespaceJanitorPage(
+size_t Gc::bulkDeleteChunkKeys() const
+{
+    const uint64_t configured = store->poolConfig().gc_bulk_delete_chunk_keys;
+    const uint64_t storage_limit = store->poolBackendPtr()->bulkDeleteKeyLimit();
+    return std::clamp<size_t>(std::min(configured, storage_limit), 1, kBulkDeleteMaxKeys);
+}
+
+void Gc::runNamespaceJanitor(
     const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows)
 {
     GcPhaseTimer t(phase_sink, "namespace_cleanup");
     t.metric("evidence_rows", cleanup_evidence_rows);
-    NamespaceJanitorResult janitor_result;
+    NamespaceJanitorResult result;
     try
     {
-        CasRequests & requests = store->openRequests();
-        const Layout & layout = store->layout();
-        NamespaceJanitor janitor(requests, layout, 1000);
-        /// ONE authority read per page, made here rather than from the predicate: the janitor's
-        /// operation samples its liveness before every request, and a page walks up to a thousand keys.
-        refreshAuthority(leased_state.lease.seq);
-        janitor_result = janitor.runOnePage(suppress_destructive, [this] { return authority_held; });
-        for (const String & anomaly : janitor_result.anomalies)
-            LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
-        if (janitor_result.leaked)
-            ProfileEvents::increment(ProfileEvents::CASGCNamespaceCleanupLeaks, janitor_result.leaked);
+        const uint64_t lease_seq = leased_state.lease.seq;
+        JanitorRunContext context;
+        /// One authority read per page, from the refresh; the predicate is sampled before every request.
+        context.liveness = [this] { return authority_held.load(); };
+        context.refresh_authority = [this, lease_seq] { refreshAuthority(lease_seq); };
+        context.batch_keys = bulkDeleteChunkKeys();
+        context.budget_ms = kJanitorPhaseBudgetMs;
+        context.now_ms = mono_ms_fn;
+        context.io_pool = io_pool.get();
+        context.schedule_refuse_at_for_test = &io_pool_refuse_at_for_test;
+        NamespaceJanitor(store->openRequests(), store->layout(), kJanitorPageKeys).run(suppress_destructive, context, result);
     }
     catch (const std::exception & e)
     {
-        LOG_WARNING(logger, "CAS namespace janitor skipped this round: {}", e.what());
+        LOG_WARNING(logger, "CAS namespace janitor stopped this round: {}", e.what());
     }
-    t.metric("janitor_pages", janitor_result.pages);
-    t.metric("janitor_keys", janitor_result.keys);
-    t.metric("janitor_deleted", janitor_result.deleted);
-    t.metric("leaked", janitor_result.leaked);
+    for (const String & anomaly : result.anomalies)
+        LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
+    if (result.leaked)
+        ProfileEvents::increment(ProfileEvents::CASGCNamespaceCleanupLeaks, result.leaked);
+    t.metric("janitor_pages", result.pages);
+    t.metric("janitor_keys", result.keys);
+    t.metric("janitor_deleted", result.deleted);
+    t.metric("leaked", result.leaked);
+    t.metric("batches", result.batches);
+    t.metric("batches_leaked", result.batches_leaked);
+    t.metric("batches_held", result.batches_held);
+    t.metric("delete_jobs", result.delete_jobs);
+    t.metric("delete_jobs_skipped", result.delete_jobs_skipped);
+    t.metric("batch_keys", result.batch_keys);
+    t.metric("budget_exhausted", result.budget_exhausted ? 1 : 0);
+    t.metric("cursor_advanced", result.cursor_advanced ? 1 : 0);
 }
 
-uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<WriteOnceKey> & chunk, const Retry & policy)
+void removeCohortWriteOnce(
+    CasOperation & op,
+    const std::vector<WriteOnceKey> & cohort,
+    size_t request_keys,
+    const Retry & policy,
+    const std::function<void(size_t begin, size_t end)> & on_request_done)
 {
-    try
+    const size_t step = std::clamp<size_t>(request_keys, 1, kBulkDeleteMaxKeys);
+    for (size_t begin = 0; begin < cohort.size(); begin += step)
     {
-        op.removeManyWriteOnce(chunk, policy);
-        return 1;
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() != ErrorCodes::NOT_IMPLEMENTED)
-            throw;
-        for (const WriteOnceKey & key : chunk)
-            op.removeManyWriteOnce({key}, policy);
-        /// +1: the failed bulk attempt above is itself a call this helper made.
-        return 1 + chunk.size();
+        const size_t end = std::min(cohort.size(), begin + step);
+        op.removeManyWriteOnce(std::vector<WriteOnceKey>(cohort.begin() + begin, cohort.begin() + end), policy);
+        on_request_done(begin, end);
     }
 }
 
@@ -820,7 +841,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// DEFER has no `FoldResult`, hence no complete global destructive verdict. The janitor still
         /// takes its bounded page and catalog cut, but suppression keeps both deletes and valid-page
         /// cursor progress at the same position for the bounded forced fold to retry.
-        runNamespaceJanitorPage(state, /*suppress_destructive=*/true, /*cleanup_evidence_rows=*/0);
+        runNamespaceJanitor(state, /*suppress_destructive=*/true, /*cleanup_evidence_rows=*/0);
         return report;   /// no fold, no pre-CAS deletes, no gc/state CAS — sealed generation stays pinned
     }
 
@@ -1271,57 +1292,79 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         const std::map<ManifestId, Etag> & mf_cleanup_now =
             suppress_destructive ? kNoManifestCleanup : folded.mf_cleanup;
 
-        /// Chunks of write-once keys, one request each, with no per-key precondition: a manifest key is
-        /// never written twice, so the body at it is the one the fold observed or nothing. The engine
-        /// reissues a failed chunk whole; a chunk that exhausts its policy throws here, and the chunks
-        /// before it are already recorded below. A key that one of the exhausted chunk's own attempts
-        /// did delete is not recorded either: deletion and recording are all-or-nothing per request,
-        /// never per key, so the next round's fold sees that key as already gone. The etag the fold
-        /// observed rides the event as information only.
-        const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
+        /// Cohorts of write-once keys with no per-key precondition: a manifest key is never written twice,
+        /// so the body at it is the one the fold observed or nothing. Each cohort is cut into storage
+        /// requests; the engine reissues a failed request whole, and a request that exhausts its policy
+        /// throws here with the requests before it already recorded below. A key that one of the exhausted
+        /// request's own attempts did delete is not recorded either: deletion and recording are
+        /// all-or-nothing per request, never per key, so the next round's fold sees that key as already
+        /// gone. The etag the fold observed rides the event as information only.
+        const size_t cohort_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
+        const size_t request_keys = bulkDeleteChunkKeys();
         uint64_t attempted = 0;
         uint64_t requests = 0;
+        bool capability_learned = false;
         std::vector<WriteOnceKey> chunk;
         std::vector<const std::pair<const ManifestId, Etag> *> chunk_entries;
         const auto flush = [&]
         {
             if (chunk.empty())
                 return;
-            /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here;
-            /// `chunk_entries`' per-key bookkeeping below is unaffected either way -- it counts objects
-            /// that are gone after this call returns, not how many requests it took to get them there.
-            requests += removeChunkWriteOnceOrOneByOne(op, chunk, Retry::standard());
-            for (const auto * entry : chunk_entries)
+            removeCohortWriteOnce(op, chunk, request_keys, Retry::standard(), [&](size_t begin, size_t end)
             {
-                ++report.manifests_deleted;
-                EventEmitter{*store}.emit([&](CasEvent & e)
+                ++requests;
+                for (size_t i = begin; i < end; ++i)
                 {
-                    e.type = CasEventType::ManifestDelete;
-                    e.namespace_ = entry->first.root_namespace.string();
-                    e.object_kind = CasEventObjectKind::Manifest;
-                    e.object_hash = manifestRefDebugString(entry->first.ref);
-                    e.token = entry->second.render();
-                    e.round = new_round;
-                    e.gen = generation;
-                    e.outcome = "deleted_or_absent";
-                    e.reason = "owner-removed manifest body; batch delete of a write-once key after decrements adopted";
-                });
-            }
+                    const auto * entry = chunk_entries[i];
+                    ++report.manifests_deleted;
+                    EventEmitter{*store}.emit([&](CasEvent & e)
+                    {
+                        e.type = CasEventType::ManifestDelete;
+                        e.namespace_ = entry->first.root_namespace.string();
+                        e.object_kind = CasEventObjectKind::Manifest;
+                        e.object_hash = manifestRefDebugString(entry->first.ref);
+                        e.token = entry->second.render();
+                        e.round = new_round;
+                        e.gen = generation;
+                        e.outcome = "deleted_or_absent";
+                        e.reason = "owner-removed manifest body; batch delete of a write-once key after decrements adopted";
+                    });
+                }
+            });
             chunk.clear();
             chunk_entries.clear();
         };
-        for (const auto & entry : mf_cleanup_now)
+        try
         {
-            ++attempted;
-            chunk.push_back(layout.writeOnceManifestKey(entry.first));
-            chunk_entries.push_back(&entry);
-            if (chunk.size() >= chunk_keys)
-                flush();
+            for (const auto & entry : mf_cleanup_now)
+            {
+                ++attempted;
+                chunk.push_back(layout.writeOnceManifestKey(entry.first));
+                chunk_entries.push_back(&entry);
+                if (chunk.size() >= cohort_keys)
+                    flush();
+            }
+            flush();
         }
-        flush();
+        catch (const Exception & e)
+        {
+            if (e.code() != ErrorCodes::NOT_IMPLEMENTED)
+                throw;
+            /// The intake cursor that found these bodies is committed. The orphan-manifest sweep reclaims a
+            /// skipped body once the namespace's sealed cursor is past the body's writer epoch.
+            /// Later requests carry one key.
+            capability_learned = true;
+            ++requests;
+            LOG_WARNING(logger, "CAS GC manifest_deletes: the storage rejected a batch delete; the remaining "
+                "owner-removed manifest bodies are left to the orphan-manifest sweep, which reclaims each once the "
+                "namespace's sealed cursor is past its writer epoch: {}", e.message());
+        }
+        const uint64_t accepted = report.manifests_deleted - manifests_deleted_before;
         t.metric("attempted", attempted);
-        t.metric("accepted", report.manifests_deleted - manifests_deleted_before);
+        t.metric("accepted", accepted);
         t.metric("requests", requests);
+        t.metric("unsent", mf_cleanup_now.size() - accepted);
+        t.metric("capability_learned", capability_learned ? 1 : 0);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
     }
 
@@ -1331,17 +1374,19 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     uint64_t cleanup_evidence_rows = 0;
     for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
         cleanup_evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
-    runNamespaceJanitorPage(state, suppress_destructive, cleanup_evidence_rows);
+    runNamespaceJanitor(state, suppress_destructive, cleanup_evidence_rows);
     /// PHASE 17/18 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
     /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
     /// what a reader of a round that reclaimed nothing needs to see.
     {
         GcPhaseTimer t(phase_sink, "ref_object_cleanup");
+        bool capability_learned = false;
         if (trim_enabled)
-            cleanupRefObjects(folded, state.lease, suppress_destructive, round_work_budget);
+            capability_learned = cleanupRefObjects(folded, state.lease, suppress_destructive, round_work_budget);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
         t.metric("trim_enabled", trim_enabled ? 1 : 0);
         t.metric("namespaces_planned", folded.ref_tables.size());
+        t.metric("capability_learned", capability_learned ? 1 : 0);
     }
 
     /// Bounded orphan-manifest backstop. The fold already exact-read each candidate, retired its exact
@@ -3703,14 +3748,14 @@ void Gc::reportSweepRetention(const ManifestSweepResult & result)
     retain_rollup_passes_since_report = 0;
 }
 
-void Gc::cleanupRefObjects(
+bool Gc::cleanupRefObjects(
     const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive,
     GcRoundWorkBudget & work_budget)
 {
     /// A clamp / ref-folding abort this round may leave landed-before-cut edges unfolded behind the clamp,
     /// so a covered-log cleanup could delete a log whose delta is not yet durable -- defer to a clean pass.
     if (suppress_destructive)
-        return;
+        return false;
 
     CasOperation op = store->openRequests().admit();
     const Layout & layout = store->layout();
@@ -3833,32 +3878,42 @@ void Gc::cleanupRefObjects(
             cohort.push_back(layout.writeOnceRefSnapshotKey(life, snap_id));
         }
 
-        const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
+        const size_t cohort_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
+        const size_t request_keys = bulkDeleteChunkKeys();
         for (size_t begin = 0; begin < cohort.size(); )
         {
-            /// Cumulative per-round cap in KEYS, exactly as before; a chunk is cut to what remains. The
-            /// plan recomputes the same remaining candidates from durable state next round, so nothing
-            /// here needs its own cursor.
+            /// Cumulative per-round cap in KEYS; a cohort is cut to what remains. The plan recomputes the same
+            /// remaining candidates from durable state next round, so nothing here needs its own cursor.
             if (!work_budget.refCleanupAvailable())
-                return;
-            size_t end = std::min(cohort.size(), begin + chunk_keys);
+                return false;
+            size_t end = std::min(cohort.size(), begin + cohort_keys);
             if (work_budget.max_ref_cleanup_objects != 0)
                 end = std::min(end, begin + (work_budget.max_ref_cleanup_objects - work_budget.ref_cleanup_objects_used));
             std::vector<WriteOnceKey> chunk(cohort.begin() + begin, cohort.begin() + end);
+            /// One authority read per cohort, not per request: on a store without batch delete a per-request
+            /// read would add two GETs per key.
             if (!authorityHolds(chunk.front().str()))
-                return;
-            /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here.
-            /// The budget and the profile event below count OBJECTS in `chunk`, which is the same
-            /// `chunk.size()` whichever way `removeChunkWriteOnceOrOneByOne` actually sent them.
-            removeChunkWriteOnceOrOneByOne(op, chunk, Retry::standard());
-            work_budget.ref_cleanup_objects_used += chunk.size();
-            ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted, chunk.size());   /// cleanup object deletion
-            /// Advance by what was actually sent, not the nominal chunk size: the budget cap above can
-            /// truncate a chunk short of `chunk_keys`, and advancing by the full stride would skip the
-            /// untried remainder instead of retrying it next iteration.
+                return false;
+            try
+            {
+                removeCohortWriteOnce(op, chunk, request_keys, Retry::standard(), [&](size_t request_begin, size_t request_end)
+                {
+                    work_budget.ref_cleanup_objects_used += request_end - request_begin;
+                    ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted, request_end - request_begin);
+                });
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::NOT_IMPLEMENTED)
+                    throw;
+                LOG_WARNING(logger, "CAS GC ref cleanup: the storage rejected a batch delete; the remaining candidates "
+                    "wait for the next round: {}", e.message());
+                return true;
+            }
             begin = end;
         }
     }
+    return false;
 }
 
 namespace
@@ -4849,16 +4904,17 @@ void Gc::rememberObservation(const GcLease & lease)
 
 void Gc::refreshAuthority(uint64_t admitted_generation)
 {
-    /// Fail-closed first, so every early exit below leaves this leader deposed.
-    authority_held = false;
+    /// Janitor jobs read the flag during this read, so it keeps the confirmed value until one verdict is
+    /// stored at the end; every failure still stores `false`.
+    bool held = false;
     try
     {
         CasOperation op = store->openRequests().admit();
-        const auto got = op.read(store->layout().gcStateKey(), Retry::standard());
-        if (!got)
-            return;
-        const GcState current = decodeGcState(got->bytes);
-        authority_held = current.lease.owner == gc_id && current.lease.seq == admitted_generation;
+        if (const auto got = op.read(store->layout().gcStateKey(), Retry::standard()))
+        {
+            const GcState current = decodeGcState(got->bytes);
+            held = current.lease.owner == gc_id && current.lease.seq == admitted_generation;
+        }
     }
     catch (...)
     {
@@ -4866,6 +4922,7 @@ void Gc::refreshAuthority(uint64_t admitted_generation)
             "CAS gc: the leader-authority probe failed; this round's destructive operations treat the "
             "lease as lost");
     }
+    authority_held.store(held);
 }
 
 void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
@@ -5011,7 +5068,7 @@ CatalogLifecycleReconcileResult Gc::drainCompletedRemoving(const GcState & lease
     /// second -- the single reading taken here would otherwise authorise all of them.
     const uint64_t admitted_generation = leased_state.lease.seq;
     refreshAuthority(admitted_generation);
-    CasOperation op = store->openRequests().admit([this] { return authority_held; });
+    CasOperation op = store->openRequests().admit([this] { return authority_held.load(); });
     return CatalogLifecycleReconciler(op, store->layout(), *parent)
         .reconcile([this, admitted_generation] { refreshAuthority(admitted_generation); });
 }
