@@ -12,7 +12,12 @@ doc_type: 'reference'
 A `CAS` read never touches a classical local-metadata path: there is no local directory listing to
 consult, only a ref resolve followed by object-store reads. This page covers the three ways a file
 access is served, the full chain for the common case, the two caches that sit on that chain, and
-how a part still open inside a write transaction serves its own reads.
+how a part still open inside a write transaction serves its own reads. A directory probe on a path
+inside a part (`<table>/<part>/<file>`, which `MergeTree` issues for every checksum entry at load)
+is answered from the part's retained folder manifest: a plain file is not a directory, a nested
+directory is and lists its children. No object-store `LIST` is involved; only a probe whose part
+does not resolve falls back to a listing: the table-level file listing on an `Atomic` table, the
+mirrored live-tree listing on a non-`Atomic` table.
 
 ## How a file access is served {#access-kinds}
 
@@ -36,30 +41,33 @@ decoding the whole body is cheaper than any partial-read machinery would be.
 
 | Cache | Keyed by | Setting | Default | What still hits the network |
 |---|---|---|---|---|
-| Manifest decode cache | `(ManifestId, Token)` | `cas_manifest_decode_cache_bytes` | 128 MiB | A mandatory `HEAD` on **every** access, cache hit or miss |
-| Part-folder view cache (`Cas::CachedPartFolderAccess`, `Parts/PartFolderAccess.h`) | Part ref key | `cas_part_folder_cache_bytes`, `cas_part_folder_cache_max_entries`, `cas_part_folder_cache_max_entry_bytes` | 64 MiB / 10 000 entries / 16 MiB | Its `ForceFresh` policy re-proves the manifest body via that same mandatory `HEAD`, paced by `cas_part_folder_validate` (`always` \| `never` \| `age <seconds>`) |
+| Manifest decode cache | `ManifestId` | `cas_manifest_decode_cache_bytes` | 128 MiB | Nothing on a hit; one `GET` on a miss |
+| Part-folder view cache (`Cas::CachedPartFolderAccess`, `Parts/PartFolderAccess.h`) | Part ref key | `cas_part_folder_cache_bytes`, `cas_part_folder_cache_max_entries`, `cas_part_folder_cache_max_entry_bytes` | 64 MiB / 10 000 entries / 16 MiB | Nothing on a validated hit; a `ForceFresh` access bypasses the retained view and rebuilds from the manifest decode cache |
 
-**The `HEAD` is mandatory even on a cache hit** — the page's most counter-intuitive fact, because it
-means a cache hit still costs one object-store round trip:
+**A cache hit costs no request.** A manifest id is minted once and its body is written once, so one
+id names one content forever and a cached decode can be served without asking the object store:
 
 ```mermaid
 flowchart TD
-    A["readManifestShared(ManifestId)"] --> B["HEAD the manifest key"]
-    B -->|"absent"| C["throw FILE_DOESNT_EXIST --<br/>a live ref must never name a missing object"]
-    B -->|"present, token t"| D{"cache lookup (ManifestId, t)"}
-    D -->|hit| E["return the cached decode -- no GET"]
-    D -->|miss| F["GET the body"]
-    F --> G{"body's own ref and namespace<br/>match the key?"}
-    G -->|no| H["throw CORRUPTED_DATA"]
-    G -->|yes| I["decode, insert into cache keyed by (ManifestId, t), return"]
+    A["readManifestShared(ManifestId)"] --> B{"decode cache lookup by ManifestId"}
+    B -->|hit| C["return the cached decode -- no request"]
+    B -->|miss| D["GET the body"]
+    D -->|"absent"| E["throw FILE_DOESNT_EXIST --<br/>a live ref must never name a missing object"]
+    D -->|"present"| F{"body's own ref and namespace<br/>match the key?"}
+    F -->|no| G["throw CORRUPTED_DATA"]
+    F -->|yes| H["decode, insert into the cache keyed by ManifestId, return"]
 ```
 
-The `HEAD` is what proves the live ref still names an existing object — the no-dangle invariant —
-and it supplies the token that keys the cache; only then is the decode cache consulted. On a miss,
-the `GET` is followed by the two identity checks in the diagram, each `CORRUPTED_DATA` on failure.
-Only a fully validated decode enters the cache. Setting either cache's byte budget to `0` disables
-retention while leaving the `HEAD`-and-validate sequence intact — a cache is purely an
-optimization, never a trust boundary.
+On a miss, the `GET` is followed by the two identity checks in the diagram, each `CORRUPTED_DATA` on
+failure, and only a fully validated decode enters the cache. A live ref that names a missing body is
+detected on a miss, by the garbage collector before it deletes a manifest, and by `fsck`; a reader
+holding a cached decode for a manifest the collector has since removed sees a snapshot-consistent
+manifest and fails with a typed error when it reads a blob that is gone. Write paths that carry
+entries forward from a committed part (hardlinks, renames, single-file rewrites, relink) adopt the
+source blobs on the strength of the source ref's live edge, which the collector honours; deleting
+objects out of band, behind the collector's back, is outside that contract and is what `fsck`
+reports. Setting either cache's byte budget to `0` disables retention while leaving the
+`GET`-and-validate sequence intact — a cache is purely an optimization, never a trust boundary.
 
 The part-folder view cache is invalidated on every promote and repoint, and is single-flight on a
 cold build: concurrent readers of the same not-yet-cached view coalesce into one build rather than
@@ -75,7 +83,7 @@ temporary part is never mistaken for a real, resolvable part.
 
 ## Diagnostic and read-only access {#read-only-access}
 
-A read-only or diagnostic opener of a `CAS` disk (`ca-fsck`, `ca-gc-dryrun`, and similar tools)
+A read-only or diagnostic opener of a `CAS` disk (`cas-fsck`, `cas-gc-dryrun`, and similar tools)
 must not claim mount ownership, schedule `GC`, or mint writer state — read-only enforcement sits
 below the ordinary facade checks, at the backend layer itself. A mounted `Pool` caches its ref
 table and does not re-recover it on every read; a diagnostic tool that deliberately performs a

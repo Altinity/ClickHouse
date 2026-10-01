@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 
 #include <atomic>
 #include <chrono>
@@ -34,7 +35,14 @@
 
 namespace DB::ErrorCodes
 {
+extern const int FAULT_INJECTED;
 extern const int INVALID_STATE;
+}
+
+namespace DB::FailPoints
+{
+extern const char cas_gc_scheduler_fail_before_heartbeat_worker_start[];
+extern const char cas_gc_scheduler_fail_before_worker_start[];
 }
 
 using namespace DB;
@@ -63,13 +71,14 @@ const std::string kSrid = "test";
 /// gtest_cas_lifecycle_condition.cpp's helper — used by the operator-STOP-persistence test below.
 void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
 {
-    const auto got = backend.get(mount_key);
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto got = (*op).read(mount_key, DB::Cas::Retry::once());
     ASSERT_TRUE(got.has_value());
     DB::Cas::MountLease m = DB::Cas::decodeMountLease(got->bytes);
     m.gc_fenced = true;
     m.seq += 1;
-    ASSERT_EQ(backend.putOverwrite(mount_key, DB::Cas::encodeMountLease(m), got->token).outcome,
-              DB::Cas::PutOutcome::Done);
+    const auto put = (*op).replace(mount_key, DB::Cas::encodeMountLease(m), got->etag, DB::Cas::Retry::once());
+    ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
 }
 
 /// A real `ContentAddressedMetadataStorage` over a fresh, unique local object storage. `context == nullptr`
@@ -341,6 +350,42 @@ TEST(CASGCStopStart, StopAndStartAreIdempotent)
     sched.stop();
 }
 
+TEST(CASGCStopStart, StopClearsLeadershipAfterManualRoundWithoutStart)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    CasGcScheduler sched(store, std::chrono::seconds(3600), "CasGcManualStopTest", "ca-disk");
+
+    const RoundReport report = sched.runOneRoundNow();
+    ASSERT_TRUE(report.acquired_lease);
+    ASSERT_TRUE(sched.gcHealth().is_leader);
+
+    sched.stop();
+    EXPECT_FALSE(sched.gcHealth().is_leader);
+}
+
+TEST(CASGCStopStart, StartFailureRollsBackAndCanBeRetried)
+{
+    for (const char * failpoint :
+        {FailPoints::cas_gc_scheduler_fail_before_heartbeat_worker_start,
+         FailPoints::cas_gc_scheduler_fail_before_worker_start})
+    {
+        SCOPED_TRACE(failpoint);
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = openPoolForTest(backend);
+        CasGcScheduler sched(store, std::chrono::seconds(3600), "CasGcStartFailureTest", "ca-disk");
+
+        FailPointInjection::enableFailPoint(failpoint);
+        Cas::tests::expectThrowsCode(ErrorCodes::FAULT_INJECTED, [&] { sched.start(); });
+        FailPointInjection::disableFailPoint(failpoint);
+        EXPECT_TRUE(sched.isQuiescent());
+
+        EXPECT_NO_THROW(sched.start());
+        sched.stop();
+        EXPECT_TRUE(sched.isQuiescent());
+    }
+}
+
 /// (d) START refuses on a Vanished disk with the typed 668 (`INVALID_STATE`) error -- restarting GC on a
 /// decommissioned pool is meaningless and would only spin failing rounds -- while STOP on the SAME
 /// Vanished disk (with a live scheduler present) SUCCEEDS: stopping the reclaimer on a sick disk is a
@@ -436,6 +481,42 @@ TEST(CASGCStopStart, ConcurrentStopStartFromTwoThreadsStaysConsistent)
     EXPECT_NO_THROW(commitOnePart(*storage));
     EXPECT_TRUE(storage->existsFile(kPartFile));
     storage->gcStop();
+}
+
+TEST(CASGCStopStart, RequestRoundSoonConcurrentWithStopStartDoesNotRace)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    CasGcScheduler sched(store, std::chrono::seconds(3600), "CasGcRequestStopRaceTest", "ca-disk");
+    sched.start();
+
+    std::promise<void> start;
+    const auto begin = start.get_future().share();
+
+    auto requester = std::async(std::launch::async, [&]
+    {
+        begin.wait();
+        for (size_t i = 0; i < 1000; ++i)
+            sched.requestRoundSoon();
+    });
+    auto lifecycle = std::async(std::launch::async, [&]
+    {
+        begin.wait();
+        for (size_t i = 0; i < 1000; ++i)
+        {
+            sched.stop();
+            sched.start();
+        }
+    });
+
+    start.set_value();
+    ASSERT_EQ(requester.wait_for(std::chrono::seconds(60)), std::future_status::ready);
+    ASSERT_EQ(lifecycle.wait_for(std::chrono::seconds(60)), std::future_status::ready);
+    requester.get();
+    lifecycle.get();
+
+    sched.stop();
+    EXPECT_FALSE(sched.gcHealth().is_leader);
 }
 
 /// (T11 cannot-verify, acceptance matrix) Operator intent PERSISTS across a transient recovery: after the

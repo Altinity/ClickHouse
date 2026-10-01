@@ -68,6 +68,7 @@ namespace ErrorCodes
     extern const int INCORRECT_DATA;
     extern const int BAD_ARGUMENTS;
     extern const int FILE_ALREADY_EXISTS;
+    extern const int CORRUPTED_DATA;
 }
 
 namespace FailPoints
@@ -815,11 +816,11 @@ bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
     return configuration->getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::HIVE;
 }
 
-SinkToStoragePtr StorageObjectStorage::import(
+IStorage::ImportResult StorageObjectStorage::import(
     const std::string & file_name,
     Block & block_with_partition_values,
     const std::function<void(const std::string &)> & new_file_path_callback,
-    bool overwrite_if_exists,
+    MergeTreePartExportFileAlreadyExistsPolicy file_already_exists_policy,
     std::size_t max_bytes_per_file,
     std::size_t max_rows_per_file,
     const std::optional<std::string> & iceberg_metadata_json_string,
@@ -830,13 +831,13 @@ SinkToStoragePtr StorageObjectStorage::import(
     {
         configuration->lazyInitializeIfNeeded(object_storage, local_context);
         auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
-        return configuration->getExternalMetadata()->import(
+        return ImportResult::createSink(configuration->getExternalMetadata()->import(
             catalog,
             new_file_path_callback,
             std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
             *iceberg_metadata_json_string,
             format_settings_ ? format_settings_ : format_settings,
-            local_context);
+            local_context));
     }
 
     std::string partition_key;
@@ -872,18 +873,35 @@ SinkToStoragePtr StorageObjectStorage::import(
 
     const auto base_path = configuration->getPathForWrite(partition_key, file_name).path;
 
-    return std::make_shared<MultiFileStorageObjectStorageSink>(
+    /// A commit file is written only once every data file has been finalized, so -- unlike the
+    /// presence of any individual data file -- it proves a previous export produced the whole
+    /// part here. There is nothing left to write, whatever the conflict policy says: that policy
+    /// governs the leftovers of an attempt that never committed. `overwrite` is asked to redo the
+    /// work, so it does not get to short-circuit.
+    if (file_already_exists_policy != MergeTreePartExportFileAlreadyExistsPolicy::overwrite)
+    {
+        if (auto committed_paths = MultiFileStorageObjectStorageSink::tryReadCommittedPaths(
+                base_path, /* transaction_id= */ file_name, object_storage, local_context))
+        {
+            if (committed_paths->empty())
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "Commit file for {} lists no data files", base_path);
+
+            return ImportResult::createAlreadyExported(std::move(*committed_paths));
+        }
+    }
+
+    return ImportResult::createSink(std::make_shared<MultiFileStorageObjectStorageSink>(
         base_path,
         /* transaction_id= */ file_name, /// not pretty, but the sink needs some sort of id to generate the commit file name. Using the source part name should be enough
         object_storage,
         configuration,
         max_bytes_per_file,
         max_rows_per_file,
-        overwrite_if_exists,
+        /* overwrite_existing_data_files= */ file_already_exists_policy != MergeTreePartExportFileAlreadyExistsPolicy::error,
         new_file_path_callback,
         format_settings_ ? format_settings_ : format_settings,
         std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
-        local_context);
+        local_context));
 }
 
 IStorage::ExportPartitionCommitInfo StorageObjectStorage::commitExportPartitionTransaction(
