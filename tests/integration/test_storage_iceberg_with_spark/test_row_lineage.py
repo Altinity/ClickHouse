@@ -397,9 +397,9 @@ def test_row_id_clickhouse_is_not_affected_by_filter_pushdown(
 
 
 @pytest.mark.parametrize("storage_type", ["s3"])
-def test_row_id_clickhouse_survives_delete(started_cluster_iceberg_with_spark, storage_type):
+def test_row_id_clickhouse_v3_delete_rejected(started_cluster_iceberg_with_spark, storage_type):
     instance = started_cluster_iceberg_with_spark.instances["node1"]
-    TABLE_NAME = "test_row_id_clickhouse_after_delete_" + storage_type + "_" + get_uuid_str()
+    TABLE_NAME = "test_row_id_clickhouse_v3_delete_rejected_" + storage_type + "_" + get_uuid_str()
 
     _create_clickhouse_table(
         started_cluster_iceberg_with_spark, storage_type, TABLE_NAME, "(id Int32, s String)"
@@ -408,12 +408,16 @@ def test_row_id_clickhouse_survives_delete(started_cluster_iceberg_with_spark, s
     instance.query(
         f"INSERT INTO {TABLE_NAME} SELECT number, 'a' FROM numbers(4)", settings=INSERT_SETTINGS
     )
-    instance.query(f"ALTER TABLE {TABLE_NAME} DELETE WHERE id = 1", settings=INSERT_SETTINGS)
 
-    assert int(instance.query(f"SELECT count() FROM {TABLE_NAME}")) == 3
+    # Iceberg v3 forbids new position-delete files and ClickHouse cannot write deletion vectors yet,
+    # so the mutation must fail before writing anything and leave the rows and their ids as they were.
+    error = instance.query_and_get_error(
+        f"ALTER TABLE {TABLE_NAME} DELETE WHERE id = 1", settings=INSERT_SETTINGS
+    )
+    assert "SUPPORT_IS_DISABLED" in error
 
-    # Deleting a row does not renumber the rows that stay.
-    assert _row_ids(_clickhouse_lineage(instance, TABLE_NAME)) == {0: 0, 2: 2, 3: 3}
+    assert int(instance.query(f"SELECT count() FROM {TABLE_NAME}")) == 4
+    assert _row_ids(_clickhouse_lineage(instance, TABLE_NAME)) == {k: k for k in range(4)}
 
 
 @pytest.mark.parametrize("storage_type", ["s3"])
