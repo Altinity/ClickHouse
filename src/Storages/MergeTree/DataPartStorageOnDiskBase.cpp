@@ -928,6 +928,17 @@ void DataPartStorageOnDiskBase::remove(
     bool has_delete_prefix = part_dir_without_slash.filename().string().starts_with("delete_tmp_");
     std::optional<CanRemoveDescription> can_remove_description;
     auto disk = volume->getDisk();
+
+    /// On a content-addressed disk a part is one ref, and dropping it is one atomic ref-log record.
+    /// The `delete_tmp_` rename and the unlink batch below would each publish a new manifest first:
+    /// two manifest writes and five extra ref-log records per removed part, more with projections.
+    if (disk->isContentAddressed() && getParentDirectory() != MergeTreeData::DETACHED_DIR_NAME)
+    {
+        auto description = can_remove_callback();
+        disk->removeSharedRecursive(fs::path(from) / "", !description.can_remove_anything, description.files_not_to_remove);
+        return;
+    }
+
     fs::path to = fs::path(root_path) / part_dir_without_slash;
 
     if (!has_delete_prefix)
