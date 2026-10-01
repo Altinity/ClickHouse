@@ -165,11 +165,11 @@ void ReadPipeline::needDecryption(String path, size_t buffer_size, KeyFinderFunc
         .key_finder = std::move(key_finder)});
 }
 
-<<<<<<< HEAD
 void ReadPipeline::needLongConnectionLimit(std::shared_ptr<LongConnectionLimit> limit)
 {
     long_connection_limit = std::move(limit);
-=======
+}
+
 void ReadPipeline::needFileView(String file_name, size_t left_bound, size_t right_bound)
 {
     if (right_bound < left_bound)
@@ -179,7 +179,6 @@ void ReadPipeline::needFileView(String file_name, size_t left_bound, size_t righ
         .file_name = std::move(file_name),
         .left_bound = left_bound,
         .right_bound = right_bound};
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 }
 
 std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::build() const
@@ -219,26 +218,14 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::tryBuildReaderExecutor() c
     if (!settings.reader_executor.enabled)
         return nullptr;
 
-<<<<<<< HEAD
-    /// The executor implements neither async prefetch nor the distributed cache, so fall back rather
-    /// than silently drop those stages. Decryption, the filesystem cache, and the page (memory) cache
-    /// ARE supported (fed below).
-    if (distributed_cache || async_prefetch)
+    /// The executor implements neither async prefetch, the distributed cache, nor a file_view byte
+    /// window, so fall back rather than silently drop those stages. Decryption, the filesystem cache,
+    /// and the page (memory) cache ARE supported (fed below).
+    if (distributed_cache || async_prefetch || file_view)
     {
         LOG_DEBUG(log,
             "use_reader_executor: falling back to the legacy read path "
-            "(distributed cache or async prefetch not supported by the executor)");
-=======
-    /// The executor does not implement caches, decryption, async prefetch, the
-    /// distributed cache, or a file_view byte window, so fall back rather than
-    /// silently drop a configured stage.
-    if (distributed_cache || memory_cache || !filesystem_caches.empty()
-        || !decryption_stages.empty() || async_prefetch || file_view)
-    {
-        LOG_DEBUG(log,
-            "use_reader_executor: falling back to the legacy read path "
-            "(caches/decryption/file_view not yet supported by the executor)");
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+            "(distributed cache, async prefetch or file_view not supported by the executor)");
         return nullptr;
     }
 

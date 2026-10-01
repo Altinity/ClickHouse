@@ -716,16 +716,10 @@ bool WriteBufferFromS3::completeMultipartUpload()
             /// Pass the canonical S3 error name: a conditional-write 412 is UNMODELED for the SDK
             /// (the error type is UNKNOWN), so the name is the caller's only typed signal.
             throw S3Exception(
-<<<<<<< HEAD
-                error.GetErrorType(),
-                "Message: {}, Key: {}, Bucket: {}, Tags: {}",
-                error.GetMessage(), key, bucket, fmt::join(multipart_tags.begin(), multipart_tags.end(), " "));
-=======
                 PreformattedMessage::create("Message: {}, Key: {}, Bucket: {}, Tags: {}",
                     outcome.GetError().GetMessage(), key, bucket, fmt::join(multipart_tags.begin(), multipart_tags.end(), " ")),
                 outcome.GetError().GetErrorType(),
                 outcome.GetError().GetExceptionName());
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         }
     }
 

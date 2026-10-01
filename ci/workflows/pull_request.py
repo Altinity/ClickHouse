@@ -14,7 +14,6 @@ from ci.defs.job_configs import JobConfigs
 from ci.jobs.scripts.workflow_hooks.filter_job import should_skip_job
 from ci.jobs.scripts.workflow_hooks.trusted import can_be_tested
 
-<<<<<<< HEAD
 # Functional tests with sanitizers are trimmed down in pull requests: instead of
 # the full suite, their `selected tests` counterparts run only the tests selected
 # for the change. The full suite still runs here in the debug and plain binary
@@ -31,21 +30,11 @@ FUNCTIONAL_TESTS_JOBS = [
     # discovery cannot provide a representative WasmEdge smoke test. Keep the
     # established full-suite MSan/WasmEdge lanes until that coverage exists.
     or "amd_msan, WasmEdge" in job.name
-] + JobConfigs.stateless_tests_selected_pr_jobs
+] + JobConfigs.stateless_tests_selected_pr_jobs + AltinityJobConfigs.cas_functional_tests_jobs
 
 ALL_FUNCTIONAL_TESTS = [job.name for job in FUNCTIONAL_TESTS_JOBS]
 
 CORE_BLOCKING_JOB_NAMES = [
-=======
-FUNCTIONAL_TESTS_JOBS = [
-    *JobConfigs.functional_tests_jobs,
-    *AltinityJobConfigs.cas_functional_tests_jobs,
-]
-
-ALL_FUNCTIONAL_TESTS = [job.name for job in FUNCTIONAL_TESTS_JOBS]
-
-FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES = [
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     job.name
     for job in FUNCTIONAL_TESTS_JOBS
     if any(
@@ -71,11 +60,6 @@ FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES = [
 STYLE_AND_FAST_TESTS = [
     # JobNames.STYLE_CHECK,
     JobNames.FAST_TEST,
-<<<<<<< HEAD
-=======
-    # NOTE (strtgbb): CI_TESTS temporarily not gating builds (allow_failure + 137 OOM during setup)
-    # JobNames.CI_TESTS,
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     # *[j.name for j in JobConfigs.tidy_build_arm_jobs],
 ]
 

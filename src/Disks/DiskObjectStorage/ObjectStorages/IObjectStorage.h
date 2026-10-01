@@ -489,7 +489,6 @@ public:
 
     virtual bool supportParallelWrite() const { return false; }
 
-<<<<<<< HEAD
     /// Whether a fetched `ObjectMetadata` is guaranteed to carry at least one comparable generation
     /// token — a non-empty `etag`, a known size, or a known modification time — so that two fetches
     /// of the same path can prove the object was not overwritten in between. Web origins may
@@ -497,7 +496,7 @@ public:
     /// that must reread the same generation of an object (e.g. lazy materialization) have to skip
     /// such storages instead of failing close at read time.
     virtual bool supportsObjectGenerationComparison() const { return true; }
-=======
+
     /// True when the incarnation tokens this storage returns from writes/HEADs are GCS generation
     /// numbers riding the ETag plumbing (http_client = gcs_hmac or gcp_oauth).
     /// Consumers (the CAS backend) stamp TokenType::Generation and route conditional writes
@@ -531,7 +530,6 @@ public:
     {
         return mode == ObjectStorageCopyMode::Default;
     }
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
     virtual ReadSettings patchSettings(const ReadSettings & read_settings) const;
 

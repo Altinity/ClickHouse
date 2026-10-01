@@ -906,7 +906,6 @@ void S3ObjectStorage::applyNewSettings(
     modified_settings->request_settings.proxy_resolver = DB::ProxyConfigurationResolverProvider::getFromOldSettingsFormat(
         ProxyConfiguration::protocolFromString(uri.uri.getScheme()), config_prefix, config);
 
-<<<<<<< HEAD
     /// The effective credentials of a non-disk S3 storage depend on the accessing session's restriction mode
     /// (`s3_allow_server_credentials_in_user_queries`), not only on the stored settings. Rebuild the client when
     /// that mode differs from the one the current client was built under, so an opt-in session cannot leave a
@@ -915,7 +914,7 @@ void S3ObjectStorage::applyNewSettings(
     /// constant and this adds no rebuilds.
     const bool restricts_now = !for_disk_s3 && context->shouldRestrictUserQueryS3Credentials();
     const bool restriction_mode_changed = client_restricts_server_credentials != restricts_now;
-=======
+
     /// A caller that derived persistent state from the conditional-ops dialect pinned it (see
     /// `IObjectStorage::pinConditionalOpsGenerationDialect`). Refuse before the client is replaced, so a
     /// rejected reload leaves the working client and its dialect in place.
@@ -940,7 +939,6 @@ void S3ObjectStorage::applyNewSettings(
                 modified_settings->auth_settings[S3AuthSetting::http_client].value,
                 would_be_generation ? "generation" : "ETag");
     }
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
     auto current_settings = s3_settings.get();
     /// A change in the accessing session's restriction mode forces a client rebuild even for an otherwise static

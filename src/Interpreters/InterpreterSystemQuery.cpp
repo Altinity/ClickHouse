@@ -3057,16 +3057,12 @@ void InterpreterSystemQuery::flushDistributed(ASTSystemQuery & query)
     if (query.query_settings)
         settings_changes = query.query_settings->as<ASTSetQuery>()->changes;
 
-<<<<<<< HEAD
     /// Keep the StoragePtr alive for the whole flush: the table holds no other owning
     /// reference here (DROP on an Atomic database does not take the exclusive drop_lock,
     /// and the flush does not hold an async-insert lock), so a concurrent DROP could
     /// otherwise destroy the table while flushClusterNodesAllData is still running.
-    auto table = DatabaseCatalog::instance().getTable(table_id, getContext());
+    auto table = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
     if (auto * storage_distributed = dynamic_cast<StorageDistributed *>(table.get()))
-=======
-    if (auto * storage_distributed = dynamic_cast<StorageDistributed *>(unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext())).get()))
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         storage_distributed->flushClusterNodesAllData(getContext(), settings_changes);
     else
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table {} is not distributed", table_id.getNameForLogs());

@@ -19,12 +19,9 @@
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/CopyObjectRequest.h>
-<<<<<<< HEAD
 #include <aws/s3/model/UploadPartCopyRequest.h>
-=======
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/s3/model/GetBucketVersioningRequest.h>
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 #include <aws/s3/S3Client.h>
 #include <aws/s3/S3Errors.h>
 
@@ -38,10 +35,7 @@
 #include <IO/ReadSettings.h>
 #include <IO/S3/Client.h>
 #include <IO/S3/copyS3File.h>
-<<<<<<< HEAD
-=======
 #include <IO/SeekableReadBuffer.h>
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
 #include <Disks/IO/ThreadPoolRemoteFSReader.h>
 #include <Disks/IO/ReadBufferFromRemoteFSGather.h>
@@ -211,7 +205,6 @@ struct EventCounts
     size_t copyObject = 0;
     size_t uploadPartCopy = 0;
     size_t writtenSize = 0;
-    size_t copyObject = 0;
     size_t deleteObject = 0;
     size_t getBucketVersioning = 0;
 
@@ -494,51 +487,12 @@ struct Client : DB::S3::Client
         return Aws::S3::Model::AbortMultipartUploadOutcome(result);
     }
 
-<<<<<<< HEAD
     /// Whole-object server-side copy. A CopyObject request carries no byte range, so it always copies the
     /// entire source object -- modelling the real S3 behaviour that makes it unsafe for a partial range.
-=======
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     Aws::S3::Model::CopyObjectOutcome CopyObject(const Aws::S3::Model::CopyObjectRequest & request) const override
     {
         ++counters.copyObject;
 
-<<<<<<< HEAD
-        const auto [src_bucket, src_key] = splitCopySource(request.GetCopySource());
-        const String & src_data = store->GetBucketStore(src_bucket).objects[src_key];
-        store->GetBucketStore(request.GetBucket()).PutObject(request.GetKey(), src_data);
-
-        Aws::S3::Model::CopyObjectResult result;
-        return Aws::S3::Model::CopyObjectOutcome(result);
-    }
-
-    /// Ranged server-side copy of one multipart part. Honours the `CopySourceRange` so only the requested
-    /// bytes are copied -- this is the path a partial-range copy must take.
-    Aws::S3::Model::UploadPartCopyOutcome UploadPartCopy(const Aws::S3::Model::UploadPartCopyRequest & request) const override
-    {
-        ++counters.uploadPartCopy;
-
-        const auto [src_bucket, src_key] = splitCopySource(request.GetCopySource());
-        const String & src_data = store->GetBucketStore(src_bucket).objects[src_key];
-
-        size_t begin = 0;
-        size_t end = src_data.size() - 1;
-        const String & range = request.GetCopySourceRange();
-        if (const String prefix = "bytes="; range.starts_with(prefix))
-        {
-            int ret = sscanf(range.c_str(), "bytes=%zu-%zu", &begin, &end); /// NOLINT
-            chassert(ret == 2);
-        }
-
-        auto & dstStore = store->GetBucketStore(request.GetBucket());
-        auto etag = dstStore.UploadPart(request.GetUploadId(), src_data.substr(begin, end - begin + 1));
-
-        Aws::S3::Model::CopyPartResult copy_part_result;
-        copy_part_result.SetETag(etag);
-        Aws::S3::Model::UploadPartCopyResult result;
-        result.SetCopyPartResult(copy_part_result);
-        return Aws::S3::Model::UploadPartCopyOutcome(result);
-=======
         if (const auto * wrapper = dynamic_cast<const DB::S3::RequestWithNativeConditionalMode *>(&request))
             last_copy_object_native_conditional = wrapper->isNativeConditional();
 
@@ -570,6 +524,34 @@ struct Client : DB::S3::Client
         details.SetETag("etag-copy-" + request.GetKey());
         result.SetCopyObjectResultDetails(details);
         return Aws::S3::Model::CopyObjectOutcome(result);
+    }
+
+    /// Ranged server-side copy of one multipart part. Honours the `CopySourceRange` so only the requested
+    /// bytes are copied -- this is the path a partial-range copy must take.
+    Aws::S3::Model::UploadPartCopyOutcome UploadPartCopy(const Aws::S3::Model::UploadPartCopyRequest & request) const override
+    {
+        ++counters.uploadPartCopy;
+
+        const auto [src_bucket, src_key] = splitCopySource(request.GetCopySource());
+        const String & src_data = store->GetBucketStore(src_bucket).objects[src_key];
+
+        size_t begin = 0;
+        size_t end = src_data.size() - 1;
+        const String & range = request.GetCopySourceRange();
+        if (const String prefix = "bytes="; range.starts_with(prefix))
+        {
+            int ret = sscanf(range.c_str(), "bytes=%zu-%zu", &begin, &end); /// NOLINT
+            chassert(ret == 2);
+        }
+
+        auto & dstStore = store->GetBucketStore(request.GetBucket());
+        auto etag = dstStore.UploadPart(request.GetUploadId(), src_data.substr(begin, end - begin + 1));
+
+        Aws::S3::Model::CopyPartResult copy_part_result;
+        copy_part_result.SetETag(etag);
+        Aws::S3::Model::UploadPartCopyResult result;
+        result.SetCopyPartResult(copy_part_result);
+        return Aws::S3::Model::UploadPartCopyOutcome(result);
     }
 
     Aws::S3::Model::DeleteObjectOutcome DeleteObject(const Aws::S3::Model::DeleteObjectRequest & request) const override
@@ -605,7 +587,6 @@ struct Client : DB::S3::Client
         Aws::S3::Model::GetBucketVersioningResult result;
         result.SetStatus(Aws::S3::Model::BucketVersioningStatus::Enabled);
         return Aws::S3::Model::GetBucketVersioningOutcome(result);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     }
 
     std::shared_ptr<S3MemStrore> store;
@@ -663,7 +644,6 @@ struct UploadPartFailIngection: InjectionModel
     }
 };
 
-<<<<<<< HEAD
 /// Fails the first `fail_times` CompleteMultipartUpload calls with the un-typed MinIO `InvalidPart`
 /// eventual-consistency error, then lets the real mock store handle the rest. The AWS SDK cannot map
 /// <Code>InvalidPart</Code> to a typed model error, so it produces UNKNOWN as the error type and keeps
@@ -687,7 +667,8 @@ struct CompleteMPUInvalidPartOnceIngection : InjectionModel
 
     size_t fail_times;
     size_t calls = 0;
-=======
+};
+
 /// Injects an arbitrary AWSError<S3Errors> on DeleteObject -- used to drive the conditional-remove
 /// (`removeObjectIfTokenMatches`) outcome mapping: a 412-shaped error (exception name "PreconditionFailed",
 /// matched by `S3::isPreconditionFailedError`) must map to `ConditionalRemoveOutcome::TokenMismatch`, and a
@@ -717,7 +698,6 @@ struct CopyObjectErrorInjection: InjectionModel
     }
 
     Aws::Client::AWSError<Aws::S3::S3Errors> error;
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 };
 
 struct BaseSyncPolicy

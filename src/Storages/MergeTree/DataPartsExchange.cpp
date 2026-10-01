@@ -93,9 +93,7 @@ constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_PARTS_ZERO_COPY = 6;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_PARTS_PROJECTION = 7;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_METADATA_VERSION = 8;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_COLUMNS_SUBSTREAMS = 9;
-<<<<<<< HEAD
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_INVALIDATED_SYSTEM_COLUMNS = 10;
-=======
 /// CAS replication 2b: fetch-by-relink. The receiver advertises its content-addressed pool identity
 /// (`cas_pool_uuid`) and, if it matches the sender's own pool, the sender sends only the
 /// part's content id (`part_id`) + the mutable header — no file bytes — and the receiver "fetches" by
@@ -111,7 +109,6 @@ constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_INVALIDATED_SYSTEM_COLUMNS = 10
 /// still exactly what the sender's ref names. A server advertising this version serves the confirm
 /// action; a receiver advertising it must confirm before it promotes.
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM = 11;
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
 std::string getEndpointId(const std::string & node_id)
 {
@@ -330,11 +327,7 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
     MergeTreePartInfo::fromPartName(part_name, data.format_version);
 
     /// We pretend to work as older server version, to be sure that client will correctly process our version
-<<<<<<< HEAD
-    response.addCookie({"server_protocol_version", toString(std::min(client_protocol_version, REPLICATION_PROTOCOL_VERSION_WITH_INVALIDATED_SYSTEM_COLUMNS))});
-=======
     response.addCookie({"server_protocol_version", toString(std::min(client_protocol_version, REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM))});
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
     LOG_TRACE(log, "Sending part {}", part_name);
 
@@ -693,15 +686,11 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     {
         {"endpoint",                endpoint_id},
         {"part",                    part_name},
-<<<<<<< HEAD
-        {"client_protocol_version", toString(REPLICATION_PROTOCOL_VERSION_WITH_INVALIDATED_SYSTEM_COLUMNS)},
-=======
         /// Advertising `..._WITH_CA_CONFIRM` is a PROMISE, not a capability list: this receiver will
         /// confirm a relink offer against its source before it promotes (`relinkPartToDisk`). It is the
         /// pair of the sender-side offer gate on the same constant, and the two cannot be separated —
         /// see the comment there.
         {"client_protocol_version", toString(REPLICATION_PROTOCOL_VERSION_WITH_CA_CONFIRM)},
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         {"compress",                "false"}
     });
 

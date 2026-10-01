@@ -54,9 +54,9 @@ void copyS3File(
     const ReadSettings & read_settings,
     BlobStorageLogWriterPtr blob_storage_log,
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
-<<<<<<< HEAD
     const CreateReadBuffer & fallback_file_reader,
-    const std::optional<ObjectAttributes> & object_metadata = std::nullopt);
+    const std::optional<ObjectAttributes> & object_metadata = std::nullopt,
+    ObjectStorageCopyMode copy_mode = ObjectStorageCopyMode::Default);
 
 /// Copies exactly `[src_offset, src_offset + src_size)` of a LARGER source object of size `src_object_size`.
 ///
@@ -80,11 +80,6 @@ void copyS3FileRange(
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
     const CreateReadBuffer & fallback_file_reader,
     const std::optional<ObjectAttributes> & object_metadata = std::nullopt);
-=======
-    const CreateReadBuffer& fallback_file_reader,
-    const std::optional<ObjectAttributes> & object_metadata = std::nullopt,
-    ObjectStorageCopyMode copy_mode = ObjectStorageCopyMode::Default);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
 /// Copies data from any seekable source to S3.
 /// The same functionality can be done by using the function copyData() and the class WriteBufferFromS3

@@ -153,7 +153,6 @@ public:
         throwNotImplemented();
     }
 
-<<<<<<< HEAD
     /// Increment the reference count of a data blob shared between metadata files.
     virtual void incrementBlobRefCount(const std::string & /* blob */)
     {
@@ -171,7 +170,7 @@ public:
     {
         throwNotImplemented();
     }
-=======
+
     /// In-flight read-your-writes for a part being assembled by THIS transaction (B59). A CA part-build
     /// transaction stages blobs (uploaded) + mutable bytes before the single commit; these let a reader
     /// that holds the transaction resolve those staged files before they are committed. Default: no
@@ -187,7 +186,6 @@ public:
     /// Immediate-child names staged directly under `path` (one level). Used so loadProjections'
     /// withPartFormatFromDisk can iterate a staged projection dir to find its mark file. Default: empty.
     virtual std::vector<std::string> listInFlightDirectory(const std::string & /*path*/) const { return {}; }
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
     virtual ~IMetadataTransaction() = default;
 

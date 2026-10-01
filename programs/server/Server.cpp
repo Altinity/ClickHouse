@@ -113,11 +113,7 @@
 #include <Databases/registerDatabases.h>
 #include <Dictionaries/registerDictionaries.h>
 #include <Disks/registerDisks.h>
-<<<<<<< HEAD
-=======
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
-#include <Common/Scheduler/Nodes/registerSchedulerNodes.h>
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 #include <Common/Scheduler/Workload/IWorkloadEntityStorage.h>
 #include <Coordination/KeeperContext.h>
 #include <Common/Config/ConfigReloader.h>

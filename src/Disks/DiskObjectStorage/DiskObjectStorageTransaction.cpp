@@ -110,7 +110,7 @@ MultipleDisksObjectStorageTransaction::MultipleDisksObjectStorageTransaction(
 
 void DiskObjectStorageTransaction::addOperation(std::function<void(MetadataTransactionPtr tx)> op)
 {
-    if (metadata_storage->appliesOperationsEagerly())
+    if (metadata_storage->appliesOperationsEagerly() || metadata_storage->transactionIsStagingOverlay())
         op(metadata_transaction);
     else
         operations_to_execute.push_back(std::move(op));
@@ -118,11 +118,7 @@ void DiskObjectStorageTransaction::addOperation(std::function<void(MetadataTrans
 
 void DiskObjectStorageTransaction::createDirectory(const std::string & path)
 {
-<<<<<<< HEAD
     addOperation([path](MetadataTransactionPtr tx)
-=======
-    dispatch([path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->createDirectory(path);
     });
@@ -130,11 +126,7 @@ void DiskObjectStorageTransaction::createDirectory(const std::string & path)
 
 void DiskObjectStorageTransaction::createDirectories(const std::string & path)
 {
-<<<<<<< HEAD
     addOperation([path](MetadataTransactionPtr tx)
-=======
-    dispatch([path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->createDirectoryRecursive(path);
     });
@@ -142,11 +134,7 @@ void DiskObjectStorageTransaction::createDirectories(const std::string & path)
 
 void DiskObjectStorageTransaction::moveDirectory(const std::string & from_path, const std::string & to_path)
 {
-<<<<<<< HEAD
     addOperation([from_path, to_path](MetadataTransactionPtr tx)
-=======
-    dispatch([from_path, to_path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->moveDirectory(from_path, to_path);
     });
@@ -154,11 +142,7 @@ void DiskObjectStorageTransaction::moveDirectory(const std::string & from_path, 
 
 void DiskObjectStorageTransaction::moveFile(const String & from_path, const String & to_path)
 {
-<<<<<<< HEAD
     addOperation([from_path, to_path](MetadataTransactionPtr tx)
-=======
-    dispatch([from_path, to_path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->moveFile(from_path, to_path);
     });
@@ -166,11 +150,7 @@ void DiskObjectStorageTransaction::moveFile(const String & from_path, const Stri
 
 void DiskObjectStorageTransaction::truncateFile(const String & path, size_t size)
 {
-<<<<<<< HEAD
     addOperation([path, size](MetadataTransactionPtr tx)
-=======
-    dispatch([path, size](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->truncateFile(path, size);
     });
@@ -194,11 +174,7 @@ void DiskObjectStorageTransaction::decrementBlobRefCount(const std::string & blo
 
 void DiskObjectStorageTransaction::replaceFile(const std::string & from_path, const std::string & to_path)
 {
-<<<<<<< HEAD
     addOperation([from_path, to_path](MetadataTransactionPtr tx)
-=======
-    dispatch([from_path, to_path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->replaceFile(from_path, to_path);
     });
@@ -206,11 +182,7 @@ void DiskObjectStorageTransaction::replaceFile(const std::string & from_path, co
 
 void DiskObjectStorageTransaction::removeFile(const std::string & path)
 {
-<<<<<<< HEAD
     addOperation([path](MetadataTransactionPtr tx)
-=======
-    dispatch([path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->unlinkFile(path, /*if_exists=*/false, /*should_remove_objects=*/true);
     });
@@ -218,11 +190,7 @@ void DiskObjectStorageTransaction::removeFile(const std::string & path)
 
 void DiskObjectStorageTransaction::removeSharedFile(const std::string & path, bool keep_shared_data)
 {
-<<<<<<< HEAD
     addOperation([path, keep_shared_data](MetadataTransactionPtr tx)
-=======
-    dispatch([path, keep_shared_data](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->unlinkFile(path, /*if_exists=*/false, /*should_remove_objects=*/!keep_shared_data);
     });
@@ -233,22 +201,14 @@ void DiskObjectStorageTransaction::removeSharedRecursive(
 {
     if (!keep_all_shared_data && file_names_remove_metadata_only.empty())
     {
-<<<<<<< HEAD
         addOperation([path](MetadataTransactionPtr tx)
-=======
-        dispatch([path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         {
             tx->removeRecursive(path, /*should_remove_objects=*/nullptr);
         });
     }
     else
     {
-<<<<<<< HEAD
         addOperation([path, keep_all_shared_data, file_names_remove_metadata_only](MetadataTransactionPtr tx)
-=======
-        dispatch([path, keep_all_shared_data, file_names_remove_metadata_only](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         {
             tx->removeRecursive(path, /*should_remove_objects=*/[keep_all_shared_data, file_names_remove_metadata_only](const std::string & relative_path)
             {
@@ -260,11 +220,7 @@ void DiskObjectStorageTransaction::removeSharedRecursive(
 
 void DiskObjectStorageTransaction::removeSharedFileIfExists(const std::string & path, bool keep_shared_data)
 {
-<<<<<<< HEAD
     addOperation([path, keep_shared_data](MetadataTransactionPtr tx)
-=======
-    dispatch([path, keep_shared_data](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects=*/!keep_shared_data);
     });
@@ -272,11 +228,7 @@ void DiskObjectStorageTransaction::removeSharedFileIfExists(const std::string & 
 
 void DiskObjectStorageTransaction::removeDirectory(const std::string & path)
 {
-<<<<<<< HEAD
     addOperation([path](MetadataTransactionPtr tx)
-=======
-    dispatch([path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->removeDirectory(path);
     });
@@ -284,11 +236,7 @@ void DiskObjectStorageTransaction::removeDirectory(const std::string & path)
 
 void DiskObjectStorageTransaction::removeRecursive(const std::string & path)
 {
-<<<<<<< HEAD
     addOperation([path](MetadataTransactionPtr tx)
-=======
-    dispatch([path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->removeRecursive(path, /*should_remove_objects=*/nullptr);
     });
@@ -296,11 +244,7 @@ void DiskObjectStorageTransaction::removeRecursive(const std::string & path)
 
 void DiskObjectStorageTransaction::removeFileIfExists(const std::string & path)
 {
-<<<<<<< HEAD
     addOperation([path](MetadataTransactionPtr tx)
-=======
-    dispatch([path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects=*/true);
     });
@@ -311,11 +255,7 @@ void DiskObjectStorageTransaction::removeSharedFiles(const RemoveBatchRequest & 
     for (const auto & [path, if_exists] : files)
     {
         const bool should_remove_objects = !keep_all_batch_data && !file_names_remove_metadata_only.contains(fs::path(path).filename());
-<<<<<<< HEAD
         addOperation([path, if_exists, should_remove_objects](MetadataTransactionPtr tx)
-=======
-        dispatch([path, if_exists, should_remove_objects](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         {
             tx->unlinkFile(path, if_exists, should_remove_objects);
         });
@@ -528,14 +468,10 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
     /// We always use mode Rewrite because we simulate append using metadata and different files
     object.bytes_size = std::move(write_blob_function)(blob_path, WriteMode::Rewrite, /*object_attributes=*/std::nullopt);
 
-<<<<<<< HEAD
-    addOperation([object, mode](MetadataTransactionPtr tx)
-=======
-    /// [TXN-ONE-PIPELINE] Routed through dispatch for uniformity. Unreachable on CA (Audit 6):
+    /// [TXN-ONE-PIPELINE] Routed through addOperation for uniformity. Unreachable on CA (Audit 6):
     /// generateObjectKeyForPath above throws NOT_IMPLEMENTED first, so CA never reaches this metadata
-    /// effect and never queues. On ordinary storage dispatch queues exactly as before.
-    dispatch([object, mode](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+    /// effect and never queues. On ordinary storage addOperation queues exactly as before.
+    addOperation([object, mode](MetadataTransactionPtr tx)
     {
         if (mode == WriteMode::Rewrite)
         {
@@ -553,17 +489,13 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
 
 void DiskObjectStorageTransaction::createHardLink(const std::string & src_path, const std::string & dst_path)
 {
-<<<<<<< HEAD
-    addOperation([src_path, dst_path](MetadataTransactionPtr tx)
-=======
-    /// For CA `dispatch` runs eagerly (call-time), which is load-bearing for read-your-writes: a
+    /// For CA `addOperation` runs eagerly (call-time), which is load-bearing for read-your-writes: a
     /// carried-forward projection hardlinked into the open whole-part transaction during a mutation must
     /// be visible to `loadProjections` (same finalize, before commit) via the directory overlay. Deferring
     /// it to commit replay would hide it until after `loadProjections` ran (B58/B63). The metadata-level
     /// `createHardLink` is an idempotent map assignment, so eager staging is equivalent to the queued
     /// replay — commit publishes the manifest from the staging.
-    dispatch([src_path, dst_path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+    addOperation([src_path, dst_path](MetadataTransactionPtr tx)
     {
         tx->createHardLink(src_path, dst_path);
     });
@@ -597,11 +529,7 @@ std::vector<std::string> DiskObjectStorageTransaction::listInFlightDirectory(con
 
 void DiskObjectStorageTransaction::setReadOnly(const std::string & path)
 {
-<<<<<<< HEAD
     addOperation([path](MetadataTransactionPtr tx)
-=======
-    dispatch([path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->setReadOnly(path);
     });
@@ -609,11 +537,7 @@ void DiskObjectStorageTransaction::setReadOnly(const std::string & path)
 
 void DiskObjectStorageTransaction::setLastModified(const std::string & path, const Poco::Timestamp & timestamp)
 {
-<<<<<<< HEAD
     addOperation([path, timestamp](MetadataTransactionPtr tx)
-=======
-    dispatch([path, timestamp](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->setLastModified(path, timestamp);
     });
@@ -621,11 +545,7 @@ void DiskObjectStorageTransaction::setLastModified(const std::string & path, con
 
 void DiskObjectStorageTransaction::chmod(const String & path, mode_t mode)
 {
-<<<<<<< HEAD
     addOperation([path, mode](MetadataTransactionPtr tx)
-=======
-    dispatch([path, mode](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     {
         tx->chmod(path, mode);
     });
@@ -723,15 +643,11 @@ void DiskObjectStorageTransaction::copyFileImpl(
         return;
     }
 
-<<<<<<< HEAD
-    addOperation([blobs_to_create, missing_locations, to_file_path](MetadataTransactionPtr tx)
-=======
-    /// [TXN-ONE-PIPELINE] Routed through dispatch for uniformity. Unreachable on CA (Audit 6):
+    /// [TXN-ONE-PIPELINE] Routed through addOperation for uniformity. Unreachable on CA (Audit 6):
     /// copyFileImpl calls generateObjectKeyForPath above, which throws NOT_IMPLEMENTED on CA before this
     /// point (and the empty-source case returns via the real writeFile above), so CA never queues here.
-    /// On ordinary storage dispatch queues exactly as before.
-    dispatch([blobs_to_create, missing_locations, to_file_path](MetadataTransactionPtr tx)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+    /// On ordinary storage addOperation queues exactly as before.
+    addOperation([blobs_to_create, missing_locations, to_file_path](MetadataTransactionPtr tx)
     {
         for (const auto & blob : blobs_to_create)
             tx->recordBlobsReplication(blob, missing_locations);
@@ -754,12 +670,12 @@ void DiskObjectStorageTransaction::commit()
 {
     /// [TXN-ONE-PIPELINE] An eager staging-overlay transaction (e.g. CA) must route every mutating method
     /// straight to the metadata transaction at call time and keep this queue empty. A non-empty queue here
-    /// means a mutating method bypassed `dispatch` — which would re-introduce the two-timeline split this
+    /// means a mutating method bypassed `addOperation` — which would re-introduce the two-timeline split this
     /// design eliminates. Fail closed with a real throw (NOT chassert, which is a no-op in release builds).
     if (metadata_storage->transactionIsStagingOverlay() && !operations_to_execute.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "An eager staging-overlay transaction must not queue deferred operations "
-            "(a mutating method bypassed dispatch): {} queued", operations_to_execute.size());
+            "(a mutating method bypassed addOperation): {} queued", operations_to_execute.size());
 
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorageTransaction::commit");
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
@@ -806,17 +722,14 @@ void DiskObjectStorageTransaction::commit()
 
 TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
 {
-<<<<<<< HEAD
-    chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
-=======
     /// [TXN-ONE-PIPELINE] See commit(): an eager staging-overlay transaction must never queue deferred
-    /// operations. Fail closed (real throw, not chassert) if a mutating method bypassed `dispatch`.
+    /// operations. Fail closed (real throw, not chassert) if a mutating method bypassed `addOperation`.
     if (metadata_storage->transactionIsStagingOverlay() && !operations_to_execute.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "An eager staging-overlay transaction must not queue deferred operations "
-            "(a mutating method bypassed dispatch): {} queued", operations_to_execute.size());
+            "(a mutating method bypassed addOperation): {} queued", operations_to_execute.size());
 
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+    chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
     for (size_t i = 0; i < operations_to_execute.size(); ++i)
     {
         try

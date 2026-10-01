@@ -61,68 +61,6 @@ class ClickHouseService:
         )
 
     def __enter__(self):
-<<<<<<< HEAD
-=======
-        Utils.add_to_PATH(temp_dir)
-
-        # Download binary if absent
-        clickhouse_bin = Path(temp_dir) / "clickhouse"
-        if not clickhouse_bin.exists():
-            self._download_binary()
-
-        # Create symlinks if absent
-        for link_name in ("clickhouse-server", "clickhouse-client", "clickhouse-local"):
-            link_path = Path(temp_dir) / link_name
-            if not link_path.exists():
-                Utils.link(clickhouse_bin, link_path)
-
-        # Copy server config files if absent
-        config_dir = Path(self.ch_config_dir)
-        if not (config_dir / "config.xml").exists():
-            config_dir.mkdir(parents=True, exist_ok=True)
-            src_dir = Path("./programs/server")
-            for name in ("config.xml", "users.xml"):
-                shutil.copy(src_dir / name, config_dir / name)
-            shutil.copytree(
-                src_dir / "config.d",
-                config_dir / "config.d",
-                symlinks=False,
-                dirs_exist_ok=True,
-            )
-
-        # Recreate data directory so it is owned by the current process user.
-        # If the directory was created on the host by a different UID (e.g. 501
-        # on macOS) and the server runs as root inside Docker, ClickHouse raises
-        # MISMATCHING_USERS_FOR_PROCESS_AND_DATA and refuses to start.
-        if Path(self.run_path).exists():
-            shutil.rmtree(self.run_path)
-        Path(self.run_path).mkdir(parents=True, exist_ok=True)
-        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
-        Path(self.pid_file).unlink(missing_ok=True)
-
-        argv = [
-            str(Path(temp_dir) / "clickhouse-server"),
-            "--config-file", self.config_file,
-            "--pid-file", self.pid_file,
-            "--",
-            "--path", self.run_path,
-            "--user_files_path", self.user_files_path,
-            "--top_level_domains_path", f"{self.ch_config_dir}/top_level_domains",
-            "--logger.stderr", f"{self.log_dir}/stderr.log",
-            # NOTE (strtgbb): master binary rejects unknown cas_log keys (ErrorCodes 137)
-            "--skip_check_for_incorrect_settings", "1",
-        ]
-        print(f"Starting ClickHouse server: {shlex.join(argv)}")
-        with open(f"{self.log_dir}/clickhouse-server.log", "w") as log_fd:
-            self._proc = subprocess.Popen(
-                argv,
-                stderr=subprocess.STDOUT,
-                stdout=log_fd,
-                start_new_session=True,
-                cwd=self.run_path,
-            )
-
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         try:
             Utils.add_to_PATH(temp_dir)
 

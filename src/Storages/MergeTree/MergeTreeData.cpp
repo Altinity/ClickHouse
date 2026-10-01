@@ -7034,32 +7034,6 @@ MergeTreeData::PartsToRemoveFromZooKeeper MergeTreeData::removePartsInRangeFromW
         new_data_part->getDataPartStorage().commitTransaction();
         rollback_tx_guard.reset();
 
-<<<<<<< HEAD
-=======
-        /// On a content-addressed disk a part directory becomes durable only when its disk-storage
-        /// transaction is committed (the ref to its manifest is published at commit, not at rename).
-        /// The flow below rolls back the in-memory MergeTreeData transaction (to keep the empty part
-        /// Outdated, not Active), which never calls commitTransaction on the disk storage — so on a CA
-        /// disk the empty covering part would leave NO on-disk ref and vanish on restart/reattach,
-        /// defeating its sole purpose (it exists only to cover the dropped parts on disk so a restart
-        /// does not treat them as uncovered unexpected parts and trip TOO_MANY_UNEXPECTED_DATA_PARTS).
-        /// On a plain disk the rename in renameTempPartAndAdd is already durable, so this is a no-op
-        /// there. Commit the disk storage transaction here (CA only) so the ref is published before the
-        /// in-memory rollback; the part still ends up Outdated, exactly as on a plain disk.
-        ///
-        /// [TXN-ONE-PIPELINE] (`2026-07-16-cas-txn-one-pipeline-design.md`, Audit 7 / Tension 2): this
-        /// hand-placed `commitTransaction()` is NOT made redundant by moving publication into `commit`
-        /// — it is the direct consequence of that design. There is no `precommit` phase under the
-        /// one-pipeline model, and this rollback path (by construction, to keep the part Outdated) never
-        /// reaches `MergeTreeData::Transaction::commit`, the only other place a disk transaction is
-        /// committed. So this call remains the ONLY thing that publishes the empty cover's ref. Keep it.
-        if (new_data_part->getDataPartStorage().isContentAddressed()
-            && new_data_part->getDataPartStorage().hasActiveTransaction())
-            new_data_part->getDataPartStorage().commitTransaction();
-
-        /// It will add the empty part to the set of Outdated parts without making it Active (exactly what we need)
-        transaction.rollback(&lock);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         new_data_part->remove_time.store(0, std::memory_order_relaxed);
         /// Such parts are always local, they don't participate in replication, they don't have shared blobs.
         /// So we don't have locks for shared data in zk for them, and can just remove blobs (this avoids leaving garbage in S3)
@@ -9264,10 +9238,6 @@ void MergeTreeData::restorePartFromBackup(std::shared_ptr<RestoredPartsHolder> r
             continue;
         }
 
-<<<<<<< HEAD
-        size_t file_size = backup->copyFileToDisk(part_path_in_backup_fs / filename, disk, temp_part_dir / filename, WriteMode::Rewrite, fsync_files);
-        reservation->update(reservation->getSize() - file_size);
-=======
         if (restore_tx)
         {
             auto in = backup->readFile(part_path_in_backup_fs / filename);
@@ -9278,10 +9248,9 @@ void MergeTreeData::restorePartFromBackup(std::shared_ptr<RestoredPartsHolder> r
         }
         else
         {
-            size_t file_size = backup->copyFileToDisk(part_path_in_backup_fs / filename, disk, temp_part_dir / filename, WriteMode::Rewrite);
+            size_t file_size = backup->copyFileToDisk(part_path_in_backup_fs / filename, disk, temp_part_dir / filename, WriteMode::Rewrite, fsync_files);
             reservation->update(reservation->getSize() - file_size);
         }
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     }
 
     if (restore_tx)

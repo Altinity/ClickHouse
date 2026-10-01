@@ -1,6 +1,5 @@
 from praktika import Workflow
 
-<<<<<<< HEAD
 from ci.defs.defs import (
     BINARIES_WITH_LONG_RETENTION,
     DOCKERS,
@@ -8,10 +7,7 @@ from ci.defs.defs import (
     SECRETS,
     ArtifactConfigs,
 )
-=======
-from ci.defs.defs import BINARIES_WITH_LONG_RETENTION, DOCKERS, SECRETS, ArtifactConfigs
 from ci.defs.altinity_jobs import AltinityJobConfigs
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 from ci.defs.job_configs import JobConfigs
 from ci.jobs.scripts.workflow_hooks.filter_job import should_skip_job
 

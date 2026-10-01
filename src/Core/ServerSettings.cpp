@@ -182,18 +182,13 @@ A value of `0` means unlimited.
 :::
 )", 0) \
     DECLARE(UInt64, max_format_parsing_thread_pool_size, 100, R"(
-<<<<<<< HEAD
 Maximum total number of threads to use for parsing input.
 )", 0) \
-=======
-    Maximum total number of threads to use for parsing input.
-    )", 0) \
     DECLARE(UInt64, cas_blob_upload_pool_size, 16, R"(
     ClickHouse uses threads from this dedicated server-wide pool to upload blobs in parallel when
     committing a content-addressed (CAS) part. `cas_blob_upload_pool_size` limits the
     maximum number of threads in the pool. Zero is rejected: the pool must have at least one thread.
     )", 0) \
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     DECLARE(UInt64, max_format_parsing_thread_pool_free_size, 0, R"(
 Maximum number of idle standby threads to keep in the thread pool for parsing input.
 )", 0) \

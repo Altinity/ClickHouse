@@ -1398,9 +1398,6 @@ def test_replicated_table_structure_alter(started_cluster):
     )
 
     competing_node.query("SYSTEM SYNC DATABASE REPLICA table_structure")
-<<<<<<< HEAD
-    competing_node.query("DETACH DATABASE table_structure SYNC")
-=======
 
     # `system.tables` only lists an attached database, so the metadata path of `mem` must be read
     # before the DETACH below; afterwards the SELECT returns nothing.
@@ -1409,8 +1406,7 @@ def test_replicated_table_structure_alter(started_cluster):
     ).strip()
     assert metadata_path, "metadata_path of table_structure.mem is empty"
 
-    competing_node.query("DETACH DATABASE table_structure")
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+    competing_node.query("DETACH DATABASE table_structure SYNC")
 
     main_node.query(
         "ALTER TABLE table_structure.rmt ADD COLUMN m int", settings=settings

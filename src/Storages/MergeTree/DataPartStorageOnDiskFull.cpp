@@ -73,21 +73,12 @@ bool DataPartStorageOnDiskFull::exists() const
 
 bool DataPartStorageOnDiskFull::existsFileImpl(const std::string & name) const
 {
-<<<<<<< HEAD
-    return volume->getDisk()->existsFile(fs::path(root_path) / part_dir / name);
-=======
     auto path = fs::path(root_path) / part_dir / name;
     /// B59: a part still being assembled by this transaction can have staged-but-uncommitted files
     /// (e.g. projection temp blocks on a content-addressed disk). Consult the held transaction first.
     if (transaction && transaction->tryGetInFlightFileSize(path).has_value())
         return true;
-    if (looksLikePackedSkipIndexFile(name))
-    {
-        if (auto reader = getSkipIndicesPackedReader(); reader && reader->exists(name))
-            return true;
-    }
     return volume->getDisk()->existsFile(path);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 }
 
 bool DataPartStorageOnDiskFull::existsDirectory(const std::string & name) const
@@ -175,26 +166,20 @@ Poco::Timestamp DataPartStorageOnDiskFull::getFileLastModified(const String & fi
 
 size_t DataPartStorageOnDiskFull::getFileSizeImpl(const String & file_name) const
 {
-    return volume->getDisk()->getFileSize(fs::path(root_path) / part_dir / file_name);
-}
-
-std::optional<UInt64> DataPartStorageOnDiskFull::getPackedFileUncompressedSize(const std::string & file_name) const
-{
     auto path = fs::path(root_path) / part_dir / file_name;
     /// B59: see existsFile — the merge stats the staged temp files before reading them back.
     if (transaction)
         if (auto size = transaction->tryGetInFlightFileSize(path))
             return *size;
+    return volume->getDisk()->getFileSize(path);
+}
+
+std::optional<UInt64> DataPartStorageOnDiskFull::getPackedFileUncompressedSize(const std::string & file_name) const
+{
     if (looksLikePackedSkipIndexFile(file_name))
         if (auto reader = getSkipIndicesPackedReader(); reader && reader->exists(file_name))
-<<<<<<< HEAD
             return reader->getFileUncompressedSize(file_name);
     return {};
-=======
-            return reader->getFileSize(file_name);
-    }
-    return volume->getDisk()->getFileSize(path);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 }
 
 UInt32 DataPartStorageOnDiskFull::getRefCount(const String & file_name) const
@@ -241,9 +226,6 @@ void DataPartStorageOnDiskFull::prepareReadImpl(
     std::optional<size_t> read_hint,
     ReadPipeline & pipeline) const
 {
-<<<<<<< HEAD
-    volume->getDisk()->prepareRead(fs::path(root_path) / part_dir / name, settings, read_hint, pipeline);
-=======
     auto path = fs::path(root_path) / part_dir / name;
 
     /// B59: read-your-writes for a part still being assembled by this transaction. A projection
@@ -280,29 +262,7 @@ void DataPartStorageOnDiskFull::prepareReadImpl(
         }
     }
 
-    if (looksLikePackedSkipIndexFile(name))
-    {
-        if (auto reader = getSkipIndicesPackedReader(); reader && reader->exists(name))
-        {
-            /// Packed substreams skip the disk's normal pipeline (filesystem cache,
-            /// async prefetch, etc.) and read through PackedFilesReader::readFile, which
-            /// opens the archive via the underlying disk and wraps the result with
-            /// ReadBufferFromFileView at the right offset. The archive's current location is
-            /// captured here and passed in, so the reader holds no path of its own.
-            auto disk = volume->getDisk();
-            String archive_path = fs::path(root_path) / part_dir / String(SKIP_INDICES_PACKED_FILENAME);
-            ReadPipeline::BufferCreator creator =
-                [reader, disk, archive_path, name, read_hint](const StoredObject &, const ReadSettings & s, bool, bool)
-                {
-                    return reader->readFile(disk, archive_path, name, s, read_hint);
-                };
-            pipeline.setSource(std::move(creator), StoredObjects{StoredObject{}}, settings);
-            return;
-        }
-    }
-
     volume->getDisk()->prepareRead(path, settings, read_hint, pipeline);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 }
 
 std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskFull::readFileIfExistsImpl(
@@ -310,9 +270,6 @@ std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskFull::readFileIfExi
     const ReadSettings & settings,
     std::optional<size_t> read_hint) const
 {
-<<<<<<< HEAD
-    return volume->getDisk()->readFileIfExists(fs::path(root_path) / part_dir / name, settings, read_hint);
-=======
     auto path = fs::path(root_path) / part_dir / name;
     /// B59: serve a file staged by this transaction (uploaded blob or inline mutable bytes) before commit.
     /// This direct delegate bypasses prepareRead, so the in-flight guard must be repeated here; it is the
@@ -320,16 +277,7 @@ std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskFull::readFileIfExi
     if (transaction)
         if (auto rb = transaction->tryReadFileInFlight(path, settings, read_hint))
             return rb;
-    if (looksLikePackedSkipIndexFile(name))
-    {
-        if (auto reader = getSkipIndicesPackedReader(); reader && reader->exists(name))
-            return reader->readFile(
-                volume->getDisk(),
-                fs::path(root_path) / part_dir / String(SKIP_INDICES_PACKED_FILENAME),
-                name, settings, read_hint);
-    }
     return volume->getDisk()->readFileIfExists(path, settings, read_hint);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 }
 
 std::unique_ptr<WriteBufferFromFileBase> DataPartStorageOnDiskFull::writeFile(

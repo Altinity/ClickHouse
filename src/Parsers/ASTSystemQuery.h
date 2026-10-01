@@ -159,7 +159,6 @@ public:
         INSTRUMENT_ADD,
         INSTRUMENT_REMOVE,
         RESET_DDL_WORKER,
-<<<<<<< HEAD
         STOP_ALL_BACKGROUND,
         START_ALL_BACKGROUND,
         PAUSE_ALL_BACKGROUND,
@@ -170,7 +169,6 @@ public:
         PAUSE,
         CANCEL,
         REFRESH,
-=======
         CAS_GC_RUN,
         CAS_GC_REBUILD,
         CAS_DROP_POOL_MEMBER,
@@ -178,7 +176,6 @@ public:
         CAS_FORGET,
         CAS_GC_STOP,
         CAS_GC_START,
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         END
     };
 

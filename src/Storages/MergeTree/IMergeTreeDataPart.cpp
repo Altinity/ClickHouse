@@ -1626,13 +1626,9 @@ MergeTreeDataPartBuilder IMergeTreeDataPart::getProjectionPartBuilder(
     MutableDataPartStoragePtr projection_storage;
     {
         ScopedJemallocThreadArena mergetree_arena_scope(JemallocMergeTreeArena::getArenaIndex());
-<<<<<<< HEAD
         projection_storage = intent == PartDirIntent::CreateFresh
-            ? getDataPartStorage().getProjectionNoInitialize(projection_name + projection_extension, !is_temp_projection)
-            : getDataPartStorage().getProjection(projection_name + projection_extension, !is_temp_projection);
-=======
-        projection_storage = getDataPartStorage().getProjection(projection_name + projection_extension, use_parent_transaction);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+            ? getDataPartStorage().getProjectionNoInitialize(projection_name + projection_extension, use_parent_transaction)
+            : getDataPartStorage().getProjection(projection_name + projection_extension, use_parent_transaction);
     }
     if (intent == PartDirIntent::CreateFresh && projection_storage->exists())
     {

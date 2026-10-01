@@ -133,16 +133,13 @@ DB::CommandPtr makeCommandSwitchDisk();
 DB::CommandPtr makeCommandGetCurrentDiskAndPath();
 DB::CommandPtr makeCommandHelp(const DisksApp & disks_app);
 DB::CommandPtr makeCommandTouch();
-<<<<<<< HEAD
 DB::CommandPtr makeCommandDiskUsage();
 DB::CommandPtr makeCommandWordCount();
-=======
 DB::CommandPtr makeCommandFsck();
 DB::CommandPtr makeCommandCaGcDryRun();
 DB::CommandPtr makeCommandCaGcRebuild();
 DB::CommandPtr makeCommandCaInspect();
 DB::CommandPtr makeCommandCaDropMember();
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 DB::CommandPtr makeCommandReadChecksums();
 DB::CommandPtr makeCommandPackedIO();
 }

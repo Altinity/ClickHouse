@@ -805,8 +805,6 @@ bool DiskObjectStorage::supportsHardLinks() const
     return !metadata_storage->isWriteOnce() && !metadata_storage->isPlain();
 }
 
-<<<<<<< HEAD
-=======
 bool DiskObjectStorage::isContentAddressed() const
 {
     return metadata_storage->isContentAddressed();
@@ -817,8 +815,6 @@ bool DiskObjectStorage::supportsAtomicFileWrites() const
     return metadata_storage->supportsAtomicFileWrites();
 }
 
-
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 String DiskObjectStorage::getReadResourceName() const
 {
     std::unique_lock lock(resource_mutex);
@@ -853,7 +849,6 @@ void DiskObjectStorage::prepareRead(
     std::optional<size_t> read_hint,
     ReadPipeline & pipeline) const
 {
-<<<<<<< HEAD
     /// A small file may be stored inline in its metadata; serve the content directly.
     if (metadata_storage->supportsInlineData())
     {
@@ -874,8 +869,6 @@ void DiskObjectStorage::prepareRead(
         }
     }
 
-    const StoredObjects storage_objects = metadata_storage->getStorageObjects(path);
-=======
     /// Content-addressed reads: in-manifest bytes come from memory (no object exists); a
     /// blob-backed part file translates to its physical blob object + a payload window, which
     /// rides the STANDARD pipeline below (gather/caches/async prefetch — same chain as plain
@@ -896,7 +889,6 @@ void DiskObjectStorage::prepareRead(
     const auto storage_objects = ca_blob_view
         ? StoredObjects{ca_blob_view->object}
         : metadata_storage->getStorageObjects(path);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
     auto read_settings = updateIOSchedulingSettings(settings, getReadResourceName(), getWriteResourceName());
     auto global_context = Context::getGlobalContextInstance();

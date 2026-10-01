@@ -342,16 +342,13 @@ void DisksApp::registerCommands()
     command_descriptions.emplace("switch-disk", makeCommandSwitchDisk());
     command_descriptions.emplace("current_disk_with_path", makeCommandGetCurrentDiskAndPath());
     command_descriptions.emplace("touch", makeCommandTouch());
-<<<<<<< HEAD
     command_descriptions.emplace("du", makeCommandDiskUsage());
     command_descriptions.emplace("wc", makeCommandWordCount());
-=======
     command_descriptions.emplace("cas-fsck", makeCommandFsck());
     command_descriptions.emplace("cas-gc-dryrun", makeCommandCaGcDryRun());
     command_descriptions.emplace("cas-gc-rebuild", makeCommandCaGcRebuild());
     command_descriptions.emplace("cas-inspect", makeCommandCaInspect());
     command_descriptions.emplace("cas-drop-member", makeCommandCaDropMember());
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     command_descriptions.emplace("read-checksums", makeCommandReadChecksums());
     command_descriptions.emplace("help", makeCommandHelp(*this));
     command_descriptions.emplace("packed-io", makeCommandPackedIO());

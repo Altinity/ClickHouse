@@ -725,6 +725,13 @@ std::optional<ObjectMetadata> LocalObjectStorage::tryGetObjectMetadata(const std
     auto resolved_path = resolvePathRelativelyToKeyPrefix(path);
     LOG_TEST(log, "Getting metadata for path: {}", resolved_path);
 
+    /// A directory is not an object: fs::file_size would throw "Is a directory". Treat it as a
+    /// missing object (nullopt) so callers probing whether a path is a readable object do not get
+    /// a raw filesystem error (B38: system.remote_data_paths traversal on a CAS pool).
+    std::error_code error;
+    if (fs::is_directory(resolved_path, error))
+        return {};
+
     return tryStatResolvedPath(resolved_path);
 }
 
@@ -788,30 +795,7 @@ ObjectMetadata LocalObjectStorage::getObjectMetadata(const std::string & path, b
         throw fs::filesystem_error(
             "Got unexpected error while getting file metadata", resolved_path, std::error_code(errno, std::generic_category()));
 
-<<<<<<< HEAD
     return makeObjectMetadata(file_stat);
-=======
-    object_metadata.size_bytes = fs::file_size(resolved_path);
-    object_metadata.etag = std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count());
-    object_metadata.last_modified = Poco::Timestamp::fromEpochTime(
-        std::chrono::duration_cast<std::chrono::seconds>(time.time_since_epoch()).count());
-    return object_metadata;
-}
-
-std::optional<ObjectMetadata> LocalObjectStorage::tryGetObjectMetadata(const std::string & path, bool) const
-{
-    auto resolved_path = resolvePathRelativelyToKeyPrefix(path);
-    LOG_TEST(log, "Getting metadata for path: {}", resolved_path);
-
-    /// A directory is not an object: fs::file_size would throw "Is a directory". Treat it as a
-    /// missing object (nullopt) so callers probing whether a path is a readable object do not get
-    /// a raw filesystem error (B38: system.remote_data_paths traversal on a CAS pool).
-    std::error_code error;
-    if (fs::is_directory(resolved_path, error))
-        return {};
-
-    return tryStatResolvedPath(resolved_path);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 }
 
 void LocalObjectStorage::listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t/* max_keys */) const

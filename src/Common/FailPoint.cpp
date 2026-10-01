@@ -349,7 +349,6 @@ static struct InitFiu
     PAUSEABLE_ONCE(iceberg_compaction_pause_before_metadata_commit) \
     REGULAR(tcp_handler_fail_connection_setup) \
     REGULAR(distributed_plan_status_check_reenqueue_fault) \
-<<<<<<< HEAD
     PAUSEABLE(keeper_changelog_read_plan_resolved) \
     PAUSEABLE(keeper_changelog_removed_from_disk_set) \
     PAUSEABLE(keeper_changelog_readahead_fill_wedge) \
@@ -370,11 +369,9 @@ static struct InitFiu
     PAUSEABLE_ONCE(limit_by_transform_mid_loop_pause) \
     PAUSEABLE_ONCE(aggregating_in_order_transform_mid_loop_pause) \
     REGULAR(smt_force_takeover_predicate_true) \
-    REGULAR(smt_takeover_fake_hardware_error_after_set)
-=======
+    REGULAR(smt_takeover_fake_hardware_error_after_set) \
     REGULAR(cas_relink_receiver_force_mechanism_failure) \
     PAUSEABLE_ONCE(cas_relink_receiver_pause_before_confirm)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
 namespace FailPoints
 {

@@ -138,8 +138,6 @@ ThreadGroup::ThreadGroup(ThreadGroupPtr parent_thread_group)
     , global_context(parent->global_context)
     , fatal_error_callback(parent->fatal_error_callback)
     , os_threads_nice_value(parent->os_threads_nice_value)
-    /// Keep the parent group alive: this child parents its trackers at the parent's via raw pointers (B90).
-    , parent_thread_group(parent)
     , memory_spill_scheduler(parent->memory_spill_scheduler)
     , performance_counters(VariableContext::Process, &parent->performance_counters)
     , memory_tracker(&parent->memory_tracker, VariableContext::Process, /*log_peak_memory_usage_in_destructor*/ false)
@@ -154,8 +152,6 @@ ThreadGroup::ThreadGroup(ContextPtr query_context_, ThreadGroupPtr parent_thread
     , global_context(query_context_->getGlobalContext())
     , fatal_error_callback(parent->fatal_error_callback)
     , os_threads_nice_value(parent->os_threads_nice_value)
-    /// Keep the parent group alive: this child parents its trackers at the parent's via raw pointers (B90).
-    , parent_thread_group(parent)
     , memory_spill_scheduler(parent->memory_spill_scheduler)
     , performance_counters(VariableContext::Process, &parent->performance_counters)
     , memory_tracker(&parent->memory_tracker, VariableContext::Process, /*log_peak_memory_usage_in_destructor*/ false)

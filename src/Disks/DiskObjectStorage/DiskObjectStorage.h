@@ -51,22 +51,16 @@ public:
 
     DataSourceDescription getDataSourceDescription() const override { return data_source_description; }
 
-<<<<<<< HEAD
     /// Keeper metadata replicates itself; in-memory metadata is transient and has no local
     /// metadata files zero-copy could ship (see `getReplicatedFilesDescriptionForRemoteDisk`).
-    bool supportZeroCopyReplication() const override
-    {
-        return metadata_storage->getType() != MetadataStorageType::Keeper
-            && metadata_storage->getType() != MetadataStorageType::Memory;
-=======
     /// A content-addressed pool deduplicates blobs across parts and has no per-replica unique blob
     /// ids; the zero-copy subsystem (B1) is explicitly out of scope for M1, so advertise it as
     /// unsupported (honest capability — B31). Other object-storage metadata types keep the old rule.
     bool supportZeroCopyReplication() const override
     {
         return metadata_storage->getType() != MetadataStorageType::Keeper
+            && metadata_storage->getType() != MetadataStorageType::Memory
             && metadata_storage->getType() != MetadataStorageType::CAS;
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     }
 
     bool supportParallelWrite() const override { return object_storages->takePointingTo(cluster->getLocalLocation())->supportParallelWrite(); }
