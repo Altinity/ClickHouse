@@ -54,9 +54,7 @@ are read through the `CAS` read path and written to the destination. Pool dedupl
 what was one blob shared by several replicas becomes ordinary files in the backup.
 
 **An `S3(...)` destination on the same `S3` endpoint as the pool** — the copy of a blob then runs
-inside the `S3` store itself: the ClickHouse server issues "copy these bytes" commands - one per
-upload part, so a payload larger than one part takes several - and `S3` moves the bytes internally
-without sending them through ClickHouse.
+inside the `S3` store itself, without sending the bytes through ClickHouse. The server issues one `UploadPartCopy` per upload part, so a payload larger than one part takes several.
 
 ```sql
 BACKUP TABLE t TO S3('http://s3.example.com/bucket/backups/b1', 'key', 'secret');
