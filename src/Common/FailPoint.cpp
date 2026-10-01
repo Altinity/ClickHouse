@@ -239,7 +239,11 @@ static struct InitFiu
     REGULAR(tcp_handler_fail_connection_setup) \
     REGULAR(distributed_plan_status_check_reenqueue_fault) \
     REGULAR(cas_relink_receiver_force_mechanism_failure) \
-    PAUSEABLE_ONCE(cas_relink_receiver_pause_before_confirm)
+    PAUSEABLE_ONCE(cas_relink_receiver_pause_before_confirm) \
+    REGULAR(cas_relink_sender_omit_pool_cookie) \
+    REGULAR(cas_relink_receiver_drop_forced_disk) \
+    ONCE(cas_gc_scheduler_fail_before_heartbeat_worker_start) \
+    ONCE(cas_gc_scheduler_fail_before_worker_start)
 
 namespace FailPoints
 {

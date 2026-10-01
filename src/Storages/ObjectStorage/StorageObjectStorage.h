@@ -85,11 +85,11 @@ public:
 
     bool supportsImport(ContextPtr) const override;
 
-    SinkToStoragePtr import(
+    ImportResult import(
         const std::string & /* file_name */,
         Block & /* block_with_partition_values */,
         const std::function<void(const std::string &)> & new_file_path_callback,
-        bool /* overwrite_if_exists */,
+        MergeTreePartExportFileAlreadyExistsPolicy /* file_already_exists_policy */,
         std::size_t /* max_bytes_per_file */,
         std::size_t /* max_rows_per_file */,
         const std::optional<std::string> & /* iceberg_metadata_json_string */,
@@ -173,6 +173,8 @@ public:
     void updateExternalDynamicMetadataIfExists(ContextPtr query_context) override;
 
     IDataLakeMetadata * getExternalMetadata(ContextPtr query_context);
+
+    std::shared_ptr<DataLake::ICatalog> getCatalog() const { return catalog; }
 
     std::optional<UInt64> totalRows(ContextPtr query_context) const override;
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
