@@ -34,6 +34,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <functional>
@@ -577,6 +578,58 @@ TEST(CASRetry, BindSaturatesAndLeavesAnEqualLeaseOffTheLeaseSource)
     const Retry::Bound lease = Retry::untilLeaseSafe(now + 91'999, 2'000).bind(now);
     EXPECT_EQ(lease.deadline_ms, now + 89'999);
     EXPECT_TRUE(lease.lease_bound);
+}
+
+TEST(CASRetrySpacing, SpacedPauseWaitsOutTheRestOfTheDraw)
+{
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 5'000), 1'000u);   /// failed at once
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 5'300), 700u);
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 6'000), 0u);       /// took exactly the draw
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 10'000), 0u);      /// took longer: retried at once
+    /// A sample before the start counts as no time taken, so the wait is never shortened by it.
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 4'000), 1'000u);
+}
+
+TEST(CASRetrySpacing, DrawIsWithinAFifthOfTheSpacing)
+{
+    bool low = false;
+    bool high = false;
+    for (int i = 0; i < 2'000; ++i)
+    {
+        const uint64_t draw = Retry::drawSpacing(1'000);
+        ASSERT_GE(draw, 800u);
+        ASSERT_LE(draw, 1'200u);
+        low = low || draw < 850;
+        high = high || draw > 1'150;
+    }
+    /// The bounds alone cannot tell a draw from a constant, so both ends must be reached.
+    EXPECT_TRUE(low);
+    EXPECT_TRUE(high);
+    EXPECT_EQ(Retry::drawSpacing(0), 0u);
+    constexpr uint64_t largest = std::numeric_limits<uint64_t>::max();
+    EXPECT_GE(Retry::drawSpacing(largest), largest - largest / 5) << "the top of the range must not wrap";
+}
+
+TEST(CASRetrySpacing, UntilDefinitiveHasNoWindowNoLeaseAndASpacing)
+{
+    constexpr uint64_t largest = std::numeric_limits<uint64_t>::max();
+    const Retry policy = Retry::untilDefinitive(1'000);
+    EXPECT_EQ(policy.window_ms, largest);
+    EXPECT_FALSE(policy.lease_deadline_ms.has_value());
+    EXPECT_FALSE(policy.single_attempt);
+    EXPECT_FALSE(policy.policy_deadline_ms.has_value());
+    EXPECT_EQ(policy.attempt_spacing_ms, std::optional<uint64_t>(1'000));
+    for (const uint64_t now : {uint64_t{0}, uint64_t{1}, uint64_t{1'000'000}, largest - 1, largest})
+    {
+        const Retry::Bound bound = policy.bind(now);
+        EXPECT_EQ(bound.deadline_ms, largest) << "now " << now;
+        EXPECT_FALSE(bound.lease_bound) << "now " << now;
+    }
+    /// Every other policy keeps the engine's own backoff.
+    EXPECT_FALSE(Retry::standard().attempt_spacing_ms.has_value());
+    EXPECT_FALSE(Retry::within(1'000).attempt_spacing_ms.has_value());
+    EXPECT_FALSE(Retry::once().attempt_spacing_ms.has_value());
+    EXPECT_FALSE(Retry::untilLeaseSafe(2'000'000, 2'000).attempt_spacing_ms.has_value());
 }
 
 TEST(CASRequests, CreateThenReplaceThenRemove)
@@ -2945,6 +2998,102 @@ TEST(CASRequestsFuse, ReadRefreshedCredentialTextDoesNotDoubleCountTheFuse)
     /// The refresh -- not the fuse's immediate reissue -- drove the resend, so the fuse counter must not
     /// move even though the exception's code and text also match `isFirstAttemptFuseTimeout`.
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRequestFirstAttemptFuse].load() - fuses_before, 0u);
+}
+
+namespace
+{
+
+/// A store whose requests each take `duration_ms` of the injected clock and fail as `fault` says.
+/// Every request is logged with the instant it started.
+class TimedFaultBackend : public InMemoryBackend
+{
+public:
+    enum class Verb : uint8_t { Put, Get };
+    struct Sent
+    {
+        Verb verb;
+        uint64_t started_ms;
+    };
+    /// The exception the request fails with, or null to serve it. `nth` counts requests of `verb` from 1.
+    using Fault = std::function<std::exception_ptr(Verb verb, size_t nth, uint64_t started_ms)>;
+
+    explicit TimedFaultBackend(FakeClock & clock_) : clock(clock_) {}
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        begin(Verb::Get);
+        return InMemoryBackend::read(key, access);
+    }
+
+    std::expected<String, DB::Cas::Backend::RawConflict> write(const String & key, const String & bytes,
+                                                               const std::optional<String> & expected_value,
+                                                               DB::Cas::TransportAccess & access) override
+    {
+        begin(Verb::Put);
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+
+    std::vector<uint64_t> startsOf(Verb verb) const
+    {
+        std::vector<uint64_t> starts;
+        for (const Sent & request : sent)
+            if (request.verb == verb)
+                starts.push_back(request.started_ms);
+        return starts;
+    }
+
+    Fault fault;
+    uint64_t duration_ms = 0;
+    std::vector<Sent> sent;
+
+private:
+    void begin(Verb verb)
+    {
+        const uint64_t started = clock.now.load();
+        const size_t nth = 1 + static_cast<size_t>(std::count_if(sent.begin(), sent.end(),
+                                                                 [&](const Sent & request) { return request.verb == verb; }));
+        sent.push_back({verb, started});
+        clock.now.fetch_add(duration_ms);
+        if (auto error = fault ? fault(verb, nth, started) : nullptr)
+            std::rethrow_exception(error);
+    }
+
+    FakeClock & clock;
+};
+
+using Verb = TimedFaultBackend::Verb;
+
+constexpr uint64_t kSpacingMs = 1'000;
+
+}
+
+/// Spacing is measured on the injected clock, so a bind that wrapped at the top of the range would
+/// refuse the first request; the only refusal is two envelopes no longer fitting before the clock ends.
+TEST(CASRequestsSpacing, UntilDefinitiveRefusesNothingBeforeTheEndOfTheClock)
+{
+    constexpr uint64_t largest = std::numeric_limits<uint64_t>::max();
+    FakeClock clock;
+    clock.now = largest - 20'000;
+    auto backend = std::make_shared<TimedFaultBackend>(clock);
+    backend->fault = [](Verb verb, size_t, uint64_t) -> std::exception_ptr
+    {
+        return verb == Verb::Put ? connectHint() : nullptr;
+    };
+    auto requests = makeRequests(backend, clock);
+    requests.setAttemptReservationForTest(7'000);
+    auto op = requests.admit();
+
+    const WriteResult result = op.create("k", "v", Retry::untilDefinitive(kSpacingMs));
+
+    const auto * gave_up = std::get_if<GaveUp>(&result);
+    ASSERT_NE(gave_up, nullptr);
+    EXPECT_EQ(gave_up->why, GaveUp::Why::Deadline);
+    EXPECT_EQ(gave_up->deadline_source, GaveUp::Source::Policy);
+    EXPECT_TRUE(gave_up->sent_any);
+    const auto puts = backend->startsOf(Verb::Put);
+    ASSERT_GE(puts.size(), 2u);
+    EXPECT_EQ(puts.front(), largest - 20'000);
+    EXPECT_LE(puts.back(), largest - 14'000) << "every PUT was admitted with room for its two envelopes";
 }
 
 #endif
