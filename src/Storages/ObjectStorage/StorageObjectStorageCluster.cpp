@@ -798,21 +798,11 @@ bool StorageObjectStorageCluster::readsFromPureStorage(ContextPtr context) const
 QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr & storage_snapshot, SelectQueryInfo & query_info) const
 {
-<<<<<<< HEAD
-    /// Full query if fall back to pure storage.
-    if (readsFromPureStorage(context))
-    {
-        if (isClusterSupported() && context->getSettingsRef()[Setting::object_storage_remote_initiator])
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
-
-=======
     if (!isClusterSupported())
         return QueryProcessingStage::Enum::FetchColumns;
 
     auto resolved = resolveClusterRead(context);
     if (shouldReadLocallyOnFallbackToPure(resolved, context))
->>>>>>> 2adad322dc1 (Merge pull request #2221 from Altinity/feature/antalya-26.6/object_storage_cluster_allow_empty)
         return QueryProcessingStage::Enum::FetchColumns;
 
     return IStorageCluster::getQueryProcessingStage(context, to_stage, storage_snapshot, query_info);
