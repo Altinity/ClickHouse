@@ -96,7 +96,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_blob_hash` | `cityhash128` | Pool blob content-hash function (`cityhash128` \| `xxh3-128` \| `sha256`). Recorded in the pool at creation; a mismatching config is refused at mount |
 | `cas_blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool. One-way: once admitted, the pool carries both algorithms permanently |
 | `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Only the preflight probe is skipped — the conditional-write correctness check still runs on every writable mount. **Not available on a writable generation-token (GCS) disk**, which refuses to mount with it: there, the probe battery is the only proof that a token-exact delete carries its generation precondition. Mount such a disk read-only if you need to defer the check |
-| `cas_mount_lease_ttl_ms` | `30000` | Milliseconds for which a mount lease remains valid after a successful claim or renewal (≥ 1). Lower values shorten stale-mount recovery but reduce tolerance for object-storage and scheduling delays |
+| `cas_mount_lease_ttl_ms` | `30000` | Milliseconds for which a mount lease remains valid after the start of a successful claim or renewal (≥ 1). Writes are never admitted past it. The background renewal keeps retrying after it until the store answers, so an outage longer than the TTL refuses writes but does not fence the mount. Lower values shorten stale-mount recovery but shorten the outage that writes ride out |
 | `cas_mount_renew_period_ms` | `10000` | Milliseconds between background mount-lease renewals (≥ 1). It must leave enough time for two attempt envelopes (a renewal write and its settlement read) and the lease safety margin before the TTL expires: `period + 2 × envelope + margin < TTL` |
 | `cas_gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
 | `cas_gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
@@ -117,21 +117,22 @@ Startup reclaim and GC's fence-out both judge liveness by the mount slot's write
 on the observer's own `CLOCK_BOOTTIME`, using the observer's own threshold — nothing about a writer's
 timing travels on the wire. Startup observes `cas_mount_lease_ttl_ms + floor(cas_mount_lease_ttl_ms /
 20) + max(1, floor(cas_mount_renew_period_ms / 2))`; GC observes `cas_mount_lease_ttl_ms +
-floor(cas_mount_lease_ttl_ms / 20) + cas_mount_renew_period_ms`. A pool member or GC leader
+floor(cas_mount_lease_ttl_ms / 20) + cas_mount_renew_period_ms`. GC counts the observation from a clock sample taken after the read that returned the token, not from the start of its round. A pool member or GC leader
 configured with a shorter threshold than its peers can therefore fence out a healthy peer whose
 token-update gap exceeds that shorter threshold — a peer renewing frequently stays live, one that
 missed a renewal does not. Change these values only with every member of the pool stopped: a
 graceful restart removes only that member's own startup observation and does not make mixed
 thresholds safe.
 
-A shorter TTL reduces the tolerance for object-storage delays; a shorter renewal period increases it
-(renewal starts earlier) at the cost of more background traffic. With the defaults,
-`cas_mount_lease_ttl_ms − cas_lease_safety_margin_ms − cas_mount_renew_period_ms − 2 × envelope =
-4000` ms is the scheduling-lateness budget before the first renewal attempt of a period can begin,
-where `envelope = cas_attempt_timeout_ms + 2 × cap` (7000 ms with defaults) and `cap` is
-`cas_attempt_timeout_ms` when the disk's `connect_timeout_ms` is `0`, else
-`min(connect_timeout_ms, cas_attempt_timeout_ms)` (1000 ms with defaults); the renewal then keeps
-retrying until `confirmed deadline − cas_lease_safety_margin_ms`.
+A longer TTL lengthens the outage that writes ride out without a refusal. A shorter renewal period starts
+each renewal earlier, so more of the TTL is left when one fails, at the cost of more background traffic.
+With the defaults, `cas_mount_lease_ttl_ms − cas_lease_safety_margin_ms − cas_mount_renew_period_ms −
+2 × envelope = 4000` ms is the slack the startup check leaves: a renewal that starts up to that late
+still leaves time to admit a write before the next one. Here `envelope = cas_attempt_timeout_ms + 2 × cap`
+(7000 ms with defaults) and `cap` is `cas_attempt_timeout_ms` when the disk's `connect_timeout_ms` is `0`,
+else `min(connect_timeout_ms, cas_attempt_timeout_ms)` (1000 ms with defaults). The background renewal
+retries, about a second apart, until the store answers. It does not stop at the lease deadline. New
+writes stop being admitted shortly before the TTL runs out and are refused once it has.
 
 The `expires_at_ms` stamped into the mount object is a writer-stamped diagnostic used by
 `system.cas_mounts` and by the non-authoritative decommission epoch-recovery precheck; it never

@@ -17,6 +17,7 @@ tools.
 | Symptom | Diagnosis | Action |
 |---|---|---|
 | A server keeps losing its mount lease and self-remounting | Check `system.cas_mounts` for the server's own `state`/`expires_at`, then correlate `watermark_renew` and `mount_remount` in `system.cas_log`; losing the lease trips a local fence and latches a remount generation | Read the failed renewal's `classification` before changing anything — it alone now says why (see [the decision flow](#mount-renewal-remount-flow)). Look for object-store latency consuming the confirmed lease or BOOTTIME advancement; see [the mount lease](/antalya/cas/architecture/mounts-and-leases#mount-lease) |
+| Writes fail with a transient error that names the lease and recover on their own | `system.cas_mounts` shows `lifecycle = 'not_live'`, `lifecycle_reason = 'lease_expired'` for the disk; `lifecycle_detail` is the text of the last failed renewal request. `CASMountLeaseExpired` in `system.events` counts the expiries that ended, and the `watermark_renew` row that ended one carries `expired_ms` in `detail` | The server could not renew its lease for longer than `cas_mount_lease_ttl_ms`, so it refuses writes until a renewal succeeds; it keeps the same `writer_epoch` and does not remount. Fix the object-store path named in `lifecycle_detail` (reachability, throttling, credentials). `CASMountRenewalAttempts` and `CASMountRenewalRetries` keep rising during the outage. If `CASMountLeaseLost` rises as well, follow [the decision flow](#mount-renewal-remount-flow) |
 | Writes slow down or stall under load, with no exception reaching the client | S3 `SlowDown`/`ServiceUnavailable`/`RequestTimeout`/`InternalError` (5xx) responses are not on the request engine's `isDefinitelyRefusedWrite` definite-failure list (only malformed-request, entity-too-large, and access-denied that no credential refresh can fix are), so they classify as ambiguous and are retried automatically. Confirm with `sum(ProfileEvents['CASConditionalWriteUnresolved'])` rising alongside `sum(ProfileEvents['CASConditionalWriteAttempts'])` over `system.query_log` for the affected window (or `ProfileEvent_CASConditionalWriteUnresolved` in `system.metric_log` for a cumulative view across queries), and check `system.blob_storage_log` for `disk_name = '<cas>'` rows with a nonzero `error_code` around the same window | Nothing to configure per-request: the request engine retries the same `(key, bytes)` with capped-exponential backoff (200ms initial, capped at 5s, full jitter) until the 90-second operation deadline — there is no separate attempts ceiling, only the deadline — and the mount-lease renewer keeps extending the fence across the disruption — this is the "blips, throttling, partial outages" case the write path is built to survive. Confirm the mount lease itself is still renewing (`system.cas_mounts.expires_at` moving forward, `last_success_age_seconds` not climbing) — if it is, this is expected and self-resolving. If `SlowDown` responses are sustained rather than transient, check the bucket's request-rate limits against the pool's actual PUT/GET rate (see [bucket requirements](/antalya/cas/bucket-requirements)) and consider lowering `cas_blob_upload_pool_size` to reduce concurrent upload traffic; a write only surfaces a client-visible `NETWORK_ERROR` if the 90-second deadline is exhausted before the store recovers, and that error is retried by the ordinary merge/insert backoff, not silently dropped |
 | `GC` never seems to reclaim space after tables are dropped | `SELECT * FROM system.cas_gc_log WHERE event_type='Finish' ORDER BY event_time DESC LIMIT 5` — check `outcome`; also `SELECT is_leader FROM system.cas_mounts` on this node | If `outcome != 'Success'`/`'Deferred'`, see [reading GC health](/antalya/cas/operations/monitoring#gc-health); if this node is not the leader (`is_leader = 0`), it never reclaims for this disk — check the peer holding leadership. Reclamation also needs at least two full rounds past condemnation by design (the grace period is rounds, not acks) — a single manual `SYSTEM CAS GC RUN` will not finish it |
 | A dangling-access exception or `CORRUPTED_DATA` on read | Run `clickhouse-disks cas-fsck --detail` and check `dangling` specifically — it is the one class that means data loss, distinct from `unreachable`/`awaiting-gc`, which are just waiting for graduation | A nonzero `dangling` count is a real incident: collect the `--detail` output (see [what to collect before filing a bug](/antalya/cas/operations/debugging#filing-a-bug)) before taking any destructive action |
@@ -38,8 +39,14 @@ Start with the `watermark_renew` timeline described in
    `CASMountRenewalRecovered` rises while `CASMountLeaseLost` and all remount counters stay flat. No
    intervention is needed unless the rate is sustained; investigate backend throttling/latency before
    the blips consume the lease budget.
-2. **External lease-safety exhaustion.** The failed row has
-   `classification = 'external_lease_deadline'`; `CASMountRenewalDeadlineExceeded` and
+1a. **Expired lease.** `CASMountLeaseExpired` rises by one when a renewal restores a lease that had
+   expired; `CASMountLeaseLost` and the remount counters stay flat. The restoring `watermark_renew` row
+   has `expired_ms` in `detail`: how long writes were refused. The server log has a `WARNING` with the
+   same duration and the last failure. While the outage lasts, the same state is visible in
+   `system.cas_mounts` (`lifecycle_reason = 'lease_expired'`); the event moves only at the restore.
+2. **External lease-safety exhaustion.** Only the renewals at startup and after a remount are bounded by
+   the lease; the background renewal is not, so this case means one of those ran out of lease. The failed
+   row has `classification = 'external_lease_deadline'`; `CASMountRenewalDeadlineExceeded` and
    `CASMountLeaseLost` rise. The runtime correctly refused to manufacture authority beyond the last
    confirmed lease. Check object-store latency and BOOTTIME/suspend history, then follow the ensuing
    remount. `classification = 'request_deadline'` is the sibling case: the ninety-second request
@@ -63,6 +70,7 @@ Start with the `watermark_renew` timeline described in
    progress. Repeated failure at the same step is the actionable signal.
 
 The default-level log policy is intentionally bounded: one warning on the first transition to retry,
-then one recovery info or terminal fence warning, plus one final line per whole-chain remount attempt.
-Use `system.cas_log` and counter deltas to reconstruct the incident; `DEBUG` contains individual
-physical retries when that extra transport detail is necessary.
+then one recovery info, terminal fence warning or expired-lease warning, plus one final line per
+whole-chain remount attempt. Individual physical retries are not logged. Use `system.cas_log` and the
+counters to reconstruct the incident: `CASMountRenewalAttempts` and `CASMountRenewalRetries` advance as
+requests are sent, so an outage shows while it lasts.
