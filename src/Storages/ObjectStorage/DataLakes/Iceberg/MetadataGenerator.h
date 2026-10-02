@@ -60,7 +60,8 @@ public:
     /// (the Iceberg "commit state unknown" case, e.g. a proxy returning 5xx after the catalog
     /// applied the update). These predicates let a retry detect that the requested change is
     /// already present instead of applying it a second time and failing.
-    bool isAddColumnApplied(const String & column_name, DataTypePtr type) const;
+    /// `first` and `after_column` are checked against the field order, as for `isModifyColumnApplied`.
+    bool isAddColumnApplied(const String & column_name, DataTypePtr type, bool first = false, const String & after_column = {}) const;
     bool isDropColumnApplied(const String & column_name) const;
     bool isRenameColumnApplied(const String & column_name, const String & new_column_name) const;
     /// `type` may be null for a position-only `MODIFY COLUMN`; `first` and `after_column` are checked against the field order.

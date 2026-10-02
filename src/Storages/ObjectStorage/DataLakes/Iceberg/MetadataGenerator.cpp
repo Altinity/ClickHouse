@@ -245,6 +245,18 @@ Int32 getNextSchemaId(Poco::JSON::Object::Ptr metadata_object)
     return max_id + 1;
 }
 
+/// Whether the field at `index` of `fields` satisfies the `FIRST` / `AFTER after_column` clause of an ALTER.
+/// `AFTER` the column itself does not move it, so any position satisfies it.
+bool isFieldAtRequestedPosition(
+    const Poco::JSON::Array::Ptr & fields, UInt32 index, const String & column_name, bool first, const String & after_column)
+{
+    if (first)
+        return index == 0;
+    if (!after_column.empty() && after_column != column_name)
+        return index > 0 && fields->getObject(index - 1)->getValue<String>(Iceberg::f_name) == after_column;
+    return true;
+}
+
 }
 
 MetadataGenerator::MetadataGenerator(Poco::JSON::Object::Ptr metadata_object_)
@@ -299,7 +311,7 @@ Poco::JSON::Object::Ptr MetadataGenerator::getCurrentSchema() const
     return current_schema;
 }
 
-bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypePtr type) const
+bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypePtr type, bool first, const String & after_column) const
 {
     auto current_schema = findCurrentSchema();
     if (!current_schema)
@@ -317,7 +329,8 @@ bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypeP
         /// The stored descriptor was produced from a lower `last-column-id` than the one we
         /// just used, so the ids of nested elements differ even for the very same type.
         return field->getValue<bool>(Iceberg::f_required) == expected_type.second
-            && icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first);
+            && icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first)
+            && isFieldAtRequestedPosition(fields, i, column_name, first, after_column);
     }
     return false;
 }
@@ -379,11 +392,7 @@ bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTy
                 return false;
         }
 
-        if (first)
-            return i == 0;
-        if (!after_column.empty() && after_column != column_name)
-            return i > 0 && fields->getObject(i - 1)->getValue<String>(Iceberg::f_name) == after_column;
-        return true;
+        return isFieldAtRequestedPosition(fields, i, column_name, first, after_column);
     }
     return false;
 }

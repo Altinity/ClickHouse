@@ -502,6 +502,46 @@ TEST(IcebergMetadataGenerator, AddColumnAfterNonexistentColumnThrows)
 }
 
 
+TEST(IcebergMetadataGenerator, AddColumnAppliedRequiresFirstPosition)
+{
+    /// A concurrent add of the same column and type landed at the end: a retry of `ADD COLUMN z ... FIRST`
+    /// must not report success.
+    auto type = makeNullable(std::make_shared<DataTypeInt64>());
+    {
+        auto metadata = makeMetadataWithGap();
+        MetadataGenerator gen(metadata);
+        gen.generateAddColumnMetadata("z", type);
+        EXPECT_FALSE(gen.isAddColumnApplied("z", type, /* first */ true));
+        EXPECT_TRUE(gen.isAddColumnApplied("z", type));
+    }
+    {
+        auto metadata = makeMetadataWithGap();
+        MetadataGenerator gen(metadata);
+        gen.generateAddColumnMetadata("z", type, /* first */ true);
+        EXPECT_TRUE(gen.isAddColumnApplied("z", type, /* first */ true));
+    }
+}
+
+
+TEST(IcebergMetadataGenerator, AddColumnAppliedRequiresAfterPosition)
+{
+    auto type = makeNullable(std::make_shared<DataTypeInt64>());
+    {
+        auto metadata = makeMetadataWithGap();
+        MetadataGenerator gen(metadata);
+        gen.generateAddColumnMetadata("z", type);
+        EXPECT_FALSE(gen.isAddColumnApplied("z", type, /* first */ false, /* after_column */ "x"));
+        EXPECT_TRUE(gen.isAddColumnApplied("z", type, /* first */ false, /* after_column */ "y"));
+    }
+    {
+        auto metadata = makeMetadataWithGap();
+        MetadataGenerator gen(metadata);
+        gen.generateAddColumnMetadata("z", type, /* first */ false, /* after_column */ "x");
+        EXPECT_TRUE(gen.isAddColumnApplied("z", type, /* first */ false, /* after_column */ "x"));
+    }
+}
+
+
 TEST(IcebergMetadataGenerator, ModifyColumnAppliedRecognisesTypeAlreadyInSchema)
 {
     /// The schema already says `long`, so a MODIFY to Int64 has taken effect.
