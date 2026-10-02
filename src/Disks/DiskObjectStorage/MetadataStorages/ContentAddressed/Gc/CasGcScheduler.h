@@ -134,9 +134,10 @@ public:
     /// scheduled-round authority. Requests coalesce into one boolean while a round is pending.
     void requestRoundSoon();
 
-    /// Test/diagnostics hook: run ONE round synchronously on the caller's thread. Returns the round
-    /// report so the SYSTEM command / tests can inspect it. Emits a Start + Finish record.
-    Cas::RoundReport runOneRoundNow(GcRoundLogRecord::Trigger trigger = GcRoundLogRecord::Trigger::Manual);
+    /// Run ONE manual round synchronously on the caller's thread. Returns the round report; emits a
+    /// Start + Finish record. A manual round acquires a free lease or renews its own but never steals a
+    /// live incumbent's: dead-incumbent recovery stays the loop's job.
+    Cas::RoundReport runOneRoundNow();
 
     /// Returns per-disk GC health for `system.cas_mounts`. The fields describing
     /// rounds snapshot this scheduler's state, while `wedged_namespace_count` is read live from the
@@ -199,9 +200,10 @@ private:
     /// Run one round through the full logging path (Start record, ProfileEventsScope, Finish
     /// record). Used by BOTH loop() and runOneRoundNow. Logging is best-effort - the logger sink
     /// never throws into the round. Rethrows a round exception (after emitting an Aborted Finish).
-    /// `allow_steal` is forwarded to `Cas::Gc::runRegularRound` verbatim (see its doc comment).
+    /// A `Scheduled` round may steal an incumbent's lease; a `Manual` one never does (see
+    /// `Cas::Gc::runRegularRound`).
     Cas::RoundReport runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger,
-                                     std::function<void()> on_lease_acquired = {}, bool allow_steal = true);
+                                     std::function<void()> on_lease_acquired = {});
 
     const Cas::PoolPtr store;
     const std::chrono::seconds interval;

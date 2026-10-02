@@ -417,7 +417,7 @@ TEST(CASGCTeardownStop, AQueuedScheduledTickEmitsNoStartAfterTeardownBegan)
     GateOpenedOnExit opener(*release);
     backend->armParkFirstRead(store->layout().gcStateKey(), entered, release);
     auto manual = std::async(std::launch::async,
-                             [&sched] { return sched.runOneRoundNow(GcRoundLogRecord::Trigger::Manual); });
+                             [&sched] { return sched.runOneRoundNow(); });
     entered->wait("entered");
 
     /// The loop wakes and queues on the round mutex behind the parked manual round.

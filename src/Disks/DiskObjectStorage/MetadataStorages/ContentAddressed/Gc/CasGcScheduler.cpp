@@ -190,9 +190,10 @@ void CasGcScheduler::onLeaseAcquired()
 }
 
 Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger,
-                                                 std::function<void()> on_lease_acquired, bool allow_steal)
+                                                 std::function<void()> on_lease_acquired)
 {
     using Rec = GcRoundLogRecord;
+    const bool allow_steal = trigger == Rec::Trigger::Scheduled;
 
     /// Mark a round in flight for the whole body (success AND exception paths). `isQuiescent` reads this;
     /// the FORGET / `GC STOP` tests use it to prove the scheduler's workers were joined (no round can be
@@ -327,13 +328,10 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     }
 }
 
-Cas::RoundReport CasGcScheduler::runOneRoundNow(GcRoundLogRecord::Trigger trigger)
+Cas::RoundReport CasGcScheduler::runOneRoundNow()
 {
     std::lock_guard round_lock(gc_round_mutex);
-    /// allow_steal=false: a manual round may acquire a FREE lease or renew ITS OWN, but must never
-    /// steal a live incumbent — see Cas::Gc::runRegularRound's doc comment. Dead-incumbent recovery
-    /// stays the loop's job (bounded ~2*interval; loop() below passes the default allow_steal=true).
-    const Cas::RoundReport report = runRoundLogged(gc, trigger, [this] { onLeaseAcquired(); }, /*allow_steal=*/false);
+    const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Manual, [this] { onLeaseAcquired(); });
     i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);
     return report;
 }
@@ -398,8 +396,8 @@ void CasGcScheduler::loop()
             /// lease is (re)acquired, before the fold runs - a new leader's first round is otherwise
             /// unprotected (i_am_leader would only flip below, AFTER the whole round returns), so a
             /// follower observing the frozen (owner, seq) across two of its own ticks would steal
-            /// deterministically once that first round outlasts them. allow_steal defaults to true here
-            /// (the loop is the ONLY caller allowed to execute the steal CAS).
+            /// deterministically once that first round outlasts them. A `Scheduled` round is the only
+            /// one that may execute the steal CAS.
             const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled, [this] { onLeaseAcquired(); });
             i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);
             if (report.acquired_lease)
