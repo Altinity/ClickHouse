@@ -60,26 +60,28 @@ INSERT INTO tab_bf16 VALUES (0, [1.0, 0.0]),
                         (9, [0.0, 2.4]);
 
 -- The nearest neighbours to [0.0, 0.2] are 5,6,7,8
+-- Round distances: ARM sanitizer builds disable SimSIMD and scalar USearch
+-- differs in the 3rd decimal (0.203125 vs 0.1875). Neighbor order is unchanged.
 
 SELECT 'Column: Array(Float32)';
 
 SELECT '-- Search vector: Array(Float64)';
 WITH CAST([0.0, 2.0] AS Array(Float64)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_f32
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;
 
 SELECT '-- Search vector: Array(Float32)';
 WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_f32
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;
 
 SELECT '-- Search vector: Array(BFloat16)';
 WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_f32
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;
@@ -88,21 +90,21 @@ SELECT 'Column: Array(BFloat16)';
 
 SELECT '-- Search vector: Array(Float64)';
 WITH [0.0, 2.0] AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_bf16
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;
 
 SELECT '-- Search vector: Array(Float32)';
 WITH CAST([0.0, 2.0] AS Array(BFloat16)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_bf16
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;
 
 SELECT '-- Search vector: Array(BFloat16)';
 WITH CAST([0.0, 2.0] AS Array(Float32)) AS reference_vec
-SELECT id, L2Distance(vec, reference_vec)
+SELECT id, round(L2Distance(vec, reference_vec), 1)
 FROM tab_bf16
 ORDER BY L2Distance(vec, reference_vec)
 LIMIT 4;

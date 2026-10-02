@@ -1729,8 +1729,9 @@ def test_graceful_shutdown(started_cluster):
 
     node_to_shutdown.query("SYSTEM STOP SWARM MODE")
 
-    # enough time to complete processing of objects, started before "SYSTEM STOP SWARM MODE"
-    time.sleep(3)
+    # Drain in-flight objects started before STOP SWARM. Query time is 3-4s
+    # normally; TSan is several times slower, so 3s is not enough.
+    time.sleep(15)
 
     node_to_shutdown.stop_clickhouse(kill=True)
 
