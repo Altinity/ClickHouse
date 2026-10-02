@@ -4,9 +4,16 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
+#include <Common/Exception.h>
 
+#include <functional>
 #include <limits>
 #include <optional>
+
+namespace DB::ErrorCodes
+{
+extern const int NETWORK_ERROR;
+}
 
 using namespace DB::Cas;
 
@@ -62,6 +69,22 @@ const char * admitName(Fence::Admit verdict)
         case Fence::Admit::NoBudget: return "NoBudget";
     }
     return "unknown";
+}
+
+/// The message of the refusal `refuse` throws; a failure when it does not throw the transient class.
+String refusalText(const std::function<void()> & refuse)
+{
+    try
+    {
+        refuse();
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR) << e.message();
+        return e.message();
+    }
+    ADD_FAILURE() << "the fence check did not refuse";
+    return {};
 }
 
 constexpr DB::UInt128 kUuid{7};
@@ -200,4 +223,30 @@ TEST(CASMountRuntime, LeaseExpiredOnlyWhileLiveAndNotLost)
 
     f->tripMountLost();
     EXPECT_FALSE(f->leaseExpiredSinceBootMs().has_value()) << "a lost fence is a lease loss, not an expiry";
+}
+
+/// Only a refusal caused by the expiry itself names it: an operator can wait for a renewal then, and for
+/// nothing else.
+TEST(CASMountRuntime, ExpiredLeaseRefusalSaysWritesResume)
+{
+    RuntimeFixture f(/*lease_safety_margin_ms=*/0);
+    f.boot_ms = 1'000;
+    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'100);
+    const uint64_t generation = f->fenceGeneration();
+    f.boot_ms = 1'100;
+
+    const String expired = refusalText([&] { f->checkFenceOrThrow(generation); });
+    EXPECT_NE(expired.find("lease expired"), String::npos) << expired;
+    EXPECT_NE(expired.find("writes resume when a renewal succeeds"), String::npos) << expired;
+
+    /// A re-arm moves the generation while the lease stays expired: the caller's incarnation is gone.
+    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'100);
+    const String moved = refusalText([&] { f->checkFenceOrThrow(generation); });
+    EXPECT_EQ(moved.find("lease expired"), String::npos) << moved;
+    EXPECT_NE(moved.find("mount fence tripped"), String::npos) << moved;
+
+    f->tripMountLost();
+    const String lost = refusalText([&] { f->checkFenceOrThrow(f->fenceGeneration()); });
+    EXPECT_EQ(lost.find("lease expired"), String::npos) << lost;
+    EXPECT_NE(lost.find("mount fence tripped"), String::npos) << lost;
 }

@@ -320,6 +320,9 @@ public:
     std::optional<uint64_t> leaseExpiredSinceBootMs() const;
     /// Text of the last failed request of the worker's renewal; empty when none failed.
     String lastRenewFailure() const;
+    /// The condition text for a request admitted under `admitted_generation` that is refused only
+    /// because the lease expired; empty when the refusal has any other cause or there is none.
+    std::optional<String> leaseExpiredRefusal(uint64_t admitted_generation) const;
     /// Counts each `PUT` of the worker's renewal as it is sent and keeps the text of every failed
     /// `PUT` or resolve read. Runs on the renewing thread.
     void noteRenewRequest(const MountRenewRequestEvent & event) noexcept;

@@ -123,6 +123,11 @@ void CasMountRuntime::tripFenceWithoutOperationalLoss()
 
 void CasMountRuntime::checkFenceOrThrow(uint64_t admitted_generation) const
 {
+    if (mayMutate() && fenceGeneration() == admitted_generation)
+        return;
+    const String subject = fmt::format("content-addressed pool '{}'", server_root_id);
+    if (const std::optional<String> expired = leaseExpiredRefusal(admitted_generation))
+        throwCasTransientUnavailable(subject, *expired);
     /// [D5]: tell only what is known here. A tripped fence (or a bumped generation) means this node no
     /// longer holds the mount incarnation the caller was admitted under -- but this same guard trips for a
     /// transient lease blip AND for a deliberate terminal decommission (FORGET) or a lost identity, and this
@@ -130,13 +135,12 @@ void CasMountRuntime::checkFenceOrThrow(uint64_t admitted_generation) const
     /// would misdiagnose the terminal case); it names both possibilities and points at the authoritative
     /// lifecycle. The CLASS is the write plane's uniform transient one (its 32 sibling write-transient sites
     /// already mint it): under genuine ambiguity the refusal must be retried, never consumed as damage.
-    if (!mayMutate() || fenceGeneration() != admitted_generation)
-        throwCasTransientUnavailable(
-            fmt::format("content-addressed pool '{}'", server_root_id),
-            "mount fence tripped: the durable write is refused because this node no longer holds the mount "
-            "incarnation it was admitted under -- either a lease loss the disk auto-recovers from, or a "
-            "FORGET decommission / lost identity that does NOT recover; consult "
-            "system.cas_mounts for the disk's lifecycle before retrying");
+    throwCasTransientUnavailable(
+        subject,
+        "mount fence tripped: the durable write is refused because this node no longer holds the mount "
+        "incarnation it was admitted under -- either a lease loss the disk auto-recovers from, or a "
+        "FORGET decommission / lost identity that does NOT recover; consult "
+        "system.cas_mounts for the disk's lifecycle before retrying");
 }
 
 Fence::Admit CasMountRuntime::admit(uint64_t admitted_generation, uint64_t needed_ms) const
@@ -179,6 +183,14 @@ std::optional<uint64_t> CasMountRuntime::leaseExpiredAt(uint64_t now_boot_ms) co
 std::optional<uint64_t> CasMountRuntime::leaseExpiredSinceBootMs() const
 {
     return leaseExpiredAt(bootMsNow());
+}
+
+std::optional<String> CasMountRuntime::leaseExpiredRefusal(uint64_t admitted_generation) const
+{
+    if (fenceGeneration() != admitted_generation || !leaseExpiredSinceBootMs())
+        return std::nullopt;
+    return String("the mount lease expired and no renewal has restored it yet; "
+                  "writes resume when a renewal succeeds");
 }
 
 String CasMountRuntime::lastRenewFailure() const
