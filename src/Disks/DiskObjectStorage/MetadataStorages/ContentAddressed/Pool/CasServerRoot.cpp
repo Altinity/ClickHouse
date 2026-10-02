@@ -1316,7 +1316,8 @@ constexpr uint64_t kFarewellBudgetMs = 10'000;
 constexpr uint64_t kFarewellSlackMs = 2'000;
 
 MountLeaseRenewer::MountLeaseRenewer(
-    CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
+    CasRequests & mount_requests_, CasRequests & open_requests_, CasRequests & worker_requests_,
+    const Layout & layout_,
     const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
     std::function<uint64_t()> min_active_build_sequence_fn_,
@@ -1325,6 +1326,7 @@ MountLeaseRenewer::MountLeaseRenewer(
     std::function<uint64_t()> boot_ms_fn_)
     : mount_requests(mount_requests_)
     , open_requests(open_requests_)
+    , worker_requests(worker_requests_)
     , key(layout_.mountKey(srid_))
     , srid(srid_)
     , server_uuid(server_uuid_)
@@ -1570,7 +1572,8 @@ MountRenewResult MountLeaseRenewer::terminalResult(MountRenewResult result)
 
 MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment & environment)
 {
-    return renewOn(mount_requests, environment);
+    return renewOn(
+        environment.policy == MountRenewPolicy::UntilDefinitive ? worker_requests : mount_requests, environment);
 }
 
 MountRenewResult MountLeaseRenewer::renewForRemount(const MountRenewOperationEnvironment & environment)

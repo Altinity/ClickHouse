@@ -173,7 +173,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     if (drain_now_fn && drain_sleep_fn)
     {
         /// Re-affirms the same values `config` above already installed on `mount_requests`/
-        /// `farewell_requests`/`gc_requests` at construction, and additionally wires `ref_ledger`'s own
+        /// `lease_requests`/`farewell_requests`/`gc_requests` at construction, and additionally wires `ref_ledger`'s own
         /// retry sleep, which has no construction-time seam of its own. `sweepNamespace` below issues
         /// its deletes on `admin`'s own GC plane.
         admin->setCasRequestNowFnForTest(drain_now_fn);

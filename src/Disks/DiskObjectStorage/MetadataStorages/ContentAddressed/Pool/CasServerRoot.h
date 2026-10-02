@@ -61,6 +61,25 @@ struct MountRenewResult
     std::exception_ptr failure;
 };
 
+/// How far a renewal may retry.
+enum class MountRenewPolicy : uint8_t
+{
+    LeaseBound,        /// startup, remount and direct renewals: `Retry::untilLeaseSafe`
+    UntilDefinitive,   /// the background worker: `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`
+};
+
+/// The spacing of an `UntilDefinitive` renewal's retries.
+inline constexpr uint64_t kMountRenewRetrySpacingMs = 1000;
+
+/// One physical request of a renewal, reported as it happens: a `PUT` sent (`failed` false), a `PUT`
+/// that failed, or a failed read that settles a `PUT` (both `failed` true).
+struct MountRenewRequestEvent
+{
+    uint32_t request_no = 0;        /// 1-based count of `PUT`s sent by this renewal
+    bool failed = false;
+    String failure_text;            /// empty unless `failed`
+};
+
 struct MountRenewOperationEnvironment
 {
     std::function<uint64_t()> boot_ms;
@@ -71,6 +90,10 @@ struct MountRenewOperationEnvironment
     /// `NotAttempted` rather than terminal only when this node had already been asked to stop --
     /// sampling it afterwards would read a flag that the refusal itself may have set.
     std::function<bool()> cancelled;
+    MountRenewPolicy policy = MountRenewPolicy::LeaseBound;
+    /// Called on the renewing thread for every request sent and for every failure. May be empty.
+    /// What it throws is ignored.
+    std::function<void(const MountRenewRequestEvent &)> on_request;
 };
 
 /// Validate a `server_root_id` — the explicit, configured identity of the content-addressed layout
@@ -536,7 +559,8 @@ class MountLeaseRenewer
 {
 public:
     MountLeaseRenewer(
-        CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
+        CasRequests & mount_requests_, CasRequests & open_requests_, CasRequests & worker_requests_,
+        const Layout & layout_,
         const String & srid_, UInt128 server_uuid_,
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
         std::function<uint64_t()> min_active_build_sequence_fn_,
@@ -577,6 +601,8 @@ private:
 
     CasRequests & mount_requests;
     CasRequests & open_requests;
+    /// The plane of an `UntilDefinitive` renewal: no lease budget, and a sleep a stop wakes.
+    CasRequests & worker_requests;
     String key;
 
     String srid;

@@ -15,7 +15,7 @@ using DB::Cas::tests::OperationForTest;
 namespace
 {
 
-/// One renewer for the mount slot of server-root "r", under (uuid=1, epoch=7) unless overridden. Both
+/// One renewer for the mount slot of server-root "r", under (uuid=1, epoch=7) unless overridden. All
 /// of its planes are the same open-fence one: what these tests exercise is the mount protocol's own
 /// exclusivity, not a fence's, and no test here renews, which is the only caller of the mount plane.
 MountLeaseRenewer makeRenewer(
@@ -25,6 +25,7 @@ MountLeaseRenewer makeRenewer(
     uint64_t epoch = 7)
 {
     return MountLeaseRenewer(
+        requests,
         requests,
         requests,
         Layout("p"),

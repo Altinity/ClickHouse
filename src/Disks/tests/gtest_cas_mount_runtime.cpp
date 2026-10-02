@@ -26,8 +26,9 @@ public:
               [this](uint64_t g, uint64_t needed) { return runtime.admit(g, needed); },
               [this](uint64_t g) { runtime.checkFenceOrThrow(g); }})
         , farewell(backend, Fence::open())
+        , lease(backend, Fence::open())
         , runtime(
-              backend, mount, farewell, layout,
+              backend, mount, farewell, lease, layout,
               MountConfig{.boot_ms_fn = [this] { return boot_ms; }},
               "test", sink,
               CasRequestBudget{.attempt_timeout_ms = attempt_timeout_ms,
@@ -47,6 +48,7 @@ private:
     CasEventSink sink;
     CasRequests mount;
     CasRequests farewell;
+    CasRequests lease;
     CasMountRuntime runtime;
 };
 

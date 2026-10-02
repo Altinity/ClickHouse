@@ -373,6 +373,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
         renewers[index] = std::make_unique<MountLeaseRenewer>(
             *planes[index],
             *planes[index],
+            *planes[index],
             *layouts[index],
             server_root_ids[index],
             UInt128(index + 1),

@@ -2055,7 +2055,7 @@ public:
 
 CasRequestBudget runtimeRenewBudget();
 
-/// A directly-constructed `CasMountRuntime` plus the two request planes it needs. `Pool` builds those
+/// A directly-constructed `CasMountRuntime` plus the request planes it needs. `Pool` builds those
 /// from its own members; a test has no `Pool`, so the mount plane's fence reaches the runtime through
 /// this holder -- the closures run only once the runtime is issuing requests, well after construction.
 class RuntimeUnderTest
@@ -2068,7 +2068,8 @@ public:
               [this](uint64_t g, uint64_t needed) { return runtime.admit(g, needed); },
               [this](uint64_t g) { runtime.checkFenceOrThrow(g); }})
         , farewell(backend, DB::Cas::Fence::open())
-        , runtime(backend, mount, farewell, std::forward<Args>(args)...)
+        , lease(backend, DB::Cas::Fence::open())
+        , runtime(backend, mount, farewell, lease, std::forward<Args>(args)...)
     {
         /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the
         /// budget field alone; every construction of this holder pairs the two via `runtimeRenewBudget`,
@@ -2080,6 +2081,9 @@ public:
         /// deadline against real boottime, finds it long past, and refuses every request unsent.
         mount.setNowFnForTest([this] { return runtime.bootMsNow(); });
         farewell.setNowFnForTest([this] { return runtime.bootMsNow(); });
+        lease.setNowFnForTest([this] { return runtime.bootMsNow(); });
+        /// As `Pool` wires it: a stop wakes the worker renewal's wait.
+        lease.setSleepFnForTest([this](uint64_t ms) { runtime.sleepInterruptibly(ms); });
     }
 
     /// The workers are joined HERE, not only by the tests that assert on teardown: `CasMountRuntime`
@@ -2102,6 +2106,7 @@ public:
 private:
     DB::Cas::CasRequests mount;
     DB::Cas::CasRequests farewell;
+    DB::Cas::CasRequests lease;
     CasMountRuntime runtime;
 };
 
