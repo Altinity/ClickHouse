@@ -201,6 +201,7 @@ String CasMountRuntime::lastRenewFailure() const
 
 void CasMountRuntime::noteRenewRequest(const MountRenewRequestEvent & event) noexcept
 {
+    warnOnceIfLeaseExpired(event);
     if (!event.failed)
     {
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalAttempts);
@@ -212,6 +213,27 @@ void CasMountRuntime::noteRenewRequest(const MountRenewRequestEvent & event) noe
     {
         std::lock_guard lock(renew_failure_mutex);
         last_renew_failure = event.failure_text;
+    }
+    catch (...)   // NOLINT(bugprone-empty-catch)
+    {
+        /// A lost diagnostic must not end the renewal.
+    }
+}
+
+void CasMountRuntime::warnOnceIfLeaseExpired(const MountRenewRequestEvent & event) noexcept
+{
+    try
+    {
+        const uint64_t now = bootMsNow();
+        const std::optional<uint64_t> expired_at = leaseExpiredAt(now);
+        if (!expired_at || *expired_at == lease_expiry_warned_at_boot_ms.load(std::memory_order_relaxed))
+            return;
+        lease_expiry_warned_at_boot_ms.store(*expired_at, std::memory_order_relaxed);
+        const String last_failure = event.failed ? event.failure_text : lastRenewFailure();
+        LOG_WARNING(getLogger("CasPool"),
+            "CAS mount lease of '{}' expired {} ms ago and no renewal has restored it yet; "
+            "the renewal keeps retrying and writes are refused until it succeeds. Last failed request: {}",
+            server_root_id, now - *expired_at, last_failure.empty() ? "none" : last_failure);
     }
     catch (...)   // NOLINT(bugprone-empty-catch)
     {
