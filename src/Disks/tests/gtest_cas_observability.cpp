@@ -177,38 +177,6 @@ TEST(CASObservability, RenewalCountersHaveExactPhysicalAndLogicalDeltas)
     run(RenewalCounterBackend::Fault::LandThenThrow, /*attempts=*/1, /*retries=*/0, /*resolved=*/1, /*recovered=*/1);
 }
 
-TEST(CASObservability, ExternalLeaseDeadlineCountsOnceWithoutReconstructingAttempts)
-{
-    auto backend = std::make_shared<RenewalCounterBackend>();
-    backend->setAttemptTimeoutMs(renewalCounterBudget().attempt_timeout_ms);
-    /// Held in a shared atomic, not a plain local: this test mutates it below, and the Pool can
-    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
-    /// capture of a local would dangle.
-    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
-    auto store = Pool::open(backend, PoolConfig{
-        .pool_prefix = "renewal-deadline-counter",
-        .server_root_id = "test",
-        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-        .cas_request_budget = renewalCounterBudget(),
-        .boot_ms_fn = [boot_ms]
-        {
-            return boot_ms->load();
-        },
-    });
-
-    /// The fence deadline is 1100 and the safety margin 20, so admission refuses once fewer than
-    /// twenty milliseconds of lease remain. At 1090 only ten milliseconds remain, short of the margin
-    /// however much a single attempt reserves, so nothing can be started and the logical renewal ends
-    /// without reconstructing a sent attempt.
-    boot_ms->store(1090);
-    const RenewalCounterSnapshot before = renewalCounters();
-    EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
-    const RenewalCounterSnapshot after = renewalCounters();
-    expectRenewalCounterDelta(
-        before, after, /*attempts=*/0, /*retries=*/0, /*resolved=*/0, /*recovered=*/0,
-        /*deadline_exceeded=*/1);
-}
-
 }
 
 /// B170/Task 1 (Part A audit events): `PartWriteTxn::stageManifest` writes a part-manifest body but never

@@ -1240,9 +1240,6 @@ bool Pool::tryRemountOnce()
     String error;
     SCOPE_EXIT(
     {
-        /// A remount re-anchor completed while the whole-chain serializer was held. Drain its POD snapshot
-        /// first, after lock destruction, so renewal recovery/failure precedes and correlates with the
-        /// containing remount result without any callback or allocation under `remount_mutex`.
         deliverDeferredMountRenewObservability(attempt_no);
 
         if (succeeded)

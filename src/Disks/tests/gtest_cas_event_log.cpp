@@ -41,24 +41,6 @@ public:
     bool throw_before_next_write = false;
     bool throw_nonretryable_next_write = false;
     bool vanish_on_next_write = false;
-    /// Runs just before an armed fault throws. The engine draws its inter-attempt backoff randomly and
-    /// admits the reissue against that drawn duration, so a test that needs the ambiguity refused
-    /// rather than reissued has to move the injected clock here -- from inside the attempt, the only
-    /// point between admission and the resolve read a test can reach.
-    std::function<void()> before_throw;
-
-    void armResolveProbe()
-    {
-        std::lock_guard lock(resolve_mutex);
-        observe_next_read = true;
-        resolve_started = false;
-    }
-
-    bool resolveStarted()
-    {
-        std::lock_guard lock(resolve_mutex);
-        return resolve_started;
-    }
 
     /// A plain read/replace through the primitive surface, for fixtures that need to observe or seed
     /// state without going through the pool under test.
@@ -72,21 +54,6 @@ public:
     {
         DB::Cas::tests::OperationForTest op(*this);
         return std::holds_alternative<Committed>((*op).replace(key, bytes, expected, Retry::standard()));
-    }
-
-    /// The engine settles an ambiguous write by reading the key back, so the observation belongs on the
-    /// READ PRIMITIVE -- the resolve read never reaches the legacy `get`.
-    std::optional<Raw> read(const String & key, DB::Cas::TransportAccess & access) override
-    {
-        {
-            std::lock_guard lock(resolve_mutex);
-            if (observe_next_read)
-            {
-                resolve_started = true;
-                observe_next_read = false;
-            }
-        }
-        return InMemoryBackend::read(key, access);
     }
 
     /// The faults sit on the WRITE PRIMITIVE, and only on a CONDITIONAL write: a lease renewal is a
@@ -107,18 +74,9 @@ public:
         if (std::exchange(throw_nonretryable_next_write, false))
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected deterministic renewal rejection");
         if (std::exchange(throw_before_next_write, false))
-        {
-            if (before_throw)
-                before_throw();
             throw Poco::TimeoutException("injected renewal timeout before commit");
-        }
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
-
-private:
-    std::mutex resolve_mutex;
-    bool observe_next_read = false;
-    bool resolve_started = false;
 };
 
 CasRequestBudget renewalEventBudget()
@@ -285,43 +243,6 @@ TEST(CASEvent, WatermarkRenewEventsAreBoundedAndComplete)
         EXPECT_TRUE(renewals[0].detail.contains(key)) << "missing detail key " << key;
 }
 
-/// An attempt that spends the lease it was admitted under must not START the resolving read. That read
-/// is the only thing that can prove the ambiguous attempt landed, and issuing it past the lease-safe
-/// bound would be a request made without the authority it was admitted under -- so the renewal reports
-/// the deadline that refused it instead of resolving anything.
-TEST(CASEvent, AnAmbiguityPastTheLeaseBoundNeverStartsTheResolvingRead)
-{
-    auto backend = std::make_shared<RenewalEventBackend>();
-    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
-    /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish holds
-    /// `shared_from_this()`), so a by-reference capture of a local would dangle.
-    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
-    auto store = openRenewalEventPool(
-        backend, boot_ms, renewalEventBudget(), "renewal-inflight-ambiguity");
-    store->setEventSink([events](CasEvent event)
-    {
-        events->push(std::move(event));
-    });
-
-    /// The lease was anchored at 100 with a 1000 ms TTL, so the fence expires at 1100 and holds a 20 ms
-    /// safety margin. At 1081 only 19 ms remain, and admission refuses the resolve read.
-    backend->before_throw = [boot_ms]
-    {
-        boot_ms->store(1'081);
-    };
-    backend->throw_before_next_write = true;
-    backend->armResolveProbe();
-    EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
-
-    EXPECT_FALSE(backend->resolveStarted())
-        << "an attempt that consumed the lease must not start the resolving read";
-    const std::vector<CasEvent> renewals = watermarkRenewEvents(events->snapshot());
-    ASSERT_EQ(renewals.size(), 1u);
-    EXPECT_EQ(renewals[0].outcome, "failed");
-    EXPECT_EQ(renewals[0].detail.at("attempts_sent"), "1");
-    EXPECT_EQ(renewals[0].detail.at("classification"), "external_lease_deadline");
-}
-
 /// Ten renewals nested through each other's conflict sinks, against an eight-slot observation stack.
 /// The two calls beyond the stack get no rich event -- and must still report their own physical attempt
 /// count, which rides the write result rather than the suppressed observation.
@@ -432,10 +353,8 @@ TEST(CASEvent, WatermarkRenewSinkFailureCannotChangeOutcome)
     EXPECT_TRUE(store->mayMutate());
 }
 
-/// The two terminal endings a renewal reaches without ever settling its write: the store refusing it
-/// outright, and the lease refusing to admit it. There is no attempt-count ending -- the engine bounds a
-/// write by time, never by a number of tries -- and the deadline ending that DOES send an attempt first
-/// is `AnAmbiguityPastTheLeaseBoundNeverStartsTheResolvingRead`.
+/// Two terminal endings and what their rows carry: the store rejecting the renewal outright, and the
+/// slot vanishing under it.
 TEST(CASEvent, TerminalRenewalDetailsPreservePhysicalTruthAndClassification)
 {
     const auto one_failed_event = [](const std::vector<CasEvent> & events) -> std::optional<CasEvent>
@@ -477,20 +396,18 @@ TEST(CASEvent, TerminalRenewalDetailsPreservePhysicalTruthAndClassification)
         /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish
         /// holds `shared_from_this()`), so a by-reference capture of a local would dangle.
         auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
-        auto store = openRenewalEventPool(backend, boot_ms, renewalEventBudget(), "renewal-deadline-details");
+        auto store = openRenewalEventPool(backend, boot_ms, renewalEventBudget(), "renewal-vanished-details");
         store->setEventSink([events](CasEvent event)
         {
             events->push(std::move(event));
         });
-        /// The lease was anchored at 100 with a 1000 ms TTL and holds a 20 ms safety margin, so 1090
-        /// leaves 10 ms of it and admission refuses the renewal before its first attempt.
-        boot_ms->store(1090);
+        backend->vanish_on_next_write = true;
 
         EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
         const std::optional<CasEvent> failed = one_failed_event(events->snapshot());
-        ASSERT_TRUE(failed.has_value()) << "the refused admission must reach the event log";
-        EXPECT_EQ(failed->detail.at("attempts_sent"), "0");
-        EXPECT_EQ(failed->detail.at("classification"), "external_lease_deadline");
+        ASSERT_TRUE(failed.has_value()) << "the vanished slot must reach the event log";
+        EXPECT_EQ(failed->detail.at("attempts_sent"), "1");
+        EXPECT_EQ(failed->detail.at("classification"), "vanished");
     }
 }
 

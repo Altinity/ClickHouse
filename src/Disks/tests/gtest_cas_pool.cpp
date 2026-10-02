@@ -2020,11 +2020,6 @@ public:
     Fault fault = Fault::None;
     DB::Cas::tests::ManualBarrier * barrier = nullptr;
     std::function<void()> after_commit;
-    /// Runs just before an armed fault throws. The engine draws its inter-attempt backoff randomly and
-    /// admits the reissue against that drawn duration, so a test that needs the ambiguity to be refused
-    /// rather than reissued has to move the injected clock here -- from inside the attempt, which is the
-    /// only point between admission and the resolve read a test can reach.
-    std::function<void()> before_throw;
     /// While it answers TRUE, every conditional write throws a transport timeout, before `fault` is
     /// consulted. Read on the renewing thread; set it before the workers start.
     std::function<bool()> outage;
@@ -2056,11 +2051,7 @@ public:
         if (current == Fault::ThrowMemoryLimitExceeded)
             throw DB::Exception(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, "injected memory limit exceeded on the renewal request");
         if (current == Fault::ThrowBefore || current == Fault::BlockThenThrow)
-        {
-            if (before_throw)
-                before_throw();
             throw Poco::TimeoutException("injected runtime renewal ambiguity before result");
-        }
 
         auto result = DB::Cas::tests::CountingBackend::write(key, bytes, expected_value, access);
         if (after_commit)
@@ -4116,53 +4107,40 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
     EXPECT_NE(run(true), std::numeric_limits<uint64_t>::max());
 }
 
-TEST(CASPool, DirectAndStartupTerminalFailuresRethrowTypedExceptions)
+/// The test seam rethrows a terminal renewal as the typed failure it ended with.
+TEST(CASPool, DirectTerminalFailureRethrowsTypedException)
 {
-    enum class Refusal : uint8_t { PreAttemptDeadline, RefusedAfterSend };
-    const auto run = [](bool startup, Refusal refusal)
+    std::atomic<bool> renewal_live{true};
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("typed-direct");
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .boot_ms_fn = [&] { return boot_ms; },
+            .renewal_live_for_test = [&] { return renewal_live.load(std::memory_order_acquire); }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(uuid, 1, anchor + 1000);
+    /// The renewal lands, then its liveness ends before the commit is confirmed.
+    backend->after_commit = [&] { renewal_live.store(false, std::memory_order_release); };
+    try
     {
-        auto backend = std::make_shared<RuntimeRenewBackend>();
-        const Layout layout(startup ? "typed-startup" : "typed-direct");
-        uint64_t wall_ms = 1000;
-        uint64_t boot_ms = 100;
-        std::atomic<bool> renewal_live{true};
-        const UInt128 uuid{1};
-        ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
-        CasEventSink sink;
-        RuntimeUnderTest runtime_holder(
-            backend, layout,
-            MountConfig{
-                .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-                .boot_ms_fn = [&] { return boot_ms; },
-                .renewal_live_for_test = [&] { return renewal_live.load(std::memory_order_acquire); }},
-            "test", sink, runtimeRenewBudget(), [] { return false; });
-        CasMountRuntime & runtime = *runtime_holder;
-        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
-        const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
-        if (refusal == Refusal::PreAttemptDeadline)
-            /// Past the point where the lease has more room left than the safety margin (deadline
-            /// `anchor + 1000` == 1100, margin 20), so admission refuses before anything is sent.
-            boot_ms = 1090;
-        else
-            backend->after_commit = [&] { renewal_live.store(false, std::memory_order_release); };
-        try
-        {
-            if (startup)
-                (void)runtime.renewRenewerForStartupOnce();
-            else
-                runtime.renewWatermarkOnce();
-            ADD_FAILURE() << "terminal renewal did not propagate";
-        }
-        catch (const DB::Exception & e)
-        {
-            EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR) << e.message();
-        }
-        runtime.finishTeardown(false);
-    };
-    for (bool startup : {true, false})
-        for (Refusal refusal : {Refusal::PreAttemptDeadline, Refusal::RefusedAfterSend})
-            run(startup, refusal);
+        runtime.renewWatermarkOnce();
+        ADD_FAILURE() << "terminal renewal did not propagate";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR) << e.message();
+    }
+    runtime.finishTeardown(false);
 }
 
 TEST(CASPool, BackgroundCadenceMustFitLeaseBeforeWritablePublication)
@@ -5204,16 +5182,10 @@ TEST(CASPool, RenewWatermarkOnceRefreshesFenceAndDepositsOneFailure)
     fake_boot->store(1200);
     EXPECT_TRUE(store->mayMutate()) << "direct success must refresh the local fence from attempt start";
 
-    backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
-    /// The renewal that succeeded at 500 anchored the lease for its 1000 ms TTL, so it expires at 1500.
-    /// Expire it from inside the attempt: the fault alone no longer ends a renewal, because the engine
-    /// settles the ambiguity by reading and reissues, and the reissue commits.
-    backend->before_throw = [fake_boot]
-    {
-        fake_boot->store(1500);
-    };
+    /// GC fences the slot out: a definitive answer, so the renewal ends on its first attempt.
+    fenceOutMount(*backend, store->layout().mountKey("test"));
     const uint64_t schedules_before = store->scheduleRemountCallCountForTest();
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->renewWatermarkOnce(); });
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->renewWatermarkOnce(); });
     EXPECT_FALSE(store->mayMutate());
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), schedules_before + 1);
 }

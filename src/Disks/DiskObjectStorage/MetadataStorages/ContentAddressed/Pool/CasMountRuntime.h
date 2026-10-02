@@ -153,9 +153,9 @@ public:
     uint64_t minActive();
     /// Test/assertion accessor for the next-to-allocate build_seq under the lock.
     uint64_t peekNextBuildSeq();
-    /// Renew the merged mount heartbeat once, including its build-watermark floor. A read-only runtime
-    /// has no renewer and fails with a logical exception rather than fabricating a heartbeat.
-    /// A test seam: it is not protected against a concurrent replacement of the renewer.
+    /// Runs the lease thread's renewal step once on the calling thread and rethrows a terminal failure:
+    /// the test seam. Refused when the runtime is configured for a lease thread, and on a read-only
+    /// runtime, which has no renewer.
     void renewWatermarkOnce();
 
     /// ---- local write fence ----
@@ -164,7 +164,7 @@ public:
     /// Latch the fence lost and count one lease loss. A trip that comes alone is re-armed by the next
     /// renewal that commits with room for a ref append, so every production caller pairs it with a
     /// remount request, a terminal lifecycle (a published FORGET intent included) or a stop, or trips
-    /// where no renewal follows: the lease loop's error exit and a direct renewal.
+    /// where no renewal follows: the lease loop's error exit.
     void tripMountLost();
     /// Publish the BOOTTIME deadline from a successful lease renewal.
     void setMountDeadline(uint64_t deadline_boot_ms);
@@ -317,15 +317,15 @@ public:
     /// renewal that commits with a start more than a TTL ago does not end the expiry, so the first expired
     /// deadline is kept until a renewal restores the lease. Empty otherwise.
     std::optional<uint64_t> leaseExpiredSinceBootMs() const;
-    /// Text of the last failed request of the worker's renewal; empty when no request failed since the
+    /// Text of the last failed renewal request; empty when no request failed since the
     /// last renewal that left the lease unexpired.
     String lastRenewFailure() const;
     /// The condition text for a request admitted under `admitted_generation` that is refused only
     /// because the lease expired; empty when the refusal has any other cause or there is none.
     std::optional<String> leaseExpiredRefusal(uint64_t admitted_generation) const;
-    /// Counts each `PUT` of the worker's renewal as it is sent and keeps the text of every failed
-    /// `PUT` or resolve read, and wakes `waitUntilArmed` on each failure. Runs on the renewing thread,
-    /// never under `driver_mutex`.
+    /// Counts each `PUT` of a renewal as it is sent and keeps the text of every failed `PUT` or resolve
+    /// read, and wakes `waitUntilArmed` on each failure. Runs on the renewing thread, never under
+    /// `driver_mutex`.
     void noteRenewRequest(const MountRenewRequestEvent & event) noexcept;
 
     /// Writes one `WARNING` per lease expiry, at the first request event after it. Lease thread only.
@@ -387,8 +387,6 @@ public:
     /// ---- mount-lease renewer and the lease thread ----
     void installRenewer(UInt128 our_uuid, uint64_t writer_epoch, const std::function<uint64_t()> & now_ms);
     uint64_t startRenewer();
-    uint64_t renewRenewerForStartupOnce();
-    uint64_t renewRenewerForRemountOnce();
     void renewerReset();
     void startBackgroundWorkers(std::chrono::milliseconds period);
     void stopBackgroundWorkers();
@@ -401,7 +399,7 @@ public:
     bool scheduleRemountForTest();
     void beginShutdownForTest();
     /// Return how many remount requests were attempted, refused ones included: `scheduleRemount`,
-    /// `tripAndRequestRemount` and the loop's terminal renewals. This is useful for testing the renewer's loss callback without starting a real recovery.
+    /// `tripAndRequestRemount` and terminal renewals. This is useful for testing the renewer's loss callback without starting a real recovery.
     uint64_t scheduleRemountCallCountForTest() const
     {
         return schedule_remount_calls_for_test.load(std::memory_order_relaxed);
@@ -429,16 +427,6 @@ public:
     void emitEvent(CasEvent && e) const { if (event_sink) event_sink(std::move(e)); }
 
 private:
-    /// Who drives a renewal. Only the loop's renewal is unbounded, counts its requests as they are
-    /// sent, and raises a remount request when it ends terminal.
-    enum class RenewCaller : uint8_t
-    {
-        Loop,
-        Startup,
-        Remount,
-        Direct,
-    };
-
     /// A committed renewal that ended an expiry: how long the lease was expired, and the text of the
     /// last failed request.
     struct RestoredLease
@@ -447,21 +435,22 @@ private:
         String last_failure;
     };
 
-    MountRenewResult renewRenewerOnce(RenewCaller caller);
-    MountRenewOperationEnvironment renewalEnvironment(RenewCaller caller);
+    /// The renewal step of the lease thread: renew, consume the result under `driver_mutex`, then report
+    /// it with no lock held.
+    MountRenewResult renewOnce();
+    MountRenewOperationEnvironment renewalEnvironment();
     std::optional<uint64_t> leaseExpiredAt(uint64_t now_boot_ms) const;
     /// Publishes a committed renewal's deadline. Requires `driver_mutex`. A deadline in the future ends
     /// the current run of trouble: it clears the failure text and, when the lease was expired, counts
     /// the restore and returns it for the caller to log after the unlock. Empty when the lease was not
     /// expired or is still expired.
     std::optional<RestoredLease> publishRenewedDeadline(uint64_t deadline_boot_ms);
-    void consumeRenewResult(const MountRenewResult & result, RenewCaller caller);
+    void consumeRenewResult(const MountRenewResult & result);
     void renewalLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);
-    /// The renewal's liveness. Every caller ends on a stop. A loop renewal also ends on a pending remount
-    /// request and on a terminal lifecycle, which includes a published FORGET intent; a lost fence alone
-    /// does not end it. FALSE ends the renewal.
-    bool renewalLive(RenewCaller caller) const;
+    /// The renewal's liveness: no stop, no pending remount request, no terminal lifecycle (a published
+    /// FORGET intent included); a lost fence alone does not end it. FALSE ends the renewal.
+    bool renewalLive() const;
     /// Whether this node has already been asked to stop. Sampled ONCE, before the write, so a refusal
     /// caused by the stop cannot be mistaken for one that preceded it.
     bool renewalCancelled() const;

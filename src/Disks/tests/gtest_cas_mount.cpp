@@ -238,8 +238,9 @@ class RenewalLogBackend final : public InMemoryBackend
 {
 public:
     bool throw_before_next_overwrite = false;
+    bool refuse_next_overwrite = false;
 
-    /// The fault lives on the primitive every write reaches the store through, keyed to the mount
+    /// The faults live on the primitive every write reaches the store through, keyed to the mount
     /// slot so the pool's other conditional writes pass untouched.
     std::expected<String, RawConflict> write(
         const String & key,
@@ -247,8 +248,13 @@ public:
         const std::optional<String> & expected_value,
         TransportAccess & access) override
     {
-        if (expected_value && key.ends_with("/mount") && std::exchange(throw_before_next_overwrite, false))
-            throw Poco::TimeoutException("injected renewal timeout before commit");
+        if (expected_value && key.ends_with("/mount"))
+        {
+            if (std::exchange(refuse_next_overwrite, false))
+                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected deterministic renewal rejection");
+            if (std::exchange(throw_before_next_overwrite, false))
+                throw Poco::TimeoutException("injected renewal timeout before commit");
+        }
         return InMemoryBackend::write(key, bytes, expected_value, access);
     }
 };
@@ -373,10 +379,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-fenced");
         ScopedRenewalLogCapture capture("information");
-        /// The lease was claimed at boot 100 with the 1000 ms TTL above, so it expires at 1100. The
-        /// fence admits only while the remaining time strictly clears the safety margin plus whatever
-        /// the attempt reserves, so exactly `margin` remaining (with the reservation on top) refuses.
-        boot_ms->store(1100 - renewalLogBudget().lease_safety_margin_ms);
+        backend->refuse_next_overwrite = true;
         EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
         const String output = capture.captured();
         EXPECT_EQ(countRenewalLogText(output, "CAS mount renewal"), 1u) << output;

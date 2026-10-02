@@ -400,7 +400,16 @@ uint64_t CasMountRuntime::peekNextBuildSeq()
 
 void CasMountRuntime::renewWatermarkOnce()
 {
-    (void)renewRenewerOnce(RenewCaller::Direct);
+    {
+        std::lock_guard lock(driver_mutex);
+        if (config.background_watermark)
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "CAS mount runtime: direct renewal is disabled when background ownership is configured");
+    }
+    const MountRenewResult result = renewOnce();
+    if (result.outcome == MountRenewOutcome::Terminal)
+        std::rethrow_exception(result.failure);
 }
 
 uint64_t CasMountRuntime::allocateBuildSeq()
@@ -498,37 +507,29 @@ uint64_t CasMountRuntime::startRenewer()
     return renewer->start([this] { return !renewalCancelled(); });
 }
 
-MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(RenewCaller caller)
+MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment()
 {
-    const bool loop = caller == RenewCaller::Loop;
     return MountRenewOperationEnvironment{
         .boot_ms = [this] { return bootMsNow(); },
-        .live = [this, caller]
+        .live = [this]
         {
-            return renewalLive(caller) && (!config.renewal_live_for_test || config.renewal_live_for_test());
+            return renewalLive() && (!config.renewal_live_for_test || config.renewal_live_for_test());
         },
         .cancelled = [this] { return renewalCancelled(); },
-        /// Only the loop keeps renewing past the lease; startup, remount and direct renewals stay
-        /// bounded by it.
-        .policy = loop ? MountRenewPolicy::UntilDefinitive : MountRenewPolicy::LeaseBound,
-        /// The loop counts its requests as they are sent, so an outage shows while it lasts.
-        .on_request = loop
-            ? std::function<void(const MountRenewRequestEvent &)>(
-                  [this](const MountRenewRequestEvent & event) { noteRenewRequest(event); })
-            : nullptr,
+        .policy = MountRenewPolicy::UntilDefinitive,
+        /// Counts the requests as they are sent, so an outage shows while it lasts.
+        .on_request = [this](const MountRenewRequestEvent & event) { noteRenewRequest(event); },
     };
 }
 
-bool CasMountRuntime::renewalLive(RenewCaller caller) const
+bool CasMountRuntime::renewalLive() const
 {
     std::lock_guard lock(driver_mutex);
-    if (workers_stop_requested)
-        return false;
-    if (caller != RenewCaller::Loop)
-        return true;
     /// A lost fence alone does not end it: the renewal that makes an open or a reclaim ready runs under
     /// one, and every trip that must end it comes with a request, a terminal lifecycle or a stop.
-    return remount_requested_generation <= remount_handled_generation && !remountTerminal();
+    return !workers_stop_requested
+        && remount_requested_generation <= remount_handled_generation
+        && !remountTerminal();
 }
 
 bool CasMountRuntime::renewalCancelled() const
@@ -543,15 +544,8 @@ void CasMountRuntime::sleepInterruptibly(uint64_t ms)
     driver_cv.wait_for(lock, std::chrono::milliseconds(ms), [this] { return workers_stop_requested; });
 }
 
-void CasMountRuntime::consumeRenewResult(const MountRenewResult & result, RenewCaller caller)
+void CasMountRuntime::consumeRenewResult(const MountRenewResult & result)
 {
-    /// The loop counts its requests as they are sent (`noteRenewRequest`). Every other renewal counts
-    /// them here, from its result.
-    if (caller != RenewCaller::Loop && result.attempts_sent > 0)
-    {
-        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalAttempts, result.attempts_sent);
-        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRetries, result.attempts_sent - 1);
-    }
     if (result.resolved_by_read)
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalResolved);
 
@@ -579,31 +573,16 @@ void CasMountRuntime::consumeRenewResult(const MountRenewResult & result, RenewC
         }
         else if (result.outcome == MountRenewOutcome::Terminal)
         {
-            switch (caller)
+            if (workers_stop_requested)
             {
-                case RenewCaller::Loop:
-                    if (workers_stop_requested)
-                    {
-                        tripFenceWithoutOperationalLoss();
-                        break;
-                    }
-                    tripMountLost();
-                    schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
-                    if (!remountTerminal() && lossNeedsNewRequest())
-                        ++remount_requested_generation;
-                    break;
-                case RenewCaller::Direct:
-                    tripMountLost();
-                    schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
-                    break;
-                case RenewCaller::Startup:
-                    tripFenceWithoutOperationalLoss();
-                    break;
-                case RenewCaller::Remount:
-                    /// The reclaim latched the fence at its start and reports this failure itself.
-                    if (workers_stop_requested)
-                        tripFenceWithoutOperationalLoss();
-                    break;
+                tripFenceWithoutOperationalLoss();
+            }
+            else
+            {
+                tripMountLost();
+                schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
+                if (!remountTerminal() && lossNeedsNewRequest())
+                    ++remount_requested_generation;
             }
         }
         driver_cv.notify_all();
@@ -645,20 +624,13 @@ void CasMountRuntime::consumeRenewResult(const MountRenewResult & result, RenewC
     }
 
     reportMountRenewCompletion(result, std::nullopt);
-
-    if (caller != RenewCaller::Loop)
-        std::rethrow_exception(result.failure);
 }
 
-MountRenewResult CasMountRuntime::renewRenewerOnce(RenewCaller caller)
+MountRenewResult CasMountRuntime::renewOnce()
 {
     MountLeaseRenewer * renewer = nullptr;
     {
         std::lock_guard lock(driver_mutex);
-        if (caller == RenewCaller::Direct && config.background_watermark)
-            throw Exception(
-                ErrorCodes::LOGICAL_ERROR,
-                "CAS mount runtime: direct renewal is disabled when background ownership is configured");
         checkRenewerOwner();
         if (!mount_renewer)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal without a renewer");
@@ -666,26 +638,10 @@ MountRenewResult CasMountRuntime::renewRenewerOnce(RenewCaller caller)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal requires an Active renewer");
         renewer = mount_renewer.get();
     }
-    /// Configuration is pointer/POD-only. A remount re-anchor retains its completed observation for the
-    /// whole-chain finalizer to deliver after `remount_mutex` is released.
-    configureMountRenewObservability(&server_root_id, &event_sink, caller == RenewCaller::Remount);
-    /// The remount re-anchor runs before `armIfAdmissible`, with the fence still latched, so it renews on
-    /// the renewer's open plane: admitted under the mount fence it could only ever give up.
-    const MountRenewResult result = caller == RenewCaller::Remount
-        ? renewer->renewForRemount(renewalEnvironment(caller))
-        : renewer->renew(renewalEnvironment(caller));
-    consumeRenewResult(result, caller);
+    configureMountRenewObservability(&server_root_id, &event_sink, /*deferred=*/false);
+    const MountRenewResult result = renewer->renew(renewalEnvironment());
+    consumeRenewResult(result);
     return result;
-}
-
-uint64_t CasMountRuntime::renewRenewerForStartupOnce()
-{
-    return renewRenewerOnce(RenewCaller::Startup).attempt_start_boot_ms;
-}
-
-uint64_t CasMountRuntime::renewRenewerForRemountOnce()
-{
-    return renewRenewerOnce(RenewCaller::Remount).attempt_start_boot_ms;
 }
 
 void CasMountRuntime::renewerReset()
@@ -831,7 +787,7 @@ void CasMountRuntime::renewalLoop()
             config.renewal_admitted_hook_for_test();
         try
         {
-            (void)renewRenewerOnce(RenewCaller::Loop);
+            (void)renewOnce();
         }
         catch (...)
         {
