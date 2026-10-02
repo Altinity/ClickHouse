@@ -121,13 +121,12 @@ WHERE disk_name = 'cas'
 ORDER BY event_time_microseconds;
 ```
 
-A `watermark_renew` row now carries only two detail keys beyond the identifying ones:
-`attempts_sent` (the number of physical HTTP attempts the whole logical renewal made) and
-`classification`. There is no per-attempt `retrying` row any more — a renewal that recovers after
-one or more physical attempts produces exactly one `recovered` row when it settles, not a `retrying`
-row followed by a `recovered` one — and the older `unresolved_reason`, `deadline_source`, and
-`stop_cause` keys are gone; everything they used to distinguish is now named directly by
-`classification`. Interpret the sequence as follows:
+A `watermark_renew` row carries `attempts_sent` (the number of physical HTTP attempts the whole logical
+renewal made), `classification` and, on the renewal that restored an expired lease, `expired_ms`. A
+renewal that recovers after one or more physical attempts produces exactly one `recovered` row when it
+settles; there is no per-attempt row. `classification` names what happened. Interpret the sequence as
+follows:
+
 
 - `outcome = 'recovered'` means a renewal landed in the same epoch after a retry, an exact `GET`, or an
   expired lease. `classification` says how: `committed_by_read` means an exact `GET` proved a landed

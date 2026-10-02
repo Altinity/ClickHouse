@@ -153,8 +153,13 @@ does not make mixed thresholds safe. With the defaults (TTL 30 s, period 10 s, m
 check `period + 2 × envelope + margin < TTL` leaves `TTL − margin − period − 2 × envelope = 4 s` of
 slack: a renewal that starts up to 4 s late still leaves time to admit a write before the next one. A
 write is admitted only while the remaining lease exceeds the time its requests may still take plus the
-margin: one envelope for a request, two for a ref-log append, so writes stop between 9 s and 16 s before
-the deadline with the defaults. Here `envelope = attempt_timeout + 2 × cap` and `cap` is
+margin. A conditional write reserves two envelopes on every attempt (the attempt and the read that
+settles it; a ref-log append reserves the same). A removal that re-observes the key after a mismatch
+reserves two plus its pause, and a retried sentinel probe reserves one plus its pause. With the defaults
+a conditional write is refused once less than 16 s of the lease remains, a retried sentinel probe once
+less than 9 s remains. Renewals start every 10 s, so the lease has 30 s left after one and 20 s just
+before the next; if renewals keep failing, conditional writes stop 14 s after the last confirmed renewal
+started, about 4 s after the next one was due. Here `envelope = attempt_timeout + 2 × cap` and `cap` is
 `attempt_timeout` when the disk's `connect_timeout_ms` is `0`, else `min(connect_timeout_ms,
 attempt_timeout)` (7 s with defaults).
 

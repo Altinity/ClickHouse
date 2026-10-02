@@ -43,17 +43,18 @@ Start with the `watermark_renew` timeline described in
    expired; `CASMountLeaseLost` and the remount counters stay flat. The restoring `watermark_renew` row
    has `outcome = 'recovered'` and `expired_ms` in `detail`: how long the lease was expired, from its
    deadline to the restoring renewal. Its `classification` is `committed_after_expiry`, or
-   `committed_after_retry` or `committed_by_read` when one of those applies first. The server log has a `WARNING` with the
-   same duration and the last failure. While the outage lasts, the same state is visible in
-   `system.cas_mounts` (`lifecycle_reason = 'lease_expired'`); the event moves only at the restore.
+   `committed_after_retry` or `committed_by_read` when one of those applies first. The server log has
+   a `WARNING` with the same duration and the last failure. While the outage lasts, the same state is
+   visible in `system.cas_mounts` (`lifecycle_reason = 'lease_expired'`); the event moves only at the
+   restore.
 2. **External lease-safety exhaustion.** Only the renewals at startup, after a remount and the direct
    renewal are bounded by the lease; the background renewal is not, so this case means one of those ran
-   out of lease. The failed
-   row has `classification = 'external_lease_deadline'`; `CASMountRenewalDeadlineExceeded` and
-   `CASMountLeaseLost` rise. The runtime correctly refused to manufacture authority beyond the last
-   confirmed lease. Check object-store latency and BOOTTIME/suspend history, then follow the ensuing
-   remount. `classification = 'request_deadline'` is the sibling case: the ninety-second request
-   policy exhausted first rather than the lease's own safety margin.
+   out of lease. The failed row has `classification = 'external_lease_deadline'`;
+   `CASMountRenewalDeadlineExceeded` and `CASMountLeaseLost` rise. The runtime correctly refused to
+   manufacture authority beyond the last confirmed lease. Check object-store latency and
+   BOOTTIME/suspend history, then follow the ensuing remount. `classification = 'request_deadline'` is
+   the sibling case: the ninety-second request policy exhausted first rather than the lease's own
+   safety margin.
 3. **Cancellation.** `classification = 'cancelled'` after a sent request is terminal and suppresses a
    clean farewell because the request may still land. Cancellation before any request remains
    `Active` and emits no failed aggregate row; during graceful shutdown that is the expected
