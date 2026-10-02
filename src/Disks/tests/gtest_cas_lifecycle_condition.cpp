@@ -118,7 +118,7 @@ public:
 /// `Vanished`) and store()-class access fails loud. rev.8: `IdentityLost` is a fail-loud TERMINAL state —
 /// `isVanished()` still reads false (it is a distinct terminal), but a direct gate re-probe refuses without
 /// ever claiming/allocating/writing (the thread-exit behavior of the background observer is covered by
-/// `RemountThreadSelfExitsOnceIdentityLost` below).
+/// `AnIdentityLostPoolRefusesARemountRequest` below).
 TEST(CASLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -151,15 +151,12 @@ TEST(CASLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
     EXPECT_GE(backend->headCount(meta_key), 1u) << "the gate still probes _pool_meta authoritatively";
 }
 
-/// (a2) rev.8 worker-exit: `IdentityLost` is terminal, so the persistent self-remount worker must self-exit
-/// — mirroring how a `Vanished` pool refuses to latch work. With `background_watermark = true`, `scheduleRemount`
-/// must REFUSE to latch a recovery generation once the pool is `IdentityLost` (`remountTerminal` covers it),
-/// exactly as it refuses on a published `Vanished` intent.
-TEST(CASLifecycleCondition, RemountThreadSelfExitsOnceIdentityLost)
+/// (a2) `IdentityLost` is terminal: a remount request is refused (`remountTerminal` covers it), as it is on
+/// a published `Vanished` intent.
+TEST(CASLifecycleCondition, AnIdentityLostPoolRefusesARemountRequest)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    /// `background_watermark = true` so the persistent recovery worker exists in production mode
-    /// (mirrors gtest_cas_pool.cpp's ShutdownGuardRefusesToArmRemount setup).
+    /// `background_watermark = true` so the lease thread exists.
     auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .background_watermark = true});
 
@@ -169,10 +166,8 @@ TEST(CASLifecycleCondition, RemountThreadSelfExitsOnceIdentityLost)
     EXPECT_FALSE(store->tryRemountOnce());
     ASSERT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
 
-    /// The runtime terminal consumer (or any direct `scheduleRemount`) must now refuse: no worker runs on a
-    /// terminal pool.
     EXPECT_FALSE(store->scheduleRemountForTest())
-        << "an IdentityLost pool is terminal (rev.8) — scheduleRemount must not latch recovery work";
+        << "an IdentityLost pool is terminal: a remount request must not latch recovery work";
 }
 
 /// (b) `_pool_meta` present but its `pool_id` is foreign → `Vanished(replaced)` immediately.

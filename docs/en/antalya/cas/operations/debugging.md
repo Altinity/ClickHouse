@@ -147,8 +147,10 @@ follows:
   differs by classification.
 - A following `mount_remount` row names the whole-chain `attempt_no` and final `step`. An `ok` row
   with `step = 'publish_live'` restored `Live` under the reported fresh `writer_epoch`; with
-  `step = 'claimed_not_armed'` the claim succeeded with too little lease to admit a write, and the next
-  renewal arms the fence and reports `Live`. A `failed` row's `step` and optional `error` identify where
+  `step = 'claimed_not_armed'` the claim succeeded but its arming conditions did not hold (too little
+  lease left, a newer remount request, a stop, or a terminal lifecycle), and the fence stays latched. The
+  next renewal arms it and reports `Live` when no request is pending; a newer request gets another
+  reclaim; a stop or a terminal lifecycle ends the lease thread. A `failed` row's `step` and optional `error` identify where
   that whole-chain attempt stopped.
 
 Use deltas of the mount counters from

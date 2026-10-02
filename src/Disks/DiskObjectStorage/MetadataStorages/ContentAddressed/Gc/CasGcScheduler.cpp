@@ -350,19 +350,19 @@ void CasGcScheduler::loop()
                 return;
             round_requested = false;
         }
-        /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit the pacing loop the moment the pool reaches — or is
+        /// Self-exit the pacing loop the moment the pool reaches — or is
         /// being driven toward — ANY terminal state. A NATURAL terminal transition (`VanishedReplaced` after
         /// a foreign pool took the prefix, or `IdentityLost` once the sentinels are gone) never calls
         /// `stop()` on this scheduler: only `~Pool`/FORGET join it. Without this check the loop would tick
         /// FOREVER — `acquireOrRenewLease` throws `CORRUPTED_DATA` against the vanished `gc/state` every
-        /// interval (the G2 zombie: an error-log line + a Failed round row each tick), and worse, after
+        /// interval (an error-log line + a Failed round row each tick), and worse, after
         /// `VanishedReplaced` the `allow_steal=true` rounds could STEAL the FOREIGN pool's `gc/state` lease
         /// and fold/condemn/delete its objects. `remountTerminal` is true from the moment FORGET
         /// publishes its intent (still pre-terminal) and on `IdentityLost`
-        /// (a fail-loud terminal state; the last G2-zombie case — eternal `CORRUPTED_DATA` retries
-        /// against a half-erased pool — closes with it). Clearing `i_am_leader` before returning keeps
+        /// (a fail-loud terminal state, which also ends eternal `CORRUPTED_DATA` retries against a
+        /// half-erased pool). Clearing `i_am_leader` before returning keeps
         /// `gcHealth` honest (a terminal, self-exited scheduler reports it no longer leads). The thread exits
-        /// its OWN loop here — no join from this context (C6-safe); `stop()`/`~CasGcScheduler` still join the
+        /// its OWN loop here — no join from this context; `stop()`/`~CasGcScheduler` still join the
         /// finished thread cleanly.
         if (store->remountTerminal())
         {
@@ -476,7 +476,7 @@ void CasGcScheduler::heartbeatLoop()
                 { return scheduler_state == SchedulerState::Stopped; }))
                 return;
         }
-        /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit on ANY terminal (or FORGET-intent) pool, same as
+        /// Self-exit on ANY terminal (or FORGET-intent) pool, same as
         /// `loop()`. A terminal pool's advisory pulses would target a deleted `gc/hb` key (`IdentityLost`) or
         /// a FOREIGN pool's key (`VanishedReplaced`) — stop pulsing the moment the pool goes terminal.
         if (store->remountTerminal())

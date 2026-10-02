@@ -1128,9 +1128,9 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     /// it, so the reclaim `finishTeardown` is written to override could never happen. Server shutdown
     /// arms instead: it joins the same scheduler with no remount step to preserve.
     ///
-    /// (1) Publish the terminal-intent latch FIRST (spec §5). The runtime stops latching remounts and
-    /// the remount loop bails at its next step boundary, so every join below is bounded to one step + one
-    /// backend timeout.
+    /// (1) Publish the terminal-intent latch FIRST. The runtime stops latching remounts and the lease
+    /// thread exits at its next step boundary, so every join below is bounded to one step + one backend
+    /// timeout.
     mount_runtime.publishVanishedIntent();
 
     /// (2) Trip the local fence — the deliberate decommission act (allowed on a live disk). No durable-
@@ -1235,7 +1235,8 @@ bool Pool::tryRemountOnce()
                 event.reason = !succeeded
                     ? "whole-chain remount returned without restoring Live"
                     : (armed ? "whole-chain remount restored Live under a fresh mount incarnation"
-                             : "whole-chain remount claimed a fresh mount incarnation; the next renewal arms the fence");
+                             : "whole-chain remount claimed a fresh mount incarnation but its arming conditions did not hold; "
+                               "the fence stays latched until a later renewal or reclaim arms it");
                 event.detail = {
                     {"attempt_no", std::to_string(attempt_no)},
                     {"step", String{step}},
@@ -1474,8 +1475,8 @@ bool Pool::tryRemountOnce()
         ///    where the gate is open while the epoch is still stale.
         step = "publish_writer_epoch";
         mount_runtime.setLiveWriterEpoch(writer_epoch);
-        /// 2. CANCEL OR JOIN every in-flight ref-table recovery, and BLOCK here until none is left (spec
-        ///    §3: "self-remount cancels or waits out recovery before rearming"). A recovery admitted under
+        /// 2. CANCEL OR JOIN every in-flight ref-table recovery, and BLOCK here until none is left. A
+        ///    recovery admitted under
         ///    the outgoing incarnation WRITES -- its seal CAS-walk mints epoch seals and advances the
         ///    `_ckpt` -- so it must be stopped at this boundary rather than caught one site at a time
         ///    after the incarnation has already changed underneath it. Strictly before the quiesce below
@@ -1491,8 +1492,8 @@ bool Pool::tryRemountOnce()
             config.remount_quiesce_hook_for_test();
 
         /// No-throw commit section. The fence and the lifecycle are published only after epoch, renewer,
-        /// recovery cancellation and ref-runtime quiescence are complete. A claim whose deadline no longer
-        /// admits a ref append leaves the fence latched; the lease thread's next renewal arms it.
+        /// recovery cancellation and ref-runtime quiescence are complete. A claim that fails the arming rule
+        /// leaves the fence latched for the lease thread's next renewal or a newer reclaim.
         step = "arm_fence";
         armed = mount_runtime.armIfAdmissible(
             remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms

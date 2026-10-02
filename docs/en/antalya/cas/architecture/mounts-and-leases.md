@@ -271,14 +271,16 @@ TTL, still leaves room for a ref append: `2 × envelope + margin` (16 s with the
 fence stays latched, the lease thread renews at once, and the first renewal whose own deadline leaves that
 room arms the fence; then the open returns. A renewal that commits with less room arms nothing, and the
 next one follows at once. If no renewal arms the fence within one TTL, the open stops and joins the lease
-thread and fails with `ABORTED`, naming the last failed renewal request. A reclaim follows the same rule: a
-claim with too little lease left keeps the pool `TransientNotLive` with the fence latched, and the next
-renewal arms the fence and reports `Live`. The `mount_remount` row of such a reclaim has `outcome = 'ok'`
+thread and fails with `ABORTED`, naming the last failed renewal request. A reclaim whose arming conditions
+(below) do not hold keeps the pool `TransientNotLive` with the fence latched. Then the next renewal arms
+the fence and reports `Live` when no request is pending, a newer request gets another reclaim, and a stop
+or a terminal lifecycle ends the thread. The `mount_remount` row of such a reclaim has `outcome = 'ok'`
 and `step = 'claimed_not_armed'`.
 
 One lease thread per writable mount renews the lease and runs the self-remount, one after the other.
-`scheduleRemount` increments a requested-generation latch and wakes the thread; a pending request also
-ends a renewal in progress. While the thread runs, only it replaces, starts or resets the renewer.
+An interference report (`tripAndRequestRemount`) and a terminal renewal trip the fence, raise the
+requested remount generation unless a request no reclaim has started serving is already pending or the
+pool is stopping or terminal, and wake the thread; a pending request also ends a renewal in progress. While the thread runs, only it replaces, starts or resets the renewer.
 
 - A reclaim latches the fence first.
 - It arms the fence, and reports `Live`, only when no newer request is pending, no stop is requested

@@ -65,6 +65,12 @@ Start with the `watermark_renew` timeline described in
    and optional `error` identify the failed owner/catalog/epoch/claim/install/quiescence/fence step.
    The current protocol retries the whole chain with bounded backoff; it does not preserve per-step
    progress. Repeated failure at the same step is the actionable signal.
+6. **Lease thread ended on its own error path.** The server log has an `ERROR` line from the `CasPool`
+   logger that starts with `CAS mount-lease renewal loop`, with the exception that ended the thread.
+   The disk shows `lifecycle = 'not_live'` in `system.cas_mounts`, every write is refused, and no
+   `watermark_renew` or `mount_remount` row follows: nothing renews, reclaims or reopens the mount.
+   Restart the server, and report the logged exception as a defect: the lease keeper exits this way
+   only when its own state machine broke its contract.
 
 The default-level log policy is intentionally bounded. The lease keeper logs nothing about a renewal
 until the renewal ends. A renewal that succeeds on its first request logs nothing. A renewal that

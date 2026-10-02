@@ -574,8 +574,8 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 /// liveness. The claim and the farewell are admitted on `claim_farewell_requests`, off the fence: a
 /// self-remount claims with the fence already latched lost, so a claim gated on the fence could never
 /// reclaim, and a farewell refused because the fence has run down would leave the slot looking live
-/// until GC fences it out. Neither is unguarded: a claim's safety is its own conditional write, and a caller that has
-/// shutdown facts hands them over as a `Liveness`.
+/// until GC fences it out. Neither is unguarded: a claim's safety is its own conditional write, and a
+/// caller that has shutdown facts hands them over as a `Liveness`.
 class MountLeaseRenewer
 {
 public:

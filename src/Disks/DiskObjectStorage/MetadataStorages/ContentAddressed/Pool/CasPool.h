@@ -470,8 +470,8 @@ public:
     /// `lost` and the monotonic deadline has not passed. Permissive until armed: a Pool that has not
     /// armed the fence (the default deadline is steady_clock::time_point::max()) always allows mutations.
     bool mayMutate() const;
-    /// Latch the fence to lost (once lost, stays lost). Called by the renewer on a superseded
-    /// or foreign observation; the gated mutate chokepoints then fail closed.
+    /// Test seam: `CasMountRuntime::tripMountLost`, with no remount request. Production trips through
+    /// the runtime.
     void tripMountLost();
     /// Refresh the write-fence deadline (a CLOCK_BOOTTIME-milliseconds instant; release).
     /// renewer renew calls this on success.
@@ -494,11 +494,12 @@ public:
     /// The real boot clock: CLOCK_BOOTTIME in milliseconds. Static so tests can compose it.
     static uint64_t bootMs();
 
-    /// ---- fence-generation admission (rev.7 [C2]/[D1]; owned by `mount_runtime`) ----
-    /// Bumped on every `tripMountLost`/`armMountFence`. Forwarders used directly by the S3-native
-    /// staging-buffer finalize (`ContentAddressedTransaction::writeFile`) -- the durable-effect site
-    /// outside `CasPlainObjects` that needs to capture-then-recheck a fence-generation token across an
-    /// async, potentially long-running upload. `CasPlainObjects` reaches the same primitives via
+    /// ---- fence-generation admission (owned by `mount_runtime`) ----
+    /// Bumped by every trip and every arm of the fence (see `CasMountRuntime::fenceGeneration`).
+    /// Forwarders used directly by the S3-native staging-buffer finalize
+    /// (`ContentAddressedTransaction::writeFile`) -- the durable-effect site outside `CasPlainObjects`
+    /// that needs to capture-then-recheck a fence-generation token across an async, potentially
+    /// long-running upload. `CasPlainObjects` reaches the same primitives via
     /// injected callbacks (see its own constructor).
     uint64_t fenceGeneration() const { return mount_runtime.fenceGeneration(); }
     /// Throws the typed transient refusal (`throwCasTransientUnavailable`) unless the fence is currently
@@ -809,26 +810,21 @@ public:
     /// `Pool::open`. Orchestration stays here; the owned mount primitives it drives (renewer swap,
     /// epoch bump, fence re-arm) live on `mount_runtime`. Returns false (and changes nothing durable
     /// beyond the epoch bump) when the
-    /// mount cannot be claimed (foreign owner / a genuinely live twin) — the caller retries. Safe to
-    /// call concurrently (serialized internally); also the synchronous test seam.
+    /// mount cannot be claimed (foreign owner / a genuinely live twin) — the caller retries. Serialized
+    /// by `remount_mutex`. While a lease thread runs, a call from any other thread fails at the renewer's
+    /// owner check (a `LOGICAL_ERROR`). Also the synchronous test seam.
     bool tryRemountOnce();
 
-    /// Test seam: latch the private self-remount path directly. In production the runtime terminal
-    /// consumer calls `scheduleRemount`, while external loss paths raise the same generation for the lease
-    /// thread.
-    /// Returns true iff an unhandled recovery generation exists after the call.
+    /// Test seam: request a remount without a trip. Production requests one through
+    /// `reportImpossibleInterference` and a terminal renewal. Returns true iff a lease thread runs and a
+    /// request is pending after the call.
     bool scheduleRemountForTest();
-    /// Test seam: how many times `scheduleRemount` has been ENTERED, counted
-    /// unconditionally as its very first statement. This increments even under the default
-    /// `background_watermark = false` (no worker exists; a
-    /// test never pays for a real self-remount attempt racing this Pool's own still-live renewer, which
-    /// -- confirmed while building this seam -- reliably takes 30+ seconds per call and is not something
-    /// a fast unit test should be driving). Positively pins that a production call site (e.g.
-    /// `reportImpossibleInterference`) actually invoked `scheduleRemount`, as opposed to merely observing
-    /// `mayMutate() == false` (which `tripMountLost` alone already accounts for).
+    /// Test seam: see `CasMountRuntime::scheduleRemountCallCountForTest`. It counts with no lease thread
+    /// too, so a test can pin that a call site such as `reportImpossibleInterference` requested a
+    /// remount, which `mayMutate() == false` alone does not show.
     uint64_t scheduleRemountCallCountForTest() const { return mount_runtime.scheduleRemountCallCountForTest(); }
     /// Test seam: publish the same worker-stop request as `~Pool` without tearing the pool down, so a
-    /// test can assert `scheduleRemount` refuses to latch work once teardown has begun.
+    /// test can assert a remount request is refused once teardown has begun.
     void beginShutdownForTest();
 
 
@@ -921,8 +917,7 @@ private:
     /// makes `key` exclusively ours: foreign bytes observed at our own wedge key, or the wedge hard
     /// contract itself violated at new-id-allocation time. LOG_ERROR with full context, emit a
     /// `ForeignInterference` CasEvent, then fence this mount closed and arm the SAME bounded
-    /// self-remount a foreign/superseded lease renewal already drives (`tripMountLost` followed by
-    /// `scheduleRemount`). Diagnosis is strictly off the
+    /// self-remount a foreign/superseded lease renewal already drives (`tripAndRequestRemount`). Diagnosis is strictly off the
     /// critical path: ONE background GET of `key` (best-effort, single attempt), decoded as far as its
     /// ref-log header parses, logged -- never blocking or throwing on the caller's thread. Does NOT
     /// itself throw: every call site raises its OWN `LOGICAL_ERROR` immediately after this returns, so

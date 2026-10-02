@@ -61,7 +61,7 @@ window and correlate them with the `server_root_id` in `system.cas_log`.
 | `CASMountRenewalRecovered` | One per logical renewal committed after a retry or exact resolving `GET` | Recovered object-store blips that retained the existing mount incarnation |
 | `CASMountLeaseExpired` | One per renewal that restored a lease that had expired | Moves at the restore, not when the lease expires. While it is expired, `system.cas_mounts` shows `lifecycle_reason = 'lease_expired'` and writes are refused; the `watermark_renew` row of the restoring renewal carries `expired_ms` |
 | `CASRemountAttempts` | One per invocation of the existing whole-chain remount attempt | Includes both successful and failed attempts |
-| `CASRemountSucceeded` | One per whole-chain attempt that completed every step through the arm step, under a fresh writer epoch | Must be a subset of `CASRemountAttempts`. Includes a reclaim whose claim left too little lease to arm the fence (`step = 'claimed_not_armed'`); the next renewal arms it |
+| `CASRemountSucceeded` | One per whole-chain attempt that completed every step through the arm step, under a fresh writer epoch | Must be a subset of `CASRemountAttempts`. Includes a reclaim that claimed but whose arming conditions did not hold (`step = 'claimed_not_armed'`), with the fence still latched |
 | `CASRemountFailed` | One per whole-chain attempt that stopped before the arm step | Includes a named step exception or a step that returned transiently, also after the mount claim succeeded (for example at `renewer_start` or `quiesce_ref_tables`) |
 
 `CASMountLeaseLost` complements those counters. It increments exactly once per operational
@@ -90,8 +90,10 @@ Ordinary first-attempt success produces no row. Every `mount_remount` attempt pr
 `failed` and details `attempt_no`, `step`, `server_root_id`, optional `writer_epoch`, and optional
 `error`.
 An `ok` row has `step = 'publish_live'` when the reclaim armed the fence and reported `Live`, or
-`step = 'claimed_not_armed'` when its claim left too little lease to admit a write; the pool then stays
-`not_live` until the next renewal arms the fence.
+`step = 'claimed_not_armed'` when it claimed but its arming conditions did not hold: too little lease left
+for a write, a newer remount request, a stop, or a terminal lifecycle. The fence stays latched. What follows
+is the lease thread's next renewal when no request is pending, another reclaim when a newer request is, or
+the thread's exit on a stop or a terminal lifecycle.
 
 Default-level text logging is bounded per logical operation. A renewal logs nothing until it ends,
 and nothing at all when it succeeds on its first request. A renewal that needed a retry, was settled

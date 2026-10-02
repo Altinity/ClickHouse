@@ -1737,18 +1737,18 @@ TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)
 TEST(CASPoolRemount, ShutdownGuardRefusesToArmRemount)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    /// `background_watermark = true` so `scheduleRemount` can latch a recovery generation for the
-    /// persistent worker in production mode (the same gate both runtime workers check).
+    /// `background_watermark = true` so a remount request can latch a recovery generation for the
+    /// lease thread.
     auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .background_watermark = true});
 
     /// Teardown has begun: `Pool` latches this before joining either persistent worker.
     store->beginShutdownForTest();
 
-    /// A lease-renewal failure firing during teardown re-enters `scheduleRemount`. With the guard it
-    /// must refuse to latch another generation after the workers are stopping.
+    /// A remount request during teardown must not latch another generation after the workers are
+    /// stopping.
     EXPECT_FALSE(store->scheduleRemountForTest())
-        << "scheduleRemount must not latch recovery work once teardown has begun";
+        << "a remount request must not latch recovery work once teardown has begun";
 }
 
 namespace
@@ -2711,8 +2711,8 @@ TEST(CASMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
 /// A reclaim arms the fence only when its claim still admits a ref append: more than two envelopes plus
 /// the margin of lease, strictly, with no period term. With attempt 100 and cap 100 that is 650 ms of the
 /// 1000 ms lease. A quiescence that leaves less reports success at step `claimed_not_armed` with the pool
-/// not `Live`; the lease thread's next renewal arms it.
-TEST(CASPoolRemount, RemountRenewerRedoUsesTheEnvelope)
+/// not `Live` and the fence latched.
+TEST(CASPoolRemount, AReclaimArmsOnlyWithRoomForTwoEnvelopesAndTheMargin)
 {
     struct AtRemountEvent
     {

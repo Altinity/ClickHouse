@@ -770,10 +770,10 @@ private:
         /// Both this flag and the condition variable are guarded by `state_mutex`.
         bool recovery_in_progress = false;
         std::condition_variable recovery_cv;
-        /// The self-remount cancellation request (spec §3: "self-remount cancels or waits out recovery
-        /// before rearming"). Set by `cancelRecoveriesAndAwaitQuiescence` from the remount thread and
-        /// polled by the recovery walk at EVERY I/O boundary; a recovery that observes it abandons its
-        /// attempt having written nothing and installed nothing.
+        /// The self-remount cancellation request: a reclaim cancels or waits out recovery before it arms.
+        /// Set by `cancelRecoveriesAndAwaitQuiescence`, which `Pool::tryRemountOnce` calls, and polled by
+        /// the recovery walk at EVERY I/O boundary; a recovery that observes it abandons its attempt
+        /// having written nothing and installed nothing.
         ///
         /// ATOMIC, not `state_mutex`-guarded like its two neighbours, and that is the point: the
         /// canceller must be able to publish the request WITHOUT queueing behind the very recovery it is

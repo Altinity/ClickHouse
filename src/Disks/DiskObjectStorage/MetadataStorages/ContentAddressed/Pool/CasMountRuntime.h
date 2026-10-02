@@ -190,10 +190,11 @@ public:
     /// The real boot clock: `CLOCK_BOOTTIME` in milliseconds. Static so tests can compose it.
     static uint64_t bootMs();
 
-    /// ---- fence-generation admission (rev.7 [C2]/[D1]) ----
-    /// Bumped by EVERY `tripMountLost` (a fence loss) and EVERY `armMountFence` (a re-arm -- a fresh
-    /// lease incarnation, e.g. after a self-remount). A durable-effect caller captures this value once
-    /// at admission and compares it again immediately before its durable backend call: a DIFFERENT
+    /// ---- fence-generation admission ----
+    /// Bumped by every trip (`tripMountLost`, `tripFenceWithoutOperationalLoss`) and every arm
+    /// (`armFence`, through `armMountFence`, `armIfAdmissible` and the renewal consume step). A
+    /// durable-effect caller captures this value once at admission and compares it again immediately
+    /// before its durable backend call: a DIFFERENT
     /// value means the lease incarnation moved from under it since admission -- even when the fence
     /// happens to be live again under a brand-new incarnation, the caller's write is stale and must not
     /// land. See `checkFenceOrThrow`.
@@ -207,18 +208,16 @@ public:
     /// admission; the caller's write must never reach the backend in either case.
     void checkFenceOrThrow(uint64_t admitted_generation) const;
 
-    /// ---- pool lifecycle condition (rev.7 §1, spec §§1-3); enum at namespace scope below ----
+    /// ---- pool lifecycle condition; enum at namespace scope below ----
     /// Atomic read of the current lifecycle (acquire).
     PoolLifecycle lifecycle() const { return pool_lifecycle.load(std::memory_order_acquire); }
     /// Whether the pool has reached one of the two fully-terminal `Vanished` values
     /// (`VanishedReplaced` / `VanishedForgotten`).
     bool isVanished() const;
     /// Whether the terminal-intent latch (`vanished_intent`) is published — set by a natural
-    /// `enterVanished`, OR EARLY (spec §5 step 1) by FORGET's `publishVanishedIntent`, and NEVER by the
-    /// non-absorbing `IdentityLost` ([C1]). This is the EARLIEST terminal signal: it can already be true
-    /// while the state is still pre-terminal (mid-FORGET). Consulted alongside `isVanished()` wherever
-    /// background work must stop the moment the pool is (being driven) terminal: `scheduleRemount`, the
-    /// lease loop and the GC scheduler.
+    /// `enterVanished`, OR EARLY by FORGET's `publishVanishedIntent`, and NEVER by `IdentityLost`. This
+    /// is the EARLIEST terminal signal: it can already be true while the state is still pre-terminal
+    /// (mid-FORGET). `remountTerminal` folds it in for the lease thread and the GC scheduler.
     bool vanishedIntentPublished() const { return vanished_intent.load(std::memory_order_acquire); }
 
     /// Non-terminal lease-loss transition: `Live -> TransientNotLive`. Idempotent and lock-free; a
@@ -256,14 +255,14 @@ public:
     /// terminal transition does NOT call this — its `enterVanished` publishes the latch itself.
     void publishVanishedIntent();
 
-    /// One-way transition to a fully-terminal `Vanished` value (spec §3). Publishes the terminal-intent
+    /// One-way transition to a fully-terminal `Vanished` value. Publishes the terminal-intent
     /// latch (so the runtime stops scheduling remount work and the lease loop exits at its next step
     /// boundary) if it is not already published, records `reason`, stores the state, then emits ONE WARN +
     /// one `CASDataRootVanished` ProfileEvent. Idempotent: the first terminal STATE transition wins (keyed
     /// on the `Vanished*` lifecycle value, not on `vanished_intent`, because FORGET publishes that intent
     /// early at step 1). `which` MUST be one of the two `Vanished*` values (`VanishedReplaced` or
     /// `VanishedForgotten`). `reason` is retained and
-    /// surfaced verbatim in the `VanishedForgotten` [D5] error message (see `vanishedReason`). Threads exit
+    /// surfaced verbatim in the `VanishedForgotten` error message (see `vanishedReason`). Threads exit
     /// their own loops; the joins happen in `~Pool` for a natural transition, or synchronously in
     /// `Pool::forgetDisk` for FORGET. Must be called under the caller's remount serialization
     /// (Pool::remount_mutex).
@@ -323,9 +322,9 @@ public:
     /// must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
     /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
     /// it is published before the state store) OR `IdentityLost` (a fail-loud TERMINAL state — no
-    /// demoted observer; recovery is restart or FORGET). Consulted by `scheduleRemount`, by the arming rule
-    /// and by the lease loop at every step boundary. (The GC scheduler applies the same three-way test through
-    /// `Pool`.)
+    /// demoted observer; recovery is restart or FORGET). Consulted by every remount request, by the arming
+    /// rule and by the lease loop at every step boundary. The GC scheduler calls it through
+    /// `Pool::remountTerminal`.
     bool remountTerminal() const
     {
         return vanished_intent.load(std::memory_order_acquire)
@@ -382,7 +381,7 @@ public:
     bool scheduleRemountForTest();
     void beginShutdownForTest();
     /// Return how many remount requests were attempted, refused ones included: `scheduleRemountForTest`,
-    /// `tripAndRequestRemount` and terminal renewals.
+    /// `tripAndRequestRemount` and terminal renewals not ended by a stop.
     uint64_t scheduleRemountCallCountForTest() const
     {
         return schedule_remount_calls_for_test.load(std::memory_order_relaxed);
@@ -514,12 +513,11 @@ private:
     /// is the gate at the ref-append mutation chokepoint.
     MountFence mount_fence;
 
-    /// Fence-generation token (rev.7 [C2]): bumped by `tripMountLost` and `armMountFence`. See
-    /// `fenceGeneration`/`checkFenceOrThrow`.
+    /// Fence-generation token: bumped by every trip and every arm. See `fenceGeneration`/`checkFenceOrThrow`.
     std::atomic<uint64_t> fence_generation{0};
     std::function<void()> arm_mount_fence_interposition_hook_for_test;
     /// The first expired deadline of an expiry that a renewal committed past did not end. `UINT64_MAX`
-    /// when there is none. Written by the renewal consumer and by `armMountFence`.
+    /// when there is none. Written by `publishRenewedDeadline` and `armFence`.
     std::atomic<uint64_t> lease_expired_at_boot_ms{std::numeric_limits<uint64_t>::max()};
     mutable std::mutex renew_failure_mutex;
     String last_renew_failure;

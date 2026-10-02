@@ -2051,15 +2051,15 @@ TEST(CASAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted)
         << "foreign interference must fault the lane";
     EXPECT_FALSE(store->mayMutate()) << "the local write fence must trip closed on the anomaly";
-    /// Positively pins that `reportImpossibleInterference` called `scheduleRemount` (not just
-    /// `tripMountLost`, which alone already accounts for `mayMutate() == false` above). Counted at
-    /// `scheduleRemount`'s own entry regardless of `background_watermark` -- see that accessor's
+    /// Positively pins that `reportImpossibleInterference` requested a remount (not just a trip,
+    /// which alone already accounts for `mayMutate() == false` above). Counted at
+    /// `tripAndRequestRemount`'s entry regardless of `background_watermark` -- see that accessor's
     /// comment for why this test deliberately does NOT enable `background_watermark` to observe a real
     /// automatic recovery: doing so was tried and makes the store's self-remount attempt race its own
     /// still-live renewer for 30+ seconds per call (confirmed while building this test), which is not
     /// something a fast unit test should be driving.
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
-        << "reportImpossibleInterference must have called scheduleRemount exactly once";
+        << "reportImpossibleInterference must have requested a remount exactly once";
 
     const std::vector<CasEvent> observed = seen->snapshot();
     const auto has_event = std::any_of(observed.begin(), observed.end(),
@@ -2132,7 +2132,7 @@ TEST(CASAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
     /// `background_watermark` plus automatic recovery -- that combination makes the store's self-remount
     /// race its own still-live renewer).
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
-        << "reportImpossibleInterference must have called scheduleRemount exactly once";
+        << "reportImpossibleInterference must have requested a remount exactly once";
 
     const std::vector<CasEvent> observed = seen->snapshot();
     const auto has_event = std::any_of(observed.begin(), observed.end(),
