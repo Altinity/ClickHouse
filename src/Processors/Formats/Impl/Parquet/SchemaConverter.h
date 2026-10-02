@@ -131,7 +131,7 @@ private:
 
     void checkHasColumns();
 
-    DataTypePtr resolveAnnotatedType(const String & column_name, const String & type_name) const;
+    DataTypePtr resolveAnnotatedType(const String & column_name, const String & type_name, const DataTypePtr & derived_type) const;
 
     void processSubtree(TraversalNode & node);
 

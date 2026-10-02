@@ -155,7 +155,7 @@ void SchemaConverter::prepareForReading()
     }
 }
 
-DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, const String & type_name) const
+DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, const String & type_name, const DataTypePtr & derived_type) const
 {
     ASTPtr ast;
     try
@@ -184,9 +184,10 @@ DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, co
             "recorded type, or pass the structure explicitly",
             type_name, column_name, clickhouse_column_types_key);
 
+    DataTypePtr annotated_type;
     try
     {
-        return DataTypeFactory::instance().get(ast);
+        annotated_type = DataTypeFactory::instance().get(ast);
     }
     catch (Exception & e)
     {
@@ -196,6 +197,15 @@ DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, co
             "server cannot resolve: {}",
             type_name, column_name, clickhouse_column_types_key, e.message());
     }
+
+    if (!annotatedTypeMatchesDerived(annotated_type, derived_type, /*strict=*/ true))
+        throw Exception(
+            ErrorCodes::INCORRECT_DATA,
+            "Parquet file records ClickHouse type {} for column {} in its `{}` metadata, but the "
+            "parquet schema for that column reads as {}",
+            annotated_type->getName(), column_name, clickhouse_column_types_key, derived_type->getName());
+
+    return annotated_type;
 }
 
 NamesAndTypesList SchemaConverter::inferSchema()
@@ -222,14 +232,7 @@ NamesAndTypesList SchemaConverter::inferSchema()
             DataTypePtr annotated_type;
             try
             {
-                annotated_type = resolveAnnotatedType(col.name, it->second);
-
-                if (!annotatedTypeMatchesDerived(annotated_type, col.output_type, /*strict=*/ true))
-                    throw Exception(
-                        ErrorCodes::INCORRECT_DATA,
-                        "Parquet file records ClickHouse type {} for column {} in its `{}` metadata, but the "
-                        "parquet schema for that column reads as {}",
-                        annotated_type->getName(), col.name, clickhouse_column_types_key, col.output_type->getName());
+                annotated_type = resolveAnnotatedType(col.name, it->second, col.output_type);
             }
             catch (Exception & e)
             {
