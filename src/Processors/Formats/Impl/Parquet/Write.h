@@ -27,7 +27,11 @@ struct WriteOptions
     bool output_datetime_as_uint32 = false;
     bool output_date_as_uint16 = false;
     bool output_enum_as_byte_array = false;
+<<<<<<< HEAD
     bool output_timestamp_adjusted_to_utc_from_timezone = false;
+=======
+    bool allow_aggregate_function_states = false;
+>>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 
     /// Note: the meaning of some compression methods here is different from
     /// wrapReadBufferWithCompressionMethod:

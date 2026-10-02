@@ -1,4 +1,10 @@
 #include <Core/Settings.h>
+<<<<<<< HEAD
+=======
+#include <DataTypes/DataTypeAggregateFunction.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <DataTypes/DataTypeNullable.h>
+>>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <Interpreters/Context.h>
@@ -345,7 +351,19 @@ Poco::JSON::Object::Ptr MetadataGenerator::getCurrentSchema() const
     return current_schema;
 }
 
+<<<<<<< HEAD
 bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypePtr type, bool first, const String & after_column) const
+=======
+static bool clickHouseTypeAnnotationMatches(const Poco::JSON::Object::Ptr & field, const DataTypePtr & type)
+{
+    const bool expected = needsClickHouseTypeAnnotation(type);
+    if (expected != field->has(Iceberg::f_clickhouse_type))
+        return false;
+    return !expected || field->getValue<String>(Iceberg::f_clickhouse_type) == getClickHouseTypeAnnotationName(type);
+}
+
+bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypePtr type) const
+>>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 {
     auto current_schema = findCurrentSchema();
     if (!current_schema)
@@ -365,7 +383,11 @@ bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypeP
         /// just used, so the ids of nested elements differ even for the very same type.
         return field->getValue<bool>(Iceberg::f_required) == expected_type.second
             && icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first)
+<<<<<<< HEAD
             && isFieldAtRequestedPosition(fields, i, column_name, first, after_column);
+=======
+            && clickHouseTypeAnnotationMatches(field, type);
+>>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
     }
     return false;
 }
@@ -416,6 +438,7 @@ bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTy
         auto field = fields->getObject(i);
         if (field->getValue<String>(Iceberg::f_name) != column_name)
             continue;
+<<<<<<< HEAD
 
         /// A position-only `MODIFY COLUMN c FIRST` carries no type.
         if (type)
@@ -429,6 +452,11 @@ bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTy
         }
 
         return isFieldAtRequestedPosition(fields, i, column_name, first, after_column);
+=======
+        return field->getValue<bool>(Iceberg::f_required) == expected_type.second
+            && icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first)
+            && clickHouseTypeAnnotationMatches(field, type);
+>>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
     }
     return false;
 }
@@ -856,6 +884,8 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
     new_field->set(Iceberg::f_name, column_name);
     new_field->set(Iceberg::f_required, new_type.second);
     new_field->set(Iceberg::f_type, new_type.first);
+    if (needsClickHouseTypeAnnotation(type))
+        new_field->set(Iceberg::f_clickhouse_type, getClickHouseTypeAnnotationName(type));
 
     if (first || !after_column.empty())
     {
@@ -920,11 +950,39 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
             if (current_field->getValue<bool>(Iceberg::f_required) == new_type.second
                 && icebergTypesEqualIgnoringIds(current_field->get(Iceberg::f_type), new_type.first))
             {
+<<<<<<< HEAD
                 Iceberg::IcebergSchemaProcessor schema_processor(
                     context, context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
                 auto current_ch_type = schema_processor.getClickHouseFieldType(current_field, context);
 
                 if (!current_ch_type->equals(*type))
+=======
+                auto existing_iceberg_type = current_field->get(Iceberg::f_type);
+                if (!existing_iceberg_type.isString())
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Cannot MODIFY COLUMN '{}': the requested and existing types both map to the same "
+                        "Iceberg complex type, and the change cannot be recorded in the Iceberg schema",
+                        column_name);
+
+                DataTypePtr reconstructed_ch_type;
+                if (current_field->has(Iceberg::f_clickhouse_type))
+                {
+                    reconstructed_ch_type
+                        = DataTypeFactory::instance().get(current_field->getValue<String>(Iceberg::f_clickhouse_type));
+                }
+                else
+                {
+                    reconstructed_ch_type = Iceberg::IcebergSchemaProcessor::getSimpleType(
+                        existing_iceberg_type.extract<String>(),
+                        context,
+                        context->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]);
+                    if (!current_field->getValue<bool>(Iceberg::f_required) && reconstructed_ch_type->canBeInsideNullable())
+                        reconstructed_ch_type = makeNullable(reconstructed_ch_type);
+                }
+
+                if (!reconstructed_ch_type->equals(*type))
+>>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
                     throw Exception(
                         ErrorCodes::BAD_ARGUMENTS,
                         "Cannot MODIFY COLUMN '{}' from {} to {}: both map to the same Iceberg type '{}' "
@@ -932,9 +990,16 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
                         column_name,
                         current_ch_type->getName(),
                         type->getName(),
+<<<<<<< HEAD
                         current_field->get(Iceberg::f_type).toString());
 
                 if (!needs_reposition)
+=======
+                        existing_iceberg_type.extract<String>());
+
+                /// `IDataType::equals` ignores the custom name of `SimpleAggregateFunction`.
+                if (clickHouseTypeAnnotationMatches(current_field, type))
+>>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
                     return false;
             }
             else
@@ -945,9 +1010,32 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
                 if (!current_field->getValue<bool>(Iceberg::f_required) && !type->isNullable())
                     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg spec doesn't allow change type from nullable to non-nullable {}", type->getPrettyName());
 
+<<<<<<< HEAD
                 type_changed = true;
             }
             break;
+=======
+            if (!current_field->getValue<bool>(Iceberg::f_required) && !type->isNullable())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg spec doesn't allow change type from nullable to non-nullable {}", type->getPrettyName());
+
+            const auto next_schema_id = getNextSchemaId(metadata_object);
+
+            current_schema = deepCopy(current_schema);
+            schema_fields = current_schema->getArray(Iceberg::f_fields);
+            current_field = schema_fields->getObject(i);
+
+            current_field->set(Iceberg::f_type, new_type.first);
+            current_field->set(Iceberg::f_required, new_type.second);
+            if (needsClickHouseTypeAnnotation(type))
+                current_field->set(Iceberg::f_clickhouse_type, getClickHouseTypeAnnotationName(type));
+            else
+                current_field->remove(Iceberg::f_clickhouse_type);
+
+            metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
+            current_schema->set(Iceberg::f_schema_id, next_schema_id);
+            metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
+            return true;
+>>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
         }
     }
 

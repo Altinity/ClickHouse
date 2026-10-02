@@ -47,7 +47,12 @@ private:
     std::vector<bool> excluded;
     std::vector<Int64> column_sizes;
     std::vector<Int64> null_counts;
+<<<<<<< HEAD
     Ranges ranges;
+=======
+    std::vector<Range> ranges;
+    std::vector<bool> track_ranges;
+>>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 };
 
 using DataFileStatisticsPtr = std::shared_ptr<DataFileStatistics>;

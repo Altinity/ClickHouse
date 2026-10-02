@@ -4,6 +4,11 @@
 #include <Processors/Formats/Impl/Parquet/ReadCommon.h>
 #include <Processors/Formats/Impl/Parquet/ThriftUtil.h>
 
+namespace DB
+{
+class ISerialization;
+}
+
 namespace DB::ErrorCodes
 {
     extern const int INCORRECT_DATA;
@@ -409,6 +414,16 @@ struct GeoConverter : public StringConverter
 
     GeoConverter(const GeoColumnMetadata & geo_metadata_, bool precise_float_parsing_)
         : geo_metadata(geo_metadata_), precise_float_parsing(precise_float_parsing_) {}
+
+    void convertColumn(std::span<const char> chars, const UInt64 * offsets, size_t separator_bytes, size_t num_values, IColumn & col) const override;
+};
+
+struct AggregateFunctionStateConverter : public StringConverter
+{
+    std::shared_ptr<const ISerialization> serialization;
+
+    explicit AggregateFunctionStateConverter(std::shared_ptr<const ISerialization> serialization_)
+        : serialization(std::move(serialization_)) {}
 
     void convertColumn(std::span<const char> chars, const UInt64 * offsets, size_t separator_bytes, size_t num_values, IColumn & col) const override;
 };

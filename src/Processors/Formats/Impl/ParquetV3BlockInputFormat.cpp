@@ -663,6 +663,7 @@ void registerParquetSchemaReader(FormatFactory & factory)
         [](const FormatSettings & settings)
         {
             return fmt::format(
+<<<<<<< HEAD
                 "schema_inference_make_columns_nullable={};schema_inference_make_json_columns_nullable={};"
                 "enable_json_parsing={};max_parser_depth={};"
                 "local_time_as_utc={};allow_geoparquet_parser={};skip_columns_with_unsupported_types={}",
@@ -672,6 +673,13 @@ void registerParquetSchemaReader(FormatFactory & factory)
                 settings.max_parser_depth,
                 settings.parquet.local_time_as_utc,
                 settings.parquet.allow_geoparquet_parser,
+=======
+                "schema_inference_make_columns_nullable={};enable_json_parsing={};"
+                "allow_aggregate_function_states={};skip_columns_with_unsupported_types_in_schema_inference={}",
+                settings.schema_inference_make_columns_nullable,
+                settings.parquet.enable_json_parsing,
+                settings.parquet.allow_aggregate_function_states,
+>>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
                 settings.parquet.skip_columns_with_unsupported_types_in_schema_inference);
         });
 }
