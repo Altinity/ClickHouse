@@ -251,29 +251,34 @@ stateDiagram-v2
     VanishedForgotten --> [*]
 ```
 
-`IdentityLost`, `VanishedReplaced` and `VanishedForgotten` are terminal and absorbing: the remount
-and GC threads self-exit, and there is deliberately no auto-revive — an identity disappearing
+`IdentityLost`, `VanishedReplaced` and `VanishedForgotten` are terminal and absorbing: the lease
+thread and the GC threads exit, and there is deliberately no auto-revive — an identity disappearing
 under a live mount is an operator-level event.
 
 ## Mount, unmount, crash {#mount-lifecycle}
 
 **Writable open** runs in a strict order: bootstrap-residual proof, capability probe under a
 random per-mount prefix, pool-meta create-or-validate, `validateServerRootId`, owner claim,
-`allocateWriterEpoch`, mount claim and synchronous renewer start, arm the fence, then create and
-release the runtime-owned renewal and remount workers before the writable pool becomes externally
-visible. If the claim consumed the TTL, one fresh synchronous renewal re-anchors the deadline
-before the fence is armed.
-Failure to construct either worker joins the partial pair, closes the fence, and fails the writable
-open. No incident path constructs a thread.
+`allocateWriterEpoch`, mount claim and synchronous renewer start, arm the fence, then start the
+runtime-owned lease thread before the writable pool becomes externally visible. If the claim consumed
+the TTL, one fresh synchronous renewal re-anchors the deadline before the fence is armed.
+Failure to start the lease thread closes the fence and fails the writable open. No incident path
+constructs a thread.
 
-The renewal and remount workers are separate and long-lived under one stable `CasMountRuntime`.
-`scheduleRemount` increments a requested-generation latch and wakes the persistent remount worker,
-including while an older generation is active. Before renewer replacement, remount requests
-`ParkRequested` and waits for the renewal driver to report `Parked`, which proves that no renewer call
-is in flight. A successful remount handles only its snapshotted generation; a newer request is
-processed before renewal resumes.
+One lease thread per writable mount renews the lease and runs the self-remount, one after the other.
+`scheduleRemount` increments a requested-generation latch and wakes the thread; a pending request also
+ends a renewal in progress. While the thread runs, only it replaces, starts or resets the renewer.
 
-**Clean unmount:** request stop and join both persistent workers, drain the ref lanes, and only if
+- A reclaim latches the fence first.
+- It arms the fence, and reports `Live`, only when no newer request is pending, no stop is requested
+  and the lifecycle is not terminal. The check and the arm are one step under the runtime's mutex,
+  which a stop, a request and a FORGET intent also take.
+- A reclaim acknowledges only the generation it served, so a request raised during a reclaim is served
+  by the next reclaim before renewal resumes.
+- A renewal's result is published before the thread looks at the requests again, so a renewal that
+  finished before a request cannot overwrite the deadline of the reclaim that follows.
+
+**Clean unmount:** request stop and join the lease thread, drain the ref lanes, and only if
 the drain *certified* quiescence call `MountLeaseRenewer::release` on an `Active` renewer to write the
 terminal farewell (`expires_at_ms` already expired, `min_active_build_sequence = UINT64_MAX`). That sentinel is what
 lets a successor reclaim instantly. A `RenewalTerminal` renewer, an unresolved ref write, or a sent
