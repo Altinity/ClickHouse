@@ -1324,7 +1324,7 @@ String describeRequestFailure(const std::exception & failure)
 }
 
 MountLeaseRenewer::MountLeaseRenewer(
-    CasRequests & mount_requests_, CasRequests & open_requests_, CasRequests & worker_requests_,
+    CasRequests & open_requests_, CasRequests & lease_requests_,
     const Layout & layout_,
     const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
@@ -1332,9 +1332,8 @@ MountLeaseRenewer::MountLeaseRenewer(
     CasEventSink event_sink_,
     std::chrono::milliseconds lease_safety_margin_,
     std::function<uint64_t()> boot_ms_fn_)
-    : mount_requests(mount_requests_)
-    , open_requests(open_requests_)
-    , worker_requests(worker_requests_)
+    : open_requests(open_requests_)
+    , lease_requests(lease_requests_)
     , key(layout_.mountKey(srid_))
     , srid(srid_)
     , server_uuid(server_uuid_)
@@ -1580,13 +1579,6 @@ MountRenewResult MountLeaseRenewer::terminalResult(MountRenewResult result)
 
 MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment & environment)
 {
-    return renewOn(
-        environment.policy == MountRenewPolicy::UntilDefinitive ? worker_requests : mount_requests, environment);
-}
-
-MountRenewResult MountLeaseRenewer::renewOn(
-    CasRequests & plane, const MountRenewOperationEnvironment & environment)
-{
     const MountRenewObservabilityRegistration observability_registration = beginMountRenewObservabilityCall();
     const MountRenewObservabilityCallGuard observability_guard(observability_registration);
 
@@ -1624,7 +1616,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
     MountRenewResult result;
     result.attempt_start_boot_ms = attempt_start_boot_ms;
 
-    CasOperation op = plane.admit(environment.live);
+    CasOperation op = lease_requests.admit(environment.live);
     if (environment.on_request)
         op.setRequestObserver([&on_request = environment.on_request](uint32_t attempt_no, const std::exception * failure)
         {
@@ -1634,9 +1626,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
                 .failure_text = failure ? describeRequestFailure(*failure) : String{},
             });
         });
-    const Retry policy = environment.policy == MountRenewPolicy::UntilDefinitive
-        ? Retry::untilDefinitive(kMountRenewRetrySpacingMs)
-        : Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()));
+    const Retry policy = Retry::untilDefinitive(kMountRenewRetrySpacingMs);
     std::optional<WriteResult> written;
     try
     {
@@ -1774,9 +1764,8 @@ void MountLeaseRenewer::terminate(CasOperation & op)
         ? std::numeric_limits<uint64_t>::max()
         : doubled_reservation_ms + kFarewellSlackMs;
     const uint64_t farewell_window_ms = std::max<uint64_t>(kFarewellBudgetMs, two_envelope_reservation_plus_slack_ms);
-    /// The derived window alone is not enough: mount-control activity must also never run past the
-    /// point this node's own fence may already be gone (the rule a bounded renewal enforces with
-    /// `Retry::untilLeaseSafe`). The precondition on this write already stops it from clobbering
+    /// The derived window alone is not enough: the farewell must also never run past the point this
+    /// node's own fence may already be gone. The precondition on this write already stops it from clobbering
     /// a successor if it DOES land late, but a shutdown holding the process open to retry a write past
     /// its own lease-safe deadline serves no one -- the successor's own reclaim does not wait for it.
     /// `confirmed_deadline_boot_ms` is set at `start()` and kept current by every successful `renew`,

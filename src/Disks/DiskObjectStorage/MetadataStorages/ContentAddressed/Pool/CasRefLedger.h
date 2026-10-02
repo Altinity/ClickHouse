@@ -91,8 +91,7 @@ class CasRefLedger
 {
 public:
     CasRefLedger(
-        /// The mount plane. Every request this ledger makes is admitted on it, so a ref-lane write and
-        /// a mount-lease renewal are measured against the same fence and the same clock.
+        /// The mount plane. Every request this ledger makes is admitted on it.
         CasRequests & mount_requests_,
         const Layout & layout_,
         RefLedgerConfig config_,

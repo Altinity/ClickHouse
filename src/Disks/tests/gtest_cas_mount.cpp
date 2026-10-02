@@ -731,7 +731,7 @@ TEST(CASMountLease, AbsentClaimThenRenewBumpsSeq)
     Ops ops(b, &boot);
     auto r = claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100);
     EXPECT_EQ(r.kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                        [&] { return boot; });
     k.start();
@@ -751,7 +751,7 @@ TEST(CASMountLease, HolderBodiesMintFreshAttemptIdsAndFenceCopiesIt)
     const String key = layout.mountKey("r");
     const MountLease claimed = decodeMountLease(ops.op.read(key, Retry::standard())->bytes);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, "r", UInt128{1}, 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, "r", UInt128{1}, 7, std::chrono::milliseconds(100),
                             [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot; });
     renewer.start();
@@ -807,7 +807,7 @@ TEST(CASMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
     uint64_t boot = 0;
     Ops ops(b, &boot);
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                        [&] { return boot; });
     k.start();
@@ -850,7 +850,7 @@ TEST(CASMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
     uint64_t now = 1000;
     Ops ops(b);
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; });
     k.start();
 
@@ -1162,7 +1162,7 @@ TEST(CASMountLease, RenewerStartAdoptsOurOwnClaimNotDoubleStart)
     Ops ops(b);
     // The normal flow: claimMount writes the live mount under (uuid=1, epoch=7), THEN renewer.start().
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, ops.lease, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.farewell, ops.lease, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; });
     EXPECT_NO_THROW(k.start());     // adopts our own live (uuid=1,epoch=7) mount — NOT a double-start
     EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 7u);
@@ -2124,7 +2124,7 @@ TEST(CASMountObservation, RenewalDuringObservationRestartsIt)
     /// wrote (no seq bump, per the ADOPT RULE), then a synchronous renewal mints a new incarnation
     /// mid-observation.
     uint64_t renewer_wall = 500;
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(500),
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(500),
                              [&] { return renewer_wall; }, [] { return uint64_t{0}; }, {},
                              std::chrono::milliseconds(0), [&] { return renewer_boot; });
     renewer.start();
@@ -2313,7 +2313,7 @@ TEST(CASMountLease, ClaimAdoptIsTwoRequests)
 
     /// The absent-slot mint.
     backend->reads = backend->heads = backend->writes = 0;
-    MountLeaseRenewer minting(ops.mount, ops.farewell, ops.lease, l, "fresh", UInt128(1), 7,
+    MountLeaseRenewer minting(ops.farewell, ops.lease, l, "fresh", UInt128(1), 7,
                              std::chrono::milliseconds(100), [&] { return now; }, [] { return uint64_t{0}; });
     minting.start();
     EXPECT_EQ(backend->reads, 1u);
@@ -2324,7 +2324,7 @@ TEST(CASMountLease, ClaimAdoptIsTwoRequests)
     ASSERT_EQ(claimMount(ops.op, l, "adopted", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind,
               MountClaimResult::Claimed);
     backend->reads = backend->heads = backend->writes = 0;
-    MountLeaseRenewer adopting(ops.mount, ops.farewell, ops.lease, l, "adopted", UInt128(1), 7,
+    MountLeaseRenewer adopting(ops.farewell, ops.lease, l, "adopted", UInt128(1), 7,
                               std::chrono::milliseconds(100), [&] { return now; }, [] { return uint64_t{0}; });
     adopting.start();
     EXPECT_EQ(backend->reads, 1u);
@@ -2332,11 +2332,8 @@ TEST(CASMountLease, ClaimAdoptIsTwoRequests)
     EXPECT_EQ(backend->heads, 0u);
 }
 
-/// A mount whose fence has dropped must still hand its slot back: the renewal is refused (it would be
-/// writing under authority this node no longer holds), while the farewell runs on the open plane and
-/// lands. Deliberately two renewers: `release` is admitted only from `Active`, so a renewer whose
-/// renewal already went terminal never reaches its own farewell -- the ordering the two halves below
-/// pin separately.
+/// The farewell is admitted on the claim-and-farewell plane, never on the renewal plane, so a renewal
+/// plane that refuses everything cannot stop it.
 TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -2360,24 +2357,14 @@ TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
     open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
     CasOperation seed = open_requests.admit();
 
-    ASSERT_EQ(claimMount(seed, l, "renewing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
     ASSERT_EQ(claimMount(seed, l, "departing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
 
-    MountLeaseRenewer renewing(mount_requests, open_requests, open_requests, l, "renewing", UInt128(1), 7,
-                              std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
-                              {}, std::chrono::milliseconds(0), [&] { return boot; });
-    MountLeaseRenewer departing(mount_requests, open_requests, open_requests, l, "departing", UInt128(1), 7,
+    MountLeaseRenewer departing(open_requests, mount_requests, l, "departing", UInt128(1), 7,
                                std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                                {}, std::chrono::milliseconds(0), [&] { return boot; });
-    renewing.start();
     departing.start();
 
     fence_lost = true;
-
-    const MountRenewResult refused = renewing.renew(MountRenewOperationEnvironment{});
-    EXPECT_EQ(refused.outcome, MountRenewOutcome::Terminal);
-    EXPECT_FALSE(refused.sent_any);
-    EXPECT_FALSE(renewing.canRelease()) << "a terminal renewal leaves no farewell to run";
 
     EXPECT_NO_THROW(departing.release());
     const MountLease farewell = decodeMountLease(seed.read(l.mountKey("departing"), Retry::standard())->bytes);
@@ -2404,7 +2391,7 @@ TEST(CASMountLease, ClaimIsNotAdmittedUnderTheMountFence)
     open_requests.setNowFnForTest([&boot] { return boot; });
     open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
 
-    MountLeaseRenewer renewer(mount_requests, open_requests, open_requests, l, "r", UInt128(1), 7,
+    MountLeaseRenewer renewer(open_requests, mount_requests, l, "r", UInt128(1), 7,
                             std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                             {}, std::chrono::milliseconds(0), [&] { return boot; });
     EXPECT_NO_THROW(renewer.start());

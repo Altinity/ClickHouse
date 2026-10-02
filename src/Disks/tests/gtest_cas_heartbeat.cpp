@@ -41,15 +41,12 @@ namespace
 /// The request planes this file's renewers run on. All are open-fence -- the exclusivity these tests
 /// exercise is the mount protocol's own, not a fence's -- on the same injected boot clock the renewer's
 /// lease deadline is expressed on, so they never disagree about how much budget is left.
-/// `sleep_step_ms`, when set, makes one inter-attempt pause jump the clock past the lease bound: that
-/// is how a test asks for exactly one physical attempt without a per-call attempt cap. It depends on
-/// the engine checking the bound, sleeping, then checking again -- a reissue that slept first would
-/// send a second attempt. `tests::OperationForTest` covers a fixture needing one operation, but
-/// neither the planes a renewer takes nor this clock, which is why this stays local.
+/// `tests::OperationForTest` covers a fixture needing one operation, but neither the planes a renewer
+/// takes nor this clock, which is why this stays local.
 class Ops
 {
 public:
-    Ops(std::shared_ptr<Backend> backend, uint64_t * boot_ms, uint64_t sleep_step_ms = 0)
+    Ops(std::shared_ptr<Backend> backend, uint64_t * boot_ms)
         : mount(openRequestsForTest(backend))
         , farewell(openRequestsForTest(backend))
         , lease(openRequestsForTest(std::move(backend)))
@@ -58,8 +55,7 @@ public:
         for (CasRequests * requests : {&mount, &farewell, &lease})
         {
             requests->setNowFnForTest([boot_ms] { return *boot_ms; });
-            requests->setSleepFnForTest(
-                [boot_ms, sleep_step_ms](uint64_t ms) { *boot_ms += sleep_step_ms ? sleep_step_ms : ms; });
+            requests->setSleepFnForTest([boot_ms](uint64_t ms) { *boot_ms += ms; });
         }
     }
 
@@ -88,10 +84,7 @@ void seedOwnClaim(CasOperation & op, const Layout & l, const String & srid, UInt
     ASSERT_EQ(claimMount(op, l, srid, uuid, epoch, now_ms, ttl_ms).kind, MountClaimResult::Claimed);
 }
 
-/// Not `final`: `EnvelopeEatingBackend` (the envelope-cutoff test below) derives from it to
-/// reuse its `Attempt`/`attempts` bookkeeping while overriding `write`/`read` with its own always-fail
-/// behavior instead of the scripted-action queue.
-class RenewalScriptBackend : public InMemoryBackend
+class RenewalScriptBackend final : public InMemoryBackend
 {
 public:
     enum class Action : uint8_t
@@ -247,7 +240,6 @@ MountRenewOperationEnvironment renewalEnvironment(
         .boot_ms = [&boot_ms] { return boot_ms; },
         .live = live,
         .cancelled = cancelled,
-        .policy = MountRenewPolicy::LeaseBound,
         .on_request = {},
     };
 }
@@ -293,7 +285,7 @@ TEST(CASHeartbeat, AnchorCarriesFloor)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [&] { return min_active_build_sequence_now; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot_ms; });
@@ -319,7 +311,7 @@ TEST(CASHeartbeat, RenewRereadsCallbackAndBumpsSeq)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [&] { return min_active_build_sequence_now; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot_ms; });
@@ -347,7 +339,7 @@ TEST(CASHeartbeat, StopStampsExpiredAndFarewellSentinel)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot_ms; });
@@ -403,7 +395,7 @@ TEST(CASHeartbeat, FarewellIsAdmittedUnderTheDefaultBudget)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/30000);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(30000), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(2000),
                             [&] { return boot_ms; });
@@ -436,7 +428,7 @@ TEST(CASHeartbeat, FarewellIsAdmittedUnderADifferentEnvelope)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/40000);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(40000), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(2000),
                             [&] { return boot_ms; });
@@ -470,7 +462,7 @@ TEST(CASHeartbeat, FarewellIsRefusedWhenTheLeaseExpiresBeforeItsDerivedWindow)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/5000);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(5000), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(2000),
                             [&] { return boot_ms; });
@@ -516,7 +508,7 @@ TEST(CASHeartbeat, ForeignIncarnationDuringFarewellLeavesTheSuccessorUntouchedAn
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot_ms; });
@@ -573,7 +565,7 @@ TEST(CASHeartbeat, SameEpochUnfencedTouchIsUncertainNotFatal)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot_ms; });
@@ -620,7 +612,7 @@ TEST(CASHeartbeat, SupersededTouchIsFailClosedNotFatal)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot_ms; });
@@ -674,7 +666,7 @@ TEST(CASHeartbeat, ForeignUuidTouchFailsClosedWithoutAborting)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot_ms; });
@@ -762,7 +754,7 @@ TEST(CASMountAudit, RenewerAdoptEmitsClaimAndTerminateEmitsRelease)
 
     std::vector<CasEvent> seen;
     CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, sink, std::chrono::milliseconds(0),
                             [&] { return boot_ms; });
@@ -800,7 +792,7 @@ TEST(CASMountAudit, RenewerForeignConflictRefusesAndNamesHolder)
     ASSERT_EQ(claimMount(ops.op, layout, srid, uuid_x, /*our_epoch=*/1, now_ms, /*ttl_ms=*/100).kind,
               MountClaimResult::Claimed);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid_y, /*writer_epoch=*/1,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid_y, /*writer_epoch=*/1,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(2000),
                             [&] { return boot_ms; });
@@ -842,7 +834,7 @@ TEST(CASMountAudit, RenewerAdoptRefusesFencedSelfWithTypedError)
     std::vector<CasEvent> seen;
     CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
     /// A renewer for the SAME (uuid, epoch) tries to adopt the now-fenced slot.
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, sink, std::chrono::milliseconds(2000),
                             [&] { return boot_ms; });
@@ -882,7 +874,7 @@ TEST(CASHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
 
     std::vector<CasEvent> seen;
     CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+    MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
                             std::chrono::milliseconds(100), [&] { return now_ms; },
                             [] { return uint64_t{5}; }, sink, std::chrono::milliseconds(0),
                             [&] { return boot_ms; });
@@ -937,7 +929,7 @@ TEST(CASHeartbeat, RenewerStateAllowsOnlyActiveReleaseOrTerminal)
         Ops ops(backend, &boot_ms);
         seedOwnClaim(ops.op, layout, "released", uuid, 9, wall_ms, 1000);
         MountLeaseRenewer renewer(
-            ops.mount, ops.farewell, ops.lease, layout, "released", uuid, 9, std::chrono::milliseconds(1000),
+            ops.farewell, ops.lease, layout, "released", uuid, 9, std::chrono::milliseconds(1000),
             [&] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(20),
             [&] { return boot_ms; });
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::New);
@@ -957,17 +949,19 @@ TEST(CASHeartbeat, RenewerStateAllowsOnlyActiveReleaseOrTerminal)
         auto backend = std::make_shared<RenewalScriptBackend>();
         uint64_t wall_ms = 1000;
         uint64_t boot_ms = 100;
-        /// One pause jumps the clock past the lease bound, so the ambiguous first attempt is the only
-        /// one this renewal ever sends and its verdict is the terminal one under test.
-        Ops ops(backend, &boot_ms, /*sleep_step_ms=*/10'000);
+        Ops ops(backend, &boot_ms);
         seedOwnClaim(ops.op, layout, "terminal", uuid, 9, wall_ms, 1000);
         MountLeaseRenewer renewer(
-            ops.mount, ops.farewell, ops.lease, layout, "terminal", uuid, 9, std::chrono::milliseconds(1000),
+            ops.farewell, ops.lease, layout, "terminal", uuid, 9, std::chrono::milliseconds(1000),
             [&] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(20),
             [&] { return boot_ms; });
         renewer.start();
         backend->actions = {RenewalScriptBackend::Action::ThrowBefore};
-        const MountRenewResult result = renewer.renew(renewalEnvironment(boot_ms));
+        backend->read_calls = 0;
+        /// Live until the ambiguous attempt's resolving read has run, so that attempt is the only one
+        /// sent and the renewal ends terminal with it unsettled.
+        const MountRenewResult result = renewer.renew(
+            renewalEnvironment(boot_ms, /*live=*/[&] { return backend->read_calls == 0; }));
         EXPECT_EQ(result.outcome, MountRenewOutcome::Terminal);
         EXPECT_NE(result.failure, nullptr);
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::RenewalTerminal);
@@ -990,7 +984,7 @@ TEST(CASHeartbeat, RenewalRetriesOneImmutableBodyAndAdoptsLostResponse)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, 9, wall_ms, 1000);
     MountLeaseRenewer renewer(
-        ops.mount, ops.farewell, ops.lease, layout, srid, uuid, 9, std::chrono::milliseconds(1000),
+        ops.farewell, ops.lease, layout, srid, uuid, 9, std::chrono::milliseconds(1000),
         [&] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(20),
         [&] { return boot_ms; });
     renewer.start();
@@ -1028,14 +1022,14 @@ TEST(CASHeartbeat, RenewalOverConnectFailuresRecoversWithoutASettleRead)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, srid, uuid, 9, wall_ms, 30000);
     MountLeaseRenewer renewer(
-        ops.mount, ops.farewell, ops.lease, layout, srid, uuid, 9, std::chrono::milliseconds(30000),
+        ops.farewell, ops.lease, layout, srid, uuid, 9, std::chrono::milliseconds(30000),
         [&] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(2000),
         [&] { return boot_ms; });
     renewer.start();
 
     backend->attempts.clear();
     backend->read_calls = 0;
-    /// Three seconds of "no free port" at 50 ms per hint, then the store answers.
+    /// Sixty connect failures, then the store answers.
     for (int i = 0; i < 60; ++i)
         backend->actions.push_back(RenewalScriptBackend::Action::ThrowConnectHint);
     backend->actions.push_back(RenewalScriptBackend::Action::Delegate);
@@ -1050,34 +1044,6 @@ TEST(CASHeartbeat, RenewalOverConnectFailuresRecoversWithoutASettleRead)
 }
 #endif
 
-TEST(CASHeartbeat, DeadlineBeforeSendTerminalizesWithTypedFailure)
-{
-    auto backend = std::make_shared<RenewalScriptBackend>();
-    Layout layout("pool");
-    uint64_t wall_ms = 1000;
-    uint64_t boot_ms = 100;
-    Ops ops(backend, &boot_ms);
-    seedOwnClaim(ops.op, layout, "test", UInt128{1}, 9, wall_ms, 100);
-    MountLeaseRenewer renewer(
-        ops.mount, ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(100),
-        [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
-        [&] { return boot_ms; });
-    renewer.start();
-    backend->attempts.clear();
-    backend->read_calls = 0;
-    boot_ms = 180;
-    const MountRenewResult result = renewer.renew(renewalEnvironment(boot_ms));
-    const DB::Exception failure = terminalException(result);
-    EXPECT_EQ(failure.code(), DB::ErrorCodes::NETWORK_ERROR);
-    EXPECT_NE(failure.message().find("no attempt sent"), String::npos) << failure.message();
-    EXPECT_NE(failure.message().find("external_lease_deadline"), String::npos) << failure.message();
-    EXPECT_FALSE(result.sent_any);
-    ASSERT_TRUE(result.deadline_source.has_value());
-    EXPECT_EQ(*result.deadline_source, GaveUp::Source::Lease);
-    EXPECT_TRUE(backend->attempts.empty());
-    EXPECT_EQ(backend->read_calls, 0u) << "a pre-send terminal deadline must perform no diagnostic read";
-}
-
 TEST(CASHeartbeat, CancellationBeforeSendIsNotAttemptedAndAllowsRelease)
 {
     auto backend = std::make_shared<RenewalScriptBackend>();
@@ -1087,7 +1053,7 @@ TEST(CASHeartbeat, CancellationBeforeSendIsNotAttemptedAndAllowsRelease)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, "test", UInt128{1}, 9, wall_ms, 1000);
     MountLeaseRenewer renewer(
-        ops.mount, ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
+        ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
         [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
         [&] { return boot_ms; });
     renewer.start();
@@ -1113,7 +1079,7 @@ TEST(CASHeartbeat, CancellationAfterSendIsTerminalAndForbidsRelease)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, "test", UInt128{1}, 9, wall_ms, 1000);
     MountLeaseRenewer renewer(
-        ops.mount, ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
+        ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
         [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
         [&] { return boot_ms; });
     renewer.start();
@@ -1142,7 +1108,7 @@ TEST(CASHeartbeat, SlowResolvedSuccessKeepsAttemptStartAnchor)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, "test", UInt128{1}, 9, wall_ms, 1000);
     MountLeaseRenewer renewer(
-        ops.mount, ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
+        ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
         [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
         [&] { return boot_ms; });
     renewer.start();
@@ -1167,7 +1133,7 @@ TEST(CASHeartbeat, SamePairTwinAndForeignOrSuccessorStayTerminal)
         Ops ops(backend, &boot_ms);
         seedOwnClaim(ops.op, layout, "test", uuid, 9, wall_ms, 1000);
         MountLeaseRenewer renewer(
-            ops.mount, ops.farewell, ops.lease, layout, "test", uuid, 9, std::chrono::milliseconds(1000),
+            ops.farewell, ops.lease, layout, "test", uuid, 9, std::chrono::milliseconds(1000),
             [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
             [&] { return boot_ms; });
         renewer.start();
@@ -1201,7 +1167,7 @@ TEST(CASHeartbeat, ExpectedPredecessorThenLateLandingIsAdoptedExactly)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, "test", UInt128{1}, 9, wall_ms, 1000);
     MountLeaseRenewer renewer(
-        ops.mount, ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
+        ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
         [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
         [&] { return boot_ms; });
     renewer.start();
@@ -1230,7 +1196,7 @@ TEST(CASHeartbeat, GcFenceAndVanishedMountStayTerminal)
         Ops ops(backend, &boot_ms);
         seedOwnClaim(ops.op, layout, "test", UInt128{1}, 9, wall_ms, 1000);
         MountLeaseRenewer renewer(
-            ops.mount, ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
+            ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
             [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
             [&] { return boot_ms; });
         renewer.start();
@@ -1261,17 +1227,19 @@ TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)
         auto backend = std::make_shared<RenewalScriptBackend>();
         uint64_t wall_ms = 1000;
         uint64_t boot_ms = 100;
-        /// One pause jumps the clock past the lease bound, so the ambiguous first attempt is the only
-        /// one this renewal sends and the renewal ends terminal with that attempt still in flight.
-        Ops ops(backend, &boot_ms, /*sleep_step_ms=*/10'000);
+        Ops ops(backend, &boot_ms);
         seedOwnClaim(ops.op, layout, "before-reclaim", UInt128{1}, 9, wall_ms, 1000);
         MountLeaseRenewer renewer(
-            ops.mount, ops.farewell, ops.lease, layout, "before-reclaim", UInt128{1}, 9, std::chrono::milliseconds(1000),
+            ops.farewell, ops.lease, layout, "before-reclaim", UInt128{1}, 9, std::chrono::milliseconds(1000),
             [&] { return wall_ms; }, [] { return uint64_t{0}; }, CasEventSink{}, std::chrono::milliseconds(20),
             [&] { return boot_ms; });
         renewer.start();
         backend->actions = {RenewalScriptBackend::Action::ThrowBeforeThenLandAfterResolve};
-        const MountRenewResult result = renewer.renew(renewalEnvironment(boot_ms));
+        backend->read_calls = 0;
+        /// Live until the resolving read has run: the delayed write lands during that read, and the
+        /// renewal ends terminal without a second attempt.
+        const MountRenewResult result = renewer.renew(
+            renewalEnvironment(boot_ms, /*live=*/[&] { return backend->read_calls == 0; }));
         EXPECT_EQ(result.outcome, MountRenewOutcome::Terminal);
 
         /// The delayed write landed during the resolving read. It carries this renewer's own epoch, and
@@ -1285,10 +1253,10 @@ TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)
         auto backend = std::make_shared<RenewalScriptBackend>();
         uint64_t wall_ms = 1000;
         uint64_t boot_ms = 100;
-        Ops ops(backend, &boot_ms, /*sleep_step_ms=*/10'000);
+        Ops ops(backend, &boot_ms);
         seedOwnClaim(ops.op, layout, "after-successor", UInt128{1}, 9, wall_ms, 1000);
         MountLeaseRenewer renewer(
-            ops.mount, ops.farewell, ops.lease, layout, "after-successor", UInt128{1}, 9, std::chrono::milliseconds(1000),
+            ops.farewell, ops.lease, layout, "after-successor", UInt128{1}, 9, std::chrono::milliseconds(1000),
             [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
             [&] { return boot_ms; });
         renewer.start();
@@ -1299,7 +1267,9 @@ TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)
             = ops.op.read(layout.mountKey("after-successor"), Retry::standard())->etag;
 
         backend->actions = {RenewalScriptBackend::Action::ThrowBefore};
-        const MountRenewResult result = renewer.renew(renewalEnvironment(boot_ms));
+        backend->read_calls = 0;
+        const MountRenewResult result = renewer.renew(
+            renewalEnvironment(boot_ms, /*live=*/[&] { return backend->read_calls == 0; }));
         ASSERT_EQ(result.outcome, MountRenewOutcome::Terminal);
         ASSERT_FALSE(backend->attempts.empty());
         const auto delayed = backend->attempts.back();
@@ -1314,7 +1284,7 @@ TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)
         ASSERT_EQ(claimMount(ops.op, layout, "after-successor", UInt128{1}, 10, wall_ms, 1000).kind,
                   MountClaimResult::Claimed);
         MountLeaseRenewer successor(
-            ops.mount, ops.farewell, ops.lease, layout, "after-successor", UInt128{1}, 10, std::chrono::milliseconds(1000),
+            ops.farewell, ops.lease, layout, "after-successor", UInt128{1}, 10, std::chrono::milliseconds(1000),
             [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
             [&] { return boot_ms; });
         successor.start();
@@ -1336,7 +1306,7 @@ TEST(CASHeartbeat, WallClockStepsAndBootSuspendCannotExtendAuthority)
     Ops ops(backend, &boot_ms);
     seedOwnClaim(ops.op, layout, "test", UInt128{1}, 9, wall_ms, 1000);
     MountLeaseRenewer renewer(
-        ops.mount, ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
+        ops.farewell, ops.lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
         [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
         [&] { return boot_ms; });
     renewer.start();
@@ -1349,76 +1319,17 @@ TEST(CASHeartbeat, WallClockStepsAndBootSuspendCannotExtendAuthority)
     backend->attempts.clear();
     boot_ms += 10'000;
     const MountRenewResult suspended = renewer.renew(renewalEnvironment(boot_ms));
-    const DB::Exception failure = terminalException(suspended);
-    EXPECT_EQ(failure.code(), DB::ErrorCodes::NETWORK_ERROR);
-    EXPECT_TRUE(backend->attempts.empty()) << "suspend-sized BOOTTIME overshoot must close admission";
-}
-
-/// Every attempt costs the whole envelope (attempt 100 + 2 * cap 50 = 200 ms) and fails ambiguously.
-/// Under a 1000 ms lease with a 100 ms margin the renewal must stop issuing before the cutoff rather
-/// than start an attempt that cannot finish inside it.
-namespace
-{
-/// Bypasses `RenewalScriptBackend`'s scripted-action queue for a guarded mount write and instead
-/// always fails it (and every read) once armed, each failure costing the whole envelope on the
-/// injected boot clock. Left unarmed during `seedOwnClaim` (an unconditional read then an unguarded
-/// create -- neither is a guarded mount write, but the read would still hit the always-throwing
-/// override below) and during `renewer.start()`'s adopt read, so the fixture itself can land.
-struct EnvelopeEatingBackend : RenewalScriptBackend
-{
-    uint64_t * boot_ms = nullptr;
-    bool armed = false;
-    uint64_t attemptTimeoutMs() const override { return 100; }
-    uint64_t attemptEnvelopeMs() const override { return 200; }
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value, TransportAccess & access) override
-    {
-        if (armed && expected_value && key.ends_with("/mount"))
-        {
-            attempts.push_back({key, bytes, expected_value});
-            *boot_ms += 200;
-            throw Poco::TimeoutException("the whole envelope, gone");
-        }
-        return InMemoryBackend::write(key, bytes, expected_value, access);
-    }
-    std::optional<Raw> read(const String & key, TransportAccess & access) override
-    {
-        if (armed)
-        {
-            *boot_ms += 200;
-            throw Poco::TimeoutException("the read too");
-        }
-        return InMemoryBackend::read(key, access);
-    }
-};
-}
-
-TEST(CASHeartbeat, RenewalStopsBeforeTheCutoffWhenEveryAttemptConsumesTheEnvelope)
-{
-    auto backend = std::make_shared<EnvelopeEatingBackend>();
-    uint64_t wall_ms = 1000;
-    uint64_t boot_ms = 100;
-    backend->boot_ms = &boot_ms;
-    Layout layout("pool");
-    Ops ops(backend, &boot_ms);
-    seedOwnClaim(ops.op, layout, "test", UInt128{0x1234}, 9, wall_ms, 1000);
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, "test", UInt128{0x1234}, 9, std::chrono::milliseconds(1000),
-                              [&] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(100),
-                              [&] { return boot_ms; });
-    renewer.start();
-    const uint64_t cutoff = renewer.lastCommittedAttemptStartBootMs() + 1000 - 100;
-    backend->attempts.clear();
-    backend->armed = true;
-    const MountRenewResult result = renewer.renew(renewalEnvironment(boot_ms));
-    EXPECT_EQ(result.outcome, MountRenewOutcome::Terminal);
-    EXPECT_LE(boot_ms, cutoff) << "the last attempt started inside the cutoff and the engine did not start one that could not finish";
+    ASSERT_EQ(suspended.outcome, MountRenewOutcome::Committed);
+    EXPECT_EQ(suspended.attempt_start_boot_ms, boot_ms)
+        << "a renewal after a suspend anchors at its own start, never at the deadline it last confirmed";
+    EXPECT_EQ(renewer.lastCommittedAttemptStartBootMs(), boot_ms);
+    EXPECT_EQ(backend->attempts.size(), 1u);
 }
 
 namespace
 {
 /// The production shape at test scale: a 30 s lease, renewed one 10 s period after its anchor, with a
-/// 2 s safety margin and the 7 s attempt envelope a bounded renewal reserves twice before each
-/// request. That leaves a bounded renewal about 4 s of retries; an `UntilDefinitive` one has no bound.
+/// 2 s safety margin and a 7 s attempt envelope.
 class UnboundedRenewalFixture
 {
 public:
@@ -1434,7 +1345,7 @@ public:
         ops = std::make_unique<Ops>(backend, &boot_ms);
         seedOwnClaim(ops->op, layout, "test", UInt128{1}, 9, wall_ms, ttl_ms);
         renewer = std::make_unique<MountLeaseRenewer>(
-            ops->mount, ops->farewell, ops->lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(ttl_ms),
+            ops->farewell, ops->lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(ttl_ms),
             [this] { return wall_ms; }, [] { return uint64_t{0}; },
             [this](CasEvent event) { events.push_back(std::move(event)); },
             std::chrono::milliseconds(margin_ms), [this] { return boot_ms; });
@@ -1450,7 +1361,6 @@ public:
     UnboundedRenewalFixture & operator=(const UnboundedRenewalFixture &) = delete;
 
     MountRenewResult renew(
-        MountRenewPolicy policy,
         const std::function<bool()> & live = {},
         const std::function<bool()> & cancelled = {},
         std::function<void(const MountRenewRequestEvent &)> on_request = {})
@@ -1467,7 +1377,6 @@ public:
             return !live || live();
         };
         MountRenewOperationEnvironment environment = renewalEnvironment(boot_ms, bounded_live, cancelled);
-        environment.policy = policy;
         environment.on_request = std::move(on_request);
         MountRenewResult result = renewer->renew(environment);
         EXPECT_FALSE(request_bound_hit) << "the renewal sent " << max_requests
@@ -1508,13 +1417,12 @@ bool inSpacing(uint64_t gap_ms)
 }
 }
 
-/// An outage longer than the cutoff a bounded renewal reserves for is retried to its end.
 TEST(CASHeartbeat, RenewalOutlivesTheReservationCutoff)
 {
     UnboundedRenewalFixture f;
     f.backend->outage = [&] { return f.boot_ms < f.renewal_start + 8'000; };
 
-    const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive);
+    const MountRenewResult result = f.renew();
 
     ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
     EXPECT_EQ(f.renewer->state(), MountLeaseRenewerState::Active);
@@ -1529,7 +1437,7 @@ TEST(CASHeartbeat, RenewalSendsOneTupleOnEveryAttempt)
     UnboundedRenewalFixture f;
     f.backend->outage = [&] { return f.boot_ms < f.renewal_start + 8'000; };
 
-    const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive);
+    const MountRenewResult result = f.renew();
 
     ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
     const auto & attempts = f.backend->attempts;
@@ -1551,7 +1459,7 @@ TEST(CASHeartbeat, RenewalSucceedsPastTheDeadlineWithItsFirstStart)
     UnboundedRenewalFixture f;
     f.backend->outage = [&] { return f.boot_ms < f.anchor + UnboundedRenewalFixture::ttl_ms + 15'000; };
 
-    const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive);
+    const MountRenewResult result = f.renew();
 
     ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
     EXPECT_EQ(result.attempt_start_boot_ms, f.renewal_start);
@@ -1568,7 +1476,7 @@ TEST(CASHeartbeat, LandedAttemptIsAdoptedAfterALongOutage)
     std::vector<MountRenewRequestEvent> reported;
 
     const MountRenewResult result = f.renew(
-        MountRenewPolicy::UntilDefinitive, {}, {}, [&](const MountRenewRequestEvent & event) { reported.push_back(event); });
+        {}, {}, [&](const MountRenewRequestEvent & event) { reported.push_back(event); });
     const uint64_t reads = f.backend->read_calls;
 
     ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
@@ -1652,7 +1560,7 @@ TEST(CASHeartbeat, DefinitiveAnswersStayTerminalPastTheDeadline)
         /// A definitive answer that was retried would never end this renewal; the bound makes it fail instead.
         const uint64_t live_until = f.boot_ms + 600'000;
 
-        const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive, [&] { return f.boot_ms < live_until; });
+        const MountRenewResult result = f.renew([&] { return f.boot_ms < live_until; });
 
         const DB::Exception failure = terminalException(result);
         EXPECT_EQ(f.renewer->state(), MountLeaseRenewerState::RenewalTerminal);
@@ -1723,7 +1631,7 @@ TEST(CASHeartbeat, AFenceSeenAfterALongOutageEndsTheRenewal)
 
     /// A fence that was retried would never end this renewal; the bound makes it fail instead.
     const MountRenewResult result = f.renew(
-        MountRenewPolicy::UntilDefinitive, [&] { return f.boot_ms < f.renewal_start + 600'000; });
+        [&] { return f.boot_ms < f.renewal_start + 600'000; });
 
     const DB::Exception failure = terminalException(result);
     EXPECT_NE(failure.message().find("fenced by GC"), String::npos) << failure.message();
@@ -1752,7 +1660,7 @@ TEST(CASHeartbeat, ARefusalAfterAnUnclearAttemptIsRetriedUntilStopped)
     std::vector<MountRenewRequestEvent> reported;
 
     const MountRenewResult result = f.renew(
-        MountRenewPolicy::UntilDefinitive, /*live=*/[&] { return !stopped; }, /*cancelled=*/[&] { return stopped; },
+        /*live=*/[&] { return !stopped; }, /*cancelled=*/[&] { return stopped; },
         [&](const MountRenewRequestEvent & event) { reported.push_back(event); });
 
     const DB::Exception failure = terminalException(result);
@@ -1789,7 +1697,7 @@ TEST(CASHeartbeat, RenewalSpacesRetries)
         f.backend->outage = [&] { return f.boot_ms < f.renewal_start + 30'500; };
         f.backend->outage_action = RenewalScriptBackend::Action::ThrowConnectHint;
 
-        ASSERT_EQ(f.renew(MountRenewPolicy::UntilDefinitive).outcome, MountRenewOutcome::Committed);
+        ASSERT_EQ(f.renew().outcome, MountRenewOutcome::Committed);
 
         ASSERT_GE(log.size(), 4u);
         /// The fuse: its settling read and its reissue follow at once.
@@ -1814,7 +1722,7 @@ TEST(CASHeartbeat, RenewalSpacesRetries)
         f.backend->read_actions = {RenewalScriptBackend::Action::ThrowBefore, RenewalScriptBackend::Action::ThrowBefore};
         f.backend->outage = [&] { return f.boot_ms < f.renewal_start + 30'500; };
 
-        ASSERT_EQ(f.renew(MountRenewPolicy::UntilDefinitive).outcome, MountRenewOutcome::Committed);
+        ASSERT_EQ(f.renew().outcome, MountRenewOutcome::Committed);
 
         ASSERT_GE(log.size(), 6u);
         const uint64_t t0 = f.renewal_start;
@@ -1849,7 +1757,7 @@ TEST(CASHeartbeat, RenewalSpacesRetries)
         f.backend->actions = {RenewalScriptBackend::Action::ThrowBefore};
         f.backend->read_actions = {RenewalScriptBackend::Action::ThrowFirstAttemptFuse};
 
-        ASSERT_EQ(f.renew(MountRenewPolicy::UntilDefinitive).outcome, MountRenewOutcome::Committed);
+        ASSERT_EQ(f.renew().outcome, MountRenewOutcome::Committed);
 
         ASSERT_EQ(log.size(), 4u);
         EXPECT_EQ(log[1], std::make_pair('R', f.renewal_start));
@@ -1873,7 +1781,7 @@ TEST(CASHeartbeat, RenewalSpacesRetries)
         f.backend->on_read = [&] { log.emplace_back('R', f.boot_ms); };
         f.backend->outage = [&] { return failing; };
 
-        ASSERT_EQ(f.renew(MountRenewPolicy::UntilDefinitive).outcome, MountRenewOutcome::Committed);
+        ASSERT_EQ(f.renew().outcome, MountRenewOutcome::Committed);
 
         ASSERT_GE(log.size(), 3u);
         std::optional<uint64_t> previous_put;
@@ -1908,7 +1816,7 @@ TEST(CASHeartbeat, StopDuringARetryWaitEndsTheRenewal)
         });
 
         const MountRenewResult result = f.renew(
-            MountRenewPolicy::UntilDefinitive, /*live=*/[&] { return !stopped; }, /*cancelled=*/[&] { return stopped; });
+            /*live=*/[&] { return !stopped; }, /*cancelled=*/[&] { return stopped; });
 
         const DB::Exception failure = terminalException(result);
         EXPECT_EQ(failure.code(), DB::ErrorCodes::NETWORK_ERROR) << failure.message();
@@ -1923,7 +1831,7 @@ TEST(CASHeartbeat, StopDuringARetryWaitEndsTheRenewal)
         UnboundedRenewalFixture f;
 
         const MountRenewResult result = f.renew(
-            MountRenewPolicy::UntilDefinitive, /*live=*/[] { return false; }, /*cancelled=*/[] { return false; });
+            /*live=*/[] { return false; }, /*cancelled=*/[] { return false; });
 
         (void)terminalException(result);
         EXPECT_TRUE(f.backend->attempts.empty());
@@ -1938,7 +1846,7 @@ TEST(CASHeartbeat, RenewalReportsEachRequestAsItHappens)
     std::vector<MountRenewRequestEvent> reported;
 
     const MountRenewResult result = f.renew(
-        MountRenewPolicy::UntilDefinitive, {}, {}, [&](const MountRenewRequestEvent & event) { reported.push_back(event); });
+        {}, {}, [&](const MountRenewRequestEvent & event) { reported.push_back(event); });
 
     ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
     const std::vector<std::pair<uint32_t, bool>> expected{{1, false}, {1, true}, {2, false}, {2, true}, {3, false}};
@@ -1961,7 +1869,7 @@ TEST(CASHeartbeat, AThrowingRequestReportChangesNoOutcome)
     f.backend->actions = {RenewalScriptBackend::Action::ThrowBefore, RenewalScriptBackend::Action::ThrowBefore};
 
     const MountRenewResult result = f.renew(
-        MountRenewPolicy::UntilDefinitive, {}, {},
+        {}, {},
         [](const MountRenewRequestEvent &) { throw std::runtime_error("injected report failure"); });
 
     ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);

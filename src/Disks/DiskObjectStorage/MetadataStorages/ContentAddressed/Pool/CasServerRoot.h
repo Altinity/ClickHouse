@@ -61,14 +61,7 @@ struct MountRenewResult
     std::exception_ptr failure;
 };
 
-/// How far a renewal may retry.
-enum class MountRenewPolicy : uint8_t
-{
-    LeaseBound,        /// startup, remount and direct renewals: `Retry::untilLeaseSafe`
-    UntilDefinitive,   /// the background worker: `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`
-};
-
-/// The spacing of an `UntilDefinitive` renewal's retries.
+/// The spacing of a renewal's retries.
 inline constexpr uint64_t kMountRenewRetrySpacingMs = 1000;
 
 /// One physical request of a renewal, reported as it happens: a `PUT` sent (`failed` false), a `PUT`
@@ -90,7 +83,6 @@ struct MountRenewOperationEnvironment
     /// `NotAttempted` rather than terminal only when this node had already been asked to stop --
     /// sampling it afterwards would read a flag that the refusal itself may have set.
     std::function<bool()> cancelled;
-    MountRenewPolicy policy = MountRenewPolicy::LeaseBound;
     /// Called on the renewing thread for each `PUT` sent, each failed `PUT` and each failed resolve read.
     /// May be empty. What it throws is ignored.
     std::function<void(const MountRenewRequestEvent &)> on_request;
@@ -549,19 +541,18 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 ///   - foreign uuid → fail closed;
 ///   - absent → `create`; expired-our-uuid (any epoch) → `replace` reclaim.
 ///
-/// PLANES. A bounded renewal is admitted under the mount fence, because it writes under the authority
-/// the fence tracks. The worker's renewal (`UntilDefinitive`) runs on a plane with no lease budget: it
-/// keeps trying after the lease expired, and a stop, a remount request or a terminal lifecycle reaches
-/// it through its liveness. The claim and the farewell are admitted off the fence: a self-remount claims with the
-/// fence already latched lost, so a claim gated on the fence could never reclaim, and a farewell
-/// refused because the fence has run down would leave the slot looking live until GC fences it out.
-/// Neither is unguarded: a claim's safety is its own conditional write, and a caller that has shutdown
-/// facts hands them over as a `Liveness`.
+/// PLANES. A renewal runs on `lease_requests`, which has no lease budget: it keeps trying after the
+/// lease expired, and a stop, a remount request or a terminal lifecycle reaches it through its
+/// liveness. The claim and the farewell are admitted on `open_requests`, off the fence: a self-remount
+/// claims with the fence already latched lost, so a claim gated on the fence could never reclaim, and a
+/// farewell refused because the fence has run down would leave the slot looking live until GC fences it
+/// out. Neither is unguarded: a claim's safety is its own conditional write, and a caller that has
+/// shutdown facts hands them over as a `Liveness`.
 class MountLeaseRenewer
 {
 public:
     MountLeaseRenewer(
-        CasRequests & mount_requests_, CasRequests & open_requests_, CasRequests & worker_requests_,
+        CasRequests & open_requests_, CasRequests & lease_requests_,
         const Layout & layout_,
         const String & srid_, UInt128 server_uuid_,
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
@@ -575,9 +566,8 @@ public:
     /// Adopt the already-claimed mount. Returns the exact pre-I/O BOOTTIME anchor. `liveness` carries
     /// the caller's shutdown terms; the mount fence is deliberately not consulted here.
     uint64_t start(Liveness liveness = {});
-    /// The steady-state renewal. `LeaseBound` runs under the mount fence with `Retry::untilLeaseSafe`;
-    /// `UntilDefinitive` runs on the worker plane with `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`
-    /// and ends on a definitive answer, a deterministic local failure, or when `environment.live` refuses.
+    /// One renewal on `lease_requests` under `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`. Ends on
+    /// a definitive answer, a deterministic local failure, or when `environment.live` refuses.
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
     void release();
 
@@ -590,17 +580,14 @@ private:
     /// The incarnation every guarded write of this slot names. Engaged for exactly the states that
     /// admit such a write: `start` establishes it and each committed renewal replaces it.
     const Etag & precondition() const;
-    /// One renewal admitted on `plane`.
-    MountRenewResult renewOn(CasRequests & plane, const MountRenewOperationEnvironment & environment);
     Etag claim(CasOperation & op, const String & body);
     [[noreturn]] void throwRenewConflict(const Observation & seen) const;
     MountRenewResult terminalResult(MountRenewResult result);
     void terminate(CasOperation & op);
 
-    CasRequests & mount_requests;
     CasRequests & open_requests;
-    /// The plane of an `UntilDefinitive` renewal: no lease budget, and a sleep a stop wakes.
-    CasRequests & worker_requests;
+    /// The plane of a renewal: no lease budget, and a sleep a stop wakes.
+    CasRequests & lease_requests;
     String key;
 
     String srid;

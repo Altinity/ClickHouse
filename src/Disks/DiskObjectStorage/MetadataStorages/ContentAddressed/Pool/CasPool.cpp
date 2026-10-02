@@ -231,8 +231,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// reader over that plane, never this one shared across two. The event sink is installed by the
     /// factory before writable mounting starts.
     , manifest_reader(mount_requests, pool_layout, meta, event_sink_, config.manifest_decode_cache_bytes)
-    /// Ref-log / ref-table subsystem, on the MOUNT plane: a ref-lane write and a mount-lease renewal
-    /// are then measured against the same fence and the same clock. Injected with the
+    /// Ref-log / ref-table subsystem, on the MOUNT plane. Injected with the
     /// RefLedgerConfig slice + the event-sink reference + the pool `cas_request_budget`, plus callbacks
     /// into the mount/watermark state that lives
     /// on `mount_runtime` (reached through Pool delegates). The callbacks capture `this`; they are
@@ -255,13 +254,13 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this] (const RootNamespace & ns) { cancelInflightBuildsForNamespace(ns); },
           config.recovery_pre_first_request_hook_for_test)
     /// Mount / write-fence / build-watermark / self-remount runtime. Injected with
-    /// backend/layout + the mount, farewell and lease planes + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
+    /// backend/layout + the farewell and lease planes + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
     /// `cas_request_budget` + the `remount_attempt` callback (== `Pool::tryRemountOnce`, whose claim/
     /// recovery ORCHESTRATION stays on Pool). The callback captures `this`; it is invoked only at runtime
     /// (post-construction). Declared/constructed AFTER `ref_ledger`, preserving the original member order
     /// verbatim (mount destroyed first, ledger last; both orders proven safe -- see the header note).
     , mount_runtime(
-          pool_backend, mount_requests, farewell_requests, lease_requests,
+          pool_backend, farewell_requests, lease_requests,
           pool_layout, config.mountConfig(), config.server_root_id, event_sink_,
           config.cas_request_budget,
           [this] { return tryRemountOnce(); })

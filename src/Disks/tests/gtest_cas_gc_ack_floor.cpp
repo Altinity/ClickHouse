@@ -933,7 +933,7 @@ void runExpiredMountFenceOutScenario(const PoolConfig & config)
     // never changes again.
     const String srid2 = "stale-server";
     CasRequests renewer_requests = openRequestsForTest(backend);
-    MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
+    MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
         /*writer_epoch=*/1,
         std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
         std::chrono::milliseconds(0), [] { return 0u; });
@@ -1061,7 +1061,7 @@ TEST(CASGCAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
     // A stale mount, exactly as `ExpiredMountFencedOutAndExcluded`: one claim, never renewed again.
     const String srid2 = "stale-server";
     CasRequests renewer_requests = openRequestsForTest(backend);
-    MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
+    MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
         /*writer_epoch=*/1,
         std::chrono::milliseconds(100), [] { return 1000u; },
         [fake_boot]

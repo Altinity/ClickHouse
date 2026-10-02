@@ -127,11 +127,9 @@ class CasMountRuntime
 public:
     CasMountRuntime(
         BackendPtr backend_ptr_,
-        /// The planes the `MountLeaseRenewer` runs on: a bounded renewal under the mount fence, the
-        /// claim and the farewell on an open one, and the lease loop's renewal on `lease_requests_`,
-        /// which has no lease budget and whose sleep a stop wakes. Owned by `Pool` and outliving this
-        /// runtime.
-        CasRequests & mount_requests_,
+        /// The planes the `MountLeaseRenewer` runs on: the claim and the farewell on an open-fence one,
+        /// the renewal on `lease_requests_`, which has no lease budget and whose sleep a stop wakes.
+        /// Owned by `Pool` and outliving this runtime.
         CasRequests & farewell_requests_,
         CasRequests & lease_requests_,
         const Layout & layout_,
@@ -476,7 +474,6 @@ private:
 
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
     BackendPtr backend_ptr;
-    CasRequests & mount_requests;
     CasRequests & farewell_requests;
     CasRequests & lease_requests;
     const Layout & layout;

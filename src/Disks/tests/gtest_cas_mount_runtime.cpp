@@ -28,14 +28,10 @@ public:
     explicit RuntimeFixture(uint64_t lease_safety_margin_ms, uint64_t attempt_timeout_ms = 10,
                             std::optional<uint64_t> connect_timeout_cap_ms = std::nullopt)
         : backend(std::make_shared<InMemoryBackend>())
-        , mount(backend, Fence{
-              [this] { return runtime.fenceGeneration(); },
-              [this](uint64_t g, uint64_t needed) { return runtime.admit(g, needed); },
-              [this](uint64_t g) { runtime.checkFenceOrThrow(g); }})
         , farewell(backend, Fence::open())
         , lease(backend, Fence::open())
         , runtime(
-              backend, mount, farewell, lease, layout,
+              backend, farewell, lease, layout,
               MountConfig{.boot_ms_fn = [this] { return boot_ms; }},
               "test", sink,
               CasRequestBudget{.attempt_timeout_ms = attempt_timeout_ms,
@@ -53,7 +49,6 @@ private:
     std::shared_ptr<InMemoryBackend> backend;
     Layout layout{"mount-runtime-admit"};
     CasEventSink sink;
-    CasRequests mount;
     CasRequests farewell;
     CasRequests lease;
     CasMountRuntime runtime;

@@ -2064,21 +2064,15 @@ public:
 
 CasRequestBudget runtimeRenewBudget();
 
-/// A directly-constructed `CasMountRuntime` plus the request planes it needs. `Pool` builds those
-/// from its own members; a test has no `Pool`, so the mount plane's fence reaches the runtime through
-/// this holder -- the closures run only once the runtime is issuing requests, well after construction.
+/// A directly-constructed `CasMountRuntime` plus the request planes `Pool` would give it.
 class RuntimeUnderTest
 {
 public:
     template <typename BackendT, typename... Args>
     RuntimeUnderTest(const std::shared_ptr<BackendT> & backend, Args &&... args)
-        : mount(backend, DB::Cas::Fence{
-              [this] { return runtime.fenceGeneration(); },
-              [this](uint64_t g, uint64_t needed) { return runtime.admit(g, needed); },
-              [this](uint64_t g) { runtime.checkFenceOrThrow(g); }})
-        , farewell(backend, DB::Cas::Fence::open())
+        : farewell(backend, DB::Cas::Fence::open())
         , lease(backend, DB::Cas::Fence::open())
-        , runtime(backend, mount, farewell, lease, std::forward<Args>(args)...)
+        , runtime(backend, farewell, lease, std::forward<Args>(args)...)
     {
         /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the
         /// budget field alone; every construction of this holder pairs the two via `runtimeRenewBudget`,
@@ -2088,7 +2082,6 @@ public:
         /// against the clock it reads. Production runs both on `CLOCK_BOOTTIME`, so they agree; a test
         /// that injects one MUST inject the other, or `Retry::untilLeaseSafe` compares a synthetic
         /// deadline against real boottime, finds it long past, and refuses every request unsent.
-        mount.setNowFnForTest([this] { return runtime.bootMsNow(); });
         farewell.setNowFnForTest([this] { return runtime.bootMsNow(); });
         lease.setNowFnForTest([this] { return runtime.bootMsNow(); });
         /// As `Pool` wires it: a stop wakes the worker renewal's wait.
@@ -2112,17 +2105,13 @@ public:
 
     CasMountRuntime & operator*() { return runtime; }
 
-    /// The retry wait of the mount and lease planes: the worker's renewal runs on the lease plane, the
-    /// other bounded ones on the mount plane. A remount renewal runs on the farewell plane, which this
-    /// does not reach. Call before the workers start.
+    /// The retry wait of the lease plane, where the renewal runs. Call before the lease thread starts.
     void setRetrySleepForTest(const std::function<void(uint64_t)> & sleep_fn)
     {
-        mount.setSleepFnForTest(sleep_fn);
         lease.setSleepFnForTest(sleep_fn);
     }
 
 private:
-    DB::Cas::CasRequests mount;
     DB::Cas::CasRequests farewell;
     DB::Cas::CasRequests lease;
     CasMountRuntime runtime;

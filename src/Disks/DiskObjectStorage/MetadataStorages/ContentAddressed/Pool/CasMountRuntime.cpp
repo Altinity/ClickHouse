@@ -54,7 +54,6 @@ int64_t wallClockNowSeconds()
 
 CasMountRuntime::CasMountRuntime(
     BackendPtr backend_ptr_,
-    CasRequests & mount_requests_,
     CasRequests & farewell_requests_,
     CasRequests & lease_requests_,
     const Layout & layout_,
@@ -64,7 +63,6 @@ CasMountRuntime::CasMountRuntime(
     CasRequestBudget cas_request_budget_,
     std::function<bool()> remount_attempt_)
     : backend_ptr(std::move(backend_ptr_))
-    , mount_requests(mount_requests_)
     , farewell_requests(farewell_requests_)
     , lease_requests(lease_requests_)
     , layout(layout_)
@@ -479,7 +477,7 @@ void CasMountRuntime::installRenewer(
     const std::function<uint64_t()> & now_ms)
 {
     std::unique_ptr<MountLeaseRenewer> replaced = std::make_unique<MountLeaseRenewer>(
-        mount_requests, farewell_requests, lease_requests, layout, server_root_id, our_uuid, writer_epoch,
+        farewell_requests, lease_requests, layout, server_root_id, our_uuid, writer_epoch,
         config.mount_lease_ttl_ms, now_ms,
         [this] { return minActive(); },
         [this](CasEvent e) { emitEvent(std::move(e)); },
@@ -516,7 +514,6 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment()
             return renewalLive() && (!config.renewal_live_for_test || config.renewal_live_for_test());
         },
         .cancelled = [this] { return renewalCancelled(); },
-        .policy = MountRenewPolicy::UntilDefinitive,
         /// Counts the requests as they are sent, so an outage shows while it lasts.
         .on_request = [this](const MountRenewRequestEvent & event) { noteRenewRequest(event); },
     };
