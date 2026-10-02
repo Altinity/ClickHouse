@@ -112,8 +112,9 @@ only on one of these:
   absent object, or a request the store refuses on a clear attempt;
 - a stop or a remount request;
 - a deterministic local failure;
-- a lifecycle other than `Live`;
-- a lost fence.
+- a terminal lifecycle, which includes a published `FORGET` intent.
+
+A lost fence alone does not end it: the renewal that makes a mount ready runs under a latched fence.
 
 A terminal renewer cannot mint another body or publish a clean farewell. Owner cancellation before
 any request is the only `NotAttempted` result and leaves clean release possible. Cancellation after a
@@ -239,9 +240,9 @@ The in-process `PoolLifecycle` runtime, by contrast, is a literal enum (`CasMoun
 ```mermaid
 stateDiagram-v2
     [*] --> Live: Pool constructed, fence unarmed
-    Live --> Live: mountWritable arms the fence
+    Live --> Live: the open's claim or first renewal arms the fence
     Live --> TransientNotLive: terminal renewal result, tripMountLost, lost=true
-    TransientNotLive --> Live: self-remount succeeds with a fresh epoch
+    TransientNotLive --> Live: the reclaim or the next renewal arms the fence under a fresh epoch
     TransientNotLive --> TransientNotLive: probe inconclusive, retry with backoff
     TransientNotLive --> IdentityLost: pool meta and owner both authoritatively absent
     TransientNotLive --> VanishedReplaced: foreign pool_id observed
@@ -260,10 +261,19 @@ under a live mount is an operator-level event.
 **Writable open** runs in a strict order: bootstrap-residual proof, capability probe under a
 random per-mount prefix, pool-meta create-or-validate, `validateServerRootId`, owner claim,
 `allocateWriterEpoch`, mount claim and synchronous renewer start, arm the fence, then start the
-runtime-owned lease thread before the writable pool becomes externally visible. If the claim consumed
-the TTL, one fresh synchronous renewal re-anchors the deadline before the fence is armed.
+runtime-owned lease thread before the writable pool becomes externally visible.
 Failure to start the lease thread closes the fence and fails the writable open. No incident path
 constructs a thread.
+
+**Readiness.** An open arms the fence from its claim only when the claim's deadline, its start plus the
+TTL, still leaves room for a ref append: `2 × envelope + margin` (16 s with the defaults). Otherwise the
+fence stays latched, the lease thread renews at once, and the first renewal whose own deadline leaves that
+room arms the fence; then the open returns. A renewal that commits with less room arms nothing, and the
+next one follows at once. If no renewal arms the fence within one TTL, the open stops and joins the lease
+thread and fails with `ABORTED`, naming the last failed renewal request. A reclaim follows the same rule: a
+claim with too little lease left keeps the pool `TransientNotLive` with the fence latched, and the next
+renewal arms the fence and reports `Live`. The `mount_remount` row of such a reclaim has `outcome = 'ok'`
+and `step = 'claimed_not_armed'`.
 
 One lease thread per writable mount renews the lease and runs the self-remount, one after the other.
 `scheduleRemount` increments a requested-generation latch and wakes the thread; a pending request also

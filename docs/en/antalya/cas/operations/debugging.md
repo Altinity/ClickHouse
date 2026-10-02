@@ -150,8 +150,10 @@ follows:
   differs by classification, and only `external_lease_deadline` and `request_deadline` are about a
   deadline at all.
 - A following `mount_remount` row names the whole-chain `attempt_no` and final `step`. An `ok` row
-  restored `Live` under the reported fresh `writer_epoch`; a `failed` row's `step` and optional
-  `error` identify where that whole-chain attempt stopped.
+  with `step = 'publish_live'` restored `Live` under the reported fresh `writer_epoch`; with
+  `step = 'claimed_not_armed'` the claim succeeded with too little lease to admit a write, and the next
+  renewal arms the fence and reports `Live`. A `failed` row's `step` and optional `error` identify where
+  that whole-chain attempt stopped.
 
 Use deltas of the mount counters from
 [monitoring](/antalya/cas/operations/monitoring#mount-renewal-remount-counters) to check completeness:
