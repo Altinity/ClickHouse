@@ -6,6 +6,9 @@
 namespace DB::Cas
 {
 
+/// The window of the default write policy.
+inline constexpr uint64_t kStandardWriteWindowMs = 90'000;
+
 /// A retry policy for one logical CAS write, expressed WITHOUT touching a clock: `window_ms` is the
 /// policy's own budget measured from the call's start, and `lease_deadline_ms` (already reduced by
 /// the caller's safety margin) is an absolute bound on whatever clock the caller's mount lease is
@@ -42,22 +45,22 @@ struct Retry
 
     /// A policy with `ms` milliseconds of its own budget and no lease bound.
     static Retry within(uint64_t ms) { return {.window_ms = ms, .lease_deadline_ms = std::nullopt, .single_attempt = false}; }
-    /// `within(90'000)` -- the default write policy.
-    static Retry standard() { return within(90'000); }
+    /// `within(kStandardWriteWindowMs)` -- the default write policy.
+    static Retry standard() { return within(kStandardWriteWindowMs); }
     /// A policy bound by the mount lease: `lease_deadline_ms` minus `margin`, clamped at 0 -- never
     /// risk a write landing after this node's fence may already be gone. `window_ms` defaults to the
-    /// standard 90 s write budget; a caller whose own budget is deliberately much smaller (the
+    /// default write window, `kStandardWriteWindowMs`; a caller whose own budget is deliberately much smaller (the
     /// graceful-shutdown farewell, whose window is derived from what ONE write costs, not from the
     /// standard policy) passes its own window explicitly, and `bind` still takes whichever of the two
     /// bounds is smaller.
-    static Retry untilLeaseSafe(uint64_t lease_deadline_ms, uint64_t margin, uint64_t window_ms = 90'000)
+    static Retry untilLeaseSafe(uint64_t lease_deadline_ms, uint64_t margin, uint64_t window_ms = kStandardWriteWindowMs)
     {
         return {.window_ms = window_ms,
                 .lease_deadline_ms = lease_deadline_ms > margin ? lease_deadline_ms - margin : 0,
                 .single_attempt = false};
     }
     /// The standard policy, but at most one attempt is ever sent.
-    static Retry once() { return {.window_ms = 90'000, .lease_deadline_ms = std::nullopt, .single_attempt = true}; }
+    static Retry once() { return {.window_ms = kStandardWriteWindowMs, .lease_deadline_ms = std::nullopt, .single_attempt = true}; }
 
     /// No window and no lease bound: retried until a definitive answer, or until the fence or the
     /// caller's liveness ends it. `bind` saturates, so the only horizon is the range of the clock.

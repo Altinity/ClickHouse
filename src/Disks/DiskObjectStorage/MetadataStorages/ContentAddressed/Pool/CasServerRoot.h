@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
@@ -586,7 +587,7 @@ public:
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
         std::function<uint64_t()> min_active_build_sequence_fn_,
         CasEventSink event_sink_ = {},
-        std::chrono::milliseconds lease_safety_margin_ = std::chrono::milliseconds(2000),
+        std::chrono::milliseconds lease_safety_margin_ = std::chrono::milliseconds(static_cast<int64_t>(kDefaultLeaseSafetyMarginMs)),
         /// boot-domain clock for the on_renew_ok anchor; empty = real CLOCK_BOOTTIME. Injectable for
         /// tests and wired by CasMountRuntime::installRenewer.
         std::function<uint64_t()> boot_ms_fn_ = {});

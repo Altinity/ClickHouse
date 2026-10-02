@@ -5,6 +5,9 @@
 namespace DB::Cas
 {
 
+/// The default margin kept between a request and the mount lease deadline.
+inline constexpr uint64_t kDefaultLeaseSafetyMarginMs = 2000;
+
 /// The limits a writable mount is configured with. `CasMountRuntime::admit` measures a request against
 /// `lease_safety_margin_ms` plus a caller-supplied need expressed in attempt envelopes (one for an
 /// ordinary attempt, TWO for a ref-log append's write-plus-settlement-read -- see
@@ -20,7 +23,7 @@ struct CasRequestBudget
     /// Startup-only margin folded into `validateCasRequestBudget`'s inequality against the mount lease
     /// TTL. Not consulted at runtime by the engine itself -- the caller's fence (backed by the local
     /// write fence's own deadline) is what actually gates lease-relative timing per attempt.
-    uint64_t lease_safety_margin_ms = 2000;
+    uint64_t lease_safety_margin_ms = kDefaultLeaseSafetyMarginMs;
 
     /// The cap the single-attempt client puts on one TCP connect and again on one TLS handshake,
     /// frozen when the pool opens as `min(disk connect_timeout_ms, attempt_timeout_ms)` (a configured
@@ -43,7 +46,8 @@ struct CasRequestBudget
     /// retried, with capped-exponential backoff, until this total wall-clock budget is spent — then the
     /// error propagates and the table's load fails for this touch (the `lazy_load_tables` database
     /// setting makes the NEXT touch retry). This sits ON TOP of each write's own `Retry` policy window
-    /// (`Retry::standard()`'s 90s): one recovery attempt may itself burn ~90s inside a single seal PUT.
+    /// (`Retry::standard()`, `kStandardWriteWindowMs`): one recovery attempt may itself spend a whole
+    /// window inside a single seal PUT.
     /// Independent of the mount-lease invariants validated in `validateCasRequestBudget` — not part of
     /// that inequality set.
     uint64_t recovery_retry_budget_ms = 120000;
