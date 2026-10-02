@@ -9,6 +9,7 @@
 
 #include <base/arithmeticOverflow.h>
 
+#include <Interpreters/Context.h>
 #include <Interpreters/IcebergMetadataLog.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
@@ -17,6 +18,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
+#include <Core/Settings.h>
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <Poco/JSON/Parser.h>
@@ -37,6 +39,11 @@ namespace DB::ErrorCodes
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
+}
+
+namespace DB::Setting
+{
+    extern const SettingsBool iceberg_tolerate_conflicting_manifest_schemas;
 }
 
 namespace ProfileEvents
@@ -319,7 +326,10 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     const Poco::JSON::Object::Ptr & schema_object = json.extract<Poco::JSON::Object::Ptr>();
     Int32 manifest_schema_id = schema_object->getValue<int>(f_schema_id);
 
-    schema_processor.addIcebergTableSchema(schema_object);
+    schema_processor.addIcebergTableSchema(
+        schema_object,
+        IcebergSchemaProcessor::SchemaSource::ManifestFile,
+        context_->getSettingsRef()[Setting::iceberg_tolerate_conflicting_manifest_schemas]);
 
     PartitionSpecification partition_spec_vec;
     for (size_t i = 0; i != partition_specification->size(); ++i)
@@ -464,13 +474,14 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
         /// those manifests still carry the original snapshot_id. The manifest file's own Avro header
         /// records the correct schema_id for the data files it describes, so falling back to
         /// manifest_schema_id is safe and correct in this case.
-        LOG_DEBUG(
-            getLogger("ManifestFileIterator"),
-            "Manifest file '{}' has entry with snapshot_id '{}' whose snapshot metadata is not present "
-            "(snapshot may have been expired by the catalog). Falling back to manifest schema_id {}.",
-            path_to_manifest_file,
-            resolved_snapshot_id,
-            manifest_schema_id);
+        if (!logged_missing_snapshot_metadata.exchange(true, std::memory_order_relaxed))
+            LOG_TEST(
+                getLogger("ManifestFileIterator"),
+                "Manifest file '{}' has entry with snapshot_id '{}' whose snapshot metadata is not present "
+                "(snapshot may have been expired by the catalog). Falling back to manifest schema_id {}.",
+                path_to_manifest_file,
+                resolved_snapshot_id,
+                manifest_schema_id);
     }
     const auto resolved_schema_id = schema_id_opt.has_value() ? *schema_id_opt : manifest_schema_id;
 
