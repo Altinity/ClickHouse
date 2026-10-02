@@ -811,9 +811,6 @@ void CasMountRuntime::setLifecycleForTest(PoolLifecycle lc)
         || lc == PoolLifecycle::VanishedForgotten)
     {
         vanished_intent.store(true, std::memory_order_release);
-        /// Keep the terminal-state guard consistent with the forced state, so a later `enterVanished`
-        /// (unusual, but not forbidden) is a clean no-op rather than re-storing / re-logging.
-        terminal_state_published.store(true, std::memory_order_release);
     }
 }
 
@@ -929,7 +926,7 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
                 "CasMountRuntime::enterVanished called with a non-terminal lifecycle value");
     }
 
-    if (terminal_state_published.load(std::memory_order_acquire))
+    if (isVanished())
         return;
 
     if (config.vanished_reason_prepare_hook_for_test)
@@ -939,12 +936,12 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
     static_assert(std::is_nothrow_move_assignable_v<String>);
 
     bool transitioned = false;
-    /// The guard is published LAST. Reason preparation above is the only potentially-throwing step;
-    /// once this block begins, the statically-proven-noexcept move and atomic stores either publish
-    /// one complete terminal transition or observe that an earlier transition already completed.
+    /// The lifecycle store is the LAST step. Reason preparation above is the only potentially-throwing
+    /// step; once this block begins, the statically-proven-noexcept move and atomic stores either
+    /// publish one complete terminal transition or observe that an earlier transition already completed.
     {
         auto lock = lockTerminalPublication();
-        if (!terminal_state_published.load(std::memory_order_acquire))
+        if (!isVanished())
         {
             transitioned = true;
 
@@ -968,7 +965,6 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
             /// a `Vanished` state (their compare-exchanges are keyed on `Live`/`TransientNotLive`), so this
             /// value is absorbing.
             pool_lifecycle.store(which, std::memory_order_release);
-            terminal_state_published.store(true, std::memory_order_release);
         }
     }
 

@@ -262,8 +262,8 @@ public:
     /// One-way transition to a fully-terminal `Vanished` value (spec §3). Publishes the terminal-intent
     /// latch (so the runtime stops scheduling remount work and the lease loop exits at its next step
     /// boundary) if it is not already published, records `reason`, stores the state, then emits ONE WARN +
-    /// one `CASDataRootVanished` ProfileEvent. Idempotent: the first terminal STATE transition wins (a
-    /// dedicated latch keyed separately from `vanished_intent`, because FORGET publishes that intent latch
+    /// one `CASDataRootVanished` ProfileEvent. Idempotent: the first terminal STATE transition wins (keyed
+    /// on the `Vanished*` lifecycle value, not on `vanished_intent`, because FORGET publishes that intent
     /// early at step 1). `which` MUST be one of the two `Vanished*` values (`VanishedReplaced` or
     /// `VanishedForgotten`). `reason` is retained and
     /// surfaced verbatim in the `VanishedForgotten` [D5] error message (see `vanishedReason`). Threads exit
@@ -540,12 +540,6 @@ private:
     /// `remountTerminal`, so a terminal pool's runtime consumer never schedules a remount and the lease
     /// loop exits at its next step boundary — no claim/allocate/write after the pool is (being driven) terminal.
     std::atomic<bool> vanished_intent{false};
-    /// Idempotency guard for the terminal STATE transition (`enterVanished`'s body). Distinct from
-    /// `vanished_intent`: FORGET publishes that intent latch at step 1, so it can no longer serve as the
-    /// "state transition already done" flag. Published last, after the no-throw reason move and terminal
-    /// stores complete under `driver_mutex`; a preparation exception therefore leaves it clear so a later
-    /// `enterVanished` can retry the whole transition.
-    std::atomic<bool> terminal_state_published{false};
     /// The reason recorded by the winning `enterVanished` (see `vanishedReason`). Written once, BEFORE the
     /// `pool_lifecycle` release-store, and immutable thereafter — so a reader that acquire-observes a
     /// terminal state also observes this string. Empty when no terminal transition has run.
