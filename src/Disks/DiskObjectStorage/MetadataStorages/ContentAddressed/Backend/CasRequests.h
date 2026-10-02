@@ -263,8 +263,9 @@ public:
     /// Told of the requests of this operation's writes, on the issuing thread: each `PUT` when it is
     /// sent (null `failure`) and again if it throws, and each failed resolve read. `attempt_no` is the
     /// count of `PUT`s sent so far. A refused precondition is an answer, not a failure, and is not
-    /// reported; nor is a read that succeeds or one the caller issued itself. What the observer throws
-    /// is ignored.
+    /// reported; nor is a read that succeeds, one the caller issued itself, or the read that
+    /// `readModifyWrite` and `readModifyWriteOnPresence` repeat after a resolve read that observed
+    /// nothing. What the observer throws is ignored.
     using RequestObserver = std::function<void(uint32_t attempt_no, const std::exception * failure)>;
     void setRequestObserver(RequestObserver observer) { request_observer = std::move(observer); }
 

@@ -1973,7 +1973,7 @@ void Pool::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
     ref_ledger.setCasRetrySleepForTest(sleep_fn);
     /// `CasRequests` falls back to the engine's plain sleep for an empty argument -- which is none of
     /// the mount, lease or open plane's defaults. Re-install them, so clearing the seam cannot leave a
-    /// parked or stopping renewal held for a whole wait, or the open plane deaf to a teardown.
+    /// stopping renewal held for a whole wait, or the open plane deaf to a teardown.
     gc_requests.setSleepFnForTest(sleep_fn ? sleep_fn : openPlaneSleepFn());
     lease_requests.setSleepFnForTest(sleep_fn ? sleep_fn : mountPlaneSleepFn());
     mount_requests.setSleepFnForTest(sleep_fn ? std::move(sleep_fn) : mountPlaneSleepFn());

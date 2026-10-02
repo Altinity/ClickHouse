@@ -534,9 +534,9 @@ public:
     /// A non-gated, I/O-free lifecycle snapshot for `system.cas_mounts` (spec §7,
     /// Factory class). Reads only the runtime's atomics — NO backend op — so it is truthful in EVERY
     /// state, including the terminal ones the store()-class surface refuses. `detail` is the same [D5]
-    /// reason text `throwIfLifecycleTerminal` throws (empty while `Live`/`TransientNotLive`), which spec §1
+    /// reason text `throwIfLifecycleTerminal` throws (empty while `Live`/`TransientNotLive` unless `lease_expired`), which spec §1
     /// requires appear verbatim in the snapshot; `since` is the wall-clock second the current non-`Live`
-    /// state was entered (0 while `Live`). The metadata-storage layer maps `lifecycle` to the operator
+    /// state was entered (0 while `Live` unless `lease_expired`). The metadata-storage layer maps `lifecycle` to the operator
     /// vocabulary and derives the enum-clean sub-state word separately (see `CasLifecycleSnapshot`).
     struct LifecycleSnapshot
     {

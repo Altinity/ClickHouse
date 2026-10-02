@@ -91,8 +91,8 @@ struct MountRenewOperationEnvironment
     /// sampling it afterwards would read a flag that the refusal itself may have set.
     std::function<bool()> cancelled;
     MountRenewPolicy policy = MountRenewPolicy::LeaseBound;
-    /// Called on the renewing thread for every request sent and for every failure. May be empty.
-    /// What it throws is ignored.
+    /// Called on the renewing thread for each `PUT` sent, each failed `PUT` and each failed resolve read.
+    /// May be empty. What it throws is ignored.
     std::function<void(const MountRenewRequestEvent &)> on_request;
 };
 
@@ -577,7 +577,7 @@ public:
     uint64_t start(Liveness liveness = {});
     /// The steady-state renewal. `LeaseBound` runs under the mount fence with `Retry::untilLeaseSafe`;
     /// `UntilDefinitive` runs on the worker plane with `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`
-    /// and ends only on a definitive answer or when `environment.live` refuses.
+    /// and ends on a definitive answer, a deterministic local failure, or when `environment.live` refuses.
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
     /// The remount's re-anchor, which is bootstrap control rather than steady state: a remount renews
     /// BEFORE it arms the fence for the new incarnation, so the fence is still latched lost and an

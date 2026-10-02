@@ -315,10 +315,11 @@ public:
     /// ---- lease expiry ----
     /// The instant this server's confirmed lease expired, on the fence clock, while it stays expired:
     /// the lifecycle is `Live`, the fence is not lost and `bootMsNow` has reached the deadline. A
-    /// renewal that commits with a start more than a TTL ago does not end the expiry, so its start is
-    /// kept until a renewal restores the lease. Empty otherwise.
+    /// renewal that commits with a start more than a TTL ago does not end the expiry, so the first expired
+    /// deadline is kept until a renewal restores the lease. Empty otherwise.
     std::optional<uint64_t> leaseExpiredSinceBootMs() const;
-    /// Text of the last failed request of the worker's renewal; empty when none failed.
+    /// Text of the last failed request of the worker's renewal; empty when no request failed since the
+    /// last renewal that left the lease unexpired.
     String lastRenewFailure() const;
     /// The condition text for a request admitted under `admitted_generation` that is refused only
     /// because the lease expired; empty when the refusal has any other cause or there is none.
