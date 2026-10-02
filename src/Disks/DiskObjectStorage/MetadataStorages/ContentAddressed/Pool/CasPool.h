@@ -511,11 +511,9 @@ public:
     /// Whether the pool has reached one of the two fully-terminal `Vanished` values
     /// (`VanishedReplaced` / `VanishedForgotten`).
     bool isVanished() const { return mount_runtime.isVanished(); }
-    /// Whether the terminal-intent latch is published — a natural `enterVanished`, OR FORGET's early
-    /// (spec §5 step 1) `publishVanishedIntent`, and NEVER `IdentityLost` ([C1]). See
-    /// `CasMountRuntime::vanishedIntentPublished`. The GC scheduler consults this ALONGSIDE `isVanished()`
-    /// to self-exit its loops the instant the pool is (being driven) terminal, at the earliest signal.
-    bool vanishedIntentPublished() const { return mount_runtime.vanishedIntentPublished(); }
+    /// Whether background work must stop: a terminal intent is published (a natural `enterVanished` or
+    /// FORGET's early publication) or the pool is `IdentityLost`. See `CasMountRuntime::remountTerminal`.
+    bool remountTerminal() const { return mount_runtime.remountTerminal(); }
     /// The store()-class lifecycle gate: throws the typed `INVALID_STATE` error, whose message names the
     /// terminal sub-state, when the pool has entered `IdentityLost` or any `Vanished` state; returns
     /// silently while `Live`/`TransientNotLive`. This is the minimal "nothing silently proceeds" hook the
