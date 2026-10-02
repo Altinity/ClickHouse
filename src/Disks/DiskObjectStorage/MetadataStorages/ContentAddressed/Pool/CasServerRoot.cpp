@@ -352,23 +352,6 @@ void deliverMountRenewObservability(
         const uint64_t now_boot_ms = defaultBootMs();
         const String write_attempt_id = u128ToHex(context.write_attempt_id).substr(0, 12);
 
-        for (uint32_t attempt_no = 2; attempt_no <= context.attempts_sent; ++attempt_no)
-        {
-            try
-            {
-                LOG_DEBUG(
-                    getLogger("CasMountLeaseRenewer"),
-                    "CAS mount renewal '{}' physical retry attempt {} (writer_epoch={}, seq={})",
-                    *context.server_root_id,
-                    attempt_no,
-                    context.writer_epoch,
-                    context.seq);
-            }
-            catch (...)
-            {
-            }
-        }
-
         const bool recovered = context.outcome == MountRenewOutcome::Committed
             && (context.attempts_sent > 1 || context.resolved_by_read || context.expired_ms.has_value());
         if (recovered)
