@@ -1632,8 +1632,10 @@ TEST(CASHeartbeat, DefinitiveAnswersStayTerminalPastTheDeadline)
         f.events.clear();
         /// Past the lease: a bounded renewal would send nothing here.
         f.boot_ms = f.anchor + UnboundedRenewalFixture::ttl_ms + 1'000;
+        /// A definitive answer that was retried would never end this renewal; the bound makes it fail instead.
+        const uint64_t live_until = f.boot_ms + 600'000;
 
-        const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive);
+        const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive, [&] { return f.boot_ms < live_until; });
 
         const DB::Exception failure = terminalException(result);
         EXPECT_EQ(f.renewer->state(), MountLeaseRenewerState::RenewalTerminal);
@@ -1702,7 +1704,9 @@ TEST(CASHeartbeat, AFenceSeenAfterALongOutageEndsTheRenewal)
         mustCommit(f.ops->op.replace(f.mountKey(), encodeMountLease(lease), got->etag, Retry::standard()), "fence-out");
     });
 
-    const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive);
+    /// A fence that was retried would never end this renewal; the bound makes it fail instead.
+    const MountRenewResult result = f.renew(
+        MountRenewPolicy::UntilDefinitive, [&] { return f.boot_ms < f.renewal_start + 600'000; });
 
     const DB::Exception failure = terminalException(result);
     EXPECT_NE(failure.message().find("fenced by GC"), String::npos) << failure.message();

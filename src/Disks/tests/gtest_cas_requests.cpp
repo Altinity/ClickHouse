@@ -3210,8 +3210,8 @@ Etag seedK(TimedFaultBackend & backend, CasOperation & op)
 
 }
 
-/// Spacing is measured on the injected clock, so a bind that wrapped at the top of the range would
-/// refuse the first request; the only refusal is two envelopes no longer fitting before the clock ends.
+/// A `bind` whose deadline wrapped at the top of the clock would refuse the first request; the only
+/// legitimate refusal is a request whose two envelopes no longer fit before the clock ends.
 TEST(CASRequestsSpacing, UntilDefinitiveRefusesNothingBeforeTheEndOfTheClock)
 {
     constexpr uint64_t largest = std::numeric_limits<uint64_t>::max();
@@ -3239,7 +3239,7 @@ TEST(CASRequestsSpacing, UntilDefinitiveRefusesNothingBeforeTheEndOfTheClock)
     EXPECT_LE(puts.back(), largest - 14'000) << "every PUT was admitted with room for its two envelopes";
 }
 
-/// Spec test 10, first case: a hinted PUT is reissued without a read, every reissue starts one draw
+/// A hinted PUT is reissued without a read, every reissue starts one draw
 /// after the previous one started, and the call is still retrying after 30 s.
 TEST(CASRequestsSpacing, FastConnectFailuresAreSpacedFromTheirStart)
 {
@@ -3283,7 +3283,7 @@ TEST(CASRequestsSpacing, FastConnectFailuresAreSpacedFromTheirStart)
     EXPECT_EQ(clock.sleeps.size(), puts.size() - 2) << "one sleep per hinted reissue, none for the fuse";
 }
 
-/// Spec test 10, second case: the read after an unclear PUT is sent at once, the read's own fuse is
+/// The read after an unclear PUT is sent at once, the read's own fuse is
 /// reissued at once, and the retries of the read and of the PUT are spaced.
 TEST(CASRequestsSpacing, TheResolveReadFollowsAtOnceAndItsRetriesAreSpaced)
 {
@@ -3337,7 +3337,7 @@ TEST(CASRequestsSpacing, TheResolveReadFollowsAtOnceAndItsRetriesAreSpaced)
     EXPECT_LE(max_spaced, 1'200u);
 }
 
-/// Spec test 10, third case: a request that takes 5 s on the injected clock is followed by the next one
+/// A request that takes 5 s on the injected clock is followed by the next one
 /// with no wait, for the read and for the PUT; the PUT's own fuse reissue does not sleep at all.
 TEST(CASRequestsSpacing, ARequestThatTookLongerThanTheSpacingIsRetriedAtOnce)
 {
@@ -3446,6 +3446,49 @@ TEST(CASRequestsSpacing, CleanConflictPausesAreSpacedUnderASpacedPolicy)
 
     ASSERT_TRUE(std::holds_alternative<Committed>(result));
     ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K));
+    for (const uint64_t pause : clock.sleeps)
+    {
+        EXPECT_GE(pause, 800u);
+        EXPECT_LE(pause, 1'200u);
+    }
+}
+
+TEST(CASRequestsSpacing, PresenceOnlyConflictPausesAreSpacedUnderASpacedPolicy)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    constexpr int K = 3;
+    RaceMaker races(backend, clock, "k", K, /*ambiguous=*/false);
+
+    const WriteResult result = op.readModifyWriteOnPresence("k",
+        [](const std::optional<Meta> &) -> std::optional<String> { return String("w"); }, Retry::untilDefinitive(kSpacingMs));
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(K));
+    for (const uint64_t pause : clock.sleeps)
+    {
+        EXPECT_GE(pause, 800u);
+        EXPECT_LE(pause, 1'200u);
+    }
+}
+
+TEST(CASRequestsSpacing, ARetriedReadCalledDirectlyIsSpaced)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("injected read failure")));
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("injected read failure")));
+
+    const auto object = op.read("k", Retry::untilDefinitive(kSpacingMs));
+
+    ASSERT_TRUE(object.has_value());
+    ASSERT_EQ(clock.sleeps.size(), 2u);
     for (const uint64_t pause : clock.sleeps)
     {
         EXPECT_GE(pause, 800u);

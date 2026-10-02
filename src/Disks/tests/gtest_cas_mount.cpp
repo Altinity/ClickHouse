@@ -362,8 +362,10 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         ScopedRenewalLogCapture capture("debug");
         backend->throw_before_next_overwrite = true;
         EXPECT_NO_THROW(store->renewWatermarkOnce());
-        EXPECT_EQ(countRenewalLogText(capture.captured(), "physical retry attempt"), 0u)
-            << "requests are counted by the attempt counters, not replayed as log lines when the renewal ends";
+        const String output = capture.captured();
+        EXPECT_GE(countRenewalLogText(output, "recovered"), 1u) << "the capture sees the renewal at all: " << output;
+        EXPECT_EQ(countRenewalLogText(output, "physical retry attempt"), 0u)
+            << "requests are counted by the attempt counters, not replayed as log lines when the renewal ends: " << output;
     }
 
     {
