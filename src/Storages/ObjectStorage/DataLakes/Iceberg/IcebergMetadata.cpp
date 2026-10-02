@@ -162,7 +162,7 @@ String dumpMetadataObjectToString(const Poco::JSON::Object::Ptr & metadata_objec
 /// Check if a previous attempt already committed this transaction the snapshot
 /// (with our transaction_id embedded in its summary) is still present in the snapshots array
 /// unless an external engine ran expireSnapshots in the meantime. If found, skip re-committing.
-bool isExportPartitionTransactionAlreadyCommitted(const Poco::JSON::Object::Ptr & metadata, const String & transaction_id)
+bool isExportTransactionAlreadyCommitted(const Poco::JSON::Object::Ptr & metadata, const String & transaction_id)
 {
     const auto throw_error = [&](const std::string & missing_field_name)
     {
@@ -1804,7 +1804,7 @@ std::vector<Field> recomputeExportPartitionValues(
 
 }
 
-std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImportPartitionTransactionImpl(
+std::optional<IStorage::ExportCommitInfo> IcebergMetadata::commitImportPartitionTransactionImpl(
     FileNamesGenerator & filename_generator,
     Poco::JSON::Object::Ptr & metadata,
     Poco::JSON::Object::Ptr & partition_spec,
@@ -1827,16 +1827,16 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
     ContextPtr context)
 {
     /// this check also exists here because the metadata might have been updated upon retry attempts.
-    if (isExportPartitionTransactionAlreadyCommitted(metadata, transaction_id))
+    if (isExportTransactionAlreadyCommitted(metadata, transaction_id))
     {
         LOG_INFO(log,
             "Export transaction {} already committed, skipping re-commit",
             transaction_id);
         /// Surface a sentinel so the caller treats this as a successful attempt (non-empty
         /// commit info), persists a commit_info znode, and makes the situation visible in
-        /// system.partition_exports.committed_metadata_file. We do not know the
+        /// system.distributed_exports.committed_metadata_file. We do not know the
         /// original committer's paths from here.
-        IStorage::ExportPartitionCommitInfo already_committed_info;
+        IStorage::ExportCommitInfo already_committed_info;
         already_committed_info.iceberg_metadata_file = "<committed in a previous run, paths unavailable>";
         return already_committed_info;
     }
@@ -2096,7 +2096,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
             tryLogCurrentException(log,
                 "Post-publish work failed after Iceberg snapshot was committed; "
                 "skipping manifest cleanup to preserve published snapshot");
-            IStorage::ExportPartitionCommitInfo published_info;
+            IStorage::ExportCommitInfo published_info;
             published_info.iceberg_metadata_file = resolver.resolve(metadata_info.path);
             published_info.iceberg_manifest_list = storage_manifest_list_name;
             published_info.iceberg_manifest_file = storage_manifest_entry_name;
@@ -2112,14 +2112,14 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
     /// export task can persist them in ZooKeeper for observability. Only set here
     /// (not on the retry / "already committed" paths) so the struct reflects
     /// exactly what this attempt produced.
-    IStorage::ExportPartitionCommitInfo published_info;
+    IStorage::ExportCommitInfo published_info;
     published_info.iceberg_metadata_file = resolver.resolve(metadata_info.path);
     published_info.iceberg_manifest_list = storage_manifest_list_name;
     published_info.iceberg_manifest_file = storage_manifest_entry_name;
     return published_info;
 }
 
-IStorage::ExportPartitionCommitInfo IcebergMetadata::commitExportPartitionTransaction(
+IStorage::ExportCommitInfo IcebergMetadata::commitExportTransaction(
     std::shared_ptr<DataLake::ICatalog> catalog,
     const StorageID & table_id,
     const String & transaction_id,
@@ -2153,12 +2153,12 @@ IStorage::ExportPartitionCommitInfo IcebergMetadata::commitExportPartitionTransa
         updated_metadata_file_info.compression_method,
         persistent_components.table_uuid);
 
-    if (isExportPartitionTransactionAlreadyCommitted(metadata, transaction_id))
+    if (isExportTransactionAlreadyCommitted(metadata, transaction_id))
     {
         LOG_INFO(log,
             "Export transaction {} already committed, skipping re-commit",
             transaction_id);
-        IStorage::ExportPartitionCommitInfo already_committed_info;
+        IStorage::ExportCommitInfo already_committed_info;
         already_committed_info.iceberg_metadata_file = "<committed in a previous run, paths unavailable>";
         return already_committed_info;
     }
@@ -2258,6 +2258,31 @@ IStorage::ExportPartitionCommitInfo IcebergMetadata::commitExportPartitionTransa
     throw Exception(ErrorCodes::UNFINISHED,
         "Failed to commit export partition transaction after {} attempts due to repeated metadata conflicts.",
         attempt);
+}
+
+bool IcebergMetadata::isExportTransactionCommitted(const String & transaction_id, ContextPtr context)
+{
+    const auto latest_metadata_file_info = getLatestOrExplicitMetadataFileAndVersion(
+        object_storage,
+        persistent_components.table_path,
+        data_lake_settings,
+        persistent_components.metadata_cache,
+        context,
+        getLogger("IcebergMetadata").get(),
+        persistent_components.table_uuid,
+        persistent_components.metadata_compression_method,
+        true);
+
+    const auto metadata = getMetadataJSONObject(
+        latest_metadata_file_info.path,
+        object_storage,
+        persistent_components.metadata_cache,
+        context,
+        getLogger("IcebergMetadata"),
+        latest_metadata_file_info.compression_method,
+        persistent_components.table_uuid);
+
+    return isExportTransactionAlreadyCommitted(metadata, transaction_id);
 }
 
 Poco::JSON::Object::Ptr IcebergMetadata::getMetadataJSON(ContextPtr local_context) const

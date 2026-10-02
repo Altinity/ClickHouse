@@ -1,5 +1,6 @@
 #include <Storages/System/StorageSystemKeywords.h>
-#include <Storages/System/StorageSystemPartitionExports.h>
+#include <Storages/System/StorageSystemDistributedExports.h>
+#include <Storages/System/StorageSystemTTLExports.h>
 #include "config.h"
 
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
@@ -269,9 +270,8 @@ void attachSystemTablesServer(ContextPtr context, IDatabase & system_database, b
     attach<StorageSystemExports>(context, system_database, "exports", "Contains a list of exports currently executing exports of MergeTree tables and their progress. Each export operation is represented by a single row.");
     if (context->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
     {
-        attach<StorageSystemPartitionExports>(context, system_database, "partition_exports", "Contains a list of partition exports of MergeTree tables, both plain and replicated, and their progress. Each export operation is represented by a single row.");
-        /// Backwards-compatible alias from when plain and replicated exports had separate tables.
-        attach<StorageSystemPartitionExports>(context, system_database, "replicated_partition_exports", "Alias of system.partition_exports, kept for backwards compatibility. Returns the same rows, including exports of plain (non-replicated) MergeTree tables.");
+        attach<StorageSystemDistributedExports>(context, system_database, "distributed_exports", "Contains the export tasks of MergeTree tables, both plain and replicated, created by `EXPORT PARTITION` or by a `TTL ... EXPORT` expression, and their progress. Each task is represented by a single row.");
+        attach<StorageSystemTTLExports>(context, system_database, "ttl_exports", "Contains the state of the `TTL ... EXPORT TO TABLE` expression of MergeTree tables, one row per partition: exported, claimed and eligible parts, the task exporting it, and the last error.");
     }
     attach<StorageSystemMutations>(context, system_database, "mutations", "Contains a list of mutations and their progress. Each mutation command is represented by a single row.");
     attachNoDescription<StorageSystemReplicas>(context, system_database, "replicas", "Contains information and status of all table replicas on current server. Each replica is represented by a single row.");

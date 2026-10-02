@@ -44,11 +44,15 @@ public:
         const std::optional<FormatSettings> & format_settings_,
         ContextPtr context) override;
 
-    ExportPartitionCommitInfo commitExportPartitionTransaction(
+    ExportCommitInfo commitExportTransaction(
         const String & transaction_id,
         const String & partition_id,
         const Strings & exported_paths,
-        const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
+        const IcebergCommitExportArguments & iceberg_commit_export_arguments,
+        ContextPtr local_context) override;
+
+    bool isExportTransactionCommitted(
+        const String & transaction_id,
         ContextPtr local_context) override;
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(

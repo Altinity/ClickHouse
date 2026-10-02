@@ -6,7 +6,8 @@
 #include <Storages/AlterCommands.h>
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeCleanupThread.h>
-#include <Storages/MergeTree/MergeTreePartitionExportScheduler.h>
+#include <Storages/MergeTree/MergeTreeExportTaskScheduler.h>
+#include <Storages/MergeTree/ExportFence.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
@@ -30,6 +31,7 @@ namespace DB
 {
 
 class PreparedSetsCache;
+class MergeTreeExportTTLIndex;
 using PreparedSetsCachePtr = std::shared_ptr<PreparedSetsCache>;
 
 /** See the description of the data structure in MergeTreeData.
@@ -128,27 +130,57 @@ public:
 
     MergeTreeDeduplicationLog * getDeduplicationLog() { return deduplication_log.get(); }
 
-    /// EXPORT PARTITION for a plain (non-replicated) MergeTree table. Coordinated locally by
-    /// `partition_export_scheduler`; the task descriptor is persisted on disk (no ZooKeeper).
-    void exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context) override;
+    /// Coordinated locally by `export_task_scheduler`; the task descriptor is persisted on disk (no
+    /// ZooKeeper). With an index update, the parts are claimed under the lock that merge selection
+    /// holds, before the task is created: a crash in between leaves a claim without a task.
+    bool exportParts(const ExportPartsRequest & request, ContextPtr local_context, const ExportTTLIndexUpdate * index_update) override;
 
-    CancellationCode killExportPartition(const String & transaction_id) override;
+    CancellationCode killExportTask(const String & transaction_id) override;
 
-    /// Snapshot of local partition-export tasks for `system.partition_exports`. No disk I/O.
-    std::vector<PartitionExportInfo> getPartitionExportsInfo() const override;
+    /// Snapshot of local partition-export tasks for `system.distributed_exports`. No disk I/O.
+    std::vector<ExportTaskInfo> getExportTasksInfo() const override;
+
+    /// Nullptr if partition export is disabled.
+    IExportTTLIndex * getExportTTLIndex() const override;
+
+    std::optional<ExportTaskStatus> getExportTaskStatus(const String & transaction_id) const override;
+    std::optional<ExportTaskStatus> getKnownExportTaskStatus(const String & transaction_id) const override
+    {
+        return getExportTaskStatus(transaction_id);
+    }
+    bool isPartBeingMerged(const MergeTreePartInfo & part_info) const override;
 
 private:
-    friend class MergeTreePartitionExportScheduler;
+    friend class MergeTreeExportTaskScheduler;
+    friend class MergeTreeExportTTLIndex;
+
+    /// Builds the descriptor of an export task of `parts` from the settings of `query_context`, and
+    /// validates the destination for them. The caller sets the transaction id and the source.
+    MergeTreeExportTask buildExportTask(
+        const StorageID & dest_storage_id,
+        const StoragePtr & dest_storage,
+        const StorageMetadataPtr & src_snapshot,
+        const StorageMetadataPtr & destination_snapshot,
+        const DataPartsVector & parts,
+        const String & partition_id,
+        ContextPtr query_context) const;
+
+    /// The export index of the `EXPORT` TTL. Only created, like the scheduler, when partition export is enabled.
+    std::shared_ptr<MergeTreeExportTTLIndex> export_ttl_index;
+    BackgroundSchedulePoolTaskHolder export_ttl_task;
+    void exportTTLTask();
+    /// E.g. when a task of the `EXPORT` TTL finished, so it is recorded as exported right away.
+    void wakeUpExportTTL();
 
     /// Local coordinator + on-disk state for EXPORT PARTITION. Only created when the server setting
     /// `allow_experimental_export_merge_tree_partition` is enabled.
-    std::shared_ptr<MergeTreePartitionExportScheduler> partition_export_scheduler;
-    BackgroundSchedulePoolTaskHolder partition_export_task;
+    std::shared_ptr<MergeTreeExportTaskScheduler> export_task_scheduler;
+    BackgroundSchedulePoolTaskHolder export_task_scheduling_task;
 
-    /// Schedule-pool task body: drives partition_export_scheduler->run() periodically.
-    void partitionExportTask();
+    /// Schedule-pool task body: drives export_task_scheduler->run() periodically.
+    void exportTaskSchedulingTask();
     /// Wakes up the partition-export schedule-pool task (no-op when the feature is disabled).
-    void triggerPartitionExportTask();
+    void triggerExportTaskScheduling();
 
 
     /// Mutex and condvar for synchronous mutations wait

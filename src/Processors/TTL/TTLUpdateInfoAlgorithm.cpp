@@ -40,6 +40,10 @@ void TTLUpdateInfoAlgorithm::finalize(const MutableDataPartPtr & data_part) cons
     {
         data_part->ttl_infos.moves_ttl[ttl_update_key] = new_ttl_info;
     }
+    else if (ttl_update_field == TTLUpdateField::EXPORT_TTL)
+    {
+        data_part->ttl_infos.export_ttl[ttl_update_key] = new_ttl_info;
+    }
     else if (ttl_update_field == TTLUpdateField::GROUP_BY_TTL)
     {
         data_part->ttl_infos.group_by_ttl[ttl_update_key] = new_ttl_info;

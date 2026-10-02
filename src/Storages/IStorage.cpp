@@ -311,7 +311,7 @@ CancellationCode IStorage::killPartMoveToShard(const UUID & /*task_uuid*/)
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Part moves between shards are not supported by storage {}", getName());
 }
 
-CancellationCode IStorage::killExportPartition(const String & /*transaction_id*/)
+CancellationCode IStorage::killExportTask(const String & /*transaction_id*/)
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Export partition is not supported by storage {}", getName());
 }

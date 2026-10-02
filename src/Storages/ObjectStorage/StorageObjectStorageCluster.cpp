@@ -1167,30 +1167,39 @@ IStorage::ImportResult StorageObjectStorageCluster::import(
         context);
 }
 
-IStorage::ExportPartitionCommitInfo StorageObjectStorageCluster::commitExportPartitionTransaction(
+IStorage::ExportCommitInfo StorageObjectStorageCluster::commitExportTransaction(
     const String & transaction_id,
     const String & partition_id,
     const Strings & exported_paths,
-    const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
+    const IcebergCommitExportArguments & iceberg_commit_export_arguments,
     ContextPtr local_context)
 {
     if (pure_storage)
     {
-        return pure_storage->commitExportPartitionTransaction(
+        return pure_storage->commitExportTransaction(
             transaction_id,
             partition_id,
             exported_paths,
-            iceberg_commit_export_partition_arguments,
+            iceberg_commit_export_arguments,
             local_context
         );
     }
-    return IStorageCluster::commitExportPartitionTransaction(
+    return IStorageCluster::commitExportTransaction(
         transaction_id,
         partition_id,
         exported_paths,
-        iceberg_commit_export_partition_arguments,
+        iceberg_commit_export_arguments,
         local_context
     );
+}
+
+bool StorageObjectStorageCluster::isExportTransactionCommitted(
+    const String & transaction_id,
+    ContextPtr local_context)
+{
+    if (pure_storage)
+        return pure_storage->isExportTransactionCommitted(transaction_id, local_context);
+    return IStorageCluster::isExportTransactionCommitted(transaction_id, local_context);
 }
 
 }

@@ -24,6 +24,8 @@ MergeTreeMergePredicate::MergeTreeMergePredicate(const StorageMergeTree & storag
     , merge_mutate_lock(merge_mutate_lock_)
     , committing_blocks(storage.getCommittingBlocks())
     , min_update_block(getMinUpdateBlockNumber(committing_blocks))
+    , export_fence(storage.getLatestExportFence())
+    , delete_gate(storage.getExportTTLDeleteGate())
 {
     auto patches_vector = getPatchPartInfos(storage);
     patches_by_partition = getPatchPartsByPartition(patches_vector, min_update_block.value_or(std::numeric_limits<Int64>::max()));
@@ -45,6 +47,12 @@ std::expected<void, PreformattedMessage> MergeTreeMergePredicate::canMergeParts(
         return std::unexpected(PreformattedMessage::create(
             "Parts have different projection sets: {} in '{}' and {} in '{}'",
             left.projection_names, left.name, right.projection_names, right.name));
+    }
+
+    if (export_fence)
+    {
+        if (auto reason = export_fence->checkCanMerge(left.info, right.info))
+            return std::unexpected(PreformattedMessage::create("{}", *reason));
     }
 
     {
@@ -73,6 +81,9 @@ std::expected<void, PreformattedMessage> MergeTreeMergePredicate::canUsePartInMe
 
     if (storage.currently_merging_mutating_parts.contains(part->info))
         return std::unexpected(PreformattedMessage::create("Part {} currently in a merging or mutating process", part->name));
+
+    if (auto reason = delete_gate.check(part->name, part->info, part->ttl_infos, export_fence.get()))
+        return std::unexpected(PreformattedMessage::create("{}", *reason));
 
     if (min_update_block && part->info.getDataVersion() >= *min_update_block)
     {

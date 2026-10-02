@@ -8,5 +8,6 @@ Both destinations received the partition
 2	2020
 1	2020
 2	2020
-Re-exporting to the first destination is still rejected
-EXPORT_PARTITION_ALREADY_EXPORTED
+Re-exporting to the first destination only adds a task of the first destination
+{db}	x.y	1
+{db}.x	y	2

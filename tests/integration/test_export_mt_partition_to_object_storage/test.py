@@ -4,6 +4,7 @@ import pytest
 
 from helpers.cluster import ClickHouseCluster
 from helpers.export_partition_helpers import (
+    commit_marker_lines,
     make_mt,
     unique_suffix,
     wait_for_export_status,
@@ -107,10 +108,7 @@ def test_export_partition_without_keeper(cluster):
 
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == "3\n"
     assert (
-        node.query(
-            f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)"
-        )
-        != "0\n"
+        commit_marker_lines(node, mt_table, s3_table, "2020") != 0
     ), "Commit file missing for partition 2020"
 
 

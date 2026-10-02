@@ -8084,22 +8084,23 @@ Default value is empty.
     DECLARE(Bool, export_merge_tree_part_overwrite_file_if_exists, false, R"(
 Overwrite file if it already exists when exporting a merge tree part
 )", 0) \
-    DECLARE(Bool, export_merge_tree_partition_force_export, false, R"(
-Ignore existing partition export and overwrite the zookeeper entry
+    DECLARE(Bool, allow_experimental_export_ttl, false, R"(
+Allow creating tables with, or altering tables to have, a `TTL ... EXPORT TO TABLE` expression, which exports parts of a `MergeTree` table to an Iceberg or object storage table in the background once they expire.
+Also requires the server setting `allow_experimental_export_merge_tree_partition`.
+)", EXPERIMENTAL) \
+    DECLARE(UInt64, export_merge_tree_retry_initial_backoff_seconds, 5, R"(
+Initial delay (in seconds) before retrying a failed part export in an export task (`EXPORT PARTITION` or `TTL ... EXPORT`).
+The delay grows exponentially with the per-replica retry count (capped doubling): `delay = min(initial << (attempts - 1), max)`, where `max` is `export_merge_tree_retry_max_backoff_seconds`.
+The back-off is per-replica in-memory state: it only spaces this replica's retries out in time and never prevents another replica from attempting the same part. Retryable failures are retried until the task succeeds or `export_merge_tree_task_timeout_seconds` elapses.
+To survive a long transient outage (e.g. object storage downtime), raise `export_merge_tree_task_timeout_seconds`.
 )", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_retry_initial_backoff_seconds, 5, R"(
-Initial delay (in seconds) before retrying a failed part export in an export partition task.
-The delay grows exponentially with the per-replica retry count (capped doubling): `delay = min(initial << (attempts - 1), max)`, where `max` is `export_merge_tree_partition_retry_max_backoff_seconds`.
-The back-off is per-replica in-memory state: it only spaces this replica's retries out in time and never prevents another replica from attempting the same part. Retryable failures are retried until the task succeeds or `export_merge_tree_partition_task_timeout_seconds` elapses.
-To survive a long transient outage (e.g. object storage downtime), raise `export_merge_tree_partition_task_timeout_seconds`.
+    DECLARE(UInt64, export_merge_tree_retry_max_backoff_seconds, 300, R"(
+Maximum delay (in seconds) between retries of a failed part export in an export task. Caps the exponential growth controlled by `export_merge_tree_retry_initial_backoff_seconds`.
 )", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_retry_max_backoff_seconds, 300, R"(
-Maximum delay (in seconds) between retries of a failed part export in an export partition task. Caps the exponential growth controlled by `export_merge_tree_partition_retry_initial_backoff_seconds`.
-)", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 86400, R"(
-Maximum wall-clock duration (in seconds) an export partition task is allowed to remain in the PENDING state before it is auto-killed by the background cleanup loop.
+    DECLARE(UInt64, export_merge_tree_task_timeout_seconds, 86400, R"(
+Maximum wall-clock duration (in seconds) an export task is allowed to remain in the PENDING state before it is auto-killed by the background cleanup loop.
 The timeout is measured from the manifest's create_time. Set to 0 to disable the timeout.
-When the timeout is exceeded the task transitions to KILLED (same terminal state as `KILL QUERY ... EXPORT PARTITION`), and `last_exception` is populated with a timeout reason.
+When the timeout is exceeded the task transitions to KILLED (same terminal state as `KILL EXPORT`), and `last_exception` is populated with a timeout reason.
 
 IMPORTANT: In case the storage is managed by a 3rd party application that cleans up old manifest files, it is important that the TTL of such files are greater than the timeout of export partition tasks.
 If it is not configured in such a way, it is possible to accidentally duplicate data in the extremely rare case a ClickHouse node is the only node working on a given export task, commits the data to Iceberg, crashes before marking the task as done and only boots up after the manifest cleanup has deleted the commit manifest.
@@ -8133,7 +8134,7 @@ Failure handling for `ALTER TABLE ... EXPORT PARTITION ALL ...`.
 Possible values:
 - `throw_first` (default) - stop at the first failed partition; partitions already scheduled remain scheduled.
 - `collect` - try every partition and throw a single aggregated exception at the end if any failed; partitions that succeeded remain scheduled.
-- `skip_conflicts` - silently skip partitions that are already exported / being exported (errors with code EXPORT_PARTITION_ALREADY_EXPORTED); fail-fast on every other error.
+- `skip_conflicts` - silently skip partitions whose export fails with code `EXPORT_PARTITION_ALREADY_EXPORTED`; fail-fast on every other error. `EXPORT PARTITION` no longer refuses re-exports, so nothing is skipped and this behaves like `throw_first`.
 Has no effect on `EXPORT PARTITION <id>` (single-partition export).
 )", 0) \
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
@@ -8604,6 +8605,10 @@ Name of the named collection used by `aiEmbed` when the call does not pass `cred
     /** Obsolete settings which are kept around for compatibility reasons. They have no effect anymore. */ \
     MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_manifest_ttl, 86400) \
     MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_max_retries, 3) \
+    MAKE_OBSOLETE(M, Bool, export_merge_tree_partition_force_export, false) \
+    MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_retry_initial_backoff_seconds, 5) \
+    MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_retry_max_backoff_seconds, 300) \
+    MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_task_timeout_seconds, 86400) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_query_deduplication, false) \
     MAKE_OBSOLETE(M, Bool, query_condition_cache_store_conditions_as_plaintext, false) \
     MAKE_OBSOLETE(M, Bool, update_insert_deduplication_token_in_dependent_materialized_views, 0) \

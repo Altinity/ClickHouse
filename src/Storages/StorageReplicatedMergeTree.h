@@ -11,9 +11,10 @@
 #include <Storages/MergeTree/BackgroundJobsAssignee.h>
 #include <Storages/MergeTree/DataPartsExchange.h>
 #include <Storages/MergeTree/EphemeralLockInZooKeeper.h>
-#include <Storages/MergeTree/ExportPartitionManifestUpdatingTask.h>
-#include <Storages/MergeTree/ExportPartitionTaskScheduler.h>
-#include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
+#include <Storages/MergeTree/ReplicatedExportTaskUpdater.h>
+#include <Storages/MergeTree/ReplicatedExportTaskScheduler.h>
+#include <Storages/MergeTree/ReplicatedExportTTLIndex.h>
+#include <Storages/ExportReplicatedMergeTreeTaskEntry.h>
 #include <Storages/MergeTree/FutureMergedMutatedPart.h>
 #include <Storages/MergeTree/MergeFromLogEntryTask.h>
 #include <Storages/MergeTree/MergeTreeData.h>
@@ -376,7 +377,14 @@ public:
     using ShutdownDeadline = std::chrono::time_point<std::chrono::system_clock>;
     void waitForUniquePartsToBeFetchedByOtherReplicas(ShutdownDeadline shutdown_deadline);
 
-    std::vector<PartitionExportInfo> getPartitionExportsInfo() const override;
+    std::vector<ExportTaskInfo> getExportTasksInfo() const override;
+
+    /// nullptr if partition export is disabled.
+    ReplicatedExportTTLIndex * getExportTTLIndex() const override { return export_ttl_index.get(); }
+
+    std::optional<ExportTaskStatus> getExportTaskStatus(const String & transaction_id) const override;
+    std::optional<ExportTaskStatus> getKnownExportTaskStatus(const String & transaction_id) const override;
+    bool isPartBeingMerged(const MergeTreePartInfo & part_info) const override;
 
 private:
     std::atomic_bool are_restoring_replica {false};
@@ -402,8 +410,8 @@ private:
     friend class MergeFromLogEntryTask;
     friend class MutateFromLogEntryTask;
     friend class ReplicatedMergeMutateTaskBase;
-    friend class ExportPartitionManifestUpdatingTask;
-    friend class ExportPartitionTaskScheduler;
+    friend class ReplicatedExportTaskUpdater;
+    friend class ReplicatedExportTaskScheduler;
 
     using MergeStrategyPicker = ReplicatedMergeTreeMergeStrategyPicker;
     using LogEntry = ReplicatedMergeTreeLogEntry;
@@ -516,21 +524,33 @@ private:
     /// A task that marks finished mutations as done.
     BackgroundSchedulePoolTaskHolder mutations_finalizing_task;
 
-    BackgroundSchedulePoolTaskHolder export_merge_tree_partition_updating_task;
+    BackgroundSchedulePoolTaskHolder export_task_updating_task;
 
     /// mostly handle kill operations
-    BackgroundSchedulePoolTaskHolder export_merge_tree_partition_status_handling_task;
-    std::shared_ptr<ExportPartitionManifestUpdatingTask> export_merge_tree_partition_manifest_updater;
+    BackgroundSchedulePoolTaskHolder export_task_status_handling_task;
+    std::shared_ptr<ReplicatedExportTaskUpdater> export_task_updater;
 
-    std::shared_ptr<ExportPartitionTaskScheduler> export_merge_tree_partition_task_scheduler;
+    std::shared_ptr<ReplicatedExportTaskScheduler> export_task_scheduler;
 
-    Coordination::WatchCallbackPtr export_merge_tree_partition_watch_callback;
+    Coordination::WatchCallbackPtr export_task_watch_callback;
 
-    BackgroundSchedulePoolTaskHolder export_merge_tree_partition_select_task;
+    BackgroundSchedulePoolTaskHolder export_task_select_task;
 
     /// Immutable snapshot republished after each writer batch (part_references stripped). Readers
     /// (system table, scheduler, KILL) get() a consistent version with no lock and no ZooKeeper.
-    MultiVersion<ExportPartitionTaskEntriesContainer> export_partition_manifests;
+    MultiVersion<ExportTaskEntriesContainer> export_partition_manifests;
+
+    /// The export index of the `EXPORT` TTL and the merge fence built from it. Only created when
+    /// partition export is enabled; a replica without it must not assign merges of parts exported by
+    /// the TTL, which is why it does not advertise `export_features`.
+    ReplicatedExportTTLIndexPtr export_ttl_index;
+
+    /// Runs `export_ttl_scheduler`.
+    BackgroundSchedulePoolTaskHolder export_ttl_task;
+
+    /// Keeps the copy of `export_ttl_index` up to date, woken by its watches.
+    BackgroundSchedulePoolTaskHolder export_ttl_index_updating_task;
+
     /// A thread that removes old parts, log entries, and blocks.
     ReplicatedMergeTreeCleanupThread cleanup_thread;
 
@@ -766,10 +786,10 @@ private:
     void selectPartsToExport();
 
     /// update in-memory list of partition exports
-    void exportMergeTreePartitionUpdatingTask();
+    void exportTaskUpdatingTask();
 
     /// handle status changes for export partition tasks
-    void exportMergeTreePartitionStatusHandlingTask();
+    void exportTaskStatusHandlingTask();
 
     /** Write the selected parts to merge into the log,
       * Call when merge_selecting_mutex is locked.
@@ -789,6 +809,7 @@ private:
         bool cleanup,
         ReplicatedMergeTreeLogEntryData * out_log_entry,
         int32_t log_version,
+        int32_t export_index_version,
         MergeType merge_type);
 
     CreateMergeEntryResult createLogEntryToMutatePart(
@@ -959,7 +980,7 @@ private:
     void movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, ContextPtr query_context) override;
     void movePartitionToShard(const ASTPtr & partition, bool move_part, const String & to, ContextPtr query_context) override;
     CancellationCode killPartMoveToShard(const UUID & task_uuid) override;
-    CancellationCode killExportPartition(const String & transaction_id) override;
+    CancellationCode killExportTask(const String & transaction_id) override;
     void fetchPartition(
         const ASTPtr & partition,
         const StorageMetadataPtr & metadata_snapshot,
@@ -967,8 +988,36 @@ private:
         bool fetch_part,
         ContextPtr query_context) override;
     void forgetPartition(const ASTPtr & partition, ContextPtr query_context) override;
-    
-    void exportPartitionToTable(const PartitionCommand &, ContextPtr) override;
+
+    /// Creates the task in one Keeper transaction. With an index update, the same transaction stores
+    /// the entry and checks the version of `/log` that the merge predicate read, so no merge of the
+    /// parts can be assigned between checking them and claiming them.
+    bool exportParts(const ExportPartsRequest & request, ContextPtr local_context, const ExportTTLIndexUpdate * index_update) override;
+
+    /// Builds the descriptor of an export task of `parts` from the settings of `query_context`, and
+    /// validates the destination for them. The caller sets the transaction id and the source.
+    ExportReplicatedMergeTreeTaskManifest buildExportTaskManifest(
+        const StorageID & dest_storage_id,
+        const StoragePtr & dest_storage,
+        const StorageMetadataPtr & src_snapshot,
+        const StorageMetadataPtr & destination_snapshot,
+        const DataPartsVector & parts,
+        const String & partition_id,
+        ContextPtr query_context) const;
+
+    /// Throws unless every replica enforces the export states of parts when assigning merges.
+    void checkAllReplicasSupportExportTTL(const zkutil::ZooKeeperPtr & zookeeper) const;
+    void checkReplicasSupportExportTTL() const override;
+
+    /// Creates (or removes, if partition export is disabled) `<replica_path>/export_features`.
+    void advertiseExportFeatures(const zkutil::ZooKeeperPtr & zookeeper) const;
+
+    void exportTTLTask();
+
+    void exportTTLIndexUpdatingTask();
+
+    /// E.g. when a task of the `EXPORT` TTL finished, so the next group does not wait for the next check.
+    void wakeUpExportTTL();
 
     /// NOTE: there are no guarantees for concurrent merges. Dropping part can
     /// be concurrently merged into some covering part and dropPart will do

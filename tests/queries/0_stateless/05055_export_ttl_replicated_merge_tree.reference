@@ -1,0 +1,18 @@
+Destination after the first group
+1	2020
+2	2020
+3	2020
+Tasks
+ttl	COMPLETED	2	2020
+Partition 2021 is not due
+0	0
+Parts in different export states are not merged
+refused
+A part that becomes due later is exported on its own
+1	2020
+2	2020
+3	2020
+6	2020
+2	2	3
+Removing the TTL forgets what was exported
+0

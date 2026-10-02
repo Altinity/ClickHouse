@@ -2576,6 +2576,9 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ParserKeyword s_materialize_ttl(Keyword::MATERIALIZE_TTL);
     ParserKeyword s_remove_ttl(Keyword::REMOVE_TTL);
     ParserKeyword s_modify_ttl(Keyword::MODIFY_TTL);
+    ParserKeyword s_export(Keyword::EXPORT);
+    ParserKeyword s_to_table(Keyword::TO_TABLE);
+    ParserToken s_dot(TokenType::Dot);
 
     ParserIdentifier parser_identifier;
     ParserStringLiteral parser_string_literal;
@@ -2620,6 +2623,13 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     {
         mode = TTLMode::RECOMPRESS;
     }
+    else if (s_export.ignore(pos, expected))
+    {
+        if (!s_to_table.ignore(pos, expected))
+            return false;
+        mode = TTLMode::EXPORT;
+        destination_type = DataDestinationType::TABLE;
+    }
     else
     {
         /// DELETE is the default mode.
@@ -2632,6 +2642,7 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ASTPtr recompression_codec;
     ASTPtr group_by_assignments;
     bool if_exists = false;
+    String destination_database;
 
     if (mode == TTLMode::MOVE)
     {
@@ -2671,8 +2682,25 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         if (!parser_codec.parse(pos, recompression_codec, expected))
             return false;
     }
+    else if (mode == TTLMode::EXPORT)
+    {
+        ASTPtr first_name;
+        if (!parser_identifier.parse(pos, first_name, expected))
+            return false;
+        destination_name = getIdentifierName(first_name);
+
+        if (s_dot.ignore(pos, expected))
+        {
+            ASTPtr table_name;
+            if (!parser_identifier.parse(pos, table_name, expected))
+                return false;
+            destination_database = destination_name;
+            destination_name = getIdentifierName(table_name);
+        }
+    }
 
     auto ttl_element = make_intrusive<ASTTTLElement>(mode, destination_type, destination_name, if_exists);
+    ttl_element->destination_database = destination_database;
     ttl_element->setTTL(std::move(ttl_expr));
     if (where_expr)
         ttl_element->setWhere(std::move(where_expr));

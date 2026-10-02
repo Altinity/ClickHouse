@@ -60,6 +60,9 @@ void MergeTreeDataPartTTLInfos::update(const MergeTreeDataPartTTLInfos & other_i
     for (const auto & [expression, ttl_info] : other_infos.moves_ttl)
         moves_ttl[expression].update(ttl_info);
 
+    for (const auto & [expression, ttl_info] : other_infos.export_ttl)
+        export_ttl[expression].update(ttl_info);
+
     table_ttl.update(other_infos.table_ttl);
     updatePartMinMaxTTL(table_ttl);
 }
@@ -125,6 +128,11 @@ void MergeTreeDataPartTTLInfos::read(ReadBuffer & in)
     {
         const JSON & moves = json["moves"];
         fill_ttl_info_map(moves, moves_ttl, false);
+    }
+    if (json.has("export"))
+    {
+        const JSON & exports = json["export"];
+        fill_ttl_info_map(exports, export_ttl, false);
     }
     if (json.has("recompression"))
     {
@@ -213,6 +221,12 @@ void MergeTreeDataPartTTLInfos::write(WriteBuffer & out) const
         is_first = false;
     }
 
+    if (!export_ttl.empty())
+    {
+        write_infos(export_ttl, "export", is_first);
+        is_first = false;
+    }
+
     if (!recompression_ttl.empty())
     {
         write_infos(recompression_ttl, "recompression", is_first);
@@ -265,6 +279,9 @@ bool MergeTreeDataPartTTLInfos::hasAnyNonFinishedTTLs() const
         return true;
 
     if (has_non_finished_ttl(moves_ttl))
+        return true;
+
+    if (has_non_finished_ttl(export_ttl))
         return true;
 
     if (has_non_finished_ttl(recompression_ttl))
