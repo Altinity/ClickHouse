@@ -83,13 +83,14 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   equals its immutable request. If the predecessor token is still current, another identical `PUT`
   may follow bounded backoff. A same-pair twin, GC-fenced body, successor, foreign holder, or absent
   body is never treated as this renewal.
-- **Lease deadline.** The lease is valid for `cas_mount_lease_ttl_ms` from the start of the last confirmed
-  renewal. It is measured on `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`, so a VM resumed from suspend
-  correctly observes itself expired. The deadline decides about writes: none is admitted past it. The
-  background renewal does not stop at the deadline. It retries timeouts, `5xx` answers and connection
-  errors about a second apart until the store answers. The renewals at startup and after a remount stay
-  bounded: they stop at the last confirmed deadline minus the safety margin. A retry, `GET`, response
-  timestamp, or wall-clock step never extends authority.
+- **Lease deadline.** The lease is valid for `cas_mount_lease_ttl_ms` from the start of the last
+  confirmed renewal. It is measured on `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`, so a VM resumed from
+  suspend correctly observes itself expired. The deadline decides about writes: none is admitted past
+  it, and none is admitted once the remaining lease cannot cover the requests it may send plus the
+  safety margin. The background renewal does not stop at the deadline. It retries timeouts, `5xx`
+  answers and connection errors about a second apart until the store answers. The renewals at startup,
+  after a remount and the direct renewal stay bounded: they stop at the last confirmed deadline minus
+  the safety margin. A retry, `GET`, response timestamp, or wall-clock step never extends authority.
 - **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
   10 s), with TTL `cas_mount_lease_ttl_ms` (default 30 s, TTL/3 renewal ratio). The next beat is anchored
   at the committed body's pre-I/O BOOTTIME start. A slow recovery therefore causes an immediate
@@ -106,18 +107,22 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
 durable-slot state machine. A committed result advances its token, sequence, confirmed BOOTTIME
 deadline, and cadence anchor. The background renewal moves it to `RenewalTerminal` only on a definitive
 answer: a confirmed foreign, successor or same-pair body, `gc_fenced`, an absent object, a request the
-store refuses for good, or a stop or remount request. A terminal renewer cannot mint another body or
-publish a clean farewell. Owner cancellation before any request is the only `NotAttempted` result and
-leaves clean release possible. Cancellation after a request was sent is terminal because that request
-may still land.
+store refuses on a clear attempt, or a stop or remount request. A terminal renewer cannot mint another
+body or publish a clean farewell. Owner cancellation before any request is the only `NotAttempted`
+result and leaves clean release possible. Cancellation after a request was sent is terminal because
+that request may still land.
 
 While retries continue past the lease deadline, the lease is *expired*. New durable writes are refused
 with a transient `NETWORK_ERROR` that names the lease, reads are not gated, and the pool does not
 remount. When a renewal succeeds, writes are admitted again under the same `writer_epoch`.
 `system.cas_mounts` shows the expired period as `lifecycle = 'not_live'`,
-`lifecycle_reason = 'lease_expired'` (see [`system.cas_mounts`](#mounts-table)). The
+`lifecycle_reason = 'lease_expired'` (see [`system.cas_mounts`](#mounts-table)); it shows
+`lifecycle = 'live'` until the deadline passes, even though writes stop a few seconds earlier. The
 `CASMountLeaseExpired` event advances by one when a renewal restores an expired lease, not when the lease
-expires.
+expires. Failing renewals alone do not fence or remount the mount. A GC leader on another member still
+fences a slot whose token has not changed for `TTL + floor(TTL/20) + period`, and a definitive answer
+from the store that the slot holds something else ends it; in both cases the server remounts under a new
+`writer_epoch`.
 
 After the renewer call returns, `CasMountRuntime` consumes the result. A terminal result trips the
 local fence (latches `lost`, bumps the fence generation, moves the in-process runtime to
@@ -127,30 +132,31 @@ only an epoch: recovery reclaims with a fresh one, bounded at three whole-chain 
 general CAS posture: doubt about the source fails closed, while transport ambiguity may retry only
 inside authority already proved by the last confirmed lease.
 
-GC's own view of a dead server is symmetric and clock-skew-immune: a slot becomes fence-eligible
-only after the leader observes the *same* renewal token hold stable, on its own monotonic clock,
-for `TTL + floor(TTL/20) + period` — close to, but not identical to, the threshold a re-mounting
-server uses to wait out a predecessor, which observes `TTL + floor(TTL/20) + max(1,
-floor(period/2))`. GC starts counting from a clock sample taken after the read that returned the token, so
-time the round spent on a slow `LIST` or `GET` before that read is not credited as time spent watching. Both thresholds are evaluated purely on the observer's own clock and its own
-configured `TTL`/`period`; nothing about the writer's timing travels on the wire. The stamped
-`expires_at_ms` never participates in either decision — it is a writer-stamped diagnostic used by
-`system.cas_mounts` and by the non-authoritative decommission epoch-recovery precheck, never an
-authorization; local fencing is derived instead from the confirmed request's pre-I/O `BOOTTIME`
-anchor plus the TTL, and wall-clock `now` stays audit-only.
+GC's own view of a dead server is symmetric and clock-skew-immune: a slot becomes fence-eligible only
+after the leader observes the *same* renewal token hold stable, on its own monotonic clock, for `TTL +
+floor(TTL/20) + period` — close to, but not identical to, the threshold a re-mounting server uses to
+wait out a predecessor, which observes `TTL + floor(TTL/20) + max(1, floor(period/2))`. GC starts
+counting from a clock sample taken after the read that returned the token, so time the round spent on a
+slow `LIST` or `GET` before that read is not credited as time spent watching. Both thresholds are
+evaluated purely on the observer's own clock and its own configured `TTL`/`period`; nothing about the
+writer's timing travels on the wire. The stamped `expires_at_ms` never participates in either decision —
+it is a writer-stamped diagnostic used by `system.cas_mounts` and by the non-authoritative decommission
+epoch-recovery precheck, never an authorization; local fencing is derived instead from the confirmed
+request's pre-I/O `BOOTTIME` anchor plus the TTL, and wall-clock `now` stays audit-only.
 
 Every server sharing a pool must therefore run the identical `cas_mount_lease_ttl_ms` and
-`cas_mount_renew_period_ms`: a member or GC leader configured with a shorter threshold than its
-peers can fence out a healthy peer whose token-update gap merely exceeds that shorter threshold —
-a peer renewing frequently stays live, one that missed a renewal does not. Change these values only
-with every member of the pool stopped; a graceful restart removes only that member's own startup
-observation and does not make mixed thresholds safe. With the defaults (TTL 30 s, period 10 s, margin 2 s), the startup check
-`period + 2 × envelope + margin < TTL` leaves `TTL − margin − period − 2 × envelope = 4 s` of slack: a
-renewal that starts up to 4 s late still leaves time to admit a write before the next one. A later or
-failing renewal does not fence the mount. Writes stop being admitted shortly before the TTL runs out and
-are refused once it has. Here `envelope = attempt_timeout + 2 × cap` and `cap` is `attempt_timeout` when
-the disk's `connect_timeout_ms` is `0`, else `min(connect_timeout_ms, attempt_timeout)` (7 s with
-defaults).
+`cas_mount_renew_period_ms`: a member or GC leader configured with a shorter threshold than its peers
+can fence out a healthy peer whose token-update gap merely exceeds that shorter threshold — a peer
+renewing frequently stays live, one that missed a renewal does not. Change these values only with every
+member of the pool stopped; a graceful restart removes only that member's own startup observation and
+does not make mixed thresholds safe. With the defaults (TTL 30 s, period 10 s, margin 2 s), the startup
+check `period + 2 × envelope + margin < TTL` leaves `TTL − margin − period − 2 × envelope = 4 s` of
+slack: a renewal that starts up to 4 s late still leaves time to admit a write before the next one. A
+write is admitted only while the remaining lease exceeds the time its requests may still take plus the
+margin: one envelope for a request, two for a ref-log append, so writes stop between 9 s and 16 s before
+the deadline with the defaults. Here `envelope = attempt_timeout + 2 × cap` and `cap` is
+`attempt_timeout` when the disk's `connect_timeout_ms` is `0`, else `min(connect_timeout_ms,
+attempt_timeout)` (7 s with defaults).
 
 ## The two monotone counters {#counters}
 

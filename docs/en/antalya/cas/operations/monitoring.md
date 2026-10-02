@@ -55,16 +55,17 @@ window and correlate them with the `server_root_id` in `system.cas_log`.
 
 | Metric | Counting dimension | Interpretation |
 |---|---|---|
-| `CASMountRenewalAttempts` | One per physical conditional renewal `PUT` sent | Physical object-store load; one logical renewal can contribute several |
+| `CASMountRenewalAttempts` | One per physical conditional renewal `PUT` sent | Physical object-store load; one logical renewal can contribute several. The background renewal counts each `PUT` as it is sent, so the counter keeps rising during an outage |
 | `CASMountRenewalRetries` | One per physical renewal `PUT` after the first in the same logical renewal | Positive growth shows in-period retry, not a later cadence beat |
 | `CASMountRenewalResolved` | One per logical renewal proved committed by an exact resolving `GET` | A response was ambiguous, but exact bytes and `write_attempt_id` proved the write |
 | `CASMountRenewalRecovered` | One per logical renewal committed after a retry or exact resolving `GET` | Recovered object-store blips that retained the existing mount incarnation |
 | `CASMountRenewalDeadlineExceeded` | One per logical renewal stopped by the external lease-safety deadline | The last confirmed lease no longer left enough safe time; this is narrower than request-budget exhaustion |
+| `CASMountLeaseExpired` | One per renewal that restored a lease that had expired | Moves at the restore, not when the lease expires. While it is expired, `system.cas_mounts` shows `lifecycle_reason = 'lease_expired'` and writes are refused; the `watermark_renew` row of the restoring renewal carries `expired_ms` |
 | `CASRemountAttempts` | One per invocation of the existing whole-chain remount attempt | Includes both successful and failed attempts |
 | `CASRemountSucceeded` | One per whole-chain attempt that restored `Live` under a fresh writer epoch | Must be a subset of `CASRemountAttempts` |
 | `CASRemountFailed` | One per whole-chain attempt that returned without restoring `Live` | Includes a named step exception or a step that returned transiently |
 
-`CASMountLeaseLost` complements those eight counters. It increments exactly once per operational
+`CASMountLeaseLost` complements those nine counters. It increments exactly once per operational
 `Live -> TransientNotLive` recovery generation: either the initiating external loss or the first
 ordinary terminal renewal consumer owns it. A parked terminal result and shutdown do not duplicate
 the count.
@@ -77,14 +78,15 @@ FROM system.events
 WHERE event IN (
     'CASMountRenewalAttempts', 'CASMountRenewalRetries', 'CASMountRenewalResolved',
     'CASMountRenewalRecovered', 'CASMountRenewalDeadlineExceeded', 'CASMountLeaseLost',
-    'CASRemountAttempts', 'CASRemountSucceeded', 'CASRemountFailed')
+    'CASMountLeaseExpired', 'CASRemountAttempts', 'CASRemountSucceeded', 'CASRemountFailed')
 SETTINGS system_events_show_zero_values = 1;
 ```
 
 `system.cas_log` records only nontrivial logical renewals. A `watermark_renew` row has outcome
 `recovered` or `failed` — there is no per-attempt `retrying` row; the terminal event is the whole
 story — with detail keys `server_root_id`, `writer_epoch`, `seq`, a shortened `write_attempt_id`,
-`attempts_sent`, `elapsed_ms`, `remaining_confirmed_budget_ms`, and `classification`. The older
+`attempts_sent`, `elapsed_ms`, `remaining_confirmed_budget_ms`, and `classification`, plus
+`expired_ms` on the renewal that restored an expired lease. The older
 `unresolved_reason`, `deadline_source`, and `stop_cause` keys no longer exist; `classification`
 carries what they used to say between them (see [debugging](/antalya/cas/operations/debugging#trace-renewal-remount)
 for the full value list). Ordinary first-attempt
@@ -93,8 +95,9 @@ success produces no row. Every `mount_remount` attempt produces one final row wi
 `error`.
 
 Default-level text logging is bounded per logical operation: the first ambiguous transition may
-emit one retry `WARNING`, followed by one recovery `INFO` or final fence `WARNING`; individual
-physical retries remain `DEBUG`. Each whole-chain remount attempt emits one final default-level line
+emit one retry `WARNING`, followed by one recovery `INFO` or final fence `WARNING`; a renewal that
+restores an expired lease emits one `WARNING` with the expired duration and the last failed request.
+Individual physical retries are not logged. Each whole-chain remount attempt emits one final default-level line
 with its attempt number and last/current step. Use the structured rows for correlation instead of
 counting backend-attempt log lines.
 

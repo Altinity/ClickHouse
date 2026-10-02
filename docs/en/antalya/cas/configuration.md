@@ -96,7 +96,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_blob_hash` | `cityhash128` | Pool blob content-hash function (`cityhash128` \| `xxh3-128` \| `sha256`). Recorded in the pool at creation; a mismatching config is refused at mount |
 | `cas_blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool. One-way: once admitted, the pool carries both algorithms permanently |
 | `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Only the preflight probe is skipped — the conditional-write correctness check still runs on every writable mount. **Not available on a writable generation-token (GCS) disk**, which refuses to mount with it: there, the probe battery is the only proof that a token-exact delete carries its generation precondition. Mount such a disk read-only if you need to defer the check |
-| `cas_mount_lease_ttl_ms` | `30000` | Milliseconds for which a mount lease remains valid after the start of a successful claim or renewal (≥ 1). Writes are never admitted past it. The background renewal keeps retrying after it until the store answers, so an outage longer than the TTL refuses writes but does not fence the mount. Lower values shorten stale-mount recovery but shorten the outage that writes ride out |
+| `cas_mount_lease_ttl_ms` | `30000` | Milliseconds for which a mount lease remains valid after the start of a successful claim or renewal (≥ 1). Writes are never admitted past it, and stop earlier (see below). The background renewal keeps retrying after it until the store answers, so a failing or timing-out renewal does not by itself fence or remount the mount; GC on another pool member can still fence it after the observation threshold above, and a definitive answer from the store (`gc_fenced`, a foreign or successor body, an absent object) ends it. Lower values shorten stale-mount recovery but shorten the outage that writes ride out |
 | `cas_mount_renew_period_ms` | `10000` | Milliseconds between background mount-lease renewals (≥ 1). It must leave enough time for two attempt envelopes (a renewal write and its settlement read) and the lease safety margin before the TTL expires: `period + 2 × envelope + margin < TTL` |
 | `cas_gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
 | `cas_gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
@@ -131,8 +131,13 @@ With the defaults, `cas_mount_lease_ttl_ms − cas_lease_safety_margin_ms − ca
 still leaves time to admit a write before the next one. Here `envelope = cas_attempt_timeout_ms + 2 × cap`
 (7000 ms with defaults) and `cap` is `cas_attempt_timeout_ms` when the disk's `connect_timeout_ms` is `0`,
 else `min(connect_timeout_ms, cas_attempt_timeout_ms)` (1000 ms with defaults). The background renewal
-retries, about a second apart, until the store answers. It does not stop at the lease deadline. New
-writes stop being admitted shortly before the TTL runs out and are refused once it has.
+retries, about a second apart, until the store answers. It does not stop at the lease deadline.
+
+A write is admitted only while the remaining lease exceeds the time its requests may still take plus
+`cas_lease_safety_margin_ms`: one attempt envelope for a request, two for a ref-log append (the write
+and its settlement read). With the defaults (envelope 7000 ms, margin 2000 ms) writes stop between
+9000 ms and 16000 ms before the 30000 ms deadline. `system.cas_mounts` still shows `lifecycle = 'live'`
+until the deadline itself passes; from then it shows `lifecycle_reason = 'lease_expired'`.
 
 The `expires_at_ms` stamped into the mount object is a writer-stamped diagnostic used by
 `system.cas_mounts` and by the non-authoritative decommission epoch-recovery precheck; it never

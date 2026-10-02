@@ -129,9 +129,11 @@ row followed by a `recovered` one — and the older `unresolved_reason`, `deadli
 `stop_cause` keys are gone; everything they used to distinguish is now named directly by
 `classification`. Interpret the sequence as follows:
 
-- `outcome = 'recovered'` means an in-budget renewal landed, in the same epoch. `classification`
-  says how: `committed_by_read` means an exact `GET` proved a landed request; `committed_after_retry`
-  means a later identical physical `PUT` completed and the response itself proved it.
+- `outcome = 'recovered'` means a renewal landed in the same epoch after a retry, an exact `GET`, or an
+  expired lease. `classification` says how: `committed_by_read` means an exact `GET` proved a landed
+  request; `committed_after_retry` means a later identical physical `PUT` completed and the response
+  itself proved it; `committed_after_expiry` means the renewal restored a lease that had expired (the
+  row also has `expired_ms`). When more than one applies, the first of those three in that order wins.
 - `outcome = 'failed'` carries the decisive `classification`: `external_lease_deadline` (the
   confirmed lease's own safety margin, not the request policy, ran out first — check object-store
   latency or `BOOTTIME` advancement before anything else), `request_deadline` (the ninety-second
