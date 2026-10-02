@@ -549,12 +549,14 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 ///   - foreign uuid → fail closed;
 ///   - absent → `create`; expired-our-uuid (any epoch) → `replace` reclaim.
 ///
-/// PLANES. Only the RENEWAL is admitted under the mount fence, because only a renewal writes under
-/// authority the fence is tracking. The claim and the farewell are admitted off it: a self-remount
-/// claims with the fence already latched lost, so a claim gated on the fence could never reclaim, and
-/// a farewell refused because the fence has run down would leave the slot looking live until GC
-/// fences it out. Neither is unguarded: a claim's safety is its own conditional write, and a caller
-/// that has shutdown facts hands them over as a `Liveness`.
+/// PLANES. A bounded renewal is admitted under the mount fence, because it writes under the authority
+/// the fence tracks. The worker's renewal (`UntilDefinitive`) runs on a plane with no lease budget: it
+/// keeps trying after the lease expired, and a stop, a park or a terminal lifecycle reaches it through
+/// its liveness. The claim and the farewell are admitted off the fence: a self-remount claims with the
+/// fence already latched lost, so a claim gated on the fence could never reclaim, and a farewell
+/// refused because the fence has run down would leave the slot looking live until GC fences it out.
+/// Neither is unguarded: a claim's safety is its own conditional write, and a caller that has shutdown
+/// facts hands them over as a `Liveness`.
 class MountLeaseRenewer
 {
 public:
@@ -573,7 +575,9 @@ public:
     /// Adopt the already-claimed mount. Returns the exact pre-I/O BOOTTIME anchor. `liveness` carries
     /// the caller's shutdown terms; the mount fence is deliberately not consulted here.
     uint64_t start(Liveness liveness = {});
-    /// The steady-state renewal, admitted under the mount fence.
+    /// The steady-state renewal. `LeaseBound` runs under the mount fence with `Retry::untilLeaseSafe`;
+    /// `UntilDefinitive` runs on the worker plane with `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`
+    /// and ends only on a definitive answer or when `environment.live` refuses.
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
     /// The remount's re-anchor, which is bootstrap control rather than steady state: a remount renews
     /// BEFORE it arms the fence for the new incarnation, so the fence is still latched lost and an

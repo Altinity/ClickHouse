@@ -8,6 +8,7 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
+#include <Poco/Exception.h>
 #include <Core/UUID.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
@@ -1315,6 +1316,20 @@ constexpr uint64_t kFarewellBudgetMs = 10'000;
 /// "admission-time arithmetic needs room to actually run, not just to pass at t=0".
 constexpr uint64_t kFarewellSlackMs = 2'000;
 
+namespace
+{
+/// The text of a failed request as an operator should read it: a `DB::Exception`'s message, a Poco
+/// exception's display text (its `what` is only the class name), any other exception's `what`.
+String describeRequestFailure(const std::exception & failure)
+{
+    if (const auto * db_failure = dynamic_cast<const Exception *>(&failure))
+        return db_failure->message();
+    if (const auto * poco_failure = dynamic_cast<const Poco::Exception *>(&failure))
+        return poco_failure->displayText();
+    return failure.what();
+}
+}
+
 MountLeaseRenewer::MountLeaseRenewer(
     CasRequests & mount_requests_, CasRequests & open_requests_, CasRequests & worker_requests_,
     const Layout & layout_,
@@ -1622,11 +1637,22 @@ MountRenewResult MountLeaseRenewer::renewOn(
     result.attempt_start_boot_ms = attempt_start_boot_ms;
 
     CasOperation op = plane.admit(environment.live);
+    if (environment.on_request)
+        op.setRequestObserver([&on_request = environment.on_request](uint32_t attempt_no, const std::exception * failure)
+        {
+            on_request(MountRenewRequestEvent{
+                .request_no = attempt_no,
+                .failed = failure != nullptr,
+                .failure_text = failure ? describeRequestFailure(*failure) : String{},
+            });
+        });
+    const Retry policy = environment.policy == MountRenewPolicy::UntilDefinitive
+        ? Retry::untilDefinitive(kMountRenewRetrySpacingMs)
+        : Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()));
     std::optional<WriteResult> written;
     try
     {
-        written = op.replace(key, body, precondition(),
-            Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count())));
+        written = op.replace(key, body, precondition(), policy);
     }
     catch (...)
     {
@@ -1761,8 +1787,8 @@ void MountLeaseRenewer::terminate(CasOperation & op)
         : doubled_reservation_ms + kFarewellSlackMs;
     const uint64_t farewell_window_ms = std::max<uint64_t>(kFarewellBudgetMs, two_envelope_reservation_plus_slack_ms);
     /// The derived window alone is not enough: mount-control activity must also never run past the
-    /// point this node's own fence may already be gone (the same rule `renew` enforces via
-    /// `Retry::untilLeaseSafe` above). The precondition on this write already stops it from clobbering
+    /// point this node's own fence may already be gone (the rule a bounded renewal enforces with
+    /// `Retry::untilLeaseSafe`). The precondition on this write already stops it from clobbering
     /// a successor if it DOES land late, but a shutdown holding the process open to retry a write past
     /// its own lease-safe deadline serves no one -- the successor's own reclaim does not wait for it.
     /// `confirmed_deadline_boot_ms` is set at `start()` and kept current by every successful `renew`,

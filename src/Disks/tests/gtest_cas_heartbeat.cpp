@@ -12,7 +12,9 @@
 
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -21,6 +23,8 @@ namespace DB::ErrorCodes
 {
     extern const int NETWORK_ERROR;
     extern const int ABORTED;
+    extern const int CORRUPTED_DATA;
+    extern const int FILE_DOESNT_EXIST;
 }
 
 using namespace DB::Cas;
@@ -98,6 +102,8 @@ public:
         ReturnThenCancel,
         ThrowBeforeThenLandAfterResolve,
         ThrowConnectHint,
+        ThrowFirstAttemptFuse,
+        ThrowStoreRefusal,
     };
 
     struct Attempt
@@ -111,6 +117,17 @@ public:
     std::vector<Attempt> attempts;
     std::function<void()> cancel_after_write;
     uint64_t read_calls = 0;
+    /// Consulted when `actions` is empty: TRUE fails the guarded write with `outage_action`.
+    std::function<bool()> outage;
+    Action outage_action = Action::ThrowBefore;
+    /// Scripted answers for reads of a mount slot: `ThrowBefore` and `ThrowFirstAttemptFuse` fail the
+    /// read, `Delegate` serves it. Consulted before `read_outage`.
+    std::deque<Action> read_actions;
+    /// TRUE fails a read of a mount slot with a transport timeout.
+    std::function<bool()> read_outage;
+    /// Called on every scripted write and on every read of a mount slot, before it is answered.
+    std::function<void()> on_attempt;
+    std::function<void()> on_read;
 
     /// Only a GUARDED write of a mount slot is scripted; the fixture's own seeding and every other
     /// key reach the store untouched.
@@ -122,9 +139,18 @@ public:
             return InMemoryBackend::write(key, bytes, expected_value, access);
 
         attempts.push_back({key, bytes, expected_value});
-        const Action action = actions.empty() ? Action::Delegate : actions.front();
+        if (on_attempt)
+            on_attempt();
+        Action action = Action::Delegate;
         if (!actions.empty())
+        {
+            action = actions.front();
             actions.pop_front();
+        }
+        else if (outage && outage())
+        {
+            action = outage_action;
+        }
 
         if (action == Action::ThrowConnectHint)
         {
@@ -133,6 +159,16 @@ public:
                                   Aws::S3::S3Errors::NETWORK_CONNECTION);
 #else
             throw Poco::TimeoutException("connect timed out");
+#endif
+        }
+        if (action == Action::ThrowFirstAttemptFuse)
+            throwFirstAttemptFuse();
+        if (action == Action::ThrowStoreRefusal)
+        {
+#if USE_AWS_S3
+            throw DB::S3Exception("the store answered MalformedXML", Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
+#else
+            throw DB::Exception(DB::ErrorCodes::ABORTED, "a store refusal needs USE_AWS_S3");
 #endif
         }
 
@@ -158,6 +194,24 @@ public:
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         ++read_calls;
+        if (key.ends_with("/mount"))
+        {
+            if (on_read)
+                on_read();
+            if (!read_actions.empty())
+            {
+                const Action action = read_actions.front();
+                read_actions.pop_front();
+                if (action == Action::ThrowFirstAttemptFuse)
+                    throwFirstAttemptFuse();
+                if (action == Action::ThrowBefore)
+                    throw Poco::TimeoutException("injected renewal read failure");
+            }
+            else if (read_outage && read_outage())
+            {
+                throw Poco::TimeoutException("injected renewal read outage");
+            }
+        }
         std::optional<Raw> result = InMemoryBackend::read(key, access);
         if (pending && pending->key == key)
         {
@@ -171,6 +225,16 @@ public:
     }
 
 private:
+    /// The adaptive first-attempt timeout the engine reissues at once.
+    [[noreturn]] static void throwFirstAttemptFuse()
+    {
+#if USE_AWS_S3
+        throw DB::S3Exception("Timeout", Aws::S3::S3Errors::NETWORK_CONNECTION);
+#else
+        throw Poco::TimeoutException("first-attempt fuse");
+#endif
+    }
+
     std::optional<Attempt> pending;
 };
 
@@ -1348,4 +1412,565 @@ TEST(CASHeartbeat, RenewalStopsBeforeTheCutoffWhenEveryAttemptConsumesTheEnvelop
     const MountRenewResult result = renewer.renew(renewalEnvironment(boot_ms));
     EXPECT_EQ(result.outcome, MountRenewOutcome::Terminal);
     EXPECT_LE(boot_ms, cutoff) << "the last attempt started inside the cutoff and the engine did not start one that could not finish";
+}
+
+namespace
+{
+/// The production shape at test scale: a 30 s lease, renewed one 10 s period after its anchor, with a
+/// 2 s safety margin and the 7 s attempt envelope a bounded renewal reserves twice before each
+/// request. That leaves a bounded renewal about 4 s of retries; an `UntilDefinitive` one has no bound.
+class UnboundedRenewalFixture
+{
+public:
+    static constexpr uint64_t ttl_ms = 30'000;
+    static constexpr uint64_t period_ms = 10'000;
+    static constexpr uint64_t margin_ms = 2'000;
+
+    UnboundedRenewalFixture()
+    {
+        backend->setAttemptTimeoutMs(7'000);
+        ops = std::make_unique<Ops>(backend, &boot_ms);
+        seedOwnClaim(ops->op, layout, "test", UInt128{1}, 9, wall_ms, ttl_ms);
+        renewer = std::make_unique<MountLeaseRenewer>(
+            ops->mount, ops->farewell, ops->lease, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(ttl_ms),
+            [this] { return wall_ms; }, [] { return uint64_t{0}; },
+            [this](CasEvent event) { events.push_back(std::move(event)); },
+            std::chrono::milliseconds(margin_ms), [this] { return boot_ms; });
+        anchor = renewer->start();
+        backend->attempts.clear();
+        backend->read_calls = 0;
+        events.clear();
+        boot_ms = anchor + period_ms;
+        renewal_start = boot_ms;
+    }
+
+    UnboundedRenewalFixture(const UnboundedRenewalFixture &) = delete;
+    UnboundedRenewalFixture & operator=(const UnboundedRenewalFixture &) = delete;
+
+    MountRenewResult renew(
+        MountRenewPolicy policy,
+        const std::function<bool()> & live = {},
+        const std::function<bool()> & cancelled = {},
+        std::function<void(const MountRenewRequestEvent &)> on_request = {})
+    {
+        MountRenewOperationEnvironment environment = renewalEnvironment(boot_ms, live, cancelled);
+        environment.policy = policy;
+        environment.on_request = std::move(on_request);
+        return renewer->renew(environment);
+    }
+
+    /// The `branch` of every `MountConflict` event, in order.
+    std::vector<String> conflictBranches() const
+    {
+        std::vector<String> branches;
+        for (const CasEvent & event : events)
+            if (event.type == CasEventType::MountConflict)
+                branches.push_back(event.detail.at("branch"));
+        return branches;
+    }
+
+    String mountKey() const { return layout.mountKey("test"); }
+
+    std::shared_ptr<RenewalScriptBackend> backend = std::make_shared<RenewalScriptBackend>();
+    Layout layout{"pool"};
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    std::vector<CasEvent> events;
+    std::unique_ptr<Ops> ops;
+    std::unique_ptr<MountLeaseRenewer> renewer;
+    uint64_t anchor = 0;
+    uint64_t renewal_start = 0;
+};
+
+/// A request start (`P`) or a resolve read (`R`), with the boot clock when it was issued.
+using RequestLog = std::vector<std::pair<char, uint64_t>>;
+
+bool inSpacing(uint64_t gap_ms)
+{
+    return gap_ms >= kMountRenewRetrySpacingMs * 8 / 10 && gap_ms <= kMountRenewRetrySpacingMs * 12 / 10;
+}
+}
+
+/// An outage longer than the cutoff a bounded renewal reserves for is retried to its end.
+TEST(CASHeartbeat, RenewalOutlivesTheReservationCutoff)
+{
+    UnboundedRenewalFixture f;
+    f.backend->outage = [&] { return f.boot_ms < f.renewal_start + 8'000; };
+
+    const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive);
+
+    ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
+    EXPECT_EQ(f.renewer->state(), MountLeaseRenewerState::Active);
+    /// One request per spacing interval of 800 to 1200 ms until the outage ends, then the one that lands.
+    EXPECT_GE(f.backend->attempts.size(), 8u);
+    EXPECT_LE(f.backend->attempts.size(), 11u);
+    EXPECT_EQ(static_cast<size_t>(result.attempts_sent), f.backend->attempts.size());
+}
+
+TEST(CASHeartbeat, RenewalSendsOneTupleOnEveryAttempt)
+{
+    UnboundedRenewalFixture f;
+    f.backend->outage = [&] { return f.boot_ms < f.renewal_start + 8'000; };
+
+    const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive);
+
+    ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
+    const auto & attempts = f.backend->attempts;
+    ASSERT_GT(attempts.size(), 1u);
+    const UInt128 attempt_id = decodeMountLease(attempts.front().bytes).write_attempt_id;
+    for (const auto & attempt : attempts)
+    {
+        EXPECT_EQ(attempt.key, attempts.front().key);
+        EXPECT_EQ(attempt.bytes, attempts.front().bytes);
+        EXPECT_EQ(attempt.expected, attempts.front().expected);
+        EXPECT_EQ(decodeMountLease(attempt.bytes).write_attempt_id, attempt_id);
+    }
+    EXPECT_EQ(f.ops->op.read(f.mountKey(), Retry::standard())->bytes, attempts.front().bytes)
+        << "the body that landed is the one every attempt carried";
+}
+
+TEST(CASHeartbeat, RenewalSucceedsPastTheDeadlineWithItsFirstStart)
+{
+    UnboundedRenewalFixture f;
+    f.backend->outage = [&] { return f.boot_ms < f.anchor + UnboundedRenewalFixture::ttl_ms + 15'000; };
+
+    const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive);
+
+    ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
+    EXPECT_EQ(result.attempt_start_boot_ms, f.renewal_start);
+    EXPECT_EQ(f.renewer->lastCommittedAttemptStartBootMs(), f.renewal_start);
+    EXPECT_LT(result.attempt_start_boot_ms + UnboundedRenewalFixture::ttl_ms, f.boot_ms)
+        << "the lease this success confirms is already over";
+}
+
+TEST(CASHeartbeat, LandedAttemptIsAdoptedAfterALongOutage)
+{
+    UnboundedRenewalFixture f;
+    f.backend->actions = {RenewalScriptBackend::Action::LandThenThrow};
+    f.backend->read_outage = [&] { return f.boot_ms < f.anchor + UnboundedRenewalFixture::ttl_ms + 15'000; };
+    std::vector<MountRenewRequestEvent> reported;
+
+    const MountRenewResult result = f.renew(
+        MountRenewPolicy::UntilDefinitive, {}, {}, [&](const MountRenewRequestEvent & event) { reported.push_back(event); });
+    const uint64_t reads = f.backend->read_calls;
+
+    ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
+    EXPECT_TRUE(result.resolved_by_read);
+    EXPECT_EQ(result.attempts_sent, 1u);
+    EXPECT_GT(f.boot_ms, f.anchor + UnboundedRenewalFixture::ttl_ms) << "the adopting read came after the deadline";
+    EXPECT_TRUE(f.conflictBranches().empty()) << "an adopted attempt is not a conflict such as same_epoch_state_uncertain";
+    EXPECT_EQ(decodeMountLease(f.ops->op.read(f.mountKey(), Retry::standard())->bytes).write_attempt_id,
+              decodeMountLease(f.backend->attempts.front().bytes).write_attempt_id);
+
+    /// The one PUT sent, its failure, then one failed event per failed read; the last read succeeded.
+    ASSERT_GE(reads, 2u);
+    ASSERT_EQ(reported.size(), 2 + (reads - 1));
+    EXPECT_FALSE(reported[0].failed);
+    EXPECT_TRUE(reported[1].failed);
+    EXPECT_NE(reported[1].failure_text.find("injected renewal response loss after commit"), String::npos)
+        << reported[1].failure_text;
+    for (size_t i = 2; i < reported.size(); ++i)
+    {
+        EXPECT_EQ(reported[i].request_no, 1u) << i;
+        EXPECT_TRUE(reported[i].failed) << i << ": no request but the first PUT was sent";
+        EXPECT_NE(reported[i].failure_text.find("injected renewal read outage"), String::npos)
+            << i << ": " << reported[i].failure_text;
+    }
+}
+
+/// Each definitive answer, met by a request sent past the deadline, ends the renewal with today's
+/// classification.
+TEST(CASHeartbeat, DefinitiveAnswersStayTerminalPastTheDeadline)
+{
+    enum class Answer : uint8_t { GcFenced, Foreign, NewerOwnEpoch, OwnEpochOtherBytes, Absent, StoreRefusal, LocalFailure };
+    const auto run = [](Answer answer)
+    {
+        UnboundedRenewalFixture f;
+        const String key = f.mountKey();
+        const auto replace_slot = [&](const std::function<void(MountLease &)> & change)
+        {
+            const auto got = f.ops->op.read(key, Retry::standard());
+            ASSERT_TRUE(got.has_value());
+            MountLease lease = decodeMountLease(got->bytes);
+            change(lease);
+            ++lease.seq;
+            mustCommit(f.ops->op.replace(key, encodeMountLease(lease), got->etag, Retry::standard()), "changed slot");
+        };
+        switch (answer)
+        {
+            case Answer::GcFenced:
+                replace_slot([](MountLease & lease) { lease.gc_fenced = true; });
+                break;
+            case Answer::Foreign:
+                replace_slot([](MountLease & lease) { lease.server_uuid = UInt128{2}; });
+                break;
+            case Answer::NewerOwnEpoch:
+                replace_slot([](MountLease & lease) { lease.writer_epoch = 10; });
+                break;
+            case Answer::OwnEpochOtherBytes:
+                replace_slot([](MountLease & lease) { lease.write_attempt_id = UInt128{0xAAAA}; });
+                break;
+            case Answer::Absent:
+            {
+                const auto got = f.ops->op.read(key, Retry::standard());
+                ASSERT_TRUE(got.has_value());
+                ASSERT_EQ(f.ops->op.remove(key, got->etag, Retry::standard()), Removal::Removed);
+                break;
+            }
+            case Answer::StoreRefusal:
+#if USE_AWS_S3
+                f.backend->failNextWriteWith(key, std::make_exception_ptr(DB::S3Exception(
+                    "the store answered MalformedXML", Aws::S3::S3Errors::UNKNOWN, "MalformedXML")));
+#endif
+                break;
+            case Answer::LocalFailure:
+                f.backend->failNextWriteWith(key, std::make_exception_ptr(DB::Exception(
+                    DB::ErrorCodes::CORRUPTED_DATA, "injected deterministic local failure")));
+                break;
+        }
+        f.backend->attempts.clear();
+        f.events.clear();
+        /// Past the lease: a bounded renewal would send nothing here.
+        f.boot_ms = f.anchor + UnboundedRenewalFixture::ttl_ms + 1'000;
+
+        const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive);
+
+        const DB::Exception failure = terminalException(result);
+        EXPECT_EQ(f.renewer->state(), MountLeaseRenewerState::RenewalTerminal);
+        EXPECT_EQ(f.backend->attempts.size(), 1u) << "the answer came to a request sent past the deadline";
+        const std::vector<String> branches = f.conflictBranches();
+        switch (answer)
+        {
+            case Answer::GcFenced:
+                EXPECT_EQ(branches, std::vector<String>{"fenced_by_gc"});
+                break;
+            case Answer::Foreign:
+                EXPECT_EQ(branches, std::vector<String>{"foreign_writer"});
+                break;
+            case Answer::NewerOwnEpoch:
+                EXPECT_EQ(branches, std::vector<String>{"superseded"});
+                break;
+            case Answer::OwnEpochOtherBytes:
+                EXPECT_EQ(branches, std::vector<String>{"same_epoch_state_uncertain"});
+                break;
+            case Answer::Absent:
+                EXPECT_EQ(branches, std::vector<String>{"vanished"});
+                EXPECT_EQ(failure.code(), DB::ErrorCodes::FILE_DOESNT_EXIST) << failure.message();
+                break;
+            case Answer::StoreRefusal:
+                EXPECT_TRUE(branches.empty());
+                EXPECT_NE(failure.message().find("the store refused the renewal"), String::npos) << failure.message();
+                break;
+            case Answer::LocalFailure:
+                EXPECT_TRUE(branches.empty());
+                EXPECT_EQ(failure.code(), DB::ErrorCodes::CORRUPTED_DATA) << failure.message();
+                EXPECT_NE(failure.message().find("injected deterministic local failure"), String::npos);
+                break;
+        }
+    };
+    for (Answer answer : {Answer::GcFenced, Answer::Foreign, Answer::NewerOwnEpoch, Answer::OwnEpochOtherBytes,
+                          Answer::Absent, Answer::StoreRefusal, Answer::LocalFailure})
+    {
+#if !USE_AWS_S3
+        if (answer == Answer::StoreRefusal)
+            continue;
+#endif
+        SCOPED_TRACE(static_cast<int>(answer));
+        run(answer);
+    }
+}
+
+/// The cut-off node's story: renewals fail past the deadline, GC on a healthy node fences the slot,
+/// and the first request that reaches the store reads the fence.
+TEST(CASHeartbeat, AFenceSeenAfterALongOutageEndsTheRenewal)
+{
+    UnboundedRenewalFixture f;
+    const uint64_t fenced_at = f.anchor + UnboundedRenewalFixture::ttl_ms + 15'000;
+    bool fenced = false;
+    f.backend->outage = [&] { return !fenced; };
+    f.ops->lease.setSleepFnForTest([&](uint64_t ms)
+    {
+        f.boot_ms += ms;
+        if (fenced || f.boot_ms < fenced_at)
+            return;
+        fenced = true;
+        const auto got = f.ops->op.read(f.mountKey(), Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease lease = decodeMountLease(got->bytes);
+        lease.gc_fenced = true;
+        ++lease.seq;
+        mustCommit(f.ops->op.replace(f.mountKey(), encodeMountLease(lease), got->etag, Retry::standard()), "fence-out");
+    });
+
+    const MountRenewResult result = f.renew(MountRenewPolicy::UntilDefinitive);
+
+    const DB::Exception failure = terminalException(result);
+    EXPECT_NE(failure.message().find("fenced by GC"), String::npos) << failure.message();
+    EXPECT_EQ(f.conflictBranches(), std::vector<String>{"fenced_by_gc"});
+    EXPECT_GE(f.boot_ms, fenced_at);
+}
+
+#if USE_AWS_S3
+/// After an unclear attempt the engine cannot tell whether that attempt will still land, so a refusal
+/// is not an answer about the slot: the renewal keeps retrying at the spacing until a stop ends it.
+TEST(CASHeartbeat, ARefusalAfterAnUnclearAttemptIsRetriedUntilStopped)
+{
+    UnboundedRenewalFixture f;
+    f.backend->actions = {RenewalScriptBackend::Action::ThrowBefore};
+    f.backend->outage = [] { return true; };
+    f.backend->outage_action = RenewalScriptBackend::Action::ThrowStoreRefusal;
+    std::vector<uint64_t> sent_at;
+    f.backend->on_attempt = [&] { sent_at.push_back(f.boot_ms); };
+    bool stopped = false;
+    f.ops->lease.setSleepFnForTest([&](uint64_t ms)
+    {
+        f.boot_ms += ms;
+        if (f.boot_ms >= f.renewal_start + 30'000)
+            stopped = true;
+    });
+    std::vector<MountRenewRequestEvent> reported;
+
+    const MountRenewResult result = f.renew(
+        MountRenewPolicy::UntilDefinitive, /*live=*/[&] { return !stopped; }, /*cancelled=*/[&] { return stopped; },
+        [&](const MountRenewRequestEvent & event) { reported.push_back(event); });
+
+    const DB::Exception failure = terminalException(result);
+    EXPECT_EQ(failure.code(), DB::ErrorCodes::NETWORK_ERROR) << failure.message();
+    EXPECT_EQ(f.renewer->state(), MountLeaseRenewerState::RenewalTerminal);
+    EXPECT_TRUE(f.conflictBranches().empty()) << "the read kept showing our own unchanged body";
+
+    /// One PUT per spacing interval over the 30 s the store kept refusing.
+    ASSERT_GE(sent_at.size(), 2u);
+    for (size_t i = 1; i < sent_at.size(); ++i)
+        EXPECT_TRUE(inSpacing(sent_at[i] - sent_at[i - 1])) << i << ": " << sent_at[i] - sent_at[i - 1];
+    EXPECT_GE(sent_at.size(), 30'000 / (kMountRenewRetrySpacingMs * 12 / 10));
+    EXPECT_LE(sent_at.size(), 30'000 / (kMountRenewRetrySpacingMs * 8 / 10) + 1);
+
+    /// Every refusal was reported as a failed request.
+    size_t refusals = 0;
+    for (const MountRenewRequestEvent & event : reported)
+        if (event.failed && event.failure_text.find("MalformedXML") != String::npos)
+            ++refusals;
+    EXPECT_EQ(refusals, sent_at.size() - 1) << "every PUT after the unclear first one was refused";
+}
+#endif
+
+TEST(CASHeartbeat, RenewalSpacesRetries)
+{
+#if USE_AWS_S3
+    {
+        SCOPED_TRACE("fast connect failures");
+        UnboundedRenewalFixture f;
+        RequestLog log;
+        f.backend->on_attempt = [&] { log.emplace_back('P', f.boot_ms); };
+        f.backend->on_read = [&] { log.emplace_back('R', f.boot_ms); };
+        f.backend->actions = {RenewalScriptBackend::Action::ThrowFirstAttemptFuse};
+        f.backend->outage = [&] { return f.boot_ms < f.renewal_start + 30'500; };
+        f.backend->outage_action = RenewalScriptBackend::Action::ThrowConnectHint;
+
+        ASSERT_EQ(f.renew(MountRenewPolicy::UntilDefinitive).outcome, MountRenewOutcome::Committed);
+
+        ASSERT_GE(log.size(), 4u);
+        /// The fuse: its settling read and its reissue follow at once.
+        EXPECT_EQ(log[0], std::make_pair('P', f.renewal_start));
+        EXPECT_EQ(log[1], std::make_pair('R', f.renewal_start));
+        EXPECT_EQ(log[2], std::make_pair('P', f.renewal_start));
+        /// A connect failure is reissued without a read, one spacing interval after it started.
+        for (size_t i = 3; i < log.size(); ++i)
+        {
+            EXPECT_EQ(log[i].first, 'P') << i;
+            EXPECT_TRUE(inSpacing(log[i].second - log[i - 1].second)) << i << ": " << log[i].second - log[i - 1].second;
+        }
+        EXPECT_GE(log.back().second, f.renewal_start + 30'000) << "still renewing after 30 s";
+    }
+#endif
+    {
+        SCOPED_TRACE("unclear PUT with a failing read");
+        UnboundedRenewalFixture f;
+        RequestLog log;
+        f.backend->on_attempt = [&] { log.emplace_back('P', f.boot_ms); };
+        f.backend->on_read = [&] { log.emplace_back('R', f.boot_ms); };
+        f.backend->read_actions = {RenewalScriptBackend::Action::ThrowBefore, RenewalScriptBackend::Action::ThrowBefore};
+        f.backend->outage = [&] { return f.boot_ms < f.renewal_start + 30'500; };
+
+        ASSERT_EQ(f.renew(MountRenewPolicy::UntilDefinitive).outcome, MountRenewOutcome::Committed);
+
+        ASSERT_GE(log.size(), 6u);
+        const uint64_t t0 = f.renewal_start;
+        EXPECT_EQ(log[0], std::make_pair('P', t0));
+        EXPECT_EQ(log[1], std::make_pair('R', t0)) << "the read that settles an unclear PUT is sent at once";
+        EXPECT_EQ(log[2].first, 'R');
+        EXPECT_TRUE(inSpacing(log[2].second - log[1].second)) << log[2].second - log[1].second;
+        EXPECT_EQ(log[3].first, 'R');
+        EXPECT_TRUE(inSpacing(log[3].second - log[2].second)) << log[3].second - log[2].second;
+        EXPECT_EQ(log[4], std::make_pair('P', log[3].second))
+            << "more than one interval has passed since the PUT started, so it is retried at once";
+        uint64_t previous_put = log[4].second;
+        for (size_t i = 5; i < log.size(); ++i)
+        {
+            if (log[i].first == 'R')
+            {
+                EXPECT_EQ(log[i].second, log[i - 1].second) << i;
+                continue;
+            }
+            EXPECT_TRUE(inSpacing(log[i].second - previous_put)) << i << ": " << log[i].second - previous_put;
+            previous_put = log[i].second;
+        }
+        EXPECT_GE(previous_put, t0 + 30'000) << "still renewing after 30 s";
+    }
+#if USE_AWS_S3
+    {
+        SCOPED_TRACE("first-attempt fuse of the read");
+        UnboundedRenewalFixture f;
+        RequestLog log;
+        f.backend->on_attempt = [&] { log.emplace_back('P', f.boot_ms); };
+        f.backend->on_read = [&] { log.emplace_back('R', f.boot_ms); };
+        f.backend->actions = {RenewalScriptBackend::Action::ThrowBefore};
+        f.backend->read_actions = {RenewalScriptBackend::Action::ThrowFirstAttemptFuse};
+
+        ASSERT_EQ(f.renew(MountRenewPolicy::UntilDefinitive).outcome, MountRenewOutcome::Committed);
+
+        ASSERT_EQ(log.size(), 4u);
+        EXPECT_EQ(log[1], std::make_pair('R', f.renewal_start));
+        EXPECT_EQ(log[2], std::make_pair('R', f.renewal_start)) << "a fused read is reissued at once";
+        EXPECT_EQ(log[3].first, 'P');
+        EXPECT_TRUE(inSpacing(log[3].second - log[0].second)) << log[3].second - log[0].second;
+    }
+#endif
+    {
+        SCOPED_TRACE("slow requests");
+        UnboundedRenewalFixture f;
+        RequestLog log;
+        bool failing = false;
+        f.backend->on_attempt = [&]
+        {
+            log.emplace_back('P', f.boot_ms);
+            failing = f.boot_ms < f.renewal_start + 30'500;
+            if (failing)
+                f.boot_ms += 5'000;
+        };
+        f.backend->on_read = [&] { log.emplace_back('R', f.boot_ms); };
+        f.backend->outage = [&] { return failing; };
+
+        ASSERT_EQ(f.renew(MountRenewPolicy::UntilDefinitive).outcome, MountRenewOutcome::Committed);
+
+        ASSERT_GE(log.size(), 3u);
+        std::optional<uint64_t> previous_put;
+        for (size_t i = 0; i < log.size(); ++i)
+        {
+            if (log[i].first == 'R')
+            {
+                EXPECT_EQ(log[i].second, log[i - 1].second + 5'000) << i;
+                continue;
+            }
+            if (previous_put)
+                EXPECT_EQ(log[i].second, *previous_put + 5'000) << i << ": a 5 s request is retried with no wait";
+            previous_put = log[i].second;
+        }
+        EXPECT_GE(*previous_put, f.renewal_start + 30'000) << "still renewing after 30 s";
+    }
+}
+
+TEST(CASHeartbeat, StopDuringARetryWaitEndsTheRenewal)
+{
+    {
+        SCOPED_TRACE("a stop during the wait");
+        UnboundedRenewalFixture f;
+        bool stopped = false;
+        std::vector<uint64_t> waits;
+        f.backend->outage = [] { return true; };
+        /// The stop wakes the wait, so the clock does not move.
+        f.ops->lease.setSleepFnForTest([&](uint64_t ms)
+        {
+            waits.push_back(ms);
+            stopped = true;
+        });
+
+        const MountRenewResult result = f.renew(
+            MountRenewPolicy::UntilDefinitive, /*live=*/[&] { return !stopped; }, /*cancelled=*/[&] { return stopped; });
+
+        const DB::Exception failure = terminalException(result);
+        EXPECT_EQ(failure.code(), DB::ErrorCodes::NETWORK_ERROR) << failure.message();
+        ASSERT_EQ(waits.size(), 1u);
+        EXPECT_TRUE(inSpacing(waits[0])) << waits[0];
+        EXPECT_EQ(f.backend->attempts.size(), 1u) << "nothing is sent after the stop";
+        EXPECT_EQ(f.renewer->state(), MountLeaseRenewerState::RenewalTerminal);
+        EXPECT_FALSE(f.renewer->canRelease());
+    }
+    {
+        SCOPED_TRACE("a stop after the renewal began, before its first send");
+        UnboundedRenewalFixture f;
+
+        const MountRenewResult result = f.renew(
+            MountRenewPolicy::UntilDefinitive, /*live=*/[] { return false; }, /*cancelled=*/[] { return false; });
+
+        (void)terminalException(result);
+        EXPECT_TRUE(f.backend->attempts.empty());
+        EXPECT_FALSE(f.renewer->canRelease());
+    }
+}
+
+TEST(CASHeartbeat, RenewalReportsEachRequestAsItHappens)
+{
+    UnboundedRenewalFixture f;
+    f.backend->actions = {RenewalScriptBackend::Action::ThrowBefore, RenewalScriptBackend::Action::ThrowBefore};
+    std::vector<MountRenewRequestEvent> reported;
+
+    const MountRenewResult result = f.renew(
+        MountRenewPolicy::UntilDefinitive, {}, {}, [&](const MountRenewRequestEvent & event) { reported.push_back(event); });
+
+    ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
+    const std::vector<std::pair<uint32_t, bool>> expected{{1, false}, {1, true}, {2, false}, {2, true}, {3, false}};
+    ASSERT_EQ(reported.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i)
+    {
+        EXPECT_EQ(reported[i].request_no, expected[i].first) << i;
+        EXPECT_EQ(reported[i].failed, expected[i].second) << i;
+        if (reported[i].failed)
+            EXPECT_NE(reported[i].failure_text.find("injected renewal response uncertainty"), String::npos)
+                << reported[i].failure_text;
+        else
+            EXPECT_TRUE(reported[i].failure_text.empty()) << i;
+    }
+}
+
+TEST(CASHeartbeat, AThrowingRequestReportChangesNoOutcome)
+{
+    UnboundedRenewalFixture f;
+    f.backend->actions = {RenewalScriptBackend::Action::ThrowBefore, RenewalScriptBackend::Action::ThrowBefore};
+
+    const MountRenewResult result = f.renew(
+        MountRenewPolicy::UntilDefinitive, {}, {},
+        [](const MountRenewRequestEvent &) { throw std::runtime_error("injected report failure"); });
+
+    ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
+    EXPECT_EQ(result.attempts_sent, 3u);
+    EXPECT_EQ(f.renewer->state(), MountLeaseRenewerState::Active);
+}
+
+/// The startup, remount and direct renewals keep their lease bound.
+TEST(CASHeartbeat, BoundedPathsStillStopAtTheLeaseDeadline)
+{
+    for (const bool remount : {false, true})
+    {
+        SCOPED_TRACE(remount ? "renewForRemount" : "renew");
+        UnboundedRenewalFixture f;
+        std::vector<uint64_t> sent_at;
+        f.backend->on_attempt = [&] { sent_at.push_back(f.boot_ms); };
+        /// Longer than any lease, so only the bound can end the renewal.
+        f.backend->outage = [&] { return f.boot_ms < f.renewal_start + 60'000; };
+        MountRenewOperationEnvironment environment = renewalEnvironment(f.boot_ms);
+        environment.policy = MountRenewPolicy::LeaseBound;
+
+        const MountRenewResult result = remount ? f.renewer->renewForRemount(environment) : f.renewer->renew(environment);
+
+        const DB::Exception failure = terminalException(result);
+        EXPECT_NE(failure.message().find("external_lease_deadline"), String::npos) << failure.message();
+        ASSERT_TRUE(result.deadline_source.has_value());
+        EXPECT_EQ(*result.deadline_source, GaveUp::Source::Lease);
+        ASSERT_FALSE(sent_at.empty());
+        const uint64_t lease_safe = f.anchor + UnboundedRenewalFixture::ttl_ms - UnboundedRenewalFixture::margin_ms;
+        for (uint64_t at : sent_at)
+            EXPECT_LT(at, lease_safe) << "no request starts past the lease-safe bound";
+    }
 }
