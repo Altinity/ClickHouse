@@ -456,8 +456,10 @@ private:
         bool worker_call);
     MountRenewOperationEnvironment renewalEnvironment(bool worker_call);
     std::optional<uint64_t> leaseExpiredAt(uint64_t now_boot_ms) const;
-    /// Publishes a committed renewal's deadline. Returns how long the lease had been expired when this
-    /// deadline restores it; empty when it was not expired or is still expired.
+    /// Publishes a committed renewal's deadline. A deadline in the future ends the current run of
+    /// trouble: it clears the failure text and, when the lease was expired, counts and logs the
+    /// restore. Returns how long the lease had been expired when this deadline restores it; empty
+    /// when it was not expired or is still expired.
     std::optional<uint64_t> publishRenewedDeadline(uint64_t deadline_boot_ms);
     void consumeRenewResult(
         const MountRenewResult & result,

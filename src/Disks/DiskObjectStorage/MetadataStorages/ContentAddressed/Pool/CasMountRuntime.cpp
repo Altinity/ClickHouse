@@ -224,15 +224,27 @@ std::optional<uint64_t> CasMountRuntime::publishRenewedDeadline(uint64_t deadlin
     const uint64_t now = bootMsNow();
     const std::optional<uint64_t> expired_at = leaseExpiredAt(now);
     setMountDeadline(deadline_boot_ms);
-    if (expired_at && deadline_boot_ms <= now)
+    if (deadline_boot_ms <= now)
     {
-        lease_expired_at_boot_ms.store(*expired_at, std::memory_order_release);
+        lease_expired_at_boot_ms.store(
+            expired_at.value_or(std::numeric_limits<uint64_t>::max()), std::memory_order_release);
         return std::nullopt;
     }
     lease_expired_at_boot_ms.store(std::numeric_limits<uint64_t>::max(), std::memory_order_release);
+    String ended_failure;
+    {
+        std::lock_guard lock(renew_failure_mutex);
+        ended_failure.swap(last_renew_failure);
+    }
     if (!expired_at)
         return std::nullopt;
-    return now - *expired_at;
+    const uint64_t expired_ms = now - *expired_at;
+    ProfileEvents::incrementNoTrace(ProfileEvents::CASMountLeaseExpired);
+    LOG_WARNING(getLogger("CasPool"),
+        "CAS mount lease of '{}' was expired for {} ms; a renewal restored it and writes resume. "
+        "Last failed renewal request: {}",
+        server_root_id, expired_ms, ended_failure);
+    return expired_ms;
 }
 
 void CasMountRuntime::setMountDeadline(uint64_t deadline_boot_ms)
@@ -568,16 +580,6 @@ void CasMountRuntime::consumeRenewResult(
             result.attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
                 ? std::numeric_limits<uint64_t>::max()
                 : result.attempt_start_boot_ms + ttl_ms);
-        if (expired_ms)
-        {
-            ProfileEvents::incrementNoTrace(ProfileEvents::CASMountLeaseExpired);
-            LOG_WARNING(getLogger("CasPool"),
-                "CAS mount lease of '{}' was expired for {} ms; a renewal restored it and writes resume. "
-                "Last failed renewal request: {}",
-                server_root_id, *expired_ms, lastRenewFailure());
-            std::lock_guard lock(renew_failure_mutex);
-            last_renew_failure.clear();
-        }
         reportMountRenewCompletion(result, expired_ms);
         return;
     }
