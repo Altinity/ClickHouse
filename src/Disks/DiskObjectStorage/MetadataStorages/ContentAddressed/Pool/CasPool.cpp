@@ -1789,8 +1789,7 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
 
     /// Incidental-only detection has the same fail-closed reaction as a foreign/superseded lease
     /// renewal. The fence and the lease thread, which runs the self-remount, live on `mount_runtime`.
-    mount_runtime.tripMountLost();
-    mount_runtime.scheduleRemount();
+    mount_runtime.tripAndRequestRemount();
 
     /// Diagnosis off the critical path: a background task may spend a FEW
     /// requests -- never the caller's thread, and never blocking this call's own return.

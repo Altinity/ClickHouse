@@ -674,8 +674,8 @@ void CasMountRuntime::renewalLoop()
         lease_thread_id = std::this_thread::get_id();
     }
 
-    /// The wake condition of every wait in this loop; the reclaim backoff ignores a request, which is
-    /// the one it is retrying.
+    /// The wake condition of every wait in this loop. The reclaim backoff ignores requests: a newer one
+    /// waits for the backoff too.
     const auto woken = [this](bool by_request)
     {
         const bool wake = workers_stop_requested
@@ -994,11 +994,11 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
 
 void CasMountRuntime::publishVanishedIntent()
 {
-    /// spec §5 step 1: publish the terminal-intent latch WITHOUT settling the state. `scheduleRemount`
+    /// FORGET's first step: publish the terminal-intent latch WITHOUT settling the state. `scheduleRemount`
     /// and the lease loop consult `vanished_intent` at their step boundaries, so this stops new remount
     /// scheduling and makes the lease loop exit at its next step — bounding FORGET's join of the lease
-    /// thread to one step + one backend timeout. The state store + WARN follow in `enterVanished`
-    /// (step 6). Idempotent.
+    /// thread to one step + one backend timeout. The state store + WARN follow in `enterVanished`.
+    /// Idempotent.
     {
         auto lock = lockTerminalPublication();
         vanished_intent.store(true, std::memory_order_release);
@@ -1013,6 +1013,21 @@ void CasMountRuntime::scheduleRemount()
     if (workers_stop_requested || remountTerminal())
         return;
     ++remount_requested_generation;
+    driver_cv.notify_all();
+}
+
+void CasMountRuntime::tripAndRequestRemount()
+{
+    schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(driver_mutex);
+    /// Atomics only.
+    tripMountLost();
+    if (workers_stop_requested || remountTerminal())
+        return;
+    /// A request in `reclaim_generation` is already being served by a reclaim that latched before this
+    /// trip, so it does not cover the trip.
+    if (remount_requested_generation <= std::max(remount_handled_generation, reclaim_generation))
+        ++remount_requested_generation;
     driver_cv.notify_all();
 }
 

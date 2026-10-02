@@ -34,7 +34,7 @@ using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 ///   - `TransientNotLive` — the lease was lost; access is uncertain and a self-remount retries. The §2
 ///                          `Present`+identity-match recovery rule fires only from here (or `Live`).
 ///   - `IdentityLost`     — the pool sentinels are authoritatively absent (both KeyAbsent):
-///                          fail-loud and TERMINAL (rev.8). The lease and GC threads exit;
+///                          fail-loud and TERMINAL. The lease and GC threads exit;
 ///                          matching-sentinel reappearance does NOT auto-revive it ([D3]); recovery is a
 ///                          restart or `SYSTEM CAS FORGET`.
 ///   - `Vanished*`        — fully terminal truth: the data root was replaced by a foreign pool, or the
@@ -155,6 +155,7 @@ public:
     uint64_t peekNextBuildSeq();
     /// Renew the merged mount heartbeat once, including its build-watermark floor. A read-only runtime
     /// has no renewer and fails with a logical exception rather than fabricating a heartbeat.
+    /// A test seam: it is not protected against a concurrent replacement of the renewer.
     void renewWatermarkOnce();
 
     /// ---- local write fence ----
@@ -246,10 +247,10 @@ public:
     void setLifecycleForTest(PoolLifecycle lc);
 
     /// Publish the terminal-intent latch (`vanished_intent`) WITHOUT settling the lifecycle state. This is
-    /// spec §5 step 1 of `SYSTEM CAS FORGET`: publishing the latch FIRST makes the runtime stop latching
+    /// the first step of `SYSTEM CAS FORGET`: publishing the latch FIRST makes the runtime stop latching
     /// remount generations and the lease loop exit at its next step boundary, so FORGET's join of the
     /// lease thread is bounded by one step and one backend timeout. The state store + WARN happen
-    /// later, in `enterVanished` at step 6. Idempotent. Publication is serialized by `driver_mutex` and
+    /// later, in `enterVanished`. Idempotent. Publication is serialized by `driver_mutex` and
     /// followed by a condition-variable notification, so the lease loop cannot miss the terminal edge
     /// between its predicate sample and wait. A natural
     /// terminal transition does NOT call this — its `enterVanished` publishes the latch itself.
@@ -380,6 +381,10 @@ public:
     void stopBackgroundWorkers();
     /// Latch a recovery generation for the lease thread. It never constructs a thread.
     void scheduleRemount();
+    /// One interference report: trip the fence and request a remount in one `driver_mutex` step, so no
+    /// reclaim can arm between the two. Raises no generation when a request that no reclaim has started
+    /// serving is pending: the reclaim that serves it latches after this trip.
+    void tripAndRequestRemount();
     bool scheduleRemountForTest();
     void beginShutdownForTest();
     /// Return how many times `scheduleRemount` was entered, including calls refused by the background

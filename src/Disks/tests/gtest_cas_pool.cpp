@@ -24,7 +24,6 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <future>
-#include <latch>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -3440,6 +3439,8 @@ TEST(CASPoolRemount, ReclaimWaitsForTheRenewalToEnd)
     DB::Cas::tests::ManualBarrier renewal_barrier;
     DB::Cas::tests::ManualBarrier remount_barrier;
     std::atomic<uint64_t> remount_calls{0};
+    std::atomic<bool> renewal_request_returned{false};
+    std::atomic<bool> reclaim_saw_the_request_returned{false};
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
@@ -3448,6 +3449,7 @@ TEST(CASPoolRemount, ReclaimWaitsForTheRenewalToEnd)
         "test", sink, runtimeRenewBudget(), [&]
         {
             ++remount_calls;
+            reclaim_saw_the_request_returned = renewal_request_returned.load();
             remount_barrier.arriveAndWait();
             return false;
         });
@@ -3457,6 +3459,8 @@ TEST(CASPoolRemount, ReclaimWaitsForTheRenewalToEnd)
     runtime.armMountFence(uuid, 1, anchor + 1000);
     backend->barrier = &renewal_barrier;
     backend->fault = RuntimeRenewBackend::Fault::BlockThenDelegate;
+    /// Set after the setup's own writes: only the held renewal request sets it.
+    backend->after_commit = [&] { renewal_request_returned = true; };
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
     renewal_barrier.waitUntilArrived();
     runtime.tripMountLost();
@@ -3465,6 +3469,8 @@ TEST(CASPoolRemount, ReclaimWaitsForTheRenewalToEnd)
     renewal_barrier.release();
     remount_barrier.waitUntilArrived();
     EXPECT_EQ(remount_calls.load(), 1u);
+    EXPECT_TRUE(reclaim_saw_the_request_returned.load())
+        << "the reclaim must start only after the renewal's request in flight returned";
     remount_barrier.release();
     runtime.stopBackgroundWorkers();
     runtime.finishTeardown(false);
@@ -3722,15 +3728,12 @@ TEST(CASPoolRemount, ALeaseWaitCannotMissNaturalTerminalPublication)
                       MountClaimResult::Claimed);
             WorkerExitLatch exits;
             std::once_flag pause_once;
-            std::latch predicate_sampled_false{1};
-            std::latch release_predicate{1};
-            std::once_flag release_once;
+            /// Bounded: a regression fails after the barrier's timeout instead of hanging the gate.
+            DB::Cas::tests::ManualBarrier waiter;
+            std::atomic<bool> waiter_timed_out{false};
             std::atomic<bool> waiter_holds_driver_mutex{false};
             std::atomic<bool> publication_entered_while_held{false};
-            const auto release_waiter = [&]
-            {
-                std::call_once(release_once, [&] { release_predicate.count_down(); });
-            };
+            const auto release_waiter = [&] { waiter.release(); };
             RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
             {
                 return ThreadFromGlobalPool([&, body = std::move(worker_body)]
@@ -3752,8 +3755,14 @@ TEST(CASPoolRemount, ALeaseWaitCannotMissNaturalTerminalPublication)
                         std::call_once(pause_once, [&]
                         {
                             waiter_holds_driver_mutex.store(true, std::memory_order_release);
-                            predicate_sampled_false.count_down();
-                            release_predicate.wait();
+                            try
+                            {
+                                waiter.arriveAndWait();
+                            }
+                            catch (...)
+                            {
+                                waiter_timed_out = true;
+                            }
                             waiter_holds_driver_mutex.store(false, std::memory_order_release);
                         });
                     },
@@ -3783,7 +3792,7 @@ TEST(CASPoolRemount, ALeaseWaitCannotMissNaturalTerminalPublication)
             }
             runtime.startBackgroundWorkers(std::chrono::hours(1));
 
-            predicate_sampled_false.wait();
+            waiter.waitUntilArrived();
             if (terminal == PoolLifecycle::IdentityLost)
             {
                 runtime.tripMountLost();
@@ -3793,8 +3802,12 @@ TEST(CASPoolRemount, ALeaseWaitCannotMissNaturalTerminalPublication)
             {
                 runtime.enterVanished(PoolLifecycle::VanishedReplaced, "injected replacement during a lease wait");
             }
+            /// A publication that took no `driver_mutex` released nobody; release the waiter here so it
+            /// waits, misses the edge, and the expectation below fails instead of hanging.
+            release_waiter();
             const bool exited_without_stop = exits.waitForAtLeast(1);
             runtime.stopBackgroundWorkers();
+            EXPECT_FALSE(waiter_timed_out.load());
             EXPECT_FALSE(publication_entered_while_held.load())
                 << "the publication must not take driver_mutex while the waiter holds it";
             EXPECT_TRUE(exited_without_stop);
@@ -4571,11 +4584,17 @@ TEST(CASMountRuntime, StopWakesTheRetryWaitOfAnUnboundedRenewal)
                 std::chrono::steady_clock::now() - started).count();
     });
     backend->outage = [] { return true; };
+    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
 
     ASSERT_EQ(wait_requested.wait_for(std::chrono::seconds(20)), std::future_status::ready);
     const uint64_t requested_ms = wait_requested.get();
     runtime.stopBackgroundWorkers();
+    /// The renewal the stop ended had sent a request, so it ends terminal on a `Live` pool.
+    EXPECT_FALSE(runtime.mayMutate()) << "the stop latches the fence";
+    EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::Live);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before)
+        << "the stop counts no lease loss";
 
     EXPECT_GE(requested_ms, kMountRenewRetrySpacingMs * 8 / 10);
     EXPECT_LE(requested_ms, kMountRenewRetrySpacingMs * 12 / 10);
@@ -4666,8 +4685,9 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
     runtime.finishTeardown(false);
 }
 
-/// An interference report raised while a reclaim runs: that reclaim arms nothing, the next one starts
-/// with the fence latched, and no write is admitted between the two.
+/// A remount request raised on an armed fence: the reclaim latches the fence before anything else and
+/// counts one loss. An interference report raised while that reclaim runs: it arms nothing, the next
+/// one starts with the fence latched, and no write is admitted between the two.
 TEST(CASMountRuntime, NothingArmsWhileARemountRequestIsPending)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
@@ -4678,6 +4698,10 @@ TEST(CASMountRuntime, NothingArmsWhileARemountRequestIsPending)
     ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
               MountClaimResult::Claimed);
     std::atomic<uint32_t> calls{0};
+    bool may_mutate_before_first_latch = false;
+    bool may_mutate_after_first_latch = true;
+    PoolLifecycle lifecycle_after_first_latch = PoolLifecycle::Live;
+    uint64_t lost_after_first_latch = 0;
     bool first_armed = true;
     bool may_mutate_after_first = true;
     bool may_mutate_at_second_entry = true;
@@ -4697,10 +4721,13 @@ TEST(CASMountRuntime, NothingArmsWhileARemountRequestIsPending)
             CasMountRuntime & reclaiming = *runtime_ptr;
             if (++calls == 1)
             {
+                may_mutate_before_first_latch = reclaiming.mayMutate();
                 reclaiming.beginReclaim();
+                may_mutate_after_first_latch = reclaiming.mayMutate();
+                lifecycle_after_first_latch = reclaiming.lifecycle();
+                lost_after_first_latch = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
                 /// An interference report while this reclaim runs.
-                reclaiming.tripMountLost();
-                reclaiming.scheduleRemount();
+                reclaiming.tripAndRequestRemount();
                 first_armed = reclaiming.armIfAdmissible(boot_ms + 1000);
                 may_mutate_after_first = reclaiming.mayMutate();
                 return true;
@@ -4722,11 +4749,16 @@ TEST(CASMountRuntime, NothingArmsWhileARemountRequestIsPending)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
+    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
     runtime.startBackgroundWorkers(std::chrono::hours(1));
-    runtime.tripMountLost();
+    /// A request without a trip: the fence is still armed when the reclaim starts.
     runtime.scheduleRemount();
 
     second_done.waitUntilArrived();
+    EXPECT_TRUE(may_mutate_before_first_latch) << "the request alone must leave the fence armed";
+    EXPECT_FALSE(may_mutate_after_first_latch) << "a reclaim starts with the fence latched";
+    EXPECT_EQ(lifecycle_after_first_latch, PoolLifecycle::TransientNotLive);
+    EXPECT_EQ(lost_after_first_latch, lost_before + 1) << "the latch counts the one loss";
     EXPECT_FALSE(first_armed) << "a reclaim must not arm while a newer remount request is pending";
     EXPECT_FALSE(may_mutate_after_first);
     EXPECT_FALSE(may_mutate_at_second_entry) << "no write may be admitted between the two reclaims";
@@ -4738,6 +4770,100 @@ TEST(CASMountRuntime, NothingArmsWhileARemountRequestIsPending)
     second_done.release();
     runtime.stopBackgroundWorkers();
     runtime.finishTeardown(false);
+}
+
+/// An interference report that lands while a reclaim runs, before its arm or while the arm holds
+/// `driver_mutex`: the arm does not override it. The fence ends latched with one request pending, the
+/// report counts a loss only on a `Live` pool, and the next reclaim serves it.
+TEST(CASMountRuntime, AnInterferenceReportDuringAReclaimIsServedByTheNextReclaim)
+{
+    enum class ReportAt : uint8_t { BeforeTheArm, InsideTheArm };
+    const auto run = [](ReportAt report_at)
+    {
+        auto backend = std::make_shared<RuntimeRenewBackend>();
+        const Layout layout(report_at == ReportAt::BeforeTheArm ? "report-before-arm" : "report-inside-arm");
+        uint64_t wall_ms = 1000;
+        const uint64_t boot_ms = 100;
+        const UInt128 uuid{1};
+        ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+                  MountClaimResult::Claimed);
+        std::atomic<uint32_t> calls{0};
+        bool first_armed = false;
+        bool may_mutate_after_first = true;
+        uint64_t generation_after_first = 0;
+        bool may_mutate_at_second_entry = true;
+        bool second_armed = false;
+        std::future<void> report;
+        DB::Cas::tests::ManualBarrier second_done;
+        CasMountRuntime * runtime_ptr = nullptr;
+        CasEventSink sink;
+        RuntimeUnderTest runtime_holder(
+            backend, layout,
+            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+                        .boot_ms_fn = [&] { return boot_ms; }},
+            "test", sink, runtimeRenewBudget(), [&]
+            {
+                CasMountRuntime & reclaiming = *runtime_ptr;
+                if (++calls == 1)
+                {
+                    reclaiming.beginReclaim();
+                    if (report_at == ReportAt::BeforeTheArm)
+                    {
+                        reclaiming.tripAndRequestRemount();
+                    }
+                    else
+                    {
+                        /// The hook runs inside the arm with `driver_mutex` held, so the report starts
+                        /// there and can finish only after the arm's section.
+                        reclaiming.setArmMountFenceInterpositionHookForTest([&]
+                        {
+                            report = std::async(std::launch::async, [&] { runtime_ptr->tripAndRequestRemount(); });
+                        });
+                    }
+                    first_armed = reclaiming.armIfAdmissible(boot_ms + 1000);
+                    reclaiming.setArmMountFenceInterpositionHookForTest({});
+                    if (report.valid())
+                        report.get();
+                    may_mutate_after_first = reclaiming.mayMutate();
+                    generation_after_first = reclaiming.remountRequestedGenerationForTest();
+                    return true;
+                }
+                may_mutate_at_second_entry = reclaiming.mayMutate();
+                reclaiming.beginReclaim();
+                second_armed = reclaiming.armIfAdmissible(boot_ms + 1000);
+                second_done.arriveAndWait();
+                return true;
+            });
+        SCOPE_EXIT({ second_done.release(); });
+        CasMountRuntime & runtime = *runtime_holder;
+        runtime_ptr = &runtime;
+        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+        const uint64_t anchor = runtime.startRenewer();
+        runtime.armMountFence(uuid, 1, anchor + 1000);
+        const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+        runtime.startBackgroundWorkers(std::chrono::hours(1));
+        runtime.scheduleRemount();
+
+        second_done.waitUntilArrived();
+        if (report_at == ReportAt::BeforeTheArm)
+            EXPECT_FALSE(first_armed) << "a report raised during the reclaim must stop its arm";
+        else
+            EXPECT_TRUE(first_armed) << "the report waits for the arm's section";
+        EXPECT_FALSE(may_mutate_after_first) << "the arm must not override the report's trip";
+        EXPECT_EQ(generation_after_first, 2u) << "the report raises one generation";
+        EXPECT_FALSE(may_mutate_at_second_entry);
+        EXPECT_TRUE(second_armed) << "the next reclaim serves the report";
+        EXPECT_EQ(calls.load(), 2u);
+        EXPECT_EQ(runtime.remountRequestedGenerationForTest(), 2u);
+        /// The first latch counts one loss; the report counts one more only when the arm made the pool `Live`.
+        EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(),
+                  lost_before + (report_at == ReportAt::BeforeTheArm ? 1 : 2));
+        second_done.release();
+        runtime.stopBackgroundWorkers();
+        runtime.finishTeardown(false);
+    };
+    run(ReportAt::BeforeTheArm);
+    run(ReportAt::InsideTheArm);
 }
 
 /// One interference report produces one remount generation, one epoch change and one lease-loss
@@ -4871,8 +4997,7 @@ TEST(CASMountRuntime, AReclaimFinishedAfterTheForgetIntentArmsNothing)
 }
 
 /// A stop requested during a reclaim: the join returns once the attempt returns, the reclaim arms
-/// nothing, the stop counts no lease loss, and no farewell is written for the slot this runtime did
-/// not claim back.
+/// nothing, and no farewell is written for the slot this runtime did not claim back.
 TEST(CASMountRuntime, StopDuringAReclaimJoinsTheThread)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
@@ -4942,8 +5067,6 @@ TEST(CASMountRuntime, StopDuringAReclaimJoinsTheThread)
     EXPECT_FALSE(armed) << "a reclaim that finishes after a stop must not arm the fence";
     EXPECT_FALSE(runtime.mayMutate());
     EXPECT_EQ(lost_at_latch, lost_before + 1) << "the fenced-out renewal counts the one loss";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_at_latch)
-        << "the stop counts no lease loss";
     const auto slot_before_teardown = readObj(*backend, key);
     ASSERT_TRUE(slot_before_teardown.has_value());
     runtime.finishTeardown(true);
