@@ -215,8 +215,16 @@ void CasMountRuntime::noteRenewRequest(const MountRenewRequestEvent & event) noe
     }
     try
     {
-        std::lock_guard lock(renew_failure_mutex);
-        last_renew_failure = event.failure_text;
+        {
+            std::lock_guard lock(renew_failure_mutex);
+            last_renew_failure = event.failure_text;
+        }
+        /// `waitUntilArmed` re-reads the fence clock on this wake-up. Passing through `driver_mutex` orders
+        /// the notification after its predicate check, so the wake-up is not lost.
+        {
+            std::lock_guard lock(driver_mutex);
+        }
+        driver_cv.notify_all();
     }
     catch (...)   // NOLINT(bugprone-empty-catch)
     {
@@ -308,6 +316,28 @@ bool CasMountRuntime::armIfAdmissible(uint64_t deadline_boot_ms)
     }
     driver_cv.notify_all();
     return arm;
+}
+
+bool CasMountRuntime::waitUntilArmed(uint64_t timeout_ms) const
+{
+    const uint64_t started = bootMsNow();
+    const uint64_t give_up = started > std::numeric_limits<uint64_t>::max() - timeout_ms
+        ? std::numeric_limits<uint64_t>::max()
+        : started + timeout_ms;
+    std::unique_lock lock(driver_mutex);
+    while (true)
+    {
+        if (!mount_fence.lost.load(std::memory_order_acquire))
+            return true;
+        if (workers_stop_requested || remountTerminal() || !workers_started)
+            return false;
+        const uint64_t now = bootMsNow();
+        if (now >= give_up)
+            return false;
+        /// The fence clock can be injected and move with no real time passing, so every wake-up re-reads
+        /// it: an arm, a failed renewal request, a stop and a terminal publication all notify.
+        driver_cv.wait_for(lock, std::chrono::milliseconds(give_up - now));
+    }
 }
 
 bool CasMountRuntime::canArm(uint64_t deadline_boot_ms) const
@@ -475,7 +505,7 @@ bool CasMountRuntime::renewalLive(RenewCaller caller) const
     if (caller != RenewCaller::Loop)
         return true;
     /// A lost fence alone does not end it: the renewal that makes an open or a reclaim ready runs under
-    /// one, and every trip that must end it comes with a request, an intent or a stop.
+    /// one, and every trip that must end it comes with a request, a terminal lifecycle or a stop.
     return remount_requested_generation <= remount_handled_generation && !remountTerminal();
 }
 

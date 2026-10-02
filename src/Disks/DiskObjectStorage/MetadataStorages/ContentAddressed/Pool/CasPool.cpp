@@ -710,8 +710,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// loop to classify (and log) an unclean reclaim.
     MountPriorState claimed_prior = MountPriorState::None;
     /// The pre-I/O boot-clock instant of the claim attempt FINALLY adopted below -- survives the
-    /// `break` so the arm below can detect a claim that consumed the lease TTL and re-anchor before
-    /// arming (rev.4 Phase B, round-3 finding 2).
+    /// `break` so the arm below computes the claim's deadline from it.
     uint64_t claim_anchor_boot_ms = 0;
     constexpr int max_fence_recoveries = 3;
     for (int fence_recovery = 0; ; ++fence_recovery)
@@ -862,64 +861,39 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                 : "");
     }
 
-    /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline at the claim
-    /// attempt's anchor + ttl (NOT `bootMsNow()` here -- arming from a post-I/O instant would authorize
-    /// mutations under a deadline the durable lease never actually backs). From here ordinary ref
-    /// mutations (appendRefOps) are fence-gated via mayMutate.
+    /// The claim's deadline is its attempt's start plus the TTL, never a later instant: a post-I/O instant
+    /// would authorize writes under a deadline the durable lease does not back. The fence is armed from it
+    /// only if it still admits a ref append; otherwise it stays latched until a renewal arms it.
     const uint64_t ttl_ms_u = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
-    const uint64_t safety_ms = store->config.cas_request_budget.lease_safety_margin_ms;
-    const uint64_t safe_deadline = claim_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms_u
-        ? std::numeric_limits<uint64_t>::max() - safety_ms
-        : claim_anchor_boot_ms + ttl_ms_u - safety_ms;
-    const uint64_t now_boot_ms = store->bootMsNow();
-    const uint64_t period_ms = static_cast<uint64_t>(store->config.mount_renew_period.count());
-    const uint64_t envelope_ms = store->config.cas_request_budget.attemptEnvelopeMs();
-    const uint64_t two_envelopes_ms = envelope_ms > std::numeric_limits<uint64_t>::max() / 2
-        ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
-    const uint64_t renewal_window_ms = store->config.background_watermark
-        ? (two_envelopes_ms > std::numeric_limits<uint64_t>::max() - period_ms
-              ? std::numeric_limits<uint64_t>::max() : period_ms + two_envelopes_ms)
-        : two_envelopes_ms;
-    /// Preserve one ordinary cadence followed by one physical renewal attempt (a write and its
-    /// settlement read: two envelopes) inside the safe lease window. If that publication horizon was
-    /// consumed, re-anchor synchronously before opening the fence; the renewer independently retains
-    /// its per-request deadline checks. STRICT, like `CasMountRuntime::admit`: a horizon that fits
-    /// exactly still starts a renewal the fence would then refuse.
-    const bool renewal_window_fits = now_boot_ms <= safe_deadline
-        && renewal_window_ms < safe_deadline - now_boot_ms;
-    if (!renewal_window_fits)
-    {
-        /// The claim path outlived the lease TTL: its anchor can no longer authorize an armed fence (a
-        /// successor may have legally started reclaiming). Re-anchor with ONE fresh conditional lease
-        /// write -- it fails closed (Phase A classification) if anything took the slot meanwhile -- and
-        /// arm from the new attempt's anchor (rev.4 Phase B, round-3 finding 2).
-        ///
-        /// The unbounded operator-configured wait this guard was written for (`T_mat`) is gone, so
-        /// reaching it now means the claim's adoption write outran the safe lease window
-        /// TTL, which `validateCasRequestBudget` already refuses to configure. It stays because a stalled
-        /// socket can still outlive a budget, and its recovery is one conditional write that fails closed;
-        /// it is LOUD rather than fatal because a slow open under a healthy protocol is not a reason to
-        /// refuse to start.
-        LOG_WARNING(getLogger("CasPool"),
-            "Content-addressed mount {}: the mount claim consumed the lease TTL ({} ms) before the write "
-            "fence could be armed; re-writing the lease first", srid, ttl_ms_u);
-        claim_anchor_boot_ms = store->mount_runtime.renewRenewerForStartupOnce();
-    }
+    const uint64_t claim_deadline_boot_ms = claim_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms_u
+        ? std::numeric_limits<uint64_t>::max()
+        : claim_anchor_boot_ms + ttl_ms_u;
     store->mount_runtime.setLiveWriterEpoch(writer_epoch);
-    store->armMountFence(
-        our_uuid,
-        writer_epoch,
-        claim_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms_u
-            ? std::numeric_limits<uint64_t>::max()
-            : claim_anchor_boot_ms + ttl_ms_u);
-    /// Gate the lease thread with `background_watermark`: it runs only in production
-    /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
-    /// drive `renewWatermarkOnce` explicitly and rely on the armed sub-TTL deadline, never on a loop.
-    /// The synchronous renewer is still started above (it must adopt the mount and arm the fence on
-    /// every writable open); only the lease thread is conditional. The merged
-    /// heartbeat renews at `mount_renew_period` — one beat now renews the lease and the floor.
-    if (store->config.background_watermark)
-        store->mount_runtime.startBackgroundWorkers(store->config.mount_renew_period);
+    const bool armed = store->mount_runtime.armIfAdmissible(claim_deadline_boot_ms);
+    if (!store->config.background_watermark)
+    {
+        /// Nothing would renew this claim, so a latched fence would refuse writes for good.
+        if (!armed)
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS mount '{}': the mount claim left too little of the {} ms lease to admit a write, and this "
+                "mount has no lease thread to renew it; retry the open", srid, ttl_ms_u);
+        return;
+    }
+    store->mount_runtime.startBackgroundWorkers(store->config.mount_renew_period);
+    if (armed)
+        return;
+    LOG_WARNING(getLogger("CasPool"),
+        "Content-addressed mount {}: the mount claim left too little of the {} ms lease to admit a write; "
+        "the open waits for the lease thread's first renewal", srid, ttl_ms_u);
+    if (store->mount_runtime.waitUntilArmed(ttl_ms_u))
+        return;
+    /// Joined before the failure propagates, so no renewal of this open runs after it.
+    store->mount_runtime.stopBackgroundWorkers();
+    const String last_failure = store->mount_runtime.lastRenewFailure();
+    throw Exception(ErrorCodes::ABORTED,
+        "CAS mount '{}': no renewal left enough of the {} ms lease to admit a write within one lease after "
+        "the mount claim; last failed renewal request: {}",
+        srid, ttl_ms_u, last_failure.empty() ? String("none") : last_failure);
 }
 
 PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid)
@@ -1256,6 +1230,7 @@ bool Pool::tryRemountOnce()
     const String & srid = config.server_root_id;
     std::string_view step = "entry";
     bool succeeded = false;
+    bool armed = false;
     uint64_t result_writer_epoch = 0;
     String error;
     SCOPE_EXIT(
@@ -1277,9 +1252,10 @@ bool Pool::tryRemountOnce()
                 CasEvent event;
                 event.type = CasEventType::MountRemount;
                 event.outcome = succeeded ? "ok" : "failed";
-                event.reason = succeeded
-                    ? "whole-chain remount restored Live under a fresh mount incarnation"
-                    : "whole-chain remount returned without restoring Live";
+                event.reason = !succeeded
+                    ? "whole-chain remount returned without restoring Live"
+                    : (armed ? "whole-chain remount restored Live under a fresh mount incarnation"
+                             : "whole-chain remount claimed a fresh mount incarnation; the next renewal arms the fence");
                 event.detail = {
                     {"attempt_no", std::to_string(attempt_no)},
                     {"step", String{step}},
@@ -1508,7 +1484,7 @@ bool Pool::tryRemountOnce()
         step = "renewer_install";
         mount_runtime.installRenewer(our_uuid, writer_epoch, now_ms);
         step = "renewer_start";
-        uint64_t remount_anchor_boot_ms = mount_runtime.startRenewer();
+        const uint64_t remount_anchor_boot_ms = mount_runtime.startRenewer();
 
         /// Re-establish the ref-protocol incarnation BEFORE re-arming the fence. Order is load-bearing:
         /// Starting the renewer does NOT clear `lost`, so the fence stays closed here and no append/publish can race the
@@ -1536,42 +1512,15 @@ bool Pool::tryRemountOnce()
         if (config.remount_quiesce_hook_for_test)
             config.remount_quiesce_hook_for_test();
 
-        /// Quiescence may consume most of the new lease. The same renewal-window gate used at startup
-        /// admits one synchronous re-anchor while at least one physical attempt still fits the old
-        /// authority window and before the fence is armed.
-        const uint64_t safety_ms = config.cas_request_budget.lease_safety_margin_ms;
-        const uint64_t safe_deadline = remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
-            ? std::numeric_limits<uint64_t>::max() - safety_ms
-            : remount_anchor_boot_ms + ttl_ms - safety_ms;
-        const uint64_t now_boot_ms = mount_runtime.bootMsNow();
-        const uint64_t period_ms = static_cast<uint64_t>(config.mount_renew_period.count());
-        const uint64_t envelope_ms = config.cas_request_budget.attemptEnvelopeMs();
-        const uint64_t two_envelopes_ms = envelope_ms > std::numeric_limits<uint64_t>::max() / 2
-            ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
-        const uint64_t renewal_window_ms = config.background_watermark
-            ? (two_envelopes_ms > std::numeric_limits<uint64_t>::max() - period_ms
-                  ? std::numeric_limits<uint64_t>::max() : period_ms + two_envelopes_ms)
-            : two_envelopes_ms;
-        /// STRICT, like the open path and `CasMountRuntime::admit`: a horizon that fits exactly still
-        /// starts a renewal the fence would then refuse.
-        const bool renewal_window_fits = now_boot_ms <= safe_deadline
-            && renewal_window_ms < safe_deadline - now_boot_ms;
-        if (!renewal_window_fits)
-        {
-            step = "renewer_redo";
-            remount_anchor_boot_ms = mount_runtime.renewRenewerForRemountOnce();
-        }
-
-        /// No-throw commit section: arm only after epoch, renewer, recovery cancellation, and ref-runtime
-        /// quiescence are complete, and only under the arming rule. A reclaim that claimed and did not
-        /// arm still returns true: its request is acknowledged, and a false would make the loop back off
-        /// and claim yet another epoch.
+        /// No-throw commit section. The fence and the lifecycle are published only after epoch, renewer,
+        /// recovery cancellation and ref-runtime quiescence are complete. A claim whose deadline no longer
+        /// admits a ref append leaves the fence latched; the lease thread's next renewal arms it.
         step = "arm_fence";
-        const uint64_t deadline_boot_ms = remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
-            ? std::numeric_limits<uint64_t>::max()
-            : remount_anchor_boot_ms + ttl_ms;
-        if (mount_runtime.armIfAdmissible(deadline_boot_ms))
-            step = "publish_live";
+        armed = mount_runtime.armIfAdmissible(
+            remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
+                ? std::numeric_limits<uint64_t>::max()
+                : remount_anchor_boot_ms + ttl_ms);
+        step = armed ? "publish_live" : "claimed_not_armed";
         succeeded = true;
         return true;
     }

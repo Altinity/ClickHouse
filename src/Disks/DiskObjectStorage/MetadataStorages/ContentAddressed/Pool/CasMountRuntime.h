@@ -161,9 +161,10 @@ public:
     /// ---- local write fence ----
     /// Return whether a mutable operation may start under the locally observed lease state.
     bool mayMutate() const;
-    /// Latch the fence lost and count one lease loss. Every production caller pairs the trip with a
-    /// remount request, a published FORGET intent or a stop. A trip that comes alone is re-armed by the
-    /// next renewal that commits with room for a ref append.
+    /// Latch the fence lost and count one lease loss. A trip that comes alone is re-armed by the next
+    /// renewal that commits with room for a ref append, so every production caller pairs it with a
+    /// remount request, a terminal lifecycle (a published FORGET intent included) or a stop, or trips
+    /// where no renewal follows: the lease loop's error exit and a direct renewal.
     void tripMountLost();
     /// Publish the BOOTTIME deadline from a successful lease renewal.
     void setMountDeadline(uint64_t deadline_boot_ms);
@@ -177,6 +178,9 @@ public:
     /// `beginReclaim` recorded, publish the deadline, and arm the fence and report `Live` if the arming
     /// rule holds; otherwise latch the fence. Returns whether it armed.
     bool armIfAdmissible(uint64_t deadline_boot_ms);
+    /// Blocks until the fence is armed. Gives up after `timeout_ms` on the fence clock, on a stop, on a
+    /// terminal lifecycle, or when no lease thread runs. Returns whether the fence is armed.
+    bool waitUntilArmed(uint64_t timeout_ms) const;
     /// Test-only interposition at the publication boundary between the re-armed generation and the
     /// live fence. A caller admitted from this hook must be refused: the old generation is already
     /// dead, while the new generation is not live until `lost` is cleared. Through `armIfAdmissible`
@@ -317,7 +321,8 @@ public:
     /// because the lease expired; empty when the refusal has any other cause or there is none.
     std::optional<String> leaseExpiredRefusal(uint64_t admitted_generation) const;
     /// Counts each `PUT` of the worker's renewal as it is sent and keeps the text of every failed
-    /// `PUT` or resolve read. Runs on the renewing thread.
+    /// `PUT` or resolve read, and wakes `waitUntilArmed` on each failure. Runs on the renewing thread,
+    /// never under `driver_mutex`.
     void noteRenewRequest(const MountRenewRequestEvent & event) noexcept;
 
     /// TRUE once the pool has reached — or is being driven toward — a state on which the lease thread

@@ -2338,36 +2338,6 @@ private:
     int old_level;
 };
 
-class ScopedParkedRenewalLogCapture
-{
-public:
-    ScopedParkedRenewalLogCapture()
-        : logger(getLogger("CasMountLeaseRenewer"))
-        , channel(new Poco::StreamChannel(stream))
-        , old_channel(logger->getChannel(), /*shared=*/true)
-        , old_level(logger->getLevel())
-    {
-        logger->setChannel(channel.get());
-        logger->setLevel("information");
-    }
-
-    ~ScopedParkedRenewalLogCapture()
-    {
-        logger->setChannel(old_channel);
-        logger->setLevel(old_level);
-    }
-
-    String captured() const { return stream.str(); }
-
-private:
-    LoggerPtr logger;
-    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    Poco::AutoPtr<Poco::StreamChannel> channel;
-    /// A real reference (shared=true), so the parked previous channel cannot die while ours is installed.
-    Poco::AutoPtr<Poco::Channel> old_channel;
-    int old_level;
-};
-
 size_t countRemountFinalLogs(const String & output)
 {
     constexpr std::string_view needle = "CAS whole-chain remount attempt";
@@ -2757,90 +2727,38 @@ TEST(CASMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
         << "a certified-dead predecessor needs neither the observation window nor any grace period";
 }
 
-/// The open-time publication horizon must reserve TWO attempt envelopes (connect cap included), not
-/// two bare attempt timeouts -- a slow connect could otherwise overrun the reservation the horizon
-/// check was guarding. `background_watermark` defaults false (not set below), so `CasPool.cpp`'s
-/// `renewal_window_ms` ternary takes its no-period branch: `2 * attemptEnvelopeMs()`. The check is also
-/// STRICT (refuses equality), matching `CasMountRuntime::admit`.
-TEST(CASMountOpenWaits, PublicationHorizonUsesTheEnvelope)
-{
-    /// Opens with a boot clock costing `per_call_ms` per read (models a faster or slower claim) and
-    /// returns how many times the mount key was written. attempt 100, cap 100: envelope =
-    /// 100 + 2*100 = 300, so 2*envelope = 600; the old code reserved 2*attempt = 200. Empirically the
-    /// claim path's own anchor read and the horizon check's own `now_boot_ms` read are five reads apart,
-    /// so `remaining = safe_deadline(TTL 1000 - margin 50 = 950) - now = 950 - 5 * per_call_ms`.
-    const auto mountWriteCount = [](uint64_t per_call_ms) -> uint64_t
-    {
-        auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-        Layout l{"p"};
-        DB::Cas::tests::seedPoolMetaForRestart(*b);
-        /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
-        /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
-        /// a by-reference capture of a local would dangle.
-        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
-        PoolPtr store;
-        store = Pool::open(b, PoolConfig{
-            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-            .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100},
-            .boot_ms_fn = [fake_boot, per_call_ms]
-            {
-                return fake_boot->fetch_add(per_call_ms);
-            },
-            .wait_sleep_fn = [fake_boot](uint64_t ms)
-            {
-                *fake_boot += ms;
-            },
-        });
-        if (!store)
-            return 0;
-        return b->putOverwriteCount(l.mountKey("test")) + b->putCount(l.mountKey("test"));
-    };
-
-    /// remaining = 945 (per_call_ms=1): both 2*attempt(200) and 2*envelope(600) fit -- two writes (the
-    /// claim's own reclaim, then the renewer's adopt) and no re-anchor.
-    EXPECT_EQ(mountWriteCount(1), 2u) << "a horizon that fits both windows must not re-anchor";
-    /// remaining = 450 (per_call_ms=100): 2*attempt(200) fits, 2*envelope(600) does not -- the
-    /// re-anchor costs one extra write. This is the discriminator: reverting the reservation to
-    /// 2*attempt would make this case behave like the one above (two writes).
-    EXPECT_EQ(mountWriteCount(100), 3u) << "the old 2*attempt window fit here; only the envelope window must redo";
-    /// remaining = 600 (per_call_ms=70) exactly equals 2*envelope: STRICT ("<", not "<=") refuses
-    /// equality too, so this must also redo -- reverting the strict comparison to "<=" would make this
-    /// case behave like the fits-both case (two writes).
-    EXPECT_EQ(mountWriteCount(70), 3u) << "an exact boundary (renewal_window_ms == remaining) must be refused, not accepted";
-}
-
-/// Same reservation change as `PublicationHorizonUsesTheEnvelope` above, exercised through the remount
-/// path's own `renewer_redo` step (`CasPool.cpp` ~1503). Modelled directly on
-/// `CASPoolRemount.TheRenewerRedoRenewsOnTheOpenPlane` above: the step's admission refuses a driver that
-/// was never parked by a persistent renewal worker, so `background_watermark` must be true and the
-/// remount must be driven through `scheduleRemountForTest` (which parks the worker before running it),
-/// never through a bare `tryRemountOnce` with no workers -- the direct-driven attempt deadlocks in
-/// exactly the way that test's own comment describes.
+/// A reclaim arms the fence only when its claim still admits a ref append: more than two envelopes plus
+/// the margin of lease, strictly, with no period term. With attempt 100 and cap 100 that is 650 ms of the
+/// 1000 ms lease. A quiescence that leaves less reports success at step `claimed_not_armed` with the pool
+/// not `Live`; the lease thread's next renewal arms it.
 TEST(CASPoolRemount, RemountRenewerRedoUsesTheEnvelope)
 {
-    /// One successful self-remount whose quiescence costs `quiesce_ms`; returns the conditional
-    /// mount-slot writes it issued, counted while the remount worker is still held inside the event
-    /// sink that reported the result (so the renewal worker it un-parks cannot add one).
-    const auto remountConditionalMountWrites = [](uint64_t quiesce_ms) -> uint64_t
+    struct AtRemountEvent
+    {
+        String step;
+        PoolLifecycle lifecycle = PoolLifecycle::IdentityLost;
+        bool may_mutate = true;
+    };
+    /// One reclaim whose quiescence costs `quiesce_ms`; returns what the MountRemount event and the pool
+    /// show while the lease thread is held inside the sink that reported it.
+    const auto remountWithQuiesce = [](uint64_t quiesce_ms) -> AtRemountEvent
     {
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-        /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
-        /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
-        /// a by-reference capture of a local would dangle.
+        /// Held in shared state: the hooks below mutate it, and the Pool can outlive this lambda's frame.
         auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
-        /// Heap-owned, not a plain local: declaration order relative to `store` only protects against an
-        /// ordinary same-thread unwind, not a detached background completion that holds an extra
-        /// `shared_from_this()` and can still be running on another thread after this call returns.
         auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
+        auto step = std::make_shared<String>();
         auto store = Pool::open(backend, PoolConfig{
             .pool_prefix = "remount-renewer-redo-envelope",
             .server_root_id = "test",
             .background_watermark = true,
-            .event_sink = [committed](const CasEvent & event)
+            .event_sink = [committed, step](const CasEvent & event)
             {
                 if (event.type == CasEventType::MountRemount && event.outcome == "ok")
+                {
+                    *step = event.detail.at("step");
                     committed->arriveAndWait();
+                }
             },
             .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
             .mount_renew_period = std::chrono::milliseconds(100),
@@ -2858,42 +2776,39 @@ TEST(CASPoolRemount, RemountRenewerRedoUsesTheEnvelope)
                 *fake_boot += quiesce_ms;
             },
         });
-        const String mount_key = store->layout().mountKey("test");
-
-        fenceOutMount(*backend, mount_key);
-        const uint64_t before = backend->putOverwriteCount(mount_key);
-        EXPECT_TRUE(store->scheduleRemountForTest())
-            << "the remount must be latched with quiesce_ms=" << quiesce_ms;
+        fenceOutMount(*backend, store->layout().mountKey("test"));
+        EXPECT_TRUE(store->scheduleRemountForTest()) << "the remount must be latched with quiesce_ms=" << quiesce_ms;
         committed->waitUntilArrived();
-        const uint64_t writes = backend->putOverwriteCount(mount_key) - before;
+        AtRemountEvent seen{.step = *step, .lifecycle = store->lifecycle(), .may_mutate = store->mayMutate()};
         committed->release();
-        return writes;
+        return seen;
     };
 
-    /// attempt 100, cap 100: envelope = 100 + 2*100 = 300, so period(100) + 2*envelope(600) = 700. A
-    /// 450 ms quiescence leaves remaining = TTL(1000) - margin(50) - 450 = 500: the old
-    /// period + 2*attempt (300) window fit that, but the new period + 2*envelope (700) window does not
-    /// -- so only the envelope-based check must redo (validation: 100 + 600 + 50 = 750 < 1000).
-    const uint64_t control = remountConditionalMountWrites(0);
-    EXPECT_GT(remountConditionalMountWrites(450), control)
-        << "a quiescence that fits the old attempt-only window but not the envelope window must still cost the redo";
-    /// A 250 ms quiescence leaves remaining = 950 - 250 = 700, exactly equal to
-    /// period + 2*envelope (700): STRICT ("<", not "<=") refuses equality too, so this must also
-    /// redo -- reverting the strict comparison to "<=" would make this case behave like the control.
-    EXPECT_GT(remountConditionalMountWrites(250), control)
-        << "an exact boundary (renewal_window_ms == remaining) must be refused, not accepted";
+    for (uint64_t quiesce_ms : {0, 300})
+    {
+        const AtRemountEvent seen = remountWithQuiesce(quiesce_ms);
+        EXPECT_EQ(seen.step, "publish_live") << "quiesce_ms=" << quiesce_ms;
+        EXPECT_EQ(seen.lifecycle, PoolLifecycle::Live) << "quiesce_ms=" << quiesce_ms;
+        EXPECT_TRUE(seen.may_mutate) << "quiesce_ms=" << quiesce_ms;
+    }
+    /// 350: 650 ms left, exactly the reservation, refused. 450: 550 ms left; two bare attempts plus the
+    /// margin (250) would fit, two envelopes do not.
+    for (uint64_t quiesce_ms : {350, 450})
+    {
+        const AtRemountEvent seen = remountWithQuiesce(quiesce_ms);
+        EXPECT_EQ(seen.step, "claimed_not_armed") << "quiesce_ms=" << quiesce_ms;
+        EXPECT_EQ(seen.lifecycle, PoolLifecycle::TransientNotLive) << "quiesce_ms=" << quiesce_ms;
+        EXPECT_FALSE(seen.may_mutate) << "quiesce_ms=" << quiesce_ms;
+    }
 }
 
 namespace
 {
-/// Stalls the CLAIM ITSELF past the lease TTL, and counts what the open writes afterwards.
+/// Ages the claim on its own I/O, and counts what the open writes afterwards.
 ///
-/// The mount key is written twice before the write fence arms: once by `claimMount`'s reclaim, then
-/// once by the renewer's adopt -- and the fence's anchor is taken BETWEEN them. So advancing the
-/// injected boot clock on the SECOND write models exactly the thing the Phase B redo exists for: the
-/// claim's own I/O outliving the lease it is about to arm a fence under. (This used to be modelled by
-/// a materialization grace long enough to consume the TTL; that wait is retired, and the guard it
-/// motivated is not -- a stalled socket can still outlive a validated request budget.)
+/// The mount key is written twice before the open decides whether to arm: once by `claimMount`'s
+/// reclaim, then once by the renewer's adopt, and the claim's start is taken BETWEEN them. A hook on
+/// the SECOND write therefore ages the claim the open arms from.
 class StalledMountClaimBackend final : public DB::Cas::InMemoryBackend
 {
 public:
@@ -2922,9 +2837,8 @@ public:
 };
 }
 
-/// Phase B startup-arm (spec rev.4, codex round-3 finding 2): a claim path that consumed the lease TTL
-/// must force ONE fresh conditional lease write before arming — the fence must never arm from an anchor
-/// that has already expired (a successor could have legally reclaimed meanwhile).
+/// A claim path that consumed most of the lease must not arm the fence from that claim: the open waits for
+/// the lease thread's first renewal, which writes the lease once more and arms from its own start.
 TEST(CASPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
 {
     auto backend = std::make_shared<StalledMountClaimBackend>();
@@ -2969,9 +2883,8 @@ TEST(CASPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
     {
         return fake_boot_ms->load();
     };
-    /// The renewer's adopt write stalls for 15 s of boot clock. That consumes the publication horizon
-    /// (one 10 s cadence plus one 5 s attempt) while leaving one physical attempt admissible inside
-    /// the old lease's safety window, so the synchronous redo can safely re-anchor.
+    /// The renewer's adopt write stalls for 15 s of boot clock: 15 s of the lease are left, a ref append
+    /// needs 2 x 7 s + 2 s = 16 s, so the open waits; the loop's renewal is due at once (10 s cadence).
     backend->on_second_mount_write = [fake_boot_ms]
     {
         *fake_boot_ms += 15'000;
@@ -2981,12 +2894,71 @@ TEST(CASPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
     ASSERT_NE(store, nullptr);
 
     ASSERT_EQ(backend->mount_writes.load(), 3)
-        << "the fixture assumes exactly two mount writes before the redo (the reclaim and the renewer's "
-           "adopt, with the fence anchor between them); a different sequence would make the stall land "
-           "somewhere else and this test would stop testing the redo";
+        << "the fixture assumes exactly two mount writes before the open decides (the reclaim and the "
+           "renewer's adopt, with the claim's start between them), then the loop's renewal";
     EXPECT_EQ(backend->mount_writes_after_stall.load(), 1)
-        << "a TTL-consuming claim must be followed by exactly ONE fresh conditional lease write "
-           "(the re-anchoring redo) before the write fence arms";
+        << "a claim that consumed the lease is followed by exactly one renewal before the open returns";
+    EXPECT_TRUE(store->mayMutate()) << "the open returns with the fence armed";
+}
+
+/// The arming rule at an open reserves what a ref append needs: two attempt envelopes, connect cap
+/// included, plus the margin, strictly, and no renewal period. With attempt 100 and cap 100 the envelope is
+/// 300 ms, so a claim arms the fence only while more than 2 x 300 + 50 = 650 ms of its 1000 ms lease remain.
+/// The 340 ms period keeps the lease thread from renewing an armed claim before the count is read.
+TEST(CASMountOpenWaits, PublicationHorizonUsesTheEnvelope)
+{
+    /// Opens over a fenced predecessor whose adopt write ages the claim by `claim_age_ms`, and returns the
+    /// conditional writes of the mount key made before the open returned.
+    const auto mountWritesAtOpen = [](uint64_t claim_age_ms) -> int
+    {
+        auto backend = std::make_shared<StalledMountClaimBackend>();
+        DB::Cas::Layout layout("pool");
+        DB::Cas::tests::seedPoolMetaForRestart(*backend, "pool");
+        backend->mount_key = layout.mountKey("s");
+        MountLease prior;
+        prior.server_uuid = DB::UInt128(0x42);
+        prior.writer_epoch = 7;
+        prior.seq = 7;
+        prior.expires_at_ms = 1;
+        prior.gc_fenced = true;
+        prior.write_attempt_id = DB::UInt128{7};
+        createObj(*backend, layout.mountKey("s"), encodeMountLease(prior));
+        createObj(*backend, layout.epochKey("s"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
+        /// Held in a shared atomic: the Pool can outlive this lambda's frame.
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(10'000);
+        backend->on_second_mount_write = [fake_boot, claim_age_ms]
+        {
+            *fake_boot += claim_age_ms;
+        };
+        DB::Cas::PoolConfig cfg;
+        cfg.pool_prefix = "pool";
+        cfg.server_id = DB::UInt128(0x42);
+        cfg.server_root_id = "s";
+        cfg.background_watermark = true;
+        cfg.mount_lease_ttl_ms = std::chrono::milliseconds(1000);
+        cfg.mount_renew_period = std::chrono::milliseconds(340);
+        cfg.cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100};
+        cfg.boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        };
+        cfg.wait_sleep_fn = [fake_boot](uint64_t ms)
+        {
+            *fake_boot += ms;
+        };
+        auto store = Pool::open(backend, cfg);
+        EXPECT_TRUE(store && store->mayMutate()) << "claim_age_ms=" << claim_age_ms;
+        return backend->mount_writes.load();
+    };
+
+    /// 1000 ms left: the claim arms; the reclaim and the adopt only.
+    EXPECT_EQ(mountWritesAtOpen(0), 2);
+    /// 700 ms left: the claim arms. A window with the period in it (340 + 600 = 940) would not fit here.
+    EXPECT_EQ(mountWritesAtOpen(300), 2) << "the arming rule has no period term";
+    /// 650 ms left, exactly the reservation: refused, strict like `admit`; the loop's renewal arms.
+    EXPECT_EQ(mountWritesAtOpen(350), 3) << "an exact boundary must be refused";
+    /// 600 ms left: two bare attempts plus the margin (250) would fit, two envelopes (650) do not.
+    EXPECT_EQ(mountWritesAtOpen(400), 3) << "the reservation counts envelopes, not bare attempts";
 }
 
 /// ==== What a self-remount may block on ====
@@ -4067,200 +4039,6 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
     second.release();
     runtime.stopBackgroundWorkers();
     runtime.finishTeardown(false);
-}
-
-TEST(CASPoolRemount, StaleRemountAnchorPerformsParkedRedo)
-{
-    auto backend = std::make_shared<RuntimeRenewBackend>();
-    /// Held in a shared atomic, not a plain local: `remount_quiesce_hook_for_test` below mutates it,
-    /// and the Pool can outlive this stack frame (a background publish holds `shared_from_this()`), so
-    /// a by-reference capture of a local would dangle.
-    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(100);
-    /// Heap-owned, not a plain local: declaration order relative to the Pool below only protects
-    /// against an ordinary same-thread unwind, not a detached background completion that holds an
-    /// extra `shared_from_this()` and can still be running on another thread after this frame returns.
-    auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
-    PoolConfig config{
-        .pool_prefix = "stale-remount-anchor",
-        .server_root_id = "test",
-        .background_watermark = true,
-        .event_sink = [committed](const CasEvent & event)
-        {
-            if (event.type == CasEventType::MountRemount && event.outcome == "ok")
-                committed->arriveAndWait();
-        },
-        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-        .mount_renew_period = std::chrono::milliseconds(100),
-        .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [fake_boot]
-        {
-            return fake_boot->load();
-        },
-        .remount_quiesce_hook_for_test = [fake_boot]
-        {
-            *fake_boot += 900;
-        },
-    };
-    auto store = Pool::open(backend, config);
-    const String key = store->layout().mountKey("test");
-    fenceOutMount(*backend, key);
-    const uint64_t writes_before = backend->putOverwriteCount(key);
-    ASSERT_TRUE(store->scheduleRemountForTest());
-    committed->waitUntilArrived();
-    EXPECT_GE(backend->putOverwriteCount(key), writes_before + 3)
-        << "claim, renewer start, and the stale-anchor parked redo must all write";
-    committed->release();
-}
-
-TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
-{
-    auto backend = std::make_shared<RuntimeRenewBackend>();
-    /// Held in a shared atomic, not a plain local: `remount_quiesce_hook_for_test` below mutates it,
-    /// and the Pool can outlive this stack frame (a background publish holds `shared_from_this()`), so
-    /// a by-reference capture of a local would dangle.
-    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(100);
-    /// Heap-owned, not plain locals: `event_sink` below mutates them, and the Pool can outlive this
-    /// stack frame (a background publish holds `shared_from_this()`), so a by-reference capture of a
-    /// local -- including a non-copyable `std::promise` -- would dangle.
-    auto result_observed = std::make_shared<std::promise<void>>();
-    std::future<void> result_future = result_observed->get_future();
-    auto result_published = std::make_shared<std::atomic<bool>>(false);
-    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
-    PoolConfig config{
-        .pool_prefix = "parked-redo-recovered-observability",
-        .server_root_id = "test",
-        .background_watermark = true,
-        .event_sink = [result_observed, result_published, events](CasEvent event)
-        {
-            const bool final_remount = event.type == CasEventType::MountRemount && event.outcome == "ok";
-            events->push(std::move(event));
-            if (final_remount && !result_published->exchange(true))
-                result_observed->set_value();
-        },
-        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-        /// 500 with a 700 ms quiescence, so the redo's window (period + attempt timeout = 510) does not
-        /// fit the 280 ms of safe lease left -- and the reissue the ambiguity needs still does, whatever
-        /// the engine's jittered backoff draws from its first-reissue range of at most 200 ms.
-        .mount_renew_period = std::chrono::milliseconds(500),
-        .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [fake_boot]
-        {
-            return fake_boot->load();
-        },
-        /// `backend` is captured BY VALUE (a copy of the shared_ptr, not the stack slot holding it):
-        /// the Pool can outlive this frame, so a by-reference capture of the local `shared_ptr` itself
-        /// would dangle even though the pointee it owns is heap-allocated.
-        .remount_quiesce_hook_for_test = [fake_boot, backend]
-        {
-            *fake_boot += 700;
-            backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
-        },
-    };
-    auto store = Pool::open(backend, config);
-    std::weak_ptr<Pool> store_lifetime = store;
-    ScopedParkedRenewalLogCapture renewal_logs;
-    fenceOutMount(*backend, store->layout().mountKey("test"));
-    ASSERT_TRUE(store->scheduleRemountForTest());
-    ASSERT_EQ(result_future.wait_for(std::chrono::seconds(20)), std::future_status::ready);
-
-    const std::vector<CasEvent> observed = events->snapshot();
-    const auto recovered = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
-    {
-        return event.type == CasEventType::WatermarkRenew && event.outcome == "recovered";
-    });
-    const auto remounted = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
-    {
-        return event.type == CasEventType::MountRemount && event.outcome == "ok";
-    });
-    ASSERT_NE(recovered, observed.end());
-    ASSERT_NE(remounted, observed.end());
-    EXPECT_LT(std::distance(observed.begin(), recovered), std::distance(observed.begin(), remounted));
-    EXPECT_EQ(recovered->detail.at("remount_attempt_no"), remounted->detail.at("attempt_no"));
-    EXPECT_EQ(recovered->detail.at("classification"), "committed_after_retry");
-    /// The physical retry itself: the ambiguous attempt and the reissue that committed.
-    EXPECT_EQ(recovered->detail.at("attempts_sent"), "2");
-    EXPECT_NE(renewal_logs.captured().find("CAS mount renewal 'test' recovered"), String::npos);
-
-    /// `~Pool` stops and joins both persistent runtime workers. Make that quiescence boundary part of
-    /// the test, before any event/log capture state referenced by those workers can leave scope.
-    store.reset();
-    EXPECT_TRUE(store_lifetime.expired());
-}
-
-TEST(CASPoolRemount, ParkedRedoFailureObservabilityPrecedesRemountResult)
-{
-    auto backend = std::make_shared<RuntimeRenewBackend>();
-    /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can outlive
-    /// this stack frame (a background publish holds `shared_from_this()`), so a by-reference capture
-    /// of a local would dangle.
-    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(100);
-    /// Heap-owned, not plain locals: `event_sink` below mutates them, and the Pool can outlive this
-    /// stack frame (a background publish holds `shared_from_this()`), so a by-reference capture of a
-    /// local -- including a non-copyable `std::promise` -- would dangle.
-    auto result_observed = std::make_shared<std::promise<void>>();
-    std::future<void> result_future = result_observed->get_future();
-    auto result_published = std::make_shared<std::atomic<bool>>(false);
-    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
-    PoolConfig config{
-        .pool_prefix = "parked-redo-failed-observability",
-        .server_root_id = "test",
-        .background_watermark = true,
-        .event_sink = [result_observed, result_published, events](CasEvent event)
-        {
-            const bool final_remount = event.type == CasEventType::MountRemount && event.outcome == "failed";
-            events->push(std::move(event));
-            if (final_remount && !result_published->exchange(true))
-                result_observed->set_value();
-        },
-        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-        .mount_renew_period = std::chrono::milliseconds(100),
-        .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [fake_boot]
-        {
-            return fake_boot->load();
-        },
-        /// `backend` is captured BY VALUE (a copy of the shared_ptr): the Pool can outlive this frame,
-        /// so a by-reference capture of the local `shared_ptr` itself would dangle.
-        .remount_quiesce_hook_for_test = [fake_boot, backend]
-        {
-            *fake_boot += 900;
-            backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
-            /// The attempt is admitted 80 ms before its lease-safe bound; spending 90 inside it puts the
-            /// resolve read past that bound, so the ambiguity is refused instead of reissued.
-            backend->before_throw = [fake_boot]
-            {
-                *fake_boot += 90;
-            };
-        },
-    };
-    auto store = Pool::open(backend, config);
-    std::weak_ptr<Pool> store_lifetime = store;
-    ScopedParkedRenewalLogCapture renewal_logs;
-    fenceOutMount(*backend, store->layout().mountKey("test"));
-    ASSERT_TRUE(store->scheduleRemountForTest());
-    ASSERT_EQ(result_future.wait_for(std::chrono::seconds(20)), std::future_status::ready);
-
-    const std::vector<CasEvent> observed = events->snapshot();
-    const auto failed_renew = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
-    {
-        return event.type == CasEventType::WatermarkRenew && event.outcome == "failed";
-    });
-    const auto failed_remount = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
-    {
-        return event.type == CasEventType::MountRemount && event.outcome == "failed";
-    });
-    ASSERT_NE(failed_renew, observed.end());
-    ASSERT_NE(failed_remount, observed.end());
-    EXPECT_LT(std::distance(observed.begin(), failed_renew), std::distance(observed.begin(), failed_remount));
-    EXPECT_EQ(failed_renew->detail.at("remount_attempt_no"), failed_remount->detail.at("attempt_no"));
-    EXPECT_EQ(failed_renew->detail.at("attempts_sent"), "1");
-    EXPECT_EQ(failed_renew->detail.at("classification"), "external_lease_deadline");
-    EXPECT_NE(renewal_logs.captured().find("CAS mount renewal 'test' fenced"), String::npos);
-
-    /// A ready final-result future proves publication order; destruction additionally proves the
-    /// background renewal/remount threads are joined before the fixture's captured state is destroyed.
-    store.reset();
-    EXPECT_TRUE(store_lifetime.expired());
 }
 
 TEST(CASPoolRemount, ThrowingEventSinkAfterCommitLeavesRuntimeLive)
@@ -5485,75 +5263,6 @@ TEST(CASPoolRemount, WholeChainResultsAreNumberedAndStepLabelled)
     const uint64_t second_attempt = std::stoull(remounts[1].detail.at("attempt_no"));
     EXPECT_EQ(second_attempt, first_attempt + 1);
     EXPECT_EQ(countRemountFinalLogs(logs.captured()), 2u) << logs.captured();
-}
-
-/// The remount's `renewer_redo` step re-anchors the lease BEFORE `armMountFence`, so it runs with the
-/// fence still latched lost. Admitted on the mount plane it could only ever give up, and every remount
-/// that reached the step would fail -- so it renews on the renewer's open plane instead.
-///
-/// Driven the way production reaches the step, which is the only way it CAN be reached: the persistent
-/// renewal worker runs, `scheduleRemount` parks it, and the redo is the parked driver's one call. A
-/// remount driven directly with no workers leaves that driver dormant, and the step's admission refuses
-/// a dormant driver rather than renewing.
-///
-/// The step is reached only when quiescence has eaten most of the new lease: with a fresh anchor the
-/// renewal window fits and the step is skipped entirely. So the quiesce hook advances the injected boot
-/// clock to just inside the safety margin, and the paired run with no quiesce cost is the control that
-/// proves the step was reached rather than skipped.
-TEST(CASPoolRemount, TheRenewerRedoRenewsOnTheOpenPlane)
-{
-    /// One successful self-remount whose quiescence costs `quiesce_ms`; returns the conditional
-    /// mount-slot writes it issued. Counted while the remount worker is still held inside the event
-    /// sink that reported the result, so the renewal worker it un-parks cannot add one.
-    const auto remountConditionalMountWrites = [](uint64_t quiesce_ms) -> uint64_t
-    {
-        auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-        /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
-        /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
-        /// a by-reference capture of a local would dangle.
-        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
-        /// Heap-owned, not a plain local: declaration order relative to `store` only protects against an
-        /// ordinary same-thread unwind, not a detached background completion that holds an extra
-        /// `shared_from_this()` and can still be running on another thread after this call returns.
-        auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
-        auto store = Pool::open(backend, PoolConfig{
-            .pool_prefix = "remount-renewer-redo",
-            .server_root_id = "test",
-            .background_watermark = true,
-            .event_sink = [committed](const CasEvent & event)
-            {
-                if (event.type == CasEventType::MountRemount && event.outcome == "ok")
-                    committed->arriveAndWait();
-            },
-            .boot_ms_fn = [fake_boot]
-            {
-                return fake_boot->load();
-            },
-            .wait_sleep_fn = [fake_boot](uint64_t ms)
-            {
-                *fake_boot += ms;
-            },
-            .remount_quiesce_hook_for_test = [fake_boot, quiesce_ms]
-            {
-                *fake_boot += quiesce_ms;
-            },
-        });
-        const String mount_key = store->layout().mountKey("test");
-
-        fenceOutMount(*backend, mount_key);
-        const uint64_t before = backend->putOverwriteCount(mount_key);
-        EXPECT_TRUE(store->scheduleRemountForTest())
-            << "the remount must be latched with quiesce_ms=" << quiesce_ms;
-        committed->waitUntilArrived();
-        const uint64_t writes = backend->putOverwriteCount(mount_key) - before;
-        committed->release();
-        return writes;
-    };
-
-    /// 27 s of a 30 s lease, against a 2 s safety margin and a window of one renewal period plus one
-    /// attempt (15 s, since the renewal worker runs here): the window no longer fits.
-    EXPECT_GT(remountConditionalMountWrites(27'000), remountConditionalMountWrites(0))
-        << "a quiescence that consumed the lease must cost one extra lease write -- the redo";
 }
 
 TEST(CASPoolRemount, LeaseLossHasOneOperationalOwner)
@@ -6821,3 +6530,572 @@ TEST(CASMountRuntime, ARenewalArmsNothingWhileARequestIsPending)
     runtime.stopBackgroundWorkers();
     runtime.finishTeardown(false);
 }
+
+namespace
+{
+/// Fails the conditional writes of the mount key that `on_mount_write` says to fail, with a timeout raised
+/// before the store applied anything. The hook gets the 1-based number of the conditional write of the
+/// mount key, counting every one: reclaims, adopts, renewals and a test's own fence-out.
+class MountWriteScriptBackend final : public DB::Cas::InMemoryBackend
+{
+public:
+    String mount_key;
+    std::function<bool(uint32_t write_no)> on_mount_write;
+    std::atomic<uint32_t> mount_writes{0};
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+        const std::optional<String> & expected_value, DB::Cas::TransportAccess & access) override
+    {
+        if (key == mount_key && expected_value)
+        {
+            const uint32_t write_no = ++mount_writes;
+            if (on_mount_write && on_mount_write(write_no))
+                throw Poco::TimeoutException("injected readiness renewal timeout");
+        }
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+};
+
+const UInt128 kReadyUuid{0x42};
+constexpr uint64_t kReadyClaimBootMs = 10'000;
+/// The adopt write or the quiesce takes 20 s: the claim leaves 10 s of the default 30 s lease, and a ref
+/// append needs 2 x 7 s + 2 s = 16 s with the default budget.
+constexpr uint64_t kReadyClaimAgeMs = 20'000;
+constexpr uint64_t kReadyPeriodMs = 10'000;
+
+/// Pool meta, and a fenced, long-expired predecessor under epoch 7 with the epoch object that minted it.
+/// An open as `kReadyUuid` reclaims it at once and writes the mount key exactly twice (the reclaim, then
+/// the renewer's adopt) before it decides whether to arm.
+void seedFencedPredecessor(DB::Cas::Backend & backend, const String & pool_prefix)
+{
+    DB::Cas::tests::seedPoolMetaForRestart(backend, pool_prefix);
+    const Layout layout(pool_prefix);
+    MountLease prior;
+    prior.server_uuid = kReadyUuid;
+    prior.writer_epoch = 7;
+    prior.seq = 7;
+    prior.expires_at_ms = 1;
+    prior.gc_fenced = true;
+    prior.write_attempt_id = UInt128{7};
+    createObj(backend, layout.mountKey("s"), encodeMountLease(prior));
+    createObj(backend, layout.epochKey("s"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
+}
+
+/// A writable pool with a lease thread, the default lease, period and budget, and a boot clock that only
+/// the test and the injected sleeps move.
+PoolConfig readinessPoolConfig(const String & pool_prefix, const std::shared_ptr<std::atomic<uint64_t>> & fake_boot)
+{
+    PoolConfig config;
+    config.pool_prefix = pool_prefix;
+    config.server_id = kReadyUuid;
+    config.server_root_id = "s";
+    config.background_watermark = true;
+    config.boot_ms_fn = [fake_boot]
+    {
+        return fake_boot->load();
+    };
+    config.wait_sleep_fn = [fake_boot](uint64_t ms)
+    {
+        *fake_boot += ms;
+    };
+    config.retry_sleep_fn = [fake_boot](uint64_t ms)
+    {
+        *fake_boot += ms;
+    };
+    return config;
+}
+
+/// What a readiness scenario records on the lease thread. Heap-owned and captured by value: a `Pool` can
+/// outlive the test frame.
+struct ReadinessSeen
+{
+    std::thread::id opening_thread;
+    std::atomic<bool> renewal_on_opening_thread{true};
+    std::atomic<uint64_t> renewal_boot_ms{0};
+    std::atomic<uint32_t> failed_renewals{0};
+    std::atomic<bool> request_bound_hit{false};
+    std::atomic<Pool *> pool{nullptr};
+    std::atomic<int> lifecycle_at_renewal{-1};
+    std::atomic<int> may_mutate_at_renewal{-1};
+    std::atomic<int> lifecycle_at_arm{-1};
+    std::atomic<int> may_mutate_at_arm{-1};
+    std::atomic<int> lifecycle_after_arm{-1};
+    std::atomic<int> may_mutate_after_arm{-1};
+    /// Written on the lease thread before the sink's barrier, read by the test after it.
+    String remount_outcome;
+    String remount_step;
+};
+}
+
+/// Spec test 14, cases 1, 6 and 7. An open whose claim is too old returns only after the lease thread's
+/// renewal armed the fence; a reclaim whose quiescence aged its claim the same way reports success with
+/// the pool not `Live` and the fence latched, and the next renewal arms it. No sampled point sees the
+/// fence armed while the pool is not `Live`.
+TEST(CASMountRuntime, OpenAndRemountReportReadyOnlyWhenWritable)
+{
+    /// Case 1. The claim starts at 10 s and the adopt write ends at 30 s.
+    {
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
+        auto seen = std::make_shared<ReadinessSeen>();
+        seen->opening_thread = std::this_thread::get_id();
+        auto backend = std::make_shared<MountWriteScriptBackend>();
+        seedFencedPredecessor(*backend, "ready-open");
+        backend->mount_key = Layout("ready-open").mountKey("s");
+        backend->on_mount_write = [fake_boot, seen](uint32_t write_no)
+        {
+            if (write_no == 2)
+            {
+                *fake_boot += kReadyClaimAgeMs;
+            }
+            else if (write_no == 3)
+            {
+                seen->renewal_boot_ms = fake_boot->load();
+                seen->renewal_on_opening_thread = std::this_thread::get_id() == seen->opening_thread;
+            }
+            return false;
+        };
+        auto store = Pool::open(backend, readinessPoolConfig("ready-open", fake_boot));
+        ASSERT_TRUE(store);
+        EXPECT_EQ(backend->mount_writes.load(), 3u) << "the reclaim, the adopt and one renewal";
+        EXPECT_FALSE(seen->renewal_on_opening_thread.load()) << "the lease thread renews, not the opening thread";
+        EXPECT_EQ(seen->renewal_boot_ms.load(), kReadyClaimBootMs + kReadyClaimAgeMs) << "the renewal is sent with no cadence wait";
+        EXPECT_EQ(store->lifecycle(), PoolLifecycle::Live);
+        EXPECT_TRUE(store->mayMutate());
+        /// The claim's deadline (40 s) would leave 10 s at 30 s; only the renewal's (60 s) admits the append.
+        EXPECT_NO_THROW(publishPart(store, "srv/ready-open", "x", "payload")) << "a ref append is admitted when the open returns";
+    }
+
+    /// Cases 6 and 7. A fresh open arms at once. Then a reclaim: claim at 10 s, quiescence until 30 s.
+    {
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
+        auto seen = std::make_shared<ReadinessSeen>();
+        auto remounted = std::make_shared<DB::Cas::tests::ManualBarrier>();
+        auto renewed_after_arm = std::make_shared<DB::Cas::tests::ManualBarrier>();
+        auto backend = std::make_shared<MountWriteScriptBackend>();
+        seedFencedPredecessor(*backend, "ready-remount");
+        const String mount_key = Layout("ready-remount").mountKey("s");
+        backend->mount_key = mount_key;
+        /// 1, 2: the open's reclaim and adopt. 3: the test's fence-out. 4, 5: the remount's claim and adopt.
+        /// 6: the renewal that arms. 7: the renewal after it.
+        backend->on_mount_write = [fake_boot, seen, renewed_after_arm](uint32_t write_no)
+        {
+            if (write_no == 6)
+            {
+                Pool * pool = seen->pool.load();
+                seen->renewal_boot_ms = fake_boot->load();
+                seen->lifecycle_at_renewal = static_cast<int>(pool->lifecycle());
+                seen->may_mutate_at_renewal = pool->mayMutate();
+            }
+            else if (write_no == 7)
+            {
+                Pool * pool = seen->pool.load();
+                seen->lifecycle_after_arm = static_cast<int>(pool->lifecycle());
+                seen->may_mutate_after_arm = pool->mayMutate();
+                renewed_after_arm->arriveAndWait();
+            }
+            return false;
+        };
+        PoolConfig config = readinessPoolConfig("ready-remount", fake_boot);
+        config.event_sink = [seen, remounted](const CasEvent & event)
+        {
+            if (event.type != CasEventType::MountRemount)
+                return;
+            seen->remount_outcome = event.outcome;
+            seen->remount_step = event.detail.at("step");
+            remounted->arriveAndWait();
+        };
+        config.remount_quiesce_hook_for_test = [fake_boot]
+        {
+            *fake_boot += kReadyClaimAgeMs;
+        };
+        auto store = Pool::open(backend, config);
+        ASSERT_TRUE(store);
+        ASSERT_EQ(backend->mount_writes.load(), 2u) << "a fresh claim arms at once";
+        seen->pool = store.get();
+        /// Runs inside the arm, after the new generation and before `Live` and the open fence. It also makes
+        /// the next renewal due at once, so its request shows the state the arm left.
+        store->setArmMountFenceInterpositionHookForTest([seen, fake_boot]
+        {
+            Pool * pool = seen->pool.load();
+            seen->lifecycle_at_arm = static_cast<int>(pool->lifecycle());
+            seen->may_mutate_at_arm = pool->mayMutate();
+            *fake_boot += kReadyPeriodMs;
+        });
+        const uint64_t succeeded_before = eventCount(ProfileEvents::CASRemountSucceeded);
+        fenceOutMount(*backend, mount_key);
+        ASSERT_TRUE(store->scheduleRemountForTest());
+
+        remounted->waitUntilArrived();
+        EXPECT_EQ(seen->remount_outcome, "ok");
+        EXPECT_EQ(seen->remount_step, "claimed_not_armed");
+        EXPECT_EQ(eventCount(ProfileEvents::CASRemountSucceeded), succeeded_before + 1);
+        EXPECT_EQ(store->lifecycle(), PoolLifecycle::TransientNotLive) << "case 6: not Live after the reclaim";
+        EXPECT_FALSE(store->mayMutate()) << "case 6: the fence stays latched";
+        remounted->release();
+
+        renewed_after_arm->waitUntilArrived();
+        ASSERT_EQ(backend->mount_writes.load(), 7u);
+        EXPECT_EQ(seen->renewal_boot_ms.load(), kReadyClaimBootMs + kReadyClaimAgeMs) << "the loop renewed at once";
+        /// Case 7: at every sampled point, an armed fence comes with `Live`.
+        EXPECT_EQ(seen->lifecycle_at_renewal.load(), static_cast<int>(PoolLifecycle::TransientNotLive));
+        EXPECT_EQ(seen->may_mutate_at_renewal.load(), 0) << "the renewal is sent under the latched fence";
+        EXPECT_EQ(seen->lifecycle_at_arm.load(), static_cast<int>(PoolLifecycle::TransientNotLive));
+        EXPECT_EQ(seen->may_mutate_at_arm.load(), 0) << "inside the arm, before `Live`, the fence still refuses";
+        EXPECT_EQ(seen->lifecycle_after_arm.load(), static_cast<int>(PoolLifecycle::Live));
+        EXPECT_EQ(seen->may_mutate_after_arm.load(), 1) << "after the arm: `Live` and writable";
+        renewed_after_arm->release();
+    }
+}
+
+/// Spec test 14, case 2. Every readiness renewal fails: the open waits one lease on the fence clock, then
+/// stops and joins the lease thread and fails, naming the last failed request.
+TEST(CASMountRuntime, AnOpenWhoseReadinessRenewalKeepsFailingFailsAfterOneTtl)
+{
+    /// Longer than the largest spacing draw, so a failed request is retried at once.
+    constexpr uint64_t failed_request_ms = 1'300;
+    /// Far above the 24 failures one lease takes; reached only if the open never gives up.
+    constexpr uint32_t max_failed_renewals = 10'000;
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
+    auto seen = std::make_shared<ReadinessSeen>();
+    auto exits = std::make_shared<WorkerExitLatch>();
+    auto backend = std::make_shared<MountWriteScriptBackend>();
+    seedFencedPredecessor(*backend, "ready-fail");
+    backend->mount_key = Layout("ready-fail").mountKey("s");
+    backend->on_mount_write = [fake_boot, seen](uint32_t write_no)
+    {
+        if (write_no == 2)
+            *fake_boot += kReadyClaimAgeMs;
+        if (write_no < 3)
+            return false;
+        if (seen->failed_renewals.load() >= max_failed_renewals)
+        {
+            seen->request_bound_hit = true;
+            return false;
+        }
+        ++seen->failed_renewals;
+        *fake_boot += failed_request_ms;
+        return true;
+    };
+    PoolConfig config = readinessPoolConfig("ready-fail", fake_boot);
+    config.worker_factory = [exits](std::function<void()> worker_body)
+    {
+        return ThreadFromGlobalPool([exits, body = std::move(worker_body)]
+        {
+            body();
+            exits->recordExit();
+        });
+    };
+    const uint64_t lost_before = eventCount(ProfileEvents::CASMountLeaseLost);
+    const uint64_t expired_before = eventCount(ProfileEvents::CASMountLeaseExpired);
+
+    int code = 0;
+    String message;
+    try
+    {
+        (void)Pool::open(backend, config);
+        ADD_FAILURE() << "an open whose readiness renewal never succeeds must fail";
+    }
+    catch (const DB::Exception & e)
+    {
+        code = e.code();
+        message = e.message();
+    }
+
+    EXPECT_EQ(code, DB::ErrorCodes::ABORTED) << message;
+    EXPECT_NE(message.find("injected readiness renewal timeout"), String::npos) << "the failure names the last request: " << message;
+    EXPECT_FALSE(seen->request_bound_hit.load()) << "the open never gave up";
+    /// The wait starts at 30 s or later and ends once the fence clock passes one lease after its start:
+    /// 23 failures reach 59.9 s, the 24th 61.2 s.
+    EXPECT_GE(seen->failed_renewals.load(), 24u) << "the open waited one lease, not until a lease bound";
+    EXPECT_EQ(exits->count(), 1u) << "the lease thread was joined before the open failed";
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountLeaseLost), lost_before) << "a failed open is not a lease loss";
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountLeaseExpired), expired_before);
+}
+
+/// Ruling O1: a writable open with no lease thread whose claim does not admit a ref append fails at once
+/// with a retryable error, and sends no renewal.
+TEST(CASPool, AnOpenWithoutALeaseThreadFailsWhenItsClaimIsTooOld)
+{
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
+    auto backend = std::make_shared<MountWriteScriptBackend>();
+    seedFencedPredecessor(*backend, "ready-no-thread");
+    backend->mount_key = Layout("ready-no-thread").mountKey("s");
+    backend->on_mount_write = [fake_boot](uint32_t write_no)
+    {
+        if (write_no == 2)
+            *fake_boot += kReadyClaimAgeMs;
+        return false;
+    };
+    PoolConfig config = readinessPoolConfig("ready-no-thread", fake_boot);
+    config.background_watermark = false;
+    const uint64_t attempts_before = eventCount(ProfileEvents::CASMountRenewalAttempts);
+
+    int code = 0;
+    String message;
+    try
+    {
+        (void)Pool::open(backend, config);
+        ADD_FAILURE() << "an open with no lease thread and a claim too old must fail";
+    }
+    catch (const DB::Exception & e)
+    {
+        code = e.code();
+        message = e.message();
+    }
+
+    EXPECT_EQ(code, DB::ErrorCodes::ABORTED) << message;
+    EXPECT_NE(message.find("no lease thread"), String::npos) << message;
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountRenewalAttempts), attempts_before) << "nothing renewed the claim";
+}
+
+namespace
+{
+/// What the open's wait and the reclaim saw when the readiness renewal met a definitive answer.
+struct DefinitiveReadinessSeen
+{
+    bool armed = false;
+    uint32_t puts_at_first_reclaim = 0;
+    String admit_at_first_reclaim = "unobserved";
+    bool may_mutate_at_first_reclaim = true;
+    uint32_t reclaims = 0;
+    uint64_t boot_before_wait = 0;
+    uint64_t boot_after_wait = 0;
+    ReadinessView after;
+    uint64_t live_writer_epoch = 0;
+    uint64_t requested_generation = 0;
+    uint64_t lease_lost = 0;
+};
+
+/// The open's shape at the runtime level, with a lease of 1000 ms: the claim starts at 100 ms and the open
+/// decides at 1070 ms, with 30 ms left and 40 ms needed. The slot is GC-fenced before the loop starts, so the
+/// readiness renewal gets a definitive answer. The reclaim either claims epoch 2 and arms, or fails each
+/// attempt and moves the fence clock 600 ms.
+void runDefinitiveAnswerDuringReadiness(bool reclaim_arms, DefinitiveReadinessSeen & seen)
+{
+    const Layout layout(reclaim_arms ? "runtime-readiness-definitive-reclaimed" : "runtime-readiness-definitive-failing");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{100};
+    std::atomic<uint32_t> puts{0};
+    std::atomic<uint32_t> reclaims{0};
+    CasMountRuntime * runtime_ptr = nullptr;
+    const uint64_t lost_before = eventCount(ProfileEvents::CASMountLeaseLost);
+    CasEventSink sink;
+    auto backend = std::make_shared<ExpiryScriptBackend>();
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return boot_ms.load(); }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            CasMountRuntime & reclaiming = *runtime_ptr;
+            if (++reclaims == 1)
+            {
+                seen.puts_at_first_reclaim = puts.load();
+                seen.admit_at_first_reclaim = expiryAdmitName(reclaiming.admit(reclaiming.fenceGeneration(), 0));
+                seen.may_mutate_at_first_reclaim = reclaiming.mayMutate();
+            }
+            reclaiming.beginReclaim();
+            if (!reclaim_arms)
+            {
+                boot_ms.fetch_add(600);
+                return false;
+            }
+            if (claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 2, wall_ms, 1000).kind
+                != MountClaimResult::Claimed)
+                return false;
+            reclaiming.installRenewer(uuid, 2, [&] { return wall_ms; });
+            const uint64_t fresh_anchor = reclaiming.startRenewer();
+            reclaiming.setLiveWriterEpoch(2);
+            /// On a regression that does not arm, the clock passes the open's bound and the arm's
+            /// notification ends the wait, so the test fails instead of hanging.
+            if (!reclaiming.armIfAdmissible(fresh_anchor + 1000))
+                boot_ms.fetch_add(2000);
+            return true;
+        });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    boot_ms = 1070;
+    ASSERT_FALSE(runtime.armIfAdmissible(anchor + 1000)) << "the claim leaves 30 ms, a ref append needs 40";
+    fenceOutMount(*backend, layout.mountKey("test"));
+    backend->on_put = [&](uint32_t put_no)
+    {
+        ++puts;
+        /// A second renewal before any reclaim is the regression this test names. Fail it and move the
+        /// clock past the open's bound: the failure notifies the wait, which then gives up.
+        if (put_no >= 2 && reclaims.load() == 0)
+        {
+            boot_ms.fetch_add(2000);
+            return true;
+        }
+        return false;
+    };
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(300));
+
+    seen.boot_before_wait = boot_ms.load();
+    seen.armed = runtime.waitUntilArmed(1000);
+    seen.boot_after_wait = boot_ms.load();
+
+    /// The join orders every write of the lease thread before the reads below.
+    runtime.stopBackgroundWorkers();
+    seen.after = readinessViewOf(runtime);
+    seen.reclaims = reclaims.load();
+    seen.live_writer_epoch = runtime.liveWriterEpoch();
+    seen.requested_generation = runtime.remountRequestedGenerationForTest();
+    seen.lease_lost = eventCount(ProfileEvents::CASMountLeaseLost) - lost_before;
+    runtime.finishTeardown(false);
+}
+
+/// Throws a `LOGICAL_ERROR` from the renewal's conditional write of the mount key once `failing` is set: the
+/// renewal hands it to the loop, which leaves through its own error path.
+class LeaseLoopFailureBackend final : public DB::Cas::tests::CountingBackend
+{
+public:
+    std::atomic<bool> failing{false};
+    std::atomic<uint32_t> failures{0};
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+        const std::optional<String> & expected_value, DB::Cas::TransportAccess & access) override
+    {
+        if (failing.load() && expected_value && key.ends_with("/mount"))
+        {
+            /// Bounds a retry of the failure, should the engine ever retry one: the renewal then commits,
+            /// the fence arms and the test fails on `armed` instead of hanging.
+            if (++failures >= kReadinessRequestBound)
+                failing = false;
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "injected lease-loop failure");
+        }
+        return DB::Cas::tests::CountingBackend::write(key, bytes, expected_value, access);
+    }
+};
+
+struct LeaseThreadEndSeen
+{
+    uint32_t exits = 0;
+    uint32_t failures = 0;
+    bool armed = true;
+    uint64_t boot_before_wait = 0;
+    uint64_t boot_after_wait = 0;
+    bool may_mutate = true;
+};
+
+/// The open's shape with a 1000 ms lease, as above; the readiness renewal's first request throws a
+/// `LOGICAL_ERROR`. After the thread is gone, every read of the fence clock moves it 600 ms, so the wait's
+/// bound is reached on that clock.
+void runLeaseThreadEndsOnItsOwn(LeaseThreadEndSeen & seen)
+{
+    const Layout layout("runtime-readiness-thread-ended");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{100};
+    std::atomic<bool> thread_gone{false};
+    WorkerExitLatch exits;
+    RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+    {
+        return ThreadFromGlobalPool([&, body = std::move(worker_body)]
+        {
+            body();
+            exits.recordExit();
+        });
+    };
+    CasEventSink sink;
+    auto backend = std::make_shared<LeaseLoopFailureBackend>();
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return thread_gone.load() ? boot_ms.fetch_add(600) + 600 : boot_ms.load(); },
+            .worker_factory = factory},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    boot_ms = 1070;
+    ASSERT_FALSE(runtime.armIfAdmissible(anchor + 1000));
+    backend->failing = true;
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(300));
+
+    ASSERT_TRUE(exits.waitForAtLeast(1)) << "the loop must leave through its own error path";
+    thread_gone = true;
+    seen.boot_before_wait = boot_ms.load();
+    seen.armed = runtime.waitUntilArmed(1000);
+    seen.boot_after_wait = boot_ms.load();
+    seen.may_mutate = runtime.mayMutate();
+    seen.exits = static_cast<uint32_t>(exits.count());
+    seen.failures = backend->failures.load();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+}
+
+/// The open's readiness renewal meets a definitive answer: the renewal is terminal and raises one remount
+/// generation, the fence stays latched, and the loop reclaims before any further renewal. The open's wait
+/// ends armed when the reclaim arms under the new epoch, and gives up after one lease on the fence clock when
+/// every reclaim fails.
+TEST(CASMountRuntime, ADefinitiveAnswerDuringReadinessIsServedByAReclaim)
+{
+    DefinitiveReadinessSeen reclaimed;
+    ASSERT_NO_FATAL_FAILURE(runDefinitiveAnswerDuringReadiness(/*reclaim_arms=*/true, reclaimed));
+    EXPECT_TRUE(reclaimed.armed) << "the reclaim armed the fence";
+    EXPECT_EQ(reclaimed.puts_at_first_reclaim, 1u) << "the loop reclaimed before any further renewal";
+    EXPECT_EQ(reclaimed.admit_at_first_reclaim, "LostOrRearmed") << "no write is admitted before the arm";
+    EXPECT_FALSE(reclaimed.may_mutate_at_first_reclaim);
+    EXPECT_EQ(reclaimed.reclaims, 1u);
+    EXPECT_STREQ(reclaimed.after.admit, "Ok");
+    EXPECT_TRUE(reclaimed.after.ref_append_ok);
+    EXPECT_EQ(reclaimed.after.lifecycle, PoolLifecycle::Live);
+    EXPECT_EQ(reclaimed.live_writer_epoch, 2u) << "armed under the new epoch";
+    EXPECT_EQ(reclaimed.requested_generation, 1u) << "one definitive answer, one remount generation";
+    EXPECT_EQ(reclaimed.lease_lost, 1u) << "the definitive answer counts one lease loss; the open's latch none";
+
+    DefinitiveReadinessSeen failing;
+    ASSERT_NO_FATAL_FAILURE(runDefinitiveAnswerDuringReadiness(/*reclaim_arms=*/false, failing));
+    EXPECT_FALSE(failing.armed);
+    EXPECT_GE(failing.boot_after_wait, failing.boot_before_wait + 1000) << "the wait gave up after one lease on the fence clock";
+    EXPECT_EQ(failing.puts_at_first_reclaim, 1u);
+    EXPECT_EQ(failing.admit_at_first_reclaim, "LostOrRearmed");
+    EXPECT_GE(failing.reclaims, 1u);
+    EXPECT_STREQ(failing.after.admit, "LostOrRearmed") << "nothing armed";
+    EXPECT_FALSE(failing.after.may_mutate);
+    EXPECT_EQ(failing.live_writer_epoch, 0u);
+    EXPECT_EQ(failing.requested_generation, 1u);
+    EXPECT_EQ(failing.lease_lost, 1u);
+}
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
+/// The lease thread leaves through its own error path while the open waits. The fence stays latched and the
+/// wait returns false; nothing notifies it, so it ends at its bound of one lease on the fence clock.
+TEST(CASMountRuntime, AnOpenFailsWhenTheLeaseThreadEndedOnItsOwn)
+{
+    LeaseThreadEndSeen seen;
+    ASSERT_NO_FATAL_FAILURE(runLeaseThreadEndsOnItsOwn(seen));
+    EXPECT_EQ(seen.exits, 1u);
+    EXPECT_EQ(seen.failures, 1u) << "the first readiness request reached the loop's error path";
+    EXPECT_FALSE(seen.armed);
+    EXPECT_GE(seen.boot_after_wait, seen.boot_before_wait + 1000) << "the wait ended at its bound on the fence clock";
+    EXPECT_FALSE(seen.may_mutate) << "the fence stays latched";
+}
+#else
+/// A `LOGICAL_ERROR` aborts a debug or sanitizer build where it is constructed, so the loop's error path is
+/// reached only in a release build. Here the scenario must end the process.
+TEST(CASMountRuntimeDeathTest, AnOpenFailsWhenTheLeaseThreadEndedOnItsOwn)
+{
+    EXPECT_DEATH(
+        {
+            LeaseThreadEndSeen seen;
+            runLeaseThreadEndsOnItsOwn(seen);
+        },
+        "injected lease-loop failure");
+}
+#endif
