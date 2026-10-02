@@ -45,7 +45,7 @@ struct SchemaConverter
     std::unordered_map<String, GeoColumnMetadata> geo_columns;
 
     /// Type names from the `clickhouse.column_types` footer metadata.
-    std::unordered_map<String, String> clickhouse_column_type_names;
+    std::unordered_map<String, String> annotated_column_type_names;
 
     SchemaConverter(const parq::FileMetaData &, const ReadOptions &, const Block *);
 

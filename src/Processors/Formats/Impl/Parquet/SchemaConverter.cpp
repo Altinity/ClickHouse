@@ -72,7 +72,7 @@ SchemaConverter::SchemaConverter(
                 Poco::JSON::Parser parser;
                 const auto object = parser.parse(kv.value).extract<Poco::JSON::Object::Ptr>();
                 for (const auto & name : object->getNames())
-                    clickhouse_column_type_names[name] = object->getValue<String>(name);
+                    annotated_column_type_names[name] = object->getValue<String>(name);
             }
             catch (Exception & e)
             {
@@ -212,8 +212,8 @@ NamesAndTypesList SchemaConverter::inferSchema()
         if (node.output_idx.has_value())
         {
             const OutputColumnInfo & col = output_columns.at(node.output_idx.value());
-            auto it = clickhouse_column_type_names.find(col.name);
-            if (it == clickhouse_column_type_names.end())
+            auto it = annotated_column_type_names.find(col.name);
+            if (it == annotated_column_type_names.end())
             {
                 res.emplace_back(col.name, col.output_type);
                 continue;
