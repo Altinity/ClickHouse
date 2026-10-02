@@ -143,6 +143,7 @@ def setup_cluster(request):
         "node",
         main_configs=[
             "configs/disk_s3.xml",
+            "configs/disk_cas.xml",
             "configs/named_collection_s3_backups.xml",
             "configs/s3_settings.xml",
             "configs/blob_log.xml",
@@ -154,6 +155,7 @@ def setup_cluster(request):
             "configs/zookeeper_retries.xml",
         ],
         with_minio=True,
+        with_rustfs=True,
         # The test compares some S3 events. We disable the remote DB disk, so it doesn't affect the comparing events.
         with_remote_database_disk=False,
         with_zookeeper=True,
@@ -176,6 +178,14 @@ def cluster(setup_cluster):
 
 
 backup_id_counter = 0
+
+CAS_POLICIES = ["policy_cas", "policy_cas_cache"]
+
+
+def s3_backup_destination(storage_policy, backup_name):
+    if storage_policy in CAS_POLICIES:
+        return f"S3('http://rustfs1:11121/test/backups/{backup_name}', 'clickhouse', 'clickhouse')"
+    return f"S3('http://minio1:9001/root/data/backups/{backup_name}', 'minio', '{minio_secret_key}')"
 
 
 def new_backup_name():
@@ -293,6 +303,8 @@ def check_system_tables(cluster, backup_query_id=None):
         ("disk_s3_plain", "ObjectStorage", "S3", "Plain"),
         ("disk_s3_plain_rewritable", "ObjectStorage", "S3", "PlainRewritable"),
         ("disk_s3_restricted_user", "ObjectStorage", "S3", "Local"),
+        ("disk_cas", "ObjectStorage", "S3", "CAS"),
+        ("disk_cas_cache", "ObjectStorage", "S3", "CAS"),
     )
     assert len(expected_disks) == len(disks)
     for expected_disk in expected_disks:
@@ -335,6 +347,16 @@ def check_system_tables(cluster, backup_query_id=None):
             "default",
             "disk_s3_plain",
             id="from_local_to_s3_plain",
+        ),
+        pytest.param(
+            "policy_cas",
+            "default",
+            id="from_cas_to_local",
+        ),
+        pytest.param(
+            "policy_cas",
+            "disk_s3",
+            id="from_cas_to_s3",
         ),
     ],
 )
@@ -531,14 +553,22 @@ def test_backup_to_s3_multipart(cluster):
         "policy_s3",
         "policy_s3_other_bucket",
         "policy_s3_plain_rewritable",
+        "policy_cas",
     ],
 )
 def test_backup_to_s3_native_copy(cluster, storage_policy):
     backup_name = new_backup_name()
-    backup_destination = f"S3('http://minio1:9001/root/data/backups/{backup_name}', 'minio', '{minio_secret_key}')"
+    backup_destination = s3_backup_destination(storage_policy, backup_name)
     (backup_events, restore_events) = check_backup_and_restore(
         cluster, storage_policy, backup_destination
     )
+
+    if storage_policy in CAS_POLICIES:
+        # A CAS file can be a range inside a blob object, so the server-side copy may be ranged.
+        for events in (backup_events, restore_events):
+            assert events.get("S3CopyObject", 0) + events.get("S3UploadPartCopy", 0) > 0
+        return
+
     # single part upload
     assert backup_events["S3CopyObject"] > 0
     assert restore_events["S3CopyObject"] > 0
@@ -703,13 +733,12 @@ def test_incremental_backup_append_table_def(cluster):
         (True, True, True),
     ],
 )
+@pytest.mark.parametrize("storage_policy", ["policy_s3_cache", "policy_cas_cache"])
 def test_backup_with_fs_cache(
-    cluster, in_cache_initially, allow_backup_read_cache, allow_s3_native_copy
+    cluster, in_cache_initially, allow_backup_read_cache, allow_s3_native_copy, storage_policy
 ):
-    storage_policy = "policy_s3_cache"
-
     backup_name = new_backup_name()
-    backup_destination = f"S3('http://minio1:9001/root/data/backups/{backup_name}', 'minio', '{minio_secret_key}')"
+    backup_destination = s3_backup_destination(storage_policy, backup_name)
 
     insert_settings = {
         "enable_filesystem_cache_on_write_operations": int(in_cache_initially)

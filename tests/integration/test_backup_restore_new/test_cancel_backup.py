@@ -1,4 +1,5 @@
 import re
+import time
 import uuid
 
 import pytest
@@ -17,6 +18,8 @@ main_configs = [
     "configs/backups_disk.xml",
     "configs/slow_backups.xml",
     "configs/shutdown_cancel_backups.xml",
+    "configs/cas_storage.xml",
+    "configs/cas_gc.xml",
 ]
 
 node = cluster.add_instance(
@@ -24,7 +27,10 @@ node = cluster.add_instance(
     main_configs=main_configs,
     external_dirs=["/backups/"],
     stay_alive=True,
+    with_rustfs=True,
 )
+
+CAS_POOL_PREFIXES = ["backup_restore_new/blobs/", "backup_restore_new/parts/"]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -179,11 +185,57 @@ def cancel_restore(restore_id):
     assert kill_duration_ms < kill_duration_ms_threshold
 
 
+def table_settings(storage_policy):
+    if storage_policy is None:
+        return ""
+    return f" SETTINGS storage_policy = '{storage_policy}'"
+
+
+def count_cas_pool_objects():
+    return sum(
+        len(
+            list(
+                cluster.rustfs_client.list_objects(
+                    cluster.rustfs_bucket, prefix, recursive=True
+                )
+            )
+        )
+        for prefix in CAS_POOL_PREFIXES
+    )
+
+
+def wait_cas_pool_settled():
+    previous = count_cas_pool_objects()
+    for _ in range(40):
+        time.sleep(3)
+        current = count_cas_pool_objects()
+        if current == previous:
+            return current
+        previous = current
+    return previous
+
+
+def wait_cas_pool_reclaimed(baseline):
+    current = count_cas_pool_objects()
+    for _ in range(120):
+        if current <= baseline:
+            break
+        time.sleep(1)
+        current = count_cas_pool_objects()
+    assert (
+        current <= baseline
+    ), f"CAS pool objects were not reclaimed: baseline={baseline}, current={current}"
+
+
 # Test that BACKUP and RESTORE operations can be cancelled with KILL QUERY.
-def test_cancel_backup():
+@pytest.mark.parametrize("storage_policy", [None, "cas_policy"])
+def test_cancel_backup(storage_policy):
+    cas_pool_baseline = wait_cas_pool_settled() if storage_policy == "cas_policy" else None
+
     # We use partitioning so backups would contain more files.
     node.query(
         "CREATE TABLE tbl (x UInt64) ENGINE=MergeTree() ORDER BY tuple() PARTITION BY x%20"
+        + table_settings(storage_policy)
     )
 
     node.query("INSERT INTO tbl SELECT number FROM numbers(500)")
@@ -209,11 +261,23 @@ def test_cancel_backup():
     start_restore(restore_id, backup_id)
     wait_restore(restore_id)
 
+    assert node.query("SELECT count(), sum(x) FROM tbl") == "500\t124750\n"
+    assert (
+        node.query("CHECK TABLE tbl SETTINGS check_query_single_value_result = 1")
+        == "1\n"
+    )
+
+    if cas_pool_baseline is not None:
+        node.query("DROP TABLE tbl SYNC")
+        wait_cas_pool_reclaimed(cas_pool_baseline)
+
 
 # Test that shutdown cancels a running backup and doesn't wait until it finishes.
-def test_shutdown_cancel_backup():
+@pytest.mark.parametrize("storage_policy", [None, "cas_policy"])
+def test_shutdown_cancel_backup(storage_policy):
     node.query(
         "CREATE TABLE tbl (x UInt64) ENGINE=MergeTree() ORDER BY tuple() PARTITION BY x%5"
+        + table_settings(storage_policy)
     )
 
     node.query("INSERT INTO tbl SELECT number FROM numbers(500)")

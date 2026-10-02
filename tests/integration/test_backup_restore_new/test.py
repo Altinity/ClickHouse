@@ -18,9 +18,10 @@ script_dir = os.path.dirname(os.path.realpath(__file__))
 cluster = ClickHouseCluster(__file__)
 instance = cluster.add_instance(
     "instance",
-    main_configs=["configs/backups_disk.xml"],
+    main_configs=["configs/backups_disk.xml", "configs/cas_storage.xml"],
     user_configs=["configs/zookeeper_retries.xml"],
     external_dirs=["/backups/"],
+    with_rustfs=True,
 )
 instance_with_short_timeout = cluster.add_instance(
     "instance_with_short_timeout",
@@ -30,11 +31,14 @@ instance_with_short_timeout = cluster.add_instance(
 )
 
 
-def create_and_fill_table(engine="MergeTree", n=100):
+def create_and_fill_table(engine="MergeTree", n=100, storage_policy=None):
     if engine == "MergeTree":
         engine = "MergeTree ORDER BY y PARTITION BY x%10"
     instance.query("CREATE DATABASE test")
-    instance.query(f"CREATE TABLE test.table(x UInt32, y String) ENGINE={engine}")
+    create_query = f"CREATE TABLE test.table(x UInt32, y String) ENGINE={engine}"
+    if storage_policy is not None:
+        create_query += f" SETTINGS storage_policy = '{storage_policy}'"
+    instance.query(create_query)
     instance.query(
         f"INSERT INTO test.table SELECT number, toString(number) FROM numbers({n})"
     )
@@ -222,6 +226,33 @@ def test_restore_table(engine):
 
     instance.query(f"RESTORE TABLE test.table FROM {backup_name}")
     assert instance.query("SELECT count(), sum(x) FROM test.table") == "100\t4950\n"
+
+
+@pytest.mark.parametrize("backup_disk", ["backups", "cas"])
+def test_restore_table_on_cas_disk(backup_disk):
+    backup_name = new_backup_name()
+    if backup_disk == "cas":
+        backup_name = backup_name.replace("Disk('backups', '", "Disk('cas', 'backups/")
+    create_and_fill_table(storage_policy="cas_policy")
+
+    assert instance.query("SELECT count(), sum(x) FROM test.table") == "100\t4950\n"
+    assert (
+        instance.query("SELECT storage_policy FROM system.tables WHERE name = 'table'")
+        == "cas_policy\n"
+    )
+    instance.query(f"BACKUP TABLE test.table TO {backup_name}")
+    instance.query("DROP TABLE test.table")
+    instance.query(f"RESTORE TABLE test.table FROM {backup_name}")
+
+    assert instance.query("SELECT count(), sum(x) FROM test.table") == "100\t4950\n"
+    assert (
+        instance.query("SELECT storage_policy FROM system.tables WHERE name = 'table'")
+        == "cas_policy\n"
+    )
+    assert (
+        instance.query("CHECK TABLE test.table SETTINGS check_query_single_value_result = 1")
+        == "1\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1504,8 +1535,9 @@ def test_system_users_async():
     )
 
 
-def test_projection():
-    create_and_fill_table(n=3)
+@pytest.mark.parametrize("storage_policy", [None, "cas_policy"])
+def test_projection(storage_policy):
+    create_and_fill_table(n=3, storage_policy=storage_policy)
 
     instance.query("ALTER TABLE test.table ADD PROJECTION prjmax (SELECT MAX(x))")
     instance.query("INSERT INTO test.table VALUES (100, 'a'), (101, 'b')")
@@ -1554,6 +1586,18 @@ def test_projection():
         )
         == "2\n"
     )
+
+    if storage_policy is not None:
+        assert (
+            instance.query("SELECT storage_policy FROM system.tables WHERE name = 'table'")
+            == f"{storage_policy}\n"
+        )
+        assert (
+            instance.query(
+                "CHECK TABLE test.table SETTINGS check_query_single_value_result = 1"
+            )
+            == "1\n"
+        )
 
 
 def test_restore_table_not_evaluate_table_defaults():
@@ -1950,8 +1994,10 @@ def test_system_backups():
     assert info.bytes_read == 0
 
 
-def test_mutation():
-    create_and_fill_table(engine="MergeTree ORDER BY tuple()", n=5)
+def check_mutation(storage_policy=None):
+    create_and_fill_table(
+        engine="MergeTree ORDER BY tuple()", n=5, storage_policy=storage_policy
+    )
 
     instance.query(
         "INSERT INTO test.table SELECT number, toString(number) FROM numbers(5, 5)"
@@ -1973,6 +2019,12 @@ def test_mutation():
     instance.query("ALTER TABLE test.table UPDATE x=x+1 WHERE 1")
     instance.query("ALTER TABLE test.table UPDATE x=x+1 WHERE 1")
 
+    if storage_policy is not None:
+        assert (
+            instance.query("SELECT storage_policy FROM system.tables WHERE name = 'table'")
+            == f"{storage_policy}\n"
+        )
+        assert instance.query("SELECT count() FROM test.table") == "15\n"
     backup_name = new_backup_name()
     instance.query(f"BACKUP TABLE test.table TO {backup_name}")
 
@@ -1986,6 +2038,20 @@ def test_mutation():
     instance.query("DROP TABLE test.table")
 
     instance.query(f"RESTORE TABLE test.table FROM {backup_name}")
+    if storage_policy is not None:
+        assert (
+            instance.query("SELECT storage_policy FROM system.tables WHERE name = 'table'")
+            == f"{storage_policy}\n"
+        )
+        assert instance.query("SELECT count() FROM test.table") == "15\n"
+
+
+def test_mutation():
+    check_mutation()
+
+
+def test_mutation_on_cas_disk():
+    check_mutation(storage_policy="cas_policy")
 
 
 def test_tables_dependency():
@@ -2215,12 +2281,17 @@ def test_restore_table_with_checksum_data_file_name(engine):
     assert instance.query("SELECT count(), sum(x) FROM test.table") == "100\t4950\n"
 
 
-def test_incremental_backup_with_checksum_data_file_name():
+def check_incremental_backup_with_checksum_data_file_name(storage_policy=None):
     backup_name = new_backup_name()
     incremental_backup_name = new_backup_name()
-    create_and_fill_table()
+    create_and_fill_table(storage_policy=storage_policy)
 
     assert instance.query("SELECT count(), sum(x) FROM test.table") == "100\t4950\n"
+    if storage_policy is not None:
+        assert (
+            instance.query("SELECT storage_policy FROM system.tables WHERE name = 'table'")
+            == f"{storage_policy}\n"
+        )
     instance.query(
         f"BACKUP TABLE test.table TO {backup_name} SETTINGS data_file_name_generator='checksum'"
     )
@@ -2236,6 +2307,19 @@ def test_incremental_backup_with_checksum_data_file_name():
         f"RESTORE TABLE test.table AS test.table2 FROM {incremental_backup_name}"
     )
     assert instance.query("SELECT count(), sum(x) FROM test.table2") == "102\t5081\n"
+    if storage_policy is not None:
+        assert (
+            instance.query("SELECT storage_policy FROM system.tables WHERE name = 'table2'")
+            == f"{storage_policy}\n"
+        )
+
+
+def test_incremental_backup_with_checksum_data_file_name():
+    check_incremental_backup_with_checksum_data_file_name()
+
+
+def test_incremental_backup_with_checksum_data_file_name_on_cas_disk():
+    check_incremental_backup_with_checksum_data_file_name(storage_policy="cas_policy")
 
 
 def test_async_backup_restore_with_max_execution_time_zero():
