@@ -26,6 +26,11 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ActionsDAG.h>
+
+#include <Poco/JSON/Parser.h>
+#include <Poco/JSON/Object.h>
+#include <Poco/JSON/Array.h>
 
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/getSchemaFromSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/PartitionPruner.h>
@@ -49,6 +54,7 @@ namespace DB::Setting
     extern const SettingsInt64 delta_lake_snapshot_version;
     extern const SettingsBool delta_lake_throw_on_engine_predicate_error;
     extern const SettingsBool delta_lake_enable_engine_predicate;
+    extern const SettingsBool delta_lake_clustering_predicate_fallback;
 }
 
 namespace ProfileEvents
@@ -56,6 +62,7 @@ namespace ProfileEvents
     extern const Event DeltaLakePartitionPrunedFiles;
     extern const Event DeltaLakeSnapshotInitializations;
     extern const Event DeltaLakeScannedFiles;
+    extern const Event DeltaLakeClusteringPredicateFallbacks;
 }
 
 namespace DB::FailPoints
@@ -96,6 +103,7 @@ public:
         const TableSchema & table_schema_,
         const DB::NameToNameMap & physical_names_map_,
         const DB::Names & partition_columns_,
+        const DB::Names & clustering_columns_,
         DB::ObjectStoragePtr object_storage_,
         const DB::ActionsDAG * filter_,
         DB::IDataLakeMetadata::FileProgressCallback callback_,
@@ -103,6 +111,7 @@ public:
         bool enable_expression_visitor_logging_,
         bool throw_on_engine_predicate_error_,
         bool enable_engine_predicate_,
+        bool enable_clustering_predicate_fallback_,
         UpdateStatsFunc update_stats_func_,
         LoggerPtr log_)
         : kernel_snapshot_state(kernel_snapshot_state_)
@@ -111,6 +120,7 @@ public:
         , read_schema(read_schema_)
         , expression_schema(table_schema_)
         , partition_columns(partition_columns_)
+        , clustering_columns(clustering_columns_)
         , object_storage(object_storage_)
         , callback(callback_)
         , list_batch_size(list_batch_size_)
@@ -118,6 +128,7 @@ public:
         , enable_expression_visitor_logging(enable_expression_visitor_logging_)
         , throw_on_engine_predicate_error(throw_on_engine_predicate_error_)
         , enable_engine_predicate(enable_engine_predicate_)
+        , enable_clustering_predicate_fallback(enable_clustering_predicate_fallback_)
         , update_stats_func(update_stats_func_)
     {
         if (filter_)
@@ -189,6 +200,57 @@ public:
                     predicate.get(),
                     /* schema */nullptr),
                 "scan");
+
+            if (engine_predicate_exception && enable_clustering_predicate_fallback && !clustering_columns.empty())
+            {
+                /// Full predicate translation failed. Try a fallback: restrict the filter
+                /// to only reference clustering columns (which always have per-file min/max stats).
+                /// `restrictFilterDAGToInputs` replaces non-computable AND branches with `true`,
+                /// giving us a weaker but valid predicate for file-level skipping.
+                DB::NameSet clustering_inputs;
+                for (const auto & col : clustering_columns)
+                    clustering_inputs.insert(col);
+
+                const auto * filter_output = filter->getOutputs().at(0);
+                auto restricted_dag = filter->restrictFilterDAGToInputs(filter_output, clustering_inputs);
+
+                /// Check if the restricted filter is non-trivial (has at least one function node).
+                /// If restrictFilterDAGToInputs replaced everything with constant `true`,
+                /// the DAG will have no function nodes.
+                bool has_function = false;
+                for (const auto & node : restricted_dag.getNodes())
+                {
+                    if (node.type == DB::ActionsDAG::ActionType::FUNCTION)
+                    {
+                        has_function = true;
+                        break;
+                    }
+                }
+
+                if (has_function)
+                {
+                    std::exception_ptr fallback_exception;
+                    auto fallback_predicate = getEnginePredicate(restricted_dag, fallback_exception, nullptr);
+                    if (!fallback_exception)
+                    {
+                        LOG_INFO(
+                            log,
+                            "Full predicate translation failed; falling back to clustering-column-only "
+                            "predicate for file-level data skipping (clustering columns: {})",
+                            fmt::join(clustering_columns, ", "));
+
+                        ProfileEvents::increment(ProfileEvents::DeltaLakeClusteringPredicateFallbacks);
+
+                        scan = KernelUtils::unwrapResult(
+                            ffi::scan(
+                                kernel_snapshot_state->snapshot.get(),
+                                kernel_snapshot_state->engine.get(),
+                                fallback_predicate.get(),
+                                /* schema */nullptr),
+                            "scan");
+                    }
+                }
+            }
         }
         else
         {
@@ -617,6 +679,7 @@ private:
     DB::NamesAndTypesList read_schema;
     DB::NamesAndTypesList expression_schema;
     DB::Names partition_columns;
+    DB::Names clustering_columns;
     const DB::ObjectStoragePtr object_storage;
     const DB::IDataLakeMetadata::FileProgressCallback callback;
     const size_t list_batch_size;
@@ -624,6 +687,7 @@ private:
     const bool enable_expression_visitor_logging;
     const bool throw_on_engine_predicate_error;
     const bool enable_engine_predicate;
+    const bool enable_clustering_predicate_fallback;
     const UpdateStatsFunc update_stats_func;
 
     std::exception_ptr scan_exception;
@@ -919,6 +983,7 @@ DB::ObjectIterator TableSnapshot::iterate(
     const auto & settings = context->getSettingsRef();
     std::lock_guard lock(mutex);
     initOrUpdateSchemaIfChanged();
+    initOrUpdateClusteringColumns();
     auto state = getKernelSnapshotState();
     auto update_stats_func = [self = shared_from_this(), version = state->snapshot_version, this]
         (SnapshotStats && stats)
@@ -942,6 +1007,7 @@ DB::ObjectIterator TableSnapshot::iterate(
         schema->table_schema,
         schema->physical_names_map,
         schema->partition_columns,
+        *clustering_columns,
         object_storage,
         filter_dag,
         callback,
@@ -949,6 +1015,7 @@ DB::ObjectIterator TableSnapshot::iterate(
         settings[DB::Setting::delta_lake_enable_expression_visitor_logging],
         settings[DB::Setting::delta_lake_throw_on_engine_predicate_error],
         settings[DB::Setting::delta_lake_enable_engine_predicate],
+        settings[DB::Setting::delta_lake_clustering_predicate_fallback],
         std::move(update_stats_func),
         log);
 }
@@ -1009,6 +1076,98 @@ const DB::NameToNameMap & TableSnapshot::getPhysicalNamesMap() const
     std::lock_guard lock(mutex);
     initOrUpdateSchemaIfChanged();
     return schema->physical_names_map;
+}
+
+const DB::Names & TableSnapshot::getClusteringColumns() const
+{
+    std::lock_guard lock(mutex);
+    initOrUpdateClusteringColumns();
+    return *clustering_columns;
+}
+
+void TableSnapshot::initOrUpdateClusteringColumns() const
+{
+    if (clustering_columns.has_value())
+        return;
+
+    auto state = getKernelSnapshotState();
+    auto result = KernelUtils::unwrapResult(
+        ffi::get_domain_metadata_internal(
+            state->snapshot.get(),
+            KernelUtils::toDeltaString("delta.clustering"),
+            state->engine.get(),
+            KernelUtils::allocateString),
+        "get_domain_metadata_internal(delta.clustering)");
+
+    if (!result)
+    {
+        LOG_TRACE(log, "No delta.clustering domain metadata found — table is not liquid-clustered");
+        clustering_columns.emplace();
+        return;
+    }
+
+    std::unique_ptr<std::string> json_str(static_cast<std::string *>(result));
+
+    DB::Names physical_columns;
+    try
+    {
+        Poco::JSON::Parser parser;
+        auto json = parser.parse(*json_str);
+        auto obj = json.extract<Poco::JSON::Object::Ptr>();
+
+        auto arr = obj->getArray("clusteringColumns");
+        if (!arr)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "delta.clustering: missing clusteringColumns array");
+
+        for (size_t i = 0; i < arr->size(); ++i)
+        {
+            auto path_arr = arr->getArray(static_cast<unsigned int>(i));
+            if (!path_arr || path_arr->size() == 0)
+                continue;
+
+            std::string col_name;
+            for (size_t j = 0; j < path_arr->size(); ++j)
+            {
+                if (!col_name.empty())
+                    col_name += '.';
+                col_name += path_arr->getElement<std::string>(static_cast<unsigned int>(j));
+            }
+            physical_columns.push_back(std::move(col_name));
+        }
+    }
+    catch (const Poco::Exception & e)
+    {
+        throw DB::Exception(
+            DB::ErrorCodes::BAD_ARGUMENTS,
+            "Failed to parse delta.clustering domain metadata: {}", e.displayText());
+    }
+
+    /// Convert physical column names to logical names using the inverse of physical_names_map.
+    /// The filter DAG uses logical names, so the clustering column names must match.
+    DB::Names logical_columns;
+    if (schema.has_value() && !schema->physical_names_map.empty())
+    {
+        /// Build reverse map: physical → logical
+        DB::NameToNameMap reverse_map;
+        for (const auto & [logical, physical] : schema->physical_names_map)
+            reverse_map[physical] = logical;
+
+        for (const auto & phys : physical_columns)
+        {
+            auto it = reverse_map.find(phys);
+            if (it != reverse_map.end())
+                logical_columns.push_back(it->second);
+            else
+                logical_columns.push_back(phys);
+        }
+    }
+    else
+    {
+        logical_columns = std::move(physical_columns);
+    }
+
+    LOG_TRACE(log, "Clustering columns: {}", fmt::join(logical_columns, ", "));
+    clustering_columns.emplace(std::move(logical_columns));
 }
 
 }

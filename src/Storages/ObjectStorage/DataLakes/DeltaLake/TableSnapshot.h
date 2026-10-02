@@ -58,6 +58,10 @@ public:
     const DB::Names & getPartitionColumns() const;
     const DB::NameToNameMap & getPhysicalNamesMap() const;
 
+    /// Get the clustering columns from the `delta.clustering` domain metadata.
+    /// Returns an empty list if the table is not liquid-clustered.
+    const DB::Names & getClusteringColumns() const;
+
     DB::ObjectStoragePtr getObjectStorage() const { return object_storage; }
 private:
     class Iterator;
@@ -106,6 +110,10 @@ private:
     };
     mutable std::optional<SchemaInfo> schema;
 
+    /// Clustering columns from the `delta.clustering` domain metadata.
+    /// std::nullopt means not yet fetched; empty vector means not clustered.
+    mutable std::optional<DB::Names> clustering_columns;
+
     struct SnapshotStats
     {
         /// Total number of bytes in table
@@ -121,6 +129,7 @@ private:
 
     void initOrUpdateSnapshot() const TSA_REQUIRES(mutex);
     void initOrUpdateSchemaIfChanged() const TSA_REQUIRES(mutex);
+    void initOrUpdateClusteringColumns() const TSA_REQUIRES(mutex);
 
     SnapshotStats getSnapshotStats() const TSA_REQUIRES(mutex);
     SnapshotStats getSnapshotStatsImpl() const TSA_REQUIRES(mutex);
