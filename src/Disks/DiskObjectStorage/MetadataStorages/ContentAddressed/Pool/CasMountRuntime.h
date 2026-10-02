@@ -87,7 +87,7 @@ struct MountConfig
     /// Deterministic failure injection at the vanished-reason preparation boundary.
     std::function<void()> vanished_reason_prepare_hook_for_test = {};
     /// Test-only extra liveness condition, for exact pre/post-send gate interleavings. It is ANDed with
-    /// the ordinary predicate, so a stop still ends the renewal. FALSE ends it exactly as a lost fence does.
+    /// the ordinary predicate, so a stop still ends the renewal. FALSE ends the renewal early.
     std::function<bool()> renewal_live_for_test = {};
 };
 
@@ -161,7 +161,9 @@ public:
     /// ---- local write fence ----
     /// Return whether a mutable operation may start under the locally observed lease state.
     bool mayMutate() const;
-    /// Permanently latch the local fence as lost for this runtime incarnation.
+    /// Latch the fence lost and count one lease loss. Every production caller pairs the trip with a
+    /// remount request, a published FORGET intent or a stop. A trip that comes alone is re-armed by the
+    /// next renewal that commits with room for a ref append.
     void tripMountLost();
     /// Publish the BOOTTIME deadline from a successful lease renewal.
     void setMountDeadline(uint64_t deadline_boot_ms);
@@ -173,7 +175,7 @@ public:
     void beginReclaim();
     /// End of a reclaim that claimed. One step under `driver_mutex`: acknowledge the generation
     /// `beginReclaim` recorded, publish the deadline, and arm the fence and report `Live` if the arming
-    /// rule holds. Returns whether it armed.
+    /// rule holds; otherwise latch the fence. Returns whether it armed.
     bool armIfAdmissible(uint64_t deadline_boot_ms);
     /// Test-only interposition at the publication boundary between the re-armed generation and the
     /// live fence. A caller admitted from this hook must be refused: the old generation is already
@@ -445,9 +447,9 @@ private:
     void consumeRenewResult(const MountRenewResult & result, RenewCaller caller);
     void renewalLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);
-    /// The renewal's liveness: no stop requested and, for the loop, no pending remount request, a pool
-    /// that is `Live` and a fence that is not lost -- the loop's plane has no fence of its own. FALSE
-    /// ends the renewal.
+    /// The renewal's liveness. Every caller ends on a stop. A loop renewal also ends on a pending remount
+    /// request and on a terminal lifecycle, which includes a published FORGET intent; a lost fence alone
+    /// does not end it. FALSE ends the renewal.
     bool renewalLive(RenewCaller caller) const;
     /// Whether this node has already been asked to stop. Sampled ONCE, before the write, so a refusal
     /// caused by the stop cannot be mistaken for one that preceded it.
@@ -457,9 +459,13 @@ private:
     /// `Live` is published before the fence opens, so a reader that sees the fence armed reads `Live`.
     void armFence(uint64_t deadline_boot_ms, bool report_live);
     /// The arming rule: no remount request pending, no stop requested, a lifecycle that is not
-    /// terminal. Requires `driver_mutex`, the mutex that a stop, a request and a terminal publication
-    /// take, so the check and the arm are one step.
+    /// terminal, and a deadline that admits a ref append now. Requires `driver_mutex`, the mutex that a
+    /// stop, a request and a terminal publication take, so the check and the arm are one step.
     bool canArm(uint64_t deadline_boot_ms) const;
+    /// `admit`'s budget verdict for a lease that ends at `deadline_boot_ms`, at `now_boot_ms`.
+    Fence::Admit budgetAdmits(uint64_t deadline_boot_ms, uint64_t now_boot_ms, uint64_t needed_ms) const;
+    /// What a ref append reserves: a write and the read that settles it, two attempt envelopes.
+    uint64_t refAppendReservationMs() const;
     /// Whether a new loss needs a new remount generation. Requires `driver_mutex`. False only while a
     /// request that no reclaim has snapshotted is pending: the reclaim that serves it latches after the
     /// loss.

@@ -148,26 +148,31 @@ Fence::Admit CasMountRuntime::admit(uint64_t admitted_generation, uint64_t neede
     if (mount_fence.lost.load(std::memory_order_acquire) || fenceGeneration() != admitted_generation)
         return Fence::Admit::LostOrRearmed;
     const uint64_t now = bootMsNow();
-    const uint64_t deadline = mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
-    if (now >= deadline)
+    return budgetAdmits(mount_fence.deadline_boot_ms.load(std::memory_order_acquire), now, needed_ms);
+}
+
+Fence::Admit CasMountRuntime::budgetAdmits(uint64_t deadline_boot_ms, uint64_t now_boot_ms, uint64_t needed_ms) const
+{
+    if (now_boot_ms >= deadline_boot_ms)
         return Fence::Admit::NoBudget;
     /// Compared by subtraction rather than as the sum `needed_ms + margin`, which can wrap for an
     /// absurd configuration and then read as if there were room.
-    const uint64_t remaining = deadline - now;
+    const uint64_t remaining = deadline_boot_ms - now_boot_ms;
     if (needed_ms >= remaining || cas_request_budget.lease_safety_margin_ms >= remaining - needed_ms)
         return Fence::Admit::NoBudget;
     return Fence::Admit::Ok;
 }
 
+uint64_t CasMountRuntime::refAppendReservationMs() const
+{
+    /// Two envelopes: a write and its settlement read, which is what `writeLoop` reserves.
+    const uint64_t envelope_ms = cas_request_budget.attemptEnvelopeMs();
+    return envelope_ms > std::numeric_limits<uint64_t>::max() / 2 ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
+}
+
 bool CasMountRuntime::refAppendFenceOk() const
 {
-    /// Two envelopes' worth of room under the live generation -- a write and its settlement read, which
-    /// is what `writeLoop` reserves -- so a ref-log attempt is not started when it cannot plausibly
-    /// finish, safety margin included, before the lease expires.
-    const uint64_t envelope_ms = cas_request_budget.attemptEnvelopeMs();
-    const uint64_t needed_ms = envelope_ms > std::numeric_limits<uint64_t>::max() / 2
-        ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
-    return admit(fenceGeneration(), needed_ms) == Fence::Admit::Ok;
+    return admit(fenceGeneration(), refAppendReservationMs()) == Fence::Admit::Ok;
 }
 
 std::optional<uint64_t> CasMountRuntime::leaseExpiredAt(uint64_t now_boot_ms) const
@@ -289,18 +294,29 @@ bool CasMountRuntime::armIfAdmissible(uint64_t deadline_boot_ms)
     remount_handled_generation = std::max(remount_handled_generation, reclaim_generation);
     const bool arm = canArm(deadline_boot_ms);
     if (arm)
+    {
         armFence(deadline_boot_ms, /*report_live=*/true);
+    }
     else
+    {
+        /// An open starts unarmed, which admits writes; a claim that does not admit a ref append must
+        /// not leave it so. Latched before the deadline is published, so no reader sees the claim's
+        /// deadline on an open fence. A reclaim arrives here already latched by `beginReclaim`.
+        if (!mount_fence.lost.load(std::memory_order_acquire))
+            tripFenceWithoutOperationalLoss();
         setMountDeadline(deadline_boot_ms);
+    }
     driver_cv.notify_all();
     return arm;
 }
 
-bool CasMountRuntime::canArm(uint64_t /*deadline_boot_ms*/) const
+bool CasMountRuntime::canArm(uint64_t deadline_boot_ms) const
 {
+    /// The clock is read last and only when every other term holds.
     return !workers_stop_requested
         && !remountTerminal()
-        && remount_requested_generation <= remount_handled_generation;
+        && remount_requested_generation <= remount_handled_generation
+        && budgetAdmits(deadline_boot_ms, bootMsNow(), refAppendReservationMs()) == Fence::Admit::Ok;
 }
 
 bool CasMountRuntime::lossNeedsNewRequest() const
@@ -458,9 +474,9 @@ bool CasMountRuntime::renewalLive(RenewCaller caller) const
         return false;
     if (caller != RenewCaller::Loop)
         return true;
-    return remount_requested_generation <= remount_handled_generation
-        && lifecycle() == PoolLifecycle::Live
-        && !mount_fence.lost.load(std::memory_order_acquire);
+    /// A lost fence alone does not end it: the renewal that makes an open or a reclaim ready runs under
+    /// one, and every trip that must end it comes with a request, an intent or a stop.
+    return remount_requested_generation <= remount_handled_generation && !remountTerminal();
 }
 
 bool CasMountRuntime::renewalCancelled() const
@@ -501,10 +517,13 @@ void CasMountRuntime::consumeRenewResult(const MountRenewResult & result, RenewC
         if (result.outcome == MountRenewOutcome::Committed)
         {
             const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
-            restored = publishRenewedDeadline(
-                result.attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
-                    ? std::numeric_limits<uint64_t>::max()
-                    : result.attempt_start_boot_ms + ttl_ms);
+            const uint64_t deadline_boot_ms = result.attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
+                ? std::numeric_limits<uint64_t>::max()
+                : result.attempt_start_boot_ms + ttl_ms;
+            restored = publishRenewedDeadline(deadline_boot_ms);
+            /// A latched fence is armed by the first renewal whose own deadline leaves room for a ref append.
+            if (mount_fence.lost.load(std::memory_order_acquire) && canArm(deadline_boot_ms))
+                armFence(deadline_boot_ms, /*report_live=*/true);
         }
         else if (result.outcome == MountRenewOutcome::Terminal)
         {
