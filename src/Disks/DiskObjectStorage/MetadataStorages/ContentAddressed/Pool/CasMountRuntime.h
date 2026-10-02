@@ -447,8 +447,9 @@ private:
     void renewalLoop();
     void remountLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);
-    /// The renewal's liveness: facts the mount fence cannot see -- a shutdown request, a parked or
-    /// park-requested driver, a pool that left `Live`. FALSE ends the renewal.
+    /// The renewal's liveness: a shutdown request and, for the worker, a parked or park-requested
+    /// driver, a pool that left `Live`, or a lost fence -- the worker's plane has no fence of its own.
+    /// FALSE ends the renewal.
     bool renewalLive(bool worker_call) const;
     /// Whether this node has already been asked to stop. Sampled ONCE, before the write, so a refusal
     /// caused by the stop cannot be mistaken for one that preceded it.

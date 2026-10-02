@@ -431,7 +431,9 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
             return config.renewal_live_for_test ? config.renewal_live_for_test() : renewalLive(worker_call);
         },
         .cancelled = [this] { return renewalCancelled(); },
-        .policy = MountRenewPolicy::LeaseBound,
+        /// Only the worker keeps renewing past the lease; startup, remount and direct renewals stay
+        /// bounded by it.
+        .policy = worker_call ? MountRenewPolicy::UntilDefinitive : MountRenewPolicy::LeaseBound,
         .on_request = {},
     };
 }

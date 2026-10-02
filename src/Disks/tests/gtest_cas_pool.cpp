@@ -2020,6 +2020,12 @@ public:
     /// rather than reissued has to move the injected clock here -- from inside the attempt, which is the
     /// only point between admission and the resolve read a test can reach.
     std::function<void()> before_throw;
+    /// While it answers TRUE, every conditional write throws a transport timeout, before `fault` is
+    /// consulted. Read on the renewing thread; set it before the workers start.
+    std::function<bool()> outage;
+    /// Runs on every write `outage` fails, before it throws.
+    std::function<void()> on_outage_write;
+    std::atomic<uint64_t> outage_writes{0};
 
     /// The fault sits on the WRITE PRIMITIVE, and only on a CONDITIONAL one: a lease renewal is a
     /// replace, so a create on the same key must not consume the one-shot fault.
@@ -2028,6 +2034,13 @@ public:
     {
         if (!expected_value)
             return DB::Cas::tests::CountingBackend::write(key, bytes, expected_value, access);
+        if (outage && outage())
+        {
+            outage_writes.fetch_add(1, std::memory_order_relaxed);
+            if (on_outage_write)
+                on_outage_write();
+            throw Poco::TimeoutException("injected runtime renewal outage");
+        }
         const Fault current = std::exchange(fault, Fault::None);
         if (current == Fault::BlockThenDelegate || current == Fault::BlockThenThrow)
         {
@@ -2102,6 +2115,14 @@ public:
     }
 
     CasMountRuntime & operator*() { return runtime; }
+
+    /// The retry wait of the mount and lease planes, the two a renewal can run on. Call before the
+    /// workers start.
+    void setRetrySleepForTest(const std::function<void(uint64_t)> & sleep_fn)
+    {
+        mount.setSleepFnForTest(sleep_fn);
+        lease.setSleepFnForTest(sleep_fn);
+    }
 
 private:
     DB::Cas::CasRequests mount;
@@ -4075,12 +4096,8 @@ TEST(CASPoolRemount, TerminalDepositionDoesNotTouchRenewerAfterReplacement)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
-    /// Expire the lease from inside the attempt. The fault alone no longer ends a renewal: the engine
-    /// settles the ambiguity by reading and then reissues, and the reissue commits. With the clock past
-    /// the deadline the renewal was admitted under, neither the settling read nor the reissue is
-    /// admitted, so the renewal ends terminal -- which is what this test deposits.
-    backend->before_throw = [&, deadline = anchor + 1000] { boot_ms = deadline; };
+    /// A definitive answer ends the worker's renewal; a transient fault would only be retried.
+    fenceOutMount(*backend, layout.mountKey("test"));
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
     terminal_deposited.waitUntilArrived();
     EXPECT_TRUE(replaced.load(std::memory_order_acquire));
@@ -4165,11 +4182,9 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
                 runtime_ptr->armMountFence(uuid, 2, fresh_anchor + 10'000);
                 runtime_ptr->noteRemounted();
                 boot_ms = 2'000;
-                backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
-                /// Expire the fresh lease from inside the attempt, so the ambiguity can be neither
-                /// settled by a read nor reissued: otherwise the engine reissues and the renewal
-                /// commits, and there is no dropped failure to catch up on.
-                backend->before_throw = [&, deadline = fresh_anchor + 10'000] { boot_ms = deadline; };
+                /// A definitive answer for the fresh incarnation's first worker renewal; a transient
+                /// fault would only be retried.
+                fenceOutMount(*backend, layout.mountKey("test"));
                 first.arriveAndWait();
                 return true;
             }
@@ -4597,15 +4612,252 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
-    /// Expire the lease from inside the attempt, so the ambiguity can be neither settled by a read nor
-    /// reissued: without that the engine reissues and the renewal commits, and this worker never fences.
-    backend->before_throw = [&, deadline = anchor + 1000] { boot_ms = deadline; };
+    /// A definitive answer ends the worker's renewal; a transient fault would only be retried.
+    fenceOutMount(*backend, layout.mountKey("test"));
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
     remount_entered.waitUntilArrived();
     EXPECT_FALSE(runtime.mayMutate());
     EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::TransientNotLive);
     remount_entered.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+/// A remount request ends a worker renewal that is retrying past its lease, inside the wait or the
+/// request it is in: no request and no wait starts after it.
+TEST(CASMountRuntime, ParkEndsAnUnboundedRenewal)
+{
+    enum class ParkDuring : uint8_t { Wait, Request };
+    const auto run = [](ParkDuring park_during)
+    {
+        auto backend = std::make_shared<RuntimeRenewBackend>();
+        const Layout layout(park_during == ParkDuring::Wait ? "unbounded-park-in-wait" : "unbounded-park-in-request");
+        const UInt128 uuid{1};
+        uint64_t wall_ms = 1000;
+        std::atomic<uint64_t> boot_ms{100};
+        std::atomic<uint64_t> past_the_lease{std::numeric_limits<uint64_t>::max()};
+        std::atomic<bool> held{false};
+        std::atomic<uint64_t> waits{0};
+        std::atomic<uint64_t> writes_at_remount{0};
+        std::atomic<uint64_t> waits_at_remount{0};
+        DB::Cas::tests::ManualBarrier holding;
+        DB::Cas::tests::ManualBarrier remount_entered;
+        const auto hold_once_past_the_lease = [&]
+        {
+            if (boot_ms.load() >= past_the_lease.load() && !held.exchange(true))
+                holding.arriveAndWait();
+        };
+        ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+                  MountClaimResult::Claimed);
+        CasEventSink sink;
+        RuntimeUnderTest runtime_holder(
+            backend, layout,
+            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+                        .boot_ms_fn = [&] { return boot_ms.load(); }},
+            "test", sink, runtimeRenewBudget(), [&]
+            {
+                writes_at_remount = backend->outage_writes.load();
+                waits_at_remount = waits.load();
+                remount_entered.arriveAndWait();
+                return false;
+            });
+        CasMountRuntime & runtime = *runtime_holder;
+        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+        const uint64_t anchor = runtime.startRenewer();
+        runtime.armMountFence(uuid, 1, anchor + 1000);
+        /// Five lease lengths on: a renewal bounded by its lease ended long before.
+        past_the_lease = anchor + 5'000;
+        runtime_holder.setRetrySleepForTest([&](uint64_t ms)
+        {
+            ++waits;
+            boot_ms += ms;
+            if (park_during == ParkDuring::Wait)
+                hold_once_past_the_lease();
+        });
+        if (park_during == ParkDuring::Request)
+            backend->on_outage_write = hold_once_past_the_lease;
+        backend->outage = [] { return true; };
+        runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+
+        holding.waitUntilArrived();
+        const uint64_t writes_at_park = backend->outage_writes.load();
+        const uint64_t waits_at_park = waits.load();
+        runtime.scheduleRemount();
+        EXPECT_EQ(runtime.renewalDriverStateForTest(), RenewalDriverState::ParkRequested);
+        holding.release();
+        remount_entered.waitUntilArrived();
+        EXPECT_EQ(runtime.renewalDriverStateForTest(), RenewalDriverState::Parked);
+        EXPECT_EQ(writes_at_remount.load(), writes_at_park) << "no request starts after the park";
+        EXPECT_EQ(waits_at_remount.load(), waits_at_park) << "no wait starts after the park";
+        remount_entered.release();
+        runtime.stopBackgroundWorkers();
+        runtime.finishTeardown(false);
+    };
+    run(ParkDuring::Wait);
+    run(ParkDuring::Request);
+}
+
+/// FORGET while the worker's renewal retries past its lease: the intent then the trip, in the order
+/// `Pool::forgetDisk` uses, end the renewal inside the wait it is in, both workers exit, and no remount
+/// generation is raised.
+TEST(CASMountRuntime, ForgetEndsAnUnboundedRenewal)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("unbounded-forget");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{100};
+    std::atomic<uint64_t> past_the_lease{std::numeric_limits<uint64_t>::max()};
+    std::atomic<bool> held{false};
+    std::atomic<uint64_t> waits{0};
+    DB::Cas::tests::ManualBarrier holding;
+    WorkerExitLatch exits;
+    RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+    {
+        return ThreadFromGlobalPool([&, body = std::move(worker_body)]
+        {
+            body();
+            exits.recordExit();
+        });
+    };
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms.load(); }, .worker_factory = factory},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(uuid, 1, anchor + 1000);
+    past_the_lease = anchor + 5'000;
+    runtime_holder.setRetrySleepForTest([&](uint64_t ms)
+    {
+        ++waits;
+        boot_ms += ms;
+        if (boot_ms.load() >= past_the_lease.load() && !held.exchange(true))
+            holding.arriveAndWait();
+    });
+    backend->outage = [] { return true; };
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+
+    holding.waitUntilArrived();
+    const uint64_t writes_at_forget = backend->outage_writes.load();
+    const uint64_t waits_at_forget = waits.load();
+    const uint64_t generation_at_forget = runtime.remountRequestedGenerationForTest();
+    runtime.publishVanishedIntent();
+    runtime.tripMountLost();
+    holding.release();
+
+    const bool both_exited = exits.waitForAtLeast(2);
+    EXPECT_TRUE(both_exited) << "the worker loops must exit on the published intent";
+    EXPECT_EQ(backend->outage_writes.load(), writes_at_forget) << "no request starts after FORGET";
+    EXPECT_EQ(waits.load(), waits_at_forget) << "no wait starts after FORGET";
+    EXPECT_EQ(runtime.remountRequestedGenerationForTest(), generation_at_forget);
+    EXPECT_FALSE(runtime.mayMutate());
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+TEST(CASMountRuntime, StopWakesTheRetryWaitOfAnUnboundedRenewal)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("unbounded-stop-in-wait");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    const uint64_t boot_ms = 100;
+    std::promise<uint64_t> wait_entered;
+    std::future<uint64_t> wait_requested = wait_entered.get_future();
+    std::atomic<bool> first_wait{true};
+    std::atomic<int64_t> first_wait_slept_ms{-1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms; }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime_holder.setRetrySleepForTest([&](uint64_t ms)
+    {
+        const bool first = first_wait.exchange(false);
+        if (first)
+            wait_entered.set_value(ms);
+        const auto started = std::chrono::steady_clock::now();
+        runtime.sleepInterruptibly(ms);
+        if (first)
+            first_wait_slept_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+    });
+    backend->outage = [] { return true; };
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+
+    ASSERT_EQ(wait_requested.wait_for(std::chrono::seconds(20)), std::future_status::ready);
+    const uint64_t requested_ms = wait_requested.get();
+    runtime.stopBackgroundWorkers();
+
+    EXPECT_GE(requested_ms, kMountRenewRetrySpacingMs * 8 / 10);
+    EXPECT_LE(requested_ms, kMountRenewRetrySpacingMs * 12 / 10);
+    ASSERT_GE(first_wait_slept_ms.load(), 0);
+    EXPECT_LT(static_cast<uint64_t>(first_wait_slept_ms.load()), requested_ms)
+        << "the stop woke the wait instead of letting it run out";
+    EXPECT_EQ(backend->outage_writes.load(), 1u) << "nothing is sent after the stop";
+    runtime.finishTeardown(false);
+}
+
+/// A success whose lease is already over is followed by the next renewal with no cadence wait.
+TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("unbounded-stale-success");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{100};
+    std::atomic<uint64_t> outage_until{0};
+    std::vector<uint64_t> commit_boot_ms;
+    std::vector<bool> may_mutate_at_commit;
+    DB::Cas::tests::ManualBarrier second_commit;
+    CasMountRuntime * runtime_ptr = nullptr;
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms.load(); }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime_holder.setRetrySleepForTest([&](uint64_t ms) { boot_ms += ms; });
+    /// The first renewal starts one period after the anchor and fails for three lease lengths.
+    boot_ms = anchor + 500;
+    outage_until = anchor + 3'500;
+    backend->outage = [&] { return boot_ms.load() < outage_until.load(); };
+    backend->after_commit = [&]
+    {
+        commit_boot_ms.push_back(boot_ms.load());
+        may_mutate_at_commit.push_back(runtime_ptr->mayMutate());
+        if (commit_boot_ms.size() == 2)
+            second_commit.arriveAndWait();
+    };
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(500));
+
+    second_commit.waitUntilArrived();
+    ASSERT_EQ(commit_boot_ms.size(), 2u);
+    EXPECT_GE(commit_boot_ms[0], anchor + 3'500) << "the first renewal outlived its own lease";
+    EXPECT_EQ(commit_boot_ms[1], commit_boot_ms[0])
+        << "no time passed: a cadence wait on this frozen clock would never have ended";
+    EXPECT_FALSE(may_mutate_at_commit[1]) << "the stale success left the lease expired";
+    second_commit.release();
     runtime.stopBackgroundWorkers();
     runtime.finishTeardown(false);
 }
