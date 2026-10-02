@@ -91,9 +91,11 @@ Ordinary first-attempt success produces no row. Every `mount_remount` attempt pr
 `failed` and details `attempt_no`, `step`, `server_root_id`, optional `writer_epoch`, and optional
 `error`.
 
-Default-level text logging is bounded per logical operation: a renewal logs nothing until it ends,
-then one recovery `INFO` or one final fence `WARNING`; a renewal that restores an expired lease emits
-the recovery `INFO` and one `WARNING` with the expired duration and the last failed request.
+Default-level text logging is bounded per logical operation. A renewal logs nothing until it ends,
+and nothing at all when it succeeds on its first request. A renewal that needed a retry, was settled
+by a read, or restored an expired lease emits one recovery `INFO`; a terminal renewal emits one fence
+`WARNING`. A renewal that restores an expired lease also emits one `WARNING` with the expired
+duration and the last failed request.
 Individual physical retries are not logged. Each whole-chain remount attempt emits one final
 default-level line
 with its attempt number and last/current step. Use the structured rows for correlation instead of

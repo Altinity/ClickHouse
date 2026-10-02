@@ -74,8 +74,10 @@ Start with the `watermark_renew` timeline described in
    progress. Repeated failure at the same step is the actionable signal.
 
 The default-level log policy is intentionally bounded. The lease keeper logs nothing about a renewal
-until the renewal ends. Then it logs one recovery `INFO` or one terminal fence `WARNING`; the restore of
-an expired lease also logs a `WARNING` with the expired time and the last failure. Each whole-chain
-remount attempt logs one final line. Individual physical retries are not logged. During an outage the
-signal is the row in `system.cas_mounts`. Use `system.cas_log` and the counters to reconstruct the
+until the renewal ends. A renewal that succeeds on its first request logs nothing. A renewal that
+needed a retry, was settled by a read, or restored an expired lease logs one recovery `INFO`; a
+terminal renewal logs one fence `WARNING`. The restore of an expired lease also logs a `WARNING` with
+the expired time and the last failure. Each whole-chain remount attempt logs one final line.
+Individual physical retries are not logged. During an outage the signal is the row in
+`system.cas_mounts`. Use `system.cas_log` and the counters to reconstruct the
 incident: `CASMountRenewalAttempts` and `CASMountRenewalRetries` advance as `PUT`s are sent.

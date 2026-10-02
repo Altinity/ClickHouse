@@ -112,12 +112,12 @@ only on one of these:
   absent object, or a request the store refuses on a clear attempt;
 - a stop or a remount request;
 - a deterministic local failure;
-- a terminal lifecycle state;
+- a lifecycle other than `Live`;
 - a lost fence.
 
-A terminal renewer cannot mint another body or publish a clean farewell. Owner cancellation before any request is the only `NotAttempted`
-result and leaves clean release possible. Cancellation after a request was sent is terminal because
-that request may still land.
+A terminal renewer cannot mint another body or publish a clean farewell. Owner cancellation before
+any request is the only `NotAttempted` result and leaves clean release possible. Cancellation after a
+request was sent is terminal because that request may still land.
 
 While retries continue past the lease deadline, the lease is *expired*. New durable writes are refused
 with a transient `NETWORK_ERROR` that names the lease, reads are not gated, and the pool does not
@@ -126,13 +126,12 @@ enough lease for a write's reservation. A renewal that succeeds after its own de
 the TTL has already passed) leaves the lease expired, and the next renewal follows at once.
 `system.cas_mounts` shows the expired period as `lifecycle = 'not_live'`,
 `lifecycle_reason = 'lease_expired'` (see [`system.cas_mounts`](#mounts-table)); it shows
-`lifecycle = 'live'` until the deadline passes, although with the defaults conditional writes stop 16 s
-earlier. The
-`CASMountLeaseExpired` event advances by one when a renewal restores an expired lease, not when the lease
-expires. Failing renewals alone do not fence or remount the mount. A GC leader on another member still
-fences a slot whose token has not changed for `TTL + floor(TTL/20) + period`, and a definitive answer
-from the store that the slot holds something else ends it; in both cases the server remounts under a new
-`writer_epoch`.
+`lifecycle = 'live'` until the deadline passes, although with the defaults conditional writes stop
+16 s earlier. The `CASMountLeaseExpired` event advances by one when a renewal restores an expired
+lease, not when the lease expires. Failing renewals alone do not fence or remount the mount. A GC
+leader on another member still fences a slot whose token has not changed for
+`TTL + floor(TTL/20) + period`, and a definitive answer from the store that the slot holds something
+else ends it; in both cases the server remounts under a new `writer_epoch`.
 
 After the renewer call returns, `CasMountRuntime` consumes the result. A terminal result trips the
 local fence (latches `lost`, bumps the fence generation, moves the in-process runtime to
