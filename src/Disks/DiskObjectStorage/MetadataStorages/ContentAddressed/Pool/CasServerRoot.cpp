@@ -1584,11 +1584,6 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
         environment.policy == MountRenewPolicy::UntilDefinitive ? worker_requests : mount_requests, environment);
 }
 
-MountRenewResult MountLeaseRenewer::renewForRemount(const MountRenewOperationEnvironment & environment)
-{
-    return renewOn(open_requests, environment);
-}
-
 MountRenewResult MountLeaseRenewer::renewOn(
     CasRequests & plane, const MountRenewOperationEnvironment & environment)
 {

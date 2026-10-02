@@ -2443,35 +2443,3 @@ TEST(CASServerRootClaim, OwnerLostToARacerIsDecidedFromTheConflictObservation)
     }
 }
 
-/// A remount re-anchors its lease BEFORE it arms the fence for the new incarnation, so the fence is
-/// still latched lost at that moment. The steady-state renewal is refused there — the sibling test
-/// above pins that — and the remount's own renewal has to be admitted off the fence, or the pool could
-/// never re-anchor and the remount attempt would fail on exactly the throttled store that caused it.
-TEST(CASMountLease, RemountRenewalIsAdmittedOffTheMountFence)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    Layout l("p");
-    uint64_t now = 1000;
-    uint64_t boot = 0;
-
-    CasRequests mount_requests(backend, Fence{
-        [] { return uint64_t{0}; },
-        [](uint64_t, uint64_t) { return Fence::Admit::LostOrRearmed; },
-        [](uint64_t) { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "mount fence lost"); }});
-    mount_requests.setNowFnForTest([&boot] { return boot; });
-    mount_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
-    CasRequests open_requests = openRequestsForTest(backend);
-    open_requests.setNowFnForTest([&boot] { return boot; });
-    open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
-
-    MountLeaseRenewer renewer(mount_requests, open_requests, open_requests, l, "r", UInt128(1), 7,
-                            std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
-                            {}, std::chrono::milliseconds(0), [&] { return boot; });
-    renewer.start();
-
-    const MountRenewResult redo = renewer.renewForRemount();
-    EXPECT_EQ(redo.outcome, MountRenewOutcome::Committed);
-
-    CasOperation reader = open_requests.admit();
-    EXPECT_EQ(decodeMountLease(reader.read(l.mountKey("r"), Retry::standard())->bytes).seq, 2u);
-}

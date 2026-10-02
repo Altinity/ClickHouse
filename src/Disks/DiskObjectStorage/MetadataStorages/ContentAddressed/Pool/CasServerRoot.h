@@ -579,12 +579,6 @@ public:
     /// `UntilDefinitive` runs on the worker plane with `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`
     /// and ends on a definitive answer, a deterministic local failure, or when `environment.live` refuses.
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
-    /// The remount's re-anchor, which is bootstrap control rather than steady state: a remount renews
-    /// BEFORE it arms the fence for the new incarnation, so the fence is still latched lost and an
-    /// operation admitted under it would be refused before its first attempt. It admits on this
-    /// renewer's own open plane, the one the claim and the farewell use, so there is no plane for a
-    /// caller to get wrong. Same policy and same verdicts as `renew`.
-    MountRenewResult renewForRemount(const MountRenewOperationEnvironment & environment = {});
     void release();
 
     MountLeaseRenewerState state() const { return renewer_state; }
@@ -596,7 +590,7 @@ private:
     /// The incarnation every guarded write of this slot names. Engaged for exactly the states that
     /// admit such a write: `start` establishes it and each committed renewal replaces it.
     const Etag & precondition() const;
-    /// One renewal admitted on `plane`; `renew` and `renewForRemount` differ only in which they pass.
+    /// One renewal admitted on `plane`.
     MountRenewResult renewOn(CasRequests & plane, const MountRenewOperationEnvironment & environment);
     Etag claim(CasOperation & op, const String & body);
     [[noreturn]] void throwRenewConflict(const Observation & seen) const;

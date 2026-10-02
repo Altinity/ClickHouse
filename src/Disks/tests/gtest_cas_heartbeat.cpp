@@ -1969,29 +1969,3 @@ TEST(CASHeartbeat, AThrowingRequestReportChangesNoOutcome)
     EXPECT_EQ(f.renewer->state(), MountLeaseRenewerState::Active);
 }
 
-/// The startup, remount and direct renewals keep their lease bound.
-TEST(CASHeartbeat, BoundedPathsStillStopAtTheLeaseDeadline)
-{
-    for (const bool remount : {false, true})
-    {
-        SCOPED_TRACE(remount ? "renewForRemount" : "renew");
-        UnboundedRenewalFixture f;
-        std::vector<uint64_t> sent_at;
-        f.backend->on_attempt = [&] { sent_at.push_back(f.boot_ms); };
-        /// Longer than any lease, so only the bound can end the renewal.
-        f.backend->outage = [&] { return f.boot_ms < f.renewal_start + 60'000; };
-        MountRenewOperationEnvironment environment = renewalEnvironment(f.boot_ms);
-        environment.policy = MountRenewPolicy::LeaseBound;
-
-        const MountRenewResult result = remount ? f.renewer->renewForRemount(environment) : f.renewer->renew(environment);
-
-        const DB::Exception failure = terminalException(result);
-        EXPECT_NE(failure.message().find("external_lease_deadline"), String::npos) << failure.message();
-        ASSERT_TRUE(result.deadline_source.has_value());
-        EXPECT_EQ(*result.deadline_source, GaveUp::Source::Lease);
-        ASSERT_FALSE(sent_at.empty());
-        const uint64_t lease_safe = f.anchor + UnboundedRenewalFixture::ttl_ms - UnboundedRenewalFixture::margin_ms;
-        for (uint64_t at : sent_at)
-            EXPECT_LT(at, lease_safe) << "no request starts past the lease-safe bound";
-    }
-}
