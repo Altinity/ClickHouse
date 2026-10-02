@@ -161,10 +161,6 @@ public:
     /// prove the scheduler's worker threads were joined — no round can be mid-flight once `stop()` returned.
     bool isQuiescent() const { return !round_in_flight.load(std::memory_order_acquire); }
 
-    /// Test seam: force the in-flight-round flag `isQuiescent` reads, so a test can drive
-    /// "running round => not quiescent" without spinning up a real round against a live backend.
-    void setRoundInFlightForTest(bool v) { round_in_flight.store(v, std::memory_order_release); }
-
     /// Test seam (rev.7 §3 [C1]): block up to `timeout` for BOTH the pacing and heartbeat loops to have
     /// SELF-EXITED via the terminal-lifecycle check — a `Vanished` pool or a published FORGET intent — as
     /// opposed to exiting through `stop()` transitioning `scheduler_state` to `Stopped`. Returns false on timeout. Predicate-based

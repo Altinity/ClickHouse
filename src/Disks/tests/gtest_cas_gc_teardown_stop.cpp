@@ -384,8 +384,10 @@ TEST(CASGCTeardownStop, BackgroundRoundIsCutAtItsNextRequest)
     auto release = std::make_shared<Gate>();
     GateOpenedOnExit opener(*release);
     backend->armParkFirstRead(store->layout().gcStateKey(), entered, release);
+    EXPECT_TRUE(sched.isQuiescent()) << "no round has started yet";
     sched.start();
     entered->wait("entered");
+    EXPECT_FALSE(sched.isQuiescent()) << "a round parked inside a request must not read as GC-quiescent";
 
     store->beginTeardown();
     const uint64_t requests_at_arm = backend->requestsTotal();
