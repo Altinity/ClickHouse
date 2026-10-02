@@ -531,13 +531,13 @@ public:
     /// truth-absent on removes/enumeration — is `checkOpAdmitted`; this covers only the terminal states.
     void throwIfLifecycleTerminal() const;
 
-    /// A non-gated, I/O-free lifecycle snapshot for `system.cas_mounts` (spec §7,
-    /// Factory class). Reads only the runtime's atomics — NO backend op — so it is truthful in EVERY
-    /// state, including the terminal ones the store()-class surface refuses. `detail` is the same [D5]
-    /// reason text `throwIfLifecycleTerminal` throws (empty while `Live`/`TransientNotLive` unless `lease_expired`), which spec §1
-    /// requires appear verbatim in the snapshot; `since` is the wall-clock second the current non-`Live`
-    /// state was entered (0 while `Live` unless `lease_expired`). The metadata-storage layer maps `lifecycle` to the operator
-    /// vocabulary and derives the enum-clean sub-state word separately (see `CasLifecycleSnapshot`).
+    /// A non-gated, I/O-free lifecycle snapshot for `system.cas_mounts`. Reads only the runtime's
+    /// atomics, no backend op, so it is truthful in every state, including the terminal ones the
+    /// store()-class surface refuses. `detail` is the same reason text `throwIfLifecycleTerminal` throws
+    /// (empty while `Live`/`TransientNotLive` unless `lease_expired`), verbatim; `since` is the
+    /// wall-clock second the current non-`Live` state was entered (0 while `Live` unless `lease_expired`).
+    /// The metadata-storage layer maps `lifecycle` to the operator vocabulary and derives the enum-clean
+    /// sub-state word separately (see `CasLifecycleSnapshot`).
     struct LifecycleSnapshot
     {
         PoolLifecycle lifecycle = PoolLifecycle::Live;
@@ -1175,9 +1175,9 @@ private:
         return std::forward<Mutation>(mutation)();
     }
 
-    /// The mount plane's inter-attempt sleep: interruptible, so a parked or stopping renewal is not
-    /// held for a whole capped backoff. Named rather than inlined because the test seam has to be able
-    /// to put it back.
+    /// The mount plane's inter-attempt sleep: woken only by a stop of the workers, so a stopping renewal
+    /// is not held for a whole capped backoff. A park or a remount request does not wake it; the wait
+    /// runs out. Named rather than inlined because the test seam has to be able to put it back.
     std::function<void(uint64_t)> mountPlaneSleepFn()
     {
         return [this](uint64_t ms) { mount_runtime.sleepInterruptibly(ms); };

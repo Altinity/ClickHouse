@@ -341,10 +341,11 @@ public:
             || lifecycle() == PoolLifecycle::IdentityLost;
     }
 
-    /// The inter-attempt sleep the mount plane runs on. A plain sleep would hold a parked or stopping
-    /// renewal for the whole capped backoff; this one wakes on the same stop signal the workers watch.
-    /// It shortens a stop, not a fence loss: the fence cannot see a stop request, so a woken operation
-    /// still reissues unless its own liveness predicate refuses.
+    /// The inter-attempt sleep the mount plane runs on. A plain sleep would hold a stopping renewal
+    /// for the whole capped backoff; this one wakes on the same stop signal the workers watch.
+    /// A park or a remount request does not wake it: the wait runs out, at most one spacing draw for
+    /// the background renewal. It shortens a stop, not a fence loss: the fence cannot see a stop request,
+    /// so a woken operation still reissues unless its own liveness predicate refuses.
     void sleepInterruptibly(uint64_t ms);
 
     /// The mount fence's admission verdict, as `Fence::admit` expects it: may a request admitted under
