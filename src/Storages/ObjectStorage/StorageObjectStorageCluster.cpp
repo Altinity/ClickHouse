@@ -41,7 +41,7 @@ namespace DB
 {
 namespace Setting
 {
-    extern const SettingsBool iceberg_delete_data_on_drop;
+    extern const SettingsBool data_lake_delete_data_on_drop;
     extern const SettingsBool use_hive_partitioning;
     extern const SettingsBool cluster_function_process_archive_on_multiple_nodes;
     extern const SettingsObjectStorageGranularityLevel cluster_table_function_split_granularity;
@@ -303,6 +303,13 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 std::string StorageObjectStorageCluster::getName() const
 {
     return configuration->getEngineName();
+}
+
+void StorageObjectStorageCluster::prepareForDrop(ContextPtr query_context)
+{
+    /// `drop` is delegated to `pure_storage`, so the captured value has to reach it.
+    if (pure_storage)
+        pure_storage->prepareForDrop(query_context);
 }
 
 std::optional<UInt64> StorageObjectStorageCluster::totalRows(ContextPtr query_context) const

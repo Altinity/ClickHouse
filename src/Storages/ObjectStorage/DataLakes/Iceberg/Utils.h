@@ -163,6 +163,8 @@ std::optional<String> getSortingKeyDisplayStringFromMetadata(
     Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema);
 std::optional<String> getPartitionKeyStringFromMetadata(
     Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context);
+
+std::pair<ASTPtr, ASTPtr> getPartitionAndSortingKeyASTsFromMetadata(const Poco::JSON::Object::Ptr & metadata_object);
 void sortBlockByKeyDescription(Block & block, const KeyDescription & sort_description, ContextPtr context);
 
 void forEachAvroEntry(

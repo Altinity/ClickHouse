@@ -71,12 +71,20 @@ public:
 
     std::optional<StorageType> getStorageType() const override;
 
+    String getDefaultBaseLocation() const override;
+
     DB::DatabaseDataLakeCatalogType getCatalogType() const override
     {
         return DB::DatabaseDataLakeCatalogType::ICEBERG_REST;
     }
 
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
+    bool createTable(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr metadata_content,
+        DB::CompressionMethod metadata_compression_method,
+        bool if_not_exists) const override;
 
     bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const override;
 
@@ -89,7 +97,7 @@ public:
 
     bool isTransactional() const override { return true; }
 
-    void dropTable(const String & namespace_name, const String & table_name, bool delete_data) const override;
+    void dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const override;
 
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
 
@@ -308,6 +316,9 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_ONELAKE;
     }
 
+    /// OneLake keeps data in Azure Data Lake Storage, whatever the catalog reports.
+    std::optional<StorageType> getStorageType() const override { return StorageType::Azure; }
+
     DB::HTTPHeaderEntries getAuthHeaders(
         const CatalogState & catalog_state,
         bool update_token,
@@ -358,6 +369,9 @@ public:
     {
         return DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE;
     }
+
+    /// BigLake keeps data in Google Cloud Storage, which is accessed through the S3 API.
+    std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
 
     DB::HTTPHeaderEntries getAuthHeaders(
         const CatalogState & catalog_state,

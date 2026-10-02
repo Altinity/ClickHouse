@@ -51,6 +51,8 @@ public:
         const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
 
+    void prepareForDrop(ContextPtr query_context) override;
+
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node * predicate,
         const ActionsDAG * filter,
