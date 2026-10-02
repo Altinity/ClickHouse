@@ -303,6 +303,14 @@ bool CasMountRuntime::canArm(uint64_t /*deadline_boot_ms*/) const
         && remount_requested_generation <= remount_handled_generation;
 }
 
+void CasMountRuntime::checkRenewerOwner() const
+{
+    if (workers_started && lease_thread_id != std::this_thread::get_id())
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "CAS mount runtime: only the lease thread may drive the renewer while it runs");
+}
+
 uint64_t CasMountRuntime::minActive()
 {
     std::lock_guard lk(builds_mutex);
@@ -396,6 +404,7 @@ void CasMountRuntime::installRenewer(
 
     /// The previous renewer is destroyed after the unlock.
     std::lock_guard lock(driver_mutex);
+    checkRenewerOwner();
     std::swap(mount_renewer, replaced);
 }
 
@@ -404,6 +413,7 @@ uint64_t CasMountRuntime::startRenewer()
     MountLeaseRenewer * renewer = nullptr;
     {
         std::lock_guard lock(driver_mutex);
+        checkRenewerOwner();
         if (!mount_renewer)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startRenewer without a renewer");
         if (mount_renewer->state() != MountLeaseRenewerState::New)
@@ -572,6 +582,7 @@ MountRenewResult CasMountRuntime::renewRenewerOnce(RenewCaller caller)
             throw Exception(
                 ErrorCodes::LOGICAL_ERROR,
                 "CAS mount runtime: direct renewal is disabled when background ownership is configured");
+        checkRenewerOwner();
         if (!mount_renewer)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal without a renewer");
         if (mount_renewer->state() != MountLeaseRenewerState::Active)
@@ -604,6 +615,7 @@ void CasMountRuntime::renewerReset()
 {
     std::unique_ptr<MountLeaseRenewer> released;
     std::lock_guard lock(driver_mutex);
+    checkRenewerOwner();
     std::swap(mount_renewer, released);
 }
 
@@ -624,6 +636,7 @@ void CasMountRuntime::startBackgroundWorkers(std::chrono::milliseconds period)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: the lease thread requires an Active renewer");
         workers_started = true;
         workers_stop_requested = false;
+        lease_thread_id = {};
         renewal_period = period;
     }
 
@@ -639,6 +652,7 @@ void CasMountRuntime::startBackgroundWorkers(std::chrono::milliseconds period)
             std::lock_guard lock(driver_mutex);
             workers_stop_requested = true;
             workers_started = false;
+            lease_thread_id = {};
             driver_cv.notify_all();
         }
         tripFenceWithoutOperationalLoss();
@@ -655,6 +669,10 @@ void CasMountRuntime::renewalLoop()
     /// The tracker still counts this thread's allocations but never throws on it: a renewal failed by a
     /// memory limit costs the mount, and an exception outside the request ends this thread.
     LockMemoryExceptionInThread memory_exception_lock(VariableContext::Global);
+    {
+        std::lock_guard lock(driver_mutex);
+        lease_thread_id = std::this_thread::get_id();
+    }
 
     /// The wake condition of every wait in this loop; the reclaim backoff ignores a request, which is
     /// the one it is retrying.
@@ -775,6 +793,7 @@ void CasMountRuntime::stopBackgroundWorkers()
     {
         std::lock_guard lock(driver_mutex);
         workers_started = false;
+        lease_thread_id = {};
         driver_cv.notify_all();
     }
 }

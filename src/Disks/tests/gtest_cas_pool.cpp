@@ -14,6 +14,7 @@
 #include <Common/CurrentThread.h>
 #include <Common/MemoryTracker.h>
 #include <base/scope_guard.h>
+#include <base/defines.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Poco/Exception.h>
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <future>
 #include <latch>
 #include <limits>
@@ -42,6 +44,7 @@ extern const int FILE_DOESNT_EXIST;
 extern const int UNKNOWN_EXCEPTION;
 extern const int NETWORK_ERROR;
 extern const int MEMORY_LIMIT_EXCEEDED;
+extern const int LOGICAL_ERROR;
 }
 
 namespace ProfileEvents
@@ -5192,6 +5195,71 @@ TEST(CASMountRuntime, ACommitConsumedAfterARemountRequestCannotOverwriteTheRecla
         << "the deadline is the reclaim's, not the one of the renewal consumed after the request";
     second_admission.release();
     runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+/// While the lease thread runs, no other thread may replace, reset or start the renewer. Constructing
+/// a `LOGICAL_ERROR` exception aborts under a debug or sanitizer build, so there the same contract is
+/// a death expectation.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASMountRuntime, OnlyTheLeaseThreadReplacesTheRenewerWhileItRuns)
+#else
+TEST(CASMountRuntimeDeathTest, OnlyTheLeaseThreadReplacesTheRenewerWhileItRuns)
+#endif
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-renewer-owner");
+    uint64_t wall_ms = 1000;
+    const uint64_t boot_ms = 100;
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    DB::Cas::tests::ManualBarrier admitted;
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms; },
+                    .renewal_admitted_hook_for_test = [&] { admitted.arriveAndWait(); }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    SCOPE_EXIT({ admitted.release(); });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    /// The lease thread is held between its decision to renew and the renewal, with no lock held.
+    admitted.waitUntilArrived();
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
+    const auto expect_owner_refusal = [](const char * what, const std::function<void()> & call)
+    {
+        try
+        {
+            call();
+            ADD_FAILURE() << what << " from a test thread must be refused while the lease thread runs";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR) << what;
+            EXPECT_NE(e.message().find("only the lease thread"), String::npos) << what << ": " << e.message();
+        }
+    };
+    expect_owner_refusal("installRenewer", [&] { runtime.installRenewer(uuid, 2, [&] { return wall_ms; }); });
+    expect_owner_refusal("renewerReset", [&] { runtime.renewerReset(); });
+    expect_owner_refusal("startRenewer", [&] { (void)runtime.startRenewer(); });
+#else
+    /// The child exits through `std::_Exit` if the call does not abort: running exit handlers in a
+    /// forked child can block on a thread pool mutex a vanished thread held.
+    EXPECT_DEATH({ runtime.installRenewer(uuid, 2, [&] { return wall_ms; }); std::_Exit(0); }, "only the lease thread");
+    EXPECT_DEATH({ runtime.renewerReset(); std::_Exit(0); }, "only the lease thread");
+    EXPECT_DEATH({ (void)runtime.startRenewer(); std::_Exit(0); }, "only the lease thread");
+#endif
+
+    admitted.release();
+    runtime.stopBackgroundWorkers();
+    /// With the thread joined the caller drives the renewer again.
+    EXPECT_NO_THROW(runtime.renewerReset());
     runtime.finishTeardown(false);
 }
 

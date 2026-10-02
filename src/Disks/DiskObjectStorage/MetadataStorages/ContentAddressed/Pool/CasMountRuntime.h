@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 
 namespace DB::Cas
 {
@@ -454,6 +455,8 @@ private:
     /// terminal. Requires `driver_mutex`, the mutex that a stop, a request and a terminal publication
     /// take, so the check and the arm are one step.
     bool canArm(uint64_t deadline_boot_ms) const;
+    /// Throws `LOGICAL_ERROR` when a lease thread runs and the caller is not it. Requires `driver_mutex`.
+    void checkRenewerOwner() const;
     std::unique_lock<std::mutex> lockTerminalPublication();
 
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
@@ -503,6 +506,8 @@ private:
     mutable std::condition_variable driver_cv;
     bool workers_started = false;
     bool workers_stop_requested = false;
+    /// The lease thread, from its first statement until `stopBackgroundWorkers` joins it.
+    std::thread::id lease_thread_id;
     std::chrono::milliseconds renewal_period{0};
     uint64_t remount_requested_generation = 0;
     uint64_t remount_handled_generation = 0;
