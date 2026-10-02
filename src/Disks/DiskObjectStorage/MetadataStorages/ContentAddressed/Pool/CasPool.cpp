@@ -890,9 +890,14 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// Joined before the failure propagates, so no renewal of this open runs after it.
     store->mount_runtime.stopBackgroundWorkers();
     const String last_failure = store->mount_runtime.lastRenewFailure();
+    if (store->mount_runtime.remountTerminal())
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS mount '{}': the pool became terminal while the open waited for a renewal to arm the fence; "
+            "last failed renewal request: {}",
+            srid, last_failure.empty() ? String("none") : last_failure);
     throw Exception(ErrorCodes::ABORTED,
-        "CAS mount '{}': no renewal left enough of the {} ms lease to admit a write within one lease after "
-        "the mount claim; last failed renewal request: {}",
+        "CAS mount '{}': no renewal armed the fence while the open waited, up to {} ms on the fence clock; "
+        "last failed renewal request: {}",
         srid, ttl_ms_u, last_failure.empty() ? String("none") : last_failure);
 }
 

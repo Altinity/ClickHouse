@@ -277,10 +277,10 @@ void CasMountRuntime::armFence(uint64_t deadline_boot_ms, bool report_live)
     /// A fresh lease incarnation is a fresh generation too: a durable-effect caller admitted under the
     /// PRIOR incarnation must re-check and abort rather than ride this re-arm through.
     fence_generation.fetch_add(1, std::memory_order_acq_rel);
-    if (arm_mount_fence_interposition_hook_for_test)
-        arm_mount_fence_interposition_hook_for_test();
     if (report_live)
         noteRemounted();
+    if (arm_mount_fence_interposition_hook_for_test)
+        arm_mount_fence_interposition_hook_for_test();
     /// Open the gate LAST. A caller that observes `lost == false` with acquire semantics must also see
     /// the fresh generation; publishing the latch first exposes one admission window in which the dead
     /// generation looks live again.

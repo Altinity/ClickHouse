@@ -4224,7 +4224,7 @@ TEST(CASPool, DisabledBackgroundDoesNotReserveRenewalCadence)
     auto store = Pool::open(backend, config);
     const String key = store->layout().mountKey("test");
     EXPECT_EQ(backend->putOverwriteCount(key), 1u)
-        << "a disabled worker cadence must not force a synchronous startup redo";
+        << "an open with no lease thread whose claim admits a ref append writes the lease only once";
 }
 
 TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
@@ -6122,7 +6122,7 @@ TEST(CASMountRuntime, AReadinessRenewalArmsOnlyWithRoomForARefAppend)
     const uint64_t anchor = runtime.startRenewer();
     ASSERT_EQ(anchor, kExpiryClaimBootMs);
 
-    /// Case 5, before the thread starts: the claim leaves 30 ms of its lease, a ref append needs 40.
+    /// Before the thread starts: the claim leaves 30 ms of its lease, a ref append needs 40.
     boot_ms = kReadinessDecideBootMs;
     const uint64_t generation_before = runtime.fenceGeneration();
     EXPECT_FALSE(runtime.armIfAdmissible(anchor + kExpiryTtlMs)) << "a claim without room for a ref append arms nothing";
@@ -6167,12 +6167,12 @@ TEST(CASMountRuntime, AReadinessRenewalArmsOnlyWithRoomForARefAppend)
         FAIL() << "no renewal armed the fence; request bound hit: " << request_bound_hit.load();
     }
 
-    /// Case 5, while the readiness renewal itself is sent.
+    /// While the readiness renewal itself is sent.
     EXPECT_STREQ(during_first_put.admit, "LostOrRearmed") << "the latched fence refuses a write while the renewal is sent";
     EXPECT_FALSE(during_first_put.may_mutate);
     EXPECT_FALSE(during_first_put.expired);
 
-    /// Case 3: the first renewal started at 129.97 s and committed at 161.17 s, past its own start + TTL.
+    /// A stale success: the first renewal started at 129.97 s and committed at 161.17 s, past its own start + TTL.
     EXPECT_STREQ(after_stale.admit, "LostOrRearmed") << "a stale success arms nothing";
     EXPECT_EQ(after_stale.lifecycle, PoolLifecycle::Live);
     EXPECT_EQ(after_stale.generation, latched_generation);
@@ -6183,7 +6183,7 @@ TEST(CASMountRuntime, AReadinessRenewalArmsOnlyWithRoomForARefAppend)
     EXPECT_EQ(admitted_at[0], kReadinessDecideBootMs) << "the first renewal is due at once";
     EXPECT_EQ(admitted_at[1], kReadinessStaleCommitBootMs) << "a stale success is followed at once";
 
-    /// Case 4: the second renewal started at 161.17 s and committed at 191.135 s with 35 ms left.
+    /// A short success: the second renewal started at 161.17 s and committed at 191.135 s with 35 ms left.
     EXPECT_STREQ(after_short.admit, "LostOrRearmed") << "a success with less lease than a ref append needs arms nothing";
     EXPECT_EQ(after_short.generation, latched_generation);
     EXPECT_TRUE(after_short.failure.empty()) << "a deadline in the future ends the run of trouble: " << after_short.failure;
@@ -6627,13 +6627,13 @@ struct ReadinessSeen
 };
 }
 
-/// Spec test 14, cases 1, 6 and 7. An open whose claim is too old returns only after the lease thread's
+/// An open whose claim is too old returns only after the lease thread's
 /// renewal armed the fence; a reclaim whose quiescence aged its claim the same way reports success with
 /// the pool not `Live` and the fence latched, and the next renewal arms it. No sampled point sees the
 /// fence armed while the pool is not `Live`.
 TEST(CASMountRuntime, OpenAndRemountReportReadyOnlyWhenWritable)
 {
-    /// Case 1. The claim starts at 10 s and the adopt write ends at 30 s.
+    /// An open whose claim starts at 10 s and whose adopt write ends at 30 s.
     {
         auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
         auto seen = std::make_shared<ReadinessSeen>();
@@ -6665,7 +6665,7 @@ TEST(CASMountRuntime, OpenAndRemountReportReadyOnlyWhenWritable)
         EXPECT_NO_THROW(publishPart(store, "srv/ready-open", "x", "payload")) << "a ref append is admitted when the open returns";
     }
 
-    /// Cases 6 and 7. A fresh open arms at once. Then a reclaim: claim at 10 s, quiescence until 30 s.
+    /// A fresh open arms at once. Then a reclaim: claim at 10 s, quiescence until 30 s.
     {
         auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
         auto seen = std::make_shared<ReadinessSeen>();
@@ -6712,8 +6712,8 @@ TEST(CASMountRuntime, OpenAndRemountReportReadyOnlyWhenWritable)
         ASSERT_TRUE(store);
         ASSERT_EQ(backend->mount_writes.load(), 2u) << "a fresh claim arms at once";
         seen->pool = store.get();
-        /// Runs inside the arm, after the new generation and before `Live` and the open fence. It also makes
-        /// the next renewal due at once, so its request shows the state the arm left.
+        /// Runs inside the arm, after `Live` is reported and before the fence opens, so it sees the order of
+        /// the two. It also makes the next renewal due at once, so its request shows the state the arm left.
         store->setArmMountFenceInterpositionHookForTest([seen, fake_boot]
         {
             Pool * pool = seen->pool.load();
@@ -6729,25 +6729,25 @@ TEST(CASMountRuntime, OpenAndRemountReportReadyOnlyWhenWritable)
         EXPECT_EQ(seen->remount_outcome, "ok");
         EXPECT_EQ(seen->remount_step, "claimed_not_armed");
         EXPECT_EQ(eventCount(ProfileEvents::CASRemountSucceeded), succeeded_before + 1);
-        EXPECT_EQ(store->lifecycle(), PoolLifecycle::TransientNotLive) << "case 6: not Live after the reclaim";
-        EXPECT_FALSE(store->mayMutate()) << "case 6: the fence stays latched";
+        EXPECT_EQ(store->lifecycle(), PoolLifecycle::TransientNotLive) << "not Live after the reclaim";
+        EXPECT_FALSE(store->mayMutate()) << "the fence stays latched";
         remounted->release();
 
         renewed_after_arm->waitUntilArrived();
         ASSERT_EQ(backend->mount_writes.load(), 7u);
         EXPECT_EQ(seen->renewal_boot_ms.load(), kReadyClaimBootMs + kReadyClaimAgeMs) << "the loop renewed at once";
-        /// Case 7: at every sampled point, an armed fence comes with `Live`.
+        /// At every sampled point, an armed fence comes with `Live`.
         EXPECT_EQ(seen->lifecycle_at_renewal.load(), static_cast<int>(PoolLifecycle::TransientNotLive));
         EXPECT_EQ(seen->may_mutate_at_renewal.load(), 0) << "the renewal is sent under the latched fence";
-        EXPECT_EQ(seen->lifecycle_at_arm.load(), static_cast<int>(PoolLifecycle::TransientNotLive));
-        EXPECT_EQ(seen->may_mutate_at_arm.load(), 0) << "inside the arm, before `Live`, the fence still refuses";
+        EXPECT_EQ(seen->lifecycle_at_arm.load(), static_cast<int>(PoolLifecycle::Live)) << "`Live` is reported first";
+        EXPECT_EQ(seen->may_mutate_at_arm.load(), 0) << "inside the arm, after `Live`, the fence still refuses";
         EXPECT_EQ(seen->lifecycle_after_arm.load(), static_cast<int>(PoolLifecycle::Live));
         EXPECT_EQ(seen->may_mutate_after_arm.load(), 1) << "after the arm: `Live` and writable";
         renewed_after_arm->release();
     }
 }
 
-/// Spec test 14, case 2. Every readiness renewal fails: the open waits one lease on the fence clock, then
+/// Every readiness renewal fails: the open waits one lease on the fence clock, then
 /// stops and joins the lease thread and fails, naming the last failed request.
 TEST(CASMountRuntime, AnOpenWhoseReadinessRenewalKeepsFailingFailsAfterOneTtl)
 {
@@ -6812,7 +6812,7 @@ TEST(CASMountRuntime, AnOpenWhoseReadinessRenewalKeepsFailingFailsAfterOneTtl)
     EXPECT_EQ(eventCount(ProfileEvents::CASMountLeaseExpired), expired_before);
 }
 
-/// Ruling O1: a writable open with no lease thread whose claim does not admit a ref append fails at once
+/// A writable open with no lease thread whose claim does not admit a ref append fails at once
 /// with a retryable error, and sends no renewal.
 TEST(CASPool, AnOpenWithoutALeaseThreadFailsWhenItsClaimIsTooOld)
 {
@@ -7088,13 +7088,17 @@ TEST(CASMountRuntime, AnOpenFailsWhenTheLeaseThreadEndedOnItsOwn)
 }
 #else
 /// A `LOGICAL_ERROR` aborts a debug or sanitizer build where it is constructed, so the loop's error path is
-/// reached only in a release build. Here the scenario must end the process.
+/// reached only in a release build. Here the scenario must end the process. The child is a re-executed
+/// process, not a fork: a forked child inherits the global thread pool's count of idle workers but not
+/// the workers, so the lease thread's job could stay queued and the join would hang.
 TEST(CASMountRuntimeDeathTest, AnOpenFailsWhenTheLeaseThreadEndedOnItsOwn)
 {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_DEATH(
         {
             LeaseThreadEndSeen seen;
             runLeaseThreadEndsOnItsOwn(seen);
+            std::_Exit(0);
         },
         "injected lease-loop failure");
 }

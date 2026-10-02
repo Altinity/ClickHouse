@@ -179,10 +179,13 @@ public:
     /// rule holds; otherwise latch the fence. Returns whether it armed.
     bool armIfAdmissible(uint64_t deadline_boot_ms);
     /// Blocks until the fence is armed. Gives up after `timeout_ms` on the fence clock, on a stop, on a
-    /// terminal lifecycle, or when no lease thread runs. Returns whether the fence is armed.
+    /// terminal lifecycle, or when the lease thread was never started or was stopped. A lease thread that
+    /// ended on its own does not end the wait early: it waits out `timeout_ms`. Returns whether the fence
+    /// is armed.
     bool waitUntilArmed(uint64_t timeout_ms) const;
     /// Test-only interposition at the publication boundary between the re-armed generation and the
-    /// live fence. A caller admitted from this hook must be refused: the old generation is already
+    /// live fence: after the new generation and, for a production arm, the `Live` report, before `lost`
+    /// is cleared. A caller admitted from this hook must be refused: the old generation is already
     /// dead, while the new generation is not live until `lost` is cleared. Through `armIfAdmissible`
     /// it runs with `driver_mutex` held.
     void setArmMountFenceInterpositionHookForTest(std::function<void()> hook)
