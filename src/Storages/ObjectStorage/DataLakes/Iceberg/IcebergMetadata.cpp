@@ -30,6 +30,7 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/ObjectStorage/StorageObjectStorageConfiguration.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Stringifier.h>
@@ -847,9 +848,15 @@ Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & meta, Int64
         "Schema with id {} not found in table metadata", schema_id);
 }
 
-using PartitionSpecSignature = std::vector<std::pair<Int32, String>>;
+struct PartitionTerm
+{
+    Int32 column_id;
+    String transform;
+};
 
-/// (source column id, transform name) per partition field in spec order
+using PartitionSpecSignature = std::vector<PartitionTerm>;
+
+/// One term per partition field in spec order
 PartitionSpecSignature getPartitionSpecSignature(const Poco::JSON::Array::Ptr & spec_fields)
 {
     PartitionSpecSignature signature;
@@ -875,8 +882,8 @@ std::vector<size_t> mapTargetFieldsToSpecPositions(
     {
         for (size_t j = 0; j < entry_spec.size(); ++j)
         {
-            if (entry_spec[j].source_id == signature[i].first
-                && Poco::toLower(entry_spec[j].transform_name) == signature[i].second)
+            if (entry_spec[j].source_id == signature[i].column_id
+                && Poco::toLower(entry_spec[j].transform_name) == signature[i].transform)
             {
                 positions[i] = j;
                 break;
@@ -1204,24 +1211,25 @@ bool IcebergMetadata::tryDropPartitionOnce(
 
     auto metadata_object = getMetadataJSONObject(metadata_path, object_storage, persistent_components.metadata_cache, context, log, compression_method, persistent_components.table_uuid);
 
-    if (!metadata_object->has(f_current_snapshot_id))
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No snapshot exists for this Iceberg table");
+    if (!metadata_object->has(f_current_snapshot_id) || metadata_object->isNull(f_current_snapshot_id))
+    {
+        LOG_INFO(log, "Iceberg table has no current snapshot, nothing to drop");
+        return true;
+    }
 
     const Int64 current_snapshot_id = metadata_object->getValue<Int64>(f_current_snapshot_id);
     if (current_snapshot_id < 0)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No snapshot exists for this Iceberg table");
+    {
+        LOG_INFO(log, "Iceberg table has no current snapshot, nothing to drop");
+        return true;
+    }
 
     auto data_snapshot = getIcebergDataSnapshot(metadata_object, current_snapshot_id, context);
     const auto schema_id = static_cast<Int32>(data_snapshot->schema_id_on_snapshot_commit);
 
     const Int32 format_version = metadata_object->getValue<Int32>(f_format_version);
-    if (format_version < 2)
-        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "DROP PARTITION is supported only for Iceberg format version 2 and above");
-
-    if (format_version >= 3)
-        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-            "DROP PARTITION is not supported for Iceberg format version {}. Dropping Puffin deletion vectors "
-            "is not implemented yet", format_version);
+    if (format_version != 2)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "DROP PARTITION is supported only for Iceberg format version 2");
 
     /// Also registers every schema in the schema processor, needed for the type lookup below
     const auto current_schema_id = parseTableSchema(metadata_object, *persistent_components.schema_processor, context, log);
@@ -1246,9 +1254,10 @@ bool IcebergMetadata::tryDropPartitionOnce(
         spec_fields, current_schema->getArray(f_fields), context, std::make_shared<const Block>(partition_source_header));
 
     const auto target_partition_key = evaluateTargetPartitionKey(partitioner, partition_source_header, source_values);
+    const auto target_partition_description = dumpPartitionTuple(target_partition_key);
 
     LOG_INFO(log, "Iceberg DROP PARTITION requested for partition {} of spec {}",
-        dumpPartitionTuple(target_partition_key), partition_spec_id);
+        target_partition_description, partition_spec_id);
 
     const auto scan = scanManifestsForPartition(
         data_snapshot, spec_fields, target_partition_key, partition_spec_id, schema_id, context, purge);
@@ -1256,7 +1265,7 @@ bool IcebergMetadata::tryDropPartitionOnce(
     if (scan.matched_files == 0)
     {
         LOG_INFO(log, "No files belong to partition {} (scanned {} files), nothing to drop",
-            dumpPartitionTuple(target_partition_key), scan.total_files);
+            target_partition_description, scan.total_files);
         return true;
     }
 
@@ -1270,7 +1279,7 @@ bool IcebergMetadata::tryDropPartitionOnce(
 
     LOG_INFO(log, "Dropping partition {}: {} data files ({} records), {} position delete files, {} equality delete "
         "files, {} bytes; {} manifests dropped, {} rewritten, {} kept unchanged",
-        dumpPartitionTuple(target_partition_key), scan.matched_data_files, scan.matched_records,
+        target_partition_description, scan.matched_data_files, scan.matched_records,
         scan.matched_position_delete_files, scan.matched_equality_delete_files, scan.matched_bytes,
         manifest_actions.size(), scan.manifests_to_rewrite.size(), scan.kept_manifests);
 
@@ -1315,6 +1324,9 @@ bool IcebergMetadata::tryDropPartitionOnce(
         compression_method,
         write_format);
     filename_generator.setVersion(last_version + 1);
+
+    /// Set once the new snapshot is reachable by readers, after which its files must survive.
+    bool published = false;
 
     std::vector<String> written_objects;
     auto cleanup_written_objects = [&]
@@ -1445,21 +1457,47 @@ bool IcebergMetadata::tryDropPartitionOnce(
             return false;
         }
 
+        written_objects.push_back(resolver.resolve(metadata_info.path));
+        /// Assume readers can reach the snapshot until the catalog says it rejected the commit.
+        published = true;
+
         if (catalog)
         {
             const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
             if (!catalog->updateMetadata(namespace_name, table_name, resolver.resolveForCatalog(metadata_info.path), new_snapshot))
             {
-                cleanup_written_objects();
-                return false;
+                /// A retryable error does not say whether the commit landed, so ask the catalog which
+                /// metadata it points at: ours means it did, and deleting anything would break the table.
+                DataLake::TableMetadata table_metadata = DataLake::TableMetadata().withLocation().withDataLakeSpecificProperties();
+                catalog->getTableMetadata(namespace_name, table_name, context, table_metadata);
+
+                auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
+                if (!table_specific_properties.has_value() || table_specific_properties->iceberg_metadata_file_location.empty())
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "Catalog didn't return iceberg metadata location for table {}.{}", namespace_name, table_name);
+
+                const auto committed_name = std::filesystem::path(
+                    table_metadata.getMetadataLocation(table_specific_properties->iceberg_metadata_file_location)).filename();
+
+                if (committed_name != std::filesystem::path(metadata_info.path.serialize()).filename())
+                {
+                    published = false;
+                    cleanup_written_objects();
+                    return false;
+                }
+
+                LOG_INFO(log, "Iceberg DROP PARTITION reported a failed catalog commit that the catalog accepted");
             }
         }
     }
     catch (...)
     {
-        cleanup_written_objects();
+        if (!published)
+            cleanup_written_objects();
         throw;
     }
+
+    persistent_components.invalidateMetadataCache();
 
     if (purge)
     {
@@ -1484,13 +1522,21 @@ bool IcebergMetadata::tryDropPartitionOnce(
                 storage->removeObjectsIfExist(batch);
             } catch (...)
             {
-                tryLogCurrentException(log, "Failed to purge data files after DROP PARTITION");
+                Strings surviving_paths;
+                surviving_paths.reserve(batch.size());
+                for (const auto & object : batch)
+                    surviving_paths.push_back(object.remote_path);
+
+                tryLogCurrentException(log, fmt::format(
+                    "Failed to purge data files after DROP PARTITION, these files may still exist in storage {} and "
+                    "are not retried by re-running the query: {}",
+                    storage->getDescription(), fmt::join(surviving_paths, ", ")));
             }
         }
     }
 
     LOG_INFO(log, "Dropped partition {} in snapshot {} (purge={})",
-        dumpPartitionTuple(target_partition_key), new_snapshot->getValue<Int64>(f_metadata_snapshot_id), purge);
+        target_partition_description, new_snapshot->getValue<Int64>(f_metadata_snapshot_id), purge);
     return true;
 }
 

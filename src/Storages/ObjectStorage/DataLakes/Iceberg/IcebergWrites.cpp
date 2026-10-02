@@ -1057,6 +1057,10 @@ ManifestRewriteResult rewriteManifestFileExcludingFiles(
         avro::GenericRecord & entry = datum.value<avro::GenericRecord>();
         avro::GenericRecord & data_file = entry.field(Iceberg::f_data_file).value<avro::GenericRecord>();
 
+        /// Copying a DELETED entry would revive it, since every entry below is restamped EXISTING.
+        if (entry.field(Iceberg::f_status).value<Int32>() == static_cast<Int32>(Iceberg::ManifestEntryStatus::DELETED))
+            continue;
+
         if (excluded_file_paths.contains(data_file.field(Iceberg::f_file_path).value<std::string>()))
         {
             ++result.removed_entries;

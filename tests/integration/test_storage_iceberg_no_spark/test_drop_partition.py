@@ -8,6 +8,8 @@ import pyarrow as pa
 from pyiceberg.catalog import load_catalog
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
+from pyiceberg.expressions import GreaterThanOrEqual
+from pyiceberg.manifest import ManifestEntryStatus
 from pyiceberg.transforms import DayTransform, IdentityTransform
 from pyiceberg.types import (
     DoubleType,
@@ -748,5 +750,40 @@ def test_drop_partition_purges_data_files(started_cluster_iceberg_no_spark):
     operation, summary = current_snapshot_history(instance, namespace, table_name)
     assert operation == "DELETE"
     assert summary["deleted-data-files"] == "1"
+
+    instance.query(f"DROP DATABASE {namespace}")
+
+
+def test_drop_partition_does_not_revive_deleted_entries(started_cluster_iceberg_no_spark):
+    """Rewriting a manifest must not turn a DELETED entry back into a live file."""
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    catalog = load_catalog_impl(started_cluster_iceberg_no_spark)
+
+    namespace = f"clickhouse_drop_partition_{uuid.uuid4().hex}"
+    table_name = "deleted_entries"
+    table = create_day_partitioned_table(catalog, namespace, table_name)
+
+    table.delete(GreaterThanOrEqual("ts", datetime(2024, 1, 17)))
+    table.refresh()
+
+    manifests = table.current_snapshot().manifests(table.io)
+    assert len(manifests) == 1, f"this test needs one shared manifest, got {len(manifests)}"
+    entries = manifests[0].fetch_manifest_entry(table.io, discard_deleted=False)
+    statuses = [entry.status for entry in entries]
+    assert ManifestEntryStatus.DELETED in statuses, (
+        f"this test needs a DELETED entry in the current manifest, got {statuses}"
+    )
+
+    create_iceberg_database(instance, namespace)
+    ch_table = f"{namespace}.`{namespace}.{table_name}`"
+
+    assert instance.query(f"SELECT id FROM {ch_table} ORDER BY id FORMAT TSV") == "1\n2\n3\n4\n5\n"
+
+    # 2024-01-16 stays, so the shared manifest is rewritten rather than dropped
+    instance.query(
+        f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15'", settings=WRITE_SETTINGS
+    )
+
+    assert instance.query(f"SELECT id FROM {ch_table} ORDER BY id FORMAT TSV") == "4\n5\n"
 
     instance.query(f"DROP DATABASE {namespace}")
