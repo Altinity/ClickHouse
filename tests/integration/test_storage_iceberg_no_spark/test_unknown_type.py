@@ -363,16 +363,23 @@ def test_unknown_type_nested_write(started_cluster_iceberg_no_spark):
         settings={"allow_insert_into_iceberg": 1},
     )
 
-    result = instance.query(
-        f"SELECT id, name, nested.a, nested.u FROM {table_name} ORDER BY id"
-    ).strip()
     expected = (
         "1\talice\t\\N\t\\N\n"
         "2\tbob\t\\N\t\\N\n"
         "3\tcharlie\t42\t\\N\n"
         "4\tdave\t\\N\t\\N"
     )
-    assert result == expected
+    for read_optimization in (0, 1):
+        result = instance.query(
+            f"SELECT id, name, nested.a, nested.u FROM {table_name} ORDER BY id",
+            settings={"allow_experimental_iceberg_read_optimization": read_optimization},
+        ).strip()
+        assert result == expected, read_optimization
+
+    result = instance.query(
+        f"SELECT id, nested FROM {table_name} WHERE id >= 3 ORDER BY id"
+    ).strip()
+    assert result == "3\t(42,NULL)\n4\t(NULL,NULL)"
 
 
 def test_unknown_type_list_write(started_cluster_iceberg_no_spark):
@@ -421,8 +428,12 @@ def test_unknown_type_list_write(started_cluster_iceberg_no_spark):
 
 def test_unknown_type_rejected_on_v2(started_cluster_iceberg_no_spark):
     """`unknown` exists only from Iceberg format version 3, so ClickHouse must not
-    write it into the metadata of a table with an older format version."""
+    write it into the metadata of a table with an older format version.
+
+    ClickHouse itself refuses a top-level `Nullable(Nothing)` column in any table,
+    but `Nothing` nested in a `Tuple` is accepted, so that is what reaches Iceberg."""
     instance = started_cluster_iceberg_no_spark.instances["node1"]
+    nested_unknown = "Tuple(a Nullable(Int64), u Nullable(Nothing))"
 
     table_name = "test_unknown_type_create_v2_" + get_uuid_str()
     error = instance.query_and_get_error(
@@ -430,30 +441,30 @@ def test_unknown_type_rejected_on_v2(started_cluster_iceberg_no_spark):
             "local",
             table_name,
             started_cluster_iceberg_no_spark,
-            "(id Int64, u Nullable(Nothing))",
+            f"(id Int64, nested {nested_unknown})",
             2,
         )
     )
     assert "BAD_ARGUMENTS" in error, error
     assert "requires format version 3" in error, error
 
-    table_name = "test_unknown_type_add_column_v2_" + get_uuid_str()
+    table_name = "test_unknown_type_modify_column_v2_" + get_uuid_str()
     create_iceberg_table(
         "local",
         instance,
         table_name,
         started_cluster_iceberg_no_spark,
-        "(id Int64, name Nullable(String))",
+        "(id Int64, nested Tuple(a Nullable(Int64)))",
         format_version=2,
     )
+    describe_before = instance.query(f"DESCRIBE TABLE {table_name}")
     error = instance.query_and_get_error(
-        f"ALTER TABLE {table_name} ADD COLUMN u Nullable(Nothing)",
+        f"ALTER TABLE {table_name} MODIFY COLUMN nested {nested_unknown}",
         settings={"allow_insert_into_iceberg": 1},
     )
     assert "BAD_ARGUMENTS" in error, error
     assert "requires format version 3" in error, error
-    describe = instance.query(f"DESCRIBE TABLE {table_name}")
-    assert [line.split("\t")[0] for line in describe.strip().split("\n")] == ["id", "name"]
+    assert instance.query(f"DESCRIBE TABLE {table_name}") == describe_before
 
     table_name = "test_unknown_type_create_v3_" + get_uuid_str()
     create_iceberg_table(
@@ -461,12 +472,12 @@ def test_unknown_type_rejected_on_v2(started_cluster_iceberg_no_spark):
         instance,
         table_name,
         started_cluster_iceberg_no_spark,
-        "(id Int64, u Nullable(Nothing))",
+        f"(id Int64, nested {nested_unknown})",
         format_version=3,
     )
     describe = instance.query(f"DESCRIBE TABLE {table_name}")
-    u_row = [line.split("\t") for line in describe.strip().split("\n") if line.startswith("u\t")]
-    assert len(u_row) == 1 and u_row[0][1] == "Nullable(Nothing)", describe
+    nested_row = [line.split("\t") for line in describe.strip().split("\n") if line.startswith("nested\t")]
+    assert len(nested_row) == 1 and "Nothing" in nested_row[0][1], describe
 
 
 def test_unknown_type_write_keeps_bounds(started_cluster_iceberg_no_spark):
@@ -547,12 +558,12 @@ def test_unknown_type_only_column_rejected(started_cluster_iceberg_no_spark):
         instance,
         table_name,
         started_cluster_iceberg_no_spark,
-        "(u Nullable(Nothing))",
+        "(t Tuple(u Nullable(Nothing)))",
         format_version=3,
     )
 
     error = instance.query_and_get_error(
-        f"INSERT INTO {table_name} VALUES (NULL), (NULL)",
+        f"INSERT INTO {table_name} SELECT tuple(NULL) FROM numbers(2)",
         settings={"allow_insert_into_iceberg": 1},
     )
     assert "NOT_IMPLEMENTED" in error, error
