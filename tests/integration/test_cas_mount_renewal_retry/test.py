@@ -364,6 +364,13 @@ def start_cluster():
         cluster.shutdown()
 
 
+@pytest.fixture(autouse=True)
+def disarm_proxy(start_cluster):
+    # A test that fails while a fault is armed must not leave it armed for the tests after it.
+    yield
+    _control(start_cluster["control_url"], "/config", {"reset": True})
+
+
 def test_openpoolview_handoff_freezes_the_connect_cap_from_the_real_disk(start_cluster):
     # `ContentAddressedMetadataStorage::openPoolView` derives `connect_timeout_cap_ms` from the
     # disk's OWN S3 client (`freezeConnectTimeoutCapMs`) and hands it into the pool's request budget;
@@ -655,7 +662,7 @@ def test_long_put_outage_resumes_under_the_same_epoch(start_cluster):
         return (lifecycle, reason, detail) if (lifecycle, reason) == ("not_live", "lease_expired") else None
 
     _, _, detail = _wait_until(expired, timeout=40, interval=0.1)
-    assert detail, "lifecycle_detail must carry the last failed request"
+    assert any(word in detail for word in ("SlowDown", "Please reduce your request rate", "503")), detail
 
     error = node.query_and_get_error("INSERT INTO renewal_probe VALUES (301, 'during-outage')")
     assert "NETWORK_ERROR" in error and "lease" in error.lower(), error
@@ -667,6 +674,13 @@ def test_long_put_outage_resumes_under_the_same_epoch(start_cluster):
     _wait_until(lambda deadline: _lease_row(node, timeout=deadline.remaining())[0] == "live", timeout=40)
     delta = _event_delta(counters_before, _profile_events(node))
 
+    assert _lease_row(node) == ("live", "", "")
+    assert node.query(
+        "SELECT lifecycle_since IS NULL FROM system.cas_mounts WHERE disk = '{}' AND server_root_id = '{}'".format(
+            DISK, SERVER_ROOT_ID
+        )
+    ).strip() == "1"
+    assert node.query("SELECT count() FROM renewal_probe WHERE id = 301").strip() == "0"
     assert _writer_epoch(node) == epoch_before
     assert delta["CASMountLeaseExpired"] == 1, delta
     assert delta["CASMountLeaseLost"] == 0, delta
