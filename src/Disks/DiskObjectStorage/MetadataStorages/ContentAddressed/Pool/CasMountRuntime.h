@@ -374,7 +374,7 @@ public:
     void installRenewer(UInt128 our_uuid, uint64_t writer_epoch, const std::function<uint64_t()> & now_ms);
     uint64_t startRenewer();
     void renewerReset();
-    void startBackgroundWorkers(std::chrono::milliseconds period);
+    void startBackgroundWorkers();
     void stopBackgroundWorkers();
     /// Latch a recovery generation for the lease thread. It never constructs a thread.
     void scheduleRemount();
@@ -501,7 +501,6 @@ private:
     bool workers_stop_requested = false;
     /// The lease thread, from its first statement until `stopBackgroundWorkers` joins it.
     std::thread::id lease_thread_id;
-    std::chrono::milliseconds renewal_period{0};
     uint64_t remount_requested_generation = 0;
     uint64_t remount_handled_generation = 0;
     /// The requested generation `beginReclaim` recorded; `armIfAdmissible` acknowledges it.

@@ -516,7 +516,6 @@ TEST(CASEvent, TheReportIsBuiltFromTheResult)
     ASSERT_EQ(quiet.attempts_sent, 1u);
     reportMountRenewCompletion(quiet, server_root_id, sink, quiet.attempt_start_boot_ms + 1000, std::nullopt);
     const MountRenewResult skipped = renewer.renew(MountRenewOperationEnvironment{
-        .boot_ms = {},
         .live = [] { return false; },
         .cancelled = [] { return true; },
         .on_request = {},

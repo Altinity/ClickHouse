@@ -232,12 +232,10 @@ private:
 };
 
 MountRenewOperationEnvironment renewalEnvironment(
-    uint64_t & boot_ms,
     const std::function<bool()> & live = {},
     const std::function<bool()> & cancelled = {})
 {
     return MountRenewOperationEnvironment{
-        .boot_ms = [&boot_ms] { return boot_ms; },
         .live = live,
         .cancelled = cancelled,
         .on_request = {},
@@ -996,7 +994,7 @@ TEST(CASHeartbeat, RenewerStateAllowsOnlyActiveReleaseOrTerminal)
             [&] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(20),
             [&] { return boot_ms; });
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::New);
-        EXPECT_RENEWER_STATE_REJECTION(renewer.renew(renewalEnvironment(boot_ms)));
+        EXPECT_RENEWER_STATE_REJECTION(renewer.renew(renewalEnvironment()));
         EXPECT_RENEWER_STATE_REJECTION(renewer.release(renewer.lastCommittedAttemptStartBootMs() + 1000));
         EXPECT_EQ(renewer.start(), 100u);
         EXPECT_RENEWER_STATE_REJECTION(renewer.start());
@@ -1004,7 +1002,7 @@ TEST(CASHeartbeat, RenewerStateAllowsOnlyActiveReleaseOrTerminal)
         renewer.release(renewer.lastCommittedAttemptStartBootMs() + 1000);
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::Released);
         EXPECT_RENEWER_STATE_REJECTION(renewer.start());
-        EXPECT_RENEWER_STATE_REJECTION(renewer.renew(renewalEnvironment(boot_ms)));
+        EXPECT_RENEWER_STATE_REJECTION(renewer.renew(renewalEnvironment()));
         EXPECT_RENEWER_STATE_REJECTION(renewer.release(renewer.lastCommittedAttemptStartBootMs() + 1000));
     }
 
@@ -1024,12 +1022,12 @@ TEST(CASHeartbeat, RenewerStateAllowsOnlyActiveReleaseOrTerminal)
         /// Live until the ambiguous attempt's resolving read has run, so that attempt is the only one
         /// sent and the renewal ends terminal with it unsettled.
         const MountRenewResult result = renewer.renew(
-            renewalEnvironment(boot_ms, /*live=*/[&] { return backend->read_calls == 0; }));
+            renewalEnvironment(/*live=*/[&] { return backend->read_calls == 0; }));
         EXPECT_EQ(result.outcome, MountRenewOutcome::Terminal);
         EXPECT_NE(result.failure, nullptr);
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::RenewalTerminal);
         EXPECT_RENEWER_STATE_REJECTION(renewer.start());
-        EXPECT_RENEWER_STATE_REJECTION(renewer.renew(renewalEnvironment(boot_ms)));
+        EXPECT_RENEWER_STATE_REJECTION(renewer.renew(renewalEnvironment()));
         EXPECT_RENEWER_STATE_REJECTION(renewer.release(renewer.lastCommittedAttemptStartBootMs() + 1000));
     }
 
@@ -1054,7 +1052,7 @@ TEST(CASHeartbeat, RenewalRetriesOneImmutableBodyAndAdoptsLostResponse)
 
     backend->attempts.clear();
     backend->actions = {RenewalScriptBackend::Action::ThrowBefore, RenewalScriptBackend::Action::Delegate};
-    MountRenewResult retried = renewer.renew(renewalEnvironment(boot_ms));
+    MountRenewResult retried = renewer.renew(renewalEnvironment());
     ASSERT_EQ(retried.outcome, MountRenewOutcome::Committed);
     ASSERT_EQ(backend->attempts.size(), 2u);
     EXPECT_EQ(backend->attempts[0].key, backend->attempts[1].key);
@@ -1065,7 +1063,7 @@ TEST(CASHeartbeat, RenewalRetriesOneImmutableBodyAndAdoptsLostResponse)
 
     backend->attempts.clear();
     backend->actions = {RenewalScriptBackend::Action::LandThenThrow};
-    MountRenewResult adopted = renewer.renew(renewalEnvironment(boot_ms));
+    MountRenewResult adopted = renewer.renew(renewalEnvironment());
     EXPECT_EQ(adopted.outcome, MountRenewOutcome::Committed);
     EXPECT_TRUE(adopted.resolved_by_read);
     EXPECT_EQ(adopted.attempts_sent, 1u);
@@ -1096,7 +1094,7 @@ TEST(CASHeartbeat, RenewalOverConnectFailuresRecoversWithoutASettleRead)
     for (int i = 0; i < 60; ++i)
         backend->actions.push_back(RenewalScriptBackend::Action::ThrowConnectHint);
     backend->actions.push_back(RenewalScriptBackend::Action::Delegate);
-    const MountRenewResult renewed = renewer.renew(renewalEnvironment(boot_ms));
+    const MountRenewResult renewed = renewer.renew(renewalEnvironment());
     ASSERT_EQ(renewed.outcome, MountRenewOutcome::Committed);
     EXPECT_GT(renewed.attempts_sent, 1u);
     EXPECT_FALSE(renewed.resolved_by_read);            /// classification `committed_after_retry`
@@ -1122,8 +1120,7 @@ TEST(CASHeartbeat, CancellationBeforeSendIsNotAttemptedAndAllowsRelease)
     renewer.start();
     backend->attempts.clear();
     backend->read_calls = 0;
-    const MountRenewResult result = renewer.renew(renewalEnvironment(
-        boot_ms, /*live=*/[] { return false; }, /*cancelled=*/[] { return true; }));
+    const MountRenewResult result = renewer.renew(renewalEnvironment(/*live=*/[] { return false; }, /*cancelled=*/[] { return true; }));
     EXPECT_EQ(result.outcome, MountRenewOutcome::NotAttempted);
     EXPECT_EQ(result.failure, nullptr);
     EXPECT_EQ(renewer.state(), MountLeaseRenewerState::Active);
@@ -1151,7 +1148,7 @@ TEST(CASHeartbeat, CancellationAfterSendIsTerminalAndForbidsRelease)
     backend->cancel_after_write = [&] { cancelled = true; };
     backend->actions = {RenewalScriptBackend::Action::ReturnThenCancel};
     const MountRenewResult result = renewer.renew(
-        renewalEnvironment(boot_ms, /*live=*/[&] { return !cancelled; }, /*cancelled=*/[&] { return cancelled; }));
+        renewalEnvironment(/*live=*/[&] { return !cancelled; }, /*cancelled=*/[&] { return cancelled; }));
     const DB::Exception failure = terminalException(result);
     EXPECT_EQ(failure.code(), DB::ErrorCodes::NETWORK_ERROR);
     EXPECT_TRUE(result.sent_any);
@@ -1178,7 +1175,7 @@ TEST(CASHeartbeat, SlowResolvedSuccessKeepsAttemptStartAnchor)
     boot_ms = 150;
     backend->cancel_after_write = [&] { boot_ms = 400; };
     backend->actions = {RenewalScriptBackend::Action::LandThenThrow};
-    const MountRenewResult result = renewer.renew(renewalEnvironment(boot_ms));
+    const MountRenewResult result = renewer.renew(renewalEnvironment());
     EXPECT_EQ(result.outcome, MountRenewOutcome::Committed);
     EXPECT_EQ(result.attempt_start_boot_ms, 150u);
     EXPECT_EQ(renewer.lastCommittedAttemptStartBootMs(), 150u);
@@ -1209,7 +1206,7 @@ TEST(CASHeartbeat, SamePairTwinAndForeignOrSuccessorStayTerminal)
         mustCommit(ops.op.replace(layout.mountKey("test"), encodeMountLease(current), got->etag,
                                   Retry::standard()), "competing slot");
         backend->read_calls = 0;
-        const MountRenewResult result = renewer.renew(renewalEnvironment(boot_ms));
+        const MountRenewResult result = renewer.renew(renewalEnvironment());
         const DB::Exception failure = terminalException(result);
         EXPECT_NE(failure.code(), DB::ErrorCodes::LOGICAL_ERROR);
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::RenewalTerminal);
@@ -1239,7 +1236,7 @@ TEST(CASHeartbeat, ExpectedPredecessorThenLateLandingIsAdoptedExactly)
         RenewalScriptBackend::Action::ThrowBeforeThenLandAfterResolve,
         RenewalScriptBackend::Action::Delegate,
     };
-    const MountRenewResult result = renewer.renew(renewalEnvironment(boot_ms));
+    const MountRenewResult result = renewer.renew(renewalEnvironment());
     EXPECT_EQ(result.outcome, MountRenewOutcome::Committed);
     EXPECT_TRUE(result.resolved_by_read);
     ASSERT_EQ(backend->attempts.size(), 2u);
@@ -1303,7 +1300,7 @@ TEST(CASHeartbeat, GcFenceAndVanishedMountStayTerminal)
             mustCommit(ops.op.replace(key, encodeMountLease(fenced), got->etag, Retry::standard()),
                        "fence-out");
         }
-        const DB::Exception failure = terminalException(renewer.renew(renewalEnvironment(boot_ms)));
+        const DB::Exception failure = terminalException(renewer.renew(renewalEnvironment()));
         EXPECT_NE(failure.code(), DB::ErrorCodes::LOGICAL_ERROR);
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::RenewalTerminal);
     };
@@ -1318,7 +1315,7 @@ TEST(CASHeartbeat, RenewReturnsWhatItsReportNeeds)
     {
         ReportFieldsCase c("commit");
         c.backend->on_attempt = [&boot_ms = c.boot_ms] { boot_ms += 250; };
-        const MountRenewResult result = c.renewer.renew(renewalEnvironment(c.boot_ms));
+        const MountRenewResult result = c.renewer.renew(renewalEnvironment());
         ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
         ASSERT_EQ(c.backend->attempts.size(), 1u);
         const MountLease sent = decodeMountLease(c.backend->attempts.back().bytes);
@@ -1344,7 +1341,7 @@ TEST(CASHeartbeat, RenewReturnsWhatItsReportNeeds)
         mustCommit(c.ops.op.replace(key, encodeMountLease(foreign), got->etag, Retry::standard()), "foreign slot");
         c.backend->attempts.clear();
         c.backend->on_attempt = [&boot_ms = c.boot_ms] { boot_ms += 250; };
-        const MountRenewResult result = c.renewer.renew(renewalEnvironment(c.boot_ms));
+        const MountRenewResult result = c.renewer.renew(renewalEnvironment());
         ASSERT_EQ(result.outcome, MountRenewOutcome::Terminal);
         ASSERT_EQ(c.backend->attempts.size(), 1u);
         const MountLease sent = decodeMountLease(c.backend->attempts.back().bytes);
@@ -1361,7 +1358,7 @@ TEST(CASHeartbeat, RenewReturnsWhatItsReportNeeds)
         const auto got = c.ops.op.read(key, Retry::standard());
         ASSERT_TRUE(got.has_value());
         ASSERT_EQ(c.ops.op.remove(key, got->etag, Retry::standard()), Removal::Removed);
-        const MountRenewResult result = c.renewer.renew(renewalEnvironment(c.boot_ms));
+        const MountRenewResult result = c.renewer.renew(renewalEnvironment());
         ASSERT_EQ(result.outcome, MountRenewOutcome::Terminal);
         EXPECT_EQ(result.classification, MountRenewTerminalClassification::Vanished);
         EXPECT_EQ(result.seq, 2u);
@@ -1371,8 +1368,7 @@ TEST(CASHeartbeat, RenewReturnsWhatItsReportNeeds)
     {
         /// Ended before its first request by a liveness that refuses with no stop requested.
         ReportFieldsCase c("refused");
-        const MountRenewResult result = c.renewer.renew(renewalEnvironment(
-            c.boot_ms, /*live=*/[] { return false; }, /*cancelled=*/[] { return false; }));
+        const MountRenewResult result = c.renewer.renew(renewalEnvironment(/*live=*/[] { return false; }, /*cancelled=*/[] { return false; }));
         ASSERT_EQ(result.outcome, MountRenewOutcome::Terminal);
         EXPECT_TRUE(c.backend->attempts.empty());
         EXPECT_EQ(result.classification, MountRenewTerminalClassification::FenceOrLifecycleLost);
@@ -1385,8 +1381,7 @@ TEST(CASHeartbeat, RenewReturnsWhatItsReportNeeds)
     {
         /// Ended before its first request by a stop.
         ReportFieldsCase c("stopped");
-        const MountRenewResult result = c.renewer.renew(renewalEnvironment(
-            c.boot_ms, /*live=*/[] { return false; }, /*cancelled=*/[] { return true; }));
+        const MountRenewResult result = c.renewer.renew(renewalEnvironment(/*live=*/[] { return false; }, /*cancelled=*/[] { return true; }));
         ASSERT_EQ(result.outcome, MountRenewOutcome::NotAttempted);
         EXPECT_EQ(result.classification, MountRenewTerminalClassification::Cancelled);
         EXPECT_EQ(result.seq, 2u);
@@ -1412,7 +1407,7 @@ TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)
         /// Live until the resolving read has run: the delayed write lands during that read, and the
         /// renewal ends terminal without a second attempt.
         const MountRenewResult result = renewer.renew(
-            renewalEnvironment(boot_ms, /*live=*/[&] { return backend->read_calls == 0; }));
+            renewalEnvironment(/*live=*/[&] { return backend->read_calls == 0; }));
         EXPECT_EQ(result.outcome, MountRenewOutcome::Terminal);
 
         /// The delayed write landed during the resolving read. It carries this renewer's own epoch, and
@@ -1442,7 +1437,7 @@ TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)
         backend->actions = {RenewalScriptBackend::Action::ThrowBefore};
         backend->read_calls = 0;
         const MountRenewResult result = renewer.renew(
-            renewalEnvironment(boot_ms, /*live=*/[&] { return backend->read_calls == 0; }));
+            renewalEnvironment(/*live=*/[&] { return backend->read_calls == 0; }));
         ASSERT_EQ(result.outcome, MountRenewOutcome::Terminal);
         ASSERT_FALSE(backend->attempts.empty());
         const auto delayed = backend->attempts.back();
@@ -1485,13 +1480,13 @@ TEST(CASHeartbeat, WallClockStepsAndBootSuspendCannotExtendAuthority)
     renewer.start();
 
     wall_ms = 9'000'000;
-    EXPECT_EQ(renewer.renew(renewalEnvironment(boot_ms)).outcome, MountRenewOutcome::Committed);
+    EXPECT_EQ(renewer.renew(renewalEnvironment()).outcome, MountRenewOutcome::Committed);
     wall_ms = 1;
-    EXPECT_EQ(renewer.renew(renewalEnvironment(boot_ms)).outcome, MountRenewOutcome::Committed);
+    EXPECT_EQ(renewer.renew(renewalEnvironment()).outcome, MountRenewOutcome::Committed);
 
     backend->attempts.clear();
     boot_ms += 10'000;
-    const MountRenewResult suspended = renewer.renew(renewalEnvironment(boot_ms));
+    const MountRenewResult suspended = renewer.renew(renewalEnvironment());
     ASSERT_EQ(suspended.outcome, MountRenewOutcome::Committed);
     EXPECT_EQ(suspended.attempt_start_boot_ms, boot_ms)
         << "a renewal after a suspend anchors at its own start, never at the deadline it last confirmed";
@@ -1549,7 +1544,7 @@ public:
             }
             return !live || live();
         };
-        MountRenewOperationEnvironment environment = renewalEnvironment(boot_ms, bounded_live, cancelled);
+        MountRenewOperationEnvironment environment = renewalEnvironment(bounded_live, cancelled);
         environment.on_request = std::move(on_request);
         MountRenewResult result = renewer->renew(environment);
         EXPECT_FALSE(request_bound_hit) << "the renewal sent " << max_requests

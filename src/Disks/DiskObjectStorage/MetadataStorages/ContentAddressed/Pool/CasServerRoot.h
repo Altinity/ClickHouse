@@ -105,7 +105,6 @@ struct MountRenewRequestEvent
 
 struct MountRenewOperationEnvironment
 {
-    std::function<uint64_t()> boot_ms;
     /// Facts the mount fence cannot see (a remount request, a pool no longer live, shutdown). FALSE ends
     /// the renewal exactly as a lost fence does; the engine does not need to know which refused.
     std::function<bool()> live;

@@ -864,7 +864,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                 "mount has no lease thread to renew it; retry the open", srid, ttl_ms_u);
         return;
     }
-    store->mount_runtime.startBackgroundWorkers(store->config.mount_renew_period);
+    store->mount_runtime.startBackgroundWorkers();
     if (armed)
         return;
     LOG_WARNING(getLogger("CasPool"),

@@ -3365,14 +3365,14 @@ TEST(CASPoolRemount, DirectRenewIsRefusedForBackgroundConfiguredRuntimeAfterStop
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.startBackgroundWorkers();
     runtime.stopBackgroundWorkers();
     EXPECT_RUNTIME_STATE_REJECTION(runtime.renewWatermarkOnce());
     runtime.finishTeardown(true);
@@ -3396,7 +3396,7 @@ TEST(CASPoolRemount, ReclaimWaitsForTheRenewalToEnd)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -3413,7 +3413,7 @@ TEST(CASPoolRemount, ReclaimWaitsForTheRenewalToEnd)
     backend->fault = RuntimeRenewBackend::Fault::BlockThenDelegate;
     /// Set after the setup's own writes: only the held renewal request sets it.
     backend->after_commit = [&] { renewal_request_returned = true; };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
     renewal_barrier.waitUntilArrived();
     runtime.tripMountLost();
     runtime.scheduleRemount();
@@ -3448,14 +3448,14 @@ TEST(CASPoolRemount, TeardownJoinsTheLeaseThreadBeforeRelease)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.startBackgroundWorkers();
     runtime.stopBackgroundWorkers();
     EXPECT_EQ(worker_exits.load(), 1u);
     runtime.finishTeardown(true);
@@ -3548,7 +3548,7 @@ TEST(CASMountRuntime, MemoryLimitDoesNotEndTheLeaseThread)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms; },
             .renewal_admitted_hook_for_test = [&]
@@ -3573,7 +3573,7 @@ TEST(CASMountRuntime, MemoryLimitDoesNotEndTheLeaseThread)
     const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
 
     backend->fault = RuntimeRenewBackend::Fault::ThrowMemoryLimitExceeded;
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
 
     reported.waitUntilArrived();
     const String reported_outcome = outcome;
@@ -3627,7 +3627,7 @@ TEST(CASPoolRemount, NaturalTerminalTransitionMakesTheLeaseThreadExit)
         RuntimeUnderTest runtime_holder(
             backend, layout,
             MountConfig{
-                .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+                .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1),
                 .background_watermark = true,
                 .boot_ms_fn = [&] { return boot_ms; },
                 .worker_factory = factory},
@@ -3645,7 +3645,7 @@ TEST(CASPoolRemount, NaturalTerminalTransitionMakesTheLeaseThreadExit)
         runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
         runtime.armMountFence(uuid, 1, anchor + 1000);
-        runtime.startBackgroundWorkers(std::chrono::hours(1));
+        runtime.startBackgroundWorkers();
         runtime.tripMountLost();
         runtime.scheduleRemount();
         transitioned.waitUntilArrived();
@@ -3699,7 +3699,7 @@ TEST(CASPoolRemount, ALeaseWaitCannotMissNaturalTerminalPublication)
             RuntimeUnderTest runtime_holder(
                 backend, layout,
                 MountConfig{
-                    .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+                    .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1),
                     .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; },
                     .worker_factory = factory,
@@ -3743,7 +3743,7 @@ TEST(CASPoolRemount, ALeaseWaitCannotMissNaturalTerminalPublication)
                 runtime.tripMountLost();
                 runtime.scheduleRemount();
             }
-            runtime.startBackgroundWorkers(std::chrono::hours(1));
+            runtime.startBackgroundWorkers();
 
             waiter.waitUntilArrived();
             if (terminal == PoolLifecycle::IdentityLost)
@@ -3792,7 +3792,7 @@ TEST(CASPoolRemount, VanishedReasonPreparationFailureLeavesTerminalTransitionRet
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms; },
             .worker_factory = factory,
@@ -3806,7 +3806,7 @@ TEST(CASPoolRemount, VanishedReasonPreparationFailureLeavesTerminalTransitionRet
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.startBackgroundWorkers();
     runtime.tripMountLost();
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
@@ -3846,14 +3846,14 @@ TEST(CASPoolRemount, WorkerConstructionRollbackFailsOpenClosed)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(10), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    EXPECT_THROW(runtime.startBackgroundWorkers(std::chrono::milliseconds(10)), DB::Exception);
+    EXPECT_THROW(runtime.startBackgroundWorkers(), DB::Exception);
     EXPECT_FALSE(runtime.mayMutate());
     EXPECT_FALSE(runtime.workersRunningForTest());
     runtime.finishTeardown(false);
@@ -3877,7 +3877,7 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
     CasMountRuntime * runtime_ptr = nullptr;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -3904,7 +3904,7 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
     backend->barrier = &renewal_barrier;
     backend->fault = RuntimeRenewBackend::Fault::BlockThenDelegate;
     const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
     renewal_barrier.waitUntilArrived();
     runtime.tripMountLost();
     runtime.scheduleRemount();
@@ -3933,7 +3933,7 @@ TEST(CASPoolRemount, ConcurrentRemountRequestIsProcessedAfterActiveGeneration)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -3945,7 +3945,7 @@ TEST(CASPoolRemount, ConcurrentRemountRequestIsProcessedAfterActiveGeneration)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.startBackgroundWorkers();
     runtime.tripMountLost();
     runtime.scheduleRemount();
     first.waitUntilArrived();
@@ -3976,7 +3976,7 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
     CasMountRuntime * runtime_ptr = nullptr;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(10'000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(10'000), .mount_renew_period = std::chrono::milliseconds(1000), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -4007,7 +4007,7 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 10'000);
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(1000));
+    runtime.startBackgroundWorkers();
     runtime.tripMountLost();
     runtime.scheduleRemount();
     first.waitUntilArrived();
@@ -4065,7 +4065,8 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
         CasEventSink sink;
         RuntimeUnderTest runtime_holder(
             backend, layout,
-            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+                        .mount_renew_period = std::chrono::milliseconds(ambiguous ? 0 : 3'600'000), .background_watermark = true,
                         .boot_ms_fn = [&] { return boot_ms; }},
             "test", sink, runtimeRenewBudget(), [] { return false; });
         CasMountRuntime & runtime = *runtime_holder;
@@ -4076,7 +4077,7 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
         {
             backend->barrier = &barrier;
             backend->fault = RuntimeRenewBackend::Fault::BlockThenThrow;
-            runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+            runtime.startBackgroundWorkers();
             barrier.waitUntilArrived();
             auto stop = std::async(std::launch::async, [&] { runtime.stopBackgroundWorkers(); });
             barrier.release();
@@ -4084,7 +4085,7 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
         }
         else
         {
-            runtime.startBackgroundWorkers(std::chrono::hours(1));
+            runtime.startBackgroundWorkers();
             runtime.stopBackgroundWorkers();
         }
         runtime.finishTeardown(true);
@@ -4205,7 +4206,7 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -4218,7 +4219,7 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
     runtime.armMountFence(uuid, 1, anchor + 1000);
     /// A definitive answer ends the lease thread's renewal; a transient fault would only be retried.
     fenceOutMount(*backend, layout.mountKey("test"));
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
     remount_entered.waitUntilArrived();
     EXPECT_FALSE(runtime.mayMutate());
     EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::TransientNotLive);
@@ -4255,7 +4256,7 @@ TEST(CASMountRuntime, ForgetEndsAnUnboundedRenewal)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms.load(); }, .worker_factory = factory},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
@@ -4271,7 +4272,7 @@ TEST(CASMountRuntime, ForgetEndsAnUnboundedRenewal)
             holding.arriveAndWait();
     });
     backend->outage = [] { return true; };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
 
     holding.waitUntilArrived();
     const uint64_t writes_at_forget = backend->outage_writes.load();
@@ -4310,7 +4311,7 @@ TEST(CASMountRuntime, StopWakesTheRetryWaitOfAnUnboundedRenewal)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
@@ -4330,7 +4331,7 @@ TEST(CASMountRuntime, StopWakesTheRetryWaitOfAnUnboundedRenewal)
     });
     backend->outage = [] { return true; };
     const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
 
     ASSERT_EQ(wait_requested.wait_for(std::chrono::seconds(20)), std::future_status::ready);
     const uint64_t requested_ms = wait_requested.get();
@@ -4372,7 +4373,7 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(500), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms.load(); },
                     /// The test clock moves only through the sleep seam, so a regression that zeroes the
                     /// pauses would retry forever; the request count ends the renewal instead.
@@ -4401,7 +4402,7 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
         if (commit_boot_ms.size() == 2)
             second_commit.arriveAndWait();
     };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(500));
+    runtime.startBackgroundWorkers();
 
     bool arrived = true;
     try
@@ -4459,7 +4460,7 @@ TEST(CASMountRuntime, NothingArmsWhileARemountRequestIsPending)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -4495,7 +4496,7 @@ TEST(CASMountRuntime, NothingArmsWhileARemountRequestIsPending)
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.startBackgroundWorkers();
     /// A request without a trip: the fence is still armed when the reclaim starts.
     runtime.scheduleRemount();
 
@@ -4545,7 +4546,7 @@ TEST(CASMountRuntime, AnInterferenceReportDuringAReclaimIsServedByTheNextReclaim
         CasEventSink sink;
         RuntimeUnderTest runtime_holder(
             backend, layout,
-            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
                         .boot_ms_fn = [&] { return boot_ms; }},
             "test", sink, runtimeRenewBudget(), [&]
             {
@@ -4601,7 +4602,7 @@ TEST(CASMountRuntime, AnInterferenceReportDuringAReclaimIsServedByTheNextReclaim
         const uint64_t anchor = runtime.startRenewer();
         runtime.armMountFence(uuid, 1, anchor + 1000);
         const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
-        runtime.startBackgroundWorkers(std::chrono::hours(1));
+        runtime.startBackgroundWorkers();
         runtime.scheduleRemount();
 
         second_done.waitUntilArrived();
@@ -4646,7 +4647,7 @@ TEST(CASMountRuntime, AReclaimAcknowledgesOnlyTheGenerationItServed)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -4675,7 +4676,7 @@ TEST(CASMountRuntime, AReclaimAcknowledgesOnlyTheGenerationItServed)
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
     const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.startBackgroundWorkers();
     /// One interference report.
     runtime.tripMountLost();
     runtime.scheduleRemount();
@@ -4722,7 +4723,7 @@ TEST(CASMountRuntime, AReclaimFinishedAfterTheForgetIntentArmsNothing)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -4739,7 +4740,7 @@ TEST(CASMountRuntime, AReclaimFinishedAfterTheForgetIntentArmsNothing)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.startBackgroundWorkers();
     runtime.tripMountLost();
     runtime.scheduleRemount();
 
@@ -4789,7 +4790,7 @@ TEST(CASMountRuntime, StopDuringAReclaimJoinsTheThread)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -4814,7 +4815,7 @@ TEST(CASMountRuntime, StopDuringAReclaimJoinsTheThread)
     /// A definitive answer ends the first renewal and requests the reclaim; nobody claims the slot back.
     fenceOutMount(*backend, key);
     const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
 
     reclaim_entered.waitUntilArrived();
     stop_requested_by_test = true;
@@ -4890,7 +4891,7 @@ TEST(CASMountRuntime, ARemountRequestEndsTheRenewalAndTheSameThreadReclaims)
         CasEventSink sink;
         RuntimeUnderTest runtime_holder(
             backend, layout,
-            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                         .boot_ms_fn = [&] { return boot_ms.load(); }, .worker_factory = factory},
             "test", sink, runtimeRenewBudget(), [&]
             {
@@ -4942,7 +4943,7 @@ TEST(CASMountRuntime, ARemountRequestEndsTheRenewalAndTheSameThreadReclaims)
                 renewed.arriveAndWait();
             }
         };
-        runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+        runtime.startBackgroundWorkers();
 
         holding.waitUntilArrived();
         const uint64_t writes_at_request = backend->outage_writes.load();
@@ -5023,7 +5024,7 @@ TEST(CASMountRuntime, ACommitConsumedAfterARemountRequestCannotOverwriteTheRecla
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0),
             .background_watermark = true,
             .boot_ms_fn = [&]
             {
@@ -5068,7 +5069,7 @@ TEST(CASMountRuntime, ACommitConsumedAfterARemountRequestCannotOverwriteTheRecla
     runtime.armMountFence(uuid, 1, anchor + 1000);
     /// Set after the setup's own writes: only the loop's renewal may raise the request.
     backend->after_commit = [&] { committed = true; };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
 
     second_admission.waitUntilArrived();
     EXPECT_FALSE(hold_timed_out.load());
@@ -5102,7 +5103,7 @@ TEST(CASMountRuntimeDeathTest, OnlyTheLeaseThreadReplacesTheRenewerWhileItRuns)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; },
                     .renewal_admitted_hook_for_test = [&] { admitted.arriveAndWait(); }},
         "test", sink, runtimeRenewBudget(), [] { return false; });
@@ -5111,7 +5112,7 @@ TEST(CASMountRuntimeDeathTest, OnlyTheLeaseThreadReplacesTheRenewerWhileItRuns)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
     /// The lease thread is held between its decision to renew and the renewal, with no lock held.
     admitted.waitUntilArrived();
 
@@ -5488,7 +5489,7 @@ void runExpiryScenario(const String & layout_prefix, ExpiryObservation & seen)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -5550,7 +5551,7 @@ void runExpiryScenario(const String & layout_prefix, ExpiryObservation & seen)
         return true;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     third_pass.waitUntilArrived();
 
     seen.writer_epoch_on_store = decodeMountLease(readObj(*backend, layout.mountKey("test"))->bytes).writer_epoch;
@@ -5601,7 +5602,7 @@ void runReadOutageScenario(const String & layout_prefix, ReadOutageObservation &
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -5643,7 +5644,7 @@ void runReadOutageScenario(const String & layout_prefix, ReadOutageObservation &
         return true;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     second_pass.waitUntilArrived();
     second_pass.release();
     runtime.stopBackgroundWorkers();
@@ -5802,7 +5803,7 @@ void runExpiryLogScenario(const String & layout_prefix, ExpiryLogRig & rig, uint
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return rig.boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -5839,7 +5840,7 @@ void runExpiryLogScenario(const String & layout_prefix, ExpiryLogRig & rig, uint
         return true;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     stop.waitUntilArrived();
     rig.final_log = rig.log.captured();
 
@@ -5963,7 +5964,7 @@ TEST(CASMountRuntime, ASuccessEndsTheFailureTextOfItsRun)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -6004,7 +6005,7 @@ TEST(CASMountRuntime, ASuccessEndsTheFailureTextOfItsRun)
         return false;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     third_pass.waitUntilArrived();
     third_pass.release();
     runtime.stopBackgroundWorkers();
@@ -6042,7 +6043,7 @@ TEST(CASMountRuntime, EachRestoredExpiryIsCountedOnce)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -6097,7 +6098,7 @@ TEST(CASMountRuntime, EachRestoredExpiryIsCountedOnce)
         return failing;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     last_pass.waitUntilArrived();
     last_pass.release();
     runtime.stopBackgroundWorkers();
@@ -6129,7 +6130,7 @@ TEST(CASMountRuntime, AnExpiryEndedByAFenceIsNotCountedAsARestore)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -6159,7 +6160,7 @@ TEST(CASMountRuntime, AnExpiryEndedByAFenceIsNotCountedAsARestore)
         return failing;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     remount_entered.waitUntilArrived();
 
     EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::TransientNotLive);
@@ -6241,7 +6242,7 @@ TEST(CASMountRuntime, AReadinessRenewalArmsOnlyWithRoomForARefAppend)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -6303,7 +6304,7 @@ TEST(CASMountRuntime, AReadinessRenewalArmsOnlyWithRoomForARefAppend)
             boot_ms.store(kReadinessShortCommitBootMs);
         return false;
     };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
 
     bool arrived = true;
     try
@@ -6386,7 +6387,7 @@ TEST(CASMountRuntime, ARenewalIsSentUnderALatchedFence)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -6429,7 +6430,7 @@ TEST(CASMountRuntime, ARenewalIsSentUnderALatchedFence)
         }
         return false;
     };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
 
     third_put.waitUntilArrived();
     runtime.tripMountLost();
@@ -6494,7 +6495,7 @@ TEST(CASMountRuntime, TheForgetIntentAloneEndsARenewal)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .worker_factory = factory,
@@ -6529,7 +6530,7 @@ TEST(CASMountRuntime, TheForgetIntentAloneEndsARenewal)
         boot_ms.fetch_add(kExpiryFailedPutMs);
         return true;
     };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
 
     third_put.waitUntilArrived();
     const uint64_t generation_at_intent = runtime.remountRequestedGenerationForTest();
@@ -6573,7 +6574,7 @@ TEST(CASMountRuntime, ATripAloneIsRearmedByTheNextRenewal)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -6601,7 +6602,7 @@ TEST(CASMountRuntime, ATripAloneIsRearmedByTheNextRenewal)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
 
     second_pass.waitUntilArrived();
     EXPECT_STREQ(after_renewal.admit, "Ok") << "the renewal at 110 s re-armed the fence";
@@ -6640,7 +6641,7 @@ TEST(CASMountRuntime, ARenewalArmsNothingWhileARequestIsPending)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms; },
             .renewal_live_for_test = [&]
@@ -6670,7 +6671,7 @@ TEST(CASMountRuntime, ARenewalArmsNothingWhileARequestIsPending)
     const uint64_t writes_before = backend->putOverwriteCount(key);
     const uint64_t requests_before = runtime.scheduleRemountCallCountForTest();
     backend->after_commit = [&] { renewal_landed = true; };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
 
     reclaim_entered.waitUntilArrived();
     EXPECT_TRUE(request_raised);
@@ -7042,7 +7043,7 @@ void runDefinitiveAnswerDuringReadiness(bool reclaim_arms, DefinitiveReadinessSe
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(300),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); }},
         "test", sink, runtimeRenewBudget(), [&]
@@ -7091,7 +7092,7 @@ void runDefinitiveAnswerDuringReadiness(bool reclaim_arms, DefinitiveReadinessSe
         }
         return false;
     };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(300));
+    runtime.startBackgroundWorkers();
 
     seen.boot_before_wait = boot_ms.load();
     seen.armed = runtime.waitUntilArmed(1000);
@@ -7167,7 +7168,7 @@ void runLeaseThreadEndsOnItsOwn(LeaseThreadEndSeen & seen)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(300),
             .background_watermark = true,
             .boot_ms_fn = [&] { return thread_gone.load() ? boot_ms.fetch_add(600) + 600 : boot_ms.load(); },
             .worker_factory = factory},
@@ -7178,7 +7179,7 @@ void runLeaseThreadEndsOnItsOwn(LeaseThreadEndSeen & seen)
     boot_ms = 1070;
     ASSERT_FALSE(runtime.armIfAdmissible(anchor + 1000));
     backend->failing = true;
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(300));
+    runtime.startBackgroundWorkers();
 
     ASSERT_TRUE(exits.waitForAtLeast(1)) << "the loop must leave through its own error path";
     thread_gone = true;

@@ -15,13 +15,11 @@
 #include <magic_enum.hpp>
 
 #include <algorithm>
-#include <array>
 #include <ctime>
 #include <exception>
 #include <limits>
 #include <set>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 #include <variant>
 #include <unistd.h>
@@ -1345,14 +1343,13 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
             key,
             static_cast<uint32_t>(renewer_state));
 
-    const auto boot_clock = environment.boot_ms ? environment.boot_ms : boot_ms_fn;
     /// Sampled BEFORE the write. A refused admission is reported as "never attempted" only when this
     /// node had already been asked to stop, and reading the flag afterwards could not tell that apart
     /// from a flag the refusal itself set.
     const bool cancelled = environment.cancelled && environment.cancelled();
 
     const uint64_t wall_ms = now_ms_fn();
-    const uint64_t attempt_start_boot_ms = boot_clock();
+    const uint64_t attempt_start_boot_ms = boot_ms_fn();
     const uint64_t next_seq = seq + 1;
     const UInt128 write_attempt_id = newMountWriteAttemptId();
     const String body = encodeBody(next_seq, wall_ms, min_active_build_sequence_fn(), write_attempt_id);
@@ -1362,9 +1359,9 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
     result.writer_epoch = writer_epoch;
     result.seq = next_seq;
     result.write_attempt_id = write_attempt_id;
-    const auto finished = [&boot_clock, attempt_start_boot_ms](MountRenewResult done)
+    const auto finished = [this, attempt_start_boot_ms](MountRenewResult done)
     {
-        done.elapsed_ms = elapsedSince(attempt_start_boot_ms, boot_clock());
+        done.elapsed_ms = elapsedSince(attempt_start_boot_ms, boot_ms_fn());
         return done;
     };
 

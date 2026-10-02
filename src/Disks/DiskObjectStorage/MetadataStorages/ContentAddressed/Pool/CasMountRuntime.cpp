@@ -480,7 +480,6 @@ uint64_t CasMountRuntime::startRenewer()
 MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment()
 {
     return MountRenewOperationEnvironment{
-        .boot_ms = [this] { return bootMsNow(); },
         .live = [this]
         {
             return renewalLive() && (!config.renewal_live_for_test || config.renewal_live_for_test());
@@ -617,7 +616,7 @@ ThreadFromGlobalPool CasMountRuntime::makeWorker(std::function<void()> body)
     return ThreadFromGlobalPool(std::move(body));
 }
 
-void CasMountRuntime::startBackgroundWorkers(std::chrono::milliseconds period)
+void CasMountRuntime::startBackgroundWorkers()
 {
     {
         std::lock_guard lock(driver_mutex);
@@ -628,7 +627,6 @@ void CasMountRuntime::startBackgroundWorkers(std::chrono::milliseconds period)
         workers_started = true;
         workers_stop_requested = false;
         lease_thread_id = {};
-        renewal_period = period;
     }
 
     ThreadFromGlobalPool worker;
@@ -702,7 +700,7 @@ void CasMountRuntime::renewalLoop()
             else
             {
                 const uint64_t last_anchor = mount_renewer->lastCommittedAttemptStartBootMs();
-                const uint64_t period_ms = static_cast<uint64_t>(std::max<int64_t>(0, renewal_period.count()));
+                const uint64_t period_ms = static_cast<uint64_t>(std::max<int64_t>(0, config.mount_renew_period.count()));
                 const uint64_t due = last_anchor > std::numeric_limits<uint64_t>::max() - period_ms
                     ? std::numeric_limits<uint64_t>::max()
                     : last_anchor + period_ms;
