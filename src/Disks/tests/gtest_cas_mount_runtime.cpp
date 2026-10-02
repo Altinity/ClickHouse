@@ -176,3 +176,28 @@ TEST(CASMountRuntime, RefAppendFenceOkIsAdmitAtTwoEnvelopesWithANonzeroCap)
     EXPECT_FALSE(f->refAppendFenceOk());
     EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 400)), "NoBudget");
 }
+
+/// An expiry is this server's own confirmed deadline passing while nothing else is wrong. A lost fence or
+/// a lifecycle that left `Live` is a different state and reports as itself.
+TEST(CASMountRuntime, LeaseExpiredOnlyWhileLiveAndNotLost)
+{
+    RuntimeFixture f(/*lease_safety_margin_ms=*/0);
+    f.boot_ms = 1'000;
+    EXPECT_FALSE(f->leaseExpiredSinceBootMs().has_value()) << "an unarmed fence has no deadline to pass";
+
+    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'100);
+    f.boot_ms = 1'099;
+    EXPECT_FALSE(f->leaseExpiredSinceBootMs().has_value());
+    f.boot_ms = 1'100;
+    ASSERT_TRUE(f->leaseExpiredSinceBootMs().has_value()) << "the deadline instant is already past, as `admit` reads it";
+    EXPECT_EQ(*f->leaseExpiredSinceBootMs(), 1'100u);
+    EXPECT_TRUE(f->lastRenewFailure().empty()) << "no renewal request has failed";
+
+    f->setLifecycleForTest(PoolLifecycle::IdentityLost);
+    EXPECT_FALSE(f->leaseExpiredSinceBootMs().has_value()) << "only a `Live` pool reports an expiry";
+    f->setLifecycleForTest(PoolLifecycle::Live);
+    ASSERT_TRUE(f->leaseExpiredSinceBootMs().has_value());
+
+    f->tripMountLost();
+    EXPECT_FALSE(f->leaseExpiredSinceBootMs().has_value()) << "a lost fence is a lease loss, not an expiry";
+}

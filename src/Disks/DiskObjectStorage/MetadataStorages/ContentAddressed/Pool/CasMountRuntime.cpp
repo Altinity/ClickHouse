@@ -165,6 +165,27 @@ bool CasMountRuntime::refAppendFenceOk() const
     return admit(fenceGeneration(), needed_ms) == Fence::Admit::Ok;
 }
 
+std::optional<uint64_t> CasMountRuntime::leaseExpiredAt(uint64_t now_boot_ms) const
+{
+    if (lifecycle() != PoolLifecycle::Live || mount_fence.lost.load(std::memory_order_acquire))
+        return std::nullopt;
+    const uint64_t deadline = mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
+    if (now_boot_ms < deadline)
+        return std::nullopt;
+    return std::min(deadline, lease_expired_at_boot_ms.load(std::memory_order_acquire));
+}
+
+std::optional<uint64_t> CasMountRuntime::leaseExpiredSinceBootMs() const
+{
+    return leaseExpiredAt(bootMsNow());
+}
+
+String CasMountRuntime::lastRenewFailure() const
+{
+    std::lock_guard lock(renew_failure_mutex);
+    return last_renew_failure;
+}
+
 void CasMountRuntime::setMountDeadline(uint64_t deadline_boot_ms)
 {
     mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
@@ -175,6 +196,7 @@ void CasMountRuntime::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, 
     mount_fence.server_uuid = server_uuid;
     mount_fence.writer_epoch = writer_epoch;
     mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
+    lease_expired_at_boot_ms.store(std::numeric_limits<uint64_t>::max(), std::memory_order_release);
     /// A fresh lease incarnation is a fresh generation too: a durable-effect caller admitted under the
     /// PRIOR incarnation must re-check and abort rather than ride this re-arm through (rev.7 [C2]).
     fence_generation.fetch_add(1, std::memory_order_acq_rel);

@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 namespace DB::Cas
@@ -311,6 +312,15 @@ public:
     /// it cannot plausibly finish before the fence expires.
     bool refAppendFenceOk() const;
 
+    /// ---- lease expiry ----
+    /// The instant this server's confirmed lease expired, on the fence clock, while it stays expired:
+    /// the lifecycle is `Live`, the fence is not lost and `bootMsNow` has reached the deadline. A
+    /// renewal that commits with a start more than a TTL ago does not end the expiry, so its start is
+    /// kept until a renewal restores the lease. Empty otherwise.
+    std::optional<uint64_t> leaseExpiredSinceBootMs() const;
+    /// Text of the last failed request of the worker's renewal; empty when none failed.
+    String lastRenewFailure() const;
+
     /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
     /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
     /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
@@ -439,6 +449,7 @@ private:
         bool propagate_failure,
         bool worker_call);
     MountRenewOperationEnvironment renewalEnvironment(bool worker_call);
+    std::optional<uint64_t> leaseExpiredAt(uint64_t now_boot_ms) const;
     void consumeRenewResult(
         const MountRenewResult & result,
         RenewalDriverState active_state,
@@ -524,6 +535,11 @@ private:
     /// `fenceGeneration`/`checkFenceOrThrow`.
     std::atomic<uint64_t> fence_generation{0};
     std::function<void()> arm_mount_fence_interposition_hook_for_test;
+    /// The first expired deadline of an expiry that a renewal committed past did not end. `UINT64_MAX`
+    /// when there is none. Written by the renewal consumer and by `armMountFence`.
+    std::atomic<uint64_t> lease_expired_at_boot_ms{std::numeric_limits<uint64_t>::max()};
+    mutable std::mutex renew_failure_mutex;
+    String last_renew_failure;
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
     /// (`noteLeaseLost`/`noteRemounted`) are lock-free compare-exchanges guarded by their exact
