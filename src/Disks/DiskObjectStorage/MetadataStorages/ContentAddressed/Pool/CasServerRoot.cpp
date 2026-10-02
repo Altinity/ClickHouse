@@ -771,10 +771,6 @@ MountClaimResult claimMountAwaitingExpiry(
             watch = TokenWatch::sighted(*current_etag, mono_ms_fn());
             if (on_wait_start && r.body)
                 on_wait_start(*r.body, threshold_ms);
-            LOG_INFO(getLogger("CasMountLease"),
-                "Attempting to mount content-addressed server root {} after node change or hard "
-                "restart; waiting ~{} ms (token-stability observation) to confirm the previous "
-                "incarnation's operations are all finalized", srid, threshold_ms);
         }
 
         sleep_ms_fn(poll);
