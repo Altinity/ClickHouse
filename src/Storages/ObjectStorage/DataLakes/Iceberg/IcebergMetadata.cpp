@@ -938,12 +938,13 @@ Block getPartitionSourceHeader(
     return Block(std::move(columns));
 }
 
-std::vector<Field> extractPartitionSourceValues(
+/// The values are the partition key already transformed like in MergeTree
+Row extractPartitionValues(
     const ASTPartition & partition_ast,
-    const Block & partition_source_header,
+    const DataTypes & partition_value_types,
     const ContextPtr & context)
 {
-    const size_t fields_count = partition_source_header.columns();
+    const size_t fields_count = partition_value_types.size();
 
     ASTPtr value_ast = partition_ast.value->clone();
 
@@ -961,10 +962,10 @@ std::vector<Field> extractPartitionSourceValues(
 
     Field partition_value = evaluateConstantExpression(value_ast, context).first;
 
-    std::vector<Field> source_values;
+    Row partition_values;
     if (fields_count == 1 && partition_value.getType() != Field::Types::Tuple)
     {
-        source_values.push_back(std::move(partition_value));
+        partition_values.push_back(std::move(partition_value));
     }
     else
     {
@@ -973,40 +974,17 @@ std::vector<Field> extractPartitionSourceValues(
                 "Expected a tuple for a partition key with {} fields, got {}", fields_count, partition_value.getTypeName());
 
         const auto & tuple_value = partition_value.safeGet<Tuple>();
-        source_values.assign(tuple_value.begin(), tuple_value.end());
+        partition_values.assign(tuple_value.begin(), tuple_value.end());
     }
 
-    if (source_values.size() != fields_count)
+    if (partition_values.size() != fields_count)
         throw Exception(ErrorCodes::INVALID_PARTITION_VALUE,
-            "Wrong number of fields in the partition expression: {}, must be: {}", source_values.size(), fields_count);
+            "Wrong number of fields in the partition expression: {}, must be: {}", partition_values.size(), fields_count);
 
     for (size_t i = 0; i < fields_count; ++i)
-        source_values[i] = convertFieldToTypeOrThrow(source_values[i], *partition_source_header.getByPosition(i).type);
+        partition_values[i] = convertFieldToTypeOrThrow(partition_values[i], *partition_value_types[i]);
 
-    return source_values;
-}
-
-Row evaluateTargetPartitionKey(
-    ChunkPartitioner & partitioner,
-    const Block & partition_source_header,
-    const std::vector<Field> & source_values)
-{
-    Columns columns;
-    columns.reserve(partition_source_header.columns());
-    for (size_t i = 0; i < partition_source_header.columns(); ++i)
-    {
-        auto column = partition_source_header.getByPosition(i).type->createColumn();
-        column->insert(source_values[i]);
-        columns.push_back(std::move(column));
-    }
-
-    auto partitioned = partitioner.partitionChunk(Chunk(std::move(columns), 1));
-    if (partitioned.size() != 1)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Iceberg partition transforms produced {} partitions for a single row, expected exactly one",
-            partitioned.size());
-
-    return partitioned.front().first;
+    return partition_values;
 }
 
 String dumpPartitionTuple(const Row & partition_values)
@@ -1248,12 +1226,11 @@ bool IcebergMetadata::tryDropPartitionOnce(
         *persistent_components.schema_processor,
         current_schema_id);
 
-    const auto source_values = extractPartitionSourceValues(partition_ast, partition_source_header, context);
-
-    ChunkPartitioner partitioner(
+    /// Built only for the transform result types, which are what the manifests store.
+    const ChunkPartitioner partitioner(
         spec_fields, current_schema->getArray(f_fields), context, std::make_shared<const Block>(partition_source_header));
 
-    const auto target_partition_key = evaluateTargetPartitionKey(partitioner, partition_source_header, source_values);
+    const auto target_partition_key = extractPartitionValues(partition_ast, partitioner.getResultTypes(), context);
     const auto target_partition_description = dumpPartitionTuple(target_partition_key);
 
     LOG_INFO(log, "Iceberg DROP PARTITION requested for partition {} of spec {}",

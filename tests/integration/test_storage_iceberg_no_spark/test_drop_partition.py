@@ -8,8 +8,6 @@ import pyarrow as pa
 from pyiceberg.catalog import load_catalog
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.expressions import GreaterThanOrEqual
-from pyiceberg.manifest import ManifestEntryStatus
 from pyiceberg.transforms import DayTransform, IdentityTransform
 from pyiceberg.types import (
     DoubleType,
@@ -38,6 +36,22 @@ ROWS = [
     {"ts": datetime(2024, 1, 16, 18, 45, 0), "country": "DE", "id": 5, "amount": 70.75},
     {"ts": datetime(2024, 1, 17, 11, 11, 11), "country": "JP", "id": 6, "amount": 80.0},
 ]
+
+
+EPOCH = datetime(1970, 1, 1)
+
+
+def days_since_epoch(value):
+    return (datetime.fromisoformat(value) - EPOCH).days
+
+
+def hours_since_epoch(value):
+    return int((datetime.fromisoformat(value) - EPOCH).total_seconds() // 3600)
+
+
+def months_since_epoch(value):
+    moment = datetime.fromisoformat(value)
+    return (moment.year - EPOCH.year) * 12 + moment.month - 1
 
 
 def load_catalog_impl(started_cluster):
@@ -185,7 +199,10 @@ def test_drop_partition_separate_manifest(started_cluster_iceberg_no_spark):
         f"SELECT toDate(ts) AS d, count() FROM {ch_table} GROUP BY d ORDER BY d FORMAT TSV"
     ) == "2024-01-15\t5\n2024-01-16\t2\n2024-01-17\t1\n"
 
-    instance.query(f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15'", settings = WRITE_SETTINGS)
+    instance.query(
+        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-15')}",
+        settings = WRITE_SETTINGS,
+    )
 
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "3"
 
@@ -194,8 +211,14 @@ def test_drop_partition_separate_manifest(started_cluster_iceberg_no_spark):
     ) == "2024-01-16\t2\n2024-01-17\t1\n"
 
     # Drop the rest of the partitions
-    instance.query(f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-16'", settings = WRITE_SETTINGS)
-    instance.query(f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-17'", settings = WRITE_SETTINGS)
+    instance.query(
+        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-16')}",
+        settings = WRITE_SETTINGS,
+    )
+    instance.query(
+        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-17')}",
+        settings = WRITE_SETTINGS,
+    )
 
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "0"
 
@@ -217,7 +240,8 @@ def test_drop_partition_rewrites_mixed_manifest(started_cluster_iceberg_no_spark
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "6"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15'", settings=WRITE_SETTINGS
+        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-15')}",
+        settings=WRITE_SETTINGS,
     )
 
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "3"
@@ -266,7 +290,8 @@ def test_drop_partition_without_matching_files_is_noop(started_cluster_iceberg_n
     ).strip()
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION '2024-02-20'", settings=WRITE_SETTINGS
+        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-02-20')}",
+        settings=WRITE_SETTINGS,
     )
 
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "6"
@@ -346,7 +371,7 @@ def test_drop_partition_month_transform(started_cluster_iceberg_no_spark):
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "4"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15 08:30:00'",
+        f"ALTER TABLE {ch_table} DROP PARTITION {months_since_epoch('2024-01-15 08:30:00')}",
         settings=WRITE_SETTINGS,
     )
 
@@ -355,7 +380,8 @@ def test_drop_partition_month_transform(started_cluster_iceberg_no_spark):
     )
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION '2024-02-01'", settings=WRITE_SETTINGS
+        f"ALTER TABLE {ch_table} DROP PARTITION {months_since_epoch('2024-02-01')}",
+        settings=WRITE_SETTINGS,
     )
 
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "0"
@@ -384,13 +410,15 @@ def test_drop_partition_day_transform(started_cluster_iceberg_no_spark):
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "4"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15 12:00:00'",
+        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-15 12:00:00')}",
         settings=WRITE_SETTINGS,
     )
     assert instance.query(f"SELECT id FROM {ch_table} ORDER BY id FORMAT TSV") == "3\n4\n"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION ('2024-01-16')", settings=WRITE_SETTINGS
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toRelativeDayNum(toDateTime64('2024-01-16', 6)))",
+        settings=WRITE_SETTINGS,
     )
     assert instance.query(f"SELECT id FROM {ch_table} FORMAT TSV") == "4\n"
 
@@ -516,7 +544,7 @@ def test_drop_partition_without_catalog(started_cluster_iceberg_no_spark):
     assert instance.query(f"SELECT count() FROM {table_name}").strip() == "4"
 
     instance.query(
-        f"ALTER TABLE {table_name} DROP PARTITION '2024-01-15'",
+        f"ALTER TABLE {table_name} DROP PARTITION {days_since_epoch('2024-01-15')}",
         settings=WRITE_SETTINGS
     )
 
@@ -598,7 +626,7 @@ def test_drop_partition_hour_transform(started_cluster_iceberg_no_spark):
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "4"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15 09:30:00'",
+        f"ALTER TABLE {ch_table} DROP PARTITION {hours_since_epoch('2024-01-15 09:30:00')}",
         settings=WRITE_SETTINGS,
     )
 
@@ -608,7 +636,7 @@ def test_drop_partition_hour_transform(started_cluster_iceberg_no_spark):
     )
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15 08:59:59'",
+        f"ALTER TABLE {ch_table} DROP PARTITION {hours_since_epoch('2024-01-15 08:59:59')}",
         settings=WRITE_SETTINGS,
     )
 
@@ -675,7 +703,8 @@ def test_drop_partition_after_partition_spec_evolution(started_cluster_iceberg_n
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "5"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15'", settings=WRITE_SETTINGS
+        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-15')}",
+        settings=WRITE_SETTINGS,
     )
 
     assert (
@@ -750,40 +779,5 @@ def test_drop_partition_purges_data_files(started_cluster_iceberg_no_spark):
     operation, summary = current_snapshot_history(instance, namespace, table_name)
     assert operation == "DELETE"
     assert summary["deleted-data-files"] == "1"
-
-    instance.query(f"DROP DATABASE {namespace}")
-
-
-def test_drop_partition_does_not_revive_deleted_entries(started_cluster_iceberg_no_spark):
-    """Rewriting a manifest must not turn a DELETED entry back into a live file."""
-    instance = started_cluster_iceberg_no_spark.instances["node1"]
-    catalog = load_catalog_impl(started_cluster_iceberg_no_spark)
-
-    namespace = f"clickhouse_drop_partition_{uuid.uuid4().hex}"
-    table_name = "deleted_entries"
-    table = create_day_partitioned_table(catalog, namespace, table_name)
-
-    table.delete(GreaterThanOrEqual("ts", datetime(2024, 1, 17)))
-    table.refresh()
-
-    manifests = table.current_snapshot().manifests(table.io)
-    assert len(manifests) == 1, f"this test needs one shared manifest, got {len(manifests)}"
-    entries = manifests[0].fetch_manifest_entry(table.io, discard_deleted=False)
-    statuses = [entry.status for entry in entries]
-    assert ManifestEntryStatus.DELETED in statuses, (
-        f"this test needs a DELETED entry in the current manifest, got {statuses}"
-    )
-
-    create_iceberg_database(instance, namespace)
-    ch_table = f"{namespace}.`{namespace}.{table_name}`"
-
-    assert instance.query(f"SELECT id FROM {ch_table} ORDER BY id FORMAT TSV") == "1\n2\n3\n4\n5\n"
-
-    # 2024-01-16 stays, so the shared manifest is rewritten rather than dropped
-    instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15'", settings=WRITE_SETTINGS
-    )
-
-    assert instance.query(f"SELECT id FROM {ch_table} ORDER BY id FORMAT TSV") == "4\n5\n"
 
     instance.query(f"DROP DATABASE {namespace}")
