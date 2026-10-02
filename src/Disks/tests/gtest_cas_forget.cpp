@@ -359,14 +359,14 @@ TEST(CASForget, ForgetCleanFarewellGatedOnDrain)
     }
 }
 
-/// (b1) BOUNDED COMPLETION: FORGET racing an ACTIVE persistent remount worker joins it without deadlock. Here the
-/// faulting backend keeps every attempt at `StayTransient` (it never reaches `armMountFence`), so this
+/// (b1) BOUNDED COMPLETION: FORGET racing an ACTIVE reclaim on the lease thread joins it without deadlock. Here the
+/// faulting backend keeps every attempt at `StayTransient` (it never reaches the arm), so this
 /// isolates the join/no-deadlock property; the fence re-arm path is covered by (b2) below. Uses a
 /// `std::future` timeout wait (never a sleep) — the timeout only fires on a genuine deadlock regression.
 TEST(CASForget, ForgetRacingActiveRemountThreadCompletesBounded)
 {
     auto backend = std::make_shared<ToggleableTransportFaultBackend>();
-    /// `background_watermark = true` so the persistent recovery worker exists (mirrors
+    /// `background_watermark = true` so the lease thread exists (mirrors
     /// gtest_cas_pool.cpp's ShutdownGuardRefusesToArmRemount setup).
     auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .background_watermark = true});
@@ -375,9 +375,9 @@ TEST(CASForget, ForgetRacingActiveRemountThreadCompletesBounded)
     /// trip the fence and latch a recovery generation — the worker now loops `tryRemountOnce` against the fault.
     backend->fail.store(true);
     store->tripMountLost();
-    ASSERT_TRUE(store->scheduleRemountForTest()) << "the recovery worker must accept the request and run";
+    ASSERT_TRUE(store->scheduleRemountForTest()) << "the lease thread must accept the request and run";
 
-    /// FORGET from ANOTHER thread must join the active remount worker and finish in bounded time.
+    /// FORGET from ANOTHER thread must join the lease thread and finish in bounded time.
     std::promise<void> done;
     auto fut = done.get_future();
     std::thread forgetter([&]

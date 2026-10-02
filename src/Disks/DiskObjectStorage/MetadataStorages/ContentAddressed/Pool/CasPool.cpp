@@ -912,11 +912,11 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         claim_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms_u
             ? std::numeric_limits<uint64_t>::max()
             : claim_anchor_boot_ms + ttl_ms_u);
-    /// Gate the two persistent runtime workers with `background_watermark`: they run only in production
+    /// Gate the lease thread with `background_watermark`: it runs only in production
     /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
     /// drive `renewWatermarkOnce` explicitly and rely on the armed sub-TTL deadline, never on a loop.
     /// The synchronous renewer is still started above (it must adopt the mount and arm the fence on
-    /// every writable open); only the worker pair is conditional. The merged
+    /// every writable open); only the lease thread is conditional. The merged
     /// heartbeat renews at `mount_renew_period` — one beat now renews the lease and the floor.
     if (store->config.background_watermark)
         store->mount_runtime.startBackgroundWorkers(store->config.mount_renew_period);
@@ -1021,7 +1021,7 @@ Pool::~Pool()
         }
     };
 
-    /// 1. Stop and join both persistent mount-runtime workers before draining or releasing the renewer.
+    /// 1. Stop and join the lease thread before draining or releasing the renewer.
     guarded([this]
     {
         if (config.teardown_phase1_throw_for_test)
@@ -1145,12 +1145,12 @@ void Pool::setDetachedDrainDeadlineBudgetForTest(const CasRequestBudget & budget
 
 void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason)
 {
-    /// Hazard C6: FORGET joins both mount-runtime workers (and, via `stop_and_join_gc`, the GC threads), so it
-    /// MUST run on the admin/query thread — never a pool thread, whose join of itself would deadlock. The
-    /// guard is a programming-error assertion (a self-join hangs; it never corrupts), so a chassert is the
-    /// right severity, not a release fail-close.
+    /// FORGET joins the lease thread (and, via `stop_and_join_gc`, the GC threads), so it MUST run on the
+    /// admin/query thread — never a pool thread, whose join of itself would deadlock. The guard is a
+    /// programming-error assertion (a self-join hangs; it never corrupts), so a chassert is the right
+    /// severity, not a release fail-close.
     const ThreadName tn = getThreadName();
-    chassert(tn != ThreadName::CAS_REMOUNT && tn != ThreadName::CAS_GC_SCHEDULER
+    chassert(tn != ThreadName::CAS_LEASE_RENEWER && tn != ThreadName::CAS_GC_SCHEDULER
              && tn != ThreadName::CAS_GC_HEARTBEAT
              && "SYSTEM CAS FORGET must not run on a CAS pool thread (self-join deadlock)");
 
@@ -1186,7 +1186,7 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     if (stop_and_join_gc)
         stop_and_join_gc();
 
-    /// (5a) Stop and join both persistent mount-runtime workers outside `remount_mutex`.
+    /// (5a) Stop and join the lease thread outside `remount_mutex`.
     mount_runtime.stopBackgroundWorkers();
 
     /// A reclaim in flight when step 1 published the intent finishes its current step, and the arming
@@ -1209,7 +1209,7 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     /// The pool object OUTLIVES this FORGET (it stays registered, `Vanished(forgotten)`, until DROP/restart),
     /// so `~Pool` will re-run the same teardown. Drop the renewer now so that later teardown finds none and
     /// skips it: `MountLeaseRenewer::release` is admitted only from `Active`, so a renewer already released
-    /// here must not be released again. `renewerReset` is safe now: both renewer-driving workers are joined.
+    /// here must not be released again. `renewerReset` is safe now: the lease thread is joined.
     mount_runtime.renewerReset();
 
     /// (6) Publish the terminal state + WARN, under remount serialization — matching the natural-transition
@@ -1260,7 +1260,7 @@ bool Pool::tryRemountOnce()
     String error;
     SCOPE_EXIT(
     {
-        /// A parked redo completed while the whole-chain serializer was held. Drain its POD snapshot
+        /// A remount re-anchor completed while the whole-chain serializer was held. Drain its POD snapshot
         /// first, after lock destruction, so renewal recovery/failure precedes and correlates with the
         /// containing remount result without any callback or allocation under `remount_mutex`.
         deliverDeferredMountRenewObservability(attempt_no);
@@ -1391,7 +1391,7 @@ bool Pool::tryRemountOnce()
                 break;   /// fall through to the existing fresh-incarnation recovery.
             case LifecycleGateVerdict::Replaced:
                 /// NOT while a FORGET is in progress (spec §9 rev.8 item 7). `forgetDisk` publishes the
-                /// terminal-intent latch at step 1 (`publishVanishedIntent`), then joins the remount worker;
+                /// terminal-intent latch at step 1 (`publishVanishedIntent`), then joins the lease thread;
                 /// a `tryRemountOnce` already IN FLIGHT — one that passed the step-0 `isVanished()` gate
                 /// BEFORE the intent was published, which that gate therefore cannot catch — could otherwise
                 /// settle `Vanished(replaced)` mid-FORGET, stranding FORGET's own
@@ -1405,7 +1405,7 @@ bool Pool::tryRemountOnce()
             case LifecycleGateVerdict::IdentityLost:
                 /// Both sentinels authoritatively absent. Enter `IdentityLost` once (from `TransientNotLive`);
                 /// a repeat probe while already `IdentityLost` is a no-op. rev.8: `IdentityLost` is a
-                /// fail-loud TERMINAL state — the remount worker self-exits at its next boundary (see
+                /// fail-loud TERMINAL state — the lease thread exits at its next boundary (see
                 /// `CasMountRuntime::remountTerminal`), so there is no demoted observer.
                 if (mount_runtime.lifecycle() != PoolLifecycle::IdentityLost)
                     mount_runtime.enterIdentityLost();
@@ -1503,8 +1503,8 @@ bool Pool::tryRemountOnce()
         /// build's own tests the moment someone reuses an epoch across a remount.
         chassert(writer_epoch > mount_runtime.liveWriterEpoch());
 
-        /// The persistent renewal worker is parked before this callback is entered, so renewer
-        /// replacement cannot race any synchronous lease operation.
+        /// This runs on the lease thread, or with no lease thread running, so no renewal is in flight
+        /// while the renewer is replaced.
         step = "renewer_install";
         mount_runtime.installRenewer(our_uuid, writer_epoch, now_ms);
         step = "renewer_start";
@@ -1537,7 +1537,7 @@ bool Pool::tryRemountOnce()
             config.remount_quiesce_hook_for_test();
 
         /// Quiescence may consume most of the new lease. The same renewal-window gate used at startup
-        /// admits one synchronous parked redo while at least one physical attempt still fits the old
+        /// admits one synchronous re-anchor while at least one physical attempt still fits the old
         /// authority window and before the fence is armed.
         const uint64_t safety_ms = config.cas_request_budget.lease_safety_margin_ms;
         const uint64_t safe_deadline = remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
@@ -1589,7 +1589,7 @@ bool Pool::tryRemountOnce()
     }
 }
 
-/// The persistent self-remount and merged-heartbeat renewal workers live in `mount_runtime`
+/// The lease thread, which renews and runs the self-remount, lives in `mount_runtime`
 /// (`Pool/CasMountRuntime.h`); these are thin delegates. `mount_runtime`'s `remount_attempt` callback is
 /// bound to `Pool::tryRemountOnce` (the claim/recovery orchestration that stays on Pool).
 bool Pool::scheduleRemountForTest()
@@ -1788,7 +1788,7 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
     });
 
     /// Incidental-only detection has the same fail-closed reaction as a foreign/superseded lease
-    /// renewal. The fence and persistent self-remount ownership live on `mount_runtime`.
+    /// renewal. The fence and the lease thread, which runs the self-remount, live on `mount_runtime`.
     mount_runtime.tripMountLost();
     mount_runtime.scheduleRemount();
 

@@ -83,7 +83,7 @@ struct MountRenewRequestEvent
 struct MountRenewOperationEnvironment
 {
     std::function<uint64_t()> boot_ms;
-    /// Facts the mount fence cannot see (park requested, pool no longer live, shutdown). FALSE ends
+    /// Facts the mount fence cannot see (a remount request, a pool no longer live, shutdown). FALSE ends
     /// the renewal exactly as a lost fence does; the engine does not need to know which refused.
     std::function<bool()> live;
     /// Sampled ONCE before the write. A renewal refused before its first attempt is reported as
@@ -551,8 +551,8 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 ///
 /// PLANES. A bounded renewal is admitted under the mount fence, because it writes under the authority
 /// the fence tracks. The worker's renewal (`UntilDefinitive`) runs on a plane with no lease budget: it
-/// keeps trying after the lease expired, and a stop, a park or a terminal lifecycle reaches it through
-/// its liveness. The claim and the farewell are admitted off the fence: a self-remount claims with the
+/// keeps trying after the lease expired, and a stop, a remount request or a terminal lifecycle reaches
+/// it through its liveness. The claim and the farewell are admitted off the fence: a self-remount claims with the
 /// fence already latched lost, so a claim gated on the fence could never reclaim, and a farewell
 /// refused because the fence has run down would leave the slot looking live until GC fences it out.
 /// Neither is unguarded: a claim's safety is its own conditional write, and a caller that has shutdown

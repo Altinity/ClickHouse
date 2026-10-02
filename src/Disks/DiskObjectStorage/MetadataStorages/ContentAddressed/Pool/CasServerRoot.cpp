@@ -147,8 +147,8 @@ struct MountRenewObservabilityConfiguration
 };
 
 /// Event sinks may synchronously renew another Pool on the same thread. A fixed stack keeps every
-/// registered outer per-call snapshot stable without allocation, including while a parked redo holds
-/// `remount_mutex`. Overflow suppresses rich event/log delivery for the nested call rather than
+/// registered outer per-call snapshot stable without allocation, including while a remount re-anchor
+/// holds `remount_mutex`. Overflow suppresses rich event/log delivery for the nested call rather than
 /// aliasing an outer call or changing protocol behavior; physical attempt truth is independently
 /// retained by the stack-local observer in `MountLeaseRenewer::renew`.
 struct MountRenewObservabilityStack
@@ -1522,7 +1522,7 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
         /// This decoded authoritative observation is the exact point at which this incarnation learns
         /// that a foreign successor owns the slot. Terminal teardown intentionally performs no release
         /// I/O, so account the skipped farewell here, once, before the renewer enters its terminal state.
-        /// The renewal may be parked under `remount_mutex`; keep the increment trace-free.
+        /// The renewal may run under `remount_mutex`; keep the increment trace-free.
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountReleaseSkippedForeignOccupant);
         emitMountEvent(
             event_sink, CasEventType::MountConflict, srid, "foreign_writer", &current,

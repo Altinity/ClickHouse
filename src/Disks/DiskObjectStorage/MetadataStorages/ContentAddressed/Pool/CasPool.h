@@ -182,7 +182,7 @@ struct PoolConfig
     /// overlap. `1` issues no read-ahead and no fan-out at all and is the sequential round, request
     /// for request.
     uint64_t gc_io_concurrency = 16;
-    /// Tests drive `renewWatermarkOnce` explicitly; gates both persistent runtime workers.
+    /// Tests drive `renewWatermarkOnce` explicitly; gates the lease thread.
     bool background_watermark = false;
     /// Installed on the pool before a writable mount can start its runtime-owned workers.
     CasEventSink event_sink = {};
@@ -552,15 +552,15 @@ public:
     /// `SYSTEM CAS FORGET` — the operator force-Vanish (spec §5). Drives THIS pool to
     /// `Vanished(forgotten)` with the fence-first protocol, node-locally, regardless of the current
     /// lifecycle (it works precisely on a NOT-live disk — a stuck transient/`IdentityLost` pool). In order:
-    /// (1) publish the terminal-intent latch FIRST (so both runtime worker loops bail at their
+    /// (1) publish the terminal-intent latch FIRST (so the lease loop exits at its
     /// next step boundary, bounding the joins below); (2) trip the local fence (the deliberate
     /// decommission act, allowed on a live disk); (3+4) stop the GC scheduler via `stop_and_join_gc` —
     /// injected because the scheduler is owned above the Pool, a no-op in contexts that run none — and stop
-    /// + join both persistent workers; (5) drain the ref lanes (bounded) and retire the renewer WITHOUT an
+    /// + join the lease thread; (5) drain the ref lanes (bounded) and retire the renewer WITHOUT an
     /// unearned clean farewell (the lease expires by observation unless the lanes provably drained); then
     /// (6) publish `Vanished(forgotten)` carrying `reason` (the [D5] message with the operator's decommission
     /// timestamp). Idempotent: an already-`Vanished` pool returns immediately (first terminal transition
-    /// wins). MUST run on the admin/query thread, never a pool (remount/GC) thread — the joins would
+    /// wins). MUST run on the admin/query thread, never a pool (lease or GC) thread — the joins would
     /// otherwise self-deadlock (hazard C6).
     void forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason);
 
@@ -827,7 +827,8 @@ public:
     bool tryRemountOnce();
 
     /// Test seam: latch the private self-remount path directly. In production the runtime terminal
-    /// consumer calls `scheduleRemount`, while external loss paths may latch the same persistent worker.
+    /// consumer calls `scheduleRemount`, while external loss paths raise the same generation for the lease
+    /// thread.
     /// Returns true iff an unhandled recovery generation exists after the call.
     bool scheduleRemountForTest();
     /// Test seam: how many times `scheduleRemount` has been ENTERED, counted
@@ -1175,8 +1176,8 @@ private:
         return std::forward<Mutation>(mutation)();
     }
 
-    /// The mount plane's inter-attempt sleep: woken only by a stop of the workers, so a stopping renewal
-    /// is not held for a whole capped backoff. A park or a remount request does not wake it; the wait
+    /// The mount plane's inter-attempt sleep: woken only by a stop of the lease thread, so a stopping
+    /// renewal is not held for a whole capped backoff. A remount request does not wake it; the wait
     /// runs out. Named rather than inlined because the test seam has to be able to put it back.
     std::function<void(uint64_t)> mountPlaneSleepFn()
     {
@@ -1212,8 +1213,8 @@ private:
     mutable CasRequests mount_requests;
     mutable CasRequests farewell_requests;
     mutable CasRequests gc_requests;
-    /// The worker renewal's plane: no lease budget, because the renewal keeps trying after the lease
-    /// expired; a stop, a park or a terminal lifecycle ends it through its liveness.
+    /// The lease loop's renewal plane: no lease budget, because the renewal keeps trying after the lease
+    /// expired; a stop, a remount request or a terminal lifecycle ends it through its liveness.
     mutable CasRequests lease_requests;
 
     std::shared_ptr<DetachedRegistryState> detached_work = std::make_shared<DetachedRegistryState>();
@@ -1259,7 +1260,7 @@ private:
     /// from Pool. Owns the `MountLeaseRenewer`, the local `MountFence`, the per-server
     /// build watermark (`process_epoch` + the `builds_mutex`-guarded seq/registry) and its in-flight-build
     /// map, the live-incarnation `live_writer_epoch`, the unclean-epoch high-water-mark, and the
-    /// persistent renewal and remount workers (with one driver mutex/condition pair). Injected with backend/layout
+    /// lease thread (with one driver mutex/condition pair). Injected with backend/layout
     /// the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool `cas_request_budget`
     /// + a `remount_attempt` callback (== `Pool::tryRemountOnce`, which STAYS on Pool: the claim/recovery
     /// ORCHESTRATION drives these owned primitives).
@@ -1276,7 +1277,7 @@ private:
     CasMountRuntime mount_runtime;
 
     /// Serializes `tryRemountOnce` (whose claim/recovery ORCHESTRATION stays on Pool). STAYS here with
-    /// its guarded critical section: persistent worker ownership, fence atomics, and the build registry
+    /// its guarded critical section: lease-thread ownership, fence atomics, and the build registry
     /// moved to `mount_runtime`, but the top-level remount serialization guards
     /// the Pool-side orchestration, so it stays on Pool.
     std::mutex remount_mutex;
