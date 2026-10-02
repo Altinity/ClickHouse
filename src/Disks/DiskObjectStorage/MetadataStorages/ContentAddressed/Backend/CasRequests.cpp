@@ -454,13 +454,6 @@ bool CasOperation::fits(uint64_t needed_ms, const Retry::Bound & bound) const
     return needed_ms <= bound.deadline_ms - now;
 }
 
-uint64_t CasOperation::reissuePause(const Retry & policy, uint64_t request_started_ms, uint64_t unspaced_ms) const
-{
-    if (!policy.attempt_spacing_ms)
-        return unspaced_ms;
-    return Retry::spacedPause(Retry::drawSpacing(*policy.attempt_spacing_ms), request_started_ms, owner.now_ms());
-}
-
 bool CasOperation::refreshAndClassifyReadFault(const std::exception & e, bool & refresh_attempted, bool & refreshed)
 {
     if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && isDeterministicLocalFailure(db_e->code()))
@@ -875,13 +868,15 @@ std::optional<WriteResult> CasOperation::gatedPause(uint64_t pause_ms, uint32_t 
 
 std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, const Retry & policy, const Retry::Bound & bound)
 {
-    const uint64_t pause_ms = reissuePause(policy, state.attempt_started_ms, Retry::backoff(++state.reissues));
+    ++state.reissues;
+    const uint64_t pause_ms = reissuePause(
+        policy, state.attempt_started_ms, [reissues = state.reissues] { return Retry::backoff(reissues); });
     return gatedPause(pause_ms, 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 
 std::optional<WriteResult> CasOperation::pauseForConflict(WriteState & state, const Retry & policy, const Retry::Bound & bound)
 {
-    const uint64_t pause_ms = reissuePause(policy, state.attempt_started_ms, Retry::conflictBackoff());
+    const uint64_t pause_ms = reissuePause(policy, state.attempt_started_ms, Retry::conflictBackoff);
     return gatedPause(pause_ms, 2, state, bound, detail::recordConflictPause, /*should_sleep=*/true);
 }
 
@@ -890,7 +885,7 @@ static constexpr uint64_t kConnectHintPauseMs = 50;
 
 std::optional<WriteResult> CasOperation::pauseFlat(WriteState & state, const Retry & policy, const Retry::Bound & bound)
 {
-    const uint64_t pause_ms = reissuePause(policy, state.attempt_started_ms, kConnectHintPauseMs);
+    const uint64_t pause_ms = reissuePause(policy, state.attempt_started_ms, [] { return kConnectHintPauseMs; });
     return gatedPause(pause_ms, 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 

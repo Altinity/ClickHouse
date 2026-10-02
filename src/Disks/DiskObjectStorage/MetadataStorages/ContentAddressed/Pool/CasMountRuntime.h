@@ -106,8 +106,8 @@ struct MountConfig
     std::function<void()> terminal_publication_driver_lock_acquired_hook_for_test = {};
     /// Deterministic failure injection at the vanished-reason preparation boundary.
     std::function<void()> vanished_reason_prepare_hook_for_test = {};
-    /// Test-only override of the renewal's liveness predicate, for exact pre/post-send gate
-    /// interleavings. FALSE ends the renewal exactly as a lost fence does.
+    /// Test-only extra liveness condition, for exact pre/post-send gate interleavings. It is ANDed with
+    /// the ordinary predicate, so a stop still ends the renewal. FALSE ends it exactly as a lost fence does.
     std::function<bool()> renewal_live_for_test = {};
 };
 
@@ -452,8 +452,7 @@ private:
     uint64_t renewRenewerOnce(
         AdmittedRenewerCall call,
         RenewalDriverState active,
-        bool propagate_failure,
-        bool worker_call);
+        bool propagate_failure);
     MountRenewOperationEnvironment renewalEnvironment(bool worker_call);
     std::optional<uint64_t> leaseExpiredAt(uint64_t now_boot_ms) const;
     /// Publishes a committed renewal's deadline. A deadline in the future ends the current run of

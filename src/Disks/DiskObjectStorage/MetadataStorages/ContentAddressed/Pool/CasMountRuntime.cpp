@@ -223,13 +223,16 @@ std::optional<uint64_t> CasMountRuntime::publishRenewedDeadline(uint64_t deadlin
 {
     const uint64_t now = bootMsNow();
     const std::optional<uint64_t> expired_at = leaseExpiredAt(now);
-    setMountDeadline(deadline_boot_ms);
     if (deadline_boot_ms <= now)
     {
+        /// The carried instant goes first: a concurrent snapshot reads the deadline and this instant
+        /// separately, and must never see the new deadline without it.
         lease_expired_at_boot_ms.store(
             expired_at.value_or(std::numeric_limits<uint64_t>::max()), std::memory_order_release);
+        setMountDeadline(deadline_boot_ms);
         return std::nullopt;
     }
+    setMountDeadline(deadline_boot_ms);
     lease_expired_at_boot_ms.store(std::numeric_limits<uint64_t>::max(), std::memory_order_release);
     String ended_failure;
     {
@@ -287,8 +290,7 @@ void CasMountRuntime::renewWatermarkOnce()
     (void)renewRenewerOnce(
         std::move(call),
         RenewalDriverState::DirectCall,
-        /*propagate_failure=*/true,
-        /*worker_call=*/false);
+        /*propagate_failure=*/true);
 }
 
 uint64_t CasMountRuntime::allocateBuildSeq()
@@ -511,7 +513,7 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
         .boot_ms = [this] { return bootMsNow(); },
         .live = [this, worker_call]
         {
-            return config.renewal_live_for_test ? config.renewal_live_for_test() : renewalLive(worker_call);
+            return renewalLive(worker_call) && (!config.renewal_live_for_test || config.renewal_live_for_test());
         },
         .cancelled = [this] { return renewalCancelled(); },
         /// Only the worker keeps renewing past the lease; startup, remount and direct renewals stay
@@ -615,9 +617,9 @@ void CasMountRuntime::consumeRenewResult(
 uint64_t CasMountRuntime::renewRenewerOnce(
     AdmittedRenewerCall call,
     RenewalDriverState active,
-    bool propagate_failure,
-    bool worker_call)
+    bool propagate_failure)
 {
+    const bool worker_call = active == RenewalDriverState::WorkerCall;
     /// Configuration is pointer/POD-only. A parked redo retains its completed observation for the
     /// whole-chain finalizer to deliver after `remount_mutex` is released.
     configureMountRenewObservability(
@@ -645,8 +647,7 @@ uint64_t CasMountRuntime::renewRenewerForStartupOnce()
     return renewRenewerOnce(
         std::move(call),
         RenewalDriverState::StartupCall,
-        /*propagate_failure=*/true,
-        /*worker_call=*/false);
+        /*propagate_failure=*/true);
 }
 
 uint64_t CasMountRuntime::renewRenewerForRemountOnce()
@@ -655,8 +656,7 @@ uint64_t CasMountRuntime::renewRenewerForRemountOnce()
     return renewRenewerOnce(
         std::move(call),
         RenewalDriverState::RemountCall,
-        /*propagate_failure=*/true,
-        /*worker_call=*/false);
+        /*propagate_failure=*/true);
 }
 
 void CasMountRuntime::renewerReset()
@@ -807,8 +807,7 @@ void CasMountRuntime::renewalLoop()
             (void)renewRenewerOnce(
                 std::move(call),
                 RenewalDriverState::WorkerCall,
-                /*propagate_failure=*/false,
-                /*worker_call=*/true);
+                /*propagate_failure=*/false);
         }
         catch (...)
         {

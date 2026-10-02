@@ -434,9 +434,15 @@ private:
     /// fresh connection, not a store fault, so nothing here is paced against it.
     std::optional<WriteResult> reissueAtOnce(WriteState & state, const Retry::Bound & bound);
 
-    /// The pause before a reissue: `unspaced_ms`, or under `Retry::attempt_spacing_ms` what is left of
-    /// a fresh draw since `request_started_ms`.
-    uint64_t reissuePause(const Retry & policy, uint64_t request_started_ms, uint64_t unspaced_ms) const;
+    /// The pause before a reissue: `unspaced_ms()`, or under `Retry::attempt_spacing_ms` what is left of
+    /// a fresh draw since `request_started_ms`. `unspaced_ms` is not called when spacing applies.
+    template <typename UnspacedPause>
+    uint64_t reissuePause(const Retry & policy, uint64_t request_started_ms, UnspacedPause && unspaced_ms) const
+    {
+        if (!policy.attempt_spacing_ms)
+            return unspaced_ms();
+        return Retry::spacedPause(Retry::drawSpacing(*policy.attempt_spacing_ms), request_started_ms, owner.now_ms());
+    }
 
     /// `sleep_ms` plus `envelopes` attempt reservations, saturating.
     uint64_t reservedFor(uint64_t sleep_ms, uint32_t envelopes) const;
@@ -537,7 +543,9 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
             }
         }
 
-        const uint64_t pause_ms = reissuePause(policy, attempt_started_ms, Retry::backoff(++ordinary_reissues));
+        ++ordinary_reissues;
+        const uint64_t pause_ms = reissuePause(
+            policy, attempt_started_ms, [ordinary_reissues] { return Retry::backoff(ordinary_reissues); });
         const uint64_t needed = reservedFor(pause_ms, 1);
         switch (gate(needed))
         {
