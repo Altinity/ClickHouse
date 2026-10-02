@@ -575,6 +575,8 @@ void CasMountRuntime::consumeRenewResult(
                 "CAS mount lease of '{}' was expired for {} ms; a renewal restored it and writes resume. "
                 "Last failed renewal request: {}",
                 server_root_id, *expired_ms, lastRenewFailure());
+            std::lock_guard lock(renew_failure_mutex);
+            last_renew_failure.clear();
         }
         reportMountRenewCompletion(result, expired_ms);
         return;

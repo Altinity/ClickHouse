@@ -5221,6 +5221,7 @@ struct ExpiryObservation
     /// At the loop pass after the restoring renewal.
     Fence::Admit admit_after_restore = Fence::Admit::LostOrRearmed;
     std::optional<uint64_t> expired_since_after_restore;
+    String last_failure_after_restore;
     PoolLifecycle lifecycle_after_restore = PoolLifecycle::TransientNotLive;
     uint64_t generation_after_restore = 0;
     uint64_t lease_expired_after_restore = 0;
@@ -5266,6 +5267,7 @@ void runExpiryScenario(const String & layout_prefix, ExpiryObservation & seen)
         CasMountRuntime & runtime = *runtime_ptr;
         seen.admit_after_restore = runtime.admit(seen.generation_before, 0);
         seen.expired_since_after_restore = runtime.leaseExpiredSinceBootMs();
+        seen.last_failure_after_restore = runtime.lastRenewFailure();
         seen.lifecycle_after_restore = runtime.lifecycle();
         seen.generation_after_restore = runtime.fenceGeneration();
         seen.lease_expired_after_restore = eventCount(ProfileEvents::CASMountLeaseExpired) - seen.lease_expired_before;
@@ -5496,6 +5498,8 @@ TEST(CASMountRuntime, ExpiryIsReported)
     EXPECT_EQ(seen.lease_expired_after_stale, 0u) << "that renewal is not a restore";
 
     EXPECT_FALSE(seen.expired_since_after_restore.has_value());
+    EXPECT_TRUE(seen.last_failure_after_restore.empty())
+        << "a restore ends the outage the text described: " << seen.last_failure_after_restore;
     EXPECT_EQ(seen.lease_expired_after_restore, 1u);
     /// 25 requests by the first renewal and one by the second, each counted once.
     EXPECT_EQ(seen.attempts_after_restore, kExpiryFailedPuts + 2);
