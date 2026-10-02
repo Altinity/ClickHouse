@@ -543,6 +543,9 @@ public:
         PoolLifecycle lifecycle = PoolLifecycle::Live;
         String detail;
         time_t since = 0;
+        /// The lifecycle is `Live` but this server's lease expired and no renewal has restored it yet.
+        /// `detail` is then the last failed renewal request and `since` the expired deadline.
+        bool lease_expired = false;
     };
     LifecycleSnapshot lifecycleSnapshot() const;
 

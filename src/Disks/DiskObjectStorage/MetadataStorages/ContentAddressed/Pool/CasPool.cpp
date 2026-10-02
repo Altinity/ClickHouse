@@ -77,6 +77,16 @@ namespace
 
 std::atomic<uint64_t> remount_attempt_sequence{0};
 
+/// The wall-clock second of a past `CLOCK_BOOTTIME` instant: wall now minus how long ago it was on the
+/// boot clock. Both clocks are this server's own, sampled at one moment.
+time_t wallSecondOfPastBootInstant(uint64_t past_boot_ms, uint64_t now_boot_ms)
+{
+    const int64_t wall_now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const uint64_t ago_ms = now_boot_ms > past_boot_ms ? now_boot_ms - past_boot_ms : 0;
+    return static_cast<time_t>((wall_now_ms - static_cast<int64_t>(ago_ms)) / 1000);
+}
+
 /// Validate every writable factory's lease/request/cadence relationship before it can publish
 /// owner, epoch, mount, or probe authority. Decommission forces background renewal before calling
 /// this helper, so it is held to the same cadence window as an ordinary production mount.
@@ -380,6 +390,14 @@ Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
     snap.lifecycle = mount_runtime.lifecycle();
     snap.detail = lifecycleReasonDetail(snap.lifecycle);
     snap.since = mount_runtime.lifecycleSinceWallS();
+    if (snap.lifecycle != PoolLifecycle::Live)
+        return snap;
+    const std::optional<uint64_t> expired_at = mount_runtime.leaseExpiredSinceBootMs();
+    if (!expired_at)
+        return snap;
+    snap.lease_expired = true;
+    snap.detail = mount_runtime.lastRenewFailure();
+    snap.since = wallSecondOfPastBootInstant(*expired_at, mount_runtime.bootMsNow());
     return snap;
 }
 
