@@ -258,7 +258,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// (post-construction). Declared/constructed AFTER `ref_ledger`, preserving the original member order
     /// verbatim (mount destroyed first, ledger last; both orders proven safe -- see the header note).
     , mount_runtime(
-          pool_backend, farewell_requests, lease_requests,
+          farewell_requests, lease_requests,
           pool_layout, config.mountConfig(), config.server_root_id, event_sink_,
           config.cas_request_budget,
           [this] { return tryRemountOnce(); })
@@ -328,9 +328,9 @@ void Pool::setMountDeadline(uint64_t deadline_boot_ms)
     mount_runtime.setMountDeadline(deadline_boot_ms);
 }
 
-void Pool::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms)
+void Pool::armMountFence(uint64_t deadline_boot_ms)
 {
-    mount_runtime.armMountFence(server_uuid, writer_epoch, deadline_boot_ms);
+    mount_runtime.armMountFence(deadline_boot_ms);
 }
 
 String Pool::lifecycleReasonDetail(PoolLifecycle lc) const

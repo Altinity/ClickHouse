@@ -69,7 +69,6 @@ struct MountRenewResult
     /// a give-up, a conflict, or a store refusal.
     uint32_t attempts_sent = 0;
     bool resolved_by_read = false;
-    bool sent_any = false;
     std::exception_ptr failure;
     /// The body this renewal wrote or tried to write.
     uint64_t writer_epoch = 0;

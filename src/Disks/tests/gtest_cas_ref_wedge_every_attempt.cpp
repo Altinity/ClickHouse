@@ -444,7 +444,7 @@ String epochSealBytes(const RootNamespace & ns, const RefTxnId & id, std::option
 void bumpFenceGeneration(const PoolPtr & store, uint64_t writer_epoch)
 {
     store->tripMountLost();
-    store->armMountFence(DB::UInt128{0, 1}, writer_epoch, store->bootMsNow() + 600000);
+    store->armMountFence(store->bootMsNow() + 600000);
     /// The fence re-arm alone moves the GENERATION; the live incarnation's writer epoch is a separate
     /// publication (`tryRemountOnce` does both), and the append lane derives its ids from that one.
     store->setLiveWriterEpochForTest(writer_epoch);

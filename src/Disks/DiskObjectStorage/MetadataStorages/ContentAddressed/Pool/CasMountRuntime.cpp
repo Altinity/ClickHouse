@@ -47,7 +47,6 @@ int64_t wallClockNowSeconds()
 }
 
 CasMountRuntime::CasMountRuntime(
-    BackendPtr backend_ptr_,
     CasRequests & farewell_requests_,
     CasRequests & lease_requests_,
     const Layout & layout_,
@@ -56,8 +55,7 @@ CasMountRuntime::CasMountRuntime(
     const CasEventSink & event_sink_,
     CasRequestBudget cas_request_budget_,
     std::function<bool()> remount_attempt_)
-    : backend_ptr(std::move(backend_ptr_))
-    , farewell_requests(farewell_requests_)
+    : farewell_requests(farewell_requests_)
     , lease_requests(lease_requests_)
     , layout(layout_)
     , config(std::move(config_))
@@ -272,10 +270,8 @@ void CasMountRuntime::setMountDeadline(uint64_t deadline_boot_ms)
     mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
 }
 
-void CasMountRuntime::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms)
+void CasMountRuntime::armMountFence(uint64_t deadline_boot_ms)
 {
-    mount_fence.server_uuid = server_uuid;
-    mount_fence.writer_epoch = writer_epoch;
     armFence(deadline_boot_ms, /*report_live=*/false);
 }
 

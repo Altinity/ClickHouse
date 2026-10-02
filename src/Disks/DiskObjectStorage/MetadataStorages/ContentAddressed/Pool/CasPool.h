@@ -476,8 +476,8 @@ public:
     /// Refresh the write-fence deadline (a CLOCK_BOOTTIME-milliseconds instant; release).
     /// renewer renew calls this on success.
     void setMountDeadline(uint64_t deadline_boot_ms);
-    /// Arm the fence at startup: set (uuid, epoch, deadline), clear `lost`.
-    void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms);
+    /// Arm the fence at startup: set the deadline, clear `lost`.
+    void armMountFence(uint64_t deadline_boot_ms);
     void setArmMountFenceInterpositionHookForTest(std::function<void()> hook)
     {
         mount_runtime.setArmMountFenceInterpositionHookForTest(std::move(hook));
@@ -753,11 +753,6 @@ public:
     /// operation admitted here is refused the moment the fence trips, is re-armed under a fresh lease
     /// incarnation, or runs out of room before the lease expires.
     CasRequests & mountRequests() { return mount_requests; }
-    /// The farewell plane, on an open fence -- shared with the mount-lease renewer's own claim/adopt,
-    /// not only its release: a self-remount claims with the fence already latched lost, so gating the
-    /// claim on the fence could never reclaim, and refusing the farewell because the mount fence has
-    /// already run down would leave the slot looking live until GC fences it out.
-    CasRequests & farewellRequests() { return farewell_requests; }
     /// The open-fence plane: GC, the offline tools, this pool's own reads, and the bootstrap-control
     /// claims. None of them hold a mount lease -- the claims are what ESTABLISHES one, so gating them
     /// on the fence would make a self-remount, which runs with the fence latched lost, unable ever to
@@ -1252,7 +1247,7 @@ private:
     /// from Pool. Owns the `MountLeaseRenewer`, the local `MountFence`, the per-server
     /// build watermark (the `builds_mutex`-guarded seq/registry) and its in-flight-build
     /// map, the live-incarnation `live_writer_epoch`, and the
-    /// lease thread (with one driver mutex/condition pair). Injected with backend/layout
+    /// lease thread (with one driver mutex/condition pair). Injected with the layout +
     /// the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool `cas_request_budget`
     /// + a `remount_attempt` callback (== `Pool::tryRemountOnce`, which STAYS on Pool: the claim/recovery
     /// ORCHESTRATION drives these owned primitives).

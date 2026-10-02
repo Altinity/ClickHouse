@@ -1397,13 +1397,11 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
         result.outcome = MountRenewOutcome::Committed;
         result.attempts_sent = committed->attempts_sent;
         result.resolved_by_read = committed->resolved_by_read;
-        result.sent_any = committed->attempts_sent != 0;
         return finished(std::move(result));
     }
 
     if (const Conflict * conflict = std::get_if<Conflict>(&*written))
     {
-        result.sent_any = true;
         result.attempts_sent = conflict->attempts_sent;
         try
         {
@@ -1418,7 +1416,6 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
 
     if (const Refused * refused = std::get_if<Refused>(&*written))
     {
-        result.sent_any = true;
         result.attempts_sent = refused->attempts_sent;
         result.classification = MountRenewTerminalClassification::DeterministicFailure;
         result.failure = std::make_exception_ptr(Exception(
@@ -1429,7 +1426,6 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
 
     if (const GaveUp * gave_up = std::get_if<GaveUp>(&*written))
     {
-        result.sent_any = gave_up->sent_any;
         result.attempts_sent = gave_up->attempts_sent;
 
         /// Nothing was sent and the node was already stopping: the lease is exactly as it was, so this

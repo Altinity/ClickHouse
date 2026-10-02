@@ -107,8 +107,6 @@ struct MountConfig
 /// Container pause is already safe under either clock (the process is frozen, so no local check runs).
 struct MountFence
 {
-    UInt128 server_uuid{};
-    uint64_t writer_epoch = 0;
     /// Until something arms a real lease deadline, the permissive default allows mutations. UINT64_MAX =
     /// unarmed (never expires); otherwise a CLOCK_BOOTTIME-milliseconds instant.
     std::atomic<uint64_t> deadline_boot_ms{std::numeric_limits<uint64_t>::max()};
@@ -119,14 +117,13 @@ struct MountFence
 /// the `MountLeaseRenewer`, local `MountFence`, build watermark and in-flight build registry,
 /// `live_writer_epoch`, and the lease thread. `Pool` retains the higher-level
 /// claim/recovery sequence and its `remount_mutex`; in particular, the runtime does not acquire or own
-/// the ref-ledger locks. The runtime receives its backend, layout, configuration, event sink, request
+/// the ref-ledger locks. The runtime receives its request planes, layout, configuration, event sink, request
 /// budget, and a callback that performs one pool-level remount attempt, so it has no `Pool` back-reference.
 /// `Pool` delegates preserve the existing callers and test seams.
 class CasMountRuntime
 {
 public:
     CasMountRuntime(
-        BackendPtr backend_ptr_,
         /// The planes the `MountLeaseRenewer` runs on: the claim and the farewell on an open-fence one,
         /// the renewal on `lease_requests_`, which has no lease budget and whose sleep a stop wakes.
         /// Owned by `Pool` and outliving this runtime.
@@ -164,7 +161,7 @@ public:
     void setMountDeadline(uint64_t deadline_boot_ms);
     /// Arm a new lease incarnation and clear any loss latched for the prior incarnation. Unconditional
     /// and reports no `Live`; a reclaim arms through `armIfAdmissible`.
-    void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms);
+    void armMountFence(uint64_t deadline_boot_ms);
     /// Step 0 of a reclaim. One step under `driver_mutex`: record the requested generation this attempt
     /// serves and latch the fence.
     void beginReclaim();
@@ -461,7 +458,6 @@ private:
     std::unique_lock<std::mutex> lockTerminalPublication();
 
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
-    BackendPtr backend_ptr;
     CasRequests & farewell_requests;
     CasRequests & lease_requests;
     const Layout & layout;

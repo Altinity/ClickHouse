@@ -2072,7 +2072,7 @@ public:
     RuntimeUnderTest(const std::shared_ptr<BackendT> & backend, Args &&... args)
         : farewell(backend, DB::Cas::Fence::open())
         , lease(backend, DB::Cas::Fence::open())
-        , runtime(backend, farewell, lease, std::forward<Args>(args)...)
+        , runtime(farewell, lease, std::forward<Args>(args)...)
     {
         /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the
         /// budget field alone; every construction of this holder pairs the two via `runtimeRenewBudget`,
@@ -2178,7 +2178,7 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
 
     DB::Cas::tests::OperationForTest successor_op(*backend);
     auto ours = (*successor_op).read(key, Retry::standard());
@@ -3371,7 +3371,7 @@ TEST(CASPoolRemount, DirectRenewIsRefusedForBackgroundConfiguredRuntimeAfterStop
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     runtime.startBackgroundWorkers();
     runtime.stopBackgroundWorkers();
     EXPECT_RUNTIME_STATE_REJECTION(runtime.renewWatermarkOnce());
@@ -3408,7 +3408,7 @@ TEST(CASPoolRemount, ReclaimWaitsForTheRenewalToEnd)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     backend->barrier = &renewal_barrier;
     backend->fault = RuntimeRenewBackend::Fault::BlockThenDelegate;
     /// Set after the setup's own writes: only the held renewal request sets it.
@@ -3454,7 +3454,7 @@ TEST(CASPoolRemount, TeardownJoinsTheLeaseThreadBeforeRelease)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     runtime.startBackgroundWorkers();
     runtime.stopBackgroundWorkers();
     EXPECT_EQ(worker_exits.load(), 1u);
@@ -3569,7 +3569,7 @@ TEST(CASMountRuntime, MemoryLimitDoesNotEndTheLeaseThread)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
 
     backend->fault = RuntimeRenewBackend::Fault::ThrowMemoryLimitExceeded;
@@ -3644,7 +3644,7 @@ TEST(CASPoolRemount, NaturalTerminalTransitionMakesTheLeaseThreadExit)
         runtime_ptr = &runtime;
         runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
+        runtime.armMountFence(anchor + 1000);
         runtime.startBackgroundWorkers();
         runtime.tripMountLost();
         runtime.scheduleRemount();
@@ -3736,7 +3736,7 @@ TEST(CASPoolRemount, ALeaseWaitCannotMissNaturalTerminalPublication)
             CasMountRuntime & runtime = *runtime_holder;
             runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
             const uint64_t anchor = runtime.startRenewer();
-            runtime.armMountFence(uuid, 1, anchor + 1000);
+            runtime.armMountFence(anchor + 1000);
             if (wait == Wait::ReclaimBackoff)
             {
                 /// A request before the start makes the first pass a reclaim, which fails and backs off.
@@ -3805,7 +3805,7 @@ TEST(CASPoolRemount, VanishedReasonPreparationFailureLeavesTerminalTransitionRet
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     runtime.startBackgroundWorkers();
     runtime.tripMountLost();
 
@@ -3852,7 +3852,7 @@ TEST(CASPoolRemount, WorkerConstructionRollbackFailsOpenClosed)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     EXPECT_THROW(runtime.startBackgroundWorkers(), DB::Exception);
     EXPECT_FALSE(runtime.mayMutate());
     EXPECT_FALSE(runtime.workersRunningForTest());
@@ -3900,7 +3900,7 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     backend->barrier = &renewal_barrier;
     backend->fault = RuntimeRenewBackend::Fault::BlockThenDelegate;
     const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
@@ -3944,7 +3944,7 @@ TEST(CASPoolRemount, ConcurrentRemountRequestIsProcessedAfterActiveGeneration)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     runtime.startBackgroundWorkers();
     runtime.tripMountLost();
     runtime.scheduleRemount();
@@ -4006,7 +4006,7 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 10'000);
+    runtime.armMountFence(anchor + 10'000);
     runtime.startBackgroundWorkers();
     runtime.tripMountLost();
     runtime.scheduleRemount();
@@ -4072,7 +4072,7 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
         CasMountRuntime & runtime = *runtime_holder;
         runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
+        runtime.armMountFence(anchor + 1000);
         if (ambiguous)
         {
             backend->barrier = &barrier;
@@ -4117,7 +4117,7 @@ TEST(CASPool, DirectTerminalFailureRethrowsTypedException)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     /// The renewal lands, then its liveness ends before the commit is confirmed.
     backend->after_commit = [&] { renewal_live.store(false, std::memory_order_release); };
     try
@@ -4216,7 +4216,7 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     /// A definitive answer ends the lease thread's renewal; a transient fault would only be retried.
     fenceOutMount(*backend, layout.mountKey("test"));
     runtime.startBackgroundWorkers();
@@ -4262,7 +4262,7 @@ TEST(CASMountRuntime, ForgetEndsAnUnboundedRenewal)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     past_the_lease = anchor + 5'000;
     runtime_holder.setRetrySleepForTest([&](uint64_t ms)
     {
@@ -4317,7 +4317,7 @@ TEST(CASMountRuntime, StopWakesTheRetryWaitOfAnUnboundedRenewal)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     runtime_holder.setRetrySleepForTest([&](uint64_t ms)
     {
         const bool first = first_wait.exchange(false);
@@ -4389,7 +4389,7 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     runtime_holder.setRetrySleepForTest([&](uint64_t ms) { boot_ms += ms; });
     /// The first renewal starts one period after the anchor and fails for three lease lengths.
     boot_ms = anchor + 500;
@@ -4494,7 +4494,7 @@ TEST(CASMountRuntime, NothingArmsWhileARemountRequestIsPending)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
     runtime.startBackgroundWorkers();
     /// A request without a trip: the fence is still armed when the reclaim starts.
@@ -4600,7 +4600,7 @@ TEST(CASMountRuntime, AnInterferenceReportDuringAReclaimIsServedByTheNextReclaim
         runtime_ptr = &runtime;
         runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
+        runtime.armMountFence(anchor + 1000);
         const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
         runtime.startBackgroundWorkers();
         runtime.scheduleRemount();
@@ -4674,7 +4674,7 @@ TEST(CASMountRuntime, AReclaimAcknowledgesOnlyTheGenerationItServed)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
     runtime.startBackgroundWorkers();
     /// One interference report.
@@ -4739,7 +4739,7 @@ TEST(CASMountRuntime, AReclaimFinishedAfterTheForgetIntentArmsNothing)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     runtime.startBackgroundWorkers();
     runtime.tripMountLost();
     runtime.scheduleRemount();
@@ -4810,7 +4810,7 @@ TEST(CASMountRuntime, StopDuringAReclaimJoinsTheThread)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     const String key = layout.mountKey("test");
     /// A definitive answer ends the first renewal and requests the reclaim; nobody claims the slot back.
     fenceOutMount(*backend, key);
@@ -4922,7 +4922,7 @@ TEST(CASMountRuntime, ARemountRequestEndsTheRenewalAndTheSameThreadReclaims)
         runtime_ptr = &runtime;
         runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
+        runtime.armMountFence(anchor + 1000);
         /// Five lease lengths on: a renewal bounded by its lease ended long before.
         past_the_lease = anchor + 5'000;
         runtime_holder.setRetrySleepForTest([&](uint64_t ms)
@@ -5066,7 +5066,7 @@ TEST(CASMountRuntime, ACommitConsumedAfterARemountRequestCannotOverwriteTheRecla
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     /// Set after the setup's own writes: only the loop's renewal may raise the request.
     backend->after_commit = [&] { committed = true; };
     runtime.startBackgroundWorkers();
@@ -5111,7 +5111,7 @@ TEST(CASMountRuntimeDeathTest, OnlyTheLeaseThreadReplacesTheRenewerWhileItRuns)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     runtime.startBackgroundWorkers();
     /// The lease thread is held between its decision to renew and the renewal, with no lock held.
     admitted.waitUntilArrived();
@@ -5524,7 +5524,7 @@ void runExpiryScenario(const String & layout_prefix, ExpiryObservation & seen)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     ASSERT_EQ(anchor, kExpiryClaimBootMs);
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
 
     seen.generation_before = runtime.fenceGeneration();
     seen.attempts_before = eventCount(ProfileEvents::CASMountRenewalAttempts);
@@ -5624,7 +5624,7 @@ void runReadOutageScenario(const String & layout_prefix, ReadOutageObservation &
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
 
     seen.attempts_before = eventCount(ProfileEvents::CASMountRenewalAttempts);
     seen.retries_before = eventCount(ProfileEvents::CASMountRenewalRetries);
@@ -5827,7 +5827,7 @@ void runExpiryLogScenario(const String & layout_prefix, ExpiryLogRig & rig, uint
     rig.runtime = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
     rig.generation = runtime.fenceGeneration();
 
     backend->on_put = [&](uint32_t put_no)
@@ -5991,7 +5991,7 @@ TEST(CASMountRuntime, ASuccessEndsTheFailureTextOfItsRun)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
 
     backend->on_put = [&](uint32_t put_no)
     {
@@ -6065,7 +6065,7 @@ TEST(CASMountRuntime, EachRestoredExpiryIsCountedOnce)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
     generation = runtime.fenceGeneration();
 
     /// Renewal 1 fails 24 times and then lands stale (put 25); renewal 2 restores (put 26). Renewal 3
@@ -6149,7 +6149,7 @@ TEST(CASMountRuntime, AnExpiryEndedByAFenceIsNotCountedAsARestore)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
     /// The first renewal lands stale, so the lease is still expired when GC fences the slot out; the
     /// next renewal meets the fence.
     backend->on_put = [&](uint32_t put_no)
@@ -6414,7 +6414,7 @@ TEST(CASMountRuntime, ARenewalIsSentUnderALatchedFence)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
 
     /// Puts 1 to 4 fail, 1.3 s each; put 5 commits at 115.2 s, inside the lease of the 100 s claim.
     backend->on_put = [&](uint32_t put_no)
@@ -6519,7 +6519,7 @@ TEST(CASMountRuntime, TheForgetIntentAloneEndsARenewal)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
 
     /// Every put fails; put 3 is held until the intent is published.
     backend->on_put = [&](uint32_t put_no)
@@ -6601,7 +6601,7 @@ TEST(CASMountRuntime, ATripAloneIsRearmedByTheNextRenewal)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
     runtime.startBackgroundWorkers();
 
     second_pass.waitUntilArrived();
@@ -6666,7 +6666,7 @@ TEST(CASMountRuntime, ARenewalArmsNothingWhileARequestIsPending)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     const String key = layout.mountKey("test");
     const uint64_t writes_before = backend->putOverwriteCount(key);
     const uint64_t requests_before = runtime.scheduleRemountCallCountForTest();
