@@ -58,6 +58,7 @@ extern const Event CASRemountFailed;
 extern const Event CASMountLeaseExpired;
 extern const Event CASMountRenewalAttempts;
 extern const Event CASMountRenewalRetries;
+extern const Event CASIdentityLost;
 }
 
 using namespace DB::Cas;
@@ -7003,6 +7004,71 @@ TEST(CASPool, AnOpenWithoutALeaseThreadFailsWhenItsClaimIsTooOld)
     EXPECT_EQ(eventCount(ProfileEvents::CASMountRenewalAttempts), attempts_before) << "nothing renewed the claim";
 }
 
+/// The pool becomes terminal while the open waits: the readiness renewal meets a fenced-out slot, and the
+/// reclaim it requests finds both pool sentinels gone and enters `IdentityLost`. The open fails naming the
+/// terminal pool. Every later write of the mount key moves the fence clock a lease, so a regression that
+/// keeps the pool going ends the open's wait instead of hanging.
+TEST(CASMountRuntime, AnOpenFailsWhenThePoolBecomesTerminalWhileItWaits)
+{
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
+    auto backend = std::make_shared<MountWriteScriptBackend>();
+    seedFencedPredecessor(*backend, "ready-terminal");
+    const Layout layout("ready-terminal");
+    const String mount_key = layout.mountKey("s");
+    const String meta_key = layout.poolMetaKey();
+    const String owner_key = layout.ownerKey("s");
+    backend->mount_key = mount_key;
+    PoolConfig config = readinessPoolConfig("ready-terminal", fake_boot);
+    const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
+    /// The hook is stored in the backend, so it holds a plain pointer to it.
+    DB::Cas::Backend * raw_backend = backend.get();
+    /// 1, 2: the open's reclaim and adopt. 3: the readiness renewal. 4: the fence-out made inside it.
+    backend->on_mount_write = [fake_boot, raw_backend, mount_key, meta_key, owner_key, ttl_ms](uint32_t write_no)
+    {
+        if (write_no == 2)
+        {
+            *fake_boot += kReadyClaimAgeMs;
+        }
+        else if (write_no == 3)
+        {
+            fenceOutMount(*raw_backend, mount_key);
+            DB::Cas::tests::OperationForTest op(*raw_backend);
+            for (const String & key : {meta_key, owner_key})
+            {
+                const auto got = (*op).read(key, Retry::once());
+                EXPECT_TRUE(got.has_value()) << key;
+                if (got)
+                    (*op).remove(key, got->etag, Retry::once());
+            }
+        }
+        else if (write_no > 4)
+        {
+            *fake_boot += ttl_ms;
+        }
+        return false;
+    };
+    const uint64_t identity_lost_before = eventCount(ProfileEvents::CASIdentityLost);
+
+    int code = 0;
+    String message;
+    try
+    {
+        (void)Pool::open(backend, config);
+        ADD_FAILURE() << "an open whose pool became terminal must fail";
+    }
+    catch (const DB::Exception & e)
+    {
+        code = e.code();
+        message = e.message();
+    }
+
+    EXPECT_EQ(code, DB::ErrorCodes::ABORTED) << message;
+    EXPECT_NE(message.find("the pool became terminal while the open waited"), String::npos) << message;
+    EXPECT_EQ(message.find("no renewal armed the fence"), String::npos) << message;
+    EXPECT_EQ(backend->mount_writes.load(), 4u) << "no mount write after the fence-out";
+    EXPECT_EQ(eventCount(ProfileEvents::CASIdentityLost), identity_lost_before + 1);
+}
+
 namespace
 {
 /// What the open's wait and the reclaim saw when the readiness renewal met a definitive answer.
@@ -7019,7 +7085,12 @@ struct DefinitiveReadinessSeen
     uint64_t live_writer_epoch = 0;
     uint64_t requested_generation = 0;
     uint64_t lease_lost = 0;
+    uint32_t wait_clock_reads = 0;
 };
+
+/// The open's wait reads the fence clock once per wake-up. On a regression that leaves it unnotified the
+/// injected clock stands still, so at this many reads the fixture moves the clock past the wait's bound.
+constexpr uint32_t kReadinessWaitWakeUpBound = 20;
 
 /// The open's shape at the runtime level, with a lease of 1000 ms: the claim starts at 100 ms and the open
 /// decides at 1070 ms, with 30 ms left and 40 ms needed. The slot is GC-fenced before the loop starts, so the
@@ -7033,6 +7104,9 @@ void runDefinitiveAnswerDuringReadiness(bool reclaim_arms, DefinitiveReadinessSe
     std::atomic<uint64_t> boot_ms{100};
     std::atomic<uint32_t> puts{0};
     std::atomic<uint32_t> reclaims{0};
+    const std::thread::id test_thread = std::this_thread::get_id();
+    std::atomic<bool> waiting{false};
+    std::atomic<uint32_t> wait_clock_reads{0};
     CasMountRuntime * runtime_ptr = nullptr;
     const uint64_t lost_before = eventCount(ProfileEvents::CASMountLeaseLost);
     CasEventSink sink;
@@ -7045,7 +7119,13 @@ void runDefinitiveAnswerDuringReadiness(bool reclaim_arms, DefinitiveReadinessSe
         MountConfig{
             .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(300),
             .background_watermark = true,
-            .boot_ms_fn = [&] { return boot_ms.load(); }},
+            .boot_ms_fn = [&]
+            {
+                if (waiting.load() && std::this_thread::get_id() == test_thread
+                    && ++wait_clock_reads == kReadinessWaitWakeUpBound)
+                    boot_ms.fetch_add(2000);
+                return boot_ms.load();
+            }},
         "test", sink, runtimeRenewBudget(), [&]
         {
             CasMountRuntime & reclaiming = *runtime_ptr;
@@ -7095,8 +7175,11 @@ void runDefinitiveAnswerDuringReadiness(bool reclaim_arms, DefinitiveReadinessSe
     runtime.startBackgroundWorkers();
 
     seen.boot_before_wait = boot_ms.load();
+    waiting = true;
     seen.armed = runtime.waitUntilArmed(1000);
+    waiting = false;
     seen.boot_after_wait = boot_ms.load();
+    seen.wait_clock_reads = wait_clock_reads.load();
 
     /// The join orders every write of the lease thread before the reads below.
     runtime.stopBackgroundWorkers();
@@ -7202,6 +7285,7 @@ TEST(CASMountRuntime, ADefinitiveAnswerDuringReadinessIsServedByAReclaim)
 {
     DefinitiveReadinessSeen reclaimed;
     ASSERT_NO_FATAL_FAILURE(runDefinitiveAnswerDuringReadiness(/*reclaim_arms=*/true, reclaimed));
+    EXPECT_LT(reclaimed.wait_clock_reads, kReadinessWaitWakeUpBound) << "nothing ended the wait: it ran out its wake-ups";
     EXPECT_TRUE(reclaimed.armed) << "the reclaim armed the fence";
     EXPECT_EQ(reclaimed.puts_at_first_reclaim, 1u) << "the loop reclaimed before any further renewal";
     EXPECT_EQ(reclaimed.admit_at_first_reclaim, "LostOrRearmed") << "no write is admitted before the arm";
@@ -7216,6 +7300,7 @@ TEST(CASMountRuntime, ADefinitiveAnswerDuringReadinessIsServedByAReclaim)
 
     DefinitiveReadinessSeen failing;
     ASSERT_NO_FATAL_FAILURE(runDefinitiveAnswerDuringReadiness(/*reclaim_arms=*/false, failing));
+    EXPECT_LT(failing.wait_clock_reads, kReadinessWaitWakeUpBound) << "nothing ended the wait: it ran out its wake-ups";
     EXPECT_FALSE(failing.armed);
     EXPECT_GE(failing.boot_after_wait, failing.boot_before_wait + 1000) << "the wait gave up after one lease on the fence clock";
     EXPECT_EQ(failing.puts_at_first_reclaim, 1u);

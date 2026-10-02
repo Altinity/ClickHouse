@@ -10,6 +10,7 @@
 
 #include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <string>
 #include <vector>
@@ -271,6 +272,50 @@ TEST(CASGCSchedulerSteal, ManualRoundNeverStealsALiveHeartbeatingIncumbent)
     EXPECT_FALSE(sched.runOneRoundNow().acquired_lease);
     Gc::pulseHeartbeat(*store, kIncumbent);   /// hb 1->2
     EXPECT_FALSE(sched.runOneRoundNow().acquired_lease);
+}
+
+/// The loop's side of `ManualRoundNeverStealsEvenADeadIncumbent`: its scheduled rounds see the dead
+/// incumbent's lease tuple and heartbeat frozen across two of their own observations, and the second one
+/// takes the lease over.
+TEST(CASGCSchedulerSteal, ScheduledRoundStealsADeadIncumbent)
+{
+    constexpr size_t kRoundBound = 4;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    const UInt128 kIncumbent = hexToU128("00000000000000000000000000000abc");
+    Gc incumbent(store, kIncumbent);
+    ASSERT_TRUE(incumbent.runRegularRound().acquired_lease);
+
+    std::mutex rows_mutex;
+    std::condition_variable rows_cv;
+    std::vector<Rec> finishes;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r)
+        {
+            if (r.event_type != Rec::EventType::Finish)
+                return;
+            std::lock_guard g(rows_mutex);
+            finishes.push_back(r);
+            rows_cv.notify_all();
+        });
+
+    sched.start();
+    bool stolen = false;
+    for (size_t round = 1; round <= kRoundBound && !stolen; ++round)
+    {
+        sched.requestRoundSoon();
+        std::unique_lock lock(rows_mutex);
+        ASSERT_TRUE(rows_cv.wait_for(lock, std::chrono::seconds(30), [&] { return finishes.size() >= round; }))
+            << "timed out waiting for Finish row #" << round;
+        for (const Rec & r : finishes)
+            stolen = stolen || r.outcome == Rec::Outcome::Success || r.outcome == Rec::Outcome::Deferred;
+    }
+    sched.stop();
+    for (const Rec & r : finishes)
+        EXPECT_EQ(r.trigger, Rec::Trigger::Scheduled);
+    EXPECT_TRUE(stolen) << "no scheduled round in " << kRoundBound << " took over the dead incumbent's lease";
 }
 
 /// A round whose backend throws must produce a Finish with `outcome == Aborted` and a non-empty

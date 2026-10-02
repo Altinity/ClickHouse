@@ -13,6 +13,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -385,8 +387,14 @@ TEST(CASForget, ForgetRacingActiveRemountThreadCompletesBounded)
         store->forgetDisk([] {}, kForgetReason);
         done.set_value();
     });
-    EXPECT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready)
-        << "FORGET must not deadlock against an in-flight self-remount";
+    if (fut.wait_for(std::chrono::seconds(30)) != std::future_status::ready)
+    {
+        ADD_FAILURE() << "FORGET must not deadlock against an in-flight self-remount";
+        /// Nothing can release the deadlocked threads, and the process does not exit while they are
+        /// parked, so the binary ends here instead of hanging.
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
     forgetter.join();
 
     /// Disarm before ~Pool so its residual teardown is not fighting the injected fault.

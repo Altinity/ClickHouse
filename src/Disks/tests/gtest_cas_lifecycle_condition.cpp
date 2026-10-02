@@ -137,6 +137,7 @@ TEST(CASLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
     EXPECT_FALSE(store->tryRemountOnce());
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
     EXPECT_FALSE(store->isVanished()) << "IdentityLost is a distinct terminal, not a Vanished state";
+    EXPECT_FALSE(store->mayMutate()) << "the fence stays latched";
 
     /// store()-class access now fails loud with the typed lifecycle error.
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->throwIfLifecycleTerminal(); });

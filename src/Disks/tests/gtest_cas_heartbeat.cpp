@@ -1151,7 +1151,7 @@ TEST(CASHeartbeat, CancellationAfterSendIsTerminalAndForbidsRelease)
         renewalEnvironment(/*live=*/[&] { return !cancelled; }, /*cancelled=*/[&] { return cancelled; }));
     const DB::Exception failure = terminalException(result);
     EXPECT_EQ(failure.code(), DB::ErrorCodes::NETWORK_ERROR);
-    EXPECT_GE(result.attempts_sent, 1u);
+    EXPECT_EQ(result.attempts_sent, 1u);
     EXPECT_EQ(backend->read_calls, 0u) << "post-write cancellation must not start a diagnostic read";
     EXPECT_EQ(renewer.state(), MountLeaseRenewerState::RenewalTerminal);
     const String bytes_before = ops.op.read(layout.mountKey("test"), Retry::standard())->bytes;
