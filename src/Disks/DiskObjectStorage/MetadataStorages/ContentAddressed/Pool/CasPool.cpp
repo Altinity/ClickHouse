@@ -1346,7 +1346,7 @@ bool Pool::tryRemountOnce()
     /// `Recover` (a present `_pool_meta` whose identity matches, in a non-`IdentityLost` state) falls
     /// through to the existing recovery below; every other verdict resolves here and returns false.
     step = "lease_loss_transition";
-    mount_runtime.noteLeaseLost();
+    mount_runtime.beginReclaim();
     /// A fully-terminal `Vanished` pool never probes/claims/writes again.
     step = "terminal_gate";
     if (mount_runtime.isVanished())
@@ -1570,14 +1570,11 @@ bool Pool::tryRemountOnce()
         /// No-throw commit section: publish the fence and lifecycle only after epoch, renewer, recovery
         /// cancellation, and ref-runtime quiescence are complete.
         step = "arm_fence";
-        mount_runtime.armMountFence(
-            our_uuid,
-            writer_epoch,
-            remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
-                ? std::numeric_limits<uint64_t>::max()
-                : remount_anchor_boot_ms + ttl_ms);
-        step = "publish_live";
-        mount_runtime.noteRemounted();
+        const uint64_t deadline_boot_ms = remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
+            ? std::numeric_limits<uint64_t>::max()
+            : remount_anchor_boot_ms + ttl_ms;
+        if (mount_runtime.armIfAdmissible(deadline_boot_ms))
+            step = "publish_live";
         succeeded = true;
         return true;
     }

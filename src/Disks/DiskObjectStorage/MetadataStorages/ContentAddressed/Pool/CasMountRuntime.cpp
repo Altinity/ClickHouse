@@ -259,17 +259,36 @@ void CasMountRuntime::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, 
 {
     mount_fence.server_uuid = server_uuid;
     mount_fence.writer_epoch = writer_epoch;
+    armFence(deadline_boot_ms, /*report_live=*/false);
+}
+
+void CasMountRuntime::armFence(uint64_t deadline_boot_ms, bool report_live)
+{
     mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
     lease_expired_at_boot_ms.store(std::numeric_limits<uint64_t>::max(), std::memory_order_release);
     /// A fresh lease incarnation is a fresh generation too: a durable-effect caller admitted under the
-    /// PRIOR incarnation must re-check and abort rather than ride this re-arm through (rev.7 [C2]).
+    /// PRIOR incarnation must re-check and abort rather than ride this re-arm through.
     fence_generation.fetch_add(1, std::memory_order_acq_rel);
     if (arm_mount_fence_interposition_hook_for_test)
         arm_mount_fence_interposition_hook_for_test();
+    if (report_live)
+        noteRemounted();
     /// Open the gate LAST. A caller that observes `lost == false` with acquire semantics must also see
     /// the fresh generation; publishing the latch first exposes one admission window in which the dead
     /// generation looks live again.
     mount_fence.lost.store(false, std::memory_order_release);
+}
+
+void CasMountRuntime::beginReclaim()
+{
+    (void)noteLeaseLost();
+}
+
+bool CasMountRuntime::armIfAdmissible(uint64_t deadline_boot_ms)
+{
+    armFence(deadline_boot_ms, /*report_live=*/false);
+    noteRemounted();
+    return true;
 }
 
 uint64_t CasMountRuntime::minActive()

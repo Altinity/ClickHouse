@@ -185,6 +185,11 @@ public:
     void setMountDeadline(uint64_t deadline_boot_ms);
     /// Arm a new lease incarnation and clear any loss latched for the prior incarnation.
     void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms);
+    /// Step 0 of a reclaim, before its identity probe: move a `Live` pool to `TransientNotLive`.
+    void beginReclaim();
+    /// End of a reclaim that claimed: publish `deadline_boot_ms`, arm the fence and report `Live`.
+    /// Returns whether it armed.
+    bool armIfAdmissible(uint64_t deadline_boot_ms);
     /// Test-only interposition at the publication boundary between the re-armed generation and the
     /// live fence. A caller admitted from this hook must be refused: the old generation is already
     /// dead, while the new generation is not live until `lost` is cleared.
@@ -478,6 +483,9 @@ private:
     /// caused by the stop cannot be mistaken for one that preceded it.
     bool renewalCancelled() const;
     void tripFenceWithoutOperationalLoss();
+    /// Publish `deadline_boot_ms` as a fresh lease incarnation and open the fence. With `report_live`,
+    /// `Live` is published before the fence opens, so a reader that sees the fence armed reads `Live`.
+    void armFence(uint64_t deadline_boot_ms, bool report_live);
     std::unique_lock<std::mutex> lockTerminalPublication();
 
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
