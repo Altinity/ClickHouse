@@ -34,7 +34,7 @@ Poco::JSON::Object::Ptr parseSchema(const std::string & json)
 DB::ContextMutablePtr contextWithAggregateFunctionStates(bool allow)
 {
     auto context = DB::Context::createCopy(getContext().context);
-    context->setSetting("allow_experimental_aggregate_function_states_in_iceberg", DB::Field(allow));
+    context->setSetting("allow_experimental_aggregate_function_states_in_open_formats", DB::Field(allow));
     return context;
 }
 

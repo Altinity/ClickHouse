@@ -144,7 +144,7 @@ extern const SettingsString iceberg_metadata_compression_method;
 extern const SettingsBool allow_insert_into_iceberg;
 extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_geo_types_in_iceberg;
-extern const SettingsBool allow_experimental_aggregate_function_states_in_iceberg;
+extern const SettingsBool allow_experimental_aggregate_function_states_in_open_formats;
 extern const SettingsBool allow_iceberg_remove_orphan_files;
 extern const SettingsBool allow_experimental_expire_snapshots;
 extern const SettingsBool iceberg_delete_data_on_drop;
@@ -857,14 +857,14 @@ static void checkAggregateFunctionStatesAllowed(const String & column_name, cons
 {
     if (!type || !needsClickHouseTypeAnnotation(type))
         return;
-    if (context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_iceberg])
+    if (context->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_open_formats])
         return;
 
     throw Exception(
         ErrorCodes::SUPPORT_IS_DISABLED,
         "Column '{}' has type {}, which Iceberg cannot express natively: the aggregate state is stored as "
         "binary and its ClickHouse type is recorded in the schema. To allow this, enable setting "
-        "allow_experimental_aggregate_function_states_in_iceberg",
+        "allow_experimental_aggregate_function_states_in_open_formats",
         column_name,
         type->getName());
 }

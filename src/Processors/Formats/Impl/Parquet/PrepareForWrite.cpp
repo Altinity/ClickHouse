@@ -866,7 +866,7 @@ void prepareColumnRecursive(
                 throw Exception(
                     ErrorCodes::UNKNOWN_TYPE,
                     "Internal type '{}' of column '{}' is not supported for conversion into Parquet data format. "
-                    "Enable setting allow_experimental_aggregate_function_states_in_parquet to write the "
+                    "Enable setting allow_experimental_aggregate_function_states_in_open_formats to write the "
                     "serialized states",
                     type->getFamilyName(), name);
 

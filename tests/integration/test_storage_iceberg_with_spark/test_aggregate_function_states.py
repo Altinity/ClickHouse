@@ -15,11 +15,11 @@ from helpers.iceberg_utils import (
 from helpers.test_tools import TSV
 
 
-SETTING = "allow_experimental_aggregate_function_states_in_iceberg"
+SETTING = "allow_experimental_aggregate_function_states_in_open_formats"
 
 STATE_SETTINGS = {SETTING: 1}
 WRITE_SETTINGS = {"allow_insert_into_iceberg": 1}
-PARQUET_STATE_SETTINGS = ["allow_experimental_aggregate_function_states_in_parquet = 1"]
+PARQUET_STATE_SETTINGS = [f"{SETTING} = 1"]
 
 SCHEMA = "(k Int32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64))"
 

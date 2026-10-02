@@ -1424,7 +1424,7 @@ def test_export_part_aggregate_function_states(cluster):
         iceberg,
         columns,
         "k",
-        extra_settings="allow_experimental_aggregate_function_states_in_iceberg = 1",
+        extra_settings="allow_experimental_aggregate_function_states_in_open_formats = 1",
     )
 
     node.query(
@@ -1439,17 +1439,14 @@ def test_export_part_aggregate_function_states(cluster):
         mt,
         part,
         iceberg,
-        extra_settings=(
-            "allow_experimental_aggregate_function_states_in_parquet = 1, "
-            "allow_experimental_aggregate_function_states_in_iceberg = 1"
-        ),
+        extra_settings="allow_experimental_aggregate_function_states_in_open_formats = 1",
     )
     wait_for_export_part(node, mt, part)
     assert_part_log(node, mt, part)
 
     exported = node.query(
         f"SELECT k, uniqMerge(u), sum(s) FROM {iceberg} GROUP BY k ORDER BY k "
-        f"SETTINGS allow_experimental_aggregate_function_states_in_iceberg = 1"
+        f"SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1"
     )
     assert exported == node.query(
         f"SELECT k, uniqMerge(u), sum(s) FROM {mt} WHERE k = 0 GROUP BY k ORDER BY k"

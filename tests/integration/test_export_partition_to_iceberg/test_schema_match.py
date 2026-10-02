@@ -910,7 +910,7 @@ def test_export_partition_aggregate_function_states(cluster, source_engine):
         iceberg_table,
         columns,
         partition_by="k",
-        extra_settings="allow_experimental_aggregate_function_states_in_iceberg = 1",
+        extra_settings="allow_experimental_aggregate_function_states_in_open_formats = 1",
     )
 
     node.query(
@@ -923,15 +923,14 @@ def test_export_partition_aggregate_function_states(cluster, source_engine):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '0' TO TABLE {iceberg_table}",
         settings={
             "allow_insert_into_iceberg": 1,
-            "allow_experimental_aggregate_function_states_in_parquet": 1,
-            "allow_experimental_aggregate_function_states_in_iceberg": 1,
+            "allow_experimental_aggregate_function_states_in_open_formats": 1,
         },
     )
     wait_for_export_status(node, mt_table, iceberg_table, "0", "COMPLETED")
 
     exported = node.query(
         f"SELECT k, uniqMerge(u), sum(s) FROM {iceberg_table} GROUP BY k ORDER BY k "
-        f"SETTINGS allow_experimental_aggregate_function_states_in_iceberg = 1"
+        f"SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1"
     )
     assert exported == node.query(
         f"SELECT k, uniqMerge(u), sum(s) FROM {mt_table} WHERE k = 0 GROUP BY k ORDER BY k"

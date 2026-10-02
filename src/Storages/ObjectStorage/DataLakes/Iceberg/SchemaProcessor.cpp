@@ -59,7 +59,7 @@ extern const int SUPPORT_IS_DISABLED;
 
 namespace Setting
 {
-extern const SettingsBool allow_experimental_aggregate_function_states_in_iceberg;
+extern const SettingsBool allow_experimental_aggregate_function_states_in_open_formats;
 extern const SettingsTimezone iceberg_timezone_for_timestamptz;
 }
 
@@ -589,12 +589,12 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
 
     /// Read the gate from the query context rather than the context captured at `ATTACH`.
     if (hasAggregateFunctionType(annotated_type)
-        && !context_->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_iceberg])
+        && !context_->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_open_formats])
         throw Exception(
             ErrorCodes::SUPPORT_IS_DISABLED,
             "Iceberg field '{}' records ClickHouse type {} in its `{}` key. Reading aggregate function "
             "states from an Iceberg table is disabled: enable setting "
-            "allow_experimental_aggregate_function_states_in_iceberg to honour the recorded type",
+            "allow_experimental_aggregate_function_states_in_open_formats to honour the recorded type",
             field->has(f_name) ? field->getValue<String>(f_name) : type_key,
             annotated_name,
             f_clickhouse_type);

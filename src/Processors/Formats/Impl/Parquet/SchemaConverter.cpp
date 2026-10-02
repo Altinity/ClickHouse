@@ -180,7 +180,7 @@ DataTypePtr SchemaConverter::resolveAnnotatedType(const String & column_name, co
             ErrorCodes::INCORRECT_DATA,
             "Parquet file records ClickHouse type {} for column {} in its `{}` metadata. Inferring "
             "aggregate function states from parquet metadata is disabled: enable setting "
-            "allow_experimental_aggregate_function_states_in_parquet to honour the "
+            "allow_experimental_aggregate_function_states_in_open_formats to honour the "
             "recorded type, or pass the structure explicitly",
             type_name, column_name, clickhouse_column_types_key);
 

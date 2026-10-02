@@ -119,7 +119,7 @@ Iceberg values and records the ClickHouse type name in a `clickhouse.type` key o
 Other query engines ignore the key and see a plain `binary` (or `T`-typed) column.
 
 Creating such a table requires
-[`allow_experimental_aggregate_function_states_in_iceberg`](/operations/settings/settings#allow_experimental_aggregate_function_states_in_iceberg),
+[`allow_experimental_aggregate_function_states_in_open_formats`](/operations/settings/settings#allow_experimental_aggregate_function_states_in_open_formats),
 and so does every query that reads a column whose `clickhouse.type` names an `AggregateFunction` - an
 `INSERT` or an `ALTER TABLE ... EXPORT PART` as much as a `SELECT`. A state is an opaque blob handed
 to the deserializer of the aggregate function the table's metadata names, so with the setting enabled
@@ -133,43 +133,39 @@ for them it takes effect per query; the table engine parses the schema once and 
 query that first touches the table after `ATTACH` decides, and that outcome holds - including for
 queries that do not set it - until `DETACH TABLE` or a server restart.
 
-Writing additionally requires
-[`allow_experimental_aggregate_function_states_in_parquet`](/operations/settings/settings#allow_experimental_aggregate_function_states_in_parquet),
-since the data files are written by the ordinary Parquet writer. An object storage table engine
-freezes its format settings at `CREATE TABLE` - the server settings plus that query's `SETTINGS`
-clause, session settings ignored - so for `INSERT` the Parquet setting belongs there and has no
-effect if given on the `INSERT` instead:
+Writing goes through the ordinary Parquet writer, which takes the same setting from its format
+settings. An object storage table engine freezes its format settings at `CREATE TABLE` - the server
+settings plus that query's `SETTINGS` clause, session settings ignored - so for `INSERT` the setting
+must also be in that clause; given only on the `INSERT`, it does not reach the writer:
 
 ```sql
 CREATE TABLE agg (k UInt32, u AggregateFunction(uniq, UInt64), s SimpleAggregateFunction(sum, UInt64))
 ENGINE = IcebergLocal('/path/to/table/')
 PARTITION BY k
-SETTINGS allow_experimental_aggregate_function_states_in_iceberg = 1,
-         allow_experimental_aggregate_function_states_in_parquet = 1;
+SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1;
 
 -- The states merge exactly as they do in an AggregatingMergeTree table.
 SELECT k, uniqMerge(u), sum(s) FROM agg GROUP BY k
-SETTINGS allow_experimental_aggregate_function_states_in_iceberg = 1;
+SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1;
 ```
 
 `ALTER TABLE ... EXPORT PART` and `ALTER TABLE ... EXPORT PARTITION` from an `AggregatingMergeTree`
 table into such an Iceberg table work as well, so a partition of pre-aggregated states can be moved
-into the lake without finalizing it. Both take the settings off the `ALTER` query itself:
+into the lake without finalizing it. Both take the setting off the `ALTER` query itself:
 
 ```sql
 ALTER TABLE mt EXPORT PART 'all_1_1_0' TO TABLE agg
-SETTINGS allow_experimental_aggregate_function_states_in_parquet = 1;
+SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1;
 
--- EXPORT PARTITION, which only ReplicatedMergeTree implements, records both values in its manifest,
--- so every replica executing the task applies them in place of its own profile.
+-- EXPORT PARTITION, which only ReplicatedMergeTree implements, records the value in its manifest,
+-- so every replica executing the task applies it in place of its own profile.
 ALTER TABLE rmt EXPORT PARTITION ID '1' TO TABLE agg
-SETTINGS allow_experimental_aggregate_function_states_in_parquet = 1,
-         allow_experimental_aggregate_function_states_in_iceberg = 1;
+SETTINGS allow_experimental_aggregate_function_states_in_open_formats = 1;
 ```
 
 The Parquet footer of each data file carries the same information, so `DESCRIBE file('data.parquet')`
-reports the aggregate types too; that path goes through Parquet schema inference and needs the
-Parquet setting rather than the Iceberg one. See
+reports the aggregate types too; that path goes through Parquet schema inference, gated by the same
+setting. See
 [aggregate function states in Parquet](/interfaces/formats/Parquet#aggregate-function-states).
 
 ## Schema evolution {#schema-evolution}

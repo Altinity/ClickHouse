@@ -28,14 +28,14 @@ cleanup()
 }
 trap cleanup EXIT
 
-STATES="--allow_experimental_aggregate_function_states_in_parquet=1"
+STATES="--allow_experimental_aggregate_function_states_in_open_formats=1"
 SKIP="--input_format_parquet_skip_columns_with_unsupported_types_in_schema_inference=1"
 NO_CACHE="--schema_inference_use_cache_for_file=0"
 
 echo '-- without the setting writing a state is refused, as it was before Parquet supported states'
 if ${CLICKHOUSE_CLIENT} --query "
     INSERT INTO FUNCTION file('${REFUSED}', Parquet) SELECT uniqState(number) AS u FROM numbers(10)
-" 2>&1 | grep -q "allow_experimental_aggregate_function_states_in_parquet"
+" 2>&1 | grep -q "allow_experimental_aggregate_function_states_in_open_formats"
 then
     echo 1
 fi
@@ -58,7 +58,7 @@ ${CLICKHOUSE_CLIENT} ${STATES} --query "
 
 echo '-- without the setting the recorded state type is refused, not silently read as String'
 if ${CLICKHOUSE_CLIENT} --query "DESC file('${FILE}', Parquet)" 2>&1 \
-    | grep -q "allow_experimental_aggregate_function_states_in_parquet"
+    | grep -q "allow_experimental_aggregate_function_states_in_open_formats"
 then
     echo 1
 fi
@@ -200,7 +200,7 @@ ${CLICKHOUSE_CLIENT} ${STATES} --query "
 touch -t 200001010000 "${USER_FILES_PATH}/${CACHED}"
 ${CLICKHOUSE_CLIENT} ${STATES} --query "DESC file('${CACHED}', Parquet)"
 if ${CLICKHOUSE_CLIENT} --query "DESC file('${CACHED}', Parquet)" 2>&1 \
-    | grep -q "allow_experimental_aggregate_function_states_in_parquet"
+    | grep -q "allow_experimental_aggregate_function_states_in_open_formats"
 then
     echo 1
 fi
@@ -213,7 +213,7 @@ ${CLICKHOUSE_CLIENT} ${STATES} --query "
 touch -t 200001010000 "${USER_FILES_PATH}/${CACHED_SKIP}"
 ${CLICKHOUSE_CLIENT} ${SKIP} --query "DESC file('${CACHED_SKIP}', Parquet)"
 if ${CLICKHOUSE_CLIENT} --query "DESC file('${CACHED_SKIP}', Parquet)" 2>&1 \
-    | grep -q "allow_experimental_aggregate_function_states_in_parquet"
+    | grep -q "allow_experimental_aggregate_function_states_in_open_formats"
 then
     echo 1
 fi
