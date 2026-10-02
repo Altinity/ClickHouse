@@ -861,7 +861,7 @@ TEST(CASMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
     /// a renewal, so the farewell's guarded write is the first thing to observe it.
     ASSERT_EQ(ops.op.removeCurrent(mount_key, Retry::standard()), Removal::Removed);
 
-    EXPECT_NO_THROW(k.release())
+    EXPECT_NO_THROW(k.release(k.lastCommittedAttemptStartBootMs() + 100))
         << "clean release against a vanished store must be a no-op, not a LOGICAL_ERROR abort";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before);
 }
@@ -2366,7 +2366,7 @@ TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
 
     fence_lost = true;
 
-    EXPECT_NO_THROW(departing.release());
+    EXPECT_NO_THROW(departing.release(departing.lastCommittedAttemptStartBootMs() + 1000));
     const MountLease farewell = decodeMountLease(seed.read(l.mountKey("departing"), Retry::standard())->bytes);
     EXPECT_EQ(farewell.min_active_build_sequence, std::numeric_limits<uint64_t>::max());
 }

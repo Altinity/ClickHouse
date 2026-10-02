@@ -597,7 +597,9 @@ public:
     /// One renewal on `lease_requests` under `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`. Ends on
     /// a definitive answer, a deterministic local failure, or when `environment.live` refuses.
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
-    void release();
+    /// The farewell. It gives up rather than run past `lease_deadline_boot_ms` less the safety margin;
+    /// the deadline is on the boot clock this renewer anchors its renewals on.
+    void release(uint64_t lease_deadline_boot_ms);
 
     MountLeaseRenewerState state() const { return renewer_state; }
     bool canRelease() const { return renewer_state == MountLeaseRenewerState::Active; }
@@ -613,7 +615,7 @@ private:
     /// holds the classification before the event sink runs, so the sink cannot change it.
     [[noreturn]] void throwRenewConflict(const Observation & seen, MountRenewTerminalClassification & classification) const;
     MountRenewResult terminalResult(MountRenewResult result);
-    void terminate(CasOperation & op);
+    void terminate(CasOperation & op, uint64_t lease_deadline_boot_ms);
 
     CasRequests & open_requests;
     /// The plane of a renewal: no lease budget, and a sleep a stop wakes.
@@ -636,7 +638,6 @@ private:
     /// The incarnation our last landed write created; every renewal and the farewell name it as the
     /// precondition. Unset only before `start` has landed one.
     std::optional<Etag> last_etag;
-    uint64_t confirmed_deadline_boot_ms = 0;
     uint64_t last_committed_attempt_start_boot_ms = 0;
 };
 

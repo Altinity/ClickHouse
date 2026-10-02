@@ -1077,9 +1077,13 @@ void CasMountRuntime::finishTeardown(bool drained)
         return;
     if (drained && mount_renewer->state() == MountLeaseRenewerState::Active)
     {
+        const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
+        const uint64_t start_boot_ms = mount_renewer->lastCommittedAttemptStartBootMs();
         try
         {
-            mount_renewer->release();
+            mount_renewer->release(start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
+                ? std::numeric_limits<uint64_t>::max()
+                : start_boot_ms + ttl_ms);
         }
         catch (...)
         {

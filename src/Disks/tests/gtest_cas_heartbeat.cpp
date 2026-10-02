@@ -346,7 +346,7 @@ TEST(CASHeartbeat, StopStampsExpiredAndFarewellSentinel)
     renewer.start();
 
     now_ms = 2000;
-    renewer.release();
+    renewer.release(renewer.lastCommittedAttemptStartBootMs() + 100);
 
     auto m = decodeMountLease(ops.op.read(layout.mountKey(srid), Retry::standard())->bytes);
     /// Terminal body stamps the lease already-expired (so a same-server reopen reclaims immediately)
@@ -402,7 +402,7 @@ TEST(CASHeartbeat, FarewellIsAdmittedUnderTheDefaultBudget)
     renewer.start();
 
     now_ms = 2000;
-    EXPECT_NO_THROW(renewer.release())
+    EXPECT_NO_THROW(renewer.release(renewer.lastCommittedAttemptStartBootMs() + 30000))
         << "the farewell's policy window must admit the write's own two-envelope reservation "
            "(2 * 7000 ms with the shipped defaults) -- otherwise a clean shutdown never hands the "
            "mount slot back and every restart pays a full incarnation-stability observation";
@@ -435,7 +435,7 @@ TEST(CASHeartbeat, FarewellIsAdmittedUnderADifferentEnvelope)
     renewer.start();
 
     now_ms = 2000;
-    EXPECT_NO_THROW(renewer.release())
+    EXPECT_NO_THROW(renewer.release(renewer.lastCommittedAttemptStartBootMs() + 40000))
         << "the farewell's policy window must be DERIVED from this backend's own envelope "
            "(2 * 9000 ms), not hardcoded to the shipped-default window -- a window fixed at "
            "16000 ms would refuse this write's 18000 ms reservation";
@@ -474,7 +474,7 @@ TEST(CASHeartbeat, FarewellIsRefusedWhenTheLeaseExpiresBeforeItsDerivedWindow)
     bool threw = false;
     try
     {
-        renewer.release();
+        renewer.release(renewer.lastCommittedAttemptStartBootMs() + 5000);
     }
     catch (const DB::Exception & e)
     {
@@ -491,6 +491,69 @@ TEST(CASHeartbeat, FarewellIsRefusedWhenTheLeaseExpiresBeforeItsDerivedWindow)
     auto m = decodeMountLease(ops.op.read(layout.mountKey(srid), Retry::standard())->bytes);
     EXPECT_NE(m.min_active_build_sequence, std::numeric_limits<uint64_t>::max())
         << "the refused write must not have landed";
+}
+
+/// The farewell is bounded by the deadline its caller passes. A near deadline refuses it although the
+/// renewer's own lease would admit it, and a far one admits it although that lease would refuse it.
+TEST(CASHeartbeat, FarewellIsBoundByTheDeadlineItIsGiven)
+{
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+
+    {
+        auto backend = std::make_shared<DefaultEnvelopeBackend>();
+        uint64_t now_ms = 1000;
+        uint64_t boot_ms = 100;
+        Ops ops(backend, &boot_ms);
+        seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/30000);
+        MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+                                  std::chrono::milliseconds(30000), [&] { return now_ms; },
+                                  [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(2000),
+                                  [&] { return boot_ms; });
+        renewer.start();
+
+        now_ms = 2000;
+        String message;
+        int code = 0;
+        try
+        {
+            /// A TTL of 30000 admits this farewell (`FarewellIsAdmittedUnderTheDefaultBudget`); the
+            /// deadline passed here leaves too little past the margin for the write's reservation.
+            renewer.release(boot_ms + 5000);
+            ADD_FAILURE() << "a farewell must be refused when the deadline it is given cannot admit it";
+        }
+        catch (const DB::Exception & e)
+        {
+            message = e.message();
+            code = e.code();
+        }
+        EXPECT_EQ(code, DB::ErrorCodes::NETWORK_ERROR) << message;
+        EXPECT_NE(message.find("gave up at the lease deadline after zero attempt(s)"), String::npos) << message;
+        EXPECT_NE(decodeMountLease(ops.op.read(layout.mountKey(srid), Retry::standard())->bytes).min_active_build_sequence,
+                  std::numeric_limits<uint64_t>::max())
+            << "the refused farewell must not have landed";
+    }
+
+    {
+        auto backend = std::make_shared<DefaultEnvelopeBackend>();
+        uint64_t now_ms = 1000;
+        uint64_t boot_ms = 100;
+        Ops ops(backend, &boot_ms);
+        seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/5000);
+        MountLeaseRenewer renewer(ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9,
+                                  std::chrono::milliseconds(5000), [&] { return now_ms; },
+                                  [] { return uint64_t{5}; }, {}, std::chrono::milliseconds(2000),
+                                  [&] { return boot_ms; });
+        renewer.start();
+
+        now_ms = 2000;
+        /// A TTL of 5000 refuses this farewell (`FarewellIsRefusedWhenTheLeaseExpiresBeforeItsDerivedWindow`).
+        EXPECT_NO_THROW(renewer.release(boot_ms + 30000));
+        const MountLease farewell = decodeMountLease(ops.op.read(layout.mountKey(srid), Retry::standard())->bytes);
+        EXPECT_LE(farewell.expires_at_ms, now_ms);
+        EXPECT_EQ(farewell.min_active_build_sequence, std::numeric_limits<uint64_t>::max());
+    }
 }
 
 /// The lease bound added above must not change what an ordinary Conflict outcome does: a successor
@@ -532,7 +595,7 @@ TEST(CASHeartbeat, ForeignIncarnationDuringFarewellLeavesTheSuccessorUntouchedAn
     int code = 0;
     try
     {
-        renewer.release();
+        renewer.release(renewer.lastCommittedAttemptStartBootMs() + 100);
         FAIL() << "a farewell that finds a foreign, unfenced incarnation must report the conflict, "
                   "not silently succeed or clobber the successor";
     }
@@ -766,7 +829,7 @@ TEST(CASMountAudit, RenewerAdoptEmitsClaimAndTerminateEmitsRelease)
 
     seen.clear();
     now_ms = 2000;
-    renewer.release();
+    renewer.release(renewer.lastCommittedAttemptStartBootMs() + 100);
 
     ASSERT_EQ(seen.size(), 1u);
     EXPECT_EQ(seen[0].type, CasEventType::MountRelease);
@@ -934,15 +997,15 @@ TEST(CASHeartbeat, RenewerStateAllowsOnlyActiveReleaseOrTerminal)
             [&] { return boot_ms; });
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::New);
         EXPECT_RENEWER_STATE_REJECTION(renewer.renew(renewalEnvironment(boot_ms)));
-        EXPECT_RENEWER_STATE_REJECTION(renewer.release());
+        EXPECT_RENEWER_STATE_REJECTION(renewer.release(renewer.lastCommittedAttemptStartBootMs() + 1000));
         EXPECT_EQ(renewer.start(), 100u);
         EXPECT_RENEWER_STATE_REJECTION(renewer.start());
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::Active);
-        renewer.release();
+        renewer.release(renewer.lastCommittedAttemptStartBootMs() + 1000);
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::Released);
         EXPECT_RENEWER_STATE_REJECTION(renewer.start());
         EXPECT_RENEWER_STATE_REJECTION(renewer.renew(renewalEnvironment(boot_ms)));
-        EXPECT_RENEWER_STATE_REJECTION(renewer.release());
+        EXPECT_RENEWER_STATE_REJECTION(renewer.release(renewer.lastCommittedAttemptStartBootMs() + 1000));
     }
 
     {
@@ -967,7 +1030,7 @@ TEST(CASHeartbeat, RenewerStateAllowsOnlyActiveReleaseOrTerminal)
         EXPECT_EQ(renewer.state(), MountLeaseRenewerState::RenewalTerminal);
         EXPECT_RENEWER_STATE_REJECTION(renewer.start());
         EXPECT_RENEWER_STATE_REJECTION(renewer.renew(renewalEnvironment(boot_ms)));
-        EXPECT_RENEWER_STATE_REJECTION(renewer.release());
+        EXPECT_RENEWER_STATE_REJECTION(renewer.release(renewer.lastCommittedAttemptStartBootMs() + 1000));
     }
 
 #undef EXPECT_RENEWER_STATE_REJECTION
@@ -1065,7 +1128,7 @@ TEST(CASHeartbeat, CancellationBeforeSendIsNotAttemptedAndAllowsRelease)
     EXPECT_EQ(result.failure, nullptr);
     EXPECT_EQ(renewer.state(), MountLeaseRenewerState::Active);
     EXPECT_TRUE(backend->attempts.empty());
-    EXPECT_NO_THROW(renewer.release());
+    EXPECT_NO_THROW(renewer.release(renewer.lastCommittedAttemptStartBootMs() + 1000));
     EXPECT_EQ(renewer.state(), MountLeaseRenewerState::Released);
 }
 

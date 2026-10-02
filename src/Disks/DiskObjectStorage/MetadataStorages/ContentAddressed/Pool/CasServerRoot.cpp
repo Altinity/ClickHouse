@@ -1237,10 +1237,6 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
     seq = 1;
     last_etag = etag;
     last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
-    const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
-    confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
-        ? std::numeric_limits<uint64_t>::max()
-        : attempt_start_boot_ms + ttl_ms;
     renewer_state = MountLeaseRenewerState::Active;
     return attempt_start_boot_ms;
 }
@@ -1402,10 +1398,6 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
         seq = next_seq;
         last_etag = std::move(committed->etag);
         last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
-        const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
-        confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
-            ? std::numeric_limits<uint64_t>::max()
-            : attempt_start_boot_ms + ttl_ms;
         result.outcome = MountRenewOutcome::Committed;
         result.attempts_sent = committed->attempts_sent;
         result.resolved_by_read = committed->resolved_by_read;
@@ -1485,7 +1477,7 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
         "CAS mount-lease: the renewal of key '{}' was declined, which a replace cannot report", key);
 }
 
-void MountLeaseRenewer::terminate(CasOperation & op)
+void MountLeaseRenewer::terminate(CasOperation & op, uint64_t lease_deadline_boot_ms)
 {
     const uint64_t wall_ms = now_ms_fn();
     const String body = encodeMountLease(MountLease{
@@ -1504,10 +1496,10 @@ void MountLeaseRenewer::terminate(CasOperation & op)
     /// `CasOperation::writeLoop` -- is exactly `2 * open_requests.attemptReservationMs()`. A window
     /// below that value refuses the write before its first attempt, deterministically, on every call:
     /// `kFarewellBudgetMs` alone predates the attempt-envelope reservation and can no longer be trusted
-    /// to admit it. Saturating, like every other deadline computation on this path (see the
-    /// `expires_at_ms`/`confirmed_deadline_boot_ms` arithmetic above): an operator-configured envelope
-    /// is not bounds-checked against this doubling, and wrapping past `UINT64_MAX` would turn a too-long
-    /// window into a too-SHORT one -- the exact failure mode this fix exists to remove.
+    /// to admit it. Saturating, like every other deadline computation on this path: an
+    /// operator-configured envelope is not bounds-checked against this doubling, and wrapping past
+    /// `UINT64_MAX` would turn a too-long window into a too-SHORT one -- the exact failure mode this fix
+    /// exists to remove.
     const uint64_t reservation_ms = open_requests.attemptReservationMs();
     const uint64_t doubled_reservation_ms = reservation_ms > std::numeric_limits<uint64_t>::max() / 2
         ? std::numeric_limits<uint64_t>::max()
@@ -1520,11 +1512,8 @@ void MountLeaseRenewer::terminate(CasOperation & op)
     /// node's own fence may already be gone. The precondition on this write already stops it from clobbering
     /// a successor if it DOES land late, but a shutdown holding the process open to retry a write past
     /// its own lease-safe deadline serves no one -- the successor's own reclaim does not wait for it.
-    /// `confirmed_deadline_boot_ms` is set at `start()` and kept current by every successful `renew`,
-    /// so it is valid here whenever `terminate` runs (only reachable from `release`, which requires
-    /// `Active`, which `start` alone establishes).
     WriteResult written = op.replace(key, body, precondition(),
-        Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()), farewell_window_ms));
+        Retry::untilLeaseSafe(lease_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()), farewell_window_ms));
 
     if (Committed * committed = std::get_if<Committed>(&written))
     {
@@ -1557,7 +1546,7 @@ void MountLeaseRenewer::terminate(CasOperation & op)
     orThrow(std::move(written), fmt::format("CAS mount-lease release of key '{}'", key));
 }
 
-void MountLeaseRenewer::release()
+void MountLeaseRenewer::release(uint64_t lease_deadline_boot_ms)
 {
     if (renewer_state != MountLeaseRenewerState::Active)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount-lease: release is allowed only in Active state for key '{}'", key);
@@ -1566,7 +1555,7 @@ void MountLeaseRenewer::release()
     /// run down still has to hand the slot back, and refusing the write there would leave the slot
     /// looking live until GC fences it out.
     CasOperation op = open_requests.admit();
-    terminate(op);
+    terminate(op, lease_deadline_boot_ms);
 }
 
 void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix) noexcept
