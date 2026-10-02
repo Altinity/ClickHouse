@@ -131,6 +131,11 @@ namespace Setting
     extern const SettingsMap additional_table_filters;
     extern const SettingsUInt64 aggregation_in_order_max_block_bytes;
     extern const SettingsUInt64 aggregation_memory_efficient_merge_threads;
+<<<<<<< HEAD
+=======
+    extern const SettingsBool allow_calculating_subcolumns_sizes_for_merge_tree_reading;
+    extern const SettingsBool allow_experimental_analyzer;
+>>>>>>> 5e9165a4d99 (Merge pull request #123431 from mkmkme/fix/view-analyzer-distributed-26.8)
     extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
     extern const SettingsUInt64 automatic_parallel_replicas_mode;
     extern const SettingsBool allow_experimental_query_deduplication;
@@ -3694,7 +3699,15 @@ void InterpreterSelectQuery::initSettings()
 {
     auto & query = getSelectQuery();
     if (query.settings())
+    {
         InterpreterSetQuery(query.settings(), context).executeForCurrentContext(options.ignore_setting_constraints);
+
+        /// The old interpreter disabled the analyzer in `IInterpreterUnionOrSelectQuery`, but a `SELECT`
+        /// stored in a `VIEW` may enable it again here. Storages must not use analyzer-only query tree
+        /// paths (for example, `StorageDistributed::read`) when this interpreter built the query.
+        if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
+            context->setSetting("allow_experimental_analyzer", false);
+    }
 
     const auto & client_info = context->getClientInfo();
     auto min_major = DBMS_MIN_MAJOR_VERSION_WITH_CURRENT_AGGREGATION_VARIANT_SELECTION_METHOD;
