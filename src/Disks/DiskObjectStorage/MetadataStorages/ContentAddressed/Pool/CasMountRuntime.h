@@ -326,9 +326,6 @@ public:
     /// `driver_mutex`.
     void noteRenewRequest(const MountRenewRequestEvent & event) noexcept;
 
-    /// Writes one `WARNING` per lease expiry, at the first request event after it. Called from `noteRenewRequest`.
-    void warnOnceIfLeaseExpired(const MountRenewRequestEvent & event) noexcept;
-
     /// TRUE once the pool has reached — or is being driven toward — a state on which the lease thread
     /// must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
     /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
@@ -453,6 +450,8 @@ private:
     /// caused by the stop cannot be mistaken for one that preceded it.
     bool renewalCancelled() const;
     void tripFenceWithoutOperationalLoss();
+    /// Writes one `WARNING` per lease expiry, at the first request event after it. Called from `noteRenewRequest`.
+    void warnOnceIfLeaseExpired(const MountRenewRequestEvent & event) noexcept;
     /// Publish `deadline_boot_ms` as a fresh lease incarnation and open the fence. With `report_live`,
     /// `Live` is published before the fence opens, so a reader that sees the fence armed reads `Live`.
     void armFence(uint64_t deadline_boot_ms, bool report_live);
