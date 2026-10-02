@@ -574,14 +574,16 @@ async function getCIReportsFromPR(prUrl) {
 
   console.log(`Fetching CI reports for PR #${prNumber}...\n`);
 
-  // Fetch PR comments to find CI bot comment.
+  // Report URLs are the signal — do not filter by bot login.
+  // Altinity posts via github-actions[bot] with the virtual-hosted S3 URL;
+  // older comments used clickhouse-gh[bot] and path-style S3.
   // Drop GH_CONFIG_DIR before spawning gh: some agent/runner checkouts set it to a poisoned
   // config dir (no/expired auth) that makes `gh api` fail, while the default config is fine.
   // Other repo tooling (patch-release-check) does the same via `env -u GH_CONFIG_DIR gh`.
   const ghEnv = { ...process.env };
   delete ghEnv.GH_CONFIG_DIR;
   try {
-    const commentsJson = execSync(`gh api repos/Altinity/ClickHouse/issues/${prNumber}/comments --paginate --jq '.[] | select(.user.login == "clickhouse-gh[bot]") | {body, created_at}'`, {
+    const commentsJson = execSync(`gh api repos/Altinity/ClickHouse/issues/${prNumber}/comments --paginate --jq '.[] | {body, created_at}'`, {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: ghEnv
@@ -589,15 +591,12 @@ async function getCIReportsFromPR(prUrl) {
 
     const comments = commentsJson.trim().split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
     comments.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-    if (!comments || comments.length === 0) {
-      throw new Error('No CI bot comment found');
-    }
 
-    // Search through all bot comments for CI report URLs (not just the latest). Exclude backtick and
+    // Search through all comments for CI report URLs (not just the latest). Exclude backtick and
     // quote chars so a URL quoted in markdown (e.g. inside the AI-review text) is not captured with
     // trailing junk, strip trailing punctuation, and dedupe -- otherwise the same report is fetched
-    // twice and the summary is doubled.
-    const reportUrlPattern = /https:\/\/s3\.amazonaws\.com\/altinity-build-artifacts\/json\.html\?[^\s)`'"]+/g;
+    // twice and the summary is doubled. Match both path-style and virtual-hosted S3 URLs.
+    const reportUrlPattern = /https:\/\/(?:s3\.amazonaws\.com\/altinity-build-artifacts|altinity-build-artifacts\.s3\.amazonaws\.com)\/json\.html\?[^\s)`'"]+/g;
     for (const comment of comments) {
       if (!comment.body) continue;
       let urls = comment.body.match(reportUrlPattern);
@@ -607,9 +606,9 @@ async function getCIReportsFromPR(prUrl) {
       }
     }
 
-    throw new Error('No CI report URLs found in bot comments');
+    throw new Error('No CI report URLs found in PR comments');
   } catch (error) {
-    if (error.message.includes('No CI bot comment found') || error.message.includes('No CI report URLs found')) {
+    if (error.message.includes('No CI report URLs found')) {
       throw error;
     }
     throw new Error(`Failed to fetch PR comments: ${error.message}`);

@@ -59,6 +59,10 @@ USE_CUSTOM_GH_AUTH = False
 
 INSTALL_PYTHON_REQS_FOR_NATIVE_JOBS = ""
 
+# NOTE (strtgbb): anonymous submodule fetches of non-tip pins get refused
+# after the burst of ~150 clones; send the ambient gh token instead.
+ENABLE_SUBMODULE_CLONE_AUTH = True
+
 DISABLED_WORKFLOWS = [
     "backport_branches.py",
     "custom_build_praktika.py",
