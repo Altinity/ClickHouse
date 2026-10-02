@@ -60,35 +60,35 @@ SchemaConverter::SchemaConverter(
     }
 
     /// An explicit structure takes precedence over type annotations in the footer.
-    for (const auto & kv : file_metadata.key_value_metadata)
+    if (!sample_block)
     {
-        if (sample_block)
+        for (const auto & kv : file_metadata.key_value_metadata)
+        {
+            if (kv.key != clickhouse_column_types_key)
+                continue;
+
+            try
+            {
+                Poco::JSON::Parser parser;
+                const auto object = parser.parse(kv.value).extract<Poco::JSON::Object::Ptr>();
+                for (const auto & name : object->getNames())
+                    clickhouse_column_type_names[name] = object->getValue<String>(name);
+            }
+            catch (Exception & e)
+            {
+                e.addMessage("while parsing the `{}` key-value metadata of the parquet file", clickhouse_column_types_key);
+                throw;
+            }
+            catch (const Poco::Exception & e)
+            {
+                throw Exception(
+                    ErrorCodes::INCORRECT_DATA,
+                    "Cannot parse the `{}` key-value metadata of the parquet file: {}",
+                    clickhouse_column_types_key,
+                    e.displayText());
+            }
             break;
-
-        if (kv.key != clickhouse_column_types_key)
-            continue;
-
-        try
-        {
-            Poco::JSON::Parser parser;
-            const auto object = parser.parse(kv.value).extract<Poco::JSON::Object::Ptr>();
-            for (const auto & name : object->getNames())
-                clickhouse_column_type_names[name] = object->getValue<String>(name);
         }
-        catch (Exception & e)
-        {
-            e.addMessage("while parsing the `{}` key-value metadata of the parquet file", clickhouse_column_types_key);
-            throw;
-        }
-        catch (const Poco::Exception & e)
-        {
-            throw Exception(
-                ErrorCodes::INCORRECT_DATA,
-                "Cannot parse the `{}` key-value metadata of the parquet file: {}",
-                clickhouse_column_types_key,
-                e.displayText());
-        }
-        break;
     }
 }
 

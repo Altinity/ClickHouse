@@ -843,25 +843,6 @@ void prepareColumnRecursive(
     /// parquet dictionary-encoding.
     column = column->convertToFullColumnIfReplicated()->convertToFullColumnIfSparse()->convertToFullColumnIfConst();
 
-    if (type->getTypeId() == TypeIndex::AggregateFunction)
-    {
-        if (!options.allow_aggregate_function_states)
-            throw Exception(
-                ErrorCodes::UNKNOWN_TYPE,
-                "Internal type '{}' of column '{}' is not supported for conversion into Parquet data format. "
-                "Enable setting allow_experimental_aggregate_function_states_in_parquet to write the "
-                "serialized states",
-                type->getFamilyName(), name);
-
-        convertAggregateFunctionColumnToString(column, type);
-        /// Serialized states are binary even when Parquet strings use the UTF8 logical type.
-        WriteOptions binary_options = options;
-        binary_options.output_string_as_string = false;
-        preparePrimitiveColumn(
-            column, type, name, binary_options, states, schemas, lookupLeafFieldId(column_field_ids, name));
-        return;
-    }
-
     switch (type->getTypeId())
     {
         case TypeIndex::Nullable: prepareColumnNullable(column, type, name, options, states, schemas, column_field_ids); break;
@@ -877,6 +858,24 @@ void prepareColumnRecursive(
             else
                 /// Use nested data type, but keep ColumnLowCardinality. The encoder can deal with it.
                 preparePrimitiveColumn(column, nested_type, name, options, states, schemas, lookupLeafFieldId(column_field_ids, name));
+            break;
+        }
+        case TypeIndex::AggregateFunction:
+        {
+            if (!options.allow_aggregate_function_states)
+                throw Exception(
+                    ErrorCodes::UNKNOWN_TYPE,
+                    "Internal type '{}' of column '{}' is not supported for conversion into Parquet data format. "
+                    "Enable setting allow_experimental_aggregate_function_states_in_parquet to write the "
+                    "serialized states",
+                    type->getFamilyName(), name);
+
+            convertAggregateFunctionColumnToString(column, type);
+            /// Serialized states are binary even when Parquet strings use the UTF8 logical type.
+            WriteOptions binary_options = options;
+            binary_options.output_string_as_string = false;
+            preparePrimitiveColumn(
+                column, type, name, binary_options, states, schemas, lookupLeafFieldId(column_field_ids, name));
             break;
         }
         default:
