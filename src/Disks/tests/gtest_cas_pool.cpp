@@ -4838,6 +4838,9 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
     std::vector<bool> may_mutate_at_commit;
     DB::Cas::tests::ManualBarrier second_commit;
     CasMountRuntime * runtime_ptr = nullptr;
+    /// Far above the longest legitimate outage here (one request per second for three lease lengths).
+    constexpr uint64_t max_outage_requests = 500;
+    std::atomic<bool> request_bound_hit{false};
     /// Declared after the locals its hooks capture.
     auto backend = std::make_shared<RuntimeRenewBackend>();
     ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
@@ -4846,7 +4849,16 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
-                    .boot_ms_fn = [&] { return boot_ms.load(); }},
+                    .boot_ms_fn = [&] { return boot_ms.load(); },
+                    /// The test clock moves only through the sleep seam, so a regression that zeroes the
+                    /// pauses would retry forever; the request count ends the renewal instead.
+                    .renewal_live_for_test = [&]
+                    {
+                        if (backend->outage_writes.load() < max_outage_requests)
+                            return true;
+                        request_bound_hit = true;
+                        return false;
+                    }},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
     runtime_ptr = &runtime;
@@ -4867,7 +4879,23 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
     };
     runtime.startBackgroundWorkers(std::chrono::milliseconds(500));
 
-    second_commit.waitUntilArrived();
+    bool arrived = true;
+    try
+    {
+        second_commit.waitUntilArrived();
+    }
+    catch (const DB::Exception &)
+    {
+        arrived = false;
+    }
+    if (!arrived)
+    {
+        runtime.stopBackgroundWorkers();
+        runtime.finishTeardown(false);
+        FAIL() << "the second renewal never committed; request bound hit: " << request_bound_hit.load();
+    }
+    EXPECT_FALSE(request_bound_hit.load())
+        << "the first renewal sent " << max_outage_requests << " requests without the clock reaching the end of the outage";
     ASSERT_EQ(commit_boot_ms.size(), 2u);
     EXPECT_GE(commit_boot_ms[0], anchor + 3'500) << "the first renewal outlived its own lease";
     EXPECT_EQ(commit_boot_ms[1], commit_boot_ms[0])

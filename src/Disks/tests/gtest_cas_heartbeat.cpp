@@ -1425,6 +1425,8 @@ public:
     static constexpr uint64_t ttl_ms = 30'000;
     static constexpr uint64_t period_ms = 10'000;
     static constexpr uint64_t margin_ms = 2'000;
+    /// Far above the longest legitimate renewal (one request per second for a few lease lengths).
+    static constexpr size_t max_requests = 500;
 
     UnboundedRenewalFixture()
     {
@@ -1453,10 +1455,24 @@ public:
         const std::function<bool()> & cancelled = {},
         std::function<void(const MountRenewRequestEvent &)> on_request = {})
     {
-        MountRenewOperationEnvironment environment = renewalEnvironment(boot_ms, live, cancelled);
+        /// The test clock moves only through the sleep seam, so a regression that zeroes every pause would
+        /// loop forever; the request count bounds the renewal and the check below fails it instead.
+        const auto bounded_live = [this, live]
+        {
+            if (backend->attempts.size() + backend->read_calls >= max_requests)
+            {
+                request_bound_hit = true;
+                return false;
+            }
+            return !live || live();
+        };
+        MountRenewOperationEnvironment environment = renewalEnvironment(boot_ms, bounded_live, cancelled);
         environment.policy = policy;
         environment.on_request = std::move(on_request);
-        return renewer->renew(environment);
+        MountRenewResult result = renewer->renew(environment);
+        EXPECT_FALSE(request_bound_hit) << "the renewal sent " << max_requests
+            << " requests without the clock reaching the end of the outage: the spaced pauses are not advancing it";
+        return result;
     }
 
     /// The `branch` of every `MountConflict` event, in order.
@@ -1480,6 +1496,7 @@ public:
     std::unique_ptr<MountLeaseRenewer> renewer;
     uint64_t anchor = 0;
     uint64_t renewal_start = 0;
+    bool request_bound_hit = false;
 };
 
 /// A request start (`P`) or a resolve read (`R`), with the boot clock when it was issued.
