@@ -334,7 +334,7 @@ bool CasMountRuntime::waitUntilArmed(uint64_t timeout_ms) const
     {
         if (!mount_fence.lost.load(std::memory_order_acquire))
             return true;
-        if (workers_stop_requested || remountTerminal() || !workers_started)
+        if (stopOrTerminal() || !workers_started)
             return false;
         const uint64_t now = bootMsNow();
         if (now >= give_up)
@@ -348,10 +348,19 @@ bool CasMountRuntime::waitUntilArmed(uint64_t timeout_ms) const
 bool CasMountRuntime::canArm(uint64_t deadline_boot_ms) const
 {
     /// The clock is read last and only when every other term holds.
-    return !workers_stop_requested
-        && !remountTerminal()
-        && remount_requested_generation <= remount_handled_generation
+    return !stopOrTerminal()
+        && !remountRequestPending()
         && budgetAdmits(deadline_boot_ms, bootMsNow(), cas_request_budget.writeAndSettlementReadMs()) == Fence::Admit::Ok;
+}
+
+bool CasMountRuntime::remountRequestPending() const
+{
+    return remount_requested_generation > remount_handled_generation;
+}
+
+bool CasMountRuntime::stopOrTerminal() const
+{
+    return workers_stop_requested || remountTerminal();
 }
 
 bool CasMountRuntime::lossNeedsNewRequest() const
@@ -491,9 +500,7 @@ bool CasMountRuntime::renewalLive() const
     std::lock_guard lock(driver_mutex);
     /// A lost fence alone does not end it: the renewal that makes an open or a reclaim ready runs under
     /// one, and every trip that must end it comes with a request, a terminal lifecycle or a stop.
-    return !workers_stop_requested
-        && remount_requested_generation <= remount_handled_generation
-        && !remountTerminal();
+    return !stopOrTerminal() && !remountRequestPending();
 }
 
 bool CasMountRuntime::renewalCancelled() const
@@ -549,23 +556,6 @@ std::optional<CasMountRuntime::RestoredLease> CasMountRuntime::consumeRenewResul
         driver_cv.notify_all();
     }
 
-    if (result.outcome != MountRenewOutcome::Terminal)
-        return restored;
-
-    if (!result.failure)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: terminal renewal has no failure");
-    try
-    {
-        std::rethrow_exception(result.failure);
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() == ErrorCodes::LOGICAL_ERROR)
-            throw;
-    }
-    catch (...)
-    {
-    }
     return restored;
 }
 
@@ -663,9 +653,7 @@ void CasMountRuntime::renewalLoop()
     /// waits for the backoff too.
     const auto woken = [this](bool by_request)
     {
-        const bool wake = workers_stop_requested
-            || remountTerminal()
-            || (by_request && remount_requested_generation > remount_handled_generation);
+        const bool wake = stopOrTerminal() || (by_request && remountRequestPending());
         if (!wake && config.lease_wait_predicate_false_hook_for_test)
             config.lease_wait_predicate_false_hook_for_test();
         return wake;
@@ -681,9 +669,9 @@ void CasMountRuntime::renewalLoop()
         uint64_t snapshot = 0;
         {
             std::unique_lock lock(driver_mutex);
-            if (workers_stop_requested || remountTerminal())
+            if (stopOrTerminal())
                 return;
-            if (remount_requested_generation > remount_handled_generation)
+            if (remountRequestPending())
             {
                 reclaim = true;
                 snapshot = remount_requested_generation;
@@ -987,23 +975,13 @@ void CasMountRuntime::publishVanishedIntent()
     driver_cv.notify_all();
 }
 
-void CasMountRuntime::scheduleRemount()
-{
-    schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard lock(driver_mutex);
-    if (workers_stop_requested || remountTerminal())
-        return;
-    ++remount_requested_generation;
-    driver_cv.notify_all();
-}
-
 void CasMountRuntime::tripAndRequestRemount()
 {
     schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(driver_mutex);
     /// Atomics only.
     tripMountLost();
-    if (workers_stop_requested || remountTerminal())
+    if (stopOrTerminal())
         return;
     if (lossNeedsNewRequest())
         ++remount_requested_generation;
@@ -1012,9 +990,14 @@ void CasMountRuntime::tripAndRequestRemount()
 
 bool CasMountRuntime::scheduleRemountForTest()
 {
-    scheduleRemount();
+    schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(driver_mutex);
-    return workers_started && remount_requested_generation > remount_handled_generation;
+    if (!stopOrTerminal())
+    {
+        ++remount_requested_generation;
+        driver_cv.notify_all();
+    }
+    return workers_started && remountRequestPending();
 }
 
 void CasMountRuntime::beginShutdownForTest()

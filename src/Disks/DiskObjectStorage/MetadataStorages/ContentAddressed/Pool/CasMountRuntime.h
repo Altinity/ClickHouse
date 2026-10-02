@@ -373,16 +373,16 @@ public:
     void renewerReset();
     void startBackgroundWorkers();
     void stopBackgroundWorkers();
-    /// Latch a recovery generation for the lease thread. It never constructs a thread.
-    void scheduleRemount();
     /// One interference report: trip the fence and request a remount in one `driver_mutex` step, so no
     /// reclaim can arm between the two. Raises no generation when a request that no reclaim has started
     /// serving is pending: the reclaim that serves it latches after this trip.
     void tripAndRequestRemount();
+    /// Request a remount without a trip, unless a stop or a terminal lifecycle refuses it. Returns whether
+    /// a lease thread runs and a request is pending.
     bool scheduleRemountForTest();
     void beginShutdownForTest();
-    /// Return how many remount requests were attempted, refused ones included: `scheduleRemount`,
-    /// `tripAndRequestRemount` and terminal renewals. This is useful for testing the renewer's loss callback without starting a real recovery.
+    /// Return how many remount requests were attempted, refused ones included: `scheduleRemountForTest`,
+    /// `tripAndRequestRemount` and terminal renewals.
     uint64_t scheduleRemountCallCountForTest() const
     {
         return schedule_remount_calls_for_test.load(std::memory_order_relaxed);
@@ -453,6 +453,10 @@ private:
     /// request that no reclaim has snapshotted is pending: the reclaim that serves it latches after the
     /// loss.
     bool lossNeedsNewRequest() const;
+    /// A remount request no reclaim has acknowledged. Requires `driver_mutex`.
+    bool remountRequestPending() const;
+    /// A stop is requested or the lifecycle is terminal. Requires `driver_mutex`.
+    bool stopOrTerminal() const;
     /// Throws `LOGICAL_ERROR` when a lease thread runs and the caller is not it. Requires `driver_mutex`.
     void checkRenewerOwner() const;
     std::unique_lock<std::mutex> lockTerminalPublication();
@@ -502,7 +506,7 @@ private:
     /// The requested generation `beginReclaim` recorded; `armIfAdmissible` acknowledges it.
     uint64_t reclaim_generation = 0;
     ThreadFromGlobalPool renewal_worker;
-    /// Counted entries into `scheduleRemount`; retained as a test-only observability seam.
+    /// Read only by `scheduleRemountCallCountForTest`.
     std::atomic<uint64_t> schedule_remount_calls_for_test{0};
 
     /// Local write fence. The unarmed default (`deadline_boot_ms = UINT64_MAX`, `lost = false`) permits

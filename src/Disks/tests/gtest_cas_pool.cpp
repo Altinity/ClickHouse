@@ -3416,7 +3416,7 @@ TEST(CASPoolRemount, ReclaimWaitsForTheRenewalToEnd)
     runtime.startBackgroundWorkers();
     renewal_barrier.waitUntilArrived();
     runtime.tripMountLost();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
     EXPECT_EQ(remount_calls.load(), 0u) << "the reclaim must wait until the renewal in flight ends";
     renewal_barrier.release();
     remount_barrier.waitUntilArrived();
@@ -3647,7 +3647,7 @@ TEST(CASPoolRemount, NaturalTerminalTransitionMakesTheLeaseThreadExit)
         runtime.armMountFence(anchor + 1000);
         runtime.startBackgroundWorkers();
         runtime.tripMountLost();
-        runtime.scheduleRemount();
+        runtime.scheduleRemountForTest();
         transitioned.waitUntilArrived();
         transitioned.release();
         const bool exited_without_stop = exits.waitForAtLeast(1);
@@ -3741,7 +3741,7 @@ TEST(CASPoolRemount, ALeaseWaitCannotMissNaturalTerminalPublication)
             {
                 /// A request before the start makes the first pass a reclaim, which fails and backs off.
                 runtime.tripMountLost();
-                runtime.scheduleRemount();
+                runtime.scheduleRemountForTest();
             }
             runtime.startBackgroundWorkers();
 
@@ -3907,7 +3907,7 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
     runtime.startBackgroundWorkers();
     renewal_barrier.waitUntilArrived();
     runtime.tripMountLost();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
     renewal_barrier.release();
     remount_barrier.waitUntilArrived();
     EXPECT_EQ(remount_calls.load(), 1u);
@@ -3947,9 +3947,9 @@ TEST(CASPoolRemount, ConcurrentRemountRequestIsProcessedAfterActiveGeneration)
     runtime.armMountFence(anchor + 1000);
     runtime.startBackgroundWorkers();
     runtime.tripMountLost();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
     first.waitUntilArrived();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
     first.release();
     second.waitUntilArrived();
     EXPECT_EQ(calls.load(), 2u);
@@ -4009,7 +4009,7 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
     runtime.armMountFence(anchor + 10'000);
     runtime.startBackgroundWorkers();
     runtime.tripMountLost();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
     first.waitUntilArrived();
     first.release();
     second.waitUntilArrived();
@@ -4498,7 +4498,7 @@ TEST(CASMountRuntime, NothingArmsWhileARemountRequestIsPending)
     const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
     runtime.startBackgroundWorkers();
     /// A request without a trip: the fence is still armed when the reclaim starts.
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
 
     second_done.waitUntilArrived();
     EXPECT_TRUE(may_mutate_before_first_latch) << "the request alone must leave the fence armed";
@@ -4603,7 +4603,7 @@ TEST(CASMountRuntime, AnInterferenceReportDuringAReclaimIsServedByTheNextReclaim
         runtime.armMountFence(anchor + 1000);
         const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
         runtime.startBackgroundWorkers();
-        runtime.scheduleRemount();
+        runtime.scheduleRemountForTest();
 
         second_done.waitUntilArrived();
         EXPECT_FALSE(report_never_started.load()) << "the report did not start within the bound";
@@ -4679,7 +4679,7 @@ TEST(CASMountRuntime, AReclaimAcknowledgesOnlyTheGenerationItServed)
     runtime.startBackgroundWorkers();
     /// One interference report.
     runtime.tripMountLost();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
 
     reclaimed.waitUntilArrived();
     EXPECT_EQ(calls.load(), 3u);
@@ -4742,7 +4742,7 @@ TEST(CASMountRuntime, AReclaimFinishedAfterTheForgetIntentArmsNothing)
     runtime.armMountFence(anchor + 1000);
     runtime.startBackgroundWorkers();
     runtime.tripMountLost();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
 
     latched.waitUntilArrived();
     runtime.publishVanishedIntent();
@@ -4950,7 +4950,7 @@ TEST(CASMountRuntime, ARemountRequestEndsTheRenewalAndTheSameThreadReclaims)
         const uint64_t waits_at_request = waits.load();
         /// An interference report while the renewal retries past its lease.
         runtime.tripMountLost();
-        runtime.scheduleRemount();
+        runtime.scheduleRemountForTest();
         holding.release();
         renewed.waitUntilArrived();
 
@@ -5040,7 +5040,7 @@ TEST(CASMountRuntime, ACommitConsumedAfterARemountRequestCannotOverwriteTheRecla
             .renewal_live_for_test = [&]
             {
                 if (committed.load() && !requested.exchange(true))
-                    runtime_ptr->scheduleRemount();
+                    runtime_ptr->scheduleRemountForTest();
                 return true;
             }},
         "test", sink, runtimeRenewBudget(), [&]
@@ -6650,7 +6650,7 @@ TEST(CASMountRuntime, ARenewalArmsNothingWhileARequestIsPending)
                 {
                     request_raised = true;
                     runtime_ptr->tripMountLost();
-                    runtime_ptr->scheduleRemount();
+                    runtime_ptr->scheduleRemountForTest();
                 }
                 return true;
             }},
