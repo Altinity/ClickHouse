@@ -2835,7 +2835,7 @@ def test_catalog_commit_conflict_reaches_caller_at_once(started_cluster):
         node.query(
             f"""
             SELECT
-                countIf(logger_name LIKE 'RestCatalog%' AND message LIKE '%updateMetadata conflict%'),
+                countIf(logger_name LIKE 'RestCatalog%' AND message LIKE '%updateMetadata%got retryable HTTP 409%'),
                 countIf(logger_name = 'ReadWriteBufferFromHTTP')
             FROM system.text_log
             WHERE query_id = '{query_id}' AND message LIKE '%409%'
