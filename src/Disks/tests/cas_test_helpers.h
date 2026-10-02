@@ -2217,7 +2217,7 @@ using HintHoleBackend = HintHoleBackendOn<DB::Cas::InMemoryBackend>;
 /// AFTER the reaction. It bumps the fence GENERATION, exactly as a real re-arm does.
 inline void rearmMountFenceAfterAnomalyForTest(const DB::Cas::PoolPtr & store)
 {
-    store->armMountFence(DB::UInt128{0, 1}, store->liveWriterEpoch(), store->bootMsNow() + 600000);
+    store->armMountFence(store->bootMsNow() + 600000);
 }
 
 /// Delegates the FIRST matching create-shaped write to `CountingBackend` -- so the write actually

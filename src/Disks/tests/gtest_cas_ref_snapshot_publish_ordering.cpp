@@ -142,7 +142,7 @@ RefTxnId publishRef(const PoolPtr & store, const RootNamespace & ns, const Strin
 void forceAdoptablePublishWedge(
     const PoolPtr & store, const RootNamespace & ns, uint64_t ref_sequence, const String & ref, uint64_t ordinal)
 {
-    const RefTxnId txn_id{store->writerEpoch(), ref_sequence};
+    const RefTxnId txn_id{store->liveWriterEpoch(), ref_sequence};
     RefLogTxn txn;
     txn.ns = ns.string();
     txn.txn_id = txn_id;
@@ -165,9 +165,9 @@ TEST(CASRefSnapshotPublishOrdering, SnapshotBodyIsDurableBeforeCheckpointAdvance
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/order_body_before_ckpt"};
 
-    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->liveWriterEpoch(), 1}));
     const NamespaceLifeId life = *store->refTableLifeForTest(ns);
-    const String snapshot_key = store->layout().refSnapshotKey(life, RefTxnId{store->writerEpoch(), 1});
+    const String snapshot_key = store->layout().refSnapshotKey(life, RefTxnId{store->liveWriterEpoch(), 1});
     const String ckpt_key = store->layout().refCkptKey(life);
 
     /// The birth transaction above already CAS'd `_ckpt` itself (once for its own `life_epoch`, once for
@@ -207,9 +207,9 @@ TEST(CASRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
     auto clock = VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/order_adoption_after_both"};
 
-    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->liveWriterEpoch(), 1}));
     const NamespaceLifeId life = *store->refTableLifeForTest(ns);
-    const String snapshot_key = store->layout().refSnapshotKey(life, RefTxnId{store->writerEpoch(), 1});
+    const String snapshot_key = store->layout().refSnapshotKey(life, RefTxnId{store->liveWriterEpoch(), 1});
     const String ckpt_key = store->layout().refCkptKey(life);
 
     /// Refuse the `_ckpt` CAS for as long as `publishCkpt` keeps reissuing, so it ends at its own retry
@@ -236,7 +236,7 @@ TEST(CASRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
     EXPECT_EQ(backend->putCount(snapshot_key), 2u)
         << "the retry's body create is its own attempt, accepted against identical, already-durable "
            "bytes rather than writing a second object";
-    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::make_optional(RefTxnId{store->writerEpoch(), 1}))
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::make_optional(RefTxnId{store->liveWriterEpoch(), 1}))
         << "adoption happens exactly once, after both effects are durable";
 }
 
@@ -278,11 +278,11 @@ TEST(CASRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPu
     auto clock = VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/order_poisoned_refuses"};
 
-    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->liveWriterEpoch(), 1}));
     const NamespaceLifeId life = *store->refTableLifeForTest(ns);
     const String ckpt_key = store->layout().refCkptKey(life);
     /// The durable transaction the stale cache will be missing: `dropRef`'s removal, sequence 2.
-    const RefTxnId missing_durable_txn{store->writerEpoch(), 2};
+    const RefTxnId missing_durable_txn{store->liveWriterEpoch(), 2};
     const String next_snapshot_key = store->layout().refSnapshotKey(life, missing_durable_txn);
 
     /// Drive the very next mutation's OWN checkpoint-frontier CAS into persistent conflict: the log PUT
@@ -388,7 +388,7 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     auto clock = VirtualRetryClock::installOn(store);
     const RootNamespace ns{"srv1/order_backoff"};
 
-    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->liveWriterEpoch(), 1}));
     store->waitForSnapshotPublishSettleForTest(ns);   /// drain the birth's own auto-dispatched publish
     /// The birth's own auto-dispatch already published a snapshot at this point (threshold 0); the
     /// baseline every "no new publish yet" check below compares against.
@@ -406,7 +406,7 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     const auto dispatchCount = [&] { return global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(); };
 
     /// Attempt 1: admitted immediately (no backoff armed yet). Fails -> backoff armed at the initial 1000ms.
-    ASSERT_EQ(publishRef(store, ns, "ref_2", 2), (RefTxnId{store->writerEpoch(), 2}));
+    ASSERT_EQ(publishRef(store, ns, "ref_2", 2), (RefTxnId{store->liveWriterEpoch(), 2}));
     store->waitForSnapshotPublishSettleForTest(ns);
     const uint64_t d1 = dispatchCount();
     EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), snapshot_after_birth)
@@ -458,7 +458,7 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     EXPECT_NE(store->newestPublishedSnapshotIdForTest(ns), snapshot_after_birth)
         << "the fault is disarmed, so this attempt actually advances the published snapshot";
 
-    ASSERT_EQ(publishRef(store, ns, "ref_3", 3), (RefTxnId{store->writerEpoch(), 3}));
+    ASSERT_EQ(publishRef(store, ns, "ref_3", 3), (RefTxnId{store->liveWriterEpoch(), 3}));
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(dispatchCount(), d1 + 4)
         << "resetPublishBackoff must have cleared the cooldown: the very next over-threshold trigger, at "
@@ -471,7 +471,7 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     /// 1000ms, admitted at 1000ms -- which a no-op reset cannot produce (it would refuse both probes,
     /// since the stale deadline is still far in the future).
     backend->armWriteFailure("_snap/", kFaultsBeyondTheRetryWindow);
-    ASSERT_EQ(publishRef(store, ns, "ref_4", 4), (RefTxnId{store->writerEpoch(), 4}));
+    ASSERT_EQ(publishRef(store, ns, "ref_4", 4), (RefTxnId{store->liveWriterEpoch(), 4}));
     store->waitForSnapshotPublishSettleForTest(ns);
     const uint64_t d2 = dispatchCount();
     *fake_now += 500;
@@ -530,11 +530,11 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
         return global_counters[ProfileEvents::CASRefSnapshotPublishBackoff].load();
     };
 
-    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->liveWriterEpoch(), 1}));
     store->waitForSnapshotPublishSettleForTest(ns);
     ASSERT_EQ(
         store->newestPublishedSnapshotIdForTest(ns),
-        std::make_optional(RefTxnId{store->writerEpoch(), 1}));
+        std::make_optional(RefTxnId{store->liveWriterEpoch(), 1}));
 
     /// Direct calls remain one attempt per invocation even while a cooldown is armed. This first
     /// refusal is also the non-hanging RED discriminator: without the production fix the backoff
@@ -552,7 +552,7 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
     /// Resolve the exact wedge through the real append-lane adoption path. Its adopted txn and
     /// the caller's own txn raise the table above threshold, but the warm-up cooldown prevents an
     /// automatic publish while the fixture prepares one uncovered tail entry.
-    ASSERT_EQ(publishRef(store, ns, "ref_3", 3), (RefTxnId{store->writerEpoch(), 3}));
+    ASSERT_EQ(publishRef(store, ns, "ref_3", 3), (RefTxnId{store->liveWriterEpoch(), 3}));
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 
     bool appended_during_capture = false;
@@ -561,14 +561,14 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
         if (appended_during_capture)
             return;
         appended_during_capture = true;
-        EXPECT_EQ(publishRef(store, ns, "ref_4", 4), (RefTxnId{store->writerEpoch(), 4}));
+        EXPECT_EQ(publishRef(store, ns, "ref_4", 4), (RefTxnId{store->liveWriterEpoch(), 4}));
     });
     ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     store->setSnapshotAfterCaptureHookForTest(nullptr);
     ASSERT_TRUE(appended_during_capture);
     ASSERT_EQ(
         store->newestPublishedSnapshotIdForTest(ns),
-        std::make_optional(RefTxnId{store->writerEpoch(), 3}));
+        std::make_optional(RefTxnId{store->liveWriterEpoch(), 3}));
 
     /// One uncovered tail entry now exists with no cooldown. Make the lane non-Ready before the read
     /// trigger, so the first production dispatch is an admitted refusal rather than a body PUT.
@@ -622,7 +622,7 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
     /// Adopt the outstanding wedge through production and publish durably. The hook commits one later
     /// txn after capture while the capped cooldown is still armed; a correct durable publication resets
     /// that cooldown, so an immediate same-clock read dispatches the leftover tail without waiting.
-    ASSERT_EQ(publishRef(store, ns, "ref_6", 6), (RefTxnId{store->writerEpoch(), 6}));
+    ASSERT_EQ(publishRef(store, ns, "ref_6", 6), (RefTxnId{store->liveWriterEpoch(), 6}));
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
     bool appended_after_reset_capture = false;
     store->setSnapshotAfterCaptureHookForTest([&]
@@ -630,14 +630,14 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
         if (appended_after_reset_capture)
             return;
         appended_after_reset_capture = true;
-        EXPECT_EQ(publishRef(store, ns, "ref_7", 7), (RefTxnId{store->writerEpoch(), 7}));
+        EXPECT_EQ(publishRef(store, ns, "ref_7", 7), (RefTxnId{store->liveWriterEpoch(), 7}));
     });
     ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     store->setSnapshotAfterCaptureHookForTest(nullptr);
     ASSERT_TRUE(appended_after_reset_capture);
     ASSERT_EQ(
         store->newestPublishedSnapshotIdForTest(ns),
-        std::make_optional(RefTxnId{store->writerEpoch(), 6}));
+        std::make_optional(RefTxnId{store->liveWriterEpoch(), 6}));
 
     const uint64_t dispatches_before_reset_probe = dispatch_count();
     store->resolveRef(ns, "ref_1");
@@ -646,5 +646,5 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
         << "durable publication must clear the capped cooldown for an immediate same-clock trigger";
     EXPECT_EQ(
         store->newestPublishedSnapshotIdForTest(ns),
-        std::make_optional(RefTxnId{store->writerEpoch(), 7}));
+        std::make_optional(RefTxnId{store->liveWriterEpoch(), 7}));
 }

@@ -15,13 +15,11 @@
 #include <magic_enum.hpp>
 
 #include <algorithm>
-#include <array>
 #include <ctime>
 #include <exception>
 #include <limits>
 #include <set>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 #include <variant>
 #include <unistd.h>
@@ -45,11 +43,6 @@ namespace ErrorCodes
 
 namespace DB::Cas
 {
-
-void reportMountRenewCompletion(const MountRenewResult & result, std::optional<uint64_t> expired_ms) noexcept;
-void configureMountRenewObservability(
-    const String * server_root_id, const CasEventSink * event_sink, bool deferred) noexcept;
-void deliverDeferredMountRenewObservability(uint64_t remount_attempt_no) noexcept;
 
 /// The owner, epoch, and mount-lease wire codecs are implemented in
 /// `Formats/CasServerRootFormats`; this file contains the mount-safety protocol logic that uses
@@ -97,199 +90,30 @@ uint64_t defaultBootMs()
     return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
 }
 
-/// Why a renewal ended without a retained lease, in the vocabulary the audit event reports. Each
-/// value is assigned from exactly one arm of the write's verdict, so the event never re-derives a
-/// reason from state the request engine does not carry.
-enum class MountRenewTerminalClassification : uint8_t
-{
-    Unclassified,
-    DeterministicFailure,
-    Conflict,
-    Vanished,
-    Cancelled,
-    FenceOrLifecycleLost,
-    ExternalLeaseDeadline,
-    RequestDeadline,
-    Unresolved,
-};
-
-/// One logical renewal's audit snapshot. Fixed-size and trivially copyable so a reentrant event sink
-/// gets a distinct stack slot instead of aliasing the call that is still running.
-struct MountRenewObservabilityContext
-{
-    bool active = false;
-    bool completed = false;
-    bool deferred = false;
-    const String * server_root_id = nullptr;
-    const CasEventSink * event_sink = nullptr;
-    uint64_t writer_epoch = 0;
-    uint64_t seq = 0;
-    UInt128 write_attempt_id{};
-    uint64_t observability_start_boot_ms = 0;
-    uint64_t confirmed_deadline_boot_ms = 0;
-    uint64_t initial_confirmed_budget_ms = 0;
-    MountRenewOutcome outcome = MountRenewOutcome::NotAttempted;
-    MountRenewTerminalClassification terminal_classification = MountRenewTerminalClassification::Unclassified;
-    uint32_t attempts_sent = 0;
-    bool resolved_by_read = false;
-    /// How long the lease had been expired when this renewal restored it; empty unless it did.
-    std::optional<uint64_t> expired_ms = std::nullopt;
-};
-
-static_assert(std::is_trivially_copyable_v<MountRenewObservabilityContext>);
-
-struct MountRenewObservabilityConfiguration
-{
-    bool configured = false;
-    bool deferred = false;
-    const String * server_root_id = nullptr;
-    const CasEventSink * event_sink = nullptr;
-};
-
-/// Event sinks may synchronously renew another Pool on the same thread. A fixed stack keeps every
-/// registered outer per-call snapshot stable without allocation, including while a parked redo holds
-/// `remount_mutex`. Overflow suppresses rich event/log delivery for the nested call rather than
-/// aliasing an outer call or changing protocol behavior; physical attempt truth is independently
-/// retained by the stack-local observer in `MountLeaseRenewer::renew`.
-struct MountRenewObservabilityStack
-{
-    static constexpr size_t capacity = 8;
-    std::array<MountRenewObservabilityContext, capacity> contexts;
-    size_t depth = 0;
-    size_t suppressed_depth = 0;
-    MountRenewObservabilityConfiguration pending;
-};
-
-thread_local MountRenewObservabilityStack mount_renew_observability;
-
-MountRenewObservabilityContext * currentMountRenewObservability() noexcept
-{
-    if (mount_renew_observability.suppressed_depth != 0 || mount_renew_observability.depth == 0)
-        return nullptr;
-    return &mount_renew_observability.contexts[mount_renew_observability.depth - 1];
-}
-
-void markMountRenewTermination(MountRenewTerminalClassification classification) noexcept
-{
-    if (MountRenewObservabilityContext * context = currentMountRenewObservability())
-        context->terminal_classification = classification;
-}
-
-enum class MountRenewObservabilityRegistration : uint8_t
-{
-    Stack,
-    Suppressed,
-    Ignored,
-};
-
-MountRenewObservabilityRegistration beginMountRenewObservabilityCall() noexcept
-{
-    const MountRenewObservabilityConfiguration configured = std::exchange(
-        mount_renew_observability.pending, MountRenewObservabilityConfiguration{});
-    if (!configured.configured)
-        return MountRenewObservabilityRegistration::Ignored;
-    if (mount_renew_observability.depth == MountRenewObservabilityStack::capacity)
-    {
-        ++mount_renew_observability.suppressed_depth;
-        return MountRenewObservabilityRegistration::Suppressed;
-    }
-
-    mount_renew_observability.contexts[mount_renew_observability.depth++] = MountRenewObservabilityContext{
-        .deferred = configured.deferred,
-        .server_root_id = configured.server_root_id,
-        .event_sink = configured.event_sink,
-    };
-    return MountRenewObservabilityRegistration::Stack;
-}
-
-void abandonMountRenewObservabilityCall() noexcept
-{
-    if (mount_renew_observability.suppressed_depth != 0)
-    {
-        --mount_renew_observability.suppressed_depth;
-        return;
-    }
-    if (mount_renew_observability.depth != 0)
-        --mount_renew_observability.depth;
-}
-
-class MountRenewObservabilityCallGuard
-{
-public:
-    explicit MountRenewObservabilityCallGuard(MountRenewObservabilityRegistration registration_)
-        : registration(registration_)
-        , uncaught_on_entry(std::uncaught_exceptions())
-    {
-    }
-
-    ~MountRenewObservabilityCallGuard()
-    {
-        if (registration == MountRenewObservabilityRegistration::Ignored)
-            return;
-        if (std::uncaught_exceptions() > uncaught_on_entry)
-            abandonMountRenewObservabilityCall();
-    }
-
-private:
-    MountRenewObservabilityRegistration registration;
-    int uncaught_on_entry;
-};
-
-void initializeMountRenewObservability(
-    const String & server_root_id,
-    uint64_t writer_epoch,
-    uint64_t seq,
-    UInt128 write_attempt_id,
-    uint64_t attempt_start_boot_ms,
-    uint64_t confirmed_deadline_boot_ms,
-    const CasEventSink & event_sink) noexcept
-{
-    MountRenewObservabilityContext * context = currentMountRenewObservability();
-    if (!context)
-        return;
-    const bool deferred = context->deferred;
-    const String * configured_server_root_id = context->server_root_id;
-    const CasEventSink * configured_event_sink = context->event_sink;
-    *context = MountRenewObservabilityContext{
-        .active = true,
-        .completed = false,
-        .deferred = deferred,
-        .server_root_id = configured_server_root_id ? configured_server_root_id : &server_root_id,
-        .event_sink = configured_event_sink ? configured_event_sink : &event_sink,
-        .writer_epoch = writer_epoch,
-        .seq = seq,
-        .write_attempt_id = write_attempt_id,
-        .observability_start_boot_ms = defaultBootMs(),
-        .confirmed_deadline_boot_ms = confirmed_deadline_boot_ms,
-        .initial_confirmed_budget_ms = confirmed_deadline_boot_ms > attempt_start_boot_ms
-            ? confirmed_deadline_boot_ms - attempt_start_boot_ms
-            : 0,
-    };
-}
-
 uint64_t elapsedSince(uint64_t start_boot_ms, uint64_t now_boot_ms)
 {
     return now_boot_ms >= start_boot_ms ? now_boot_ms - start_boot_ms : 0;
 }
 
-uint64_t remainingConfirmedBudget(const MountRenewObservabilityContext & context, uint64_t now_boot_ms)
+/// What was left of the lease the renewal started under when the renewal returned.
+uint64_t remainingConfirmedBudget(const MountRenewResult & result, uint64_t lease_deadline_before_boot_ms)
 {
-    const uint64_t elapsed_ms = elapsedSince(context.observability_start_boot_ms, now_boot_ms);
-    return context.initial_confirmed_budget_ms > elapsed_ms
-        ? context.initial_confirmed_budget_ms - elapsed_ms
+    const uint64_t initial_budget_ms = lease_deadline_before_boot_ms > result.attempt_start_boot_ms
+        ? lease_deadline_before_boot_ms - result.attempt_start_boot_ms
         : 0;
+    return initial_budget_ms > result.elapsed_ms ? initial_budget_ms - result.elapsed_ms : 0;
 }
 
 void emitMountRenewEvent(
-    const MountRenewObservabilityContext & context,
-    const String & write_attempt_id,
+    const MountRenewResult & result,
+    const String & server_root_id,
+    const CasEventSink & event_sink,
+    uint64_t lease_deadline_before_boot_ms,
+    std::optional<uint64_t> expired_ms,
     std::string_view outcome,
-    uint32_t attempts_sent,
-    uint64_t now_boot_ms,
-    std::string_view classification,
-    uint64_t remount_attempt_no) noexcept
+    std::string_view classification) noexcept
 {
-    if (!context.event_sink || !*context.event_sink || !context.server_root_id)
+    if (!event_sink)
         return;
     try
     {
@@ -298,25 +122,24 @@ void emitMountRenewEvent(
         event.outcome = String{outcome};
         if (outcome != "recovered")
             event.reason = "CAS mount renewal ended without retained authority and fenced the mount";
-        else if (context.expired_ms)
+        else if (expired_ms)
             event.reason = "CAS mount renewal restored a lease that had expired";
         else
             event.reason = "CAS mount renewal committed after a retry or a resolving read";
         event.detail = {
-            {"server_root_id", *context.server_root_id},
-            {"writer_epoch", std::to_string(context.writer_epoch)},
-            {"seq", std::to_string(context.seq)},
-            {"write_attempt_id", write_attempt_id},
-            {"attempts_sent", std::to_string(attempts_sent)},
-            {"elapsed_ms", std::to_string(elapsedSince(context.observability_start_boot_ms, now_boot_ms))},
-            {"remaining_confirmed_budget_ms", std::to_string(remainingConfirmedBudget(context, now_boot_ms))},
+            {"server_root_id", server_root_id},
+            {"writer_epoch", std::to_string(result.writer_epoch)},
+            {"seq", std::to_string(result.seq)},
+            {"write_attempt_id", u128ToHex(result.write_attempt_id).substr(0, 12)},
+            {"attempts_sent", std::to_string(result.attempts_sent)},
+            {"elapsed_ms", std::to_string(result.elapsed_ms)},
+            {"remaining_confirmed_budget_ms",
+             std::to_string(remainingConfirmedBudget(result, lease_deadline_before_boot_ms))},
             {"classification", String{classification}},
         };
-        if (remount_attempt_no != 0)
-            event.detail["remount_attempt_no"] = std::to_string(remount_attempt_no);
-        if (context.expired_ms)
-            event.detail["expired_ms"] = std::to_string(*context.expired_ms);
-        (*context.event_sink)(std::move(event));
+        if (expired_ms)
+            event.detail["expired_ms"] = std::to_string(*expired_ms);
+        event_sink(std::move(event));
     }
     catch (...)
     {
@@ -333,90 +156,10 @@ constexpr std::string_view terminalClassificationName(MountRenewTerminalClassifi
         case MountRenewTerminalClassification::Vanished: return "vanished";
         case MountRenewTerminalClassification::Cancelled: return "cancelled";
         case MountRenewTerminalClassification::FenceOrLifecycleLost: return "fence_or_lifecycle_lost";
-        case MountRenewTerminalClassification::ExternalLeaseDeadline: return "external_lease_deadline";
-        case MountRenewTerminalClassification::RequestDeadline: return "request_deadline";
         case MountRenewTerminalClassification::Unresolved: return "unresolved";
         case MountRenewTerminalClassification::Unclassified: return "terminal_unclassified";
     }
     return "terminal_unclassified";
-}
-
-void deliverMountRenewObservability(
-    const MountRenewObservabilityContext & context, uint64_t remount_attempt_no) noexcept
-{
-    if (!context.active || !context.completed || !context.server_root_id)
-        return;
-
-    try
-    {
-        const uint64_t now_boot_ms = defaultBootMs();
-        const String write_attempt_id = u128ToHex(context.write_attempt_id).substr(0, 12);
-
-        const bool recovered = context.outcome == MountRenewOutcome::Committed
-            && (context.attempts_sent > 1 || context.resolved_by_read || context.expired_ms.has_value());
-        if (recovered)
-        {
-            std::string_view classification = "committed_after_expiry";
-            if (context.resolved_by_read)
-                classification = "committed_by_read";
-            else if (context.attempts_sent > 1)
-                classification = "committed_after_retry";
-            emitMountRenewEvent(
-                context,
-                write_attempt_id,
-                "recovered",
-                context.attempts_sent,
-                now_boot_ms,
-                classification,
-                remount_attempt_no);
-            try
-            {
-                LOG_INFO(
-                    getLogger("CasMountLeaseRenewer"),
-                    "CAS mount renewal '{}' recovered after {} physical attempts in {} ms "
-                    "(classification={}, confirmed_deadline_boot_ms={})",
-                    *context.server_root_id,
-                    context.attempts_sent,
-                    elapsedSince(context.observability_start_boot_ms, now_boot_ms),
-                    classification,
-                    context.confirmed_deadline_boot_ms);
-            }
-            catch (...)
-            {
-            }
-        }
-        else if (context.outcome == MountRenewOutcome::Terminal)
-        {
-            const std::string_view classification = terminalClassificationName(context.terminal_classification);
-            emitMountRenewEvent(
-                context,
-                write_attempt_id,
-                "failed",
-                context.attempts_sent,
-                now_boot_ms,
-                classification,
-                remount_attempt_no);
-            try
-            {
-                LOG_WARNING(
-                    getLogger("CasMountLeaseRenewer"),
-                    "CAS mount renewal '{}' fenced after {} physical attempts in {} ms "
-                    "(classification={}, confirmed_deadline_boot_ms={})",
-                    *context.server_root_id,
-                    context.attempts_sent,
-                    elapsedSince(context.observability_start_boot_ms, now_boot_ms),
-                    classification,
-                    context.confirmed_deadline_boot_ms);
-            }
-            catch (...)
-            {
-            }
-        }
-    }
-    catch (...)
-    {
-        /// Formatting, logger, and event-sink failures are diagnostic-only.
-    }
 }
 
 /// Forward declaration: defined below (same TU-unique anonymous namespace) — `allocateWriterEpoch`
@@ -445,50 +188,68 @@ void throwIfOwnerRetired(const OwnerObject & owner, const String & srid)
 }
 }
 
-void configureMountRenewObservability(
-    const String * server_root_id, const CasEventSink * event_sink, bool deferred) noexcept
+void reportMountRenewCompletion(
+    const MountRenewResult & result,
+    const String & server_root_id,
+    const CasEventSink & event_sink,
+    uint64_t lease_deadline_before_boot_ms,
+    std::optional<uint64_t> expired_ms) noexcept
 {
-    mount_renew_observability.pending = MountRenewObservabilityConfiguration{
-        .configured = true,
-        .deferred = deferred,
-        .server_root_id = server_root_id,
-        .event_sink = event_sink,
-    };
-}
-
-void reportMountRenewCompletion(const MountRenewResult & result, std::optional<uint64_t> expired_ms) noexcept
-{
-    if (mount_renew_observability.suppressed_depth != 0)
+    try
     {
-        --mount_renew_observability.suppressed_depth;
-        return;
+        const bool recovered = result.outcome == MountRenewOutcome::Committed
+            && (result.attempts_sent > 1 || result.resolved_by_read || expired_ms.has_value());
+        if (recovered)
+        {
+            std::string_view classification = "committed_after_expiry";
+            if (result.resolved_by_read)
+                classification = "committed_by_read";
+            else if (result.attempts_sent > 1)
+                classification = "committed_after_retry";
+            emitMountRenewEvent(
+                result, server_root_id, event_sink, lease_deadline_before_boot_ms, expired_ms, "recovered", classification);
+            try
+            {
+                LOG_INFO(
+                    getLogger("CasMountLeaseRenewer"),
+                    "CAS mount renewal '{}' recovered after {} physical attempts in {} ms "
+                    "(classification={}, confirmed_deadline_boot_ms={})",
+                    server_root_id,
+                    result.attempts_sent,
+                    result.elapsed_ms,
+                    classification,
+                    lease_deadline_before_boot_ms);
+            }
+            catch (...)
+            {
+            }
+        }
+        else if (result.outcome == MountRenewOutcome::Terminal)
+        {
+            const std::string_view classification = terminalClassificationName(result.classification);
+            emitMountRenewEvent(
+                result, server_root_id, event_sink, lease_deadline_before_boot_ms, expired_ms, "failed", classification);
+            try
+            {
+                LOG_WARNING(
+                    getLogger("CasMountLeaseRenewer"),
+                    "CAS mount renewal '{}' fenced after {} physical attempts in {} ms "
+                    "(classification={}, confirmed_deadline_boot_ms={})",
+                    server_root_id,
+                    result.attempts_sent,
+                    result.elapsed_ms,
+                    classification,
+                    lease_deadline_before_boot_ms);
+            }
+            catch (...)
+            {
+            }
+        }
     }
-    MountRenewObservabilityContext * context = currentMountRenewObservability();
-    if (!context || !context->active)
-        return;
-    context->completed = true;
-    context->outcome = result.outcome;
-    context->attempts_sent = std::max(context->attempts_sent, result.attempts_sent);
-    context->resolved_by_read = result.resolved_by_read;
-    context->expired_ms = expired_ms;
-    if (context->deferred)
-        return;
-
-    /// Pop before invoking any callback. A reentrant sink gets a distinct stack slot and cannot alter
-    /// the completed outer snapshot.
-    const MountRenewObservabilityContext completed = *context;
-    --mount_renew_observability.depth;
-    deliverMountRenewObservability(completed, /*remount_attempt_no=*/0);
-}
-
-void deliverDeferredMountRenewObservability(uint64_t remount_attempt_no) noexcept
-{
-    MountRenewObservabilityContext * context = currentMountRenewObservability();
-    if (!context || !context->deferred)
-        return;
-    const MountRenewObservabilityContext completed = *context;
-    --mount_renew_observability.depth;
-    deliverMountRenewObservability(completed, remount_attempt_no);
+    catch (...)
+    {
+        /// Formatting, logger, and event-sink failures are diagnostic-only.
+    }
 }
 
 bool serverRootSubtreeEmpty(
@@ -1010,10 +771,6 @@ MountClaimResult claimMountAwaitingExpiry(
             watch = TokenWatch::sighted(*current_etag, mono_ms_fn());
             if (on_wait_start && r.body)
                 on_wait_start(*r.body, threshold_ms);
-            LOG_INFO(getLogger("CasMountLease"),
-                "Attempting to mount content-addressed server root {} after node change or hard "
-                "restart; waiting ~{} ms (token-stability observation) to confirm the previous "
-                "incarnation's operations are all finalized", srid, threshold_ms);
         }
 
         sleep_ms_fn(poll);
@@ -1324,7 +1081,7 @@ String describeRequestFailure(const std::exception & failure)
 }
 
 MountLeaseRenewer::MountLeaseRenewer(
-    CasRequests & mount_requests_, CasRequests & open_requests_, CasRequests & worker_requests_,
+    CasRequests & claim_farewell_requests_, CasRequests & lease_requests_,
     const Layout & layout_,
     const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
@@ -1332,9 +1089,8 @@ MountLeaseRenewer::MountLeaseRenewer(
     CasEventSink event_sink_,
     std::chrono::milliseconds lease_safety_margin_,
     std::function<uint64_t()> boot_ms_fn_)
-    : mount_requests(mount_requests_)
-    , open_requests(open_requests_)
-    , worker_requests(worker_requests_)
+    : claim_farewell_requests(claim_farewell_requests_)
+    , lease_requests(lease_requests_)
     , key(layout_.mountKey(srid_))
     , srid(srid_)
     , server_uuid(server_uuid_)
@@ -1469,25 +1225,22 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
     /// Off the mount fence: a self-remount claims with the fence already latched lost, and a claim
     /// admitted under it would be refused on every request. What makes the claim safe is that every
     /// write below is conditional.
-    CasOperation op = open_requests.admit(std::move(liveness));
+    CasOperation op = claim_farewell_requests.admit(std::move(liveness));
     const Etag etag = claim(op, body);
 
     seq = 1;
     last_etag = etag;
     last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
-    const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
-    confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
-        ? std::numeric_limits<uint64_t>::max()
-        : attempt_start_boot_ms + ttl_ms;
     renewer_state = MountLeaseRenewerState::Active;
     return attempt_start_boot_ms;
 }
 
-[[noreturn]] void MountLeaseRenewer::throwRenewConflict(const Observation & seen) const
+[[noreturn]] void MountLeaseRenewer::throwRenewConflict(
+    const Observation & seen, MountRenewTerminalClassification & classification) const
 {
     if (const Object * occupant = std::get_if<Object>(&seen))
     {
-        markMountRenewTermination(MountRenewTerminalClassification::Conflict);
+        classification = MountRenewTerminalClassification::Conflict;
         const MountLease current = decodeMountLease(occupant->bytes);
         if (current.server_uuid == server_uuid && current.gc_fenced)
         {
@@ -1522,7 +1275,6 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
         /// This decoded authoritative observation is the exact point at which this incarnation learns
         /// that a foreign successor owns the slot. Terminal teardown intentionally performs no release
         /// I/O, so account the skipped farewell here, once, before the renewer enters its terminal state.
-        /// The renewal may be parked under `remount_mutex`; keep the increment trace-free.
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountReleaseSkippedForeignOccupant);
         emitMountEvent(
             event_sink, CasEventType::MountConflict, srid, "foreign_writer", &current,
@@ -1535,7 +1287,7 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
 
     if (std::holds_alternative<ProvenAbsent>(seen))
     {
-        markMountRenewTermination(MountRenewTerminalClassification::Vanished);
+        classification = MountRenewTerminalClassification::Vanished;
         emitMountEvent(
             event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
             "mount slot vanished while renewing -- failing closed");
@@ -1546,7 +1298,7 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
 
     /// The precondition was refused but nothing identifiable was read back: neither the successor nor
     /// an absence is established, so the only honest verdict is that this renewal settled nothing.
-    markMountRenewTermination(MountRenewTerminalClassification::Unresolved);
+    classification = MountRenewTerminalClassification::Unresolved;
     throwCasWriteRetryLater(fmt::format(
         "CAS mount-lease: key '{}' refused our precondition and the resolving read established neither "
         "an occupant nor an absence", key));
@@ -1580,21 +1332,6 @@ MountRenewResult MountLeaseRenewer::terminalResult(MountRenewResult result)
 
 MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment & environment)
 {
-    return renewOn(
-        environment.policy == MountRenewPolicy::UntilDefinitive ? worker_requests : mount_requests, environment);
-}
-
-MountRenewResult MountLeaseRenewer::renewForRemount(const MountRenewOperationEnvironment & environment)
-{
-    return renewOn(open_requests, environment);
-}
-
-MountRenewResult MountLeaseRenewer::renewOn(
-    CasRequests & plane, const MountRenewOperationEnvironment & environment)
-{
-    const MountRenewObservabilityRegistration observability_registration = beginMountRenewObservabilityCall();
-    const MountRenewObservabilityCallGuard observability_guard(observability_registration);
-
     if (renewer_state != MountLeaseRenewerState::Active)
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
@@ -1602,34 +1339,29 @@ MountRenewResult MountLeaseRenewer::renewOn(
             key,
             static_cast<uint32_t>(renewer_state));
 
-    const auto boot_clock = environment.boot_ms ? environment.boot_ms : boot_ms_fn;
     /// Sampled BEFORE the write. A refused admission is reported as "never attempted" only when this
     /// node had already been asked to stop, and reading the flag afterwards could not tell that apart
     /// from a flag the refusal itself set.
     const bool cancelled = environment.cancelled && environment.cancelled();
 
     const uint64_t wall_ms = now_ms_fn();
-    const uint64_t attempt_start_boot_ms = boot_clock();
+    const uint64_t attempt_start_boot_ms = boot_ms_fn();
     const uint64_t next_seq = seq + 1;
     const UInt128 write_attempt_id = newMountWriteAttemptId();
     const String body = encodeBody(next_seq, wall_ms, min_active_build_sequence_fn(), write_attempt_id);
 
-    if (observability_registration != MountRenewObservabilityRegistration::Ignored)
-    {
-        initializeMountRenewObservability(
-            srid,
-            writer_epoch,
-            next_seq,
-            write_attempt_id,
-            attempt_start_boot_ms,
-            confirmed_deadline_boot_ms,
-            event_sink);
-    }
-
     MountRenewResult result;
     result.attempt_start_boot_ms = attempt_start_boot_ms;
+    result.writer_epoch = writer_epoch;
+    result.seq = next_seq;
+    result.write_attempt_id = write_attempt_id;
+    const auto finished = [this, attempt_start_boot_ms](MountRenewResult done)
+    {
+        done.elapsed_ms = elapsedSince(attempt_start_boot_ms, boot_ms_fn());
+        return done;
+    };
 
-    CasOperation op = plane.admit(environment.live);
+    CasOperation op = lease_requests.admit(environment.live);
     if (environment.on_request)
         op.setRequestObserver([&on_request = environment.on_request](uint32_t attempt_no, const std::exception * failure)
         {
@@ -1639,9 +1371,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
                 .failure_text = failure ? describeRequestFailure(*failure) : String{},
             });
         });
-    const Retry policy = environment.policy == MountRenewPolicy::UntilDefinitive
-        ? Retry::untilDefinitive(kMountRenewRetrySpacingMs)
-        : Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()));
+    const Retry policy = Retry::untilDefinitive(kMountRenewRetrySpacingMs);
     std::optional<WriteResult> written;
     try
     {
@@ -1650,9 +1380,9 @@ MountRenewResult MountLeaseRenewer::renewOn(
     catch (...)
     {
         /// The engine surfaces a deterministic local failure unchanged rather than reissuing it.
-        markMountRenewTermination(MountRenewTerminalClassification::DeterministicFailure);
+        result.classification = MountRenewTerminalClassification::DeterministicFailure;
         result.failure = std::current_exception();
-        return terminalResult(std::move(result));
+        return finished(terminalResult(std::move(result)));
     }
 
     if (Committed * committed = std::get_if<Committed>(&*written))
@@ -1660,57 +1390,47 @@ MountRenewResult MountLeaseRenewer::renewOn(
         seq = next_seq;
         last_etag = std::move(committed->etag);
         last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
-        const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
-        confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
-            ? std::numeric_limits<uint64_t>::max()
-            : attempt_start_boot_ms + ttl_ms;
         result.outcome = MountRenewOutcome::Committed;
         result.attempts_sent = committed->attempts_sent;
         result.resolved_by_read = committed->resolved_by_read;
-        result.sent_any = committed->attempts_sent != 0;
-        return result;
+        return finished(std::move(result));
     }
 
     if (const Conflict * conflict = std::get_if<Conflict>(&*written))
     {
-        result.sent_any = true;
         result.attempts_sent = conflict->attempts_sent;
         try
         {
-            throwRenewConflict(conflict->seen);
+            throwRenewConflict(conflict->seen, result.classification);
         }
         catch (...)
         {
             result.failure = std::current_exception();
         }
-        return terminalResult(std::move(result));
+        return finished(terminalResult(std::move(result)));
     }
 
     if (const Refused * refused = std::get_if<Refused>(&*written))
     {
-        result.sent_any = true;
         result.attempts_sent = refused->attempts_sent;
-        markMountRenewTermination(MountRenewTerminalClassification::DeterministicFailure);
+        result.classification = MountRenewTerminalClassification::DeterministicFailure;
         result.failure = std::make_exception_ptr(Exception(
             refused->store_error,
             "CAS mount-lease: the store refused the renewal of key '{}': {}", key, refused->message));
-        return terminalResult(std::move(result));
+        return finished(terminalResult(std::move(result)));
     }
 
     if (const GaveUp * gave_up = std::get_if<GaveUp>(&*written))
     {
-        result.sent_any = gave_up->sent_any;
         result.attempts_sent = gave_up->attempts_sent;
-        if (gave_up->why == GaveUp::Why::Deadline)
-            result.deadline_source = gave_up->deadline_source;
 
         /// Nothing was sent and the node was already stopping: the lease is exactly as it was, so this
         /// is a renewal that never ran, not one that lost its authority.
         if (gave_up->why == GaveUp::Why::FenceLost && !gave_up->sent_any && cancelled)
         {
-            markMountRenewTermination(MountRenewTerminalClassification::Cancelled);
+            result.classification = MountRenewTerminalClassification::Cancelled;
             result.outcome = MountRenewOutcome::NotAttempted;
-            return result;
+            return finished(std::move(result));
         }
 
         MountRenewTerminalClassification classification = MountRenewTerminalClassification::Unresolved;
@@ -1721,16 +1441,13 @@ MountRenewResult MountLeaseRenewer::renewOn(
                     ? MountRenewTerminalClassification::Cancelled
                     : MountRenewTerminalClassification::FenceOrLifecycleLost;
                 break;
+            /// Reachable only at the end of the clock's range: the policy has no lease bound and no window.
             case GaveUp::Why::Deadline:
-                classification = gave_up->deadline_source == GaveUp::Source::Lease
-                    ? MountRenewTerminalClassification::ExternalLeaseDeadline
-                    : MountRenewTerminalClassification::RequestDeadline;
-                break;
             case GaveUp::Why::Unresolved:
                 classification = MountRenewTerminalClassification::Unresolved;
                 break;
         }
-        markMountRenewTermination(classification);
+        result.classification = classification;
         result.failure = makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS mount-lease renewal for key '{}' did not retain the lease ({}, {} attempt sent, last "
             "observation: {})",
@@ -1738,7 +1455,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
             terminalClassificationName(classification),
             gave_up->sent_any ? "at least one" : "no",
             detail::renderObservation(gave_up->last_seen)));
-        return terminalResult(std::move(result));
+        return finished(terminalResult(std::move(result)));
     }
 
     /// The remaining alternative is `Declined`, which only a decide returning nothing produces; a
@@ -1748,7 +1465,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
         "CAS mount-lease: the renewal of key '{}' was declined, which a replace cannot report", key);
 }
 
-void MountLeaseRenewer::terminate(CasOperation & op)
+void MountLeaseRenewer::terminate(CasOperation & op, uint64_t lease_deadline_boot_ms)
 {
     const uint64_t wall_ms = now_ms_fn();
     const String body = encodeMountLease(MountLease{
@@ -1762,16 +1479,16 @@ void MountLeaseRenewer::terminate(CasOperation & op)
         .min_active_build_sequence = std::numeric_limits<uint64_t>::max(),
         .write_attempt_id = newMountWriteAttemptId(),
     });
-    /// The farewell is admitted on `open_requests` (see `release`, which calls this via `open_requests.admit()`),
+    /// The farewell is admitted on `claim_farewell_requests` (see `release`),
     /// so its own reservation -- attempt plus the read that settles it, `reservedFor(0, 2)` in
-    /// `CasOperation::writeLoop` -- is exactly `2 * open_requests.attemptReservationMs()`. A window
+    /// `CasOperation::writeLoop` -- is exactly `2 * claim_farewell_requests.attemptReservationMs()`. A window
     /// below that value refuses the write before its first attempt, deterministically, on every call:
     /// `kFarewellBudgetMs` alone predates the attempt-envelope reservation and can no longer be trusted
-    /// to admit it. Saturating, like every other deadline computation on this path (see the
-    /// `expires_at_ms`/`confirmed_deadline_boot_ms` arithmetic above): an operator-configured envelope
-    /// is not bounds-checked against this doubling, and wrapping past `UINT64_MAX` would turn a too-long
-    /// window into a too-SHORT one -- the exact failure mode this fix exists to remove.
-    const uint64_t reservation_ms = open_requests.attemptReservationMs();
+    /// to admit it. Saturating, like every other deadline computation on this path: an
+    /// operator-configured envelope is not bounds-checked against this doubling, and wrapping past
+    /// `UINT64_MAX` would turn a too-long window into a too-SHORT one -- the exact failure mode this fix
+    /// exists to remove.
+    const uint64_t reservation_ms = claim_farewell_requests.attemptReservationMs();
     const uint64_t doubled_reservation_ms = reservation_ms > std::numeric_limits<uint64_t>::max() / 2
         ? std::numeric_limits<uint64_t>::max()
         : reservation_ms * 2;
@@ -1779,16 +1496,12 @@ void MountLeaseRenewer::terminate(CasOperation & op)
         ? std::numeric_limits<uint64_t>::max()
         : doubled_reservation_ms + kFarewellSlackMs;
     const uint64_t farewell_window_ms = std::max<uint64_t>(kFarewellBudgetMs, two_envelope_reservation_plus_slack_ms);
-    /// The derived window alone is not enough: mount-control activity must also never run past the
-    /// point this node's own fence may already be gone (the rule a bounded renewal enforces with
-    /// `Retry::untilLeaseSafe`). The precondition on this write already stops it from clobbering
+    /// The derived window alone is not enough: the farewell must also never run past the point this
+    /// node's own fence may already be gone. The precondition on this write already stops it from clobbering
     /// a successor if it DOES land late, but a shutdown holding the process open to retry a write past
     /// its own lease-safe deadline serves no one -- the successor's own reclaim does not wait for it.
-    /// `confirmed_deadline_boot_ms` is set at `start()` and kept current by every successful `renew`,
-    /// so it is valid here whenever `terminate` runs (only reachable from `release`, which requires
-    /// `Active`, which `start` alone establishes).
     WriteResult written = op.replace(key, body, precondition(),
-        Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()), farewell_window_ms));
+        Retry::untilLeaseSafe(lease_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()), farewell_window_ms));
 
     if (Committed * committed = std::get_if<Committed>(&written))
     {
@@ -1821,7 +1534,7 @@ void MountLeaseRenewer::terminate(CasOperation & op)
     orThrow(std::move(written), fmt::format("CAS mount-lease release of key '{}'", key));
 }
 
-void MountLeaseRenewer::release()
+void MountLeaseRenewer::release(uint64_t lease_deadline_boot_ms)
 {
     if (renewer_state != MountLeaseRenewerState::Active)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount-lease: release is allowed only in Active state for key '{}'", key);
@@ -1829,8 +1542,8 @@ void MountLeaseRenewer::release()
     /// Off the mount fence, for the same reason the claim is: a departing mount whose lease has already
     /// run down still has to hand the slot back, and refusing the write there would leave the slot
     /// looking live until GC fences it out.
-    CasOperation op = open_requests.admit();
-    terminate(op);
+    CasOperation op = claim_farewell_requests.admit();
+    terminate(op, lease_deadline_boot_ms);
 }
 
 void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix) noexcept

@@ -38,7 +38,6 @@ namespace DB
     M(CAS_GC_SCHEDULER, "CasGcSched") \
     M(CAS_LEASE_RENEWER, "CasLeaseRenewer") \
     M(CAS_REF_SNAPSHOT_PUBLISH, "CasRefSnapPub") \
-    M(CAS_REMOUNT, "CasRemount") \
     M(CGROUP_MEMORY_OBSERVER, "CgrpMemUsgObsr") \
     M(CLICKHOUSE_WATCH, "ClickHouseWatch") \
     M(CLUSTER_DISCOVERY, "ClusterDiscover") \

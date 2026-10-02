@@ -14,6 +14,7 @@
 #include <Common/CurrentThread.h>
 #include <Common/MemoryTracker.h>
 #include <base/scope_guard.h>
+#include <base/defines.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Poco/Exception.h>
@@ -21,8 +22,8 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <future>
-#include <latch>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -42,6 +43,7 @@ extern const int FILE_DOESNT_EXIST;
 extern const int UNKNOWN_EXCEPTION;
 extern const int NETWORK_ERROR;
 extern const int MEMORY_LIMIT_EXCEEDED;
+extern const int LOGICAL_ERROR;
 }
 
 namespace ProfileEvents
@@ -56,6 +58,7 @@ extern const Event CASRemountFailed;
 extern const Event CASMountLeaseExpired;
 extern const Event CASMountRenewalAttempts;
 extern const Event CASMountRenewalRetries;
+extern const Event CASIdentityLost;
 }
 
 using namespace DB::Cas;
@@ -1734,18 +1737,18 @@ TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)
 TEST(CASPoolRemount, ShutdownGuardRefusesToArmRemount)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    /// `background_watermark = true` so `scheduleRemount` can latch a recovery generation for the
-    /// persistent worker in production mode (the same gate both runtime workers check).
+    /// `background_watermark = true` so a remount request can latch a recovery generation for the
+    /// lease thread.
     auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .background_watermark = true});
 
     /// Teardown has begun: `Pool` latches this before joining either persistent worker.
     store->beginShutdownForTest();
 
-    /// A lease-renewal failure firing during teardown re-enters `scheduleRemount`. With the guard it
-    /// must refuse to latch another generation after the workers are stopping.
+    /// A remount request during teardown must not latch another generation after the workers are
+    /// stopping.
     EXPECT_FALSE(store->scheduleRemountForTest())
-        << "scheduleRemount must not latch recovery work once teardown has begun";
+        << "a remount request must not latch recovery work once teardown has begun";
 }
 
 namespace
@@ -2018,11 +2021,6 @@ public:
     Fault fault = Fault::None;
     DB::Cas::tests::ManualBarrier * barrier = nullptr;
     std::function<void()> after_commit;
-    /// Runs just before an armed fault throws. The engine draws its inter-attempt backoff randomly and
-    /// admits the reissue against that drawn duration, so a test that needs the ambiguity to be refused
-    /// rather than reissued has to move the injected clock here -- from inside the attempt, which is the
-    /// only point between admission and the resolve read a test can reach.
-    std::function<void()> before_throw;
     /// While it answers TRUE, every conditional write throws a transport timeout, before `fault` is
     /// consulted. Read on the renewing thread; set it before the workers start.
     std::function<bool()> outage;
@@ -2054,11 +2052,7 @@ public:
         if (current == Fault::ThrowMemoryLimitExceeded)
             throw DB::Exception(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, "injected memory limit exceeded on the renewal request");
         if (current == Fault::ThrowBefore || current == Fault::BlockThenThrow)
-        {
-            if (before_throw)
-                before_throw();
             throw Poco::TimeoutException("injected runtime renewal ambiguity before result");
-        }
 
         auto result = DB::Cas::tests::CountingBackend::write(key, bytes, expected_value, access);
         if (after_commit)
@@ -2071,21 +2065,15 @@ public:
 
 CasRequestBudget runtimeRenewBudget();
 
-/// A directly-constructed `CasMountRuntime` plus the request planes it needs. `Pool` builds those
-/// from its own members; a test has no `Pool`, so the mount plane's fence reaches the runtime through
-/// this holder -- the closures run only once the runtime is issuing requests, well after construction.
+/// A directly-constructed `CasMountRuntime` plus the request planes `Pool` would give it.
 class RuntimeUnderTest
 {
 public:
     template <typename BackendT, typename... Args>
     RuntimeUnderTest(const std::shared_ptr<BackendT> & backend, Args &&... args)
-        : mount(backend, DB::Cas::Fence{
-              [this] { return runtime.fenceGeneration(); },
-              [this](uint64_t g, uint64_t needed) { return runtime.admit(g, needed); },
-              [this](uint64_t g) { runtime.checkFenceOrThrow(g); }})
-        , farewell(backend, DB::Cas::Fence::open())
+        : farewell(backend, DB::Cas::Fence::open())
         , lease(backend, DB::Cas::Fence::open())
-        , runtime(backend, mount, farewell, lease, std::forward<Args>(args)...)
+        , runtime(farewell, lease, std::forward<Args>(args)...)
     {
         /// What the request engine reserves per attempt is the BACKEND's attempt timeout, not the
         /// budget field alone; every construction of this holder pairs the two via `runtimeRenewBudget`,
@@ -2095,10 +2083,9 @@ public:
         /// against the clock it reads. Production runs both on `CLOCK_BOOTTIME`, so they agree; a test
         /// that injects one MUST inject the other, or `Retry::untilLeaseSafe` compares a synthetic
         /// deadline against real boottime, finds it long past, and refuses every request unsent.
-        mount.setNowFnForTest([this] { return runtime.bootMsNow(); });
         farewell.setNowFnForTest([this] { return runtime.bootMsNow(); });
         lease.setNowFnForTest([this] { return runtime.bootMsNow(); });
-        /// As `Pool` wires it: a stop wakes the worker renewal's wait.
+        /// As `Pool` wires it: a stop wakes the lease thread's renewal wait.
         lease.setSleepFnForTest([this](uint64_t ms) { runtime.sleepInterruptibly(ms); });
     }
 
@@ -2119,17 +2106,13 @@ public:
 
     CasMountRuntime & operator*() { return runtime; }
 
-    /// The retry wait of the mount and lease planes: the worker's renewal runs on the lease plane, the
-    /// other bounded ones on the mount plane. A remount renewal runs on the farewell plane, which this
-    /// does not reach. Call before the workers start.
+    /// The retry wait of the lease plane, where the renewal runs. Call before the lease thread starts.
     void setRetrySleepForTest(const std::function<void(uint64_t)> & sleep_fn)
     {
-        mount.setSleepFnForTest(sleep_fn);
         lease.setSleepFnForTest(sleep_fn);
     }
 
 private:
-    DB::Cas::CasRequests mount;
     DB::Cas::CasRequests farewell;
     DB::Cas::CasRequests lease;
     CasMountRuntime runtime;
@@ -2196,7 +2179,7 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
 
     DB::Cas::tests::OperationForTest successor_op(*backend);
     auto ours = (*successor_op).read(key, Retry::standard());
@@ -2320,36 +2303,6 @@ public:
     }
 
     ~ScopedRemountLogCapture()
-    {
-        logger->setChannel(old_channel);
-        logger->setLevel(old_level);
-    }
-
-    String captured() const { return stream.str(); }
-
-private:
-    LoggerPtr logger;
-    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    Poco::AutoPtr<Poco::StreamChannel> channel;
-    /// A real reference (shared=true), so the parked previous channel cannot die while ours is installed.
-    Poco::AutoPtr<Poco::Channel> old_channel;
-    int old_level;
-};
-
-class ScopedParkedRenewalLogCapture
-{
-public:
-    ScopedParkedRenewalLogCapture()
-        : logger(getLogger("CasMountLeaseRenewer"))
-        , channel(new Poco::StreamChannel(stream))
-        , old_channel(logger->getChannel(), /*shared=*/true)
-        , old_level(logger->getLevel())
-    {
-        logger->setChannel(channel.get());
-        logger->setLevel("information");
-    }
-
-    ~ScopedParkedRenewalLogCapture()
     {
         logger->setChannel(old_channel);
         logger->setLevel(old_level);
@@ -2755,90 +2708,38 @@ TEST(CASMountOpenWaits, FencedPriorReclaimsWithoutAnyWait)
         << "a certified-dead predecessor needs neither the observation window nor any grace period";
 }
 
-/// The open-time publication horizon must reserve TWO attempt envelopes (connect cap included), not
-/// two bare attempt timeouts -- a slow connect could otherwise overrun the reservation the horizon
-/// check was guarding. `background_watermark` defaults false (not set below), so `CasPool.cpp`'s
-/// `renewal_window_ms` ternary takes its no-period branch: `2 * attemptEnvelopeMs()`. The check is also
-/// STRICT (refuses equality), matching `CasMountRuntime::admit`.
-TEST(CASMountOpenWaits, PublicationHorizonUsesTheEnvelope)
+/// A reclaim arms the fence only when its claim still admits a ref append: more than two envelopes plus
+/// the margin of lease, strictly, with no period term. With attempt 100 and cap 100 that is 650 ms of the
+/// 1000 ms lease. A quiescence that leaves less reports success at step `claimed_not_armed` with the pool
+/// not `Live` and the fence latched.
+TEST(CASPoolRemount, AReclaimArmsOnlyWithRoomForTwoEnvelopesAndTheMargin)
 {
-    /// Opens with a boot clock costing `per_call_ms` per read (models a faster or slower claim) and
-    /// returns how many times the mount key was written. attempt 100, cap 100: envelope =
-    /// 100 + 2*100 = 300, so 2*envelope = 600; the old code reserved 2*attempt = 200. Empirically the
-    /// claim path's own anchor read and the horizon check's own `now_boot_ms` read are five reads apart,
-    /// so `remaining = safe_deadline(TTL 1000 - margin 50 = 950) - now = 950 - 5 * per_call_ms`.
-    const auto mountWriteCount = [](uint64_t per_call_ms) -> uint64_t
+    struct AtRemountEvent
     {
-        auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-        Layout l{"p"};
-        DB::Cas::tests::seedPoolMetaForRestart(*b);
-        /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
-        /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
-        /// a by-reference capture of a local would dangle.
-        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
-        PoolPtr store;
-        store = Pool::open(b, PoolConfig{
-            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-            .cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100},
-            .boot_ms_fn = [fake_boot, per_call_ms]
-            {
-                return fake_boot->fetch_add(per_call_ms);
-            },
-            .wait_sleep_fn = [fake_boot](uint64_t ms)
-            {
-                *fake_boot += ms;
-            },
-        });
-        if (!store)
-            return 0;
-        return b->putOverwriteCount(l.mountKey("test")) + b->putCount(l.mountKey("test"));
+        String step;
+        PoolLifecycle lifecycle = PoolLifecycle::IdentityLost;
+        bool may_mutate = true;
     };
-
-    /// remaining = 945 (per_call_ms=1): both 2*attempt(200) and 2*envelope(600) fit -- two writes (the
-    /// claim's own reclaim, then the renewer's adopt) and no re-anchor.
-    EXPECT_EQ(mountWriteCount(1), 2u) << "a horizon that fits both windows must not re-anchor";
-    /// remaining = 450 (per_call_ms=100): 2*attempt(200) fits, 2*envelope(600) does not -- the
-    /// re-anchor costs one extra write. This is the discriminator: reverting the reservation to
-    /// 2*attempt would make this case behave like the one above (two writes).
-    EXPECT_EQ(mountWriteCount(100), 3u) << "the old 2*attempt window fit here; only the envelope window must redo";
-    /// remaining = 600 (per_call_ms=70) exactly equals 2*envelope: STRICT ("<", not "<=") refuses
-    /// equality too, so this must also redo -- reverting the strict comparison to "<=" would make this
-    /// case behave like the fits-both case (two writes).
-    EXPECT_EQ(mountWriteCount(70), 3u) << "an exact boundary (renewal_window_ms == remaining) must be refused, not accepted";
-}
-
-/// Same reservation change as `PublicationHorizonUsesTheEnvelope` above, exercised through the remount
-/// path's own `renewer_redo` step (`CasPool.cpp` ~1503). Modelled directly on
-/// `CASPoolRemount.TheRenewerRedoRenewsOnTheOpenPlane` above: the step's admission refuses a driver that
-/// was never parked by a persistent renewal worker, so `background_watermark` must be true and the
-/// remount must be driven through `scheduleRemountForTest` (which parks the worker before running it),
-/// never through a bare `tryRemountOnce` with no workers -- the direct-driven attempt deadlocks in
-/// exactly the way that test's own comment describes.
-TEST(CASPoolRemount, RemountRenewerRedoUsesTheEnvelope)
-{
-    /// One successful self-remount whose quiescence costs `quiesce_ms`; returns the conditional
-    /// mount-slot writes it issued, counted while the remount worker is still held inside the event
-    /// sink that reported the result (so the renewal worker it un-parks cannot add one).
-    const auto remountConditionalMountWrites = [](uint64_t quiesce_ms) -> uint64_t
+    /// One reclaim whose quiescence costs `quiesce_ms`; returns what the MountRemount event and the pool
+    /// show while the lease thread is held inside the sink that reported it.
+    const auto remountWithQuiesce = [](uint64_t quiesce_ms) -> AtRemountEvent
     {
         auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-        /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
-        /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
-        /// a by-reference capture of a local would dangle.
+        /// Held in shared state: the hooks below mutate it, and the Pool can outlive this lambda's frame.
         auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
-        /// Heap-owned, not a plain local: declaration order relative to `store` only protects against an
-        /// ordinary same-thread unwind, not a detached background completion that holds an extra
-        /// `shared_from_this()` and can still be running on another thread after this call returns.
         auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
+        auto step = std::make_shared<String>();
         auto store = Pool::open(backend, PoolConfig{
             .pool_prefix = "remount-renewer-redo-envelope",
             .server_root_id = "test",
             .background_watermark = true,
-            .event_sink = [committed](const CasEvent & event)
+            .event_sink = [committed, step](const CasEvent & event)
             {
                 if (event.type == CasEventType::MountRemount && event.outcome == "ok")
+                {
+                    *step = event.detail.at("step");
                     committed->arriveAndWait();
+                }
             },
             .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
             .mount_renew_period = std::chrono::milliseconds(100),
@@ -2856,42 +2757,39 @@ TEST(CASPoolRemount, RemountRenewerRedoUsesTheEnvelope)
                 *fake_boot += quiesce_ms;
             },
         });
-        const String mount_key = store->layout().mountKey("test");
-
-        fenceOutMount(*backend, mount_key);
-        const uint64_t before = backend->putOverwriteCount(mount_key);
-        EXPECT_TRUE(store->scheduleRemountForTest())
-            << "the remount must be latched with quiesce_ms=" << quiesce_ms;
+        fenceOutMount(*backend, store->layout().mountKey("test"));
+        EXPECT_TRUE(store->scheduleRemountForTest()) << "the remount must be latched with quiesce_ms=" << quiesce_ms;
         committed->waitUntilArrived();
-        const uint64_t writes = backend->putOverwriteCount(mount_key) - before;
+        AtRemountEvent seen{.step = *step, .lifecycle = store->lifecycle(), .may_mutate = store->mayMutate()};
         committed->release();
-        return writes;
+        return seen;
     };
 
-    /// attempt 100, cap 100: envelope = 100 + 2*100 = 300, so period(100) + 2*envelope(600) = 700. A
-    /// 450 ms quiescence leaves remaining = TTL(1000) - margin(50) - 450 = 500: the old
-    /// period + 2*attempt (300) window fit that, but the new period + 2*envelope (700) window does not
-    /// -- so only the envelope-based check must redo (validation: 100 + 600 + 50 = 750 < 1000).
-    const uint64_t control = remountConditionalMountWrites(0);
-    EXPECT_GT(remountConditionalMountWrites(450), control)
-        << "a quiescence that fits the old attempt-only window but not the envelope window must still cost the redo";
-    /// A 250 ms quiescence leaves remaining = 950 - 250 = 700, exactly equal to
-    /// period + 2*envelope (700): STRICT ("<", not "<=") refuses equality too, so this must also
-    /// redo -- reverting the strict comparison to "<=" would make this case behave like the control.
-    EXPECT_GT(remountConditionalMountWrites(250), control)
-        << "an exact boundary (renewal_window_ms == remaining) must be refused, not accepted";
+    for (uint64_t quiesce_ms : {0, 300})
+    {
+        const AtRemountEvent seen = remountWithQuiesce(quiesce_ms);
+        EXPECT_EQ(seen.step, "publish_live") << "quiesce_ms=" << quiesce_ms;
+        EXPECT_EQ(seen.lifecycle, PoolLifecycle::Live) << "quiesce_ms=" << quiesce_ms;
+        EXPECT_TRUE(seen.may_mutate) << "quiesce_ms=" << quiesce_ms;
+    }
+    /// 350: 650 ms left, exactly the reservation, refused. 450: 550 ms left; two bare attempts plus the
+    /// margin (250) would fit, two envelopes do not.
+    for (uint64_t quiesce_ms : {350, 450})
+    {
+        const AtRemountEvent seen = remountWithQuiesce(quiesce_ms);
+        EXPECT_EQ(seen.step, "claimed_not_armed") << "quiesce_ms=" << quiesce_ms;
+        EXPECT_EQ(seen.lifecycle, PoolLifecycle::TransientNotLive) << "quiesce_ms=" << quiesce_ms;
+        EXPECT_FALSE(seen.may_mutate) << "quiesce_ms=" << quiesce_ms;
+    }
 }
 
 namespace
 {
-/// Stalls the CLAIM ITSELF past the lease TTL, and counts what the open writes afterwards.
+/// Ages the claim on its own I/O, and counts what the open writes afterwards.
 ///
-/// The mount key is written twice before the write fence arms: once by `claimMount`'s reclaim, then
-/// once by the renewer's adopt -- and the fence's anchor is taken BETWEEN them. So advancing the
-/// injected boot clock on the SECOND write models exactly the thing the Phase B redo exists for: the
-/// claim's own I/O outliving the lease it is about to arm a fence under. (This used to be modelled by
-/// a materialization grace long enough to consume the TTL; that wait is retired, and the guard it
-/// motivated is not -- a stalled socket can still outlive a validated request budget.)
+/// The mount key is written twice before the open decides whether to arm: once by `claimMount`'s
+/// reclaim, then once by the renewer's adopt, and the claim's start is taken BETWEEN them. A hook on
+/// the SECOND write therefore ages the claim the open arms from.
 class StalledMountClaimBackend final : public DB::Cas::InMemoryBackend
 {
 public:
@@ -2920,9 +2818,8 @@ public:
 };
 }
 
-/// Phase B startup-arm (spec rev.4, codex round-3 finding 2): a claim path that consumed the lease TTL
-/// must force ONE fresh conditional lease write before arming — the fence must never arm from an anchor
-/// that has already expired (a successor could have legally reclaimed meanwhile).
+/// A claim path that consumed most of the lease must not arm the fence from that claim: the open waits for
+/// the lease thread's first renewal, which writes the lease once more and arms from its own start.
 TEST(CASPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
 {
     auto backend = std::make_shared<StalledMountClaimBackend>();
@@ -2967,9 +2864,8 @@ TEST(CASPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
     {
         return fake_boot_ms->load();
     };
-    /// The renewer's adopt write stalls for 15 s of boot clock. That consumes the publication horizon
-    /// (one 10 s cadence plus one 5 s attempt) while leaving one physical attempt admissible inside
-    /// the old lease's safety window, so the synchronous redo can safely re-anchor.
+    /// The renewer's adopt write stalls for 15 s of boot clock: 15 s of the lease are left, a ref append
+    /// needs 2 x 7 s + 2 s = 16 s, so the open waits; the loop's renewal is due at once (10 s cadence).
     backend->on_second_mount_write = [fake_boot_ms]
     {
         *fake_boot_ms += 15'000;
@@ -2979,12 +2875,71 @@ TEST(CASPool, StartupArmRedoesLeaseWriteWhenTheClaimConsumesTtl)
     ASSERT_NE(store, nullptr);
 
     ASSERT_EQ(backend->mount_writes.load(), 3)
-        << "the fixture assumes exactly two mount writes before the redo (the reclaim and the renewer's "
-           "adopt, with the fence anchor between them); a different sequence would make the stall land "
-           "somewhere else and this test would stop testing the redo";
+        << "the fixture assumes exactly two mount writes before the open decides (the reclaim and the "
+           "renewer's adopt, with the claim's start between them), then the loop's renewal";
     EXPECT_EQ(backend->mount_writes_after_stall.load(), 1)
-        << "a TTL-consuming claim must be followed by exactly ONE fresh conditional lease write "
-           "(the re-anchoring redo) before the write fence arms";
+        << "a claim that consumed the lease is followed by exactly one renewal before the open returns";
+    EXPECT_TRUE(store->mayMutate()) << "the open returns with the fence armed";
+}
+
+/// The arming rule at an open reserves what a ref append needs: two attempt envelopes, connect cap
+/// included, plus the margin, strictly, and no renewal period. With attempt 100 and cap 100 the envelope is
+/// 300 ms, so a claim arms the fence only while more than 2 x 300 + 50 = 650 ms of its 1000 ms lease remain.
+/// The 340 ms period keeps the lease thread from renewing an armed claim before the count is read.
+TEST(CASMountOpenWaits, PublicationHorizonUsesTheEnvelope)
+{
+    /// Opens over a fenced predecessor whose adopt write ages the claim by `claim_age_ms`, and returns the
+    /// conditional writes of the mount key made before the open returned.
+    const auto mountWritesAtOpen = [](uint64_t claim_age_ms) -> int
+    {
+        auto backend = std::make_shared<StalledMountClaimBackend>();
+        DB::Cas::Layout layout("pool");
+        DB::Cas::tests::seedPoolMetaForRestart(*backend, "pool");
+        backend->mount_key = layout.mountKey("s");
+        MountLease prior;
+        prior.server_uuid = DB::UInt128(0x42);
+        prior.writer_epoch = 7;
+        prior.seq = 7;
+        prior.expires_at_ms = 1;
+        prior.gc_fenced = true;
+        prior.write_attempt_id = DB::UInt128{7};
+        createObj(*backend, layout.mountKey("s"), encodeMountLease(prior));
+        createObj(*backend, layout.epochKey("s"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
+        /// Held in a shared atomic: the Pool can outlive this lambda's frame.
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(10'000);
+        backend->on_second_mount_write = [fake_boot, claim_age_ms]
+        {
+            *fake_boot += claim_age_ms;
+        };
+        DB::Cas::PoolConfig cfg;
+        cfg.pool_prefix = "pool";
+        cfg.server_id = DB::UInt128(0x42);
+        cfg.server_root_id = "s";
+        cfg.background_watermark = true;
+        cfg.mount_lease_ttl_ms = std::chrono::milliseconds(1000);
+        cfg.mount_renew_period = std::chrono::milliseconds(340);
+        cfg.cas_request_budget = CasRequestBudget{.attempt_timeout_ms = 100, .lease_safety_margin_ms = 50, .connect_timeout_cap_ms = 100};
+        cfg.boot_ms_fn = [fake_boot]
+        {
+            return fake_boot->load();
+        };
+        cfg.wait_sleep_fn = [fake_boot](uint64_t ms)
+        {
+            *fake_boot += ms;
+        };
+        auto store = Pool::open(backend, cfg);
+        EXPECT_TRUE(store && store->mayMutate()) << "claim_age_ms=" << claim_age_ms;
+        return backend->mount_writes.load();
+    };
+
+    /// 1000 ms left: the claim arms; the reclaim and the adopt only.
+    EXPECT_EQ(mountWritesAtOpen(0), 2);
+    /// 700 ms left: the claim arms. A window with the period in it (340 + 600 = 940) would not fit here.
+    EXPECT_EQ(mountWritesAtOpen(300), 2) << "the arming rule has no period term";
+    /// 650 ms left, exactly the reservation: refused, strict like `admit`; the loop's renewal arms.
+    EXPECT_EQ(mountWritesAtOpen(350), 3) << "an exact boundary must be refused";
+    /// 600 ms left: two bare attempts plus the margin (250) would fit, two envelopes (650) do not.
+    EXPECT_EQ(mountWritesAtOpen(400), 3) << "the reservation counts envelopes, not bare attempts";
 }
 
 /// ==== What a self-remount may block on ====
@@ -3400,109 +3355,6 @@ TEST(CASPool, CachedSourceDecodeLetsAdoptionCommitAnAbsentBlobThatFsckReports)
 #define EXPECT_RUNTIME_STATE_REJECTION(statement) EXPECT_THROW(statement, DB::Exception)
 #endif
 
-TEST(CASPoolRemount, DirectRenewCannotRaceWorkerStartOrRenewerReplacement)
-{
-    auto backend = std::make_shared<RuntimeRenewBackend>();
-    const Layout layout("runtime-direct");
-    uint64_t wall_ms = 1000;
-    uint64_t boot_ms = 100;
-    const UInt128 uuid{1};
-    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
-    CasEventSink sink;
-    RuntimeUnderTest runtime_holder(
-        backend, layout, MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-                                     .boot_ms_fn = [&] { return boot_ms; }},
-        "test", sink, runtimeRenewBudget(), [] { return false; });
-    CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
-    const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
-
-    DB::Cas::tests::ManualBarrier barrier;
-    backend->barrier = &barrier;
-    backend->fault = RuntimeRenewBackend::Fault::BlockThenDelegate;
-    auto direct = std::async(std::launch::async, [&] { runtime.renewWatermarkOnce(); });
-    barrier.waitUntilArrived();
-    EXPECT_RUNTIME_STATE_REJECTION(runtime.startBackgroundWorkers(std::chrono::milliseconds(10)));
-    EXPECT_RUNTIME_STATE_REJECTION(runtime.installRenewer(uuid, 2, [&] { return wall_ms; }));
-    EXPECT_RUNTIME_STATE_REJECTION(runtime.renewerReset());
-    barrier.release();
-    EXPECT_NO_THROW(direct.get());
-    runtime.finishTeardown(true);
-}
-
-TEST(CASPoolRemount, DueWorkerAdmissionIsReservedBeforeParkRequest)
-{
-    auto backend = std::make_shared<RuntimeRenewBackend>();
-    const Layout layout("runtime-admission-park");
-    uint64_t wall_ms = 1000;
-    uint64_t boot_ms = 100;
-    const UInt128 uuid{1};
-    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
-    DB::Cas::tests::ManualBarrier admitted;
-    DB::Cas::tests::ManualBarrier remount;
-    CasEventSink sink;
-    RuntimeUnderTest runtime_holder(
-        backend, layout,
-        MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-            .background_watermark = true,
-            .boot_ms_fn = [&] { return boot_ms; },
-            .renewal_admitted_hook_for_test = [&] { admitted.arriveAndWait(); }},
-        "test", sink, runtimeRenewBudget(), [&]
-        {
-            remount.arriveAndWait();
-            return false;
-        });
-    CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
-    const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
-    admitted.waitUntilArrived();
-    runtime.tripMountLost();
-    runtime.scheduleRemount();
-    EXPECT_EQ(runtime.renewalDriverStateForTest(), RenewalDriverState::ParkRequested);
-    admitted.release();
-    remount.waitUntilArrived();
-    EXPECT_EQ(runtime.renewalDriverStateForTest(), RenewalDriverState::Parked);
-    remount.release();
-    runtime.stopBackgroundWorkers();
-    runtime.finishTeardown(false);
-}
-
-TEST(CASPoolRemount, DueWorkerAdmissionIsReservedBeforeStop)
-{
-    auto backend = std::make_shared<RuntimeRenewBackend>();
-    const Layout layout("runtime-admission-stop");
-    uint64_t wall_ms = 1000;
-    uint64_t boot_ms = 100;
-    const UInt128 uuid{1};
-    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
-    DB::Cas::tests::ManualBarrier admitted;
-    CasEventSink sink;
-    RuntimeUnderTest runtime_holder(
-        backend, layout,
-        MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-            .background_watermark = true,
-            .boot_ms_fn = [&] { return boot_ms; },
-            .renewal_admitted_hook_for_test = [&] { admitted.arriveAndWait(); }},
-        "test", sink, runtimeRenewBudget(), [] { return false; });
-    CasMountRuntime & runtime = *runtime_holder;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
-    const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
-    admitted.waitUntilArrived();
-    auto stop = std::async(std::launch::async, [&] { runtime.stopBackgroundWorkers(); });
-    runtime.waitForRenewalDriverStateForTest(RenewalDriverState::Stopping);
-    admitted.release();
-    EXPECT_NO_THROW(stop.get());
-    EXPECT_EQ(runtime.renewalDriverStateForTest(), RenewalDriverState::Dormant);
-    runtime.finishTeardown(false);
-}
-
 TEST(CASPoolRemount, DirectRenewIsRefusedForBackgroundConfiguredRuntimeAfterStop)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
@@ -3514,14 +3366,14 @@ TEST(CASPoolRemount, DirectRenewIsRefusedForBackgroundConfiguredRuntimeAfterStop
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.armMountFence(anchor + 1000);
+    runtime.startBackgroundWorkers();
     runtime.stopBackgroundWorkers();
     EXPECT_RUNTIME_STATE_REJECTION(runtime.renewWatermarkOnce());
     runtime.finishTeardown(true);
@@ -3529,10 +3381,10 @@ TEST(CASPoolRemount, DirectRenewIsRefusedForBackgroundConfiguredRuntimeAfterStop
 
 #undef EXPECT_RUNTIME_STATE_REJECTION
 
-TEST(CASPoolRemount, RemountWaitsForRenewalParkedBeforeReplacement)
+TEST(CASPoolRemount, ReclaimWaitsForTheRenewalToEnd)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
-    const Layout layout("runtime-park");
+    const Layout layout("runtime-reclaim-waits");
     uint64_t wall_ms = 1000;
     uint64_t boot_ms = 10'000;
     const UInt128 uuid{1};
@@ -3540,38 +3392,44 @@ TEST(CASPoolRemount, RemountWaitsForRenewalParkedBeforeReplacement)
     DB::Cas::tests::ManualBarrier renewal_barrier;
     DB::Cas::tests::ManualBarrier remount_barrier;
     std::atomic<uint64_t> remount_calls{0};
+    std::atomic<bool> renewal_request_returned{false};
+    std::atomic<bool> reclaim_saw_the_request_returned{false};
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
             ++remount_calls;
+            reclaim_saw_the_request_returned = renewal_request_returned.load();
             remount_barrier.arriveAndWait();
             return false;
         });
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     backend->barrier = &renewal_barrier;
     backend->fault = RuntimeRenewBackend::Fault::BlockThenDelegate;
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    /// Set after the setup's own writes: only the held renewal request sets it.
+    backend->after_commit = [&] { renewal_request_returned = true; };
+    runtime.startBackgroundWorkers();
     renewal_barrier.waitUntilArrived();
     runtime.tripMountLost();
-    runtime.scheduleRemount();
-    runtime.waitForRenewalDriverStateForTest(RenewalDriverState::ParkRequested);
-    EXPECT_EQ(remount_calls.load(), 0u) << "replacement callback must wait until renewal has parked";
+    runtime.scheduleRemountForTest();
+    EXPECT_EQ(remount_calls.load(), 0u) << "the reclaim must wait until the renewal in flight ends";
     renewal_barrier.release();
     remount_barrier.waitUntilArrived();
-    EXPECT_EQ(runtime.renewalDriverStateForTest(), RenewalDriverState::Parked);
+    EXPECT_EQ(remount_calls.load(), 1u);
+    EXPECT_TRUE(reclaim_saw_the_request_returned.load())
+        << "the reclaim must start only after the renewal's request in flight returned";
     remount_barrier.release();
     runtime.stopBackgroundWorkers();
     runtime.finishTeardown(false);
 }
 
-TEST(CASPoolRemount, TeardownJoinsBothWorkersBeforeRelease)
+TEST(CASPoolRemount, TeardownJoinsTheLeaseThreadBeforeRelease)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
     const Layout layout("runtime-join");
@@ -3591,16 +3449,16 @@ TEST(CASPoolRemount, TeardownJoinsBothWorkersBeforeRelease)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.armMountFence(anchor + 1000);
+    runtime.startBackgroundWorkers();
     runtime.stopBackgroundWorkers();
-    EXPECT_EQ(worker_exits.load(), 2u);
+    EXPECT_EQ(worker_exits.load(), 1u);
     runtime.finishTeardown(true);
     EXPECT_EQ(decodeMountLease(readObj(*backend, layout.mountKey("test"))->bytes).min_active_build_sequence,
               std::numeric_limits<uint64_t>::max());
@@ -3691,7 +3549,7 @@ TEST(CASMountRuntime, MemoryLimitDoesNotEndTheLeaseThread)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms; },
             .renewal_admitted_hook_for_test = [&]
@@ -3712,11 +3570,11 @@ TEST(CASMountRuntime, MemoryLimitDoesNotEndTheLeaseThread)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
 
     backend->fault = RuntimeRenewBackend::Fault::ThrowMemoryLimitExceeded;
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
 
     reported.waitUntilArrived();
     const String reported_outcome = outcome;
@@ -3743,7 +3601,7 @@ TEST(CASMountRuntime, MemoryLimitDoesNotEndTheLeaseThread)
     runtime.finishTeardown(false);
 }
 
-TEST(CASPoolRemount, NaturalTerminalTransitionMakesBothPersistentWorkersSelfExit)
+TEST(CASPoolRemount, NaturalTerminalTransitionMakesTheLeaseThreadExit)
 {
     for (PoolLifecycle terminal : {PoolLifecycle::IdentityLost, PoolLifecycle::VanishedReplaced})
     {
@@ -3770,7 +3628,7 @@ TEST(CASPoolRemount, NaturalTerminalTransitionMakesBothPersistentWorkersSelfExit
         RuntimeUnderTest runtime_holder(
             backend, layout,
             MountConfig{
-                .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+                .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1),
                 .background_watermark = true,
                 .boot_ms_fn = [&] { return boot_ms; },
                 .worker_factory = factory},
@@ -3787,130 +3645,129 @@ TEST(CASPoolRemount, NaturalTerminalTransitionMakesBothPersistentWorkersSelfExit
         runtime_ptr = &runtime;
         runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
-        runtime.startBackgroundWorkers(std::chrono::hours(1));
+        runtime.armMountFence(anchor + 1000);
+        runtime.startBackgroundWorkers();
         runtime.tripMountLost();
-        runtime.scheduleRemount();
+        runtime.scheduleRemountForTest();
         transitioned.waitUntilArrived();
         transitioned.release();
-        const bool both_exited_without_stop = exits.waitForAtLeast(2);
+        const bool exited_without_stop = exits.waitForAtLeast(1);
         runtime.stopBackgroundWorkers();
-        EXPECT_TRUE(both_exited_without_stop);
-        EXPECT_EQ(exits.count(), 2u);
+        EXPECT_TRUE(exited_without_stop);
+        EXPECT_EQ(exits.count(), 1u);
         runtime.finishTeardown(false);
     }
 }
 
-TEST(CASPoolRemount, ParkedRenewalCannotMissNaturalTerminalPublication)
+/// A terminal publication that races a wait of the lease loop is serialized by `driver_mutex`: it
+/// cannot land between the wait predicate's sample and the wait, so the thread exits without a stop.
+/// Two waits: the cadence wait and the reclaim backoff. The backoff case checks only the exit: a missed
+/// edge there costs one backoff, at most 1 s here, so it does not catch an unserialized publication.
+TEST(CASPoolRemount, ALeaseWaitCannotMissNaturalTerminalPublication)
 {
-    for (PoolLifecycle terminal : {PoolLifecycle::IdentityLost, PoolLifecycle::VanishedReplaced})
+    enum class Wait : uint8_t { Cadence, ReclaimBackoff };
+    for (Wait wait : {Wait::Cadence, Wait::ReclaimBackoff})
     {
-        auto backend = std::make_shared<RuntimeRenewBackend>();
-        const Layout layout(terminal == PoolLifecycle::IdentityLost
-            ? "runtime-parked-terminal-identity-lost"
-            : "runtime-parked-terminal-vanished");
-        uint64_t wall_ms = 1000;
-        uint64_t boot_ms = 100;
-        const UInt128 uuid{1};
-        ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
-        WorkerExitLatch exits;
-        std::latch renewal_before_driver_lock{1};
-        std::latch release_renewal{1};
-        std::once_flag pause_renewal_once;
-        std::latch parked_predicate_sampled_false{1};
-        std::latch release_parked_predicate{1};
-        std::latch terminal_pre_lock_reached{1};
-        std::latch terminal_post_lock_reached{1};
-        std::once_flag release_once;
-        std::atomic<bool> renewal_holds_driver_mutex{false};
-        std::atomic<bool> terminal_reached_post_lock_while_renewal_held{false};
-        const auto release_parked = [&]
+        for (PoolLifecycle terminal : {PoolLifecycle::IdentityLost, PoolLifecycle::VanishedReplaced})
         {
-            std::call_once(release_once, [&] { release_parked_predicate.count_down(); });
-        };
-        RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
-        {
-            return ThreadFromGlobalPool([&, body = std::move(worker_body)]
+            auto backend = std::make_shared<RuntimeRenewBackend>();
+            const Layout layout(fmt::format(
+                "runtime-wait-terminal-{}-{}",
+                wait == Wait::Cadence ? "cadence" : "backoff",
+                terminal == PoolLifecycle::IdentityLost ? "identity-lost" : "vanished"));
+            uint64_t wall_ms = 1000;
+            uint64_t boot_ms = 100;
+            const UInt128 uuid{1};
+            ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+                      MountClaimResult::Claimed);
+            WorkerExitLatch exits;
+            std::once_flag pause_once;
+            /// Bounded: a regression fails after the barrier's timeout instead of hanging the gate.
+            DB::Cas::tests::ManualBarrier waiter;
+            std::atomic<bool> waiter_timed_out{false};
+            std::atomic<bool> waiter_holds_driver_mutex{false};
+            std::atomic<bool> publication_entered_while_held{false};
+            const auto release_waiter = [&] { waiter.release(); };
+            RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
             {
-                body();
-                exits.recordExit();
-            });
-        };
-        CasMountRuntime * runtime_ptr = nullptr;
-        CasEventSink sink;
-        RuntimeUnderTest runtime_holder(
-            backend, layout,
-            MountConfig{
-                .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-                .background_watermark = true,
-                .boot_ms_fn = [&] { return boot_ms; },
-                .worker_factory = factory,
-                .remount_parked_hook_for_test = [&]
+                return ThreadFromGlobalPool([&, body = std::move(worker_body)]
                 {
-                    release_renewal.count_down();
-                },
-                .renewal_before_driver_lock_hook_for_test = [&]
-                {
-                    std::call_once(pause_renewal_once, [&]
+                    body();
+                    exits.recordExit();
+                });
+            };
+            CasEventSink sink;
+            RuntimeUnderTest runtime_holder(
+                backend, layout,
+                MountConfig{
+                    .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1),
+                    .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms; },
+                    .worker_factory = factory,
+                    .lease_wait_predicate_false_hook_for_test = [&]
                     {
-                        renewal_before_driver_lock.count_down();
-                        release_renewal.wait();
-                    });
-                },
-                .renewal_parked_predicate_false_hook_for_test = [&]
-                {
-                    renewal_holds_driver_mutex.store(true, std::memory_order_release);
-                    parked_predicate_sampled_false.count_down();
-                    release_parked_predicate.wait();
-                    renewal_holds_driver_mutex.store(false, std::memory_order_release);
-                },
-                .terminal_publication_waiting_for_driver_lock_hook_for_test = [&]
-                {
-                    terminal_pre_lock_reached.count_down();
-                },
-                .terminal_publication_driver_lock_contended_hook_for_test = [&]
-                {
-                    release_parked();
-                },
-                .terminal_publication_driver_lock_acquired_hook_for_test = [&]
-                {
-                    if (renewal_holds_driver_mutex.load(std::memory_order_acquire))
-                        terminal_reached_post_lock_while_renewal_held.store(true, std::memory_order_release);
-                    release_parked();
-                    terminal_post_lock_reached.count_down();
-                }},
-            "test", sink, runtimeRenewBudget(), [&]
+                        std::call_once(pause_once, [&]
+                        {
+                            waiter_holds_driver_mutex.store(true, std::memory_order_release);
+                            try
+                            {
+                                waiter.arriveAndWait();
+                            }
+                            catch (...)
+                            {
+                                waiter_timed_out = true;
+                            }
+                            waiter_holds_driver_mutex.store(false, std::memory_order_release);
+                        });
+                    },
+                    .terminal_publication_driver_lock_contended_hook_for_test = [&]
+                    {
+                        release_waiter();
+                    },
+                    .terminal_publication_driver_lock_acquired_hook_for_test = [&]
+                    {
+                        if (waiter_holds_driver_mutex.load(std::memory_order_acquire))
+                            publication_entered_while_held.store(true, std::memory_order_release);
+                        release_waiter();
+                    }},
+                "test", sink, runtimeRenewBudget(), [] { return false; });
+            /// Declared after the runtime so it runs first: a failed expectation must not leave the
+            /// lease thread inside the hook while the runtime's destructor joins it.
+            SCOPE_EXIT({ release_waiter(); });
+            CasMountRuntime & runtime = *runtime_holder;
+            runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+            const uint64_t anchor = runtime.startRenewer();
+            runtime.armMountFence(anchor + 1000);
+            if (wait == Wait::ReclaimBackoff)
             {
-                parked_predicate_sampled_false.wait();
-                if (terminal == PoolLifecycle::IdentityLost)
-                    runtime_ptr->enterIdentityLost();
-                else
-                    runtime_ptr->enterVanished(PoolLifecycle::VanishedReplaced, "injected parked-wait replacement");
-                /// Before the fix, terminal publication does not wait for `driver_mutex`, so it reaches
-                /// this release only after its notification has raced ahead of the renewal worker's wait.
-                /// After the fix, the pre-lock hook above releases the waiter before publication blocks.
-                release_parked();
-                return false;
-            });
-        CasMountRuntime & runtime = *runtime_holder;
-        runtime_ptr = &runtime;
-        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
-        const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
-        runtime.startBackgroundWorkers(std::chrono::hours(1));
-        renewal_before_driver_lock.wait();
-        runtime.tripMountLost();
-        runtime.scheduleRemount();
-        terminal_pre_lock_reached.wait();
-        terminal_post_lock_reached.wait();
-        const bool violated_serialization
-            = terminal_reached_post_lock_while_renewal_held.load(std::memory_order_acquire);
-        const bool both_exited_without_stop = violated_serialization ? false : exits.waitForAtLeast(2);
-        runtime.stopBackgroundWorkers();
-        EXPECT_FALSE(violated_serialization);
-        EXPECT_TRUE(both_exited_without_stop);
-        EXPECT_EQ(exits.count(), 2u);
-        runtime.finishTeardown(false);
+                /// A request before the start makes the first pass a reclaim, which fails and backs off.
+                runtime.tripMountLost();
+                runtime.scheduleRemountForTest();
+            }
+            runtime.startBackgroundWorkers();
+
+            waiter.waitUntilArrived();
+            if (terminal == PoolLifecycle::IdentityLost)
+            {
+                runtime.tripMountLost();
+                runtime.enterIdentityLost();
+            }
+            else
+            {
+                runtime.enterVanished(PoolLifecycle::VanishedReplaced, "injected replacement during a lease wait");
+            }
+            /// A publication that took no `driver_mutex` released nobody; release the waiter here so it
+            /// waits, misses the edge, and the expectation below fails instead of hanging.
+            release_waiter();
+            const bool exited_without_stop = exits.waitForAtLeast(1);
+            runtime.stopBackgroundWorkers();
+            EXPECT_FALSE(waiter_timed_out.load());
+            EXPECT_FALSE(publication_entered_while_held.load())
+                << "the publication must not take driver_mutex while the waiter holds it";
+            EXPECT_TRUE(exited_without_stop);
+            EXPECT_EQ(exits.count(), 1u);
+            runtime.finishTeardown(false);
+        }
     }
 }
 
@@ -3936,7 +3793,7 @@ TEST(CASPoolRemount, VanishedReasonPreparationFailureLeavesTerminalTransitionRet
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms; },
             .worker_factory = factory,
@@ -3949,8 +3806,8 @@ TEST(CASPoolRemount, VanishedReasonPreparationFailureLeavesTerminalTransitionRet
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.armMountFence(anchor + 1000);
+    runtime.startBackgroundWorkers();
     runtime.tripMountLost();
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
@@ -3967,46 +3824,40 @@ TEST(CASPoolRemount, VanishedReasonPreparationFailureLeavesTerminalTransitionRet
     runtime.enterVanished(PoolLifecycle::VanishedForgotten, "must-remain-ignored");
     EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::VanishedReplaced);
     EXPECT_EQ(runtime.vanishedReason(), "retry-completed");
-    const bool both_exited_without_stop = exits.waitForAtLeast(2);
+    const bool exited_without_stop = exits.waitForAtLeast(1);
     runtime.stopBackgroundWorkers();
-    EXPECT_TRUE(both_exited_without_stop);
-    EXPECT_EQ(exits.count(), 2u);
+    EXPECT_TRUE(exited_without_stop);
+    EXPECT_EQ(exits.count(), 1u);
     EXPECT_EQ(preparation_calls.load(), 2u);
     runtime.finishTeardown(false);
 }
 
 TEST(CASPoolRemount, WorkerConstructionRollbackFailsOpenClosed)
 {
-    for (uint64_t throw_on : {1u, 2u})
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-worker-failure");
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    RuntimeWorkerFactory factory = [](std::function<void()>) -> ThreadFromGlobalPool
     {
-        auto backend = std::make_shared<RuntimeRenewBackend>();
-        const Layout layout("runtime-worker-failure-" + std::to_string(throw_on));
-        uint64_t wall_ms = 1000;
-        uint64_t boot_ms = 100;
-        uint64_t factory_calls = 0;
-        RuntimeWorkerFactory factory = [&](std::function<void()> fn)
-        {
-            if (++factory_calls == throw_on)
-                throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected runtime worker construction failure");
-            return ThreadFromGlobalPool(std::move(fn));
-        };
-        const UInt128 uuid{1};
-        ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
-        CasEventSink sink;
-        RuntimeUnderTest runtime_holder(
-            backend, layout,
-            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
-                        .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
-            "test", sink, runtimeRenewBudget(), [] { return false; });
-        CasMountRuntime & runtime = *runtime_holder;
-        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
-        const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
-        EXPECT_THROW(runtime.startBackgroundWorkers(std::chrono::milliseconds(10)), DB::Exception);
-        EXPECT_FALSE(runtime.mayMutate());
-        EXPECT_FALSE(runtime.workersRunningForTest());
-        runtime.finishTeardown(false);
-    }
+        throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected runtime worker construction failure");
+    };
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(10), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + 1000);
+    EXPECT_THROW(runtime.startBackgroundWorkers(), DB::Exception);
+    EXPECT_FALSE(runtime.mayMutate());
+    EXPECT_FALSE(runtime.workersRunningForTest());
+    runtime.finishTeardown(false);
 }
 
 TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
@@ -4027,11 +3878,12 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
     CasMountRuntime * runtime_ptr = nullptr;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
             ++remount_calls;
+            runtime_ptr->beginReclaim();
             ++fresh_epochs;
             fenceOutMount(*backend, layout.mountKey("test"));
             const MountClaimResult fresh = claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 2, wall_ms, 1000);
@@ -4040,10 +3892,8 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
                 return false;
             runtime_ptr->installRenewer(uuid, 2, [&] { return wall_ms; });
             const uint64_t fresh_anchor = runtime_ptr->startRenewer();
-            runtime_ptr->setProcessEpoch(2, std::memory_order_release);
             runtime_ptr->setLiveWriterEpoch(2);
-            runtime_ptr->armMountFence(uuid, 2, fresh_anchor + 1000);
-            runtime_ptr->noteRemounted();
+            EXPECT_TRUE(runtime_ptr->armIfAdmissible(fresh_anchor + 1000));
             remount_barrier.arriveAndWait();
             return true;
         });
@@ -4051,14 +3901,14 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     backend->barrier = &renewal_barrier;
     backend->fault = RuntimeRenewBackend::Fault::BlockThenDelegate;
     const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
     renewal_barrier.waitUntilArrived();
     runtime.tripMountLost();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
     renewal_barrier.release();
     remount_barrier.waitUntilArrived();
     EXPECT_EQ(remount_calls.load(), 1u);
@@ -4066,55 +3916,6 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
     EXPECT_EQ(runtime.remountRequestedGenerationForTest(), 1u);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before + 1);
     remount_barrier.release();
-    runtime.stopBackgroundWorkers();
-    runtime.finishTeardown(false);
-}
-
-TEST(CASPoolRemount, TerminalDepositionDoesNotTouchRenewerAfterReplacement)
-{
-    auto backend = std::make_shared<RuntimeRenewBackend>();
-    const Layout layout("runtime-terminal-replacement");
-    uint64_t wall_ms = 1000;
-    uint64_t boot_ms = 100;
-    const UInt128 uuid{1};
-    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
-    DB::Cas::tests::ManualBarrier terminal_deposited;
-    DB::Cas::tests::ManualBarrier remount;
-    std::atomic<bool> replaced{false};
-    CasMountRuntime * runtime_ptr = nullptr;
-    CasEventSink sink;
-    RuntimeUnderTest runtime_holder(
-        backend, layout,
-        MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-            .background_watermark = true,
-            .boot_ms_fn = [&] { return boot_ms; },
-            .renewal_terminal_deposited_hook_for_test = [&]
-            {
-                runtime_ptr->renewerReset();
-                runtime_ptr->installRenewer(uuid, 2, [&] { return wall_ms; });
-                runtime_ptr->renewerReset();
-                replaced.store(true, std::memory_order_release);
-                terminal_deposited.arriveAndWait();
-            }},
-        "test", sink, runtimeRenewBudget(), [&]
-        {
-            remount.arriveAndWait();
-            return false;
-        });
-    CasMountRuntime & runtime = *runtime_holder;
-    runtime_ptr = &runtime;
-    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
-    const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
-    /// A definitive answer ends the worker's renewal; a transient fault would only be retried.
-    fenceOutMount(*backend, layout.mountKey("test"));
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
-    terminal_deposited.waitUntilArrived();
-    EXPECT_TRUE(replaced.load(std::memory_order_acquire));
-    terminal_deposited.release();
-    remount.waitUntilArrived();
-    remount.release();
     runtime.stopBackgroundWorkers();
     runtime.finishTeardown(false);
 }
@@ -4133,7 +3934,7 @@ TEST(CASPoolRemount, ConcurrentRemountRequestIsProcessedAfterActiveGeneration)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -4144,12 +3945,12 @@ TEST(CASPoolRemount, ConcurrentRemountRequestIsProcessedAfterActiveGeneration)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
-    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.armMountFence(anchor + 1000);
+    runtime.startBackgroundWorkers();
     runtime.tripMountLost();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
     first.waitUntilArrived();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
     first.release();
     second.waitUntilArrived();
     EXPECT_EQ(calls.load(), 2u);
@@ -4176,13 +3977,14 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
     CasMountRuntime * runtime_ptr = nullptr;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(10'000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(10'000), .mount_renew_period = std::chrono::milliseconds(1000), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
             const uint64_t call = ++calls;
             if (call == 1)
             {
+                runtime_ptr->beginReclaim();
                 fenceOutMount(*backend, layout.mountKey("test"));
                 const MountClaimResult fresh = claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 2, wall_ms, 10'000);
                 EXPECT_EQ(fresh.kind, MountClaimResult::Claimed);
@@ -4190,10 +3992,9 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
                     return false;
                 runtime_ptr->installRenewer(uuid, 2, [&] { return wall_ms; });
                 const uint64_t fresh_anchor = runtime_ptr->startRenewer();
-                runtime_ptr->armMountFence(uuid, 2, fresh_anchor + 10'000);
-                runtime_ptr->noteRemounted();
+                EXPECT_TRUE(runtime_ptr->armIfAdmissible(fresh_anchor + 10'000));
                 boot_ms = 2'000;
-                /// A definitive answer for the fresh incarnation's first worker renewal; a transient
+                /// A definitive answer for the fresh incarnation's first renewal on the lease thread; a transient
                 /// fault would only be retried.
                 fenceOutMount(*backend, layout.mountKey("test"));
                 first.arriveAndWait();
@@ -4206,10 +4007,10 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 10'000);
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(1000));
+    runtime.armMountFence(anchor + 10'000);
+    runtime.startBackgroundWorkers();
     runtime.tripMountLost();
-    runtime.scheduleRemount();
+    runtime.scheduleRemountForTest();
     first.waitUntilArrived();
     first.release();
     second.waitUntilArrived();
@@ -4220,200 +4021,6 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
     runtime.finishTeardown(false);
 }
 
-TEST(CASPoolRemount, StaleRemountAnchorPerformsParkedRedo)
-{
-    auto backend = std::make_shared<RuntimeRenewBackend>();
-    /// Held in a shared atomic, not a plain local: `remount_quiesce_hook_for_test` below mutates it,
-    /// and the Pool can outlive this stack frame (a background publish holds `shared_from_this()`), so
-    /// a by-reference capture of a local would dangle.
-    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(100);
-    /// Heap-owned, not a plain local: declaration order relative to the Pool below only protects
-    /// against an ordinary same-thread unwind, not a detached background completion that holds an
-    /// extra `shared_from_this()` and can still be running on another thread after this frame returns.
-    auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
-    PoolConfig config{
-        .pool_prefix = "stale-remount-anchor",
-        .server_root_id = "test",
-        .background_watermark = true,
-        .event_sink = [committed](const CasEvent & event)
-        {
-            if (event.type == CasEventType::MountRemount && event.outcome == "ok")
-                committed->arriveAndWait();
-        },
-        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-        .mount_renew_period = std::chrono::milliseconds(100),
-        .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [fake_boot]
-        {
-            return fake_boot->load();
-        },
-        .remount_quiesce_hook_for_test = [fake_boot]
-        {
-            *fake_boot += 900;
-        },
-    };
-    auto store = Pool::open(backend, config);
-    const String key = store->layout().mountKey("test");
-    fenceOutMount(*backend, key);
-    const uint64_t writes_before = backend->putOverwriteCount(key);
-    ASSERT_TRUE(store->scheduleRemountForTest());
-    committed->waitUntilArrived();
-    EXPECT_GE(backend->putOverwriteCount(key), writes_before + 3)
-        << "claim, renewer start, and the stale-anchor parked redo must all write";
-    committed->release();
-}
-
-TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
-{
-    auto backend = std::make_shared<RuntimeRenewBackend>();
-    /// Held in a shared atomic, not a plain local: `remount_quiesce_hook_for_test` below mutates it,
-    /// and the Pool can outlive this stack frame (a background publish holds `shared_from_this()`), so
-    /// a by-reference capture of a local would dangle.
-    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(100);
-    /// Heap-owned, not plain locals: `event_sink` below mutates them, and the Pool can outlive this
-    /// stack frame (a background publish holds `shared_from_this()`), so a by-reference capture of a
-    /// local -- including a non-copyable `std::promise` -- would dangle.
-    auto result_observed = std::make_shared<std::promise<void>>();
-    std::future<void> result_future = result_observed->get_future();
-    auto result_published = std::make_shared<std::atomic<bool>>(false);
-    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
-    PoolConfig config{
-        .pool_prefix = "parked-redo-recovered-observability",
-        .server_root_id = "test",
-        .background_watermark = true,
-        .event_sink = [result_observed, result_published, events](CasEvent event)
-        {
-            const bool final_remount = event.type == CasEventType::MountRemount && event.outcome == "ok";
-            events->push(std::move(event));
-            if (final_remount && !result_published->exchange(true))
-                result_observed->set_value();
-        },
-        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-        /// 500 with a 700 ms quiescence, so the redo's window (period + attempt timeout = 510) does not
-        /// fit the 280 ms of safe lease left -- and the reissue the ambiguity needs still does, whatever
-        /// the engine's jittered backoff draws from its first-reissue range of at most 200 ms.
-        .mount_renew_period = std::chrono::milliseconds(500),
-        .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [fake_boot]
-        {
-            return fake_boot->load();
-        },
-        /// `backend` is captured BY VALUE (a copy of the shared_ptr, not the stack slot holding it):
-        /// the Pool can outlive this frame, so a by-reference capture of the local `shared_ptr` itself
-        /// would dangle even though the pointee it owns is heap-allocated.
-        .remount_quiesce_hook_for_test = [fake_boot, backend]
-        {
-            *fake_boot += 700;
-            backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
-        },
-    };
-    auto store = Pool::open(backend, config);
-    std::weak_ptr<Pool> store_lifetime = store;
-    ScopedParkedRenewalLogCapture renewal_logs;
-    fenceOutMount(*backend, store->layout().mountKey("test"));
-    ASSERT_TRUE(store->scheduleRemountForTest());
-    ASSERT_EQ(result_future.wait_for(std::chrono::seconds(20)), std::future_status::ready);
-
-    const std::vector<CasEvent> observed = events->snapshot();
-    const auto recovered = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
-    {
-        return event.type == CasEventType::WatermarkRenew && event.outcome == "recovered";
-    });
-    const auto remounted = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
-    {
-        return event.type == CasEventType::MountRemount && event.outcome == "ok";
-    });
-    ASSERT_NE(recovered, observed.end());
-    ASSERT_NE(remounted, observed.end());
-    EXPECT_LT(std::distance(observed.begin(), recovered), std::distance(observed.begin(), remounted));
-    EXPECT_EQ(recovered->detail.at("remount_attempt_no"), remounted->detail.at("attempt_no"));
-    EXPECT_EQ(recovered->detail.at("classification"), "committed_after_retry");
-    /// The physical retry itself: the ambiguous attempt and the reissue that committed.
-    EXPECT_EQ(recovered->detail.at("attempts_sent"), "2");
-    EXPECT_NE(renewal_logs.captured().find("CAS mount renewal 'test' recovered"), String::npos);
-
-    /// `~Pool` stops and joins both persistent runtime workers. Make that quiescence boundary part of
-    /// the test, before any event/log capture state referenced by those workers can leave scope.
-    store.reset();
-    EXPECT_TRUE(store_lifetime.expired());
-}
-
-TEST(CASPoolRemount, ParkedRedoFailureObservabilityPrecedesRemountResult)
-{
-    auto backend = std::make_shared<RuntimeRenewBackend>();
-    /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can outlive
-    /// this stack frame (a background publish holds `shared_from_this()`), so a by-reference capture
-    /// of a local would dangle.
-    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(100);
-    /// Heap-owned, not plain locals: `event_sink` below mutates them, and the Pool can outlive this
-    /// stack frame (a background publish holds `shared_from_this()`), so a by-reference capture of a
-    /// local -- including a non-copyable `std::promise` -- would dangle.
-    auto result_observed = std::make_shared<std::promise<void>>();
-    std::future<void> result_future = result_observed->get_future();
-    auto result_published = std::make_shared<std::atomic<bool>>(false);
-    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
-    PoolConfig config{
-        .pool_prefix = "parked-redo-failed-observability",
-        .server_root_id = "test",
-        .background_watermark = true,
-        .event_sink = [result_observed, result_published, events](CasEvent event)
-        {
-            const bool final_remount = event.type == CasEventType::MountRemount && event.outcome == "failed";
-            events->push(std::move(event));
-            if (final_remount && !result_published->exchange(true))
-                result_observed->set_value();
-        },
-        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-        .mount_renew_period = std::chrono::milliseconds(100),
-        .cas_request_budget = runtimeRenewBudget(),
-        .boot_ms_fn = [fake_boot]
-        {
-            return fake_boot->load();
-        },
-        /// `backend` is captured BY VALUE (a copy of the shared_ptr): the Pool can outlive this frame,
-        /// so a by-reference capture of the local `shared_ptr` itself would dangle.
-        .remount_quiesce_hook_for_test = [fake_boot, backend]
-        {
-            *fake_boot += 900;
-            backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
-            /// The attempt is admitted 80 ms before its lease-safe bound; spending 90 inside it puts the
-            /// resolve read past that bound, so the ambiguity is refused instead of reissued.
-            backend->before_throw = [fake_boot]
-            {
-                *fake_boot += 90;
-            };
-        },
-    };
-    auto store = Pool::open(backend, config);
-    std::weak_ptr<Pool> store_lifetime = store;
-    ScopedParkedRenewalLogCapture renewal_logs;
-    fenceOutMount(*backend, store->layout().mountKey("test"));
-    ASSERT_TRUE(store->scheduleRemountForTest());
-    ASSERT_EQ(result_future.wait_for(std::chrono::seconds(20)), std::future_status::ready);
-
-    const std::vector<CasEvent> observed = events->snapshot();
-    const auto failed_renew = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
-    {
-        return event.type == CasEventType::WatermarkRenew && event.outcome == "failed";
-    });
-    const auto failed_remount = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
-    {
-        return event.type == CasEventType::MountRemount && event.outcome == "failed";
-    });
-    ASSERT_NE(failed_renew, observed.end());
-    ASSERT_NE(failed_remount, observed.end());
-    EXPECT_LT(std::distance(observed.begin(), failed_renew), std::distance(observed.begin(), failed_remount));
-    EXPECT_EQ(failed_renew->detail.at("remount_attempt_no"), failed_remount->detail.at("attempt_no"));
-    EXPECT_EQ(failed_renew->detail.at("attempts_sent"), "1");
-    EXPECT_EQ(failed_renew->detail.at("classification"), "external_lease_deadline");
-    EXPECT_NE(renewal_logs.captured().find("CAS mount renewal 'test' fenced"), String::npos);
-
-    /// A ready final-result future proves publication order; destruction additionally proves the
-    /// background renewal/remount threads are joined before the fixture's captured state is destroyed.
-    store.reset();
-    EXPECT_TRUE(store_lifetime.expired());
-}
-
 TEST(CASPoolRemount, ThrowingEventSinkAfterCommitLeavesRuntimeLive)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -4421,8 +4028,8 @@ TEST(CASPoolRemount, ThrowingEventSinkAfterCommitLeavesRuntimeLive)
         .pool_prefix = "throwing-remount-event", .server_root_id = "test", .background_watermark = true});
     /// Heap-owned, not a plain local declared after `store`: if `waitUntilArrived` below throws on its
     /// own internal timeout, unwinding would destroy a stack-local barrier before `store`'s destructor
-    /// joins the remount worker, and that worker can still be inside `arriveAndWait` on the dangling
-    /// reference. A `shared_ptr` capture keeps the barrier alive for as long as the worker needs it,
+    /// joins the lease thread, and that thread can still be inside `arriveAndWait` on the dangling
+    /// reference. A `shared_ptr` capture keeps the barrier alive for as long as the thread needs it,
     /// independent of declaration order.
     auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
     store->setEventSink([committed](const CasEvent & event)
@@ -4459,18 +4066,19 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
         CasEventSink sink;
         RuntimeUnderTest runtime_holder(
             backend, layout,
-            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+                        .mount_renew_period = std::chrono::milliseconds(ambiguous ? 0 : 3'600'000), .background_watermark = true,
                         .boot_ms_fn = [&] { return boot_ms; }},
             "test", sink, runtimeRenewBudget(), [] { return false; });
         CasMountRuntime & runtime = *runtime_holder;
         runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
         const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
+        runtime.armMountFence(anchor + 1000);
         if (ambiguous)
         {
             backend->barrier = &barrier;
             backend->fault = RuntimeRenewBackend::Fault::BlockThenThrow;
-            runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+            runtime.startBackgroundWorkers();
             barrier.waitUntilArrived();
             auto stop = std::async(std::launch::async, [&] { runtime.stopBackgroundWorkers(); });
             barrier.release();
@@ -4478,7 +4086,7 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
         }
         else
         {
-            runtime.startBackgroundWorkers(std::chrono::hours(1));
+            runtime.startBackgroundWorkers();
             runtime.stopBackgroundWorkers();
         }
         runtime.finishTeardown(true);
@@ -4489,53 +4097,40 @@ TEST(CASPoolShutdown, PreSendCancellationAllowsFarewellButAmbiguityDoesNot)
     EXPECT_NE(run(true), std::numeric_limits<uint64_t>::max());
 }
 
-TEST(CASPool, DirectAndStartupTerminalFailuresRethrowTypedExceptions)
+/// The test seam rethrows a terminal renewal as the typed failure it ended with.
+TEST(CASPool, DirectTerminalFailureRethrowsTypedException)
 {
-    enum class Refusal : uint8_t { PreAttemptDeadline, RefusedAfterSend };
-    const auto run = [](bool startup, Refusal refusal)
+    std::atomic<bool> renewal_live{true};
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("typed-direct");
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .boot_ms_fn = [&] { return boot_ms; },
+            .renewal_live_for_test = [&] { return renewal_live.load(std::memory_order_acquire); }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + 1000);
+    /// The renewal lands, then its liveness ends before the commit is confirmed.
+    backend->after_commit = [&] { renewal_live.store(false, std::memory_order_release); };
+    try
     {
-        auto backend = std::make_shared<RuntimeRenewBackend>();
-        const Layout layout(startup ? "typed-startup" : "typed-direct");
-        uint64_t wall_ms = 1000;
-        uint64_t boot_ms = 100;
-        std::atomic<bool> renewal_live{true};
-        const UInt128 uuid{1};
-        ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
-        CasEventSink sink;
-        RuntimeUnderTest runtime_holder(
-            backend, layout,
-            MountConfig{
-                .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-                .boot_ms_fn = [&] { return boot_ms; },
-                .renewal_live_for_test = [&] { return renewal_live.load(std::memory_order_acquire); }},
-            "test", sink, runtimeRenewBudget(), [] { return false; });
-        CasMountRuntime & runtime = *runtime_holder;
-        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
-        const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
-        if (refusal == Refusal::PreAttemptDeadline)
-            /// Past the point where the lease has more room left than the safety margin (deadline
-            /// `anchor + 1000` == 1100, margin 20), so admission refuses before anything is sent.
-            boot_ms = 1090;
-        else
-            backend->after_commit = [&] { renewal_live.store(false, std::memory_order_release); };
-        try
-        {
-            if (startup)
-                (void)runtime.renewRenewerForStartupOnce();
-            else
-                runtime.renewWatermarkOnce();
-            ADD_FAILURE() << "terminal renewal did not propagate";
-        }
-        catch (const DB::Exception & e)
-        {
-            EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR) << e.message();
-        }
-        runtime.finishTeardown(false);
-    };
-    for (bool startup : {true, false})
-        for (Refusal refusal : {Refusal::PreAttemptDeadline, Refusal::RefusedAfterSend})
-            run(startup, refusal);
+        runtime.renewWatermarkOnce();
+        ADD_FAILURE() << "terminal renewal did not propagate";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR) << e.message();
+    }
+    runtime.finishTeardown(false);
 }
 
 TEST(CASPool, BackgroundCadenceMustFitLeaseBeforeWritablePublication)
@@ -4597,7 +4192,7 @@ TEST(CASPool, DisabledBackgroundDoesNotReserveRenewalCadence)
     auto store = Pool::open(backend, config);
     const String key = store->layout().mountKey("test");
     EXPECT_EQ(backend->putOverwriteCount(key), 1u)
-        << "a disabled worker cadence must not force a synchronous startup redo";
+        << "an open with no lease thread whose claim admits a ref append writes the lease only once";
 }
 
 TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
@@ -4612,7 +4207,7 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -4622,10 +4217,10 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
-    /// A definitive answer ends the worker's renewal; a transient fault would only be retried.
+    runtime.armMountFence(anchor + 1000);
+    /// A definitive answer ends the lease thread's renewal; a transient fault would only be retried.
     fenceOutMount(*backend, layout.mountKey("test"));
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
     remount_entered.waitUntilArrived();
     EXPECT_FALSE(runtime.mayMutate());
     EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::TransientNotLive);
@@ -4634,83 +4229,8 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
     runtime.finishTeardown(false);
 }
 
-/// A remount request ends a worker renewal that is retrying past its lease, inside the wait or the
-/// request it is in: no request and no wait starts after it.
-TEST(CASMountRuntime, ParkEndsAnUnboundedRenewal)
-{
-    enum class ParkDuring : uint8_t { Wait, Request };
-    const auto run = [](ParkDuring park_during)
-    {
-        const Layout layout(park_during == ParkDuring::Wait ? "unbounded-park-in-wait" : "unbounded-park-in-request");
-        const UInt128 uuid{1};
-        uint64_t wall_ms = 1000;
-        std::atomic<uint64_t> boot_ms{100};
-        std::atomic<uint64_t> past_the_lease{std::numeric_limits<uint64_t>::max()};
-        std::atomic<bool> held{false};
-        std::atomic<uint64_t> waits{0};
-        std::atomic<uint64_t> writes_at_remount{0};
-        std::atomic<uint64_t> waits_at_remount{0};
-        DB::Cas::tests::ManualBarrier holding;
-        DB::Cas::tests::ManualBarrier remount_entered;
-        const auto hold_once_past_the_lease = [&]
-        {
-            if (boot_ms.load() >= past_the_lease.load() && !held.exchange(true))
-                holding.arriveAndWait();
-        };
-        /// Declared after the locals its hooks capture.
-        auto backend = std::make_shared<RuntimeRenewBackend>();
-        ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
-                  MountClaimResult::Claimed);
-        CasEventSink sink;
-        RuntimeUnderTest runtime_holder(
-            backend, layout,
-            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
-                        .boot_ms_fn = [&] { return boot_ms.load(); }},
-            "test", sink, runtimeRenewBudget(), [&]
-            {
-                writes_at_remount = backend->outage_writes.load();
-                waits_at_remount = waits.load();
-                remount_entered.arriveAndWait();
-                return false;
-            });
-        CasMountRuntime & runtime = *runtime_holder;
-        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
-        const uint64_t anchor = runtime.startRenewer();
-        runtime.armMountFence(uuid, 1, anchor + 1000);
-        /// Five lease lengths on: a renewal bounded by its lease ended long before.
-        past_the_lease = anchor + 5'000;
-        runtime_holder.setRetrySleepForTest([&](uint64_t ms)
-        {
-            ++waits;
-            boot_ms += ms;
-            if (park_during == ParkDuring::Wait)
-                hold_once_past_the_lease();
-        });
-        if (park_during == ParkDuring::Request)
-            backend->on_outage_write = hold_once_past_the_lease;
-        backend->outage = [] { return true; };
-        runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
-
-        holding.waitUntilArrived();
-        const uint64_t writes_at_park = backend->outage_writes.load();
-        const uint64_t waits_at_park = waits.load();
-        runtime.scheduleRemount();
-        EXPECT_EQ(runtime.renewalDriverStateForTest(), RenewalDriverState::ParkRequested);
-        holding.release();
-        remount_entered.waitUntilArrived();
-        EXPECT_EQ(runtime.renewalDriverStateForTest(), RenewalDriverState::Parked);
-        EXPECT_EQ(writes_at_remount.load(), writes_at_park) << "no request starts after the park";
-        EXPECT_EQ(waits_at_remount.load(), waits_at_park) << "no wait starts after the park";
-        remount_entered.release();
-        runtime.stopBackgroundWorkers();
-        runtime.finishTeardown(false);
-    };
-    run(ParkDuring::Wait);
-    run(ParkDuring::Request);
-}
-
-/// FORGET while the worker's renewal retries past its lease: the intent then the trip, in the order
-/// `Pool::forgetDisk` uses, end the renewal inside the wait it is in, both workers exit, and no remount
+/// FORGET while the lease thread's renewal retries past its lease: the intent then the trip, in the order
+/// `Pool::forgetDisk` uses, end the renewal inside the wait it is in, the lease thread exits, and no remount
 /// generation is raised.
 TEST(CASMountRuntime, ForgetEndsAnUnboundedRenewal)
 {
@@ -4737,13 +4257,13 @@ TEST(CASMountRuntime, ForgetEndsAnUnboundedRenewal)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms.load(); }, .worker_factory = factory},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     past_the_lease = anchor + 5'000;
     runtime_holder.setRetrySleepForTest([&](uint64_t ms)
     {
@@ -4753,7 +4273,7 @@ TEST(CASMountRuntime, ForgetEndsAnUnboundedRenewal)
             holding.arriveAndWait();
     });
     backend->outage = [] { return true; };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    runtime.startBackgroundWorkers();
 
     holding.waitUntilArrived();
     const uint64_t writes_at_forget = backend->outage_writes.load();
@@ -4763,8 +4283,8 @@ TEST(CASMountRuntime, ForgetEndsAnUnboundedRenewal)
     runtime.tripMountLost();
     holding.release();
 
-    const bool both_exited = exits.waitForAtLeast(2);
-    EXPECT_TRUE(both_exited) << "the worker loops must exit on the published intent";
+    const bool exited = exits.waitForAtLeast(1);
+    EXPECT_TRUE(exited) << "the lease loop must exit on the published intent";
     EXPECT_EQ(backend->outage_writes.load(), writes_at_forget) << "no request starts after FORGET";
     EXPECT_EQ(waits.load(), waits_at_forget) << "no wait starts after FORGET";
     EXPECT_EQ(runtime.remountRequestedGenerationForTest(), generation_at_forget);
@@ -4792,13 +4312,13 @@ TEST(CASMountRuntime, StopWakesTheRetryWaitOfAnUnboundedRenewal)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms; }},
         "test", sink, runtimeRenewBudget(), [] { return false; });
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     runtime_holder.setRetrySleepForTest([&](uint64_t ms)
     {
         const bool first = first_wait.exchange(false);
@@ -4811,11 +4331,17 @@ TEST(CASMountRuntime, StopWakesTheRetryWaitOfAnUnboundedRenewal)
                 std::chrono::steady_clock::now() - started).count();
     });
     backend->outage = [] { return true; };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+    runtime.startBackgroundWorkers();
 
     ASSERT_EQ(wait_requested.wait_for(std::chrono::seconds(20)), std::future_status::ready);
     const uint64_t requested_ms = wait_requested.get();
     runtime.stopBackgroundWorkers();
+    /// The renewal the stop ended had sent a request, so it ends terminal on a `Live` pool.
+    EXPECT_FALSE(runtime.mayMutate()) << "the stop latches the fence";
+    EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::Live);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before)
+        << "the stop counts no lease loss";
 
     EXPECT_GE(requested_ms, kMountRenewRetrySpacingMs * 8 / 10);
     EXPECT_LE(requested_ms, kMountRenewRetrySpacingMs * 12 / 10);
@@ -4848,7 +4374,7 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
     CasEventSink sink;
     RuntimeUnderTest runtime_holder(
         backend, layout,
-        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(500), .background_watermark = true,
                     .boot_ms_fn = [&] { return boot_ms.load(); },
                     /// The test clock moves only through the sleep seam, so a regression that zeroes the
                     /// pauses would retry forever; the request count ends the renewal instead.
@@ -4864,7 +4390,7 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.armMountFence(anchor + 1000);
     runtime_holder.setRetrySleepForTest([&](uint64_t ms) { boot_ms += ms; });
     /// The first renewal starts one period after the anchor and fails for three lease lengths.
     boot_ms = anchor + 500;
@@ -4877,7 +4403,7 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
         if (commit_boot_ms.size() == 2)
             second_commit.arriveAndWait();
     };
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(500));
+    runtime.startBackgroundWorkers();
 
     bool arrived = true;
     try
@@ -4906,6 +4432,723 @@ TEST(CASMountRuntime, AStaleSuccessIsFollowedAtOnceByTheNextRenewal)
     runtime.finishTeardown(false);
 }
 
+/// A remount request raised on an armed fence: the reclaim latches the fence before anything else and
+/// counts one loss. An interference report raised while that reclaim runs: it arms nothing, the next
+/// one starts with the fence latched, and no write is admitted between the two.
+TEST(CASMountRuntime, NothingArmsWhileARemountRequestIsPending)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-nothing-arms-while-pending");
+    uint64_t wall_ms = 1000;
+    const uint64_t boot_ms = 100;
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    std::atomic<uint32_t> calls{0};
+    bool may_mutate_before_first_latch = false;
+    bool may_mutate_after_first_latch = true;
+    PoolLifecycle lifecycle_after_first_latch = PoolLifecycle::Live;
+    uint64_t lost_after_first_latch = 0;
+    bool first_armed = true;
+    bool may_mutate_after_first = true;
+    bool may_mutate_at_second_entry = true;
+    bool may_mutate_after_second_latch = true;
+    PoolLifecycle lifecycle_after_second_latch = PoolLifecycle::Live;
+    bool second_armed = false;
+    bool may_mutate_after_second = false;
+    DB::Cas::tests::ManualBarrier second_done;
+    CasMountRuntime * runtime_ptr = nullptr;
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms; }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            CasMountRuntime & reclaiming = *runtime_ptr;
+            if (++calls == 1)
+            {
+                may_mutate_before_first_latch = reclaiming.mayMutate();
+                reclaiming.beginReclaim();
+                may_mutate_after_first_latch = reclaiming.mayMutate();
+                lifecycle_after_first_latch = reclaiming.lifecycle();
+                lost_after_first_latch = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+                /// An interference report while this reclaim runs.
+                reclaiming.tripAndRequestRemount();
+                first_armed = reclaiming.armIfAdmissible(boot_ms + 1000);
+                may_mutate_after_first = reclaiming.mayMutate();
+                return true;
+            }
+            may_mutate_at_second_entry = reclaiming.mayMutate();
+            reclaiming.beginReclaim();
+            may_mutate_after_second_latch = reclaiming.mayMutate();
+            lifecycle_after_second_latch = reclaiming.lifecycle();
+            second_armed = reclaiming.armIfAdmissible(boot_ms + 1000);
+            may_mutate_after_second = reclaiming.mayMutate();
+            second_done.arriveAndWait();
+            return true;
+        });
+    /// Declared after the runtime so it runs first: a failed expectation must not leave the reclaim
+    /// parked on the barrier while the runtime's destructor joins the thread.
+    SCOPE_EXIT({ second_done.release(); });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + 1000);
+    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+    runtime.startBackgroundWorkers();
+    /// A request without a trip: the fence is still armed when the reclaim starts.
+    runtime.scheduleRemountForTest();
+
+    second_done.waitUntilArrived();
+    EXPECT_TRUE(may_mutate_before_first_latch) << "the request alone must leave the fence armed";
+    EXPECT_FALSE(may_mutate_after_first_latch) << "a reclaim starts with the fence latched";
+    EXPECT_EQ(lifecycle_after_first_latch, PoolLifecycle::TransientNotLive);
+    EXPECT_EQ(lost_after_first_latch, lost_before + 1) << "the latch counts the one loss";
+    EXPECT_FALSE(first_armed) << "a reclaim must not arm while a newer remount request is pending";
+    EXPECT_FALSE(may_mutate_after_first);
+    EXPECT_FALSE(may_mutate_at_second_entry) << "no write may be admitted between the two reclaims";
+    EXPECT_FALSE(may_mutate_after_second_latch) << "a reclaim starts with the fence latched";
+    EXPECT_EQ(lifecycle_after_second_latch, PoolLifecycle::TransientNotLive);
+    EXPECT_TRUE(second_armed) << "the reclaim that served the last request arms";
+    EXPECT_TRUE(may_mutate_after_second);
+    EXPECT_EQ(calls.load(), 2u);
+    second_done.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+/// An interference report that lands while a reclaim runs, before its arm or while the arm holds
+/// `driver_mutex`: the arm does not override it. The fence ends latched with one request pending, the
+/// report counts a loss only on a `Live` pool, and the next reclaim serves it.
+TEST(CASMountRuntime, AnInterferenceReportDuringAReclaimIsServedByTheNextReclaim)
+{
+    enum class ReportAt : uint8_t { BeforeTheArm, InsideTheArm };
+    const auto run = [](ReportAt report_at)
+    {
+        auto backend = std::make_shared<RuntimeRenewBackend>();
+        const Layout layout(report_at == ReportAt::BeforeTheArm ? "report-before-arm" : "report-inside-arm");
+        uint64_t wall_ms = 1000;
+        const uint64_t boot_ms = 100;
+        const UInt128 uuid{1};
+        ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+                  MountClaimResult::Claimed);
+        std::atomic<uint32_t> calls{0};
+        bool first_armed = false;
+        bool may_mutate_after_first = true;
+        uint64_t generation_after_first = 0;
+        bool may_mutate_at_second_entry = true;
+        bool second_armed = false;
+        std::future<void> report;
+        std::atomic<bool> report_never_started{false};
+        DB::Cas::tests::ManualBarrier second_done;
+        CasMountRuntime * runtime_ptr = nullptr;
+        CasEventSink sink;
+        RuntimeUnderTest runtime_holder(
+            backend, layout,
+            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
+                        .boot_ms_fn = [&] { return boot_ms; }},
+            "test", sink, runtimeRenewBudget(), [&]
+            {
+                CasMountRuntime & reclaiming = *runtime_ptr;
+                if (++calls == 1)
+                {
+                    reclaiming.beginReclaim();
+                    if (report_at == ReportAt::BeforeTheArm)
+                    {
+                        reclaiming.tripAndRequestRemount();
+                    }
+                    else
+                    {
+                        /// The hook runs inside the arm with `driver_mutex` held, so the report starts
+                        /// there and can finish only after the arm's section.
+                        reclaiming.setArmMountFenceInterpositionHookForTest([&]
+                        {
+                            const uint64_t requests_before = runtime_ptr->scheduleRemountCallCountForTest();
+                            report = std::async(std::launch::async, [&] { runtime_ptr->tripAndRequestRemount(); });
+                            /// One step: the count rises before the lock, so no trip has landed yet. Two
+                            /// steps: the unlocked trip lands before the count rises, and the arm clears it.
+                            /// The bound only turns a hang into a failure.
+                            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+                            while (runtime_ptr->scheduleRemountCallCountForTest() == requests_before)
+                            {
+                                if (std::chrono::steady_clock::now() >= until)
+                                {
+                                    report_never_started = true;
+                                    break;
+                                }
+                                std::this_thread::yield();
+                            }
+                        });
+                    }
+                    first_armed = reclaiming.armIfAdmissible(boot_ms + 1000);
+                    reclaiming.setArmMountFenceInterpositionHookForTest({});
+                    if (report.valid())
+                        report.get();
+                    may_mutate_after_first = reclaiming.mayMutate();
+                    generation_after_first = reclaiming.remountRequestedGenerationForTest();
+                    return true;
+                }
+                may_mutate_at_second_entry = reclaiming.mayMutate();
+                reclaiming.beginReclaim();
+                second_armed = reclaiming.armIfAdmissible(boot_ms + 1000);
+                second_done.arriveAndWait();
+                return true;
+            });
+        SCOPE_EXIT({ second_done.release(); });
+        CasMountRuntime & runtime = *runtime_holder;
+        runtime_ptr = &runtime;
+        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+        const uint64_t anchor = runtime.startRenewer();
+        runtime.armMountFence(anchor + 1000);
+        const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+        runtime.startBackgroundWorkers();
+        runtime.scheduleRemountForTest();
+
+        second_done.waitUntilArrived();
+        EXPECT_FALSE(report_never_started.load()) << "the report did not start within the bound";
+        if (report_at == ReportAt::BeforeTheArm)
+            EXPECT_FALSE(first_armed) << "a report raised during the reclaim must stop its arm";
+        else
+            EXPECT_TRUE(first_armed) << "the report waits for the arm's section";
+        EXPECT_FALSE(may_mutate_after_first) << "the arm must not override the report's trip";
+        EXPECT_EQ(generation_after_first, 2u) << "the report raises one generation";
+        EXPECT_FALSE(may_mutate_at_second_entry);
+        EXPECT_TRUE(second_armed) << "the next reclaim serves the report";
+        EXPECT_EQ(calls.load(), 2u);
+        EXPECT_EQ(runtime.remountRequestedGenerationForTest(), 2u);
+        /// The first latch counts one loss; the report counts one more only when the arm made the pool `Live`.
+        EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(),
+                  lost_before + (report_at == ReportAt::BeforeTheArm ? 1 : 2));
+        second_done.release();
+        runtime.stopBackgroundWorkers();
+        runtime.finishTeardown(false);
+    };
+    run(ReportAt::BeforeTheArm);
+    run(ReportAt::InsideTheArm);
+}
+
+/// One interference report produces one remount generation, one epoch change and one lease-loss
+/// count, also when the reclaim fails twice before it succeeds. Two failures cost one and two seconds
+/// of the loop's real backoff.
+TEST(CASMountRuntime, AReclaimAcknowledgesOnlyTheGenerationItServed)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-reclaim-acknowledges");
+    uint64_t wall_ms = 1000;
+    const uint64_t boot_ms = 100;
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    std::atomic<uint32_t> calls{0};
+    std::atomic<uint32_t> fresh_epochs{0};
+    DB::Cas::tests::ManualBarrier reclaimed;
+    CasMountRuntime * runtime_ptr = nullptr;
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms; }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            CasMountRuntime & reclaiming = *runtime_ptr;
+            reclaiming.beginReclaim();
+            if (++calls < 3)
+                return false;
+            fenceOutMount(*backend, layout.mountKey("test"));
+            const MountClaimResult fresh
+                = claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 2, wall_ms, 1000);
+            EXPECT_EQ(fresh.kind, MountClaimResult::Claimed);
+            if (fresh.kind != MountClaimResult::Claimed)
+                return false;
+            ++fresh_epochs;
+            reclaiming.installRenewer(uuid, 2, [&] { return wall_ms; });
+            const uint64_t fresh_anchor = reclaiming.startRenewer();
+            reclaiming.setLiveWriterEpoch(2);
+            EXPECT_TRUE(reclaiming.armIfAdmissible(fresh_anchor + 1000));
+            reclaimed.arriveAndWait();
+            return true;
+        });
+    SCOPE_EXIT({ reclaimed.release(); });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + 1000);
+    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+    runtime.startBackgroundWorkers();
+    /// One interference report.
+    runtime.tripMountLost();
+    runtime.scheduleRemountForTest();
+
+    reclaimed.waitUntilArrived();
+    EXPECT_EQ(calls.load(), 3u);
+    EXPECT_EQ(fresh_epochs.load(), 1u);
+    EXPECT_EQ(runtime.remountRequestedGenerationForTest(), 1u) << "a failed reclaim raises no generation";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before + 1)
+        << "the latch of each attempt counts no further loss";
+    EXPECT_TRUE(runtime.mayMutate());
+    reclaimed.release();
+    runtime.stopBackgroundWorkers();
+    EXPECT_EQ(calls.load(), 3u) << "the served generation is not reclaimed again";
+    runtime.finishTeardown(false);
+}
+
+/// The first two steps of `Pool::forgetDisk` land while a reclaim runs: the reclaim that finishes
+/// after them arms nothing, so the fence is latched before FORGET's second trip, and the thread exits.
+TEST(CASMountRuntime, AReclaimFinishedAfterTheForgetIntentArmsNothing)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-reclaim-after-intent");
+    uint64_t wall_ms = 1000;
+    const uint64_t boot_ms = 100;
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    WorkerExitLatch exits;
+    uint64_t threads = 0;
+    RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+    {
+        ++threads;
+        return ThreadFromGlobalPool([&, body = std::move(worker_body)]
+        {
+            body();
+            exits.recordExit();
+        });
+    };
+    DB::Cas::tests::ManualBarrier latched;
+    bool armed = true;
+    bool may_mutate_after_reclaim = true;
+    CasMountRuntime * runtime_ptr = nullptr;
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::hours(1), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            CasMountRuntime & reclaiming = *runtime_ptr;
+            reclaiming.beginReclaim();
+            latched.arriveAndWait();
+            armed = reclaiming.armIfAdmissible(boot_ms + 1000);
+            may_mutate_after_reclaim = reclaiming.mayMutate();
+            return true;
+        });
+    SCOPE_EXIT({ latched.release(); });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + 1000);
+    runtime.startBackgroundWorkers();
+    runtime.tripMountLost();
+    runtime.scheduleRemountForTest();
+
+    latched.waitUntilArrived();
+    runtime.publishVanishedIntent();
+    runtime.tripMountLost();
+    latched.release();
+
+    const bool exited = exits.waitForAtLeast(threads);
+    EXPECT_TRUE(exited) << "the published intent must end the loop";
+    EXPECT_FALSE(armed) << "a reclaim that finished after the intent must not arm the fence";
+    EXPECT_FALSE(may_mutate_after_reclaim);
+    EXPECT_FALSE(runtime.mayMutate()) << "the fence is latched before FORGET's second trip";
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+/// A stop requested during a reclaim: the join returns once the attempt returns, the reclaim arms
+/// nothing, and no farewell is written for the slot this runtime did not claim back.
+TEST(CASMountRuntime, StopDuringAReclaimJoinsTheThread)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-stop-during-reclaim");
+    uint64_t wall_ms = 1000;
+    const uint64_t boot_ms = 100;
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    WorkerExitLatch exits;
+    uint64_t threads = 0;
+    RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+    {
+        ++threads;
+        return ThreadFromGlobalPool([&, body = std::move(worker_body)]
+        {
+            body();
+            exits.recordExit();
+        });
+    };
+    DB::Cas::tests::ManualBarrier reclaim_entered;
+    std::atomic<bool> stop_requested_by_test{false};
+    bool stop_seen_by_reclaim = false;
+    bool armed = true;
+    std::atomic<bool> reclaim_returned{false};
+    uint64_t lost_at_latch = 0;
+    CasMountRuntime * runtime_ptr = nullptr;
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms; }, .worker_factory = factory},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            CasMountRuntime & reclaiming = *runtime_ptr;
+            reclaiming.beginReclaim();
+            lost_at_latch = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+            reclaim_entered.arriveAndWait();
+            /// Returns on the stop; the timeout only bounds a failing run.
+            reclaiming.sleepInterruptibly(20'000);
+            stop_seen_by_reclaim = stop_requested_by_test.load();
+            armed = reclaiming.armIfAdmissible(boot_ms + 1000);
+            reclaim_returned = true;
+            return true;
+        });
+    SCOPE_EXIT({ reclaim_entered.release(); });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + 1000);
+    const String key = layout.mountKey("test");
+    /// A definitive answer ends the first renewal and requests the reclaim; nobody claims the slot back.
+    fenceOutMount(*backend, key);
+    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+    runtime.startBackgroundWorkers();
+
+    reclaim_entered.waitUntilArrived();
+    stop_requested_by_test = true;
+    auto stop = std::async(std::launch::async, [&] { runtime.stopBackgroundWorkers(); });
+    reclaim_entered.release();
+    stop.get();
+
+    EXPECT_TRUE(reclaim_returned.load()) << "the join waits for the reclaim attempt to return";
+    EXPECT_EQ(exits.count(), threads);
+    EXPECT_TRUE(stop_seen_by_reclaim) << "the reclaim must finish after the stop was requested";
+    EXPECT_FALSE(armed) << "a reclaim that finishes after a stop must not arm the fence";
+    EXPECT_FALSE(runtime.mayMutate());
+    EXPECT_EQ(lost_at_latch, lost_before + 1) << "the fenced-out renewal counts the one loss";
+    const auto slot_before_teardown = readObj(*backend, key);
+    ASSERT_TRUE(slot_before_teardown.has_value());
+    runtime.finishTeardown(true);
+    const auto slot_after_teardown = readObj(*backend, key);
+    ASSERT_TRUE(slot_after_teardown.has_value());
+    EXPECT_EQ(slot_after_teardown->bytes, slot_before_teardown->bytes)
+        << "no farewell for a slot this runtime did not claim back";
+}
+
+/// An interference report while the renewal retries past its lease ends it inside the wait or the
+/// request it is in: no request and no wait starts after the report. The thread that renewed runs the
+/// reclaim and then renews under the new epoch.
+TEST(CASMountRuntime, ARemountRequestEndsTheRenewalAndTheSameThreadReclaims)
+{
+    enum class RequestDuring : uint8_t { Wait, Request };
+    const auto run = [](RequestDuring request_during)
+    {
+        const Layout layout(request_during == RequestDuring::Wait ? "same-thread-reclaim-in-wait" : "same-thread-reclaim-in-request");
+        const UInt128 uuid{1};
+        uint64_t wall_ms = 1000;
+        std::atomic<uint64_t> boot_ms{100};
+        std::atomic<uint64_t> past_the_lease{std::numeric_limits<uint64_t>::max()};
+        std::atomic<bool> held{false};
+        std::atomic<bool> outage_on{true};
+        std::atomic<uint64_t> waits{0};
+        std::atomic<uint64_t> writes_at_reclaim{0};
+        std::atomic<uint64_t> waits_at_reclaim{0};
+        std::atomic<uint64_t> worker_threads{0};
+        std::atomic<bool> reclaimed{false};
+        std::atomic<bool> renewed_after_reclaim{false};
+        std::mutex thread_ids_mutex;
+        std::thread::id renewing_thread;
+        std::thread::id reclaiming_thread;
+        std::thread::id renewing_after_reclaim_thread;
+        DB::Cas::tests::ManualBarrier holding;
+        DB::Cas::tests::ManualBarrier renewed;
+        CasMountRuntime * runtime_ptr = nullptr;
+        const auto record_thread = [&](std::thread::id & slot)
+        {
+            std::lock_guard lock(thread_ids_mutex);
+            slot = std::this_thread::get_id();
+        };
+        const auto hold_once_past_the_lease = [&]
+        {
+            if (boot_ms.load() >= past_the_lease.load() && !held.exchange(true))
+            {
+                record_thread(renewing_thread);
+                holding.arriveAndWait();
+            }
+        };
+        RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+        {
+            ++worker_threads;
+            return ThreadFromGlobalPool(std::move(worker_body));
+        };
+        /// Declared after the locals its hooks capture.
+        auto backend = std::make_shared<RuntimeRenewBackend>();
+        ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+                  MountClaimResult::Claimed);
+        CasEventSink sink;
+        RuntimeUnderTest runtime_holder(
+            backend, layout,
+            MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
+                        .boot_ms_fn = [&] { return boot_ms.load(); }, .worker_factory = factory},
+            "test", sink, runtimeRenewBudget(), [&]
+            {
+                CasMountRuntime & reclaiming = *runtime_ptr;
+                writes_at_reclaim = backend->outage_writes.load();
+                waits_at_reclaim = waits.load();
+                record_thread(reclaiming_thread);
+                outage_on = false;
+                reclaiming.beginReclaim();
+                fenceOutMount(*backend, layout.mountKey("test"));
+                const MountClaimResult fresh
+                    = claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 2, wall_ms, 1000);
+                EXPECT_EQ(fresh.kind, MountClaimResult::Claimed);
+                if (fresh.kind != MountClaimResult::Claimed)
+                    return false;
+                reclaiming.installRenewer(uuid, 2, [&] { return wall_ms; });
+                const uint64_t fresh_anchor = reclaiming.startRenewer();
+                reclaiming.setLiveWriterEpoch(2);
+                EXPECT_TRUE(reclaiming.armIfAdmissible(fresh_anchor + 1000));
+                reclaimed = true;
+                return true;
+            });
+        SCOPE_EXIT({
+            holding.release();
+            renewed.release();
+        });
+        CasMountRuntime & runtime = *runtime_holder;
+        runtime_ptr = &runtime;
+        runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+        const uint64_t anchor = runtime.startRenewer();
+        runtime.armMountFence(anchor + 1000);
+        /// Five lease lengths on: a renewal bounded by its lease ended long before.
+        past_the_lease = anchor + 5'000;
+        runtime_holder.setRetrySleepForTest([&](uint64_t ms)
+        {
+            ++waits;
+            boot_ms += ms;
+            if (request_during == RequestDuring::Wait)
+                hold_once_past_the_lease();
+        });
+        if (request_during == RequestDuring::Request)
+            backend->on_outage_write = hold_once_past_the_lease;
+        backend->outage = [&] { return outage_on.load(); };
+        backend->after_commit = [&]
+        {
+            if (reclaimed.load() && !renewed_after_reclaim.exchange(true))
+            {
+                record_thread(renewing_after_reclaim_thread);
+                renewed.arriveAndWait();
+            }
+        };
+        runtime.startBackgroundWorkers();
+
+        holding.waitUntilArrived();
+        const uint64_t writes_at_request = backend->outage_writes.load();
+        const uint64_t waits_at_request = waits.load();
+        /// An interference report while the renewal retries past its lease.
+        runtime.tripMountLost();
+        runtime.scheduleRemountForTest();
+        holding.release();
+        renewed.waitUntilArrived();
+
+        EXPECT_EQ(worker_threads.load(), 1u) << "one thread renews and reclaims";
+        {
+            std::lock_guard lock(thread_ids_mutex);
+            EXPECT_EQ(reclaiming_thread, renewing_thread) << "the reclaim runs on the thread that renewed";
+            EXPECT_EQ(renewing_after_reclaim_thread, renewing_thread) << "the same thread renews after the reclaim";
+        }
+        EXPECT_EQ(writes_at_reclaim.load(), writes_at_request) << "no request starts after the remount request";
+        EXPECT_EQ(waits_at_reclaim.load(), waits_at_request) << "no wait starts after the remount request";
+        EXPECT_EQ(decodeMountLease(readObj(*backend, layout.mountKey("test"))->bytes).writer_epoch, 2u)
+            << "the renewal after the reclaim runs under the new epoch";
+        EXPECT_EQ(runtime.remountRequestedGenerationForTest(), 1u);
+        renewed.release();
+        runtime.stopBackgroundWorkers();
+        runtime.finishTeardown(false);
+    };
+    run(RequestDuring::Wait);
+    run(RequestDuring::Request);
+}
+
+/// A renewal whose write committed before a remount request is consumed before the reclaim runs, so
+/// its deadline cannot overwrite the one the reclaim arms. The renewal's last liveness check comes
+/// after its write committed: the request is raised there, so the renewal still returns `Committed`.
+TEST(CASMountRuntime, ACommitConsumedAfterARemountRequestCannotOverwriteTheReclaimedDeadline)
+{
+    const Layout layout("commit-consumed-after-request");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{100};
+    std::atomic<uint64_t> worker_threads{0};
+    std::atomic<std::thread::id> first_worker_thread{};
+    std::atomic<bool> committed{false};
+    std::atomic<bool> requested{false};
+    std::atomic<bool> held{false};
+    std::atomic<bool> hold_timed_out{false};
+    std::atomic<bool> armed_by_reclaim{false};
+    std::atomic<uint32_t> admissions{0};
+    std::promise<void> reclaim_armed;
+    std::shared_future<void> reclaim_armed_future = reclaim_armed.get_future().share();
+    DB::Cas::tests::ManualBarrier second_admission;
+    CasMountRuntime * runtime_ptr = nullptr;
+    RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+    {
+        const bool first = worker_threads.fetch_add(1) == 0;
+        return ThreadFromGlobalPool([&, first, body = std::move(worker_body)]
+        {
+            if (first)
+                first_worker_thread = std::this_thread::get_id();
+            body();
+        });
+    };
+    /// With a second thread the reclaim can run before the renewing thread consumes its result. Hold
+    /// that consumption at its first clock read until the reclaim armed. With one thread this never
+    /// waits: the consumption comes before the reclaim on the same thread.
+    const auto hold_consumption_until_armed = [&]
+    {
+        if (worker_threads.load() == 2 && requested.load()
+            && std::this_thread::get_id() == first_worker_thread.load() && !held.exchange(true))
+        {
+            if (reclaim_armed_future.wait_for(std::chrono::seconds(20)) != std::future_status::ready)
+                hold_timed_out = true;
+        }
+    };
+    /// Declared after the locals its hooks capture.
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0),
+            .background_watermark = true,
+            .boot_ms_fn = [&]
+            {
+                hold_consumption_until_armed();
+                return boot_ms.load();
+            },
+            .worker_factory = factory,
+            .renewal_admitted_hook_for_test = [&]
+            {
+                if (++admissions == 2)
+                    second_admission.arriveAndWait();
+            },
+            .renewal_live_for_test = [&]
+            {
+                if (committed.load() && !requested.exchange(true))
+                    runtime_ptr->scheduleRemountForTest();
+                return true;
+            }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            CasMountRuntime & reclaiming = *runtime_ptr;
+            reclaiming.beginReclaim();
+            fenceOutMount(*backend, layout.mountKey("test"));
+            const MountClaimResult fresh
+                = claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 2, wall_ms, 1000);
+            EXPECT_EQ(fresh.kind, MountClaimResult::Claimed);
+            if (fresh.kind != MountClaimResult::Claimed)
+                return false;
+            reclaiming.installRenewer(uuid, 2, [&] { return wall_ms; });
+            boot_ms = 500;
+            const uint64_t fresh_anchor = reclaiming.startRenewer();
+            reclaiming.setLiveWriterEpoch(2);
+            armed_by_reclaim = reclaiming.armIfAdmissible(fresh_anchor + 1000);
+            reclaim_armed.set_value();
+            return true;
+        });
+    SCOPE_EXIT({ second_admission.release(); });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + 1000);
+    /// Set after the setup's own writes: only the loop's renewal may raise the request.
+    backend->after_commit = [&] { committed = true; };
+    runtime.startBackgroundWorkers();
+
+    second_admission.waitUntilArrived();
+    EXPECT_FALSE(hold_timed_out.load());
+    ASSERT_TRUE(armed_by_reclaim.load());
+    /// Between the first renewal's deadline (100 + 1000) and the reclaim's (500 + 1000).
+    boot_ms = 1200;
+    EXPECT_TRUE(runtime.mayMutate())
+        << "the deadline is the reclaim's, not the one of the renewal consumed after the request";
+    second_admission.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+/// While the lease thread runs, no other thread may replace, reset or start the renewer. Constructing
+/// a `LOGICAL_ERROR` exception aborts under a debug or sanitizer build, so there the same contract is
+/// a death expectation.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CASMountRuntime, OnlyTheLeaseThreadReplacesTheRenewerWhileItRuns)
+#else
+TEST(CASMountRuntimeDeathTest, OnlyTheLeaseThreadReplacesTheRenewerWhileItRuns)
+#endif
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-renewer-owner");
+    uint64_t wall_ms = 1000;
+    const uint64_t boot_ms = 100;
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    DB::Cas::tests::ManualBarrier admitted;
+    CasEventSink sink;
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms; },
+                    .renewal_admitted_hook_for_test = [&] { admitted.arriveAndWait(); }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    SCOPE_EXIT({ admitted.release(); });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + 1000);
+    runtime.startBackgroundWorkers();
+    /// The lease thread is held between its decision to renew and the renewal, with no lock held.
+    admitted.waitUntilArrived();
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
+    const auto expect_owner_refusal = [](const char * what, const std::function<void()> & call)
+    {
+        try
+        {
+            call();
+            ADD_FAILURE() << what << " from a test thread must be refused while the lease thread runs";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR) << what;
+            EXPECT_NE(e.message().find("only the lease thread"), String::npos) << what << ": " << e.message();
+        }
+    };
+    expect_owner_refusal("installRenewer", [&] { runtime.installRenewer(uuid, 2, [&] { return wall_ms; }); });
+    expect_owner_refusal("renewerReset", [&] { runtime.renewerReset(); });
+    expect_owner_refusal("startRenewer", [&] { (void)runtime.startRenewer(); });
+#else
+    /// The child exits through `std::_Exit` if the call does not abort: running exit handlers in a
+    /// forked child can block on a thread pool mutex a vanished thread held.
+    EXPECT_DEATH({ runtime.installRenewer(uuid, 2, [&] { return wall_ms; }); std::_Exit(0); }, "only the lease thread");
+    EXPECT_DEATH({ runtime.renewerReset(); std::_Exit(0); }, "only the lease thread");
+    EXPECT_DEATH({ (void)runtime.startRenewer(); std::_Exit(0); }, "only the lease thread");
+#endif
+
+    admitted.release();
+    runtime.stopBackgroundWorkers();
+    /// With the thread joined the caller drives the renewer again.
+    EXPECT_NO_THROW(runtime.renewerReset());
+    runtime.finishTeardown(false);
+}
+
 TEST(CASPool, RenewWatermarkOnceRefreshesFenceAndDepositsOneFailure)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
@@ -4929,16 +5172,10 @@ TEST(CASPool, RenewWatermarkOnceRefreshesFenceAndDepositsOneFailure)
     fake_boot->store(1200);
     EXPECT_TRUE(store->mayMutate()) << "direct success must refresh the local fence from attempt start";
 
-    backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
-    /// The renewal that succeeded at 500 anchored the lease for its 1000 ms TTL, so it expires at 1500.
-    /// Expire it from inside the attempt: the fault alone no longer ends a renewal, because the engine
-    /// settles the ambiguity by reading and reissues, and the reissue commits.
-    backend->before_throw = [fake_boot]
-    {
-        fake_boot->store(1500);
-    };
+    /// GC fences the slot out: a definitive answer, so the renewal ends on its first attempt.
+    fenceOutMount(*backend, store->layout().mountKey("test"));
     const uint64_t schedules_before = store->scheduleRemountCallCountForTest();
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->renewWatermarkOnce(); });
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->renewWatermarkOnce(); });
     EXPECT_FALSE(store->mayMutate());
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), schedules_before + 1);
 }
@@ -4988,75 +5225,6 @@ TEST(CASPoolRemount, WholeChainResultsAreNumberedAndStepLabelled)
     const uint64_t second_attempt = std::stoull(remounts[1].detail.at("attempt_no"));
     EXPECT_EQ(second_attempt, first_attempt + 1);
     EXPECT_EQ(countRemountFinalLogs(logs.captured()), 2u) << logs.captured();
-}
-
-/// The remount's `renewer_redo` step re-anchors the lease BEFORE `armMountFence`, so it runs with the
-/// fence still latched lost. Admitted on the mount plane it could only ever give up, and every remount
-/// that reached the step would fail -- so it renews on the renewer's open plane instead.
-///
-/// Driven the way production reaches the step, which is the only way it CAN be reached: the persistent
-/// renewal worker runs, `scheduleRemount` parks it, and the redo is the parked driver's one call. A
-/// remount driven directly with no workers leaves that driver dormant, and the step's admission refuses
-/// a dormant driver rather than renewing.
-///
-/// The step is reached only when quiescence has eaten most of the new lease: with a fresh anchor the
-/// renewal window fits and the step is skipped entirely. So the quiesce hook advances the injected boot
-/// clock to just inside the safety margin, and the paired run with no quiesce cost is the control that
-/// proves the step was reached rather than skipped.
-TEST(CASPoolRemount, TheRenewerRedoRenewsOnTheOpenPlane)
-{
-    /// One successful self-remount whose quiescence costs `quiesce_ms`; returns the conditional
-    /// mount-slot writes it issued. Counted while the remount worker is still held inside the event
-    /// sink that reported the result, so the renewal worker it un-parks cannot add one.
-    const auto remountConditionalMountWrites = [](uint64_t quiesce_ms) -> uint64_t
-    {
-        auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-        /// Held in a shared atomic, not a plain local: the hooks below mutate it, and the Pool can
-        /// outlive this lambda's own stack frame (a background publish holds `shared_from_this()`), so
-        /// a by-reference capture of a local would dangle.
-        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(1'000'000);
-        /// Heap-owned, not a plain local: declaration order relative to `store` only protects against an
-        /// ordinary same-thread unwind, not a detached background completion that holds an extra
-        /// `shared_from_this()` and can still be running on another thread after this call returns.
-        auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
-        auto store = Pool::open(backend, PoolConfig{
-            .pool_prefix = "remount-renewer-redo",
-            .server_root_id = "test",
-            .background_watermark = true,
-            .event_sink = [committed](const CasEvent & event)
-            {
-                if (event.type == CasEventType::MountRemount && event.outcome == "ok")
-                    committed->arriveAndWait();
-            },
-            .boot_ms_fn = [fake_boot]
-            {
-                return fake_boot->load();
-            },
-            .wait_sleep_fn = [fake_boot](uint64_t ms)
-            {
-                *fake_boot += ms;
-            },
-            .remount_quiesce_hook_for_test = [fake_boot, quiesce_ms]
-            {
-                *fake_boot += quiesce_ms;
-            },
-        });
-        const String mount_key = store->layout().mountKey("test");
-
-        fenceOutMount(*backend, mount_key);
-        const uint64_t before = backend->putOverwriteCount(mount_key);
-        EXPECT_TRUE(store->scheduleRemountForTest())
-            << "the remount must be latched with quiesce_ms=" << quiesce_ms;
-        committed->waitUntilArrived();
-        const uint64_t writes = backend->putOverwriteCount(mount_key) - before;
-        committed->release();
-        return writes;
-    };
-
-    /// 27 s of a 30 s lease, against a 2 s safety margin and a window of one renewal period plus one
-    /// attempt (15 s, since the renewal worker runs here): the window no longer fits.
-    EXPECT_GT(remountConditionalMountWrites(27'000), remountConditionalMountWrites(0))
-        << "a quiescence that consumed the lease must cost one extra lease write -- the redo";
 }
 
 TEST(CASPoolRemount, LeaseLossHasOneOperationalOwner)
@@ -5322,7 +5490,7 @@ void runExpiryScenario(const String & layout_prefix, ExpiryObservation & seen)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -5357,7 +5525,7 @@ void runExpiryScenario(const String & layout_prefix, ExpiryObservation & seen)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     ASSERT_EQ(anchor, kExpiryClaimBootMs);
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
 
     seen.generation_before = runtime.fenceGeneration();
     seen.attempts_before = eventCount(ProfileEvents::CASMountRenewalAttempts);
@@ -5384,7 +5552,7 @@ void runExpiryScenario(const String & layout_prefix, ExpiryObservation & seen)
         return true;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     third_pass.waitUntilArrived();
 
     seen.writer_epoch_on_store = decodeMountLease(readObj(*backend, layout.mountKey("test"))->bytes).writer_epoch;
@@ -5435,7 +5603,7 @@ void runReadOutageScenario(const String & layout_prefix, ReadOutageObservation &
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -5457,7 +5625,7 @@ void runReadOutageScenario(const String & layout_prefix, ReadOutageObservation &
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
 
     seen.attempts_before = eventCount(ProfileEvents::CASMountRenewalAttempts);
     seen.retries_before = eventCount(ProfileEvents::CASMountRenewalRetries);
@@ -5477,7 +5645,7 @@ void runReadOutageScenario(const String & layout_prefix, ReadOutageObservation &
         return true;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     second_pass.waitUntilArrived();
     second_pass.release();
     runtime.stopBackgroundWorkers();
@@ -5636,7 +5804,7 @@ void runExpiryLogScenario(const String & layout_prefix, ExpiryLogRig & rig, uint
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return rig.boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -5660,7 +5828,7 @@ void runExpiryLogScenario(const String & layout_prefix, ExpiryLogRig & rig, uint
     rig.runtime = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
     rig.generation = runtime.fenceGeneration();
 
     backend->on_put = [&](uint32_t put_no)
@@ -5673,7 +5841,7 @@ void runExpiryLogScenario(const String & layout_prefix, ExpiryLogRig & rig, uint
         return true;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     stop.waitUntilArrived();
     rig.final_log = rig.log.captured();
 
@@ -5797,7 +5965,7 @@ TEST(CASMountRuntime, ASuccessEndsTheFailureTextOfItsRun)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -5824,7 +5992,7 @@ TEST(CASMountRuntime, ASuccessEndsTheFailureTextOfItsRun)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
 
     backend->on_put = [&](uint32_t put_no)
     {
@@ -5838,7 +6006,7 @@ TEST(CASMountRuntime, ASuccessEndsTheFailureTextOfItsRun)
         return false;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     third_pass.waitUntilArrived();
     third_pass.release();
     runtime.stopBackgroundWorkers();
@@ -5876,7 +6044,7 @@ TEST(CASMountRuntime, EachRestoredExpiryIsCountedOnce)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -5898,7 +6066,7 @@ TEST(CASMountRuntime, EachRestoredExpiryIsCountedOnce)
     runtime_ptr = &runtime;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
     generation = runtime.fenceGeneration();
 
     /// Renewal 1 fails 24 times and then lands stale (put 25); renewal 2 restores (put 26). Renewal 3
@@ -5931,7 +6099,7 @@ TEST(CASMountRuntime, EachRestoredExpiryIsCountedOnce)
         return failing;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     last_pass.waitUntilArrived();
     last_pass.release();
     runtime.stopBackgroundWorkers();
@@ -5963,7 +6131,7 @@ TEST(CASMountRuntime, AnExpiryEndedByAFenceIsNotCountedAsARestore)
     RuntimeUnderTest runtime_holder(
         backend, layout,
         MountConfig{
-            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
             .background_watermark = true,
             .boot_ms_fn = [&] { return boot_ms.load(); },
             .renewal_before_driver_lock_hook_for_test = [&]
@@ -5982,7 +6150,7 @@ TEST(CASMountRuntime, AnExpiryEndedByAFenceIsNotCountedAsARestore)
     CasMountRuntime & runtime = *runtime_holder;
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
-    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    runtime.armMountFence(anchor + kExpiryTtlMs);
     /// The first renewal lands stale, so the lease is still expired when GC fences the slot out; the
     /// next renewal meets the fence.
     backend->on_put = [&](uint32_t put_no)
@@ -5993,7 +6161,7 @@ TEST(CASMountRuntime, AnExpiryEndedByAFenceIsNotCountedAsARestore)
         return failing;
     };
 
-    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    runtime.startBackgroundWorkers();
     remount_entered.waitUntilArrived();
 
     EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::TransientNotLive);
@@ -6004,3 +6172,1174 @@ TEST(CASMountRuntime, AnExpiryEndedByAFenceIsNotCountedAsARestore)
     runtime.stopBackgroundWorkers();
     runtime.finishTeardown(false);
 }
+
+namespace
+{
+/// Clock values of the runtime readiness cases. With `runtimeRenewBudget` a ref append needs
+/// 2 x 10 + 20 = 40 ms of lease. The claim starts at 100 s and the open decides with 30 ms left.
+constexpr uint64_t kReadinessDecideBootMs = kExpiryDeadlineBootMs - 30;
+/// The first readiness renewal fails 24 times, 1.3 s each, and commits with a start more than a TTL ago.
+constexpr uint64_t kReadinessStaleCommitBootMs = kReadinessDecideBootMs + kExpiryFailedPuts * kExpiryFailedPutMs;
+static_assert(kReadinessStaleCommitBootMs >= kReadinessDecideBootMs + kExpiryTtlMs);
+/// The second commits with 35 ms of its lease left: in the future, but under the 40 ms a ref append needs.
+constexpr uint64_t kReadinessShortCommitBootMs = kReadinessStaleCommitBootMs + kExpiryTtlMs - 35;
+/// Far above any request count these tests reach, so only a regression hits it.
+constexpr uint32_t kReadinessRequestBound = 100;
+
+struct ReadinessView
+{
+    const char * admit = "";
+    bool may_mutate = true;
+    PoolLifecycle lifecycle = PoolLifecycle::IdentityLost;
+    bool expired = true;
+    String failure;
+    uint64_t generation = 0;
+    bool ref_append_ok = false;
+};
+
+ReadinessView readinessViewOf(CasMountRuntime & runtime)
+{
+    return ReadinessView{
+        .admit = expiryAdmitName(runtime.admit(runtime.fenceGeneration(), 0)),
+        .may_mutate = runtime.mayMutate(),
+        .lifecycle = runtime.lifecycle(),
+        .expired = runtime.leaseExpiredSinceBootMs().has_value(),
+        .failure = runtime.lastRenewFailure(),
+        .generation = runtime.fenceGeneration(),
+        .ref_append_ok = runtime.refAppendFenceOk(),
+    };
+}
+}
+
+/// The open's closed state, at the runtime level: a claim with too little lease for a ref append leaves
+/// the fence latched, and only a loop renewal whose own deadline leaves that room arms it. A stale success
+/// and a success with too little room arm nothing, and each is followed at once by the next renewal.
+TEST(CASMountRuntime, AReadinessRenewalArmsOnlyWithRoomForARefAppend)
+{
+    /// Everything the hooks capture is declared before the backend and the runtime that store them.
+    const Layout layout("runtime-readiness-room");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{kExpiryClaimBootMs};
+    std::atomic<uint32_t> puts{0};
+    std::atomic<uint32_t> remount_calls{0};
+    std::atomic<bool> request_bound_hit{false};
+    uint32_t loop_passes = 0;
+    std::vector<uint64_t> admitted_at;
+    ReadinessView during_first_put;
+    ReadinessView after_stale;
+    ReadinessView after_short;
+    ReadinessView after_arm;
+    DB::Cas::tests::ManualBarrier armed_pass;
+    CasMountRuntime * runtime_ptr = nullptr;
+    const uint64_t lost_before = eventCount(ProfileEvents::CASMountLeaseLost);
+    const uint64_t expired_before = eventCount(ProfileEvents::CASMountLeaseExpired);
+    CasEventSink sink;
+    auto backend = std::make_shared<ExpiryScriptBackend>();
+
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, kExpiryTtlMs).kind,
+              MountClaimResult::Claimed);
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return boot_ms.load(); },
+            .renewal_before_driver_lock_hook_for_test = [&]
+            {
+                ++loop_passes;
+                if (loop_passes == 2)
+                    after_stale = readinessViewOf(*runtime_ptr);
+                else if (loop_passes == 3)
+                    after_short = readinessViewOf(*runtime_ptr);
+                else if (loop_passes == 4)
+                {
+                    after_arm = readinessViewOf(*runtime_ptr);
+                    armed_pass.arriveAndWait();
+                }
+            },
+            .renewal_admitted_hook_for_test = [&] { admitted_at.push_back(boot_ms.load()); },
+            .renewal_live_for_test = [&]
+            {
+                if (puts.load() < kReadinessRequestBound)
+                    return true;
+                request_bound_hit = true;
+                return false;
+            }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            ++remount_calls;
+            return false;
+        });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    ASSERT_EQ(anchor, kExpiryClaimBootMs);
+
+    /// Before the thread starts: the claim leaves 30 ms of its lease, a ref append needs 40.
+    boot_ms = kReadinessDecideBootMs;
+    const uint64_t generation_before = runtime.fenceGeneration();
+    EXPECT_FALSE(runtime.armIfAdmissible(anchor + kExpiryTtlMs)) << "a claim without room for a ref append arms nothing";
+    const uint64_t latched_generation = runtime.fenceGeneration();
+    EXPECT_EQ(latched_generation, generation_before + 1) << "the latch ends the unarmed incarnation";
+    EXPECT_STREQ(expiryAdmitName(runtime.admit(latched_generation, 0)), "LostOrRearmed");
+    EXPECT_FALSE(runtime.mayMutate());
+    EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::Live) << "the open's closed state; nothing was lost";
+    EXPECT_FALSE(runtime.leaseExpiredSinceBootMs().has_value()) << "a latched fence is not an expiry";
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountLeaseLost), lost_before) << "the latch counts no lease loss";
+
+    backend->on_put = [&](uint32_t put_no)
+    {
+        ++puts;
+        if (put_no == 1)
+            during_first_put = readinessViewOf(*runtime_ptr);
+        if (put_no <= kExpiryFailedPuts)
+        {
+            boot_ms.fetch_add(kExpiryFailedPutMs);
+            return true;
+        }
+        /// Put 25 commits the first renewal, stale. Put 26, the second renewal, lands with 35 ms left.
+        if (put_no == kExpiryFailedPuts + 2)
+            boot_ms.store(kReadinessShortCommitBootMs);
+        return false;
+    };
+    runtime.startBackgroundWorkers();
+
+    bool arrived = true;
+    try
+    {
+        armed_pass.waitUntilArrived();
+    }
+    catch (const DB::Exception &)
+    {
+        arrived = false;
+    }
+    if (!arrived)
+    {
+        runtime.stopBackgroundWorkers();
+        runtime.finishTeardown(false);
+        FAIL() << "no renewal armed the fence; request bound hit: " << request_bound_hit.load();
+    }
+
+    /// While the readiness renewal itself is sent.
+    EXPECT_STREQ(during_first_put.admit, "LostOrRearmed") << "the latched fence refuses a write while the renewal is sent";
+    EXPECT_FALSE(during_first_put.may_mutate);
+    EXPECT_FALSE(during_first_put.expired);
+
+    /// A stale success: the first renewal started at 129.97 s and committed at 161.17 s, past its own start + TTL.
+    EXPECT_STREQ(after_stale.admit, "LostOrRearmed") << "a stale success arms nothing";
+    EXPECT_EQ(after_stale.lifecycle, PoolLifecycle::Live);
+    EXPECT_EQ(after_stale.generation, latched_generation);
+    EXPECT_FALSE(after_stale.expired) << "a latched fence reports no expiry, also after a stale success";
+    EXPECT_NE(after_stale.failure.find("injected renewal timeout"), String::npos)
+        << "a stale success does not end the run of trouble: " << after_stale.failure;
+    ASSERT_EQ(admitted_at.size(), 3u);
+    EXPECT_EQ(admitted_at[0], kReadinessDecideBootMs) << "the first renewal is due at once";
+    EXPECT_EQ(admitted_at[1], kReadinessStaleCommitBootMs) << "a stale success is followed at once";
+
+    /// A short success: the second renewal started at 161.17 s and committed at 191.135 s with 35 ms left.
+    EXPECT_STREQ(after_short.admit, "LostOrRearmed") << "a success with less lease than a ref append needs arms nothing";
+    EXPECT_EQ(after_short.generation, latched_generation);
+    EXPECT_TRUE(after_short.failure.empty()) << "a deadline in the future ends the run of trouble: " << after_short.failure;
+    EXPECT_FALSE(after_short.expired);
+    EXPECT_EQ(admitted_at[2], kReadinessShortCommitBootMs) << "a short success is followed at once";
+
+    /// The third renewal started at 191.135 s with the whole TTL ahead: it arms, from its own start.
+    EXPECT_STREQ(after_arm.admit, "Ok");
+    EXPECT_TRUE(after_arm.ref_append_ok) << "the arm leaves room for a ref append";
+    EXPECT_EQ(after_arm.lifecycle, PoolLifecycle::Live);
+    EXPECT_EQ(after_arm.generation, latched_generation + 1) << "one arm, one new generation";
+    EXPECT_FALSE(after_arm.expired);
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountLeaseLost), lost_before) << "readiness is not a lease loss";
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountLeaseExpired), expired_before) << "an arm is not a restore";
+    EXPECT_EQ(puts.load(), kExpiryFailedPuts + 3);
+    EXPECT_FALSE(request_bound_hit.load());
+    EXPECT_EQ(remount_calls.load(), 0u);
+
+    armed_pass.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+/// A trip that comes with no remount request, no intent and no stop does not end a loop renewal: its
+/// requests keep going out under the latched fence until one commits.
+TEST(CASMountRuntime, ARenewalIsSentUnderALatchedFence)
+{
+    const Layout layout("runtime-renew-under-latch");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{kExpiryClaimBootMs};
+    std::atomic<uint32_t> puts{0};
+    std::atomic<uint32_t> remount_calls{0};
+    std::atomic<bool> request_bound_hit{false};
+    uint32_t loop_passes = 0;
+    std::vector<String> admit_at_put;
+    DB::Cas::tests::ManualBarrier third_put;
+    DB::Cas::tests::ManualBarrier second_pass;
+    CasMountRuntime * runtime_ptr = nullptr;
+    CasEventSink sink;
+    auto backend = std::make_shared<ExpiryScriptBackend>();
+
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, kExpiryTtlMs).kind,
+              MountClaimResult::Claimed);
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return boot_ms.load(); },
+            .renewal_before_driver_lock_hook_for_test = [&]
+            {
+                ++loop_passes;
+                if (loop_passes == 1)
+                    boot_ms.store(kExpiryFirstStartBootMs);
+                else if (loop_passes == 2)
+                    second_pass.arriveAndWait();
+            },
+            .renewal_live_for_test = [&]
+            {
+                if (puts.load() < kReadinessRequestBound)
+                    return true;
+                request_bound_hit = true;
+                return false;
+            }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            ++remount_calls;
+            return false;
+        });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + kExpiryTtlMs);
+
+    /// Puts 1 to 4 fail, 1.3 s each; put 5 commits at 115.2 s, inside the lease of the 100 s claim.
+    backend->on_put = [&](uint32_t put_no)
+    {
+        ++puts;
+        admit_at_put.push_back(expiryAdmitName(runtime_ptr->admit(runtime_ptr->fenceGeneration(), 0)));
+        if (put_no == 3)
+            third_put.arriveAndWait();
+        if (put_no <= 4)
+        {
+            boot_ms.fetch_add(kExpiryFailedPutMs);
+            return true;
+        }
+        return false;
+    };
+    runtime.startBackgroundWorkers();
+
+    third_put.waitUntilArrived();
+    runtime.tripMountLost();
+    third_put.release();
+    bool arrived = true;
+    try
+    {
+        second_pass.waitUntilArrived();
+    }
+    catch (const DB::Exception &)
+    {
+        arrived = false;
+    }
+    if (!arrived)
+    {
+        runtime.stopBackgroundWorkers();
+        runtime.finishTeardown(false);
+        FAIL() << "the renewal never finished; request bound hit: " << request_bound_hit.load();
+    }
+
+    EXPECT_EQ(puts.load(), 5u) << "the renewal kept sending after the trip until it committed";
+    EXPECT_EQ(admit_at_put, (std::vector<String>{"Ok", "Ok", "Ok", "LostOrRearmed", "LostOrRearmed"}))
+        << "puts 4 and 5 went out under the latched fence";
+    EXPECT_EQ(runtime.remountRequestedGenerationForTest(), 0u) << "a lost fence alone requests no remount";
+    EXPECT_EQ(remount_calls.load(), 0u);
+    EXPECT_FALSE(request_bound_hit.load());
+
+    second_pass.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+/// A FORGET intent published while the renewal retries ends it at its next admission check, with no trip
+/// and no remount request; the loop exits.
+TEST(CASMountRuntime, TheForgetIntentAloneEndsARenewal)
+{
+    const Layout layout("runtime-intent-alone");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{kExpiryClaimBootMs};
+    std::atomic<uint32_t> puts{0};
+    std::atomic<uint32_t> remount_calls{0};
+    std::atomic<bool> request_bound_hit{false};
+    uint32_t loop_passes = 0;
+    DB::Cas::tests::ManualBarrier third_put;
+    WorkerExitLatch exits;
+    RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+    {
+        return ThreadFromGlobalPool([&, body = std::move(worker_body)]
+        {
+            body();
+            exits.recordExit();
+        });
+    };
+    const uint64_t lost_before = eventCount(ProfileEvents::CASMountLeaseLost);
+    CasEventSink sink;
+    auto backend = std::make_shared<ExpiryScriptBackend>();
+
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, kExpiryTtlMs).kind,
+              MountClaimResult::Claimed);
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return boot_ms.load(); },
+            .worker_factory = factory,
+            .renewal_before_driver_lock_hook_for_test = [&]
+            {
+                if (++loop_passes == 1)
+                    boot_ms.store(kExpiryFirstStartBootMs);
+            },
+            .renewal_live_for_test = [&]
+            {
+                if (puts.load() < kReadinessRequestBound)
+                    return true;
+                request_bound_hit = true;
+                return false;
+            }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            ++remount_calls;
+            return false;
+        });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + kExpiryTtlMs);
+
+    /// Every put fails; put 3 is held until the intent is published.
+    backend->on_put = [&](uint32_t put_no)
+    {
+        ++puts;
+        if (put_no == 3)
+            third_put.arriveAndWait();
+        boot_ms.fetch_add(kExpiryFailedPutMs);
+        return true;
+    };
+    runtime.startBackgroundWorkers();
+
+    third_put.waitUntilArrived();
+    const uint64_t generation_at_intent = runtime.remountRequestedGenerationForTest();
+    runtime.publishVanishedIntent();
+    third_put.release();
+
+    const bool exited = exits.waitForAtLeast(1);
+    EXPECT_TRUE(exited) << "the loop exits on the published intent";
+    EXPECT_EQ(puts.load(), 3u) << "no request after the intent";
+    EXPECT_FALSE(request_bound_hit.load()) << "the intent, not the request bound, ended the renewal";
+    EXPECT_EQ(runtime.remountRequestedGenerationForTest(), generation_at_intent);
+    EXPECT_EQ(remount_calls.load(), 0u);
+    EXPECT_FALSE(runtime.mayMutate()) << "the early end trips the fence";
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountLeaseLost), lost_before) << "a FORGET is not a lease loss";
+
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+/// A trip with no request, no intent and no stop: the next renewal that commits with room for a ref
+/// append arms the fence again under the same epoch and reports `Live`.
+TEST(CASMountRuntime, ATripAloneIsRearmedByTheNextRenewal)
+{
+    const Layout layout("runtime-trip-alone");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{kExpiryClaimBootMs};
+    std::atomic<uint32_t> remount_calls{0};
+    uint32_t loop_passes = 0;
+    uint64_t generation_after_trip = 0;
+    ReadinessView after_renewal;
+    DB::Cas::tests::ManualBarrier second_pass;
+    CasMountRuntime * runtime_ptr = nullptr;
+    const uint64_t lost_before = eventCount(ProfileEvents::CASMountLeaseLost);
+    CasEventSink sink;
+    auto backend = std::make_shared<ExpiryScriptBackend>();
+
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, kExpiryTtlMs).kind,
+              MountClaimResult::Claimed);
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs), .mount_renew_period = std::chrono::milliseconds(kExpiryPeriodMs),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return boot_ms.load(); },
+            .renewal_before_driver_lock_hook_for_test = [&]
+            {
+                ++loop_passes;
+                if (loop_passes == 1)
+                {
+                    boot_ms.store(kExpiryFirstStartBootMs);
+                    runtime_ptr->tripMountLost();
+                    generation_after_trip = runtime_ptr->fenceGeneration();
+                }
+                else if (loop_passes == 2)
+                {
+                    after_renewal = readinessViewOf(*runtime_ptr);
+                    second_pass.arriveAndWait();
+                }
+            }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            ++remount_calls;
+            return false;
+        });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + kExpiryTtlMs);
+    runtime.startBackgroundWorkers();
+
+    second_pass.waitUntilArrived();
+    EXPECT_STREQ(after_renewal.admit, "Ok") << "the renewal at 110 s re-armed the fence";
+    EXPECT_EQ(after_renewal.lifecycle, PoolLifecycle::Live);
+    EXPECT_EQ(after_renewal.generation, generation_after_trip + 1);
+    EXPECT_EQ(runtime.liveWriterEpoch(), 0u) << "no reclaim ran: the epoch the test never published is unchanged";
+    EXPECT_EQ(runtime.remountRequestedGenerationForTest(), 0u);
+    EXPECT_EQ(remount_calls.load(), 0u);
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountLeaseLost), lost_before + 1) << "the trip counted its loss once";
+    second_pass.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+/// A renewal that commits while a remount request is pending does not arm a latched fence, whatever room
+/// its deadline leaves: the reclaim that follows starts from a fence that refuses writes. The request is
+/// raised from the renewal's liveness check after its write landed, the last check before the commit is
+/// consumed; a request raised earlier ends the renewal instead.
+TEST(CASMountRuntime, ARenewalArmsNothingWhileARequestIsPending)
+{
+    const Layout layout("runtime-no-arm-while-pending");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    String admit_at_reclaim = "unobserved";
+    bool may_mutate_at_reclaim = true;
+    PoolLifecycle lifecycle_at_reclaim = PoolLifecycle::Live;
+    std::atomic<bool> renewal_landed{false};
+    bool request_raised = false;
+    DB::Cas::tests::ManualBarrier reclaim_entered;
+    CasMountRuntime * runtime_ptr = nullptr;
+    CasEventSink sink;
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(0),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return boot_ms; },
+            .renewal_live_for_test = [&]
+            {
+                if (renewal_landed.load() && !request_raised)
+                {
+                    request_raised = true;
+                    runtime_ptr->tripMountLost();
+                    runtime_ptr->scheduleRemountForTest();
+                }
+                return true;
+            }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            admit_at_reclaim = expiryAdmitName(runtime_ptr->admit(runtime_ptr->fenceGeneration(), 0));
+            may_mutate_at_reclaim = runtime_ptr->mayMutate();
+            lifecycle_at_reclaim = runtime_ptr->lifecycle();
+            reclaim_entered.arriveAndWait();
+            return false;
+        });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(anchor + 1000);
+    const String key = layout.mountKey("test");
+    const uint64_t writes_before = backend->putOverwriteCount(key);
+    const uint64_t requests_before = runtime.scheduleRemountCallCountForTest();
+    backend->after_commit = [&] { renewal_landed = true; };
+    runtime.startBackgroundWorkers();
+
+    reclaim_entered.waitUntilArrived();
+    EXPECT_TRUE(request_raised);
+    EXPECT_EQ(backend->putOverwriteCount(key), writes_before + 1) << "the renewal committed, with 1000 ms of lease ahead";
+    EXPECT_EQ(runtime.scheduleRemountCallCountForTest(), requests_before + 1)
+        << "the commit was consumed as one: a terminal loop renewal would have counted a request of its own";
+    EXPECT_EQ(admit_at_reclaim, "LostOrRearmed") << "a commit consumed under a pending request arms nothing";
+    EXPECT_FALSE(may_mutate_at_reclaim);
+    EXPECT_EQ(lifecycle_at_reclaim, PoolLifecycle::TransientNotLive);
+    reclaim_entered.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+namespace
+{
+/// Fails the conditional writes of the mount key that `on_mount_write` says to fail, with a timeout raised
+/// before the store applied anything. The hook gets the 1-based number of the conditional write of the
+/// mount key, counting every one: reclaims, adopts, renewals and a test's own fence-out.
+class MountWriteScriptBackend final : public DB::Cas::InMemoryBackend
+{
+public:
+    String mount_key;
+    std::function<bool(uint32_t write_no)> on_mount_write;
+    std::atomic<uint32_t> mount_writes{0};
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+        const std::optional<String> & expected_value, DB::Cas::TransportAccess & access) override
+    {
+        if (key == mount_key && expected_value)
+        {
+            const uint32_t write_no = ++mount_writes;
+            if (on_mount_write && on_mount_write(write_no))
+                throw Poco::TimeoutException("injected readiness renewal timeout");
+        }
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+};
+
+const UInt128 kReadyUuid{0x42};
+constexpr uint64_t kReadyClaimBootMs = 10'000;
+/// The adopt write or the quiesce takes 20 s: the claim leaves 10 s of the default 30 s lease, and a ref
+/// append needs 2 x 7 s + 2 s = 16 s with the default budget.
+constexpr uint64_t kReadyClaimAgeMs = 20'000;
+constexpr uint64_t kReadyPeriodMs = 10'000;
+
+/// Pool meta, and a fenced, long-expired predecessor under epoch 7 with the epoch object that minted it.
+/// An open as `kReadyUuid` reclaims it at once and writes the mount key exactly twice (the reclaim, then
+/// the renewer's adopt) before it decides whether to arm.
+void seedFencedPredecessor(DB::Cas::Backend & backend, const String & pool_prefix)
+{
+    DB::Cas::tests::seedPoolMetaForRestart(backend, pool_prefix);
+    const Layout layout(pool_prefix);
+    MountLease prior;
+    prior.server_uuid = kReadyUuid;
+    prior.writer_epoch = 7;
+    prior.seq = 7;
+    prior.expires_at_ms = 1;
+    prior.gc_fenced = true;
+    prior.write_attempt_id = UInt128{7};
+    createObj(backend, layout.mountKey("s"), encodeMountLease(prior));
+    createObj(backend, layout.epochKey("s"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 8}));
+}
+
+/// A writable pool with a lease thread, the default lease, period and budget, and a boot clock that only
+/// the test and the injected sleeps move.
+PoolConfig readinessPoolConfig(const String & pool_prefix, const std::shared_ptr<std::atomic<uint64_t>> & fake_boot)
+{
+    PoolConfig config;
+    config.pool_prefix = pool_prefix;
+    config.server_id = kReadyUuid;
+    config.server_root_id = "s";
+    config.background_watermark = true;
+    config.boot_ms_fn = [fake_boot]
+    {
+        return fake_boot->load();
+    };
+    config.wait_sleep_fn = [fake_boot](uint64_t ms)
+    {
+        *fake_boot += ms;
+    };
+    config.retry_sleep_fn = [fake_boot](uint64_t ms)
+    {
+        *fake_boot += ms;
+    };
+    return config;
+}
+
+/// What a readiness scenario records on the lease thread. Heap-owned and captured by value: a `Pool` can
+/// outlive the test frame.
+struct ReadinessSeen
+{
+    std::thread::id opening_thread;
+    std::atomic<bool> renewal_on_opening_thread{true};
+    std::atomic<uint64_t> renewal_boot_ms{0};
+    std::atomic<uint32_t> failed_renewals{0};
+    std::atomic<bool> request_bound_hit{false};
+    std::atomic<Pool *> pool{nullptr};
+    std::atomic<int> lifecycle_at_renewal{-1};
+    std::atomic<int> may_mutate_at_renewal{-1};
+    std::atomic<int> lifecycle_at_arm{-1};
+    std::atomic<int> may_mutate_at_arm{-1};
+    std::atomic<int> lifecycle_after_arm{-1};
+    std::atomic<int> may_mutate_after_arm{-1};
+    /// Written on the lease thread before the sink's barrier, read by the test after it.
+    String remount_outcome;
+    String remount_step;
+};
+}
+
+/// An open whose claim is too old returns only after the lease thread's
+/// renewal armed the fence; a reclaim whose quiescence aged its claim the same way reports success with
+/// the pool not `Live` and the fence latched, and the next renewal arms it. No sampled point sees the
+/// fence armed while the pool is not `Live`.
+TEST(CASMountRuntime, OpenAndRemountReportReadyOnlyWhenWritable)
+{
+    /// An open whose claim starts at 10 s and whose adopt write ends at 30 s.
+    {
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
+        auto seen = std::make_shared<ReadinessSeen>();
+        seen->opening_thread = std::this_thread::get_id();
+        auto backend = std::make_shared<MountWriteScriptBackend>();
+        seedFencedPredecessor(*backend, "ready-open");
+        backend->mount_key = Layout("ready-open").mountKey("s");
+        backend->on_mount_write = [fake_boot, seen](uint32_t write_no)
+        {
+            if (write_no == 2)
+            {
+                *fake_boot += kReadyClaimAgeMs;
+            }
+            else if (write_no == 3)
+            {
+                seen->renewal_boot_ms = fake_boot->load();
+                seen->renewal_on_opening_thread = std::this_thread::get_id() == seen->opening_thread;
+            }
+            return false;
+        };
+        auto store = Pool::open(backend, readinessPoolConfig("ready-open", fake_boot));
+        ASSERT_TRUE(store);
+        EXPECT_EQ(backend->mount_writes.load(), 3u) << "the reclaim, the adopt and one renewal";
+        EXPECT_FALSE(seen->renewal_on_opening_thread.load()) << "the lease thread renews, not the opening thread";
+        EXPECT_EQ(seen->renewal_boot_ms.load(), kReadyClaimBootMs + kReadyClaimAgeMs) << "the renewal is sent with no cadence wait";
+        EXPECT_EQ(store->lifecycle(), PoolLifecycle::Live);
+        EXPECT_TRUE(store->mayMutate());
+        /// The claim's deadline (40 s) would leave 10 s at 30 s; only the renewal's (60 s) admits the append.
+        EXPECT_NO_THROW(publishPart(store, "srv/ready-open", "x", "payload")) << "a ref append is admitted when the open returns";
+    }
+
+    /// A fresh open arms at once. Then a reclaim: claim at 10 s, quiescence until 30 s.
+    {
+        auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
+        auto seen = std::make_shared<ReadinessSeen>();
+        auto remounted = std::make_shared<DB::Cas::tests::ManualBarrier>();
+        auto renewed_after_arm = std::make_shared<DB::Cas::tests::ManualBarrier>();
+        auto backend = std::make_shared<MountWriteScriptBackend>();
+        seedFencedPredecessor(*backend, "ready-remount");
+        const String mount_key = Layout("ready-remount").mountKey("s");
+        backend->mount_key = mount_key;
+        /// 1, 2: the open's reclaim and adopt. 3: the test's fence-out. 4, 5: the remount's claim and adopt.
+        /// 6: the renewal that arms. 7: the renewal after it.
+        backend->on_mount_write = [fake_boot, seen, renewed_after_arm](uint32_t write_no)
+        {
+            if (write_no == 6)
+            {
+                Pool * pool = seen->pool.load();
+                seen->renewal_boot_ms = fake_boot->load();
+                seen->lifecycle_at_renewal = static_cast<int>(pool->lifecycle());
+                seen->may_mutate_at_renewal = pool->mayMutate();
+            }
+            else if (write_no == 7)
+            {
+                Pool * pool = seen->pool.load();
+                seen->lifecycle_after_arm = static_cast<int>(pool->lifecycle());
+                seen->may_mutate_after_arm = pool->mayMutate();
+                renewed_after_arm->arriveAndWait();
+            }
+            return false;
+        };
+        PoolConfig config = readinessPoolConfig("ready-remount", fake_boot);
+        config.event_sink = [seen, remounted](const CasEvent & event)
+        {
+            if (event.type != CasEventType::MountRemount)
+                return;
+            seen->remount_outcome = event.outcome;
+            seen->remount_step = event.detail.at("step");
+            remounted->arriveAndWait();
+        };
+        config.remount_quiesce_hook_for_test = [fake_boot]
+        {
+            *fake_boot += kReadyClaimAgeMs;
+        };
+        auto store = Pool::open(backend, config);
+        ASSERT_TRUE(store);
+        ASSERT_EQ(backend->mount_writes.load(), 2u) << "a fresh claim arms at once";
+        seen->pool = store.get();
+        /// Runs inside the arm, after `Live` is reported and before the fence opens, so it sees the order of
+        /// the two. It also makes the next renewal due at once, so its request shows the state the arm left.
+        store->setArmMountFenceInterpositionHookForTest([seen, fake_boot]
+        {
+            Pool * pool = seen->pool.load();
+            seen->lifecycle_at_arm = static_cast<int>(pool->lifecycle());
+            seen->may_mutate_at_arm = pool->mayMutate();
+            *fake_boot += kReadyPeriodMs;
+        });
+        const uint64_t succeeded_before = eventCount(ProfileEvents::CASRemountSucceeded);
+        fenceOutMount(*backend, mount_key);
+        ASSERT_TRUE(store->scheduleRemountForTest());
+
+        remounted->waitUntilArrived();
+        EXPECT_EQ(seen->remount_outcome, "ok");
+        EXPECT_EQ(seen->remount_step, "claimed_not_armed");
+        EXPECT_EQ(eventCount(ProfileEvents::CASRemountSucceeded), succeeded_before + 1);
+        EXPECT_EQ(store->lifecycle(), PoolLifecycle::TransientNotLive) << "not Live after the reclaim";
+        EXPECT_FALSE(store->mayMutate()) << "the fence stays latched";
+        remounted->release();
+
+        renewed_after_arm->waitUntilArrived();
+        ASSERT_EQ(backend->mount_writes.load(), 7u);
+        EXPECT_EQ(seen->renewal_boot_ms.load(), kReadyClaimBootMs + kReadyClaimAgeMs) << "the loop renewed at once";
+        /// At every sampled point, an armed fence comes with `Live`.
+        EXPECT_EQ(seen->lifecycle_at_renewal.load(), static_cast<int>(PoolLifecycle::TransientNotLive));
+        EXPECT_EQ(seen->may_mutate_at_renewal.load(), 0) << "the renewal is sent under the latched fence";
+        EXPECT_EQ(seen->lifecycle_at_arm.load(), static_cast<int>(PoolLifecycle::Live)) << "`Live` is reported first";
+        EXPECT_EQ(seen->may_mutate_at_arm.load(), 0) << "inside the arm, after `Live`, the fence still refuses";
+        EXPECT_EQ(seen->lifecycle_after_arm.load(), static_cast<int>(PoolLifecycle::Live));
+        EXPECT_EQ(seen->may_mutate_after_arm.load(), 1) << "after the arm: `Live` and writable";
+        renewed_after_arm->release();
+    }
+}
+
+/// Every readiness renewal fails: the open waits one lease on the fence clock, then
+/// stops and joins the lease thread and fails, naming the last failed request.
+TEST(CASMountRuntime, AnOpenWhoseReadinessRenewalKeepsFailingFailsAfterOneTtl)
+{
+    /// Longer than the largest spacing draw, so a failed request is retried at once.
+    constexpr uint64_t failed_request_ms = 1'300;
+    /// Far above the 24 failures one lease takes; reached only if the open never gives up.
+    constexpr uint32_t max_failed_renewals = 10'000;
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
+    auto seen = std::make_shared<ReadinessSeen>();
+    auto exits = std::make_shared<WorkerExitLatch>();
+    auto backend = std::make_shared<MountWriteScriptBackend>();
+    seedFencedPredecessor(*backend, "ready-fail");
+    backend->mount_key = Layout("ready-fail").mountKey("s");
+    backend->on_mount_write = [fake_boot, seen](uint32_t write_no)
+    {
+        if (write_no == 2)
+            *fake_boot += kReadyClaimAgeMs;
+        if (write_no < 3)
+            return false;
+        if (seen->failed_renewals.load() >= max_failed_renewals)
+        {
+            seen->request_bound_hit = true;
+            return false;
+        }
+        ++seen->failed_renewals;
+        *fake_boot += failed_request_ms;
+        return true;
+    };
+    PoolConfig config = readinessPoolConfig("ready-fail", fake_boot);
+    config.worker_factory = [exits](std::function<void()> worker_body)
+    {
+        return ThreadFromGlobalPool([exits, body = std::move(worker_body)]
+        {
+            body();
+            exits->recordExit();
+        });
+    };
+    const uint64_t lost_before = eventCount(ProfileEvents::CASMountLeaseLost);
+    const uint64_t expired_before = eventCount(ProfileEvents::CASMountLeaseExpired);
+
+    int code = 0;
+    String message;
+    try
+    {
+        (void)Pool::open(backend, config);
+        ADD_FAILURE() << "an open whose readiness renewal never succeeds must fail";
+    }
+    catch (const DB::Exception & e)
+    {
+        code = e.code();
+        message = e.message();
+    }
+
+    EXPECT_EQ(code, DB::ErrorCodes::ABORTED) << message;
+    EXPECT_NE(message.find("injected readiness renewal timeout"), String::npos) << "the failure names the last request: " << message;
+    EXPECT_FALSE(seen->request_bound_hit.load()) << "the open never gave up";
+    /// The wait starts at 30 s or later and ends once the fence clock passes one lease after its start:
+    /// 23 failures reach 59.9 s, the 24th 61.2 s.
+    EXPECT_GE(seen->failed_renewals.load(), 24u) << "the open waited one lease, not until a lease bound";
+    EXPECT_EQ(exits->count(), 1u) << "the lease thread was joined before the open failed";
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountLeaseLost), lost_before) << "a failed open is not a lease loss";
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountLeaseExpired), expired_before);
+}
+
+/// A writable open with no lease thread whose claim does not admit a ref append fails at once
+/// with a retryable error, and sends no renewal.
+TEST(CASPool, AnOpenWithoutALeaseThreadFailsWhenItsClaimIsTooOld)
+{
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
+    auto backend = std::make_shared<MountWriteScriptBackend>();
+    seedFencedPredecessor(*backend, "ready-no-thread");
+    backend->mount_key = Layout("ready-no-thread").mountKey("s");
+    backend->on_mount_write = [fake_boot](uint32_t write_no)
+    {
+        if (write_no == 2)
+            *fake_boot += kReadyClaimAgeMs;
+        return false;
+    };
+    PoolConfig config = readinessPoolConfig("ready-no-thread", fake_boot);
+    config.background_watermark = false;
+    const uint64_t attempts_before = eventCount(ProfileEvents::CASMountRenewalAttempts);
+
+    int code = 0;
+    String message;
+    try
+    {
+        (void)Pool::open(backend, config);
+        ADD_FAILURE() << "an open with no lease thread and a claim too old must fail";
+    }
+    catch (const DB::Exception & e)
+    {
+        code = e.code();
+        message = e.message();
+    }
+
+    EXPECT_EQ(code, DB::ErrorCodes::ABORTED) << message;
+    EXPECT_NE(message.find("no lease thread"), String::npos) << message;
+    EXPECT_EQ(eventCount(ProfileEvents::CASMountRenewalAttempts), attempts_before) << "nothing renewed the claim";
+}
+
+/// The pool becomes terminal while the open waits: the readiness renewal meets a fenced-out slot, and the
+/// reclaim it requests finds both pool sentinels gone and enters `IdentityLost`. The open fails naming the
+/// terminal pool. Every later write of the mount key moves the fence clock a lease, so a regression that
+/// keeps the pool going ends the open's wait instead of hanging.
+TEST(CASMountRuntime, AnOpenFailsWhenThePoolBecomesTerminalWhileItWaits)
+{
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(kReadyClaimBootMs);
+    auto backend = std::make_shared<MountWriteScriptBackend>();
+    seedFencedPredecessor(*backend, "ready-terminal");
+    const Layout layout("ready-terminal");
+    const String mount_key = layout.mountKey("s");
+    const String meta_key = layout.poolMetaKey();
+    const String owner_key = layout.ownerKey("s");
+    backend->mount_key = mount_key;
+    PoolConfig config = readinessPoolConfig("ready-terminal", fake_boot);
+    const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
+    /// The hook is stored in the backend, so it holds a plain pointer to it.
+    DB::Cas::Backend * raw_backend = backend.get();
+    /// 1, 2: the open's reclaim and adopt. 3: the readiness renewal. 4: the fence-out made inside it.
+    backend->on_mount_write = [fake_boot, raw_backend, mount_key, meta_key, owner_key, ttl_ms](uint32_t write_no)
+    {
+        if (write_no == 2)
+        {
+            *fake_boot += kReadyClaimAgeMs;
+        }
+        else if (write_no == 3)
+        {
+            fenceOutMount(*raw_backend, mount_key);
+            DB::Cas::tests::OperationForTest op(*raw_backend);
+            for (const String & key : {meta_key, owner_key})
+            {
+                const auto got = (*op).read(key, Retry::once());
+                EXPECT_TRUE(got.has_value()) << key;
+                if (got)
+                    (*op).remove(key, got->etag, Retry::once());
+            }
+        }
+        else if (write_no > 4)
+        {
+            *fake_boot += ttl_ms;
+        }
+        return false;
+    };
+    const uint64_t identity_lost_before = eventCount(ProfileEvents::CASIdentityLost);
+
+    int code = 0;
+    String message;
+    try
+    {
+        (void)Pool::open(backend, config);
+        ADD_FAILURE() << "an open whose pool became terminal must fail";
+    }
+    catch (const DB::Exception & e)
+    {
+        code = e.code();
+        message = e.message();
+    }
+
+    EXPECT_EQ(code, DB::ErrorCodes::ABORTED) << message;
+    EXPECT_NE(message.find("the pool became terminal while the open waited"), String::npos) << message;
+    EXPECT_EQ(message.find("no renewal armed the fence"), String::npos) << message;
+    EXPECT_EQ(backend->mount_writes.load(), 4u) << "no mount write after the fence-out";
+    EXPECT_EQ(eventCount(ProfileEvents::CASIdentityLost), identity_lost_before + 1);
+}
+
+namespace
+{
+/// What the open's wait and the reclaim saw when the readiness renewal met a definitive answer.
+struct DefinitiveReadinessSeen
+{
+    bool armed = false;
+    uint32_t puts_at_first_reclaim = 0;
+    String admit_at_first_reclaim = "unobserved";
+    bool may_mutate_at_first_reclaim = true;
+    uint32_t reclaims = 0;
+    uint64_t boot_before_wait = 0;
+    uint64_t boot_after_wait = 0;
+    ReadinessView after;
+    uint64_t live_writer_epoch = 0;
+    uint64_t requested_generation = 0;
+    uint64_t lease_lost = 0;
+    uint32_t wait_clock_reads = 0;
+};
+
+/// The open's wait reads the fence clock once per wake-up. On a regression that leaves it unnotified the
+/// injected clock stands still, so at this many reads the fixture moves the clock past the wait's bound.
+constexpr uint32_t kReadinessWaitWakeUpBound = 20;
+
+/// The open's shape at the runtime level, with a lease of 1000 ms: the claim starts at 100 ms and the open
+/// decides at 1070 ms, with 30 ms left and 40 ms needed. The slot is GC-fenced before the loop starts, so the
+/// readiness renewal gets a definitive answer. The reclaim either claims epoch 2 and arms, or fails each
+/// attempt and moves the fence clock 600 ms.
+void runDefinitiveAnswerDuringReadiness(bool reclaim_arms, DefinitiveReadinessSeen & seen)
+{
+    const Layout layout(reclaim_arms ? "runtime-readiness-definitive-reclaimed" : "runtime-readiness-definitive-failing");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{100};
+    std::atomic<uint32_t> puts{0};
+    std::atomic<uint32_t> reclaims{0};
+    const std::thread::id test_thread = std::this_thread::get_id();
+    std::atomic<bool> waiting{false};
+    std::atomic<uint32_t> wait_clock_reads{0};
+    CasMountRuntime * runtime_ptr = nullptr;
+    const uint64_t lost_before = eventCount(ProfileEvents::CASMountLeaseLost);
+    CasEventSink sink;
+    auto backend = std::make_shared<ExpiryScriptBackend>();
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(300),
+            .background_watermark = true,
+            .boot_ms_fn = [&]
+            {
+                if (waiting.load() && std::this_thread::get_id() == test_thread
+                    && ++wait_clock_reads == kReadinessWaitWakeUpBound)
+                    boot_ms.fetch_add(2000);
+                return boot_ms.load();
+            }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            CasMountRuntime & reclaiming = *runtime_ptr;
+            if (++reclaims == 1)
+            {
+                seen.puts_at_first_reclaim = puts.load();
+                seen.admit_at_first_reclaim = expiryAdmitName(reclaiming.admit(reclaiming.fenceGeneration(), 0));
+                seen.may_mutate_at_first_reclaim = reclaiming.mayMutate();
+            }
+            reclaiming.beginReclaim();
+            if (!reclaim_arms)
+            {
+                boot_ms.fetch_add(600);
+                return false;
+            }
+            if (claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 2, wall_ms, 1000).kind
+                != MountClaimResult::Claimed)
+                return false;
+            reclaiming.installRenewer(uuid, 2, [&] { return wall_ms; });
+            const uint64_t fresh_anchor = reclaiming.startRenewer();
+            reclaiming.setLiveWriterEpoch(2);
+            /// On a regression that does not arm, the clock passes the open's bound and the arm's
+            /// notification ends the wait, so the test fails instead of hanging.
+            if (!reclaiming.armIfAdmissible(fresh_anchor + 1000))
+                boot_ms.fetch_add(2000);
+            return true;
+        });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    boot_ms = 1070;
+    ASSERT_FALSE(runtime.armIfAdmissible(anchor + 1000)) << "the claim leaves 30 ms, a ref append needs 40";
+    fenceOutMount(*backend, layout.mountKey("test"));
+    backend->on_put = [&](uint32_t put_no)
+    {
+        ++puts;
+        /// A second renewal before any reclaim is the regression this test names. Fail it and move the
+        /// clock past the open's bound: the failure notifies the wait, which then gives up.
+        if (put_no >= 2 && reclaims.load() == 0)
+        {
+            boot_ms.fetch_add(2000);
+            return true;
+        }
+        return false;
+    };
+    runtime.startBackgroundWorkers();
+
+    seen.boot_before_wait = boot_ms.load();
+    waiting = true;
+    seen.armed = runtime.waitUntilArmed(1000);
+    waiting = false;
+    seen.boot_after_wait = boot_ms.load();
+    seen.wait_clock_reads = wait_clock_reads.load();
+
+    /// The join orders every write of the lease thread before the reads below.
+    runtime.stopBackgroundWorkers();
+    seen.after = readinessViewOf(runtime);
+    seen.reclaims = reclaims.load();
+    seen.live_writer_epoch = runtime.liveWriterEpoch();
+    seen.requested_generation = runtime.remountRequestedGenerationForTest();
+    seen.lease_lost = eventCount(ProfileEvents::CASMountLeaseLost) - lost_before;
+    runtime.finishTeardown(false);
+}
+
+/// Throws a `LOGICAL_ERROR` from the renewal's conditional write of the mount key once `failing` is set: the
+/// renewal hands it to the loop, which leaves through its own error path.
+class LeaseLoopFailureBackend final : public DB::Cas::tests::CountingBackend
+{
+public:
+    std::atomic<bool> failing{false};
+    std::atomic<uint32_t> failures{0};
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+        const std::optional<String> & expected_value, DB::Cas::TransportAccess & access) override
+    {
+        if (failing.load() && expected_value && key.ends_with("/mount"))
+        {
+            /// Bounds a retry of the failure, should the engine ever retry one: the renewal then commits,
+            /// the fence arms and the test fails on `armed` instead of hanging.
+            if (++failures >= kReadinessRequestBound)
+                failing = false;
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "injected lease-loop failure");
+        }
+        return DB::Cas::tests::CountingBackend::write(key, bytes, expected_value, access);
+    }
+};
+
+struct LeaseThreadEndSeen
+{
+    uint32_t exits = 0;
+    uint32_t failures = 0;
+    bool armed = true;
+    uint64_t boot_before_wait = 0;
+    uint64_t boot_after_wait = 0;
+    bool may_mutate = true;
+};
+
+/// The open's shape with a 1000 ms lease, as above; the readiness renewal's first request throws a
+/// `LOGICAL_ERROR`. After the thread is gone, every read of the fence clock moves it 600 ms, so the wait's
+/// bound is reached on that clock.
+void runLeaseThreadEndsOnItsOwn(LeaseThreadEndSeen & seen)
+{
+    const Layout layout("runtime-readiness-thread-ended");
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{100};
+    std::atomic<bool> thread_gone{false};
+    WorkerExitLatch exits;
+    RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+    {
+        return ThreadFromGlobalPool([&, body = std::move(worker_body)]
+        {
+            body();
+            exits.recordExit();
+        });
+    };
+    CasEventSink sink;
+    auto backend = std::make_shared<LeaseLoopFailureBackend>();
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind,
+              MountClaimResult::Claimed);
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000), .mount_renew_period = std::chrono::milliseconds(300),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return thread_gone.load() ? boot_ms.fetch_add(600) + 600 : boot_ms.load(); },
+            .worker_factory = factory},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    boot_ms = 1070;
+    ASSERT_FALSE(runtime.armIfAdmissible(anchor + 1000));
+    backend->failing = true;
+    runtime.startBackgroundWorkers();
+
+    ASSERT_TRUE(exits.waitForAtLeast(1)) << "the loop must leave through its own error path";
+    thread_gone = true;
+    seen.boot_before_wait = boot_ms.load();
+    seen.armed = runtime.waitUntilArmed(1000);
+    seen.boot_after_wait = boot_ms.load();
+    seen.may_mutate = runtime.mayMutate();
+    seen.exits = static_cast<uint32_t>(exits.count());
+    seen.failures = backend->failures.load();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+}
+
+/// The open's readiness renewal meets a definitive answer: the renewal is terminal and raises one remount
+/// generation, the fence stays latched, and the loop reclaims before any further renewal. The open's wait
+/// ends armed when the reclaim arms under the new epoch, and gives up after one lease on the fence clock when
+/// every reclaim fails.
+TEST(CASMountRuntime, ADefinitiveAnswerDuringReadinessIsServedByAReclaim)
+{
+    DefinitiveReadinessSeen reclaimed;
+    ASSERT_NO_FATAL_FAILURE(runDefinitiveAnswerDuringReadiness(/*reclaim_arms=*/true, reclaimed));
+    EXPECT_LT(reclaimed.wait_clock_reads, kReadinessWaitWakeUpBound) << "nothing ended the wait: it ran out its wake-ups";
+    EXPECT_TRUE(reclaimed.armed) << "the reclaim armed the fence";
+    EXPECT_EQ(reclaimed.puts_at_first_reclaim, 1u) << "the loop reclaimed before any further renewal";
+    EXPECT_EQ(reclaimed.admit_at_first_reclaim, "LostOrRearmed") << "no write is admitted before the arm";
+    EXPECT_FALSE(reclaimed.may_mutate_at_first_reclaim);
+    EXPECT_EQ(reclaimed.reclaims, 1u);
+    EXPECT_STREQ(reclaimed.after.admit, "Ok");
+    EXPECT_TRUE(reclaimed.after.ref_append_ok);
+    EXPECT_EQ(reclaimed.after.lifecycle, PoolLifecycle::Live);
+    EXPECT_EQ(reclaimed.live_writer_epoch, 2u) << "armed under the new epoch";
+    EXPECT_EQ(reclaimed.requested_generation, 1u) << "one definitive answer, one remount generation";
+    EXPECT_EQ(reclaimed.lease_lost, 1u) << "the definitive answer counts one lease loss; the open's latch none";
+
+    DefinitiveReadinessSeen failing;
+    ASSERT_NO_FATAL_FAILURE(runDefinitiveAnswerDuringReadiness(/*reclaim_arms=*/false, failing));
+    EXPECT_LT(failing.wait_clock_reads, kReadinessWaitWakeUpBound) << "nothing ended the wait: it ran out its wake-ups";
+    EXPECT_FALSE(failing.armed);
+    EXPECT_GE(failing.boot_after_wait, failing.boot_before_wait + 1000) << "the wait gave up after one lease on the fence clock";
+    EXPECT_EQ(failing.puts_at_first_reclaim, 1u);
+    EXPECT_EQ(failing.admit_at_first_reclaim, "LostOrRearmed");
+    EXPECT_GE(failing.reclaims, 1u);
+    EXPECT_STREQ(failing.after.admit, "LostOrRearmed") << "nothing armed";
+    EXPECT_FALSE(failing.after.may_mutate);
+    EXPECT_EQ(failing.live_writer_epoch, 0u);
+    EXPECT_EQ(failing.requested_generation, 1u);
+    EXPECT_EQ(failing.lease_lost, 1u);
+}
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
+/// The lease thread leaves through its own error path while the open waits. The fence stays latched and the
+/// wait returns false; nothing notifies it, so it ends at its bound of one lease on the fence clock.
+TEST(CASMountRuntime, AnOpenFailsWhenTheLeaseThreadEndedOnItsOwn)
+{
+    LeaseThreadEndSeen seen;
+    ASSERT_NO_FATAL_FAILURE(runLeaseThreadEndsOnItsOwn(seen));
+    EXPECT_EQ(seen.exits, 1u);
+    EXPECT_EQ(seen.failures, 1u) << "the first readiness request reached the loop's error path";
+    EXPECT_FALSE(seen.armed);
+    EXPECT_GE(seen.boot_after_wait, seen.boot_before_wait + 1000) << "the wait ended at its bound on the fence clock";
+    EXPECT_FALSE(seen.may_mutate) << "the fence stays latched";
+}
+#else
+/// A `LOGICAL_ERROR` aborts a debug or sanitizer build where it is constructed, so the loop's error path is
+/// reached only in a release build. Here the scenario must end the process. The child is a re-executed
+/// process, not a fork: a forked child inherits the global thread pool's count of idle workers but not
+/// the workers, so the lease thread's job could stay queued and the join would hang.
+TEST(CASMountRuntimeDeathTest, AnOpenFailsWhenTheLeaseThreadEndedOnItsOwn)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            LeaseThreadEndSeen seen;
+            runLeaseThreadEndsOnItsOwn(seen);
+            std::_Exit(0);
+        },
+        "injected lease-loop failure");
+}
+#endif

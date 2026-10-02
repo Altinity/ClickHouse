@@ -374,21 +374,6 @@ TEST(CASOperationGate, GcEntryPointsRefuseOnNotLive)
     Cas::tests::expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { storage->runOneGcRoundForTest(); });
 }
 
-/// (i) `CasGcScheduler::isQuiescent` reflects the round-in-flight flag: a round in flight => not quiescent.
-/// (This is the join-completion signal the FORGET / GC-STOP tests rely on.)
-TEST(CASOperationGate, GcSchedulerIsQuiescentReflectsRoundInFlight)
-{
-    auto backend = std::make_shared<Cas::InMemoryBackend>();
-    auto pool = Cas::tests::openPoolForTest(backend);
-    auto scheduler = std::make_shared<Cas::CasGcScheduler>(
-        pool, std::chrono::seconds(3600), "op-gate-test-gc", "disk", Cas::GcRoundLogger{});
-    EXPECT_TRUE(scheduler->isQuiescent());
-    scheduler->setRoundInFlightForTest(true);
-    EXPECT_FALSE(scheduler->isQuiescent()) << "a round in flight must NOT read as GC-quiescent";
-    scheduler->setRoundInFlightForTest(false);
-    EXPECT_TRUE(scheduler->isQuiescent());
-}
-
 /// (j) (acceptance matrix — transient auto-recovery / DROP-drain round-trip) The full §4 recovery arc on ONE
 /// storage: a Remove-class op (the DROP shape) throws the typed transient refusal while the mount lease is
 /// lost, then SUCCEEDS and actually drains once the disk self-remounts back to Live — no operator action,

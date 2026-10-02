@@ -24,7 +24,6 @@ extern const Event CASMountRenewalAttempts;
 extern const Event CASMountRenewalRetries;
 extern const Event CASMountRenewalResolved;
 extern const Event CASMountRenewalRecovered;
-extern const Event CASMountRenewalDeadlineExceeded;
 }
 
 using namespace DB::Cas;
@@ -91,7 +90,6 @@ struct RenewalCounterSnapshot
     uint64_t retries;
     uint64_t resolved;
     uint64_t recovered;
-    uint64_t deadline_exceeded;
 };
 
 RenewalCounterSnapshot renewalCounters()
@@ -102,7 +100,6 @@ RenewalCounterSnapshot renewalCounters()
         .retries = global_counters[ProfileEvents::CASMountRenewalRetries].load(),
         .resolved = global_counters[ProfileEvents::CASMountRenewalResolved].load(),
         .recovered = global_counters[ProfileEvents::CASMountRenewalRecovered].load(),
-        .deadline_exceeded = global_counters[ProfileEvents::CASMountRenewalDeadlineExceeded].load(),
     };
 }
 
@@ -112,14 +109,12 @@ void expectRenewalCounterDelta(
     uint64_t attempts,
     uint64_t retries,
     uint64_t resolved,
-    uint64_t recovered,
-    uint64_t deadline_exceeded)
+    uint64_t recovered)
 {
     EXPECT_EQ(after.attempts - before.attempts, attempts);
     EXPECT_EQ(after.retries - before.retries, retries);
     EXPECT_EQ(after.resolved - before.resolved, resolved);
     EXPECT_EQ(after.recovered - before.recovered, recovered);
-    EXPECT_EQ(after.deadline_exceeded - before.deadline_exceeded, deadline_exceeded);
 }
 
 /// Publish ONE ref naming a single-blob part through the real writer sequence (mirrors
@@ -169,44 +164,12 @@ TEST(CASObservability, RenewalCountersHaveExactPhysicalAndLogicalDeltas)
         const RenewalCounterSnapshot before = renewalCounters();
         EXPECT_NO_THROW(store->renewWatermarkOnce());
         const RenewalCounterSnapshot after = renewalCounters();
-        expectRenewalCounterDelta(before, after, attempts, retries, resolved, recovered, 0);
+        expectRenewalCounterDelta(before, after, attempts, retries, resolved, recovered);
     };
 
     run(RenewalCounterBackend::Fault::None, /*attempts=*/1, /*retries=*/0, /*resolved=*/0, /*recovered=*/0);
     run(RenewalCounterBackend::Fault::ThrowBefore, /*attempts=*/2, /*retries=*/1, /*resolved=*/0, /*recovered=*/1);
     run(RenewalCounterBackend::Fault::LandThenThrow, /*attempts=*/1, /*retries=*/0, /*resolved=*/1, /*recovered=*/1);
-}
-
-TEST(CASObservability, ExternalLeaseDeadlineCountsOnceWithoutReconstructingAttempts)
-{
-    auto backend = std::make_shared<RenewalCounterBackend>();
-    backend->setAttemptTimeoutMs(renewalCounterBudget().attempt_timeout_ms);
-    /// Held in a shared atomic, not a plain local: this test mutates it below, and the Pool can
-    /// outlive this stack frame (a background publish holds `shared_from_this()`), so a by-reference
-    /// capture of a local would dangle.
-    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
-    auto store = Pool::open(backend, PoolConfig{
-        .pool_prefix = "renewal-deadline-counter",
-        .server_root_id = "test",
-        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-        .cas_request_budget = renewalCounterBudget(),
-        .boot_ms_fn = [boot_ms]
-        {
-            return boot_ms->load();
-        },
-    });
-
-    /// The fence deadline is 1100 and the safety margin 20, so admission refuses once fewer than
-    /// twenty milliseconds of lease remain. At 1090 only ten milliseconds remain, short of the margin
-    /// however much a single attempt reserves, so nothing can be started and the logical renewal ends
-    /// without reconstructing a sent attempt.
-    boot_ms->store(1090);
-    const RenewalCounterSnapshot before = renewalCounters();
-    EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
-    const RenewalCounterSnapshot after = renewalCounters();
-    expectRenewalCounterDelta(
-        before, after, /*attempts=*/0, /*retries=*/0, /*resolved=*/0, /*recovered=*/0,
-        /*deadline_exceeded=*/1);
 }
 
 }

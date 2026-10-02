@@ -190,9 +190,10 @@ void CasGcScheduler::onLeaseAcquired()
 }
 
 Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger,
-                                                 std::function<void()> on_lease_acquired, bool allow_steal)
+                                                 std::function<void()> on_lease_acquired)
 {
     using Rec = GcRoundLogRecord;
+    const bool allow_steal = trigger == Rec::Trigger::Scheduled;
 
     /// Mark a round in flight for the whole body (success AND exception paths). `isQuiescent` reads this;
     /// the FORGET / `GC STOP` tests use it to prove the scheduler's workers were joined (no round can be
@@ -327,13 +328,10 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     }
 }
 
-Cas::RoundReport CasGcScheduler::runOneRoundNow(GcRoundLogRecord::Trigger trigger)
+Cas::RoundReport CasGcScheduler::runOneRoundNow()
 {
     std::lock_guard round_lock(gc_round_mutex);
-    /// allow_steal=false: a manual round may acquire a FREE lease or renew ITS OWN, but must never
-    /// steal a live incumbent — see Cas::Gc::runRegularRound's doc comment. Dead-incumbent recovery
-    /// stays the loop's job (bounded ~2*interval; loop() below passes the default allow_steal=true).
-    const Cas::RoundReport report = runRoundLogged(gc, trigger, [this] { onLeaseAcquired(); }, /*allow_steal=*/false);
+    const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Manual, [this] { onLeaseAcquired(); });
     i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);
     return report;
 }
@@ -352,22 +350,21 @@ void CasGcScheduler::loop()
                 return;
             round_requested = false;
         }
-        /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit the pacing loop the moment the pool reaches — or is
+        /// Self-exit the pacing loop the moment the pool reaches — or is
         /// being driven toward — ANY terminal state. A NATURAL terminal transition (`VanishedReplaced` after
         /// a foreign pool took the prefix, or `IdentityLost` once the sentinels are gone) never calls
         /// `stop()` on this scheduler: only `~Pool`/FORGET join it. Without this check the loop would tick
         /// FOREVER — `acquireOrRenewLease` throws `CORRUPTED_DATA` against the vanished `gc/state` every
-        /// interval (the G2 zombie: an error-log line + a Failed round row each tick), and worse, after
+        /// interval (an error-log line + a Failed round row each tick), and worse, after
         /// `VanishedReplaced` the `allow_steal=true` rounds could STEAL the FOREIGN pool's `gc/state` lease
-        /// and fold/condemn/delete its objects. We also exit on a published FORGET intent
-        /// (`vanishedIntentPublished`, still pre-terminal) — earliest-signal discipline — and on `IdentityLost`
-        /// (rev.8: a fail-loud terminal state; the last G2-zombie case — eternal `CORRUPTED_DATA` retries
-        /// against a half-erased pool — closes with it). Clearing `i_am_leader` before returning keeps
+        /// and fold/condemn/delete its objects. `remountTerminal` is true from the moment FORGET
+        /// publishes its intent (still pre-terminal) and on `IdentityLost`
+        /// (a fail-loud terminal state, which also ends eternal `CORRUPTED_DATA` retries against a
+        /// half-erased pool). Clearing `i_am_leader` before returning keeps
         /// `gcHealth` honest (a terminal, self-exited scheduler reports it no longer leads). The thread exits
-        /// its OWN loop here — no join from this context (C6-safe); `stop()`/`~CasGcScheduler` still join the
+        /// its OWN loop here — no join from this context; `stop()`/`~CasGcScheduler` still join the
         /// finished thread cleanly.
-        if (store->isVanished() || store->vanishedIntentPublished()
-            || store->lifecycle() == Cas::PoolLifecycle::IdentityLost)
+        if (store->remountTerminal())
         {
             i_am_leader.store(false, std::memory_order_relaxed);
             {
@@ -398,8 +395,8 @@ void CasGcScheduler::loop()
             /// lease is (re)acquired, before the fold runs - a new leader's first round is otherwise
             /// unprotected (i_am_leader would only flip below, AFTER the whole round returns), so a
             /// follower observing the frozen (owner, seq) across two of its own ticks would steal
-            /// deterministically once that first round outlasts them. allow_steal defaults to true here
-            /// (the loop is the ONLY caller allowed to execute the steal CAS).
+            /// deterministically once that first round outlasts them. A `Scheduled` round is the only
+            /// one that may execute the steal CAS.
             const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled, [this] { onLeaseAcquired(); });
             i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);
             if (report.acquired_lease)
@@ -479,11 +476,10 @@ void CasGcScheduler::heartbeatLoop()
                 { return scheduler_state == SchedulerState::Stopped; }))
                 return;
         }
-        /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit on ANY terminal (or FORGET-intent) pool, same as
+        /// Self-exit on ANY terminal (or FORGET-intent) pool, same as
         /// `loop()`. A terminal pool's advisory pulses would target a deleted `gc/hb` key (`IdentityLost`) or
         /// a FOREIGN pool's key (`VanishedReplaced`) — stop pulsing the moment the pool goes terminal.
-        if (store->isVanished() || store->vanishedIntentPublished()
-            || store->lifecycle() == Cas::PoolLifecycle::IdentityLost)
+        if (store->remountTerminal())
         {
             {
                 std::lock_guard exit_lock(terminal_exit_mutex);

@@ -91,7 +91,7 @@ std::map<String, UInt64> runRoundAndReadIntakeMetrics(const PoolPtr & store)
     std::vector<GcRoundLogRecord> rows;
     CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca",
                          [&](const GcRoundLogRecord & r) { rows.push_back(r); });
-    EXPECT_TRUE(sched.runOneRoundNow(GcRoundLogRecord::Trigger::Manual).acquired_lease);
+    EXPECT_TRUE(sched.runOneRoundNow().acquired_lease);
     for (const GcRoundLogRecord & r : rows)
         if (r.event_type == GcRoundLogRecord::EventType::Phase && r.phase == "fold_ref_intake")
             return r.phase_metrics;

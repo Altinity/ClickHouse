@@ -28,14 +28,10 @@ public:
     explicit RuntimeFixture(uint64_t lease_safety_margin_ms, uint64_t attempt_timeout_ms = 10,
                             std::optional<uint64_t> connect_timeout_cap_ms = std::nullopt)
         : backend(std::make_shared<InMemoryBackend>())
-        , mount(backend, Fence{
-              [this] { return runtime.fenceGeneration(); },
-              [this](uint64_t g, uint64_t needed) { return runtime.admit(g, needed); },
-              [this](uint64_t g) { runtime.checkFenceOrThrow(g); }})
         , farewell(backend, Fence::open())
         , lease(backend, Fence::open())
         , runtime(
-              backend, mount, farewell, lease, layout,
+              farewell, lease, layout,
               MountConfig{.boot_ms_fn = [this] { return boot_ms; }},
               "test", sink,
               CasRequestBudget{.attempt_timeout_ms = attempt_timeout_ms,
@@ -53,7 +49,6 @@ private:
     std::shared_ptr<InMemoryBackend> backend;
     Layout layout{"mount-runtime-admit"};
     CasEventSink sink;
-    CasRequests mount;
     CasRequests farewell;
     CasRequests lease;
     CasMountRuntime runtime;
@@ -87,8 +82,6 @@ String refusalText(const std::function<void()> & refuse)
     return {};
 }
 
-constexpr DB::UInt128 kUuid{7};
-
 }
 
 /// The boundary is STRICT on both terms: a request that would only just finish as the lease runs out
@@ -97,7 +90,7 @@ TEST(CASMountRuntime, AdmitRefusesAtTheExactBudgetBoundary)
 {
     RuntimeFixture f(/*lease_safety_margin_ms=*/20);
     f.boot_ms = 1'000;
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'100);   /// 100 ms of lease left
+    f->armMountFence(/*deadline_boot_ms=*/1'100);   /// 100 ms of lease left
     const uint64_t generation = f->fenceGeneration();
 
     EXPECT_STREQ(admitName(f->admit(generation, 80)), "NoBudget") << "needed + margin == remaining must refuse";
@@ -110,7 +103,7 @@ TEST(CASMountRuntime, AdmitDoesNotWrapOnAnAbsurdNeed)
 {
     RuntimeFixture f(/*lease_safety_margin_ms=*/20);
     f.boot_ms = 1'000;
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'100);
+    f->armMountFence(/*deadline_boot_ms=*/1'100);
 
     EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), std::numeric_limits<uint64_t>::max())), "NoBudget");
 }
@@ -119,7 +112,7 @@ TEST(CASMountRuntime, AdmitRefusesAnExpiredLease)
 {
     RuntimeFixture f(/*lease_safety_margin_ms=*/0);
     f.boot_ms = 1'000;
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'100);
+    f->armMountFence(/*deadline_boot_ms=*/1'100);
     const uint64_t generation = f->fenceGeneration();
 
     f.boot_ms = 1'099;
@@ -139,9 +132,9 @@ TEST(CASMountRuntime, AdmitRefusesAGenerationTheFenceMovedPast)
 {
     RuntimeFixture f(/*lease_safety_margin_ms=*/0);
     f.boot_ms = 1'000;
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/100'000);
+    f->armMountFence(/*deadline_boot_ms=*/100'000);
     const uint64_t stale = f->fenceGeneration();
-    f->armMountFence(kUuid, 2, /*deadline_boot_ms=*/100'000);
+    f->armMountFence(/*deadline_boot_ms=*/100'000);
 
     EXPECT_STREQ(admitName(f->admit(stale, 0)), "LostOrRearmed");
     EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 0)), "Ok");
@@ -153,7 +146,7 @@ TEST(CASMountRuntime, AdmitRefusesALostFenceWhateverTheBudget)
 {
     RuntimeFixture f(/*lease_safety_margin_ms=*/0);
     f.boot_ms = 1'000;
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/100'000);
+    f->armMountFence(/*deadline_boot_ms=*/100'000);
     f->tripMountLost();
 
     EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 0)), "LostOrRearmed");
@@ -176,7 +169,7 @@ TEST(CASMountRuntime, RefAppendFenceOkIsAdmitAtTwoEnvelopes)
     /// timeout (10 ms); refAppendFenceOk asks for TWO of them (a write and its settlement read).
     RuntimeFixture f(/*lease_safety_margin_ms=*/20, /*attempt_timeout_ms=*/10);
     f.boot_ms = 1'000;
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'041);   /// 41 ms left: one more than 2*10 + 20
+    f->armMountFence(/*deadline_boot_ms=*/1'041);   /// 41 ms left: one more than 2*10 + 20
     EXPECT_TRUE(f->refAppendFenceOk());
     EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 20)), "Ok");
 
@@ -191,7 +184,7 @@ TEST(CASMountRuntime, RefAppendFenceOkIsAdmitAtTwoEnvelopesWithANonzeroCap)
 {
     RuntimeFixture f(/*lease_safety_margin_ms=*/20, /*attempt_timeout_ms=*/100, /*connect_timeout_cap_ms=*/50);
     f.boot_ms = 1'000;
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'421);   /// 421 ms left: one more than 2*200 + 20
+    f->armMountFence(/*deadline_boot_ms=*/1'421);   /// 421 ms left: one more than 2*200 + 20
     EXPECT_TRUE(f->refAppendFenceOk());
     EXPECT_STREQ(admitName(f->admit(f->fenceGeneration(), 400)), "Ok");
 
@@ -208,7 +201,7 @@ TEST(CASMountRuntime, LeaseExpiredOnlyWhileLiveAndNotLost)
     f.boot_ms = 1'000;
     EXPECT_FALSE(f->leaseExpiredSinceBootMs().has_value()) << "an unarmed fence has no deadline to pass";
 
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'100);
+    f->armMountFence(/*deadline_boot_ms=*/1'100);
     f.boot_ms = 1'099;
     EXPECT_FALSE(f->leaseExpiredSinceBootMs().has_value());
     f.boot_ms = 1'100;
@@ -231,16 +224,16 @@ TEST(CASMountRuntime, ExpiredLeaseRefusalSaysWritesResume)
 {
     RuntimeFixture f(/*lease_safety_margin_ms=*/0);
     f.boot_ms = 1'000;
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'100);
+    f->armMountFence(/*deadline_boot_ms=*/1'100);
     const uint64_t generation = f->fenceGeneration();
     f.boot_ms = 1'100;
 
     const String expired = refusalText([&] { f->checkFenceOrThrow(generation); });
     EXPECT_NE(expired.find("lease expired"), String::npos) << expired;
-    EXPECT_NE(expired.find("writes resume when a renewal succeeds"), String::npos) << expired;
+    EXPECT_NE(expired.find("writes resume when a renewal restores it"), String::npos) << expired;
 
     /// A re-arm moves the generation while the lease stays expired: the caller's incarnation is gone.
-    f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'100);
+    f->armMountFence(/*deadline_boot_ms=*/1'100);
     const String moved = refusalText([&] { f->checkFenceOrThrow(generation); });
     EXPECT_EQ(moved.find("lease expired"), String::npos) << moved;
     EXPECT_NE(moved.find("mount fence tripped"), String::npos) << moved;

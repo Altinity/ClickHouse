@@ -13,6 +13,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -359,14 +361,14 @@ TEST(CASForget, ForgetCleanFarewellGatedOnDrain)
     }
 }
 
-/// (b1) BOUNDED COMPLETION: FORGET racing an ACTIVE persistent remount worker joins it without deadlock. Here the
-/// faulting backend keeps every attempt at `StayTransient` (it never reaches `armMountFence`), so this
+/// (b1) BOUNDED COMPLETION: FORGET racing an ACTIVE reclaim on the lease thread joins it without deadlock. Here the
+/// faulting backend keeps every attempt at `StayTransient` (it never reaches the arm), so this
 /// isolates the join/no-deadlock property; the fence re-arm path is covered by (b2) below. Uses a
 /// `std::future` timeout wait (never a sleep) — the timeout only fires on a genuine deadlock regression.
 TEST(CASForget, ForgetRacingActiveRemountThreadCompletesBounded)
 {
     auto backend = std::make_shared<ToggleableTransportFaultBackend>();
-    /// `background_watermark = true` so the persistent recovery worker exists (mirrors
+    /// `background_watermark = true` so the lease thread exists (mirrors
     /// gtest_cas_pool.cpp's ShutdownGuardRefusesToArmRemount setup).
     auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .background_watermark = true});
@@ -375,9 +377,9 @@ TEST(CASForget, ForgetRacingActiveRemountThreadCompletesBounded)
     /// trip the fence and latch a recovery generation — the worker now loops `tryRemountOnce` against the fault.
     backend->fail.store(true);
     store->tripMountLost();
-    ASSERT_TRUE(store->scheduleRemountForTest()) << "the recovery worker must accept the request and run";
+    ASSERT_TRUE(store->scheduleRemountForTest()) << "the lease thread must accept the request and run";
 
-    /// FORGET from ANOTHER thread must join the active remount worker and finish in bounded time.
+    /// FORGET from ANOTHER thread must join the lease thread and finish in bounded time.
     std::promise<void> done;
     auto fut = done.get_future();
     std::thread forgetter([&]
@@ -385,8 +387,14 @@ TEST(CASForget, ForgetRacingActiveRemountThreadCompletesBounded)
         store->forgetDisk([] {}, kForgetReason);
         done.set_value();
     });
-    EXPECT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready)
-        << "FORGET must not deadlock against an in-flight self-remount";
+    if (fut.wait_for(std::chrono::seconds(30)) != std::future_status::ready)
+    {
+        ADD_FAILURE() << "FORGET must not deadlock against an in-flight self-remount";
+        /// Nothing can release the deadlocked threads, and the process does not exit while they are
+        /// parked, so the binary ends here instead of hanging.
+        std::fflush(stdout);
+        std::_Exit(1);
+    }
     forgetter.join();
 
     /// Disarm before ~Pool so its residual teardown is not fighting the injected fault.
@@ -396,34 +404,32 @@ TEST(CASForget, ForgetRacingActiveRemountThreadCompletesBounded)
     EXPECT_FALSE(store->mayMutate()) << "the fence must stay latched even if a raced reclaim re-armed it";
 }
 
-/// (b2) FENCE RE-LATCH REGRESSION GUARD (the fix's raison d'être): a self-remount that reaches
-/// `armMountFence` re-arms the local fence (`lost=false`) after FORGET has already tripped it. FORGET's
-/// SECOND `tripMountLost` — placed AFTER the remount worker is joined — must override it.
-///
-/// (b1)'s fault keeps every attempt at `StayTransient`, so it can NOT catch removal of that second trip. To
-/// make EXACTLY ONE reclaim reach `armMountFence` inside FORGET's window, deterministically and without a
-/// sleep, we drive a REAL `tryRemountOnce` from FORGET's own GC-stop step (invoked at spec §5 step 3/4,
-/// strictly AFTER the fence trip): the mount is fenced-out so the reclaim succeeds fast and re-arms the
-/// fence, and `tryRemountOnce`'s step-0 gate checks `isVanished()` — still false in this window — so it does
-/// NOT bail. The re-arm therefore lands after trip#1 and before trip#2, exactly the interval trip#2 guards.
-/// Verified to go RED when trip#2 is removed (see task-10-report.md — test_task10b_reddemo.log).
-TEST(CASForget, ForgetReLatchesFenceAfterAReclaimReachesArmMountFence)
+/// (b2) A reclaim that finishes after FORGET published its intent arms nothing. The reclaim runs from
+/// FORGET's own GC-stop step, after the intent and the first trip; the mount is fenced out, so it claims a
+/// fresh incarnation at once. FORGET's second trip stays as a backstop.
+TEST(CASForget, AReclaimDuringForgetArmsNothing)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
 
-    /// Make the current mount claimable so a self-remount SUCCEEDS fast and reaches `armMountFence`.
+    /// Make the current mount claimable so the reclaim claims at once.
     fenceOutMount(*backend, store->layout().mountKey(kSrid));
 
     bool reclaimed = false;
-    store->forgetDisk([&] { reclaimed = store->tryRemountOnce(); }, kForgetReason);
+    bool may_mutate_after_reclaim = true;
+    store->forgetDisk(
+        [&]
+        {
+            reclaimed = store->tryRemountOnce();
+            may_mutate_after_reclaim = store->mayMutate();
+        },
+        kForgetReason);
 
-    /// Guard against a vacuous pass: if the injected reclaim did not actually succeed (reach
-    /// `armMountFence`), there is no re-arm for trip#2 to override and the test proves nothing.
-    ASSERT_TRUE(reclaimed) << "the injected reclaim must reach armMountFence, else this guard is vacuous";
+    /// Guard against a vacuous pass: a reclaim that never claimed reaches no arm at all.
+    ASSERT_TRUE(reclaimed) << "the injected reclaim must claim, else this test proves nothing";
+    EXPECT_FALSE(may_mutate_after_reclaim) << "a reclaim after the FORGET intent must not arm the fence";
     EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedForgotten);
-    EXPECT_FALSE(store->mayMutate())
-        << "FORGET's post-join fence re-latch (trip#2) must override the fence the reclaim re-armed";
+    EXPECT_FALSE(store->mayMutate());
 }
 
 /// (b3) PROMOTION-GUARD REGRESSION (spec §9 rev.8 item 7): with the erasure-proof excised, the natural

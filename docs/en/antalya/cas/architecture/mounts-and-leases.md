@@ -88,9 +88,7 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   suspend correctly observes itself expired. The deadline decides about writes: none is admitted past
   it, and none is admitted once the remaining lease cannot cover the requests it may send plus the
   safety margin. The background renewal does not stop at the deadline. It retries timeouts, `5xx`
-  answers and connection errors about a second apart until the store answers. The renewals at startup,
-  after a remount and the direct renewal stay bounded: they stop at the last confirmed deadline minus
-  the safety margin. A retry, `GET`, response timestamp, or wall-clock step never extends authority.
+  answers and connection errors about a second apart until the store answers. A retry, `GET`, response timestamp, or wall-clock step never extends authority.
 - **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
   10 s), with TTL `cas_mount_lease_ttl_ms` (default 30 s, TTL/3 renewal ratio). The next beat is anchored
   at the committed body's pre-I/O BOOTTIME start. A slow recovery therefore causes an immediate
@@ -112,8 +110,9 @@ only on one of these:
   absent object, or a request the store refuses on a clear attempt;
 - a stop or a remount request;
 - a deterministic local failure;
-- a lifecycle other than `Live`;
-- a lost fence.
+- a terminal lifecycle, which includes a published `FORGET` intent.
+
+A lost fence alone does not end it: the renewal that makes a mount ready runs under a latched fence.
 
 A terminal renewer cannot mint another body or publish a clean farewell. Owner cancellation before
 any request is the only `NotAttempted` result and leaves clean release possible. Cancellation after a
@@ -141,10 +140,10 @@ local fence (latches `lost`, bumps the fence generation, moves the in-process ru
 `TransientNotLive`) and latches one self-remount generation. A confirmed foreign/successor or
 same-pair conflict remains a typed fail-closed error; it is never adopted. A real fence still costs
 only an epoch: recovery reclaims with a fresh one, bounded at three whole-chain attempts. This is the
-general CAS posture: doubt about the source fails closed. Fenced mutations and the bounded renewals
-(startup, remount and direct) retry transport ambiguity only inside authority already proved by the last
-confirmed lease. The background renewal may keep retrying after that lease has expired; write authority
-stays bounded by the start of the renewal that last succeeded plus the TTL.
+general CAS posture: doubt about the source fails closed. Fenced mutations retry transport ambiguity
+only inside authority already proved by the last confirmed lease. The renewal may keep retrying after
+that lease has expired; write authority stays bounded by the start of the renewal that last succeeded
+plus the TTL.
 
 GC's own view of a dead server is symmetric and clock-skew-immune: a slot becomes fence-eligible only
 after the leader observes the *same* renewal token hold stable, on its own monotonic clock, for `TTL +
@@ -242,9 +241,9 @@ The in-process `PoolLifecycle` runtime, by contrast, is a literal enum (`CasMoun
 ```mermaid
 stateDiagram-v2
     [*] --> Live: Pool constructed, fence unarmed
-    Live --> Live: mountWritable arms the fence
+    Live --> Live: the open's claim or first renewal arms the fence
     Live --> TransientNotLive: terminal renewal result, tripMountLost, lost=true
-    TransientNotLive --> Live: self-remount succeeds with a fresh epoch
+    TransientNotLive --> Live: the reclaim or the next renewal arms the fence under a fresh epoch
     TransientNotLive --> TransientNotLive: probe inconclusive, retry with backoff
     TransientNotLive --> IdentityLost: pool meta and owner both authoritatively absent
     TransientNotLive --> VanishedReplaced: foreign pool_id observed
@@ -254,29 +253,45 @@ stateDiagram-v2
     VanishedForgotten --> [*]
 ```
 
-`IdentityLost`, `VanishedReplaced` and `VanishedForgotten` are terminal and absorbing: the remount
-and GC threads self-exit, and there is deliberately no auto-revive — an identity disappearing
+`IdentityLost`, `VanishedReplaced` and `VanishedForgotten` are terminal and absorbing: the lease
+thread and the GC threads exit, and there is deliberately no auto-revive — an identity disappearing
 under a live mount is an operator-level event.
 
 ## Mount, unmount, crash {#mount-lifecycle}
 
 **Writable open** runs in a strict order: bootstrap-residual proof, capability probe under a
 random per-mount prefix, pool-meta create-or-validate, `validateServerRootId`, owner claim,
-`allocateWriterEpoch`, mount claim and synchronous renewer start, arm the fence, then create and
-release the runtime-owned renewal and remount workers before the writable pool becomes externally
-visible. If the claim consumed the TTL, one fresh synchronous renewal re-anchors the deadline
-before the fence is armed.
-Failure to construct either worker joins the partial pair, closes the fence, and fails the writable
-open. No incident path constructs a thread.
+`allocateWriterEpoch`, mount claim and synchronous renewer start, arm the fence, then start the
+runtime-owned lease thread before the writable pool becomes externally visible.
+Failure to start the lease thread closes the fence and fails the writable open. No incident path
+constructs a thread.
 
-The renewal and remount workers are separate and long-lived under one stable `CasMountRuntime`.
-`scheduleRemount` increments a requested-generation latch and wakes the persistent remount worker,
-including while an older generation is active. Before renewer replacement, remount requests
-`ParkRequested` and waits for the renewal driver to report `Parked`, which proves that no renewer call
-is in flight. A successful remount handles only its snapshotted generation; a newer request is
-processed before renewal resumes.
+**Readiness.** An open arms the fence from its claim only when the claim's deadline, its start plus the
+TTL, still leaves room for a ref append: `2 × envelope + margin` (16 s with the defaults). Otherwise the
+fence stays latched, the lease thread renews at once, and the first renewal whose own deadline leaves that
+room arms the fence; then the open returns. A renewal that commits with less room arms nothing, and the
+next one follows at once. If no renewal arms the fence within one TTL, the open stops and joins the lease
+thread and fails with `ABORTED`, naming the last failed renewal request. A reclaim whose arming conditions
+(below) do not hold keeps the pool `TransientNotLive` with the fence latched. Then the next renewal arms
+the fence and reports `Live` when no request is pending, a newer request gets another reclaim, and a stop
+or a terminal lifecycle ends the thread. The `mount_remount` row of such a reclaim has `outcome = 'ok'`
+and `step = 'claimed_not_armed'`.
 
-**Clean unmount:** request stop and join both persistent workers, drain the ref lanes, and only if
+One lease thread per writable mount renews the lease and runs the self-remount, one after the other.
+An interference report (`tripAndRequestRemount`) and a terminal renewal trip the fence, raise the
+requested remount generation unless a request no reclaim has started serving is already pending or the
+pool is stopping or terminal, and wake the thread; a pending request also ends a renewal in progress. While the thread runs, only it replaces, starts or resets the renewer.
+
+- A reclaim latches the fence first.
+- It arms the fence, and reports `Live`, only when no newer request is pending, no stop is requested
+  and the lifecycle is not terminal. The check and the arm are one step under the runtime's mutex,
+  which a stop, a request and a FORGET intent also take.
+- A reclaim acknowledges only the generation it served, so a request raised during a reclaim is served
+  by the next reclaim before renewal resumes.
+- A renewal's result is published before the thread looks at the requests again, so a renewal that
+  finished before a request cannot overwrite the deadline of the reclaim that follows.
+
+**Clean unmount:** request stop and join the lease thread, drain the ref lanes, and only if
 the drain *certified* quiescence call `MountLeaseRenewer::release` on an `Active` renewer to write the
 terminal farewell (`expires_at_ms` already expired, `min_active_build_sequence = UINT64_MAX`). That sentinel is what
 lets a successor reclaim instantly. A `RenewalTerminal` renewer, an unresolved ref write, or a sent

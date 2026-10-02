@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
@@ -46,6 +47,20 @@ enum class MountRenewOutcome : uint8_t
     Terminal,
 };
 
+/// Why a renewal ended without committing, in the words of its audit event. `renew` sets it in the arm
+/// of the write's verdict that ended the renewal. `Cancelled` is also set when nothing was attempted and
+/// the lease is kept.
+enum class MountRenewTerminalClassification : uint8_t
+{
+    Unclassified,
+    DeterministicFailure,
+    Conflict,
+    Vanished,
+    Cancelled,
+    FenceOrLifecycleLost,
+    Unresolved,
+};
+
 struct MountRenewResult
 {
     MountRenewOutcome outcome = MountRenewOutcome::Terminal;
@@ -54,21 +69,28 @@ struct MountRenewResult
     /// a give-up, a conflict, or a store refusal.
     uint32_t attempts_sent = 0;
     bool resolved_by_read = false;
-    bool sent_any = false;
-    /// Which bound ended a renewal that ran out of time; unset for every other ending, including a
-    /// committed one -- no deadline ended it, so naming one would invent a fact.
-    std::optional<GaveUp::Source> deadline_source;
     std::exception_ptr failure;
+    /// The body this renewal wrote or tried to write.
+    uint64_t writer_epoch = 0;
+    uint64_t seq = 0;
+    UInt128 write_attempt_id{};
+    /// `Unclassified` for a committed renewal.
+    MountRenewTerminalClassification classification = MountRenewTerminalClassification::Unclassified;
+    /// From `attempt_start_boot_ms` to the return of `renew`, on the renewal's boot clock.
+    uint64_t elapsed_ms = 0;
 };
 
-/// How far a renewal may retry.
-enum class MountRenewPolicy : uint8_t
-{
-    LeaseBound,        /// startup, remount and direct renewals: `Retry::untilLeaseSafe`
-    UntilDefinitive,   /// the background worker: `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`
-};
+/// One event and one log line for a renewal that retried, was resolved by a read, restored an expired
+/// lease, or ended terminal; silent otherwise. `lease_deadline_before_boot_ms` is the lease deadline
+/// the renewal started under. Never throws.
+void reportMountRenewCompletion(
+    const MountRenewResult & result,
+    const String & server_root_id,
+    const CasEventSink & event_sink,
+    uint64_t lease_deadline_before_boot_ms,
+    std::optional<uint64_t> expired_ms) noexcept;
 
-/// The spacing of an `UntilDefinitive` renewal's retries.
+/// The spacing of a renewal's retries.
 inline constexpr uint64_t kMountRenewRetrySpacingMs = 1000;
 
 /// One physical request of a renewal, reported as it happens: a `PUT` sent (`failed` false), a `PUT`
@@ -82,15 +104,13 @@ struct MountRenewRequestEvent
 
 struct MountRenewOperationEnvironment
 {
-    std::function<uint64_t()> boot_ms;
-    /// Facts the mount fence cannot see (park requested, pool no longer live, shutdown). FALSE ends
+    /// Facts the mount fence cannot see (a remount request, a pool no longer live, shutdown). FALSE ends
     /// the renewal exactly as a lost fence does; the engine does not need to know which refused.
     std::function<bool()> live;
     /// Sampled ONCE before the write. A renewal refused before its first attempt is reported as
     /// `NotAttempted` rather than terminal only when this node had already been asked to stop --
     /// sampling it afterwards would read a flag that the refusal itself may have set.
     std::function<bool()> cancelled;
-    MountRenewPolicy policy = MountRenewPolicy::LeaseBound;
     /// Called on the renewing thread for each `PUT` sent, each failed `PUT` and each failed resolve read.
     /// May be empty. What it throws is ignored.
     std::function<void(const MountRenewRequestEvent &)> on_request;
@@ -549,25 +569,24 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 ///   - foreign uuid → fail closed;
 ///   - absent → `create`; expired-our-uuid (any epoch) → `replace` reclaim.
 ///
-/// PLANES. A bounded renewal is admitted under the mount fence, because it writes under the authority
-/// the fence tracks. The worker's renewal (`UntilDefinitive`) runs on a plane with no lease budget: it
-/// keeps trying after the lease expired, and a stop, a park or a terminal lifecycle reaches it through
-/// its liveness. The claim and the farewell are admitted off the fence: a self-remount claims with the
-/// fence already latched lost, so a claim gated on the fence could never reclaim, and a farewell
-/// refused because the fence has run down would leave the slot looking live until GC fences it out.
-/// Neither is unguarded: a claim's safety is its own conditional write, and a caller that has shutdown
-/// facts hands them over as a `Liveness`.
+/// PLANES. A renewal runs on `lease_requests`, which has no lease budget: it keeps trying after the
+/// lease expired, and a stop, a remount request or a terminal lifecycle reaches it through its
+/// liveness. The claim and the farewell are admitted on `claim_farewell_requests`, off the fence: a
+/// self-remount claims with the fence already latched lost, so a claim gated on the fence could never
+/// reclaim, and a farewell refused because the fence has run down would leave the slot looking live
+/// until GC fences it out. Neither is unguarded: a claim's safety is its own conditional write, and a
+/// caller that has shutdown facts hands them over as a `Liveness`.
 class MountLeaseRenewer
 {
 public:
     MountLeaseRenewer(
-        CasRequests & mount_requests_, CasRequests & open_requests_, CasRequests & worker_requests_,
+        CasRequests & claim_farewell_requests_, CasRequests & lease_requests_,
         const Layout & layout_,
         const String & srid_, UInt128 server_uuid_,
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
         std::function<uint64_t()> min_active_build_sequence_fn_,
         CasEventSink event_sink_ = {},
-        std::chrono::milliseconds lease_safety_margin_ = std::chrono::milliseconds(2000),
+        std::chrono::milliseconds lease_safety_margin_ = std::chrono::milliseconds(static_cast<int64_t>(kDefaultLeaseSafetyMarginMs)),
         /// boot-domain clock for the on_renew_ok anchor; empty = real CLOCK_BOOTTIME. Injectable for
         /// tests and wired by CasMountRuntime::installRenewer.
         std::function<uint64_t()> boot_ms_fn_ = {});
@@ -575,17 +594,12 @@ public:
     /// Adopt the already-claimed mount. Returns the exact pre-I/O BOOTTIME anchor. `liveness` carries
     /// the caller's shutdown terms; the mount fence is deliberately not consulted here.
     uint64_t start(Liveness liveness = {});
-    /// The steady-state renewal. `LeaseBound` runs under the mount fence with `Retry::untilLeaseSafe`;
-    /// `UntilDefinitive` runs on the worker plane with `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`
-    /// and ends on a definitive answer, a deterministic local failure, or when `environment.live` refuses.
+    /// One renewal on `lease_requests` under `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`. Ends on
+    /// a definitive answer, a deterministic local failure, or when `environment.live` refuses.
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
-    /// The remount's re-anchor, which is bootstrap control rather than steady state: a remount renews
-    /// BEFORE it arms the fence for the new incarnation, so the fence is still latched lost and an
-    /// operation admitted under it would be refused before its first attempt. It admits on this
-    /// renewer's own open plane, the one the claim and the farewell use, so there is no plane for a
-    /// caller to get wrong. Same policy and same verdicts as `renew`.
-    MountRenewResult renewForRemount(const MountRenewOperationEnvironment & environment = {});
-    void release();
+    /// The farewell. It gives up rather than run past `lease_deadline_boot_ms` less the safety margin;
+    /// the deadline is on the boot clock this renewer anchors its renewals on.
+    void release(uint64_t lease_deadline_boot_ms);
 
     MountLeaseRenewerState state() const { return renewer_state; }
     bool canRelease() const { return renewer_state == MountLeaseRenewerState::Active; }
@@ -596,17 +610,16 @@ private:
     /// The incarnation every guarded write of this slot names. Engaged for exactly the states that
     /// admit such a write: `start` establishes it and each committed renewal replaces it.
     const Etag & precondition() const;
-    /// One renewal admitted on `plane`; `renew` and `renewForRemount` differ only in which they pass.
-    MountRenewResult renewOn(CasRequests & plane, const MountRenewOperationEnvironment & environment);
     Etag claim(CasOperation & op, const String & body);
-    [[noreturn]] void throwRenewConflict(const Observation & seen) const;
+    /// Sets `classification` for the arm it takes, then throws what ended the renewal. The caller
+    /// holds the classification before the event sink runs, so the sink cannot change it.
+    [[noreturn]] void throwRenewConflict(const Observation & seen, MountRenewTerminalClassification & classification) const;
     MountRenewResult terminalResult(MountRenewResult result);
-    void terminate(CasOperation & op);
+    void terminate(CasOperation & op, uint64_t lease_deadline_boot_ms);
 
-    CasRequests & mount_requests;
-    CasRequests & open_requests;
-    /// The plane of an `UntilDefinitive` renewal: no lease budget, and a sleep a stop wakes.
-    CasRequests & worker_requests;
+    CasRequests & claim_farewell_requests;
+    /// The plane of a renewal: no lease budget, and a sleep a stop wakes.
+    CasRequests & lease_requests;
     String key;
 
     String srid;
@@ -625,7 +638,6 @@ private:
     /// The incarnation our last landed write created; every renewal and the farewell name it as the
     /// precondition. Unset only before `start` has landed one.
     std::optional<Etag> last_etag;
-    uint64_t confirmed_deadline_boot_ms = 0;
     uint64_t last_committed_attempt_start_boot_ms = 0;
 };
 

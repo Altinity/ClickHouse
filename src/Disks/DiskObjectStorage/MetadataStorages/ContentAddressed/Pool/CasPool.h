@@ -182,7 +182,7 @@ struct PoolConfig
     /// overlap. `1` issues no read-ahead and no fan-out at all and is the sequential round, request
     /// for request.
     uint64_t gc_io_concurrency = 16;
-    /// Tests drive `renewWatermarkOnce` explicitly; gates both persistent runtime workers.
+    /// Tests drive `renewWatermarkOnce` explicitly; gates the lease thread.
     bool background_watermark = false;
     /// Installed on the pool before a writable mount can start its runtime-owned workers.
     CasEventSink event_sink = {};
@@ -216,10 +216,11 @@ struct PoolConfig
     std::function<void(const BlobRef &)> gc_redelete_apply_hook_for_test = {};
     std::optional<size_t> gc_io_pool_refuse_at_for_test = std::nullopt;
 
-    /// Mount-lease TTL: how long a freshly-renewed mount lease is valid. The local
-    /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
-    /// once `this` elapses with no successful renew. The background renewer runs every
-    /// `mount_renew_period` (default ttl/3) so a healthy mount renews well before expiry.
+    /// Mount-lease TTL: how long a claim or renewal keeps the lease valid. The local write fence's
+    /// deadline is the start of the last committed claim or renewal attempt plus this, so a superseded
+    /// or paused writer is fenced once `this` elapses with no successful renewal. The background renewer
+    /// starts a renewal every `mount_renew_period` (default ttl/3) so a healthy mount renews well before
+    /// expiry.
     std::chrono::milliseconds mount_lease_ttl_ms{30000};
     std::chrono::milliseconds mount_renew_period{10000};   /// = ttl/3 by default
 
@@ -454,14 +455,6 @@ public:
     void setDetachedDrainDeadlineBudgetForTest(const CasRequestBudget & budget);
 
     /// ---- per-server watermark surface ----
-    /// process_epoch: random nonzero per Pool (process). GC checks epoch EQUALITY, never ordering.
-    uint64_t epoch() const { return mount_runtime.epoch(); }
-    /// The durable-monotone writer_epoch allocated at writable open. On a
-    /// writable Pool this is the value bridged into `process_epoch` (so the watermark + the manifest
-    /// manifest ref carries it); on a read-only open the random `process_epoch` is unchanged and
-    /// no durable epoch is allocated. A self-remount re-establishes this to the fresh incarnation's
-    /// writer_epoch (kept equal to `liveWriterEpoch`). The epoch-aware sweep reads this value.
-    uint64_t writerEpoch() const { return mount_runtime.writerEpoch(); }
     /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
     /// quiescent server's watermark floor advances to the next-to-be-allocated seq). Locks builds_mutex.
     uint64_t minActive();
@@ -477,14 +470,15 @@ public:
     /// `lost` and the monotonic deadline has not passed. Permissive until armed: a Pool that has not
     /// armed the fence (the default deadline is steady_clock::time_point::max()) always allows mutations.
     bool mayMutate() const;
-    /// Latch the fence to lost (once lost, stays lost). Called by the renewer on a superseded
-    /// or foreign observation; the gated mutate chokepoints then fail closed.
+    /// Test seam: `CasMountRuntime::tripMountLost`, with no remount request. Production trips through
+    /// the runtime.
     void tripMountLost();
-    /// Refresh the write-fence deadline (a CLOCK_BOOTTIME-milliseconds instant; release).
-    /// renewer renew calls this on success.
+    /// Test seam: `CasMountRuntime::setMountDeadline`. Production publishes a renewed deadline through
+    /// `CasMountRuntime::publishRenewedDeadline`.
     void setMountDeadline(uint64_t deadline_boot_ms);
-    /// Arm the fence at startup: set (uuid, epoch, deadline), clear `lost`.
-    void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms);
+    /// Test seam: `CasMountRuntime::armMountFence`. Production arms through `armIfAdmissible` and the
+    /// renewal's consume step.
+    void armMountFence(uint64_t deadline_boot_ms);
     void setArmMountFenceInterpositionHookForTest(std::function<void()> hook)
     {
         mount_runtime.setArmMountFenceInterpositionHookForTest(std::move(hook));
@@ -501,11 +495,12 @@ public:
     /// The real boot clock: CLOCK_BOOTTIME in milliseconds. Static so tests can compose it.
     static uint64_t bootMs();
 
-    /// ---- fence-generation admission (rev.7 [C2]/[D1]; owned by `mount_runtime`) ----
-    /// Bumped on every `tripMountLost`/`armMountFence`. Forwarders used directly by the S3-native
-    /// staging-buffer finalize (`ContentAddressedTransaction::writeFile`) -- the durable-effect site
-    /// outside `CasPlainObjects` that needs to capture-then-recheck a fence-generation token across an
-    /// async, potentially long-running upload. `CasPlainObjects` reaches the same primitives via
+    /// ---- fence-generation admission (owned by `mount_runtime`) ----
+    /// Bumped by every trip and every arm of the fence (see `CasMountRuntime::fenceGeneration`).
+    /// Forwarders used directly by the S3-native staging-buffer finalize
+    /// (`ContentAddressedTransaction::writeFile`) -- the durable-effect site outside `CasPlainObjects`
+    /// that needs to capture-then-recheck a fence-generation token across an async, potentially
+    /// long-running upload. `CasPlainObjects` reaches the same primitives via
     /// injected callbacks (see its own constructor).
     uint64_t fenceGeneration() const { return mount_runtime.fenceGeneration(); }
     /// Throws the typed transient refusal (`throwCasTransientUnavailable`) unless the fence is currently
@@ -518,11 +513,9 @@ public:
     /// Whether the pool has reached one of the two fully-terminal `Vanished` values
     /// (`VanishedReplaced` / `VanishedForgotten`).
     bool isVanished() const { return mount_runtime.isVanished(); }
-    /// Whether the terminal-intent latch is published — a natural `enterVanished`, OR FORGET's early
-    /// (spec §5 step 1) `publishVanishedIntent`, and NEVER `IdentityLost` ([C1]). See
-    /// `CasMountRuntime::vanishedIntentPublished`. The GC scheduler consults this ALONGSIDE `isVanished()`
-    /// to self-exit its loops the instant the pool is (being driven) terminal, at the earliest signal.
-    bool vanishedIntentPublished() const { return mount_runtime.vanishedIntentPublished(); }
+    /// Whether background work must stop: a terminal intent is published (a natural `enterVanished` or
+    /// FORGET's early publication) or the pool is `IdentityLost`. See `CasMountRuntime::remountTerminal`.
+    bool remountTerminal() const { return mount_runtime.remountTerminal(); }
     /// The store()-class lifecycle gate: throws the typed `INVALID_STATE` error, whose message names the
     /// terminal sub-state, when the pool has entered `IdentityLost` or any `Vanished` state; returns
     /// silently while `Live`/`TransientNotLive`. This is the minimal "nothing silently proceeds" hook the
@@ -552,15 +545,15 @@ public:
     /// `SYSTEM CAS FORGET` — the operator force-Vanish (spec §5). Drives THIS pool to
     /// `Vanished(forgotten)` with the fence-first protocol, node-locally, regardless of the current
     /// lifecycle (it works precisely on a NOT-live disk — a stuck transient/`IdentityLost` pool). In order:
-    /// (1) publish the terminal-intent latch FIRST (so both runtime worker loops bail at their
+    /// (1) publish the terminal-intent latch FIRST (so the lease loop exits at its
     /// next step boundary, bounding the joins below); (2) trip the local fence (the deliberate
     /// decommission act, allowed on a live disk); (3+4) stop the GC scheduler via `stop_and_join_gc` —
     /// injected because the scheduler is owned above the Pool, a no-op in contexts that run none — and stop
-    /// + join both persistent workers; (5) drain the ref lanes (bounded) and retire the renewer WITHOUT an
+    /// + join the lease thread; (5) drain the ref lanes (bounded) and retire the renewer WITHOUT an
     /// unearned clean farewell (the lease expires by observation unless the lanes provably drained); then
     /// (6) publish `Vanished(forgotten)` carrying `reason` (the [D5] message with the operator's decommission
     /// timestamp). Idempotent: an already-`Vanished` pool returns immediately (first terminal transition
-    /// wins). MUST run on the admin/query thread, never a pool (remount/GC) thread — the joins would
+    /// wins). MUST run on the admin/query thread, never a pool (lease or GC) thread — the joins would
     /// otherwise self-deadlock (hazard C6).
     void forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason);
 
@@ -762,11 +755,6 @@ public:
     /// operation admitted here is refused the moment the fence trips, is re-armed under a fresh lease
     /// incarnation, or runs out of room before the lease expires.
     CasRequests & mountRequests() { return mount_requests; }
-    /// The farewell plane, on an open fence -- shared with the mount-lease renewer's own claim/adopt,
-    /// not only its release: a self-remount claims with the fence already latched lost, so gating the
-    /// claim on the fence could never reclaim, and refusing the farewell because the mount fence has
-    /// already run down would leave the slot looking live until GC fences it out.
-    CasRequests & farewellRequests() { return farewell_requests; }
     /// The open-fence plane: GC, the offline tools, this pool's own reads, and the bootstrap-control
     /// claims. None of them hold a mount lease -- the claims are what ESTABLISHES one, so gating them
     /// on the fence would make a self-remount, which runs with the fence latched lost, unable ever to
@@ -806,6 +794,7 @@ public:
 
     /// The writer_epoch of the LIVE mount incarnation. Bumped by `tryRemountOnce` (self-remount
     /// after a GC fence-out) — a `PartWriteTxn` minted under an older epoch fails closed on its next step.
+    /// Zero on a read-only pool, which claims no mount.
     uint64_t liveWriterEpoch() const { return mount_runtime.liveWriterEpoch(); }
 
     /// Test seam: publish a new live-incarnation writer epoch WITHOUT running a self-remount -- the
@@ -822,25 +811,22 @@ public:
     /// `Pool::open`. Orchestration stays here; the owned mount primitives it drives (renewer swap,
     /// epoch bump, fence re-arm) live on `mount_runtime`. Returns false (and changes nothing durable
     /// beyond the epoch bump) when the
-    /// mount cannot be claimed (foreign owner / a genuinely live twin) — the caller retries. Safe to
-    /// call concurrently (serialized internally); also the synchronous test seam.
+    /// mount cannot be claimed (foreign owner / a genuinely live twin) — the caller retries. Serialized
+    /// by `remount_mutex`. While a lease thread runs, a call from any other thread fails at the renewer's
+    /// owner check (a `LOGICAL_ERROR`), after it has claimed the mount under a fresh epoch, so such a call
+    /// is never harmless. Also the synchronous test seam.
     bool tryRemountOnce();
 
-    /// Test seam: latch the private self-remount path directly. In production the runtime terminal
-    /// consumer calls `scheduleRemount`, while external loss paths may latch the same persistent worker.
-    /// Returns true iff an unhandled recovery generation exists after the call.
+    /// Test seam: request a remount without a trip. Production requests one through
+    /// `reportImpossibleInterference` and a terminal renewal. Returns true iff a lease thread runs and a
+    /// request is pending after the call.
     bool scheduleRemountForTest();
-    /// Test seam: how many times `scheduleRemount` has been ENTERED, counted
-    /// unconditionally as its very first statement. This increments even under the default
-    /// `background_watermark = false` (no worker exists; a
-    /// test never pays for a real self-remount attempt racing this Pool's own still-live renewer, which
-    /// -- confirmed while building this seam -- reliably takes 30+ seconds per call and is not something
-    /// a fast unit test should be driving). Positively pins that a production call site (e.g.
-    /// `reportImpossibleInterference`) actually invoked `scheduleRemount`, as opposed to merely observing
-    /// `mayMutate() == false` (which `tripMountLost` alone already accounts for).
+    /// Test seam: see `CasMountRuntime::scheduleRemountCallCountForTest`. It counts with no lease thread
+    /// too, so a test can pin that a call site such as `reportImpossibleInterference` requested a
+    /// remount, which `mayMutate() == false` alone does not show.
     uint64_t scheduleRemountCallCountForTest() const { return mount_runtime.scheduleRemountCallCountForTest(); }
     /// Test seam: publish the same worker-stop request as `~Pool` without tearing the pool down, so a
-    /// test can assert `scheduleRemount` refuses to latch work once teardown has begun.
+    /// test can assert a remount request is refused once teardown has begun.
     void beginShutdownForTest();
 
 
@@ -933,8 +919,7 @@ private:
     /// makes `key` exclusively ours: foreign bytes observed at our own wedge key, or the wedge hard
     /// contract itself violated at new-id-allocation time. LOG_ERROR with full context, emit a
     /// `ForeignInterference` CasEvent, then fence this mount closed and arm the SAME bounded
-    /// self-remount a foreign/superseded lease renewal already drives (`tripMountLost` followed by
-    /// `scheduleRemount`). Diagnosis is strictly off the
+    /// self-remount a foreign/superseded lease renewal already drives (`tripAndRequestRemount`). Diagnosis is strictly off the
     /// critical path: ONE background GET of `key` (best-effort, single attempt), decoded as far as its
     /// ref-log header parses, logged -- never blocking or throwing on the caller's thread. Does NOT
     /// itself throw: every call site raises its OWN `LOGICAL_ERROR` immediately after this returns, so
@@ -1175,8 +1160,8 @@ private:
         return std::forward<Mutation>(mutation)();
     }
 
-    /// The mount plane's inter-attempt sleep: woken only by a stop of the workers, so a stopping renewal
-    /// is not held for a whole capped backoff. A park or a remount request does not wake it; the wait
+    /// The mount plane's inter-attempt sleep: woken only by a stop of the lease thread, so a stopping
+    /// renewal is not held for a whole capped backoff. A remount request does not wake it; the wait
     /// runs out. Named rather than inlined because the test seam has to be able to put it back.
     std::function<void(uint64_t)> mountPlaneSleepFn()
     {
@@ -1212,8 +1197,8 @@ private:
     mutable CasRequests mount_requests;
     mutable CasRequests farewell_requests;
     mutable CasRequests gc_requests;
-    /// The worker renewal's plane: no lease budget, because the renewal keeps trying after the lease
-    /// expired; a stop, a park or a terminal lifecycle ends it through its liveness.
+    /// The lease loop's renewal plane: no lease budget, because the renewal keeps trying after the lease
+    /// expired; a stop, a remount request or a terminal lifecycle ends it through its liveness.
     mutable CasRequests lease_requests;
 
     std::shared_ptr<DetachedRegistryState> detached_work = std::make_shared<DetachedRegistryState>();
@@ -1257,26 +1242,23 @@ private:
     CasRefLedger ref_ledger;
     /// The mount / write-fence / build-watermark / self-remount runtime, extracted
     /// from Pool. Owns the `MountLeaseRenewer`, the local `MountFence`, the per-server
-    /// build watermark (`process_epoch` + the `builds_mutex`-guarded seq/registry) and its in-flight-build
-    /// map, the live-incarnation `live_writer_epoch`, the unclean-epoch high-water-mark, and the
-    /// persistent renewal and remount workers (with one driver mutex/condition pair). Injected with backend/layout
+    /// build watermark (the `builds_mutex`-guarded seq/registry) and its in-flight-build
+    /// map, the live-incarnation `live_writer_epoch`, and the
+    /// lease thread (with one driver mutex/condition pair). Injected with the layout +
     /// the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool `cas_request_budget`
     /// + a `remount_attempt` callback (== `Pool::tryRemountOnce`, which STAYS on Pool: the claim/recovery
     /// ORCHESTRATION drives these owned primitives).
     ///
-    /// Declared AFTER `ref_ledger` -- preserving the pre-3.5 relative order VERBATIM (the mount raw-members
-    /// this component replaces all sat after `ref_ledger`), so `mount_runtime` is destroyed FIRST and
-    /// `ref_ledger` LAST. Both orders were proven equally safe -- `~Pool`
-    /// quiesces both subsystems before ANY member dtor runs (`stopBackgroundWorkers` ->
-    /// ref_ledger.drainRefLanesForShutdown -> mount_runtime.finishTeardown), and the ledger's async paths
-    /// pin `Pool::shared_from_this`, so no ledger->mount callback can fire during destruction in either
-    /// order. Both safe ⇒ this is a pure behavior-preserving relocation, so the ORIGINAL order is kept and
-    /// NO member-order change is introduced. Declared after event_sink_, pool_backend, config and
+    /// Declared AFTER `ref_ledger`, so `mount_runtime` is destroyed FIRST and `ref_ledger` LAST. Either
+    /// order is safe -- `~Pool` quiesces both subsystems before ANY member dtor runs
+    /// (`stopBackgroundWorkers` -> ref_ledger.drainRefLanesForShutdown -> mount_runtime.finishTeardown), and
+    /// the ledger's async paths pin `Pool::shared_from_this`, so no ledger->mount callback can fire during
+    /// destruction in either order. Declared after event_sink_, pool_backend, config and
     /// pool_layout so it is constructed after every dependency it is injected with.
     CasMountRuntime mount_runtime;
 
     /// Serializes `tryRemountOnce` (whose claim/recovery ORCHESTRATION stays on Pool). STAYS here with
-    /// its guarded critical section: persistent worker ownership, fence atomics, and the build registry
+    /// its guarded critical section: lease-thread ownership, fence atomics, and the build registry
     /// moved to `mount_runtime`, but the top-level remount serialization guards
     /// the Pool-side orchestration, so it stays on Pool.
     std::mutex remount_mutex;

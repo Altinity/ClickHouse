@@ -473,7 +473,7 @@ void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed,
 ManifestId seedOrphanManifestBody(Pool & victim, const String & ns_str)
 {
     const RootNamespace ns(ns_str);
-    const ManifestRef ref{.writer_epoch = victim.writerEpoch(), .build_sequence = 99, .manifest_ordinal = 1};
+    const ManifestRef ref{.writer_epoch = victim.liveWriterEpoch(), .build_sequence = 99, .manifest_ordinal = 1};
     const ManifestId id = writeManifestRaw(*victim.poolBackendPtr(), victim.layout(), ns, ref, {});
     /// EXPECT, not ASSERT: this function returns a value now, and ASSERT_* expands to a bare `return;`
     /// -- invalid in a non-void function.
@@ -511,12 +511,12 @@ TEST(CASDecommission, ClaimsDeadMemberAndBumpsEpoch)
     uint64_t victim_epoch = 0;
     {
         auto victim = openVictim(backend);
-        victim_epoch = victim->writerEpoch();
+        victim_epoch = victim->liveWriterEpoch();
     }   /// graceful close: lease stamped already-expired + farewell — the slot is claimable
 
     auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
     ASSERT_TRUE(admin != nullptr);
-    EXPECT_GT(admin->writerEpoch(), victim_epoch);
+    EXPECT_GT(admin->liveWriterEpoch(), victim_epoch);
     /// The admin store IS the victim server root now (impersonation).
     EXPECT_EQ(admin->poolConfig().server_root_id, "victim");
 }
@@ -795,7 +795,7 @@ TEST(CASDecommission, CountsRealisticEpochPrecommit)
     uint64_t victim_epoch = 0;
     {
         auto victim = openVictim(backend);
-        victim_epoch = victim->writerEpoch();
+        victim_epoch = victim->liveWriterEpoch();
         makeTableWithRefs(*victim, "victim/db/t1", /*committed=*/1, /*precommits=*/0);
 
         const RootNamespace ns("victim/db/t1");

@@ -25,7 +25,6 @@ RENEWAL_EVENTS = (
     "CASMountRenewalRetries",
     "CASMountRenewalResolved",
     "CASMountRenewalRecovered",
-    "CASMountRenewalDeadlineExceeded",
     "CASMountLeaseLost",
     "CASMountLeaseExpired",
     "CASRemountAttempts",
@@ -457,7 +456,6 @@ def test_transient_mount_renewal_retries_without_remount(start_cluster):
     assert delta["CASMountRenewalAttempts"] > 1, delta
     assert delta["CASMountRenewalRetries"] > 0, delta
     assert delta["CASMountRenewalRecovered"] > 0, delta
-    assert delta["CASMountRenewalDeadlineExceeded"] == 0, delta
     assert delta["CASRemountAttempts"] == 0, delta
     assert delta["CASRemountSucceeded"] == 0, delta
     assert delta["CASRemountFailed"] == 0, delta
@@ -584,7 +582,6 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
     assert delta["CASMountRenewalRetries"] == 0, delta
     assert delta["CASMountRenewalResolved"] == 1, delta
     assert delta["CASMountRenewalRecovered"] == 1, delta
-    assert delta["CASMountRenewalDeadlineExceeded"] == 0, delta
     assert delta["CASRemountAttempts"] == 0, delta
     assert delta["CASRemountSucceeded"] == 0, delta
     assert delta["CASRemountFailed"] == 0, delta
@@ -707,7 +704,7 @@ def test_hard_restart_observes_then_the_unsafe_knob_skips_the_observation(start_
     # hard-coded, so this stays correct if that fixed budget ever changes.
     poll_ms = max(1, MOUNT_RENEW_PERIOD_MS // 2)
     threshold_ms = MOUNT_LEASE_TTL_MS + MOUNT_LEASE_TTL_MS // 20 + poll_ms
-    observation = "waiting ~{} ms (token-stability observation)".format(threshold_ms)
+    observation = "observing its write-token for up to ~{} ms before reclaiming".format(threshold_ms)
     epoch_before = int(
         node.query(
             "SELECT writer_epoch FROM system.cas_mounts WHERE disk = '{}' LIMIT 1".format(DISK)

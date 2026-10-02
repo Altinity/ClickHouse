@@ -657,7 +657,7 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
         }
         snapshot = gc_scheduler;
     }
-    return snapshot->runOneRoundNow(Cas::GcRoundLogRecord::Trigger::Manual);
+    return snapshot->runOneRoundNow();
 }
 
 Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) const

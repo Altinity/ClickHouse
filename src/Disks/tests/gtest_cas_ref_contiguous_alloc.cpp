@@ -176,7 +176,7 @@ TEST(CASRefContiguousAlloc, TwoNamespacesAllocateIndependently)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
-    const uint64_t epoch = store->writerEpoch();
+    const uint64_t epoch = store->liveWriterEpoch();
     const RootNamespace ns_a{"srv1/contig_ns_a"};
     const RootNamespace ns_b{"srv1/contig_ns_b"};
 
@@ -204,7 +204,7 @@ TEST(CASRefContiguousAlloc, PreAttemptRefusalConsumesNoId)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolFenceControlled(backend);
-    const uint64_t epoch = store->writerEpoch();
+    const uint64_t epoch = store->liveWriterEpoch();
     const RootNamespace ns{"srv1/contig_no_gap"};
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
@@ -239,13 +239,13 @@ TEST(CASRefContiguousAlloc, EpochChangeRestartsTheSequenceAtOne)
     uint64_t e1 = 0;
     {
         auto predecessor = openPool(backend);
-        e1 = predecessor->writerEpoch();
+        e1 = predecessor->liveWriterEpoch();
         ASSERT_EQ(publishRef(predecessor, ns, "ref_1", 1), (RefTxnId{e1, 1}));
         ASSERT_EQ(publishRef(predecessor, ns, "ref_2", 2), (RefTxnId{e1, 2}));
     }   /// predecessor destroyed: its mount lease is released
 
     auto successor = openPool(backend);
-    const uint64_t e2 = successor->writerEpoch();
+    const uint64_t e2 = successor->liveWriterEpoch();
     ASSERT_GT(e2, e1);
     EXPECT_EQ(publishRef(successor, ns, "ref_3", 3), (RefTxnId{e2, 1}))
         << "a fresh incarnation starts this table's sequence over at 1";
@@ -324,7 +324,7 @@ TEST(CASRefContiguousAlloc, NeedsRecoveryReplaysBeforeAllocatingTheNextId)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
-    const uint64_t epoch = store->writerEpoch();
+    const uint64_t epoch = store->liveWriterEpoch();
     const RootNamespace ns{"srv1/contig_durable_floor"};
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
@@ -373,7 +373,7 @@ TEST(CASRefContiguousAlloc, NeedsRecoveryReplaysBeforeSnapshotPublication)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
-    const uint64_t epoch = store->writerEpoch();
+    const uint64_t epoch = store->liveWriterEpoch();
     const RootNamespace ns{"srv1/contig_poison_publish"};
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
@@ -420,7 +420,7 @@ TEST(CASRefContiguousAlloc, RecreationRefusedWhileAMountSlotIsStillHeld)
     auto backend = std::make_shared<InMemoryBackend>();
     auto holder = openPool(backend);
     const RootNamespace ns{"srv1/contig_quiesce"};
-    ASSERT_EQ(publishRef(holder, ns, "ref_1", 1), (RefTxnId{holder->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(holder, ns, "ref_1", 1), (RefTxnId{holder->liveWriterEpoch(), 1}));
 
     /// The operator removes the pool identity, intending to recreate -- but the holder is still up.
     ASSERT_EQ(eraseKeysContaining(*backend, "_pool_meta"), 1u);
@@ -434,7 +434,7 @@ TEST(CASRefContiguousAlloc, RecreationRefusedWhileAMountSlotIsStillHeld)
         << "the holder must be identified so the operator knows what to stop: " << message;
 
     /// And the holder is untouched by the refused recreation: its own stream continues contiguously.
-    EXPECT_EQ(publishRef(holder, ns, "ref_2", 2), (RefTxnId{holder->writerEpoch(), 2}));
+    EXPECT_EQ(publishRef(holder, ns, "ref_2", 2), (RefTxnId{holder->liveWriterEpoch(), 2}));
 }
 
 /// Recreation quiesce, acceptance leg. Once the holder is gone its slot carries the graceful-farewell
@@ -463,7 +463,7 @@ TEST(CASRefContiguousAlloc, RecreationProceedsOnceTheHolderIsTerminal)
     /// mints a fresh pool that starts its own ref stream at 1.
     ASSERT_GT(eraseKeysContaining(*backend, ""), 0u);
     auto recreated = openPoolWithoutSeeding(backend, "test");
-    EXPECT_EQ(publishRef(recreated, ns, "ref_1", 1), (RefTxnId{recreated->writerEpoch(), 1}));
+    EXPECT_EQ(publishRef(recreated, ns, "ref_1", 1), (RefTxnId{recreated->liveWriterEpoch(), 1}));
 }
 
 /// The other half of the rule: if the prefix IS cleared while a writer survives (the mistake the
@@ -491,7 +491,7 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
     auto survivor = Pool::open(backend, survivor_cfg);
     const RootNamespace ns{"srv1/contig_survivor"};
-    ASSERT_EQ(publishRef(survivor, ns, "ref_1", 1), (RefTxnId{survivor->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(survivor, ns, "ref_1", 1), (RefTxnId{survivor->liveWriterEpoch(), 1}));
     const uint64_t skipped_before
         = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
     const uint64_t violations_before
@@ -519,7 +519,7 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
         << "the survivor's queued write must be refused";
 
     /// The recreated pool is unaffected and owns the stream from 1.
-    EXPECT_EQ(publishRef(recreated, ns, "ref_1", 1), (RefTxnId{recreated->writerEpoch(), 1}));
+    EXPECT_EQ(publishRef(recreated, ns, "ref_1", 1), (RefTxnId{recreated->liveWriterEpoch(), 1}));
 
     /// The survivor's TEARDOWN is the other half, and it is asserted here rather than left to the
     /// destructor at scope exit. A terminal renewer must skip release without backend I/O: the renewal

@@ -418,14 +418,14 @@ TEST(CASPartWriteTxn, StageManifestUsesPerBuildOrdinals)
     const ManifestId first = build->stageManifest({blobManifestEntry("a.bin", "a")});
     const ManifestId second = build->stageManifest({blobManifestEntry("b.bin", "b")});
 
-    EXPECT_EQ(first.ref.writer_epoch, s->writerEpoch());
+    EXPECT_EQ(first.ref.writer_epoch, s->liveWriterEpoch());
     EXPECT_EQ(first.ref.build_sequence, build->buildSeq());
     EXPECT_EQ(first.ref.manifest_ordinal, 1u);
     EXPECT_EQ(second.ref.writer_epoch, first.ref.writer_epoch);
     EXPECT_EQ(second.ref.build_sequence, first.ref.build_sequence);
     EXPECT_EQ(second.ref.manifest_ordinal, 2u);
     /// Canonical hex build directory (spec §Manifest Identifier): `<epoch-hex>-<build-seq-hex>/`.
-    const String build_segment = renderRefTxnId(RefTxnId{s->writerEpoch(), build->buildSeq()});
+    const String build_segment = renderRefTxnId(RefTxnId{s->liveWriterEpoch(), build->buildSeq()});
     EXPECT_EQ(s->layout().manifestKey(first), "p/cas/manifests/test/tbl@cas@/" + build_segment + "/000001.zst");
     EXPECT_EQ(s->layout().manifestKey(second), "p/cas/manifests/test/tbl@cas@/" + build_segment + "/000002.zst");
 

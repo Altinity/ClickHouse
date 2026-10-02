@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 
 namespace DB::Cas
 {
@@ -33,7 +34,7 @@ using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 ///   - `TransientNotLive` — the lease was lost; access is uncertain and a self-remount retries. The §2
 ///                          `Present`+identity-match recovery rule fires only from here (or `Live`).
 ///   - `IdentityLost`     — the pool sentinels are authoritatively absent (both KeyAbsent):
-///                          fail-loud and TERMINAL (rev.8). The remount/GC workers self-exit;
+///                          fail-loud and TERMINAL. The lease and GC threads exit;
 ///                          matching-sentinel reappearance does NOT auto-revive it ([D3]); recovery is a
 ///                          restart or `SYSTEM CAS FORGET`.
 ///   - `Vanished*`        — fully terminal truth: the data root was replaced by a foreign pool, or the
@@ -45,19 +46,6 @@ enum class PoolLifecycle : uint8_t
     IdentityLost,
     VanishedReplaced,
     VanishedForgotten,
-};
-
-enum class RenewalDriverState : uint8_t
-{
-    Dormant,
-    StartupCall,
-    DirectCall,
-    RemountCall,
-    WorkerIdle,
-    WorkerCall,
-    ParkRequested,
-    Parked,
-    Stopping,
 };
 
 using RuntimeWorkerFactory = std::function<ThreadFromGlobalPool(std::function<void()>)>;
@@ -75,25 +63,17 @@ struct MountConfig
     std::function<uint64_t()> boot_ms_fn = {};
     std::function<void(uint64_t)> wait_sleep_fn = {};
     RuntimeWorkerFactory worker_factory = {};
-    /// Deterministic test interposition after the remount worker has confirmed renewal is parked,
-    /// immediately before it releases `driver_mutex` and begins the real remount callback.
-    /// Runs with `driver_mutex` held: it must issue no backend request and never wait on the pool's
-    /// hot-key lane, whose holders sleep under that mutex, or the test deadlocks itself.
-    std::function<void()> remount_parked_hook_for_test = {};
-    /// Deterministic test interposition at the top of the renewal loop, before it acquires
-    /// `driver_mutex` to inspect cadence or parking state.
+    /// Deterministic test interposition at the top of each pass of the lease loop, before it takes
+    /// `driver_mutex`.
     std::function<void()> renewal_before_driver_lock_hook_for_test = {};
-    /// Deterministic test interposition after a due worker has atomically reserved renewal ownership
-    /// and captured its renewer, but before renewer/backend I/O starts.
+    /// Deterministic test interposition after the loop decided to renew and released `driver_mutex`,
+    /// before the renewal's I/O starts.
     std::function<void()> renewal_admitted_hook_for_test = {};
-    /// Deterministic test interposition after terminal ownership has been deposited and the renewer is
-    /// no longer reachable by the completed call.
-    std::function<void()> renewal_terminal_deposited_hook_for_test = {};
-    /// Deterministic test interposition after the parked renewal predicate has sampled terminal false,
-    /// immediately before the condition-variable wait atomically releases `driver_mutex`.
+    /// Deterministic test interposition after a wait predicate of the lease loop sampled false,
+    /// immediately before the wait atomically releases `driver_mutex`.
     /// Runs with `driver_mutex` held: it must issue no backend request and never wait on the pool's
     /// hot-key lane, whose holders sleep under that mutex, or the test deadlocks itself.
-    std::function<void()> renewal_parked_predicate_false_hook_for_test = {};
+    std::function<void()> lease_wait_predicate_false_hook_for_test = {};
     /// Deterministic test interposition immediately before a terminal publisher attempts to acquire
     /// `driver_mutex`.
     std::function<void()> terminal_publication_waiting_for_driver_lock_hook_for_test = {};
@@ -107,7 +87,7 @@ struct MountConfig
     /// Deterministic failure injection at the vanished-reason preparation boundary.
     std::function<void()> vanished_reason_prepare_hook_for_test = {};
     /// Test-only extra liveness condition, for exact pre/post-send gate interleavings. It is ANDed with
-    /// the ordinary predicate, so a stop still ends the renewal. FALSE ends it exactly as a lost fence does.
+    /// the ordinary predicate, so a stop still ends the renewal. FALSE ends the renewal early.
     std::function<bool()> renewal_live_for_test = {};
 };
 
@@ -127,8 +107,6 @@ struct MountConfig
 /// Container pause is already safe under either clock (the process is frozen, so no local check runs).
 struct MountFence
 {
-    UInt128 server_uuid{};
-    uint64_t writer_epoch = 0;
     /// Until something arms a real lease deadline, the permissive default allows mutations. UINT64_MAX =
     /// unarmed (never expires); otherwise a CLOCK_BOOTTIME-milliseconds instant.
     std::atomic<uint64_t> deadline_boot_ms{std::numeric_limits<uint64_t>::max()};
@@ -137,20 +115,18 @@ struct MountFence
 
 /// Owns the live writer-incarnation mechanics shared by the pool's mount and recovery orchestration:
 /// the `MountLeaseRenewer`, local `MountFence`, build watermark and in-flight build registry,
-/// `live_writer_epoch`, unclean-boundary marker, and both persistent workers. `Pool` retains the higher-level
+/// `live_writer_epoch`, and the lease thread. `Pool` retains the higher-level
 /// claim/recovery sequence and its `remount_mutex`; in particular, the runtime does not acquire or own
-/// the ref-ledger locks. The runtime receives its backend, layout, configuration, event sink, request
+/// the ref-ledger locks. The runtime receives its request planes, layout, configuration, event sink, request
 /// budget, and a callback that performs one pool-level remount attempt, so it has no `Pool` back-reference.
 /// `Pool` delegates preserve the existing callers and test seams.
 class CasMountRuntime
 {
 public:
     CasMountRuntime(
-        BackendPtr backend_ptr_,
-        /// The planes the `MountLeaseRenewer` runs on: a bounded renewal under the mount fence, the
-        /// claim and the farewell on an open one, and the worker's renewal on `lease_requests_`, which
-        /// has no lease budget and whose sleep a stop wakes. Owned by `Pool` and outliving this runtime.
-        CasRequests & mount_requests_,
+        /// The planes the `MountLeaseRenewer` runs on: the claim and the farewell on an open-fence one,
+        /// the renewal on `lease_requests_`, which has no lease budget and whose sleep a stop wakes.
+        /// Owned by `Pool` and outliving this runtime.
         CasRequests & farewell_requests_,
         CasRequests & lease_requests_,
         const Layout & layout_,
@@ -159,35 +135,50 @@ public:
         const CasEventSink & event_sink_,
         CasRequestBudget cas_request_budget_,
         /// One pool-level recovery attempt. The callback captures the owning `Pool` and is invoked only
-        /// after construction, from the recovery thread.
+        /// after construction, from the lease thread.
         std::function<bool()> remount_attempt_);
 
-    /// ---- per-server watermark and identity ----
-    /// `process_epoch` is random and nonzero for this pool incarnation. GC compares it for equality,
-    /// never ordering; a different value means that the previous writer incarnation is no longer live.
-    uint64_t epoch() const { return process_epoch.load(std::memory_order_acquire); }
-    uint64_t writerEpoch() const { return process_epoch.load(std::memory_order_acquire); }
+    /// ---- per-server watermark ----
     /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
     /// quiescent server's watermark floor advances to the next-to-be-allocated seq). Locks builds_mutex.
     uint64_t minActive();
     /// Test/assertion accessor for the next-to-allocate build_seq under the lock.
     uint64_t peekNextBuildSeq();
-    /// Renew the merged mount heartbeat once, including its build-watermark floor. A read-only runtime
-    /// has no renewer and fails with a logical exception rather than fabricating a heartbeat.
+    /// Runs the lease thread's renewal step once on the calling thread and rethrows a terminal failure:
+    /// the test seam. Refused when the runtime is configured for a lease thread, and on a read-only
+    /// runtime, which has no renewer.
     void renewWatermarkOnce();
 
     /// ---- local write fence ----
     /// Return whether a mutable operation may start under the locally observed lease state.
     bool mayMutate() const;
-    /// Permanently latch the local fence as lost for this runtime incarnation.
+    /// Latch the fence lost and count one lease loss. A trip that comes alone is re-armed by the next
+    /// renewal that commits with room for a ref append, so every production caller pairs it with a
+    /// remount request, a terminal lifecycle (a published FORGET intent included) or a stop, or trips
+    /// where no renewal follows: the lease loop's error exit.
     void tripMountLost();
     /// Publish the BOOTTIME deadline from a successful lease renewal.
     void setMountDeadline(uint64_t deadline_boot_ms);
-    /// Arm a new lease incarnation and clear any loss latched for the prior incarnation.
-    void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms);
+    /// Arm a new lease incarnation and clear any loss latched for the prior incarnation. Unconditional
+    /// and reports no `Live`; a reclaim arms through `armIfAdmissible`.
+    void armMountFence(uint64_t deadline_boot_ms);
+    /// Step 0 of a reclaim. One step under `driver_mutex`: record the requested generation this attempt
+    /// serves and latch the fence.
+    void beginReclaim();
+    /// End of a reclaim that claimed. One step under `driver_mutex`: acknowledge the generation
+    /// `beginReclaim` recorded, publish the deadline, and arm the fence and report `Live` if the arming
+    /// rule holds; otherwise latch the fence. Returns whether it armed.
+    bool armIfAdmissible(uint64_t deadline_boot_ms);
+    /// Blocks until the fence is armed. Gives up after `timeout_ms` on the fence clock, on a stop, on a
+    /// terminal lifecycle, or when the lease thread was never started or was stopped. A lease thread that
+    /// ended on its own does not end the wait early: it waits out `timeout_ms`. Returns whether the fence
+    /// is armed.
+    bool waitUntilArmed(uint64_t timeout_ms) const;
     /// Test-only interposition at the publication boundary between the re-armed generation and the
-    /// live fence. A caller admitted from this hook must be refused: the old generation is already
-    /// dead, while the new generation is not live until `lost` is cleared.
+    /// live fence: after the new generation and, for a production arm, the `Live` report, before `lost`
+    /// is cleared. A caller admitted from this hook must be refused: the old generation is already
+    /// dead, while the new generation is not live until `lost` is cleared. Through `armIfAdmissible`
+    /// it runs with `driver_mutex` held.
     void setArmMountFenceInterpositionHookForTest(std::function<void()> hook)
     {
         arm_mount_fence_interposition_hook_for_test = std::move(hook);
@@ -199,10 +190,11 @@ public:
     /// The real boot clock: `CLOCK_BOOTTIME` in milliseconds. Static so tests can compose it.
     static uint64_t bootMs();
 
-    /// ---- fence-generation admission (rev.7 [C2]/[D1]) ----
-    /// Bumped by EVERY `tripMountLost` (a fence loss) and EVERY `armMountFence` (a re-arm -- a fresh
-    /// lease incarnation, e.g. after a self-remount). A durable-effect caller captures this value once
-    /// at admission and compares it again immediately before its durable backend call: a DIFFERENT
+    /// ---- fence-generation admission ----
+    /// Bumped by every trip (`tripMountLost`, `tripFenceWithoutOperationalLoss`) and every arm
+    /// (`armFence`, through `armMountFence`, `armIfAdmissible` and the renewal consume step). A
+    /// durable-effect caller captures this value once at admission and compares it again immediately
+    /// before its durable backend call: a DIFFERENT
     /// value means the lease incarnation moved from under it since admission -- even when the fence
     /// happens to be live again under a brand-new incarnation, the caller's write is stale and must not
     /// land. See `checkFenceOrThrow`.
@@ -216,24 +208,21 @@ public:
     /// admission; the caller's write must never reach the backend in either case.
     void checkFenceOrThrow(uint64_t admitted_generation) const;
 
-    /// ---- pool lifecycle condition (rev.7 §1, spec §§1-3); enum at namespace scope below ----
+    /// ---- pool lifecycle condition; enum at namespace scope below ----
     /// Atomic read of the current lifecycle (acquire).
     PoolLifecycle lifecycle() const { return pool_lifecycle.load(std::memory_order_acquire); }
     /// Whether the pool has reached one of the two fully-terminal `Vanished` values
     /// (`VanishedReplaced` / `VanishedForgotten`).
     bool isVanished() const;
     /// Whether the terminal-intent latch (`vanished_intent`) is published — set by a natural
-    /// `enterVanished`, OR EARLY (spec §5 step 1) by FORGET's `publishVanishedIntent`, and NEVER by the
-    /// non-absorbing `IdentityLost` ([C1]). This is the EARLIEST terminal signal: it can already be true
-    /// while the state is still pre-terminal (mid-FORGET). Consulted alongside `isVanished()` by every
-    /// background worker that must self-exit the moment the pool is (being driven) terminal — the renewer
-    /// callback (`scheduleRemount`), the remount loop, and the GC scheduler.
+    /// `enterVanished`, OR EARLY by FORGET's `publishVanishedIntent`, and NEVER by `IdentityLost`. This
+    /// is the EARLIEST terminal signal: it can already be true while the state is still pre-terminal
+    /// (mid-FORGET). `remountTerminal` folds it in for the lease thread and the GC scheduler.
     bool vanishedIntentPublished() const { return vanished_intent.load(std::memory_order_acquire); }
 
     /// Non-terminal lease-loss transition: `Live -> TransientNotLive`. Idempotent and lock-free; a
     /// compare-exchange FROM `Live` only, so it never downgrades a terminal state. `tripMountLost`
-    /// calls this (the lease-loss primitive), and the remount loop's identity gate calls it as its
-    /// first step so a direct/forced remount attempt has a valid non-terminal predecessor state.
+    /// calls this (the lease-loss primitive).
     /// Returns true only to the compare-exchange winner, which owns the one-per-loss metric.
     bool noteLeaseLost();
     /// Non-terminal recovery transition: `TransientNotLive -> Live`. Called after a self-remount
@@ -244,7 +233,7 @@ public:
     /// One-way terminal transition to `IdentityLost`, from `TransientNotLive` only (a compare-exchange
     /// FROM `TransientNotLive`, so it is idempotent and cannot fire from `Live`/`Vanished`). On the
     /// transition it emits ONE WARN and one `CASIdentityLost` ProfileEvent. rev.8: `IdentityLost` is a
-    /// fail-loud TERMINAL state — `remountTerminal` reports it, so the remount worker self-exits
+    /// fail-loud TERMINAL state — `remountTerminal` reports it, so the lease thread exits
     /// (and the GC scheduler self-exits, through `Pool`) at its next boundary; there is no demoted observer.
     /// It deliberately does NOT publish the `vanished_intent` latch (which is reserved for the `Vanished*`
     /// idempotency/FORGET protocol); `remountTerminal` widens the worker-exit boundary to include it.
@@ -257,23 +246,23 @@ public:
     void setLifecycleForTest(PoolLifecycle lc);
 
     /// Publish the terminal-intent latch (`vanished_intent`) WITHOUT settling the lifecycle state. This is
-    /// spec §5 step 1 of `SYSTEM CAS FORGET`: publishing the latch FIRST makes the runtime terminal
-    /// consumer stop latching remount generations and the remount loop bail at its next step boundary, so
-    /// FORGET's subsequent worker joins are bounded to one step + one backend timeout. The state store + WARN happen
-    /// later, in `enterVanished` at step 6. Idempotent. Publication is serialized by `driver_mutex` and
-    /// followed by a condition-variable notification, so a worker cannot miss the terminal edge between
-    /// its predicate sample and wait. A natural
+    /// the first step of `SYSTEM CAS FORGET`: publishing the latch FIRST makes the runtime stop latching
+    /// remount generations and the lease loop exit at its next step boundary, so FORGET's join of the
+    /// lease thread is bounded by one step and one backend timeout. The state store + WARN happen
+    /// later, in `enterVanished`. Idempotent. Publication is serialized by `driver_mutex` and
+    /// followed by a condition-variable notification, so the lease loop cannot miss the terminal edge
+    /// between its predicate sample and wait. A natural
     /// terminal transition does NOT call this — its `enterVanished` publishes the latch itself.
     void publishVanishedIntent();
 
-    /// One-way transition to a fully-terminal `Vanished` value (spec §3). Publishes the terminal-intent
-    /// latch (so the runtime stops scheduling remount work and the remount loop exits at its next step
+    /// One-way transition to a fully-terminal `Vanished` value. Publishes the terminal-intent
+    /// latch (so the runtime stops scheduling remount work and the lease loop exits at its next step
     /// boundary) if it is not already published, records `reason`, stores the state, then emits ONE WARN +
-    /// one `CASDataRootVanished` ProfileEvent. Idempotent: the first terminal STATE transition wins (a
-    /// dedicated latch keyed separately from `vanished_intent`, because FORGET publishes that intent latch
+    /// one `CASDataRootVanished` ProfileEvent. Idempotent: the first terminal STATE transition wins (keyed
+    /// on the `Vanished*` lifecycle value, not on `vanished_intent`, because FORGET publishes that intent
     /// early at step 1). `which` MUST be one of the two `Vanished*` values (`VanishedReplaced` or
     /// `VanishedForgotten`). `reason` is retained and
-    /// surfaced verbatim in the `VanishedForgotten` [D5] error message (see `vanishedReason`). Threads exit
+    /// surfaced verbatim in the `VanishedForgotten` error message (see `vanishedReason`). Threads exit
     /// their own loops; the joins happen in `~Pool` for a natural transition, or synchronously in
     /// `Pool::forgetDisk` for FORGET. Must be called under the caller's remount serialization
     /// (Pool::remount_mutex).
@@ -318,26 +307,24 @@ public:
     /// renewal that commits with a start more than a TTL ago does not end the expiry, so the first expired
     /// deadline is kept until a renewal restores the lease. Empty otherwise.
     std::optional<uint64_t> leaseExpiredSinceBootMs() const;
-    /// Text of the last failed request of the worker's renewal; empty when no request failed since the
+    /// Text of the last failed renewal request; empty when no request failed since the
     /// last renewal that left the lease unexpired.
     String lastRenewFailure() const;
     /// The condition text for a request admitted under `admitted_generation` that is refused only
     /// because the lease expired; empty when the refusal has any other cause or there is none.
     std::optional<String> leaseExpiredRefusal(uint64_t admitted_generation) const;
-    /// Counts each `PUT` of the worker's renewal as it is sent and keeps the text of every failed
-    /// `PUT` or resolve read. Runs on the renewing thread.
+    /// Counts each `PUT` of a renewal as it is sent and keeps the text of every failed `PUT` or resolve
+    /// read, and wakes `waitUntilArmed` on each failure. Runs on the renewing thread, never under
+    /// `driver_mutex`.
     void noteRenewRequest(const MountRenewRequestEvent & event) noexcept;
 
-    /// Writes one `WARNING` per lease expiry, at the first request event after it. Lease thread only.
-    void warnOnceIfLeaseExpired(const MountRenewRequestEvent & event) noexcept;
-
-    /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
-    /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
+    /// TRUE once the pool has reached — or is being driven toward — a state on which the lease thread
+    /// must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
     /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
     /// it is published before the state store) OR `IdentityLost` (a fail-loud TERMINAL state — no
-    /// demoted observer; recovery is restart or FORGET). Consulted by `scheduleRemount` before arming and by
-    /// the remount loop at every step boundary. (The GC scheduler applies the same three-way test through
-    /// `Pool`.)
+    /// demoted observer; recovery is restart or FORGET). Consulted by every remount request, by the arming
+    /// rule and by the lease loop at every step boundary. The GC scheduler calls it through
+    /// `Pool::remountTerminal`.
     bool remountTerminal() const
     {
         return vanished_intent.load(std::memory_order_acquire)
@@ -345,9 +332,9 @@ public:
     }
 
     /// The inter-attempt sleep the mount plane runs on. A plain sleep would hold a stopping renewal
-    /// for the whole capped backoff; this one wakes on the same stop signal the workers watch.
-    /// A park or a remount request does not wake it: the wait runs out, at most one spacing draw for
-    /// the background renewal. It shortens a stop, not a fence loss: the fence cannot see a stop request,
+    /// for the whole capped backoff; this one wakes on the stop signal the lease thread watches.
+    /// A remount request does not wake it: the wait runs out, at most one spacing draw for the loop's
+    /// renewal. It shortens a stop, not a fence loss: the fence cannot see a stop request,
     /// so a woken operation still reissues unless its own liveness predicate refuses.
     void sleepInterruptibly(uint64_t ms);
 
@@ -375,51 +362,45 @@ public:
     /// cancellation may take a different path and must not run under the registry lock.
     void cancelInflightBuildsForNamespace(const RootNamespace & ns);
 
-    /// ---- process epoch (identity) ----
-    /// Mint the random nonzero process identity used by GC's equality check.
-    void mintRandomProcessEpoch();
-    /// Set `process_epoch` to the durable `writer_epoch`. The caller supplies the memory order because
-    /// the initial writable claim and a later self-remount have different publication requirements.
-    void setProcessEpoch(uint64_t v, std::memory_order order);
+    /// ---- live writer epoch ----
     /// Publish the live-incarnation `live_writer_epoch` with release ordering.
     void setLiveWriterEpoch(uint64_t v);
 
-    /// ---- mount-lease renewer and persistent workers ----
+    /// ---- mount-lease renewer and the lease thread ----
     void installRenewer(UInt128 our_uuid, uint64_t writer_epoch, const std::function<uint64_t()> & now_ms);
     uint64_t startRenewer();
-    uint64_t renewRenewerForStartupOnce();
-    uint64_t renewRenewerForRemountOnce();
     void renewerReset();
-    void startBackgroundWorkers(std::chrono::milliseconds period);
+    void startBackgroundWorkers();
     void stopBackgroundWorkers();
-    /// Latch a recovery generation. Persistent remount ownership means this never constructs a thread.
-    void scheduleRemount();
+    /// One interference report: trip the fence and request a remount in one `driver_mutex` step, so no
+    /// reclaim can arm between the two. Raises no generation when a request that no reclaim has started
+    /// serving is pending: the reclaim that serves it latches after this trip.
+    void tripAndRequestRemount();
+    /// Request a remount without a trip, unless a stop or a terminal lifecycle refuses it. Returns whether
+    /// a lease thread runs and a request is pending.
     bool scheduleRemountForTest();
     void beginShutdownForTest();
-    /// Return how many times `scheduleRemount` was entered, including calls refused by the background
-    /// setting. This is useful for testing the renewer's loss callback without starting a real recovery.
+    /// Return how many remount requests were attempted, refused ones included: `scheduleRemountForTest`,
+    /// `tripAndRequestRemount` and terminal renewals not ended by a stop.
     uint64_t scheduleRemountCallCountForTest() const
     {
         return schedule_remount_calls_for_test.load(std::memory_order_relaxed);
     }
 
-    RenewalDriverState renewalDriverStateForTest() const;
-    void waitForRenewalDriverStateForTest(RenewalDriverState expected) const;
     bool workersRunningForTest() const;
     uint64_t remountRequestedGenerationForTest() const;
 
-    /// Join both persistent workers before an `Active` renewer may write its clean farewell.
+    /// Join the lease thread before an `Active` renewer may write its clean farewell.
     void finishTeardown(bool drained);
 
     /// Sleep through the injected test hook when present; otherwise use the production thread sleep.
-    /// `Pool` claim observation and materialization grace waits share this seam so tests control both.
     void waitSleep(uint64_t ms) const;
     /// Swap the wait hook after construction -- a test that must change what a wait DOES partway
     /// through a scenario (e.g. driving a second incarnation's renewal from inside the observed
     /// incarnation's own poll) cannot express that through `PoolConfig::wait_sleep_fn` alone, since
     /// that value is fixed at open time. Unsynchronized against `waitSleep`'s `const` read of the same
-    /// field: safe only called from the test's own thread before any worker is running (no persistent
-    /// renewal/remount worker reads `config.wait_sleep_fn` concurrently with this write).
+    /// field: safe only called from the test's own thread before the lease thread starts (nothing else
+    /// reads `config.wait_sleep_fn` concurrently with this write).
     void setWaitSleepForTest(std::function<void(uint64_t)> fn) { config.wait_sleep_fn = std::move(fn); }
 
     /// Forward renewer events to the injected sink. The sink is held by reference so it observes the
@@ -427,65 +408,59 @@ public:
     void emitEvent(CasEvent && e) const { if (event_sink) event_sink(std::move(e)); }
 
 private:
-    class DriverLease
+    /// A committed renewal that ended an expiry: how long the lease was expired, and the text of the
+    /// last failed request.
+    struct RestoredLease
     {
-    public:
-        DriverLease(CasMountRuntime & runtime_, RenewalDriverState active_);
-        ~DriverLease();
-        RenewalDriverState finish(RenewalDriverState ordinary_destination, const MountRenewResult * result = nullptr);
-
-    private:
-        CasMountRuntime & runtime;
-        RenewalDriverState active;
-        bool finished = false;
+        uint64_t expired_ms = 0;
+        String last_failure;
     };
 
-    struct AdmittedRenewerCall
-    {
-        std::unique_ptr<DriverLease> lease;
-        MountLeaseRenewer * renewer = nullptr;
-    };
-
-    /// The renewal worker may drive a renewal only while it exclusively owns the driver and the renewer
-    /// is Active. Requires `driver_mutex`. `admitRenewerCall` enforces the same three conditions for every
-    /// other driver; the worker loop must park rather than throw when they do not hold, so it needs the
-    /// predicate separately. Both the park test and the wake predicate use this one definition, so they
-    /// cannot drift apart.
-    bool renewalWorkerMayRenew() const;
-
-    AdmittedRenewerCall admitRenewerCall(RenewalDriverState required, RenewalDriverState active);
-    uint64_t renewRenewerOnce(
-        AdmittedRenewerCall call,
-        RenewalDriverState active,
-        bool propagate_failure);
-    MountRenewOperationEnvironment renewalEnvironment(bool worker_call);
+    /// The renewal step of the lease thread: renew, consume the result under `driver_mutex`, then report
+    /// it with no lock held.
+    MountRenewResult renewOnce();
+    MountRenewOperationEnvironment renewalEnvironment();
     std::optional<uint64_t> leaseExpiredAt(uint64_t now_boot_ms) const;
-    /// Publishes a committed renewal's deadline. A deadline in the future ends the current run of
-    /// trouble: it clears the failure text and, when the lease was expired, counts and logs the
-    /// restore. Returns how long the lease had been expired when this deadline restores it; empty
-    /// when it was not expired or is still expired.
-    std::optional<uint64_t> publishRenewedDeadline(uint64_t deadline_boot_ms);
-    void consumeRenewResult(
-        const MountRenewResult & result,
-        RenewalDriverState active_state,
-        RenewalDriverState returned_state,
-        bool propagate_failure);
+    /// Publishes a committed renewal's deadline. Requires `driver_mutex`. A deadline in the future ends
+    /// the current run of trouble: it clears the failure text and, when the lease was expired, counts
+    /// the restore and returns it for the caller to log after the unlock. Empty when the lease was not
+    /// expired or is still expired.
+    std::optional<RestoredLease> publishRenewedDeadline(uint64_t deadline_boot_ms);
+    /// The consume step: takes `driver_mutex` itself and returns the restore for the caller to log.
+    std::optional<RestoredLease> consumeRenewResult(const MountRenewResult & result);
     void renewalLoop();
-    void remountLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);
-    /// The renewal's liveness: a shutdown request and, for the worker, a parked or park-requested
-    /// driver, a pool that left `Live`, or a lost fence -- the worker's plane has no fence of its own.
-    /// FALSE ends the renewal.
-    bool renewalLive(bool worker_call) const;
+    /// The renewal's liveness: no stop, no pending remount request, no terminal lifecycle (a published
+    /// FORGET intent included); a lost fence alone does not end it. FALSE ends the renewal.
+    bool renewalLive() const;
     /// Whether this node has already been asked to stop. Sampled ONCE, before the write, so a refusal
     /// caused by the stop cannot be mistaken for one that preceded it.
     bool renewalCancelled() const;
     void tripFenceWithoutOperationalLoss();
+    /// Writes one `WARNING` per lease expiry, at the first request event after it. Called from `noteRenewRequest`.
+    void warnOnceIfLeaseExpired(const MountRenewRequestEvent & event) noexcept;
+    /// Publish `deadline_boot_ms` as a fresh lease incarnation and open the fence. With `report_live`,
+    /// `Live` is published before the fence opens, so a reader that sees the fence armed reads `Live`.
+    void armFence(uint64_t deadline_boot_ms, bool report_live);
+    /// The arming rule: no remount request pending, no stop requested, a lifecycle that is not
+    /// terminal, and a deadline that admits a ref append now. Requires `driver_mutex`, the mutex that a
+    /// stop, a request and a terminal publication take, so the check and the arm are one step.
+    bool canArm(uint64_t deadline_boot_ms) const;
+    /// `admit`'s budget verdict for a lease that ends at `deadline_boot_ms`, at `now_boot_ms`.
+    Fence::Admit budgetAdmits(uint64_t deadline_boot_ms, uint64_t now_boot_ms, uint64_t needed_ms) const;
+    /// Whether a new loss needs a new remount generation. Requires `driver_mutex`. False only while a
+    /// request that no reclaim has snapshotted is pending: the reclaim that serves it latches after the
+    /// loss.
+    bool lossNeedsNewRequest() const;
+    /// A remount request no reclaim has acknowledged. Requires `driver_mutex`.
+    bool remountRequestPending() const;
+    /// A stop is requested or the lifecycle is terminal. Requires `driver_mutex`.
+    bool stopOrTerminal() const;
+    /// Throws `LOGICAL_ERROR` when a lease thread runs and the caller is not it. Requires `driver_mutex`.
+    void checkRenewerOwner() const;
     std::unique_lock<std::mutex> lockTerminalPublication();
 
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
-    BackendPtr backend_ptr;
-    CasRequests & mount_requests;
     CasRequests & farewell_requests;
     CasRequests & lease_requests;
     const Layout & layout;
@@ -495,17 +470,10 @@ private:
     CasRequestBudget cas_request_budget;
     std::function<bool()> remount_attempt;
 
-    /// Per-server build watermark. `process_epoch` is a random
-    /// nonzero u64 minted once at open: GC checks it for EQUALITY (an object stamped with a different
-    /// epoch is from a dead incarnation), never for ordering. next_build_seq is a strictly-increasing
-    /// per-process counter (monotonicity is load-bearing — a seq is never reused or lowered);
-    /// active_build_seqs holds the seqs of in-flight builds, so `minActive` yields the GC floor. The floor
-    /// is published by the merged `mount_renewer`
-    /// beat (there is no standalone watermark object anymore). ATOMIC because a self-remount re-stamps it
-    /// (kept equal to `live_writer_epoch`) from the runtime-owned remount worker while `epoch`/`writerEpoch`
-    /// may observe it; the ref-lane hot readers were moved to `liveWriterEpoch`, so this now backs only
-    /// the identity accessors.
-    std::atomic<uint64_t> process_epoch{0};
+    /// Per-server build watermark. `next_build_seq` is a strictly-increasing per-process counter
+    /// (monotonicity is load-bearing: a seq is never reused or lowered); `active_build_seqs` holds the
+    /// seqs of in-flight builds, so `minActive` yields the GC floor. The floor is published by the
+    /// merged `mount_renewer` beat (there is no standalone watermark object).
     std::mutex builds_mutex;
     uint64_t next_build_seq = 1;
     std::set<uint64_t> active_build_seqs;
@@ -515,30 +483,29 @@ private:
     std::map<uint64_t, std::weak_ptr<PartWriteTxn>> inflight_builds;
 
     /// Synchronous mount-lease protocol state. Constructed and started on a writable open after the
-    /// owner/epoch/mount startup protocol; the runtime-owned renewal worker is its sole background
-    /// driver and publishes successful anchors or terminal loss into the local fence. After both
-    /// workers join, teardown releases an `Active` renewer so a same-server reopen can reclaim
-    /// immediately. Null on a read-only open.
+    /// owner/epoch/mount startup protocol; while the lease thread runs it is the renewer's only driver
+    /// and publishes successful anchors or terminal loss into the local fence. After the lease thread
+    /// joins, teardown releases an `Active` renewer so a same-server reopen can reclaim immediately.
+    /// Null on a read-only open.
     std::unique_ptr<MountLeaseRenewer> mount_renewer;
 
     std::atomic<uint64_t> live_writer_epoch{0};
 
-    /// One mutex/condition pair owns driver admission, worker lifecycle, cadence, and the remount
-    /// generation latch, and terminal predicates paired with `driver_cv`. It is never held across
-    /// renewer/backend calls, remount callbacks, logging, or joins.
+    /// One mutex/condition pair guards the lease thread's lifecycle, the cadence, the remount
+    /// generations, and the terminal predicates paired with `driver_cv`. It is never held across a
+    /// renewer or backend call, the reclaim, logging or a join.
     mutable std::mutex driver_mutex;
     mutable std::condition_variable driver_cv;
-    RenewalDriverState renewal_driver_state = RenewalDriverState::Dormant;
-    bool workers_starting = false;
     bool workers_started = false;
-    bool worker_loops_released = false;
     bool workers_stop_requested = false;
-    std::chrono::milliseconds renewal_period{0};
+    /// The lease thread, from its first statement until `stopBackgroundWorkers` joins it.
+    std::thread::id lease_thread_id;
     uint64_t remount_requested_generation = 0;
     uint64_t remount_handled_generation = 0;
+    /// The requested generation `beginReclaim` recorded; `armIfAdmissible` acknowledges it.
+    uint64_t reclaim_generation = 0;
     ThreadFromGlobalPool renewal_worker;
-    ThreadFromGlobalPool remount_worker;
-    /// Counted entries into `scheduleRemount`; retained as a test-only observability seam.
+    /// Read only by `scheduleRemountCallCountForTest`.
     std::atomic<uint64_t> schedule_remount_calls_for_test{0};
 
     /// Local write fence. The unarmed default (`deadline_boot_ms = UINT64_MAX`, `lost = false`) permits
@@ -546,12 +513,11 @@ private:
     /// is the gate at the ref-append mutation chokepoint.
     MountFence mount_fence;
 
-    /// Fence-generation token (rev.7 [C2]): bumped by `tripMountLost` and `armMountFence`. See
-    /// `fenceGeneration`/`checkFenceOrThrow`.
+    /// Fence-generation token: bumped by every trip and every arm. See `fenceGeneration`/`checkFenceOrThrow`.
     std::atomic<uint64_t> fence_generation{0};
     std::function<void()> arm_mount_fence_interposition_hook_for_test;
     /// The first expired deadline of an expiry that a renewal committed past did not end. `UINT64_MAX`
-    /// when there is none. Written by the renewal consumer and by `armMountFence`.
+    /// when there is none. Written by `publishRenewedDeadline` and `armFence`.
     std::atomic<uint64_t> lease_expired_at_boot_ms{std::numeric_limits<uint64_t>::max()};
     mutable std::mutex renew_failure_mutex;
     String last_renew_failure;
@@ -561,22 +527,16 @@ private:
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
     /// (`noteLeaseLost`/`noteRemounted`) are lock-free compare-exchanges guarded by their exact
-    /// predecessor state; terminal predicate publication is serialized with worker waits by
+    /// predecessor state; terminal predicate publication is serialized with the lease loop's waits by
     /// `driver_mutex`, while the caller's `Pool::remount_mutex` serializes the higher-level remount flow.
     std::atomic<PoolLifecycle> pool_lifecycle{PoolLifecycle::Live};
     /// Terminal-intent latch (spec §3), published before the state store — by `enterVanished` for a
     /// natural transition, or EARLY (step 1) by `publishVanishedIntent` for FORGET. Only the fully-terminal
     /// `Vanished*` transition sets it — `IdentityLost` deliberately does NOT (rev.8 folds IdentityLost into
     /// the worker-exit boundary via `remountTerminal` instead). Consulted (with `IdentityLost`) by
-    /// `remountTerminal`, so a terminal pool's runtime consumer never schedules a remount and the remount
-    /// loop bails at its next step boundary — no claim/allocate/write after the pool is (being driven) terminal.
+    /// `remountTerminal`, so a terminal pool's runtime consumer never schedules a remount and the lease
+    /// loop exits at its next step boundary — no claim/allocate/write after the pool is (being driven) terminal.
     std::atomic<bool> vanished_intent{false};
-    /// Idempotency guard for the terminal STATE transition (`enterVanished`'s body). Distinct from
-    /// `vanished_intent`: FORGET publishes that intent latch at step 1, so it can no longer serve as the
-    /// "state transition already done" flag. Published last, after the no-throw reason move and terminal
-    /// stores complete under `driver_mutex`; a preparation exception therefore leaves it clear so a later
-    /// `enterVanished` can retry the whole transition.
-    std::atomic<bool> terminal_state_published{false};
     /// The reason recorded by the winning `enterVanished` (see `vanishedReason`). Written once, BEFORE the
     /// `pool_lifecycle` release-store, and immutable thereafter — so a reader that acquire-observes a
     /// terminal state also observes this string. Empty when no terminal transition has run.

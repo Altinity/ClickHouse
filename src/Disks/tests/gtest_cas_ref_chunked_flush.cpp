@@ -406,7 +406,7 @@ TEST(CASRefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
     /// fixture directly to `backend` after open, but before `ns` is ever touched, is observed identically
     /// to writing it before open.
     auto store = openPool(backend);
-    const uint64_t epoch = store->writerEpoch();
+    const uint64_t epoch = store->liveWriterEpoch();
     /// Stage B (Task 4-C): pin `ns` to the sentinel now, before the raw snapshot below -- `listRefs`/
     /// `dropNamespace` further down are real production reads that trigger `resolveNamespaceLife`,
     /// which for an UNADMITTED namespace mints a fresh RANDOM incarnation rather than adopting the

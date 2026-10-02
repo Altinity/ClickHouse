@@ -2051,15 +2051,14 @@ TEST(CASAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Faulted)
         << "foreign interference must fault the lane";
     EXPECT_FALSE(store->mayMutate()) << "the local write fence must trip closed on the anomaly";
-    /// Positively pins that `reportImpossibleInterference` called `scheduleRemount` (not just
-    /// `tripMountLost`, which alone already accounts for `mayMutate() == false` above). Counted at
-    /// `scheduleRemount`'s own entry regardless of `background_watermark` -- see that accessor's
-    /// comment for why this test deliberately does NOT enable `background_watermark` to observe a real
-    /// automatic recovery: doing so was tried and makes the store's self-remount attempt race its own
+    /// Positively pins that `reportImpossibleInterference` requested a remount (not just a trip,
+    /// which alone already accounts for `mayMutate() == false` above). Counted at
+    /// `tripAndRequestRemount`'s entry regardless of `background_watermark`. This test does not enable
+    /// `background_watermark` to observe a real automatic recovery: doing so was tried and makes the store's self-remount attempt race its own
     /// still-live renewer for 30+ seconds per call (confirmed while building this test), which is not
     /// something a fast unit test should be driving.
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
-        << "reportImpossibleInterference must have called scheduleRemount exactly once";
+        << "reportImpossibleInterference must have requested a remount exactly once";
 
     const std::vector<CasEvent> observed = seen->snapshot();
     const auto has_event = std::any_of(observed.begin(), observed.end(),
@@ -2132,7 +2131,7 @@ TEST(CASAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
     /// `background_watermark` plus automatic recovery -- that combination makes the store's self-remount
     /// race its own still-live renewer).
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
-        << "reportImpossibleInterference must have called scheduleRemount exactly once";
+        << "reportImpossibleInterference must have requested a remount exactly once";
 
     const std::vector<CasEvent> observed = seen->snapshot();
     const auto has_event = std::any_of(observed.begin(), observed.end(),
@@ -3388,7 +3387,7 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
     uint64_t e1 = 0;
     {
         auto predecessor = openPool(backend);
-        e1 = predecessor->writerEpoch();
+        e1 = predecessor->liveWriterEpoch();
     }   /// predecessor released; only its epoch is needed -- the stale precommits are seeded raw below
 
     /// Seed kTotalStale precommits directly (bypassing any Pool) under the predecessor's epoch,
@@ -3676,11 +3675,10 @@ TEST(CASRefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
 }
 
 /// ===================================================================================
-/// C1: self-remount establishes a fresh ref-protocol incarnation (spec §Startup And Recovery /
-/// §write-fence). A self-remount bumps the durable writer_epoch, so every ref transaction it stamps
-/// afterward sorts strictly above any log a dead-incarnation or same-uuid twin left durable under an
-/// older epoch, and it drops its stale in-memory cache so the next touch re-recovers under the new
-/// epoch. The unfixed code kept the open-time `process_epoch` and the cached tables across the fence-out.
+/// A self-remount establishes a fresh ref-protocol incarnation. It bumps the durable writer_epoch, so
+/// every ref transaction it stamps afterward sorts strictly above any log a dead-incarnation or
+/// same-uuid twin left durable under an older epoch, and it drops its stale in-memory cache so the next
+/// touch re-recovers under the new epoch.
 /// ===================================================================================
 
 namespace

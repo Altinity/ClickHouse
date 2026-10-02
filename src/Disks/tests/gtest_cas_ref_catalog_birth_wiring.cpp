@@ -178,7 +178,7 @@ TEST(CASRefCatalogBirthWiring, FirstOpenMintsALiveCatalogEntryAndKeysTheBirthAtI
     const RootNamespace ns{"srv1/birth_wiring"};
 
     const RefTxnId id = publishBirth(store, ns, "a");
-    EXPECT_EQ(id, (RefTxnId{store->writerEpoch(), 1}));
+    EXPECT_EQ(id, (RefTxnId{store->liveWriterEpoch(), 1}));
 
     const CasRefCatalog::Snapshot snap = CasRefCatalog::read(op, store->layout());
     const CatalogEntry * entry = findEntry(snap.catalog, ns);
@@ -346,14 +346,14 @@ TEST(CASRefCatalogBirthWiring, AnExistingLiveEntryIsAdoptedRatherThanReminted)
                              .creator = std::nullopt};
     CasRefCatalog::casAdmitEntry(op, layout, 1, entry);
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
-        .life_epoch = store->writerEpoch(),
+        .life_epoch = store->liveWriterEpoch(),
         .committed_through = std::nullopt,
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
     });
 
     const RefTxnId id = publishBirth(store, ns, "a");
-    EXPECT_EQ(id, (RefTxnId{store->writerEpoch(), 1}));
+    EXPECT_EQ(id, (RefTxnId{store->liveWriterEpoch(), 1}));
 
     /// The read result must outlive the returned pointer -- findEntry points into its entries.
     const auto after_cut = CasRefCatalog::read(op, layout);
@@ -468,7 +468,7 @@ TEST(CASRefCatalogBirthWiring, AStaleCreatingEntryFromATerminatedForeignFenceIsR
     /// The production path resumes creation itself: reconciles the stale entry onto THIS mount's own
     /// fence and completes it to `Live`, over the SAME incarnation the dead creator minted.
     const RefTxnId id = publishBirth(store, ns, "a");
-    EXPECT_EQ(id, (RefTxnId{store->writerEpoch(), 1}));
+    EXPECT_EQ(id, (RefTxnId{store->liveWriterEpoch(), 1}));
 
     /// The read result must outlive the returned pointer -- findEntry points into its entries.
     const auto live_cut = CasRefCatalog::read(op, layout);

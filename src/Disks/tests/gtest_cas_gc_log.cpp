@@ -10,6 +10,7 @@
 
 #include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <string>
 #include <vector>
@@ -124,7 +125,7 @@ TEST(CASGCLog, EmitsStartFinishWithCounts)
     for (size_t round = 0; round < max_rounds; ++round)
     {
         const size_t before = rows.size();
-        sched.runOneRoundNow(Rec::Trigger::Manual);
+        sched.runOneRoundNow();
         store->renewWatermarkOnce();
 
         /// Each call emits exactly one Start (first) and one Finish (last), with the round's phase rows
@@ -240,11 +241,11 @@ TEST(CASGCSchedulerSteal, ManualRoundNeverStealsEvenADeadIncumbent)
     DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca");
 
     /// obs #1: records the incumbent's (owner, seq, hb=absent).
-    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    EXPECT_FALSE(sched.runOneRoundNow().acquired_lease);
     /// obs #2 and #3: the same frozen (owner, seq, hb) observed repeatedly would be steal-eligible on
     /// the loop path (see the Core-level test this mirrors), but the manual path keeps backing off.
-    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
-    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    EXPECT_FALSE(sched.runOneRoundNow().acquired_lease);
+    EXPECT_FALSE(sched.runOneRoundNow().acquired_lease);
 }
 
 /// Negative-control companion to the test above (reviewer-requested): with the incumbent visibly alive
@@ -265,12 +266,56 @@ TEST(CASGCSchedulerSteal, ManualRoundNeverStealsALiveHeartbeatingIncumbent)
     DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca");
 
     /// obs #1: records (owner=incumbent, seq, hb=absent).
-    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    EXPECT_FALSE(sched.runOneRoundNow().acquired_lease);
     Gc::pulseHeartbeat(*store, kIncumbent);   /// the incumbent is alive and pulsing (hb 0->1)
     /// obs #2: hb advanced since obs #1 => alive => no steal (never reaches the observe-only branch).
-    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    EXPECT_FALSE(sched.runOneRoundNow().acquired_lease);
     Gc::pulseHeartbeat(*store, kIncumbent);   /// hb 1->2
-    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    EXPECT_FALSE(sched.runOneRoundNow().acquired_lease);
+}
+
+/// The loop's side of `ManualRoundNeverStealsEvenADeadIncumbent`: its scheduled rounds see the dead
+/// incumbent's lease tuple and heartbeat frozen across two of their own observations, and the second one
+/// takes the lease over.
+TEST(CASGCSchedulerSteal, ScheduledRoundStealsADeadIncumbent)
+{
+    constexpr size_t kRoundBound = 4;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    const UInt128 kIncumbent = hexToU128("00000000000000000000000000000abc");
+    Gc incumbent(store, kIncumbent);
+    ASSERT_TRUE(incumbent.runRegularRound().acquired_lease);
+
+    std::mutex rows_mutex;
+    std::condition_variable rows_cv;
+    std::vector<Rec> finishes;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r)
+        {
+            if (r.event_type != Rec::EventType::Finish)
+                return;
+            std::lock_guard g(rows_mutex);
+            finishes.push_back(r);
+            rows_cv.notify_all();
+        });
+
+    sched.start();
+    bool stolen = false;
+    for (size_t round = 1; round <= kRoundBound && !stolen; ++round)
+    {
+        sched.requestRoundSoon();
+        std::unique_lock lock(rows_mutex);
+        ASSERT_TRUE(rows_cv.wait_for(lock, std::chrono::seconds(30), [&] { return finishes.size() >= round; }))
+            << "timed out waiting for Finish row #" << round;
+        for (const Rec & r : finishes)
+            stolen = stolen || r.outcome == Rec::Outcome::Success || r.outcome == Rec::Outcome::Deferred;
+    }
+    sched.stop();
+    for (const Rec & r : finishes)
+        EXPECT_EQ(r.trigger, Rec::Trigger::Scheduled);
+    EXPECT_TRUE(stolen) << "no scheduled round in " << kRoundBound << " took over the dead incumbent's lease";
 }
 
 /// A round whose backend throws must produce a Finish with `outcome == Aborted` and a non-empty
@@ -288,7 +333,7 @@ TEST(CASGCLog, AbortedFinishOnThrowingRound)
 
     backend->arm.store(true);
 
-    EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+    EXPECT_THROW(sched.runOneRoundNow(), DB::Exception);
 
     /// A throwing round still emits a Start and an Aborted Finish. It also emits the phase row of the
     /// phase it died in -- the timer is RAII, so it fires during unwinding, which is exactly the forensic
@@ -349,7 +394,7 @@ TEST(CASGCLog, TransientThrowIsClassifiedAborted)
         [&](const Rec & r) { rows.push_back(r); });
 
     backend->arm.store(true);
-    EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+    EXPECT_THROW(sched.runOneRoundNow(), DB::Exception);
 
     const std::vector<Rec> round_rows = roundRowsOnly(rows);
     ASSERT_EQ(round_rows.size(), 2u);
@@ -426,7 +471,7 @@ TEST(CASGCLog, AbortedFinishCarriesProgressiveCounters)
         [&](const Rec & r) { rows.push_back(r); });
 
     backend->arm.store(true);
-    EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+    EXPECT_THROW(sched.runOneRoundNow(), DB::Exception);
 
     const std::vector<Rec> round_rows = roundRowsOnly(rows);
     ASSERT_EQ(round_rows.size(), 2u);
@@ -576,7 +621,7 @@ TEST(CASGCLog, EveryRowOfARoundSharesOneRoundId)
         store, std::chrono::seconds(1), "test::gc", "ca",
         [&](const Rec & r) { rows.push_back(r); });
 
-    sched.runOneRoundNow(Rec::Trigger::Manual);
+    sched.runOneRoundNow();
     const size_t after_first = rows.size();
     ASSERT_GE(after_first, 2u);
     const String first_id = rows.front().round_id;
@@ -585,7 +630,7 @@ TEST(CASGCLog, EveryRowOfARoundSharesOneRoundId)
         EXPECT_EQ(rows[i].round_id, first_id) << "row " << i << " of the first round has a different round_id";
 
     store->renewWatermarkOnce();
-    sched.runOneRoundNow(Rec::Trigger::Manual);
+    sched.runOneRoundNow();
     ASSERT_GT(rows.size(), after_first);
     const String second_id = rows[after_first].round_id;
     EXPECT_FALSE(second_id.empty());
@@ -639,7 +684,7 @@ TEST(CASGCLog, FoldingRoundEmitsEveryPhaseInOrder)
         store, std::chrono::seconds(1), "test::gc", "ca",
         [&](const Rec & r) { rows.push_back(r); });
 
-    ASSERT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    ASSERT_TRUE(sched.runOneRoundNow().acquired_lease);
 
     const std::vector<String> expected = {
         "lease", "pre_fold_ref_drain", "heartbeat_floor", "defer_decision", "parent_seal_read",
@@ -703,7 +748,7 @@ TEST(CASGCLog, NotALeaderRoundEmitsOnlyTheLeasePhase)
     DB::Cas::CasGcScheduler sched(
         store, std::chrono::seconds(1), "test::gc", "ca",
         [&](const Rec & r) { rows.push_back(r); });
-    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    EXPECT_FALSE(sched.runOneRoundNow().acquired_lease);
 
     EXPECT_EQ(phaseNames(rows, 0), (std::vector<String>{"lease"}));
     EXPECT_EQ(metricsOf(rows, 0, "lease").at("acquired"), 0u);
@@ -734,7 +779,7 @@ TEST(CASGCHealth, ReflectsLeadershipAndPendingReclaim)
     EXPECT_EQ(h0.pending_reclaim, 0);
     EXPECT_EQ(h0.wedged_namespace_count, 0u);
 
-    const RoundReport rep = sched.runOneRoundNow(Rec::Trigger::Manual);
+    const RoundReport rep = sched.runOneRoundNow();
     ASSERT_TRUE(rep.acquired_lease);
 
     const auto h1 = sched.gcHealth();
@@ -785,7 +830,7 @@ TEST(CASGCLog, TransientFailureAfterTeardownBeganIsStopped)
 
     backend->arm_key = store->layout().gcStateKey();
     backend->on_read = [&store] { store->beginTeardown(); };
-    EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+    EXPECT_THROW(sched.runOneRoundNow(), DB::Exception);
 
     const std::vector<Rec> round_rows = roundRowsOnly(rows);
     ASSERT_EQ(round_rows.size(), 2u);
@@ -820,7 +865,7 @@ TEST(CASGCLog, NonTransientFailureCoincidingWithTeardownStaysFailed)
     }
     backend->arm_key = store->layout().gcStateKey();
     backend->on_read = [&store] { store->beginTeardown(); };
-    EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+    EXPECT_THROW(sched.runOneRoundNow(), DB::Exception);
 
     const std::vector<Rec> round_rows = roundRowsOnly(rows);
     ASSERT_EQ(round_rows.size(), 2u);

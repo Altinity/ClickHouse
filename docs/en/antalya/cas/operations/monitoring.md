@@ -59,16 +59,15 @@ window and correlate them with the `server_root_id` in `system.cas_log`.
 | `CASMountRenewalRetries` | One per physical renewal `PUT` after the first in the same logical renewal | Positive growth shows in-period retry, not a later cadence beat |
 | `CASMountRenewalResolved` | One per logical renewal proved committed by an exact resolving `GET` | A response was ambiguous, but exact bytes and `write_attempt_id` proved the write |
 | `CASMountRenewalRecovered` | One per logical renewal committed after a retry or exact resolving `GET` | Recovered object-store blips that retained the existing mount incarnation |
-| `CASMountRenewalDeadlineExceeded` | One per logical renewal stopped by the external lease-safety deadline | The last confirmed lease no longer left enough safe time; this is narrower than request-budget exhaustion. Only the bounded renewals (startup, remount and direct) can reach it; the background renewal does not |
 | `CASMountLeaseExpired` | One per renewal that restored a lease that had expired | Moves at the restore, not when the lease expires. While it is expired, `system.cas_mounts` shows `lifecycle_reason = 'lease_expired'` and writes are refused; the `watermark_renew` row of the restoring renewal carries `expired_ms` |
 | `CASRemountAttempts` | One per invocation of the existing whole-chain remount attempt | Includes both successful and failed attempts |
-| `CASRemountSucceeded` | One per whole-chain attempt that restored `Live` under a fresh writer epoch | Must be a subset of `CASRemountAttempts` |
-| `CASRemountFailed` | One per whole-chain attempt that returned without restoring `Live` | Includes a named step exception or a step that returned transiently |
+| `CASRemountSucceeded` | One per whole-chain attempt that completed every step through the arm step, under a fresh writer epoch | Must be a subset of `CASRemountAttempts`. Includes a reclaim that claimed but whose arming conditions did not hold (`step = 'claimed_not_armed'`), with the fence still latched |
+| `CASRemountFailed` | One per whole-chain attempt that stopped before the arm step | Includes a named step exception or a step that returned transiently, also after the mount claim succeeded (for example at `renewer_start` or `quiesce_ref_tables`) |
 
-`CASMountLeaseLost` complements those nine counters. It increments exactly once per operational
+`CASMountLeaseLost` complements those counters. It increments exactly once per operational
 `Live -> TransientNotLive` recovery generation: either the initiating external loss or the first
-ordinary terminal renewal consumer owns it. A parked terminal result and shutdown do not duplicate
-the count.
+ordinary terminal renewal consumer owns it. A renewal ended by a pending remount request does not
+duplicate the count, and neither does shutdown.
 
 To inspect the current cumulative values, including counters that have never incremented:
 
@@ -77,7 +76,7 @@ SELECT event, value
 FROM system.events
 WHERE event IN (
     'CASMountRenewalAttempts', 'CASMountRenewalRetries', 'CASMountRenewalResolved',
-    'CASMountRenewalRecovered', 'CASMountRenewalDeadlineExceeded', 'CASMountLeaseLost',
+    'CASMountRenewalRecovered', 'CASMountLeaseLost',
     'CASMountLeaseExpired', 'CASRemountAttempts', 'CASRemountSucceeded', 'CASRemountFailed')
 SETTINGS system_events_show_zero_values = 1;
 ```
@@ -90,6 +89,11 @@ SETTINGS system_events_show_zero_values = 1;
 Ordinary first-attempt success produces no row. Every `mount_remount` attempt produces one final row with outcome `ok` or
 `failed` and details `attempt_no`, `step`, `server_root_id`, optional `writer_epoch`, and optional
 `error`.
+An `ok` row has `step = 'publish_live'` when the reclaim armed the fence and reported `Live`, or
+`step = 'claimed_not_armed'` when it claimed but its arming conditions did not hold: too little lease left
+for a write, a newer remount request, a stop, or a terminal lifecycle. The fence stays latched. What follows
+is the lease thread's next renewal when no request is pending, another reclaim when a newer request is, or
+the thread's exit on a stop or a terminal lifecycle.
 
 Default-level text logging is bounded per logical operation. A renewal logs nothing until it ends,
 and nothing at all when it succeeds on its first request. A renewal that needed a retry, was settled

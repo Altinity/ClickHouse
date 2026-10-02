@@ -27,6 +27,12 @@ uint64_t CasRequestBudget::attemptEnvelopeMs() const
         : attempt_timeout_ms + connects;
 }
 
+uint64_t CasRequestBudget::writeAndSettlementReadMs() const
+{
+    const uint64_t envelope = attemptEnvelopeMs();
+    return envelope > std::numeric_limits<uint64_t>::max() / 2 ? std::numeric_limits<uint64_t>::max() : 2 * envelope;
+}
+
 void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_lease_ttl_ms,
                               uint64_t mount_renew_period_ms, bool background_renewal)
 {
@@ -47,11 +53,9 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
     if (background_renewal)
     {
         /// A renewal is a write: two envelopes (the attempt and its settlement read) after one period.
-        /// Saturating doubling first (matching the production horizon checks' own arithmetic), then
-        /// subtraction-based comparisons against the TTL -- no truncating division, so this enforces
+        /// Subtraction-based comparisons against the TTL, no truncating division, so this enforces
         /// exactly the inequality the exception message states, not an off-by-one-tighter one.
-        const uint64_t two_envelope = envelope > std::numeric_limits<uint64_t>::max() / 2
-            ? std::numeric_limits<uint64_t>::max() : 2 * envelope;
+        const uint64_t two_envelope = budget.writeAndSettlementReadMs();
         const bool cadence_fits = mount_renew_period_ms < mount_lease_ttl_ms
             && two_envelope < mount_lease_ttl_ms - mount_renew_period_ms
             && budget.lease_safety_margin_ms < mount_lease_ttl_ms - mount_renew_period_ms - two_envelope;
