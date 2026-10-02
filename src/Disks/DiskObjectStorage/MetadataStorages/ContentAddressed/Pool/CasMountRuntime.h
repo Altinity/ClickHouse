@@ -117,7 +117,7 @@ struct MountFence
 
 /// Owns the live writer-incarnation mechanics shared by the pool's mount and recovery orchestration:
 /// the `MountLeaseRenewer`, local `MountFence`, build watermark and in-flight build registry,
-/// `live_writer_epoch`, unclean-boundary marker, and the lease thread. `Pool` retains the higher-level
+/// `live_writer_epoch`, and the lease thread. `Pool` retains the higher-level
 /// claim/recovery sequence and its `remount_mutex`; in particular, the runtime does not acquire or own
 /// the ref-ledger locks. The runtime receives its backend, layout, configuration, event sink, request
 /// budget, and a callback that performs one pool-level remount attempt, so it has no `Pool` back-reference.
@@ -326,7 +326,7 @@ public:
     /// `driver_mutex`.
     void noteRenewRequest(const MountRenewRequestEvent & event) noexcept;
 
-    /// Writes one `WARNING` per lease expiry, at the first request event after it. Lease thread only.
+    /// Writes one `WARNING` per lease expiry, at the first request event after it. Called from `noteRenewRequest`.
     void warnOnceIfLeaseExpired(const MountRenewRequestEvent & event) noexcept;
 
     /// TRUE once the pool has reached — or is being driven toward — a state on which the lease thread
@@ -410,7 +410,6 @@ public:
     void finishTeardown(bool drained);
 
     /// Sleep through the injected test hook when present; otherwise use the production thread sleep.
-    /// `Pool` claim observation and materialization grace waits share this seam so tests control both.
     void waitSleep(uint64_t ms) const;
     /// Swap the wait hook after construction -- a test that must change what a wait DOES partway
     /// through a scenario (e.g. driving a second incarnation's renewal from inside the observed

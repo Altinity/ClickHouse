@@ -1728,7 +1728,7 @@ TEST(CASHeartbeat, DefinitiveAnswersStayTerminalPastTheDeadline)
         }
         f.backend->attempts.clear();
         f.events.clear();
-        /// Past the lease: a bounded renewal would send nothing here.
+        /// Past the lease: the renewal still sends, because it has no lease bound.
         f.boot_ms = f.anchor + UnboundedRenewalFixture::ttl_ms + 1'000;
         /// A definitive answer that was retried would never end this renewal; the bound makes it fail instead.
         const uint64_t live_until = f.boot_ms + 600'000;

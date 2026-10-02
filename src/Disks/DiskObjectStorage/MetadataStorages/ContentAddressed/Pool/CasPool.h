@@ -216,10 +216,11 @@ struct PoolConfig
     std::function<void(const BlobRef &)> gc_redelete_apply_hook_for_test = {};
     std::optional<size_t> gc_io_pool_refuse_at_for_test = std::nullopt;
 
-    /// Mount-lease TTL: how long a freshly-renewed mount lease is valid. The local
-    /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
-    /// once `this` elapses with no successful renew. The background renewer runs every
-    /// `mount_renew_period` (default ttl/3) so a healthy mount renews well before expiry.
+    /// Mount-lease TTL: how long a claim or renewal keeps the lease valid. The local write fence's
+    /// deadline is the start of the last committed claim or renewal attempt plus this, so a superseded
+    /// or paused writer is fenced once `this` elapses with no successful renewal. The background renewer
+    /// starts a renewal every `mount_renew_period` (default ttl/3) so a healthy mount renews well before
+    /// expiry.
     std::chrono::milliseconds mount_lease_ttl_ms{30000};
     std::chrono::milliseconds mount_renew_period{10000};   /// = ttl/3 by default
 
@@ -1259,20 +1260,17 @@ private:
     /// The mount / write-fence / build-watermark / self-remount runtime, extracted
     /// from Pool. Owns the `MountLeaseRenewer`, the local `MountFence`, the per-server
     /// build watermark (`process_epoch` + the `builds_mutex`-guarded seq/registry) and its in-flight-build
-    /// map, the live-incarnation `live_writer_epoch`, the unclean-epoch high-water-mark, and the
+    /// map, the live-incarnation `live_writer_epoch`, and the
     /// lease thread (with one driver mutex/condition pair). Injected with backend/layout
     /// the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool `cas_request_budget`
     /// + a `remount_attempt` callback (== `Pool::tryRemountOnce`, which STAYS on Pool: the claim/recovery
     /// ORCHESTRATION drives these owned primitives).
     ///
-    /// Declared AFTER `ref_ledger` -- preserving the pre-3.5 relative order VERBATIM (the mount raw-members
-    /// this component replaces all sat after `ref_ledger`), so `mount_runtime` is destroyed FIRST and
-    /// `ref_ledger` LAST. Both orders were proven equally safe -- `~Pool`
-    /// quiesces both subsystems before ANY member dtor runs (`stopBackgroundWorkers` ->
-    /// ref_ledger.drainRefLanesForShutdown -> mount_runtime.finishTeardown), and the ledger's async paths
-    /// pin `Pool::shared_from_this`, so no ledger->mount callback can fire during destruction in either
-    /// order. Both safe ⇒ this is a pure behavior-preserving relocation, so the ORIGINAL order is kept and
-    /// NO member-order change is introduced. Declared after event_sink_, pool_backend, config and
+    /// Declared AFTER `ref_ledger`, so `mount_runtime` is destroyed FIRST and `ref_ledger` LAST. Either
+    /// order is safe -- `~Pool` quiesces both subsystems before ANY member dtor runs
+    /// (`stopBackgroundWorkers` -> ref_ledger.drainRefLanesForShutdown -> mount_runtime.finishTeardown), and
+    /// the ledger's async paths pin `Pool::shared_from_this`, so no ledger->mount callback can fire during
+    /// destruction in either order. Declared after event_sink_, pool_backend, config and
     /// pool_layout so it is constructed after every dependency it is injected with.
     CasMountRuntime mount_runtime;
 

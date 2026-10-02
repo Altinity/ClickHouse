@@ -659,10 +659,9 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// observation window. Derived from existing config — no new knob.
     const uint64_t poll_interval_ms = std::max<uint64_t>(
         1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
-    /// routes through `mount_runtime.waitSleep` (which itself routes through
-    /// `config.wait_sleep_fn` when a test injected one) rather than a bare `sleep_for` directly, so
-    /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on -- and since the
-    /// post-reclaim materialization grace was retired, this observation poll is the only one left.
+    /// Routes through `mount_runtime.waitSleep` (which itself routes through `config.wait_sleep_fn` when
+    /// a test injected one) rather than a bare `sleep_for`, so a test intercepting `wait_sleep_fn`
+    /// observes every wait `open` can block on.
     const auto sleep_ms = [s = store.get()](uint64_t ms) { s->mount_runtime.waitSleep(ms); };
     /// Operator-visible log the moment startup decides to watch a stale-looking self-mount (the
     /// disk-open path blocks up to ~threshold_ms here, so a silent block would be confusing). May
@@ -1151,8 +1150,8 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     mount_runtime.publishVanishedIntent();
 
     /// (2) Trip the local fence — the deliberate decommission act (allowed on a live disk). No durable-
-    /// effect write admits past this point (the fence-generation gate), and a live pool moves to
-    /// `TransientNotLive`, so store-class access already fails loud during the teardown window below.
+    /// effect write admits past this point (the fence-generation gate). The published intent keeps the
+    /// trip from counting a lease loss, so a live pool stays `Live` until step (6).
     mount_runtime.tripMountLost();
 
     /// (3+4) Stop the GC scheduler (clears its leadership and JOINS its worker + heartbeat threads) BEFORE

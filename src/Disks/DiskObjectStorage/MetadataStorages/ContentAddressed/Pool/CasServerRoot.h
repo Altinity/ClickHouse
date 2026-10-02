@@ -47,8 +47,9 @@ enum class MountRenewOutcome : uint8_t
     Terminal,
 };
 
-/// Why a renewal ended without retaining the lease, in the words of its audit event. `renew` sets it in
-/// the arm of the write's verdict that ended the renewal.
+/// Why a renewal ended without committing, in the words of its audit event. `renew` sets it in the arm
+/// of the write's verdict that ended the renewal. `Cancelled` is also set when nothing was attempted and
+/// the lease is kept.
 enum class MountRenewTerminalClassification : uint8_t
 {
     Unclassified,

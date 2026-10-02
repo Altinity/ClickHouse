@@ -1281,7 +1281,6 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
         /// This decoded authoritative observation is the exact point at which this incarnation learns
         /// that a foreign successor owns the slot. Terminal teardown intentionally performs no release
         /// I/O, so account the skipped farewell here, once, before the renewer enters its terminal state.
-        /// The renewal may run under `remount_mutex`; keep the increment trace-free.
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountReleaseSkippedForeignOccupant);
         emitMountEvent(
             event_sink, CasEventType::MountConflict, srid, "foreign_writer", &current,

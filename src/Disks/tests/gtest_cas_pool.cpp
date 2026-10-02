@@ -2084,7 +2084,7 @@ public:
         /// deadline against real boottime, finds it long past, and refuses every request unsent.
         farewell.setNowFnForTest([this] { return runtime.bootMsNow(); });
         lease.setNowFnForTest([this] { return runtime.bootMsNow(); });
-        /// As `Pool` wires it: a stop wakes the worker renewal's wait.
+        /// As `Pool` wires it: a stop wakes the lease thread's renewal wait.
         lease.setSleepFnForTest([this](uint64_t ms) { runtime.sleepInterruptibly(ms); });
     }
 
@@ -3994,7 +3994,7 @@ TEST(CASPoolRemount, ImmediatePostRemountRenewalFailureIsNotDropped)
                 const uint64_t fresh_anchor = runtime_ptr->startRenewer();
                 EXPECT_TRUE(runtime_ptr->armIfAdmissible(fresh_anchor + 10'000));
                 boot_ms = 2'000;
-                /// A definitive answer for the fresh incarnation's first worker renewal; a transient
+                /// A definitive answer for the fresh incarnation's first renewal on the lease thread; a transient
                 /// fault would only be retried.
                 fenceOutMount(*backend, layout.mountKey("test"));
                 first.arriveAndWait();
@@ -4028,8 +4028,8 @@ TEST(CASPoolRemount, ThrowingEventSinkAfterCommitLeavesRuntimeLive)
         .pool_prefix = "throwing-remount-event", .server_root_id = "test", .background_watermark = true});
     /// Heap-owned, not a plain local declared after `store`: if `waitUntilArrived` below throws on its
     /// own internal timeout, unwinding would destroy a stack-local barrier before `store`'s destructor
-    /// joins the remount worker, and that worker can still be inside `arriveAndWait` on the dangling
-    /// reference. A `shared_ptr` capture keeps the barrier alive for as long as the worker needs it,
+    /// joins the lease thread, and that thread can still be inside `arriveAndWait` on the dangling
+    /// reference. A `shared_ptr` capture keeps the barrier alive for as long as the thread needs it,
     /// independent of declaration order.
     auto committed = std::make_shared<DB::Cas::tests::ManualBarrier>();
     store->setEventSink([committed](const CasEvent & event)
@@ -4217,7 +4217,7 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    /// A definitive answer ends the worker's renewal; a transient fault would only be retried.
+    /// A definitive answer ends the lease thread's renewal; a transient fault would only be retried.
     fenceOutMount(*backend, layout.mountKey("test"));
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
     remount_entered.waitUntilArrived();
@@ -4228,7 +4228,7 @@ TEST(CASPool, DeterministicWorkerFailureFencesWithoutWaitingForCadence)
     runtime.finishTeardown(false);
 }
 
-/// FORGET while the worker's renewal retries past its lease: the intent then the trip, in the order
+/// FORGET while the lease thread's renewal retries past its lease: the intent then the trip, in the order
 /// `Pool::forgetDisk` uses, end the renewal inside the wait it is in, the lease thread exits, and no remount
 /// generation is raised.
 TEST(CASMountRuntime, ForgetEndsAnUnboundedRenewal)

@@ -654,7 +654,7 @@ private:
     /// `Cas::PoolConfig::cas_request_budget.attempt_timeout_ms` and the backend's own
     /// `attemptTimeoutMs()`.
     const uint64_t cas_attempt_timeout_ms;
-    /// Startup-only margin validated against the mount lease TTL; feeds
+    /// Room kept between a request and the mount lease deadline; feeds
     /// `Cas::PoolConfig::cas_request_budget.lease_safety_margin_ms`.
     const uint64_t cas_lease_safety_margin_ms;
     /// Configured staging backend; `Local` preserves the existing write path.

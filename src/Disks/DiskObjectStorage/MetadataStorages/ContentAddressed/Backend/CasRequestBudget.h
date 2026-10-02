@@ -20,9 +20,10 @@ struct CasRequestBudget
     /// every attempt it starts; the actual socket-level wait is configured on the object storage's
     /// client (the object storage backend's single-attempt client), not by this struct.
     uint64_t attempt_timeout_ms = 5000;
-    /// Startup-only margin folded into `validateCasRequestBudget`'s inequality against the mount lease
-    /// TTL. Not consulted at runtime by the engine itself -- the caller's fence (backed by the local
-    /// write fence's own deadline) is what actually gates lease-relative timing per attempt.
+    /// Room kept between the end of a request and the mount lease deadline. `CasMountRuntime::admit`
+    /// refuses a request unless its need plus this margin fits in the remaining lease, and the farewell's
+    /// lease bound stops short of the deadline by it. `validateCasRequestBudget` checks it against the
+    /// lease TTL when a writable mount opens.
     uint64_t lease_safety_margin_ms = kDefaultLeaseSafetyMarginMs;
 
     /// The cap the single-attempt client puts on one TCP connect and again on one TLS handshake,
@@ -62,13 +63,6 @@ struct CasRequestBudget
 /// and, when `background_renewal` is true (the mount runs a background renewer):
 ///   mount_renew_period_ms + 2 × attemptEnvelopeMs() + lease_safety_margin_ms < mount_lease_ttl_ms
 /// (a renewal is a write: two envelopes for the attempt and its settlement read).
-///
-/// A successor mounting over an unclean predecessor waits at least one lease TTL, plus its
-/// materialization grace period, before trusting recovery listings. This is long enough for any
-/// conditional PUT still in flight at the predecessor to either land or be abandoned by its own
-/// exhausted retry budget. The predecessor's budget is constrained by
-/// `attemptEnvelopeMs() + lease_safety_margin_ms < mount_lease_ttl_ms`, so no additional handover
-/// check is needed here.
 void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_lease_ttl_ms, uint64_t mount_renew_period_ms,
                               bool background_renewal);
 
