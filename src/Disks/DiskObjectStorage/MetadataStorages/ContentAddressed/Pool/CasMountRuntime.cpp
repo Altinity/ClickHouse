@@ -195,7 +195,7 @@ std::optional<String> CasMountRuntime::leaseExpiredRefusal(uint64_t admitted_gen
     if (fenceGeneration() != admitted_generation || !leaseExpiredSinceBootMs())
         return std::nullopt;
     return String("the mount lease expired and no renewal has restored it yet; "
-                  "writes resume when a renewal succeeds");
+                  "writes resume when a renewal restores it");
 }
 
 String CasMountRuntime::lastRenewFailure() const

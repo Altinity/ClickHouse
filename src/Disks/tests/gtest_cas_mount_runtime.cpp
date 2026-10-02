@@ -237,7 +237,7 @@ TEST(CASMountRuntime, ExpiredLeaseRefusalSaysWritesResume)
 
     const String expired = refusalText([&] { f->checkFenceOrThrow(generation); });
     EXPECT_NE(expired.find("lease expired"), String::npos) << expired;
-    EXPECT_NE(expired.find("writes resume when a renewal succeeds"), String::npos) << expired;
+    EXPECT_NE(expired.find("writes resume when a renewal restores it"), String::npos) << expired;
 
     /// A re-arm moves the generation while the lease stays expired: the caller's incarnation is gone.
     f->armMountFence(kUuid, 1, /*deadline_boot_ms=*/1'100);
