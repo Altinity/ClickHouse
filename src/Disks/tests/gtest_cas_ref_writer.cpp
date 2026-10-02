@@ -2053,9 +2053,8 @@ TEST(CASAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     EXPECT_FALSE(store->mayMutate()) << "the local write fence must trip closed on the anomaly";
     /// Positively pins that `reportImpossibleInterference` requested a remount (not just a trip,
     /// which alone already accounts for `mayMutate() == false` above). Counted at
-    /// `tripAndRequestRemount`'s entry regardless of `background_watermark` -- see that accessor's
-    /// comment for why this test deliberately does NOT enable `background_watermark` to observe a real
-    /// automatic recovery: doing so was tried and makes the store's self-remount attempt race its own
+    /// `tripAndRequestRemount`'s entry regardless of `background_watermark`. This test does not enable
+    /// `background_watermark` to observe a real automatic recovery: doing so was tried and makes the store's self-remount attempt race its own
     /// still-live renewer for 30+ seconds per call (confirmed while building this test), which is not
     /// something a fast unit test should be driving.
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)

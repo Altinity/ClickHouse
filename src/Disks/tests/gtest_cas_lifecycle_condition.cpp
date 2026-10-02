@@ -115,9 +115,9 @@ public:
 }
 
 /// (a) `_pool_meta` + the owner anchor authoritatively absent → the gate enters `IdentityLost` (never
-/// `Vanished`) and store()-class access fails loud. rev.8: `IdentityLost` is a fail-loud TERMINAL state —
+/// `Vanished`) and store()-class access fails loud. `IdentityLost` is a fail-loud TERMINAL state —
 /// `isVanished()` still reads false (it is a distinct terminal), but a direct gate re-probe refuses without
-/// ever claiming/allocating/writing (the thread-exit behavior of the background observer is covered by
+/// ever claiming/allocating/writing (a remount request on an `IdentityLost` pool is covered by
 /// `AnIdentityLostPoolRefusesARemountRequest` below).
 TEST(CASLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
 {

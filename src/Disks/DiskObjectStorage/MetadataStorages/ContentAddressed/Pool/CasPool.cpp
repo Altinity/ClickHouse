@@ -1471,7 +1471,7 @@ bool Pool::tryRemountOnce()
         /// Starting the renewer does NOT clear `lost`, so the fence stays closed here and no append/publish can race the
         /// swap.
         /// 1. Bump the live epoch so every subsequent `allocateRefTxnId` sorts strictly above any older
-        ///    (dead-incarnation or twin) durable log. Do this BEFORE `armMountFence` so there is no window
+        ///    (dead-incarnation or twin) durable log. Do this BEFORE `armIfAdmissible` so there is no window
         ///    where the gate is open while the epoch is still stale.
         step = "publish_writer_epoch";
         mount_runtime.setLiveWriterEpoch(writer_epoch);

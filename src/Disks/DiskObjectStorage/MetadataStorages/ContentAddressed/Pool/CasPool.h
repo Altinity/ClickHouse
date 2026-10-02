@@ -473,10 +473,11 @@ public:
     /// Test seam: `CasMountRuntime::tripMountLost`, with no remount request. Production trips through
     /// the runtime.
     void tripMountLost();
-    /// Refresh the write-fence deadline (a CLOCK_BOOTTIME-milliseconds instant; release).
-    /// renewer renew calls this on success.
+    /// Test seam: `CasMountRuntime::setMountDeadline`. Production publishes a renewed deadline through
+    /// `CasMountRuntime::publishRenewedDeadline`.
     void setMountDeadline(uint64_t deadline_boot_ms);
-    /// Arm the fence at startup: set the deadline, clear `lost`.
+    /// Test seam: `CasMountRuntime::armMountFence`. Production arms through `armIfAdmissible` and the
+    /// renewal's consume step.
     void armMountFence(uint64_t deadline_boot_ms);
     void setArmMountFenceInterpositionHookForTest(std::function<void()> hook)
     {
@@ -812,7 +813,8 @@ public:
     /// beyond the epoch bump) when the
     /// mount cannot be claimed (foreign owner / a genuinely live twin) — the caller retries. Serialized
     /// by `remount_mutex`. While a lease thread runs, a call from any other thread fails at the renewer's
-    /// owner check (a `LOGICAL_ERROR`). Also the synchronous test seam.
+    /// owner check (a `LOGICAL_ERROR`), after it has claimed the mount under a fresh epoch, so such a call
+    /// is never harmless. Also the synchronous test seam.
     bool tryRemountOnce();
 
     /// Test seam: request a remount without a trip. Production requests one through
