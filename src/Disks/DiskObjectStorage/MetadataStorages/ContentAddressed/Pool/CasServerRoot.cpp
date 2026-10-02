@@ -1081,7 +1081,7 @@ String describeRequestFailure(const std::exception & failure)
 }
 
 MountLeaseRenewer::MountLeaseRenewer(
-    CasRequests & open_requests_, CasRequests & lease_requests_,
+    CasRequests & claim_farewell_requests_, CasRequests & lease_requests_,
     const Layout & layout_,
     const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
@@ -1089,7 +1089,7 @@ MountLeaseRenewer::MountLeaseRenewer(
     CasEventSink event_sink_,
     std::chrono::milliseconds lease_safety_margin_,
     std::function<uint64_t()> boot_ms_fn_)
-    : open_requests(open_requests_)
+    : claim_farewell_requests(claim_farewell_requests_)
     , lease_requests(lease_requests_)
     , key(layout_.mountKey(srid_))
     , srid(srid_)
@@ -1225,7 +1225,7 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
     /// Off the mount fence: a self-remount claims with the fence already latched lost, and a claim
     /// admitted under it would be refused on every request. What makes the claim safe is that every
     /// write below is conditional.
-    CasOperation op = open_requests.admit(std::move(liveness));
+    CasOperation op = claim_farewell_requests.admit(std::move(liveness));
     const Etag etag = claim(op, body);
 
     seq = 1;
@@ -1479,16 +1479,16 @@ void MountLeaseRenewer::terminate(CasOperation & op, uint64_t lease_deadline_boo
         .min_active_build_sequence = std::numeric_limits<uint64_t>::max(),
         .write_attempt_id = newMountWriteAttemptId(),
     });
-    /// The farewell is admitted on `open_requests` (see `release`, which calls this via `open_requests.admit()`),
+    /// The farewell is admitted on `claim_farewell_requests` (see `release`),
     /// so its own reservation -- attempt plus the read that settles it, `reservedFor(0, 2)` in
-    /// `CasOperation::writeLoop` -- is exactly `2 * open_requests.attemptReservationMs()`. A window
+    /// `CasOperation::writeLoop` -- is exactly `2 * claim_farewell_requests.attemptReservationMs()`. A window
     /// below that value refuses the write before its first attempt, deterministically, on every call:
     /// `kFarewellBudgetMs` alone predates the attempt-envelope reservation and can no longer be trusted
     /// to admit it. Saturating, like every other deadline computation on this path: an
     /// operator-configured envelope is not bounds-checked against this doubling, and wrapping past
     /// `UINT64_MAX` would turn a too-long window into a too-SHORT one -- the exact failure mode this fix
     /// exists to remove.
-    const uint64_t reservation_ms = open_requests.attemptReservationMs();
+    const uint64_t reservation_ms = claim_farewell_requests.attemptReservationMs();
     const uint64_t doubled_reservation_ms = reservation_ms > std::numeric_limits<uint64_t>::max() / 2
         ? std::numeric_limits<uint64_t>::max()
         : reservation_ms * 2;
@@ -1542,7 +1542,7 @@ void MountLeaseRenewer::release(uint64_t lease_deadline_boot_ms)
     /// Off the mount fence, for the same reason the claim is: a departing mount whose lease has already
     /// run down still has to hand the slot back, and refusing the write there would leave the slot
     /// looking live until GC fences it out.
-    CasOperation op = open_requests.admit();
+    CasOperation op = claim_farewell_requests.admit();
     terminate(op, lease_deadline_boot_ms);
 }
 
