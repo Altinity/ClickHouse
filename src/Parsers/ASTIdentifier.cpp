@@ -268,6 +268,18 @@ void ASTIdentifier::restoreTable()
     }
 }
 
+void ASTIdentifier::resetSemanticTable()
+{
+    // Only reset semantic table for column identifiers (not table identifiers)
+    if (semantic && !semantic->special)
+    {
+        semantic->table.clear();
+        semantic->can_be_alias = true;
+        semantic->membership = std::nullopt;
+    }
+}
+
+
 boost::intrusive_ptr<ASTTableIdentifier> ASTIdentifier::createTable() const
 {
     /// A parameterized name is not resolvable: the rebuilt identifier below would drop the
