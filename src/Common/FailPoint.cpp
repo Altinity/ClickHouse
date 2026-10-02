@@ -250,6 +250,7 @@ static struct InitFiu
     REGULAR(export_partition_processed_paths_sync_fail) \
     REGULAR(export_part_non_retryable_throw) \
     REGULAR(export_part_retryable_throw) \
+    PAUSEABLE_ONCE(export_part_pause_before_schema_validation) \
     ONCE(backup_add_empty_memory_table) \
     ONCE(backup_from_snapshot_fail_after_batch) \
     ONCE(backup_from_snapshot_fail_after_lock_file_creation) \
