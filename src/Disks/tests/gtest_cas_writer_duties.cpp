@@ -392,7 +392,7 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
     ManifestId abandoned_id;
     auto abandoned = stageEmptyManifest(predecessor, ns, "abandoned", abandoned_id);
     abandoned->precommitAdd(ns, "abandoned", abandoned_id);
-    const uint64_t predecessor_epoch = predecessor->writerEpoch();
+    const uint64_t predecessor_epoch = predecessor->liveWriterEpoch();
     const Layout layout = predecessor->layout();
     const String mount_key = layout.mountKey("test");
 
@@ -428,7 +428,7 @@ TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
             waits->push(ms);
         },
     });
-    ASSERT_GT(successor_store->writerEpoch(), predecessor_epoch);
+    ASSERT_GT(successor_store->liveWriterEpoch(), predecessor_epoch);
     ASSERT_FALSE(waits->empty()) << "the predecessor supplied no clean-death certificate";
 
     ManifestId successor_id;
@@ -525,7 +525,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
     driveToNetworkErrorGiveUp(*backend, *clock, [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
     ASSERT_TRUE(predecessor->refLaneWedgedForTest(ns));
     ASSERT_EQ(rejected->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
-    const uint64_t predecessor_epoch = predecessor->writerEpoch();
+    const uint64_t predecessor_epoch = predecessor->liveWriterEpoch();
 
     rejected.reset();
     predecessor.reset();
@@ -556,7 +556,7 @@ TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
             waits->push(ms);
         },
     });
-    ASSERT_GT(successor_store->writerEpoch(), predecessor_epoch);
+    ASSERT_GT(successor_store->liveWriterEpoch(), predecessor_epoch);
     ASSERT_FALSE(waits->empty()) << "the predecessor supplied no clean-death certificate";
 
     /// An ordinary successor mutation both drains the inherited duty as a no-op (the rejected grant

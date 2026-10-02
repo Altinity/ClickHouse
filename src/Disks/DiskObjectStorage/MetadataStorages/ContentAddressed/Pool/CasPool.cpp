@@ -568,11 +568,6 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// durably admitted (the invariant this whole design rests on).
     chassert(store->isAlgoAdmitted(write_algo));
 
-    /// Per-server watermark: mint the random NONZERO `process_epoch`
-    /// once per Pool (GC checks it for equality only -- a different epoch == a dead incarnation). The
-    /// masking/redraw detail lives in `CasMountRuntime::mintRandomProcessEpoch`.
-    store->mount_runtime.mintRandomProcessEpoch();
-
     /// W-ANCHOR: the per-server watermark must be durable BEFORE any object PUT. A read-only open
     /// must never mutate the pool (the probe is skipped above for the same reason), so the watermark
     /// — which rides inside the `gc/server-roots/<server_root_id>/mount` lease object — is only
@@ -630,10 +625,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             std::chrono::system_clock::now().time_since_epoch()).count());
     };
 
-    /// 3. Durable-monotone writer_epoch — CAS-bump the sticky `epoch` object. THE BRIDGE: this
-    ///    durable value REPLACES the random `process_epoch` for identity, so the watermark + every
-    ///    manifest ref carries it (the random mint above stays for the read-only
-    ///    path, which never reaches here). The epoch-aware sweep reads this value.
+    /// 3. Durable-monotone writer_epoch — CAS-bump the sticky `epoch` object.
     /// Mutable: a GC fence of our fresh lease during open (expiry mid-open racing a GC round) is
     /// recoverable — a fence costs an epoch, so the fence-recovery loop below re-allocates a fresh
     /// writer_epoch and re-claims (the TLA+-checked `NoPermanentWedge` invariant).
@@ -647,7 +639,6 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     CasOperation epoch_op = store->gc_requests.admit();
     uint64_t writer_epoch = allocateWriterEpoch(
         epoch_op, store->pool_layout, srid, epoch_policy, now_ms(), observe_catalog);
-    store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
 
     /// 4. Mount lease — LIVENESS. Decide over the current mount object using the wall-clock `now_ms`
     ///    hoisted above.
@@ -762,7 +753,6 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             CasOperation reallocate_op = store->gc_requests.admit();
             writer_epoch = allocateWriterEpoch(
                 reallocate_op, store->pool_layout, srid, epoch_policy, now_ms(), observe_catalog);
-            store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
             continue;
         }
         if (claim.kind != MountClaimResult::Claimed)
@@ -809,7 +799,6 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             CasOperation refenced_epoch_op = store->gc_requests.admit();
             writer_epoch = allocateWriterEpoch(
                 refenced_epoch_op, store->pool_layout, srid, epoch_policy, now_ms(), observe_catalog);
-            store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
             continue;
         }
         break;
@@ -962,11 +951,6 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// Register-before-first-write, belt-and-braces: same invariant `open` asserts.
     chassert(store->isAlgoAdmitted(write_algo));
 
-    /// No random `process_epoch` mint here: `open` pays that prologue because its read-only path
-    /// never reaches `mountWritable` and so needs SOME nonzero epoch, but this factory is
-    /// writer-only -- `mountWritable` below unconditionally overwrites `process_epoch` with the
-    /// freshly allocated durable `writer_epoch` before anything could observe the zero-initialized
-    /// default.
     mountWritable(store, *victim_uuid, MountClaimPolicy::NoWait);
     return store;
 }
@@ -1487,11 +1471,9 @@ bool Pool::tryRemountOnce()
         /// swap.
         /// 1. Bump the live epoch so every subsequent `allocateRefTxnId` sorts strictly above any older
         ///    (dead-incarnation or twin) durable log. Do this BEFORE `armMountFence` so there is no window
-        ///    where the gate is open while the epoch is still stale. Keep `process_epoch` (the identity
-        ///    accessors) equal to it.
+        ///    where the gate is open while the epoch is still stale.
         step = "publish_writer_epoch";
         mount_runtime.setLiveWriterEpoch(writer_epoch);
-        mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_release);
         /// 2. CANCEL OR JOIN every in-flight ref-table recovery, and BLOCK here until none is left (spec
         ///    §3: "self-remount cancels or waits out recovery before rearming"). A recovery admitted under
         ///    the outgoing incarnation WRITES -- its seal CAS-walk mints epoch seals and advances the

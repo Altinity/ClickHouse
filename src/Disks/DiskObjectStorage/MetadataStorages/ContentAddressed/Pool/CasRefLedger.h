@@ -982,8 +982,8 @@ private:
     /// A post-durable install failure moves the lane to `NeedsRecovery`, so this function is not called
     /// again until replay has installed that durable transaction and advanced `greatest_applied`.
     ///
-    /// The epoch component is the live mount incarnation's writer epoch, not the open-time
-    /// `process_epoch`: a self-remount allocates a strictly-greater durable writer_epoch, so every ref
+    /// The epoch component is the live mount incarnation's writer epoch: a self-remount allocates a
+    /// strictly-greater durable writer_epoch, so every ref
     /// transaction stamped after the remount sorts strictly ABOVE any (dead-incarnation or twin) log
     /// still durable under an older epoch. `RefTxnId` compares epoch first, so the epoch bump alone
     /// guarantees that a new log is never inserted at or below an already durable table log id.

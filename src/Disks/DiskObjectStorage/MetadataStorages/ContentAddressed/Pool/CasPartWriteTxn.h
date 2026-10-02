@@ -358,7 +358,7 @@ private:
     uint64_t txn_generation{};
     UInt128 build_id{};
     uint64_t build_seq{};                                 /// per-process monotone sequence
-    uint64_t epoch{};                                     /// owning Pool's process_epoch
+    uint64_t epoch{};                                     /// the owning Pool's live writer epoch when the build began
     uint32_t next_manifest_ordinal = 1;                   /// per-build monotone manifest ordinal
     PartWriteInfo info;
     bool alive = true;

@@ -455,14 +455,6 @@ public:
     void setDetachedDrainDeadlineBudgetForTest(const CasRequestBudget & budget);
 
     /// ---- per-server watermark surface ----
-    /// process_epoch: random nonzero per Pool (process). GC checks epoch EQUALITY, never ordering.
-    uint64_t epoch() const { return mount_runtime.epoch(); }
-    /// The durable-monotone writer_epoch allocated at writable open. On a
-    /// writable Pool this is the value bridged into `process_epoch` (so the watermark + the manifest
-    /// manifest ref carries it); on a read-only open the random `process_epoch` is unchanged and
-    /// no durable epoch is allocated. A self-remount re-establishes this to the fresh incarnation's
-    /// writer_epoch (kept equal to `liveWriterEpoch`). The epoch-aware sweep reads this value.
-    uint64_t writerEpoch() const { return mount_runtime.writerEpoch(); }
     /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
     /// quiescent server's watermark floor advances to the next-to-be-allocated seq). Locks builds_mutex.
     uint64_t minActive();
@@ -807,6 +799,7 @@ public:
 
     /// The writer_epoch of the LIVE mount incarnation. Bumped by `tryRemountOnce` (self-remount
     /// after a GC fence-out) — a `PartWriteTxn` minted under an older epoch fails closed on its next step.
+    /// Zero on a read-only pool, which claims no mount.
     uint64_t liveWriterEpoch() const { return mount_runtime.liveWriterEpoch(); }
 
     /// Test seam: publish a new live-incarnation writer epoch WITHOUT running a self-remount -- the
@@ -1259,7 +1252,7 @@ private:
     CasRefLedger ref_ledger;
     /// The mount / write-fence / build-watermark / self-remount runtime, extracted
     /// from Pool. Owns the `MountLeaseRenewer`, the local `MountFence`, the per-server
-    /// build watermark (`process_epoch` + the `builds_mutex`-guarded seq/registry) and its in-flight-build
+    /// build watermark (the `builds_mutex`-guarded seq/registry) and its in-flight-build
     /// map, the live-incarnation `live_writer_epoch`, and the
     /// lease thread (with one driver mutex/condition pair). Injected with backend/layout
     /// the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool `cas_request_budget`

@@ -141,11 +141,7 @@ public:
         /// after construction, from the lease thread.
         std::function<bool()> remount_attempt_);
 
-    /// ---- per-server watermark and identity ----
-    /// `process_epoch` is random and nonzero for this pool incarnation. GC compares it for equality,
-    /// never ordering; a different value means that the previous writer incarnation is no longer live.
-    uint64_t epoch() const { return process_epoch.load(std::memory_order_acquire); }
-    uint64_t writerEpoch() const { return process_epoch.load(std::memory_order_acquire); }
+    /// ---- per-server watermark ----
     /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
     /// quiescent server's watermark floor advances to the next-to-be-allocated seq). Locks builds_mutex.
     uint64_t minActive();
@@ -370,12 +366,7 @@ public:
     /// cancellation may take a different path and must not run under the registry lock.
     void cancelInflightBuildsForNamespace(const RootNamespace & ns);
 
-    /// ---- process epoch (identity) ----
-    /// Mint the random nonzero process identity used by GC's equality check.
-    void mintRandomProcessEpoch();
-    /// Set `process_epoch` to the durable `writer_epoch`. The caller supplies the memory order because
-    /// the initial writable claim and a later self-remount have different publication requirements.
-    void setProcessEpoch(uint64_t v, std::memory_order order);
+    /// ---- live writer epoch ----
     /// Publish the live-incarnation `live_writer_epoch` with release ordering.
     void setLiveWriterEpoch(uint64_t v);
 
@@ -480,17 +471,10 @@ private:
     CasRequestBudget cas_request_budget;
     std::function<bool()> remount_attempt;
 
-    /// Per-server build watermark. `process_epoch` is a random
-    /// nonzero u64 minted once at open: GC checks it for EQUALITY (an object stamped with a different
-    /// epoch is from a dead incarnation), never for ordering. next_build_seq is a strictly-increasing
-    /// per-process counter (monotonicity is load-bearing — a seq is never reused or lowered);
-    /// active_build_seqs holds the seqs of in-flight builds, so `minActive` yields the GC floor. The floor
-    /// is published by the merged `mount_renewer`
-    /// beat (there is no standalone watermark object anymore). ATOMIC because a self-remount re-stamps it
-    /// (kept equal to `live_writer_epoch`) from the lease thread while `epoch`/`writerEpoch`
-    /// may observe it; the ref-lane hot readers were moved to `liveWriterEpoch`, so this now backs only
-    /// the identity accessors.
-    std::atomic<uint64_t> process_epoch{0};
+    /// Per-server build watermark. `next_build_seq` is a strictly-increasing per-process counter
+    /// (monotonicity is load-bearing: a seq is never reused or lowered); `active_build_seqs` holds the
+    /// seqs of in-flight builds, so `minActive` yields the GC floor. The floor is published by the
+    /// merged `mount_renewer` beat (there is no standalone watermark object).
     std::mutex builds_mutex;
     uint64_t next_build_seq = 1;
     std::set<uint64_t> active_build_seqs;

@@ -3891,7 +3891,6 @@ TEST(CASPoolRemount, ExternalLossDuringRenewalUsesOneRecoveryGeneration)
                 return false;
             runtime_ptr->installRenewer(uuid, 2, [&] { return wall_ms; });
             const uint64_t fresh_anchor = runtime_ptr->startRenewer();
-            runtime_ptr->setProcessEpoch(2, std::memory_order_release);
             runtime_ptr->setLiveWriterEpoch(2);
             EXPECT_TRUE(runtime_ptr->armIfAdmissible(fresh_anchor + 1000));
             remount_barrier.arriveAndWait();

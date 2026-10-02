@@ -1204,7 +1204,7 @@ TEST(CASMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
     auto b = std::make_shared<InMemoryBackend>();
     auto s1 = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
-    const uint64_t e1 = s1->writerEpoch();
+    const uint64_t e1 = s1->liveWriterEpoch();
 
     /// Simulate shutdown: the Pool dtor stops the renewer, whose terminate() retires the lease
     /// (stamps it already-expired). The owner + the durable epoch object stay sticky.
@@ -1214,7 +1214,7 @@ TEST(CASMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
     /// higher durable writer_epoch.
     auto s2 = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
-    const uint64_t e2 = s2->writerEpoch();
+    const uint64_t e2 = s2->liveWriterEpoch();
     EXPECT_GT(e2, e1);
 }
 
@@ -1400,7 +1400,7 @@ TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = tiny_budget});
     ASSERT_NE(a, nullptr);
-    const uint64_t e1 = a->writerEpoch();
+    const uint64_t e1 = a->liveWriterEpoch();
     const String mount_key = a->layout().mountKey("r");
     Ops ops(b);
     const auto stale_mount = ops.op.read(mount_key, Retry::standard());
@@ -1441,7 +1441,7 @@ TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
                 *a2_fake_boot += ms;
             }}));
     ASSERT_NE(a2, nullptr);
-    EXPECT_GT(a2->writerEpoch(), e1);
+    EXPECT_GT(a2->liveWriterEpoch(), e1);
 
     /// The original live-object overlap: a first Pool is still alive when a replacement reclaims its
     /// slot, so the first one's release meets a stranger. This was an `EXPECT_DEATH` pinning a

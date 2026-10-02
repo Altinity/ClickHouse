@@ -1102,12 +1102,12 @@ TEST(CASRefCheckpoint, NamespaceBirthCreatesTheCheckpointCarryingItsLifeEpoch)
     /// test cannot yet compute.
     EXPECT_TRUE(CasRefCatalog::read(op, store->layout()).catalog.entries.empty())
         << "nothing exists before the birth";
-    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->liveWriterEpoch(), 1}));
 
     const NamespaceLifeId life = liveLifeOrFail(op, store->layout(), ns);
     const auto sample = readCkpt(op, store->layout(), life);
     ASSERT_TRUE(sample.has_value()) << "spec §3 creates the _ckpt before the namespace becomes Live";
-    EXPECT_EQ(sample->ckpt.life_epoch, store->writerEpoch());
+    EXPECT_EQ(sample->ckpt.life_epoch, store->liveWriterEpoch());
     EXPECT_FALSE(sample->ckpt.checkpoint_snapshot_id.has_value()) << "a newborn namespace has no base yet";
     EXPECT_FALSE(sample->ckpt.last_epoch_seal.has_value());
 }
@@ -1119,7 +1119,7 @@ TEST(CASRefCheckpoint, ACommittedSnapshotPublishAdvancesTheCheckpoint)
     auto store = openPool(backend);
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
-    const uint64_t epoch = store->writerEpoch();
+    const uint64_t epoch = store->liveWriterEpoch();
     const RootNamespace ns{"srv1/ckpt_publish"};
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
@@ -1149,7 +1149,7 @@ TEST(CASRefCheckpoint, CleanupPlannedBetweenTheBodyPutAndTheCkptCasCannotDeleteT
     auto store = openPool(backend);
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
-    const uint64_t epoch = store->writerEpoch();
+    const uint64_t epoch = store->liveWriterEpoch();
     const RootNamespace ns{"srv1/ckpt_race"};
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
@@ -1185,7 +1185,7 @@ TEST(CASRefCheckpoint, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttem
     auto store = openPool(backend);
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
-    const uint64_t epoch = store->writerEpoch();
+    const uint64_t epoch = store->liveWriterEpoch();
     const RootNamespace ns{"srv1/ckpt_republish"};
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
@@ -1218,12 +1218,12 @@ TEST(CASRefCheckpoint, SnapshotPublisherRefusesEpochSealCandidateWithoutAnyWrite
     uint64_t predecessor_epoch = 0;
     {
         auto predecessor = openPool(backend);
-        predecessor_epoch = predecessor->writerEpoch();
+        predecessor_epoch = predecessor->liveWriterEpoch();
         ASSERT_EQ(publishRef(predecessor, ns, "ref_1", 1), (RefTxnId{predecessor_epoch, 1}));
     }
 
     auto store = openPool(backend);
-    ASSERT_GT(store->writerEpoch(), predecessor_epoch);
+    ASSERT_GT(store->liveWriterEpoch(), predecessor_epoch);
     ASSERT_EQ(store->listRefs(ns).size(), 1u) << "recovery must close the predecessor epoch before publishing";
 
     const RefTxnId seal_id{predecessor_epoch, 2};
@@ -1242,7 +1242,7 @@ TEST(CASRefCheckpoint, SnapshotPublisherRefusesEpochSealCandidateWithoutAnyWrite
     EXPECT_EQ(backend->writes(ckpt_key), ckpt_writes_before);
 
     /// Once an ordinary transaction advances the candidate beyond the seal, normal publication resumes.
-    ASSERT_EQ(publishRef(store, ns, "ref_2", 2), (RefTxnId{store->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(store, ns, "ref_2", 2), (RefTxnId{store->liveWriterEpoch(), 1}));
     EXPECT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
 }
 
@@ -1255,7 +1255,7 @@ TEST(CASRefCheckpoint, NeedsRecoveryReplaysBeforeCheckpointAdvance)
     CasOperation op = requests.admit();
     const RootNamespace ns{"srv1/ckpt_poisoned"};
 
-    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->liveWriterEpoch(), 1}));
     const NamespaceLifeId life = liveLifeOrFail(op, store->layout(), ns);
     const String key = store->layout().refCkptKey(life);
     const auto before = readCkpt(op, store->layout(), life);
@@ -1305,7 +1305,7 @@ TEST(CASRefCheckpoint, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
     CasRequests requests = DB::Cas::tests::openRequestsForTest(backend);
     CasOperation op = requests.admit();
 
-    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
+    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->liveWriterEpoch(), 1}));
     const NamespaceLifeId life = liveLifeOrFail(op, store->layout(), ns);
     const String ckpt_key = store->layout().refCkptKey(life);
     const auto before = readCkpt(op, store->layout(), life);

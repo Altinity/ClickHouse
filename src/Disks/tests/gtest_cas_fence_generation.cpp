@@ -216,7 +216,7 @@ TEST(CASFenceGeneration, RearmPublishesTheNewGenerationBeforeOpeningTheFence)
             << "no runtime may be published in the re-arm interposition";
     });
 
-    store->armMountFence(DB::UInt128{0, 1}, store->writerEpoch(), store->bootMsNow() + 600000);
+    store->armMountFence(DB::UInt128{0, 1}, store->liveWriterEpoch(), store->bootMsNow() + 600000);
     store->setArmMountFenceInterpositionHookForTest(nullptr);
 
     EXPECT_FALSE(admitted_in_interposition);

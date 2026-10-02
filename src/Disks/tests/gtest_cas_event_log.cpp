@@ -245,7 +245,7 @@ TEST(CASEvent, WatermarkRenewEventsAreBoundedAndComplete)
     EXPECT_EQ(renewals[0].detail.at("attempts_sent"), "2");
     EXPECT_EQ(renewals[0].detail.at("classification"), "committed_after_retry");
     EXPECT_EQ(renewals[0].detail.at("server_root_id"), "test");
-    EXPECT_EQ(renewals[0].detail.at("writer_epoch"), std::to_string(store->writerEpoch()));
+    EXPECT_EQ(renewals[0].detail.at("writer_epoch"), std::to_string(store->liveWriterEpoch()));
     EXPECT_EQ(renewals[0].detail.at("seq"), "2");
     EXPECT_FALSE(renewals[0].detail.at("write_attempt_id").empty());
     EXPECT_LT(renewals[0].detail.at("write_attempt_id").size(), 32u);

@@ -4,7 +4,6 @@
 #include <Common/LockMemoryExceptionInThread.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
-#include <Common/thread_local_rng.h>
 #include <algorithm>
 #include <chrono>
 #include <ctime>
@@ -437,23 +436,6 @@ void CasMountRuntime::cancelInflightBuildsForNamespace(const RootNamespace & ns)
     }
     for (const auto & build : builds_to_check)
         build->cancelForNamespaceRemoval(ns);
-}
-
-void CasMountRuntime::mintRandomProcessEpoch()
-{
-    /// Mint a nonzero equality-only identity. Keep it away from the zero/unarmed and UINT64_MAX/retired
-    /// sentinels; 52 random bits are sufficient for the expected collision risk of this token.
-    constexpr uint64_t EPOCH_MASK = (1ULL << 52) - 1;
-    process_epoch.store(
-        (thread_local_rng() ^ (static_cast<uint64_t>(thread_local_rng()) << 32)) & EPOCH_MASK,
-        std::memory_order_relaxed);
-    if (process_epoch.load(std::memory_order_relaxed) == 0)
-        process_epoch.store(1, std::memory_order_relaxed);
-}
-
-void CasMountRuntime::setProcessEpoch(uint64_t v, std::memory_order order)
-{
-    process_epoch.store(v, order);
 }
 
 void CasMountRuntime::setLiveWriterEpoch(uint64_t v)

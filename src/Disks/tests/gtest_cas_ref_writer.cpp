@@ -3388,7 +3388,7 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
     uint64_t e1 = 0;
     {
         auto predecessor = openPool(backend);
-        e1 = predecessor->writerEpoch();
+        e1 = predecessor->liveWriterEpoch();
     }   /// predecessor released; only its epoch is needed -- the stale precommits are seeded raw below
 
     /// Seed kTotalStale precommits directly (bypassing any Pool) under the predecessor's epoch,
@@ -3676,11 +3676,10 @@ TEST(CASRefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
 }
 
 /// ===================================================================================
-/// C1: self-remount establishes a fresh ref-protocol incarnation (spec §Startup And Recovery /
-/// §write-fence). A self-remount bumps the durable writer_epoch, so every ref transaction it stamps
-/// afterward sorts strictly above any log a dead-incarnation or same-uuid twin left durable under an
-/// older epoch, and it drops its stale in-memory cache so the next touch re-recovers under the new
-/// epoch. The unfixed code kept the open-time `process_epoch` and the cached tables across the fence-out.
+/// A self-remount establishes a fresh ref-protocol incarnation. It bumps the durable writer_epoch, so
+/// every ref transaction it stamps afterward sorts strictly above any log a dead-incarnation or
+/// same-uuid twin left durable under an older epoch, and it drops its stale in-memory cache so the next
+/// touch re-recovers under the new epoch.
 /// ===================================================================================
 
 namespace
