@@ -43,6 +43,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
+            {"iceberg_target_data_file_size_bytes", 536870912, 536870912, "Target file size for Iceberg bin-packing compaction (default 512 MiB)."},
+            {"iceberg_min_data_file_size_bytes", 402653184, 402653184, "Files below this size are candidates for Iceberg bin-packing compaction (default 384 MiB)."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",

@@ -47,6 +47,19 @@ public:
         const Iceberg::IcebergPathFromMetadata & metadata_file_path,
         Int64 parent_snapshot_id);
 
+    /// Create a `replace` snapshot for bin-packing compaction: atomically removes small files and adds merged files.
+    NextMetadataResult generateReplaceSnapshot(
+        FileNamesGenerator & generator,
+        const Iceberg::IcebergPathFromMetadata & metadata_file_path,
+        Int64 parent_snapshot_id,
+        Int64 added_data_files,
+        Int64 added_records,
+        Int64 added_files_size,
+        Int64 removed_data_files,
+        Int64 removed_records,
+        Int64 removed_files_size,
+        Int64 num_partitions);
+
     void generateAddColumnMetadata(const String & column_name, DataTypePtr type);
     void generateDropColumnMetadata(const String & column_name);
     /// Returns false when the column already has the requested type (no metadata change).

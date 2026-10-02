@@ -55,9 +55,27 @@ void writeMessageToFile(
     const std::string & write_if_match = "",
     DB::CompressionMethod compression_method = DB::CompressionMethod::None);
 
+enum class MetadataCommitResult : uint8_t
+{
+    Committed,
+    /// The metadata file already existed, so nothing was written.
+    Conflict,
+    /// Writing the metadata file failed, and it is unknown whether the file was created.
+    Unknown,
+};
+
 /// Tries to write metadata file and version hint file. Uses If-None-Match header to avoid overwriting existing files.
-/// Maybe return false if failed to write metadata.json
 /// Will try to write hint multiple times, but will not report failure to write hint.
+MetadataCommitResult tryWriteMetadataFileAndVersionHint(
+    const IcebergPathResolver & resolver,
+    const DB::GeneratedMetadataFileWithInfo & metadata_file_info,
+    const std::string & metadata_file_content,
+    const IcebergPathFromMetadata & version_hint_path,
+    DB::ObjectStoragePtr object_storage,
+    DB::ContextPtr context,
+    bool try_write_version_hint);
+
+/// Same as `tryWriteMetadataFileAndVersionHint`, returns false unless the result is `Committed`.
 bool writeMetadataFileAndVersionHint(
     const IcebergPathResolver & resolver,
     const DB::GeneratedMetadataFileWithInfo & metadata_file_info,
