@@ -745,6 +745,134 @@ TEST(CASRequests, AmbiguousCreateThatNeverLandedIsReissued)
     EXPECT_EQ(clock.sleeps.size(), 1u);
 }
 
+/// The observer hears of each physical write attempt when it is sent, and of each one that throws.
+TEST(CASRequests, RequestObserverSeesEachPutAndEachFailure)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->injectAmbiguousWrite("k");
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    std::vector<std::pair<uint32_t, bool>> seen;
+    op.setRequestObserver([&](uint32_t attempt_no, const std::exception * failure)
+    {
+        seen.emplace_back(attempt_no, failure != nullptr);
+    });
+
+    WriteResult result = op.create("k", "v", Retry::standard());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    const std::vector<std::pair<uint32_t, bool>> expected{{1, false}, {1, true}, {2, false}};
+    EXPECT_EQ(seen, expected);
+}
+
+/// A deterministic local failure is reported before it propagates unchanged.
+TEST(CASRequests, RequestObserverSeesADeterministicFailureBeforeItPropagates)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextWriteWith("k", std::make_exception_ptr(DB::Exception(
+        DB::ErrorCodes::CORRUPTED_DATA, "injected deterministic failure")));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    std::vector<std::pair<uint32_t, int>> seen;
+    op.setRequestObserver([&](uint32_t attempt_no, const std::exception * failure)
+    {
+        const auto * db_failure = dynamic_cast<const DB::Exception *>(failure);
+        seen.emplace_back(attempt_no, failure == nullptr ? 0 : (db_failure ? db_failure->code() : -1));
+    });
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)op.create("k", "v", Retry::standard()); });
+
+    const std::vector<std::pair<uint32_t, int>> expected{{1, 0}, {1, DB::ErrorCodes::CORRUPTED_DATA}};
+    EXPECT_EQ(seen, expected);
+}
+
+/// A refused precondition is the store's answer, not a failed request.
+TEST(CASRequests, RequestObserverIsNotToldOfARefusedPrecondition)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->refuseNextWrite("k");
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    std::vector<std::pair<uint32_t, bool>> seen;
+    op.setRequestObserver([&](uint32_t attempt_no, const std::exception * failure)
+    {
+        seen.emplace_back(attempt_no, failure != nullptr);
+    });
+
+    WriteResult result = op.create("k", "v", Retry::standard());
+
+    EXPECT_TRUE(std::holds_alternative<Conflict>(result));
+    const std::vector<std::pair<uint32_t, bool>> expected{{1, false}};
+    EXPECT_EQ(seen, expected);
+}
+
+/// Each failed resolve read is reported with the count of `PUT`s sent so far; the read that succeeds is not.
+TEST(CASRequests, RequestObserverSeesEachFailedResolveRead)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->injectAmbiguousWrite("k");
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("injected read failure")));
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("injected read failure")));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    std::vector<std::pair<uint32_t, bool>> seen;
+    op.setRequestObserver([&](uint32_t attempt_no, const std::exception * failure)
+    {
+        seen.emplace_back(attempt_no, failure != nullptr);
+    });
+
+    WriteResult result = op.create("k", "v", Retry::standard());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    /// PUT 1 sent, PUT 1 failed, two failed reads, PUT 2 sent.
+    const std::vector<std::pair<uint32_t, bool>> expected{{1, false}, {1, true}, {1, true}, {1, true}, {2, false}};
+    EXPECT_EQ(seen, expected);
+}
+
+/// A read the caller issues itself is not a resolve read and is not reported.
+TEST(CASRequests, RequestObserverIsNotToldOfACallersOwnRead)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("injected read failure")));
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    uint32_t calls = 0;
+    op.setRequestObserver([&](uint32_t, const std::exception *) { ++calls; });
+
+    EXPECT_FALSE(op.read("k", Retry::standard()).has_value());
+
+    EXPECT_EQ(calls, 0u);
+}
+
+/// An observer that throws on every call changes neither the verdict nor the requests sent.
+TEST(CASRequests, ThrowingRequestObserverChangesNothing)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    backend->injectAmbiguousWrite("k");
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    uint32_t calls = 0;
+    op.setRequestObserver([&](uint32_t, const std::exception *)
+    {
+        ++calls;
+        throw std::runtime_error("injected observer failure");
+    });
+
+    WriteResult result = op.create("k", "v", Retry::standard());
+
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, 2u);
+    EXPECT_EQ(backend->getTotal(), 1u);
+    EXPECT_EQ(calls, 3u);
+}
+
 /// The engine's own attempt number reaches the transport through `TransportAccess::attemptNo()`, for
 /// every primitive -- write, read (the resolve read is its own call, with its own attempt count) and
 /// list.

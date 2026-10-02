@@ -260,6 +260,14 @@ public:
     /// The write lane for keys several writers of this pool share.
     CasHotKeys & hotKeys() const { return *owner.hot_keys; }
 
+    /// Told of the requests of this operation's writes, on the issuing thread: each `PUT` when it is
+    /// sent (null `failure`) and again if it throws, and each failed resolve read. `attempt_no` is the
+    /// count of `PUT`s sent so far. A refused precondition is an answer, not a failure, and is not
+    /// reported; nor is a read that succeeds or one the caller issued itself. What the observer throws
+    /// is ignored.
+    using RequestObserver = std::function<void(uint32_t attempt_no, const std::exception * failure)>;
+    void setRequestObserver(RequestObserver observer) { request_observer = std::move(observer); }
+
     /// `policy` with its window turned into an absolute deadline on this operation's clock, taken NOW.
     /// A hand-written loop freezes its policy once before it starts and passes the frozen value to
     /// every call it makes, so the loop ends when the window it was given ends -- rather than granting
@@ -400,6 +408,9 @@ private:
     /// state the read never saw, which is how a lease refusal used to be reported as a policy deadline.
     WriteResult gaveUpAfterFailedObservation(std::optional<ReadStop> stop, WriteState & state,
                                              const Retry::Bound & bound) const;
+    /// Calls `request_observer` if one is set. A report must not change a verdict, so whatever the
+    /// observer throws is swallowed here.
+    void notifyRequest(uint32_t attempt_no, const std::exception * failure) const noexcept;
     /// The shared shape behind every gated pause below: admission for `envelopes` attempt reservations
     /// plus `pause_ms`, the deadline check, the counter this pause records itself under, then the sleep
     /// -- called even with a zero `pause_ms` UNLESS `should_sleep` is false, which is reserved for the
@@ -453,6 +464,10 @@ private:
     /// Written immediately before a read-class give-up throws, cleared and read only by the resolve
     /// read that swallows it. Every other caller lets the exception carry the verdict.
     std::optional<ReadStop> last_read_stop;
+    RequestObserver request_observer;
+    /// The `PUT` count while a write's resolve read runs, 0 otherwise. A read failure is reported only
+    /// when it is set, so the caller's own reads stay silent.
+    uint32_t resolve_read_put_no = 0;
 };
 
 template <typename Fn>
@@ -487,6 +502,8 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         }
         catch (const std::exception & e)
         {
+            if (resolve_read_put_no != 0)
+                notifyRequest(resolve_read_put_no, &e);
             bool refreshed = false;
             if (refreshAndClassifyReadFault(e, refresh_attempted, refreshed))
                 throw;

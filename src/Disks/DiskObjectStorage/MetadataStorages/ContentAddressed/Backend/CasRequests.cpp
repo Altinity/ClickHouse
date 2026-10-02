@@ -6,6 +6,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
 #include <Common/logger_useful.h>
+#include <base/scope_guard.h>
 #include <base/sleep.h>
 
 #include "config.h"
@@ -898,6 +899,19 @@ std::optional<WriteResult> CasOperation::reissueAtOnce(WriteState & state, const
     return gatedPause(0, 2, state, bound, detail::recordReissue, /*should_sleep=*/false);
 }
 
+void CasOperation::notifyRequest(uint32_t attempt_no, const std::exception * failure) const noexcept
+{
+    if (!request_observer)
+        return;
+    try
+    {
+        request_observer(attempt_no, failure);
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+    }
+}
+
 WriteResult CasOperation::writeLoop(const String & key, const String & bytes, const std::optional<Etag> & expected,
                                     const Retry & policy, const Retry::Bound & bound, WriteState & state,
                                     ResolveWith resolve_refusal_with)
@@ -930,6 +944,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         detail::recordAttempt();
         ++state.attempts_sent;
         state.sent_any = true;
+        notifyRequest(state.attempts_sent, nullptr);
 
         /// Disengaged means the attempt threw: its fate is unproven, and nothing may be read out of it.
         std::optional<std::expected<String, Backend::RawConflict>> outcome;
@@ -956,6 +971,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         }
         catch (const Exception & e)
         {
+            notifyRequest(state.attempts_sent, &e);
             if (isDeterministicLocalFailure(e.code()))
                 throw;
             /// ONE refresh per call, only for the class a credential could explain, and only when a
@@ -1007,6 +1023,7 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         }
         catch (const std::exception & e)
         {
+            notifyRequest(state.attempts_sent, &e);
             /// Only the transport can have landed anything, and every exception it raises is a
             /// `Poco::Exception`. A local fault -- a bad allocation, a logic error raised inside the
             /// attempt -- is not a store answer, and settling it by a read would bury the bug behind an
@@ -1056,9 +1073,14 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         /// caller settles it with a HEAD; proving an ambiguous attempt landed needs the bytes, and there
         /// the body read is unavoidable.
         ProfileEvents::increment(ProfileEvents::CASRequestResolveRead);
-        const Resolved resolved = resolve_refusal_with == ResolveWith::Presence && !state.any_ambiguous
-            ? observePresence(key, policy, bound)
-            : observe(key, policy, bound);
+        resolve_read_put_no = state.attempts_sent;
+        Resolved resolved;
+        {
+            SCOPE_EXIT({ resolve_read_put_no = 0; });
+            resolved = resolve_refusal_with == ResolveWith::Presence && !state.any_ambiguous
+                ? observePresence(key, policy, bound)
+                : observe(key, policy, bound);
+        }
         state.last_seen = resolved.seen;
         /// A bound refused the resolve, so say WHICH. Erasing it here is what let a lost fence be
         /// reported as an ordinary conflict and a lease refusal as a policy deadline.
