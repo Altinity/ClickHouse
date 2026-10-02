@@ -1189,12 +1189,10 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     /// (5a) Stop and join both persistent mount-runtime workers outside `remount_mutex`.
     mount_runtime.stopBackgroundWorkers();
 
-    /// A remount attempt already IN FLIGHT when step 1 published the intent completes its current step
-    /// before the loop bails (the "one step + one backend timeout" bound of §5), and a successful reclaim in
-    /// that window re-arms the local fence (`lost = false`). Now that the remount worker is JOINED and can
-    /// never run again, re-latch the fence so the terminal `mayMutate() == false` holds regardless of any
-    /// such raced reclaim. Idempotent; the durable mount lease the reclaim wrote is retired by the
-    /// `finishTeardown` below (it operates on whatever renewer is current — the reclaimed one).
+    /// A reclaim in flight when step 1 published the intent finishes its current step, and the arming
+    /// rule refuses to arm after the intent. This second trip is a backstop: nothing can arm the fence
+    /// once the workers are joined. Idempotent; the durable mount lease such a reclaim wrote is retired
+    /// by the `finishTeardown` below (it operates on whatever renewer is current — the reclaimed one).
     mount_runtime.tripMountLost();
 
     /// (5b) Drain the ref lanes (bounded by one attempt's budget + safety margin) to learn whether a clean
@@ -1339,12 +1337,11 @@ bool Pool::tryRemountOnce()
     const uint64_t poll_interval_ms = std::max<uint64_t>(
         1, static_cast<uint64_t>(config.mount_renew_period.count()) / 2);
 
-    /// ==== Step 0 (rev.7 §2): pool lifecycle identity gate — BEFORE any claim/allocate/mount write ====
-    /// A remount attempt means the lease is presumed lost, so first ensure we are at least transient
-    /// (production reaches here already transient via `tripMountLost`; a direct/forced call may still be
-    /// `Live`). Then authoritatively probe the pool sentinels and dispatch per the §2 verdict table. Only
-    /// `Recover` (a present `_pool_meta` whose identity matches, in a non-`IdentityLost` state) falls
-    /// through to the existing recovery below; every other verdict resolves here and returns false.
+    /// ==== Step 0: pool lifecycle identity gate — BEFORE any claim/allocate/mount write ====
+    /// A reclaim starts with the fence latched and records the remount generation it serves. Then it
+    /// authoritatively probes the pool sentinels. Only `Recover` (a present `_pool_meta` whose identity
+    /// matches, in a non-`IdentityLost` state) falls through to the recovery below; every other verdict
+    /// resolves here and returns false.
     step = "lease_loss_transition";
     mount_runtime.beginReclaim();
     /// A fully-terminal `Vanished` pool never probes/claims/writes again.
@@ -1399,10 +1396,8 @@ bool Pool::tryRemountOnce()
                 /// BEFORE the intent was published, which that gate therefore cannot catch — could otherwise
                 /// settle `Vanished(replaced)` mid-FORGET, stranding FORGET's own
                 /// `enterVanished(VanishedForgotten)` (first terminal STATE transition wins) and mislabeling
-                /// the operator-visible reason. The bail lives HERE, at the terminal settle, so the
-                /// Recover/`armMountFence` reclaim path is untouched — its mid-FORGET fence re-arm is the
-                /// SEPARATE hazard `forgetDisk`'s post-join re-trip (trip#2) guards. Post-excision this is the
-                /// ONLY surviving mid-FORGET natural-terminal race (the old erasure-proof promotion is gone).
+                /// the operator-visible reason. Post-excision this is the ONLY surviving mid-FORGET
+                /// natural-terminal race (the old erasure-proof promotion is gone).
                 if (mount_runtime.vanishedIntentPublished())
                     return false;
                 mount_runtime.enterVanished(PoolLifecycle::VanishedReplaced, gate.reason);
@@ -1567,8 +1562,10 @@ bool Pool::tryRemountOnce()
             remount_anchor_boot_ms = mount_runtime.renewRenewerForRemountOnce();
         }
 
-        /// No-throw commit section: publish the fence and lifecycle only after epoch, renewer, recovery
-        /// cancellation, and ref-runtime quiescence are complete.
+        /// No-throw commit section: arm only after epoch, renewer, recovery cancellation, and ref-runtime
+        /// quiescence are complete, and only under the arming rule. A reclaim that claimed and did not
+        /// arm still returns true: its request is acknowledged, and a false would make the loop back off
+        /// and claim yet another epoch.
         step = "arm_fence";
         const uint64_t deadline_boot_ms = remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
             ? std::numeric_limits<uint64_t>::max()

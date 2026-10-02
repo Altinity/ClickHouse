@@ -281,14 +281,31 @@ void CasMountRuntime::armFence(uint64_t deadline_boot_ms, bool report_live)
 
 void CasMountRuntime::beginReclaim()
 {
-    (void)noteLeaseLost();
+    std::lock_guard lock(driver_mutex);
+    reclaim_generation = remount_requested_generation;
+    /// A request can come without a trip; latching here keeps the pool from running not `Live` on an
+    /// armed fence. Atomics only.
+    tripMountLost();
 }
 
 bool CasMountRuntime::armIfAdmissible(uint64_t deadline_boot_ms)
 {
-    armFence(deadline_boot_ms, /*report_live=*/false);
-    noteRemounted();
-    return true;
+    std::lock_guard lock(driver_mutex);
+    remount_handled_generation = std::max(remount_handled_generation, reclaim_generation);
+    const bool arm = canArm(deadline_boot_ms);
+    if (arm)
+        armFence(deadline_boot_ms, /*report_live=*/true);
+    else
+        setMountDeadline(deadline_boot_ms);
+    driver_cv.notify_all();
+    return arm;
+}
+
+bool CasMountRuntime::canArm(uint64_t /*deadline_boot_ms*/) const
+{
+    return !workers_stop_requested
+        && !remountTerminal()
+        && remount_requested_generation <= remount_handled_generation;
 }
 
 uint64_t CasMountRuntime::minActive()

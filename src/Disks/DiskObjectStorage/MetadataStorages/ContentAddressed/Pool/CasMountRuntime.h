@@ -185,14 +185,17 @@ public:
     void setMountDeadline(uint64_t deadline_boot_ms);
     /// Arm a new lease incarnation and clear any loss latched for the prior incarnation.
     void armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms);
-    /// Step 0 of a reclaim, before its identity probe: move a `Live` pool to `TransientNotLive`.
+    /// Step 0 of a reclaim. One step under `driver_mutex`: record the requested generation this attempt
+    /// serves and latch the fence.
     void beginReclaim();
-    /// End of a reclaim that claimed: publish `deadline_boot_ms`, arm the fence and report `Live`.
-    /// Returns whether it armed.
+    /// End of a reclaim that claimed. One step under `driver_mutex`: acknowledge the generation
+    /// `beginReclaim` recorded, publish the deadline, and arm the fence and report `Live` if the arming
+    /// rule holds. Returns whether it armed.
     bool armIfAdmissible(uint64_t deadline_boot_ms);
     /// Test-only interposition at the publication boundary between the re-armed generation and the
     /// live fence. A caller admitted from this hook must be refused: the old generation is already
-    /// dead, while the new generation is not live until `lost` is cleared.
+    /// dead, while the new generation is not live until `lost` is cleared. Through `armIfAdmissible`
+    /// it runs with `driver_mutex` held.
     void setArmMountFenceInterpositionHookForTest(std::function<void()> hook)
     {
         arm_mount_fence_interposition_hook_for_test = std::move(hook);
@@ -486,6 +489,10 @@ private:
     /// Publish `deadline_boot_ms` as a fresh lease incarnation and open the fence. With `report_live`,
     /// `Live` is published before the fence opens, so a reader that sees the fence armed reads `Live`.
     void armFence(uint64_t deadline_boot_ms, bool report_live);
+    /// The arming rule: no remount request pending, no stop requested, a lifecycle that is not
+    /// terminal. Requires `driver_mutex`, the mutex that a stop, a request and a terminal publication
+    /// take, so the check and the arm are one step.
+    bool canArm(uint64_t deadline_boot_ms) const;
     std::unique_lock<std::mutex> lockTerminalPublication();
 
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
@@ -541,6 +548,8 @@ private:
     std::chrono::milliseconds renewal_period{0};
     uint64_t remount_requested_generation = 0;
     uint64_t remount_handled_generation = 0;
+    /// The requested generation `beginReclaim` recorded; `armIfAdmissible` acknowledges it.
+    uint64_t reclaim_generation = 0;
     ThreadFromGlobalPool renewal_worker;
     ThreadFromGlobalPool remount_worker;
     /// Counted entries into `scheduleRemount`; retained as a test-only observability seam.
