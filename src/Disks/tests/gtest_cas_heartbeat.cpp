@@ -1185,6 +1185,34 @@ TEST(CASHeartbeat, ExpectedPredecessorThenLateLandingIsAdoptedExactly)
               decodeMountLease(backend->attempts[0].bytes).write_attempt_id);
 }
 
+namespace
+{
+/// One renewer over a scripted store, started on its own seeded claim, for the cases of
+/// `RenewReturnsWhatItsReportNeeds`. The clocks come first: hooks stored in `backend` capture them.
+struct ReportFieldsCase
+{
+    explicit ReportFieldsCase(String srid_)
+        : srid(std::move(srid_))
+    {
+        seedOwnClaim(ops.op, layout, srid, uuid, /*epoch=*/9, wall_ms, /*ttl_ms=*/1000);
+        renewer.start();
+        backend->attempts.clear();
+    }
+
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    String srid;
+    UInt128 uuid{1};
+    Layout layout{"pool"};
+    std::shared_ptr<RenewalScriptBackend> backend = std::make_shared<RenewalScriptBackend>();
+    Ops ops{backend, &boot_ms};
+    MountLeaseRenewer renewer{
+        ops.farewell, ops.lease, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(1000),
+        [this] { return wall_ms; }, [] { return uint64_t{0}; }, CasEventSink{}, std::chrono::milliseconds(20),
+        [this] { return boot_ms; }};
+};
+}
+
 TEST(CASHeartbeat, GcFenceAndVanishedMountStayTerminal)
 {
     const auto run_case = [](bool vanish)
@@ -1218,6 +1246,88 @@ TEST(CASHeartbeat, GcFenceAndVanishedMountStayTerminal)
     };
     run_case(false);
     run_case(true);
+}
+
+/// A renewal returns what its report names: the body it wrote or tried to write, why it ended, and
+/// how long it took on its own boot clock.
+TEST(CASHeartbeat, RenewReturnsWhatItsReportNeeds)
+{
+    {
+        ReportFieldsCase c("commit");
+        c.backend->on_attempt = [&boot_ms = c.boot_ms] { boot_ms += 250; };
+        const MountRenewResult result = c.renewer.renew(renewalEnvironment(c.boot_ms));
+        ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
+        ASSERT_EQ(c.backend->attempts.size(), 1u);
+        const MountLease sent = decodeMountLease(c.backend->attempts.back().bytes);
+        EXPECT_EQ(result.writer_epoch, 9u);
+        EXPECT_EQ(result.seq, 2u);
+        EXPECT_EQ(sent.seq, 2u);
+        EXPECT_NE(result.write_attempt_id, UInt128{});
+        EXPECT_EQ(result.write_attempt_id, sent.write_attempt_id);
+        EXPECT_EQ(result.classification, MountRenewTerminalClassification::Unclassified);
+        EXPECT_EQ(result.attempt_start_boot_ms, 100u);
+        EXPECT_EQ(result.elapsed_ms, 250u);
+    }
+
+    {
+        ReportFieldsCase c("conflict");
+        const String key = c.layout.mountKey(c.srid);
+        const auto got = c.ops.op.read(key, Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease foreign = decodeMountLease(got->bytes);
+        foreign.server_uuid = UInt128{2};
+        foreign.seq = 40;
+        foreign.write_attempt_id = UInt128{0xF0F0};
+        mustCommit(c.ops.op.replace(key, encodeMountLease(foreign), got->etag, Retry::standard()), "foreign slot");
+        c.backend->attempts.clear();
+        c.backend->on_attempt = [&boot_ms = c.boot_ms] { boot_ms += 250; };
+        const MountRenewResult result = c.renewer.renew(renewalEnvironment(c.boot_ms));
+        ASSERT_EQ(result.outcome, MountRenewOutcome::Terminal);
+        ASSERT_EQ(c.backend->attempts.size(), 1u);
+        const MountLease sent = decodeMountLease(c.backend->attempts.back().bytes);
+        EXPECT_EQ(result.classification, MountRenewTerminalClassification::Conflict);
+        EXPECT_EQ(result.writer_epoch, 9u);
+        EXPECT_EQ(result.seq, 2u) << "the seq this renewal tried to write, not the occupant's";
+        EXPECT_EQ(result.write_attempt_id, sent.write_attempt_id);
+        EXPECT_EQ(result.elapsed_ms, 250u);
+    }
+
+    {
+        ReportFieldsCase c("vanished");
+        const String key = c.layout.mountKey(c.srid);
+        const auto got = c.ops.op.read(key, Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        ASSERT_EQ(c.ops.op.remove(key, got->etag, Retry::standard()), Removal::Removed);
+        const MountRenewResult result = c.renewer.renew(renewalEnvironment(c.boot_ms));
+        ASSERT_EQ(result.outcome, MountRenewOutcome::Terminal);
+        EXPECT_EQ(result.classification, MountRenewTerminalClassification::Vanished);
+        EXPECT_EQ(result.seq, 2u);
+        EXPECT_NE(result.write_attempt_id, UInt128{});
+    }
+
+    {
+        /// Ended before its first request by a liveness that refuses with no stop requested.
+        ReportFieldsCase c("refused");
+        const MountRenewResult result = c.renewer.renew(renewalEnvironment(
+            c.boot_ms, /*live=*/[] { return false; }, /*cancelled=*/[] { return false; }));
+        ASSERT_EQ(result.outcome, MountRenewOutcome::Terminal);
+        EXPECT_TRUE(c.backend->attempts.empty());
+        EXPECT_EQ(result.classification, MountRenewTerminalClassification::FenceOrLifecycleLost);
+        EXPECT_EQ(result.writer_epoch, 9u);
+        EXPECT_EQ(result.seq, 2u);
+        EXPECT_NE(result.write_attempt_id, UInt128{}) << "the id is minted before the renewal is admitted";
+        EXPECT_EQ(result.elapsed_ms, 0u);
+    }
+
+    {
+        /// Ended before its first request by a stop.
+        ReportFieldsCase c("stopped");
+        const MountRenewResult result = c.renewer.renew(renewalEnvironment(
+            c.boot_ms, /*live=*/[] { return false; }, /*cancelled=*/[] { return true; }));
+        ASSERT_EQ(result.outcome, MountRenewOutcome::NotAttempted);
+        EXPECT_EQ(result.classification, MountRenewTerminalClassification::Cancelled);
+        EXPECT_EQ(result.seq, 2u);
+    }
 }
 
 TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)

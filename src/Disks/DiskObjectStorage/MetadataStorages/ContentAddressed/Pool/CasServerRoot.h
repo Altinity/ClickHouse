@@ -46,6 +46,19 @@ enum class MountRenewOutcome : uint8_t
     Terminal,
 };
 
+/// Why a renewal ended without retaining the lease, in the words of its audit event. `renew` sets it in
+/// the arm of the write's verdict that ended the renewal.
+enum class MountRenewTerminalClassification : uint8_t
+{
+    Unclassified,
+    DeterministicFailure,
+    Conflict,
+    Vanished,
+    Cancelled,
+    FenceOrLifecycleLost,
+    Unresolved,
+};
+
 struct MountRenewResult
 {
     MountRenewOutcome outcome = MountRenewOutcome::Terminal;
@@ -56,6 +69,14 @@ struct MountRenewResult
     bool resolved_by_read = false;
     bool sent_any = false;
     std::exception_ptr failure;
+    /// The body this renewal wrote or tried to write.
+    uint64_t writer_epoch = 0;
+    uint64_t seq = 0;
+    UInt128 write_attempt_id{};
+    /// `Unclassified` for a committed renewal.
+    MountRenewTerminalClassification classification = MountRenewTerminalClassification::Unclassified;
+    /// From `attempt_start_boot_ms` to the return of `renew`, on the renewal's boot clock.
+    uint64_t elapsed_ms = 0;
 };
 
 /// The spacing of a renewal's retries.
@@ -578,7 +599,9 @@ private:
     /// admit such a write: `start` establishes it and each committed renewal replaces it.
     const Etag & precondition() const;
     Etag claim(CasOperation & op, const String & body);
-    [[noreturn]] void throwRenewConflict(const Observation & seen) const;
+    /// Sets `classification` for the arm it takes, then throws what ended the renewal. The caller
+    /// holds the classification before the event sink runs, so the sink cannot change it.
+    [[noreturn]] void throwRenewConflict(const Observation & seen, MountRenewTerminalClassification & classification) const;
     MountRenewResult terminalResult(MountRenewResult result);
     void terminate(CasOperation & op);
 

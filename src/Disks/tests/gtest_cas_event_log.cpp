@@ -410,6 +410,31 @@ TEST(CASEvent, TerminalRenewalDetailsPreservePhysicalTruthAndClassification)
     }
 }
 
+/// A pending remount request ends the renewal before its first request, and its row says so.
+TEST(CASEvent, ATerminalRenewalThatSentNothingReportsZeroAttempts)
+{
+    auto backend = std::make_shared<RenewalEventBackend>();
+    auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
+    /// Heap-owned, not a plain local: the Pool can outlive this stack frame (a background publish holds
+    /// `shared_from_this()`), so a by-reference capture of a local would dangle.
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    auto store = openRenewalEventPool(backend, boot_ms, renewalEventBudget(), "renewal-sent-nothing");
+    store->setEventSink([events](CasEvent event)
+    {
+        events->push(std::move(event));
+    });
+
+    (void)store->scheduleRemountForTest();
+    EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
+
+    const std::vector<CasEvent> renewals = watermarkRenewEvents(events->snapshot());
+    ASSERT_EQ(renewals.size(), 1u);
+    EXPECT_EQ(renewals[0].outcome, "failed");
+    EXPECT_EQ(renewals[0].detail.at("attempts_sent"), "0");
+    EXPECT_EQ(renewals[0].detail.at("classification"), "fence_or_lifecycle_lost");
+    EXPECT_EQ(renewals[0].detail.at("seq"), "2");
+}
+
 TEST(CASEvent, ReentrantRenewalSinkPreservesOuterObservationIdentity)
 {
     auto backend = std::make_shared<RenewalEventBackend>();

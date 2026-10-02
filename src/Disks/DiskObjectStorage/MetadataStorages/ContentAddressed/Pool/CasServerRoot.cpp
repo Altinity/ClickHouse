@@ -97,20 +97,6 @@ uint64_t defaultBootMs()
     return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
 }
 
-/// Why a renewal ended without a retained lease, in the vocabulary the audit event reports. Each
-/// value is assigned from the write's verdict, so the event never re-derives a reason from state the
-/// request engine does not carry.
-enum class MountRenewTerminalClassification : uint8_t
-{
-    Unclassified,
-    DeterministicFailure,
-    Conflict,
-    Vanished,
-    Cancelled,
-    FenceOrLifecycleLost,
-    Unresolved,
-};
-
 /// One logical renewal's audit snapshot. Fixed-size and trivially copyable so a reentrant event sink
 /// gets a distinct stack slot instead of aliasing the call that is still running.
 struct MountRenewObservabilityContext
@@ -165,12 +151,6 @@ MountRenewObservabilityContext * currentMountRenewObservability() noexcept
     if (mount_renew_observability.suppressed_depth != 0 || mount_renew_observability.depth == 0)
         return nullptr;
     return &mount_renew_observability.contexts[mount_renew_observability.depth - 1];
-}
-
-void markMountRenewTermination(MountRenewTerminalClassification classification) noexcept
-{
-    if (MountRenewObservabilityContext * context = currentMountRenewObservability())
-        context->terminal_classification = classification;
 }
 
 enum class MountRenewObservabilityRegistration : uint8_t
@@ -463,6 +443,7 @@ void reportMountRenewCompletion(const MountRenewResult & result, std::optional<u
     if (!context || !context->active)
         return;
     context->completed = true;
+    context->terminal_classification = result.classification;
     context->outcome = result.outcome;
     context->attempts_sent = std::max(context->attempts_sent, result.attempts_sent);
     context->resolved_by_read = result.resolved_by_read;
@@ -1478,11 +1459,12 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
     return attempt_start_boot_ms;
 }
 
-[[noreturn]] void MountLeaseRenewer::throwRenewConflict(const Observation & seen) const
+[[noreturn]] void MountLeaseRenewer::throwRenewConflict(
+    const Observation & seen, MountRenewTerminalClassification & classification) const
 {
     if (const Object * occupant = std::get_if<Object>(&seen))
     {
-        markMountRenewTermination(MountRenewTerminalClassification::Conflict);
+        classification = MountRenewTerminalClassification::Conflict;
         const MountLease current = decodeMountLease(occupant->bytes);
         if (current.server_uuid == server_uuid && current.gc_fenced)
         {
@@ -1530,7 +1512,7 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
 
     if (std::holds_alternative<ProvenAbsent>(seen))
     {
-        markMountRenewTermination(MountRenewTerminalClassification::Vanished);
+        classification = MountRenewTerminalClassification::Vanished;
         emitMountEvent(
             event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
             "mount slot vanished while renewing -- failing closed");
@@ -1541,7 +1523,7 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
 
     /// The precondition was refused but nothing identifiable was read back: neither the successor nor
     /// an absence is established, so the only honest verdict is that this renewal settled nothing.
-    markMountRenewTermination(MountRenewTerminalClassification::Unresolved);
+    classification = MountRenewTerminalClassification::Unresolved;
     throwCasWriteRetryLater(fmt::format(
         "CAS mount-lease: key '{}' refused our precondition and the resolving read established neither "
         "an occupant nor an absence", key));
@@ -1611,6 +1593,14 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
 
     MountRenewResult result;
     result.attempt_start_boot_ms = attempt_start_boot_ms;
+    result.writer_epoch = writer_epoch;
+    result.seq = next_seq;
+    result.write_attempt_id = write_attempt_id;
+    const auto finished = [&boot_clock, attempt_start_boot_ms](MountRenewResult done)
+    {
+        done.elapsed_ms = elapsedSince(attempt_start_boot_ms, boot_clock());
+        return done;
+    };
 
     CasOperation op = lease_requests.admit(environment.live);
     if (environment.on_request)
@@ -1631,9 +1621,9 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
     catch (...)
     {
         /// The engine surfaces a deterministic local failure unchanged rather than reissuing it.
-        markMountRenewTermination(MountRenewTerminalClassification::DeterministicFailure);
+        result.classification = MountRenewTerminalClassification::DeterministicFailure;
         result.failure = std::current_exception();
-        return terminalResult(std::move(result));
+        return finished(terminalResult(std::move(result)));
     }
 
     if (Committed * committed = std::get_if<Committed>(&*written))
@@ -1649,7 +1639,7 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
         result.attempts_sent = committed->attempts_sent;
         result.resolved_by_read = committed->resolved_by_read;
         result.sent_any = committed->attempts_sent != 0;
-        return result;
+        return finished(std::move(result));
     }
 
     if (const Conflict * conflict = std::get_if<Conflict>(&*written))
@@ -1658,24 +1648,24 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
         result.attempts_sent = conflict->attempts_sent;
         try
         {
-            throwRenewConflict(conflict->seen);
+            throwRenewConflict(conflict->seen, result.classification);
         }
         catch (...)
         {
             result.failure = std::current_exception();
         }
-        return terminalResult(std::move(result));
+        return finished(terminalResult(std::move(result)));
     }
 
     if (const Refused * refused = std::get_if<Refused>(&*written))
     {
         result.sent_any = true;
         result.attempts_sent = refused->attempts_sent;
-        markMountRenewTermination(MountRenewTerminalClassification::DeterministicFailure);
+        result.classification = MountRenewTerminalClassification::DeterministicFailure;
         result.failure = std::make_exception_ptr(Exception(
             refused->store_error,
             "CAS mount-lease: the store refused the renewal of key '{}': {}", key, refused->message));
-        return terminalResult(std::move(result));
+        return finished(terminalResult(std::move(result)));
     }
 
     if (const GaveUp * gave_up = std::get_if<GaveUp>(&*written))
@@ -1687,9 +1677,9 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
         /// is a renewal that never ran, not one that lost its authority.
         if (gave_up->why == GaveUp::Why::FenceLost && !gave_up->sent_any && cancelled)
         {
-            markMountRenewTermination(MountRenewTerminalClassification::Cancelled);
+            result.classification = MountRenewTerminalClassification::Cancelled;
             result.outcome = MountRenewOutcome::NotAttempted;
-            return result;
+            return finished(std::move(result));
         }
 
         MountRenewTerminalClassification classification = MountRenewTerminalClassification::Unresolved;
@@ -1706,7 +1696,7 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
                 classification = MountRenewTerminalClassification::Unresolved;
                 break;
         }
-        markMountRenewTermination(classification);
+        result.classification = classification;
         result.failure = makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS mount-lease renewal for key '{}' did not retain the lease ({}, {} attempt sent, last "
             "observation: {})",
@@ -1714,7 +1704,7 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
             terminalClassificationName(classification),
             gave_up->sent_any ? "at least one" : "no",
             detail::renderObservation(gave_up->last_seen)));
-        return terminalResult(std::move(result));
+        return finished(terminalResult(std::move(result)));
     }
 
     /// The remaining alternative is `Declined`, which only a decide returning nothing produces; a
