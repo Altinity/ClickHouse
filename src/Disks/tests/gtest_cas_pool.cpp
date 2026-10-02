@@ -3708,7 +3708,8 @@ TEST(CASPoolRemount, NaturalTerminalTransitionMakesTheLeaseThreadExit)
 
 /// A terminal publication that races a wait of the lease loop is serialized by `driver_mutex`: it
 /// cannot land between the wait predicate's sample and the wait, so the thread exits without a stop.
-/// Two waits: the cadence wait and the reclaim backoff.
+/// Two waits: the cadence wait and the reclaim backoff. The backoff case checks only the exit: a missed
+/// edge there costs one backoff, at most 1 s here, so it does not catch an unserialized publication.
 TEST(CASPoolRemount, ALeaseWaitCannotMissNaturalTerminalPublication)
 {
     enum class Wait : uint8_t { Cadence, ReclaimBackoff };
@@ -4794,6 +4795,7 @@ TEST(CASMountRuntime, AnInterferenceReportDuringAReclaimIsServedByTheNextReclaim
         bool may_mutate_at_second_entry = true;
         bool second_armed = false;
         std::future<void> report;
+        std::atomic<bool> report_never_started{false};
         DB::Cas::tests::ManualBarrier second_done;
         CasMountRuntime * runtime_ptr = nullptr;
         CasEventSink sink;
@@ -4817,7 +4819,21 @@ TEST(CASMountRuntime, AnInterferenceReportDuringAReclaimIsServedByTheNextReclaim
                         /// there and can finish only after the arm's section.
                         reclaiming.setArmMountFenceInterpositionHookForTest([&]
                         {
+                            const uint64_t requests_before = runtime_ptr->scheduleRemountCallCountForTest();
                             report = std::async(std::launch::async, [&] { runtime_ptr->tripAndRequestRemount(); });
+                            /// One step: the count rises before the lock, so no trip has landed yet. Two
+                            /// steps: the unlocked trip lands before the count rises, and the arm clears it.
+                            /// The bound only turns a hang into a failure.
+                            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+                            while (runtime_ptr->scheduleRemountCallCountForTest() == requests_before)
+                            {
+                                if (std::chrono::steady_clock::now() >= until)
+                                {
+                                    report_never_started = true;
+                                    break;
+                                }
+                                std::this_thread::yield();
+                            }
                         });
                     }
                     first_armed = reclaiming.armIfAdmissible(boot_ms + 1000);
@@ -4845,6 +4861,7 @@ TEST(CASMountRuntime, AnInterferenceReportDuringAReclaimIsServedByTheNextReclaim
         runtime.scheduleRemount();
 
         second_done.waitUntilArrived();
+        EXPECT_FALSE(report_never_started.load()) << "the report did not start within the bound";
         if (report_at == ReportAt::BeforeTheArm)
             EXPECT_FALSE(first_armed) << "a report raised during the reclaim must stop its arm";
         else

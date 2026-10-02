@@ -303,6 +303,13 @@ bool CasMountRuntime::canArm(uint64_t /*deadline_boot_ms*/) const
         && remount_requested_generation <= remount_handled_generation;
 }
 
+bool CasMountRuntime::lossNeedsNewRequest() const
+{
+    /// A request up to `reclaim_generation` was snapshotted by a reclaim that latched before this loss,
+    /// so it does not cover the loss.
+    return remount_requested_generation <= std::max(remount_handled_generation, reclaim_generation);
+}
+
 void CasMountRuntime::checkRenewerOwner() const
 {
     if (workers_started && lease_thread_id != std::this_thread::get_id())
@@ -511,8 +518,7 @@ void CasMountRuntime::consumeRenewResult(const MountRenewResult & result, RenewC
                     }
                     tripMountLost();
                     schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
-                    /// A pending request already covers this loss.
-                    if (!remountTerminal() && remount_requested_generation == remount_handled_generation)
+                    if (!remountTerminal() && lossNeedsNewRequest())
                         ++remount_requested_generation;
                     break;
                 case RenewCaller::Direct:
@@ -1024,9 +1030,7 @@ void CasMountRuntime::tripAndRequestRemount()
     tripMountLost();
     if (workers_stop_requested || remountTerminal())
         return;
-    /// A request in `reclaim_generation` is already being served by a reclaim that latched before this
-    /// trip, so it does not cover the trip.
-    if (remount_requested_generation <= std::max(remount_handled_generation, reclaim_generation))
+    if (lossNeedsNewRequest())
         ++remount_requested_generation;
     driver_cv.notify_all();
 }

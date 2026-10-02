@@ -387,8 +387,8 @@ public:
     void tripAndRequestRemount();
     bool scheduleRemountForTest();
     void beginShutdownForTest();
-    /// Return how many times `scheduleRemount` was entered, including calls refused by the background
-    /// setting. This is useful for testing the renewer's loss callback without starting a real recovery.
+    /// Return how many remount requests were attempted, refused ones included: `scheduleRemount`,
+    /// `tripAndRequestRemount` and the loop's terminal renewals. This is useful for testing the renewer's loss callback without starting a real recovery.
     uint64_t scheduleRemountCallCountForTest() const
     {
         return schedule_remount_calls_for_test.load(std::memory_order_relaxed);
@@ -460,6 +460,10 @@ private:
     /// terminal. Requires `driver_mutex`, the mutex that a stop, a request and a terminal publication
     /// take, so the check and the arm are one step.
     bool canArm(uint64_t deadline_boot_ms) const;
+    /// Whether a new loss needs a new remount generation. Requires `driver_mutex`. False only while a
+    /// request that no reclaim has snapshotted is pending: the reclaim that serves it latches after the
+    /// loss.
+    bool lossNeedsNewRequest() const;
     /// Throws `LOGICAL_ERROR` when a lease thread runs and the caller is not it. Requires `driver_mutex`.
     void checkRenewerOwner() const;
     std::unique_lock<std::mutex> lockTerminalPublication();
