@@ -98,8 +98,8 @@ uint64_t defaultBootMs()
 }
 
 /// Why a renewal ended without a retained lease, in the vocabulary the audit event reports. Each
-/// value is assigned from exactly one arm of the write's verdict, so the event never re-derives a
-/// reason from state the request engine does not carry.
+/// value is assigned from the write's verdict, so the event never re-derives a reason from state the
+/// request engine does not carry.
 enum class MountRenewTerminalClassification : uint8_t
 {
     Unclassified,
@@ -108,8 +108,6 @@ enum class MountRenewTerminalClassification : uint8_t
     Vanished,
     Cancelled,
     FenceOrLifecycleLost,
-    ExternalLeaseDeadline,
-    RequestDeadline,
     Unresolved,
 };
 
@@ -333,8 +331,6 @@ constexpr std::string_view terminalClassificationName(MountRenewTerminalClassifi
         case MountRenewTerminalClassification::Vanished: return "vanished";
         case MountRenewTerminalClassification::Cancelled: return "cancelled";
         case MountRenewTerminalClassification::FenceOrLifecycleLost: return "fence_or_lifecycle_lost";
-        case MountRenewTerminalClassification::ExternalLeaseDeadline: return "external_lease_deadline";
-        case MountRenewTerminalClassification::RequestDeadline: return "request_deadline";
         case MountRenewTerminalClassification::Unresolved: return "unresolved";
         case MountRenewTerminalClassification::Unclassified: return "terminal_unclassified";
     }
@@ -1686,8 +1682,6 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
     {
         result.sent_any = gave_up->sent_any;
         result.attempts_sent = gave_up->attempts_sent;
-        if (gave_up->why == GaveUp::Why::Deadline)
-            result.deadline_source = gave_up->deadline_source;
 
         /// Nothing was sent and the node was already stopping: the lease is exactly as it was, so this
         /// is a renewal that never ran, not one that lost its authority.
@@ -1706,11 +1700,8 @@ MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment &
                     ? MountRenewTerminalClassification::Cancelled
                     : MountRenewTerminalClassification::FenceOrLifecycleLost;
                 break;
+            /// Reachable only at the end of the clock's range: the policy has no lease bound and no window.
             case GaveUp::Why::Deadline:
-                classification = gave_up->deadline_source == GaveUp::Source::Lease
-                    ? MountRenewTerminalClassification::ExternalLeaseDeadline
-                    : MountRenewTerminalClassification::RequestDeadline;
-                break;
             case GaveUp::Why::Unresolved:
                 classification = MountRenewTerminalClassification::Unresolved;
                 break;

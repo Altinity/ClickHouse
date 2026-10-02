@@ -30,7 +30,6 @@ namespace ProfileEvents
     extern const Event CASMountRenewalRetries;
     extern const Event CASMountRenewalResolved;
     extern const Event CASMountRenewalRecovered;
-    extern const Event CASMountRenewalDeadlineExceeded;
 }
 
 namespace DB::Cas
@@ -548,9 +547,6 @@ void CasMountRuntime::consumeRenewResult(const MountRenewResult & result)
 
     if (result.outcome == MountRenewOutcome::Committed && (result.attempts_sent > 1 || result.resolved_by_read))
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRecovered);
-    if (result.outcome == MountRenewOutcome::Terminal
-        && result.deadline_source == GaveUp::Source::Lease)
-        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalDeadlineExceeded);
 
     /// One step under `driver_mutex`. The loop reads the remount generations only after it, so no
     /// reclaim can arm between a commit and the publication of its deadline.

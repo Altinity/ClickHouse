@@ -24,7 +24,6 @@ extern const Event CASMountRenewalAttempts;
 extern const Event CASMountRenewalRetries;
 extern const Event CASMountRenewalResolved;
 extern const Event CASMountRenewalRecovered;
-extern const Event CASMountRenewalDeadlineExceeded;
 }
 
 using namespace DB::Cas;
@@ -91,7 +90,6 @@ struct RenewalCounterSnapshot
     uint64_t retries;
     uint64_t resolved;
     uint64_t recovered;
-    uint64_t deadline_exceeded;
 };
 
 RenewalCounterSnapshot renewalCounters()
@@ -102,7 +100,6 @@ RenewalCounterSnapshot renewalCounters()
         .retries = global_counters[ProfileEvents::CASMountRenewalRetries].load(),
         .resolved = global_counters[ProfileEvents::CASMountRenewalResolved].load(),
         .recovered = global_counters[ProfileEvents::CASMountRenewalRecovered].load(),
-        .deadline_exceeded = global_counters[ProfileEvents::CASMountRenewalDeadlineExceeded].load(),
     };
 }
 
@@ -112,14 +109,12 @@ void expectRenewalCounterDelta(
     uint64_t attempts,
     uint64_t retries,
     uint64_t resolved,
-    uint64_t recovered,
-    uint64_t deadline_exceeded)
+    uint64_t recovered)
 {
     EXPECT_EQ(after.attempts - before.attempts, attempts);
     EXPECT_EQ(after.retries - before.retries, retries);
     EXPECT_EQ(after.resolved - before.resolved, resolved);
     EXPECT_EQ(after.recovered - before.recovered, recovered);
-    EXPECT_EQ(after.deadline_exceeded - before.deadline_exceeded, deadline_exceeded);
 }
 
 /// Publish ONE ref naming a single-blob part through the real writer sequence (mirrors
@@ -169,7 +164,7 @@ TEST(CASObservability, RenewalCountersHaveExactPhysicalAndLogicalDeltas)
         const RenewalCounterSnapshot before = renewalCounters();
         EXPECT_NO_THROW(store->renewWatermarkOnce());
         const RenewalCounterSnapshot after = renewalCounters();
-        expectRenewalCounterDelta(before, after, attempts, retries, resolved, recovered, 0);
+        expectRenewalCounterDelta(before, after, attempts, retries, resolved, recovered);
     };
 
     run(RenewalCounterBackend::Fault::None, /*attempts=*/1, /*retries=*/0, /*resolved=*/0, /*recovered=*/0);

@@ -133,22 +133,18 @@ follows:
   request; `committed_after_retry` means a later identical physical `PUT` completed and the response
   itself proved it; `committed_after_expiry` means the renewal restored a lease that had expired (the
   row also has `expired_ms`). When more than one applies, the first of those three in that order wins.
-- `outcome = 'failed'` carries the decisive `classification`: `external_lease_deadline` (the
-  confirmed lease's own safety margin, not the request policy, ran out first — check object-store
-  latency or `BOOTTIME` advancement before anything else), `request_deadline` (the ninety-second
-  request policy exhausted first), `unresolved` (every attempt was ambiguous and never settled by
+- `outcome = 'failed'` carries the decisive `classification`: `unresolved` (every attempt was ambiguous and never settled by
   the time the operation gave up), `conflict` (an exact resolve read found another body — a
   same-pair twin, a GC-fenced body, a successor epoch, or a foreign holder), `cancelled` (a
-  renewal in flight was cancelled by shutdown or a remount park request; expected during graceful
-  shutdown), `fence_or_lifecycle_lost` (another local fence loss or a terminal lifecycle transition
-  closed admission while the operation was active), `deterministic_failure` (the store's own
+  renewal in flight was cancelled by shutdown; expected during graceful shutdown),
+  `fence_or_lifecycle_lost` (a pending remount request or a terminal lifecycle, including a published
+  FORGET intent, ended the renewal), `deterministic_failure` (the store's own
   answer proved the write never applied), and `vanished` (an exact resolve read proved the mount
   slot absent — the pool directory was removed or renamed out of band, or a decommission raced the
   renewal). `terminal_unclassified` means the renewal terminated through a path that assigned no
   classification; that is a defect to report together with the surrounding rows, not an operator
   condition. Do not collapse these into a generic timeout — the action
-  differs by classification, and only `external_lease_deadline` and `request_deadline` are about a
-  deadline at all.
+  differs by classification.
 - A following `mount_remount` row names the whole-chain `attempt_no` and final `step`. An `ok` row
   with `step = 'publish_live'` restored `Live` under the reported fresh `writer_epoch`; with
   `step = 'claimed_not_armed'` the claim succeeded with too little lease to admit a write, and the next

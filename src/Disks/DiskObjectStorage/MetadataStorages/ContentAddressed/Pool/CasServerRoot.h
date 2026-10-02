@@ -55,9 +55,6 @@ struct MountRenewResult
     uint32_t attempts_sent = 0;
     bool resolved_by_read = false;
     bool sent_any = false;
-    /// Which bound ended a renewal that ran out of time; unset for every other ending, including a
-    /// committed one -- no deadline ended it, so naming one would invent a fact.
-    std::optional<GaveUp::Source> deadline_source;
     std::exception_ptr failure;
 };
 

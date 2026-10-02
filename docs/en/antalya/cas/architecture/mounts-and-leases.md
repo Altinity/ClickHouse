@@ -88,9 +88,7 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   suspend correctly observes itself expired. The deadline decides about writes: none is admitted past
   it, and none is admitted once the remaining lease cannot cover the requests it may send plus the
   safety margin. The background renewal does not stop at the deadline. It retries timeouts, `5xx`
-  answers and connection errors about a second apart until the store answers. The renewals at startup,
-  after a remount and the direct renewal stay bounded: they stop at the last confirmed deadline minus
-  the safety margin. A retry, `GET`, response timestamp, or wall-clock step never extends authority.
+  answers and connection errors about a second apart until the store answers. A retry, `GET`, response timestamp, or wall-clock step never extends authority.
 - **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
   10 s), with TTL `cas_mount_lease_ttl_ms` (default 30 s, TTL/3 renewal ratio). The next beat is anchored
   at the committed body's pre-I/O BOOTTIME start. A slow recovery therefore causes an immediate
@@ -142,10 +140,10 @@ local fence (latches `lost`, bumps the fence generation, moves the in-process ru
 `TransientNotLive`) and latches one self-remount generation. A confirmed foreign/successor or
 same-pair conflict remains a typed fail-closed error; it is never adopted. A real fence still costs
 only an epoch: recovery reclaims with a fresh one, bounded at three whole-chain attempts. This is the
-general CAS posture: doubt about the source fails closed. Fenced mutations and the bounded renewals
-(startup, remount and direct) retry transport ambiguity only inside authority already proved by the last
-confirmed lease. The background renewal may keep retrying after that lease has expired; write authority
-stays bounded by the start of the renewal that last succeeded plus the TTL.
+general CAS posture: doubt about the source fails closed. Fenced mutations retry transport ambiguity
+only inside authority already proved by the last confirmed lease. The renewal may keep retrying after
+that lease has expired; write authority stays bounded by the start of the renewal that last succeeded
+plus the TTL.
 
 GC's own view of a dead server is symmetric and clock-skew-immune: a slot becomes fence-eligible only
 after the leader observes the *same* renewal token hold stable, on its own monotonic clock, for `TTL +

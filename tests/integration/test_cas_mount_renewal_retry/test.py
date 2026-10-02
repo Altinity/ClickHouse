@@ -25,7 +25,6 @@ RENEWAL_EVENTS = (
     "CASMountRenewalRetries",
     "CASMountRenewalResolved",
     "CASMountRenewalRecovered",
-    "CASMountRenewalDeadlineExceeded",
     "CASMountLeaseLost",
     "CASMountLeaseExpired",
     "CASRemountAttempts",
@@ -457,7 +456,6 @@ def test_transient_mount_renewal_retries_without_remount(start_cluster):
     assert delta["CASMountRenewalAttempts"] > 1, delta
     assert delta["CASMountRenewalRetries"] > 0, delta
     assert delta["CASMountRenewalRecovered"] > 0, delta
-    assert delta["CASMountRenewalDeadlineExceeded"] == 0, delta
     assert delta["CASRemountAttempts"] == 0, delta
     assert delta["CASRemountSucceeded"] == 0, delta
     assert delta["CASRemountFailed"] == 0, delta
@@ -584,7 +582,6 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
     assert delta["CASMountRenewalRetries"] == 0, delta
     assert delta["CASMountRenewalResolved"] == 1, delta
     assert delta["CASMountRenewalRecovered"] == 1, delta
-    assert delta["CASMountRenewalDeadlineExceeded"] == 0, delta
     assert delta["CASRemountAttempts"] == 0, delta
     assert delta["CASRemountSucceeded"] == 0, delta
     assert delta["CASRemountFailed"] == 0, delta

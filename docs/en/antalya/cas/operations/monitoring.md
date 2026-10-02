@@ -59,16 +59,15 @@ window and correlate them with the `server_root_id` in `system.cas_log`.
 | `CASMountRenewalRetries` | One per physical renewal `PUT` after the first in the same logical renewal | Positive growth shows in-period retry, not a later cadence beat |
 | `CASMountRenewalResolved` | One per logical renewal proved committed by an exact resolving `GET` | A response was ambiguous, but exact bytes and `write_attempt_id` proved the write |
 | `CASMountRenewalRecovered` | One per logical renewal committed after a retry or exact resolving `GET` | Recovered object-store blips that retained the existing mount incarnation |
-| `CASMountRenewalDeadlineExceeded` | One per logical renewal stopped by the external lease-safety deadline | The last confirmed lease no longer left enough safe time; this is narrower than request-budget exhaustion. Only the bounded renewals (startup, remount and direct) can reach it; the background renewal does not |
 | `CASMountLeaseExpired` | One per renewal that restored a lease that had expired | Moves at the restore, not when the lease expires. While it is expired, `system.cas_mounts` shows `lifecycle_reason = 'lease_expired'` and writes are refused; the `watermark_renew` row of the restoring renewal carries `expired_ms` |
 | `CASRemountAttempts` | One per invocation of the existing whole-chain remount attempt | Includes both successful and failed attempts |
 | `CASRemountSucceeded` | One per whole-chain attempt that completed every step through the arm step, under a fresh writer epoch | Must be a subset of `CASRemountAttempts`. Includes a reclaim whose claim left too little lease to arm the fence (`step = 'claimed_not_armed'`); the next renewal arms it |
 | `CASRemountFailed` | One per whole-chain attempt that stopped before the arm step | Includes a named step exception or a step that returned transiently, also after the mount claim succeeded (for example at `renewer_start` or `quiesce_ref_tables`) |
 
-`CASMountLeaseLost` complements those nine counters. It increments exactly once per operational
+`CASMountLeaseLost` complements those counters. It increments exactly once per operational
 `Live -> TransientNotLive` recovery generation: either the initiating external loss or the first
-ordinary terminal renewal consumer owns it. A parked terminal result and shutdown do not duplicate
-the count.
+ordinary terminal renewal consumer owns it. A renewal ended by a pending remount request does not
+duplicate the count, and neither does shutdown.
 
 To inspect the current cumulative values, including counters that have never incremented:
 
@@ -77,7 +76,7 @@ SELECT event, value
 FROM system.events
 WHERE event IN (
     'CASMountRenewalAttempts', 'CASMountRenewalRetries', 'CASMountRenewalResolved',
-    'CASMountRenewalRecovered', 'CASMountRenewalDeadlineExceeded', 'CASMountLeaseLost',
+    'CASMountRenewalRecovered', 'CASMountLeaseLost',
     'CASMountLeaseExpired', 'CASRemountAttempts', 'CASRemountSucceeded', 'CASRemountFailed')
 SETTINGS system_events_show_zero_values = 1;
 ```
