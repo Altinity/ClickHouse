@@ -70,8 +70,6 @@ namespace ProfileEvents
 namespace DB::Cas
 {
 
-void deliverDeferredMountRenewObservability(uint64_t remount_attempt_no) noexcept;
-
 namespace
 {
 
@@ -1239,8 +1237,6 @@ bool Pool::tryRemountOnce()
     String error;
     SCOPE_EXIT(
     {
-        deliverDeferredMountRenewObservability(attempt_no);
-
         if (succeeded)
             ProfileEvents::increment(ProfileEvents::CASRemountSucceeded);
         else

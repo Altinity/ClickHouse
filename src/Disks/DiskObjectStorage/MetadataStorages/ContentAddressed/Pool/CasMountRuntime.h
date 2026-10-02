@@ -443,7 +443,8 @@ private:
     /// the restore and returns it for the caller to log after the unlock. Empty when the lease was not
     /// expired or is still expired.
     std::optional<RestoredLease> publishRenewedDeadline(uint64_t deadline_boot_ms);
-    void consumeRenewResult(const MountRenewResult & result);
+    /// The consume step: takes `driver_mutex` itself and returns the restore for the caller to log.
+    std::optional<RestoredLease> consumeRenewResult(const MountRenewResult & result);
     void renewalLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);
     /// The renewal's liveness: no stop, no pending remount request, no terminal lifecycle (a published

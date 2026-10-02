@@ -79,6 +79,16 @@ struct MountRenewResult
     uint64_t elapsed_ms = 0;
 };
 
+/// One event and one log line for a renewal that retried, was resolved by a read, restored an expired
+/// lease, or ended terminal; silent otherwise. `lease_deadline_before_boot_ms` is the lease deadline
+/// the renewal started under. Never throws.
+void reportMountRenewCompletion(
+    const MountRenewResult & result,
+    const String & server_root_id,
+    const CasEventSink & event_sink,
+    uint64_t lease_deadline_before_boot_ms,
+    std::optional<uint64_t> expired_ms) noexcept;
+
 /// The spacing of a renewal's retries.
 inline constexpr uint64_t kMountRenewRetrySpacingMs = 1000;
 

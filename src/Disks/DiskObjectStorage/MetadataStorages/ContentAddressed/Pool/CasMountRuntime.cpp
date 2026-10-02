@@ -35,10 +35,6 @@ namespace ProfileEvents
 namespace DB::Cas
 {
 
-void reportMountRenewCompletion(const MountRenewResult & result, std::optional<uint64_t> expired_ms) noexcept;
-void configureMountRenewObservability(
-    const String * server_root_id, const CasEventSink * event_sink, bool deferred) noexcept;
-
 namespace
 {
 /// Wall-clock seconds since epoch — the `since` timestamp the lifecycle snapshot reports (spec §7). A
@@ -540,7 +536,7 @@ void CasMountRuntime::sleepInterruptibly(uint64_t ms)
     driver_cv.wait_for(lock, std::chrono::milliseconds(ms), [this] { return workers_stop_requested; });
 }
 
-void CasMountRuntime::consumeRenewResult(const MountRenewResult & result)
+std::optional<CasMountRuntime::RestoredLease> CasMountRuntime::consumeRenewResult(const MountRenewResult & result)
 {
     if (result.resolved_by_read)
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalResolved);
@@ -581,25 +577,8 @@ void CasMountRuntime::consumeRenewResult(const MountRenewResult & result)
         driver_cv.notify_all();
     }
 
-    if (restored)
-        LOG_WARNING(getLogger("CasPool"),
-            "CAS mount lease of '{}' was expired for {} ms; a renewal restored it and writes resume. "
-            "Last failed renewal request: {}",
-            server_root_id, restored->expired_ms, restored->last_failure);
-
-    if (result.outcome == MountRenewOutcome::Committed)
-    {
-        std::optional<uint64_t> expired_ms;
-        if (restored)
-            expired_ms = restored->expired_ms;
-        reportMountRenewCompletion(result, expired_ms);
-        return;
-    }
-    if (result.outcome == MountRenewOutcome::NotAttempted)
-    {
-        reportMountRenewCompletion(result, std::nullopt);
-        return;
-    }
+    if (result.outcome != MountRenewOutcome::Terminal)
+        return restored;
 
     if (!result.failure)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: terminal renewal has no failure");
@@ -615,8 +594,7 @@ void CasMountRuntime::consumeRenewResult(const MountRenewResult & result)
     catch (...)
     {
     }
-
-    reportMountRenewCompletion(result, std::nullopt);
+    return restored;
 }
 
 MountRenewResult CasMountRuntime::renewOnce()
@@ -631,9 +609,19 @@ MountRenewResult CasMountRuntime::renewOnce()
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal requires an Active renewer");
         renewer = mount_renewer.get();
     }
-    configureMountRenewObservability(&server_root_id, &event_sink, /*deferred=*/false);
+    const uint64_t lease_deadline_before_boot_ms = mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
     const MountRenewResult result = renewer->renew(renewalEnvironment());
-    consumeRenewResult(result);
+    const std::optional<RestoredLease> restored = consumeRenewResult(result);
+
+    if (restored)
+        LOG_WARNING(getLogger("CasPool"),
+            "CAS mount lease of '{}' was expired for {} ms; a renewal restored it and writes resume. "
+            "Last failed renewal request: {}",
+            server_root_id, restored->expired_ms, restored->last_failure);
+    std::optional<uint64_t> expired_ms;
+    if (restored)
+        expired_ms = restored->expired_ms;
+    reportMountRenewCompletion(result, server_root_id, event_sink, lease_deadline_before_boot_ms, expired_ms);
     return result;
 }
 
