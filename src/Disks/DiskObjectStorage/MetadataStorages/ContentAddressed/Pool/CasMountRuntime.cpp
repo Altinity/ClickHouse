@@ -156,16 +156,11 @@ Fence::Admit CasMountRuntime::budgetAdmits(uint64_t deadline_boot_ms, uint64_t n
     return Fence::Admit::Ok;
 }
 
-uint64_t CasMountRuntime::refAppendReservationMs() const
-{
-    /// Two envelopes: a write and its settlement read, which is what `writeLoop` reserves.
-    const uint64_t envelope_ms = cas_request_budget.attemptEnvelopeMs();
-    return envelope_ms > std::numeric_limits<uint64_t>::max() / 2 ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
-}
-
 bool CasMountRuntime::refAppendFenceOk() const
 {
-    return admit(fenceGeneration(), refAppendReservationMs()) == Fence::Admit::Ok;
+    /// A write and its settlement read, which is what `writeLoop` reserves: a ref-log attempt is not
+    /// started when it cannot plausibly finish, safety margin included, before the lease expires.
+    return admit(fenceGeneration(), cas_request_budget.writeAndSettlementReadMs()) == Fence::Admit::Ok;
 }
 
 std::optional<uint64_t> CasMountRuntime::leaseExpiredAt(uint64_t now_boot_ms) const
@@ -361,7 +356,7 @@ bool CasMountRuntime::canArm(uint64_t deadline_boot_ms) const
     return !workers_stop_requested
         && !remountTerminal()
         && remount_requested_generation <= remount_handled_generation
-        && budgetAdmits(deadline_boot_ms, bootMsNow(), refAppendReservationMs()) == Fence::Admit::Ok;
+        && budgetAdmits(deadline_boot_ms, bootMsNow(), cas_request_budget.writeAndSettlementReadMs()) == Fence::Admit::Ok;
 }
 
 bool CasMountRuntime::lossNeedsNewRequest() const

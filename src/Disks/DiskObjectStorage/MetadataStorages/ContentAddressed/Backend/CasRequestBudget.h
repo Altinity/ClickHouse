@@ -33,6 +33,11 @@ struct CasRequestBudget
     /// every attempt it starts.
     uint64_t attemptEnvelopeMs() const;
 
+    /// What a conditional write can cost end to end: its attempt and the read that settles it, two
+    /// envelopes, saturating. Ref-log appends are admitted against this, and so is the renewal cadence rule
+    /// of `validateCasRequestBudget`.
+    uint64_t writeAndSettlementReadMs() const;
+
     /// Recovery-level retry (`CasRefLedger::ensureRefTableRecovered`): a whole ref-table recovery
     /// attempt (LIST + snapshot/log GETs + seal PUT) that fails with a transient NETWORK_ERROR is
     /// retried, with capped-exponential backoff, until this total wall-clock budget is spent — then the

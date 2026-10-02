@@ -1340,6 +1340,26 @@ TEST(CASRequestBudget, ValidateAcceptsDefaultsAndRejectsAnOverflowingSumWithoutW
     });
 }
 
+TEST(CASRequestBudget, WriteAndSettlementReadIsTwoEnvelopesAndSaturates)
+{
+    const CasRequestBudget defaults{};
+    EXPECT_EQ(defaults.attemptEnvelopeMs(), 7000u);
+    EXPECT_EQ(defaults.writeAndSettlementReadMs(), 14000u);
+
+    /// No S3 client: the envelope is the attempt alone.
+    const CasRequestBudget no_connect_cap{.attempt_timeout_ms = 5000, .connect_timeout_cap_ms = std::nullopt};
+    EXPECT_EQ(no_connect_cap.writeAndSettlementReadMs(), 10'000u);
+
+    /// The largest envelope that doubles without wrapping, and the first one that does not.
+    constexpr uint64_t half_max = std::numeric_limits<uint64_t>::max() / 2;
+    const CasRequestBudget fits{.attempt_timeout_ms = half_max - 2000};
+    ASSERT_EQ(fits.attemptEnvelopeMs(), half_max);
+    EXPECT_EQ(fits.writeAndSettlementReadMs(), 2 * half_max);
+    const CasRequestBudget wraps{.attempt_timeout_ms = half_max - 1999};
+    ASSERT_EQ(wraps.attemptEnvelopeMs(), half_max + 1);
+    EXPECT_EQ(wraps.writeAndSettlementReadMs(), std::numeric_limits<uint64_t>::max());
+}
+
 /// Pool::open must call validateCasRequestBudget itself (not just the free function in isolation,
 /// pinned directly above): an inconsistent cas_request_budget must refuse a writable mount end-to-end
 /// (RFC cas-s3-timeout-retry-control §required-timeout-model), never mount silently with a budget that

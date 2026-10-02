@@ -463,8 +463,6 @@ private:
     bool canArm(uint64_t deadline_boot_ms) const;
     /// `admit`'s budget verdict for a lease that ends at `deadline_boot_ms`, at `now_boot_ms`.
     Fence::Admit budgetAdmits(uint64_t deadline_boot_ms, uint64_t now_boot_ms, uint64_t needed_ms) const;
-    /// What a ref append reserves: a write and the read that settles it, two attempt envelopes.
-    uint64_t refAppendReservationMs() const;
     /// Whether a new loss needs a new remount generation. Requires `driver_mutex`. False only while a
     /// request that no reclaim has snapshotted is pending: the reclaim that serves it latches after the
     /// loss.
