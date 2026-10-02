@@ -105,19 +105,29 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
 
 **A transient renewal failure does not end the mount.** `MountLeaseRenewer` is a synchronous
 durable-slot state machine. A committed result advances its token, sequence, confirmed BOOTTIME
-deadline, and cadence anchor. The background renewal moves it to `RenewalTerminal` only on a definitive
-answer: a confirmed foreign, successor or same-pair body, `gc_fenced`, an absent object, a request the
-store refuses on a clear attempt, or a stop or remount request. A terminal renewer cannot mint another
-body or publish a clean farewell. Owner cancellation before any request is the only `NotAttempted`
+deadline, and cadence anchor. The background renewal ends, and moves the renewer to `RenewalTerminal`,
+only on one of these:
+
+- a definitive answer from the store: a confirmed foreign, successor or same-pair body, `gc_fenced`, an
+  absent object, or a request the store refuses on a clear attempt;
+- a stop or a remount request;
+- a deterministic local failure;
+- a terminal lifecycle state;
+- a lost fence.
+
+A terminal renewer cannot mint another body or publish a clean farewell. Owner cancellation before any request is the only `NotAttempted`
 result and leaves clean release possible. Cancellation after a request was sent is terminal because
 that request may still land.
 
 While retries continue past the lease deadline, the lease is *expired*. New durable writes are refused
 with a transient `NETWORK_ERROR` that names the lease, reads are not gated, and the pool does not
-remount. When a renewal succeeds, writes are admitted again under the same `writer_epoch`.
+remount. Writes are admitted again, under the same `writer_epoch`, when a renewal succeeds and leaves
+enough lease for a write's reservation. A renewal that succeeds after its own deadline (its start plus
+the TTL has already passed) leaves the lease expired, and the next renewal follows at once.
 `system.cas_mounts` shows the expired period as `lifecycle = 'not_live'`,
 `lifecycle_reason = 'lease_expired'` (see [`system.cas_mounts`](#mounts-table)); it shows
-`lifecycle = 'live'` until the deadline passes, even though writes stop a few seconds earlier. The
+`lifecycle = 'live'` until the deadline passes, although with the defaults conditional writes stop 16 s
+earlier. The
 `CASMountLeaseExpired` event advances by one when a renewal restores an expired lease, not when the lease
 expires. Failing renewals alone do not fence or remount the mount. A GC leader on another member still
 fences a slot whose token has not changed for `TTL + floor(TTL/20) + period`, and a definitive answer
@@ -129,8 +139,10 @@ local fence (latches `lost`, bumps the fence generation, moves the in-process ru
 `TransientNotLive`) and latches one self-remount generation. A confirmed foreign/successor or
 same-pair conflict remains a typed fail-closed error; it is never adopted. A real fence still costs
 only an epoch: recovery reclaims with a fresh one, bounded at three whole-chain attempts. This is the
-general CAS posture: doubt about the source fails closed, while transport ambiguity may retry only
-inside authority already proved by the last confirmed lease.
+general CAS posture: doubt about the source fails closed. Fenced mutations and the bounded renewals
+(startup, remount and direct) retry transport ambiguity only inside authority already proved by the last
+confirmed lease. The background renewal may keep retrying after that lease has expired; write authority
+stays bounded by the start of the renewal that last succeeded plus the TTL.
 
 GC's own view of a dead server is symmetric and clock-skew-immune: a slot becomes fence-eligible only
 after the leader observes the *same* renewal token hold stable, on its own monotonic clock, for `TTL +

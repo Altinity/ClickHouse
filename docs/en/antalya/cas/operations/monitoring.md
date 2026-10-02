@@ -55,11 +55,11 @@ window and correlate them with the `server_root_id` in `system.cas_log`.
 
 | Metric | Counting dimension | Interpretation |
 |---|---|---|
-| `CASMountRenewalAttempts` | One per physical conditional renewal `PUT` sent | Physical object-store load; one logical renewal can contribute several. The background renewal counts each `PUT` as it is sent, so the counter keeps rising during an outage |
+| `CASMountRenewalAttempts` | One per physical conditional renewal `PUT` sent | Physical object-store load; one logical renewal can contribute several. The background renewal counts each `PUT` as it is sent, so the counter advances during an outage while `PUT`s are being sent |
 | `CASMountRenewalRetries` | One per physical renewal `PUT` after the first in the same logical renewal | Positive growth shows in-period retry, not a later cadence beat |
 | `CASMountRenewalResolved` | One per logical renewal proved committed by an exact resolving `GET` | A response was ambiguous, but exact bytes and `write_attempt_id` proved the write |
 | `CASMountRenewalRecovered` | One per logical renewal committed after a retry or exact resolving `GET` | Recovered object-store blips that retained the existing mount incarnation |
-| `CASMountRenewalDeadlineExceeded` | One per logical renewal stopped by the external lease-safety deadline | The last confirmed lease no longer left enough safe time; this is narrower than request-budget exhaustion |
+| `CASMountRenewalDeadlineExceeded` | One per logical renewal stopped by the external lease-safety deadline | The last confirmed lease no longer left enough safe time; this is narrower than request-budget exhaustion. Only the bounded renewals (startup, remount and direct) can reach it; the background renewal does not |
 | `CASMountLeaseExpired` | One per renewal that restored a lease that had expired | Moves at the restore, not when the lease expires. While it is expired, `system.cas_mounts` shows `lifecycle_reason = 'lease_expired'` and writes are refused; the `watermark_renew` row of the restoring renewal carries `expired_ms` |
 | `CASRemountAttempts` | One per invocation of the existing whole-chain remount attempt | Includes both successful and failed attempts |
 | `CASRemountSucceeded` | One per whole-chain attempt that restored `Live` under a fresh writer epoch | Must be a subset of `CASRemountAttempts` |
@@ -91,9 +91,9 @@ Ordinary first-attempt success produces no row. Every `mount_remount` attempt pr
 `failed` and details `attempt_no`, `step`, `server_root_id`, optional `writer_epoch`, and optional
 `error`.
 
-Default-level text logging is bounded per logical operation: the first ambiguous transition may
-emit one retry `WARNING`, followed by one recovery `INFO` or final fence `WARNING`; a renewal that
-restores an expired lease emits one `WARNING` with the expired duration and the last failed request.
+Default-level text logging is bounded per logical operation: a renewal logs nothing until it ends,
+then one recovery `INFO` or one final fence `WARNING`; a renewal that restores an expired lease emits
+the recovery `INFO` and one `WARNING` with the expired duration and the last failed request.
 Individual physical retries are not logged. Each whole-chain remount attempt emits one final
 default-level line
 with its attempt number and last/current step. Use the structured rows for correlation instead of
