@@ -53,6 +53,9 @@ extern const Event CASMountReleaseSkippedForeignOccupant;
 extern const Event CASRemountAttempts;
 extern const Event CASRemountSucceeded;
 extern const Event CASRemountFailed;
+extern const Event CASMountLeaseExpired;
+extern const Event CASMountRenewalAttempts;
+extern const Event CASMountRenewalRetries;
 }
 
 using namespace DB::Cas;
@@ -5126,4 +5129,400 @@ TEST(CASPool, ConcurrentNamespaceCreationsNeverRaceEachOtherOnTheCatalog)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASHotKeyReadStarts].load() - lane_reads_mid, 0u)
         << "the next hold starts from what the resolve read saw";
     EXPECT_EQ(backend->writeCount(key) - writes_mid, 3u) << "one refused, two landed";
+}
+
+namespace
+{
+
+/// Fails the guarded mount `PUT`s that `on_put` says to fail, with a timeout raised before the store
+/// applied anything, and the reads of the mount slot that `on_read` says to fail. Both run on the
+/// renewing thread with the 1-based number of the request of their kind.
+class ExpiryScriptBackend final : public DB::Cas::tests::CountingBackend
+{
+public:
+    std::function<bool(uint32_t put_no)> on_put;
+    std::function<bool(uint32_t read_no)> on_read;
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        if (on_read && key.ends_with("/mount") && on_read(++reads))
+            throw Poco::TimeoutException("injected resolve read timeout");
+        return DB::Cas::tests::CountingBackend::read(key, access);
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+        const std::optional<String> & expected_value, DB::Cas::TransportAccess & access) override
+    {
+        if (on_put && expected_value && key.ends_with("/mount") && on_put(++puts))
+            throw Poco::TimeoutException("injected renewal timeout before the store applied it");
+        return DB::Cas::tests::CountingBackend::write(key, bytes, expected_value, access);
+    }
+
+private:
+    uint32_t puts = 0;
+    uint32_t reads = 0;
+};
+
+constexpr uint64_t kExpiryTtlMs = 30'000;
+constexpr uint64_t kExpiryPeriodMs = 10'000;
+constexpr uint64_t kExpiryClaimBootMs = 100'000;
+constexpr uint64_t kExpiryDeadlineBootMs = kExpiryClaimBootMs + kExpiryTtlMs;
+constexpr uint64_t kExpiryFirstStartBootMs = kExpiryClaimBootMs + kExpiryPeriodMs;
+/// Longer than the largest retry-spacing draw, so a failed request is retried at once.
+constexpr uint64_t kExpiryFailedPutMs = 1'300;
+/// Enough failures to carry the first renewal past its own start + TTL.
+constexpr uint32_t kExpiryFailedPuts = 24;
+constexpr uint64_t kExpiryRestoreBootMs = kExpiryFirstStartBootMs + kExpiryFailedPuts * kExpiryFailedPutMs;
+/// A request sent while the lease is expired and the first renewal still retries.
+constexpr uint32_t kExpiryObservedPut = 20;
+static_assert(kExpiryFirstStartBootMs + (kExpiryObservedPut - 1) * kExpiryFailedPutMs > kExpiryDeadlineBootMs);
+static_assert(kExpiryRestoreBootMs > kExpiryFirstStartBootMs + kExpiryTtlMs);
+
+const char * expiryAdmitName(Fence::Admit verdict)
+{
+    switch (verdict)
+    {
+        case Fence::Admit::Ok: return "Ok";
+        case Fence::Admit::LostOrRearmed: return "LostOrRearmed";
+        case Fence::Admit::NoBudget: return "NoBudget";
+    }
+    return "unknown";
+}
+
+uint64_t eventCount(ProfileEvents::Event event)
+{
+    return ProfileEvents::global_counters[event].load();
+}
+
+struct ExpiryObservation
+{
+    uint64_t generation_before = 0;
+    uint64_t attempts_before = 0;
+    uint64_t retries_before = 0;
+    uint64_t lease_expired_before = 0;
+    uint64_t lease_lost_before = 0;
+
+    /// Inside `PUT` number `kExpiryObservedPut`.
+    Fence::Admit admit_during = Fence::Admit::Ok;
+    bool may_mutate_during = true;
+    PoolLifecycle lifecycle_during = PoolLifecycle::TransientNotLive;
+    std::optional<uint64_t> expired_since_during;
+    String last_failure_during;
+    uint64_t attempts_during = 0;
+    uint64_t retries_during = 0;
+
+    /// At the loop pass after the renewal that committed with a start more than a TTL ago.
+    Fence::Admit admit_after_stale = Fence::Admit::Ok;
+    std::optional<uint64_t> expired_since_after_stale;
+    uint64_t lease_expired_after_stale = 0;
+    uint64_t boot_ms_after_stale = 0;
+    uint64_t boot_ms_at_next_admission = 0;
+
+    /// At the loop pass after the restoring renewal.
+    Fence::Admit admit_after_restore = Fence::Admit::LostOrRearmed;
+    std::optional<uint64_t> expired_since_after_restore;
+    PoolLifecycle lifecycle_after_restore = PoolLifecycle::TransientNotLive;
+    uint64_t generation_after_restore = 0;
+    uint64_t lease_expired_after_restore = 0;
+    uint64_t lease_lost_after_restore = 0;
+    uint64_t attempts_after_restore = 0;
+    uint64_t retries_after_restore = 0;
+
+    uint64_t writer_epoch_on_store = 0;
+    uint32_t remount_calls = 0;
+    std::vector<CasEvent> events;
+    String log;
+};
+
+void runExpiryScenario(const String & layout_prefix, ExpiryObservation & seen)
+{
+    /// Everything the hooks capture is declared before the backend and the runtime that store them.
+    const Layout layout(layout_prefix);
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{kExpiryClaimBootMs};
+    std::atomic<uint32_t> remount_calls{0};
+    uint32_t loop_passes = 0;
+    DB::Cas::tests::ManualBarrier third_pass;
+    CasMountRuntime * runtime_ptr = nullptr;
+    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
+    CasEventSink sink = [events](CasEvent event) { events->push(std::move(event)); };
+    ScopedRemountLogCapture log_capture;
+    auto backend = std::make_shared<ExpiryScriptBackend>();
+
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, kExpiryTtlMs).kind,
+              MountClaimResult::Claimed);
+
+    const auto observe_after_stale = [&]
+    {
+        CasMountRuntime & runtime = *runtime_ptr;
+        seen.admit_after_stale = runtime.admit(seen.generation_before, 0);
+        seen.expired_since_after_stale = runtime.leaseExpiredSinceBootMs();
+        seen.lease_expired_after_stale = eventCount(ProfileEvents::CASMountLeaseExpired) - seen.lease_expired_before;
+        seen.boot_ms_after_stale = boot_ms.load();
+    };
+    const auto observe_after_restore = [&]
+    {
+        CasMountRuntime & runtime = *runtime_ptr;
+        seen.admit_after_restore = runtime.admit(seen.generation_before, 0);
+        seen.expired_since_after_restore = runtime.leaseExpiredSinceBootMs();
+        seen.lifecycle_after_restore = runtime.lifecycle();
+        seen.generation_after_restore = runtime.fenceGeneration();
+        seen.lease_expired_after_restore = eventCount(ProfileEvents::CASMountLeaseExpired) - seen.lease_expired_before;
+        seen.lease_lost_after_restore = eventCount(ProfileEvents::CASMountLeaseLost) - seen.lease_lost_before;
+        seen.attempts_after_restore = eventCount(ProfileEvents::CASMountRenewalAttempts) - seen.attempts_before;
+        seen.retries_after_restore = eventCount(ProfileEvents::CASMountRenewalRetries) - seen.retries_before;
+    };
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return boot_ms.load(); },
+            .renewal_before_driver_lock_hook_for_test = [&]
+            {
+                ++loop_passes;
+                if (loop_passes == 1)
+                {
+                    boot_ms.store(kExpiryFirstStartBootMs);
+                }
+                else if (loop_passes == 2)
+                {
+                    observe_after_stale();
+                }
+                else if (loop_passes == 3)
+                {
+                    observe_after_restore();
+                    third_pass.arriveAndWait();
+                }
+            },
+            .renewal_admitted_hook_for_test = [&]
+            {
+                if (loop_passes == 2)
+                    seen.boot_ms_at_next_admission = boot_ms.load();
+            }},
+        "test", sink, runtimeRenewBudget(), [&]
+        {
+            ++remount_calls;
+            return false;
+        });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    ASSERT_EQ(anchor, kExpiryClaimBootMs);
+    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+
+    seen.generation_before = runtime.fenceGeneration();
+    seen.attempts_before = eventCount(ProfileEvents::CASMountRenewalAttempts);
+    seen.retries_before = eventCount(ProfileEvents::CASMountRenewalRetries);
+    seen.lease_expired_before = eventCount(ProfileEvents::CASMountLeaseExpired);
+    seen.lease_lost_before = eventCount(ProfileEvents::CASMountLeaseLost);
+
+    backend->on_put = [&](uint32_t put_no)
+    {
+        if (put_no == kExpiryObservedPut)
+        {
+            CasMountRuntime & renewing = *runtime_ptr;
+            seen.admit_during = renewing.admit(seen.generation_before, 0);
+            seen.may_mutate_during = renewing.mayMutate();
+            seen.lifecycle_during = renewing.lifecycle();
+            seen.expired_since_during = renewing.leaseExpiredSinceBootMs();
+            seen.last_failure_during = renewing.lastRenewFailure();
+            seen.attempts_during = eventCount(ProfileEvents::CASMountRenewalAttempts) - seen.attempts_before;
+            seen.retries_during = eventCount(ProfileEvents::CASMountRenewalRetries) - seen.retries_before;
+        }
+        if (put_no > kExpiryFailedPuts)
+            return false;
+        boot_ms.fetch_add(kExpiryFailedPutMs);
+        return true;
+    };
+
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    third_pass.waitUntilArrived();
+
+    seen.writer_epoch_on_store = decodeMountLease(readObj(*backend, layout.mountKey("test"))->bytes).writer_epoch;
+    seen.remount_calls = remount_calls.load();
+    seen.events = events->snapshot();
+    seen.log = log_capture.captured();
+
+    third_pass.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+/// One renewal whose first `PUT` is unclear and whose resolve reads then fail long enough for the lease
+/// to expire; the 19th read finds the slot unchanged and the reissued `PUT` lands.
+constexpr uint32_t kReadOutageFailedReads = 18;
+constexpr uint32_t kReadOutageObservedRead = 17;
+static_assert(kExpiryFirstStartBootMs + (kReadOutageObservedRead - 1) * kExpiryFailedPutMs > kExpiryDeadlineBootMs);
+
+struct ReadOutageObservation
+{
+    uint64_t attempts_before = 0;
+    uint64_t retries_before = 0;
+    /// Inside read number `kReadOutageObservedRead`.
+    std::optional<uint64_t> expired_since_during;
+    String last_failure_during;
+    uint64_t attempts_during = 0;
+    uint64_t retries_during = 0;
+    /// At the loop pass after the renewal.
+    uint64_t attempts_after = 0;
+    uint64_t retries_after = 0;
+};
+
+void runReadOutageScenario(const String & layout_prefix, ReadOutageObservation & seen)
+{
+    const Layout layout(layout_prefix);
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    std::atomic<uint64_t> boot_ms{kExpiryClaimBootMs};
+    uint32_t loop_passes = 0;
+    DB::Cas::tests::ManualBarrier second_pass;
+    CasMountRuntime * runtime_ptr = nullptr;
+    CasEventSink sink;
+    auto backend = std::make_shared<ExpiryScriptBackend>();
+
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, kExpiryTtlMs).kind,
+              MountClaimResult::Claimed);
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return boot_ms.load(); },
+            .renewal_before_driver_lock_hook_for_test = [&]
+            {
+                ++loop_passes;
+                if (loop_passes == 1)
+                {
+                    boot_ms.store(kExpiryFirstStartBootMs);
+                }
+                else if (loop_passes == 2)
+                {
+                    seen.attempts_after = eventCount(ProfileEvents::CASMountRenewalAttempts) - seen.attempts_before;
+                    seen.retries_after = eventCount(ProfileEvents::CASMountRenewalRetries) - seen.retries_before;
+                    second_pass.arriveAndWait();
+                }
+            }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime_ptr = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+
+    seen.attempts_before = eventCount(ProfileEvents::CASMountRenewalAttempts);
+    seen.retries_before = eventCount(ProfileEvents::CASMountRenewalRetries);
+    backend->on_put = [](uint32_t put_no) { return put_no == 1; };
+    backend->on_read = [&](uint32_t read_no)
+    {
+        if (read_no == kReadOutageObservedRead)
+        {
+            seen.expired_since_during = runtime_ptr->leaseExpiredSinceBootMs();
+            seen.last_failure_during = runtime_ptr->lastRenewFailure();
+            seen.attempts_during = eventCount(ProfileEvents::CASMountRenewalAttempts) - seen.attempts_before;
+            seen.retries_during = eventCount(ProfileEvents::CASMountRenewalRetries) - seen.retries_before;
+        }
+        if (read_no > kReadOutageFailedReads)
+            return false;
+        boot_ms.fetch_add(kExpiryFailedPutMs);
+        return true;
+    };
+
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    second_pass.waitUntilArrived();
+    second_pass.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+std::vector<CasEvent> renewEventsOf(const std::vector<CasEvent> & events)
+{
+    std::vector<CasEvent> renewals;
+    for (const CasEvent & event : events)
+        if (event.type == CasEventType::WatermarkRenew)
+            renewals.push_back(event);
+    return renewals;
+}
+
+}
+
+/// An expiry refuses writes without touching the fence, a renewal that commits with a start more than a
+/// TTL ago restores nothing and is followed at once, and the next one restores writes under the same
+/// epoch and generation. Runs the real worker loop.
+TEST(CASMountRuntime, ExpiryRefusesWritesAndResumesUnderTheSameEpoch)
+{
+    ExpiryObservation seen;
+    ASSERT_NO_FATAL_FAILURE(runExpiryScenario("runtime-expiry-resume", seen));
+
+    EXPECT_STREQ(expiryAdmitName(seen.admit_during), "NoBudget") << "refused, and not because the fence is lost";
+    EXPECT_FALSE(seen.may_mutate_during);
+    EXPECT_EQ(seen.lifecycle_during, PoolLifecycle::Live);
+
+    EXPECT_STREQ(expiryAdmitName(seen.admit_after_stale), "NoBudget")
+        << "a renewal whose start + TTL is already past restores nothing";
+    /// The clock moves only when the test moves it, so a renewal admitted at all after the stale success
+    /// was admitted without a cadence wait; a wait would have left loop pass 3 unreached.
+    EXPECT_EQ(seen.boot_ms_at_next_admission, seen.boot_ms_after_stale);
+
+    EXPECT_STREQ(expiryAdmitName(seen.admit_after_restore), "Ok");
+    EXPECT_EQ(seen.lifecycle_after_restore, PoolLifecycle::Live);
+    EXPECT_EQ(seen.generation_after_restore, seen.generation_before) << "an expiry is not a re-arm";
+    EXPECT_EQ(seen.lease_lost_after_restore, 0u);
+    EXPECT_EQ(seen.writer_epoch_on_store, 1u) << "the same epoch holds the slot";
+    EXPECT_EQ(seen.remount_calls, 0u);
+}
+
+/// What an operator sees: the expiry and its last failure while it lasts, the attempt counters moving
+/// during the outage, and one counter, event field and warning when a renewal restores the lease.
+TEST(CASMountRuntime, ExpiryIsReported)
+{
+    ExpiryObservation seen;
+    ASSERT_NO_FATAL_FAILURE(runExpiryScenario("runtime-expiry-report", seen));
+
+    ASSERT_TRUE(seen.expired_since_during.has_value());
+    EXPECT_EQ(*seen.expired_since_during, kExpiryDeadlineBootMs);
+    EXPECT_NE(seen.last_failure_during.find("injected renewal timeout"), String::npos) << seen.last_failure_during;
+    /// The request being sent is counted before it reaches the store.
+    EXPECT_EQ(seen.attempts_during, kExpiryObservedPut) << "attempts advance as requests are sent";
+    EXPECT_EQ(seen.retries_during, kExpiryObservedPut - 1);
+
+    ASSERT_TRUE(seen.expired_since_after_stale.has_value());
+    EXPECT_EQ(*seen.expired_since_after_stale, kExpiryDeadlineBootMs)
+        << "a renewal committed past its own start + TTL keeps the expiry and when it began";
+    EXPECT_EQ(seen.lease_expired_after_stale, 0u) << "that renewal is not a restore";
+
+    EXPECT_FALSE(seen.expired_since_after_restore.has_value());
+    EXPECT_EQ(seen.lease_expired_after_restore, 1u);
+    /// 25 requests by the first renewal and one by the second, each counted once.
+    EXPECT_EQ(seen.attempts_after_restore, kExpiryFailedPuts + 2);
+    EXPECT_EQ(seen.retries_after_restore, kExpiryFailedPuts);
+
+    const std::vector<CasEvent> renewals = renewEventsOf(seen.events);
+    ASSERT_EQ(renewals.size(), 2u) << "the retried renewal and the restoring one";
+    EXPECT_FALSE(renewals[0].detail.contains("expired_ms")) << "the first renewal left the lease expired";
+    EXPECT_EQ(renewals[0].detail.at("classification"), "committed_after_retry");
+    EXPECT_EQ(renewals[1].outcome, "recovered");
+    EXPECT_EQ(renewals[1].detail.at("classification"), "committed_after_expiry");
+    ASSERT_TRUE(renewals[1].detail.contains("expired_ms"));
+    EXPECT_EQ(renewals[1].detail.at("expired_ms"), std::to_string(kExpiryRestoreBootMs - kExpiryDeadlineBootMs));
+
+    EXPECT_NE(seen.log.find(fmt::format("expired for {} ms", kExpiryRestoreBootMs - kExpiryDeadlineBootMs)), String::npos)
+        << seen.log;
+    EXPECT_NE(seen.log.find("injected renewal timeout"), String::npos) << "the warning names the last failure: " << seen.log;
+
+    /// An unclear `PUT` whose resolve reads then fail: the reads are what the operator needs to see,
+    /// and they are not requests of the renewal.
+    ReadOutageObservation reads;
+    ASSERT_NO_FATAL_FAILURE(runReadOutageScenario("runtime-expiry-read-outage", reads));
+    ASSERT_TRUE(reads.expired_since_during.has_value()) << "the read outage outlasted the lease, so the row shows this text";
+    EXPECT_NE(reads.last_failure_during.find("injected resolve read timeout"), String::npos)
+        << "lifecycle_detail carries the last failed read: " << reads.last_failure_during;
+    EXPECT_EQ(reads.attempts_during, 1u) << "failed reads do not advance the attempt counter";
+    EXPECT_EQ(reads.retries_during, 0u);
+    EXPECT_EQ(reads.attempts_after, 2u) << "the unclear PUT and its reissue";
+    EXPECT_EQ(reads.retries_after, 1u);
 }

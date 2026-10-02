@@ -46,7 +46,7 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-void reportMountRenewCompletion(const MountRenewResult & result) noexcept;
+void reportMountRenewCompletion(const MountRenewResult & result, std::optional<uint64_t> expired_ms) noexcept;
 void configureMountRenewObservability(
     const String * server_root_id, const CasEventSink * event_sink, bool deferred) noexcept;
 void deliverDeferredMountRenewObservability(uint64_t remount_attempt_no) noexcept;
@@ -132,6 +132,8 @@ struct MountRenewObservabilityContext
     MountRenewTerminalClassification terminal_classification = MountRenewTerminalClassification::Unclassified;
     uint32_t attempts_sent = 0;
     bool resolved_by_read = false;
+    /// How long the lease had been expired when this renewal restored it; empty unless it did.
+    std::optional<uint64_t> expired_ms = std::nullopt;
 };
 
 static_assert(std::is_trivially_copyable_v<MountRenewObservabilityContext>);
@@ -294,9 +296,12 @@ void emitMountRenewEvent(
         CasEvent event;
         event.type = CasEventType::WatermarkRenew;
         event.outcome = String{outcome};
-        event.reason = outcome == "recovered"
-            ? "CAS mount renewal recovered before its confirmed lease-safety deadline"
-            : "CAS mount renewal ended without retained authority and fenced the mount";
+        if (outcome != "recovered")
+            event.reason = "CAS mount renewal ended without retained authority and fenced the mount";
+        else if (context.expired_ms)
+            event.reason = "CAS mount renewal restored a lease that had expired";
+        else
+            event.reason = "CAS mount renewal committed after a retry or a resolving read";
         event.detail = {
             {"server_root_id", *context.server_root_id},
             {"writer_epoch", std::to_string(context.writer_epoch)},
@@ -309,6 +314,8 @@ void emitMountRenewEvent(
         };
         if (remount_attempt_no != 0)
             event.detail["remount_attempt_no"] = std::to_string(remount_attempt_no);
+        if (context.expired_ms)
+            event.detail["expired_ms"] = std::to_string(*context.expired_ms);
         (*context.event_sink)(std::move(event));
     }
     catch (...)
@@ -363,12 +370,14 @@ void deliverMountRenewObservability(
         }
 
         const bool recovered = context.outcome == MountRenewOutcome::Committed
-            && (context.attempts_sent > 1 || context.resolved_by_read);
+            && (context.attempts_sent > 1 || context.resolved_by_read || context.expired_ms.has_value());
         if (recovered)
         {
-            const std::string_view classification = context.resolved_by_read
-                ? "committed_by_read"
-                : "committed_after_retry";
+            std::string_view classification = "committed_after_expiry";
+            if (context.resolved_by_read)
+                classification = "committed_by_read";
+            else if (context.attempts_sent > 1)
+                classification = "committed_after_retry";
             emitMountRenewEvent(
                 context,
                 write_attempt_id,
@@ -464,7 +473,7 @@ void configureMountRenewObservability(
     };
 }
 
-void reportMountRenewCompletion(const MountRenewResult & result) noexcept
+void reportMountRenewCompletion(const MountRenewResult & result, std::optional<uint64_t> expired_ms) noexcept
 {
     if (mount_renew_observability.suppressed_depth != 0)
     {
@@ -478,6 +487,7 @@ void reportMountRenewCompletion(const MountRenewResult & result) noexcept
     context->outcome = result.outcome;
     context->attempts_sent = std::max(context->attempts_sent, result.attempts_sent);
     context->resolved_by_read = result.resolved_by_read;
+    context->expired_ms = expired_ms;
     if (context->deferred)
         return;
 

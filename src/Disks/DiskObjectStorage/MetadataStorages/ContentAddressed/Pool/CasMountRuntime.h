@@ -320,6 +320,9 @@ public:
     std::optional<uint64_t> leaseExpiredSinceBootMs() const;
     /// Text of the last failed request of the worker's renewal; empty when none failed.
     String lastRenewFailure() const;
+    /// Counts each `PUT` of the worker's renewal as it is sent and keeps the text of every failed
+    /// `PUT` or resolve read. Runs on the renewing thread.
+    void noteRenewRequest(const MountRenewRequestEvent & event) noexcept;
 
     /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
     /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
@@ -450,6 +453,9 @@ private:
         bool worker_call);
     MountRenewOperationEnvironment renewalEnvironment(bool worker_call);
     std::optional<uint64_t> leaseExpiredAt(uint64_t now_boot_ms) const;
+    /// Publishes a committed renewal's deadline. Returns how long the lease had been expired when this
+    /// deadline restores it; empty when it was not expired or is still expired.
+    std::optional<uint64_t> publishRenewedDeadline(uint64_t deadline_boot_ms);
     void consumeRenewResult(
         const MountRenewResult & result,
         RenewalDriverState active_state,

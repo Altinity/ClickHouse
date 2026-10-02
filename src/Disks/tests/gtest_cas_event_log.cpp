@@ -29,7 +29,7 @@ namespace DB::Cas
 {
 void configureMountRenewObservability(
     const String * server_root_id, const CasEventSink * event_sink, bool deferred) noexcept;
-void reportMountRenewCompletion(const MountRenewResult & result) noexcept;
+void reportMountRenewCompletion(const MountRenewResult & result, std::optional<uint64_t> expired_ms) noexcept;
 }
 
 namespace
@@ -345,7 +345,7 @@ TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
     {
         configureMountRenewObservability(&server_root_ids[index], &sinks[index], /*deferred=*/false);
         MountRenewResult result = renewers[index]->renew(MountRenewOperationEnvironment{});
-        reportMountRenewCompletion(result);
+        reportMountRenewCompletion(result, std::nullopt);
         return result;
     };
 

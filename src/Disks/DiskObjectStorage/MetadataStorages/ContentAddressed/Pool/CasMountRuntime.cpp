@@ -25,6 +25,7 @@ namespace ProfileEvents
     extern const Event CASIdentityLost;
     extern const Event CASDataRootVanished;
     extern const Event CASMountLeaseLost;
+    extern const Event CASMountLeaseExpired;
     extern const Event CASMountRenewalAttempts;
     extern const Event CASMountRenewalRetries;
     extern const Event CASMountRenewalResolved;
@@ -35,7 +36,7 @@ namespace ProfileEvents
 namespace DB::Cas
 {
 
-void reportMountRenewCompletion(const MountRenewResult & result) noexcept;
+void reportMountRenewCompletion(const MountRenewResult & result, std::optional<uint64_t> expired_ms) noexcept;
 void configureMountRenewObservability(
     const String * server_root_id, const CasEventSink * event_sink, bool deferred) noexcept;
 
@@ -184,6 +185,42 @@ String CasMountRuntime::lastRenewFailure() const
 {
     std::lock_guard lock(renew_failure_mutex);
     return last_renew_failure;
+}
+
+void CasMountRuntime::noteRenewRequest(const MountRenewRequestEvent & event) noexcept
+{
+    if (!event.failed)
+    {
+        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalAttempts);
+        if (event.request_no > 1)
+            ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRetries);
+        return;
+    }
+    try
+    {
+        std::lock_guard lock(renew_failure_mutex);
+        last_renew_failure = event.failure_text;
+    }
+    catch (...)   // NOLINT(bugprone-empty-catch)
+    {
+        /// A lost diagnostic must not end the renewal.
+    }
+}
+
+std::optional<uint64_t> CasMountRuntime::publishRenewedDeadline(uint64_t deadline_boot_ms)
+{
+    const uint64_t now = bootMsNow();
+    const std::optional<uint64_t> expired_at = leaseExpiredAt(now);
+    setMountDeadline(deadline_boot_ms);
+    if (expired_at && deadline_boot_ms <= now)
+    {
+        lease_expired_at_boot_ms.store(*expired_at, std::memory_order_release);
+        return std::nullopt;
+    }
+    lease_expired_at_boot_ms.store(std::numeric_limits<uint64_t>::max(), std::memory_order_release);
+    if (!expired_at)
+        return std::nullopt;
+    return now - *expired_at;
 }
 
 void CasMountRuntime::setMountDeadline(uint64_t deadline_boot_ms)
@@ -456,7 +493,11 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
         /// Only the worker keeps renewing past the lease; startup, remount and direct renewals stay
         /// bounded by it.
         .policy = worker_call ? MountRenewPolicy::UntilDefinitive : MountRenewPolicy::LeaseBound,
-        .on_request = {},
+        /// The worker counts its requests as they are sent, so an outage shows while it lasts.
+        .on_request = worker_call
+            ? std::function<void(const MountRenewRequestEvent &)>(
+                  [this](const MountRenewRequestEvent & event) { noteRenewRequest(event); })
+            : nullptr,
     };
 }
 
@@ -492,9 +533,9 @@ void CasMountRuntime::consumeRenewResult(
 {
     /// Driver ownership has already been restored by `DriverLease::finish`; this is the single logical
     /// consumption boundary and it runs without `driver_mutex` or renewer access.
-    /// The physical counters come off the result rather than off a per-attempt callback, so they count
-    /// the same on every ending: a renewal that gave up still sent what it sent.
-    if (result.attempts_sent > 0)
+    /// The worker's renewal counts its requests as they are sent (`noteRenewRequest`). Every other
+    /// renewal counts them here, from its result.
+    if (active_state != RenewalDriverState::WorkerCall && result.attempts_sent > 0)
     {
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalAttempts, result.attempts_sent);
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRetries, result.attempts_sent - 1);
@@ -511,16 +552,24 @@ void CasMountRuntime::consumeRenewResult(
     if (result.outcome == MountRenewOutcome::Committed)
     {
         const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
-        setMountDeadline(
+        const std::optional<uint64_t> expired_ms = publishRenewedDeadline(
             result.attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
                 ? std::numeric_limits<uint64_t>::max()
                 : result.attempt_start_boot_ms + ttl_ms);
-        reportMountRenewCompletion(result);
+        if (expired_ms)
+        {
+            ProfileEvents::incrementNoTrace(ProfileEvents::CASMountLeaseExpired);
+            LOG_WARNING(getLogger("CasPool"),
+                "CAS mount lease of '{}' was expired for {} ms; a renewal restored it and writes resume. "
+                "Last failed renewal request: {}",
+                server_root_id, *expired_ms, lastRenewFailure());
+        }
+        reportMountRenewCompletion(result, expired_ms);
         return;
     }
     if (result.outcome == MountRenewOutcome::NotAttempted)
     {
-        reportMountRenewCompletion(result);
+        reportMountRenewCompletion(result, std::nullopt);
         return;
     }
 
@@ -539,9 +588,8 @@ void CasMountRuntime::consumeRenewResult(
     {
     }
 
-    reportMountRenewCompletion(result);
+    reportMountRenewCompletion(result, std::nullopt);
 
-    (void)active_state;
     (void)returned_state;
 
     if (propagate_failure)
