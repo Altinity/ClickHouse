@@ -328,6 +328,9 @@ public:
     /// never under `driver_mutex`.
     void noteRenewRequest(const MountRenewRequestEvent & event) noexcept;
 
+    /// Writes one `WARNING` per lease expiry, at the first request event after it. Lease thread only.
+    void warnOnceIfLeaseExpired(const MountRenewRequestEvent & event) noexcept;
+
     /// TRUE once the pool has reached — or is being driven toward — a state on which the lease thread
     /// must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
     /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
@@ -554,6 +557,9 @@ private:
     std::atomic<uint64_t> lease_expired_at_boot_ms{std::numeric_limits<uint64_t>::max()};
     mutable std::mutex renew_failure_mutex;
     String last_renew_failure;
+    /// The expiry instant `warnOnceIfLeaseExpired` last wrote a line for. A renewal that commits past
+    /// its own deadline keeps the instant, so the same expiry is not reported twice.
+    std::atomic<uint64_t> lease_expiry_warned_at_boot_ms{std::numeric_limits<uint64_t>::max()};
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
     /// (`noteLeaseLost`/`noteRemounted`) are lock-free compare-exchanges guarded by their exact

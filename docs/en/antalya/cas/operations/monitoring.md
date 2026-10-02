@@ -97,8 +97,10 @@ An `ok` row has `step = 'publish_live'` when the reclaim armed the fence and rep
 Default-level text logging is bounded per logical operation. A renewal logs nothing until it ends,
 and nothing at all when it succeeds on its first request. A renewal that needed a retry, was settled
 by a read, or restored an expired lease emits one recovery `INFO`; a terminal renewal emits one fence
-`WARNING`. A renewal that restores an expired lease also emits one `WARNING` with the expired
-duration and the last failed request.
+`WARNING`. An expired lease emits one `WARNING` when it expires, written at the first request of the
+renewal after the expiry (a request that hangs delays it by up to one attempt timeout), and a renewal
+that restores it emits one `WARNING` with the expired duration and the last failed request. The live
+state during the outage is the row in `system.cas_mounts`.
 Individual physical retries are not logged. Each whole-chain remount attempt emits one final
 default-level line
 with its attempt number and last/current step. Use the structured rows for correlation instead of

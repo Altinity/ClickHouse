@@ -125,6 +125,9 @@ with a transient `NETWORK_ERROR` that names the lease, reads are not gated, and 
 remount. Writes are admitted again, under the same `writer_epoch`, when a renewal succeeds and leaves
 enough lease for a write's reservation. A renewal that succeeds after its own deadline (its start plus
 the TTL has already passed) leaves the lease expired, and the next renewal follows at once.
+The log carries one `WARNING` when the lease expires, written at the first request of the renewal
+after the expiry (a request that hangs delays it by up to one attempt timeout), and the restore
+`WARNING` when a renewal restores it.
 `system.cas_mounts` shows the expired period as `lifecycle = 'not_live'`,
 `lifecycle_reason = 'lease_expired'` (see [`system.cas_mounts`](#mounts-table)); it shows
 `lifecycle = 'live'` until the deadline passes, although with the defaults conditional writes stop

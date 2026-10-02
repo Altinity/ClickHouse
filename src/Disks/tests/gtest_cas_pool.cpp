@@ -5782,6 +5782,200 @@ TEST(CASMountRuntime, ExpiryIsReported)
     EXPECT_EQ(reads.retries_after, 1u);
 }
 
+namespace
+{
+
+const String kExpiryWarningPrefix = "CAS mount lease of 'test' expired ";
+const String kRestoreWarningText = "was expired for";
+
+size_t countText(const String & haystack, const String & needle)
+{
+    size_t count = 0;
+    for (size_t at = haystack.find(needle); at != String::npos; at = haystack.find(needle, at + needle.size()))
+        ++count;
+    return count;
+}
+
+/// What the lease thread sees while it runs `runExpiryLogScenario`. Declared by the test before the
+/// runtime that stores the hooks capturing it.
+struct ExpiryLogRig
+{
+    ScopedRemountLogCapture log;
+    std::atomic<uint64_t> boot_ms{kExpiryClaimBootMs};
+    CasMountRuntime * runtime = nullptr;
+    uint64_t generation = 0;
+
+    /// Return true to fail the guarded mount `PUT` with that 1-based number.
+    std::function<bool(ExpiryLogRig &, uint32_t put_no)> on_put;
+    std::function<void(ExpiryLogRig &, uint32_t pass)> on_pass;
+
+    size_t expiryWarnings() const { return countText(log.captured(), kExpiryWarningPrefix); }
+
+    /// Per `PUT`, as the lease thread enters it.
+    std::vector<size_t> expiry_at_put;
+    std::vector<uint64_t> boot_at_put;
+    /// Per loop pass, before the renewal of that pass.
+    std::vector<size_t> expiry_at_pass;
+    std::vector<size_t> restore_at_pass;
+    uint32_t refused_writes = 0;
+    bool overran = false;
+    String final_log;
+};
+
+constexpr uint32_t kExpiryLogMaxPasses = 8;
+
+/// Runs the real worker loop until pass `stop_pass`, which is the loop pass before the renewal after
+/// the one whose result the test wants to see.
+void runExpiryLogScenario(const String & layout_prefix, ExpiryLogRig & rig, uint32_t stop_pass)
+{
+    const Layout layout(layout_prefix);
+    const UInt128 uuid{1};
+    uint64_t wall_ms = 1000;
+    uint32_t loop_passes = 0;
+    DB::Cas::tests::ManualBarrier stop;
+    CasEventSink sink;
+    auto backend = std::make_shared<ExpiryScriptBackend>();
+
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, kExpiryTtlMs).kind,
+              MountClaimResult::Claimed);
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(kExpiryTtlMs),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return rig.boot_ms.load(); },
+            .renewal_before_driver_lock_hook_for_test = [&]
+            {
+                ++loop_passes;
+                if (loop_passes == 1)
+                    rig.boot_ms.store(kExpiryFirstStartBootMs);
+                const String text = rig.log.captured();
+                rig.expiry_at_pass.push_back(countText(text, kExpiryWarningPrefix));
+                rig.restore_at_pass.push_back(countText(text, kRestoreWarningText));
+                if (rig.on_pass)
+                    rig.on_pass(rig, loop_passes);
+                if (loop_passes >= stop_pass || loop_passes >= kExpiryLogMaxPasses)
+                {
+                    rig.overran = loop_passes > stop_pass;
+                    stop.arriveAndWait();
+                }
+            }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    CasMountRuntime & runtime = *runtime_holder;
+    rig.runtime = &runtime;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(uuid, 1, anchor + kExpiryTtlMs);
+    rig.generation = runtime.fenceGeneration();
+
+    backend->on_put = [&](uint32_t put_no)
+    {
+        rig.expiry_at_put.push_back(rig.expiryWarnings());
+        rig.boot_at_put.push_back(rig.boot_ms.load());
+        if (!rig.on_put || !rig.on_put(rig, put_no))
+            return false;
+        rig.boot_ms.fetch_add(kExpiryFailedPutMs);
+        return true;
+    };
+
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(kExpiryPeriodMs));
+    stop.waitUntilArrived();
+    rig.final_log = rig.log.captured();
+
+    stop.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+}
+
+/// The log carries one `WARNING` per expiry, written at the first request after it: not for an
+/// outage the lease outlives, not per retry or per refused write, not when a renewal commits after its
+/// own deadline, and again for a second expiry.
+TEST(CASMountRuntime, ExpiryIsLoggedOncePerExpiry)
+{
+    {
+        ExpiryLogRig rig;
+        constexpr uint32_t kShortOutagePuts = 5;
+        static_assert(kExpiryFirstStartBootMs + kShortOutagePuts * kExpiryFailedPutMs < kExpiryDeadlineBootMs);
+        rig.on_put = [](ExpiryLogRig &, uint32_t put_no) { return put_no <= kShortOutagePuts; };
+        ASSERT_NO_FATAL_FAILURE(runExpiryLogScenario("runtime-expiry-log-short", rig, 2));
+        EXPECT_FALSE(rig.overran);
+        EXPECT_EQ(rig.expiry_at_put.size(), kShortOutagePuts + 1u) << "the outage ran as scripted";
+        EXPECT_EQ(countText(rig.final_log, kExpiryWarningPrefix), 0u) << rig.final_log;
+        EXPECT_EQ(countText(rig.final_log, kRestoreWarningText), 0u) << rig.final_log;
+    }
+
+    ExpiryLogRig rig;
+    uint64_t second_outage_floor_boot_ms = 0;
+    rig.on_put = [&](ExpiryLogRig & r, uint32_t put_no)
+    {
+        if (put_no == kExpiryObservedPut)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                try
+                {
+                    r.runtime->checkFenceOrThrow(r.generation);
+                }
+                catch (const DB::Exception &)
+                {
+                    ++r.refused_writes;
+                }
+            }
+        }
+        if (put_no <= kExpiryFailedPuts)
+            return true;
+        if (second_outage_floor_boot_ms == 0)
+            return false;
+        return r.boot_ms.load() <= second_outage_floor_boot_ms;
+    };
+    rig.on_pass = [&](ExpiryLogRig & r, uint32_t pass)
+    {
+        /// The restoring renewal has committed. The next one starts a period later and fails until
+        /// the lease that was just restored has run out.
+        if (pass == 3)
+        {
+            second_outage_floor_boot_ms = r.boot_ms.load() + kExpiryTtlMs;
+            r.boot_ms.fetch_add(kExpiryPeriodMs);
+        }
+    };
+    ASSERT_NO_FATAL_FAILURE(runExpiryLogScenario("runtime-expiry-log-twice", rig, 4));
+    ASSERT_FALSE(rig.overran) << "the worker ran more passes than scripted";
+    ASSERT_GT(rig.expiry_at_put.size(), kExpiryFailedPuts + 1u);
+
+    /// Outage past the deadline: a request that sees the lease expired has already written the line.
+    for (uint32_t put_no = 1; put_no <= kExpiryFailedPuts + 1; ++put_no)
+    {
+        const size_t expected = rig.boot_at_put[put_no - 1] >= kExpiryDeadlineBootMs ? 1 : 0;
+        EXPECT_EQ(rig.expiry_at_put[put_no - 1], expected) << "at PUT " << put_no << " (boot " << rig.boot_at_put[put_no - 1] << ")";
+    }
+    EXPECT_EQ(rig.refused_writes, 3u);
+
+    /// Pass 2 follows the renewal that committed after its own deadline: the lease is still expired.
+    ASSERT_GE(rig.expiry_at_pass.size(), 4u);
+    EXPECT_EQ(rig.expiry_at_pass[1], 1u) << "a renewal that commits past its own deadline does not warn again";
+    EXPECT_EQ(rig.restore_at_pass[1], 0u);
+    /// Pass 3 follows the restoring renewal.
+    EXPECT_EQ(rig.expiry_at_pass[2], 1u);
+    EXPECT_EQ(rig.restore_at_pass[2], 1u);
+    /// Pass 4 follows the renewal that restored a second expiry.
+    EXPECT_EQ(rig.expiry_at_pass[3], 2u) << "a lease that expires again warns again";
+    EXPECT_EQ(rig.restore_at_pass[3], 2u);
+
+    EXPECT_EQ(countText(rig.final_log, kExpiryWarningPrefix), 2u) << rig.final_log;
+
+    /// The first line names the server root, the injected failure and a positive elapsed time.
+    const size_t first = rig.final_log.find(kExpiryWarningPrefix);
+    ASSERT_NE(first, String::npos) << rig.final_log;
+    const String line = rig.final_log.substr(first, rig.final_log.find('\n', first) - first);
+    EXPECT_NE(line.find("injected renewal timeout"), String::npos) << line;
+    const uint64_t elapsed_ms = std::stoull(line.substr(kExpiryWarningPrefix.size()));
+    EXPECT_GT(elapsed_ms, 0u) << line;
+    EXPECT_LE(elapsed_ms, kExpiryFailedPutMs) << "written at the first request after the expiry: " << line;
+}
+
 /// The failure text explains the current run of trouble only. A renewal that fails once and then commits
 /// with a deadline in the future ends that run; a later expiry in which no request fails shows no text.
 TEST(CASMountRuntime, ASuccessEndsTheFailureTextOfItsRun)

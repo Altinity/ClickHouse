@@ -44,9 +44,10 @@ Start with the `watermark_renew` timeline described in
    has `outcome = 'recovered'` and `expired_ms` in `detail`: how long the lease was expired, from its
    deadline to the restoring renewal. Its `classification` is `committed_after_expiry`, or
    `committed_after_retry` or `committed_by_read` when one of those applies first. The server log has
-   a `WARNING` with the same duration and the last failure. While the outage lasts, the same state is
-   visible in `system.cas_mounts` (`lifecycle_reason = 'lease_expired'`); the event moves only at the
-   restore.
+   a `WARNING` with the same duration and the last failure. While the outage lasts, the log carries one
+   `WARNING` when the lease expires, written at the first request of the renewal after the expiry (a
+   request that hangs delays it by up to one attempt timeout). The live state is the row in
+   `system.cas_mounts` (`lifecycle_reason = 'lease_expired'`); the event moves only at the restore.
 2. **External lease-safety exhaustion.** Only the renewals at startup, after a remount and the direct
    renewal are bounded by the lease; the background renewal is not, so this case means one of those ran
    out of lease. The failed row has `classification = 'external_lease_deadline'`;
@@ -76,8 +77,9 @@ Start with the `watermark_renew` timeline described in
 The default-level log policy is intentionally bounded. The lease keeper logs nothing about a renewal
 until the renewal ends. A renewal that succeeds on its first request logs nothing. A renewal that
 needed a retry, was settled by a read, or restored an expired lease logs one recovery `INFO`; a
-terminal renewal logs one fence `WARNING`. The restore of an expired lease also logs a `WARNING` with
-the expired time and the last failure. Each whole-chain remount attempt logs one final line.
-Individual physical retries are not logged. During an outage the signal is the row in
+terminal renewal logs one fence `WARNING`. An expired lease logs one `WARNING` when it expires, at the
+first request of the renewal after the expiry, and another with the expired time and the last failure
+when a renewal restores it. Each whole-chain remount attempt logs one final line.
+Individual physical retries are not logged. During an outage the live state is the row in
 `system.cas_mounts`. Use `system.cas_log` and the counters to reconstruct the
 incident: `CASMountRenewalAttempts` and `CASMountRenewalRetries` advance as `PUT`s are sent.
