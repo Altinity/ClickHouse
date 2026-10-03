@@ -218,6 +218,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "26.6.2.20001.altinityantalya",
         {
+            {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
         });
         addSettingsChanges(settings_changes_history, "26.6",
