@@ -11,6 +11,7 @@
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/JSON/Parser.h>
 
+#include <Common/StringUtils.h>
 #include <Common/randomSeed.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
@@ -160,46 +161,43 @@ bool checkValidSchemaEvolution(Poco::Dynamic::Var old_type, Poco::Dynamic::Var n
 }
 
 
-/// Recursively drop the field ids Iceberg assigns to nested elements of a complex type.
-/// `getIcebergType` allocates them from a running counter, so regenerating the same
-/// ClickHouse type with a different counter start yields a different - but structurally
-/// identical - descriptor. Removing the ids makes such descriptors comparable.
-void stripNestedFieldIds(Poco::JSON::Object::Ptr type_object)
+String removeASCIIWhitespace(const String & s)
 {
-    for (const auto & id_field : {Iceberg::f_id, Iceberg::f_element_id, Iceberg::f_key_id, Iceberg::f_value_id})
-        type_object->remove(id_field);
-
-    for (const auto & nested_field : {Iceberg::f_element, Iceberg::f_key, Iceberg::f_value, Iceberg::f_type})
+    String result;
+    result.reserve(s.size());
+    for (char c : s)
     {
-        if (!type_object->has(nested_field))
-            continue;
-        auto nested = type_object->get(nested_field);
-        if (nested.isString())
-            continue;
-        if (auto nested_object = nested.extract<Poco::JSON::Object::Ptr>())
-            stripNestedFieldIds(nested_object);
+        if (!isWhitespaceASCII(c))
+            result.push_back(c);
     }
-
-    if (type_object->has(Iceberg::f_fields))
-    {
-        auto fields = type_object->getArray(Iceberg::f_fields);
-        for (UInt32 i = 0; i < fields->size(); ++i)
-        {
-            if (auto field = fields->getObject(i))
-                stripNestedFieldIds(field);
-        }
-    }
+    return result;
 }
 
-/// Like `icebergTypesEqual`, but ignores the field ids embedded in complex types.
-/// Used to recognize a type that a previous attempt already wrote, where the ids
-/// were allocated from a lower `last-column-id` than the one we would use now.
+/// A missing key matches only a missing key.
+bool optionalBoolsEqual(const Poco::JSON::Object::Ptr & first, const Poco::JSON::Object::Ptr & second, const char * key)
+{
+    const bool first_has = first->has(key);
+    if (first_has != second->has(key))
+        return false;
+    return !first_has || first->getValue<bool>(key) == second->getValue<bool>(key);
+}
+
+/// Whether two Iceberg type descriptors denote the same type.
+/// Only the properties that define the type are compared. Field ids are ignored because
+/// `getIcebergType` allocates them from a running counter, so a previous attempt may have written
+/// the very same type with lower ids. Other keys (`doc`, defaults, the `required` that
+/// `getIcebergType` puts on a list) are ignored because other writers emit or omit them freely.
 bool icebergTypesEqualIgnoringIds(Poco::Dynamic::Var old_type, Poco::Dynamic::Var new_type)
 {
-    if (old_type.isString() && new_type.isString())
-        return old_type.extract<String>() == new_type.extract<String>();
-
     if (old_type.isString() || new_type.isString())
+    {
+        if (!old_type.isString() || !new_type.isString())
+            return false;
+        /// Writers differ in spacing, e.g. `decimal(10,2)` and `decimal(10, 2)`.
+        return removeASCIIWhitespace(old_type.extract<String>()) == removeASCIIWhitespace(new_type.extract<String>());
+    }
+
+    if (old_type.type() != typeid(Poco::JSON::Object::Ptr) || new_type.type() != typeid(Poco::JSON::Object::Ptr))
         return false;
 
     auto old_object = old_type.extract<Poco::JSON::Object::Ptr>();
@@ -207,16 +205,52 @@ bool icebergTypesEqualIgnoringIds(Poco::Dynamic::Var old_type, Poco::Dynamic::Va
     if (!old_object || !new_object)
         return false;
 
-    auto old_stripped = deepCopy(old_object);
-    auto new_stripped = deepCopy(new_object);
-    stripNestedFieldIds(old_stripped);
-    stripNestedFieldIds(new_stripped);
+    if (old_object->has("precision") || new_object->has("precision"))
+    {
+        return old_object->has("precision") && new_object->has("precision")
+            && old_object->getValue<Int32>("precision") == new_object->getValue<Int32>("precision")
+            && old_object->getValue<Int32>("scale") == new_object->getValue<Int32>("scale");
+    }
 
-    std::ostringstream oss_old; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    std::ostringstream oss_new; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    old_stripped->stringify(oss_old);
-    new_stripped->stringify(oss_new);
-    return oss_old.str() == oss_new.str();
+    if (!old_object->has(Iceberg::f_type) || !new_object->has(Iceberg::f_type))
+        return false;
+    const auto kind = old_object->getValue<String>(Iceberg::f_type);
+    if (kind != new_object->getValue<String>(Iceberg::f_type))
+        return false;
+
+    if (kind == Iceberg::f_list)
+    {
+        return optionalBoolsEqual(old_object, new_object, Iceberg::f_element_required)
+            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_element), new_object->get(Iceberg::f_element));
+    }
+
+    if (kind == Iceberg::f_map)
+    {
+        return optionalBoolsEqual(old_object, new_object, Iceberg::f_value_required)
+            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_key), new_object->get(Iceberg::f_key))
+            && icebergTypesEqualIgnoringIds(old_object->get(Iceberg::f_value), new_object->get(Iceberg::f_value));
+    }
+
+    if (kind == Iceberg::f_struct)
+    {
+        auto old_fields = old_object->getArray(Iceberg::f_fields);
+        auto new_fields = new_object->getArray(Iceberg::f_fields);
+        if (!old_fields || !new_fields || old_fields->size() != new_fields->size())
+            return false;
+        for (UInt32 i = 0; i < old_fields->size(); ++i)
+        {
+            auto old_field = old_fields->getObject(i);
+            auto new_field = new_fields->getObject(i);
+            if (!old_field || !new_field
+                || old_field->getValue<String>(Iceberg::f_name) != new_field->getValue<String>(Iceberg::f_name)
+                || !optionalBoolsEqual(old_field, new_field, Iceberg::f_required)
+                || !icebergTypesEqualIgnoringIds(old_field->get(Iceberg::f_type), new_field->get(Iceberg::f_type)))
+                return false;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 /// The Iceberg spec marks `snapshots`, `metadata-log` and `snapshot-log` as optional, so table

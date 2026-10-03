@@ -828,7 +828,7 @@ void IcebergMetadata::checkAlterIsPossible(const AlterCommands & commands)
                 ErrorCodes::NOT_IMPLEMENTED,
                 "Removing column property '{}' from column '{}' is not supported by Iceberg storage", command.to_remove, command.column_name);
 
-        if (command.type == AlterCommand::Type::MODIFY_COLUMN)
+        if (command.type == AlterCommand::Type::ADD_COLUMN || command.type == AlterCommand::Type::MODIFY_COLUMN)
         {
             /// The Iceberg schema records only the type and the field order, so any other clause would be dropped.
             const char * unsupported_property = nullptr;
@@ -846,7 +846,10 @@ void IcebergMetadata::checkAlterIsPossible(const AlterCommands & commands)
             if (unsupported_property)
                 throw Exception(
                     ErrorCodes::NOT_IMPLEMENTED,
-                    "Changing the {} of column '{}' is not supported by Iceberg storage", unsupported_property, command.column_name);
+                    "{} the {} of column '{}' is not supported by Iceberg storage",
+                    command.type == AlterCommand::Type::ADD_COLUMN ? "Setting" : "Changing",
+                    unsupported_property,
+                    command.column_name);
         }
 
         if (command.type == AlterCommand::Type::MODIFY_COLUMN && !command.data_type

@@ -894,4 +894,46 @@ TEST(IcebergMetadataGenerator, ModifyColumnToComplexTypeAlreadyInSchemaAddsNoSch
     expectSchemaUnchanged(metadata, before);
 }
 
+TEST(IcebergMetadataGenerator, ModifyColumnSameArrayTypeWithFirstOnlyRepositions)
+{
+    /// A list as other writers store it: unlike `getIcebergType`, no `required` on the list itself.
+    auto metadata = makeMetadataWithIntAndComplexField(makeListType("int", 3), /* last_column_id */ 3);
+
+    EXPECT_TRUE(MetadataGenerator(metadata).generateModifyColumnMetadata(
+        "t", std::make_shared<DataTypeArray>(std::make_shared<DataTypeInt32>()), getContext().context, /* first */ true));
+
+    auto names = getCurrentFieldNames(metadata);
+    ASSERT_EQ(names.size(), 2u);
+    EXPECT_EQ(names[0], "t");
+    EXPECT_EQ(names[1], "x");
+
+    auto stored_type = findCurrentFieldType(metadata, "t");
+    ASSERT_EQ(stored_type.type(), typeid(Poco::JSON::Object::Ptr));
+    auto stored_list = stored_type.extract<Poco::JSON::Object::Ptr>();
+    EXPECT_EQ(stored_list->getValue<String>(f_element), "int");
+    EXPECT_TRUE(stored_list->getValue<bool>(f_element_required));
+    EXPECT_FALSE(stored_list->has(f_required));
+}
+
+TEST(IcebergMetadataGenerator, ModifyColumnSameComplexTypeWithDocOnlyRepositions)
+{
+    auto struct_type = makeStructType("a", "int", 3);
+    struct_type->getArray(f_fields)->getObject(0)->set("doc", "documented by another writer");
+    auto metadata = makeMetadataWithIntAndComplexField(struct_type, /* last_column_id */ 3);
+
+    EXPECT_TRUE(MetadataGenerator(metadata).generateModifyColumnMetadata(
+        "t", makeTupleOf(std::make_shared<DataTypeInt32>()), getContext().context, /* first */ true));
+
+    auto names = getCurrentFieldNames(metadata);
+    ASSERT_EQ(names.size(), 2u);
+    EXPECT_EQ(names[0], "t");
+    EXPECT_EQ(names[1], "x");
+
+    auto stored_type = findCurrentFieldType(metadata, "t");
+    ASSERT_EQ(stored_type.type(), typeid(Poco::JSON::Object::Ptr));
+    auto stored_fields = stored_type.extract<Poco::JSON::Object::Ptr>()->getArray(f_fields);
+    ASSERT_EQ(stored_fields->size(), 1u);
+    EXPECT_EQ(stored_fields->getObject(0)->getValue<String>(f_type), "int");
+}
+
 #endif
