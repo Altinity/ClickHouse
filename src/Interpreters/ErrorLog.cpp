@@ -130,7 +130,7 @@ void ErrorLog::stepFunction(TimePoint current_time)
     for (size_t index = 0, size = ErrorCodes::size(); index < size; ++index)
     {
         const auto code = ErrorCodes::getCode(index);
-        if (ErrorCodes::getName(code).empty())
+        if (index == static_cast<size_t>(ErrorCodes::end() - 1))
             continue;
         const auto error = ErrorCodes::getValue(index).get();
         auto & previous = previous_values.at(index);

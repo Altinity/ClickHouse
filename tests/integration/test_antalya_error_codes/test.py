@@ -31,7 +31,7 @@ def started_cluster():
         cluster.shutdown()
 
 
-@pytest.mark.parametrize("code", [-1, 779, 1009, 10000, 10007, 2147483647])
+@pytest.mark.parametrize("code", [-1, 1009, 10000, 10007, 2147483647])
 def test_unknown_code_is_not_logged_as_sentinel(code):
     message = f"unknown code {code} must not become sentinel"
     error = origin.query_and_get_error(
@@ -53,6 +53,24 @@ def test_unknown_code_is_not_logged_as_sentinel(code):
             f"AND exception_code = {code} AND position(exception, '{message}') > 0"
         )
         == "1\n"
+    )
+
+
+@pytest.mark.parametrize("code", [779, 780, 899])
+def test_upstream_gap_code_is_logged_with_original_identity(code):
+    message = f"upstream gap code {code} must retain its identity"
+    assert origin.query(f"SELECT errorCodeToName({code})") == "\n"
+    error = origin.query_and_get_error(
+        f"SELECT throwIf(1, '{message}', toInt32({code}))", settings=SETTINGS
+    )
+    assert f"Code: {code}." in error
+    origin.query("SYSTEM FLUSH LOGS")
+    assert (
+        origin.query(
+            "SELECT DISTINCT code FROM system.error_log "
+            f"WHERE position(last_error_message, '{message}') > 0"
+        )
+        == f"{code}\n"
     )
 
 

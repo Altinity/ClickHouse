@@ -66,7 +66,9 @@ separate. Unknown codes retain their identity in exceptions. Codes outside the
 upstream array, unless registered by Antalya, share an unnamed out-of-range
 accounting slot. Unassigned slots inside the upstream array keep their existing
 accounting behavior. Unknown codes do not acquire a registered name or increment
-an Antalya error's counters. The aggregated error log skips unnamed slots, as do
-`system.errors` and Prometheus, rather than reporting the shared slot number as
-an exception identity. `system.query_log.exception_code` retains the original
-numeric code.
+an Antalya error's counters. The aggregated error log skips only the shared
+out-of-range accounting slot, rather than reporting its slot number as an
+exception identity. Errors in unassigned slots inside the upstream array remain
+logged under their original numeric codes, even without a symbolic name.
+`system.errors` and Prometheus omit unnamed entries.
+`system.query_log.exception_code` retains the original numeric code.
