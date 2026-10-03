@@ -85,7 +85,9 @@ public:
         const String & table_name,
         const String & new_metadata_path,
         Poco::JSON::Object::Ptr new_schema,
-        Int32 previous_schema_id) const override;
+        Int32 previous_schema_id,
+        Int32 new_last_column_id,
+        Poco::JSON::Object::Ptr metadata = nullptr) const override;
 
     bool isTransactional() const override { return true; }
 
@@ -443,6 +445,23 @@ protected:
         std::optional<DB::HTTPHeaderEntries> & new_auth_headers,
         std::unique_ptr<AccessToken> & new_access_token) override;
 };
+
+/// Builds the JSON body for a schema-update commit via the Iceberg REST catalog.
+/// Includes an assert-current-schema-id requirement (when previous_schema_id >= 0),
+/// schema deduplication against existing schemas in metadata, and last-column-id
+/// propagation when adding a new schema.
+Poco::JSON::Object::Ptr buildUpdateSchemaRequestBody(
+    const String & namespace_name,
+    const String & table_name,
+    Poco::JSON::Object::Ptr metadata,
+    Poco::JSON::Object::Ptr new_schema,
+    Int32 previous_schema_id,
+    Int32 new_last_column_id);
+
+Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
+    const String & namespace_name,
+    const String & table_name,
+    Poco::JSON::Object::Ptr new_snapshot);
 
 }
 
