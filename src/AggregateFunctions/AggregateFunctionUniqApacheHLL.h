@@ -246,7 +246,6 @@ public:
     {
         assert_cast<ColumnUInt64 &>(to).getData().push_back(this->data(place).size(target_type));
     }
-
 };
 
 }
