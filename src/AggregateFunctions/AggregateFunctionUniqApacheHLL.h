@@ -100,6 +100,9 @@ public:
 
     void merge(const HllSketchData & rhs, uint8_t lg_config_k, datasketches::target_hll_type tgt_type)
     {
+        if (!rhs.sk_update && !rhs.sk_union)
+            return;
+
         datasketches::hll_union * u = getSkUnion(lg_config_k);
 
         foldUpdateIntoUnionIfNeeded();

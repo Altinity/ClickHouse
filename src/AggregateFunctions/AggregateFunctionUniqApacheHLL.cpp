@@ -1,7 +1,6 @@
 #include <AggregateFunctions/AggregateFunctionUniqApacheHLL.h>
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/FactoryHelpers.h>
-#include <Common/FieldVisitorConvertToNumber.h>
 
 #if USE_DATASKETCHES
 
@@ -28,7 +27,12 @@ static AggregateFunctionPtr createAggregateFunctionUniqApacheHLL(
 
     if (!params.empty())
     {
-        const UInt64 lg_k_param = applyVisitor(FieldVisitorConvertToNumber<UInt64>(), params[0]);
+        const Field::Types::Which lg_k_type = params[0].getType();
+        if (lg_k_type != Field::Types::UInt64 && !(lg_k_type == Field::Types::Int64 && params[0].safeGet<Int64>() >= 0))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Parameter lg_k for aggregate function {} must be an unsigned integer.", name);
+
+        const UInt64 lg_k_param = lg_k_type == Field::Types::Int64 ? static_cast<UInt64>(params[0].safeGet<Int64>()) : params[0].safeGet<UInt64>();
         if (lg_k_param < 4 || lg_k_param > 21)
             throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND,
                 "Parameter lg_k for aggregate function {} is out of range: [4, 21].", name);
