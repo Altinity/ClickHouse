@@ -7,8 +7,14 @@ from ci.defs.defs import (
     SECRETS,
     ArtifactConfigs,
 )
+from ci.defs.altinity_jobs import AltinityJobConfigs
 from ci.defs.job_configs import JobConfigs
 from ci.jobs.scripts.workflow_hooks.filter_job import should_skip_job
+
+FUNCTIONAL_TESTS_JOBS = [
+    *JobConfigs.functional_tests_jobs,
+    *AltinityJobConfigs.cas_functional_tests_jobs,
+]
 
 builds_for_release_branch = [
     job
@@ -38,7 +44,7 @@ workflow = Workflow.Config(
         JobConfigs.docker_server,
         JobConfigs.docker_keeper,
         *JobConfigs.install_check_master_jobs,
-        *[job for job in JobConfigs.functional_tests_jobs if "asan" in job.name],
+        *[job for job in FUNCTIONAL_TESTS_JOBS if "asan" in job.name],
         *[job for job in JobConfigs.unittest_jobs if "fuzzer" not in job.name],
         *[
             job

@@ -51,7 +51,7 @@ from errno import EPERM, ESRCH
 from pathlib import Path
 from ssl import SSLEOFError
 from subprocess import PIPE, Popen
-from time import sleep, time
+from time import monotonic, sleep, time
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 try:
@@ -1173,12 +1173,21 @@ def get_transactions_list(args):
         return f"Cannot get list of transactions: {e}"
 
 
+# Per-PID lldb budget: the release value is also the fallback for a caller that
+# cannot tell which flavor the server is.
+LLDB_TIMEOUT = 30
+LLDB_SLOW_BUILD_TIMEOUT = 120
+
+
 # collect server stacktraces using lldb (used uniformly on Linux and macOS)
-def get_stacktraces_from_lldb(pid):
-    # 30s ceiling: `thread backtrace all` should finish in seconds even on a
-    # debug build with many threads; anything beyond that means lldb itself
-    # is wedged (e.g. signal-handler deadlock on the inferior). Killing lldb
-    # leaves the server process untouched.
+def get_stacktraces_from_lldb(pid, timeout: float = LLDB_TIMEOUT):
+    # The budget bounds a wedged lldb (e.g. signal-handler deadlock on the
+    # inferior); it is not an estimate of the work, which scales with the
+    # binary's unwind/symbol cost. Killing lldb leaves the server untouched
+    # only without lldb's JIT-loader breakpoint: the linker folds the empty
+    # `__jit_debug_register_code` with other functions, so the `int3` a killed
+    # lldb leaves there traps server threads with SIGTRAP, a fatal signal to
+    # the server, and it wedges (state S, no logs, ignores SIGTERM).
     # macOS restricts task_for_pid(): in --batch mode a non-root lldb cannot
     # attach to the server on a CI runner (the user is not in the _developer
     # group and there is no interactive authorization), so it exits 1. The
@@ -1192,8 +1201,9 @@ def get_stacktraces_from_lldb(pid):
     # print_c_stacktraces save the full dump to c_stacktraces.log and preview
     # it, instead of shell_get_output flooding stderr with nothing attached.
     return shell_get_output(
-        f"{sudo}{lldb} --batch -p {pid} -o 'thread backtrace all' -o 'detach' -o 'quit'",
-        timeout=30,
+        f"{sudo}{lldb} --batch -O 'settings set plugin.jit-loader.gdb.enable off' "
+        f"-p {pid} -o 'thread backtrace all' -o 'detach' -o 'quit'",
+        timeout=timeout,
         keep_output_on_error=True,
     )
 
@@ -1384,15 +1394,76 @@ def _append_stacktrace_log(filename: str, block: str) -> None:
         print(f"Could not write {filename}: {e}", file=sys.stderr)
 
 
-def print_c_stacktraces(args) -> None:
+def is_slow_build_binary(args) -> bool:
+    """Debug/sanitizer/coverage flavor read from the binary, not the server.
+
+    Mirrors the flag set `collect_build_flags` derives, so the answer matches
+    what `args.build_flags` would have said had the server come up. An
+    unreadable or unparseable result is reported as not-slow, keeping the
+    tighter of the two budgets.
+    """
+    binary = getattr(args, "binary", "clickhouse")
+    local = find_clickhouse_command(binary, "local")
+    # Name the same four sanitizers `collect_build_flags` maps, not every
+    # `-fsanitize=`: a CFI build carries `-fsanitize=cfi-vcall` on top of
+    # RelWithDebInfo, and the collected-flags path calls that a release build.
+    sanitizers = " OR ".join(
+        f"position('sanitize={san}' IN value)"
+        for san in ("thread", "address", "undefined", "memory")
+    )
+    out = shell_get_output(
+        f"{local} --query \""
+        "SELECT countIf(name = 'BUILD_TYPE' AND position('Debug' IN value)) "
+        "+ countIf(name = 'WITH_COVERAGE' AND value IN ('ON', '1')) "
+        f"+ countIf(name = 'CXX_FLAGS' AND ({sanitizers})) "
+        'FROM system.build_options"',
+        timeout=60,
+    )
+    try:
+        return int(out.strip()) > 0
+    except ValueError:
+        return False
+
+
+def lldb_timeout_for_build(args) -> float:
+    """Per-PID lldb budget for this server's build flavor.
+
+    Debug, sanitizer and coverage builds are far more expensive to unwind and
+    symbolize. Must read `args.build_flags`, not the module-level
+    RELEASE_NON_SANITIZED / SANITIZED globals, which a spawned worker
+    re-imports at their defaults while `args` is transferred intact. When the
+    flags were never collected (server never started), read the flavor from
+    the binary via `clickhouse local`.
+    """
+    build_flags = getattr(args, "build_flags", None)
+    if build_flags is None:
+        return LLDB_SLOW_BUILD_TIMEOUT if is_slow_build_binary(args) else LLDB_TIMEOUT
+    slow_build = (
+        any(flag in build_flags for flag in BuildFlags.SANITIZERS)
+        or BuildFlags.DEBUG in build_flags
+        or BuildFlags.WITH_COVERAGE in build_flags
+    )
+    return LLDB_SLOW_BUILD_TIMEOUT if slow_build else LLDB_TIMEOUT
+
+
+def print_c_stacktraces(
+    args,
+    per_pid_timeout: Optional[float] = None,
+    total_timeout: float = LLDB_SLOW_BUILD_TIMEOUT,
+) -> None:
     """C++-side backtraces via lldb.  Works whenever the server process
     exists and is debuggable, independent of whether SQL is reachable.
 
     Every call site is one of two situations: we're aborting the whole
     run (SERVER_DIED, liveness check, hung-check, check_server_started)
-    or terminating the one wedged test (timeout_handler).  lldb's "thread
-    backtrace all" pause is on the order of seconds - acceptable in both
-    cases against the diagnostic value.
+    or terminating the one wedged test (timeout_handler).
+
+    `per_pid_timeout` None means derive it from the build flavor, which on a
+    server that never started costs a `clickhouse local` read of the binary.
+    `total_timeout` bounds the whole pid loop, which can span many
+    processes; it is an independent limit, not a multiple of the per-PID one.
+    A caller inside a fired one-shot `signal.alarm` must pass both, because
+    that alarm cannot bound work running in its own handler.
 
     Skipped under ASan, where attaching a debugger disables
     LeakSanitizer detections.
@@ -1425,10 +1496,23 @@ def print_c_stacktraces(args) -> None:
         )
         return
 
-    for pid in all_pids:
+    if per_pid_timeout is None:
+        per_pid_timeout = lldb_timeout_for_build(args)
+
+    deadline = monotonic() + total_timeout
+    for index, pid in enumerate(all_pids):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            # Name the skipped pids: silence here reads as "nothing to dump".
+            print(
+                f"Ran out of the {total_timeout:.0f}s lldb budget: "
+                f"skipping {len(all_pids) - index} of {len(all_pids)} processes "
+                f"({', '.join(str(p) for p in all_pids[index:])})."
+            )
+            break
         label = "main server" if pid == server_pid else "replica"
         print(f"\nCollecting C stacktraces from {label} process {pid} with lldb:")
-        bt = get_stacktraces_from_lldb(pid)
+        bt = get_stacktraces_from_lldb(pid, timeout=min(per_pid_timeout, remaining))
         if bt and len(bt) >= 1000:
             block = f"=== PID {pid} ({label}) ===\n{bt}"
             _append_stacktrace_log(C_STACKTRACES_LOG, block)
@@ -1522,6 +1606,7 @@ class FailureReason(enum.Enum):
     OBJECT_STORAGE = "object-storage"
     COVERAGE = "coverage"
     S3_STORAGE = "s3-storage"
+    CAS_STORAGE = "cas-storage"
     AZURE_BLOB_STORAGE = "azure-blob-storage"
     BUILD = "not running for current build"
     NO_PARALLEL_REPLICAS = "smth is not supported with parallel replicas"
@@ -3145,18 +3230,32 @@ class TestCase:
 
         if tags and ("no-s3-storage" in tags) and args.s3_storage:
             return FailureReason.S3_STORAGE
+        if (
+            tags
+            and ("no-cas-storage" in tags)
+            and args.cas_storage
+        ):
+            return FailureReason.CAS_STORAGE
         if tags and ("no-azure-blob-storage" in tags) and args.azure_blob_storage:
             return FailureReason.AZURE_BLOB_STORAGE
         if (
             tags
             and ("no-object-storage" in tags)
-            and (args.azure_blob_storage or args.s3_storage)
+            and (
+                args.azure_blob_storage
+                or args.s3_storage
+                or args.cas_storage
+            )
         ):
             return FailureReason.OBJECT_STORAGE
         if (
             tags
             and "no-object-storage-with-slow-build" in tags
-            and (args.s3_storage or args.azure_blob_storage)
+            and (
+                args.s3_storage
+                or args.azure_blob_storage
+                or args.cas_storage
+            )
             and BuildFlags.RELEASE not in args.build_flags
         ):
             return FailureReason.OBJECT_STORAGE
@@ -5014,7 +5113,12 @@ def run_tests_array(
                         # stay around either way and can be captured at
                         # end-of-run.
                         print_sql_stacktraces(args)
-                        print_c_stacktraces(args)
+                        # Explicit budget: this runs from the fired one-shot
+                        # alarm, which cannot bound its own handler, and
+                        # stop_tests() below still needs the outer timeout.
+                        print_c_stacktraces(
+                            args, per_pid_timeout=LLDB_TIMEOUT, total_timeout=60
+                        )
                         stop_tests()
                     raise TimeoutError("Test execution timed out")
 
@@ -6441,6 +6545,16 @@ def main(args):
     if args.s3_storage and (BuildFlags.RELEASE not in args.build_flags):
         args.no_random_settings = True
 
+    if args.cas_s3_storage:
+        # CA-over-S3 is a CAS disk AND it is backed by S3 (minio).
+        # Mirror the local-CA gating (no-cas-storage + no-object-storage)
+        # and additionally honour no-s3-storage, since this disk IS s3-backed.
+        # Done AFTER the no_random_settings block above on purpose: like the local-CA
+        # job we keep random (merge-tree) settings; we only want the s3/object-storage
+        # *gating*, not the s3 stateful-data / no-random-settings machinery.
+        args.cas_storage = True
+        args.s3_storage = True
+
     if args.skip:
         args.skip = set(args.skip)
 
@@ -7157,6 +7271,19 @@ def parse_args():
         action="store_true",
         default=False,
         help="Run tests over s3 storage",
+    )
+    parser.add_argument(
+        "--cas-storage",
+        action="store_true",
+        default=False,
+        help="Run tests with a CAS disk as the default MergeTree storage",
+    )
+    parser.add_argument(
+        "--cas-s3-storage",
+        action="store_true",
+        default=False,
+        help="Run tests with a CAS disk backed by S3 (minio) as the default MergeTree storage. "
+        "Implies --cas-storage (object-storage gating) and --s3-storage (s3-storage gating).",
     )
     parser.add_argument(
         "--distributed-cache",

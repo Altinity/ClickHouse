@@ -5,6 +5,7 @@
 #if USE_AWS_S3
 
 #include <IO/S3Settings.h>
+#include <IO/WriteSettings.h>
 #include <Common/threadPoolCallbackRunner.h>
 #include <Common/BlobStorageLogWriter.h>
 #include <base/types.h>
@@ -38,6 +39,9 @@ std::unique_ptr<StdStreamFromReadBuffer> createS3UploadBody(
 /// (copyDataToS3File()).
 ///
 /// read_settings - is used for throttling in case of native copy is not possible
+///
+/// `copy_mode = NativeOnly` forbids the client-side read-write fallback. If native copy is disabled
+/// or cannot complete, the failure is propagated instead.
 void copyS3File(
     std::shared_ptr<const S3::Client> src_s3_client,
     const String & src_bucket,
@@ -51,7 +55,8 @@ void copyS3File(
     BlobStorageLogWriterPtr blob_storage_log,
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
     const CreateReadBuffer & fallback_file_reader,
-    const std::optional<ObjectAttributes> & object_metadata = std::nullopt);
+    const std::optional<ObjectAttributes> & object_metadata = std::nullopt,
+    ObjectStorageCopyMode copy_mode = ObjectStorageCopyMode::Default);
 
 /// Copies exactly `[src_offset, src_offset + src_size)` of a LARGER source object of size `src_object_size`.
 ///

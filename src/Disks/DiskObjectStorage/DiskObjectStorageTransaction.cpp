@@ -110,7 +110,7 @@ MultipleDisksObjectStorageTransaction::MultipleDisksObjectStorageTransaction(
 
 void DiskObjectStorageTransaction::addOperation(std::function<void(MetadataTransactionPtr tx)> op)
 {
-    if (metadata_storage->appliesOperationsEagerly())
+    if (metadata_storage->appliesOperationsEagerly() || metadata_storage->transactionIsStagingOverlay())
         op(metadata_transaction);
     else
         operations_to_execute.push_back(std::move(op));
@@ -246,7 +246,7 @@ void DiskObjectStorageTransaction::removeFileIfExists(const std::string & path)
 {
     addOperation([path](MetadataTransactionPtr tx)
     {
-        tx->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects*/true);
+        tx->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects=*/true);
     });
 }
 
@@ -290,6 +290,16 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
     LOG_TEST(getLogger("DiskObjectStorageTransaction"), "write file {} mode {} autocommit {}", path, mode, autocommit);
 
     WriteSettings enriched_settings = updateIOSchedulingSettings(settings, read_resource_name, write_resource_name);
+
+    /// [TXN-ONE-PIPELINE] Give the metadata storage a chance to own the write (e.g. a content-addressed
+    /// hash-on-write buffer whose blob key is known only after the last byte). It returns a fully-wrapped
+    /// buffer (hash-on-write + append RMW + inline/blob split + autocommit/lifetime pin using `owner`), or
+    /// nullptr to fall through to the generic up-front-key streaming path below. Called BEFORE the append
+    /// check so a CA storage (which reports no native append) can service a verbatim append via
+    /// read-modify-rewrite inside the hook and reject a part-file append there.
+    if (auto buffer = metadata_transaction->tryCreateWriteBuffer(
+            shared_from_this(), path, buf_size, mode, enriched_settings, autocommit))
+        return buffer;
 
     /// NOTE: We check it here and not after writing blob because in case of plain/plain-rewritable metadata storages
     ///       undo of disk tx will actually remove existing data.
@@ -458,6 +468,9 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
     /// We always use mode Rewrite because we simulate append using metadata and different files
     object.bytes_size = std::move(write_blob_function)(blob_path, WriteMode::Rewrite, /*object_attributes=*/std::nullopt);
 
+    /// [TXN-ONE-PIPELINE] Routed through addOperation for uniformity. Unreachable on CA (Audit 6):
+    /// generateObjectKeyForPath above throws NOT_IMPLEMENTED first, so CA never reaches this metadata
+    /// effect and never queues. On ordinary storage addOperation queues exactly as before.
     addOperation([object, mode](MetadataTransactionPtr tx)
     {
         if (mode == WriteMode::Rewrite)
@@ -476,10 +489,42 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
 
 void DiskObjectStorageTransaction::createHardLink(const std::string & src_path, const std::string & dst_path)
 {
+    /// For CA `addOperation` runs eagerly (call-time), which is load-bearing for read-your-writes: a
+    /// carried-forward projection hardlinked into the open whole-part transaction during a mutation must
+    /// be visible to `loadProjections` (same finalize, before commit) via the directory overlay. Deferring
+    /// it to commit replay would hide it until after `loadProjections` ran (B58/B63). The metadata-level
+    /// `createHardLink` is an idempotent map assignment, so eager staging is equivalent to the queued
+    /// replay — commit publishes the manifest from the staging.
     addOperation([src_path, dst_path](MetadataTransactionPtr tx)
     {
         tx->createHardLink(src_path, dst_path);
     });
+}
+
+std::optional<StoredObjects> DiskObjectStorageTransaction::tryGetInFlightStorageObjects(const std::string & path) const
+{
+    return metadata_transaction->tryGetInFlightStorageObjects(path);
+}
+
+std::unique_ptr<ReadBufferFromFileBase> DiskObjectStorageTransaction::tryReadFileInFlight(
+    const std::string & path, const ReadSettings & settings, std::optional<size_t> read_hint) const
+{
+    return metadata_transaction->tryReadFileInFlight(path, settings, read_hint);
+}
+
+std::optional<uint64_t> DiskObjectStorageTransaction::tryGetInFlightFileSize(const std::string & path) const
+{
+    return metadata_transaction->tryGetInFlightFileSize(path);
+}
+
+bool DiskObjectStorageTransaction::hasInFlightDirectory(const std::string & path) const
+{
+    return metadata_transaction->hasInFlightDirectory(path);
+}
+
+std::vector<std::string> DiskObjectStorageTransaction::listInFlightDirectory(const std::string & path) const
+{
+    return metadata_transaction->listInFlightDirectory(path);
 }
 
 void DiskObjectStorageTransaction::setReadOnly(const std::string & path)
@@ -598,6 +643,10 @@ void DiskObjectStorageTransaction::copyFileImpl(
         return;
     }
 
+    /// [TXN-ONE-PIPELINE] Routed through addOperation for uniformity. Unreachable on CA (Audit 6):
+    /// copyFileImpl calls generateObjectKeyForPath above, which throws NOT_IMPLEMENTED on CA before this
+    /// point (and the empty-source case returns via the real writeFile above), so CA never queues here.
+    /// On ordinary storage addOperation queues exactly as before.
     addOperation([blobs_to_create, missing_locations, to_file_path](MetadataTransactionPtr tx)
     {
         for (const auto & blob : blobs_to_create)
@@ -619,6 +668,15 @@ void MultipleDisksObjectStorageTransaction::copyFile(const std::string & from_fi
 
 void DiskObjectStorageTransaction::commit()
 {
+    /// [TXN-ONE-PIPELINE] An eager staging-overlay transaction (e.g. CA) must route every mutating method
+    /// straight to the metadata transaction at call time and keep this queue empty. A non-empty queue here
+    /// means a mutating method bypassed `addOperation` — which would re-introduce the two-timeline split this
+    /// design eliminates. Fail closed with a real throw (NOT chassert, which is a no-op in release builds).
+    if (metadata_storage->transactionIsStagingOverlay() && !operations_to_execute.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "An eager staging-overlay transaction must not queue deferred operations "
+            "(a mutating method bypassed addOperation): {} queued", operations_to_execute.size());
+
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorageTransaction::commit");
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
     for (size_t i = 0; i < operations_to_execute.size(); ++i)
@@ -664,6 +722,13 @@ void DiskObjectStorageTransaction::commit()
 
 TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
 {
+    /// [TXN-ONE-PIPELINE] See commit(): an eager staging-overlay transaction must never queue deferred
+    /// operations. Fail closed (real throw, not chassert) if a mutating method bypassed `addOperation`.
+    if (metadata_storage->transactionIsStagingOverlay() && !operations_to_execute.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "An eager staging-overlay transaction must not queue deferred operations "
+            "(a mutating method bypassed addOperation): {} queued", operations_to_execute.size());
+
     chassert(operations_to_execute.empty() || !metadata_storage->appliesOperationsEagerly());
     for (size_t i = 0; i < operations_to_execute.size(); ++i)
     {

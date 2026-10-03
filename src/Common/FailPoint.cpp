@@ -236,6 +236,7 @@ static struct InitFiu
     ONCE(smt_commit_exception_before_op) \
     ONCE(disk_object_storage_fail_commit_metadata_transaction) \
     ONCE(disk_object_storage_fail_precommit_metadata_transaction) \
+    REGULAR(part_storage_fail_commit_transaction) \
     ONCE(write_file_operation_fail_on_read) \
     REGULAR(slowdown_parallel_replicas_local_plan_read) \
     REGULAR(slowdown_skip_index_read_result_build) \
@@ -371,7 +372,13 @@ static struct InitFiu
     PAUSEABLE_ONCE(limit_by_transform_mid_loop_pause) \
     PAUSEABLE_ONCE(aggregating_in_order_transform_mid_loop_pause) \
     REGULAR(smt_force_takeover_predicate_true) \
-    REGULAR(smt_takeover_fake_hardware_error_after_set)
+    REGULAR(smt_takeover_fake_hardware_error_after_set) \
+    REGULAR(cas_relink_receiver_force_mechanism_failure) \
+    PAUSEABLE_ONCE(cas_relink_receiver_pause_before_confirm) \
+    REGULAR(cas_relink_sender_omit_pool_cookie) \
+    REGULAR(cas_relink_receiver_drop_forced_disk) \
+    ONCE(cas_gc_scheduler_fail_before_heartbeat_worker_start) \
+    ONCE(cas_gc_scheduler_fail_before_worker_start)
 
 namespace FailPoints
 {

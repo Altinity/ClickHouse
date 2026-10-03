@@ -289,6 +289,14 @@ using ObjectKeysWithMetadata = std::vector<ObjectKeyWithMetadata>;
 class IObjectStorageIterator;
 using ObjectStorageIteratorPtr = std::shared_ptr<IObjectStorageIterator>;
 
+/// Outcome of a token-conditional single-object removal (content-addressed disks).
+enum class ConditionalRemoveOutcome : uint8_t { Removed, TokenMismatch, NotFound };
+struct ConditionalRemoveResult
+{
+    ConditionalRemoveOutcome outcome = ConditionalRemoveOutcome::NotFound;
+    bool created_delete_marker = false;   /// backend reported a versioning delete marker
+};
+
 /// Base class for all object storages which implement some subset of ordinary filesystem operations.
 ///
 /// Examples of object storages are S3, Azure Blob Storage, HDFS.
@@ -332,6 +340,17 @@ public:
         bool with_tags,
         const std::optional<std::string> & start_after) const;
 
+    /// Same, under a chosen control-request context (retry profile, one attempt's timeout and connect
+    /// cap, and the caller's own attempt number -- see `ObjectStorageControlRequest`). A storage that
+    /// cannot execute the profile must refuse: a caller that asked for one attempt has its own
+    /// deadline, and a transparently retried request would outlive it.
+    virtual ObjectStorageIteratorPtr iterate(
+        const std::string & path_prefix,
+        size_t max_keys,
+        bool with_tags,
+        const std::optional<std::string> & start_after,
+        const ObjectStorageControlRequest & request) const;
+
     /// Get object metadata if supported. It should be possible to receive at least size of object
     virtual ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const = 0;
     virtual ObjectMetadata getObjectMetadata(const RelativePathWithMetadata & object, bool with_tags) const
@@ -345,6 +364,18 @@ public:
     {
         return tryGetObjectMetadata(object.getPath(), with_tags);
     }
+
+    /// Same as tryGetObjectMetadata(), but lets a backend that speaks a native conditional-request
+    /// dialect (GCS generation tokens) read one while consulting this metadata. Object storages with
+    /// no such dialect fall back to the ordinary read.
+    virtual std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const
+    {
+        return tryGetObjectMetadata(path, with_tags);
+    }
+
+    /// Same, under a chosen control-request context; see the note on `iterate`.
+    virtual std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(
+        const std::string & path, bool with_tags, const ObjectStorageControlRequest & request) const;
 
     /// Read single object
     virtual std::unique_ptr<ReadBufferFromFileBase> readObject( /// NOLINT
@@ -402,6 +433,28 @@ public:
 
     /// Remove objects on path if exists
     virtual void removeObjectsIfExist(const StoredObjects & object) = 0;
+
+    /// Remove `object` ONLY if its current entity tag equals `etag`. Backends without enforced
+    /// conditional removal MUST NOT override this: the content-addressed capability probe relies on the
+    /// default to fail closed. Supported: S3 (DeleteObject If-Match, GA 2025-09).
+    virtual ConditionalRemoveResult removeObjectIfTokenMatches(const StoredObject & /*object*/, const std::string & /*etag*/)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Conditional (token-exact) object removal is not implemented for {} object storage", getName());
+    }
+
+    /// Same, under a chosen control-request context; see the note on `iterate`.
+    virtual ConditionalRemoveResult removeObjectIfTokenMatches(
+        const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request);
+
+    /// Removes every object in ONE request with no per-key precondition; an absent object is success.
+    /// Content-addressed callers use it for write-once keys only, at most 1000 per call. Throws on a
+    /// request-level failure and on any per-key error other than "not found", naming the failed keys.
+    /// Same context note as `iterate`: the default forwards a Default-profile request to
+    /// `removeObjectsIfExist` and refuses a SingleAttempt one, so a backend without a real batch
+    /// delete still needs to override this for SingleAttempt to behave correctly under that profile.
+    virtual void removeObjectsIfExistUnderProfile(
+        const StoredObjects & objects, const ObjectStorageControlRequest & request);
 
     /// Copy object with different attributes if required
     virtual void copyObject( /// NOLINT
@@ -471,6 +524,41 @@ public:
     /// that must reread the same generation of an object (e.g. lazy materialization) have to skip
     /// such storages instead of failing close at read time.
     virtual bool supportsObjectGenerationComparison() const { return true; }
+
+    /// True when the incarnation tokens this storage returns from writes/HEADs are GCS generation
+    /// numbers riding the ETag plumbing (http_client = gcs_hmac or gcp_oauth).
+    /// Consumers (the CAS backend) stamp TokenType::Generation and route conditional writes
+    /// through the single-PUT path (GCS enforces no preconditions on CompleteMultipartUpload).
+    virtual bool conditionalOpsUseGenerationTokens() const { return false; }
+
+    /// Declare that this storage's answer to `conditionalOpsUseGenerationTokens` must not change for
+    /// the rest of its life, and what that answer is expected to be. A caller that has already derived
+    /// persistent state from the dialect pins it here; a later `applyNewSettings` that would flip it
+    /// must then be refused rather than silently swapping the client underneath that state.
+    ///
+    /// The check has to live at this layer because the effective value is only known here: it is merged
+    /// from the storage's current settings, any endpoint-level block and the disk's own section, and no
+    /// caller holding configuration text alone can reproduce that resolution.
+    ///
+    /// Unpinned by default, so an ordinary storage's settings and reload behaviour are unchanged.
+    virtual void pinConditionalOpsGenerationDialect(bool /*expect_generation_tokens*/) {}
+
+    /// Whether the underlying bucket has object versioning enabled; nullopt when unknown or not
+    /// applicable. Used by the CAS capability probe on GCS: a bucket verified as versioned refuses
+    /// the mount (a token-exact DELETE there archives a noncurrent generation instead of reclaiming
+    /// storage), an unknown answer is logged and tolerated.
+    virtual std::optional<bool> isBucketVersioningEnabled() const { return std::nullopt; }
+
+    /// True when this object storage can execute writes under the given retry profile.
+    /// A caller that sets a non-Default profile on WriteSettings MUST check this first and
+    /// fail closed if unsupported (the profile is advisory only to backends that opt in).
+    virtual bool supportsRetryProfile(ObjectStorageRetryProfile profile) const { return profile == ObjectStorageRetryProfile::Default; }
+
+    /// True when this object storage can execute copies under the given transport requirement.
+    virtual bool supportsCopyMode(ObjectStorageCopyMode mode) const
+    {
+        return mode == ObjectStorageCopyMode::Default;
+    }
 
     virtual ReadSettings patchSettings(const ReadSettings & read_settings) const;
 

@@ -10,6 +10,7 @@
 #include <IO/ReadBufferFromEmptyFile.h>
 #include <IO/ReadBufferFromEncryptedFile.h>
 #include <IO/ReadBufferFromFileBase.h>
+#include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromFileDecorator.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReaderExecutor.h>
@@ -169,6 +170,17 @@ void ReadPipeline::needLongConnectionLimit(std::shared_ptr<LongConnectionLimit> 
     long_connection_limit = std::move(limit);
 }
 
+void ReadPipeline::needFileView(String file_name, size_t left_bound, size_t right_bound)
+{
+    if (right_bound < left_bound)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "ReadPipeline: file view right bound ({}) is below the left bound ({})", right_bound, left_bound);
+    file_view = FileViewStage{
+        .file_name = std::move(file_name),
+        .left_bound = left_bound,
+        .right_bound = right_bound};
+}
+
 std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::build() const
 {
     if (!source)
@@ -194,7 +206,8 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::build() const
 
     impl = wrapMemoryCache(std::move(impl));   // Stage 4
     impl = wrapAsyncPrefetch(std::move(impl)); // Stage 5
-    impl = wrapDecryption(std::move(impl));    // Stage 6 (encryption)
+    impl = wrapFileView(std::move(impl));      // Stage 6 (byte window)
+    impl = wrapDecryption(std::move(impl));    // Stage 7 (encryption)
 
     return impl;
 }
@@ -205,14 +218,14 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::tryBuildReaderExecutor() c
     if (!settings.reader_executor.enabled)
         return nullptr;
 
-    /// The executor implements neither async prefetch nor the distributed cache, so fall back rather
-    /// than silently drop those stages. Decryption, the filesystem cache, and the page (memory) cache
-    /// ARE supported (fed below).
-    if (distributed_cache || async_prefetch)
+    /// The executor implements neither async prefetch, the distributed cache, nor a file_view byte
+    /// window, so fall back rather than silently drop those stages. Decryption, the filesystem cache,
+    /// and the page (memory) cache ARE supported (fed below).
+    if (distributed_cache || async_prefetch || file_view)
     {
         LOG_DEBUG(log,
             "use_reader_executor: falling back to the legacy read path "
-            "(distributed cache or async prefetch not supported by the executor)");
+            "(distributed cache, async prefetch or file_view not supported by the executor)");
         return nullptr;
     }
 
@@ -772,6 +785,19 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::wrapAsyncPrefetch(std::uni
         async_prefetch->prefetches_log);
 }
 
+std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::wrapFileView(std::unique_ptr<ReadBufferFromFileBase> impl) const
+{
+    /// -- Stage 6: File view --
+    /// The view translates the consumer's positions/right bounds by `left_bound` and forwards
+    /// them down the chain, so `MergeTreeReaderStream::adjustRightMark` bounds reach the
+    /// object-storage reader and its range requests stay drainable (connection-pool friendly).
+    if (!file_view)
+        return impl;
+
+    return std::make_unique<ReadBufferFromFileView>(
+        std::move(impl), file_view->file_name, file_view->left_bound, file_view->right_bound);
+}
+
 std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::wrapDecryption(std::unique_ptr<ReadBufferFromFileBase> impl) const
 {
     /// -- Stage 6: Decryption (may have multiple layers for double encryption) --
@@ -832,6 +858,8 @@ String ReadPipeline::describe() const
         append("MemoryCache");
     if (async_prefetch)
         append("AsyncPrefetch");
+    if (file_view)
+        append("FileView");
     if (!decryption_stages.empty())
         append("Decrypt");
 

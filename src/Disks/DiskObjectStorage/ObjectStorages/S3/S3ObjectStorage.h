@@ -6,7 +6,10 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <atomic>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <utility>
 #include <IO/S3/S3Capabilities.h>
 #include <IO/S3Settings.h>
 #include <Common/logger_useful.h>
@@ -44,7 +47,8 @@ private:
         bool client_restricts_server_credentials_ = true)
         : uri(uri_)
         , disk_name(disk_name_)
-        , client(std::move(client_))
+        , client_slot(std::make_shared<MultiVersion<S3::Client>>(std::move(client_)))
+        , client(*client_slot)
         , client_restricts_server_credentials(client_restricts_server_credentials_)
         , s3_settings(std::move(s3_settings_))
         , s3_capabilities(s3_capabilities_)
@@ -105,6 +109,13 @@ public:
         bool with_tags,
         const std::optional<std::string> & start_after) const override;
 
+    ObjectStorageIteratorPtr iterate(
+        const std::string & path_prefix,
+        size_t max_keys,
+        bool with_tags,
+        const std::optional<std::string> & start_after,
+        const ObjectStorageControlRequest & request) const override;
+
     /// Uses `DeleteObjectRequest`.
     void removeObjectIfExists(const StoredObject & object) override;
 
@@ -112,11 +123,34 @@ public:
     /// `DeleteObjectsRequest` does not exist on GCS, see https://issuetracker.google.com/issues/162653700 .
     void removeObjectsIfExist(const StoredObjects & objects) override;
 
+    /// Uses `DeleteObjectRequest` with `If-Match` (token-exact removal for content-addressed disks).
+    ConditionalRemoveResult removeObjectIfTokenMatches(const StoredObject & object, const std::string & etag) override;
+
+    ConditionalRemoveResult removeObjectIfTokenMatches(
+        const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request) override;
+
+    /// One `DeleteObjects` for the given objects (the caller chunks to at most 1000); absence is success.
+    /// Exactly one object is always a plain `DeleteObject` instead (never gated on `s3_capabilities`: a
+    /// single physical request per call, so there is nothing here for that capability to say no to).
+    /// For more than one object, throws `NOT_IMPLEMENTED` without sending anything once `DeleteObjects`
+    /// is known unsupported (a configured or a just-learned `S3Capabilities::isBatchDeleteSupported() ==
+    /// false`) -- this storage never substitutes a per-key loop of its own, since the caller is the one
+    /// that can admit each physical delete as its own request.
+    void removeObjectsIfExistUnderProfile(
+        const StoredObjects & objects, const ObjectStorageControlRequest & request) override;
+
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 
     ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;
 
     std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override;
+
+    /// Marks the HEAD request eligible for the typed NativeConditional mode, so the CAS backend's
+    /// `nativeHead` can read a GCS generation token where the client's HTTP layer supports one.
+    std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const override;
+
+    std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(
+        const std::string & path, bool with_tags, const ObjectStorageControlRequest & request) const override;
 
     void copyObject( /// NOLINT
         const StoredObject & object_from,
@@ -153,6 +187,16 @@ public:
 
     bool isReadOnly() const override { return s3_settings.get()->request_settings[S3RequestSetting::read_only]; }
 
+    bool conditionalOpsUseGenerationTokens() const override;
+
+    void pinConditionalOpsGenerationDialect(bool expect_generation_tokens) override;
+
+    std::optional<bool> isBucketVersioningEnabled() const override;
+
+    bool supportsRetryProfile(ObjectStorageRetryProfile) const override { return true; }
+
+    bool supportsCopyMode(ObjectStorageCopyMode mode) const override;
+
     std::shared_ptr<const S3::Client> getS3StorageClient() override;
     std::shared_ptr<const S3::Client> tryGetS3StorageClient() override;
 
@@ -160,15 +204,63 @@ public:
 
     S3::URI getURI() const { return uri; }
     S3Settings getS3Settings() const { return *s3_settings.get(); }
+
+    /// Lazily-built clone of the current disk client with the single-attempt retry profile
+    /// (SingleAttemptRetryStrategy, max_retries=0, Expect:100-continue floor). Rebuilt whenever the
+    /// disk client rotates (applyNewSettings/credentials refresh) — the cached clone is keyed by the
+    /// base client's identity, so a stale clone can never outlive a rotation.
+    /// `request_timeout_ms` overrides the clone's send/receive inactivity bound; 0 keeps the disk's.
+    /// `connect_timeout_cap_ms` caps the clone's connect timeout (0 = no cap); the cache key is the
+    /// pair, so two callers asking for the same request timeout but different caps get distinct clones.
+    std::shared_ptr<const S3::Client> getSingleAttemptClient(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms = 0) const;
+
+    /// True iff a clone for exactly this (request timeout, connect cap) pair is already cached --
+    /// never builds one. Lets a test prove dispatch used a SPECIFIC key (and no other) without ever
+    /// creating a clone itself and without measuring anything.
+    bool hasSingleAttemptClientForTest(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms) const;
+
 private:
     void removeObjectImpl(const StoredObject & object, bool if_exists);
     void removeObjectsImpl(const StoredObjects & objects, bool if_exists);
+
+    /// Shared by tryGetObjectMetadata/tryGetObjectMetadataWithNativeToken: the only difference between
+    /// the two public overrides is which ObjectStorageRequestMode the HEAD wrapper carries.
+    std::optional<ObjectMetadata> tryGetObjectMetadataImpl(
+        const std::string & path,
+        bool with_tags,
+        ObjectStorageRequestMode request_mode,
+        const std::shared_ptr<const S3::Client> & used_client,
+        size_t attempt_seed = 0) const;
+
+    ConditionalRemoveResult removeObjectIfTokenMatchesImpl(
+        const StoredObject & object, const std::string & etag, const std::shared_ptr<const S3::Client> & used_client,
+        size_t attempt_seed);
+
+    void removeObjectsIfExistImpl(
+        const StoredObjects & objects, const std::shared_ptr<const S3::Client> & used_client, size_t attempt_seed);
+
+    std::shared_ptr<const S3::Client> clientForRetryProfile(const ObjectStorageControlRequest & request) const;
+
+    /// Runs `fn` and, if it failed because the vended credentials expired, refreshes this disk's
+    /// client and runs it once more. `fn` must re-read the client itself, so the second run signs
+    /// with the refreshed one.
+    template <typename Fn>
+    auto refreshAndRetryOnExpiredCredentials(Fn && fn) const;
 
     const S3::URI uri;
 
     std::string disk_name;
 
-    mutable MultiVersion<S3::Client> client;
+    /// The slot this disk's client lives in, and the only thing a credential refresh installs into.
+    /// Held by `shared_ptr` so a read buffer -- which can outlive this storage -- carries the SLOT
+    /// rather than a pointer to the storage: a refresh that arrives late then replaces a client
+    /// nobody will read again, instead of writing into a destroyed object.
+    const std::shared_ptr<MultiVersion<S3::Client>> client_slot;
+    /// Reference into the slot above. Every ordinary call site keeps using `client.get()`/`client.set()`
+    /// unchanged; only code that must capture the client independently of this storage's own lifetime
+    /// (the credential-refresh lambda handed to a read buffer that can outlive this object) captures
+    /// `client_slot` directly instead.
+    MultiVersion<S3::Client> & client;
     /// The user-query credential restriction mode the current `client` was built under (initialized by the
     /// caller from the policy used to build the initial client -- e.g. a table created with the opt-in starts
     /// `false`). `applyNewSettings` rebuilds the client when a session with a different restriction mode accesses
@@ -185,6 +277,29 @@ private:
 
     const bool for_disk_s3;
     S3CredentialsRefreshCallback credentials_refresh_callback;
+
+    /// Set once by a caller that has derived persistent state from the conditional-ops dialect (see
+    /// `pinConditionalOpsGenerationDialect`). Once set, `applyNewSettings` refuses a reload whose
+    /// effective `http_client` would flip the dialect, and keeps the working client.
+    std::atomic<int8_t> pinned_generation_dialect{-1};   /// -1 unpinned, 0 pinned ETag, 1 pinned generation
+
+    mutable std::mutex single_attempt_client_mutex;
+    /// One clone per (requested timeout, connect cap) pair: the verbs of one operation ask for
+    /// different bounds, and a single slot would rebuild a whole S3 client (and lose its connection
+    /// pool) on every alternation between them.
+    mutable std::map<std::pair<uint64_t, uint64_t>, std::shared_ptr<const S3::Client>> single_attempt_clients;
+    /// The base client the cached clones above were built from. Deliberately held as a shared_ptr (not
+    /// a raw pointer): a raw pointer would be compared for identity AFTER the object it once pointed
+    /// to could have been freed and a new client reallocated at the same address by an unrelated
+    /// rotation (ABA), which would false-match and serve a stale clone (e.g. built from retired
+    /// credentials) indefinitely. Holding the shared_ptr pins at most one retired client version —
+    /// released as soon as the next rotation is observed and the clones are dropped — which is what
+    /// makes the identity comparison in getSingleAttemptClient sound.
+    mutable std::shared_ptr<const S3::Client> single_attempt_client_base;
+    /// Set for the duration of a `shutdown()` (cleared by the matching `startup()`); every clone already
+    /// cached when `shutdown()` runs is disabled there and then, and this flag disables any built
+    /// afterwards to match. See the comment on `shutdown()` for what that disabling does and does not do.
+    mutable bool single_attempt_clients_disabled = false;
 };
 
 }

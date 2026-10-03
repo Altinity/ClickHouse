@@ -691,6 +691,12 @@
     M(1016, PENDING_MUTATIONS_NOT_ALLOWED) \
     M(1017, EXPORT_PARTITION_ALREADY_EXPORTED) \
     M(1018, PARTITION_EXPORT_FAILED) \
+    /* Fork-specific error codes live in the 1030-1099 \
+     * range, chosen to sit well above upstream's maximum error code (1017 at the time this range \
+     * was reserved) so upstream can keep adding codes below it without colliding with the fork's. \
+     * A new fork error code goes in this range, not below 1030. CAS codes occupy 1037-1038. */ \
+    M(1037, CAS_WRITE_UNATTRIBUTED) \
+    M(1038, CAS_DELETE_MARKER) \
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -707,7 +713,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
-    constexpr ErrorCode END = 1018;
+    constexpr ErrorCode END = 1038;
 
 #if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
     /** One `ErrorPairHolder` per error code, each holding two `Error` structs - the last message,

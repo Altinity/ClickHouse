@@ -413,7 +413,9 @@ bool MergeFromLogEntryTask::finalize(ReplicatedMergeMutateTaskBase::PartLogWrite
 #endif
 
     storage.merger_mutator.renameMergedTemporaryPart(part, parts, NO_TRANSACTION_PTR, *transaction_ptr);
-    part->getDataPartStorage().commitTransaction();
+    /// `renameParts` already commits the disk transaction of the part.
+    if (part->getDataPartStorage().hasActiveTransaction())
+        part->getDataPartStorage().commitTransaction();
     /// Why we reset task here? Because it holds shared pointer to part and tryRemovePartImmediately will
     /// not able to remove the part and will throw an exception (because someone holds the pointer).
     ///
