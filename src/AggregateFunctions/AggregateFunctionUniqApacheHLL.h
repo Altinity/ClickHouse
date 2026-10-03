@@ -26,8 +26,11 @@
 
 #include <hll.hpp>
 
+#include <bit>
 #include <cmath>
+#include <exception>
 #include <memory>
+#include <new>
 #include <type_traits>
 
 namespace DB
@@ -43,8 +46,9 @@ namespace ErrorCodes
 class HllSketchData
 {
 private:
-    std::unique_ptr<datasketches::hll_sketch> sk_update;
-    std::unique_ptr<datasketches::hll_union> sk_union;
+    /// Folding is deferred until the state is read, so it can happen in const methods.
+    mutable std::unique_ptr<datasketches::hll_sketch> sk_update;
+    mutable std::unique_ptr<datasketches::hll_union> sk_union;
 
     datasketches::hll_sketch * getSkUpdate(uint8_t lg_config_k, datasketches::target_hll_type tgt_type)
     {
@@ -60,7 +64,8 @@ private:
         return sk_union.get();
     }
 
-    void foldUpdateIntoUnionIfNeeded()
+    /// Inserts keep going into `sk_update` even when `sk_union` exists, to avoid creating and merging a sketch per row.
+    void foldUpdateIntoUnionIfNeeded() const
     {
         if (sk_union && sk_update)
         {
@@ -74,17 +79,17 @@ public:
     void insert(T value, uint8_t lg_config_k, datasketches::target_hll_type tgt_type)
     {
         getSkUpdate(lg_config_k, tgt_type)->update(value);
-        foldUpdateIntoUnionIfNeeded();
     }
 
     void insertData(const char * data, size_t size, uint8_t lg_config_k, datasketches::target_hll_type tgt_type)
     {
         getSkUpdate(lg_config_k, tgt_type)->update(static_cast<const void *>(data), size);
-        foldUpdateIntoUnionIfNeeded();
     }
 
     UInt64 size(datasketches::target_hll_type tgt_type) const
     {
+        foldUpdateIntoUnionIfNeeded();
+
         /// Rounding preserves exact cardinalities despite floating-point error.
         if (sk_union)
             return static_cast<UInt64>(std::llround(sk_union->get_result(tgt_type).get_estimate()));
@@ -99,10 +104,11 @@ public:
 
         foldUpdateIntoUnionIfNeeded();
 
+        /// `rhs` may hold both sketches; take both without modifying it.
+        if (rhs.sk_union)
+            u->update(rhs.sk_union->get_result(tgt_type));
         if (rhs.sk_update)
             u->update(*rhs.sk_update);
-        else if (rhs.sk_union)
-            u->update(rhs.sk_union->get_result(tgt_type));
     }
 
     /// You can only call this for an empty object.
@@ -135,6 +141,8 @@ public:
 
     void write(WriteBuffer & out, uint8_t lg_config_k, datasketches::target_hll_type tgt_type) const
     {
+        foldUpdateIntoUnionIfNeeded();
+
         datasketches::hll_sketch::vector_bytes bytes;
         if (sk_update)
             bytes = sk_update->serialize_compact();
