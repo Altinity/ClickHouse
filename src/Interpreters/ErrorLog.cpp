@@ -127,15 +127,19 @@ void ErrorLog::stepFunction(TimePoint current_time)
 
     auto event_time = std::chrono::system_clock::to_time_t(current_time);
 
-    for (ErrorCodes::ErrorCode code = 0, end = ErrorCodes::end(); code < end; ++code)
+    for (size_t index = 0, size = ErrorCodes::size(); index < size; ++index)
     {
-        const auto & error = ErrorCodes::values[code].get();
-        if (error.local.count != previous_values.at(code).local)
+        const auto code = ErrorCodes::getCode(index);
+        if (ErrorCodes::getName(code).empty())
+            continue;
+        const auto error = ErrorCodes::getValue(index).get();
+        auto & previous = previous_values.at(index);
+        if (error.local.count != previous.local)
         {
             ErrorLogElement local_elem {
                 .event_time=event_time,
                 .code=code,
-                .value=error.local.count - previous_values.at(code).local,
+                .value=error.local.count - previous.local,
                 .remote=false,
                 .last_error_time=(error.local.error_time_ms / 1000),
                 .last_error_message=error.local.message,
@@ -143,14 +147,14 @@ void ErrorLog::stepFunction(TimePoint current_time)
                 .last_error_trace=error.local.trace
             };
             this->add(std::move(local_elem));
-            previous_values[code].local = error.local.count;
+            previous.local = error.local.count;
         }
-        if (error.remote.count != previous_values.at(code).remote)
+        if (error.remote.count != previous.remote)
         {
             ErrorLogElement remote_elem {
                 .event_time=event_time,
                 .code=code,
-                .value=error.remote.count - previous_values.at(code).remote,
+                .value=error.remote.count - previous.remote,
                 .remote=true,
                 .last_error_time=(error.remote.error_time_ms / 1000),
                 .last_error_message=error.remote.message,
@@ -158,7 +162,7 @@ void ErrorLog::stepFunction(TimePoint current_time)
                 .last_error_trace=error.remote.trace
             };
             add(std::move(remote_elem));
-            previous_values[code].remote = error.remote.count;
+            previous.remote = error.remote.count;
         }
     }
 }
