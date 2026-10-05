@@ -107,14 +107,19 @@ TEST(RestCatalogUpdateMetadataBody, SnapshotUpdateWithoutParent)
 
     auto body = DataLake::buildUpdateMetadataRequestBody("ns", "t", snapshot);
     ASSERT_TRUE(body);
-    EXPECT_FALSE(body->has("requirements"));
+
+    ASSERT_TRUE(body->has("requirements"));
+    auto req = body->getArray("requirements")->getObject(0);
+    EXPECT_EQ(req->getValue<std::string>("type"), "assert-ref-snapshot-id");
+    EXPECT_EQ(req->getValue<std::string>("ref"), "main");
+    EXPECT_FALSE(req->has("snapshot-id"));
 
     auto updates = body->getArray("updates");
     ASSERT_TRUE(findUpdateByAction(updates, "add-snapshot"));
     ASSERT_TRUE(findUpdateByAction(updates, "set-snapshot-ref"));
 }
 
-TEST(RestCatalogUpdateMetadataBody, SnapshotUpdateParentMinusOneNoRequirement)
+TEST(RestCatalogUpdateMetadataBody, SnapshotUpdateParentMinusOneRequiresNoRef)
 {
     Poco::JSON::Object::Ptr snapshot = new Poco::JSON::Object;
     snapshot->set("snapshot-id", static_cast<Int64>(1));
@@ -122,7 +127,12 @@ TEST(RestCatalogUpdateMetadataBody, SnapshotUpdateParentMinusOneNoRequirement)
 
     auto body = DataLake::buildUpdateMetadataRequestBody("ns", "t", snapshot);
     ASSERT_TRUE(body);
-    EXPECT_FALSE(body->has("requirements"));
+
+    ASSERT_TRUE(body->has("requirements"));
+    auto req = body->getArray("requirements")->getObject(0);
+    EXPECT_EQ(req->getValue<std::string>("type"), "assert-ref-snapshot-id");
+    EXPECT_EQ(req->getValue<std::string>("ref"), "main");
+    EXPECT_FALSE(req->has("snapshot-id"));
 }
 
 TEST(RestCatalogUpdateSchemaBody, EquivalentSchemaDeduplicates)

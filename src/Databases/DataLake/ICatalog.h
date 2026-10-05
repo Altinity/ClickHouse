@@ -5,7 +5,9 @@
 #include <Core/NamesAndTypes.h>
 #include <Core/SettingsEnums.h>
 #include <Common/SettingsChanges.h>
+#include <IO/CompressionMethod.h>
 #include <Interpreters/StorageID.h>
+#include <Parsers/IAST_fwd.h>
 #include <Databases/DataLake/StorageCredentials.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
 #include <Databases/DataLake/DatabaseDataLakeStorageType.h>
@@ -29,6 +31,7 @@ namespace DataLake
 using StorageType = DB::DatabaseDataLakeStorageType;
 StorageType parseStorageTypeFromLocation(const std::string & location);
 StorageType parseStorageTypeFromString(const std::string &type);
+std::string storageTypeToScheme(StorageType type);
 
 /// Registry of `ALTER DATABASE ... MODIFY SETTING` validators. Each catalog that
 /// supports altering settings registers its own validator; catalog types without
@@ -65,6 +68,7 @@ public:
     TableMetadata & withStorageCredentials() { with_storage_credentials = true; return *this; }
     TableMetadata & withDataLakeSpecificProperties() { with_datalake_specific_metadata = true; return *this; }
     TableMetadata & withForceAddBucket() { force_add_bucket = true; return *this; }
+    TableMetadata & withPartitionAndSortingKeys() { with_partition_and_sorting_keys = true; return *this; }
 
     bool hasLocation() const;
     bool hasSchema() const;
@@ -87,6 +91,14 @@ public:
     void setDataLakeSpecificProperties(std::optional<DataLakeSpecificProperties> && metadata);
     std::optional<DataLakeSpecificProperties> getDataLakeSpecificProperties() const;
 
+    void setPartitionAndSortingKeys(DB::ASTPtr partition_by_, DB::ASTPtr order_by_, std::string unsupported_properties_);
+    const std::string & getUnsupportedProperties() const
+    {
+        return unsupported_properties;
+    }
+    DB::ASTPtr getPartitionBy() const;
+    DB::ASTPtr getOrderBy() const;
+
     void setTableUUID(const std::string & uuid_) { table_uuid = uuid_; }
     std::optional<std::string> getTableUUID() const { return table_uuid; }
 
@@ -94,6 +106,7 @@ public:
     bool requiresSchema() const { return with_schema; }
     bool requiresCredentials() const { return with_storage_credentials; }
     bool requiresDataLakeSpecificProperties() const { return with_datalake_specific_metadata; }
+    bool requiresPartitionAndSortingKeys() const { return with_partition_and_sorting_keys; }
 
     StorageType getStorageType() const;
 
@@ -138,6 +151,10 @@ private:
     /// Specific settings for iceberg and datalake
     std::optional<DataLakeSpecificProperties> data_lake_specific_metadata;
 
+    DB::ASTPtr partition_by;
+    DB::ASTPtr order_by;
+    std::string unsupported_properties;
+
     std::string reason_why_table_is_not_readable;
     std::optional<std::string> table_uuid;
 
@@ -147,6 +164,7 @@ private:
     bool with_schema = false;
     bool with_storage_credentials = false;
     bool with_datalake_specific_metadata = false;
+    bool with_partition_and_sorting_keys = false;
 
     std::string constructLocation(const std::string & endpoint_, DB::S3UriStyle uri_style) const;
 };
@@ -211,13 +229,31 @@ public:
     /// E.g. one of S3, Azure, Local, HDFS.
     virtual std::optional<StorageType> getStorageType() const = 0;
 
+    /// Catalog-wide base location for new tables, e.g. `s3://warehouse/data`. Empty if unknown.
+    virtual String getDefaultBaseLocation() const { return ""; }
+
     /// Creates new table in catalog. Callers must ensure the namespace exists before
     /// writing any table files to storage: a catalog that shares its storage view with
     /// the data refuses to create a namespace over a plain directory those files create.
-    virtual void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const;
+    /// `metadata_compression_method` applies only to catalogs that write the initial metadata file
+    /// themselves (`new_metadata_path` is empty): they must name it `v1.<ext>.metadata.json` and compress
+    /// it accordingly, like `DB::IcebergMetadata::createInitial` does.
+    /// Returns `true` if this call created the table, `false` if `if_not_exists` is set and the shared
+    /// catalog reported that another client had already created it.
+    virtual bool createTable(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr metadata_content,
+        DB::CompressionMethod metadata_compression_method,
+        bool if_not_exists) const;
 
     /// Creates the namespace unless it already exists.
     virtual void createNamespaceIfNotExists(const String & namespace_name, const String & location) const;
+
+    /// Whether the catalog chooses the storage location of a new table itself, so `CREATE TABLE` must
+    /// neither propose one nor write the initial metadata file.
+    virtual bool managesTableLocation() const { return false; }
 
     /// Updates metadata in catalog.
     virtual bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const;
@@ -239,7 +275,8 @@ public:
         Poco::JSON::Object::Ptr metadata = nullptr) const;
 
     /// Drop table from catalog.
-    virtual void dropTable(const String & namespace_name, const String & table_name) const;
+    /// If `purge`, the catalog is also asked to delete the underlying data files.
+    virtual void dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const;
 
     /// Does the catalog support transactions or anything like that?
     /// For example, the Iceberg REST catalog supports atomic operations "compare if snapshot X is equal to" and "add new snapshot Y".
