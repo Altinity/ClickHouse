@@ -426,7 +426,7 @@ Client → Server. The first message after the TCP connection opens.
 
 | # | Field            | Type    | Role      | Description |
 |---|------------------|---------|-----------|-------------|
-| 1 | client_name      | String  | universal | Client identifier (e.g., `"clickhouse-client"`) |
+| 1 | client_name      | String  | universal | Client identifier (e.g., `"clickhouse-client"`). An Altinity Antalya build appends `" (antalya:N)"`, where `N` is its Antalya protocol version. See [Antalya protocol version](/antalya/protocol). |
 | 2 | version_major    | VarUInt | universal | Client major version |
 | 3 | version_minor    | VarUInt | universal | Client minor version |
 | 4 | protocol_version | VarUInt | universal | Client's max supported protocol version |

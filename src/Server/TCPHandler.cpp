@@ -235,7 +235,8 @@ void validateClientInfo(const ClientInfo & session_client_info, const ClientInfo
 
     if (session_client_info.interface == ClientInfo::Interface::TCP)
     {
-        if (session_client_info.client_name != client_info.client_name)
+        /// The Antalya marker is only in the Hello `client_name`, not in the Query packet.
+        if (AntalyaProtocol::removeMarker(session_client_info.client_name) != client_info.client_name)
             throw Exception(
                 DB::ErrorCodes::CLIENT_INFO_DOES_NOT_MATCH,
                 "Client info's client_name does not match: {} not equal to {}",
@@ -1938,6 +1939,7 @@ void TCPHandler::receiveHello()
     }
 
     readStringBinary(client_name, *in, MAX_HELLO_STRING_SIZE);
+    client_antalya_protocol_version = AntalyaProtocol::parseMarker(client_name);
     readVarUInt(client_version_major, *in);
     readVarUInt(client_version_minor, *in);
     // NOTE For backward compatibility of the protocol, client cannot send its version_patch.
