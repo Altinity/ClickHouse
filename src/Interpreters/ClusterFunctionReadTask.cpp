@@ -194,8 +194,6 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
         }
     }
 
-    /// Antalya-only trailer. An upstream peer advertises no marker, so these bytes are not written
-    /// and the cluster-processing protocol version is left unchanged.
     if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO)
     {
         if (file_meta_info && *file_meta_info)

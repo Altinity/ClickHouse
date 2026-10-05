@@ -25,10 +25,7 @@ worker and worker to worker negotiate independently.
 Version 1 is the advertisement itself.
 
 Version 2 appends optional Iceberg column statistics (`DataFileMetaInfo`) to `ReadTaskResponse`,
-after the upstream cluster-processing payload. The section is a presence flag and, when set, the
-bytes written by `DataFileMetaInfo::serialize`. It is not a `DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION`
-slot. A peer that advertises `0` (an upstream build) neither writes nor reads the section, and the
-task path stays an object key.
+after the upstream cluster-processing payload.
 
 ## Adding an Antalya-only wire change {#adding-a-wire-change}
 

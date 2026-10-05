@@ -7,10 +7,9 @@
 namespace DB
 {
 
-/// Bump for every Antalya-only wire protocol change. See `docs/en/antalya/protocol.md`.
-/// 1 — advertisement only.
 /// 2 — `ReadTaskResponse` carries optional `DataFileMetaInfo` after the upstream payload.
 static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO = 2;
+/// Bump for every Antalya-only wire protocol change. See `docs/en/antalya/protocol.md`.
 static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION = DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO;
 
 namespace AntalyaProtocol
