@@ -249,6 +249,7 @@ struct RefScanSummary
 
 class RefPlan;
 class RoundInput;
+struct NamespaceJanitorResult;
 RefPlan buildRefWalkPlan(RoundInput && round_input);
 
 namespace tests
@@ -548,12 +549,17 @@ private:
     /// It performs no physical LIST or delete.
     CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state);
 
-    /// Run exactly one independently paced physical namespace-maintenance page. The caller supplies
+    /// Run the independently paced physical namespace maintenance: pages from the persisted cursor while
+    /// each one deleted dead-life objects, under a soft time budget. The caller supplies
     /// the one round-wide destructive verdict when it exists; DEFER passes suppression because it has
-    /// no folded frontier verdict. This helper owns only janitor I/O and phase metrics, never lifecycle
-    /// transitions or the hot stream walk plan.
-    void runNamespaceJanitorPage(
+    /// no folded frontier verdict, which takes one page. This helper owns only janitor I/O and phase
+    /// metrics, never lifecycle transitions or the hot stream walk plan.
+    void runNamespaceJanitor(
         const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows);
+
+    /// The janitor's `RemoveWriteOnce`: splits `keys` evenly across the GC I/O pool and waits for every job.
+    /// A failed job leaks its keys, and so does a job the pool refused to schedule.
+    void removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out);
 
     void reportStuckRemovals(const RefPlan & plan, uint64_t current_round);
 
@@ -1024,7 +1030,7 @@ private:
     std::unique_ptr<GcMetaWriter> meta_writer;
 
     /// The GC I/O pool: the fold's and rebuild's read-ahead, the orphan-manifest sweep planning reads,
-    /// and the `pending_deletes` fan-out, sized by `gc_io_concurrency`. A `unique_ptr` for the same reason as `meta_writer`: the size comes from
+    /// the `pending_deletes` fan-out and the namespace janitor's batch deletes, sized by `gc_io_concurrency`. A `unique_ptr` for the same reason as `meta_writer`: the size comes from
     /// `store->poolConfig()`, which may only be read after the constructor body has validated `store`.
     std::unique_ptr<ThreadPool> io_pool;
     std::optional<size_t> io_pool_refuse_at_for_test;

@@ -1,0 +1,36 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <cas_batch>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <cas_server_root_id>itest-janitor-batch</cas_server_root_id>
+                <endpoint>http://rustfs1:11121/test/cas_janitor_batch/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>86400</cas_gc_interval_sec>
+                <!-- One key per round leaves the dropped table's stream to the janitor. -->
+                <cas_gc_round_ref_cleanup_budget>1</cas_gc_round_ref_cleanup_budget>
+            </cas_batch>
+            <cas_no_batch>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <cas_server_root_id>itest-janitor-no-batch</cas_server_root_id>
+                <endpoint>http://rustfs1:11121/test/cas_janitor_no_batch/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <support_batch_delete>false</support_batch_delete>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>86400</cas_gc_interval_sec>
+                <cas_gc_round_ref_cleanup_budget>1</cas_gc_round_ref_cleanup_budget>
+            </cas_no_batch>
+        </disks>
+        <policies>
+            <cas_batch><volumes><main><disk>cas_batch</disk></main></volumes></cas_batch>
+            <cas_no_batch><volumes><main><disk>cas_no_batch</disk></main></volumes></cas_no_batch>
+        </policies>
+    </storage_configuration>
+</clickhouse>

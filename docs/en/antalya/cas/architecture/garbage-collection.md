@@ -57,7 +57,7 @@ follower or a deferred round execution returns before that commit.
 | 13 | `round_commit` | fold | Retention-prune old generations, then publish the single `gc/state` `CAS` that adopts the whole round |
 | 14 | `handoff_reclaim` | post-`CAS` | Reclaim a generation a ref moved off during this round, which the ordinary retention prune already skipped and will not revisit |
 | 15 | `manifest_deletes` | post-`CAS` | Delete manifest bodies whose owner-removal minus-one edge the `CAS` in phase 13 just adopted |
-| 16 | `namespace_cleanup` | leader; suppressed on `DEFER` | One bounded page of the perpetual namespace janitor, reclaiming dead-life debris |
+| 16 | `namespace_cleanup` | leader; suppressed on `DEFER` | Pages of the perpetual namespace janitor under a 20 s soft budget, reclaiming dead-life debris |
 | 17 | `ref_object_cleanup` | post-`CAS` | Prune ref logs and snapshots once both fold coverage and a live snapshot make them safe to delete |
 | 18 | `orphan_sweep` | post-`CAS` | Exact-token deletion for the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep), after phase 13 adopted each candidate's blob-source retirements and the cursor |
 
@@ -518,23 +518,36 @@ then picked up by the orphan-manifest sweep (phase 18).
 
 ## Phase 16 — namespace cleanup {#phase-16-namespace-cleanup}
 
-One bounded page of the perpetual namespace janitor: deletes the physical objects of namespace lives
-no longer in the catalog (dead-life debris).
+Pages of the perpetual namespace janitor: deletes the physical objects of namespace lives
+no longer in the catalog (dead-life debris). The phase takes the next page while the previous one
+deleted something and published its cursor, until a 20 s soft budget: no page starts after it, the
+page in progress finishes. After the last page of `cas/ns/` the next one starts from its beginning, so
+a pass that began mid-stream also reaches the debris before its cursor; the first page that deletes
+nothing ends the pass. A pool without debris costs one `LIST` per round.
 
 - **Runs on:** fold path here; also on the deferred path right after phase 4 with
   `suppress_destructive` forced on
-- **Reads:** the durable `janitor_cursor`; one `LIST` page (≤ 1000 keys) of `cas/ns/`; a fresh
-  ref-catalog snapshot; `gc/state` per fence re-check
-- **Writes / deletes:** exact-token `DELETE` per dead-life `_log` / `_snap` / `_ckpt` / `_files`
-  object; one `CAS` on the maintenance state when the page is decided
-- **Safety:** each delete is under a GC fence re-check (`lease.owner` / `lease.seq`) before it and
-  once at the end; the incarnation segment in every key makes an old life's objects structurally
+- **Reads:** per page: the durable `janitor_cursor`; one `LIST` page (≤ 1000 keys) of `cas/ns/`; a
+  fresh ref-catalog snapshot; `gc/state` for the fence re-check
+- **Writes / deletes:** per page: batch `DELETE`s of the dead-life `_log` / `_snap` objects, which
+  are write-once and need no token; the page's keys are split evenly across the GC I/O pool
+  (`cas_gc_io_concurrency`), at most `cas_gc_bulk_delete_chunk_keys` per request, and a storage
+  without a batch delete gets one request per key from the same jobs; exact-token `DELETE` per
+  dead-life `_ckpt` / `_files` object; one `CAS` on the maintenance state when the page is decided
+- **Safety:** each request is under a GC fence re-check (`lease.owner` / `lease.seq`), read once per
+  page and checked again before the cursor is published; the incarnation segment in every key makes an old life's objects structurally
   unreachable from a reborn same-name namespace, so a missed key can only leak storage, never expose
   it
-- **Fails the round if:** nothing — the whole page is wrapped in a catch-all ("namespace janitor
-  skipped this round")
+- **Fails the round if:** nothing — the whole phase is wrapped in a catch-all ("namespace janitor
+  stopped this round"). A failed batch `DELETE` leaks its keys and the cursor still advances. A failed
+  `LIST` resets the cursor to the stream start only on the first page of the phase; on a later page
+  the cursor the previous page published stays
 - **Observability:** phase row `namespace_cleanup`; metrics `janitor_pages`, `janitor_keys`,
-  `janitor_deleted`, `leaked`
+  `janitor_deleted` (keys of successful batch requests, absent ones included, plus exact removals),
+  `leaked` (failed keys of published pages; an unpublished page is listed again), `delete_requests`
+  (delete calls: one per exact-token delete and per batch, including a batch the storage refused
+  before its keys went one by one), `budget_exhausted`. Batch deletes run on the GC I/O pool, so the
+  row's `ProfileEvents` do not include their requests
 
 The cursor advances only when the whole page was decided under a held fence and an unambiguous
 catalog; under suppression it lists and classifies but deletes nothing and does not advance.
@@ -930,13 +943,17 @@ backend without batch delete: the refused bulk call plus one `DELETE` per key). 
 
 ### Phase 16 — namespace cleanup {#cost-phase-16}
 
+Per page; the phase takes one page in a round without debris and more under its 20 s budget while
+pages delete.
+
 | Key | Operation | Requests |
 |---|---|---:|
 | `<pool_prefix>/gc/maintenance_state` | `GET` | 1 (durable `janitor_cursor`) |
 | `<pool_prefix>/cas/ns/` | `LIST` | one page |
 | `<pool_prefix>/cas/ref_catalog` | `GET` | 1 |
-| `<pool_prefix>/gc/state` | `GET` | one per fence check |
-| dead-life object | `DELETE` | one per object (plus one `HEAD` per object whose `LIST` entry carried no token) |
+| `<pool_prefix>/gc/state` | `GET` | 1 (fence check) |
+| dead-life `_log` / `_snap` objects | batch `DELETE` | up to `cas_gc_io_concurrency` requests for the page's keys; one per key on a storage without a batch delete |
+| dead-life `_ckpt` / `_files` object | `DELETE` | one per object (plus one `HEAD` per object whose `LIST` entry carried no token) |
 | `<pool_prefix>/gc/maintenance_state` | `CAS` | 1 when the page is decided |
 
 ### Phase 17 — ref object cleanup {#cost-phase-17}
