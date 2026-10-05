@@ -9,6 +9,7 @@
 
 #include <Common/logger_useful.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 
 namespace DB::ErrorCodes
@@ -99,8 +100,10 @@ void requireDirectReferencedDataFileForPuffinDeletionVector(
 
 static std::strong_ordering operator<=>(const PartitionSpecsEntry & lhs, const PartitionSpecsEntry & rhs)
 {
-    return std::tie(lhs.source_id, lhs.transform_name, lhs.partition_name)
-        <=> std::tie(rhs.source_id, rhs.transform_name, rhs.partition_name);
+    if (auto cmp = lhs.source_ids <=> rhs.source_ids; cmp != std::strong_ordering::equal)
+        return cmp;
+    return std::tie(lhs.transform_name, lhs.partition_name)
+        <=> std::tie(rhs.transform_name, rhs.partition_name);
 }
 
 template <typename A>
@@ -138,7 +141,8 @@ static String dumpPartitionSpecification(const PartitionSpecification & partitio
         {
             const auto & entry = partition_specification[i];
             answer += fmt::format(
-                "(source id: {}, transform name: {}, partition name: {})", entry.source_id, entry.transform_name, entry.partition_name);
+                "(source ids: [{}], transform name: {}, partition name: {})",
+                fmt::join(entry.source_ids, ", "), entry.transform_name, entry.partition_name);
             if (i != partition_specification.size() - 1)
                 answer += ", ";
         }

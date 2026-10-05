@@ -255,11 +255,63 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     schema_processor.addIcebergTableSchema(schema_object, context_);
 
     PartitionSpecification partition_spec_vec;
+    /// Which spec-field positions made it into partition_key_ast (needed by the pruner to project
+    /// partition values, since the Avro tuple has one entry per spec field, not per kept field).
+    std::vector<size_t> partition_key_spec_positions;
     for (size_t i = 0; i != partition_specification->size(); ++i)
     {
         auto partition_specification_field = partition_specification->getObject(static_cast<UInt32>(i));
 
-        auto source_id = partition_specification_field->getValue<Int32>(f_source_id);
+        /// Iceberg V3 spec: partition fields use either singular `source-id` (single-arg transforms)
+        /// or `source-ids` (multi-arg transforms, e.g. bucket over multiple columns). They are mutually exclusive.
+        bool has_source_id = partition_specification_field->has(f_source_id);
+        bool has_source_ids = partition_specification_field->has(f_source_ids);
+
+        std::vector<Int32> source_ids;
+        if (has_source_id && has_source_ids)
+        {
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Partition field in manifest '{}' has both 'source-id' and 'source-ids' — they are mutually exclusive per the Iceberg spec",
+                path_to_manifest_file_);
+        }
+        else if (has_source_ids)
+        {
+            auto source_ids_array = partition_specification_field->getArray(f_source_ids);
+            for (UInt32 idx = 0; idx < source_ids_array->size(); ++idx)
+                source_ids.push_back(source_ids_array->getElement<Int32>(idx));
+        }
+        else if (has_source_id)
+        {
+            source_ids.push_back(partition_specification_field->getValue<Int32>(f_source_id));
+        }
+        else
+        {
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Partition field in manifest '{}' has neither 'source-id' nor 'source-ids'",
+                path_to_manifest_file_);
+        }
+
+        if (source_ids.empty())
+        {
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Partition field in manifest '{}' has an empty 'source-ids' array",
+                path_to_manifest_file_);
+        }
+
+        auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
+        auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
+        partition_spec_vec.emplace_back(PartitionSpecsEntry{std::move(source_ids), transform_name, partition_name});
+
+        /// Multi-argument transforms (V3): we cannot evaluate the transform, so skip pruning for this field.
+        /// Per the Iceberg V3 spec: "all v3 readers are required to read tables with unknown transforms,
+        /// ignoring the unsupported partition fields when filtering."
+        if (partition_spec_vec.back().isMultiArg())
+            continue;
+
+        auto source_id = partition_spec_vec.back().source_ids[0];
         /// NOTE: tricky part to support RENAME column in partition key. Instead of some name
         /// we use column internal number as it's name.
         auto numeric_column_name = DB::backQuote(DB::toString(source_id));
@@ -267,9 +319,6 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
             = schema_processor.tryGetFieldCharacteristics(manifest_schema_id, source_id);
         if (!manifest_file_column_characteristics.has_value())
             continue;
-        auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
-        auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
-        partition_spec_vec.emplace_back(source_id, transform_name, partition_name);
         auto partition_ast = getASTFromTransform(transform_name, numeric_column_name, context_->getSettingsRef()[Setting::iceberg_partition_timezone]);
         /// Unsupported partition key expression
         if (partition_ast == nullptr)
@@ -277,6 +326,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
 
         partition_key_ast->as<ASTFunction>()->arguments->children.emplace_back(std::move(partition_ast));
         partition_columns_description.emplace_back(numeric_column_name, removeNullable(manifest_file_column_characteristics->type));
+        partition_key_spec_positions.push_back(i);
     }
 
     std::optional<DB::KeyDescription> partition_key_description;
@@ -299,6 +349,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
         manifest_schema_id,
         std::make_shared<const PartitionSpecification>(std::move(partition_spec_vec)),
         std::move(partition_key_description),
+        std::move(partition_key_spec_positions),
         total_rows,
         std::move(filter_dag_),
         table_snapshot_schema_id_));
@@ -317,6 +368,7 @@ ManifestFileIterator::ManifestFileIterator(
     Int32 manifest_schema_id_,
     std::shared_ptr<const PartitionSpecification> common_partition_specification_,
     std::optional<DB::KeyDescription> partition_key_description_,
+    std::vector<size_t> partition_key_spec_positions_,
     size_t total_rows_,
     std::shared_ptr<const ActionsDAG> filter_dag_,
     Int32 table_snapshot_schema_id_)
@@ -330,6 +382,7 @@ ManifestFileIterator::ManifestFileIterator(
     , manifest_schema_id(manifest_schema_id_)
     , common_partition_specification(std::move(common_partition_specification_))
     , partition_key_description(std::move(partition_key_description_))
+    , partition_key_spec_positions(std::move(partition_key_spec_positions_))
     , table_snapshot_schema_id(table_snapshot_schema_id_)
     , total_rows(total_rows_)
     , data_files_without_deleted(std::make_shared<std::vector<ProcessedManifestFileEntryPtr>>())

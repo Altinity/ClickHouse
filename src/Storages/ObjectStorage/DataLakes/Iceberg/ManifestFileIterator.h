@@ -91,6 +91,9 @@ public:
 
     bool hasPartitionKey() const;
     const DB::KeyDescription & getPartitionKeyDescription() const;
+    /// Returns the spec-field positions (indices into the Avro partition tuple) that correspond
+    /// to the kept partition key columns.  The pruner uses this to project partition values.
+    const std::vector<size_t> & getPartitionKeySpecPositions() const { return partition_key_spec_positions; }
     /// Sums required per-file `record_count` for live entries of the given content type.
     /// Returns nullopt on negative `record_count` or Int64 overflow (fail closed).
     std::optional<Int64> getRowsCountInAllFilesExcludingDeleted(FileContentType content) const;
@@ -123,6 +126,7 @@ private:
         Int32 manifest_schema_id,
         std::shared_ptr<const PartitionSpecification> common_partition_specification,
         std::optional<DB::KeyDescription> partition_key_description,
+        std::vector<size_t> partition_key_spec_positions,
         size_t total_rows,
         std::shared_ptr<const ActionsDAG> filter_dag,
         Int32 table_snapshot_schema_id);
@@ -142,6 +146,8 @@ private:
     const Int32 manifest_schema_id;
     const std::shared_ptr<const PartitionSpecification> common_partition_specification;
     const std::optional<DB::KeyDescription> partition_key_description;
+    /// Indices (into the Avro partition tuple) of the spec fields that were kept for pruning.
+    const std::vector<size_t> partition_key_spec_positions;
     const Int32 table_snapshot_schema_id;
 
     /// Iteration state
