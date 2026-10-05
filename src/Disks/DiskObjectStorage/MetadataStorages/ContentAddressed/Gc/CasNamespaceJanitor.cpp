@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcMaintenanceState.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
+#include <fmt/format.h>
+#include <algorithm>
 
 namespace DB::Cas
 {
@@ -19,6 +21,37 @@ void throwOnRefusedOrGaveUp(WriteResult && result, std::string_view what)
         (void)orThrow(std::move(result), what);
 }
 
+uint64_t removeOnCallerThread(CasOperation & op, const std::vector<WriteOnceKey> & keys, std::vector<String> & anomalies)
+{
+    uint64_t leaked = 0;
+    for (size_t begin = 0; begin < keys.size(); begin += kBulkDeleteMaxKeys)
+    {
+        const std::vector<WriteOnceKey> batch(
+            keys.begin() + begin, keys.begin() + std::min(keys.size(), begin + kBulkDeleteMaxKeys));
+        try
+        {
+            op.removeManyWriteOnce(batch, Retry::standard());
+        }
+        catch (const std::exception & e)
+        {
+            leaked += batch.size();
+            anomalies.push_back(fmt::format(
+                "leaked {} dead-life objects starting at '{}': batch delete failed: {}",
+                batch.size(), batch.front().str(), e.what()));
+        }
+    }
+    return leaked;
+}
+
+}
+
+NamespaceJanitor::NamespaceJanitor(
+    CasRequests & requests_, const Layout & layout_, size_t page_budget_, RemoveWriteOnce remove_write_once_)
+    : requests(requests_)
+    , layout(layout_)
+    , page_budget(page_budget_)
+    , remove_write_once(remove_write_once_ ? std::move(remove_write_once_) : removeOnCallerThread)
+{
 }
 
 NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liveness liveness)
@@ -70,16 +103,19 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     /// absent objects and token mismatches are final per-key outcomes and therefore do not by
     /// themselves prevent progress.
     bool page_decided = !ambiguous && !suppress_deletes;
+    std::vector<WriteOnceKey> dead_stream_keys;
 
     for (const ListedKey & listed : page.keys)
     {
         std::optional<NamespaceLifePhysicalId> life_id;
+        std::optional<ParsedRefObjectKey> stream_key;
         try
         {
             if (listed.key.starts_with(layout.namespaceStreamRootPrefix()))
             {
-                if (const auto parsed = layout.parseRefObjectKey(listed.key))
-                    life_id = parsed->life_id;
+                stream_key = layout.parseRefObjectKey(listed.key);
+                if (stream_key)
+                    life_id = stream_key->life_id;
             }
             else if (listed.key.starts_with(layout.namespaceStateRootPrefix()))
             {
@@ -102,6 +138,15 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
         }
         if (ambiguous || suppress_deletes || catalog_cut.life_index.resolve(*life_id))
             continue;
+
+        if (stream_key)
+        {
+            if (std::optional<WriteOnceKey> write_once = layout.writeOnceStreamKey(*stream_key, listed.key))
+            {
+                dead_stream_keys.push_back(std::move(*write_once));
+                continue;
+            }
+        }
 
         std::optional<Etag> etag = listed.etag;
         if (!etag)
@@ -139,8 +184,15 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
         }
     }
 
+    if (page_decided && !dead_stream_keys.empty() && op.admitted())
+    {
+        const uint64_t leaked = remove_write_once(op, dead_stream_keys, result.anomalies);
+        result.leaked += leaked;
+        result.deleted += dead_stream_keys.size() - leaked;
+    }
+
     /// Recheck even when the page had no dead candidate. A tenure that observes fence loss after LIST
-    /// or after the last exact delete must not publish progress. Loss after this check may still race
+    /// or after the last delete must not publish progress. Loss after this check may still race
     /// with the leak-only maintenance CAS; already completed exact deletes remain safe to repeat.
     if (page_decided && !op.admitted())
         page_decided = false;
@@ -153,6 +205,8 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
             const WriteResult published = casGcMaintenanceState(op, layout, progress.etag, next, Retry::standard());
             if (std::holds_alternative<Refused>(published) || std::holds_alternative<GaveUp>(published))
                 result.anomalies.push_back("cursor publication did not commit");
+            else if (std::holds_alternative<Committed>(published))
+                result.more = result.deleted > 0 && !(cursor.empty() && page.next_cursor.empty());
         }
         catch (const std::exception & e)
         {
