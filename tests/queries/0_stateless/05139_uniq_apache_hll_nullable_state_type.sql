@@ -25,6 +25,23 @@ SELECT uniqApacheHLLMerge(s) FROM
     SELECT uniqApacheHLLState(number + 3) AS s FROM numbers(3)
 );
 
+SELECT 'the If combinator over Nullable arguments keeps the same state and type';
+SELECT toTypeName(uniqApacheHLLStateIf(toNullable(number), number % 2 = 0)) FROM numbers(1);
+SELECT toTypeName(uniqApacheHLLStateIf(number, number % 2 = 0)) FROM numbers(1);
+SELECT toTypeName(uniqApacheHLLStateIf(number, toNullable(number % 2 = 0))) FROM numbers(1);
+-- The state is the bare sketch of the values 0, 2 and 4, without a flag byte.
+SELECT
+    (SELECT hex(toString(uniqApacheHLLStateIf(toNullable(number), number % 2 = 0))) FROM numbers(5))
+  = (SELECT hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin([0, 2, 4]) AS x))
+SETTINGS max_threads = 1;
+SELECT
+    (SELECT hex(toString(uniqApacheHLLStateIf(number, toNullable(number % 2 = 0)))) FROM numbers(5))
+  = (SELECT hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin([0, 2, 4]) AS x))
+SETTINGS max_threads = 1;
+SELECT uniqApacheHLLIf(toNullable(number), number % 2 = 0) FROM numbers(10);
+SELECT uniqApacheHLLMergeIf(s, c) FROM (SELECT uniqApacheHLLState(number) AS s, number % 2 = 0 AS c FROM numbers(10) GROUP BY number);
+SELECT uniqApacheHLLMergeIf(s, toNullable(c)) FROM (SELECT uniqApacheHLLState(number) AS s, number % 2 = 0 AS c FROM numbers(10) GROUP BY number);
+
 SELECT 'a declared Nullable state type is interchangeable with the plain one';
 SELECT toTypeName(CAST(uniqApacheHLLState(number), 'AggregateFunction(uniqApacheHLL, Nullable(UInt64))')) FROM numbers(1);
 SELECT finalizeAggregation(CAST(uniqApacheHLLState(number), 'AggregateFunction(uniqApacheHLL, Nullable(UInt64))')) FROM numbers(4);

@@ -65,7 +65,7 @@ static AggregateFunctionPtr createAggregateFunctionUniqApacheHLL(
     /// Exclude wide integers: DataSketches has no portable representation for them.
     if (!which.isInt128() && !which.isInt256() && !which.isUInt128() && !which.isUInt256())
     {
-        AggregateFunctionPtr res(createWithNumericType<AggregateFunctionUniqApacheHLLPlain>(
+        AggregateFunctionPtr res(createWithNumericType<AggregateFunctionUniqApacheHLL>(
             argument_type, lg_config_k, target_type, argument_types, params));
         if (res)
             return res;
