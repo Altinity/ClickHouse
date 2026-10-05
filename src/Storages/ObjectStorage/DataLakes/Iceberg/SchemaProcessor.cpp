@@ -563,6 +563,11 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unexpected 'type' field: {}", type.toString());
 }
 
+DataTypePtr IcebergSchemaProcessor::getClickHouseFieldType(const Poco::JSON::Object::Ptr & field, ContextPtr context_)
+{
+    return getFieldType(field, f_type, context_, field->getValue<bool>(f_required));
+}
+
 /**
 * Iceberg allows only three types of primitive type conversion:
 * int -> long
