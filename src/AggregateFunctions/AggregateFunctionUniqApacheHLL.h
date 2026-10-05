@@ -4,6 +4,7 @@
 
 #if USE_DATASKETCHES
 
+#include <AggregateFunctions/Combinators/AggregateFunctionNull.h>
 #include <AggregateFunctions/Helpers.h>
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <Columns/ColumnDecimal.h>
@@ -183,6 +184,17 @@ public:
     String getName() const override { return "uniqApacheHLL"; }
 
     bool allocatesMemoryInArena() const override { return false; }
+
+    /// `NULL` rows are skipped as usual, but the state is left as a bare DataSketches sketch. The default adapter
+    /// would put a flag byte of the `Null` combinator before it, and an external implementation could not read that.
+    AggregateFunctionPtr getOwnNullAdapter(
+        const AggregateFunctionPtr & nested_function,
+        const DataTypes & arguments,
+        const Array & params,
+        const AggregateFunctionProperties & /*properties*/) const override
+    {
+        return std::make_shared<AggregateFunctionNullUnary<false, false>>(nested_function, arguments, params);
+    }
 
     void add(AggregateDataPtr __restrict place, const IColumn ** columns, size_t row_num, Arena *) const override
     {

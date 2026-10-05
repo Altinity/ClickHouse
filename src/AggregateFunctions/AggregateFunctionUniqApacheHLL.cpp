@@ -108,7 +108,7 @@ For interoperability, integers of at most 64 bits are hashed as 8-byte integers,
 Unsupported types and multiple arguments are rejected. Use `uniq`, `uniqCombined` or `uniqHLL12` for those inputs.
 
 `NULL` values and empty strings are ignored, as in the Java, Python and C++ implementations and in Spark; unlike `uniq`, an empty string is not counted as a value.
-For a `Nullable` argument the state is the sketch preceded by a single `0x01` byte, which is how the `Null` combinator marks its state, so an external consumer has to skip that byte.
+A `Nullable` argument gives the same state as a non-`Nullable` one, a bare DataSketches sketch.
 
 Merging can switch from the HIP estimator to the less accurate composite estimator, so results can depend on partitioning across threads, parts and shards.
 Merging a lower-resolution sketch permanently lowers the result's resolution, regardless of the declared `lg_k`.

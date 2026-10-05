@@ -24,14 +24,23 @@ SELECT uniqApacheHLL(x) FROM (SELECT arrayJoin(['', NULL, 'a']) AS x);
 SELECT uniqApacheHLL(CAST(NULL, 'Nullable(UInt64)')) FROM numbers(3);
 SELECT uniqApacheHLL(toNullable(number)) FROM numbers(0);
 
-SELECT 'the state of a Nullable argument is the sketch behind a 0x01 byte';
--- The `Null` combinator always writes its flag, even when every row was `NULL`.
+SELECT 'a Nullable argument gives the same state as a plain one';
+-- No flag byte of the `Null` combinator: the state is the bare DataSketches sketch, also when every row was `NULL`.
 SELECT hex(toString(uniqApacheHLLState(toNullable(number)))) FROM numbers(5) SETTINGS max_threads = 1;
+SELECT
+    (SELECT hex(toString(uniqApacheHLLState(toNullable(number)))) FROM numbers(5))
+  = (SELECT hex(toString(uniqApacheHLLState(number))) FROM numbers(5))
+SETTINGS max_threads = 1;
 SELECT hex(toString(uniqApacheHLLState(toNullable(number)))) FROM numbers(0);
 SELECT hex(toString(uniqApacheHLLState(CAST(NULL, 'Nullable(UInt64)')))) FROM numbers(3);
 SELECT hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin(['', NULL]) AS x);
--- Importing an external sketch into a Nullable state type needs the same byte.
-SELECT finalizeAggregation(CAST(unhex('011C0201070C03080500CBD7C2042BF2FB06862FF90D7581660781BC5D06'), 'AggregateFunction(uniqApacheHLL, Nullable(UInt64))'));
+-- NULL rows between values do not change the state.
+SELECT
+    (SELECT hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin([NULL, 1, NULL, 2]) AS x))
+  = (SELECT hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin([toNullable(1), 2]) AS x))
+SETTINGS max_threads = 1;
+-- An external sketch can be imported into a Nullable state type as it is.
+SELECT finalizeAggregation(CAST(unhex('1C0201070C03080500CBD7C2042BF2FB06862FF90D7581660781BC5D06'), 'AggregateFunction(uniqApacheHLL, Nullable(UInt64))'));
 -- Merging Nullable states, including one built from `NULL` values only.
 SELECT uniqApacheHLLMerge(s) FROM
 (
