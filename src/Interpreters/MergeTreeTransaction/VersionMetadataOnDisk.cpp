@@ -15,6 +15,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/TransactionID.h>
 #include <Common/logger_useful.h>
 #include <base/scope_guard.h>
@@ -28,6 +29,12 @@ namespace ErrorCodes
 extern const int LOGICAL_ERROR;
 extern const int CANNOT_OPEN_FILE;
 extern const int NOT_IMPLEMENTED;
+extern const int FAULT_INJECTED;
+}
+
+namespace FailPoints
+{
+    extern const char transaction_metadata_store_fail[];
 }
 
 namespace MergeTreeSetting
@@ -323,6 +330,12 @@ void VersionMetadataOnDisk::removeTmpMetadataFile()
 void VersionMetadataOnDisk::storeInfoToDataPartStorage(
     const MergeTreeData & storage, IDataPartStorage & data_part_storage, const VersionInfo & new_info)
 {
+    /// Fault injection for tests: fail before any I/O, so the old file stays intact.
+    fiu_do_on(FailPoints::transaction_metadata_store_fail,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure while storing version metadata");
+    });
+
     static constexpr auto filename = TXN_VERSION_METADATA_FILE_NAME;
     static constexpr auto tmp_filename = TMP_TXN_VERSION_METADATA_FILE_NAME;
 
