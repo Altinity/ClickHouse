@@ -34,6 +34,7 @@
 #include <Processors/Transforms/ExpressionTransform.h>
 #include <Processors/Transforms/ExtractColumnsTransform.h>
 #include <Processors/Transforms/FilterTransform.h>
+#include <Processors/Transforms/MaterializingTransform.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/Cache/SchemaCache.h>
 #include <Storages/HivePartitioningUtils.h>
@@ -1065,6 +1066,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     if (column_name.starts_with("materialize(") && column_name.ends_with(")"))
                         continue;
 
+                    /// Tuple element reads request nested fields like `t.a`. Writers don't have to store
+                    /// statistics for nested fields (ClickHouse stores them only for top-level columns),
+                    /// so missing statistics don't prove that the field is absent from the file.
+                    if (column_name.contains('.'))
+                        continue;
+
                     /// Skip columns produced by prewhere or row-level filter expressions —
                     /// they are computed at read time, not stored in the file.
                     if (format_filter_info
@@ -1469,6 +1476,40 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     NamesAndTypesList columns_to_extract = requested_columns_copy;
     for (const auto & column_name : row_lineage_columns)
         columns_to_extract.emplace_back(column_name, rowLineageColumnType());
+
+    /// Tuple element reads request nested fields like `t.a` as separate columns. If the data lake
+    /// schema transform has rebuilt the whole `t` instead (e.g. the file was written before `t`
+    /// was added), extract `t.a` as a subcolumn of `t`.
+    const Block & extract_header = builder.getHeader();
+    bool need_materialize = false;
+    for (auto & column : columns_to_extract)
+    {
+        const String name_in_storage = column.getNameInStorage();
+        if (extract_header.has(name_in_storage))
+            continue;
+
+        for (size_t pos = name_in_storage.rfind('.'); pos != String::npos && pos != 0; pos = name_in_storage.rfind('.', pos - 1))
+        {
+            const auto * storage_column = extract_header.findByName(name_in_storage.substr(0, pos));
+            const String subcolumn_name = column.name.substr(pos + 1);
+            if (storage_column && storage_column->type->tryGetSubcolumnType(subcolumn_name))
+            {
+                column = NameAndTypePair(storage_column->name, subcolumn_name, storage_column->type, column.type);
+                /// Subcolumns can't be extracted from a constant column, e.g. the default the schema transform
+                /// supplies for a column missing in the file.
+                need_materialize |= storage_column->column && isColumnConst(*storage_column->column);
+                break;
+            }
+        }
+    }
+
+    if (need_materialize)
+    {
+        builder.addSimpleTransform([](const SharedHeader & header)
+        {
+            return std::make_shared<MaterializingTransform>(header, /*remove_special_representations=*/ false);
+        });
+    }
 
     builder.addSimpleTransform([&](const SharedHeader & header)
     {
