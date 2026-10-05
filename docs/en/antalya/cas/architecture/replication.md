@@ -141,7 +141,7 @@ but it remains under the root that created it: `<server_root_id>/shadow/<backup>
 check therefore attributes it to exactly that server root, under the same strict prefix rule as live
 content, and that root can confirm its exact refs.
 
-`DETACH`, `ATTACH`, `delete_tmp_` cleanup, and merge-result renames all reduce to the same two
+`DETACH`, `ATTACH`, and merge-result renames all reduce to the same two
 moves: re-key any *staged* source into the destination, then `republishRef(src → dst)` for any
 *committed* source. `republishRef` resolves the source ref freshly and reads its manifest through
 the manifest cache, publishes an

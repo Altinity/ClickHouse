@@ -1,0 +1,8 @@
+plain	outdated_parts_present	1
+plain	outdated_parts_left	0
+plain	delete_tmp_events	0	ref_repoint	0	extra_manifest_publish	0	ref_drop_per_part	1	active_part_ref_drops	0
+plain	rows	400	1000
+projection	outdated_parts_present	1
+projection	outdated_parts_left	0
+projection	delete_tmp_events	0	ref_repoint	0	extra_manifest_publish	0	ref_drop_per_part	1	active_part_ref_drops	0
+projection	rows	400	1000

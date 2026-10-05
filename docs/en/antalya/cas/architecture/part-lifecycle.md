@@ -128,6 +128,13 @@ Unchanged columns are adopted by hash through a tokenless evidence dependency wi
 `GET`; changed columns are fresh uploads. A repoint therefore costs zero bytes moved for the
 carry-forward portion of the file set — only the changed content re-uploads.
 
+## Part removal {#part-removal}
+
+Removing an outdated part from a `CAS` disk is one atomic ref-log record that drops the part's ref.
+`MergeTree` does not rename the part to `delete_tmp_<name>` first, as it does on other disks, and it
+does not unlink the part's files one by one. A removal costs one ref-log transaction and no manifest
+write, whatever the number of files or projections. A crash leaves either the part or no part.
+
 ## How each MergeTree operation maps {#operation-mapping}
 
 | Operation | CAS mechanics |
@@ -136,7 +143,8 @@ carry-forward portion of the file set — only the changed content re-uploads.
 | Merge | Identical for the output part. `<proj>.tmp_proj → <proj>.proj` is an entry-prefix re-key inside the staged manifest, not a rename |
 | Mutation | `createHardLink` per unchanged file: a source staged in *this* transaction copies the entry and its pending-blob record; a **committed** source records a tokenless evidence dependency with no `HEAD` and no `GET`. A mutation is a manifest rewrite where zero bytes move for the carry-forward |
 | `ALTER` / metadata rewrites | Standalone writes into a committed part, i.e. a repoint |
-| `DROP PART` | `removeDirectory` drops the ref and clears any per-file removal marks — one ref-drop, zero repoints |
+| Outdated-part removal | One ref drop, see [Part removal](#part-removal) |
+| `DROP PART` | The part becomes outdated and is removed as in [Part removal](#part-removal): one ref drop |
 | `DROP TABLE` / `DETACHED` / `UNFREEZE` | A namespace or prefixed-ref drop. Blobs are never deleted here — removal is pointer-unlink plus deferred `GC` |
 | `RENAME TABLE` | Republishes every ref and verbatim file into the new namespace, then drops the old one. Not atomic across namespaces, but idempotent and re-drivable — true atomicity would need a move journal and is out of scope |
 | `FREEZE` / `BACKUP` / `RESTORE` / cross-disk `MOVE` | Each wraps the whole clone in one disk transaction, because a CAS part is one atomic unit |
