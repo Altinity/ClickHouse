@@ -19,8 +19,8 @@ SELECT 'Int64', hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin(CAST
 SELECT 'UInt64', hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin(CAST(['0', '9223372036854775807', '9223372036854775808', '18446744073709551615'], 'Array(UInt64)')) AS x) SETTINGS max_threads = 1;
 
 SELECT 'floats';
-SELECT 'Float64', hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin(CAST(['0', '-0', '1.5', 'nan', 'inf', '-inf', '5e-324', '1.7976931348623157e308'], 'Array(Float64)')) AS x) SETTINGS max_threads = 1;
-SELECT 'Float32', hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin(CAST(['0', '-0', '0.1', '1.5', 'nan', 'inf', '-inf', '3.4028235e38', '1e-45'], 'Array(Float32)')) AS x) SETTINGS max_threads = 1;
+SELECT 'Float64', hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin([reinterpretAsFloat64(unhex('0000000000000000')), reinterpretAsFloat64(unhex('0000000000000080')), reinterpretAsFloat64(unhex('000000000000F83F')), reinterpretAsFloat64(unhex('000000000000F87F')), reinterpretAsFloat64(unhex('000000000000F07F')), reinterpretAsFloat64(unhex('000000000000F0FF')), reinterpretAsFloat64(unhex('0100000000000000')), reinterpretAsFloat64(unhex('FFFFFFFFFFFFEF7F'))]) AS x) SETTINGS max_threads = 1;
+SELECT 'Float32', hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin([reinterpretAsFloat32(unhex('00000000')), reinterpretAsFloat32(unhex('00000080')), reinterpretAsFloat32(unhex('CDCCCC3D')), reinterpretAsFloat32(unhex('0000C03F')), reinterpretAsFloat32(unhex('0000C07F')), reinterpretAsFloat32(unhex('0000807F')), reinterpretAsFloat32(unhex('000080FF')), reinterpretAsFloat32(unhex('FFFF7F7F')), reinterpretAsFloat32(unhex('01000000'))]) AS x) SETTINGS max_threads = 1;
 SELECT 'BFloat16', hex(toString(uniqApacheHLLState(x))) FROM (SELECT arrayJoin([toBFloat16(1.5), toBFloat16(-2.0), toBFloat16(0.5), toBFloat16(256.0)]) AS x) SETTINGS max_threads = 1;
 
 SELECT 'strings';

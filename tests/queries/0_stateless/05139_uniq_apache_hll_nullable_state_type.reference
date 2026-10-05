@@ -9,9 +9,9 @@ AggregateFunction(uniqApacheHLL, String)
 states of Nullable and plain arguments mix
 6
 the If combinator over Nullable arguments keeps the same state and type
-AggregateFunction(uniqApacheHLLIf, UInt64, UInt8)
-AggregateFunction(uniqApacheHLLIf, UInt64, UInt8)
-AggregateFunction(uniqApacheHLLIf, UInt64, UInt8)
+AggregateFunction(uniqApacheHLL, UInt64)
+AggregateFunction(uniqApacheHLL, UInt64)
+AggregateFunction(uniqApacheHLL, UInt64)
 1
 1
 5
