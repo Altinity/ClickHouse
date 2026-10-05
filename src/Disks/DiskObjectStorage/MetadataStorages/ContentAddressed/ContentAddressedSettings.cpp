@@ -80,7 +80,7 @@ constexpr std::string_view CAS_KEY_PREFIX = "cas_";
     DECLARE(UInt64, manifest_decode_cache_bytes, 128ULL << 20, "Manifest DECODE cache byte budget (0 disables)", 0) \
     DECLARE(UInt64, gc_meta_pool_size, 16, "Bounded pool size for GC per-hash freshness-meta writes", 0) \
     DECLARE(UInt64, gc_io_concurrency, 16, "Maximum number of threads in the GC I/O pool. Used for fold and rebuild read-ahead, orphan-manifest sweep planning reads, pending_deletes HEAD plus conditional DELETE, and namespace janitor batch deletes. Per-hash meta writes use gc_meta_pool_size; other GC requests run on the round thread. 1 disables parallel GC I/O", 0) \
-    DECLARE(UInt64, gc_bulk_delete_chunk_keys, 1000, "Keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots); 1 to 1000", 0) \
+    DECLARE(UInt64, gc_bulk_delete_chunk_keys, 1000, "Most keys per batch delete request in GC's write-once families (owner-removed manifest bodies, covered ref logs and snapshots, the namespace janitor's dead ref logs and snapshots); 1 to 1000", 0) \
     DECLARE(UInt64, attempt_timeout_ms, 5000, "Budget for one HTTP attempt of a writable Native mount's control-plane requests (read, head, list, remove, conditional write), at least 1. With the connect cap it forms the attempt envelope the lease arithmetic reserves", 0) \
     DECLARE(UInt64, lease_safety_margin_ms, 2000, "Startup-only margin validated against the mount lease TTL: attempt envelope + this must be strictly less than the TTL, and renew period + 2 × envelope + this too", 0) \
     DECLARE(String, staging_backend, "local", "Blob staging backend (local | s3); s3 is opt-in", 0) \
