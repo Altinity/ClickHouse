@@ -105,13 +105,15 @@ public:
 
         datasketches::hll_union * u = getSkUnion(lg_config_k);
 
-        foldUpdateIntoUnionIfNeeded();
-
         /// `rhs` may hold both sketches; take both without modifying it.
-        if (rhs.sk_union)
-            u->update(rhs.sk_union->get_result(tgt_type));
         if (rhs.sk_update)
             u->update(*rhs.sk_update);
+        if (rhs.sk_union)
+            u->update(rhs.sk_union->get_result(tgt_type));
+
+        /// Fold our own pending sketch last: a lower-resolution `rhs` sketch is then taken first,
+        /// instead of a union at the declared `lg_k` being built and downsampled afterwards.
+        foldUpdateIntoUnionIfNeeded();
     }
 
     /// You can only call this for an empty object.
