@@ -1,5 +1,7 @@
 #include <AggregateFunctions/registerAggregateFunctions.h>
 
+#include "config.h"
+
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/Combinators/AggregateFunctionCombinatorFactory.h>
 
