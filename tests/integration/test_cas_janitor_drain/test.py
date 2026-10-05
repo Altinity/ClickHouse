@@ -56,7 +56,7 @@ def seed_and_drop(node, disk):
 
 def janitor_rows(node, disk, since):
     node.query("SYSTEM FLUSH LOGS")
-    columns = ["janitor_deleted", "janitor_pages", "leaked", "budget_exhausted"]
+    columns = ["janitor_deleted", "janitor_pages", "leaked", "delete_requests", "budget_exhausted"]
     select = ", ".join(f"phase_metrics['{c}']" for c in columns)
     out = node.query(
         f"SELECT {select} FROM system.cas_gc_log WHERE event_type = 'Phase' AND phase = 'namespace_cleanup' "
@@ -84,3 +84,7 @@ def test_dropped_table_drains_in_one_round(disk):
     assert row["janitor_pages"] >= 3
     assert row["leaked"] == 0
     assert row["budget_exhausted"] == 0
+    if disk == "cas_batch":
+        assert row["delete_requests"] * 10 < dead_keys, f"{disk}: the dead keys did not go in batches: {rows}"
+    else:
+        assert row["delete_requests"] >= dead_keys, f"{disk}: expected one request per key: {rows}"
