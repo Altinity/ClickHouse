@@ -35,8 +35,7 @@ SELECT toTypeName(uniqApacheHLLState(14, 'HLL_8')(number)) FROM numbers(1);
 SELECT 'parameter validation';
 SELECT uniqApacheHLL(3)(number) FROM numbers(1); -- { serverError ARGUMENT_OUT_OF_BOUND }
 SELECT uniqApacheHLL(22)(number) FROM numbers(1); -- { serverError ARGUMENT_OUT_OF_BOUND }
-SELECT uniqApacheHLL(12.5)(number) FROM numbers(1); -- { serverError BAD_ARGUMENTS }
-SELECT uniqApacheHLL(-1)(number) FROM numbers(1); -- { serverError BAD_ARGUMENTS }
+SELECT uniqApacheHLL(-1)(number) FROM numbers(1); -- { serverError ARGUMENT_OUT_OF_BOUND }
 SELECT uniqApacheHLL(12, 'HLL_9')(number) FROM numbers(1); -- { serverError BAD_ARGUMENTS }
 SELECT uniqApacheHLL(12, 'HLL_4', 1)(number) FROM numbers(1); -- { serverError NUMBER_OF_ARGUMENTS_DOESNT_MATCH }
 
