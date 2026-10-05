@@ -65,7 +65,7 @@ static AggregateFunctionPtr createAggregateFunctionUniqApacheHLL(
     /// Exclude wide integers: DataSketches has no portable representation for them.
     if (!which.isInt128() && !which.isInt256() && !which.isUInt128() && !which.isUInt256())
     {
-        AggregateFunctionPtr res(createWithNumericType<AggregateFunctionUniqApacheHLL>(
+        AggregateFunctionPtr res(createWithNumericType<AggregateFunctionUniqApacheHLLPlain>(
             argument_type, lg_config_k, target_type, argument_types, params));
         if (res)
             return res;
@@ -108,7 +108,7 @@ For interoperability, integers of at most 64 bits are hashed as 8-byte integers,
 Unsupported types and multiple arguments are rejected. Use `uniq`, `uniqCombined` or `uniqHLL12` for those inputs.
 
 `NULL` values and empty strings are ignored, as in the Java, Python and C++ implementations and in Spark; unlike `uniq`, an empty string is not counted as a value.
-A `Nullable` argument gives the same state as a non-`Nullable` one, a bare DataSketches sketch.
+A `Nullable` argument gives the same state as a non-`Nullable` one, a bare DataSketches sketch, and the same state type, `AggregateFunction(uniqApacheHLL, T)`.
 
 Merging can switch from the HIP estimator to the less accurate composite estimator, so results can depend on partitioning across threads, parts and shards.
 Merging a lower-resolution sketch permanently lowers the result's resolution, regardless of the declared `lg_k`.

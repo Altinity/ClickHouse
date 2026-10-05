@@ -4,10 +4,10 @@
 
 #if USE_DATASKETCHES
 
-#include <AggregateFunctions/Combinators/AggregateFunctionNull.h>
 #include <AggregateFunctions/Helpers.h>
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <Columns/ColumnDecimal.h>
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/Exception.h>
 #include <Common/assert_cast.h>
@@ -18,6 +18,7 @@
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypeIPv4andIPv6.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <IO/ReadBuffer.h>
@@ -27,6 +28,7 @@
 
 #include <hll.hpp>
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <exception>
@@ -161,10 +163,15 @@ public:
 };
 
 
-template <typename T>
-class AggregateFunctionUniqApacheHLL final : public IAggregateFunctionDataHelper<HllSketchData, AggregateFunctionUniqApacheHLL<T>>
+/** `nullable` is the variant that takes a `Nullable(T)` argument, skips its `NULL` rows itself and keeps the state
+  * of the plain variant: a bare DataSketches sketch. The generic `Null` combinator would put its flag byte before
+  * the sketch and give the state a `Nullable` argument type, so a state of a `Nullable` column could be neither read
+  * by another implementation nor used where the state of a plain column is expected.
+  */
+template <typename T, bool nullable = false>
+class AggregateFunctionUniqApacheHLL final : public IAggregateFunctionDataHelper<HllSketchData, AggregateFunctionUniqApacheHLL<T, nullable>>
 {
-    using Base = IAggregateFunctionDataHelper<HllSketchData, AggregateFunctionUniqApacheHLL<T>>;
+    using Base = IAggregateFunctionDataHelper<HllSketchData, AggregateFunctionUniqApacheHLL<T, nullable>>;
 
     uint8_t lg_config_k;
     datasketches::target_hll_type target_type;
@@ -185,24 +192,52 @@ public:
 
     bool allocatesMemoryInArena() const override { return false; }
 
-    /// `NULL` rows are skipped as usual, but the state is left as a bare DataSketches sketch. The default adapter
-    /// would put a flag byte of the `Null` combinator before it, and an external implementation could not read that.
     AggregateFunctionPtr getOwnNullAdapter(
-        const AggregateFunctionPtr & nested_function,
+        const AggregateFunctionPtr & /*nested_function*/,
         const DataTypes & arguments,
         const Array & params,
         const AggregateFunctionProperties & /*properties*/) const override
     {
-        return std::make_shared<AggregateFunctionNullUnary<false, false>>(nested_function, arguments, params);
+        if constexpr (nullable)
+            return nullptr;
+        else
+            return std::make_shared<AggregateFunctionUniqApacheHLL<T, true>>(lg_config_k, target_type, arguments, params);
+    }
+
+    /// The bytes of the state do not depend on the nullability of the argument, so neither does its type.
+    DataTypePtr getStateType() const override
+    {
+        if constexpr (nullable)
+            return getPlainFunction()->getStateType();
+        else
+            return IAggregateFunction::getStateType();
+    }
+
+    DataTypePtr getNormalizedStateType() const override
+    {
+        if constexpr (nullable)
+            return getPlainFunction()->getNormalizedStateType();
+        else
+            return IAggregateFunction::getNormalizedStateType();
     }
 
     void add(AggregateDataPtr __restrict place, const IColumn ** columns, size_t row_num, Arena *) const override
     {
+        const IColumn * column = columns[0];
+
+        if constexpr (nullable)
+        {
+            const auto & nullable_column = assert_cast<const ColumnNullable &>(*column);
+            if (nullable_column.isNullAt(row_num))
+                return;
+            column = &nullable_column.getNestedColumn();
+        }
+
         auto & data = this->data(place);
 
         if constexpr (std::is_same_v<T, String>)
         {
-            const auto value = columns[0]->getDataAt(row_num);
+            const auto value = column->getDataAt(row_num);
 
             /// Other DataSketches implementations ignore empty strings, and the sketch of a mixed
             /// input must be the same as theirs.
@@ -213,7 +248,7 @@ public:
         }
         else
         {
-            const auto & value = assert_cast<const ColumnVectorOrDecimal<T> &>(*columns[0]).getData()[row_num];
+            const auto & value = assert_cast<const ColumnVectorOrDecimal<T> &>(*column).getData()[row_num];
 
             if constexpr (std::is_same_v<T, UUID>)
             {
@@ -241,10 +276,19 @@ public:
         }
     }
 
-    /// Serialized sketches carry their configuration, so parameters need not match.
+    /// Serialized sketches carry their configuration, so parameters need not match, and nullability of the argument does not matter.
     bool haveSameStateRepresentationImpl(const IAggregateFunction & rhs) const override
     {
-        return getName() == rhs.getName() && this->haveEqualArgumentTypes(rhs);
+        const auto & lhs_types = this->getArgumentTypes();
+        const auto & rhs_types = rhs.getArgumentTypes();
+
+        return getName() == rhs.getName()
+            && std::equal(
+                lhs_types.begin(),
+                lhs_types.end(),
+                rhs_types.begin(),
+                rhs_types.end(),
+                [](const auto & lhs, const auto & rhs_type) { return removeNullable(lhs)->equals(*removeNullable(rhs_type)); });
     }
 
     void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
@@ -266,7 +310,24 @@ public:
     {
         assert_cast<ColumnUInt64 &>(to).getData().push_back(this->data(place).size(target_type));
     }
+
+private:
+    /// The same function for the argument types without `Nullable`; its state layout is identical.
+    AggregateFunctionPtr getPlainFunction() const
+    {
+        DataTypes plain_argument_types;
+        plain_argument_types.reserve(this->getArgumentTypes().size());
+        for (const auto & type : this->getArgumentTypes())
+            plain_argument_types.push_back(removeNullable(type));
+
+        return std::make_shared<AggregateFunctionUniqApacheHLL<T, false>>(
+            lg_config_k, target_type, plain_argument_types, this->getParameters());
+    }
 };
+
+/// The factory needs a template with a single type parameter.
+template <typename T>
+using AggregateFunctionUniqApacheHLLPlain = AggregateFunctionUniqApacheHLL<T, false>;
 
 }
 
