@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 namespace DB::Cas
@@ -23,6 +24,10 @@ struct Retry
     /// iterations a fresh window. Empty for a single verb, which gets its window from where it is
     /// called.
     std::optional<uint64_t> policy_deadline_ms = std::nullopt;
+    /// When set, a reissue in `CasOperation`'s write and read loops waits until this long (drawn in
+    /// [0.8, 1.2] of it) has passed since the failed request started, instead of the engine's backoff.
+    /// A request that took longer is reissued at once. The first-attempt fuse is reissued at once either way.
+    std::optional<uint64_t> attempt_spacing_ms = std::nullopt;
 
     /// Full jitter: uniform(0, min(5000, 200 << (attempt-1))) milliseconds. `attempt` is 1-based;
     /// `attempt == 0` returns 0.
@@ -53,6 +58,20 @@ struct Retry
     }
     /// The standard policy, but at most one attempt is ever sent.
     static Retry once() { return {.window_ms = 90'000, .lease_deadline_ms = std::nullopt, .single_attempt = true}; }
+
+    /// No window and no lease bound: retried until a definitive answer, or until the fence or the
+    /// caller's liveness ends it. `bind` saturates, so the only horizon is the range of the clock.
+    static Retry untilDefinitive(uint64_t attempt_spacing_ms_)
+    {
+        return {.window_ms = std::numeric_limits<uint64_t>::max(), .lease_deadline_ms = std::nullopt,
+                .single_attempt = false, .attempt_spacing_ms = attempt_spacing_ms_};
+    }
+
+    /// The pause before a retry under `attempt_spacing_ms`: `spacing_draw_ms` minus what the failed
+    /// request took, not below 0. A clock sample before the start counts as no time taken.
+    static uint64_t spacedPause(uint64_t spacing_draw_ms, uint64_t request_started_ms, uint64_t now_ms);
+    /// A uniform draw in [0.8, 1.2] of `attempt_spacing_ms_`, saturating at the top of the range.
+    static uint64_t drawSpacing(uint64_t attempt_spacing_ms_);
 
     /// This policy, made single-attempt. A frozen loop policy keeps its absolute deadline through it,
     /// which is what lets a loop send an unrepeatable request under the same bound as the rest.

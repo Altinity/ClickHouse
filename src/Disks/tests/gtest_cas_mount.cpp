@@ -59,13 +59,13 @@ void renewOrThrow(MountLeaseRenewer & renewer)
     ASSERT_EQ(result.outcome, MountRenewOutcome::Committed);
 }
 
-/// The two request planes a renewer in this file runs on, plus one operation for the protocol calls
-/// driven directly. Both planes are open-fence: these fixtures hold no mount lease, so nothing here
-/// should be refused by a fence it does not have. The clock and the sleep are ALWAYS injected -- a
-/// fixture that drives a lease deadline passes its own so a slow machine cannot run the bound out
-/// mid-test, and one that does not still must not sleep for real when a fault sends the engine round
-/// again. `tests::OperationForTest` covers the one-operation case but neither the two planes nor the
-/// clock, which is why this stays local.
+/// The request planes a renewer in this file runs on, plus one operation for the protocol calls driven
+/// directly. All planes are open-fence: these fixtures hold no mount lease, so nothing here should be
+/// refused by a fence it does not have. The clock and the sleep are ALWAYS injected -- a fixture that
+/// drives a lease deadline passes its own so a slow machine cannot run the bound out mid-test, and one
+/// that does not still must not sleep for real when a fault sends the engine round again.
+/// `tests::OperationForTest` covers the one-operation case but neither the planes nor the clock, which
+/// is why this stays local.
 class Ops
 {
 public:
@@ -73,11 +73,12 @@ public:
 
     Ops(std::shared_ptr<Backend> backend, uint64_t * boot_ms)
         : mount(openRequestsForTest(backend))
-        , farewell(openRequestsForTest(std::move(backend)))
+        , farewell(openRequestsForTest(backend))
+        , lease(openRequestsForTest(std::move(backend)))
         , op(mount.admit())
     {
         uint64_t * clock = boot_ms ? boot_ms : &own_clock;
-        for (CasRequests * requests : {&mount, &farewell})
+        for (CasRequests * requests : {&mount, &farewell, &lease})
         {
             requests->setNowFnForTest([clock] { return *clock; });
             requests->setSleepFnForTest([clock](uint64_t ms) { *clock += ms; });
@@ -89,6 +90,7 @@ public:
 
     CasRequests mount;
     CasRequests farewell;
+    CasRequests lease;
     CasOperation op;
 
 private:
@@ -360,7 +362,10 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         ScopedRenewalLogCapture capture("debug");
         backend->throw_before_next_overwrite = true;
         EXPECT_NO_THROW(store->renewWatermarkOnce());
-        EXPECT_EQ(countRenewalLogText(capture.captured(), "physical retry attempt 2"), 1u);
+        const String output = capture.captured();
+        EXPECT_GE(countRenewalLogText(output, "recovered"), 1u) << "the capture sees the renewal at all: " << output;
+        EXPECT_EQ(countRenewalLogText(output, "physical retry attempt"), 0u)
+            << "requests are counted by the attempt counters, not replayed as log lines when the renewal ends: " << output;
     }
 
     {
@@ -723,7 +728,7 @@ TEST(CASMountLease, AbsentClaimThenRenewBumpsSeq)
     Ops ops(b, &boot);
     auto r = claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100);
     EXPECT_EQ(r.kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                        [&] { return boot; });
     k.start();
@@ -743,7 +748,7 @@ TEST(CASMountLease, HolderBodiesMintFreshAttemptIdsAndFenceCopiesIt)
     const String key = layout.mountKey("r");
     const MountLease claimed = decodeMountLease(ops.op.read(key, Retry::standard())->bytes);
 
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, layout, "r", UInt128{1}, 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, layout, "r", UInt128{1}, 7, std::chrono::milliseconds(100),
                             [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                             [&] { return boot; });
     renewer.start();
@@ -799,7 +804,7 @@ TEST(CASMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
     uint64_t boot = 0;
     Ops ops(b, &boot);
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(0),
                        [&] { return boot; });
     k.start();
@@ -842,7 +847,7 @@ TEST(CASMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
     uint64_t now = 1000;
     Ops ops(b);
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; });
     k.start();
 
@@ -1154,7 +1159,7 @@ TEST(CASMountLease, RenewerStartAdoptsOurOwnClaimNotDoubleStart)
     Ops ops(b);
     // The normal flow: claimMount writes the live mount under (uuid=1, epoch=7), THEN renewer.start().
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-    MountLeaseRenewer k(ops.mount, ops.farewell, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100),
+    MountLeaseRenewer k(ops.mount, ops.farewell, ops.lease, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100),
                        [&] { return now; }, [] { return uint64_t{0}; });
     EXPECT_NO_THROW(k.start());     // adopts our own live (uuid=1,epoch=7) mount — NOT a double-start
     EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 7u);
@@ -1501,7 +1506,7 @@ namespace
 /// Rev.6 §token-stability observation removed the wall clock from the fence DECISION; `kNowMs` below
 /// is threaded through only as `computeHeartbeatFloor`'s audit-only `now_ms`.
 constexpr uint64_t kNowMs = 1'000'000;
-/// The fence-out threshold measured on the LEADER's OWN monotonic clock (`mono_now_ms`), independent
+/// The fence-out threshold measured on the LEADER's OWN monotonic clock (`mono_ms_fn`), independent
 /// of any lease's stamped `expires_at_ms`.
 constexpr uint64_t kStableThresholdMs = 10'000;
 
@@ -1539,6 +1544,168 @@ void renewMount(CasOperation & op, const Layout & l, const String & srid)
     mustCommit(op.replace(l.mountKey(srid), encodeMountLease(m), got->etag, Retry::standard()),
                "renewed mount " + srid);
 }
+
+/// An observer clock that does not move during a call: a sighting and the round start read the same value.
+std::function<uint64_t()> frozenClock(uint64_t ms)
+{
+    return [ms] { return ms; };
+}
+
+/// Moves the observer clock on every read of a mount slot, so a round spends time between its first
+/// clock sample and the read it decides on. With `renew_before_next_fence` set, the holder renews once
+/// just before the next guarded write of a mount slot lands, so a fence-out is refused and decided
+/// again on the holder's new token.
+class SightingClockBackend : public InMemoryBackend
+{
+public:
+    explicit SightingClockBackend(uint64_t & mono_) : mono(mono_) {}
+
+    uint64_t read_cost_ms = 0;
+    bool renew_before_next_fence = false;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (key.ends_with("/mount"))
+            mono += read_cost_ms;
+        return InMemoryBackend::read(key, access);
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
+    {
+        if (renew_before_next_fence && expected_value && key.ends_with("/mount"))
+        {
+            renew_before_next_fence = false;
+            const auto got = InMemoryBackend::read(key, access);
+            MountLease m = decodeMountLease(got->bytes);
+            m.seq += 1;
+            EXPECT_TRUE(InMemoryBackend::write(key, encodeMountLease(m), got->value, access).has_value());
+        }
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+
+private:
+    uint64_t & mono;
+};
+
+constexpr uint64_t kWalkMs = 4'000;
+
+void firstDecisionCountsFromAfterTheRead()
+{
+    uint64_t mono = 0;
+    auto b = std::make_shared<SightingClockBackend>(mono);
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const auto clock = [&mono] { return mono; };
+    MountObservationMap obs;
+
+    /// The round starts at 0 and reaches the slot at `kWalkMs`.
+    b->read_cost_ms = kWalkMs;
+    ASSERT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 0u);
+    ASSERT_TRUE(obs.contains("s1"));
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kWalkMs);
+
+    /// One threshold after the first round started, less than one after its read.
+    b->read_cost_ms = 0;
+    mono = kStableThresholdMs;
+    const HeartbeatFloor early = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_EQ(early.fenced_now, 0u) << "fenced a token watched for less than the threshold";
+    EXPECT_EQ(early.live, 1u);
+
+    mono = kWalkMs + kStableThresholdMs;
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u);
+}
+
+void reDecisionCountsFromAfterItsRead()
+{
+    uint64_t mono = 0;
+    auto b = std::make_shared<SightingClockBackend>(mono);
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const auto clock = [&mono] { return mono; };
+    MountObservationMap obs;
+
+    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_TRUE(obs.contains("s1"));
+    const Etag first = obs.at("s1").token;
+
+    /// Stable at this round's start, so it tries the fence-out. The holder renews first, the write is
+    /// refused, and the round decides again on the new token after reading it.
+    mono = kStableThresholdMs;
+    b->read_cost_ms = kWalkMs;
+    b->renew_before_next_fence = true;
+    const HeartbeatFloor refused = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_FALSE(b->renew_before_next_fence) << "the round never attempted the fence-out";
+    ASSERT_EQ(refused.fenced_now, 0u);
+    ASSERT_EQ(refused.live, 1u);
+    ASSERT_NE(obs.at("s1").token, first);
+
+    /// Nothing reads after the re-decision, so the clock still holds the value of its last read.
+    const uint64_t reread_at = mono;
+    ASSERT_GT(reread_at, kStableThresholdMs);
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, reread_at);
+
+    /// One threshold after that round started, less than one after its re-read.
+    b->read_cost_ms = 0;
+    mono = kStableThresholdMs + kStableThresholdMs;
+    ASSERT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 0u)
+        << "fenced the renewed token before it was watched for the threshold";
+
+    mono = reread_at + kStableThresholdMs;
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u);
+}
+
+void slowWalkDoesNotMoveTheStabilitySample()
+{
+    uint64_t mono = 0;
+    auto b = std::make_shared<SightingClockBackend>(mono);
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const auto clock = [&mono] { return mono; };
+    MountObservationMap obs;
+
+    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_EQ(obs.at("s1").first_seen_mono_ms, 0u);
+
+    /// The round starts one millisecond short of the threshold; its walk passes the threshold many times.
+    mono = kStableThresholdMs - 1;
+    b->read_cost_ms = 10 * kStableThresholdMs;
+    const HeartbeatFloor slow = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    EXPECT_EQ(slow.fenced_now, 0u);
+    EXPECT_EQ(slow.live, 1u);
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, 0u) << "an unchanged token keeps its first sighting";
+}
+}
+
+TEST(CASTokenWatch, CountsFromAfterTheRead)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Ops ops(b);
+    const Etag t1 = std::get<Committed>(ops.op.create("k", "v1", Retry::standard())).etag;
+    const Etag t2 = std::get<Committed>(ops.op.replace("k", "v2", t1, Retry::standard())).etag;
+    constexpr uint64_t threshold_ms = 10'000;
+
+    /// The read that returned `t1` ended at 5000: the watch counts from there.
+    const TokenWatch watch = TokenWatch::sighted(t1, /*sample_after_read_ms=*/ 5'000);
+    EXPECT_EQ(watch.token, t1);
+    EXPECT_EQ(watch.first_seen_mono_ms, 5'000u);
+
+    EXPECT_FALSE(watch.stableFor(threshold_ms, 14'999));
+    EXPECT_TRUE(watch.stableFor(threshold_ms, 15'000));
+
+    /// A sample older than the sighting proves nothing about how long the token held.
+    EXPECT_FALSE(watch.stableFor(threshold_ms, 4'000));
+    EXPECT_FALSE(watch.stableFor(0, 4'000));
+
+    /// A changed token is a new watch, counted from its own read.
+    const TokenWatch renewed = TokenWatch::sighted(t2, 15'000);
+    EXPECT_NE(renewed.token, watch.token);
+    EXPECT_FALSE(renewed.stableFor(threshold_ms, 15'000));
+    EXPECT_TRUE(renewed.stableFor(threshold_ms, 25'000));
 }
 
 TEST(CASHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
@@ -1552,7 +1719,7 @@ TEST(CASHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, /*now_ms*/ kNowMs, /*mono_now_ms*/ 0,
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, /*now_ms*/ kNowMs, frozenClock(0),
                                                          kStableThresholdMs, obs);
 
     EXPECT_EQ(floor.fenced_now, 0u);
@@ -1569,14 +1736,14 @@ TEST(CASHeartbeatFloor, StableIncarnationPastThresholdIsFenced)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     EXPECT_EQ(floor_before.fenced_now, 0u);
 
     const MountLease before = decodeMountLease(ops.op.read(l.mountKey("s1"), Retry::standard())->bytes);
 
     /// No renewal in between: the SAME incarnation, observed since mono 0, is now stable for the full
     /// threshold on the leader's own clock.
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.fenced_now, 1u);
@@ -1594,20 +1761,20 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     ASSERT_TRUE(obs.contains("s1"));
-    const Etag first_etag = obs.at("s1").etag;
+    const Etag first_etag = obs.at("s1").token;
 
     renewMount(ops.op, l, "s1");
     const Etag renewed_etag = currentEtag(ops.op, l.mountKey("s1"));
     EXPECT_NE(renewed_etag, first_etag);
 
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.fenced_now, 0u);
     ASSERT_TRUE(obs.contains("s1"));
-    EXPECT_EQ(obs.at("s1").etag, renewed_etag);
+    EXPECT_EQ(obs.at("s1").token, renewed_etag);
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kStableThresholdMs);
 }
 
@@ -1625,7 +1792,7 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     seedMount(ops.op, l, "s2", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     ASSERT_TRUE(obs.contains("s1"));
     ASSERT_TRUE(obs.contains("s2"));
 
@@ -1637,7 +1804,7 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     renewMount(ops.op, l, "s1");
     ASSERT_EQ(ops.op.removeCurrent(l.mountKey("s2"), Retry::standard()), Removal::Removed);
 
-    computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs), kStableThresholdMs, obs);
     EXPECT_TRUE(obs.contains("s1"));
     EXPECT_FALSE(obs.contains("s2"))
         << "a srid removed from the LIST entirely must be pruned from obs, not linger forever";
@@ -1664,7 +1831,7 @@ TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
     MountObservationMap obs;
 
     /// Round 1 (mono 0): first sight of every non-terminal mount — nothing is fence-eligible yet.
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     EXPECT_EQ(floor_before.live, 3u);            // s1, s2, s3: observation just started
     EXPECT_EQ(floor_before.terminated, 1u);      // s5
     EXPECT_EQ(floor_before.fenced_now, 0u);
@@ -1681,7 +1848,7 @@ TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
 
     /// Round 2 (mono == threshold): s1/s2's renewed incarnations restart their observation (still
     /// live); s3's original incarnation has now held stable for the full threshold -> fenced.
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.live, 2u);            // s1, s2: renewed, observation restarted
@@ -1759,14 +1926,14 @@ TEST(CASHeartbeatFloor, FenceOutLosesTheIncarnationRaceAndReclassifiesLive)
     MountObservationMap obs;
     /// Round 1: first sight, observation starts — never reaches the fence-out path (the race
     /// decorator stays armed for round 2).
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     EXPECT_EQ(floor_before.fenced_now, 0u);
 
     /// Round 2: the incarnation has been stable past threshold, so the function attempts the
     /// fence-out. The decorator renews concurrently under the real incarnation, the write is refused,
     /// and the re-decision reclassifies the slot as live (observation restarted on the new
     /// incarnation) — never fenced.
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.fenced_now, 0u);
@@ -1777,6 +1944,22 @@ TEST(CASHeartbeatFloor, FenceOutLosesTheIncarnationRaceAndReclassifiesLive)
     EXPECT_FALSE(decodeMountLease(after->bytes).gc_fenced);
 }
 
+TEST(CASHeartbeat, GcCountsASightingFromAfterItsRead)
+{
+    {
+        SCOPED_TRACE("first decision");
+        firstDecisionCountsFromAfterTheRead();
+    }
+    {
+        SCOPED_TRACE("re-decision after a refused fence-out");
+        reDecisionCountsFromAfterItsRead();
+    }
+    {
+        SCOPED_TRACE("slow walk");
+        slowWalkDoesNotMoveTheStabilitySample();
+    }
+}
+
 TEST(CASHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -1784,7 +1967,7 @@ TEST(CASHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
 
     Ops ops(b);
     MountObservationMap obs;
-    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
 
     EXPECT_EQ(floor.live, 0u);
     EXPECT_EQ(floor.terminated, 0u);
@@ -1938,7 +2121,7 @@ TEST(CASMountObservation, RenewalDuringObservationRestartsIt)
     /// wrote (no seq bump, per the ADOPT RULE), then a synchronous renewal mints a new incarnation
     /// mid-observation.
     uint64_t renewer_wall = 500;
-    MountLeaseRenewer renewer(ops.mount, ops.farewell, l, "r", UInt128(1), 7, std::chrono::milliseconds(500),
+    MountLeaseRenewer renewer(ops.mount, ops.farewell, ops.lease, l, "r", UInt128(1), 7, std::chrono::milliseconds(500),
                              [&] { return renewer_wall; }, [] { return uint64_t{0}; }, {},
                              std::chrono::milliseconds(0), [&] { return renewer_boot; });
     renewer.start();
@@ -2127,7 +2310,7 @@ TEST(CASMountLease, ClaimAdoptIsTwoRequests)
 
     /// The absent-slot mint.
     backend->reads = backend->heads = backend->writes = 0;
-    MountLeaseRenewer minting(ops.mount, ops.farewell, l, "fresh", UInt128(1), 7,
+    MountLeaseRenewer minting(ops.mount, ops.farewell, ops.lease, l, "fresh", UInt128(1), 7,
                              std::chrono::milliseconds(100), [&] { return now; }, [] { return uint64_t{0}; });
     minting.start();
     EXPECT_EQ(backend->reads, 1u);
@@ -2138,7 +2321,7 @@ TEST(CASMountLease, ClaimAdoptIsTwoRequests)
     ASSERT_EQ(claimMount(ops.op, l, "adopted", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind,
               MountClaimResult::Claimed);
     backend->reads = backend->heads = backend->writes = 0;
-    MountLeaseRenewer adopting(ops.mount, ops.farewell, l, "adopted", UInt128(1), 7,
+    MountLeaseRenewer adopting(ops.mount, ops.farewell, ops.lease, l, "adopted", UInt128(1), 7,
                               std::chrono::milliseconds(100), [&] { return now; }, [] { return uint64_t{0}; });
     adopting.start();
     EXPECT_EQ(backend->reads, 1u);
@@ -2177,10 +2360,10 @@ TEST(CASMountLease, FarewellRunsOnAnOpenFenceAfterTheMountFenceIsLost)
     ASSERT_EQ(claimMount(seed, l, "renewing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
     ASSERT_EQ(claimMount(seed, l, "departing", UInt128(1), 7, now, /*ttl*/ 1000).kind, MountClaimResult::Claimed);
 
-    MountLeaseRenewer renewing(mount_requests, open_requests, l, "renewing", UInt128(1), 7,
+    MountLeaseRenewer renewing(mount_requests, open_requests, open_requests, l, "renewing", UInt128(1), 7,
                               std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                               {}, std::chrono::milliseconds(0), [&] { return boot; });
-    MountLeaseRenewer departing(mount_requests, open_requests, l, "departing", UInt128(1), 7,
+    MountLeaseRenewer departing(mount_requests, open_requests, open_requests, l, "departing", UInt128(1), 7,
                                std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                                {}, std::chrono::milliseconds(0), [&] { return boot; });
     renewing.start();
@@ -2218,7 +2401,7 @@ TEST(CASMountLease, ClaimIsNotAdmittedUnderTheMountFence)
     open_requests.setNowFnForTest([&boot] { return boot; });
     open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
 
-    MountLeaseRenewer renewer(mount_requests, open_requests, l, "r", UInt128(1), 7,
+    MountLeaseRenewer renewer(mount_requests, open_requests, open_requests, l, "r", UInt128(1), 7,
                             std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                             {}, std::chrono::milliseconds(0), [&] { return boot; });
     EXPECT_NO_THROW(renewer.start());
@@ -2278,7 +2461,7 @@ TEST(CASMountLease, RemountRenewalIsAdmittedOffTheMountFence)
     open_requests.setNowFnForTest([&boot] { return boot; });
     open_requests.setSleepFnForTest([&boot](uint64_t ms) { boot += ms; });
 
-    MountLeaseRenewer renewer(mount_requests, open_requests, l, "r", UInt128(1), 7,
+    MountLeaseRenewer renewer(mount_requests, open_requests, open_requests, l, "r", UInt128(1), 7,
                             std::chrono::milliseconds(1000), [&] { return now; }, [] { return uint64_t{0}; },
                             {}, std::chrono::milliseconds(0), [&] { return boot; });
     renewer.start();

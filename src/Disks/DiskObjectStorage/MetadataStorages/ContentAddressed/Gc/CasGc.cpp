@@ -690,7 +690,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// PUT per newly-fenced mount.
     {
         GcPhaseTimer t(phase_sink, "heartbeat_floor");
-        const HeartbeatFloor floor = computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn(),
+        const HeartbeatFloor floor = computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn,
                                                            stable_threshold_ms, mount_obs);
         report.fence_outs = floor.fenced_now;
         if (floor.fenced_now > 0)
@@ -4704,7 +4704,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// `mountObservationThresholdMs` -- see its doc comment (CasServerRoot.h).
     const uint64_t stable_threshold_ms = mountObservationThresholdMs(
         ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
-    computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn(), stable_threshold_ms, mount_obs);
+    computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn, stable_threshold_ms, mount_obs);
 
     /// Retired-in-snapshot: the rebuilt seal's `condemned_summary` must be TOTAL over gc_shards so a
     /// subsequent regular round reads graduation/carry decisions zero-I/O off it (and its `carryParentRefs`

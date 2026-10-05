@@ -465,8 +465,8 @@ CasLifecycleSnapshot ContentAddressedMetadataStorage::lifecycleSnapshot() const
     }
 
     const Cas::Pool::LifecycleSnapshot ps = pool->lifecycleSnapshot();
-    snap.lifecycle = casLifecycleToString(ps.lifecycle);
-    snap.reason = casLifecycleReasonWord(ps.lifecycle);
+    snap.lifecycle = ps.lease_expired ? "not_live" : casLifecycleToString(ps.lifecycle);
+    snap.reason = ps.lease_expired ? "lease_expired" : casLifecycleReasonWord(ps.lifecycle);
     snap.detail = ps.detail;
     snap.since = ps.since;
     return snap;
