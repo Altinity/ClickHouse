@@ -168,9 +168,9 @@ DECLARE_SETTING_ENUM(DistributedProductMode)
 /// The setting for executing object storage cluster function or table JOIN sections.
 enum class ObjectStorageClusterJoinMode : uint8_t
 {
-    LOCAL,       /// Convert to local query
+    LOCAL,       /// Legacy alias of ALLOW: initiator-local join
     GLOBAL,      /// Convert to global query
-    ALLOW        /// Enable
+    ALLOW        /// Initiator-local join when the right table is not on remote nodes
 };
 
 DECLARE_SETTING_ENUM(ObjectStorageClusterJoinMode)

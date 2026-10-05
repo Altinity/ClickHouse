@@ -105,7 +105,7 @@ def test_remote_initiator_after_non_remote(started_cluster_iceberg_with_spark, s
 
 
 @pytest.mark.parametrize("storage_type", ["s3"])
-def test_remote_initiator_after_with_join_old_analyzer(started_cluster_iceberg_with_spark, storage_type):
+def test_remote_initiator_global_join_without_analyzer(started_cluster_iceberg_with_spark, storage_type):
     instance = started_cluster_iceberg_with_spark.instances["node1"]
     spark = started_cluster_iceberg_with_spark.spark_session
     TABLE_NAME = "test_remote_initiator_after_with_join_old_analyzer_table_" + get_uuid_str()
@@ -144,13 +144,14 @@ def test_remote_initiator_after_with_join_old_analyzer(started_cluster_iceberg_w
     instance.query(f"CREATE TABLE {TABLE2_NAME} (tag INT, number2 INT) ENGINE=Memory")
     instance.query(f"INSERT INTO {TABLE2_NAME} VALUES (1, 2)")
 
-    assert "object_storage_cluster_join_mode!='allow' is not supported without allow_experimental_analyzer=true" in instance.query_and_get_error(f"""
-        SELECT *
+    res = instance.query(f"""
+        SELECT t1.tag, t1.number, t2.number2
         FROM {TABLE_NAME} AS t1
         JOIN {TABLE2_NAME} AS t2 USING (tag)
         SETTINGS
             object_storage_remote_initiator=1,
             object_storage_remote_initiator_cluster='cluster_simple',
-            object_storage_cluster_join_mode='local',
+            object_storage_cluster_join_mode='global',
             allow_experimental_analyzer=0
         """)
+    assert res == "1\t1\t2\n"
