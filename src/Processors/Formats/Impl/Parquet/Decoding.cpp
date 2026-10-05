@@ -1,8 +1,12 @@
 #include <Processors/Formats/Impl/Parquet/Decoding.h>
 
 #include <base/arithmeticOverflow.h>
+#include <Columns/ColumnAggregateFunction.h>
 #include <Columns/ColumnString.h>
+#include <DataTypes/Serializations/ISerialization.h>
+#include <Formats/FormatSettings.h>
 #include <Common/FloatUtils.h>
+#include <IO/ReadBufferFromMemory.h>
 
 #include <arrow/util/bit_stream_utils_internal.h>
 #include <arrow/util/byte_stream_split_internal.h>
@@ -1710,6 +1714,32 @@ void Int96Converter::convertColumn(std::span<const char> data, size_t num_values
             throw Exception(ErrorCodes::VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE, "INT96 timestamp out of range: julian day {}, time of day {} ns", julian_day, nanos);
 
         to[i] = x;
+    }
+}
+
+void AggregateFunctionStateConverter::convertColumn(std::span<const char> chars, const UInt64 * offsets, size_t separator_bytes, size_t num_values, IColumn & col) const
+{
+    auto & column = assert_cast<ColumnAggregateFunction &>(col);
+
+    /// Plain pages may follow a dictionary page whose states are shared through `src`.
+    column.ensureOwnership();
+
+    chassert(chars.size() >= offsets[num_values - 1]);
+    const FormatSettings format_settings;
+    for (ssize_t i = 0; i < ssize_t(num_values); ++i)
+    {
+        const char * ptr = chars.data() + offsets[i - 1];
+        const size_t length = offsets[i] - offsets[i - 1] - separator_bytes;
+        ReadBufferFromMemory in(ptr, length);
+        serialization->deserializeBinary(column, in, format_settings);
+        if (!in.eof())
+        {
+            column.popBack(1);
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "Aggregate function state has {} trailing byte(s) after deserialization",
+                in.available());
+        }
     }
 }
 

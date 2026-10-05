@@ -43,6 +43,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
+            {"allow_experimental_aggregate_function_states_in_open_formats", false, false, "New setting gating aggregate function states in Parquet files and Iceberg tables. Disabled by default, so writing such a Parquet column keeps throwing `UNKNOWN_TYPE` and such an Iceberg column keeps being refused with `SUPPORT_IS_DISABLED` as in versions without the feature."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",

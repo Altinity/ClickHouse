@@ -82,6 +82,7 @@ struct MergeTreePartitionExportTask
     String filename_pattern;
     bool write_full_path_in_iceberg_metadata = false;
     bool allow_lossy_cast = false;
+    bool allow_aggregate_function_states_in_open_formats = false;
     String iceberg_metadata_json;
 
     /// Optional for backwards compatibility with descriptors written before these
@@ -189,6 +190,7 @@ struct MergeTreePartitionExportTask
         json.set("filename_pattern", filename_pattern);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
         json.set("allow_lossy_cast", allow_lossy_cast);
+        json.set("allow_aggregate_function_states_in_open_formats", allow_aggregate_function_states_in_open_formats);
         if (!iceberg_metadata_json.empty())
             json.set("iceberg_metadata_json", iceberg_metadata_json);
         if (parquet_compression_method)
@@ -281,6 +283,8 @@ struct MergeTreePartitionExportTask
         task.filename_pattern = json->getValue<String>("filename_pattern");
         task.write_full_path_in_iceberg_metadata = json->getValue<bool>("write_full_path_in_iceberg_metadata");
         task.allow_lossy_cast = json->getValue<bool>("allow_lossy_cast");
+        if (json->has("allow_aggregate_function_states_in_open_formats"))
+            task.allow_aggregate_function_states_in_open_formats = json->getValue<bool>("allow_aggregate_function_states_in_open_formats");
         if (json->has("iceberg_metadata_json"))
             task.iceberg_metadata_json = json->getValue<String>("iceberg_metadata_json");
         if (json->has("parquet_compression_method"))
