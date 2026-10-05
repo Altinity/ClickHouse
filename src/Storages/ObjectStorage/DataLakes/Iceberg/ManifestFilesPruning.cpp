@@ -130,6 +130,7 @@ ManifestFilesPruner::ManifestFilesPruner(
     if (manifest_file.hasPartitionKey())
     {
         partition_key = &manifest_file.getPartitionKeyDescription();
+        partition_key_spec_positions = manifest_file.getPartitionKeySpecPositions();
         ActionsDAGWithInversionPushDown inverted_dag(transformed_dag->getOutputs().front(), context, /* boolean_context */ true);
         partition_key_condition.emplace(
             inverted_dag, context, partition_key->column_names, partition_key->expression, true /* single_point */);
@@ -214,7 +215,18 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
     if (partition_key_condition.has_value())
     {
         const auto & partition_value = entry->parsed_entry->partition_key_value;
-        std::vector<FieldRef> index_value(partition_value.begin(), partition_value.end());
+
+        /// Project: the Avro tuple has one entry per spec field, but the key only contains the
+        /// fields at the positions recorded in `partition_key_spec_positions`.  Pick exactly those.
+        std::vector<FieldRef> index_value;
+        index_value.reserve(partition_key_spec_positions.size());
+        for (size_t pos : partition_key_spec_positions)
+        {
+            if (pos >= partition_value.size())
+                return PruningReturnStatus::NOT_PRUNED; /// fail closed — cannot prune without the value
+            index_value.push_back(FieldRef(partition_value[pos]));
+        }
+
         for (size_t i = 0; i < index_value.size(); ++i)
         {
             auto & field = index_value[i];
@@ -230,7 +242,7 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         }
 
         bool can_be_true = partition_key_condition->mayBeTrueInRange(
-            partition_value.size(), index_value.data(), index_value.data(), partition_key->data_types);
+            index_value.size(), index_value.data(), index_value.data(), partition_key->data_types);
 
         if (!can_be_true)
         {

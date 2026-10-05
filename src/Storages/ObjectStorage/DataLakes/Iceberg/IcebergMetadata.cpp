@@ -1689,8 +1689,14 @@ KeyDescription IcebergMetadata::getSortingKey(ContextPtr local_context, TableSta
 
     auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
     auto result = getSortingKeyDescriptionFromMetadata(metadata_object, *persistent_components.schema_processor->getClickhouseTableSchemaById(current_schema_id), local_context);
-    auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
-    result.sort_order_id = sort_order_id;
+    /// Only attach the sort-order id when the parsed key is non-empty.  When multi-arg or
+    /// unsupported transforms truncate the key to empty, pairing a stale sort_order_id with
+    /// an empty key would let `isDataSortedBySortingKey` incorrectly claim data is sorted.
+    if (result.definition_ast != nullptr)
+    {
+        auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
+        result.sort_order_id = sort_order_id;
+    }
     return result;
 }
 

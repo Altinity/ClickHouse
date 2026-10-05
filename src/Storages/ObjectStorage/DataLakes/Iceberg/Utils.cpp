@@ -1475,13 +1475,14 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
             auto field = fields->getObject(field_index);
 
             /// Iceberg V3: multi-argument transforms use `source-ids` instead of `source-id`.
-            /// We cannot evaluate multi-arg transforms, so skip these sort fields — this disables
-            /// the read-in-order optimization for such columns (safe: data is still correct).
+            /// We cannot evaluate multi-arg transforms.  Data sorted by (f1, f2, f3) is only
+            /// guaranteed sorted by prefixes — never by a suffix — so stop at the first
+            /// unrepresentable field and return only the prefix before it.
             if (field->has(f_source_ids))
-                continue;
+                break;
 
             if (!field->has(f_source_id))
-                continue;
+                break;
 
             auto source_id = field->getValue<Int64>(f_source_id);
             auto column_name = source_id_to_column_name[source_id];

@@ -178,6 +178,9 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     schema_processor.addIcebergTableSchema(schema_object, context_);
 
     PartitionSpecification partition_spec_vec;
+    /// Which spec-field positions made it into partition_key_ast (needed by the pruner to project
+    /// partition values, since the Avro tuple has one entry per spec field, not per kept field).
+    std::vector<size_t> partition_key_spec_positions;
     for (size_t i = 0; i != partition_specification->size(); ++i)
     {
         auto partition_specification_field = partition_specification->getObject(static_cast<UInt32>(i));
@@ -213,6 +216,14 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
                 path_to_manifest_file_);
         }
 
+        if (source_ids.empty())
+        {
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Partition field in manifest '{}' has an empty 'source-ids' array",
+                path_to_manifest_file_);
+        }
+
         auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
         auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
         partition_spec_vec.emplace_back(PartitionSpecsEntry{std::move(source_ids), transform_name, partition_name});
@@ -238,6 +249,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
 
         partition_key_ast->as<ASTFunction>()->arguments->children.emplace_back(std::move(partition_ast));
         partition_columns_description.emplace_back(numeric_column_name, removeNullable(manifest_file_column_characteristics->type));
+        partition_key_spec_positions.push_back(i);
     }
 
     std::optional<DB::KeyDescription> partition_key_description;
@@ -259,6 +271,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
         manifest_schema_id,
         std::make_shared<const PartitionSpecification>(std::move(partition_spec_vec)),
         std::move(partition_key_description),
+        std::move(partition_key_spec_positions),
         total_rows,
         std::move(filter_dag_),
         table_snapshot_schema_id_));
@@ -276,6 +289,7 @@ ManifestFileIterator::ManifestFileIterator(
     Int32 manifest_schema_id_,
     std::shared_ptr<const PartitionSpecification> common_partition_specification_,
     std::optional<DB::KeyDescription> partition_key_description_,
+    std::vector<size_t> partition_key_spec_positions_,
     size_t total_rows_,
     std::shared_ptr<const ActionsDAG> filter_dag_,
     Int32 table_snapshot_schema_id_)
@@ -289,6 +303,7 @@ ManifestFileIterator::ManifestFileIterator(
     , manifest_schema_id(manifest_schema_id_)
     , common_partition_specification(std::move(common_partition_specification_))
     , partition_key_description(std::move(partition_key_description_))
+    , partition_key_spec_positions(std::move(partition_key_spec_positions_))
     , table_snapshot_schema_id(table_snapshot_schema_id_)
     , total_rows(total_rows_)
     , data_files_without_deleted(std::make_shared<std::vector<ProcessedManifestFileEntryPtr>>())
