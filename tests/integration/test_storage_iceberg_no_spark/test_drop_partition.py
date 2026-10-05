@@ -38,22 +38,6 @@ ROWS = [
 ]
 
 
-EPOCH = datetime(1970, 1, 1)
-
-
-def days_since_epoch(value):
-    return (datetime.fromisoformat(value) - EPOCH).days
-
-
-def hours_since_epoch(value):
-    return int((datetime.fromisoformat(value) - EPOCH).total_seconds() // 3600)
-
-
-def months_since_epoch(value):
-    moment = datetime.fromisoformat(value)
-    return (moment.year - EPOCH.year) * 12 + moment.month - 1
-
-
 def load_catalog_impl(started_cluster):
     return load_catalog(
         CATALOG_NAME,
@@ -200,7 +184,8 @@ def test_drop_partition_separate_manifest(started_cluster_iceberg_no_spark):
     ) == "2024-01-15\t5\n2024-01-16\t2\n2024-01-17\t1\n"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-15')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toRelativeDayNum(toDateTime64('2024-01-15', 6)))",
         settings = WRITE_SETTINGS,
     )
 
@@ -212,11 +197,13 @@ def test_drop_partition_separate_manifest(started_cluster_iceberg_no_spark):
 
     # Drop the rest of the partitions
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-16')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toRelativeDayNum(toDateTime64('2024-01-16', 6)))",
         settings = WRITE_SETTINGS,
     )
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-17')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toRelativeDayNum(toDateTime64('2024-01-17', 6)))",
         settings = WRITE_SETTINGS,
     )
 
@@ -240,7 +227,8 @@ def test_drop_partition_rewrites_mixed_manifest(started_cluster_iceberg_no_spark
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "6"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-15')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toRelativeDayNum(toDateTime64('2024-01-15', 6)))",
         settings=WRITE_SETTINGS,
     )
 
@@ -290,7 +278,8 @@ def test_drop_partition_without_matching_files_is_noop(started_cluster_iceberg_n
     ).strip()
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-02-20')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toRelativeDayNum(toDateTime64('2024-02-20', 6)))",
         settings=WRITE_SETTINGS,
     )
 
@@ -371,7 +360,8 @@ def test_drop_partition_month_transform(started_cluster_iceberg_no_spark):
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "4"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {months_since_epoch('2024-01-15 08:30:00')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toMonthNumSinceEpoch(toDateTime64('2024-01-15 08:30:00', 6)))",
         settings=WRITE_SETTINGS,
     )
 
@@ -380,7 +370,8 @@ def test_drop_partition_month_transform(started_cluster_iceberg_no_spark):
     )
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {months_since_epoch('2024-02-01')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toMonthNumSinceEpoch(toDateTime64('2024-02-01', 6)))",
         settings=WRITE_SETTINGS,
     )
 
@@ -410,7 +401,8 @@ def test_drop_partition_day_transform(started_cluster_iceberg_no_spark):
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "4"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-15 12:00:00')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toRelativeDayNum(toDateTime64('2024-01-15 12:00:00', 6)))",
         settings=WRITE_SETTINGS,
     )
     assert instance.query(f"SELECT id FROM {ch_table} ORDER BY id FORMAT TSV") == "3\n4\n"
@@ -544,7 +536,8 @@ def test_drop_partition_without_catalog(started_cluster_iceberg_no_spark):
     assert instance.query(f"SELECT count() FROM {table_name}").strip() == "4"
 
     instance.query(
-        f"ALTER TABLE {table_name} DROP PARTITION {days_since_epoch('2024-01-15')}",
+        f"ALTER TABLE {table_name} DROP PARTITION "
+        f"tuple(toRelativeDayNum(toDateTime64('2024-01-15', 6)))",
         settings=WRITE_SETTINGS
     )
 
@@ -626,7 +619,8 @@ def test_drop_partition_hour_transform(started_cluster_iceberg_no_spark):
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "4"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {hours_since_epoch('2024-01-15 09:30:00')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toRelativeHourNum(toDateTime64('2024-01-15 09:30:00', 6, 'UTC')))",
         settings=WRITE_SETTINGS,
     )
 
@@ -636,7 +630,8 @@ def test_drop_partition_hour_transform(started_cluster_iceberg_no_spark):
     )
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {hours_since_epoch('2024-01-15 08:59:59')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toRelativeHourNum(toDateTime64('2024-01-15 08:59:59', 6, 'UTC')))",
         settings=WRITE_SETTINGS,
     )
 
@@ -703,7 +698,8 @@ def test_drop_partition_after_partition_spec_evolution(started_cluster_iceberg_n
     assert instance.query(f"SELECT count() FROM {ch_table}").strip() == "5"
 
     instance.query(
-        f"ALTER TABLE {ch_table} DROP PARTITION {days_since_epoch('2024-01-15')}",
+        f"ALTER TABLE {ch_table} DROP PARTITION "
+        f"tuple(toRelativeDayNum(toDateTime64('2024-01-15', 6)))",
         settings=WRITE_SETTINGS,
     )
 

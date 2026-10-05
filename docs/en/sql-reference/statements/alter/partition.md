@@ -81,7 +81,7 @@ Purging data files will break time travel to older snapshots that reference that
 Example purging data files:
 
 ```sql
-ALTER TABLE mt DROP PARTITION tuple(toYYYYMM(now()))
+ALTER TABLE mt DROP PARTITION tuple(toRelativeDayNum(toDate('2026-01-01')))
 SETTINGS iceberg_delete_data_on_drop = 1;
 ```
 
