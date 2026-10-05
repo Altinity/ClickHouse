@@ -2005,7 +2005,13 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
             try
             {
                 generateManifestList(
-                    resolver, metadata, object_storage, *secondary_storages, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true);
+                    resolver, metadata, object_storage, *secondary_storages, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true,
+                    /* per_entry_content_types */ {},
+                    /* existing_entry_counts */ {},
+                    /* carry_forward_manifest_paths */ {},
+                    /* entry_partition_spec_ids */ {},
+                    /* entry_partition_summaries */ {},
+                    /* entry_row_counts */ {total_rows});
                 buffer_manifest_list->finalize();
             }
             catch (...)

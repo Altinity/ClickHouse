@@ -490,6 +490,7 @@ static bool writeMetadataFiles(
     auto manifest_entries_in_storage = std::make_shared<Strings>();
     std::vector<Iceberg::IcebergPathFromMetadata> manifest_entries;
     std::vector<Int64> manifest_entry_sizes;
+    std::vector<Int64> manifest_entry_row_counts;
 
     auto cleanup = [object_storage, &delete_filenames, &path_resolver, manifest_entries_in_storage, storage_manifest_list_name, storage_metadata_name]()
     {
@@ -516,6 +517,7 @@ static bool writeMetadataFiles(
             auto manifest_entry_path = filename_generator.generateManifestEntryName();
             manifest_entries_in_storage->push_back(path_resolver.resolve(manifest_entry_path));
             manifest_entries.push_back(manifest_entry_path);
+            manifest_entry_row_counts.push_back(delete_filename.total_rows);
 
             auto buffer_manifest_entry = object_storage->writeObject(
                 StoredObject(path_resolver.resolve(manifest_entry_path)),
@@ -576,7 +578,14 @@ static bool writeMetadataFiles(
                     new_snapshot,
                     manifest_entry_sizes,
                     *buffer_manifest_list,
-                    content_type);
+                    content_type,
+                    /* use_previous_snapshots */ true,
+                    /* per_entry_content_types */ {},
+                    /* existing_entry_counts */ {},
+                    /* carry_forward_manifest_paths */ {},
+                    /* entry_partition_spec_ids */ {},
+                    /* entry_partition_summaries */ {},
+                    manifest_entry_row_counts);
                 buffer_manifest_list->finalize();
             }
             catch (...)

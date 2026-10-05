@@ -1041,6 +1041,7 @@ static void writeMetadataFiles(
     Poco::JSON::Object::Ptr initial_metadata_object = plan.initial_metadata_object;
     std::unordered_map<Iceberg::IcebergPathFromMetadata, Iceberg::IcebergPathFromMetadata> manifest_file_renamings;
     std::unordered_map<Iceberg::IcebergPathFromMetadata, Int64> manifest_file_sizes;
+    std::unordered_map<Iceberg::IcebergPathFromMetadata, Int64> manifest_file_row_counts;
 
     {
         std::unordered_map<std::shared_ptr<ManifestFilePlan>, std::unordered_set<Iceberg::IcebergPathFromMetadata>> grouped_by_manifest_files_result;
@@ -1114,6 +1115,10 @@ static void writeMetadataFiles(
                     file_byte_counts.push_back(0);
                 }
             }
+            Int64 manifest_rows = 0;
+            for (const auto rows : file_row_counts)
+                manifest_rows += static_cast<Int64>(rows);
+            manifest_file_row_counts[manifest_entry->patched_path] = manifest_rows;
             generateManifestFile(
                 metadata_object,
                 partition_columns,
@@ -1170,8 +1175,12 @@ static void writeMetadataFiles(
             }
         }
         std::vector<Int64> per_manifest_sizes;
+        std::vector<Int64> per_manifest_row_counts;
         for (const auto & entry : renamed_manifest_entries)
+        {
             per_manifest_sizes.push_back(manifest_file_sizes[entry]);
+            per_manifest_row_counts.push_back(manifest_file_row_counts[entry]);
+        }
         auto buffer_manifest_list = object_storage->writeObject(
             StoredObject(path_resolver.resolve(renamed_manifest_list)),
             WriteMode::Rewrite,
@@ -1189,7 +1198,13 @@ static void writeMetadataFiles(
             per_manifest_sizes,
             *buffer_manifest_list,
             Iceberg::FileContentType::DATA,
-            false);
+            false,
+            /* per_entry_content_types */ {},
+            /* existing_entry_counts */ {},
+            /* carry_forward_manifest_paths */ {},
+            /* entry_partition_spec_ids */ {},
+            /* entry_partition_summaries */ {},
+            per_manifest_row_counts);
         buffer_manifest_list->finalize();
     }
 

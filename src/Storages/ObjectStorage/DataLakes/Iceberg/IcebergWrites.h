@@ -155,7 +155,8 @@ void generateManifestList(
     const std::vector<ManifestListEntryExistingCounts> & existing_entry_counts = {},
     const std::unordered_set<String> & carry_forward_manifest_paths = {},
     const std::vector<Int64> & entry_partition_spec_ids = {},
-    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {});
+    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {},
+    const std::vector<Int64> & entry_row_counts = {});
 
 std::string getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path);
 
