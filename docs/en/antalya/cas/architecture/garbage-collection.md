@@ -522,8 +522,8 @@ Pages of the perpetual namespace janitor: deletes the physical objects of namesp
 no longer in the catalog (dead-life debris). The phase takes the next page while the previous one
 deleted something and published its cursor, until a 20 s soft budget: no page starts after it, the
 page in progress finishes. After the last page of `cas/ns/` the next one starts from its beginning, so
-debris on both sides of the cursor drains in one round. A pool without debris costs one `LIST` per
-round.
+a pass that began mid-stream also reaches the debris before its cursor; the first page that deletes
+nothing ends the pass. A pool without debris costs one `LIST` per round.
 
 - **Runs on:** fold path here; also on the deferred path right after phase 4 with
   `suppress_destructive` forced on
@@ -939,13 +939,17 @@ backend without batch delete: the refused bulk call plus one `DELETE` per key). 
 
 ### Phase 16 — namespace cleanup {#cost-phase-16}
 
+Per page; the phase takes one page in a round without debris and more under its 20 s budget while
+pages delete.
+
 | Key | Operation | Requests |
 |---|---|---:|
 | `<pool_prefix>/gc/maintenance_state` | `GET` | 1 (durable `janitor_cursor`) |
 | `<pool_prefix>/cas/ns/` | `LIST` | one page |
 | `<pool_prefix>/cas/ref_catalog` | `GET` | 1 |
-| `<pool_prefix>/gc/state` | `GET` | one per fence check |
-| dead-life object | `DELETE` | one per object (plus one `HEAD` per object whose `LIST` entry carried no token) |
+| `<pool_prefix>/gc/state` | `GET` | 1 (fence check) |
+| dead-life `_log` / `_snap` objects | batch `DELETE` | up to `cas_gc_io_concurrency` requests for the page's keys; one per key on a storage without a batch delete |
+| dead-life `_ckpt` / `_files` object | `DELETE` | one per object (plus one `HEAD` per object whose `LIST` entry carried no token) |
 | `<pool_prefix>/gc/maintenance_state` | `CAS` | 1 when the page is decided |
 
 ### Phase 17 — ref object cleanup {#cost-phase-17}

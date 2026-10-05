@@ -21,7 +21,7 @@ struct NamespaceJanitorResult
 };
 
 /// Deletes one page's dead `_log`/`_snap` keys under the page's operation. Returns how many keys it could
-/// not confirm deleted and adds one anomaly per failed request; throws only when nothing may be published.
+/// not confirm deleted and adds an anomaly for each group of them. An exception leaves the page unpublished.
 using RemoveWriteOnce
     = std::function<uint64_t(CasOperation & op, const std::vector<WriteOnceKey> & keys, std::vector<String> & anomalies)>;
 

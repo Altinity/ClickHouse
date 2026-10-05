@@ -557,7 +557,7 @@ private:
         const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows);
 
     /// The janitor's `RemoveWriteOnce`: splits `keys` evenly across the GC I/O pool and waits for every job.
-    /// A failed job leaks its keys. Throws when the pool refuses a job, after the scheduled ones finished.
+    /// A failed job leaks its keys, and so does a job the pool refused to schedule.
     uint64_t removeWriteOnceOnIoPool(
         CasOperation & op, const std::vector<WriteOnceKey> & keys, std::vector<String> & anomalies);
 

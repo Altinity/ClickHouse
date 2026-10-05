@@ -92,10 +92,14 @@ public:
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override
     {
         if (keys.size() > 1)
+        {
+            ++refused_batches;
             throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "no batch delete");
+        }
         ++single_key_requests;
         CountingBackend::removeManyWriteOnce(keys, access);
     }
+    std::atomic<size_t> refused_batches{0};
     std::atomic<size_t> single_key_requests{0};
 };
 
@@ -164,23 +168,24 @@ TEST(CASNamespaceJanitorBatches, DeadStreamKeysGoInOneBatchAndStateKeysStayExact
     EXPECT_FALSE(present(*backend, ckpt));
 }
 
-TEST(CASNamespaceJanitorBatches, LiveStreamKeysAreRetained)
+TEST(CASNamespaceJanitorBatches, RebornLifeOnTheSamePageKeepsItsKeys)
 {
     auto backend = std::make_shared<CountingBackend>();
     CasRequests requests(backend, Fence::open());
     const Layout layout("p");
-    const CatalogEntry entry{.ns = RootNamespace{"live"}, .state = NsState::Live, .incarnation = DB::UInt128{302}};
-    createObj(*backend, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {entry}}));
-    const std::vector<String> stream
-        = seedLogs(*backend, layout, NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation), 3);
+    const CatalogEntry reborn{.ns = RootNamespace{"t"}, .state = NsState::Live, .incarnation = DB::UInt128{302}};
+    createObj(*backend, layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {reborn}}));
+    const std::vector<String> dead_stream = seedLogs(*backend, layout, life("t", 301), 3);
+    const std::vector<String> live_stream
+        = seedLogs(*backend, layout, NamespaceLifeId::fromCatalogEntry(reborn.ns, reborn.incarnation), 3);
     backend->resetCounts();
 
     const NamespaceJanitorResult result = NamespaceJanitor(requests, layout, 100).runOnePage(false, [] { return true; });
 
-    EXPECT_EQ(result.deleted, 0u);
-    EXPECT_EQ(backend->deleteTotal(), 0u);
-    EXPECT_EQ(backend->bulkRemoveCalls(), 0u);
-    EXPECT_EQ(countPresent(*backend, stream), 3u);
+    EXPECT_EQ(result.deleted, 3u);
+    EXPECT_EQ(backend->deleteTotal(), 3u);
+    EXPECT_EQ(countPresent(*backend, dead_stream), 0u);
+    EXPECT_EQ(countPresent(*backend, live_stream), 3u);
 }
 
 TEST(CASNamespaceJanitorBatches, FailedBatchLeaksAndCursorAdvances)
@@ -284,20 +289,25 @@ TEST(CASNamespaceJanitorBatches, BudgetStopsThePassAfterThePageInProgress)
 
 TEST(CASNamespaceJanitorBatches, QuietPoolCostsOneListPerRound)
 {
-    auto backend = std::make_shared<CountingBackend>();
+    /// More than one page of live keys, and a clock that spends the budget on the first `LIST`: a pass that
+    /// went on after a page without debris would stop on the budget instead.
+    auto backend = std::make_shared<ClockOnNamespaceListBackend>();
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace live_namespace{"00/live@cas@"};
     fixture::admitLive(*backend, layout, live_namespace);
-    seedLogs(*backend, layout, fixture::fixtureLife(live_namespace), 3);
+    const std::vector<String> stream = seedLogs(*backend, layout, fixture::fixtureLife(live_namespace), 1200);
+    backend->step_ms = 30'000;
     backend->resetCounts();
 
-    Gc gc(store, DB::UInt128{315});
+    Gc gc(store, DB::UInt128{315}, {}, [&] { return backend->clock_ms.load(); });
     const auto metrics = runRoundAndGetJanitorMetrics(gc);
 
     EXPECT_EQ(metrics.at("janitor_pages"), 1u);
     EXPECT_EQ(metrics.at("janitor_deleted"), 0u);
+    EXPECT_EQ(metrics.at("budget_exhausted"), 0u);
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u);
+    EXPECT_EQ(countPresent(*backend, stream), 1200u);
 }
 
 TEST(CASNamespaceJanitorBatches, StoreWithoutBatchDeleteDrainsKeyByKeyOnThePool)
@@ -314,21 +324,26 @@ TEST(CASNamespaceJanitorBatches, StoreWithoutBatchDeleteDrainsKeyByKeyOnThePool)
     EXPECT_EQ(metrics.at("janitor_deleted"), 1200u);
     EXPECT_EQ(metrics.at("leaked"), 0u);
     EXPECT_EQ(backend->single_key_requests.load(), 1200u);
+    /// Two pages, each split into one job per pool thread.
+    EXPECT_EQ(backend->refused_batches.load(), 8u);
 }
 
-TEST(CASNamespaceJanitorBatches, RefusedEnqueueDeletesNothingAndTheNextRoundDrains)
+TEST(CASNamespaceJanitorBatches, RefusedEnqueueLeaksTheUnscheduledJobsAndTheNextRoundDrains)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openPool(backend, /*refuse_at=*/0);
+    auto store = openPool(backend, /*refuse_at=*/1);
     const Layout & layout = store->layout();
     const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 318), 100);
 
+    /// Four jobs of 25 keys: the first runs, the second is refused and takes the rest with it.
     Gc gc(store, DB::UInt128{319});
     const auto refused = runRoundAndGetJanitorMetrics(gc);
-    EXPECT_EQ(refused.at("janitor_deleted"), 0u);
-    EXPECT_EQ(countPresent(*backend, stream), 100u);
+    EXPECT_EQ(refused.at("janitor_deleted"), 25u);
+    EXPECT_EQ(refused.at("leaked"), 75u);
+    EXPECT_EQ(countPresent(*backend, stream), 75u);
 
     const auto drained = runRoundAndGetJanitorMetrics(gc);
-    EXPECT_EQ(drained.at("janitor_deleted"), 100u);
+    EXPECT_EQ(drained.at("janitor_deleted"), 75u);
+    EXPECT_EQ(drained.at("leaked"), 0u);
     EXPECT_EQ(countPresent(*backend, stream), 0u);
 }

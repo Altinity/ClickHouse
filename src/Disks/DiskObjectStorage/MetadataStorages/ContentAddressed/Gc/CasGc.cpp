@@ -347,13 +347,14 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     /// `store->poolConfig()` AFTER the null check above.
     meta_writer = std::make_unique<GcMetaWriter>(
         store, logger, static_cast<size_t>(store->poolConfig().gc_meta_pool_size));
-    /// The GC I/O pool (read-ahead and the `pending_deletes` fan-out), built here for the same reason.
+    /// The GC I/O pool (read-ahead, the `pending_deletes` fan-out and the namespace janitor's batch deletes),
+    /// built here for the same reason.
     /// The queue is UNBOUNDED because the hinting sites throttle themselves against
     /// `GcReadAhead::window`; a bounded queue would only move the throttle into
     /// `scheduleOrThrowOnError`, blocking the round thread instead of the hint loop that already knows
     /// how much it wants in flight.
     const size_t io_concurrency = std::max<size_t>(1, store->poolConfig().gc_io_concurrency);
-    /// Keep `shutdown_on_exception` false: every task on this pool (read-ahead and re-delete) is submitted
+    /// Keep `shutdown_on_exception` false: every task on this pool (read-ahead, re-delete, janitor delete) is submitted
     /// through a callback runner that stores its exception in the task's future, and no caller invokes
     /// `wait` on this pool.
     io_pool = std::make_unique<ThreadPool>(
@@ -430,24 +431,36 @@ uint64_t Gc::removeWriteOnceOnIoPool(
     std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;
     handles.reserve(chunks.size());
     SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
-    for (size_t i = 0; i < chunks.size(); ++i)
+    uint64_t leaked = 0;
+    try
     {
-        if (io_pool_refuse_at_for_test == i)
+        for (size_t i = 0; i < chunks.size(); ++i)
         {
-            io_pool_refuse_at_for_test.reset();
-            throw Exception(ErrorCodes::CANNOT_SCHEDULE_TASK, "Injected CAS namespace janitor enqueue refusal at index {}", i);
-        }
-        /// The round thread waits for every job before it refreshes `authority_held` again.
-        handles.emplace_back(runner.enqueueAndGiveOwnership(
-            [this, chunk = &chunks[i], admitted_generation = op.generation()]
+            if (io_pool_refuse_at_for_test == i)
             {
-                CasOperation job_op = store->openRequests().resume(admitted_generation, [this] { return authority_held; });
-                removeChunkWriteOnceOrOneByOne(job_op, *chunk, Retry::standard());
-            }));
+                io_pool_refuse_at_for_test.reset();
+                throw Exception(ErrorCodes::CANNOT_SCHEDULE_TASK, "Injected CAS namespace janitor enqueue refusal at index {}", i);
+            }
+            /// The round thread waits for every job before it refreshes `authority_held` again.
+            handles.emplace_back(runner.enqueueAndGiveOwnership(
+                [this, chunk = &chunks[i], admitted_generation = op.generation()]
+                {
+                    CasOperation job_op = store->openRequests().resume(admitted_generation, [this] { return authority_held; });
+                    removeChunkWriteOnceOrOneByOne(job_op, *chunk, Retry::standard());
+                }));
+        }
+    }
+    catch (...)
+    {
+        /// Leak-only like a failed request: the keys stay for the cursor's next pass over this page.
+        for (size_t i = handles.size(); i < chunks.size(); ++i)
+            leaked += chunks[i].size();
+        anomalies.push_back(fmt::format(
+            "leaked {} dead-life objects starting at '{}': delete job not scheduled: {}",
+            leaked, chunks[handles.size()].front().str(), getCurrentExceptionMessage(false)));
     }
     ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
 
-    uint64_t leaked = 0;
     for (size_t i = 0; i < handles.size(); ++i)
     {
         try
