@@ -90,7 +90,7 @@ struct SourceEdgeRecord
     PersistedEtag token{};
     uint64_t size = 0;
     uint64_t condemn_round = 0;
-    bool marker_confirmed = false;   /// durable Condemned meta confirmed for this entry (graduation gate)
+    bool marker_confirmed = false;   /// written with `delete_pending`; the graduation gate reads the marker, not this bit
 };
 
 /// The header-line `kind` word for the only live `cas_run` kind.
