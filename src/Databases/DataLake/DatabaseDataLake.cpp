@@ -208,7 +208,13 @@ void DatabaseDataLake::validateTokenForwardingSettings() const
     const DatabaseDataLakeSettings & settings = *settings_version;
 
     if (!settings[DatabaseDataLakeSetting::oauth_forward_user_token].value)
+    {
+        if (settings[DatabaseDataLakeSetting::oauth_forward_actor_token].value)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "`oauth_forward_actor_token` requires `oauth_forward_user_token = 1`");
         return;
+    }
 
     const auto catalog_type = settings[DatabaseDataLakeSetting::catalog_type].value;
 
@@ -234,6 +240,11 @@ void DatabaseDataLake::validateTokenForwardingSettings() const
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "`oauth_token_exchange_uri` requires a non-empty `catalog_credential`");
+
+    if (exchange_uri.empty() && settings[DatabaseDataLakeSetting::oauth_forward_actor_token].value)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "`oauth_forward_actor_token` requires a non-empty `oauth_token_exchange_uri`");
 
     static const std::array<std::string_view, 6> valid_token_types = {
         "urn:ietf:params:oauth:token-type:access_token",
@@ -281,6 +292,11 @@ void DatabaseDataLake::validateGlueTokenForwardingSettings(const DatabaseDataLak
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "`oauth_token_exchange_uri` is only supported for `catalog_type = 'rest'`");
+
+    if (settings[DatabaseDataLakeSetting::oauth_forward_actor_token].value)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "`oauth_forward_actor_token` is only supported for `catalog_type = 'rest'`");
 }
 
 void DatabaseDataLake::initialize() const
