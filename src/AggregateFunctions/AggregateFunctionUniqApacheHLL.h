@@ -191,6 +191,12 @@ public:
         if constexpr (std::is_same_v<T, String>)
         {
             const auto value = columns[0]->getDataAt(row_num);
+
+            /// Other DataSketches implementations ignore empty strings, and the sketch of a mixed
+            /// input must be the same as theirs.
+            if (value.size() == 0)
+                return;
+
             data.insertData(value.data(), value.size(), lg_config_k, target_type);
         }
         else

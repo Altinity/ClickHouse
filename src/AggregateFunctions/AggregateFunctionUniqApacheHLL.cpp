@@ -107,6 +107,9 @@ For interoperability, integers of at most 64 bits are hashed as 8-byte integers,
 `Date`, `Date32`, `DateTime` and `DateTime64` use their underlying integer values. External producers must use the same unit; for example, `DateTime64(3)` uses epoch milliseconds.
 Unsupported types and multiple arguments are rejected. Use `uniq`, `uniqCombined` or `uniqHLL12` for those inputs.
 
+`NULL` values and empty strings are ignored, as in the Java, Python and C++ implementations and in Spark; unlike `uniq`, an empty string is not counted as a value.
+For a `Nullable` argument the state is the sketch preceded by a single `0x01` byte, which is how the `Null` combinator marks its state, so an external consumer has to skip that byte.
+
 Merging can switch from the HIP estimator to the less accurate composite estimator, so results can depend on partitioning across threads, parts and shards.
 Merging a lower-resolution sketch permanently lowers the result's resolution, regardless of the declared `lg_k`.
     )";
