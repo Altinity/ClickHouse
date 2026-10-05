@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 
 from praktika.info import Info
@@ -20,6 +21,10 @@ def _build_version(info):
     version = CHVersion.get_current_version(no_strict=True)
     if info.pr_number != 0 and not version.flavour:
         version = version.with_tweak(1)
+    # NOTE (strtgbb): get the release flavour from the tag, validated with the --check-tag pre-hook
+    if version.flavour and os.getenv("GITHUB_REF_TYPE") == "tag":
+        version.flavour = os.getenv("GITHUB_REF_NAME", "").rsplit(".", 1)[-1]
+        version = version.with_description(version.flavour)
     return version
 
 
