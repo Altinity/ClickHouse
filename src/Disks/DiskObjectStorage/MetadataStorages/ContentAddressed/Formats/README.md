@@ -37,7 +37,7 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 
 ## Codec table
 
-Authoritative per-format traits (type string, family, strictness, compression policy, caps) live
+Authoritative per-format traits (type string, family, compression policy, caps) live
 in `CasFormat.cpp` (`TRAITS`), asserted complete by `gtest_cas_text_format.cpp`.
 
 Key naming follows a deliberate split between metadata written once per object and fields repeated
@@ -70,13 +70,15 @@ use the corresponding `old_*` and `new_*` key bundles.
 
 - `v` (header line) is the ONLY version field; reader gate: `v > G_BUILD` →
   `UNKNOWN_FORMAT_VERSION`, checked before the body.
-- Additive change = new tolerant key, no `v` bump; on MUTABLE objects the field is best-effort
+- Additive change = new ordinary key, no `v` bump (every reader skips unknown ordinary keys); on
+  MUTABLE objects the field is best-effort
   until the pool floor rises (an old writer's fresh re-encode drops it).
 - Breaking change = `v` bump + `changePoints` + write-down-to-floor; the floor raise is what
   fences old builds out (mount gates: `min_reader_generation` forward, pool-meta `v` backward).
-- Deterministic formats (`cas_fold_seal`, `cas_run`): strict keys, pinned raw, and the adoption
+- Deterministic formats (`cas_fold_seal`, `cas_run`): pinned raw, and the adoption
   pin — on a `putDeterministicArtifact` conflict, re-encode at the `v` of the EXISTING object.
-- A key prefixed `!` is critical: a reader that does not understand it fails closed.
+- A key prefixed `!` is critical: a reader that does not understand it fails with
+  `UNKNOWN_FORMAT_VERSION`. A field that changes a reader's decisions is written with `!`.
 - Padding zones (blob header pad, manifest banners) are deterministic and verified — no
   unaccounted bytes in any object.
 - `openObject` policy asymmetry: a compressed body under a raw-compression policy is rejected

@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <fmt/format.h>
+#include <algorithm>
 #include <functional>
 #include <set>
 
@@ -58,6 +59,36 @@ void expectCode(int code, F && f, const String & context)
     {
         EXPECT_EQ(e.code(), code) << context << ": " << e.message();
     }
+}
+}
+
+namespace cas_battery_detail
+{
+/// Adds `"<key>":1` as the last key of the `line`-th (0-based) line of `text`.
+inline String withExtraKeyInLine(const String & text, size_t line, std::string_view key)
+{
+    size_t begin = 0;
+    for (size_t i = 0; i < line; ++i)
+    {
+        begin = text.find('\n', begin);
+        EXPECT_NE(begin, String::npos) << "no line " << line;
+        if (begin == String::npos)
+            return text;
+        ++begin;
+    }
+    const size_t end = text.find('\n', begin);
+    const size_t close = text.rfind('}', end == String::npos ? text.size() : end);
+    EXPECT_TRUE(close != String::npos && close >= begin) << "no object on line " << line;
+    if (close == String::npos || close < begin)
+        return text;
+    String out = text;
+    out.insert(close, fmt::format("{}\"{}\":1", text[close - 1] == '{' ? "" : ",", key));
+    return out;
+}
+
+inline size_t lineCount(const String & text)
+{
+    return static_cast<size_t>(std::count(text.begin(), text.end(), '\n'));
 }
 }
 

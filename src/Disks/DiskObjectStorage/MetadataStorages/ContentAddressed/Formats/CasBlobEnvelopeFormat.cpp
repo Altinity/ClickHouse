@@ -235,7 +235,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len,
 EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*object_size*/, ObjectKind expected_kind)
 {
     ReadBufferFromMemory in(head_bytes.data(), head_bytes.size());
-    JsonObjectReader r(in, KeyStrictness::Tolerant, "blob envelope");
+    JsonObjectReader r(in, "blob envelope");
 
     EnvelopeHeader h;
     h.kind = ObjectKind::Blob;
@@ -287,7 +287,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*obje
         else if (key == EnvelopeWire::ref)
             h.intended_ref = r.readString();
         else
-            r.skipUnknown(key);   /// `!`-key -> UNKNOWN_FORMAT_VERSION; unknown plain key -> skipped (tolerant)
+            r.skipUnknown(key);   /// `!`-key -> UNKNOWN_FORMAT_VERSION; unknown plain key -> skipped
     }
     if (!saw_type)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob envelope: missing type");
