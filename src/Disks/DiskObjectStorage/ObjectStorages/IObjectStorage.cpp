@@ -173,9 +173,8 @@ RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std
     /// on that thread becomes ~100x slower. See https://github.com/Altinity/ClickHouse/issues/2362.
     ///
     /// Only try to parse strings that can be a JSON object. Object keys never start with `{`; the distributor
-    /// answer always does. The proper fix is to stop multiplexing the command into the path field (a separate
-    /// `ObjectInfo` kind or the versioned cluster-function protocol, see
-    /// https://github.com/Altinity/ClickHouse/pull/1360), after which this probe goes away entirely.
+    /// answer always does. Column statistics no longer travel in this JSON: they are an Antalya protocol
+    /// trailer on `ReadTaskResponse`. `retry_after_us` is still encoded here until that command moves too.
     {
         const auto first = task.find_first_not_of(" \t\r\n");
         if (first == std::string::npos || task[first] != '{')

@@ -2,6 +2,7 @@
 
 #include <AggregateFunctions/AggregateFunctionGroupBitmapData.h>
 #include <Common/Exception.h>
+#include <Core/AntalyaProtocol.h>
 #include <Core/NamesAndTypes.h>
 #include <Core/ProtocolDefines.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -9,6 +10,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/ClusterFunctionReadTask.h>
+#include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <config.h>
 
 #if USE_PARQUET
@@ -312,3 +314,87 @@ TEST(ClusterFunctionReadTaskResponse, RoundTripsFileBucketInfoOnSupportedProtoco
 }
 
 #endif
+
+static ClusterFunctionReadTaskResponse makeResponseWithFileMeta()
+{
+    ClusterFunctionReadTaskResponse response;
+    response.path = "data/file.parquet";
+    auto meta = std::make_shared<DataFileMetaInfo>();
+    DataFileMetaInfo::ColumnInfo column;
+    column.rows_count = 10;
+    column.nulls_count = 0;
+    column.hyperrectangle = Range(Field(Int64(1)), true, Field(Int64(5)), true);
+    meta->columns_info.emplace("id", std::move(column));
+    response.file_meta_info = std::move(meta);
+    return response;
+}
+
+TEST(ClusterFunctionReadTaskResponse, OmitsFileMetaInfoForUpstreamPeer)
+{
+    auto with_meta = makeResponseWithFileMeta();
+    ClusterFunctionReadTaskResponse without_meta;
+    without_meta.path = with_meta.path;
+
+    String with_meta_bytes;
+    String without_meta_bytes;
+    {
+        WriteBufferFromString out(with_meta_bytes);
+        with_meta.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, /*antalya_protocol_version*/ 0);
+        out.finalize();
+    }
+    {
+        WriteBufferFromString out(without_meta_bytes);
+        without_meta.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, /*antalya_protocol_version*/ 0);
+        out.finalize();
+    }
+    EXPECT_EQ(with_meta_bytes, without_meta_bytes);
+
+    ReadBufferFromString in(with_meta_bytes);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, /*antalya_protocol_version*/ 0);
+    EXPECT_FALSE(deserialized.file_meta_info.has_value());
+    EXPECT_EQ(deserialized.path, "data/file.parquet");
+    EXPECT_TRUE(in.eof());
+}
+
+TEST(ClusterFunctionReadTaskResponse, RoundTripsFileMetaInfoOnAntalyaProtocol)
+{
+    auto response = makeResponseWithFileMeta();
+
+    String serialized;
+    WriteBufferFromString out(serialized);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO);
+    out.finalize();
+
+    ReadBufferFromString in(serialized);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO);
+
+    ASSERT_TRUE(deserialized.file_meta_info && *deserialized.file_meta_info);
+    const auto & column = (*deserialized.file_meta_info)->columns_info.at("id");
+    ASSERT_TRUE(column.rows_count.has_value());
+    ASSERT_TRUE(column.nulls_count.has_value());
+    EXPECT_EQ(*column.rows_count, 10);
+    EXPECT_EQ(*column.nulls_count, 0);
+    ASSERT_TRUE(column.hyperrectangle.has_value());
+    EXPECT_EQ(column.hyperrectangle->left.safeGet<Int64>(), 1);
+    EXPECT_EQ(column.hyperrectangle->right.safeGet<Int64>(), 5);
+    EXPECT_TRUE(in.eof());
+}
+
+TEST(ClusterFunctionReadTaskResponse, AntalyaProtocolWithoutFileMetaInfoConsumesPresenceFlag)
+{
+    ClusterFunctionReadTaskResponse response;
+    response.path = "data/file.parquet";
+
+    String serialized;
+    WriteBufferFromString out(serialized);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO);
+    out.finalize();
+
+    ReadBufferFromString in(serialized);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO);
+    EXPECT_FALSE(deserialized.file_meta_info.has_value());
+    EXPECT_TRUE(in.eof());
+}

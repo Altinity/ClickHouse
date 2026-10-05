@@ -35,11 +35,12 @@ struct ClusterFunctionReadTaskResponse
     /// It is used to identify an end of processing.
     bool isEmpty() const { return path.empty(); }
 
-    /// Serialize according to the protocol version.
-    void serialize(WriteBuffer & out, size_t worker_protocol_version) const;
-    /// Deserialize. Protocol version will be received from `in`
-    /// and the result will be deserialized accordingly.
-    void deserialize(ReadBuffer & in);
+    /// Serialize according to the cluster-processing protocol version.
+    /// `antalya_protocol_version` is the negotiated Antalya version of this hop (`0` for an upstream peer).
+    void serialize(WriteBuffer & out, size_t worker_protocol_version, size_t antalya_protocol_version = 0) const;
+    /// Deserialize. The cluster-processing protocol version is read from `in`.
+    /// `antalya_protocol_version` must be the same negotiated value `serialize` was given.
+    void deserialize(ReadBuffer & in, size_t antalya_protocol_version = 0);
 };
 
 using ClusterFunctionReadTaskResponsePtr = std::shared_ptr<ClusterFunctionReadTaskResponse>;

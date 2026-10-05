@@ -44,7 +44,6 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
-    extern const SettingsBool allow_experimental_iceberg_read_optimization;
 }
 
 namespace ErrorCodes
@@ -614,14 +613,12 @@ public:
         std::vector<std::string> && ids_of_hosts,
         bool send_over_whole_archive,
         uint64_t lock_object_storage_task_distribution_ms,
-        ContextPtr context_,
-        bool iceberg_read_optimization_enabled)
+        ContextPtr context_)
         : task_distributor(
             iterator,
             std::move(ids_of_hosts),
             send_over_whole_archive,
-            lock_object_storage_task_distribution_ms,
-            iceberg_read_optimization_enabled)
+            lock_object_storage_task_distribution_ms)
         , context(context_) {}
     ~TaskDistributor() override = default;
     bool supportRerunTask() const override { return true; }
@@ -710,8 +707,7 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
         std::move(ids_of_hosts),
         /* send_over_whole_archive */!local_context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes],
         lock_object_storage_task_distribution_ms,
-        local_context,
-        /* iceberg_read_optimization_enabled */local_context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization]);
+        local_context);
 
     return RemoteQueryExecutor::Extension{ .task_iterator = std::move(callback) };
 }
