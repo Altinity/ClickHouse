@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasNamespaceJanitor.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 
+#include <fmt/format.h>
 #include <atomic>
 
 /// Batch deletes of dead-life `_log`/`_snap` keys: one page through `NamespaceJanitor`, then whole rounds
@@ -296,7 +297,16 @@ TEST(CASNamespaceJanitorBatches, QuietPoolCostsOneListPerRound)
     const Layout & layout = store->layout();
     const RootNamespace live_namespace{"00/live@cas@"};
     fixture::admitLive(*backend, layout, live_namespace);
-    const std::vector<String> stream = seedLogs(*backend, layout, fixture::fixtureLife(live_namespace), 1200);
+    const NamespaceLifeId live = fixture::fixtureLife(live_namespace);
+    createObj(*backend, layout.refCkptKey(live),
+        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
+                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
+    std::vector<String> files;
+    for (size_t i = 0; i < 1200; ++i)
+    {
+        files.push_back(layout.namespaceFilesPrefix(live) + fmt::format("file-{:04}", i));
+        createObj(*backend, files.back(), "file");
+    }
     backend->step_ms = 30'000;
     backend->resetCounts();
 
@@ -307,7 +317,11 @@ TEST(CASNamespaceJanitorBatches, QuietPoolCostsOneListPerRound)
     EXPECT_EQ(metrics.at("janitor_deleted"), 0u);
     EXPECT_EQ(metrics.at("budget_exhausted"), 0u);
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u);
-    EXPECT_EQ(countPresent(*backend, stream), 1200u);
+    EXPECT_EQ(countPresent(*backend, files), 1200u);
+    /// The page was decided, not suppressed: its cursor is published.
+    const auto state = readState(store->openRequests(), layout);
+    ASSERT_EQ(state.status, GcMaintenanceReadStatus::Valid);
+    EXPECT_FALSE(state.state->janitor_cursor.empty());
 }
 
 TEST(CASNamespaceJanitorBatches, StoreWithoutBatchDeleteDrainsKeyByKeyOnThePool)
