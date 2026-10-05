@@ -990,14 +990,21 @@ void MutationsInterpreter::prepare(bool dry_run)
     if (!patch_updated_columns.empty())
         patch_affected_materialized = affected_materialized_closure(patch_updated_columns);
 
+    NameSet materialized_with_ephemeral_dependency;
+    for (const auto & [name, readable_dependencies] : ephemeral_reading_materialized)
+        materialized_with_ephemeral_dependency.insert(name);
+
     /// MATERIALIZED columns rewritten by a CLEAR COLUMN. Must stay equal to the set the recompute
-    /// below writes, otherwise a rewritten column keeps stale dependent artifacts.
+    /// below writes, otherwise a rewritten column keeps stale dependent artifacts. A column reading
+    /// an EPHEMERAL one is not recomputable outside INSERT and must be left out, or the recompute
+    /// stage fails to resolve the EPHEMERAL name and the whole mutation fails.
     NameSet clear_affected_materialized;
     if (!clear_column_names.empty() && !affected_materialized_closure(clear_column_names).empty())
     {
         for (const auto & column : columns_desc)
         {
-            if (column.default_desc.kind == ColumnDefaultKind::Materialized && column.default_desc.expression)
+            if (column.default_desc.kind == ColumnDefaultKind::Materialized && column.default_desc.expression
+                && !materialized_with_ephemeral_dependency.contains(column.name))
                 clear_affected_materialized.insert(column.name);
         }
     }
@@ -1570,9 +1577,12 @@ void MutationsInterpreter::prepare(bool dry_run)
             bool has_dependent_materialized = false;
             for (const auto & column : columns_desc)
             {
+                /// A column reading an EPHEMERAL one is not recomputed, and its expression cannot
+                /// even be analyzed without the EPHEMERAL columns, which are absent from `all_columns`.
                 if (column.default_desc.kind != ColumnDefaultKind::Materialized
                     || !available_columns_set.contains(column.name)
-                    || !column.default_desc.expression)
+                    || !column.default_desc.expression
+                    || materialized_with_ephemeral_dependency.contains(column.name))
                     continue;
 
                 auto query = column.default_desc.expression->clone();
