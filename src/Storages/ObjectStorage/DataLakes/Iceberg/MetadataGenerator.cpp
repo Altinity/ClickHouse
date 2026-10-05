@@ -407,7 +407,8 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     Int64 num_deleted_rows,
     std::optional<Int64> user_defined_snapshot_id,
     std::optional<Int64> user_defined_timestamp,
-    bool is_truncate)
+    bool is_truncate,
+    Poco::JSON::Object::Ptr user_defined_summary)
 {
     int format_version = metadata_object->getValue<Int32>(Iceberg::f_format_version);
     Poco::JSON::Object::Ptr new_snapshot = new Poco::JSON::Object;
@@ -430,8 +431,12 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     metadata_object->set(Iceberg::f_last_updated_ms, timestamp);
 
     auto parent_snapshot = getParentSnapshot(parent_snapshot_id);
-    Poco::JSON::Object::Ptr summary = new Poco::JSON::Object;
-    if (is_truncate)
+    Poco::JSON::Object::Ptr summary = user_defined_summary ? user_defined_summary : Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    if (user_defined_summary)
+    {
+        /// The caller built the whole summary, including the operation.
+    }
+    else if (is_truncate)
     {
         summary->set(Iceberg::f_operation, Iceberg::f_overwrite);
         Int32 prev_total_records = parent_snapshot && parent_snapshot->has(Iceberg::f_summary) && parent_snapshot->getObject(Iceberg::f_summary)->has(Iceberg::f_total_records) ? std::stoi(parent_snapshot->getObject(Iceberg::f_summary)->getValue<String>(Iceberg::f_total_records)) : 0;
@@ -458,7 +463,11 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
         summary->set(Iceberg::f_changed_partition_count, std::to_string(num_partitions));
     }
 
-    if (is_truncate)
+    if (user_defined_summary)
+    {
+        /// The caller's summary already carries its own totals.
+    }
+    else if (is_truncate)
     {
         summary->set(Iceberg::f_total_records, "0");
         summary->set(Iceberg::f_total_files_size, "0");

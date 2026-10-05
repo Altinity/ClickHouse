@@ -69,6 +69,22 @@ ALTER TABLE mt DROP PARTITION '2020-11-21';
 ALTER TABLE mt DROP PART 'all_4_4_0';
 ```
 
+On Iceberg tables, `DROP PARTITION` drops the partition by writing a new snapshot with the partition data files excluded.
+
+By default, no parquet files are physically deleted from object storage.
+The `iceberg_delete_data_on_drop` option must be enabled for data files to be purged.
+
+:::note
+Purging data files will break time travel to older snapshots that reference that partition.
+:::
+
+Example purging data files:
+
+```sql
+ALTER TABLE mt DROP PARTITION tuple(toRelativeDayNum(toDate('2026-01-01')))
+SETTINGS iceberg_delete_data_on_drop = 1;
+```
+
 ## DROP DETACHED PARTITION\|PART {#drop-detached-partitionpart}
 
 ```sql
