@@ -1,0 +1,8 @@
+local_pending
+1
+1
+bad_token
+bad_arity
+distributed_sql
+distributed_plan
+global_in_subquery
