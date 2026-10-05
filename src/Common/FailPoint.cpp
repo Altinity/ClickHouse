@@ -205,6 +205,7 @@ static struct InitFiu
     REGULAR(claim_inject_stale_part_dir) \
     PAUSEABLE(infinite_sleep) \
     PAUSEABLE(async_insert_flush_pause_in_executor) \
+    PAUSEABLE(async_insert_pause_before_schedule) \
     PAUSEABLE(system_replicas_schedule_requests_pause) \
     PAUSEABLE(stop_moving_part_before_swap_with_active) \
     REGULAR(replicated_merge_tree_all_replicas_stale) \
@@ -349,6 +350,7 @@ static struct InitFiu
     PAUSEABLE(keeper_changelog_readahead_pre_drain) \
     PAUSEABLE(object_storage_source_pause_before_virtual_columns) \
     REGULAR(keeper_changelog_readahead_fill_exception) \
+    ONCE(keeper_changelog_preallocate_no_space) \
     REGULAR(distributed_plan_record_failure_while_starting_tasks) \
     ONCE(zk_send_thread_request_window_throw) \
     ONCE(zk_send_thread_operations_insert_throw) \

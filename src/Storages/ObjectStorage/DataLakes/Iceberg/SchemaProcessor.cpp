@@ -423,9 +423,14 @@ void IcebergSchemaProcessor::addIcebergTableSchema(
     {
         SharedLockGuard lock(mutex);
         auto it = iceberg_table_schemas_by_ids.find(schema_id);
-        if (it != iceberg_table_schemas_by_ids.end()
-            && (source == SchemaSource::ManifestFile || !manifest_sourced_schema_ids.contains(schema_id)))
-            registered_schema = it->second;
+        if (it != iceberg_table_schemas_by_ids.end())
+        {
+            const bool registered_from_manifest = manifest_sourced_schema_ids.contains(schema_id);
+            if (source == SchemaSource::ManifestFile && tolerate_conflicting_manifest_schemas && !registered_from_manifest)
+                return;
+            if (source == SchemaSource::ManifestFile || !registered_from_manifest)
+                registered_schema = it->second;
+        }
     }
     if (registered_schema && schemasAreIdentical(*registered_schema, *schema_ptr, type_mapping))
         return;
@@ -482,15 +487,7 @@ void IcebergSchemaProcessor::addIcebergTableSchema(
         else
         {
             if (source == SchemaSource::ManifestFile && tolerate_conflicting_manifest_schemas)
-            {
-                LOG_WARNING(
-                    getLogger("IcebergSchemaProcessor"),
-                    "Manifest file header carries schema-id {} which differs from the schema already "
-                    "registered for that id from metadata.json; ignoring the manifest header copy "
-                    "(disable setting `iceberg_tolerate_conflicting_manifest_schemas` to make this an error)",
-                    schema_id);
                 return;
-            }
             /// A schema-id is immutable per the Iceberg spec: re-binding it to different fields is malformed metadata.
             throw Exception(
                 ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
@@ -813,7 +810,15 @@ std::shared_ptr<ActionsDAG> IcebergSchemaProcessor::getSchemaTransformationDag(
                 /// a whitespace-only difference is the same type and needs only a rename, not a cast.
                 if (canonicalizeTypeSpacing(old_type) == canonicalizeTypeSpacing(new_type))
                 {
-                    if (old_json->getValue<String>(f_name) != name)
+                    /// Nullability is carried by the separate `required` key, so equal type strings
+                    /// can still resolve to different types. Only relaxing required to optional is
+                    /// legal evolution; the reverse keeps the plain passthrough.
+                    const bool old_required = old_json->getValue<bool>(f_required);
+                    if (old_required && !required && !old_node->result_type->equals(*type))
+                    {
+                        node = &dag->addCast(*old_node, type, name, nullptr);
+                    }
+                    else if (old_json->getValue<String>(f_name) != name)
                     {
                         node = &dag->addAlias(*old_node, name);
                     }
@@ -935,6 +940,13 @@ bool IcebergSchemaProcessor::hasClickHouseTableSchemaById(Int32 id) const
     SharedLockGuard lock(mutex);
 
     return clickhouse_table_schemas_by_ids.contains(id);
+}
+
+bool IcebergSchemaProcessor::isSchemaRegisteredFromMetadata(Int32 id) const
+{
+    SharedLockGuard lock(mutex);
+
+    return iceberg_table_schemas_by_ids.contains(id) && !manifest_sourced_schema_ids.contains(id);
 }
 
 std::unordered_map<String, Int64> IcebergSchemaProcessor::traverseSchema(Poco::JSON::Array::Ptr schema)
