@@ -6,6 +6,7 @@
 
 #include <fmt/format.h>
 #include <atomic>
+#include <limits>
 
 /// Batch deletes of dead-life `_log`/`_snap` keys: one page through `NamespaceJanitor`, then whole rounds
 /// through `Gc`, which adds the page loop, the time budget and the GC I/O pool.
@@ -70,8 +71,24 @@ class FailingBulkBackend : public CountingBackend
 public:
     void removeManyWriteOnce(const std::vector<WriteOnceKey> &, TransportAccess &) override
     {
+        attempted = true;
         throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "bulk delete failed");
     }
+    std::atomic<bool> attempted{false};
+};
+
+/// Fails every `LIST` of the namespace root after the first `allowed_lists` ones.
+class FailingNamespaceListBackend : public CountingBackend
+{
+public:
+    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override
+    {
+        if (prefix.ends_with("/cas/ns/") && lists++ >= allowed_lists)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "namespace LIST failed");
+        return CountingBackend::list(prefix, cursor, limit, access);
+    }
+    std::atomic<size_t> lists{0};
+    std::atomic<size_t> allowed_lists{std::numeric_limits<size_t>::max()};
 };
 
 /// The first batch delete goes through and flips `delete_done`, which a liveness predicate reads.
@@ -163,6 +180,7 @@ TEST(CASNamespaceJanitorBatches, DeadStreamKeysGoInOneBatchAndStateKeysStayExact
 
     EXPECT_EQ(backend->bulkRemoveCalls(), 1u);
     EXPECT_EQ(backend->headTotal(), 0u);
+    EXPECT_EQ(result.delete_requests, 2u) << "one batch and one exact-token delete";
     EXPECT_EQ(result.deleted, 5u);
     EXPECT_EQ(result.leaked, 0u);
     EXPECT_EQ(countPresent(*backend, stream), 0u);
@@ -207,6 +225,22 @@ TEST(CASNamespaceJanitorBatches, FailedBatchLeaksAndCursorAdvances)
     EXPECT_FALSE(state.state->janitor_cursor.empty()) << "a failed batch is leak-only: it must not pin the cursor";
 }
 
+TEST(CASNamespaceJanitorBatches, UnpublishedPageReportsNoLeaks)
+{
+    auto backend = std::make_shared<FailingBulkBackend>();
+    CasRequests requests(backend, Fence::open());
+    const Layout layout("p");
+    createObj(*backend, layout.refCatalogKey(), encodeRefCatalog({}));
+    seedLogs(*backend, layout, life("dead", 305), 4);
+
+    const NamespaceJanitorResult result
+        = NamespaceJanitor(requests, layout, 2).runOnePage(false, [&] { return !backend->attempted.load(); });
+
+    EXPECT_EQ(readState(requests, layout).status, GcMaintenanceReadStatus::Absent);
+    EXPECT_EQ(result.leaked, 0u) << "the page is listed again, so nothing on it is leaked yet";
+    EXPECT_FALSE(result.anomalies.empty());
+}
+
 TEST(CASNamespaceJanitorBatches, AuthorityLostAfterBatchHoldsCursor)
 {
     auto backend = std::make_shared<FlipAfterBulkBackend>();
@@ -241,6 +275,7 @@ TEST(CASNamespaceJanitorBatches, RoundDrainsEveryPageOfDebris)
     EXPECT_EQ(metrics.at("janitor_deleted"), 2500u);
     EXPECT_EQ(metrics.at("leaked"), 0u);
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 4u);
+    EXPECT_EQ(metrics.at("delete_requests"), 12u);
     /// Every page is split across the 4 pool threads.
     EXPECT_EQ(backend->bulkRemoveCalls(), 12u);
 }
@@ -263,6 +298,29 @@ TEST(CASNamespaceJanitorBatches, RoundDrainsDebrisOnBothSidesOfTheCursor)
 
     EXPECT_EQ(metrics.at("janitor_deleted"), 2500u);
     EXPECT_EQ(countPresent(*backend, stream), 0u) << "the pass continues from the stream start after its last page";
+}
+
+TEST(CASNamespaceJanitorBatches, ListFailureAfterTheFirstPageKeepsTheCursor)
+{
+    auto backend = std::make_shared<FailingNamespaceListBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 322), 2500);
+    backend->lists = 0;
+    backend->allowed_lists = 1;
+
+    Gc gc(store, DB::UInt128{323});
+    const auto failed = runRoundAndGetJanitorMetrics(gc);
+    EXPECT_EQ(failed.at("janitor_deleted"), 1000u);
+    EXPECT_EQ(countPresent(*backend, stream), 1500u);
+    const auto state = readState(store->openRequests(), layout);
+    ASSERT_EQ(state.status, GcMaintenanceReadStatus::Valid);
+    EXPECT_EQ(state.state->janitor_cursor, stream[999]) << "the cursor the first page published stays";
+
+    backend->allowed_lists = std::numeric_limits<size_t>::max();
+    const auto resumed = runRoundAndGetJanitorMetrics(gc);
+    EXPECT_EQ(resumed.at("janitor_deleted"), 1500u);
+    EXPECT_EQ(countPresent(*backend, stream), 0u);
 }
 
 TEST(CASNamespaceJanitorBatches, BudgetStopsThePassAfterThePageInProgress)
@@ -340,6 +398,7 @@ TEST(CASNamespaceJanitorBatches, StoreWithoutBatchDeleteDrainsKeyByKeyOnThePool)
     EXPECT_EQ(backend->single_key_requests.load(), 1200u);
     /// Two pages, each split into one job per pool thread.
     EXPECT_EQ(backend->refused_batches.load(), 8u);
+    EXPECT_EQ(metrics.at("delete_requests"), 1208u);
 }
 
 TEST(CASNamespaceJanitorBatches, RefusedEnqueueLeaksTheUnscheduledJobsAndTheNextRoundDrains)

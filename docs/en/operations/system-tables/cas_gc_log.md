@@ -86,7 +86,7 @@ The phases, in execution order:
 | `round_commit` | The generation-retention prune and the round's single `gc/state` compare-and-swap. | prune `LIST`s and deletes, one compare-and-swap |
 | `handoff_reclaim` | Wholesale-reclaim generations a moved run ref stranded below the retention cursor. | prefix `LIST`s and deletes |
 | `manifest_deletes` | Exact-token deletes of owner-removed manifest bodies, after their decrements were adopted. | one `DELETE` per body |
-| `namespace_cleanup` | Run `cas/ns/` pages across the stream and state subtrees for the perpetual dead-life janitor, under a 20 s soft budget; `budget_exhausted` is 1 when the budget stopped the phase. This phase is physical reclamation, not a lifecycle gate. | per page: one namespace-root page `LIST`, catalog cut, batch deletes of dead ref logs and snapshots, exact-token deletes of the rest |
+| `namespace_cleanup` | Run `cas/ns/` pages across the stream and state subtrees for the perpetual dead-life janitor, under a 20 s soft budget; `budget_exhausted` is 1 when the budget stopped the phase, `delete_requests` counts the phase's delete calls, which run on the GC I/O pool and are missing from this row's `ProfileEvents`. This phase is physical reclamation, not a lifecycle gate. | per page: one namespace-root page `LIST`, catalog cut, batch deletes of dead ref logs and snapshots, exact-token deletes of the rest |
 | `ref_object_cleanup` | Delete ref logs covered by both the durable fold cursor and a durable snapshot, plus superseded snapshots. | one `HEAD` + one `DELETE` per deletable object |
 | `orphan_sweep` | The budgeted, cursor-paced orphan part-manifest backstop. | budgeted `LIST` and deletes |
 

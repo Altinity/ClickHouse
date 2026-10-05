@@ -376,9 +376,9 @@ void Gc::runNamespaceJanitor(
         CasRequests & requests = store->openRequests();
         const Layout & layout = store->layout();
         NamespaceJanitor janitor(requests, layout, 1000,
-            [this](CasOperation & op, const std::vector<WriteOnceKey> & keys, std::vector<String> & anomalies)
+            [this](CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out)
             {
-                return removeWriteOnceOnIoPool(op, keys, anomalies);
+                removeWriteOnceOnIoPool(op, keys, out);
             });
         const uint64_t deadline_ms = mono_ms_fn() + kJanitorBudgetMs;
         while (true)
@@ -386,11 +386,13 @@ void Gc::runNamespaceJanitor(
             /// ONE authority read per page, made here rather than from the predicate: the janitor's
             /// operation samples its liveness before every request, and a page walks up to a thousand keys.
             refreshAuthority(leased_state.lease.seq);
-            const NamespaceJanitorResult page = janitor.runOnePage(suppress_destructive, [this] { return authority_held; });
+            const NamespaceJanitorResult page = janitor.runOnePage(
+                suppress_destructive, [this] { return authority_held; }, /*first_page_of_pass=*/janitor_result.pages == 0);
             janitor_result.pages += page.pages;
             janitor_result.keys += page.keys;
             janitor_result.deleted += page.deleted;
             janitor_result.leaked += page.leaked;
+            janitor_result.delete_requests += page.delete_requests;
             for (const String & anomaly : page.anomalies)
                 LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
             if (!page.more)
@@ -412,11 +414,11 @@ void Gc::runNamespaceJanitor(
     t.metric("janitor_keys", janitor_result.keys);
     t.metric("janitor_deleted", janitor_result.deleted);
     t.metric("leaked", janitor_result.leaked);
+    t.metric("delete_requests", janitor_result.delete_requests);
     t.metric("budget_exhausted", budget_exhausted ? 1 : 0);
 }
 
-uint64_t Gc::removeWriteOnceOnIoPool(
-    CasOperation & op, const std::vector<WriteOnceKey> & keys, std::vector<String> & anomalies)
+void Gc::removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out)
 {
     /// An even split, so a store without a batch delete sends its one-key requests from every pool thread.
     const size_t concurrency = std::max<size_t>(1, store->poolConfig().gc_io_concurrency);
@@ -427,11 +429,12 @@ uint64_t Gc::removeWriteOnceOnIoPool(
     for (size_t begin = 0; begin < keys.size(); begin += chunk_keys)
         chunks.emplace_back(keys.begin() + begin, keys.begin() + std::min(keys.size(), begin + chunk_keys));
 
+    /// Written by the job of the same index, read after every job finished.
+    std::vector<uint64_t> requests(chunks.size(), 0);
     ThreadPoolCallbackRunnerLocal<void> runner(*io_pool, ThreadName::CAS_GC_JANITOR);
     std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;
     handles.reserve(chunks.size());
     SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
-    uint64_t leaked = 0;
     try
     {
         for (size_t i = 0; i < chunks.size(); ++i)
@@ -443,39 +446,44 @@ uint64_t Gc::removeWriteOnceOnIoPool(
             }
             /// The round thread waits for every job before it refreshes `authority_held` again.
             handles.emplace_back(runner.enqueueAndGiveOwnership(
-                [this, chunk = &chunks[i], admitted_generation = op.generation()]
+                [this, chunk = &chunks[i], chunk_requests = &requests[i], admitted_generation = op.generation()]
                 {
                     CasOperation job_op = store->openRequests().resume(admitted_generation, [this] { return authority_held; });
-                    removeChunkWriteOnceOrOneByOne(job_op, *chunk, Retry::standard());
+                    /// A job that fails made at least the one call.
+                    *chunk_requests = 1;
+                    *chunk_requests = removeChunkWriteOnceOrOneByOne(job_op, *chunk, Retry::standard());
                 }));
         }
     }
     catch (...)
     {
         /// Leak-only like a failed request: the keys stay for the cursor's next pass over this page.
+        uint64_t unscheduled = 0;
         for (size_t i = handles.size(); i < chunks.size(); ++i)
-            leaked += chunks[i].size();
-        anomalies.push_back(fmt::format(
+            unscheduled += chunks[i].size();
+        out.leaked += unscheduled;
+        out.anomalies.push_back(fmt::format(
             "leaked {} dead-life objects starting at '{}': delete job not scheduled: {}",
-            leaked, chunks[handles.size()].front().str(), getCurrentExceptionMessage(false)));
+            unscheduled, chunks[handles.size()].front().str(), getCurrentExceptionMessage(false)));
     }
     ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
 
     for (size_t i = 0; i < handles.size(); ++i)
     {
+        out.delete_requests += requests[i];
         try
         {
             handles[i]->future.get();
+            out.deleted += chunks[i].size();
         }
         catch (...)
         {
-            leaked += chunks[i].size();
-            anomalies.push_back(fmt::format(
+            out.leaked += chunks[i].size();
+            out.anomalies.push_back(fmt::format(
                 "leaked {} dead-life objects starting at '{}': batch delete failed: {}",
                 chunks[i].size(), chunks[i].front().str(), getCurrentExceptionMessage(false)));
         }
     }
-    return leaked;
 }
 
 uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<WriteOnceKey> & chunk, const Retry & policy)

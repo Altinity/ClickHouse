@@ -21,26 +21,26 @@ void throwOnRefusedOrGaveUp(WriteResult && result, std::string_view what)
         (void)orThrow(std::move(result), what);
 }
 
-uint64_t removeOnCallerThread(CasOperation & op, const std::vector<WriteOnceKey> & keys, std::vector<String> & anomalies)
+void removeOnCallerThread(CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out)
 {
-    uint64_t leaked = 0;
     for (size_t begin = 0; begin < keys.size(); begin += kBulkDeleteMaxKeys)
     {
         const std::vector<WriteOnceKey> batch(
             keys.begin() + begin, keys.begin() + std::min(keys.size(), begin + kBulkDeleteMaxKeys));
+        ++out.delete_requests;
         try
         {
             op.removeManyWriteOnce(batch, Retry::standard());
+            out.deleted += batch.size();
         }
         catch (const std::exception & e)
         {
-            leaked += batch.size();
-            anomalies.push_back(fmt::format(
+            out.leaked += batch.size();
+            out.anomalies.push_back(fmt::format(
                 "leaked {} dead-life objects starting at '{}': batch delete failed: {}",
                 batch.size(), batch.front().str(), e.what()));
         }
     }
-    return leaked;
 }
 
 }
@@ -54,7 +54,7 @@ NamespaceJanitor::NamespaceJanitor(
 {
 }
 
-NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liveness liveness)
+NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liveness liveness, bool first_page_of_pass)
 {
     NamespaceJanitorResult result;
     CasOperation op = requests.admit(std::move(liveness));
@@ -76,7 +76,8 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     }
     catch (...)
     {
-        (void)casGcMaintenanceState(op, layout, progress.etag, GcMaintenanceState{}, Retry::once());
+        if (first_page_of_pass)
+            (void)casGcMaintenanceState(op, layout, progress.etag, GcMaintenanceState{}, Retry::once());
         throw;
     }
     result.pages = 1;
@@ -171,6 +172,7 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
             page_decided = false;
             break;
         }
+        ++result.delete_requests;
         try
         {
             if (op.remove(listed.key, *etag, Retry::standard()) == Removal::Removed)
@@ -185,11 +187,7 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     }
 
     if (page_decided && !dead_stream_keys.empty() && op.admitted())
-    {
-        const uint64_t leaked = remove_write_once(op, dead_stream_keys, result.anomalies);
-        result.leaked += leaked;
-        result.deleted += dead_stream_keys.size() - leaked;
-    }
+        remove_write_once(op, dead_stream_keys, result);
 
     /// Recheck even when the page had no dead candidate. A tenure that observes fence loss after LIST
     /// or after the last delete must not publish progress. Loss after this check may still race
@@ -197,22 +195,29 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     if (page_decided && !op.admitted())
         page_decided = false;
 
+    bool published = false;
     if (page_decided)
     {
         const GcMaintenanceState next{.janitor_cursor = page.next_cursor};
         try
         {
-            const WriteResult published = casGcMaintenanceState(op, layout, progress.etag, next, Retry::standard());
-            if (std::holds_alternative<Refused>(published) || std::holds_alternative<GaveUp>(published))
+            const WriteResult outcome = casGcMaintenanceState(op, layout, progress.etag, next, Retry::standard());
+            if (std::holds_alternative<Refused>(outcome) || std::holds_alternative<GaveUp>(outcome))
                 result.anomalies.push_back("cursor publication did not commit");
-            else if (std::holds_alternative<Committed>(published))
+            else if (std::holds_alternative<Committed>(outcome))
+            {
+                published = true;
                 result.more = result.deleted > 0 && !(cursor.empty() && page.next_cursor.empty());
+            }
         }
         catch (const std::exception & e)
         {
             result.anomalies.push_back("cursor publication failed: " + String(e.what()));
         }
     }
+    /// An unpublished page is listed again, so its failed keys are not leaked yet.
+    if (!published)
+        result.leaked = 0;
     return result;
 }
 

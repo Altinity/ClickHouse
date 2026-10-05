@@ -539,11 +539,15 @@ nothing ends the pass. A pool without debris costs one `LIST` per round.
   unreachable from a reborn same-name namespace, so a missed key can only leak storage, never expose
   it
 - **Fails the round if:** nothing — the whole phase is wrapped in a catch-all ("namespace janitor
-  stopped this round"). A failed batch `DELETE` leaks its keys and the cursor still advances
+  stopped this round"). A failed batch `DELETE` leaks its keys and the cursor still advances. A failed
+  `LIST` resets the cursor to the stream start only on the first page of the phase; on a later page
+  the cursor the previous page published stays
 - **Observability:** phase row `namespace_cleanup`; metrics `janitor_pages`, `janitor_keys`,
   `janitor_deleted` (keys of successful batch requests, absent ones included, plus exact removals),
-  `leaked`, `budget_exhausted`. Batch deletes run on the GC I/O pool, so the row's `ProfileEvents`
-  do not include their requests
+  `leaked` (failed keys of published pages; an unpublished page is listed again), `delete_requests`
+  (delete calls: one per exact-token delete and per batch, including a batch the storage refused
+  before its keys went one by one), `budget_exhausted`. Batch deletes run on the GC I/O pool, so the
+  row's `ProfileEvents` do not include their requests
 
 The cursor advances only when the whole page was decided under a held fence and an unambiguous
 catalog; under suppression it lists and classifies but deletes nothing and does not advance.

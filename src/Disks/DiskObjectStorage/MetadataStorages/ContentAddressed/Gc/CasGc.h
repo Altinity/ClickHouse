@@ -249,6 +249,7 @@ struct RefScanSummary
 
 class RefPlan;
 class RoundInput;
+struct NamespaceJanitorResult;
 RefPlan buildRefWalkPlan(RoundInput && round_input);
 
 namespace tests
@@ -558,8 +559,7 @@ private:
 
     /// The janitor's `RemoveWriteOnce`: splits `keys` evenly across the GC I/O pool and waits for every job.
     /// A failed job leaks its keys, and so does a job the pool refused to schedule.
-    uint64_t removeWriteOnceOnIoPool(
-        CasOperation & op, const std::vector<WriteOnceKey> & keys, std::vector<String> & anomalies);
+    void removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out);
 
     void reportStuckRemovals(const RefPlan & plan, uint64_t current_round);
 
