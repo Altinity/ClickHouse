@@ -24,15 +24,13 @@ StorageObjectStorageStableTaskDistributor::StorageObjectStorageStableTaskDistrib
     std::shared_ptr<IObjectIterator> iterator_,
     std::vector<std::string> && ids_of_nodes_,
     bool send_over_whole_archive_,
-    uint64_t lock_object_storage_task_distribution_ms_,
-    bool iceberg_read_optimization_enabled_)
+    uint64_t lock_object_storage_task_distribution_ms_)
     : iterator(std::move(iterator_))
     , send_over_whole_archive(send_over_whole_archive_)
     , connection_to_files(ids_of_nodes_.size())
     , ids_of_nodes(std::move(ids_of_nodes_))
     , lock_object_storage_task_distribution_us(lock_object_storage_task_distribution_ms_ * 1000)
     , iterator_exhausted(false)
-    , iceberg_read_optimization_enabled(iceberg_read_optimization_enabled_)
 {
     Poco::Timestamp now;
     size_t nodes = ids_of_nodes.size();
@@ -186,17 +184,6 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
         }
 
         String file_identifier = getFileIdentifier(object_info, true);
-
-        if (iceberg_read_optimization_enabled)
-        {
-            auto file_meta_info = object_info->relative_path_with_metadata.getFileMetaInfo();
-            if (file_meta_info.has_value())
-            {
-                auto file_path = send_over_whole_archive ? object_info->getPathOrPathToArchiveIfArchive() : object_info->getPath();
-                object_info->relative_path_with_metadata.command.setFilePath(file_path);
-                object_info->relative_path_with_metadata.command.setFileMetaInfo(file_meta_info.value());
-            }
-        }
 
         size_t file_replica_idx;
 

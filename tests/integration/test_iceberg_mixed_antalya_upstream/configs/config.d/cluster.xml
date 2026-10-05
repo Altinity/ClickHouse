@@ -1,0 +1,20 @@
+<clickhouse>
+    <remote_servers>
+        <antalya_only>
+            <shard>
+                <replica>
+                    <host>antalya</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </antalya_only>
+        <upstream_only>
+            <shard>
+                <replica>
+                    <host>upstream</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </upstream_only>
+    </remote_servers>
+</clickhouse>

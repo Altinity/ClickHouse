@@ -2,6 +2,7 @@
 #include <Interpreters/SetSerialization.h>
 #include <Interpreters/Context.h>
 #include <AggregateFunctions/AggregateFunctionGroupBitmapData.h>
+#include <Core/AntalyaProtocol.h>
 #include <Core/Settings.h>
 #include <Core/ProtocolDefines.h>
 #include <Common/Exception.h>
@@ -23,6 +24,7 @@ namespace ErrorCodes
 }
 namespace Setting
 {
+    extern const SettingsBool allow_experimental_iceberg_read_optimization;
     extern const SettingsBool cluster_function_process_archive_on_multiple_nodes;
 }
 
@@ -39,7 +41,8 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
         iceberg_info = iceberg_object->info;
 #endif
 
-    file_meta_info = object->relative_path_with_metadata.file_meta_info;
+    if (context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization])
+        file_meta_info = object->relative_path_with_metadata.file_meta_info;
 
     if (object->relative_path_with_metadata.getCommand().isValid())
         path = object->relative_path_with_metadata.getCommand().toString();
@@ -86,7 +89,7 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
     return object;
 }
 
-void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker_protocol_version) const
+void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker_protocol_version, size_t antalya_protocol_version) const
 {
     auto protocol_version
         = std::min(static_cast<UInt64>(worker_protocol_version), static_cast<UInt64>(DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION));
@@ -190,9 +193,22 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
             writeVarUInt(0, out);
         }
     }
+
+    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO)
+    {
+        if (file_meta_info && *file_meta_info)
+        {
+            writeVarUInt(1, out);
+            (*file_meta_info)->serialize(out);
+        }
+        else
+        {
+            writeVarUInt(0, out);
+        }
+    }
 }
 
-void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
+void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in, size_t antalya_protocol_version)
 {
     size_t protocol_version = 0;
     readVarUInt(protocol_version, in);
@@ -242,6 +258,14 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
             iceberg_info = Iceberg::IcebergObjectSerializableInfo{};
             iceberg_info->deserializeForClusterFunctionProtocol(in, protocol_version);
         }
+    }
+
+    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO)
+    {
+        UInt64 has_file_meta_info = 0;
+        readVarUInt(has_file_meta_info, in);
+        if (has_file_meta_info)
+            file_meta_info = std::make_shared<DataFileMetaInfo>(DataFileMetaInfo::deserialize(in));
     }
 }
 
