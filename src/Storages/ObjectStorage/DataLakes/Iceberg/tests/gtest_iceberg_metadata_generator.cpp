@@ -517,6 +517,7 @@ TEST(IcebergMetadataGenerator, GetIcebergTypeNullableNothingProducesUnknown)
 TEST(IcebergMetadataGenerator, AddColumnUnknownTypeRecordsUnknownInSchema)
 {
     auto metadata = makeMetadataWithGap();
+    metadata->set(f_format_version, 3);
     MetadataGenerator gen(metadata);
 
     gen.generateAddColumnMetadata("placeholder", makeNullable(std::make_shared<DataTypeNothing>()));
