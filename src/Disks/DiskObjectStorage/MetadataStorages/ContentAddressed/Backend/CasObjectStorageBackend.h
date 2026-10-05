@@ -101,6 +101,10 @@ public:
     /// under the control-plane profile; `EmulatedSingleProcess` deletes each present key under the
     /// emulation lock with the same token bookkeeping as the single-key delete.
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
+
+    /// Native: the object storage's own limit. Emulated: `kBulkDeleteMaxKeys`, since this backend deletes
+    /// the keys one by one under its emulation lock.
+    size_t bulkDeleteKeyLimit() const override;
     /// Native mints its store's own dialect (ETag or GCS generation); the emulated adapter mints its
     /// own values.
     Dialect dialect() const override { return mode == Mode::Native ? native_token_type : Dialect::Emulated; }

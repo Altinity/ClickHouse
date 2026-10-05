@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <exception>
 #include <functional>
 #include <map>
@@ -58,6 +59,9 @@ public:
     void onBeforeBulkRemove(std::function<void()> hook);
     /// How many `removeManyWriteOnce` calls reached the store, armed failures included.
     size_t bulkRemoveCalls() const;
+
+    /// The emulation deletes keys one by one under its lock, so the CAS maximum is the only bound.
+    size_t bulkDeleteKeyLimit() const override { return kBulkDeleteMaxKeys; }
 
     /// Creates the key when `expected_value` is empty, or replaces the incarnation it names. A
     /// refused precondition leaves the store unchanged. Value enforcement can be disabled with
