@@ -407,20 +407,21 @@ Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
         request_body->set("identifier", identifier);
     }
 
-    if (new_snapshot->has("parent-snapshot-id"))
     {
-        auto parent_snapshot_id = new_snapshot->getValue<Int64>("parent-snapshot-id");
-        if (parent_snapshot_id != -1)
-        {
-            Poco::JSON::Object::Ptr requirement = new Poco::JSON::Object;
-            requirement->set("type", "assert-ref-snapshot-id");
-            requirement->set("ref", "main");
-            requirement->set("snapshot-id", parent_snapshot_id);
+        Poco::JSON::Object::Ptr requirement = new Poco::JSON::Object;
+        requirement->set("type", "assert-ref-snapshot-id");
+        requirement->set("ref", "main");
 
-            Poco::JSON::Array::Ptr requirements = new Poco::JSON::Array;
-            requirements->add(requirement);
-            request_body->set("requirements", requirements);
+        if (new_snapshot->has("parent-snapshot-id"))
+        {
+            auto parent_snapshot_id = new_snapshot->getValue<Int64>("parent-snapshot-id");
+            if (parent_snapshot_id != -1)
+                requirement->set("snapshot-id", parent_snapshot_id);
         }
+
+        Poco::JSON::Array::Ptr requirements = new Poco::JSON::Array;
+        requirements->add(requirement);
+        request_body->set("requirements", requirements);
     }
 
     Poco::JSON::Array::Ptr updates = new Poco::JSON::Array;
