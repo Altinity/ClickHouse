@@ -11,6 +11,7 @@
 
 #include <Common/ProfileEvents.h>
 
+#include <algorithm>
 #include <mutex>
 #include <set>
 
@@ -1424,4 +1425,91 @@ TEST(CASRefGc, CatalogAdmittedFreshLifeWithoutParentSeedsSuccessorSeal)
     const CasFoldSeal seal = decodeFoldSeal(
         op.read(layout.foldSealKey(state.snap_generation, state.snap_attempt), Retry::once())->bytes);
     EXPECT_TRUE(seal.ref_lives.contains(life_id));
+}
+
+namespace
+{
+
+struct RefCleanupRun
+{
+    uint64_t cohort_size = 0;
+    uint64_t deleted_metric = 0;
+    uint64_t gc_state_reads = 0;
+    std::vector<size_t> call_sizes;
+    bool every_planned_key_gone = true;
+};
+
+/// One regular round over `table_count` covered logs under a backend whose batch limit is `storage_limit`.
+RefCleanupRun runRefCleanupUnderStorageLimit(size_t storage_limit, uint64_t table_count)
+{
+    auto backend = std::make_shared<BatchCapabilityBackend>();
+    backend->setStorageLimit(storage_limit);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    fixture::admitLive(*backend, layout, ns);
+
+    RefTableListing listing;
+    uint64_t last = 0;
+    for (uint64_t i = 1; i <= table_count; ++i)
+    {
+        const ManifestRef r = mref(i);
+        writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", DB::UInt128(i))});
+        last = publishCommittedTransition(*backend, layout, ns, "t" + std::to_string(i), std::nullopt, r);
+        listing.logs.push_back(RefTxnId{1, last});
+    }
+    std::vector<RefCommittedRow> committed;
+    for (uint64_t i = 1; i <= table_count; ++i)
+        committed.push_back(committedRow("t" + std::to_string(i), mref(i)));
+    writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, last}, committed));
+    listing.snapshots.push_back(RefTxnId{1, last});
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, last},
+        .checkpoint_snapshot_id = RefTxnId{1, last},
+        .last_epoch_seal = std::nullopt,
+    });
+
+    const RefCleanupPlan plan = planRefCleanup(listing, RefTxnId{1, last}, RefTxnId{1, last}, std::nullopt);
+    RefCleanupRun run;
+    run.cohort_size = plan.deletable_logs.size() + plan.deletable_snapshots.size();
+
+    const auto deleted_before = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
+    const uint64_t state_reads_before = backend->getCount(layout.gcStateKey());
+    const size_t calls_before = backend->callSizes().size();
+    Gc gc(store, kGc);
+    EXPECT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    run.deleted_metric = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load() - deleted_before;
+    run.gc_state_reads = backend->getCount(layout.gcStateKey()) - state_reads_before;
+    const std::vector<size_t> sizes = backend->callSizes();
+    run.call_sizes.assign(sizes.begin() + calls_before, sizes.end());
+
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+    OperationForTest op(*backend);
+    for (const RefTxnId & id : plan.deletable_logs)
+        run.every_planned_key_gone &= !(*op).head(layout.refLogKey(life, id), Retry::once()).has_value();
+    for (const RefTxnId & id : plan.deletable_snapshots)
+        run.every_planned_key_gone &= !(*op).head(layout.refSnapshotKey(life, id), Retry::once()).has_value();
+    return run;
+}
+
+}
+
+/// The storage's batch limit cuts the cleanup cohort into smaller requests, and the extra requests cost
+/// no extra authority reads: `authorityHolds` runs once per cohort, not once per request.
+TEST(CASRefGc, RefObjectCleanupCutsRequestsToTheStorageLimitWithoutExtraAuthorityReads)
+{
+    const RefCleanupRun limited = runRefCleanupUnderStorageLimit(3, 8);
+    const RefCleanupRun unlimited = runRefCleanupUnderStorageLimit(kBulkDeleteMaxKeys, 8);
+
+    ASSERT_GT(limited.cohort_size, 3u) << "the cohort must exceed the limit for the cut to be observable";
+    EXPECT_EQ(limited.cohort_size, unlimited.cohort_size);
+    EXPECT_TRUE(limited.every_planned_key_gone);
+    EXPECT_EQ(limited.deleted_metric, limited.cohort_size);
+    EXPECT_EQ(unlimited.deleted_metric, unlimited.cohort_size);
+
+    ASSERT_FALSE(limited.call_sizes.empty());
+    EXPECT_LE(*std::max_element(limited.call_sizes.begin(), limited.call_sizes.end()), 3u);
+    EXPECT_GT(limited.call_sizes.size(), unlimited.call_sizes.size());
+    EXPECT_EQ(limited.gc_state_reads, unlimited.gc_state_reads);
 }

@@ -137,6 +137,9 @@ public:
     void removeObjectsIfExistUnderProfile(
         const StoredObjects & objects, const ObjectStorageControlRequest & request) override;
 
+    /// `objects_chunk_size_to_delete`, at least 1, while `DeleteObjects` is not known unsupported; 1 after.
+    size_t batchDeleteKeyLimit() const override;
+
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 
     ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;

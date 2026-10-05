@@ -7,6 +7,8 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 
+#include <algorithm>
+
 /// The manifest_deletes phase sends owner-removed manifest bodies to the store in chunks of
 /// write-once keys, one request per chunk, and records every chunk that succeeded before a later
 /// one can fail.
@@ -193,4 +195,33 @@ TEST(CASGCManifestBulkDelete, ASuppressedRoundMakesNoRequest)
     OperationForTest op(*backend);
     for (const ManifestId & id : ids)
         EXPECT_TRUE((*op).head(store->layout().manifestKey(id), Retry::once()).has_value());
+}
+
+/// The storage's batch limit caps every request below the configured chunk size: 8 bodies under a
+/// limit of 3 go out as 3 + 3 + 2.
+TEST(CASGCManifestBulkDelete, StorageLimitCutsTheCohortIntoRequestsOfAtMostThatManyKeys)
+{
+    auto backend = std::make_shared<BatchCapabilityBackend>();
+    backend->setStorageLimit(3);
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
+    const auto ids = seedDroppedManifests(*backend, store->layout(), 8);
+
+    uint64_t requests_metric = 0;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "manifest_deletes")
+            requests_metric += rec.metrics.at("requests");
+    });
+    const uint64_t deleted = reclaim(gc, store, *backend, ids, 16);
+
+    EXPECT_EQ(deleted, 8u);
+    EXPECT_EQ(requests_metric, 3u);
+    const std::vector<size_t> sizes = backend->callSizes();
+    ASSERT_FALSE(sizes.empty());
+    EXPECT_LE(*std::max_element(sizes.begin(), sizes.end()), 3u);
+    EXPECT_EQ(sizes, (std::vector<size_t>{3, 3, 2}));
+    OperationForTest op(*backend);
+    for (const ManifestId & id : ids)
+        EXPECT_FALSE((*op).head(store->layout().manifestKey(id), Retry::once()).has_value());
 }

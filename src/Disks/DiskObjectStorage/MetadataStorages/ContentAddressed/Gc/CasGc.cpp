@@ -408,6 +408,30 @@ uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<Wri
     }
 }
 
+namespace
+{
+/// Deletes `cohort` as consecutive requests of at most `request_keys` keys; returns the call count.
+uint64_t removeCohortWriteOnce(
+    CasOperation & op, const std::vector<WriteOnceKey> & cohort, size_t request_keys, const Retry & policy)
+{
+    uint64_t calls = 0;
+    for (size_t begin = 0; begin < cohort.size(); begin += request_keys)
+    {
+        const size_t end = std::min(cohort.size(), begin + request_keys);
+        const std::vector<WriteOnceKey> request(cohort.begin() + begin, cohort.begin() + end);
+        calls += removeChunkWriteOnceOrOneByOne(op, request, policy);
+    }
+    return calls;
+}
+}
+
+size_t Gc::bulkDeleteChunkKeys() const
+{
+    const uint64_t configured = store->poolConfig().gc_bulk_delete_chunk_keys;
+    const uint64_t storage_limit = store->poolBackendPtr()->bulkDeleteKeyLimit();
+    return std::clamp<size_t>(std::min(configured, storage_limit), 1, kBulkDeleteMaxKeys);
+}
+
 Gc::RedeleteIo Gc::performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op)
 {
     RedeleteIo io;
@@ -1279,6 +1303,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// never per key, so the next round's fold sees that key as already gone. The etag the fold
         /// observed rides the event as information only.
         const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
+        const size_t request_keys = bulkDeleteChunkKeys();
         uint64_t attempted = 0;
         uint64_t requests = 0;
         std::vector<WriteOnceKey> chunk;
@@ -1290,7 +1315,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here;
             /// `chunk_entries`' per-key bookkeeping below is unaffected either way -- it counts objects
             /// that are gone after this call returns, not how many requests it took to get them there.
-            requests += removeChunkWriteOnceOrOneByOne(op, chunk, Retry::standard());
+            requests += removeCohortWriteOnce(op, chunk, request_keys, Retry::standard());
             for (const auto * entry : chunk_entries)
             {
                 ++report.manifests_deleted;
@@ -3834,6 +3859,7 @@ void Gc::cleanupRefObjects(
         }
 
         const size_t chunk_keys = std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys);
+        const size_t request_keys = bulkDeleteChunkKeys();
         for (size_t begin = 0; begin < cohort.size(); )
         {
             /// Cumulative per-round cap in KEYS, exactly as before; a chunk is cut to what remains. The
@@ -3850,7 +3876,7 @@ void Gc::cleanupRefObjects(
             /// A backend without `DeleteObjects` (GCS) falls back to one admitted delete per key here.
             /// The budget and the profile event below count OBJECTS in `chunk`, which is the same
             /// `chunk.size()` whichever way `removeChunkWriteOnceOrOneByOne` actually sent them.
-            removeChunkWriteOnceOrOneByOne(op, chunk, Retry::standard());
+            removeCohortWriteOnce(op, chunk, request_keys, Retry::standard());
             work_budget.ref_cleanup_objects_used += chunk.size();
             ProfileEvents::increment(ProfileEvents::CASRefCleanupObjectsDeleted, chunk.size());   /// cleanup object deletion
             /// Advance by what was actually sent, not the nominal chunk size: the budget cap above can

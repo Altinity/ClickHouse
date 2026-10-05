@@ -22,6 +22,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <Poco/Net/HTTPRequestHandler.h>
@@ -36,6 +37,11 @@
 namespace DB::ErrorCodes
 {
 extern const int NOT_IMPLEMENTED;
+}
+
+namespace DB::S3RequestSetting
+{
+extern const S3RequestSettingsUInt64 objects_chunk_size_to_delete;
 }
 
 /// `S3ObjectStorage::removeObjectsIfExistImpl` (the CAS bulk-delete path, reached through
@@ -183,7 +189,18 @@ void sendSingleDeleteError(Poco::Net::HTTPServerResponse & response, Poco::Net::
     sendXml(response, status, body);
 }
 
-std::shared_ptr<DB::S3ObjectStorage> makeStorageForTest(const std::string & endpoint, const DB::S3Capabilities & capabilities)
+/// A quiet-mode `DeleteObjects` reply (HTTP 200) listing one `<Error>` per `{key, code}` pair.
+void sendDeleteObjectsResult(Poco::Net::HTTPServerResponse & response, const std::vector<std::pair<std::string, std::string>> & errors)
+{
+    std::string body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">";
+    for (const auto & [key, code] : errors)
+        body += "<Error><Key>" + key + "</Key><Code>" + code + "</Code><Message>" + code + "</Message></Error>";
+    body += "</DeleteResult>";
+    sendXml(response, Poco::Net::HTTPResponse::HTTP_OK, body);
+}
+
+std::shared_ptr<DB::S3ObjectStorage> makeStorageForTest(
+    const std::string & endpoint, const DB::S3Capabilities & capabilities, std::optional<uint64_t> objects_chunk_size_to_delete = {})
 {
     DB::RemoteHostFilter remote_host_filter;
     DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
@@ -215,8 +232,11 @@ std::shared_ptr<DB::S3ObjectStorage> makeStorageForTest(const std::string & endp
             .is_s3express_bucket = false,
         },
         "ACCESS_KEY_ID", "SECRET_ACCESS_KEY", "", {}, {}, DB::S3::CredentialsConfiguration{});
+    auto settings = std::make_unique<DB::S3Settings>();
+    if (objects_chunk_size_to_delete)
+        settings->request_settings[DB::S3RequestSetting::objects_chunk_size_to_delete] = *objects_chunk_size_to_delete;
     return std::make_shared<DB::S3ObjectStorage>(
-        std::move(client), std::make_unique<DB::S3Settings>(),
+        std::move(client), std::move(settings),
         DB::S3::URI(endpoint + "/test-bucket/"), capabilities,
         DB::ObjectStorageKeyGeneratorPtr{}, "disk");
 }
@@ -397,6 +417,94 @@ TEST(S3BulkDeleteFallback, ExplicitlyDisabledCapabilityThrowsNotImplementedWitho
 
     EXPECT_EQ(server.countMethod("POST"), 0u);
     EXPECT_EQ(server.countMethod("DELETE"), 0u);
+}
+
+TEST(CASS3BatchDelete, KeyLimitFollowsChunkSettingAndDropsToOneOnceBatchDeleteIsUnsupported)
+{
+    (void)contextForTest();
+
+    ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+    {
+        sendBatchNotImplemented(response);
+    });
+
+    EXPECT_EQ(makeStorageForTest(server.getUrl(), DB::S3Capabilities{})->batchDeleteKeyLimit(), 1000u);
+    EXPECT_EQ(makeStorageForTest(server.getUrl(), DB::S3Capabilities{}, 500)->batchDeleteKeyLimit(), 500u);
+    EXPECT_EQ(makeStorageForTest(server.getUrl(), DB::S3Capabilities{}, 0)->batchDeleteKeyLimit(), 1u);
+    EXPECT_EQ(makeStorageForTest(server.getUrl(), DB::S3Capabilities{false}, 500)->batchDeleteKeyLimit(), 1u);
+
+    auto learning = makeStorageForTest(server.getUrl(), DB::S3Capabilities{}, 500);
+    expectNotImplemented([&]
+    {
+        learning->removeObjectsIfExistUnderProfile(
+            {DB::StoredObject("key-a"), DB::StoredObject("key-b")}, DB::ObjectStorageControlRequest{});
+    });
+    EXPECT_EQ(learning->batchDeleteKeyLimit(), 1u);
+}
+
+namespace
+{
+
+void expectRefusalNamed(const std::function<void()> & remove, const std::string & name)
+{
+    try
+    {
+        remove();
+        FAIL() << "expected an S3Exception named " << name;
+    }
+    catch (const DB::S3Exception & e)
+    {
+        EXPECT_EQ(e.getExceptionName(), name) << e.message();
+    }
+}
+
+const DB::StoredObjects kTwoObjects{DB::StoredObject("key-a"), DB::StoredObject("key-b")};
+
+}
+
+TEST(CASS3BatchDelete, RefusedDeleteObjectsKeepsTheStoresErrorName)
+{
+    (void)contextForTest();
+
+    for (const std::string code : {"EntityTooLarge", "MalformedXML"})
+    {
+        SCOPED_TRACE("whole-request " + code);
+        ScriptedS3Server server([code](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+        {
+            sendSingleDeleteError(response, Poco::Net::HTTPResponse::HTTP_BAD_REQUEST, code, "refused");
+        });
+        auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
+        expectRefusalNamed([&] { storage->removeObjectsIfExistUnderProfile(kTwoObjects, DB::ObjectStorageControlRequest{}); }, code);
+    }
+    {
+        SCOPED_TRACE("per-key EntityTooLarge in a 200 reply");
+        ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+        {
+            sendDeleteObjectsResult(response, {{"key-b", "EntityTooLarge"}});
+        });
+        auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
+        expectRefusalNamed([&] { storage->removeObjectsIfExistUnderProfile(kTwoObjects, DB::ObjectStorageControlRequest{}); }, "EntityTooLarge");
+    }
+    {
+        /// `NoSuchKey` is skipped; the first real error names the exception.
+        SCOPED_TRACE("per-key order: NoSuchKey, AccessDenied, EntityTooLarge");
+        ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+        {
+            sendDeleteObjectsResult(response, {{"key-a", "NoSuchKey"}, {"key-b", "AccessDenied"}, {"key-c", "EntityTooLarge"}});
+        });
+        auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
+        expectRefusalNamed([&] { storage->removeObjectsIfExistUnderProfile(kTwoObjects, DB::ObjectStorageControlRequest{}); }, "AccessDenied");
+    }
+    {
+        SCOPED_TRACE("one-key EntityTooLarge through deleteFileFromS3");
+        ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+        {
+            sendSingleDeleteError(response, Poco::Net::HTTPResponse::HTTP_BAD_REQUEST, "EntityTooLarge", "refused");
+        });
+        auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
+        expectRefusalNamed([&] { storage->removeObjectsIfExistUnderProfile({DB::StoredObject("solo")}, DB::ObjectStorageControlRequest{}); }, "EntityTooLarge");
+        EXPECT_EQ(server.countMethod("DELETE"), 1u);
+    }
 }
 
 #endif

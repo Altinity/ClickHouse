@@ -505,6 +505,10 @@ public:
     /// instance, and the scheduler holds `gc_round_mutex` across both the install and the round.
     void setPhaseSink(GcPhaseSink sink) { phase_sink = std::move(sink); }
 
+    /// Keys per GC write-once delete request: `gc_bulk_delete_chunk_keys` capped by the storage's batch
+    /// limit, clamped to [1, `kBulkDeleteMaxKeys`] because an empty request would never advance.
+    size_t bulkDeleteChunkKeys() const;
+
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
     /// TEST SEAM: disable the round's journal trim so a folded event stays in the journal

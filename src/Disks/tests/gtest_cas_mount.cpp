@@ -1013,6 +1013,7 @@ public:
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
+    size_t bulkDeleteKeyLimit() const override { return inner->bulkDeleteKeyLimit(); }
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value, TransportAccess & access) override
     {
