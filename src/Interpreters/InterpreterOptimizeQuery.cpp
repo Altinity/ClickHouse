@@ -60,7 +60,7 @@ BlockIO InterpreterOptimizeQuery::execute()
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "OPTIMIZE MANIFEST is incompatible with FINAL, PARTITION, DEDUPLICATE, CLEANUP, and DRY RUN options");
 
 #if USE_AVRO
-        IDataLakeMetadata * external_metadata = nullptr;
+        std::shared_ptr<IDataLakeMetadata> external_metadata;
         std::shared_ptr<DataLake::ICatalog> catalog;
 
         auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(table.get());
@@ -81,7 +81,7 @@ BlockIO InterpreterOptimizeQuery::execute()
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "OPTIMIZE MANIFEST is only supported for Iceberg tables");
         }
 
-        auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(external_metadata);
+        auto iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(external_metadata);
         if (!iceberg_metadata)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "OPTIMIZE MANIFEST is only supported for Iceberg tables");
 

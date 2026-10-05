@@ -52,6 +52,7 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
     extern const int INVALID_SETTING_VALUE;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace FailPoints
@@ -119,6 +120,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     , object_storage(object_storage_)
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
+    configuration->check(context_);
 
     const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto");
     const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && catalog;
@@ -184,7 +186,6 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
     else
         validateSupportedColumns(columns, *configuration);
-    configuration->check(context_);
 
     const bool need_resolve_sample_path = context_->getSettingsRef()[Setting::use_hive_partitioning]
         && !configuration->isDataLakeConfiguration()
@@ -868,7 +869,7 @@ StorageMetadataHandle StorageObjectStorageCluster::getInMemoryMetadataPtr(Contex
     return IStorageCluster::getInMemoryMetadataPtr(context, bypass_metadata_cache);
 }
 
-IDataLakeMetadata * StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
+std::shared_ptr<IDataLakeMetadata> StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
 {
     if (getClusterName(query_context).empty())
         return pure_storage->getExternalMetadata(query_context);
