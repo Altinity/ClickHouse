@@ -1361,11 +1361,16 @@ TEST(CASGCCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
         << "every refused graduation must count one unconfirmed carry";
 
     /// Heal the backend: the carry-time retry publishes the marker, the entry confirms + graduates, and
-    /// the pipeline reclaims the blob and drops the meta.
+    /// the pipeline reclaims the blob. The retry stamped a round above the entry's, so the entry's marker
+    /// delete leaves it: an orphan over the absent body.
+    const uint64_t entry_round = e->condemn_round;
     backend->fail_meta_writes.store(false);
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), blob));
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
-    EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), blob).has_value());
+    const auto orphan = loadMetaForTest(*backend, store->layout(), blob);
+    ASSERT_TRUE(orphan.has_value());
+    EXPECT_EQ(orphan->meta.state, MetaState::Condemned);
+    EXPECT_GT(orphan->meta.condemn_round, entry_round);
 }
 
 /// The healthy-path counterpart: with the condemn-time marker write landing normally, the gate must not
@@ -1409,14 +1414,9 @@ TEST(CASGCCondemnMarker, DurableMarkerKeepsCanonicalGraduationSchedule)
     }
 }
 
-/// The leader-restart path: `condemn_markers_confirmed` is a process-local registry on `Gc`, lost on a
-/// GC leader restart. Same idiom as the crash-replay tests above (`Gc gc2(store, kGc)` -- a fresh `Gc`
-/// object under the SAME identity models a process restart that resumes its own lease, not a steal by a
-/// different owner). The fresh instance must still confirm graduation via the ONE synchronous `loadMeta`
-/// re-check: the durable `Condemned` meta observed now is sufficient evidence on its own, with no
-/// in-process (hash, token) confirmation available at all. This proves the fallback branch -- not just
-/// the in-process registry -- authorizes the delete.
-TEST(CASGCCondemnMarker, LoadMetaFallbackConfirmsGraduationAfterLeaderRestart)
+/// The leader-restart path: a fresh `Gc` under the same identity models a process restart that resumes its own
+/// lease. It never observed the condemn round, and still graduates on the durable `Condemned` marker it reads.
+TEST(CASGCCondemnMarker, MarkerReadConfirmsGraduationAfterLeaderRestart)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1429,7 +1429,7 @@ TEST(CASGCCondemnMarker, LoadMetaFallbackConfirmsGraduationAfterLeaderRestart)
 
     {
         /// The first (soon-to-be-gone) leader: seeds the blob, condemns it, and lets the marker write
-        /// land on the healthy backend. Its `condemn_markers_confirmed` registry dies with it.
+        /// land on the healthy backend. Nothing it observed survives it.
         Gc gc(store, kGc);
         runRegularRoundReclaiming(gc);
         dropRefTransition(*backend, store->layout(), ns, "tbl", r);
@@ -1442,15 +1442,11 @@ TEST(CASGCCondemnMarker, LoadMetaFallbackConfirmsGraduationAfterLeaderRestart)
     EXPECT_EQ(lm->meta.state, MetaState::Condemned)
         << "precondition: the durable marker must be on disk before the simulated restart";
 
-    /// A brand-new `Gc` object under the SAME identity -- an empty `condemn_markers_confirmed`, exactly
-    /// as after a process restart that resumes its own lease. It never observed the condemn round above,
-    /// so the in-process confirmation path (`condemnMarkerConfirmedInProcess`) has nothing to return true
-    /// for; only the `loadMeta` fallback can authorize graduation.
+    /// A brand-new `Gc` under the same identity: only the marker read can authorize graduation.
     Gc gc2(store, kGc);
     const RoundReport rep = runRegularRoundReclaiming(gc2);
     EXPECT_EQ(rep.graduated, 1u)
-        << "the loadMeta fallback (leader-restart path) must authorize graduation from durable evidence "
-           "alone";
+        << "after a leader restart the marker read alone must authorize graduation";
     const auto e = currentEntryFor(*backend, store->layout(), blob);
     ASSERT_TRUE(e.has_value());
     EXPECT_TRUE(e->delete_pending);

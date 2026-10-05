@@ -463,10 +463,8 @@ void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & e
     /// no reason (the meta is advisory, but there is no reason to touch it on that path at all).
     if (io.del == Removal::Removed || io.del == Removal::Gone)
     {
-        meta_writer->scheduleConfirmedMetaDelete(entry.ref);
+        meta_writer->scheduleConfirmedMetaDelete(entry.ref, entry.condemn_round);
     }
-    /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
-    meta_writer->forgetCondemnMarker(entry.ref, entry.token);
 }
 
 void Gc::reportRedeleteFailure(
@@ -969,12 +967,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// `PartWriteTxn::ensureBlobPresent`) — the SOLE
             /// `Condemned -> Clean` transition. Clearing here on a
             /// deposed leader that then lost its round CAS would strand a stray-`Clean` over a still-live
-            /// condemned token and lose the reuse to a stale exact-token redelete (INV_NO_LOSS); see
+            /// condemned token and lose the reuse to a stale exact-token redelete (INV_NO_LOSS).
             /// The next `putBlob` self-heals
             /// the marker: `PartWriteTxn::ensureBlobPresent` refuses adoption on `Condemned` and
             /// publishes the writer's source under a fresh envelope.
-            /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
-            meta_writer->forgetCondemnMarker(entry.ref, entry.token);
         }
         for (const RetiredEntry & entry : merge.graduated)
         {
@@ -1016,14 +1012,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                            "incarnation; superseded the stale entry and re-condemned the current token";
                 e.detail = {{"superseded_token", renderIncarnation(replaced.old_token)}};
             });
-            /// The supersede is ALSO a blob entering the retired set fresh (a re-condemn of the
-            /// CURRENT token) — write the meta Condemned exactly like a fresh `head_blob` condemn would,
-            /// so a NEXT writer's point-read gate sees it (and the graduation gate gets its (hash, token)
-            /// confirmation on success). `peek_head` itself stays side-effect-free (it runs once per
-            /// closed candidate, not just on a real supersede — see its own comment). The SUPERSEDED
-            /// (stale) token's in-process confirmation is dropped — that entry left the pipeline.
-            meta_writer->scheduleCondemnMarkerWrite(entry.ref, entry.token, entry.condemn_round, entry.size);
-            meta_writer->forgetCondemnMarker(entry.ref, replaced.old_token);
+            /// The supersede is also a blob entering the retired set: write its marker like a fresh
+            /// `head_blob` condemn, so a writer's point-read sees it. `peek_head` stays side-effect-free.
+            meta_writer->scheduleCondemnMarkerWrite(entry.ref, entry.condemn_round, entry.size);
         }
     }
 
@@ -1980,10 +1971,11 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     std::vector<std::vector<BlobRef>> head_candidates(state.gc_shards);
     size_t head_hint_shard = 0;
     size_t next_head_hint = 0;
+    /// Head hints count only heads, so outstanding graduation reads cannot starve them.
     const auto topUpHeadHints = [&]
     {
         const std::vector<BlobRef> & shard_candidates = head_candidates[head_hint_shard];
-        while (next_head_hint < shard_candidates.size() && reads.pending() < reads.window())
+        while (next_head_hint < shard_candidates.size() && reads.pendingHeads() < reads.window())
             reads.hintHead(layout.blobKey(shard_candidates[next_head_hint++]));
     };
 
@@ -2037,14 +2029,10 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         });
         Meta adjusted = *observed;
         adjusted.size = retiredLogicalSize(ObjectKind::Blob, observed->size, store->poolMeta().blob_header_len);
-        /// This candidate unconditionally becomes a fresh `RetiredEntry` in `closeBlob` (the ONLY
-        /// caller of `head_blob`) whenever this lambda returns a value — so this is exactly the round's
-        /// side-effecting condemn site. Write the meta Condemned so the writer's point-read gate
-        /// sees it; a successful write records the in-process (hash, token) confirmation the graduation
-        /// gate consumes (`scheduleCondemnMarkerWrite` captures everything BY VALUE — never by reference
-        /// to `cur_blob`, which the fold's tight streaming loop mutates while the job is queued).
-        meta_writer->scheduleCondemnMarkerWrite(ref, PersistedEtag::capture(observed->etag),
-                                                condemn_round, adjusted.size);
+        /// This candidate always becomes a fresh `RetiredEntry` in `closeBlob` (the only caller of
+        /// `head_blob`), so this is the round's side-effecting condemn site. The job captures everything by
+        /// value: the fold mutates `cur_blob` while the job is queued.
+        meta_writer->scheduleCondemnMarkerWrite(ref, condemn_round, adjusted.size);
         return adjusted;
     };
 
@@ -2072,43 +2060,37 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         return hr;
     };
 
-    /// Graduation gate (triage 2026-07-17 §3.4): the merge consults this before publishing an entry
-    /// delete_pending. Confirmation sources, in order: the in-process (hash, token) record left by a
-    /// successful `writeCondemnedMeta` completion, then ONE synchronous `loadMeta` re-check — a durable
-    /// `Condemned` meta observed NOW is sufficient evidence, because a writer that same-token adopted
-    /// must have observed a non-Condemned meta EARLIER, its edge (EDGE-BEFORE-OBSERVE) landed before the
-    /// meta turned Condemned, and the redelete only fires from a LATER fold whose cut postdates this
-    /// round — that fold sees the edge and spares. (`BlobMeta` carries no token, so the re-check is
-    /// per-hash by design; the two-phase pipeline + the exact-token delete carry the rest.) No durable
-    /// evidence => count the carry, RETRY the marker write (liveness: a swallowed write would otherwise
-    /// carry forever), and refuse — never throw (an unreadable meta is missing evidence, not a wedge).
+    /// Marker keys admitted to a graduation read and not yet taken: every outstanding hint and the entry at the
+    /// gate. With `graduations_used` it never exceeds the graduation budget.
+    std::unordered_set<String> graduation_reserved;
+
+    /// Graduation gate. Publishing `delete_pending` authorizes an irreversible delete, and the marker is the
+    /// writer's adopt gate, so the marker is read every time, after the round's cut. A writer that adopted saw
+    /// a non-`Condemned` marker before this read; its edge is then in the delete round's cut and spares the
+    /// entry. A refusal carries the entry and rewrites the marker; a failed read is missing evidence and
+    /// never wedges the round.
     const auto confirm_condemned_marker = [&](const RetiredEntry & entry) -> bool
     {
-        if (meta_writer->condemnMarkerConfirmedInProcess(entry.ref, entry.token))
-            return true;
+        const String key = layout.blobMetaKey(entry.ref);
+        graduation_reserved.erase(key);
         try
         {
-            if (const auto lm = loadMeta(op, layout, entry.ref); lm && lm->meta.state == MetaState::Condemned)
-            {
-                meta_writer->noteCondemnMarkerDurable(entry.ref, entry.token);   /// memoize for a round-CAS-abort replay
+            /// An older round may be another incarnation's marker, which that incarnation's delete job may remove.
+            if (const auto lm = decodeLoadedMeta(reads.takeRead(key));
+                lm && lm->meta.state == MetaState::Condemned && lm->meta.condemn_round >= entry.condemn_round)
                 return true;
-            }
         }
         catch (...)
         {
             ProfileEvents::increment(ProfileEvents::CASGCMetaWriteAnomaly);
             tryLogCurrentException(logger,
-                "CAS gc: condemn-marker re-check failed to read the meta (treated as missing evidence; "
-                "the entry is carried, never wedges the round)");
+                "CAS gc: the graduation gate failed to read the condemn marker (the entry is carried; "
+                "never wedges the round)");
         }
         ProfileEvents::increment(ProfileEvents::CASGCCondemnMarkerUnconfirmedCarry);
-        /// Accepted race: this retry writes `Condemned` per-hash, with no token check. If a writer
-        /// resurrected this exact hash under a FRESH token between the original swallowed write and this
-        /// retry, the retry stamps `Condemned` over that writer's live, uncondemned incarnation. This is
-        /// never destructive -- the eventual exact-token delete is a no-op against the fresh token
-        /// (it finds a different incarnation, or none) -- worst case the resurrecting writer's later
-        /// same-token adopter sees stale `Condemned` metadata and republishes once unnecessarily.
-        meta_writer->scheduleCondemnMarkerWrite(entry.ref, entry.token, entry.condemn_round, entry.size);
+        /// This round, not the entry's: a publisher's late `Clean If-Match` names the bytes it read, and on S3
+        /// an entry-round rewrite recreates exactly those bytes.
+        meta_writer->scheduleCondemnMarkerWrite(entry.ref, condemn_round, entry.size);
         return false;
     };
 
@@ -3450,6 +3432,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// the sweep, and a retirement is a removal like any other. The round's cut is frozen well before
     /// this point -- intake has finished and `deltas` has taken its final form -- so no HEAD is issued
     /// before the round knows what it folded.
+    std::set<BlobRef> touched_blobs;
     {
         std::map<std::pair<BlobRef, UInt128>, bool> last_verdict_is_remove;
         for (const BlobDelta & delta : deltas)
@@ -3460,11 +3443,59 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         std::set<BlobRef> removed;
         std::set<BlobRef> surviving_add;
         for (const auto & [edge, is_remove] : last_verdict_is_remove)
+        {
+            /// Only the graduation read-ahead reads the set; the sequential setting has none.
+            if (reads.window() > 0)
+                touched_blobs.insert(edge.first);
             (is_remove ? removed : surviving_add).insert(edge.first);
+        }
         for (const BlobRef & ref : removed)
             if (!surviving_add.contains(ref))
                 head_candidates[blobShard(ref, state.gc_shards)].push_back(ref);
     }
+
+    /// Graduation read-ahead. A carried row that no delta or retirement touches this round has no edge and is
+    /// not superseded, so it reaches the gate; its read is hinted once the budget admits it. Hints are issued in
+    /// the merge, after intake, and the fold writes no marker of a hinted hash before the gate takes the read.
+    const auto graduationBudgetFull = [&]
+    {
+        return work_budget.max_graduations != 0
+            && work_budget.graduations_used + graduation_reserved.size() >= work_budget.max_graduations;
+    };
+    const GraduationReadHints graduation_hints{
+        .admit = [&](const BlobRef & ref)
+        {
+            const String key = layout.blobMetaKey(ref);
+            if (graduation_reserved.contains(key))
+                return true;
+            if (graduationBudgetFull())
+                return false;
+            if (graduation_reserved.size() < reads.window())
+                reads.hintRead(key);
+            graduation_reserved.insert(key);
+            return true;
+        },
+        .offer = [&](const BlobRef & ref, const CondemnedRow & row)
+        {
+            if (row.delete_pending || row.condemn_round >= current_round || suppress_destructive)
+                return true;
+            /// A touched row may still reach the gate; reserving past it would let later rows take its budget slot.
+            if (touched_blobs.contains(ref))
+                return false;
+            if (graduationBudgetFull() || graduation_reserved.size() >= reads.window())
+                return false;
+            if (const String key = layout.blobMetaKey(ref); graduation_reserved.insert(key).second)
+                reads.hintRead(key);
+            return true;
+        }};
+    const GraduationReadHints * graduation_reads = reads.window() > 0 ? &graduation_hints : nullptr;
+    /// A reservation left after a shard's merge belongs to no gate.
+    const auto discardGraduationReads = [&]
+    {
+        for (const String & key : graduation_reserved)
+            reads.discardRead(key);
+        graduation_reserved.clear();
+    };
 
     if (state.gc_shards == 1)
     {
@@ -3490,7 +3521,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                                      confirm_condemned_marker,
                                      result.retired_merge.data(), suppress_destructive,
                                      &ledger.applied, std::move(orphan_source_retirements),
-                                     &work_budget);
+                                     &work_budget, graduation_reads);
+            discardGraduationReads();
             result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
         }
     }
@@ -3534,7 +3566,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 confirm_condemned_marker,
                 &result.retired_merge[shard], suppress_destructive,
                 &ledger.applied, std::move(retirement_buckets[shard]),
-                &work_budget);
+                &work_budget, graduation_reads);
+            discardGraduationReads();
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
             result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
