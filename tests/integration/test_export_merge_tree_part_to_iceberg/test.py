@@ -219,7 +219,7 @@ def test_export_part_all_iceberg_types(cluster):
         float         f32       Float32
         double        f64       Float64
         date          event_dt  Date
-        timestamp     ts        DateTime64(6)   (DateTime / DateTime64 both → "timestamp")
+        timestamp     ts        DateTime64(6)   (DateTime / DateTime64(scale<=6) → "timestamp"; DateTime64(9) → "timestamp_ns")
         string        name      String
         uuid          uid_val   UUID
 
