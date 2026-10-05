@@ -85,7 +85,7 @@ public:
 
     bool supportsImport(ContextPtr) const override;
 
-    SinkToStoragePtr import(
+    ImportResult import(
         const std::string & /* file_name */,
         Block & /* block_with_partition_values */,
         const std::function<void(const std::string &)> & new_file_path_callback,
@@ -173,6 +173,8 @@ public:
     void updateExternalDynamicMetadataIfExists(ContextPtr query_context) override;
 
     IDataLakeMetadata * getExternalMetadata(ContextPtr query_context);
+
+    std::shared_ptr<DataLake::ICatalog> getCatalog() const { return catalog; }
 
     std::optional<UInt64> totalRows(ContextPtr query_context) const override;
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;

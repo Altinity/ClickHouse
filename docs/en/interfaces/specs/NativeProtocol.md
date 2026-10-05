@@ -426,7 +426,7 @@ Client → Server. The first message after the TCP connection opens.
 
 | # | Field            | Type    | Role      | Description |
 |---|------------------|---------|-----------|-------------|
-| 1 | client_name      | String  | universal | Client identifier (e.g., `"clickhouse-client"`) |
+| 1 | client_name      | String  | universal | Client identifier (e.g., `"clickhouse-client"`). An Altinity Antalya build appends `" (antalya:N)"`, where `N` is its Antalya protocol version. See [Antalya protocol version](/antalya/protocol). |
 | 2 | version_major    | VarUInt | universal | Client major version |
 | 3 | version_minor    | VarUInt | universal | Client minor version |
 | 4 | protocol_version | VarUInt | universal | Client's max supported protocol version |
@@ -440,7 +440,7 @@ Server → Client. The reply to ClientHello on successful authentication.
 
 | # | Field            | Type    | Role      | Condition              | Description |
 |---|------------------|---------|-----------|------------------------|-------------|
-| 1 | server_name      | String  | universal | always                 | Server identifier |
+| 1 | server_name      | String  | universal | always                 | Server identifier. An Altinity Antalya build appends `" (antalya:N)"`, where `N` is its Antalya protocol version; a client may ignore or strip the suffix. See [Antalya protocol version](/antalya/protocol). |
 | 2 | version_major    | VarUInt | universal | always                 | Server major version |
 | 3 | version_minor    | VarUInt | universal | always                 | Server minor version |
 | 4 | protocol_version | VarUInt | universal | always                 | Server's protocol version |

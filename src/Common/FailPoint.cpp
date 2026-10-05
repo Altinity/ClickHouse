@@ -35,6 +35,8 @@ static struct InitFiu
     ONCE(replicated_merge_tree_commit_zk_fail_after_op) \
     ONCE(replicated_queue_fail_next_entry) \
     REGULAR(replicated_queue_unfail_entries) \
+    ONCE(transaction_metadata_store_fail) \
+    ONCE(transaction_mutation_csn_store_fail) \
     ONCE(replicated_merge_tree_insert_quorum_fail_0) \
     REGULAR(replicated_merge_tree_commit_zk_fail_when_recovering_from_hw_fault) \
     REGULAR(rmt_dedup_conflict_part_name_missing) \
@@ -241,7 +243,9 @@ static struct InitFiu
     REGULAR(cas_relink_receiver_force_mechanism_failure) \
     PAUSEABLE_ONCE(cas_relink_receiver_pause_before_confirm) \
     REGULAR(cas_relink_sender_omit_pool_cookie) \
-    REGULAR(cas_relink_receiver_drop_forced_disk)
+    REGULAR(cas_relink_receiver_drop_forced_disk) \
+    ONCE(cas_gc_scheduler_fail_before_heartbeat_worker_start) \
+    ONCE(cas_gc_scheduler_fail_before_worker_start)
 
 namespace FailPoints
 {

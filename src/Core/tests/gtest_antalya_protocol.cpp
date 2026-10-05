@@ -1,0 +1,40 @@
+#include <gtest/gtest.h>
+
+#include <Core/AntalyaProtocol.h>
+
+using namespace DB;
+using namespace DB::AntalyaProtocol;
+
+TEST(AntalyaProtocol, AppendMarkerSpellsTheWireForm)
+{
+    EXPECT_EQ(
+        appendMarker("ClickHouse server"),
+        "ClickHouse server (antalya:" + std::to_string(DBMS_ANTALYA_PROTOCOL_VERSION) + ")");
+}
+
+TEST(AntalyaProtocol, RejectsInvalidMarkers)
+{
+    const String rejected[] = {
+        "",
+        "ClickHouse server",
+        "ClickHouse server (antalya:1",
+        "ClickHouse server (antalya:0)",
+        "ClickHouse server (antalya:01)",
+        "ClickHouse server (antalya:1234567890)",
+        "ClickHouse server (antalya:1x)",
+    };
+
+    for (auto name : rejected)
+        EXPECT_EQ(parseMarker(name), 0u) << "should not have parsed: " << name;
+}
+
+TEST(AntalyaProtocol, RemoveMarkerRemovesOnlyAValidMarker)
+{
+    EXPECT_EQ(removeMarker(appendMarker("ClickHouse client")), "ClickHouse client");
+    EXPECT_EQ(removeMarker("ClickHouse client (antalya:0)"), "ClickHouse client (antalya:0)");
+}
+
+TEST(AntalyaProtocol, ParsesMarkerAndCapsVersion)
+{
+    EXPECT_EQ(parseMarker("ClickHouse server (antalya:999999999)"), static_cast<UInt64>(DBMS_ANTALYA_PROTOCOL_VERSION));
+}

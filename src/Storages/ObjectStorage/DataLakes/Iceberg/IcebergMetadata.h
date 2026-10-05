@@ -52,6 +52,7 @@ struct IcebergFileRecord
     std::map<Int32, Int64> column_sizes;
     std::map<Int32, Int64> value_counts;
     std::vector<Int32> equality_ids;
+    std::optional<UInt64> first_row_id;
 };
 
 class IcebergMetadata : public IDataLakeMetadata
@@ -181,6 +182,11 @@ public:
     std::string getTableLocation() const override { return persistent_components.table_location; }
 
     bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override;
+    bool optimizeManifestFiles(
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & storage_id);
     bool supportsDelete() const override { return true; }
     void mutate(
         const MutationCommands & commands,

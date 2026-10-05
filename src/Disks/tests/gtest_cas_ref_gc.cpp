@@ -197,7 +197,7 @@ public:
     }
 
     /// `read` also runs on the GC read-ahead pool's threads (`CasGcReadAhead.cpp` schedules
-    /// `CasOperation::read` there; `gc_read_concurrency` defaults to 16), concurrently with the round
+    /// `CasOperation::read` there; `gc_io_concurrency` defaults to 16), concurrently with the round
     /// thread's own reads -- `catalog_seam_armed` and `last_control_key_read` below are shared mutable
     /// state a pool thread's read can land between `authorityHolds`'s two reads, so both are read AND
     /// written only under `seam_mutex`. `last_control_key_read` tracks only the catalog and `gc/state`
