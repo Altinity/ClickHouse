@@ -16,7 +16,7 @@ namespace DB
 
 namespace ErrorCodes
 {
-    /// ErrorCode identifier (index in array).
+    /// Numeric error identity, including the code transmitted to peers; not a storage index.
     using ErrorCode = int;
     using Value = size_t;
     using FramePointers = std::vector<void *>;
@@ -65,11 +65,19 @@ namespace ErrorCodes
         std::mutex mutex;
     };
 
-    /// ErrorCode identifier -> current value of error_code.
+    /// Upstream numeric code -> counters. Antalya codes must not index this array.
     extern ErrorPairHolder values[];
 
-    /// Get index just after last error_code identifier.
+    /// Get the upstream array boundary, including the unnamed out-of-range accounting slot.
     ErrorCode end();
+
+    /// Number of counter slots, including upstream holes and the unnamed accounting sentinel.
+    /// Antalya entries occupy compact slots after the upstream array.
+    size_t size();
+    /// Translate a storage index into the actual error code. The index must be less than `size`.
+    ErrorCode getCode(size_t index);
+    /// Access counters by storage index, not by numeric error identity.
+    ErrorPairHolder & getValue(size_t index);
 
     /// Increments the counter of errors for a specified error code, and remembers some information about the last error.
     /// The function returns the index of the passed error among other errors with the same code and the same `remote` flag

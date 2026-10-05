@@ -1,7 +1,11 @@
 #include <Common/CurrentThread.h>
+#include <Common/AntalyaErrorCodes.h>
 #include <Common/ErrorCodes.h>
 #include <Common/Exception.h>
 #include <chrono>
+#include <algorithm>
+#include <array>
+#include <limits>
 
 /** Previously, these constants were located in one enum.
   * But in this case there is a problem: when you add a new constant, you need to recompile
@@ -658,7 +662,6 @@
     M(776, RESOURCE_LIMIT_EXCEEDED) \
     M(777, MEMORY_RESERVATION_KILLED) \
     M(778, MEMORY_RESERVATION_FAILED) \
-    M(779, CATALOG_NAMESPACE_DISABLED) \
 \
     M(900, DISTRIBUTED_CACHE_ERROR) \
     M(901, CANNOT_USE_DISTRIBUTED_CACHE) \
@@ -676,19 +679,6 @@
     M(1006, INVALID_CURSOR_LOOKUP) \
     M(1007, ILLEGAL_STREAM) \
     M(1008, TEMPORARY_DATA_NOT_IN_CACHE) \
-    M(1009, PENDING_MUTATIONS_NOT_ALLOWED) \
-    /* 1010 and 1011 predate the fork's error-code range policy stated below, and are kept as-is \
-     * rather than renumbered: they currently collide with upstream ClickHouse's own 1010 \
-     * (UNIQUE_KEY_DENSE_INDEX_UNREADABLE) and 1011 (HANDLER_ALREADY_EXISTS). */ \
-    M(1010, EXPORT_PARTITION_ALREADY_EXPORTED) \
-    M(1011, PARTITION_EXPORT_FAILED) \
-    /* 1012 and 1013 are intentionally skipped: they collide with upstream ClickHouse's \
-     * HANDLER_DOESNT_EXIST and AMBIGUOUS_HANDLER. Fork-specific error codes live in the 1030-1099 \
-     * range, chosen to sit well above upstream's maximum error code (1017 at the time this range \
-     * was reserved) so upstream can keep adding codes below it without colliding with the fork's. \
-     * A new fork error code goes in this range, not below 1030. CAS codes occupy 1037-1038. */ \
-    M(1037, CAS_WRITE_UNATTRIBUTED) \
-    M(1038, CAS_DELETE_MARKER) \
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -705,7 +695,21 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
-    constexpr ErrorCode END = 1038;
+#define M(ID, NAME) extern const ErrorCode NAME = ANTALYA_ERROR_CODE_BASE + ID;
+    APPLY_FOR_ANTALYA_ERROR_CODES(M)
+#undef M
+
+    constexpr ErrorCode getUpstreamEnd()
+    {
+        ErrorCode maximum = 0;
+#define M(VALUE, NAME) maximum = std::max(maximum, ErrorCode{VALUE});
+        APPLY_FOR_ERROR_CODES(M)
+#undef M
+        return maximum + 1;
+    }
+
+    constexpr ErrorCode END = getUpstreamEnd();
+    static_assert(END < ANTALYA_ERROR_CODE_BASE, "Upstream range overlaps the Antalya range");
     ErrorPairHolder values[END + 1]{};
 
     struct ErrorCodesNames
@@ -719,52 +723,121 @@ namespace ErrorCodes
         }
     } static error_codes_names;
 
+    namespace
+    {
+        struct Entry
+        {
+            ErrorCode code;
+            std::string_view name;
+        };
+
+        constexpr auto antalya_entries = std::to_array<Entry>({
+#define M(ID, NAME) Entry{ANTALYA_ERROR_CODE_BASE + ID, #NAME},
+            APPLY_FOR_ANTALYA_ERROR_CODES(M)
+#undef M
+        });
+
+        constexpr bool validateAntalyaIds()
+        {
+            Int64 previous_id = 0;
+#define M(ID, NAME) \
+            if (Int64{ID} <= previous_id || Int64{ID} > std::numeric_limits<UInt16>::max() - Int64{ANTALYA_ERROR_CODE_BASE}) \
+                return false; \
+            previous_id = ID;
+            APPLY_FOR_ANTALYA_ERROR_CODES(M)
+#undef M
+            return true;
+        }
+        static_assert(validateAntalyaIds(), "Antalya IDs must be positive, ordered, unique, and fit UInt16 log columns");
+
+        constexpr bool validateAntalyaNames()
+        {
+            for (size_t index = 0; index < antalya_entries.size(); ++index)
+            {
+                const auto name = antalya_entries[index].name;
+                for (size_t previous = 0; previous < index; ++previous)
+                {
+                    if (name == antalya_entries[previous].name)
+                        return false;
+                }
+#define M(VALUE, NAME) if (name == std::string_view(#NAME)) return false;
+                APPLY_FOR_ERROR_CODES(M)
+#undef M
+            }
+            return true;
+        }
+        static_assert(validateAntalyaNames(), "Antalya error names must be unique and distinct from upstream names");
+
+        std::array<ErrorPairHolder, antalya_entries.size()> antalya_values;
+
+        size_t getIndex(ErrorCode code)
+        {
+            if (code >= 0 && code <= END)
+                return code;
+            for (size_t index = 0; index < antalya_entries.size(); ++index)
+            {
+                if (antalya_entries[index].code == code)
+                    return END + 1 + index;
+            }
+            /// Preserve out-of-range accounting without attributing it to a registered error.
+            return END;
+        }
+    }
+
     std::string_view getName(ErrorCode error_code)
     {
-        if (error_code < 0 || error_code > END)
-            return std::string_view();
-        return error_codes_names.names[error_code];
+        if (error_code >= 0 && error_code <= END)
+            return error_codes_names.names[error_code];
+        for (const auto & entry : antalya_entries)
+        {
+            if (entry.code == error_code)
+                return entry.name;
+        }
+        return {};
     }
 
     ErrorCode getErrorCodeByName(std::string_view error_name)
     {
-        for (int i = 0, end = ErrorCodes::end(); i < end; ++i)
+        for (size_t index = 0; index < size(); ++index)
         {
-            std::string_view name = ErrorCodes::getName(i);
+            const auto code = getCode(index);
+            std::string_view name = getName(code);
 
             if (name.empty())
                 continue;
 
             if (name == error_name)
-                return i;
+                return code;
         }
         throw Exception(NO_SUCH_ERROR_CODE, "No error code with name: '{}'", error_name);
     }
 
     ErrorCode end() { return END + 1; }
 
+    size_t size() { return end() + antalya_entries.size(); }
+
+    ErrorCode getCode(size_t index)
+    {
+        if (index < static_cast<size_t>(end()))
+            return static_cast<ErrorCode>(index);
+        return antalya_entries.at(index - end()).code;
+    }
+
+    ErrorPairHolder & getValue(size_t index)
+    {
+        if (index < static_cast<size_t>(end()))
+            return values[index];
+        return antalya_values.at(index - end());
+    }
+
     size_t increment(ErrorCode error_code, bool remote, const std::string & message, const std::string & format_string, const FramePointers & trace)
     {
-        if (error_code < 0 || error_code >= end())
-        {
-            /// For everything outside the range, use END.
-            /// (end() is the pointer pass the end, while END is the last value that has an element in values array).
-            error_code = end() - 1;
-        }
-
-        return values[error_code].increment(remote, message, format_string, trace);
+        return getValue(getIndex(error_code)).increment(remote, message, format_string, trace);
     }
 
     void extendedMessage(ErrorCode error_code, bool remote, size_t error_index, const std::string & message)
     {
-        if (error_code < 0 || error_code >= end())
-        {
-            /// For everything outside the range, use END.
-            /// (end() is the pointer pass the end, while END is the last value that has an element in values array).
-            error_code = end() - 1;
-        }
-
-        values[error_code].extendedMessage(remote, error_index, message);
+        getValue(getIndex(error_code)).extendedMessage(remote, error_index, message);
     }
 
     size_t ErrorPairHolder::increment(bool remote, const std::string & message, const std::string & format_string, const FramePointers & trace)
