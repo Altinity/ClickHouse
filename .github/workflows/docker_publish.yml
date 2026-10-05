@@ -50,14 +50,17 @@ jobs:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     outputs:
       image_archives_path: ${{ steps.set_path.outputs.image_archives_path }}
+      component: ${{ steps.image_info.outputs.component }}
+      published_image: ${{ steps.image_info.outputs.published_image }}
     steps:
       - name: Docker Hub Login
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
       - name: Set clickhouse-server version as new tag
+        id: image_info
         run: |
           # Determine "clickhouse-server" or "clickhouse-keeper"
           echo "Input IMAGE: $IMAGE"
@@ -86,10 +89,15 @@ jobs:
           if [[ "$IMAGE" == *-alpine* ]]; then
             NEW_TAG="${NEW_TAG}-alpine"
           fi
+          if [[ "$IMAGE" == *-ubi9* ]]; then
+            NEW_TAG="${NEW_TAG}-ubi9"
+          fi
           echo "New tag: $NEW_TAG"
 
           # Export the new tag
           echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
+          echo "component=$COMPONENT" >> $GITHUB_OUTPUT
+          echo "published_image=altinity/$COMPONENT:$NEW_TAG" >> $GITHUB_OUTPUT
 
       - name: Process multiarch manifest
         run: |
@@ -148,3 +156,56 @@ jobs:
         run: |
           aws s3 sync image_archives/ "${{ inputs.s3_upload_path }}"
 
+  redhat-certification:
+    name: Submit Red Hat container certification
+    needs: republish
+    if: ${{ vars.RED_HAT_CERTIFICATION_ENABLED == 'true' && (github.event.inputs.release_environment || inputs.release_environment) == 'production' && contains(github.event.inputs.docker_image || inputs.docker_image, '-ubi9') }}
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    env:
+      PREFLIGHT_VERSION: 1.21.0
+      PREFLIGHT_SHA256: 5e653135503c72f8702bbe31d7643197d12937c68086879133dd6b9650a9a449
+      PYXIS_API_TOKEN: ${{ secrets.RED_HAT_PYXIS_API_TOKEN }}
+      SERVER_COMPONENT_ID: ${{ secrets.RED_HAT_CLICKHOUSE_SERVER_CERTIFICATION_COMPONENT_ID }}
+      KEEPER_COMPONENT_ID: ${{ secrets.RED_HAT_CLICKHOUSE_KEEPER_CERTIFICATION_COMPONENT_ID }}
+      PUBLISHED_IMAGE: ${{ needs.republish.outputs.published_image }}
+      COMPONENT: ${{ needs.republish.outputs.component }}
+    steps:
+      - name: Install Preflight
+        run: |
+          set -euo pipefail
+          curl -fsSLo /tmp/preflight \
+            "https://github.com/redhat-openshift-ecosystem/openshift-preflight/releases/download/${PREFLIGHT_VERSION}/preflight-linux-amd64"
+          echo "${PREFLIGHT_SHA256}  /tmp/preflight" | sha256sum --check
+          sudo install -m 0755 /tmp/preflight /usr/local/bin/preflight
+
+      - name: Submit immutable multiarch image
+        run: |
+          set -euo pipefail
+          : "${PYXIS_API_TOKEN:?Set the RED_HAT_PYXIS_API_TOKEN secret}"
+          case "${COMPONENT}" in
+            clickhouse-server) component_id="${SERVER_COMPONENT_ID}" ;;
+            clickhouse-keeper) component_id="${KEEPER_COMPONENT_ID}" ;;
+            *) echo "Unknown component: ${COMPONENT}" >&2; exit 1 ;;
+          esac
+          : "${component_id:?Set the matching Red Hat certification component secret}"
+          digest=$(docker buildx imagetools inspect \
+            "${PUBLISHED_IMAGE}" --format '{{.Manifest.Digest}}')
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          pinned_image="${PUBLISHED_IMAGE%:*}@${digest}"
+          mkdir -p preflight-artifacts
+          PFLT_ARTIFACTS=preflight-artifacts \
+          PFLT_LOGFILE=preflight.log \
+          PFLT_PYXIS_API_TOKEN="${PYXIS_API_TOKEN}" \
+          PFLT_CERTIFICATION_COMPONENT_ID="${component_id}" \
+            preflight check container "${pinned_image}" --submit
+
+      - name: Upload certification evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: redhat-certification-${{ needs.republish.outputs.component }}-${{ github.run_id }}
+          path: |
+            preflight-artifacts/
+            preflight.log
+          if-no-files-found: warn
+          retention-days: 365

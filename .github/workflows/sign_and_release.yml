@@ -276,7 +276,7 @@ jobs:
     strategy:
       matrix:
         image_type: [server, keeper]
-        variant: ['', '-alpine']
+        variant: ['', '-alpine', '-ubi9']
     uses: ./.github/workflows/docker_publish.yml
     with:
       docker_image: altinityinfra/clickhouse-${{ matrix.image_type }}:${{ needs.extract-package-info.outputs.docker_version }}${{ matrix.variant }}

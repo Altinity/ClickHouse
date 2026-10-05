@@ -70,8 +70,8 @@ def docker_login(relogin: bool = True) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="A program to build clickhouse-server image, both alpine and "
-        "ubuntu versions",
+        description="Build the supported clickhouse-server and clickhouse-keeper "
+        "container image variants",
     )
     parser.add_argument(
         "--tag-type",
@@ -101,7 +101,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--reports", default=True, help=argparse.SUPPRESS)
     parser.add_argument("--push", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--os", default=["ubuntu", "alpine", "distroless"], help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--os",
+        default=["ubuntu", "alpine", "distroless", "ubi9"],
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--no-ubuntu",
         action=DelOS,
@@ -122,6 +126,13 @@ def parse_args() -> argparse.Namespace:
         nargs=0,
         default=argparse.SUPPRESS,
         help="don't build distroless image",
+    )
+    parser.add_argument(
+        "--no-ubi9",
+        action=DelOS,
+        nargs=0,
+        default=argparse.SUPPRESS,
+        help="don't build UBI 9 image",
     )
     parser.add_argument(
         "--allow-build-reuse",
@@ -219,11 +230,12 @@ def build_and_push_image(
         arch_tag = f"{tag}-{arch}"
         metadata_path = temp_path / arch_tag
         dockerfile = f"{image.path}/Dockerfile.{os}"
+        build_context = "." if os == "ubi9" else image.path
         cmd_args = list(init_args)
         urls = []
         if direct_urls:
             # distroless and ubuntu-server use an Ubuntu builder with dpkg, so they
-            # need .deb packages. alpine and ubuntu-keeper use .tgz packages.
+            # need .deb packages. Alpine, UBI, and ubuntu-keeper use .tgz packages.
             uses_deb = os == "distroless" or (
                 os == "ubuntu" and "clickhouse-server" in image.name
             )
@@ -259,7 +271,7 @@ def build_and_push_image(
                 f"--build-arg=VERSION='{version}'",
                 "--progress=plain",
                 f"--file={dockerfile}",
-                Path(image.path).as_posix(),
+                Path(build_context).as_posix(),
             ]
         )
         cmd = " ".join(cmd_args)
