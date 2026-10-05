@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Access/ForwardedAuthToken.h>
 #include <Core/NamesAndTypes.h>
 #include <Core/Types.h>
 #include <Interpreters/Context_fwd.h>
@@ -18,5 +19,7 @@ DB::DataTypePtr getType(const String & type_name, bool nullable, DB::ContextPtr 
 /// `A.B.C.D` is a table "namespace".
 /// `E` is a table name.
 std::pair<std::string, std::string> parseTableName(const std::string & name);
+
+DB::ForwardedAuthTokenPtr getForwardedAuthToken(const DB::ContextPtr & context);
 
 }

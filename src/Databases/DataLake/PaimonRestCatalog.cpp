@@ -413,7 +413,7 @@ void PaimonRestCatalog::forEachTables(
 }
 
 
-bool PaimonRestCatalog::empty() const
+bool PaimonRestCatalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     DB::Strings databases;
     DB::Names tables;
@@ -427,7 +427,7 @@ bool PaimonRestCatalog::empty() const
     return tables.empty();
 }
 
-DB::Names PaimonRestCatalog::getTables() const
+DB::Names PaimonRestCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     DB::Strings databases;
     DB::Names tables;
@@ -436,7 +436,7 @@ DB::Names PaimonRestCatalog::getTables() const
     return tables;
 }
 
-bool PaimonRestCatalog::existsTable(const String & database_name, const String & table_name) const
+bool PaimonRestCatalog::existsTable(const String & database_name, const String & table_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     try
     {

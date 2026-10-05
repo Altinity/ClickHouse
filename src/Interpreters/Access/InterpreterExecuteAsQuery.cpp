@@ -64,6 +64,9 @@ namespace
 
         context->setUser(context->getAccessControl().getID<User>(target_user_name));
 
+        /// `EXECUTE AS` changes the session identity; the original bearer token must not survive it.
+        context->setForwardedAuthToken(nullptr);
+
         /// We need to update the client info to make currentUser() return `target_user_name`.
         context->setCurrentUserName(target_user_name);
         context->setInitialUserName(target_user_name);

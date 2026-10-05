@@ -1,5 +1,7 @@
 #include <Databases/DataLake/Common.h>
 
+#include <Interpreters/Context.h>
+
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -108,6 +110,13 @@ DB::DataTypePtr getType(const String & type_name, bool nullable, DB::ContextPtr 
 
     return nullable ? DB::makeNullable(DB::Iceberg::IcebergSchemaProcessor::getSimpleType(name, context))
                     : DB::Iceberg::IcebergSchemaProcessor::getSimpleType(name, context);
+}
+
+DB::ForwardedAuthTokenPtr getForwardedAuthToken(const DB::ContextPtr & context)
+{
+    if (!context)
+        return {};
+    return context->getForwardedAuthToken();
 }
 
 std::pair<std::string, std::string> parseTableName(const std::string & name)
