@@ -74,7 +74,12 @@ void MultipleFileWriter::startNewFile()
 
 void MultipleFileWriter::consume(const Chunk & chunk)
 {
-    if (!current_file_num_rows || *current_file_num_rows >= max_data_file_num_rows || *current_file_num_bytes >= max_data_file_num_bytes)
+    /// A zero limit means "no limit": with a plain `>=` comparison it would roll over to a new
+    /// file after the first written chunk, splitting the output into one file per chunk.
+    const bool has_open_file = current_file_num_rows.has_value();
+    const bool row_limit_reached = has_open_file && max_data_file_num_rows > 0 && *current_file_num_rows >= max_data_file_num_rows;
+    const bool bytes_limit_reached = has_open_file && max_data_file_num_bytes > 0 && *current_file_num_bytes >= max_data_file_num_bytes;
+    if (!has_open_file || row_limit_reached || bytes_limit_reached)
     {
         startNewFile();
     }

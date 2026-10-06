@@ -299,13 +299,39 @@ bool writeMetadataFileAndVersionHint(
     DB::ContextPtr context,
     bool try_write_version_hint)
 {
+    return tryWriteMetadataFileAndVersionHint(
+               resolver, metadata_file_info, metadata_file_content, version_hint_path, object_storage, context, try_write_version_hint)
+        == MetadataCommitResult::Committed;
+}
+
+MetadataCommitResult tryWriteMetadataFileAndVersionHint(
+    const IcebergPathResolver & resolver,
+    const GeneratedMetadataFileWithInfo & metadata_file_info,
+    const std::string & metadata_file_content,
+    const IcebergPathFromMetadata & version_hint_path,
+    DB::ObjectStoragePtr object_storage,
+    DB::ContextPtr context,
+    bool try_write_version_hint)
+{
     auto storage_metadata_path = resolver.resolve(metadata_file_info.path);
     auto storage_version_hint_path = resolver.resolve(version_hint_path);
+
+    bool metadata_exists = false;
     try
     {
-        if (object_storage->exists(StoredObject(storage_metadata_path)))
-            return false;
+        metadata_exists = object_storage->exists(StoredObject(storage_metadata_path));
+    }
+    catch (...)
+    {
+        /// Nothing has been written yet.
+        tryLogCurrentException(__PRETTY_FUNCTION__);
+        return MetadataCommitResult::Conflict;
+    }
+    if (metadata_exists)
+        return MetadataCommitResult::Conflict;
 
+    try
+    {
         Iceberg::writeMessageToFile(
             metadata_file_content,
             storage_metadata_path,
@@ -317,8 +343,9 @@ bool writeMetadataFileAndVersionHint(
     }
     catch (...)
     {
+        /// Covers both a lost If-None-Match race and a write whose outcome is unknown (e.g. a timeout).
         tryLogCurrentException(__PRETTY_FUNCTION__);
-        return false;
+        return MetadataCommitResult::Unknown;
     }
 
     /// Once any writer has created `version-hint.text`, every subsequent writer must keep it in
@@ -383,7 +410,7 @@ bool writeMetadataFileAndVersionHint(
         ++i;
     }
 
-    return true;
+    return MetadataCommitResult::Committed;
 }
 
 

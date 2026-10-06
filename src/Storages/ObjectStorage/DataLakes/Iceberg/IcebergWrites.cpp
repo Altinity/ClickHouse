@@ -723,10 +723,16 @@ void generateManifestFile(
         const DataFileEntryLineage * entry_lineage
             = per_file_entry_lineage.empty() ? nullptr : &per_file_entry_lineage[file_idx];
 
-        manifest.field(Iceberg::f_status)
-            = avro::GenericDatum(entry_lineage ? static_cast<Int32>(ManifestEntryStatus::EXISTING)
-                                               : static_cast<Int32>(ManifestEntryStatus::ADDED));
-        Int64 snapshot_id = (entry_lineage && entry_lineage->added_snapshot_id)
+        ManifestEntryStatus entry_status;
+        if (entry_lineage && entry_lineage->status_override)
+            entry_status = *entry_lineage->status_override;
+        else if (entry_lineage)
+            entry_status = ManifestEntryStatus::EXISTING;
+        else
+            entry_status = ManifestEntryStatus::ADDED;
+        manifest.field(Iceberg::f_status) = avro::GenericDatum(static_cast<Int32>(entry_status));
+        /// The spec defines `snapshot_id` of a DELETED entry as the snapshot that deleted the file.
+        Int64 snapshot_id = (entry_status != ManifestEntryStatus::DELETED && entry_lineage && entry_lineage->added_snapshot_id)
             ? *entry_lineage->added_snapshot_id
             : new_snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);
 
@@ -1146,14 +1152,14 @@ void generateManifestList(
         auto summary = new_snapshot->getObject(Iceberg::f_summary);
         if (manifest_only_rewrite)
         {
-            /// Manifest-only rewrite (`replace`): data files already existed, so they are reported as existing, not added.
+            /// Rewrite (`replace`): the caller supplies counts matching the entry statuses it wrote.
             const auto & counts = existing_entry_counts[entry_idx];
-            setVersionedField(entry, 0, Iceberg::f_added_files_count);
-            setVersionedField(entry, counts.existing_files_count, Iceberg::f_existing_files_count);
-            setVersionedField(entry, 0, Iceberg::f_deleted_files_count);
-            setVersionedField(entry, 0, Iceberg::f_added_rows_count);
+            setVersionedField(entry, static_cast<Int32>(counts.added_files_count), Iceberg::f_added_files_count);
+            setVersionedField(entry, static_cast<Int32>(counts.existing_files_count), Iceberg::f_existing_files_count);
+            setVersionedField(entry, static_cast<Int32>(counts.deleted_files_count), Iceberg::f_deleted_files_count);
+            setVersionedField(entry, counts.added_rows_count, Iceberg::f_added_rows_count);
             setVersionedField(entry, counts.existing_rows_count, Iceberg::f_existing_rows_count);
-            setVersionedField(entry, 0, Iceberg::f_deleted_rows_count);
+            setVersionedField(entry, counts.deleted_rows_count, Iceberg::f_deleted_rows_count);
 
             /// Recompute the `partitions` summary so pruning bounds survive the rewrite (lower_bound == upper_bound per field).
             if (!entry_partition_summaries.empty())
