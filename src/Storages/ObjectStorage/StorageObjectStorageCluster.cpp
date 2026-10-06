@@ -635,7 +635,7 @@ public:
             sleepForSeconds(10);
         });
 
-        const bool worker_supports_task_retry = antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY;
+        const bool worker_supports_task_retry = antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS;
         auto task = task_distributor.getNextTask(number_of_current_replica, worker_supports_task_retry);
         if (task.retry_after_us)
         {

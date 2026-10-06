@@ -7,12 +7,11 @@
 namespace DB
 {
 
-/// 2 — `ReadTaskResponse` carries optional `DataFileMetaInfo` after the upstream payload.
-static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO = 2;
-/// 3 — `ReadTaskResponse` carries optional `retry_after_us` after the version 2 trailer.
-static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY = 3;
+/// 2 — `ReadTaskResponse` carries optional `DataFileMetaInfo`, then optional `retry_after_us`,
+/// after the upstream payload. Both fields ship in the same release.
+static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS = 2;
 /// Bump for every Antalya-only wire protocol change. See `docs/en/antalya/protocol.md`.
-static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION = DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY;
+static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION = DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS;
 
 namespace AntalyaProtocol
 {

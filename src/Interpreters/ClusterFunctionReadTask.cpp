@@ -189,7 +189,7 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
         }
     }
 
-    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO)
+    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS)
     {
         if (file_meta_info && *file_meta_info)
         {
@@ -200,10 +200,7 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
         {
             writeVarUInt(0, out);
         }
-    }
 
-    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY)
-    {
         if (retry_after_us)
         {
             writeVarUInt(1, out);
@@ -268,16 +265,13 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in, size_t antaly
         }
     }
 
-    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO)
+    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS)
     {
         UInt64 has_file_meta_info = 0;
         readVarUInt(has_file_meta_info, in);
         if (has_file_meta_info)
             file_meta_info = std::make_shared<DataFileMetaInfo>(DataFileMetaInfo::deserialize(in));
-    }
 
-    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY)
-    {
         UInt64 has_retry_after_us = 0;
         readVarUInt(has_retry_after_us, in);
         if (has_retry_after_us)

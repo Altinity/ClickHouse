@@ -24,7 +24,7 @@ struct DistributedReadTask
 {
     ObjectInfoPtr object;
     /// Microseconds the worker should wait before asking again.
-    /// Set only when `object` is empty and the worker understands Antalya protocol version 3.
+    /// Set only when `object` is empty and the worker understands Antalya protocol version 2.
     std::optional<UInt64> retry_after_us;
 };
 
@@ -37,7 +37,7 @@ public:
         bool send_over_whole_archive_,
         uint64_t lock_object_storage_task_distribution_ms_);
 
-    /// `worker_supports_task_retry` is false for a peer that did not negotiate Antalya protocol version 3.
+    /// `worker_supports_task_retry` is false for a peer that did not negotiate Antalya protocol version 2.
     /// The first such peer disables `lock_object_storage_task_distribution_ms` for the rest of the query:
     /// every replica is then given a file immediately, with no `retry_after_us`.
     DistributedReadTask getNextTask(size_t number_of_current_replica, bool worker_supports_task_retry = true);
