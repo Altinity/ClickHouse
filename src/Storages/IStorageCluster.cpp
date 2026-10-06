@@ -974,7 +974,6 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
 
     auto new_context = Context::createCopy(context);
     new_context->setSettings(new_settings);
-    new_context->increaseDistributedDepth();
     return new_context;
 }
 
