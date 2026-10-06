@@ -2026,14 +2026,16 @@ void StorageObjectStorageSource::ReadTaskIterator::resolveIcebergObjectStorageIf
 
 ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool wait_for_retry)
 {
-    if (!getContext()->isSwarmModeEnabled())
-    {
-        LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
-        return nullptr;
-    }
-
     while (true)
     {
+        /// Recheck after each `retry_after_us` wait. `SYSTEM STOP SWARM MODE` during that wait
+        /// must not be followed by another task request.
+        if (!getContext()->isSwarmModeEnabled())
+        {
+            LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
+            return nullptr;
+        }
+
         auto task = callback();
 
         if (auto query_status = getContext()->getProcessListElement())
