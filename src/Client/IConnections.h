@@ -31,8 +31,6 @@ public:
 
     virtual void sendClusterFunctionReadTaskResponse(const ClusterFunctionReadTaskResponse &) = 0;
 
-    /// Negotiated Antalya protocol version of the connection that produced the last packet.
-    /// `0` when the peer is not an Antalya build, or when this connection type has no current replica.
     virtual UInt64 getServerAntalyaProtocolVersion() const { return 0; }
     virtual void sendMergeTreeReadTaskResponse(const ParallelReadResponse & response) = 0;
 

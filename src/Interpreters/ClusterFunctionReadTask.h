@@ -27,8 +27,6 @@ struct ClusterFunctionReadTaskResponse
     std::optional<Iceberg::IcebergObjectSerializableInfo> iceberg_info;
     /// File's columns info
     std::optional<DataFileMetaInfoPtr> file_meta_info;
-    /// Microseconds the worker should wait before asking for another task.
-    /// Sent only when both peers negotiated Antalya protocol version 2.
     std::optional<UInt64> retry_after_us;
 
     /// Convert received response into ObjectInfo.

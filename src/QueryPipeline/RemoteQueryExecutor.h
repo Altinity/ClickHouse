@@ -49,7 +49,6 @@ public:
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method rescheduleTasksFromReplica is not implemented");
     }
-    /// `antalya_protocol_version` is the negotiated version of the worker that asked for a task (`0` for an upstream peer).
     virtual ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica, UInt64 antalya_protocol_version = 0) const = 0;
 };
 
