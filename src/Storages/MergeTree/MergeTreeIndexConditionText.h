@@ -179,6 +179,7 @@ private:
     bool hasIndexForMapElementValue(const RPNBuilderTreeNode & node) const;
 
     VectorWithMemoryTracking<String> stringToTokens(const Field & field) const;
+    VectorWithMemoryTracking<String> stringToTokens(std::string_view raw) const;
     VectorWithMemoryTracking<String> substringToTokens(const Field & field, bool is_prefix, bool is_suffix) const;
     VectorWithMemoryTracking<String> stringLikeToTokens(const Field & field) const;
 
@@ -198,6 +199,8 @@ private:
     static bool requiresReadingAllTokens(const RPNElement & element);
 
     Block header;
+    /// N when the index is defined over a `FixedString(N)`, directly or as the array element type.
+    std::optional<size_t> indexed_fixed_string_size;
     std::optional<String> normalized_index_column_name;
     /// A private clone of the index tokenizer when it is stateful, so concurrent conditions do not
     /// share mutable parsing state; null otherwise.

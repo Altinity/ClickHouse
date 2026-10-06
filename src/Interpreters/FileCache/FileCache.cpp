@@ -1387,6 +1387,7 @@ bool FileCache::doTryReserve(
                         file_segment.key(), file_segment.offset(), size, query_priority->getStateInfoForLog(lock));
 
                     failure_reason = "query limit exceeded";
+                    reserve_stat.not_enough_space = true;
                     return false;
                 }
                 query_eviction_info = query_priority->collectEvictionInfo(
@@ -1434,6 +1435,7 @@ bool FileCache::doTryReserve(
         invalidated_entries, query_priority, failure_reason))
     {
         chassert(!failure_reason.empty());
+        reserve_stat.not_enough_space = true;
         return false;
     }
 
