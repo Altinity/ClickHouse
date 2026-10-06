@@ -161,7 +161,9 @@ bool containsServerConstant(const ActionsDAG::Node * node)
         if (!current)
             continue;
 
-        if (current->function_base && current->function_base->isServerConstant())
+        /// `__getScalar` is marked as a server constant, but the initiator evaluates it
+        /// and sends the same value to every shard, so it does not have to stay a key.
+        if (current->function_base && current->function_base->isServerConstant() && current->function_base->getName() != "__getScalar")
             return true;
 
         for (const auto * child : current->children)
