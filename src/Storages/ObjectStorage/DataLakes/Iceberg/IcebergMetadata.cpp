@@ -1304,6 +1304,7 @@ bool IcebergMetadata::tryDropPartitionOnce(
 
     /// Set once the new snapshot is reachable by readers, after which its files must survive.
     bool published = false;
+    bool version_hint_names_metadata_file = false;
 
     std::vector<String> written_objects;
     auto cleanup_written_objects = [&]
@@ -1428,7 +1429,8 @@ bool IcebergMetadata::tryDropPartitionOnce(
                 filename_generator.generateVersionHint(),
                 object_storage,
                 context,
-                data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+                data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint],
+                &version_hint_names_metadata_file))
         {
             cleanup_written_objects();
             return false;
@@ -1476,7 +1478,12 @@ bool IcebergMetadata::tryDropPartitionOnce(
 
     persistent_components.invalidateMetadataCache();
 
-    if (purge)
+    if (purge && !version_hint_names_metadata_file)
+    {
+        LOG_WARNING(log, "Skipping the purge after DROP PARTITION: version-hint.text does not name {}, so readers "
+            "that follow it still reference the dropped files", resolver.resolve(metadata_info.path));
+    }
+    else if (purge)
     {
         std::unordered_map<std::shared_ptr<IObjectStorage>, StoredObjects> batches;
         for (const auto& file_to_purge : scan.files_to_be_purged)

@@ -297,8 +297,11 @@ bool writeMetadataFileAndVersionHint(
     const IcebergPathFromMetadata & version_hint_path,
     DB::ObjectStoragePtr object_storage,
     DB::ContextPtr context,
-    bool try_write_version_hint)
+    bool try_write_version_hint,
+    bool * version_hint_names_metadata_file)
 {
+    bool hint_names_metadata_file = false;
+
     auto storage_metadata_path = resolver.resolve(metadata_file_info.path);
     auto storage_version_hint_path = resolver.resolve(version_hint_path);
     try
@@ -342,6 +345,7 @@ bool writeMetadataFileAndVersionHint(
         else if (!try_write_version_hint)
         {
             /// The file does not exist and this writer was not asked to create it.
+            hint_names_metadata_file = true;
             break;
         }
 
@@ -369,6 +373,7 @@ bool writeMetadataFileAndVersionHint(
                     context,
                     write_if_none_match,
                     /* write-if-match */ etag);
+                hint_names_metadata_file = true;
                 break;
             }
             catch (...)
@@ -378,10 +383,15 @@ bool writeMetadataFileAndVersionHint(
         }
         else
         {
+            /// Another writer moved the hint past this metadata file, so readers that follow the
+            /// hint do not see this commit.
             break;
         }
         ++i;
     }
+
+    if (version_hint_names_metadata_file)
+        *version_hint_names_metadata_file = hint_names_metadata_file;
 
     return true;
 }

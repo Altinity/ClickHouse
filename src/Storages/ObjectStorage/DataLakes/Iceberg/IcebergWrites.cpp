@@ -1040,10 +1040,9 @@ ManifestRewriteResult rewriteManifestFileExcludingFiles(
     auto adapter = std::make_unique<OutputStreamWriteBufferAdapter>(out);
     avro::DataFileWriter<avro::GenericDatum> writer(std::move(adapter), schema);
 
-    /// `avro.schema` and `avro.codec` are written by `DataFileWriter` itself
     for (const auto & [key, value] : reader_base_ptr->metadata())
     {
-        if (key.starts_with("avro."))
+        if (key.starts_with("avro.") && key != "avro.schema")
             continue;
         writer.setMetadata(key, String(value.begin(), value.end()));
     }
