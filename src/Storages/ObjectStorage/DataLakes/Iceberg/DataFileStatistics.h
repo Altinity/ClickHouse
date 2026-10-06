@@ -40,6 +40,7 @@ private:
     std::vector<Int64> column_sizes;
     std::vector<Int64> null_counts;
     std::vector<Range> ranges;
+    std::vector<bool> track_ranges;
 };
 
 using DataFileStatisticsPtr = std::shared_ptr<DataFileStatistics>;

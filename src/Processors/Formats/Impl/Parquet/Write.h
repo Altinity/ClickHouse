@@ -25,6 +25,7 @@ struct WriteOptions
     bool output_datetime_as_uint32 = false;
     bool output_date_as_uint16 = false;
     bool output_enum_as_byte_array = false;
+    bool allow_aggregate_function_states = false;
 
     /// Note: the meaning of some compression methods here is different from
     /// wrapReadBufferWithCompressionMethod:

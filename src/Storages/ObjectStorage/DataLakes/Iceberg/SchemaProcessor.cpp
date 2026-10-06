@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -23,6 +24,7 @@
 #include <base/scope_guard.h>
 #include <Core/Settings.h>
 
+#include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -52,10 +54,12 @@ namespace ErrorCodes
 extern const int LOGICAL_ERROR;
 extern const int BAD_ARGUMENTS;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
+extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace Setting
 {
+extern const SettingsBool allow_experimental_aggregate_function_states_in_open_formats;
 extern const SettingsTimezone iceberg_timezone_for_timestamptz;
 }
 
@@ -326,7 +330,6 @@ void IcebergSchemaProcessor::addIcebergTableSchema(Poco::JSON::Object::Ptr schem
     std::lock_guard lock(mutex);
 
     Int32 schema_id = schema_ptr->getValue<Int32>(f_schema_id);
-    current_schema_id = schema_id;
     if (iceberg_table_schemas_by_ids.contains(schema_id))
     {
         chassert(clickhouse_table_schemas_by_ids.contains(schema_id));
@@ -342,27 +345,42 @@ void IcebergSchemaProcessor::addIcebergTableSchema(Poco::JSON::Object::Ptr schem
                 ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                 "Iceberg schema with schema-id {} is bound to two different schemas across metadata versions",
                 schema_id);
+        return;
     }
-    else
-    {
-        iceberg_table_schemas_by_ids[schema_id] = schema_ptr;
-        auto fields = schema_ptr->get(f_fields).extract<Poco::JSON::Array::Ptr>();
-        auto clickhouse_schema = std::make_shared<NamesAndTypesList>();
-        String current_full_name{};
-        for (size_t i = 0; i != fields->size(); ++i)
+
+    current_schema_id = schema_id;
+    bool parsed = false;
+    const auto rollback_unless_parsed = make_scope_guard(
+        [&]() TSA_NO_THREAD_SAFETY_ANALYSIS
         {
-            auto field = fields->getObject(static_cast<UInt32>(i));
-            auto name = field->getValue<String>(f_name);
-            bool required = field->getValue<bool>(f_required);
-            current_full_name = name;
-            auto type = getFieldType(field, f_type, context_, required, current_full_name, true);
-            clickhouse_schema->push_back(NameAndTypePair{name, type});
-            clickhouse_types_by_source_ids[{schema_id, field->getValue<Int32>(f_id)}] = NameAndTypePair{current_full_name, type};
-            clickhouse_ids_by_source_names[{schema_id, current_full_name}] = field->getValue<Int32>(f_id);
-        }
-        clickhouse_table_schemas_by_ids[schema_id] = clickhouse_schema;
+            /// TSA cannot see the lock held by the caller through this lambda.
+            current_schema_id = std::nullopt;
+            if (parsed)
+                return;
+            iceberg_table_schemas_by_ids.erase(schema_id);
+            clickhouse_table_schemas_by_ids.erase(schema_id);
+            std::erase_if(clickhouse_types_by_source_ids, [schema_id](const auto & entry) { return entry.first.first == schema_id; });
+            std::erase_if(clickhouse_ids_by_source_names, [schema_id](const auto & entry) { return entry.first.first == schema_id; });
+        });
+
+    auto fields = schema_ptr->get(f_fields).extract<Poco::JSON::Array::Ptr>();
+    auto clickhouse_schema = std::make_shared<NamesAndTypesList>();
+    String current_full_name{};
+    for (size_t i = 0; i != fields->size(); ++i)
+    {
+        auto field = fields->getObject(static_cast<UInt32>(i));
+        auto name = field->getValue<String>(f_name);
+        bool required = field->getValue<bool>(f_required);
+        current_full_name = name;
+        auto type = getFieldType(field, f_type, context_, required, current_full_name, true);
+        clickhouse_schema->push_back(NameAndTypePair{name, type});
+        clickhouse_types_by_source_ids[{schema_id, field->getValue<Int32>(f_id)}] = NameAndTypePair{current_full_name, type};
+        clickhouse_ids_by_source_names[{schema_id, current_full_name}] = field->getValue<Int32>(f_id);
     }
-    current_schema_id = std::nullopt;
+
+    iceberg_table_schemas_by_ids[schema_id] = schema_ptr;
+    clickhouse_table_schemas_by_ids[schema_id] = clickhouse_schema;
+    parsed = true;
 }
 
 NameAndTypePair IcebergSchemaProcessor::getFieldCharacteristics(Int32 schema_version, Int32 source_id) const
@@ -549,18 +567,48 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
     String & current_full_name,
     bool is_subfield_of_root)
 {
+    DataTypePtr derived_type;
     if (field->isObject(type_key))
-        return getComplexTypeFromObject(field->getObject(type_key), current_full_name, context_, is_subfield_of_root);
-
-    auto type = field->get(type_key);
-    if (type.isString())
+        derived_type = getComplexTypeFromObject(field->getObject(type_key), current_full_name, context_, is_subfield_of_root);
+    else
     {
-        const String & type_name = type.extract<String>();
-        auto data_type = getSimpleType(type_name, context_, allow_geo_parser);
-        return required || !data_type->canBeInsideNullable() ? data_type : makeNullable(data_type);
+        auto type = field->get(type_key);
+        if (!type.isString())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unexpected 'type' field: {}", type.toString());
+
+        derived_type = getSimpleType(type.extract<String>(), context_, allow_geo_parser);
+        if (!required && derived_type->canBeInsideNullable())
+            derived_type = makeNullable(derived_type);
     }
 
-    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unexpected 'type' field: {}", type.toString());
+    if (!field->has(f_clickhouse_type))
+        return derived_type;
+
+    const String annotated_name = field->getValue<String>(f_clickhouse_type);
+    auto annotated_type = DataTypeFactory::instance().get(annotated_name);
+
+    /// Read the gate from the query context rather than the context captured at `ATTACH`.
+    if (hasAggregateFunctionType(annotated_type)
+        && !context_->getSettingsRef()[Setting::allow_experimental_aggregate_function_states_in_open_formats])
+        throw Exception(
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            "Iceberg field '{}' records ClickHouse type {} in its `{}` key. Reading aggregate function "
+            "states from an Iceberg table is disabled: enable setting "
+            "allow_experimental_aggregate_function_states_in_open_formats to honour the recorded type",
+            field->has(f_name) ? field->getValue<String>(f_name) : type_key,
+            annotated_name,
+            f_clickhouse_type);
+
+    if (!annotatedTypeMatchesDerived(annotated_type, derived_type))
+        throw Exception(
+            ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "Iceberg field '{}' records ClickHouse type {} in its `{}` key, but the field itself reads as {}",
+            field->has(f_name) ? field->getValue<String>(f_name) : type_key,
+            annotated_name,
+            f_clickhouse_type,
+            derived_type->getName());
+
+    return annotated_type;
 }
 
 /**
