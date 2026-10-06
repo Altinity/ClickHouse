@@ -1987,7 +1987,7 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     for (size_t i = 0; i < max_threads_count; ++i)
         objects.push_back(pool_scheduler([this]() -> ObjectInfoPtr
         {
-            return takeNextObject();
+            return takeNextObject(/*wait_for_retry=*/ false);
         }, Priority{}));
 
     pool.wait();
@@ -2024,7 +2024,7 @@ void StorageObjectStorageSource::ReadTaskIterator::resolveIcebergObjectStorageIf
 #endif
 }
 
-ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject()
+ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool wait_for_retry)
 {
     if (!getContext()->isSwarmModeEnabled())
     {
@@ -2044,6 +2044,9 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject()
 
         if (task->retry_after_us)
         {
+            if (!wait_for_retry)
+                return nullptr;
+
             /// The wait stays on the worker so the initiator thread is not blocked.
             /// TODO: wait asynchronously instead of sleeping in this thread.
             auto wait_time = std::min<UInt64>(100000, *task->retry_after_us);
@@ -2065,7 +2068,7 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
     ObjectInfoPtr object_info;
     if (current_index >= buffer.size())
     {
-        object_info = takeNextObject();
+        object_info = takeNextObject(/*wait_for_retry=*/ true);
         if (!object_info)
             return nullptr;
     }
