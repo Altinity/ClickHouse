@@ -90,6 +90,8 @@
 #include <Planner/CollectSets.h>
 #include <Planner/CollectTableExpressionData.h>
 #include <Planner/findQueryForParallelReplicas.h>
+#include <Planner/findDistributedObjectStorageCandidate.h>
+#include <Planner/buildDistributedObjectStorageQueryPlan.h>
 #include <Planner/PlannerActionsVisitor.h>
 #include <Planner/PlannerContext.h>
 #include <Planner/PlannerCorrelatedSubqueries.h>
@@ -2313,7 +2315,8 @@ Planner::Planner(const QueryTreeNodePtr & query_tree_,
             findQueryForParallelReplicas(query_tree, select_query_options),
             findTableForParallelReplicas(query_tree, select_query_options),
             findTableUnionForParallelReplicas(query_tree, select_query_options),
-            collectFiltersForAnalysis(query_tree, select_query_options, post_filter_))))
+            collectFiltersForAnalysis(query_tree, select_query_options, post_filter_),
+            findDistributedObjectStorageCandidate(query_tree, select_query_options))))
 {
 }
 
@@ -2703,13 +2706,24 @@ void Planner::buildPlanForQueryNode()
     }
 
     JoinTreeQueryPlan join_tree_query_plan;
+    /// Dispatch can still decline here, when the driver is referenced more than once. Whole-or-nothing for the
+    /// dispatch boundary: on rejection, ordinary planning handles everything.
+    std::optional<JoinTreeQueryPlan> dispatched_query_plan;
+    const auto & distributed_object_storage_candidate = planner_context->getGlobalPlannerContext()->distributed_object_storage_candidate;
+    if (distributed_object_storage_candidate && distributed_object_storage_candidate->dispatch_boundary == &query_node)
+        dispatched_query_plan = buildDistributedObjectStorageQueryPlan(query_tree, *distributed_object_storage_candidate, select_query_info, planner_context);
+
+    if (dispatched_query_plan)
+    {
+        join_tree_query_plan = std::move(*dispatched_query_plan);
+    }
     /// With plan-based parallel replicas the planner builds a plain, normal local plan; distribution is
     /// applied later as a plan transformation (QueryPlanOptimizations::applyParallelReplicas). So skip the
     /// old parallel-replicas planning path here (it would emit ReadFromLocalReplica /
     /// ReadFromRemoteParallelReplicas, e.g. inside a view/union inner query) and use the normal plan.
     /// Same for a plan that is shipped to a shard: those steps are local to the server that planned
     /// them and have no serialized form, and the shard decides on parallel replicas on its own.
-    if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
+    else if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
         && planner_context->getGlobalPlannerContext()->parallel_replicas_node == &query_node
         && !settings[Setting::parallel_replicas_plan_based]
         && !select_query_options.build_logical_plan)

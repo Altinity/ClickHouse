@@ -683,6 +683,14 @@ private:
     ContextPtr context;
 };
 
+/// A catalog table is built with `lazy_init`, and a read resolves its configuration -- and with it the path a
+/// listing walks -- through StorageObjectStorage. A whole-query dispatch lists the driver's files without reading
+/// it, and would otherwise list none.
+void StorageObjectStorageCluster::prepareForWholeQueryDispatch(ContextPtr context)
+{
+    configuration->lazyInitializeIfNeeded(object_storage, context);
+}
+
 RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExtension(
     const ActionsDAG::Node * predicate,
     const ActionsDAG * filter,

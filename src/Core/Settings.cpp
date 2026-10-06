@@ -2316,6 +2316,17 @@ Possible values:
 - `allow` — Default. Reads the left object-storage table on cluster nodes and executes `JOIN` / local `IN` on the initiator, so the right table does not need to exist on remote nodes.
 - `local` — Deprecated legacy alias of `allow`.
 - `global` — `INNER`, `LEFT`, and `CROSS` run on the nodes. The initiator reads the right table once and sends it to each node. For `CROSS JOIN`, every table after the first is sent. `RIGHT` and `FULL` stay on the initiator, so unmatched rows of the preserved side are returned once.
+- `distributed` — Experimental. Dispatches a whole `JOIN` query to the cluster of its driving table, so the `JOIN` and any `GROUP BY` run on the cluster's nodes instead of on the initiator, which then only merges the partial aggregate states. The driving table is found by walking down the left side of the query -- through `INNER ALL`/`LEFT JOIN`s and through a subquery or CTE that does not itself aggregate, deduplicate, sort or limit -- and must be a `DataLake` catalog table distributed via `object_storage_cluster`.
+
+  This is attempted only for the outermost `SELECT` of an initial query, and it is all-or-nothing: either the entire query is eligible and is dispatched as one unit, or ordinary planning handles the entire query. No narrower, nested candidate is attempted, and nothing falls back per level.
+
+  Eligibility requires that every other table reachable anywhere in the query also resolves through a `DataLake` catalog, has no row-level security policy, and is readable by the current user. An explicit `*Cluster()` table function, an ordinary local or `Distributed` table, or any table failing one of those checks makes the whole query ineligible. The combination is disabled outright when `additional_table_filters` is set or `object_storage_remote_initiator` is enabled.
+
+  Performance characteristic to be aware of: only the driving table is partitioned across the cluster. Every other table in the query is read and recomputed **in full on every node**, including any `JOIN` or `GROUP BY` over them. That is a win when those relations are small relative to the driver and a loss when they are not; ClickHouse does not estimate this cost when deciding to dispatch.
+
+  Every table is sent to the nodes as the table function that reads it -- the driving table as its `*Cluster` function -- so, as for an ordinary cluster read, the storage credentials travel in the query text, and access to the table functions is checked on the nodes.
+
+  ClickHouse also does not verify that the dictionaries or user-defined functions the query references are configured identically on every node of the driver's cluster -- as with `Distributed`, that consistency is the deployment's responsibility.
 
 See [Distributed JOIN](../../sql-reference/statements/select/join.md#object-storage-cluster-join-mode).
 )", 0) \
