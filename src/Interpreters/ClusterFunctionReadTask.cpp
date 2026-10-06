@@ -44,13 +44,8 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
     if (context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization])
         file_meta_info = object->relative_path_with_metadata.file_meta_info;
 
-    if (object->relative_path_with_metadata.getCommand().isValid())
-        path = object->relative_path_with_metadata.getCommand().toString();
-    else
-    {
-        const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
-        path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
-    }
+    const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
+    path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
 
     file_bucket_info = object->file_bucket_info;
 }
@@ -133,6 +128,17 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
             DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_METADATA);
     }
 
+    /// Fail closed: dropping `retry_after_us` would send an empty path, and the worker would stop reading.
+    if (retry_after_us && antalya_protocol_version < DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY)
+    {
+        throw Exception(
+            ErrorCodes::UNKNOWN_PROTOCOL,
+            "Worker Antalya protocol version {} cannot carry `retry_after_us`, which is required for "
+            "`lock_object_storage_task_distribution_ms` (minimum Antalya protocol version: {})",
+            antalya_protocol_version,
+            DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY);
+    }
+
     /// Fail closed: protocol < 4 omits `file_bucket_info`, so each bucket task becomes a full-file
     /// read and bucket-split cluster queries return duplicated rows.
     if (protocol_version < DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_FILE_BUCKETS_INFO
@@ -206,6 +212,19 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
             writeVarUInt(0, out);
         }
     }
+
+    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY)
+    {
+        if (retry_after_us)
+        {
+            writeVarUInt(1, out);
+            writeVarUInt(*retry_after_us, out);
+        }
+        else
+        {
+            writeVarUInt(0, out);
+        }
+    }
 }
 
 void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in, size_t antalya_protocol_version)
@@ -266,6 +285,18 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in, size_t antaly
         readVarUInt(has_file_meta_info, in);
         if (has_file_meta_info)
             file_meta_info = std::make_shared<DataFileMetaInfo>(DataFileMetaInfo::deserialize(in));
+    }
+
+    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY)
+    {
+        UInt64 has_retry_after_us = 0;
+        readVarUInt(has_retry_after_us, in);
+        if (has_retry_after_us)
+        {
+            UInt64 retry = 0;
+            readVarUInt(retry, in);
+            retry_after_us = retry;
+        }
     }
 }
 

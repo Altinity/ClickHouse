@@ -398,3 +398,61 @@ TEST(ClusterFunctionReadTaskResponse, AntalyaProtocolWithoutFileMetaInfoConsumes
     EXPECT_FALSE(deserialized.file_meta_info.has_value());
     EXPECT_TRUE(in.eof());
 }
+
+TEST(ClusterFunctionReadTaskResponse, RejectsRetryAfterUsForUpstreamPeer)
+{
+    ClusterFunctionReadTaskResponse response;
+    response.retry_after_us = 1000;
+
+    String serialized;
+    WriteBufferFromString out(serialized);
+    try
+    {
+        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, /*antalya_protocol_version*/ 0);
+        FAIL() << "Expected exception";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_PROTOCOL);
+        EXPECT_NE(e.message().find("retry_after_us"), std::string::npos);
+    }
+}
+
+TEST(ClusterFunctionReadTaskResponse, RoundTripsRetryAfterUsOnAntalyaProtocol)
+{
+    ClusterFunctionReadTaskResponse response;
+    response.retry_after_us = 2500;
+    EXPECT_FALSE(response.isEmpty());
+
+    String serialized;
+    WriteBufferFromString out(serialized);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY);
+    out.finalize();
+
+    ReadBufferFromString in(serialized);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY);
+    ASSERT_TRUE(deserialized.retry_after_us.has_value());
+    EXPECT_EQ(*deserialized.retry_after_us, 2500);
+    EXPECT_TRUE(deserialized.path.empty());
+    EXPECT_FALSE(deserialized.isEmpty());
+    EXPECT_TRUE(in.eof());
+}
+
+TEST(ClusterFunctionReadTaskResponse, AntalyaProtocolWithoutRetryConsumesPresenceFlag)
+{
+    ClusterFunctionReadTaskResponse response;
+    response.path = "data/file.parquet";
+
+    String serialized;
+    WriteBufferFromString out(serialized);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY);
+    out.finalize();
+
+    ReadBufferFromString in(serialized);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY);
+    EXPECT_FALSE(deserialized.retry_after_us.has_value());
+    EXPECT_EQ(deserialized.path, "data/file.parquet");
+    EXPECT_TRUE(in.eof());
+}

@@ -191,6 +191,9 @@ public:
 private:
     ObjectInfoPtr createObjectInfoInArchive(const std::string & path_to_archive, const std::string & path_in_archive);
 
+    /// Fetch the next object, waiting and asking again when the initiator sends `retry_after_us`.
+    ObjectInfoPtr takeNextObject();
+
     /// For Iceberg objects: resolve which storage the file lives in (possibly a secondary storage)
     /// from the raw metadata path and record it on the object. No-op for non-Iceberg objects.
     void resolveIcebergObjectStorageIfNeeded(const ObjectInfoPtr & object);

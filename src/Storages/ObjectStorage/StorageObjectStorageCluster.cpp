@@ -9,6 +9,7 @@
 #include <Interpreters/Context.h>
 #include <TableFunctions/TableFunctionFactory.h>
 
+#include <Core/AntalyaProtocol.h>
 #include <Core/Settings.h>
 #include <Formats/FormatFactory.h>
 #include <Parsers/ASTSelectQuery.h>
@@ -627,16 +628,23 @@ public:
         task_distributor.rescheduleTasksFromReplica(number_of_current_replica);
     }
 
-    ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica) const override
+    ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica, UInt64 antalya_protocol_version) const override
     {
         fiu_do_on(FailPoints::storage_cluster_read_sleep,
         {
             sleepForSeconds(10);
         });
 
-        auto task = task_distributor.getNextTask(number_of_current_replica);
-        if (task)
-            return std::make_shared<ClusterFunctionReadTaskResponse>(std::move(task), context);
+        const bool worker_supports_task_retry = antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY;
+        auto task = task_distributor.getNextTask(number_of_current_replica, worker_supports_task_retry);
+        if (task.retry_after_us)
+        {
+            auto response = std::make_shared<ClusterFunctionReadTaskResponse>();
+            response->retry_after_us = task.retry_after_us;
+            return response;
+        }
+        if (task.object)
+            return std::make_shared<ClusterFunctionReadTaskResponse>(std::move(task.object), context);
         return std::make_shared<ClusterFunctionReadTaskResponse>();
     }
 

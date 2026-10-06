@@ -27,13 +27,17 @@ struct ClusterFunctionReadTaskResponse
     std::optional<Iceberg::IcebergObjectSerializableInfo> iceberg_info;
     /// File's columns info
     std::optional<DataFileMetaInfoPtr> file_meta_info;
+    /// Microseconds the worker should wait before asking for another task.
+    /// Sent only when both peers negotiated Antalya protocol version 3.
+    std::optional<UInt64> retry_after_us;
 
     /// Convert received response into ObjectInfo.
     ObjectInfoPtr getObjectInfo() const;
 
     /// Whether response is empty.
     /// It is used to identify an end of processing.
-    bool isEmpty() const { return path.empty(); }
+    /// A retry request has no path and is not the end of processing.
+    bool isEmpty() const { return path.empty() && !retry_after_us; }
 
     /// Serialize according to the cluster-processing protocol version.
     /// `antalya_protocol_version` is the negotiated Antalya version of this hop (`0` for an upstream peer).

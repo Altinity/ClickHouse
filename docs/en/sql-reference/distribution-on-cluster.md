@@ -16,6 +16,8 @@ This improves cache efficiency by minimizing data movement among nodes.
 
 Each node begins processing files for which it is the primary node. After completing its assigned files, a node may take tasks from other nodes, either immediately or after waiting for `lock_object_storage_task_distribution_ms` milliseconds if the primary node does not request new files during that interval. The default value of `lock_object_storage_task_distribution_ms` is 500 milliseconds. This setting balances between caching efficiency and workload redistribution when nodes are imbalanced.
 
+The wait is a field of `ReadTaskResponse` and is sent only when the worker negotiated Antalya protocol version 3. A worker that negotiated a lower version, including an upstream node, receives the file immediately.
+
 ## `SYSTEM STOP SWARM MODE` command
 
 If a node needs to shut down gracefully, the command `SYSTEM STOP SWARM MODE` prevents the node from receiving new tasks for *Cluster-family queries. The node finishes processing already assigned files before it can safely shut down without errors.

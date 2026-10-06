@@ -14,9 +14,18 @@
 #include <vector>
 #include <mutex>
 #include <memory>
+#include <optional>
 
 namespace DB
 {
+
+struct DistributedReadTask
+{
+    ObjectInfoPtr object;
+    /// Microseconds the worker should wait before asking again.
+    /// Set only when `object` is empty and the worker understands Antalya protocol version 3.
+    std::optional<UInt64> retry_after_us;
+};
 
 class StorageObjectStorageStableTaskDistributor
 {
@@ -27,7 +36,9 @@ public:
         bool send_over_whole_archive_,
         uint64_t lock_object_storage_task_distribution_ms_);
 
-    ObjectInfoPtr getNextTask(size_t number_of_current_replica);
+    /// `worker_supports_task_retry` is false for an upstream peer. That peer is given a file immediately,
+    /// because it cannot be asked to wait without putting a command into the object path.
+    DistributedReadTask getNextTask(size_t number_of_current_replica, bool worker_supports_task_retry = true);
 
     /// Insert objects back to unprocessed files
     void rescheduleTasksFromReplica(size_t number_of_current_replica);
@@ -36,7 +47,7 @@ private:
     size_t getReplicaForFile(const String & file_path);
     ObjectInfoPtr getPreQueuedFile(size_t number_of_current_replica);
     ObjectInfoPtr getMatchingFileFromIterator(size_t number_of_current_replica);
-    ObjectInfoPtr getAnyUnprocessedFile(size_t number_of_current_replica);
+    DistributedReadTask getAnyUnprocessedFile(size_t number_of_current_replica, bool worker_supports_task_retry);
 
     void saveLastNodeActivity(size_t number_of_current_replica);
 

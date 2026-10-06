@@ -850,22 +850,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (!object_info)
             return {};
 
-        if (object_info->relative_path_with_metadata.getCommand().isValid())
-        {
-            auto retry_after_us = object_info->relative_path_with_metadata.getCommand().getRetryAfterUs();
-            if (retry_after_us.has_value())
-            {
-                /// TODO: Make asyncronous waiting without sleep in thread
-                /// Now this sleep is on executor node in worker thread
-                /// Does not block query initiator
-                auto wait_time = std::min(Poco::Timestamp::TimeDiff(100000ul), retry_after_us.value());
-                ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
-                sleepForMicroseconds(wait_time);
-                continue;
-            }
-            object_info->relative_path_with_metadata.setFileMetaInfo(object_info->relative_path_with_metadata.getCommand().getFileMetaInfo());
-        }
-
         if (object_info->getPath().empty())
             return {};
         if (!object_info->getObjectMetadata())
@@ -2003,10 +1987,7 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     for (size_t i = 0; i < max_threads_count; ++i)
         objects.push_back(pool_scheduler([this]() -> ObjectInfoPtr
         {
-            auto task = callback();
-            if (!task || task->isEmpty())
-                return nullptr;
-            return task->getObjectInfo();
+            return takeNextObject();
         }, Priority{}));
 
     pool.wait();
@@ -2015,10 +1996,7 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     {
         auto object = object_future.get();
         if (object)
-        {
-            resolveIcebergObjectStorageIfNeeded(object);
             buffer.push_back(object);
-        }
     }
 }
 
@@ -2046,19 +2024,16 @@ void StorageObjectStorageSource::ReadTaskIterator::resolveIcebergObjectStorageIf
 #endif
 }
 
-ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
+ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject()
 {
-    size_t current_index = index.fetch_add(1, std::memory_order_relaxed);
-
-    ObjectInfoPtr object_info;
-    if (current_index >= buffer.size())
+    if (!getContext()->isSwarmModeEnabled())
     {
-        if (!getContext()->isSwarmModeEnabled())
-        {
-            LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
-            return nullptr;
-        }
+        LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
+        return nullptr;
+    }
 
+    while (true)
+    {
         auto task = callback();
 
         if (auto query_status = getContext()->getProcessListElement())
@@ -2067,13 +2042,35 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
         if (!task || task->isEmpty())
             return nullptr;
 
-        object_info = task->getObjectInfo();
+        if (task->retry_after_us)
+        {
+            /// The wait stays on the worker so the initiator thread is not blocked.
+            /// TODO: wait asynchronously instead of sleeping in this thread.
+            auto wait_time = std::min<UInt64>(100000, *task->retry_after_us);
+            ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
+            sleepForMicroseconds(wait_time);
+            continue;
+        }
+
+        auto object_info = task->getObjectInfo();
         resolveIcebergObjectStorageIfNeeded(object_info);
+        return object_info;
+    }
+}
+
+ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
+{
+    size_t current_index = index.fetch_add(1, std::memory_order_relaxed);
+
+    ObjectInfoPtr object_info;
+    if (current_index >= buffer.size())
+    {
+        object_info = takeNextObject();
+        if (!object_info)
+            return nullptr;
     }
     else
-    {
-        object_info =  buffer[current_index];
-    }
+        object_info = buffer[current_index];
 
     if (!is_archive)
         return object_info;
