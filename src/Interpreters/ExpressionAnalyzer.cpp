@@ -1,4 +1,5 @@
 #include <memory>
+#include <stack>
 
 #include <Core/Block.h>
 #include <Core/Settings.h>
@@ -149,6 +150,35 @@ bool allowEarlyConstantFolding(const ActionsDAG & actions, const Settings & sett
         }
     }
     return true;
+}
+
+/// A folded server constant (`hostName()`, `tcpPort()`, ...) must stay a GROUP BY key.
+/// Its value differs per shard. Dropping it makes the initiator look up a missing column.
+bool containsServerConstant(const ActionsDAG::Node * node)
+{
+    std::stack<const ActionsDAG::Node *> stack;
+    if (node)
+        stack.push(node);
+
+    while (!stack.empty())
+    {
+        const auto * current = stack.top();
+        stack.pop();
+
+        while (current && current->type == ActionsDAG::ActionType::ALIAS)
+            current = current->children.empty() ? nullptr : current->children.front();
+
+        if (!current)
+            continue;
+
+        if (current->function_base && current->function_base->isServerConstant())
+            return true;
+
+        for (const auto * child : current->children)
+            stack.push(child);
+    }
+
+    return false;
 }
 
 LoggerPtr getLogger() { return ::getLogger("ExpressionAnalyzer"); }
@@ -361,7 +391,8 @@ void ExpressionAnalyzer::analyzeAggregation(ActionsDAG & temp_actions)
                         if (getContext()->getClientInfo().distributed_depth == 0 || settings.distributed_group_by_no_merge > 0)
                         {
                             /// Constant expressions have non-null column pointer at this stage.
-                            if (node->column)
+                            /// Server constants stay: they are different on each shard.
+                            if (node->column && !containsServerConstant(node))
                             {
                                 select_query->group_by_with_constant_keys = true;
 
@@ -415,7 +446,8 @@ void ExpressionAnalyzer::analyzeAggregation(ActionsDAG & temp_actions)
                     if (getContext()->getClientInfo().distributed_depth == 0 || settings.distributed_group_by_no_merge > 0)
                     {
                         /// Constant expressions have non-null column pointer at this stage.
-                        if (node->column)
+                        /// Server constants stay: they are different on each shard.
+                        if (node->column && !containsServerConstant(node))
                         {
                             select_query->group_by_with_constant_keys = true;
 
