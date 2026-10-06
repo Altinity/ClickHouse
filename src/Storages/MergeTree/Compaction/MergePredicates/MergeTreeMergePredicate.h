@@ -4,6 +4,8 @@
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/MergeTreeCommittingBlock.h>
+#include <Storages/MergeTree/ExportTTLDeleteGate.h>
+#include <Storages/MergeTree/ExportFence.h>
 
 namespace DB
 {
@@ -24,6 +26,9 @@ private:
     PatchInfosByPartition patches_by_partition;
     CommittingBlocksSet committing_blocks;
     std::optional<Int64> min_update_block;
+    /// Taken under `merge_mutate_lock`, which also guards claiming parts for the `EXPORT` TTL.
+    ExportFencePtr export_fence;
+    ExportTTLDeleteGate delete_gate;
 };
 
 using MergeTreeMergePredicatePtr = std::shared_ptr<const MergeTreeMergePredicate>;

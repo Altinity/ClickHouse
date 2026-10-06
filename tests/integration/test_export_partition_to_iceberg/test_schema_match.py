@@ -2,10 +2,12 @@ import pytest
 
 from helpers.export_partition_helpers import (
     EXTRA_SOURCE_COLUMN_MODES,
+    export_transaction_id,
     make_iceberg_s3,
     make_source,
     unique_suffix,
     wait_for_export_status,
+    wait_for_new_export_transaction,
 )
 
 CLUSTER_INSTANCES = ["replica1"]
@@ -18,7 +20,7 @@ def test_export_partition_column_count_mismatch_source_more_is_rejected(cluster,
     """
     Source has 3 columns (id, year, extra), destination has 2 (id, year).
     The ALTER must be rejected synchronously with NUMBER_OF_COLUMNS_DOESNT_MATCH,
-    nothing must be scheduled in system.partition_exports, and the
+    nothing must be scheduled in system.distributed_exports, and the
     Iceberg table must remain empty.
     """
     node = cluster.instances["replica1"]
@@ -43,13 +45,13 @@ def test_export_partition_column_count_mismatch_source_more_is_rejected(cluster,
     )
 
     rows_in_system_view = node.query(
-        f"SELECT count() FROM system.partition_exports "
+        f"SELECT count() FROM system.distributed_exports "
         f"WHERE source_table = '{mt_table}' "
         f"  AND destination_table = '{iceberg_table}' "
         f"  AND partition_id = '2020'"
     ).strip()
     assert rows_in_system_view == "0", (
-        f"Expected no row in system.partition_exports after a "
+        f"Expected no row in system.distributed_exports after a "
         f"synchronously-rejected export, got {rows_in_system_view}."
     )
 
@@ -86,13 +88,13 @@ def test_export_partition_column_count_mismatch_source_fewer_is_rejected(cluster
     )
 
     rows_in_system_view = node.query(
-        f"SELECT count() FROM system.partition_exports "
+        f"SELECT count() FROM system.distributed_exports "
         f"WHERE source_table = '{mt_table}' "
         f"  AND destination_table = '{iceberg_table}' "
         f"  AND partition_id = '2020'"
     ).strip()
     assert rows_in_system_view == "0", (
-        f"Expected no row in system.partition_exports after a "
+        f"Expected no row in system.distributed_exports after a "
         f"synchronously-rejected export, got {rows_in_system_view}."
     )
 
@@ -205,13 +207,13 @@ def test_export_partition_column_count_mismatch_source_fewer_still_rejected_with
     )
 
     rows_in_system_view = node.query(
-        f"SELECT count() FROM system.partition_exports "
+        f"SELECT count() FROM system.distributed_exports "
         f"WHERE source_table = '{mt_table}' "
         f"  AND destination_table = '{iceberg_table}' "
         f"  AND partition_id = '2020'"
     ).strip()
     assert rows_in_system_view == "0", (
-        f"Expected no row in system.partition_exports after a "
+        f"Expected no row in system.distributed_exports after a "
         f"synchronously-rejected export, got {rows_in_system_view}."
     )
 
@@ -245,13 +247,13 @@ def test_export_partition_column_count_mismatch_source_fewer_reports_column_coun
     )
 
     rows_in_system_view = node.query(
-        f"SELECT count() FROM system.partition_exports "
+        f"SELECT count() FROM system.distributed_exports "
         f"WHERE source_table = '{mt_table}' "
         f"  AND destination_table = '{iceberg_table}' "
         f"  AND partition_id = '2020'"
     ).strip()
     assert rows_in_system_view == "0", (
-        f"Expected no row in system.partition_exports after a "
+        f"Expected no row in system.distributed_exports after a "
         f"synchronously-rejected export, got {rows_in_system_view}."
     )
 
@@ -286,13 +288,13 @@ def test_export_partition_column_count_mismatch_source_fewer_reports_column_coun
     )
 
     rows_in_system_view = node.query(
-        f"SELECT count() FROM system.partition_exports "
+        f"SELECT count() FROM system.distributed_exports "
         f"WHERE source_table = '{mt_table}' "
         f"  AND destination_table = '{iceberg_table}' "
         f"  AND partition_id = '2020'"
     ).strip()
     assert rows_in_system_view == "0", (
-        f"Expected no row in system.partition_exports after a "
+        f"Expected no row in system.distributed_exports after a "
         f"synchronously-rejected export, got {rows_in_system_view}."
     )
 
@@ -542,17 +544,20 @@ def test_export_partition_column_count_mismatch_into_partition_that_already_has_
         f"Expected 2 rows after first export, got {count_after_first}"
     )
 
+    first_transaction_id = export_transaction_id(node, mt_table, iceberg_table, "2020")
+
     node.query(f"INSERT INTO {mt_table} VALUES (3, 2020, 'c'), (4, 2020, 'd')")
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
-        settings={**ignore_extra_settings, "export_merge_tree_partition_force_export": 1},
+        settings=ignore_extra_settings,
     )
+    wait_for_new_export_transaction(node, mt_table, iceberg_table, "2020", first_transaction_id)
     wait_for_export_status(node=node, source_table=mt_table, dest_table=iceberg_table,
                             partition_id="2020", expected_status="COMPLETED")
 
     count_after_second = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
     assert count_after_second == 6, (
-        f"Expected 6 rows (2 original + 2 duplicated by the forced re-export + 2 new) "
+        f"Expected 6 rows (2 original + 2 duplicated by the re-export + 2 new) "
         f"after re-exporting an already-populated partition, got {count_after_second}"
     )
 
@@ -723,7 +728,7 @@ def test_export_partition_runtime_cast_failure_propagates_async(cluster, source_
     wait_for_export_status(node, mt_table, iceberg_table, "2020", "FAILED", timeout=60)
 
     exception_count = int(node.query(
-        f"SELECT any(exception_count) FROM system.partition_exports "
+        f"SELECT any(exception_count) FROM system.distributed_exports "
         f"WHERE source_table = '{mt_table}' "
         f"  AND destination_table = '{iceberg_table}' "
         f"  AND partition_id = '2020'"

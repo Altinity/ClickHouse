@@ -225,7 +225,7 @@ public:
         throwNotImplemented("import");
     }
 
-    virtual IStorage::ExportPartitionCommitInfo commitExportPartitionTransaction(
+    virtual IStorage::ExportCommitInfo commitExportTransaction(
         std::shared_ptr<DataLake::ICatalog> /* catalog */,
         const StorageID & /* table_id */,
         const String & /* transaction_id */,
@@ -237,8 +237,13 @@ public:
         StorageObjectStorageConfigurationPtr /* configuration */,
         ContextPtr /* context */)
         {
-            throwNotImplemented("commitExportPartitionTransaction");
+            throwNotImplemented("commitExportTransaction");
         }
+
+    virtual bool isExportTransactionCommitted(const String & /* transaction_id */, ContextPtr /* context */)
+    {
+        throwNotImplemented("isExportTransactionCommitted");
+    }
 
     virtual bool optimize(
         const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr /*context*/, const std::optional<FormatSettings> & /*format_settings*/)

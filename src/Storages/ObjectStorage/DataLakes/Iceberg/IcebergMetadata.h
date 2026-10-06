@@ -165,7 +165,7 @@ public:
     /// data_file_paths contains the metadata-path for each exported data file (as recorded in
     /// ZooKeeper).  For every path a co-located sidecar Avro file (same path, ".avro" extension)
     /// must exist in the object storage; it supplies record_count and file_size_in_bytes.
-    IStorage::ExportPartitionCommitInfo commitExportPartitionTransaction(
+    IStorage::ExportCommitInfo commitExportTransaction(
         std::shared_ptr<DataLake::ICatalog> catalog,
         const StorageID & table_id,
         const String & transaction_id,
@@ -176,6 +176,10 @@ public:
         const std::vector<String> & data_file_paths,
         StorageObjectStorageConfigurationPtr configuration,
         ContextPtr context) override;
+
+    /// Whether a snapshot of the latest metadata carries `transaction_id` in its summary. Like the
+    /// check done before committing, it cannot see snapshots removed by `expire_snapshots`.
+    bool isExportTransactionCommitted(const String & transaction_id, ContextPtr context) override;
 
     CompressionMethod getCompressionMethod() const { return persistent_components.metadata_compression_method; }
 
@@ -251,11 +255,11 @@ private:
     getRelevantDataSnapshotFromTableStateSnapshot(Iceberg::TableStateSnapshot table_state_snapshot, ContextPtr local_context) const;
 
     /// Non-empty return value means the attempt succeeded (covers both the normal
-    /// publish path and the `isExportPartitionTransactionAlreadyCommitted` short-circuit).
-    /// An empty `ExportPartitionCommitInfo` means the caller must retry. The
+    /// publish path and the `isExportTransactionAlreadyCommitted` short-circuit).
+    /// An empty `ExportCommitInfo` means the caller must retry. The
     /// short-circuit branch fills `iceberg_metadata_file` with a sentinel note since
     /// the original committer's paths are not trivially recoverable from inside this call.
-    std::optional<IStorage::ExportPartitionCommitInfo> commitImportPartitionTransactionImpl(
+    std::optional<IStorage::ExportCommitInfo> commitImportPartitionTransactionImpl(
         FileNamesGenerator & filename_generator,
         Poco::JSON::Object::Ptr & metadata,
         Poco::JSON::Object::Ptr & partition_spec,

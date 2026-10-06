@@ -43,6 +43,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
+            {"allow_experimental_export_ttl", false, false, "New setting to allow `TTL ... EXPORT TO TABLE`."},
+            {"export_merge_tree_retry_initial_backoff_seconds", 5, 5, "Renamed from `export_merge_tree_partition_retry_initial_backoff_seconds`, export tasks are no longer tied to a partition."},
+            {"export_merge_tree_retry_max_backoff_seconds", 300, 300, "Renamed from `export_merge_tree_partition_retry_max_backoff_seconds`, export tasks are no longer tied to a partition."},
+            {"export_merge_tree_task_timeout_seconds", 86400, 86400, "Renamed from `export_merge_tree_partition_task_timeout_seconds`, export tasks are no longer tied to a partition."},
+            {"export_merge_tree_partition_force_export", false, false, "Obsolete: `EXPORT PARTITION` no longer refuses re-exports, so there is nothing to force."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",
@@ -1349,6 +1354,8 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
     {
         addSettingsChanges(merge_tree_settings_changes_history, "26.6",
         {
+            {"ttl_export_check_period_seconds", 60, 60, "New setting"},
+            {"ttl_export_settings_profile", "", "", "New setting"},
             {"packed_skip_index_max_bytes", 0, 0, "New setting. Pack any skip-index substream whose serialized on-disk size is at most this many bytes into a single skp_idx.packed archive per part; larger substreams stay in the standalone skp_idx_<name>.idx2 / .mrk2 layout. Decision is made per substream at write time."},
             {"allow_tuple_element_aggregation", false, false, "New setting"},
             {"shared_merge_tree_enable_keeper_parts_extra_data", false, true, "Enable coordinated merges by default"},

@@ -50,7 +50,7 @@ def test_export_partition_partition_column_castable_type_mismatch(cluster, sourc
     # With a String partition column the partition_id is the SipHash of the
     # value rather than the textual representation — look it up so we can
     # reference the partition explicitly in EXPORT PARTITION ID and in
-    # subsequent system.partition_exports queries.
+    # subsequent system.distributed_exports queries.
     partition_id = node.query(
         f"SELECT partition_id FROM system.parts "
         f"WHERE database = currentDatabase() AND table = '{mt_table}' "
@@ -75,15 +75,15 @@ def test_export_partition_partition_column_castable_type_mismatch(cluster, sourc
         f"'year', got: {error!r}"
     )
 
-    # Nothing scheduled: no row in system.partition_exports.
+    # Nothing scheduled: no row in system.distributed_exports.
     rows_in_system_view = node.query(
-        f"SELECT count() FROM system.partition_exports "
+        f"SELECT count() FROM system.distributed_exports "
         f"WHERE source_table = '{mt_table}' "
         f"  AND destination_table = '{s3_table}' "
         f"  AND partition_id = '{partition_id}'"
     ).strip()
     assert rows_in_system_view == "0", (
-        f"Expected no row in system.partition_exports after a "
+        f"Expected no row in system.distributed_exports after a "
         f"synchronously-rejected export, got {rows_in_system_view}."
     )
 
@@ -210,7 +210,7 @@ def test_export_partition_coarser_source_rejected(cluster, source_engine):
     assert "BAD_ARGUMENTS" in error, f"expected BAD_ARGUMENTS, got: {error!r}"
 
     scheduled = node.query(
-        f"SELECT count() FROM system.partition_exports"
+        f"SELECT count() FROM system.distributed_exports"
         f" WHERE source_table = '{mt_table}' AND destination_table = '{s3_table}'"
     ).strip()
     assert scheduled == "0", f"expected nothing scheduled after a synchronous reject, got {scheduled}"

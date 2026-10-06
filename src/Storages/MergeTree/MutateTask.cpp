@@ -3585,6 +3585,19 @@ bool MutateTask::prepare()
     if (ctx->mutating_pipeline_builder.initialized())
         ctx->execute_ttl_type = MutationHelpers::shouldExecuteTTL(ctx->metadata_snapshot, ctx->interpreter->getColumnDependencies());
 
+    /// Rows of a part that the `EXPORT` TTL has not exported yet must not be deleted by their TTL:
+    /// it is only recalculated here, and applied by a merge once the part is exported.
+    if (ctx->execute_ttl_type == ExecuteTTLType::NORMAL)
+    {
+        const auto fence = ctx->data->getLatestExportFence();
+        if (auto reason = ctx->data->getExportTTLDeleteGate().check(
+                ctx->source_part->name, ctx->source_part->info, ctx->source_part->ttl_infos, fence.get()))
+        {
+            LOG_DEBUG(ctx->log, "Not applying TTL in the mutation: {}", *reason);
+            ctx->execute_ttl_type = ExecuteTTLType::RECALCULATE;
+        }
+    }
+
     if ((*ctx->data->getSettings())[MergeTreeSetting::exclude_deleted_rows_for_part_size_in_merge] && lightweight_delete_mode)
     {
         /// This mutation contains lightweight delete and we need to count the deleted rows,

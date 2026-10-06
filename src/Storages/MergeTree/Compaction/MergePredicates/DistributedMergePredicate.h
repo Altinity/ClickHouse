@@ -3,6 +3,7 @@
 #include <Storages/MergeTree/Compaction/MergePredicates/IMergePredicate.h>
 #include <Storages/MergeTree/MergeTreeCommittingBlock.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
+#include <Storages/MergeTree/ExportFence.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 
@@ -84,6 +85,12 @@ public:
 
         if (left.is_in_volume_where_merges_avoid || right.is_in_volume_where_merges_avoid)
             return std::unexpected(PreformattedMessage::create("One of parts ({}, {}) lies on volume where merges should be avoided", left.name, right.name));
+
+        if (export_fence_ptr)
+        {
+            if (auto reason = export_fence_ptr->checkCanMerge(left.info, right.info))
+                return std::unexpected(PreformattedMessage::create("{}", *reason));
+        }
 
         int64_t left_max_block = left.info.max_block;
         int64_t right_min_block = right.info.min_block;
@@ -202,6 +209,9 @@ protected:
 
     /// Patch parts that should be applied at merges if apply_patches_on_merge is enabled.
     PatchInfosByPartition patches_by_partition;
+
+    /// Export states of parts of partitions exported by iterations: parts in different states are not merged.
+    const ExportFence * export_fence_ptr = nullptr;
 };
 
 }
