@@ -45,6 +45,17 @@ DistributedReadTask StorageObjectStorageStableTaskDistributor::getNextTask(size_
 {
     LOG_TRACE(log, "Received request from replica {} looking for a file", number_of_current_replica);
 
+    /// One peer that cannot be asked to wait makes the lock useless: that peer would take another
+    /// node's file immediately. Run the rest of the query as if the setting were 0.
+    if (!worker_supports_task_retry && !task_retry_disabled.exchange(true, std::memory_order_relaxed))
+    {
+        LOG_INFO(
+            log,
+            "Replica {} does not support task retry, ignoring `lock_object_storage_task_distribution_ms` for this query",
+            number_of_current_replica);
+    }
+    const bool allow_task_retry = worker_supports_task_retry && !task_retry_disabled.load(std::memory_order_relaxed);
+
     saveLastNodeActivity(number_of_current_replica);
 
     {
@@ -66,7 +77,7 @@ DistributedReadTask StorageObjectStorageStableTaskDistributor::getNextTask(size_
     // 3. Process unprocessed files if iterator is exhausted
     if (!file)
     {
-        auto pending = getAnyUnprocessedFile(number_of_current_replica, worker_supports_task_retry);
+        auto pending = getAnyUnprocessedFile(number_of_current_replica, allow_task_retry);
         if (pending.retry_after_us)
             return pending;
         file = std::move(pending.object);
@@ -228,7 +239,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
 
 DistributedReadTask StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(
     size_t number_of_current_replica,
-    bool worker_supports_task_retry)
+    bool allow_task_retry)
 {
     /// Limit time of node activity to keep task in queue
     Poco::Timestamp activity_limit;
@@ -247,7 +258,7 @@ DistributedReadTask StorageObjectStorageStableTaskDistributor::getAnyUnprocessed
             auto number_of_matched_replica = it->second.second;
             auto last_activity = last_node_activity.find(number_of_matched_replica);
             if (lock_object_storage_task_distribution_us <= 0 // file deferring is turned off
-                || !worker_supports_task_retry // peer cannot be asked to wait
+                || !allow_task_retry // this request must not wait: peer is old, or the query already saw one
                 || it->second.second == number_of_current_replica // file is matching with current replica
                 || last_activity == last_node_activity.end() // msut never be happen, last_activity is filled for each replica on start
                 || activity_limit > last_activity->second) // matched replica did not ask for a new files for a while

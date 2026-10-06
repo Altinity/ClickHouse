@@ -399,23 +399,35 @@ TEST(ClusterFunctionReadTaskResponse, AntalyaProtocolWithoutFileMetaInfoConsumes
     EXPECT_TRUE(in.eof());
 }
 
-TEST(ClusterFunctionReadTaskResponse, RejectsRetryAfterUsForUpstreamPeer)
+TEST(ClusterFunctionReadTaskResponse, OmitsRetryAfterUsForUpstreamPeer)
 {
-    ClusterFunctionReadTaskResponse response;
-    response.retry_after_us = 1000;
+    ClusterFunctionReadTaskResponse with_retry;
+    with_retry.path = "data/file.parquet";
+    with_retry.retry_after_us = 1000;
 
-    String serialized;
-    WriteBufferFromString out(serialized);
-    try
+    ClusterFunctionReadTaskResponse without_retry;
+    without_retry.path = with_retry.path;
+
+    String with_retry_bytes;
+    String without_retry_bytes;
     {
-        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, /*antalya_protocol_version*/ 0);
-        FAIL() << "Expected exception";
+        WriteBufferFromString out(with_retry_bytes);
+        with_retry.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, /*antalya_protocol_version*/ 0);
+        out.finalize();
     }
-    catch (const Exception & e)
     {
-        EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_PROTOCOL);
-        EXPECT_NE(e.message().find("retry_after_us"), std::string::npos);
+        WriteBufferFromString out(without_retry_bytes);
+        without_retry.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, /*antalya_protocol_version*/ 0);
+        out.finalize();
     }
+    EXPECT_EQ(with_retry_bytes, without_retry_bytes);
+
+    ReadBufferFromString in(with_retry_bytes);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, /*antalya_protocol_version*/ 0);
+    EXPECT_FALSE(deserialized.retry_after_us.has_value());
+    EXPECT_EQ(deserialized.path, "data/file.parquet");
+    EXPECT_TRUE(in.eof());
 }
 
 TEST(ClusterFunctionReadTaskResponse, RoundTripsRetryAfterUsOnAntalyaProtocol)

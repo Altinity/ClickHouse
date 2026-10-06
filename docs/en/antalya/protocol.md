@@ -29,7 +29,8 @@ after the upstream cluster-processing payload.
 
 Version 3 appends optional `retry_after_us` after that trailer. The initiator sends it when
 `lock_object_storage_task_distribution_ms` asks a worker to wait before taking another node's file.
-A peer that negotiated a lower version is given the file immediately, so the task path stays an object key.
+If any worker negotiated a lower version, the initiator ignores that setting for the query and
+assigns files immediately, so every task path stays an object key.
 
 ## Adding an Antalya-only wire change {#adding-a-wire-change}
 

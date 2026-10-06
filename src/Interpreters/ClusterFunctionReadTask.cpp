@@ -128,17 +128,6 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
             DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_METADATA);
     }
 
-    /// Fail closed: dropping `retry_after_us` would send an empty path, and the worker would stop reading.
-    if (retry_after_us && antalya_protocol_version < DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY)
-    {
-        throw Exception(
-            ErrorCodes::UNKNOWN_PROTOCOL,
-            "Worker Antalya protocol version {} cannot carry `retry_after_us`, which is required for "
-            "`lock_object_storage_task_distribution_ms` (minimum Antalya protocol version: {})",
-            antalya_protocol_version,
-            DBMS_ANTALYA_PROTOCOL_VERSION_WITH_TASK_RETRY);
-    }
-
     /// Fail closed: protocol < 4 omits `file_bucket_info`, so each bucket task becomes a full-file
     /// read and bucket-split cluster queries return duplicated rows.
     if (protocol_version < DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_FILE_BUCKETS_INFO
