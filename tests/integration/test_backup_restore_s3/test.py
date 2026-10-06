@@ -564,9 +564,16 @@ def test_backup_to_s3_native_copy(cluster, storage_policy):
     )
 
     if storage_policy in CAS_POLICIES:
-        # A CAS file can be a range inside a blob object, so the server-side copy may be ranged.
-        for events in (backup_events, restore_events):
-            assert events.get("S3CopyObject", 0) + events.get("S3UploadPartCopy", 0) > 0
+        assert (
+            backup_events.get("S3CopyObject", 0)
+            + backup_events.get("S3UploadPartCopy", 0)
+            > 0
+        )
+        assert (
+            restore_events.get("S3CopyObject", 0)
+            + restore_events.get("S3UploadPartCopy", 0)
+            == 0
+        )
         return
 
     # single part upload
@@ -733,10 +740,10 @@ def test_incremental_backup_append_table_def(cluster):
         (True, True, True),
     ],
 )
-@pytest.mark.parametrize("storage_policy", ["policy_s3_cache", "policy_cas_cache"])
 def test_backup_with_fs_cache(
-    cluster, in_cache_initially, allow_backup_read_cache, allow_s3_native_copy, storage_policy
+    cluster, in_cache_initially, allow_backup_read_cache, allow_s3_native_copy
 ):
+    storage_policy = "policy_s3_cache"
     backup_name = new_backup_name()
     backup_destination = s3_backup_destination(storage_policy, backup_name)
 

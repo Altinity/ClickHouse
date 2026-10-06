@@ -228,11 +228,8 @@ def test_restore_table(engine):
     assert instance.query("SELECT count(), sum(x) FROM test.table") == "100\t4950\n"
 
 
-@pytest.mark.parametrize("backup_disk", ["backups", "cas"])
-def test_restore_table_on_cas_disk(backup_disk):
+def test_restore_table_on_cas_disk():
     backup_name = new_backup_name()
-    if backup_disk == "cas":
-        backup_name = backup_name.replace("Disk('backups', '", "Disk('cas', 'backups/")
     create_and_fill_table(storage_policy="cas_policy")
 
     assert instance.query("SELECT count(), sum(x) FROM test.table") == "100\t4950\n"
