@@ -305,19 +305,16 @@ ALTINITY_TRACK_BY_FLAVOUR = {
 }
 
 
-def check_tag_version(
-    tag: str, versions_path: Union[Path, str] = FILE_WITH_VERSION_PATH
-) -> None:
+def check_tag_against_versions(tag: str, versions: VERSIONS) -> None:
     # NOTE (strtgbb): Altinity tags are v<major>.<minor>.<patch>.<tweak>.<flavour>;
     # the release flavour comes from the tag, and the tweak's first digit varies by track
-    versions = read_versions(versions_path)
     expected_prefix = (
         f"v{versions['major']}.{versions['minor']}.{versions['patch']}"
         f".{versions['tweak']}."
     )
     if not tag.startswith(expected_prefix):
         raise ValueError(
-            f"Tag [{tag}] does not start with [{expected_prefix}] from {versions_path}"
+            f"Tag [{tag}] does not start with [{expected_prefix}]"
         )
     flavour = tag[len(expected_prefix) :]
     track = ALTINITY_TRACK_BY_FLAVOUR.get(flavour)
@@ -326,12 +323,17 @@ def check_tag_version(
             f"Tag [{tag}] flavour [{flavour}] is not one of "
             f"{sorted(ALTINITY_TRACK_BY_FLAVOUR)}"
         )
-    if versions["tweak"] // 10000 != track:
+    if int(versions["tweak"]) // 10000 != track:
         raise ValueError(
             f"Tag [{tag}] tweak [{versions['tweak']}] does not match the "
             f"{track}xxxx track for flavour [{flavour}]"
         )
 
+
+def check_tag_version(
+    tag: str, versions_path: Union[Path, str] = FILE_WITH_VERSION_PATH
+) -> None:
+    check_tag_against_versions(tag, read_versions(versions_path))
     print(f"Tag [{tag}] matches {versions_path}")
 
 
