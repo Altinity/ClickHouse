@@ -59,6 +59,7 @@ namespace ErrorCodes
 {
     extern const int INCORRECT_DISK_INDEX;
     extern const int CANNOT_RMDIR;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace
@@ -162,6 +163,7 @@ DiskObjectStorage::DiskObjectStorage(
         .is_encrypted = false,
         .is_cached = object_storages->takePointingTo(cluster->getLocalLocation())->supportsCache(),
         .zookeeper_name = metadata_storage->getZooKeeperName(),
+        .files_are_whole_objects = !metadata_storage->isContentAddressed(),
     };
     resource_changes_subscription = Context::getGlobalContextInstance()->getWorkloadEntityStoragePtr()->getAllEntitiesAndSubscribe(
         [this] (const std::vector<IWorkloadEntityStorage::Event> & events)
@@ -331,11 +333,14 @@ void DiskObjectStorage::copyFile( /// NOLINT
     const std::function<void()> & cancellation_hook)
 {
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorage::copyFile");
-    if (getDataSourceDescription() == to_disk.getDataSourceDescription())
+    const auto source_description = getDataSourceDescription();
+    const auto destination_description = to_disk.getDataSourceDescription();
+    auto * to_disk_object_storage = dynamic_cast<DiskObjectStorage *>(&to_disk);
+    if (to_disk_object_storage && source_description == destination_description
+        && source_description.canUseNativeCopyWith(destination_description))
     {
         /// It may use s3-server-side copy
-        auto & to_disk_object_storage = dynamic_cast<DiskObjectStorage &>(to_disk);
-        auto transaction = createObjectStorageTransactionToAnotherDisk(to_disk_object_storage);
+        auto transaction = createObjectStorageTransactionToAnotherDisk(*to_disk_object_storage);
         try
         {
             transaction->copyFile(from_file_path, to_file_path, read_settings, write_settings);
@@ -878,12 +883,16 @@ void DiskObjectStorage::prepareRead(
     if (metadata_storage->isContentAddressed())
     {
         const auto * ca = dynamic_cast<const IContentAddressedExchange *>(metadata_storage.get());
-        if (ca)
-        {
-            if (ca->prepareInManifestRead(path, settings, pipeline))
-                return;
-            ca_blob_view = ca->getBlobViewPlan(path);
-        }
+        if (!ca)
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Metadata storage of disk {} reports itself content-addressed but does not implement "
+                "IContentAddressedExchange, so the payload window of {} cannot be resolved",
+                getName(), path);
+
+        if (ca->prepareInManifestRead(path, settings, pipeline))
+            return;
+        ca_blob_view = ca->getBlobViewPlan(path);
     }
 
     const auto storage_objects = ca_blob_view

@@ -534,13 +534,7 @@ TEST(CASWiringRead, BlobViewPlanRidesTheStandardPipeline)
         DB::readStringUntilEOF(manifest_bytes, *buf);
     }
     EXPECT_EQ(manifest_bytes, "u-123");
-    /// Not a `getBlobViewPlan` call on the in-manifest path here (all-tree Task 6/9: uuid.txt is now
-    /// a real Inline manifest entry): `getBlobViewPlan`'s only production caller
-    /// (`DiskObjectStorage::prepareRead`) never reaches it once `prepareInManifestRead` returns true
-    /// above — `getBlobViewPlan`'s precondition is "confirmed not in-manifest-servable," which calling
-    /// it directly on an Inline path violates. Pre-Task-9 this assertion passed only by coincidence
-    /// (uuid.txt was not a manifest entry at all, so `findFile` returned not-found, not because
-    /// `getBlobViewPlan` gracefully handles an Inline entry it does find).
+    EXPECT_FALSE(storage->getBlobViewPlan("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt").has_value());
 
     /// Blob-backed file: a real physical key and a payload-sized window whose extent equals
     /// the object's readable size (a right-bounded read never overshoots the window).
