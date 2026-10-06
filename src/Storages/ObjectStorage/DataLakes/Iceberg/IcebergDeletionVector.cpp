@@ -8,9 +8,9 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Core/Settings.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Interpreters/Context.h>
 #include <IO/ReadBufferFromFileBase.h>
-#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergPath.h>
 #include <Storages/ObjectStorage/DataLakes/PuffinDeletionVectorReader.h>
 #include <Storages/ObjectStorage/DataLakes/PuffinFilesCache.h>
@@ -284,7 +284,7 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
         return loadDeletionVectorUncached(
             object_storage,
             puffin_path,
-            std::nullopt,
+            /*puffin_metadata=*/ std::nullopt,
             content_offset,
             content_size_in_bytes,
             expected_data_file,
@@ -319,7 +319,7 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
             return loadDeletionVectorUncached(
                 object_storage,
                 puffin_path,
-                std::nullopt,
+                /*puffin_metadata=*/ std::nullopt,
                 content_offset,
                 content_size_in_bytes,
                 expected_data_file,
@@ -345,7 +345,7 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
         return loadDeletionVectorUncached(
             object_storage,
             puffin_path,
-            puffin_object.metadata,
+            /*puffin_metadata=*/ puffin_object.metadata,
             content_offset,
             content_size_in_bytes,
             expected_data_file,
@@ -387,7 +387,7 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
             return loadDeletionVectorUncached(
                 object_storage,
                 puffin_path,
-                puffin_object.metadata,
+                /*puffin_metadata=*/ puffin_object.metadata,
                 content_offset,
                 content_size_in_bytes,
                 expected_data_file,
@@ -408,7 +408,7 @@ DataLakeObjectMetadata::ExcludedRowsPtr loadDeletionVector(
         return loadDeletionVectorUncached(
             object_storage,
             puffin_path,
-            puffin_object.metadata,
+            /*puffin_metadata=*/ puffin_object.metadata,
             content_offset,
             content_size_in_bytes,
             expected_data_file,
