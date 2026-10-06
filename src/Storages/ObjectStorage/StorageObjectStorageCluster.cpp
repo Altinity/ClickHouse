@@ -735,7 +735,7 @@ bool StorageObjectStorageCluster::isClusterSupported() const
     return configuration->isClusterSupported();
 }
 
-SinkToStoragePtr StorageObjectStorageCluster::writeFallBackToPure(
+SinkToStoragePtr StorageObjectStorageCluster::write(
     const ASTPtr & query,
     const StorageMetadataPtr & metadata_snapshot,
     ContextPtr context,
