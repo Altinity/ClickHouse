@@ -593,6 +593,20 @@ def test_backup_to_s3_native_copy(cluster, storage_policy):
     )
 
 
+def test_backup_from_cas_to_s3_different_endpoint(cluster):
+    backup_name = new_backup_name()
+    backup_destination = f"S3('http://minio1:9001/root/data/backups/{backup_name}', 'minio', '{minio_secret_key}')"
+    backup_events, restore_events = check_backup_and_restore(
+        cluster, "policy_cas", backup_destination
+    )
+
+    for events in (backup_events, restore_events):
+        assert events.get("S3UploadPartCopy", 0) == 0
+        assert events.get("S3CopyObject", 0) == 0
+        assert events.get("S3GetObject", 0) > 0
+        assert events.get("S3PutObject", 0) + events.get("S3UploadPart", 0) > 0
+
+
 @pytest.mark.parametrize(
     "storage_policy",
     [
