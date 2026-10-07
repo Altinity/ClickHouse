@@ -404,6 +404,13 @@ public:
     // prevent scheduling of new jobs.
     void shutdown();
 
+    /// Running jobs may use this to stop retrying before shutdown waits for them.
+    bool isShutdownRequested() const
+    {
+        std::lock_guard lock{mutex};
+        return shutdown_requested;
+    }
+
     // Wait for currently executing jobs to finish, but do not run any other pending jobs.
     // Not finished jobs are left in pending state:
     //  - they can be executed by calling unpause() again;

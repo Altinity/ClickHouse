@@ -769,10 +769,9 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
     {
         cancelled = true;
         ProfileEvents::increment(ProfileEvents::CASRefRecoveryCancelled);
-        throwCasWriteRetryLater(fmt::format(
-            "CAS ref-table recovery for namespace '{}' was cancelled by a self-remount before the mount "
-            "fence was re-armed; the last attempt's fate is unresolved and nothing is installed — the next "
-            "touch recovers under the fresh incarnation", ns.string()));
+        throwCasTransientUnavailable(fmt::format("CAS ref-table recovery for namespace '{}'", ns.string()),
+            "cancelled by a self-remount before the mount fence was re-armed; the last attempt's fate is "
+            "unresolved and nothing is installed — the next touch recovers under the fresh incarnation");
     }
 
     if (rt.catalog_life_invalidated.load(std::memory_order_acquire))
@@ -785,9 +784,8 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
     /// whatever it recovers belongs to a dead incarnation's cache. Checked separately from the
     /// cancellation because the two are independent facts, exactly as `resolveWedgeOnce` checks them.
     if (rt.superseded_by_remount.load(std::memory_order_acquire))
-        throwCasWriteRetryLater(fmt::format(
-            "CAS ref-table recovery for namespace '{}': this cached table was superseded by a self-remount "
-            "mid-recovery — retry against the fresh mount incarnation", ns.string()));
+        throwCasTransientUnavailable(fmt::format("CAS ref-table recovery for namespace '{}'", ns.string()),
+            "this cached table was superseded by a self-remount mid-recovery — retry against the fresh mount incarnation");
 
     /// The FENCE is deliberately NOT checked here: the walk's own `CasOperation` carries the admitted
     /// generation and refuses every request under a generation the fence has moved past, so a second
@@ -1569,10 +1567,8 @@ void CasRefLedger::ensureRefTableRecovered(
                         "before recovery install — nothing is installed",
                         ns.string(), renderIncarnation(rt.life.incarnation)));
                 if (rt.superseded_by_remount.load(std::memory_order_acquire))
-                    throwCasWriteRetryLater(fmt::format(
-                        "CAS ref-table recovery for namespace '{}': this cached table was superseded by a "
-                        "self-remount while the walk was in flight — nothing is installed",
-                        ns.string()));
+                    throwCasTransientUnavailable(fmt::format("CAS ref-table recovery for namespace '{}'", ns.string()),
+                        "this cached table was superseded by a self-remount while the walk was in flight — nothing is installed");
                 if (token && token->stopping())
                     throw Exception(ErrorCodes::ABORTED,
                         "CAS ref recovery: teardown began before recovery install");

@@ -112,7 +112,7 @@ std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
     /// site: retry-later is right even where the condition may turn out terminal, since the next attempt
     /// re-decides against fresh state. Any promise about HOW the condition clears belongs in `condition`,
     /// where the site that can actually prove it makes it -- `checkFenceOrThrow` provably cannot.
-    throw Exception(ErrorCodes::NETWORK_ERROR,
+    throw TransientStateException(ErrorCodes::NETWORK_ERROR,
         "{} -- {}; TRANSIENT unavailability, not damage", subject, condition);
 }
 
@@ -346,7 +346,8 @@ namespace
                                    std::string_view when)
 {
     if (admit == Fence::Admit::NoBudget)
-        throwCasWriteRetryLater(fmt::format("{} of '{}': no lease budget {}", verb, subject, when));
+        throwCasTransientUnavailable(fmt::format("CAS {} of '{}'", verb, subject),
+                                     fmt::format("no lease budget {}", when));
     throwCasTransientUnavailable(fmt::format("CAS {} of '{}'", verb, subject),
                                  fmt::format("mount fence tripped {}", when));
 }
