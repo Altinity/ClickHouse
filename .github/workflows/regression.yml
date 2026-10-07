@@ -534,17 +534,10 @@ jobs:
     secrets: inherit
 
   # CAS (content-addressed storage) is only available in Antalya builds >= 26.6.
-<<<<<<< HEAD
   # These jobs run the suites that support the `--cas` or `--cas-s3-cache` flag with
   # a content-addressed disk as the default MergeTree storage. Gated on the Antalya
   # version so they are never scheduled on upstream release builds where the `cas`
   # metadata type does not exist.
-=======
-  # These jobs run the suites that support the `--cas` flag with a content-addressed
-  # disk as the default MergeTree storage. Gated on the Antalya version so they are
-  # never scheduled on upstream release builds where the `cas` metadata type does
-  # not exist.
->>>>>>> 8bbac7c7135 (Merge pull request #2234 from Altinity/feature/antalya-26.6/regression-cas-jobs)
   CAS:
     if: |
       contains(fromJson(inputs.workflow_config).workflow_config.custom_data.version.string, 'antalya') &&
@@ -555,11 +548,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-<<<<<<< HEAD
         SUITE: [atomic_insert, engines, selects]
-=======
-        SUITE: [aggregate_functions, alter, atomic_insert, engines, lightweight_delete, selects]
->>>>>>> 8bbac7c7135 (Merge pull request #2234 from Altinity/feature/antalya-26.6/regression-cas-jobs)
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -577,7 +566,6 @@ jobs:
       regression_args: --cas
     secrets: inherit
 
-<<<<<<< HEAD
   CASS3Cache:
     if: |
       contains(fromJson(inputs.workflow_config).workflow_config.custom_data.version.string, 'antalya') &&
@@ -804,8 +792,6 @@ jobs:
       extra_args: --only "/alter/${{ matrix.ONLY }} partition/${{ matrix.PART && format('part {0}/', matrix.PART) || '' }}*"
     secrets: inherit
 
-=======
->>>>>>> 8bbac7c7135 (Merge pull request #2234 from Altinity/feature/antalya-26.6/regression-cas-jobs)
   TieredStorageCAS:
     if: |
       contains(fromJson(inputs.workflow_config).workflow_config.custom_data.version.string, 'antalya') &&
