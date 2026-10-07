@@ -148,7 +148,7 @@ PartManifest decodePartManifest(std::string_view data)
     {
         const String meta = readLine(in, line_cap, "cas_part_manifest");
         ReadBufferFromMemory mm(meta.data(), meta.size());
-        JsonObjectReader r(mm, KeyStrictness::Tolerant, "cas_part_manifest");
+        JsonObjectReader r(mm, "cas_part_manifest");
         ManifestRefFields fields;
         std::optional<String> ns;
         std::optional<UInt128> pd;
@@ -185,7 +185,7 @@ PartManifest decodePartManifest(std::string_view data)
     {
         readLineInto(in, row_line, line_cap, "cas_part_manifest");
         ReadBufferFromMemory l(row_line.data(), row_line.size());
-        row_reader.reset(l, KeyStrictness::Tolerant, "cas_part_manifest");
+        row_reader.reset(l, "cas_part_manifest");
         JsonObjectReader & r = row_reader;
         String key;
         if (!r.nextKey(key))

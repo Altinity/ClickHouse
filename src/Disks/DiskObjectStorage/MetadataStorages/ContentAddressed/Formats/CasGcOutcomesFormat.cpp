@@ -79,7 +79,7 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
     {
         readLineInto(in, row_line, line_cap, "outcome log");
         ReadBufferFromMemory line_in(row_line.data(), row_line.size());
-        row_reader.reset(line_in, KeyStrictness::Tolerant, "outcome log");
+        row_reader.reset(line_in, "outcome log");
         JsonObjectReader & r = row_reader;
 
         String key;
