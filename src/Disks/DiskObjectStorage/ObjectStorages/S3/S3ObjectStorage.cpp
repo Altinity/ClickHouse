@@ -748,12 +748,15 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support DeleteObjects", getName());
         }
 
-        throw S3Exception(err.GetErrorType(), "{} (Code: {}) while removing {} objects from S3 in one request",
-                          err.GetMessage(), static_cast<size_t>(err.GetErrorType()), objects.size());
+        throw S3Exception(
+            PreformattedMessage::create("{} (Code: {}) while removing {} objects from S3 in one request",
+                err.GetMessage(), static_cast<size_t>(err.GetErrorType()), objects.size()),
+            err.GetErrorType(), err.GetExceptionName());
     }
 
     String failed_keys;
     std::optional<Aws::S3::S3Errors> first_error_type;
+    String first_error_name;
     for (const auto & err : outcome.GetResult().GetErrors())
     {
         const auto error_type = classifyDeleteObjectsErrorCode(err.GetCode());
@@ -763,10 +766,21 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
             failed_keys += ", ";
         failed_keys += err.GetKey() + " (" + err.GetCode() + ": " + err.GetMessage() + ")";
         if (!first_error_type)
+        {
             first_error_type = error_type;
+            first_error_name = err.GetCode();
+        }
     }
     if (first_error_type)
-        throw S3Exception(*first_error_type, "batch removal left objects behind: [{}]", failed_keys);
+        throw S3Exception(
+            PreformattedMessage::create("batch removal left objects behind: [{}]", failed_keys), *first_error_type, first_error_name);
+}
+
+size_t S3ObjectStorage::batchDeleteKeyLimit() const
+{
+    if (const auto supported = s3_capabilities.isBatchDeleteSupported(); supported.has_value() && !*supported)
+        return 1;
+    return std::max<size_t>(1, s3_settings.get()->request_settings[S3RequestSetting::objects_chunk_size_to_delete]);
 }
 
 bool S3ObjectStorage::conditionalOpsUseGenerationTokens() const

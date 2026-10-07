@@ -9,6 +9,9 @@
 namespace DB
 {
 
+class IDisk;
+using DiskPtr = std::shared_ptr<IDisk>;
+
 class ReadPipeline;
 struct ReadSettings;
 
@@ -256,5 +259,7 @@ public:
     /// in-manifest, loose, directory, or otherwise unresolved paths.
     virtual std::optional<BlobViewPlan> getBlobViewPlan(const std::string & path) const = 0;
 };
+
+IContentAddressedExchange * tryGetContentAddressedExchange(const DiskPtr & disk);
 
 }

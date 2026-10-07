@@ -38,6 +38,9 @@ struct LoadedMeta
 std::optional<LoadedMeta> loadMeta(CasOperation & op, const Layout & layout, const BlobRef & ref,
                                    const Retry & policy = Retry::standard());
 
+/// The decode half of `loadMeta`, for a read issued elsewhere (the GC read-ahead). Decoding errors propagate.
+std::optional<LoadedMeta> decodeLoadedMeta(std::optional<Object> object);
+
 /// Creates the marker only when its key is absent, on the plane `op` belongs to -- like its siblings,
 /// so one caller's decision cannot end up split across two fences. Anything at the key that this call
 /// did not itself write -- a stale `Condemned` marker still present when a vanished body is freshly
