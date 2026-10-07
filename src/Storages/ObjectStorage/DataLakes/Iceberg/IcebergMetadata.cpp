@@ -150,6 +150,7 @@ extern const SettingsBool write_full_path_in_iceberg_metadata;
 extern const SettingsBool use_roaring_bitmap_iceberg_positional_deletes;
 extern const SettingsString iceberg_metadata_compression_method;
 extern const SettingsBool allow_insert_into_iceberg;
+extern const SettingsBool data_lake_delete_data_on_drop;
 extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_geo_types_in_iceberg;
 extern const SettingsBool allow_iceberg_remove_orphan_files;
@@ -1013,6 +1014,11 @@ void IcebergMetadata::dropPartition(
             ErrorCodes::SUPPORT_IS_DISABLED,
             "Iceberg dropPartition requires the allow_insert_into_iceberg setting to be enabled.");
 
+    if (context->getSettingsRef()[Setting::iceberg_snapshot_id].changed
+        || context->getSettingsRef()[Setting::iceberg_timestamp_ms].changed)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "DROP PARTITION does not support iceberg_snapshot_id or iceberg_timestamp_ms settings");
+
     const auto * partition_ast = partition->as<ASTPartition>();
     if (!partition_ast)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected a partition expression in DROP PARTITION");
@@ -1024,7 +1030,7 @@ void IcebergMetadata::dropPartition(
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "DROP PARTITION for Iceberg requires partition values, not a partition ID");
 
-    bool purge = context->getSettingsRef()[Setting::iceberg_delete_data_on_drop];
+    bool purge = context->getSettingsRef()[Setting::data_lake_delete_data_on_drop];
 
     for (size_t attempt = 0; attempt < MAX_TRANSACTION_RETRIES; ++attempt)
     {

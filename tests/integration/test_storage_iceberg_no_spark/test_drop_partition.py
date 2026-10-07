@@ -728,7 +728,7 @@ def data_files_in_storage(started_cluster, namespace, table_name):
 
 
 def test_drop_partition_purges_data_files(started_cluster_iceberg_no_spark):
-    """`iceberg_delete_data_on_drop` decides whether the dropped files leave object storage.
+    """`data_lake_delete_data_on_drop` decides whether the dropped files leave object storage.
     """
     instance = started_cluster_iceberg_no_spark.instances["node1"]
 
@@ -750,7 +750,7 @@ def test_drop_partition_purges_data_files(started_cluster_iceberg_no_spark):
 
     instance.query(
         f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-16'",
-        settings=dict(WRITE_SETTINGS, iceberg_delete_data_on_drop=0),
+        settings=dict(WRITE_SETTINGS, data_lake_delete_data_on_drop=0),
     )
 
     assert instance.query(f"SELECT id FROM {ch_table} ORDER BY id FORMAT TSV") == "1\n2\n4\n"
@@ -761,7 +761,7 @@ def test_drop_partition_purges_data_files(started_cluster_iceberg_no_spark):
 
     instance.query(
         f"ALTER TABLE {ch_table} DROP PARTITION '2024-01-15'",
-        settings=dict(WRITE_SETTINGS, iceberg_delete_data_on_drop=1),
+        settings=dict(WRITE_SETTINGS, data_lake_delete_data_on_drop=1),
     )
 
     assert instance.query(f"SELECT id FROM {ch_table} ORDER BY id FORMAT TSV") == "4\n"
