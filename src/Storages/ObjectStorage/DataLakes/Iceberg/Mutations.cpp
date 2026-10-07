@@ -444,13 +444,20 @@ static bool writeMetadataFiles(
     Poco::JSON::Object::Ptr partititon_spec,
     Int32 partition_spec_id,
     std::optional<ChunkPartitioner> & chunk_partitioner,
+<<<<<<< HEAD
     SharedHeader data_sample_block)
+=======
+    Iceberg::FileContentType content_type,
+    SharedHeader sample_block,
+    bool write_metadata_json_file,
+    const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path)
+>>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 {
     auto delete_sample_block = std::make_shared<const Block>(getPositionDeleteFileSampleBlock());
 
     auto metadata_info = filename_generator.generateMetadataPathWithInfo();
     Int64 parent_snapshot = -1;
-    if (metadata->has(Iceberg::f_current_snapshot_id))
+    if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
         parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
 
     auto sum_files = [](const DataFileWriteResultWithStats & set) -> std::tuple<Int64, Int64, Int64>
@@ -489,6 +496,41 @@ static bool writeMetadataFiles(
     auto new_snapshot = result.snapshot;
     auto storage_manifest_list_name = path_resolver.resolve(result.manifest_list_path);
 
+<<<<<<< HEAD
+=======
+    Poco::JSON::Object::Ptr new_snapshot;
+    String storage_manifest_list_name;
+    if (content_type == Iceberg::FileContentType::POSITION_DELETE)
+    {
+        auto result = MetadataGenerator(metadata).generateNextMetadata(
+            filename_generator,
+            previous_metadata_file_path,
+            parent_snapshot,
+            /* added_files */ 0,
+            /* added_records */ 0,
+            total_bytes,
+            /* num_partitions */ total_files,
+            /* added_delete_files */ total_files,
+            total_rows);
+        new_snapshot = result.snapshot;
+        storage_manifest_list_name = path_resolver.resolve(result.manifest_list_path);
+    }
+    else
+    {
+        auto result = MetadataGenerator(metadata).generateNextMetadata(
+            filename_generator,
+            previous_metadata_file_path,
+            parent_snapshot,
+            /* added_files */ total_files,
+            /* added_records */ total_rows,
+            total_bytes,
+            /* num_partitions */ total_files,
+            /* added_delete_files */ 0,
+            /*num_deleted_rows*/ 0);
+        new_snapshot = result.snapshot;
+        storage_manifest_list_name = path_resolver.resolve(result.manifest_list_path);
+    }
+>>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
     auto manifest_entries_in_storage = std::make_shared<Strings>();
     std::vector<Iceberg::IcebergPathFromMetadata> manifest_entries;
     std::vector<Int64> manifest_entry_sizes;
@@ -772,6 +814,7 @@ void mutate(
         filename_generator.setCompressionMethod(compression_method);
 
         auto metadata = getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
+        auto previous_metadata_path = persistent_table_components.path_resolver.reverseResolve(metadata_path);
 
         /// Iceberg v3 writers must not add new position-delete files; row-level deletes require
         /// deletion vectors. Fail closed before any object writes until ClickHouse can write DVs.
@@ -821,7 +864,7 @@ void mutate(
         current_iceberg_snapshot.metadata_file_path = metadata_path;
         current_iceberg_snapshot.metadata_version = last_version;
         current_iceberg_snapshot.schema_id = static_cast<Int32>(current_schema_id);
-        if (metadata->has(Iceberg::f_current_snapshot_id))
+        if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
         {
             Int64 snapshot_id_val = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
             if (snapshot_id_val >= 0)
@@ -850,9 +893,38 @@ void mutate(
 
         if (mutation_files)
         {
+<<<<<<< HEAD
             if (!writeMetadataFiles(
                     mutation_files->delete_file,
                     mutation_files->data_file,
+=======
+            auto result_delete_files_metadata = writeMetadataFiles(
+                mutation_files->delete_file,
+                object_storage,
+                secondary_storages,
+                context,
+                filename_generator,
+                persistent_table_components.path_resolver,
+                data_lake_settings,
+                write_format,
+                catalog,
+                storage_id,
+                metadata,
+                partititon_spec,
+                static_cast<Int32>(partition_spec_id),
+                chunk_partitioner,
+                Iceberg::FileContentType::POSITION_DELETE,
+                std::make_shared<const Block>(getPositionDeleteFileSampleBlock()),
+                !mutation_files->data_file,
+                previous_metadata_path);
+            if (!result_delete_files_metadata)
+                continue;
+
+            if (mutation_files->data_file)
+            {
+                auto result_data_files_metadata = writeMetadataFiles(
+                    *mutation_files->data_file,
+>>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
                     object_storage,
                     context,
                     filename_generator,
@@ -865,8 +937,20 @@ void mutate(
                     partititon_spec,
                     static_cast<Int32>(partition_spec_id),
                     chunk_partitioner,
+<<<<<<< HEAD
                     sample_block))
                 continue;
+=======
+                    Iceberg::FileContentType::DATA,
+                    sample_block,
+                    true,
+                    previous_metadata_path);
+                if (!result_data_files_metadata)
+                {
+                    continue;
+                }
+            }
+>>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
         }
         break;
     }

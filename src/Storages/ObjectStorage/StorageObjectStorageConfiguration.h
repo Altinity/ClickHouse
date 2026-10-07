@@ -337,6 +337,7 @@ public:
         return true;
     }
 
+<<<<<<< HEAD
     /// Whether LIMIT lazy materialization can be used (see optimizeLazyMaterialization2).
     /// It requires that the physical row numbers of the main read match a later positional
     /// re-read of the same files, which for data lakes depends on how deletes and schema
@@ -358,6 +359,10 @@ public:
     }
 
     virtual void drop(ContextPtr) {}
+=======
+    /// `delete_data` is what `StorageObjectStorage::drop` resolved from `data_lake_delete_data_on_drop`.
+    virtual void drop(bool /* delete_data */) {}
+>>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 
     virtual bool isBackgroundExecutable() const
     {

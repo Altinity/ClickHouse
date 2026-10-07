@@ -40,13 +40,23 @@ public:
 
     bool managesTableLocation() const override { return true; }
 
+    std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
+
     bool tryGetTableMetadata(
         const std::string & namespace_name,
         const std::string & table_name,
         DB::ContextPtr context_,
         TableMetadata & result) const override;
 
+<<<<<<< HEAD
     void dropTable(const String & namespace_name, const String & table_name, bool delete_data) const override;
+=======
+    bool managesTableLocation() const override { return true; }
+
+    void dropTable(const String & namespace_name, const String & table_name, bool delete_data, bool if_exists) const override;
+
+    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
+>>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 
 protected:
     /// Override the network primitives instead of `getAuthHeaders` so the SigV4 signer has
