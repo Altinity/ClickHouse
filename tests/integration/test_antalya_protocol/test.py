@@ -15,6 +15,7 @@ node_old = cluster.add_instance(
 )
 
 NEGOTIATED = "Antalya protocol: "
+MARKED_CLIENT = "(antalya:[0-9]*) version"
 
 
 @pytest.fixture(scope="module")
@@ -32,10 +33,12 @@ def count_in_log(node, substring):
 
 def test_remote_function_negotiates(started_cluster):
     initiator_before = count_in_log(node1, NEGOTIATED)
+    worker_before = count_in_log(node2, MARKED_CLIENT)
 
     assert node1.query("SELECT count() FROM remote('node2', system.one)") == "1\n"
 
     assert count_in_log(node1, NEGOTIATED) > initiator_before
+    assert count_in_log(node2, MARKED_CLIENT) > worker_before
 
 
 def test_new_initiator_against_an_unmarked_worker(started_cluster):
@@ -45,4 +48,6 @@ def test_new_initiator_against_an_unmarked_worker(started_cluster):
 
 
 def test_unmarked_initiator_against_a_marked_server(started_cluster):
+    before = count_in_log(node1, MARKED_CLIENT)
     assert node_old.query("SELECT count() FROM remote('node1', numbers(10))") == "10\n"
+    assert count_in_log(node1, MARKED_CLIENT) == before

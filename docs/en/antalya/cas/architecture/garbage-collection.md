@@ -340,7 +340,8 @@ Recomputes the per-shard in-degree snapshot and computes the round's single dest
 
 - **Runs on:** fold path only
 - **Reads:** streaming `GET` of each referenced parent run segment; one `HEAD` per zero-in-degree
-  candidate; one `.meta` `GET` per graduation candidate lacking in-process marker confirmation. When
+  candidate; one `.meta` `GET` per graduation candidate the round's graduation budget admits, read ahead
+  when `cas_gc_io_concurrency` is above 1. When
   orphan-sweep planning runs: a `LIST` page of `cas/manifests/`, a `GET` per candidate, plus
   `gc/state`, the adopted seal, the catalog, and per-namespace `_ckpt` / tail `_log`.
 - **Writes / deletes:** one `PUT` per rewritten run segment; schedules the async `.meta` condemn
@@ -673,24 +674,31 @@ flowchart LR
     B --> C["retired with condemn_round = n"]
     C --> D{"round n+1: re-verify"}
     D -->|"in-degree recovered"| S["SPARED -- recovery wins, even past the floor"]
-    D -->|"still zero, confirmed durable Condemned evidence for hash and t"| G["GRADUATED -- delete_pending"]
-    D -->|"still zero, evidence unconfirmed"| C2["carried unchanged, retry the marker, never throw"]
+    D -->|"still zero, reads .meta: Condemned at round n or newer"| G["GRADUATED -- delete_pending"]
+    D -->|"still zero, .meta absent, Clean, older or unreadable"| C2["carried, .meta rewritten at this round, never throw"]
     D -->|"current token not equal to t"| SUP["SUPERSEDED -- a writer resurrected, re-condemn the CURRENT token"]
     G --> E["round n+2, pre-CAS: exact-token DELETE of blob at t"]
-    E -->|"Deleted or Absent"| F["then drop the .meta"]
+    E -->|"Deleted or Absent"| F["then drop the .meta if it is still Condemned at round n or older"]
     E -->|TokenMismatch| H["nothing deleted -- live at a newer token, leave the .meta alone"]
 ```
 
-The `.meta` sidecar carries **no token** — it is a per-hash hint. The exact incarnation token lives
-in the condemned sentinel row inside the run, together with the condemn round and two flags,
-`delete_pending` and `marker_confirmed`. `GC`'s marker is add-only: `Clean → Condemned` yes, the
-reverse never, not even when sparing — only a writer that has already displaced the body may clear
-it. A blob whose in-degree reaches zero in round `n` is retired with `condemn_round = n`; it can
-graduate to `delete_pending` in round `n+1` at the earliest and be deleted in round `n+2`, so a
-minimum of two full rounds separate condemnation from deletion. `delete_pending` is never cleared in
-place, but it authorizes a delete only while in-degree stays zero: a fresh edge folded in a later
-round spares the entry and removes it from the retired pipeline (recovery wins, even past the
-floor).
+The `.meta` sidecar carries **no token** — it is a per-hash hint. The exact incarnation token lives in the
+condemned sentinel row inside the run, together with the condemn round and two flags, `delete_pending` and
+`marker_confirmed`; `GC` writes the second with the first and never reads it. Every `GC` marker write stamps the
+round that issues it and replaces an absent marker, `Clean`, or an older-round `Condemned`; `GC` never writes
+`Clean`, not even when sparing — only a writer that has already displaced the body clears it.
+
+Graduation reads the marker in the round that graduates and accepts only `Condemned` at the entry's round or
+newer: an older round may belong to another incarnation of the same content. The marker delete after a redelete
+removes only `Condemned` at the entry's round or older, conditional on the version it read, so a delayed delete
+never removes the marker of a later incarnation. It can leave an orphan `Condemned` marker over an absent body;
+the next writer of that hash republishes and clears it, and `cas-fsck` counts it in `meta_without_body`.
+
+A blob whose in-degree reaches zero in round `n` is retired with `condemn_round = n`; it can graduate to
+`delete_pending` in round `n+1` at the earliest and be deleted in round `n+2`, so a minimum of two full rounds
+separate condemnation from deletion. `delete_pending` is never cleared in place, but it authorizes a delete only
+while in-degree stays zero: a fresh edge folded in a later round spares the entry and removes it from the retired
+pipeline (recovery wins, even past the floor).
 
 ## Sharding {#sharding}
 
@@ -742,6 +750,8 @@ logs:
 | `GET` manifests | 1 per folded owner (manifest) edge — a manifest emits many blob edges but is read once per edge event; no manifest-body cache within a round |
 | `PUT` run segments | 1 per non-pure-carry shard, plus 1 fold seal |
 | `HEAD` blobs | 1 per newly condemned |
+| `GET` blob `.meta` at graduation | 1 per entry the graduation budget admits, plus 1 `GET` and 1 `PUT` per refusal (the rewrite job re-reads the marker before its conditional `PUT`) |
+| `GET` + conditional `DELETE` blob `.meta` after a redelete | 1 `GET` per `Deleted` or `Absent` outcome; the `DELETE` only while the marker is `Condemned` at the entry's round or older |
 | Blob `HEAD` + conditional `DELETE` | 1 `HEAD` per `redelete` entry — an entry that graduated in an *earlier* round, not the current one — up to `cas_gc_round_redelete_budget`; a `DELETE` only when the body is present at the condemned token |
 | Successful lease `CAS gc/state` | 1 |
 | Commit `CAS gc/state` | 1 |
@@ -781,7 +791,7 @@ the chunk size reject `0`:
 | `cas_gc_round_sweep_recovery_op_budget` | 5000 | committed-tail ref-log reads the sweep's recovery walk may spend (phase 9) |
 | `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for write-once families (phases 15, 17); `1` to `1000` |
 | `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes (phase 12) |
-| `cas_gc_io_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 9), the orphan-sweep planning reads (phase 9), the rebuild read-ahead and the `pending_deletes` `HEAD` + conditional `DELETE` fan-out (phase 11); other GC requests run on the round thread; `1` runs the covered requests sequentially. `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead |
+| `cas_gc_io_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 9), the graduation `.meta` reads (phase 9), the orphan-sweep planning reads (phase 9), the rebuild read-ahead and the `pending_deletes` `HEAD` + conditional `DELETE` fan-out (phase 11); other GC requests run on the round thread; `1` runs the covered requests sequentially. `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead |
 
 The fold-batching controls `gc_fold_threshold` (default 1), `gc_fold_max_defer_rounds` (default 8)
 and `gc_frontier_probe_budget` (default unbounded) are internal `PoolConfig` fields with no disk
@@ -877,7 +887,7 @@ No writes.
 |---|---|---:|
 | referenced parent run segments | streaming `GET` | one per referenced run |
 | `<pool_prefix>/blobs/...` | `HEAD` | one per zero-in-degree candidate, plus one peek per carried entry that reached zero again |
-| blob `.meta` | `GET` | one per graduation candidate with no in-process marker confirmation |
+| blob `.meta` | `GET` | one per graduation candidate the graduation budget admits |
 | new run segments | `PUT` | one per written run |
 | `<pool_prefix>/cas/manifests/` | `LIST` | one bounded page, only when orphan planning runs |
 | manifest candidate body | `GET` | one per nominated candidate (≤ `cas_manifest_sweep_delete_budget_keys`), through the read-ahead; keys decided from their name alone are never read; only when orphan planning runs |

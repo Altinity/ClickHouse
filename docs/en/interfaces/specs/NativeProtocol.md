@@ -426,7 +426,7 @@ Client → Server. The first message after the TCP connection opens.
 
 | # | Field            | Type    | Role      | Description |
 |---|------------------|---------|-----------|-------------|
-| 1 | client_name      | String  | universal | Client identifier (e.g., `"clickhouse-client"`) |
+| 1 | client_name      | String  | universal | Client identifier (e.g., `"clickhouse-client"`). An Altinity Antalya build appends `" (antalya:N)"`, where `N` is its Antalya protocol version. See [Antalya protocol version](/antalya/protocol). |
 | 2 | version_major    | VarUInt | universal | Client major version |
 | 3 | version_minor    | VarUInt | universal | Client minor version |
 | 4 | protocol_version | VarUInt | universal | Client's max supported protocol version |
@@ -833,7 +833,7 @@ External clients that don't use SSH auth never see packets 11, 12, or 18 — the
 | 6    | KeepAlive                 | not specified       | Connection keepalive |
 | 7    | Scalar                    | not specified       | Scalar data block |
 | 8    | IgnoredPartUUIDs          | not specified       | Parts to exclude from query |
-| 9    | ReadTaskResponse          | not specified       | S3 cluster read response |
+| 9    | ReadTaskResponse          | not specified       | S3 cluster read response. When both peers negotiated [Antalya protocol](/antalya/protocol) version 2 or newer, the initiator appends optional Iceberg column statistics after the upstream payload. |
 | 10   | MergeTreeReadTaskResponse | not specified       | Parallel read task response |
 | 11   | SSHChallengeRequest       | [SSH auth](#ssh-authentication) | SSH auth challenge request |
 | 12   | SSHChallengeResponse      | [SSH auth](#ssh-authentication) | SSH auth challenge response |

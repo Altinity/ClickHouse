@@ -828,10 +828,35 @@ void IcebergMetadata::checkAlterIsPossible(const AlterCommands & commands)
                 ErrorCodes::NOT_IMPLEMENTED,
                 "Removing column property '{}' from column '{}' is not supported by Iceberg storage", command.to_remove, command.column_name);
 
-        if (command.type == AlterCommand::Type::MODIFY_COLUMN && !command.data_type)
+        if (command.type == AlterCommand::Type::ADD_COLUMN || command.type == AlterCommand::Type::MODIFY_COLUMN)
+        {
+            /// The Iceberg schema records only the type and the field order, so any other clause would be dropped.
+            const char * unsupported_property = nullptr;
+            if (command.comment)
+                unsupported_property = "comment";
+            else if (command.default_expression)
+                unsupported_property = "default expression";
+            else if (command.codec)
+                unsupported_property = "codec";
+            else if (command.ttl)
+                unsupported_property = "TTL";
+            else if (!command.settings_changes.empty() || !command.settings_resets.empty())
+                unsupported_property = "settings";
+
+            if (unsupported_property)
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "{} the {} of column '{}' is not supported by Iceberg storage",
+                    command.type == AlterCommand::Type::ADD_COLUMN ? "Setting" : "Changing",
+                    unsupported_property,
+                    command.column_name);
+        }
+
+        if (command.type == AlterCommand::Type::MODIFY_COLUMN && !command.data_type
+            && !command.first && command.after_column.empty())
             throw Exception(
                 ErrorCodes::NOT_IMPLEMENTED,
-                "Modifying column '{}' without changing its type is not supported by Iceberg storage", command.column_name);
+                "Modifying column '{}' without changing its type or position is not supported by Iceberg storage", command.column_name);
     }
 }
 

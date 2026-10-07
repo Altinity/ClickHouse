@@ -14,6 +14,8 @@
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 
+#include <set>
+
 namespace DB::ErrorCodes { extern const int ABORTED; extern const int CORRUPTED_DATA; extern const int NOT_IMPLEMENTED; }
 
 using namespace DB::Cas;
@@ -207,7 +209,8 @@ SourceEdgeRecord condemnedRec(UInt128 h, const CondemnedRow & row)
     return SourceEdgeRecord{.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)},
                             .source_id = UInt128{0}, .marker = RunMarker::Condemned,
                             .delete_pending = row.delete_pending, .token = row.token,
-                            .size = row.size, .condemn_round = row.condemn_round};
+                            .size = row.size, .condemn_round = row.condemn_round,
+                            .marker_confirmed = row.marker_confirmed};
 }
 
 /// An active-edge record (`RunMarker::Edge`) for `h` at source `sid`.
@@ -1120,4 +1123,237 @@ TEST(CASThreeCursorMerge, RedeleteBudgetDrainsCohortToFixpointOverRounds)
     }
     EXPECT_EQ(total_redeleted, 10u) << "no entry lost to the cap across the whole drain";
     EXPECT_EQ(rounds, 4u) << "ceil(10 / 3) rounds to fully drain";
+}
+
+TEST(CASThreeCursorMerge, GraduationBudgetIsCheckedBeforeTheGate)
+{
+    for (const size_t refusals : {size_t{0}, size_t{2}})
+    {
+        SCOPED_TRACE(refusals);
+        InMemoryBackend backend;
+        DB::Cas::tests::OperationForTest backend_req(backend);
+        Layout layout{"pool"};
+        const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, /*condemn_round*/1, false));
+
+        GcRoundWorkBudget budget;
+        budget.max_graduations = 3;
+        size_t gate_calls = 0;
+        const std::function<bool(const RetiredEntry &)> gate = [&](const RetiredEntry &) { return ++gate_calls > refusals; };
+
+        std::vector<RunRef> runs2;
+        RetiredMergeResult rmr;
+        foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+            /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, gate,
+            &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
+            /*source_retirements*/{}, &budget);
+
+        EXPECT_EQ(gate_calls, 3 + refusals) << "the gate read entries the budget had no slot for";
+        EXPECT_EQ(rmr.graduated.size(), 3u);
+        EXPECT_EQ(budget.graduations_used, 3u);
+        EXPECT_EQ(rmr.still_retired.size(), 10u);
+    }
+}
+
+TEST(CASThreeCursorMerge, MarkerConfirmedBitDoesNotSkipTheGate)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    Layout layout{"pool"};
+    CondemnedRow row = condemnedRowFor(/*condemn_round*/1, "t1");
+    row.marker_confirmed = true;
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, {{b(1), row}});
+
+    size_t gate_calls = 0;
+    const std::function<bool(const RetiredEntry &)> refuse = [&](const RetiredEntry &) { ++gate_calls; return false; };
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(*backend_req, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, refuse, &rmr);
+
+    EXPECT_EQ(gate_calls, 1u) << "a non-pending row's bit skipped the gate";
+    EXPECT_TRUE(rmr.graduated.empty());
+    ASSERT_EQ(rmr.still_retired.size(), 1u);
+    EXPECT_FALSE(rmr.still_retired.front().delete_pending);
+}
+
+namespace
+{
+
+GraduationReadHints acceptAllHints(std::vector<BlobRef> & offered)
+{
+    return GraduationReadHints{
+        .admit = [](const BlobRef &) { return true; },
+        .offer = [&offered](const BlobRef & ref, const CondemnedRow &)
+        {
+            offered.push_back(ref);
+            return true;
+        }};
+}
+
+std::vector<std::pair<UInt128, CondemnedRow>> condemnedRowsOf(const std::vector<BlobRef> & refs)
+{
+    std::vector<std::pair<UInt128, CondemnedRow>> rows;
+    for (size_t i = 0; i < refs.size(); ++i)
+        rows.push_back({refs[i].digest.toU128(), condemnedRowFor(1, "t" + std::to_string(i))});
+    return rows;
+}
+
+}
+
+TEST(CASThreeCursorMerge, ScanAheadStopsAtTheRowCap)
+{
+    InMemoryBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    Layout layout{"pool"};
+    const uint64_t n = kGraduationLookaheadRows + 100;
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(n, 1, false));
+
+    std::vector<BlobRef> offered;
+    const GraduationReadHints hints = acceptAllHints(offered);
+    std::optional<size_t> offers_at_first_gate;
+    const std::function<bool(const RetiredEntry &)> gate = [&](const RetiredEntry &)
+    {
+        if (!offers_at_first_gate)
+            offers_at_first_gate = offered.size();
+        return true;
+    };
+
+    std::vector<RunRef> with_scan;
+    RetiredMergeResult scanned;
+    foldDeltasIntoGeneration(*backend_req, layout, {gen1}, 2, 0, 0, {}, with_scan, /*current_round*/5,
+        /*condemn_round*/6, {}, {}, gate, &scanned, false, nullptr, {}, nullptr, &hints);
+
+    ASSERT_TRUE(offers_at_first_gate.has_value());
+    EXPECT_EQ(*offers_at_first_gate, kGraduationLookaheadRows + 1) << "the current row and a full buffer, no more";
+    EXPECT_EQ(offered.size(), n - 1) << "every row after the first is offered";
+    EXPECT_EQ(std::set<BlobRef>(offered.begin(), offered.end()).size(), n - 1) << "a row was offered twice";
+
+    /// Same output key: a different run would fail the write-once replay with `CORRUPTED_DATA`.
+    std::vector<RunRef> without_scan;
+    RetiredMergeResult plain;
+    const std::function<bool(const RetiredEntry &)> accept = [](const RetiredEntry &) { return true; };
+    foldDeltasIntoGeneration(*backend_req, layout, {gen1}, 2, 0, 0, {}, without_scan, 5, 6, {}, {}, accept, &plain);
+    ASSERT_EQ(with_scan.size(), 1u);
+    ASSERT_EQ(without_scan.size(), 1u);
+    EXPECT_EQ(with_scan.front().checksum, without_scan.front().checksum);
+    EXPECT_EQ(scanned.graduated.size(), plain.graduated.size());
+}
+
+TEST(CASThreeCursorMerge, ScanAheadStopsAtTheSegmentEnd)
+{
+    DB::Cas::tests::CountingBackend backend;
+    DB::Cas::tests::OperationForTest backend_req(backend);
+    Layout layout{"pool"};
+    std::vector<BlobRef> refs;
+    for (uint64_t i = 1; i <= 20; ++i)
+        refs.push_back(bh(i));
+    std::sort(refs.begin(), refs.end());
+    const std::vector<BlobRef> first(refs.begin(), refs.begin() + 10);
+    const std::vector<BlobRef> second(refs.begin() + 10, refs.end());
+    const RunRef seg1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedRowsOf(first));
+    const RunRef seg2 = writeSourceEdgeRun(backend, layout, 1, 1, 0, condemnedRowsOf(second));
+    const std::set<BlobRef> second_set(second.begin(), second.end());
+
+    size_t early_offers = 0;
+    std::vector<BlobRef> offered;
+    const GraduationReadHints hints{
+        .admit = [](const BlobRef &) { return true; },
+        .offer = [&](const BlobRef & ref, const CondemnedRow &)
+        {
+            if (second_set.contains(ref) && backend.getStreamCount(seg2.key) == 0)
+                ++early_offers;
+            offered.push_back(ref);
+            return true;
+        }};
+    std::vector<BlobRef> gated;
+    size_t segment_two_opens_at_first_gate = 0;
+    const std::function<bool(const RetiredEntry &)> gate = [&](const RetiredEntry & e)
+    {
+        /// The first gate runs right after the scan that offered segment 1's rows, which fit the row cap.
+        if (gated.empty())
+            segment_two_opens_at_first_gate = backend.getStreamCount(seg2.key);
+        gated.push_back(e.ref);
+        return true;
+    };
+
+    std::vector<RunRef> with_scan;
+    foldDeltasIntoGeneration(*backend_req, layout, {seg1, seg2}, 2, 0, 0, {}, with_scan, 5, 6, {}, {}, gate,
+        nullptr, false, nullptr, {}, nullptr, &hints);
+
+    EXPECT_EQ(segment_two_opens_at_first_gate, 0u) << "the scan opened segment 2 before the merge reached it";
+    EXPECT_EQ(early_offers, 0u) << "a row of segment 2 was offered before the merge opened it";
+    EXPECT_EQ(offered.size(), 19u) << "offers resume once the next segment is open";
+    ASSERT_EQ(gated.size(), 20u);
+    EXPECT_EQ(gated[9], first.back()) << "the last entry of segment 1 is still admitted and read";
+
+    std::vector<RunRef> without_scan;
+    const std::function<bool(const RetiredEntry &)> accept = [](const RetiredEntry &) { return true; };
+    foldDeltasIntoGeneration(*backend_req, layout, {seg1, seg2}, 2, 0, 0, {}, without_scan, 5, 6, {}, {}, accept);
+    EXPECT_EQ(with_scan.front().checksum, without_scan.front().checksum);
+}
+
+TEST(CASThreeCursorMerge, ScanAheadKeepsRowAndChecksumValidation)
+{
+    Layout layout{"pool"};
+    std::vector<BlobRef> unused;
+    const GraduationReadHints hints = acceptAllHints(unused);
+    const std::function<bool(const RetiredEntry &)> accept = [](const RetiredEntry &) { return true; };
+
+    for (const bool with_scan : {false, true})
+    {
+        SCOPED_TRACE(with_scan);
+        /// A duplicate sentinel in the middle of a condemned cohort.
+        {
+            InMemoryBackend backend;
+            DB::Cas::tests::OperationForTest op(backend);
+            std::vector<SourceEdgeRecord> recs;
+            for (uint64_t i = 1; i <= 6; ++i)
+                recs.push_back(condemnedRec(b(i), condemnedRowFor(1, "t" + std::to_string(i))));
+            std::sort(recs.begin(), recs.end(), [](const SourceEdgeRecord & l, const SourceEdgeRecord & r) { return l.ref < r.ref; });
+            const SourceEdgeRecord duplicate = recs[2];
+            recs.insert(recs.begin() + 3, duplicate);
+            DB::WriteBufferFromOwnString out;
+            SourceEdgeRunWriter writer(out);
+            for (const SourceEdgeRecord & rec : recs)
+                writer.append(rec);
+            writer.finish();
+            out.finalize();
+            const String bytes = out.str();
+            const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0), .checksum = sourceEdgeRunChecksum(bytes),
+                             .shard = 0, .key_generation = 1};
+            (*op).create(bad.key, bytes, Retry::once());
+
+            std::vector<RunRef> out_runs;
+            DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+            {
+                foldDeltasIntoGeneration(*op, layout, {bad}, 2, 0, 0, {}, out_runs, 5, 6, {}, {}, accept, nullptr,
+                    false, nullptr, {}, nullptr, with_scan ? &hints : nullptr);
+            });
+            EXPECT_TRUE(out_runs.empty());
+            EXPECT_FALSE((*op).read(layout.blobTargetRunKey(2, 0, 0, 0), Retry::once()).has_value()) << "a successor run was written";
+        }
+        /// A bad seal checksum on segment 2.
+        {
+            InMemoryBackend backend;
+            DB::Cas::tests::OperationForTest op(backend);
+            std::vector<BlobRef> refs;
+            for (uint64_t i = 1; i <= 8; ++i)
+                refs.push_back(bh(i));
+            std::sort(refs.begin(), refs.end());
+            const RunRef seg1 = writeSourceEdgeRun(backend, layout, 1, 0, 0,
+                condemnedRowsOf(std::vector<BlobRef>(refs.begin(), refs.begin() + 4)));
+            RunRef seg2 = writeSourceEdgeRun(backend, layout, 1, 1, 0,
+                condemnedRowsOf(std::vector<BlobRef>(refs.begin() + 4, refs.end())));
+            seg2.checksum = seg2.checksum + 1;
+
+            std::vector<RunRef> out_runs;
+            DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+            {
+                foldDeltasIntoGeneration(*op, layout, {seg1, seg2}, 2, 0, 0, {}, out_runs, 5, 6, {}, {}, accept,
+                    nullptr, false, nullptr, {}, nullptr, with_scan ? &hints : nullptr);
+            });
+            EXPECT_TRUE(out_runs.empty());
+            EXPECT_FALSE((*op).read(layout.blobTargetRunKey(2, 0, 0, 0), Retry::once()).has_value()) << "a successor run was written";
+        }
+    }
 }
