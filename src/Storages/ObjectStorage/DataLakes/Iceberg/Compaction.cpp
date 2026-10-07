@@ -371,8 +371,12 @@ static void writeDataFiles(
 
         FormatFilterInfoPtr output_format_filter_info
             = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr);
+        auto write_format_settings = format_settings;
+        if (!write_format_settings)
+            write_format_settings = getFormatSettings(context);
+        write_format_settings->parquet.output_timestamp_adjusted_to_utc_from_timezone = true;
         auto output_format = FormatFactory::instance().getOutputFormat(
-            write_format, *write_buffer, *sample_block, context, format_settings, output_format_filter_info);
+            write_format, *write_buffer, *sample_block, context, write_format_settings, output_format_filter_info);
 
         while (true)
         {

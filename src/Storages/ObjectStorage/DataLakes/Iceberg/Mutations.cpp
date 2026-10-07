@@ -217,6 +217,10 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
     Poco::JSON::Object::Ptr data_schema)
 {
     chassert(commands.size() == 1);
+    auto iceberg_format_settings = format_settings;
+    if (!iceberg_format_settings)
+        iceberg_format_settings = getFormatSettings(context);
+    iceberg_format_settings->parquet.output_timestamp_adjusted_to_utc_from_timezone = true;
     DataFileWriteResultByPartitionKey delete_data_result;
     DataFileStatisticsByPartitionKey delete_data_statistics;
     std::unordered_map<ChunkPartitioner::PartitionKey, std::unique_ptr<WriteBuffer>, ChunkPartitioner::PartitionKeyHasher> delete_data_write_buffers;
@@ -284,7 +288,7 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                     column_mapper->setStorageColumnEncoding(std::move(field_ids));
                     FormatFilterInfoPtr format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr);
                     auto output_format = FormatFactory::instance().getOutputFormat(
-                        write_format, *write_buffer, delete_file_sample_block, context, format_settings, format_filter_info);
+                        write_format, *write_buffer, delete_file_sample_block, context, iceberg_format_settings, format_filter_info);
 
                     delete_data_write_buffers[partition_key] = std::move(write_buffer);
                     delete_data_writers[partition_key] = std::move(output_format);
@@ -385,7 +389,7 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                     ColumnMapperPtr data_column_mapper = createColumnMapper(data_schema);
                     FormatFilterInfoPtr data_format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, data_column_mapper, nullptr, nullptr);
                     auto data_output_format = FormatFactory::instance().getOutputFormat(
-                        write_format, *data_write_buffer, data_block, context, format_settings, data_format_filter_info);
+                        write_format, *data_write_buffer, data_block, context, iceberg_format_settings, data_format_filter_info);
 
                     update_data_write_buffers[partition_key] = std::move(data_write_buffer);
                     it = update_data_writers.emplace(partition_key, std::move(data_output_format)).first;

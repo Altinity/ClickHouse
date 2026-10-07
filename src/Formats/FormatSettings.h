@@ -374,6 +374,10 @@ struct FormatSettings
         bool output_datetime_as_uint32 = false;
         bool output_date_as_uint16 = false;
         bool output_enum_as_byte_array = false;
+        /// When false (default), DateTime64 is always written as isAdjustedToUTC=true because
+        /// ClickHouse ticks are UTC. Iceberg sets this so timestamp(_ns) is false and
+        /// timestamptz(_ns) is true, matching TIMESTAMP(*, hasExplicitTimeZone()).
+        bool output_timestamp_adjusted_to_utc_from_timezone = false;
 
         bool parallel_encoding = true;
         bool write_page_index = false;

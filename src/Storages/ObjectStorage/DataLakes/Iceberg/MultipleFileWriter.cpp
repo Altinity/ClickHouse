@@ -61,12 +61,12 @@ void MultipleFileWriter::startNewFile()
     buffer = object_storage->writeObject(
         StoredObject(storage_path), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
 
-    if (format_settings)
-    {
-        format_settings->parquet.write_page_index = true;
-        format_settings->parquet.bloom_filter_push_down = true;
-        format_settings->parquet.filter_push_down = true;
-    }
+    if (!format_settings)
+        format_settings = getFormatSettings(context);
+    format_settings->parquet.write_page_index = true;
+    format_settings->parquet.bloom_filter_push_down = true;
+    format_settings->parquet.filter_push_down = true;
+    format_settings->parquet.output_timestamp_adjusted_to_utc_from_timezone = true;
     FormatFilterInfoPtr format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr);
     output_format = FormatFactory::instance().getOutputFormatParallelIfPossible(
         write_format, *buffer, *sample_block, context, format_settings, format_filter_info);
