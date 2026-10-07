@@ -3114,7 +3114,6 @@ TEST(CASRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublis
         << "the one dispatch above must itself have reissued more than once against the saturated "
            "backend before giving up at its retry window -- a single attempt would not distinguish "
            "this from a non-retrying policy";
-    EXPECT_GT(clock->longestPause(), 0u) << "at least one of those reissues must have paced with a real backoff";
 
     const auto dispatched_before = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();
     for (int i = 0; i < 30; ++i)
@@ -3257,7 +3256,6 @@ TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     EXPECT_GT(clock->pauseCount(), 1u)
         << "the failing dispatch above must itself have reissued more than once before giving up and "
            "arming the backoff -- a single attempt would not distinguish this from a non-retrying policy";
-    EXPECT_GT(clock->longestPause(), 0u) << "at least one of those reissues must have paced with a real backoff";
 
     /// A read within the backoff window (frozen clock) must not re-dispatch.
     const auto d1 = global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();

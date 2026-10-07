@@ -18,6 +18,8 @@
 namespace DB
 {
 
+class IContentAddressedExchange;
+
 class S3BackupDiskClientFactory
 {
 public:
@@ -107,6 +109,14 @@ public:
 
 private:
     std::unique_ptr<ReadBuffer> readFile(const String & file_name, size_t expected_file_size) override;
+
+    bool tryNativeCopyFromContentAddressedDisk(
+        IContentAddressedExchange & ca,
+        const String & path_in_backup,
+        DiskPtr src_disk,
+        const String & src_path,
+        UInt64 start_pos,
+        UInt64 length);
 
     const S3::URI s3_uri;
     const DataSourceDescription data_source_description;
