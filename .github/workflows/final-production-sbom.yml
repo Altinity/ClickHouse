@@ -1,0 +1,85 @@
+name: Final production SBOM
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag, for example v26.6.4.20001.altinityantalya
+        required: true
+        type: string
+      build_run_id:
+        description: Optional MasterCI run ID; auto-detected when omitted
+        required: false
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  final-sbom:
+    name: Build final production SBOM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+    steps:
+      - name: Checkout exact release
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: utils/final_sbom/requirements.txt
+
+      - name: Install verification dependencies
+        run: |
+          python -m pip install -r utils/final_sbom/requirements.txt
+
+      - name: Test SBOM tooling
+        run: python -m unittest discover -s utils/final_sbom/tests -v
+
+      - name: Collect immutable release evidence
+        run: |
+          args=(
+            --tag "$RELEASE_TAG"
+            --repo "$GITHUB_REPOSITORY"
+            --github-token "$GH_TOKEN"
+            --output-dir sbom-work/evidence
+            --require-container
+          )
+          if [[ -n "$BUILD_RUN_ID" ]]; then
+            args+=(--build-run-id "$BUILD_RUN_ID")
+          fi
+          python utils/final_sbom/collect_release_evidence.py "${args[@]}"
+
+      - name: Generate and validate final SBOM
+        run: |
+          python utils/final_sbom/generate_final_sbom.py \
+            --evidence-dir sbom-work/evidence \
+            --output-dir sbom-work/final
+          python -m spdx_tools.spdx.clitools.pyspdxtools \
+            -i sbom-work/final/*-production.spdx.json
+          python utils/final_sbom/verify_outputs.py sbom-work/final
+
+      - name: Publish workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-sbom-${{ env.RELEASE_TAG }}
+          path: |
+            sbom-work/final/*
+            sbom-work/evidence/evidence.json
+            sbom-work/evidence/container-manifest.json
+            sbom-work/evidence/system-licenses.jsonl
+            sbom-work/evidence/*-build-components.txt
+          if-no-files-found: error
+          retention-days: 90

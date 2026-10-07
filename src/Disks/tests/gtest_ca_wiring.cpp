@@ -534,13 +534,7 @@ TEST(CASWiringRead, BlobViewPlanRidesTheStandardPipeline)
         DB::readStringUntilEOF(manifest_bytes, *buf);
     }
     EXPECT_EQ(manifest_bytes, "u-123");
-    /// Not a `getBlobViewPlan` call on the in-manifest path here (all-tree Task 6/9: uuid.txt is now
-    /// a real Inline manifest entry): `getBlobViewPlan`'s only production caller
-    /// (`DiskObjectStorage::prepareRead`) never reaches it once `prepareInManifestRead` returns true
-    /// above — `getBlobViewPlan`'s precondition is "confirmed not in-manifest-servable," which calling
-    /// it directly on an Inline path violates. Pre-Task-9 this assertion passed only by coincidence
-    /// (uuid.txt was not a manifest entry at all, so `findFile` returned not-found, not because
-    /// `getBlobViewPlan` gracefully handles an Inline entry it does find).
+    EXPECT_FALSE(storage->getBlobViewPlan("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt").has_value());
 
     /// Blob-backed file: a real physical key and a payload-sized window whose extent equals
     /// the object's readable size (a right-bounded read never overshoots the window).
@@ -870,6 +864,23 @@ TEST(CASWiringRoute, DirShapeDispatchOrderIsStable)
     EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1").shape,            DS::ShadowIntermediate);
     EXPECT_EQ(storage->classifyDirectoryForTest("a11/a11a11a1-1111-4111-8111-111111111111/deduplication_logs").shape, DS::TableSubdir);
     EXPECT_EQ(storage->classifyDirectoryForTest("store").shape,                 DS::GenericIntermediate);
+
+    /// A path INSIDE a part (file or nested directory): its own shape, decided by the ref at answer
+    /// time. Atomic, detached, moving, non-Atomic and a temporary restore part all route here; a
+    /// projection dir, a table-level subdir and a shadow part file keep their shapes.
+    const std::string tbl = "a11/a11a11a1-1111-4111-8111-111111111111";
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/all_1_1_0/columns.txt").shape,            DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/all_1_1_0/sub").shape,                    DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/detached/all_1_1_0/columns.txt").shape,   DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/moving/all_1_1_0/columns.txt").shape,     DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/tmp_restore_all_1_1_0-abcdefgh/columns.txt").shape, DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest("data/db/tbl/all_1_1_0/columns.txt").shape,        DS::PartFile);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/all_1_1_0/p.proj").shape,                 DS::ProjectionDir);
+    EXPECT_EQ(storage->classifyDirectoryForTest(tbl + "/deduplication_logs").shape,               DS::TableSubdir);
+    EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1/store/" + tbl + "/all_1_1_0/columns.txt").shape, DS::ShadowIntermediate);
+    /// The old branch's parse travels with the shape: present on an Atomic path, absent on non-Atomic.
+    EXPECT_TRUE(storage->classifyDirectoryForTest(tbl + "/all_1_1_0/columns.txt").tf.has_value());
+    EXPECT_FALSE(storage->classifyDirectoryForTest("data/db/tbl/all_1_1_0/columns.txt").tf.has_value());
 }
 
 /// ==== M-W Task 3: the write path through IMetadataTransaction ====

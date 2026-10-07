@@ -52,6 +52,7 @@ struct IcebergFileRecord
     std::map<Int32, Int64> column_sizes;
     std::map<Int32, Int64> value_counts;
     std::vector<Int32> equality_ids;
+    std::optional<UInt64> first_row_id;
 };
 
 class IcebergMetadata : public IDataLakeMetadata
@@ -223,7 +224,7 @@ public:
         StorageMetadataPtr storage_metadata,
         ContextPtr local_context) const override;
 
-    void drop(ContextPtr context) override;
+    void drop(bool delete_data) override;
 
     Poco::JSON::Object::Ptr getMetadataJSON(ContextPtr local_context) const;
 

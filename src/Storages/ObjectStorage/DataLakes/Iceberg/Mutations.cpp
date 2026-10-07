@@ -109,13 +109,13 @@ static bool alterAlreadyApplied(const MetadataGenerator & generator, const Alter
     switch (command.type)
     {
         case AlterCommand::Type::ADD_COLUMN:
-            return generator.isAddColumnApplied(command.column_name, command.data_type);
+            return generator.isAddColumnApplied(command.column_name, command.data_type, command.first, command.after_column);
         case AlterCommand::Type::DROP_COLUMN:
             return generator.isDropColumnApplied(command.column_name);
         case AlterCommand::Type::RENAME_COLUMN:
             return generator.isRenameColumnApplied(command.column_name, command.rename_to);
         case AlterCommand::Type::MODIFY_COLUMN:
-            return generator.isModifyColumnApplied(command.column_name, command.data_type);
+            return generator.isModifyColumnApplied(command.column_name, command.data_type, command.first, command.after_column);
         default:
             return false;
     }
@@ -437,12 +437,13 @@ static bool writeMetadataFiles(
     std::optional<ChunkPartitioner> & chunk_partitioner,
     Iceberg::FileContentType content_type,
     SharedHeader sample_block,
-    bool write_metadata_json_file)
+    bool write_metadata_json_file,
+    const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path)
 {
     auto metadata_info = filename_generator.generateMetadataPathWithInfo();
     auto storage_metadata_name = path_resolver.resolve(metadata_info.path);
     Int64 parent_snapshot = -1;
-    if (metadata->has(Iceberg::f_current_snapshot_id))
+    if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
         parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
 
     Int64 total_rows = 0;
@@ -461,7 +462,7 @@ static bool writeMetadataFiles(
     {
         auto result = MetadataGenerator(metadata).generateNextMetadata(
             filename_generator,
-            metadata_info.path,
+            previous_metadata_file_path,
             parent_snapshot,
             /* added_files */ 0,
             /* added_records */ 0,
@@ -476,7 +477,7 @@ static bool writeMetadataFiles(
     {
         auto result = MetadataGenerator(metadata).generateNextMetadata(
             filename_generator,
-            metadata_info.path,
+            previous_metadata_file_path,
             parent_snapshot,
             /* added_files */ total_files,
             /* added_records */ total_rows,
@@ -672,6 +673,7 @@ void mutate(
         filename_generator.setCompressionMethod(compression_method);
 
         auto metadata = getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
+        auto previous_metadata_path = persistent_table_components.path_resolver.reverseResolve(metadata_path);
 
         /// Iceberg v3 writers must not add new position-delete files; row-level deletes require
         /// deletion vectors. Fail closed before any object writes until ClickHouse can write DVs.
@@ -715,7 +717,7 @@ void mutate(
         current_iceberg_snapshot.metadata_file_path = metadata_path;
         current_iceberg_snapshot.metadata_version = last_version;
         current_iceberg_snapshot.schema_id = static_cast<Int32>(current_schema_id);
-        if (metadata->has(Iceberg::f_current_snapshot_id))
+        if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
         {
             Int64 snapshot_id_val = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
             if (snapshot_id_val >= 0)
@@ -761,7 +763,8 @@ void mutate(
                 chunk_partitioner,
                 Iceberg::FileContentType::POSITION_DELETE,
                 std::make_shared<const Block>(getPositionDeleteFileSampleBlock()),
-                !mutation_files->data_file);
+                !mutation_files->data_file,
+                previous_metadata_path);
             if (!result_delete_files_metadata)
                 continue;
 
@@ -784,7 +787,8 @@ void mutate(
                     chunk_partitioner,
                     Iceberg::FileContentType::DATA,
                     sample_block,
-                    true);
+                    true,
+                    previous_metadata_path);
                 if (!result_data_files_metadata)
                 {
                     continue;
@@ -900,7 +904,7 @@ void alter(
         switch (params[0].type)
         {
             case AlterCommand::Type::ADD_COLUMN:
-                metadata_json_generator.generateAddColumnMetadata(params[0].column_name, params[0].data_type);
+                metadata_json_generator.generateAddColumnMetadata(params[0].column_name, params[0].data_type, params[0].first, params[0].after_column);
                 break;
             case AlterCommand::Type::DROP_COLUMN:
                 if (params[0].clear)
@@ -909,7 +913,7 @@ void alter(
                 break;
             case AlterCommand::Type::MODIFY_COLUMN:
             {
-                if (!metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type, context))
+                if (!metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type, context, params[0].first, params[0].after_column))
                 {
                     succeeded = true;
                 }

@@ -41,8 +41,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// Note: please check if the key already exists to prevent duplicate entries.
         addSettingsChanges(settings_changes_history, "26.6.2.20001.altinityantalya",
         {
+            {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
             {"delta_lake_clustering_predicate_fallback", false, true, "New setting to enable clustering-aware predicate fallback for Delta Lake tables with Liquid Clustering."},
+            {"data_lake_delete_data_on_drop", false, false, "New setting that unifies dropping of data lake data; the released `iceberg_delete_data_on_drop` is kept as an alias for it."},
+            {"datalake_ignore_unsupported_table_properties", false, false, "New setting: allow `CREATE TABLE` and `SHOW CREATE TABLE` in a `DataLakeCatalog` to omit unsupported table properties."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",
