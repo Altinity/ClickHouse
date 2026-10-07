@@ -2393,7 +2393,7 @@ bool RestCatalog::createTable(
     const String & table_name,
     const String & /*new_metadata_path*/,
     Poco::JSON::Object::Ptr metadata_content,
-    DB::CompressionMethod /*metadata_compression_method*/,
+    DB::CompressionMethod metadata_compression_method,
     bool if_not_exists) const
 {
     if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
@@ -2408,11 +2408,7 @@ bool RestCatalog::createTable(
     Poco::JSON::Object::Ptr request_body = new Poco::JSON::Object;
     request_body->set("name", table_name);
     if (!managesTableLocation())
-<<<<<<< HEAD
-        request_body->set("location", metadata_content->getValue<String>("location"));
-=======
         request_body->set("location", location);
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
     {
         Poco::JSON::Object::Ptr initial_schema = metadata_content->getArray("schemas")->getObject(0);
         Poco::JSON::Array::Ptr identifier_fields = new Poco::JSON::Array;
@@ -2441,6 +2437,10 @@ bool RestCatalog::createTable(
 
     if (metadata_content->has("format-version"))
         properties->set("format-version", std::to_string(metadata_content->getValue<int>("format-version")));
+
+    /// The REST server writes the initial metadata file, so it must be told the codec to name and compress it with.
+    if (metadata_compression_method == DB::CompressionMethod::Gzip)
+        properties->set("write.metadata.compression-codec", "gzip");
 
     request_body->set("properties", properties);
 
@@ -2540,11 +2540,7 @@ bool RestCatalog::updateSchema(
     return true;
 }
 
-<<<<<<< HEAD
-void RestCatalog::dropTable(const String & namespace_name, const String & table_name, bool /*delete_data*/) const
-=======
 void RestCatalog::dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 {
     if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
@@ -2552,13 +2548,9 @@ void RestCatalog::dropTable(const String & namespace_name, const String & table_
             table_name, namespace_name);
 
     const auto state_snapshot = state.get();
-<<<<<<< HEAD
-    const std::string endpoint = fmt::format("{}/namespaces/{}/tables/{}?purgeRequested=False", base_url, namespace_name, table_name);
-=======
     const std::string base_endpoint =
         (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables" / table_name).generic_string();
     const std::string endpoint = fmt::format("{}?purgeRequested={}", base_endpoint, purge ? "true" : "false");
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 
     Poco::JSON::Object::Ptr request_body = nullptr;
     try

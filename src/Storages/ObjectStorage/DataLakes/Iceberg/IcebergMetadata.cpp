@@ -124,7 +124,6 @@ extern const int LOGICAL_ERROR;
 extern const int NOT_IMPLEMENTED;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
 extern const int S3_ERROR;
-extern const int FILE_ALREADY_EXISTS;
 extern const int TABLE_ALREADY_EXISTS;
 extern const int SUPPORT_IS_DISABLED;
 extern const int FILE_ALREADY_EXISTS;
@@ -151,8 +150,6 @@ extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_geo_types_in_iceberg;
 extern const SettingsBool allow_iceberg_remove_orphan_files;
 extern const SettingsBool allow_experimental_expire_snapshots;
-<<<<<<< HEAD
-extern const SettingsBool iceberg_delete_data_on_drop;
 extern const SettingsSeconds lock_acquire_timeout;
 extern const SettingsSeconds iceberg_compaction_delay_bias;
 extern const SettingsSeconds iceberg_compaction_data_cleanup;
@@ -162,8 +159,6 @@ extern const SettingsUInt64 iceberg_insert_max_bytes_in_data_file;
 extern const SettingsUInt64 iceberg_max_number_datafiles_to_compact;
 extern const SettingsUInt64 iceberg_data_file_size_lower_threshold_compaction;
 extern const SettingsUInt64 iceberg_data_file_size_upper_threshold_compaction;
-=======
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 }
 
 static constexpr size_t MAX_TRANSACTION_RETRIES = 100;
@@ -977,28 +972,13 @@ void IcebergMetadata::createInitial(
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to create Iceberg table, but storage configuration is expired");
 
     const bool catalog_manages_location = catalog && catalog->managesTableLocation();
-<<<<<<< HEAD
-=======
     const bool catalog_writes_metadata_file = catalog && catalog->isTransactional();
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 
     String namespace_name;
     String table_name;
     if (catalog)
         std::tie(namespace_name, table_name) = DataLake::parseTableName(table_id_.getTableName());
 
-<<<<<<< HEAD
-    if (catalog_manages_location)
-    {
-        DataLake::TableMetadata existing_table;
-        if (catalog->tryGetTableMetadata(namespace_name, table_name, local_context, existing_table))
-        {
-            if (if_not_exists)
-                return;
-            throw Exception(
-                ErrorCodes::TABLE_ALREADY_EXISTS, "Table {}.{} already exists in the catalog", namespace_name, table_name);
-        }
-=======
     auto throw_leftover_metadata = [&]
     {
         throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS,
@@ -1015,7 +995,6 @@ void IcebergMetadata::createInitial(
         if (catalog->tryGetTableMetadata(namespace_name, table_name, local_context, existing_table))
             throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS,
                 "Table {}.{} already exists in the catalog", namespace_name, table_name);
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
     }
     else
     {
@@ -1030,13 +1009,6 @@ void IcebergMetadata::createInitial(
         }
         if (!metadata_files.empty())
         {
-<<<<<<< HEAD
-            if (if_not_exists)
-                return;
-            else
-                throw Exception(
-                    ErrorCodes::TABLE_ALREADY_EXISTS, "Iceberg table with path {} already exists", configuration_ptr->getPathForRead().path);
-=======
             if (!catalog)
             {
                 if (if_not_exists)
@@ -1045,7 +1017,6 @@ void IcebergMetadata::createInitial(
                     ErrorCodes::TABLE_ALREADY_EXISTS, "Iceberg table with path {} already exists", configuration_ptr->getPathForRead().path);
             }
             throw_leftover_metadata();
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
         }
     }
 
@@ -1091,39 +1062,6 @@ void IcebergMetadata::createInitial(
         /// validation, so a rejected CREATE leaves no trace in the catalog): a catalog
         /// that shares its storage view with the data (e.g. SeaweedFS) refuses to create
         /// a namespace over the plain directory those files would leave behind.
-<<<<<<< HEAD
-        catalog->createNamespaceIfNotExists(namespace_name, location_path);
-    }
-
-    if (!catalog_manages_location)
-    {
-        try
-        {
-            writeMessageToFile(metadata_content, filename, object_storage, local_context, "*", "", compression_method);
-        }
-        catch (const Exception & e)
-        {
-            const bool precondition_failed
-                = (e.code() == ErrorCodes::S3_ERROR && e.message().contains("PreconditionFailed"))
-                || e.code() == ErrorCodes::FILE_ALREADY_EXISTS;
-            if (if_not_exists && precondition_failed)
-                return;
-            throw;
-        }
-
-        if (configuration_ptr->getDataLakeSettings()[DataLakeStorageSetting::iceberg_use_version_hint].value)
-        {
-            auto filename_version_hint = configuration_ptr->getRawPath().path + "metadata/version-hint.text";
-            writeMessageToFile("1", filename_version_hint, object_storage, local_context, "*", "");
-        }
-    }
-
-    if (catalog)
-    {
-        auto catalog_filename = configuration_ptr->getTypeName() + "://" + configuration_ptr->getNamespace() + "/"
-            + configuration_ptr->getRawPath().path + fmt::format("metadata/v1{}.metadata.json", compression_suffix);
-        catalog->createTable(namespace_name, table_name, catalog_filename, metadata_content_object);
-=======
         catalog->createNamespaceIfNotExists(namespace_name, namespace_location);
     }
 
@@ -1198,7 +1136,6 @@ void IcebergMetadata::createInitial(
             throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS,
                 "Table {}.{} already exists in the catalog", namespace_name, table_name);
         }
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
     }
 }
 
@@ -1867,23 +1804,7 @@ SinkToStoragePtr IcebergMetadata::write(
 
 void IcebergMetadata::drop(bool delete_data)
 {
-<<<<<<< HEAD
-    if (context->getSettingsRef()[Setting::iceberg_delete_data_on_drop].value)
-=======
-    if (!delete_data)
-        return;
-
-    /// Files outside `table_path` (secondary storage, or base storage elsewhere in the bucket) are only
-    /// discoverable through the metadata graph the base wipe below removes, so enumerate them first. Let
-    /// a failure propagate rather than wiping the metadata re-enumeration on retry depends on (fail closed).
-    auto external_files = Iceberg::collectReachableFiles(
-        object_storage, persistent_components, data_lake_settings, Context::getGlobalContextInstance(), log, *secondary_storages).external_files;
-
-    /// Delete these files leaf-first (reverse of the traversal's append order) so an interrupted drop
-    /// can re-enumerate the rest on retry; batch per storage. Shared files are deleted too, as with `PURGE`.
-    std::reverse(external_files.begin(), external_files.end());
-    for (size_t i = 0; i < external_files.size();)
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
+    if (delete_data)
     {
         /// Skipped rather than refused: this runs after the table is already marked as dropped, so
         /// throwing here only makes `DatabaseCatalog` retry the drop forever.
@@ -1898,7 +1819,8 @@ void IcebergMetadata::drop(bool delete_data)
             return;
         }
 
-        auto files = listFiles(*object_storage, persistent_components.table_path, persistent_components.table_path, "");
+        /// `listFiles` joins path and prefix, so the prefix must be empty.
+        auto files = listFiles(*object_storage, persistent_components.table_path, "", "");
         for (const auto & file : files)
             object_storage->removeObjectIfExists(StoredObject(file));
     }

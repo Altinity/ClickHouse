@@ -64,11 +64,7 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 max_streams_for_files_processing_in_cluster_functions;
-<<<<<<< HEAD
-    extern const SettingsBool iceberg_delete_data_on_drop;
-=======
     extern const SettingsBool data_lake_delete_data_on_drop;
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 }
 
 namespace ErrorCodes
@@ -1046,16 +1042,6 @@ void StorageObjectStorage::prepareForDrop(ContextPtr query_context)
 
 void StorageObjectStorage::drop()
 {
-<<<<<<< HEAD
-    /// We cannot use query context here, because drop is executed in the background.
-    auto drop_context = Context::getGlobalContextInstance();
-    if (catalog)
-    {
-        const auto [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        catalog->dropTable(namespace_name, table_name, drop_context->getSettingsRef()[Setting::iceberg_delete_data_on_drop]);
-    }
-    configuration->drop(drop_context);
-=======
     dropImpl(delete_data_on_drop.load(), catalog, configuration, storage_id, log);
 }
 
@@ -1085,7 +1071,6 @@ void StorageObjectStorage::dropImpl(
         catalog->dropTable(namespace_name, table_name, delete_data, /* if_exists */ false);
     }
     configuration->drop(delete_data);
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 }
 
 std::unique_ptr<ReadBufferIterator> StorageObjectStorage::createReadBufferIterator(

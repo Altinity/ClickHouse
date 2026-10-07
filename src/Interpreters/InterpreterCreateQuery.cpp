@@ -126,6 +126,7 @@ namespace Setting
     extern const SettingsBool allow_experimental_database_materialized_postgresql;
     extern const SettingsBool enable_full_text_index;
     extern const SettingsBool allow_statistics;
+    extern const SettingsBool allow_suspicious_ttl_expressions;
     extern const SettingsBool allow_materialized_view_with_bad_select;
     extern const SettingsBool compatibility_ignore_collation_in_create_table;
     extern const SettingsBool compatibility_ignore_auto_increment_in_create_table;
@@ -2110,6 +2111,9 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
         {
             /// Validate expressions before omitting properties that the destination cannot store.
             KeyDescription primary_key;
+            const TTLValidationMode ttl_validation_mode = getContext()->getSettingsRef()[Setting::allow_suspicious_ttl_expressions]
+                ? TTLValidationMode::SkipValidation
+                : TTLValidationMode::Validate;
             if (create.storage)
             {
                 auto * key = create.storage->primary_key ? create.storage->primary_key : create.storage->order_by;
@@ -2121,11 +2125,11 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
                     KeyDescription::getKeyFromAST(create.storage->unique_key->ptr(), properties.columns, {}, getContext());
                 if (create.storage->ttl_table)
                     TTLTableDescription::getTTLForTableFromAST(
-                        create.storage->ttl_table->ptr(), properties.columns, getContext(), primary_key, /*is_attach=*/ false);
+                        create.storage->ttl_table->ptr(), properties.columns, getContext(), primary_key, ttl_validation_mode);
             }
             for (const auto & column : properties.columns)
                 if (column.ttl)
-                    TTLDescription::getTTLFromAST(column.ttl, properties.columns, getContext(), primary_key, /*is_attach=*/ false);
+                    TTLDescription::getTTLFromAST(column.ttl, properties.columns, getContext(), primary_key, ttl_validation_mode);
             properties.constraints.getExpressions(getContext(), properties.columns.getAllPhysical());
 
             ColumnsDescription plain_columns;
@@ -2270,9 +2274,6 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
     }
 
     /// Actually creates table
-<<<<<<< HEAD
-    bool created = doCreateTable(create, properties, ddl_guard, mode);
-=======
     bool created = false;
     try
     {
@@ -2291,8 +2292,6 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
             e.message());
         created = false;
     }
-    ddl_guard.reset();
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 
     if (!created)   /// Table already exists
     {

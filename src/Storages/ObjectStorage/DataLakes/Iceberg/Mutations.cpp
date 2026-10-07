@@ -444,14 +444,8 @@ static bool writeMetadataFiles(
     Poco::JSON::Object::Ptr partititon_spec,
     Int32 partition_spec_id,
     std::optional<ChunkPartitioner> & chunk_partitioner,
-<<<<<<< HEAD
-    SharedHeader data_sample_block)
-=======
-    Iceberg::FileContentType content_type,
-    SharedHeader sample_block,
-    bool write_metadata_json_file,
+    SharedHeader data_sample_block,
     const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path)
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 {
     auto delete_sample_block = std::make_shared<const Block>(getPositionDeleteFileSampleBlock());
 
@@ -485,7 +479,7 @@ static bool writeMetadataFiles(
 
     auto result = MetadataGenerator(metadata).generateNextMetadata(
         filename_generator,
-        metadata_info.path,
+        previous_metadata_file_path,
         parent_snapshot,
         /* added_files */ data_files_count,
         /* added_records */ data_rows,
@@ -496,41 +490,6 @@ static bool writeMetadataFiles(
     auto new_snapshot = result.snapshot;
     auto storage_manifest_list_name = path_resolver.resolve(result.manifest_list_path);
 
-<<<<<<< HEAD
-=======
-    Poco::JSON::Object::Ptr new_snapshot;
-    String storage_manifest_list_name;
-    if (content_type == Iceberg::FileContentType::POSITION_DELETE)
-    {
-        auto result = MetadataGenerator(metadata).generateNextMetadata(
-            filename_generator,
-            previous_metadata_file_path,
-            parent_snapshot,
-            /* added_files */ 0,
-            /* added_records */ 0,
-            total_bytes,
-            /* num_partitions */ total_files,
-            /* added_delete_files */ total_files,
-            total_rows);
-        new_snapshot = result.snapshot;
-        storage_manifest_list_name = path_resolver.resolve(result.manifest_list_path);
-    }
-    else
-    {
-        auto result = MetadataGenerator(metadata).generateNextMetadata(
-            filename_generator,
-            previous_metadata_file_path,
-            parent_snapshot,
-            /* added_files */ total_files,
-            /* added_records */ total_rows,
-            total_bytes,
-            /* num_partitions */ total_files,
-            /* added_delete_files */ 0,
-            /*num_deleted_rows*/ 0);
-        new_snapshot = result.snapshot;
-        storage_manifest_list_name = path_resolver.resolve(result.manifest_list_path);
-    }
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
     auto manifest_entries_in_storage = std::make_shared<Strings>();
     std::vector<Iceberg::IcebergPathFromMetadata> manifest_entries;
     std::vector<Int64> manifest_entry_sizes;
@@ -893,38 +852,9 @@ void mutate(
 
         if (mutation_files)
         {
-<<<<<<< HEAD
             if (!writeMetadataFiles(
                     mutation_files->delete_file,
                     mutation_files->data_file,
-=======
-            auto result_delete_files_metadata = writeMetadataFiles(
-                mutation_files->delete_file,
-                object_storage,
-                secondary_storages,
-                context,
-                filename_generator,
-                persistent_table_components.path_resolver,
-                data_lake_settings,
-                write_format,
-                catalog,
-                storage_id,
-                metadata,
-                partititon_spec,
-                static_cast<Int32>(partition_spec_id),
-                chunk_partitioner,
-                Iceberg::FileContentType::POSITION_DELETE,
-                std::make_shared<const Block>(getPositionDeleteFileSampleBlock()),
-                !mutation_files->data_file,
-                previous_metadata_path);
-            if (!result_delete_files_metadata)
-                continue;
-
-            if (mutation_files->data_file)
-            {
-                auto result_data_files_metadata = writeMetadataFiles(
-                    *mutation_files->data_file,
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
                     object_storage,
                     context,
                     filename_generator,
@@ -937,20 +867,9 @@ void mutate(
                     partititon_spec,
                     static_cast<Int32>(partition_spec_id),
                     chunk_partitioner,
-<<<<<<< HEAD
-                    sample_block))
-                continue;
-=======
-                    Iceberg::FileContentType::DATA,
                     sample_block,
-                    true,
-                    previous_metadata_path);
-                if (!result_data_files_metadata)
-                {
-                    continue;
-                }
-            }
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
+                    previous_metadata_path))
+                continue;
         }
         break;
     }

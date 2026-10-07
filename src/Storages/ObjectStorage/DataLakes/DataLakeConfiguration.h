@@ -354,13 +354,8 @@ public:
 
     void drop(bool delete_data) override
     {
-<<<<<<< HEAD
         if (auto metadata = tryGetMetadata())
-            metadata->drop(local_context);
-=======
-        if (current_metadata)
-            current_metadata->drop(delete_data);
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
+            metadata->drop(delete_data);
     }
 
     SinkToStoragePtr write(

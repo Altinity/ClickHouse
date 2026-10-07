@@ -1068,11 +1068,7 @@ bool GlueCatalog::updateSchema(
     return updateTableInGlue(namespace_name, table_name, new_metadata_path, columns);
 }
 
-<<<<<<< HEAD
-void GlueCatalog::dropTable(const String & namespace_name, const String & table_name, bool /*delete_data*/) const
-=======
 void GlueCatalog::dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 {
     if (!isNamespaceAllowed(namespace_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,

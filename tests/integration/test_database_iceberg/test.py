@@ -13,12 +13,9 @@ import pyarrow as pa
 import pytest
 import requests
 import pytz
-<<<<<<< HEAD
 from avro.datafile import DataFileReader, DataFileWriter
 from avro.io import DatumReader, DatumWriter
-=======
 from minio import Minio
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 from pyiceberg.catalog import load_catalog
 from pyiceberg.partitioning import PartitionField, PartitionSpec, UNPARTITIONED_PARTITION_SPEC
 from pyiceberg.schema import Schema
@@ -1396,7 +1393,6 @@ def test_cluster_select(started_cluster):
     assert node2.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`", settings={"parallel_replicas_for_cluster_engines": 1, "enable_parallel_replicas": 2, "cluster_for_parallel_replicas": "cluster_simple"}) == 'pablo\n'
 
 
-<<<<<<< HEAD
 def test_cluster_insert(started_cluster):
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
@@ -1446,7 +1442,8 @@ def test_cluster_insert(started_cluster):
         settings=parallel_replicas_settings,
     )
     assert table_name not in node1.query(f"SHOW TABLES FROM {CATALOG_NAME}")
-=======
+
+
 def test_on_cluster_ddl_rejected_for_datalake_catalog(started_cluster):
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
@@ -1496,7 +1493,6 @@ def test_on_cluster_ddl_rejected_for_datalake_catalog(started_cluster):
             assert table_name not in tables, f"table must not have been created in the shared catalog: {tables}"
     finally:
         create_clickhouse_iceberg_database(started_cluster, node2, CATALOG_NAME)
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 
 
 def test_used_storages_in_query_log(started_cluster):
@@ -1668,7 +1664,6 @@ def test_system_tables_with_nullptr_table(started_cluster):
     node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
 
 
-<<<<<<< HEAD
 def test_system_tables_metadata_unresolvable_does_not_abort_scan(started_cluster):
     """
     Regression test for https://github.com/ClickHouse/ClickHouse/issues/110032.
@@ -1863,7 +1858,8 @@ def test_merge_over_datalake_with_unresolvable_table_does_not_hang(started_clust
         node.query("DROP TABLE IF EXISTS default.merge_over_datalake")
 
     node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
-=======
+
+
 def test_create_table_as(started_cluster):
     node = started_cluster.instances["node1"]
     namespace = f"ctas_{uuid.uuid4().hex}"
@@ -2656,7 +2652,6 @@ def test_create_if_not_exists_with_engine_over_leftover_metadata(started_cluster
         settings=settings,
     )
     assert node.query(f"EXISTS TABLE {CATALOG_NAME}.`{namespace}.t`", settings=settings) == "0\n"
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 
 
 def test_delete_on_lazy_initialized_table(started_cluster):

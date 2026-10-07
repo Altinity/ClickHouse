@@ -292,11 +292,8 @@ public:
     /// Creates the namespace unless it already exists.
     virtual void createNamespaceIfNotExists(const String & namespace_name, const String & location) const;
 
-<<<<<<< HEAD
-=======
     /// Whether the catalog chooses the storage location of a new table itself, so `CREATE TABLE` must
     /// neither propose one nor write the initial metadata file.
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
     virtual bool managesTableLocation() const { return false; }
 
     /// Updates metadata in catalog.
@@ -319,12 +316,8 @@ public:
         Poco::JSON::Object::Ptr metadata = nullptr) const;
 
     /// Drop table from catalog.
-<<<<<<< HEAD
-    virtual void dropTable(const String & namespace_name, const String & table_name, bool delete_data) const;
-=======
     /// If `purge`, the catalog is also asked to delete the underlying data files.
     virtual void dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const;
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 
     /// Does the catalog support transactions or anything like that?
     /// For example, the Iceberg REST catalog supports atomic operations "compare if snapshot X is equal to" and "add new snapshot Y".

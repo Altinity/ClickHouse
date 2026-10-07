@@ -120,15 +120,11 @@ namespace Setting
     extern const SettingsBool parallel_replicas_for_cluster_engines;
     extern const SettingsString cluster_for_parallel_replicas;
     extern const SettingsBool database_datalake_require_metadata_access;
-<<<<<<< HEAD
     extern const SettingsBool s3_allow_server_credentials_in_user_queries;
-    extern const SettingsBool show_data_lake_catalogs_in_system_tables;
-=======
     extern const SettingsBool data_lake_delete_data_on_drop;
     extern const SettingsBool datalake_ignore_unsupported_table_properties;
     extern const SettingsBool show_data_lake_catalogs_in_system_tables;
     extern const SettingsString iceberg_metadata_compression_method;
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 }
 
 namespace DataLakeStorageSetting
@@ -149,12 +145,9 @@ namespace ErrorCodes
     extern const int DATALAKE_DATABASE_ERROR;
     extern const int CANNOT_GET_CREATE_TABLE_QUERY;
     extern const int LOGICAL_ERROR;
-<<<<<<< HEAD
     extern const int ACCESS_DENIED;
-=======
     extern const int NOT_IMPLEMENTED;
     extern const int TABLE_ALREADY_EXISTS;
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 }
 
 namespace FailPoints
@@ -168,7 +161,6 @@ namespace FailPoints
 namespace
 {
 
-<<<<<<< HEAD
 /// In refresh-token mode a single token, minted with `auth_scope`, serves both the OneLake
 /// catalog and Azure storage requests, so the scope must be the Azure storage audience.
 constexpr auto ONELAKE_STORAGE_AUTH_SCOPE = "https://storage.azure.com/.default";
@@ -187,7 +179,8 @@ DataLake::TableNameFilter toCatalogTableNameFilter(const TablesFilter & tables_f
             return {DataLake::TableNameFilter::Kind::Like, tables_filter.pattern};
     }
     return {DataLake::TableNameFilter::Kind::All, {}};
-=======
+}
+
 String getLocationScheme(const std::shared_ptr<DataLake::ICatalog> & catalog)
 {
     if (auto storage_type = catalog->getStorageType(); storage_type.has_value())
@@ -198,7 +191,6 @@ String getLocationScheme(const std::shared_ptr<DataLake::ICatalog> & catalog)
         "Catalog type '{}' does not report a backing storage type, so the location scheme is unknown. "
         "Set `default_base_location` on the database or configure the catalog to expose `default-base-location`",
         catalog->getCatalogType());
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
 }
 
 }

@@ -768,11 +768,8 @@ std::unordered_map<String, CHSetting> serverSettings = {
     {"create_index_ignore_unique", trueOrFalseSettingNoOracle},
     {"create_table_empty_primary_key_by_default", trueOrFalseSettingNoOracle},
     {"cross_to_inner_join_rewrite", CHSetting(zeroOneTwo, {"0", "1", "2"}, false)},
-<<<<<<< HEAD
-    {"data_type_default_nullable", trueOrFalseSettingNoOracle},
-=======
     {"data_lake_delete_data_on_drop", trueOrFalseSettingNoOracle},
->>>>>>> beba45e69f3 (Merge pull request #2305 from Altinity/releasy/port/pr-98670-2f540f)
+    {"data_type_default_nullable", trueOrFalseSettingNoOracle},
     {"database_atomic_wait_for_drop_and_detach_synchronously", trueOrFalseSettingNoOracle},
     {"database_datalake_require_metadata_access", trueOrFalseSettingNoOracle},
     {"database_replicated_allow_explicit_uuid", CHSetting(zeroOneTwo, {}, false)},
