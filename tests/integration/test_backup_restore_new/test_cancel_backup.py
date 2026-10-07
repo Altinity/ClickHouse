@@ -275,6 +275,8 @@ def test_cancel_backup(storage_policy):
 # Test that shutdown cancels a running backup and doesn't wait until it finishes.
 @pytest.mark.parametrize("storage_policy", [None, "cas_policy"])
 def test_shutdown_cancel_backup(storage_policy):
+    cas_pool_baseline = wait_cas_pool_settled() if storage_policy == "cas_policy" else None
+
     node.query(
         "CREATE TABLE tbl (x UInt64) ENGINE=MergeTree() ORDER BY tuple() PARTITION BY x%5"
         + table_settings(storage_policy)
@@ -301,3 +303,6 @@ def test_shutdown_cancel_backup(storage_policy):
             f"RESTORE TABLE tbl FROM {get_backup_name(backup_id)}"
         ),
     )
+
+    if cas_pool_baseline is not None:
+        wait_cas_pool_reclaimed(cas_pool_baseline)
