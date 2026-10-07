@@ -367,13 +367,13 @@ GlueCatalog::GlueCatalog(
             }
 
             LOG_DEBUG(logger, "Assumed role {} as user {}", role_arn, auth_token.principal);
-            return AuthenticatedClient{build_glue_client(provider), provider};
+            return AuthenticatedClient{build_glue_client(provider), provider, auth_token.fingerprint};
         };
     }
     else
     {
         auto service_credentials_provider = DB::S3::getCredentialsProvider(poco_config, credentials, creds_config);
-        service_client = AuthenticatedClient{build_glue_client(service_credentials_provider), service_credentials_provider};
+        service_client = AuthenticatedClient{build_glue_client(service_credentials_provider), service_credentials_provider, /* token_fingerprint */ {}};
     }
 }
 
@@ -724,12 +724,11 @@ ICatalog::CredentialsRefreshCallback GlueCatalog::getCredentialsConfigurationCal
     /// S3 client is pinned to a snapshot that goes stale on long reads. This
     /// callback re-asks the same provider for current credentials each time
     /// `ReadBufferFromS3` reports an `ExpiredToken`, letting the read recover.
-    auto credentials_provider = getClient(auth_token).credentials_provider;
-
-    return [this, storage_id, credentials_provider]() -> std::shared_ptr<IStorageCredentials>
+    /// `getClient` is called on each refresh to recheck the token forwarding switch before contacting STS.
+    return [this, storage_id, auth_token]() -> std::shared_ptr<IStorageCredentials>
     {
         LOG_DEBUG(log, "Refreshing AWS credentials for {} after expired token", storage_id.getNameForLogs());
-        auto credentials = credentials_provider->GetAWSCredentials();
+        auto credentials = getClient(auth_token).credentials_provider->GetAWSCredentials();
         return std::make_shared<S3Credentials>(
             credentials.GetAWSAccessKeyId(),
             credentials.GetAWSSecretKey(),
@@ -752,7 +751,8 @@ bool GlueCatalog::empty(const DB::ForwardedAuthTokenPtr & auth_token) const
 Poco::JSON::Object::Ptr GlueCatalog::getOrFetchMetadataObject(
     const AuthenticatedClient & client, const String & metadata_uri, const TableMetadata & table_metadata) const
 {
-    auto [value, _] = metadata_objects.getOrSet(metadata_uri, [&]()
+    /// The metadata is read with the user's credentials, so a user must not get an entry fetched by another user.
+    auto [value, _] = metadata_objects.getOrSet(client.token_fingerprint + metadata_uri, [&]()
     {
         auto [object_storage, bucket_name, metadata_path] = createObjectStorageForEarlyTableAccess(client, metadata_uri, table_metadata);
         auto compression_method = DB::Iceberg::getCompressionMethodFromMetadataFile(metadata_uri);

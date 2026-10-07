@@ -109,6 +109,8 @@ private:
     {
         std::shared_ptr<Aws::Glue::GlueClient> client;
         std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider;
+        /// Fingerprint of the forwarded token; empty for `service_client`.
+        String token_fingerprint;
     };
 
     AuthenticatedClient service_client;
