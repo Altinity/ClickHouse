@@ -517,6 +517,9 @@ baseline — on a pool that has ever completed a GC round this means the object 
 `adopted_seal_generation` names which generation's fold seal the rebuild carried holds from; `0`
 when it carried none.
 
+Before rebuilding a lost `gc/state`, stop or restart every server of the pool. A request a server sent before it
+stopped can still reach the object store afterwards; this rule does not cover it.
+
 ### SYSTEM CAS GC STOP / SYSTEM CAS GC START {#system-cas-gc-stop-start}
 
 Pause or resume the background GC scheduler on one content-addressed disk, without affecting reads

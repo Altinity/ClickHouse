@@ -35,13 +35,17 @@ public:
 
     DB::Names getTables() const override;
 
+    std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
+
     bool tryGetTableMetadata(
         const std::string & namespace_name,
         const std::string & table_name,
         DB::ContextPtr context_,
         TableMetadata & result) const override;
 
-    void dropTable(const String & namespace_name, const String & table_name) const override;
+    bool managesTableLocation() const override { return true; }
+
+    void dropTable(const String & namespace_name, const String & table_name, bool delete_data, bool if_exists) const override;
 
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
 

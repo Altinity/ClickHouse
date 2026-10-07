@@ -71,7 +71,7 @@ OwnerObject decodeOwner(std::string_view data)
     expectHeaderLine(in, FormatId::Owner);
     const String body = readBodyLine(in, FormatId::Owner, "owner");
     ReadBufferFromMemory body_in(body.data(), body.size());
-    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "owner");
+    JsonObjectReader r(body_in, "owner");
 
     OwnerObject o;
     bool saw = false;
@@ -114,7 +114,7 @@ ServerEpoch decodeServerEpoch(std::string_view data)
     expectHeaderLine(in, FormatId::ServerEpoch);
     const String body = readBodyLine(in, FormatId::ServerEpoch, "server-epoch");
     ReadBufferFromMemory body_in(body.data(), body.size());
-    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "server-epoch");
+    JsonObjectReader r(body_in, "server-epoch");
 
     ServerEpoch e;
     bool saw = false;
@@ -162,7 +162,7 @@ MountLease decodeMountLease(std::string_view data)
     expectHeaderLine(in, FormatId::MountLease);
     const String body = readBodyLine(in, FormatId::MountLease, "mount-lease");
     ReadBufferFromMemory body_in(body.data(), body.size());
-    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "mount-lease");
+    JsonObjectReader r(body_in, "mount-lease");
 
     MountLease m;
     bool saw_su = false;

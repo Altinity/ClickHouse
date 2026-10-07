@@ -2250,7 +2250,7 @@ ClusterFunctionReadTaskResponsePtr TCPHandler::receiveClusterFunctionReadTaskRes
         case Protocol::Client::ReadTaskResponse:
         {
             auto task = std::make_shared<ClusterFunctionReadTaskResponse>();
-            task->deserialize(*in);
+            task->deserialize(*in, client_antalya_protocol_version);
             return task;
         }
 

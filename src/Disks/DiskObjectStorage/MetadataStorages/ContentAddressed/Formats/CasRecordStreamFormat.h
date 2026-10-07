@@ -55,7 +55,7 @@ inline RunMarker runMarkerFromByte(char byte, std::string_view what)
 /// the `RecordStream` family
 /// (`FormatId::RunFile`): unbounded-cardinality sorted records, `object_cap = 0` (NEVER materialized
 /// whole — streamed one line at a time over a `ReadBuffer`), `line_cap = 4 KiB`, `PinnedRaw` (no
-/// compression) + `Strict` (byte-deterministic for `putDeterministicArtifact` adoption).
+/// compression; byte-deterministic for `putDeterministicArtifact` adoption).
 ///
 /// This file is backend-free: it accepts caller-owned `ReadBuffer`/`WriteBuffer` objects and reaches
 /// no backend or GC machinery -- `PersistedEtag` is a value type with no live backend behind
@@ -90,7 +90,7 @@ struct SourceEdgeRecord
     PersistedEtag token{};
     uint64_t size = 0;
     uint64_t condemn_round = 0;
-    bool marker_confirmed = false;   /// durable Condemned meta confirmed for this entry (graduation gate)
+    bool marker_confirmed = false;   /// written with `delete_pending`; the graduation gate reads the marker, not this bit
 };
 
 /// The header-line `kind` word for the only live `cas_run` kind.
