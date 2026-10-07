@@ -85,6 +85,8 @@ public:
 
     void drop() override;
 
+    void prepareForDrop(ContextPtr query_context) override;
+
     void dropInnerTableIfAny(bool sync, ContextPtr context) override;
 
     void truncate(
