@@ -33,8 +33,8 @@ using RemoveWriteOnce
 class NamespaceJanitor
 {
 public:
-    /// An empty `remove_write_once_` deletes on the caller's thread, one request per `kBulkDeleteMaxKeys` keys.
-    NamespaceJanitor(CasRequests & requests_, const Layout & layout_, size_t page_budget_, RemoveWriteOnce remove_write_once_ = {});
+    /// An empty `remove_write_once_keys_` deletes on the caller's thread, one request per `kBulkDeleteMaxKeys` keys.
+    NamespaceJanitor(CasRequests & requests_, const Layout & layout_, size_t page_budget_, RemoveWriteOnce remove_write_once_keys_ = {});
 
     /// `liveness` is admitted once for the whole page (one `CasOperation` covers the read, the list,
     /// every delete and the cursor publication): a fact the fence cannot see, such as "this tenure
@@ -46,7 +46,7 @@ public:
     /// publication) reports it as `GaveUp` rather than sending anything.
     ///
     /// A dead life's canonical `_log`/`_snap` keys are write-once, so the page deletes them together through
-    /// `remove_write_once` with no per-key `HEAD` or token; `_ckpt` and `_files` keep the exact-token delete.
+    /// `remove_write_once_keys` with no per-key `HEAD` or token; `_ckpt` and `_files` keep the exact-token delete.
     ///
     /// A failed `LIST` resets the persisted cursor only when `first_page_of_pass`: that cursor comes from an
     /// earlier round and the store may reject it forever, while the one a page of this pass just published
@@ -59,7 +59,7 @@ private:
     CasRequests & requests;
     const Layout & layout;
     size_t page_budget;
-    RemoveWriteOnce remove_write_once;
+    RemoveWriteOnce remove_write_once_keys;
 };
 
 }

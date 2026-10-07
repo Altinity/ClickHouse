@@ -1,6 +1,6 @@
 """
-A dropped table's ref stream drains in one deleting round of the namespace janitor on RustFS, on a store
-with a batch delete and on one without.
+A dropped table's ref stream drains in one deleting round of the namespace janitor on RustFS: on a store with a
+batch delete, on one with a small `objects_chunk_size_to_delete`, and on one without a batch delete.
 """
 import pytest
 
@@ -8,7 +8,8 @@ from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
 
-INSERTS = 2500
+# Enough for more than one janitor page; small enough for the INSERT to finish under MSan.
+INSERTS = 1100
 MAX_ROUNDS = 3
 
 
@@ -47,7 +48,8 @@ def seed_and_drop(node, disk):
     node.query(
         f"INSERT INTO t_{disk} SELECT number FROM numbers({INSERTS}) SETTINGS max_block_size = 1, "
         "max_insert_block_size = 1, min_insert_block_size_rows = 1, min_insert_block_size_bytes = 0, "
-        "max_insert_threads = 1"
+        "max_insert_threads = 1",
+        timeout=1800,
     )
     assert len(stream_keys(disk)) >= INSERTS
     node.query(f"DROP TABLE t_{disk} SYNC")
@@ -66,7 +68,7 @@ def janitor_rows(node, disk, since):
     return [dict(zip(columns, map(int, line.split("\t")))) for line in out.strip().splitlines()]
 
 
-@pytest.mark.parametrize("disk", ["cas_batch", "cas_no_batch"])
+@pytest.mark.parametrize("disk", ["cas_batch", "cas_small_chunk", "cas_no_batch"])
 def test_dropped_table_drains_in_one_round(disk):
     node = cluster.instances["node"]
     since = node.query("SELECT now64(6)").strip()
@@ -86,5 +88,8 @@ def test_dropped_table_drains_in_one_round(disk):
     assert row["budget_exhausted"] == 0
     if disk == "cas_batch":
         assert row["delete_requests"] * 10 < dead_keys, f"{disk}: the dead keys did not go in batches: {rows}"
+    elif disk == "cas_small_chunk":
+        # One request per 100 keys, plus at most one short request per page.
+        assert dead_keys // 100 <= row["delete_requests"] <= dead_keys // 100 + row["janitor_pages"], f"{disk}: {rows}"
     else:
         assert row["delete_requests"] >= dead_keys, f"{disk}: expected one request per key: {rows}"

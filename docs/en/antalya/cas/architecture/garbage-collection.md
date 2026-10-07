@@ -531,9 +531,9 @@ nothing ends the pass. A pool without debris costs one `LIST` per round.
 - **Reads:** per page: the durable `janitor_cursor`; one `LIST` page (≤ 1000 keys) of `cas/ns/`; a
   fresh ref-catalog snapshot; `gc/state` for the fence re-check
 - **Writes / deletes:** per page: batch `DELETE`s of the dead-life `_log` / `_snap` objects, which
-  are write-once and need no token; the page's keys are split evenly across the GC I/O pool
-  (`cas_gc_io_concurrency`), at most `cas_gc_bulk_delete_chunk_keys` per request, and a storage
-  without a batch delete gets one request per key from the same jobs; exact-token `DELETE` per
+  are write-once and need no token; one request per `cas_gc_bulk_delete_chunk_keys` keys, capped by
+  the storage's batch-delete limit (`objects_chunk_size_to_delete` on S3; one key on a storage
+  without a batch delete), run as jobs on the GC I/O pool (`cas_gc_io_concurrency`); exact-token `DELETE` per
   dead-life `_ckpt` / `_files` object; one `CAS` on the maintenance state when the page is decided
 - **Safety:** each request is under a GC fence re-check (`lease.owner` / `lease.seq`), read once per
   page and checked again before the cursor is published; the incarnation segment in every key makes an old life's objects structurally
@@ -962,7 +962,7 @@ pages delete.
 | `<pool_prefix>/cas/ns/` | `LIST` | one page |
 | `<pool_prefix>/cas/ref_catalog` | `GET` | 1 |
 | `<pool_prefix>/gc/state` | `GET` | 1 (fence check) |
-| dead-life `_log` / `_snap` objects | batch `DELETE` | up to `cas_gc_io_concurrency` requests for the page's keys; one per key on a storage without a batch delete |
+| dead-life `_log` / `_snap` objects | batch `DELETE` | one per `cas_gc_bulk_delete_chunk_keys` keys, capped by the storage's batch-delete limit; one per key on a storage without a batch delete |
 | dead-life `_ckpt` / `_files` object | `DELETE` | one per object (plus one `HEAD` per object whose `LIST` entry carried no token) |
 | `<pool_prefix>/gc/maintenance_state` | `CAS` | 1 when the page is decided |
 

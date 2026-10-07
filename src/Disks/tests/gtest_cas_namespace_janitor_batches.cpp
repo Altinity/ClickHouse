@@ -103,7 +103,8 @@ public:
     std::atomic<bool> delete_done{false};
 };
 
-/// A store without a batch delete: more than one key in a request is `NOT_IMPLEMENTED`.
+/// A store that has not learned yet that it has no batch delete: it still advertises the CAS maximum,
+/// refuses every batch of more than one key, and fails one chosen key.
 class NoBatchDeleteBackend : public CountingBackend
 {
 public:
@@ -114,11 +115,21 @@ public:
             ++refused_batches;
             throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "no batch delete");
         }
+        if (keys.front().str() == failing_key)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "delete failed");
         ++single_key_requests;
         CountingBackend::removeManyWriteOnce(keys, access);
     }
+    String failing_key;
     std::atomic<size_t> refused_batches{0};
     std::atomic<size_t> single_key_requests{0};
+};
+
+/// A store known to have no batch delete: its limit is one key.
+class OneKeyLimitBackend : public CountingBackend
+{
+public:
+    size_t bulkDeleteKeyLimit() const override { return 1; }
 };
 
 /// Each `LIST` of the namespace root moves the clock, so a test can spend the janitor's budget in one page.
@@ -275,9 +286,9 @@ TEST(CASNamespaceJanitorBatches, RoundDrainsEveryPageOfDebris)
     EXPECT_EQ(metrics.at("janitor_deleted"), 2500u);
     EXPECT_EQ(metrics.at("leaked"), 0u);
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 4u);
-    EXPECT_EQ(metrics.at("delete_requests"), 12u);
-    /// Every page is split across the 4 pool threads.
-    EXPECT_EQ(backend->bulkRemoveCalls(), 12u);
+    EXPECT_EQ(metrics.at("delete_requests"), 3u);
+    /// One request per page: the in-memory store's limit is the CAS maximum.
+    EXPECT_EQ(backend->bulkRemoveCalls(), 3u);
 }
 
 TEST(CASNamespaceJanitorBatches, RoundDrainsDebrisOnBothSidesOfTheCursor)
@@ -382,12 +393,13 @@ TEST(CASNamespaceJanitorBatches, QuietPoolCostsOneListPerRound)
     EXPECT_FALSE(state.state->janitor_cursor.empty());
 }
 
-TEST(CASNamespaceJanitorBatches, StoreWithoutBatchDeleteDrainsKeyByKeyOnThePool)
+TEST(CASNamespaceJanitorBatches, StoreKnownToHaveNoBatchDeleteSendsOneRequestPerKey)
 {
-    auto backend = std::make_shared<NoBatchDeleteBackend>();
+    auto backend = std::make_shared<OneKeyLimitBackend>();
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 316), 1200);
+    backend->resetCounts();
 
     Gc gc(store, DB::UInt128{317});
     const auto metrics = runRoundAndGetJanitorMetrics(gc);
@@ -395,28 +407,47 @@ TEST(CASNamespaceJanitorBatches, StoreWithoutBatchDeleteDrainsKeyByKeyOnThePool)
     EXPECT_EQ(countPresent(*backend, stream), 0u);
     EXPECT_EQ(metrics.at("janitor_deleted"), 1200u);
     EXPECT_EQ(metrics.at("leaked"), 0u);
-    EXPECT_EQ(backend->single_key_requests.load(), 1200u);
-    /// Two pages, each split into one job per pool thread.
-    EXPECT_EQ(backend->refused_batches.load(), 8u);
-    EXPECT_EQ(metrics.at("delete_requests"), 1208u);
+    EXPECT_EQ(backend->bulkRemoveCalls(), 1200u);
+    EXPECT_EQ(metrics.at("delete_requests"), 1200u);
+}
+
+TEST(CASNamespaceJanitorBatches, RefusedBatchGoesKeyByKeyAndLeaksOnlyTheFailedKey)
+{
+    auto backend = std::make_shared<NoBatchDeleteBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 324), 1200);
+    backend->failing_key = stream[1100];
+
+    Gc gc(store, DB::UInt128{325});
+    const auto metrics = runRoundAndGetJanitorMetrics(gc);
+
+    EXPECT_EQ(countPresent(*backend, stream), 1u);
+    EXPECT_TRUE(present(*backend, stream[1100]));
+    EXPECT_EQ(metrics.at("janitor_deleted"), 1199u);
+    EXPECT_EQ(metrics.at("leaked"), 1u) << "a failure late in the chunk leaks that key, not the whole chunk";
+    EXPECT_EQ(backend->single_key_requests.load(), 1199u);
+    /// One refused batch per page, then one request per key.
+    EXPECT_EQ(backend->refused_batches.load(), 2u);
+    EXPECT_EQ(metrics.at("delete_requests"), 1202u);
 }
 
 TEST(CASNamespaceJanitorBatches, RefusedEnqueueLeaksTheUnscheduledJobsAndTheNextRoundDrains)
 {
-    auto backend = std::make_shared<CountingBackend>();
+    auto backend = std::make_shared<OneKeyLimitBackend>();
     auto store = openPool(backend, /*refuse_at=*/1);
     const Layout & layout = store->layout();
-    const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 318), 100);
+    const std::vector<String> stream = seedLogs(*backend, layout, life("dead", 318), 4);
 
-    /// Four jobs of 25 keys: the first runs, the second is refused and takes the rest with it.
+    /// Four one-key jobs: the first runs, the second is refused and takes the rest with it.
     Gc gc(store, DB::UInt128{319});
     const auto refused = runRoundAndGetJanitorMetrics(gc);
-    EXPECT_EQ(refused.at("janitor_deleted"), 25u);
-    EXPECT_EQ(refused.at("leaked"), 75u);
-    EXPECT_EQ(countPresent(*backend, stream), 75u);
+    EXPECT_EQ(refused.at("janitor_deleted"), 1u);
+    EXPECT_EQ(refused.at("leaked"), 3u);
+    EXPECT_EQ(countPresent(*backend, stream), 3u);
 
     const auto drained = runRoundAndGetJanitorMetrics(gc);
-    EXPECT_EQ(drained.at("janitor_deleted"), 75u);
+    EXPECT_EQ(drained.at("janitor_deleted"), 3u);
     EXPECT_EQ(drained.at("leaked"), 0u);
     EXPECT_EQ(countPresent(*backend, stream), 0u);
 }

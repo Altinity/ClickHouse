@@ -561,8 +561,8 @@ private:
     void runNamespaceJanitor(
         const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows);
 
-    /// The janitor's `RemoveWriteOnce`: splits `keys` evenly across the GC I/O pool and waits for every job.
-    /// A failed job leaks its keys, and so does a job the pool refused to schedule.
+    /// The janitor's `RemoveWriteOnce`: one job per `bulkDeleteChunkKeys` keys on the GC I/O pool, waited for
+    /// before it returns. A failed job leaks the keys it did not delete, and so does a job the pool refused.
     void removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out);
 
     void reportStuckRemovals(const RefPlan & plan, uint64_t current_round);

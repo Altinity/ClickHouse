@@ -46,11 +46,11 @@ void removeOnCallerThread(CasOperation & op, const std::vector<WriteOnceKey> & k
 }
 
 NamespaceJanitor::NamespaceJanitor(
-    CasRequests & requests_, const Layout & layout_, size_t page_budget_, RemoveWriteOnce remove_write_once_)
+    CasRequests & requests_, const Layout & layout_, size_t page_budget_, RemoveWriteOnce remove_write_once_keys_)
     : requests(requests_)
     , layout(layout_)
     , page_budget(page_budget_)
-    , remove_write_once(remove_write_once_ ? std::move(remove_write_once_) : removeOnCallerThread)
+    , remove_write_once_keys(remove_write_once_keys_ ? std::move(remove_write_once_keys_) : removeOnCallerThread)
 {
 }
 
@@ -187,7 +187,7 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(bool suppress_deletes, Liven
     }
 
     if (page_decided && !dead_stream_keys.empty() && op.admitted())
-        remove_write_once(op, dead_stream_keys, result);
+        remove_write_once_keys(op, dead_stream_keys, result);
 
     /// Recheck even when the page had no dead candidate. A tenure that observes fence loss after LIST
     /// or after the last delete must not publish progress. Loss after this check may still race

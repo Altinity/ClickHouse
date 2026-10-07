@@ -88,6 +88,48 @@ namespace
 /// Soft limit on the namespace janitor's phase: no page starts after it, the page in progress finishes.
 constexpr uint64_t kJanitorBudgetMs = 20'000;
 
+/// What one janitor delete job did with its chunk.
+struct WriteOnceJobResult
+{
+    uint64_t deleted = 0;
+    uint64_t leaked = 0;
+    uint64_t requests = 0;
+    String error;
+};
+
+/// Deletes `chunk` as one request. A storage that refuses the batch gets one request per key, each
+/// accounted on its own, so a failure late in the chunk leaks only the keys it did not delete.
+void removeChunkWriteOnceCountingKeys(CasOperation & op, const std::vector<WriteOnceKey> & chunk, WriteOnceJobResult & result)
+{
+    ++result.requests;
+    try
+    {
+        op.removeManyWriteOnce(chunk, Retry::standard());
+        result.deleted += chunk.size();
+        return;
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::NOT_IMPLEMENTED)
+            throw;
+    }
+    for (const WriteOnceKey & key : chunk)
+    {
+        ++result.requests;
+        try
+        {
+            op.removeManyWriteOnce({key}, Retry::standard());
+            ++result.deleted;
+        }
+        catch (...)
+        {
+            ++result.leaked;
+            if (result.error.empty())
+                result.error = getCurrentExceptionMessage(false);
+        }
+    }
+}
+
 /// The `on_page_fetched` hook GC passes to every `forEachListedKey`/`recoverRefTable`
 /// call it owns (never passed by fsck/offline-repair callers of those shared helpers) -- one increment
 /// per physical LIST page, never per listed key.
@@ -420,69 +462,73 @@ void Gc::runNamespaceJanitor(
 
 void Gc::removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out)
 {
-    /// An even split, so a store without a batch delete sends its one-key requests from every pool thread.
-    const size_t concurrency = std::max<size_t>(1, store->poolConfig().gc_io_concurrency);
-    const size_t chunk_keys = std::min(
-        std::clamp<size_t>(store->poolConfig().gc_bulk_delete_chunk_keys, 1, kBulkDeleteMaxKeys),
-        (keys.size() + concurrency - 1) / concurrency);
+    const size_t chunk_keys = bulkDeleteChunkKeys();
     std::vector<std::vector<WriteOnceKey>> chunks;
     for (size_t begin = 0; begin < keys.size(); begin += chunk_keys)
         chunks.emplace_back(keys.begin() + begin, keys.begin() + std::min(keys.size(), begin + chunk_keys));
 
-    /// Written by the job of the same index, read after every job finished.
-    std::vector<uint64_t> requests(chunks.size(), 0);
+    /// One per chunk, written by its job and read after every job finished.
+    std::vector<WriteOnceJobResult> results(chunks.size());
     ThreadPoolCallbackRunnerLocal<void> runner(*io_pool, ThreadName::CAS_GC_JANITOR);
     std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;
     handles.reserve(chunks.size());
     SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
-    try
+    size_t scheduled = 0;
+    String refusal;
+    for (; scheduled < chunks.size(); ++scheduled)
     {
-        for (size_t i = 0; i < chunks.size(); ++i)
+        try
         {
-            if (io_pool_refuse_at_for_test == i)
+            if (io_pool_refuse_at_for_test == scheduled)
             {
                 io_pool_refuse_at_for_test.reset();
-                throw Exception(ErrorCodes::CANNOT_SCHEDULE_TASK, "Injected CAS namespace janitor enqueue refusal at index {}", i);
+                throw Exception(ErrorCodes::CANNOT_SCHEDULE_TASK, "Injected CAS namespace janitor enqueue refusal at index {}", scheduled);
             }
             /// The round thread waits for every job before it refreshes `authority_held` again.
             handles.emplace_back(runner.enqueueAndGiveOwnership(
-                [this, chunk = &chunks[i], chunk_requests = &requests[i], admitted_generation = op.generation()]
+                [this, chunk = &chunks[scheduled], result = &results[scheduled], admitted_generation = op.generation()]
                 {
-                    CasOperation job_op = store->openRequests().resume(admitted_generation, [this] { return authority_held; });
-                    /// A job that fails made at least the one call.
-                    *chunk_requests = 1;
-                    *chunk_requests = removeChunkWriteOnceOrOneByOne(job_op, *chunk, Retry::standard());
+                    try
+                    {
+                        CasOperation job_op = store->openRequests().resume(admitted_generation, [this] { return authority_held; });
+                        removeChunkWriteOnceCountingKeys(job_op, *chunk, *result);
+                    }
+                    catch (...)
+                    {
+                        result->leaked = chunk->size() - result->deleted;
+                        result->error = getCurrentExceptionMessage(false);
+                    }
                 }));
-        }
-    }
-    catch (...)
-    {
-        /// Leak-only like a failed request: the keys stay for the cursor's next pass over this page.
-        uint64_t unscheduled = 0;
-        for (size_t i = handles.size(); i < chunks.size(); ++i)
-            unscheduled += chunks[i].size();
-        out.leaked += unscheduled;
-        out.anomalies.push_back(fmt::format(
-            "leaked {} dead-life objects starting at '{}': delete job not scheduled: {}",
-            unscheduled, chunks[handles.size()].front().str(), getCurrentExceptionMessage(false)));
-    }
-    ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
-
-    for (size_t i = 0; i < handles.size(); ++i)
-    {
-        out.delete_requests += requests[i];
-        try
-        {
-            handles[i]->future.get();
-            out.deleted += chunks[i].size();
         }
         catch (...)
         {
-            out.leaked += chunks[i].size();
+            refusal = getCurrentExceptionMessage(false);
+            break;
+        }
+    }
+    ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
+
+    for (size_t i = 0; i < scheduled; ++i)
+    {
+        handles[i]->future.get();
+        out.deleted += results[i].deleted;
+        out.leaked += results[i].leaked;
+        out.delete_requests += results[i].requests;
+        if (results[i].leaked)
             out.anomalies.push_back(fmt::format(
                 "leaked {} dead-life objects starting at '{}': batch delete failed: {}",
-                chunks[i].size(), chunks[i].front().str(), getCurrentExceptionMessage(false)));
-        }
+                results[i].leaked, chunks[i].front().str(), results[i].error));
+    }
+    /// Leak-only like a failed request: the keys stay for the cursor's next pass over this page.
+    uint64_t unscheduled = 0;
+    for (size_t i = scheduled; i < chunks.size(); ++i)
+        unscheduled += chunks[i].size();
+    if (unscheduled)
+    {
+        out.leaked += unscheduled;
+        out.anomalies.push_back(fmt::format(
+            "leaked {} dead-life objects starting at '{}': delete job not scheduled: {}",
+            unscheduled, chunks[scheduled].front().str(), refusal));
     }
 }
 
