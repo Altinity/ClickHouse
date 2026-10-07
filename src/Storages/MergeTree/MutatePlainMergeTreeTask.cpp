@@ -119,7 +119,8 @@ bool MutatePlainMergeTreeTask::executeStep()
 #if CLICKHOUSE_CLOUD
                 data_part_storage.setPreferredFileOrder(new_part->getPreferredFileOrder());
 #endif
-                if (data_part_storage.hasActiveTransaction())
+                /// A content-addressed part is published once, under its final name, when the transaction commits after the rename.
+                if (data_part_storage.hasActiveTransaction() && !data_part_storage.isContentAddressed())
                     data_part_storage.commitTransaction();
 
                 MergeTreeData::Transaction transaction(storage, merge_mutate_entry->txn.get());

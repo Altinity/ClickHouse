@@ -50,7 +50,7 @@ struct Rig
 
 uint64_t wasted()
 {
-    return ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted].load();
+    return ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted];
 }
 
 }

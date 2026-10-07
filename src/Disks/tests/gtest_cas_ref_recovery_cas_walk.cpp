@@ -479,7 +479,7 @@ std::optional<RefLogTxn> readLogTxn(Backend & backend, const Layout & layout, co
 
 uint64_t counterOf(ProfileEvents::Event event)
 {
-    return ProfileEvents::global_counters[event].load();
+    return ProfileEvents::global_counters[event];
 }
 
 NamespaceLifeId catalogLife(const BackendPtr & backend, const Layout & layout, const RootNamespace & ns)

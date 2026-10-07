@@ -403,4 +403,14 @@ void DataPartStorageOnDiskFull::commitTransaction()
     transaction.reset();
 }
 
+void DataPartStorageOnDiskFull::checkpointTransaction()
+{
+    /// A content-addressed part is published once, as a whole, by its final commit: a mid-build
+    /// commit would publish the files written so far as a separate partial part.
+    if (isContentAddressed())
+        return;
+
+    IDataPartStorage::checkpointTransaction();
+}
+
 }

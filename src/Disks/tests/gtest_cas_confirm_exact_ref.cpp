@@ -337,7 +337,7 @@ uint64_t backendRequests(const CountingBackend & b)
 /// attribution as a DELTA around the confirm, never an absolute (the suite shares one process).
 uint64_t refusalCount(ProfileEvents::Event event)
 {
-    return ProfileEvents::global_counters[event].load();
+    return ProfileEvents::global_counters[event];
 }
 
 /// One-shot throwing probe in the post-durable install region -- the only way to reach `NeedsRecovery`

@@ -474,7 +474,9 @@ void ReplicatedMergeTreeSink::finishDelayed(const ZooKeeperWithFaultInjectionPtr
             while (true)
             {
                 partition.temp_part->finalize();
-                partition.temp_part->part->getDataPartStorage().commitTransaction();
+                /// A content-addressed part is published once, under its final name, when the transaction commits after the rename.
+                if (!partition.temp_part->part->getDataPartStorage().isContentAddressed())
+                    partition.temp_part->part->getDataPartStorage().commitTransaction();
                 auto deduplication_hashes = partition.deduplication_info->getDeduplicationHashes(partition.block_with_partition.partition_id, deduplicate);
                 auto deduplication_blocks_ids = getDeduplicationBlockIds(deduplication_hashes);
 

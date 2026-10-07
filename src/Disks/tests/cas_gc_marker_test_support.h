@@ -231,17 +231,17 @@ inline void awaitCondition(const std::function<bool()> & condition)
 
 inline uint64_t unconfirmedCarries()
 {
-    return ProfileEvents::global_counters[ProfileEvents::CASGCCondemnMarkerUnconfirmedCarry].load();
+    return ProfileEvents::global_counters[ProfileEvents::CASGCCondemnMarkerUnconfirmedCarry];
 }
 
 inline uint64_t metaWriteAnomalies()
 {
-    return ProfileEvents::global_counters[ProfileEvents::CASGCMetaWriteAnomaly].load();
+    return ProfileEvents::global_counters[ProfileEvents::CASGCMetaWriteAnomaly];
 }
 
 inline uint64_t readAheadWasted()
 {
-    return ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted].load();
+    return ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted];
 }
 
 /// Runs a hook once, on the first HEAD of one key after `armOnHead`, before that HEAD is served and with no

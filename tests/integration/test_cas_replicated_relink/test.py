@@ -634,8 +634,11 @@ def test_version_mix_legacy_peer_gets_bytes():
     table = "vermix"
     drop_everywhere(table)
 
-    create_replicated(node1, table)
-    create_replicated(node2, table)
+    # Auto statistics would add an inline `statistics.packed` to the manifest payload, shrinking the
+    # bytes-to-manifest ratio asserted below.
+    no_auto_stats = "auto_statistics_types = ''"
+    create_replicated(node1, table, extra_settings=no_auto_stats)
+    create_replicated(node2, table, extra_settings=no_auto_stats)
     insert_rows(node1, table, 0)
     node2.query("SYSTEM SYNC REPLICA {}".format(table), timeout=60)
     part = active_part_names(node1, table)[0]

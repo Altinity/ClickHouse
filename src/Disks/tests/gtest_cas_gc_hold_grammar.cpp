@@ -1621,11 +1621,11 @@ TEST(CASGCHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaselineAndCountsTh
     ASSERT_FALSE(existsAt(*backend, layout.gcStateKey()));
 
     using ProfileEvents::global_counters;
-    const auto virgin_before = global_counters[ProfileEvents::CASGCRebuildVirginByEnumeration].load();
+    const auto virgin_before = global_counters[ProfileEvents::CASGCRebuildVirginByEnumeration];
 
     Gc gc(store, kGc);
     const RebuildReport rep = gc.rebuildBaseline(/*force=*/false);
     EXPECT_TRUE(rep.performed) << rep.refusal;
-    EXPECT_GT(global_counters[ProfileEvents::CASGCRebuildVirginByEnumeration].load(), virgin_before)
+    EXPECT_GT(global_counters[ProfileEvents::CASGCRebuildVirginByEnumeration], virgin_before)
         << "a clean slate granted from enumeration alone must be visible to whoever reads the run";
 }

@@ -415,7 +415,7 @@ TEST(CASGCRedeleteConcurrency, WorkerRemoveFaultKeepsSiblingOutcomesAndPoolAlive
     ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kFaultedBlob));
 
     backend->armRemoveFaults({blobKeyOf(*store, kFaultedBlob)});
-    const auto failed_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed].load();
+    const auto failed_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed];
     std::map<String, std::vector<OutcomeRow>> outcome_logs_before;
     collectOutcomeLogs(*backend, outcome_logs_before);
     RoundReport progress;
@@ -434,7 +434,7 @@ TEST(CASGCRedeleteConcurrency, WorkerRemoveFaultKeepsSiblingOutcomesAndPoolAlive
     store->renewWatermarkOnce();
 
     EXPECT_TRUE(backend->allFired()) << "the faulted blob delete never ran on a pool worker";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed].load() - failed_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed] - failed_before, 1u);
     EXPECT_EQ(next.redeleted, kBlobs);
     EXPECT_EQ(next.deleted, 1u);
     EXPECT_EQ(next.absent, kBlobs - 1);
@@ -698,7 +698,7 @@ namespace
 
 uint64_t failedCounter()
 {
-    return ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed].load();
+    return ProfileEvents::global_counters[ProfileEvents::CASGCRetiredRedeleteFailed];
 }
 
 void expectBodiesPresentOnlyFor(Backend & backend, const Pool & store, const std::set<uint64_t> & present)

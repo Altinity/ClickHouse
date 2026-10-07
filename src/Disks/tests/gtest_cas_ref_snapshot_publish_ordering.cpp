@@ -403,7 +403,7 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     /// before the 4th.
     backend->armWriteFailure("_snap/", kFaultsBeyondTheRetryWindow);
 
-    const auto dispatchCount = [&] { return global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(); };
+    const auto dispatchCount = [&] { return global_counters[ProfileEvents::CASRefSnapshotPublishDispatched]; };
 
     /// Attempt 1: admitted immediately (no backoff armed yet). Fails -> backoff armed at the initial 1000ms.
     ASSERT_EQ(publishRef(store, ns, "ref_2", 2), (RefTxnId{store->writerEpoch(), 2}));
@@ -523,11 +523,11 @@ TEST(CASRefSnapshotPublishOrdering, NotReadyRefusalBacksOffAndResetsAfterDurable
 
     const auto dispatch_count = [&]
     {
-        return global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load();
+        return global_counters[ProfileEvents::CASRefSnapshotPublishDispatched];
     };
     const auto backoff_count = [&]
     {
-        return global_counters[ProfileEvents::CASRefSnapshotPublishBackoff].load();
+        return global_counters[ProfileEvents::CASRefSnapshotPublishBackoff];
     };
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));

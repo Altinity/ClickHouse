@@ -432,7 +432,7 @@ TEST(CASIOTestAwsS3Client, UsesSingleAttemptRetryStrategyIdentifiesTheInstalledS
 TEST(CASIOTestAwsS3Client, NetworkErrorLogsDebugForSingleAttemptStrategy)
 {
     using ProfileEvents::global_counters;
-    const auto errors_before = global_counters[ProfileEvents::S3WriteRequestsErrors].load();
+    const auto errors_before = global_counters[ProfileEvents::S3WriteRequestsErrors];
 
     auto client = makeNetworkFailingClient(std::make_shared<DB::S3::SingleAttemptRetryStrategy>());
     DB::S3::PutObjectRequest request;
@@ -449,7 +449,7 @@ TEST(CASIOTestAwsS3Client, NetworkErrorLogsDebugForSingleAttemptStrategy)
     EXPECT_FALSE(outcome.IsSuccess());
     EXPECT_EQ(outcome.GetError().GetErrorType(), Aws::S3::S3Errors::NETWORK_CONNECTION);
     EXPECT_EQ(client->attempts, 1u);
-    EXPECT_EQ(global_counters[ProfileEvents::S3WriteRequestsErrors].load() - errors_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::S3WriteRequestsErrors] - errors_before, 1u);
     EXPECT_TRUE(log_capture.captured().empty());
 }
 
@@ -459,7 +459,7 @@ TEST(CASIOTestAwsS3Client, NetworkErrorLogsDebugForSingleAttemptStrategy)
 TEST(CASIOTestAwsS3Client, NetworkErrorLogsErrorForOrdinaryZeroRetryStrategy)
 {
     using ProfileEvents::global_counters;
-    const auto errors_before = global_counters[ProfileEvents::S3WriteRequestsErrors].load();
+    const auto errors_before = global_counters[ProfileEvents::S3WriteRequestsErrors];
 
     DB::S3::PocoHTTPClientConfiguration::RetryStrategy zero_retries{.max_retries = 0};
     auto client = makeNetworkFailingClient(std::make_shared<DB::S3::Client::RetryStrategy>(zero_retries));
@@ -474,7 +474,7 @@ TEST(CASIOTestAwsS3Client, NetworkErrorLogsErrorForOrdinaryZeroRetryStrategy)
     EXPECT_FALSE(outcome.IsSuccess());
     EXPECT_EQ(outcome.GetError().GetErrorType(), Aws::S3::S3Errors::NETWORK_CONNECTION);
     EXPECT_EQ(client->attempts, 1u);
-    EXPECT_EQ(global_counters[ProfileEvents::S3WriteRequestsErrors].load() - errors_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::S3WriteRequestsErrors] - errors_before, 1u);
     EXPECT_NE(log_capture.captured().find("Network error on S3 request, attempt 1 of 1"), std::string::npos);
 }
 

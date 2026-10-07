@@ -647,8 +647,8 @@ TEST(CASRefWriterChunkedFlush, ChunkedFlushCommitsPerChunk)
     auto c3 = std::make_shared<std::atomic<int>>(0);
 
     const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-    const uint64_t flushes_before = ProfileEvents::global_counters[ProfileEvents::CASRefBatchFlushes].load();
-    const uint64_t mutations_before = ProfileEvents::global_counters[ProfileEvents::CASRefBatchedMutations].load();
+    const uint64_t flushes_before = ProfileEvents::global_counters[ProfileEvents::CASRefBatchFlushes];
+    const uint64_t mutations_before = ProfileEvents::global_counters[ProfileEvents::CASRefBatchedMutations];
 
     auto sync = std::make_shared<CaseSync>();
     armPreCarveBlock(store, ns, sync, 3);
@@ -714,8 +714,8 @@ TEST(CASRefWriterChunkedFlush, ChunkedFlushCommitsPerChunk)
     /// snapshot-scheduling trigger is the final step of the SAME committed arm that increments
     /// `CASRefBatchFlushes`, so == 2 also proves the scheduler was invoked per chunk;
     /// `SnapshotPublisherLatchedAcrossChunks` proves that trigger actually re-fires across chunks.
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefBatchFlushes].load() - flushes_before, 2u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefBatchedMutations].load() - mutations_before, 3u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefBatchFlushes] - flushes_before, 2u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefBatchedMutations] - mutations_before, 3u);
 }
 
 namespace

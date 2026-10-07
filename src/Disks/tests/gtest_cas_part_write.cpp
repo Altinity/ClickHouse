@@ -204,6 +204,7 @@ public:
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
+    size_t bulkDeleteKeyLimit() const override { return inner->bulkDeleteKeyLimit(); }
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value, TransportAccess & access) override
     {
@@ -249,6 +250,7 @@ public:
     RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
+    size_t bulkDeleteKeyLimit() const override { return inner->bulkDeleteKeyLimit(); }
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value, TransportAccess & access) override
     {
@@ -495,8 +497,8 @@ TEST(CASPartWriteTxnMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
 {
     /// Fresh body upload writes the Clean meta exactly once: CASMetaPut +1 (choke point)
     /// and CASMetaCreateClean +1 (reason). Reuse the fixture of the nearest putBlob test.
-    const auto put_before = ProfileEvents::global_counters[ProfileEvents::CASMetaPut].load();
-    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load();
+    const auto put_before = ProfileEvents::global_counters[ProfileEvents::CASMetaPut];
+    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean];
 
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -506,8 +508,8 @@ TEST(CASPartWriteTxnMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
     auto ref = build->putBlob(idOf(payload), BlobSource::fromString(payload));
     EXPECT_EQ(ref.size, payload.size());
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaPut].load() - put_before, 1);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load() - reason_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaPut] - put_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean] - reason_before, 1);
 }
 
 /// §0 introspection: an adopt of a pre-existing body that has NO meta at all (a pre-protocol blob, or a
@@ -517,8 +519,8 @@ TEST(CASPartWriteTxnMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
 /// pairs `writeRawBlobBody` with `writeMetaClean`, which skips the `!lm` backfill branch entirely.
 TEST(CASPartWriteTxnMetaCounters, AdoptBackfillCountsChokePointAndReason)
 {
-    const auto put_before = ProfileEvents::global_counters[ProfileEvents::CASMetaPut].load();
-    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaAdoptBackfill].load();
+    const auto put_before = ProfileEvents::global_counters[ProfileEvents::CASMetaPut];
+    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaAdoptBackfill];
 
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -543,8 +545,8 @@ TEST(CASPartWriteTxnMetaCounters, AdoptBackfillCountsChokePointAndReason)
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.ref, id);
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaPut].load() - put_before, 1);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaAdoptBackfill].load() - reason_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaPut] - put_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaAdoptBackfill] - reason_before, 1);
 
     const auto lm = loadMetaForTest(*b, s->layout(), hash);
     ASSERT_TRUE(lm.has_value()) << "the adopt-backfill must leave a Clean meta for future point-readers";
@@ -675,8 +677,8 @@ TEST(CASPartWriteTxn, PutBlobRepublishesWhenMetaCondemned)
 /// choke point (`CASMetaCompareSwap`), tagged with its reason (`CASMetaResurrectClean`).
 TEST(CASPartWriteTxnMetaCounters, CondemnedRepublicationCountsCasAndReason)
 {
-    const auto cas_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCompareSwap].load();
-    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaResurrectClean].load();
+    const auto cas_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCompareSwap];
+    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaResurrectClean];
 
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -697,8 +699,8 @@ TEST(CASPartWriteTxnMetaCounters, CondemnedRepublicationCountsCasAndReason)
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.ref, id);
 
-    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASMetaCompareSwap].load() - cas_before, 1);
-    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASMetaResurrectClean].load() - reason_before, 1);
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASMetaCompareSwap] - cas_before, 1);
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASMetaResurrectClean] - reason_before, 1);
 }
 
 TEST(CASPartWriteTxn, PutBlobWrongSizeFailsClosed)
@@ -979,6 +981,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
         RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
         RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
         void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
+        size_t bulkDeleteKeyLimit() const override { return inner->bulkDeleteKeyLimit(); }
         std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                                  const std::optional<String> & expected_value, TransportAccess & access) override
         {
@@ -1072,6 +1075,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
         RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
         RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
         void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
+        size_t bulkDeleteKeyLimit() const override { return inner->bulkDeleteKeyLimit(); }
         std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                                  const std::optional<String> & expected_value, TransportAccess & access) override
         {
@@ -1167,14 +1171,14 @@ TEST(CASPartWriteTxn, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    const auto trusted_before = ProfileEvents::global_counters[ProfileEvents::CASBlobAdoptTrusted].load();
+    const auto trusted_before = ProfileEvents::global_counters[ProfileEvents::CASBlobAdoptTrusted];
     const size_t head_before = counting->headCountFor(blob_key);
     const size_t meta_get_before = counting->getCountFor(meta_key);
 
     build->promote(ns, "part_1", build->buildId(), id);
 
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBlobAdoptTrusted].load() - trusted_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBlobAdoptTrusted] - trusted_before, 1);
     EXPECT_EQ(counting->headCountFor(blob_key) - head_before, 0u) << "trust must not HEAD the adopted blob";
     EXPECT_EQ(counting->getCountFor(meta_key) - meta_get_before, 0u) << "trust must not loadMeta the adopted blob";
 }
@@ -1670,6 +1674,7 @@ TEST(CASPartWriteTxn, AdoptEvidenceRecordsTrustedManifestDependencyProofWithoutI
         RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
         RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
         void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
+        size_t bulkDeleteKeyLimit() const override { return inner->bulkDeleteKeyLimit(); }
         std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                                  const std::optional<String> & expected_value, TransportAccess & access) override
         {

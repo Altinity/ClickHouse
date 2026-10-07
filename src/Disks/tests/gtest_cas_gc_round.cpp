@@ -859,8 +859,8 @@ TEST(CASGCRound, RoundSummaryCountsManifestBodyDeletes)
 
     /// §0 introspection: both counters are captured BEFORE the condemn+delete pipeline below, which
     /// drives the round's meta pool (condemn/spare/delete) and its own orphan-sweep cursor pass.
-    const auto meta_ops_before = ProfileEvents::global_counters[ProfileEvents::CASGCMetaOps].load();
-    const auto pages_before = ProfileEvents::global_counters[ProfileEvents::CASGCEnumerationPages].load();
+    const auto meta_ops_before = ProfileEvents::global_counters[ProfileEvents::CASGCMetaOps];
+    const auto pages_before = ProfileEvents::global_counters[ProfileEvents::CASGCEnumerationPages];
 
     /// Ack-floor drift: the owner-removed manifest body is deleted in the CONDEMNING round (post-CAS,
     /// after its -1 is adopted), while the blob's exact-token delete happens a few rounds later once the
@@ -893,8 +893,8 @@ TEST(CASGCRound, RoundSummaryCountsManifestBodyDeletes)
     /// §0 introspection: the exact-token blob delete above scheduled at least one per-hash freshness-meta
     /// op on the round's bounded meta pool, and every round ran its own orphan-manifest-sweep cursor pass
     /// (default `manifest_sweep_list_budget_keys` is nonzero), fetching at least one LIST page directly.
-    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASGCMetaOps].load() - meta_ops_before, 1);
-    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASGCEnumerationPages].load() - pages_before, 1);
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASGCMetaOps] - meta_ops_before, 1);
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASGCEnumerationPages] - pages_before, 1);
 }
 
 /// Manifest-body cleanup (post-CAS `manifest_deletes` phase) has no cap: the ref-log intake cursor that
@@ -955,9 +955,9 @@ TEST(CASGCRound, EnumerationPagesCountedEvenWithSweepBudgetZeroed)
     auto store = openTestPoolWithConfig(backend, config);
 
     Gc gc(store, kGc);
-    const auto pages_before = ProfileEvents::global_counters[ProfileEvents::CASGCEnumerationPages].load();
+    const auto pages_before = ProfileEvents::global_counters[ProfileEvents::CASGCEnumerationPages];
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
-    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASGCEnumerationPages].load() - pages_before, 1)
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASGCEnumerationPages] - pages_before, 1)
         << "the round's own cas/ns/stream/ enumeration must count pages independent of "
            "the orphan sweep";
 }
@@ -1083,7 +1083,7 @@ TEST(CASGCRound, OutcomeEntryBudgetCapsSparedLogRowsWithoutRecondemning)
     writeManifestRaw(*backend, store->layout(), ns, r2, entries);
     publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
 
-    const auto spared_events_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredSpared].load();
+    const auto spared_events_before = ProfileEvents::global_counters[ProfileEvents::CASGCRetiredSpared];
     const RoundReport rep = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(rep.acquired_lease);
     const uint64_t total_spared_reported = rep.spared;
@@ -1092,7 +1092,7 @@ TEST(CASGCRound, OutcomeEntryBudgetCapsSparedLogRowsWithoutRecondemning)
     /// decision it under-reports still happened correctly.
     EXPECT_EQ(total_spared_reported, 2u)
         << "GcOutcomes rows must be capped at gc_round_outcome_entry_budget, not one per spared entry";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredSpared].load() - spared_events_before, kBlobs)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRetiredSpared] - spared_events_before, kBlobs)
         << "every spared decision must still happen even when its audit row is capped";
     for (int i = 0; i < kBlobs; ++i)
     {
@@ -1990,11 +1990,11 @@ TEST(CASGCRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     const auto occupant_before = readOf(*foreign_backend, foreign_mount_key);
     ASSERT_TRUE(occupant_before.has_value());
     const uint64_t violations_before
-        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation];
 
     invalid_store.reset();   /// must not abort, must not terminate
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation],
               violations_before + 1)
         << "a runtime that never observed a deposition must report the foreign occupant as a broken "
            "single-writer guarantee";

@@ -518,11 +518,9 @@ TEST(CASDetachedWork, ExpiredDrainIncrementsTheTimeoutCounter)
     }));
     entered->wait("entered");
 
-    const auto before = ProfileEvents::global_counters[ProfileEvents::CASDetachedWorkDrainTimeouts]
-                            .load(std::memory_order_relaxed);
+    const auto before = ProfileEvents::global_counters[ProfileEvents::CASDetachedWorkDrainTimeouts];
     storage->shutdown();
-    const auto after = ProfileEvents::global_counters[ProfileEvents::CASDetachedWorkDrainTimeouts]
-                           .load(std::memory_order_relaxed);
+    const auto after = ProfileEvents::global_counters[ProfileEvents::CASDetachedWorkDrainTimeouts];
     EXPECT_EQ(after - before, 1u);
 
     release->open();

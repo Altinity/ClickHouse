@@ -145,12 +145,12 @@ TEST(CASShutdownContext, ExpiredContextDropsTheEventAndCountsIt)
     auto context = makeTestContext();
     auto storage = openTestStorage(context);
     ASSERT_TRUE(storage->poolForTest()->hasEventSink());
-    const auto before = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired].load();
+    const auto before = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired];
 
     context.reset();
     emitTestEvent(*storage);
 
-    const auto after = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired].load();
+    const auto after = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired];
     EXPECT_EQ(after - before, 1u);
 }
 
@@ -160,11 +160,11 @@ TEST(CASShutdownContext, DisabledIntegrationCountsNothing)
 {
     auto storage = openTestStorage();
     ASSERT_FALSE(storage->poolForTest()->hasEventSink());
-    const auto before = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired].load();
+    const auto before = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired];
 
     emitTestEvent(*storage);
 
-    const auto after = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired].load();
+    const auto after = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired];
     EXPECT_EQ(after - before, 0u);
 }
 
@@ -174,11 +174,11 @@ TEST(CASShutdownContext, MissingSystemLogCountsNothing)
     auto context = makeTestContext();
     auto storage = openTestStorage(context);
     ASSERT_TRUE(storage->poolForTest()->hasEventSink());
-    const auto before = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired].load();
+    const auto before = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired];
 
     emitTestEvent(*storage);
 
-    const auto after = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired].load();
+    const auto after = ProfileEvents::global_counters[ProfileEvents::CASEventDroppedContextExpired];
     EXPECT_EQ(after - before, 0u);
 }
 

@@ -131,8 +131,8 @@ ThreadGroup::ThreadGroup(ContextPtr query_context_, Int32 os_threads_nice_value_
     };
 }
 
-ThreadGroup::ThreadGroup(ThreadGroupPtr parent_thread_group)
-    : parent(std::move(parent_thread_group))
+ThreadGroup::ThreadGroup(ThreadGroupPtr parent_)
+    : parent(std::move(parent_))
     , master_thread_id(parent->master_thread_id)
     , query_context(parent->query_context)
     , global_context(parent->global_context)
@@ -147,8 +147,8 @@ ThreadGroup::ThreadGroup(ThreadGroupPtr parent_thread_group)
 {
 }
 
-ThreadGroup::ThreadGroup(ContextPtr query_context_, ThreadGroupPtr parent_thread_group)
-    : parent(std::move(parent_thread_group))
+ThreadGroup::ThreadGroup(ContextPtr query_context_, ThreadGroupPtr parent_)
+    : parent(std::move(parent_))
     , master_thread_id(CurrentThread::get().thread_id)
     , query_context(query_context_)
     , global_context(query_context_->getGlobalContext())

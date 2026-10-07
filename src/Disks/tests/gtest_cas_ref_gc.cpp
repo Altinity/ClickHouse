@@ -11,6 +11,7 @@
 
 #include <Common/ProfileEvents.h>
 
+#include <algorithm>
 #include <mutex>
 #include <set>
 
@@ -915,12 +916,12 @@ TEST(CASRefGcCleanupAuthority, RebirthDuringAChunkDeletesOnlyTheOldLifesKeys)
                 janitor_deleted = it->second;
     });
     using ProfileEvents::global_counters;
-    const auto ref_cleanup_deleted_before = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
+    const auto ref_cleanup_deleted_before = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted];
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
     ASSERT_TRUE(ref_cleanup_suppressed.has_value()) << "the ref_object_cleanup phase row never fired";
     EXPECT_EQ(*ref_cleanup_suppressed, 0u)
         << "round two must actually run destructive work, not merely leave everything alone because it was suppressed";
-    EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load(), ref_cleanup_deleted_before)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted], ref_cleanup_deleted_before)
         << "cleanupRefObjects' own plan/cohort must delete NOTHING this round: the old life is not in it "
            "(no catalog entry names it) and the reborn life's own checkpoint-named log is not yet deletable";
     ASSERT_TRUE(janitor_deleted.has_value()) << "the namespace_cleanup phase row never fired";
@@ -1048,7 +1049,7 @@ TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
     /// supported"; the fallback's per-key calls that follow are not armed and succeed.
     backend->failNextBulkRemoveWith(std::make_exception_ptr(
         DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "no batch delete")));
-    const auto cleaned_before = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
+    const auto cleaned_before = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted];
 
     OperationForTest op(*backend);
     Gc gc(store, kGc);
@@ -1058,7 +1059,7 @@ TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
         EXPECT_FALSE((*op).head(layout.refLogKey(life, id), Retry::once()).has_value());
     for (const RefTxnId & id : plan.deletable_snapshots)
         EXPECT_FALSE((*op).head(layout.refSnapshotKey(life, id), Retry::once()).has_value());
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load() - cleaned_before, cohort_size)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted] - cleaned_before, cohort_size)
         << "the budget/profile-event accounting counts objects, unaffected by the fallback";
     /// 1 failed bulk attempt + one request per key in the cohort.
     EXPECT_EQ(backend->bulkRemoveCalls(), 1 + cohort_size);
@@ -1070,11 +1071,11 @@ TEST(CASRefGc, RefObjectCleanupFallsBackToOnePerKeyWhenBatchDeleteIsUnsupported)
 TEST(CASRefGc, RefIntakeIncrementsObservabilityCounters)
 {
     using ProfileEvents::global_counters;
-    const auto list_pages_before = global_counters[ProfileEvents::CASRefGlobalListPages].load();
-    const auto log_gets_before   = global_counters[ProfileEvents::CASRefLogBodyGets].load();
-    const auto mf_gets_before    = global_counters[ProfileEvents::CASRefManifestBodyFoldGets].load();
-    const auto edges_before      = global_counters[ProfileEvents::CASRefEmittedEdges].load();
-    const auto cleaned_before    = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
+    const auto list_pages_before = global_counters[ProfileEvents::CASRefGlobalListPages];
+    const auto log_gets_before   = global_counters[ProfileEvents::CASRefLogBodyGets];
+    const auto mf_gets_before    = global_counters[ProfileEvents::CASRefManifestBodyFoldGets];
+    const auto edges_before      = global_counters[ProfileEvents::CASRefEmittedEdges];
+    const auto cleaned_before    = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted];
 
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -1101,11 +1102,11 @@ TEST(CASRefGc, RefIntakeIncrementsObservabilityCounters)
     Gc gc(store, kGc);
     runToFixpoint(store, gc);
 
-    EXPECT_GT(global_counters[ProfileEvents::CASRefGlobalListPages].load(), list_pages_before);
-    EXPECT_GT(global_counters[ProfileEvents::CASRefLogBodyGets].load(), log_gets_before);
-    EXPECT_GT(global_counters[ProfileEvents::CASRefManifestBodyFoldGets].load(), mf_gets_before);
-    EXPECT_GT(global_counters[ProfileEvents::CASRefEmittedEdges].load(), edges_before);
-    EXPECT_GT(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load(), cleaned_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefGlobalListPages], list_pages_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefLogBodyGets], log_gets_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefManifestBodyFoldGets], mf_gets_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefEmittedEdges], edges_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted], cleaned_before);
 }
 
 /// Task 13 e2e (in-process regression twin of the rustfs integration test): the whole snapshot+log
@@ -1424,4 +1425,91 @@ TEST(CASRefGc, CatalogAdmittedFreshLifeWithoutParentSeedsSuccessorSeal)
     const CasFoldSeal seal = decodeFoldSeal(
         op.read(layout.foldSealKey(state.snap_generation, state.snap_attempt), Retry::once())->bytes);
     EXPECT_TRUE(seal.ref_lives.contains(life_id));
+}
+
+namespace
+{
+
+struct RefCleanupRun
+{
+    uint64_t cohort_size = 0;
+    uint64_t deleted_metric = 0;
+    uint64_t gc_state_reads = 0;
+    std::vector<size_t> call_sizes;
+    bool every_planned_key_gone = true;
+};
+
+/// One regular round over `table_count` covered logs under a backend whose batch limit is `storage_limit`.
+RefCleanupRun runRefCleanupUnderStorageLimit(size_t storage_limit, uint64_t table_count)
+{
+    auto backend = std::make_shared<BatchCapabilityBackend>();
+    backend->setStorageLimit(storage_limit);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    fixture::admitLive(*backend, layout, ns);
+
+    RefTableListing listing;
+    uint64_t last = 0;
+    for (uint64_t i = 1; i <= table_count; ++i)
+    {
+        const ManifestRef r = mref(i);
+        writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", DB::UInt128(i))});
+        last = publishCommittedTransition(*backend, layout, ns, "t" + std::to_string(i), std::nullopt, r);
+        listing.logs.push_back(RefTxnId{1, last});
+    }
+    std::vector<RefCommittedRow> committed;
+    for (uint64_t i = 1; i <= table_count; ++i)
+        committed.push_back(committedRow("t" + std::to_string(i), mref(i)));
+    writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, last}, committed));
+    listing.snapshots.push_back(RefTxnId{1, last});
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, last},
+        .checkpoint_snapshot_id = RefTxnId{1, last},
+        .last_epoch_seal = std::nullopt,
+    });
+
+    const RefCleanupPlan plan = planRefCleanup(listing, RefTxnId{1, last}, RefTxnId{1, last}, std::nullopt);
+    RefCleanupRun run;
+    run.cohort_size = plan.deletable_logs.size() + plan.deletable_snapshots.size();
+
+    const auto deleted_before = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted];
+    const uint64_t state_reads_before = backend->getCount(layout.gcStateKey());
+    const size_t calls_before = backend->callSizes().size();
+    Gc gc(store, kGc);
+    EXPECT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    run.deleted_metric = ProfileEvents::global_counters[ProfileEvents::CASRefCleanupObjectsDeleted] - deleted_before;
+    run.gc_state_reads = backend->getCount(layout.gcStateKey()) - state_reads_before;
+    const std::vector<size_t> sizes = backend->callSizes();
+    run.call_sizes.assign(sizes.begin() + calls_before, sizes.end());
+
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
+    OperationForTest op(*backend);
+    for (const RefTxnId & id : plan.deletable_logs)
+        run.every_planned_key_gone &= !(*op).head(layout.refLogKey(life, id), Retry::once()).has_value();
+    for (const RefTxnId & id : plan.deletable_snapshots)
+        run.every_planned_key_gone &= !(*op).head(layout.refSnapshotKey(life, id), Retry::once()).has_value();
+    return run;
+}
+
+}
+
+/// The storage's batch limit cuts the cleanup cohort into smaller requests, and the extra requests cost
+/// no extra authority reads: `authorityHolds` runs once per cohort, not once per request.
+TEST(CASRefGc, RefObjectCleanupCutsRequestsToTheStorageLimitWithoutExtraAuthorityReads)
+{
+    const RefCleanupRun limited = runRefCleanupUnderStorageLimit(3, 8);
+    const RefCleanupRun unlimited = runRefCleanupUnderStorageLimit(kBulkDeleteMaxKeys, 8);
+
+    ASSERT_GT(limited.cohort_size, 3u) << "the cohort must exceed the limit for the cut to be observable";
+    EXPECT_EQ(limited.cohort_size, unlimited.cohort_size);
+    EXPECT_TRUE(limited.every_planned_key_gone);
+    EXPECT_EQ(limited.deleted_metric, limited.cohort_size);
+    EXPECT_EQ(unlimited.deleted_metric, unlimited.cohort_size);
+
+    ASSERT_FALSE(limited.call_sizes.empty());
+    EXPECT_LE(*std::max_element(limited.call_sizes.begin(), limited.call_sizes.end()), 3u);
+    EXPECT_GT(limited.call_sizes.size(), unlimited.call_sizes.size());
+    EXPECT_EQ(limited.gc_state_reads, unlimited.gc_state_reads);
 }

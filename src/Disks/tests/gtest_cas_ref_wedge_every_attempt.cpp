@@ -835,8 +835,8 @@ TEST(CASRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
     backend->s3_definite_substr = logPrefix(store, ns);
     backend->s3_definite_latched = true;
 
-    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load();
-    const uint64_t definite_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure].load();
+    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged];
+    const uint64_t definite_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure];
     const size_t pauses_before = clock->pauseCount();
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -850,9 +850,9 @@ TEST(CASRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
         << "one call whose first attempt is unresolved leaves an object that may become durable";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged)
         << "the id must NOT be declared never-used: the marker stands until the key itself resolves";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure].load(), definite_before)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure], definite_before)
         << "this append was never definitively rejected -- only one of its attempts was";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load(), wedged_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged], wedged_before + 1);
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "nothing is applied while the lane is wedged";
     const String wedged_key = store->wedgedKeyForTest(ns);
     EXPECT_FALSE(readObj(*backend, wedged_key).has_value()) << "and nothing became durable";
@@ -1245,7 +1245,7 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
     const RefTxnId next{epoch, 3};
     ASSERT_EQ(store->lastEpochSealForTest(ns), std::nullopt);
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
-    const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendSealRejected].load();
+    const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendSealRejected];
 
     /// The successor's seal lands at exactly the id this table's next append derives.
     backend->conflict_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
@@ -1260,7 +1260,7 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
         << "the observed seal IS this namespace's epoch-closing record, whichever site observed it";
     EXPECT_TRUE(store->mayMutate()) << "the designed path must not fence the mount";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before) << "nor schedule a remount";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendSealRejected].load(), sealed_before + 1)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendSealRejected], sealed_before + 1)
         << "a deposed writer must still be COUNTED: this is the protocol working, and also the signal "
            "that this mount has lost its lease and does not know it";
 }
@@ -1465,13 +1465,13 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteWedgesWhenTheSettlingReadNamesNoOccupant
     /// proves absence and names nobody.
     backend->refuse_precondition_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
 
-    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable].load();
-    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load();
+    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable];
+    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged];
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable].load(), deferred_before + 1)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable], deferred_before + 1)
         << "the deferral is the one quiet arm here -- it must be counted or a starved loud path is invisible";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load(), wedged_before + 1)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged], wedged_before + 1)
         << "and the lane it leaves behind is a wedge, so the wedge counter must say so";
     EXPECT_TRUE(store->mayMutate()) << "the table defers without guessing that the whole mount is corrupt";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before) << "nor schedules a remount";
@@ -1512,10 +1512,10 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteWedgesWhenTheSettlingReadItselfIsRefused
     backend->refuse_precondition_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
     backend->refuse_read_after_precondition = true;
 
-    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable].load();
+    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable];
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable].load(), deferred_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable], deferred_before + 1);
     EXPECT_TRUE(store->mayMutate());
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before);
     EXPECT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1658,16 +1658,16 @@ TEST(CASRefLane, RefusedReturnsTheAttemptToReadyAndDoesNotWedge)
     backend->s3_definite_substr = logPrefix(store, ns);
     backend->s3_definite_count = 1;
 
-    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load();
-    const uint64_t definite_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure].load();
+    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged];
+    const uint64_t definite_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure];
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
 
     EXPECT_FALSE(store->refLaneWedgedForTest(ns))
         << "a proven refusal wrote nothing, so there is nothing for a wedge to resolve";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure].load(), definite_before + 1);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load(), wedged_before);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure], definite_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged], wedged_before);
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "the refused drop applied nothing";
 
     /// And the id was never consumed: the next caller re-derives it and lands the same transaction.
@@ -1690,7 +1690,7 @@ TEST(CASRefLane, PostCommitFenceLossWedges)
     publishEmptyPart(store, ns, "x");
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 
-    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load();
+    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged];
 
     /// The fence is lost INSIDE the write window, so the object lands and the call may not claim it.
     backend->armBlock(logPrefix(store, ns));
@@ -1709,7 +1709,7 @@ TEST(CASRefLane, PostCommitFenceLossWedges)
     EXPECT_TRUE(store->refLaneWedgedForTest(ns))
         << "the object is durable, so the lane must not be returned to Ready";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load(), wedged_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged], wedged_before + 1);
     EXPECT_TRUE(readObj(*backend, store->wedgedKeyForTest(ns)).has_value())
         << "the write landed -- what was refused is the CLAIM, not the object";
 }

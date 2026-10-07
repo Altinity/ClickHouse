@@ -1701,7 +1701,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     auto volume = std::make_shared<SingleDiskVolume>("volume_" + part_name, disk);
 
     MergeTreeData::MutableDataPartPtr new_data_part;
-    MergeTreeDataPartBuilder builder(data, part_name, volume, part_relative_path, part_dir, getReadSettings());
+    MergeTreeDataPartBuilder builder(data, part_name, volume, part_relative_path, part_dir, getReadSettings(), PartDirIntent::OpenExisting);
     /// Read the part format from the now-published manifest (type + storage type), exactly as the byte
     /// fetch does — authoritative over the transferred `part_type` header (kept for protocol symmetry).
     new_data_part = builder.withPartFormatFromDisk().build();

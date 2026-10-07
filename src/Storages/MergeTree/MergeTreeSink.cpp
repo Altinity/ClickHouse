@@ -310,7 +310,9 @@ void MergeTreeSink::finishDelayedChunk()
         while (true)
         {
             partition.temp_part->finalize();
-            partition.temp_part->part->getDataPartStorage().commitTransaction();
+            /// A content-addressed part is published once, under its final name, when the transaction commits after the rename.
+            if (!partition.temp_part->part->getDataPartStorage().isContentAddressed())
+                partition.temp_part->part->getDataPartStorage().commitTransaction();
 
             auto & part = partition.temp_part->part;
             auto deduplication_hashes = partition.deduplication_info->getDeduplicationHashes(part->info.getPartitionId(), deduplicate);

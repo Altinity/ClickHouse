@@ -327,10 +327,10 @@ TEST(CASOrphanSweepRequests, PageIsIdenticalInlineAndWithReadAhead)
 
     CandidateFixture ahead_f;
     ThreadPool pool = makeReadPool(4);
-    const uint64_t hits_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load();
+    const uint64_t hits_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit];
     const ManifestSweepResult ahead_r = planManifestCursorPage(
         *ahead_f.store, "", 1000, 100, true, nullptr, &pool, /*read_concurrency=*/16);
-    const uint64_t hits = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load() - hits_before;
+    const uint64_t hits = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit] - hits_before;
     const auto ahead_gets = getsOf(*ahead_f.backend);
 
     EXPECT_GT(hits, 0u) << "the fixture's committed-tail walk and candidates must actually hit the "
@@ -366,12 +366,12 @@ TEST(CASOrphanSweepRequests, EpochCrossingDiscardsAtMostOneWindowAndTheNewEpochI
     setWatermarkMinActive(*backend, layout, "test", 2, /*min_active=*/1000);
     backend->resetCounts();
 
-    const uint64_t wasted_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted].load();
-    const uint64_t hits_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load();
+    const uint64_t wasted_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted];
+    const uint64_t hits_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit];
     ThreadPool pool = makeReadPool(4);
     const ManifestSweepResult result = planManifestCursorPage(*store, "", 1000, 100, true, nullptr, &pool, 16);
-    const uint64_t wasted = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted].load() - wasted_before;
-    const uint64_t hits = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load() - hits_before;
+    const uint64_t wasted = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted] - wasted_before;
+    const uint64_t hits = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit] - hits_before;
 
     /// `publishAt` writes a manifest as a side effect of every call above, so the page's LIST sees
     /// every one of those (47) plus the one raw manifest -- the fixture is about the hint/discard

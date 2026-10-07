@@ -2883,7 +2883,7 @@ TEST(CASGCFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingPro
 
     std::map<String, UInt64> namespace_cleanup;
     const uint64_t leaks_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGCNamespaceCleanupLeaks].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCNamespaceCleanupLeaks];
     gc.setPhaseSink([&](const GcPhaseRecord & record)
     {
         if (record.phase == "namespace_cleanup")
@@ -2906,7 +2906,7 @@ TEST(CASGCFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingPro
     ASSERT_FALSE(namespace_cleanup.empty());
     EXPECT_EQ(namespace_cleanup["leaked"], 1u);
     EXPECT_EQ(
-        ProfileEvents::global_counters[ProfileEvents::CASGCNamespaceCleanupLeaks].load() - leaks_before,
+        ProfileEvents::global_counters[ProfileEvents::CASGCNamespaceCleanupLeaks] - leaks_before,
         1u);
     const String captured = log_capture.captured();
     EXPECT_NE(captured.find(terminal_key), String::npos);
@@ -2942,12 +2942,12 @@ TEST(CASGCFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDe
 
     dropRefTransition(*backend, layout, ns, "victim", mref);
     const uint64_t events_before =
-        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load();
+        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives];
     const RoundReport report = runRegularRoundReclaiming(gc);
 
     ASSERT_TRUE(report.acquired_lease);
     EXPECT_EQ(
-        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load() - events_before,
+        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives] - events_before,
         1u);
     EXPECT_EQ(report.manifests_deleted, 1u)
         << "an unmatched adopted-parent row is observed and dropped, not promoted to pool-wide suppression";
@@ -3533,7 +3533,7 @@ TEST_P(CASGCCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
 
     backend->clearJournal();
     const uint64_t plans_before  /// NOLINT(clang-analyzer-deadcode.DeadStores)
-        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt];
     backend->releaseBlockedCatalogCas();
     leader_a.join();
 
@@ -3549,7 +3549,7 @@ TEST_P(CASGCCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
         EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
         EXPECT_NE(e.message().find("pre-fold drain lost authority"), String::npos) << e.message();
     }
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - plans_before, 0u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt] - plans_before, 0u);
     EXPECT_EQ(findJournalAfter(journal, "list " + layout.casRefsPrefix(), 0), journal.size());
     EXPECT_EQ(findJournalAfter(journal, "cas_begin " + layout.gcStateKey(), 0), journal.size());
     EXPECT_FALSE(std::any_of(journal.begin(), journal.end(), [](const String & entry)

@@ -48,6 +48,9 @@
 #include <Core/Settings.h>
 
 #include <Poco/TemporaryFile.h>
+#include <Poco/Net/HTTPBasicStreamBuf.h>
+
+#include <cstring>
 
 
 namespace DB
@@ -238,6 +241,30 @@ inline std::pair<std::string, std::string> splitCopySource(const std::string & c
     return {copy_source.substr(0, slash), copy_source.substr(slash + 1)};
 }
 
+/// A GetObject body for the mock: `ReadBufferFromS3` reads the body through `ReadBufferFromIStream`,
+/// which requires the stream buffer to be a `Poco::Net::HTTPBasicStreamBuf`.
+class StringHTTPStreamBuf : public Poco::Net::HTTPBasicStreamBuf
+{
+public:
+    explicit StringHTTPStreamBuf(std::string data_)
+        : Poco::Net::HTTPBasicStreamBuf(Poco::Net::HTTP_DEFAULT_BUFFER_SIZE, std::ios::in)
+        , data(std::move(data_))
+    {
+    }
+
+    int readFromDevice(char * buffer, std::streamsize length) override
+    {
+        const size_t n = std::min(static_cast<size_t>(length), data.size() - offset);
+        std::memcpy(buffer, data.data() + offset, n);
+        offset += n;
+        return static_cast<int>(n);
+    }
+
+private:
+    std::string data;
+    size_t offset = 0;
+};
+
 struct InjectionModel
 {
     virtual ~InjectionModel() = default;
@@ -355,9 +382,8 @@ struct Client : DB::S3::Client
             chassert(ret == 2);
         }
 
-        auto factory = request.GetResponseStreamFactory();
-        Aws::Utils::Stream::ResponseStream responseStream(factory);
-        responseStream.GetUnderlyingStream() << std::stringstream(data.substr(begin, end - begin + 1)).rdbuf();
+        Aws::Utils::Stream::ResponseStream responseStream(Aws::New<Aws::Utils::Stream::DefaultUnderlyingStream>(
+            "MockS3", Aws::UniquePtr<std::streambuf>(Aws::New<StringHTTPStreamBuf>("MockS3", data.substr(begin, end - begin + 1)))));
 
         Aws::AmazonWebServiceResult<Aws::Utils::Stream::ResponseStream> awsStream(std::move(responseStream), Aws::Http::HeaderValueCollection());
         Aws::S3::Model::GetObjectResult getObjectResult(std::move(awsStream));

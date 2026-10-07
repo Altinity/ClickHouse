@@ -564,7 +564,7 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         e.phase_duration_microseconds = r.phase_duration_microseconds;
         e.phase_metrics = r.phase_metrics;
         /// Best-effort: SystemLog::add never blocks GC; a full queue drops the row with a warning.
-        log->add(std::move(e));
+        log->add([&](ContentAddressedGarbageCollectionLogElement & element) { element = std::move(e); });
     };
 }
 
@@ -608,7 +608,7 @@ Cas::CasEventSink ContentAddressedMetadataStorage::makeCasEventSink() const
         e.query_id = CurrentThread::getQueryId();
         e.detail = std::move(ev.detail);
         /// Best-effort: SystemLog::add never blocks the Core; a full queue drops the row with a warning.
-        log->add(std::move(e));
+        log->add([&](ContentAddressedLogElement & element) { element = std::move(e); });
     };
 }
 

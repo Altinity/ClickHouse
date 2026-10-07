@@ -98,11 +98,11 @@ RenewalCounterSnapshot renewalCounters()
 {
     using ProfileEvents::global_counters;
     return {
-        .attempts = global_counters[ProfileEvents::CASMountRenewalAttempts].load(),
-        .retries = global_counters[ProfileEvents::CASMountRenewalRetries].load(),
-        .resolved = global_counters[ProfileEvents::CASMountRenewalResolved].load(),
-        .recovered = global_counters[ProfileEvents::CASMountRenewalRecovered].load(),
-        .deadline_exceeded = global_counters[ProfileEvents::CASMountRenewalDeadlineExceeded].load(),
+        .attempts = global_counters[ProfileEvents::CASMountRenewalAttempts],
+        .retries = global_counters[ProfileEvents::CASMountRenewalRetries],
+        .resolved = global_counters[ProfileEvents::CASMountRenewalResolved],
+        .recovered = global_counters[ProfileEvents::CASMountRenewalRecovered],
+        .deadline_exceeded = global_counters[ProfileEvents::CASMountRenewalDeadlineExceeded],
     };
 }
 
@@ -375,8 +375,8 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     /// with a fresh condemn of B (peek, not the fresh-condemn `head_blob` hook). Capture events + the
     /// counters for exactly THIS round.
     using ProfileEvents::global_counters;
-    const auto condemned_before = global_counters[ProfileEvents::CASGCRetiredCondemned].load();
-    const auto replaced_before  = global_counters[ProfileEvents::CASGCRetireReplaced].load();
+    const auto condemned_before = global_counters[ProfileEvents::CASGCRetiredCondemned];
+    const auto replaced_before  = global_counters[ProfileEvents::CASGCRetireReplaced];
 
     s->setEventSink([seen](const CasEvent & e)
     {
@@ -386,8 +386,8 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     s->setEventSink(nullptr);
     ASSERT_TRUE(rep.acquired_lease);
 
-    const auto condemned_after = global_counters[ProfileEvents::CASGCRetiredCondemned].load();
-    const auto replaced_after  = global_counters[ProfileEvents::CASGCRetireReplaced].load();
+    const auto condemned_after = global_counters[ProfileEvents::CASGCRetiredCondemned];
+    const auto replaced_after  = global_counters[ProfileEvents::CASGCRetireReplaced];
 
     /// Phase 3 (mixed-algo pools): event `object_hash` renders are `blobIdOf(ref)` ("<algoName>:<hex>"),
     /// never a bare hex.
