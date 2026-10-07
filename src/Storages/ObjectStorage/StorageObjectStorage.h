@@ -120,6 +120,17 @@ public:
         ContextPtr local_context,
         TableExclusiveLockHolder &) override;
 
+    Pipe alterPartition(
+        const StorageMetadataPtr & metadata_snapshot,
+        const PartitionCommands & commands,
+        ContextPtr context) override;
+
+    void checkAlterPartitionIsPossible(
+        const PartitionCommands & commands,
+        const StorageMetadataPtr & metadata_snapshot,
+        const Settings & settings,
+        ContextPtr context) const override;
+
     void drop() override;
 
     void prepareForDrop(ContextPtr query_context) override;
