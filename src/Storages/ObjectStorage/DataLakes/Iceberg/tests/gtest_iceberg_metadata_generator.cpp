@@ -657,6 +657,9 @@ TEST(IcebergMetadataGenerator, AddColumnUnknownTypeRecordsUnknownInSchema)
     auto stored_type = findCurrentFieldType(metadata, "placeholder");
     ASSERT_TRUE(stored_type.isString());
     EXPECT_EQ(stored_type.extract<String>(), "unknown");
+}
+
+
 TEST(IcebergMetadataGenerator, ModifyColumnFirstMovesFieldToIndexZero)
 {
     auto metadata = makeMetadataWithGap();
