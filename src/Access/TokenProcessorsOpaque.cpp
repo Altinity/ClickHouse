@@ -2,6 +2,7 @@
 
 #if USE_JWT_CPP
 #include <Access/ParseJSON.h>
+#include <IO/ReadHelpers.h>
 #include <Common/RemoteHostFilter.h>
 #include <Common/logger_useful.h>
 #include <Common/quoteString.h>
@@ -183,12 +184,6 @@ GoogleTokenProcessor::GoogleTokenProcessor(const String & processor_name_,
     , expected_audience(expected_audience_)
     , timeouts(timeouts_)
 {
-    /// Without an audience pin, this processor accepts any Google access token
-    /// that authenticates the user against Google -- including tokens minted for
-    /// completely unrelated OAuth clients (a classic confused-deputy scenario).
-    /// Operators who actually want token-based auth almost always want it bound
-    /// to their own client_id; surface this gap loudly at startup so it can't
-    /// stay silently un-enforced.
     if (expected_audience.empty())
         LOG_WARNING(getLogger("TokenAuthentication"),
                     "{}: 'expected_audience' is not configured for Google token processor. "
@@ -201,28 +196,9 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 {
     const String & token = credentials.getToken();
 
-    std::unordered_map<String, String> user_info;
-    picojson::object user_info_json = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/userinfo"), timeouts, token);
+    /// /tokeninfo has `aud`, `exp`, `sub` and `email`; /userinfo is needed only for other claims.
+    const auto token_info = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo"), timeouts, token);
 
-    if (!user_info_json.contains("email"))
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
-                        "{}: Specified username_claim {} not found in token", processor_name, username_claim);
-
-    user_info["email"] = getValueByKey<std::string, false>(user_info_json, "email").value_or("");
-
-    user_info[username_claim] = getValueByKey(user_info_json, username_claim).value();
-
-    String user_name = user_info[username_claim];
-
-    auto token_info = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo"), timeouts, token);
-
-    /// Audience binding (H-10): the Google /tokeninfo endpoint authoritatively
-    /// reports the OAuth client_id the access token was issued for in its 'aud'
-    /// field. Without this check, a token minted for any other Google OAuth
-    /// client (the user's mobile app, a third-party tool) would authenticate
-    /// here too -- because Google /userinfo will happily honor any valid token.
-    /// Refusing tokens whose 'aud' does not match the configured client pin is
-    /// what makes the binding strict.
     if (!expected_audience.empty())
     {
         const auto aud = getValueByKey<std::string, false>(token_info, "aud").value_or("");
@@ -235,11 +211,18 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
         }
     }
 
-    /// Reject empty resolved username (M-27). `TokenCredentials::setUserName`
-    /// leaves `is_ready=false` for empty input but the function would still
-    /// return true; the cache would then accept an entry under user_name "",
-    /// collapsing every empty-username token across all IdPs into the same
-    /// dynamic ClickHouse user.
+    const picojson::object user_info = token_info.contains(username_claim)
+        ? token_info
+        : getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/userinfo"), timeouts, token);
+
+    if (!user_info.contains(username_claim))
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
+                        "{}: Specified username_claim {} not found in token", processor_name, username_claim);
+
+    const String user_name = getValueByKey<std::string, false>(user_info, username_claim).value_or("");
+    const String email = getValueByKey<std::string, false>(user_info, "email").value_or("");
+
+    /// Otherwise all such tokens would share one cache entry under an empty user name.
     if (user_name.empty())
     {
         LOG_TRACE(getLogger("TokenAuthentication"),
@@ -249,27 +232,23 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 
     credentials.setUserName(user_name);
 
-    if (token_info.contains("exp"))
+    if (const auto exp_it = token_info.find("exp"); exp_it != token_info.end())
     {
-        /// picojson stores all numerics as double; we need to validate the
-        /// value is a finite, positive Unix timestamp that fits in time_t
-        /// before casting.
-        const double exp = getValueByKey<double>(token_info, "exp").value();
-        if (!std::isfinite(exp) || exp <= 0.0
-            || exp > static_cast<double>(std::numeric_limits<time_t>::max()))
+        /// /tokeninfo returns `exp` as a decimal string, e.g. "1744687132".
+        Int64 exp = 0;
+        if (!exp_it->second.is<std::string>() || !tryParse(exp, exp_it->second.get<std::string>().c_str()) || exp <= 0)
             throw Exception(
                 ErrorCodes::AUTHENTICATION_FAILED,
-                "{}: tokeninfo response contains an out-of-range 'exp' value: {}",
-                processor_name, exp);
+                "{}: tokeninfo response contains an invalid 'exp' value: {}",
+                processor_name, exp_it->second.serialize());
         credentials.setExpiresAt(std::chrono::system_clock::from_time_t(static_cast<time_t>(exp)));
     }
 
-    /// Groups info can only be retrieved if user email is known.
-    /// If no email found in user info, we skip this step and there are no external roles for the user.
-    if (!user_info["email"].empty())
+    if (!email.empty())
     {
         std::set<String> external_groups_names;
-        const Poco::URI get_groups_uri = Poco::URI("https://cloudidentity.googleapis.com/v1/groups/-/memberships:searchDirectGroups?query=member_key_id==" + user_info["email"] + "'");
+        Poco::URI get_groups_uri("https://cloudidentity.googleapis.com/v1/groups/-/memberships:searchDirectGroups");
+        get_groups_uri.addQueryParameter("query", "member_key_id == '" + email + "'");
 
         try
         {
@@ -293,16 +272,6 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 
                 auto group_data = group.get<picojson::object>();
 
-                /// Guard against a missing or non-object `groupKey`. Without
-                /// these checks `group_data["groupKey"].get<picojson::object>()`
-                /// would auto-insert a null `picojson::value` (because picojson
-                /// objects are `std::map<string, picojson::value>` and `[]`
-                /// default-constructs on a missing key) and then throw
-                /// `std::bad_cast` on the `.get<picojson::object>()` call --
-                /// which the `catch (const Exception &)` below does NOT
-                /// catch (`std::bad_cast` is `std::exception`-derived, not
-                /// `DB::Exception`-derived). The uncaught exception used to
-                /// propagate out of `resolveAndValidate` and abort auth.
                 auto group_key_it = group_data.find("groupKey");
                 if (group_key_it == group_data.end() || !group_key_it->second.is<picojson::object>())
                 {
@@ -325,10 +294,6 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
         }
         catch (const std::exception & e)
         {
-            /// Defense in depth: catch `std::exception` (not just `DB::Exception`)
-            /// so picojson's `std::bad_cast` and `std::runtime_error` -- and any
-            /// other future deviation -- degrade to "no roles mapped" rather
-            /// than aborting the whole authentication.
             LOG_TRACE(getLogger("TokenAuthentication"),
                       "{}: Failed to get Google groups, no external roles will be mapped. reason: {}", processor_name, e.what());
             return true;
