@@ -20,6 +20,8 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
+#include <Common/scope_guard_safe.h>
+#include <Common/threadPoolCallbackRunner.h>
 #include <base/defines.h>
 #include <base/scope_guard.h>
 #include <unordered_set>
@@ -44,6 +46,7 @@ namespace ProfileEvents
     extern const Event CASGCRetiredSpared;
     extern const Event CASGCRetiredGraduated;
     extern const Event CASGCRetiredRedeleted;
+    extern const Event CASGCRetiredRedeleteFailed;
     extern const Event CASGCRetireReplaced;
     extern const Event CASGCCondemnMarkerUnconfirmedCarry;
     extern const Event CASGCHeartbeatFenceOuts;
@@ -69,6 +72,7 @@ namespace ErrorCodes
 {
     extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
+    extern const int CANNOT_SCHEDULE_TASK;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
@@ -340,14 +344,20 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     /// `store->poolConfig()` AFTER the null check above.
     meta_writer = std::make_unique<GcMetaWriter>(
         store, logger, static_cast<size_t>(store->poolConfig().gc_meta_pool_size));
-    /// The fold's read-ahead pool, built here for the same reason. The queue is UNBOUNDED because the
-    /// hinting sites throttle themselves against `GcReadAhead::window`; a bounded queue would only
-    /// move the throttle into `scheduleOrThrowOnError`, blocking the round thread instead of the
-    /// hint loop that already knows how much it wants in flight.
-    const size_t read_concurrency = std::max<size_t>(1, store->poolConfig().gc_read_concurrency);
-    read_pool = std::make_unique<ThreadPool>(
+    /// The GC I/O pool (read-ahead and the `pending_deletes` fan-out), built here for the same reason.
+    /// The queue is UNBOUNDED because the hinting sites throttle themselves against
+    /// `GcReadAhead::window`; a bounded queue would only move the throttle into
+    /// `scheduleOrThrowOnError`, blocking the round thread instead of the hint loop that already knows
+    /// how much it wants in flight.
+    const size_t io_concurrency = std::max<size_t>(1, store->poolConfig().gc_io_concurrency);
+    /// Keep `shutdown_on_exception` false: every task on this pool (read-ahead and re-delete) is submitted
+    /// through a callback runner that stores its exception in the task's future, and no caller invokes
+    /// `wait` on this pool.
+    io_pool = std::make_unique<ThreadPool>(
         CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled,
-        /*max_threads*/ read_concurrency, /*max_free_threads*/ read_concurrency, /*queue_size*/ 0);
+        /*max_threads*/ io_concurrency, /*max_free_threads*/ io_concurrency, /*queue_size*/ 0,
+        /*shutdown_on_exception*/ false);
+    io_pool_refuse_at_for_test = store->poolConfig().gc_io_pool_refuse_at_for_test;
 }
 
 void Gc::runNamespaceJanitorPage(
@@ -396,6 +406,187 @@ uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<Wri
         /// +1: the failed bulk attempt above is itself a call this helper made.
         return 1 + chunk.size();
     }
+}
+
+Gc::RedeleteIo Gc::performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op)
+{
+    RedeleteIo io;
+    io.blob_key = layout.blobKey(entry.ref);
+    /// The condemned incarnation is a PERSISTED pair and cannot itself be a precondition, so
+    /// the round observes the blob and compares the two renderings. Observing first also
+    /// settles the absent case without spending a conditional delete against a key that is
+    /// already gone.
+    const std::optional<Meta> observed = op.head(io.blob_key, Retry::standard());
+    if (observed)
+        io.del = entry.token.matches(observed->etag) ? op.remove(io.blob_key, observed->etag, Retry::standard()) : Removal::Mismatch;
+    return io;
+}
+
+void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteIo & io)
+{
+    if (const auto & hook = store->poolConfig().gc_redelete_apply_hook_for_test)
+        hook(entry.ref);
+    const OutcomeKind outcome_kind = io.del == Removal::Removed ? OutcomeKind::Deleted
+        : io.del == Removal::Gone                               ? OutcomeKind::Absent
+                                                                : OutcomeKind::Replaced;
+    OutcomeEntry outcome{.kind = entry.kind, .ref = entry.ref, .token = entry.token, .outcome = outcome_kind};
+    const String del_outcome{removalName(io.del)};
+    /// The single content-delete site is attributable per row. A mismatch (a writer recreated
+    /// the incarnation) is terminal-OK: the fresh incarnation is a live object.
+    EventEmitter{*store}.emit(
+        [&](CasEvent & e)
+        {
+            e.type = CasEventType::BlobDelete;
+            e.object_kind = CasEventObjectKind::Blob;
+            e.object_hash = blobIdOf(entry.ref);
+            e.token = renderIncarnation(entry.token);
+            e.round = ctx.new_round;
+            e.gen = ctx.snap_generation;
+            e.outcome = del_outcome;
+            e.reason = "delete_pending published by a prior pass; exact-incarnation delete (pre-CAS)";
+            e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}, {"key", io.blob_key}};
+        });
+    /// The audit row is observability only -- the delete in `performRedeleteIo` already executed
+    /// regardless of this cap. Skipping it here bounds the per-shard `GcOutcomes` body without
+    /// skipping or deferring any destructive work.
+    if (ctx.round_work_budget.outcomeEntryAvailable())
+    {
+        ctx.outcomes[ctx.shard].entries.push_back(std::move(outcome));
+        ++ctx.round_work_budget.outcome_entries_used;
+    }
+    ++ctx.report.redeleted;
+    ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
+    /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
+    /// writer already published a fresh incarnation at this hash, and that writer's own
+    /// republication path (`PartWriteTxn::ensureBlobPresent`) reconciles the meta back to Clean
+    /// right after the publication; deleting it here would race that legitimate Clean write for
+    /// no reason (the meta is advisory, but there is no reason to touch it on that path at all).
+    if (io.del == Removal::Removed || io.del == Removal::Gone)
+    {
+        meta_writer->scheduleConfirmedMetaDelete(entry.ref, entry.condemn_round);
+    }
+}
+
+void Gc::reportRedeleteFailure(
+    RedeleteRoundContext & ctx,
+    const RetiredEntry & entry,
+    const Layout & layout,
+    std::exception_ptr exception,
+    std::optional<size_t> unsent_count)
+{
+    ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleteFailed);
+    ++ctx.report.redelete_failed;
+    LOG_WARNING(logger,
+        "CAS gc: pending delete of blob {} (key `{}`, condemned at round {}) failed; the entry stays delete_pending "
+        "and is retried in the next round: {}{}",
+        blobIdOf(entry.ref), layout.blobKey(entry.ref), entry.condemn_round, getExceptionMessage(exception, false),
+        unsent_count ? fmt::format("; {} re-delete entries were not submitted", *unsent_count) : String{});
+}
+
+void Gc::redeleteBlobs(
+    RedeleteRoundContext & ctx,
+    const std::vector<RetiredEntry> & entries,
+    ThreadPool & pool,
+    size_t concurrency,
+    const Layout & layout,
+    CasOperation & op)
+{
+    std::vector<RedeleteIo> io_results(entries.size());
+    std::vector<std::exception_ptr> io_errors(entries.size());
+    std::optional<IndexedException> schedule_error;
+    size_t scheduled = 0;
+    if (concurrency <= 1 || entries.size() <= 1)
+    {
+        for (size_t i = 0; i < entries.size(); ++i)
+        {
+            try
+            {
+                io_results[i] = performRedeleteIo(entries[i], layout, op);
+            }
+            catch (...)
+            {
+                io_errors[i] = std::current_exception();
+            }
+        }
+        scheduled = entries.size();
+    }
+    else
+    {
+        ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::CAS_GC_REDELETE);
+        std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;
+        handles.reserve(entries.size());
+        SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
+
+        const uint64_t admitted_generation = op.generation();
+        try
+        {
+            for (; scheduled < entries.size(); ++scheduled)
+            {
+                if (io_pool_refuse_at_for_test == scheduled)
+                {
+                    io_pool_refuse_at_for_test.reset();
+                    throw Exception(ErrorCodes::CANNOT_SCHEDULE_TASK, "Injected CAS GC re-delete enqueue refusal at index {}", scheduled);
+                }
+                handles.emplace_back(runner.enqueueAndGiveOwnership(
+                    [slot = &io_results[scheduled],
+                     entry = entries[scheduled],
+                     layout_ptr = &layout,
+                     pool_store = store,
+                     admitted_generation]
+                    {
+                        CasOperation job_op = pool_store->openRequests().resume(admitted_generation);
+                        *slot = performRedeleteIo(entry, *layout_ptr, job_op);
+                    }));
+            }
+        }
+        catch (...)
+        {
+            schedule_error = IndexedException{scheduled, std::current_exception()};
+        }
+        ctx.jobs_scheduled += handles.size();
+
+        ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
+        for (size_t i = 0; i < handles.size(); ++i)
+        {
+            try
+            {
+                handles[i]->future.get();
+            }
+            catch (...)
+            {
+                io_errors[i] = std::current_exception();
+            }
+        }
+    }
+
+    std::optional<IndexedException> first_error;
+    for (size_t i = 0; i < scheduled; ++i)
+    {
+        if (!io_errors[i])
+            continue;
+        reportRedeleteFailure(ctx, entries[i], layout, io_errors[i]);
+        if (!first_error)
+            first_error = IndexedException{i, io_errors[i]};
+    }
+    if (schedule_error)
+    {
+        reportRedeleteFailure(
+            ctx, entries[schedule_error->index], layout, schedule_error->exception, entries.size() - schedule_error->index);
+        if (!first_error || schedule_error->index < first_error->index)
+            first_error = schedule_error;
+    }
+
+    /// Every submitted delete of the batch has already run. If `applyRedeleteOutcome` throws, the batch stays deleted
+    /// but unrecorded: the round fails before its outcome logs and `gc/state` commit, every entry stays
+    /// `delete_pending`, and the next round records the deleted ones as `Absent`.
+    for (size_t i = 0; i < scheduled; ++i)
+    {
+        if (!io_errors[i])
+            applyRedeleteOutcome(ctx, entries[i], io_results[i]);
+    }
+
+    if (first_error)
+        std::rethrow_exception(first_error->exception);
 }
 
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy,
@@ -696,6 +887,17 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     pending_deletes_timer.emplace(phase_sink, "pending_deletes");
     const uint64_t redeleted_before = report.redeleted;
     const uint64_t graduated_before = report.graduated;
+    const uint64_t redelete_failed_before = report.redelete_failed;
+    uint64_t redelete_jobs_scheduled = 0;
+    const auto record_redelete_job_metrics = [&]
+    {
+        pending_deletes_timer->metric("jobs_scheduled", redelete_jobs_scheduled);
+        pending_deletes_timer->metric("jobs_failed", report.redelete_failed - redelete_failed_before);
+    };
+    SCOPE_EXIT_SAFE({
+        if (pending_deletes_timer)
+            record_redelete_job_metrics();
+    });
     std::map<uint64_t, OutcomeLog> outcomes;
     for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
     {
@@ -717,62 +919,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         static const std::vector<RetiredEntry> kNothingToDelete;
         const std::vector<RetiredEntry> & redelete_now =
             suppress_destructive ? kNothingToDelete : merge.redelete;
-        for (const RetiredEntry & entry : redelete_now)
-        {
-            /// The condemned incarnation is a PERSISTED pair and cannot itself be a precondition, so
-            /// the round observes the blob and compares the two renderings. Observing first also
-            /// settles the absent case without spending a conditional delete against a key that is
-            /// already gone.
-            const String blob_key = layout.blobKey(entry.ref);
-            const std::optional<Meta> observed = op.head(blob_key, Retry::standard());
-            Removal del = Removal::Gone;
-            if (observed)
-                del = entry.token.matches(observed->etag)
-                    ? op.remove(blob_key, observed->etag, Retry::standard())
-                    : Removal::Mismatch;
-
-            const OutcomeKind outcome_kind = del == Removal::Removed ? OutcomeKind::Deleted
-                                            : del == Removal::Gone  ? OutcomeKind::Absent
-                                                                    : OutcomeKind::Replaced;
-            OutcomeEntry outcome{.kind = entry.kind, .ref = entry.ref, .token = entry.token, .outcome = outcome_kind};
-            const String del_outcome{removalName(del)};
-            /// The single content-delete site is attributable per row. A mismatch (a writer recreated
-            /// the incarnation) is terminal-OK: the fresh incarnation is a live object.
-            EventEmitter{*store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::BlobDelete;
-                e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = blobIdOf(entry.ref);
-                e.token = renderIncarnation(entry.token);
-                e.round = new_round;
-                e.gen = generation;
-                e.outcome = del_outcome;
-                e.reason = "delete_pending published by a prior pass; exact-incarnation delete (pre-CAS)";
-                e.detail = {{"condemn_round", std::to_string(entry.condemn_round)},
-                            {"key", blob_key}};
-            });
-            /// The audit row is observability only -- the delete above already executed regardless of
-            /// this cap. Skipping it here bounds the per-shard `GcOutcomes` body without skipping or
-            /// deferring any destructive work.
-            if (round_work_budget.outcomeEntryAvailable())
-            {
-                outcomes[shard].entries.push_back(std::move(outcome));
-                ++round_work_budget.outcome_entries_used;
-            }
-            ++report.redeleted;
-            ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
-            /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
-            /// writer already resurrected a fresh incarnation at this hash, and that writer's
-            /// own republication path already flipped the meta back to Clean; blindly deleting here
-            /// would race that legitimate Clean write for no reason (the meta is advisory, but there is
-            /// no reason to touch it on that path at all).
-            if (del == Removal::Removed || del == Removal::Gone)
-            {
-                meta_writer->scheduleConfirmedMetaDelete(entry.ref);
-            }
-            /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
-            meta_writer->forgetCondemnMarker(entry.ref, entry.token);
-        }
+        RedeleteRoundContext redelete_ctx{
+            .new_round = new_round,
+            .snap_generation = generation,
+            .shard = shard,
+            .round_work_budget = round_work_budget,
+            .report = report,
+            .outcomes = outcomes,
+            .jobs_scheduled = redelete_jobs_scheduled};
+        redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
         for (const RetiredEntry & entry : merge.spared)
         {
             /// A fresh dedup-adopt raced the condemn (see the matching CasGcFold Debug log emitted
@@ -812,12 +967,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// `PartWriteTxn::ensureBlobPresent`) — the SOLE
             /// `Condemned -> Clean` transition. Clearing here on a
             /// deposed leader that then lost its round CAS would strand a stray-`Clean` over a still-live
-            /// condemned token and lose the reuse to a stale exact-token redelete (INV_NO_LOSS); see
+            /// condemned token and lose the reuse to a stale exact-token redelete (INV_NO_LOSS).
             /// The next `putBlob` self-heals
             /// the marker: `PartWriteTxn::ensureBlobPresent` refuses adoption on `Condemned` and
             /// publishes the writer's source under a fresh envelope.
-            /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
-            meta_writer->forgetCondemnMarker(entry.ref, entry.token);
         }
         for (const RetiredEntry & entry : merge.graduated)
         {
@@ -859,14 +1012,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                            "incarnation; superseded the stale entry and re-condemned the current token";
                 e.detail = {{"superseded_token", renderIncarnation(replaced.old_token)}};
             });
-            /// The supersede is ALSO a blob entering the retired set fresh (a re-condemn of the
-            /// CURRENT token) — write the meta Condemned exactly like a fresh `head_blob` condemn would,
-            /// so a NEXT writer's point-read gate sees it (and the graduation gate gets its (hash, token)
-            /// confirmation on success). `peek_head` itself stays side-effect-free (it runs once per
-            /// closed candidate, not just on a real supersede — see its own comment). The SUPERSEDED
-            /// (stale) token's in-process confirmation is dropped — that entry left the pipeline.
-            meta_writer->scheduleCondemnMarkerWrite(entry.ref, entry.token, entry.condemn_round, entry.size);
-            meta_writer->forgetCondemnMarker(entry.ref, replaced.old_token);
+            /// The supersede is also a blob entering the retired set: write its marker like a fresh
+            /// `head_blob` condemn, so a writer's point-read sees it. `peek_head` stays side-effect-free.
+            meta_writer->scheduleCondemnMarkerWrite(entry.ref, entry.condemn_round, entry.size);
         }
     }
 
@@ -921,6 +1069,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     pending_deletes_timer->metric("replaced", report.replaced);
     pending_deletes_timer->metric("spared", report.spared);
     pending_deletes_timer->metric("outcome_logs_written", outcomes.size());
+    record_redelete_job_metrics();
     pending_deletes_timer.reset();   /// emits the `pending_deletes` row
 
     /// Wait for the round's whole batch of per-hash freshness-meta writes (condemned during the
@@ -1681,8 +1830,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// The fold's read-ahead. It fetches through `op`'s own admitted generation and hands every result
     /// back at the site that would otherwise have read inline, so the walk's order, its counters, its
     /// holds and its events are what they were; only the moment of the fetch moves. At
-    /// `gc_read_concurrency` 1 it hints nothing and every take IS the original inline read.
-    GcReadAhead reads(op, store->openRequests(), *read_pool, store->poolConfig().gc_read_concurrency);
+    /// `gc_io_concurrency` 1 it hints nothing and every take IS the original inline read.
+    GcReadAhead reads(op, store->openRequests(), *io_pool, store->poolConfig().gc_io_concurrency);
     FoldResult result;
 
     /// 1. Group the round's one enumeration of `cas/ns/stream/` (taken before the defer decision) into
@@ -1822,10 +1971,11 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     std::vector<std::vector<BlobRef>> head_candidates(state.gc_shards);
     size_t head_hint_shard = 0;
     size_t next_head_hint = 0;
+    /// Head hints count only heads, so outstanding graduation reads cannot starve them.
     const auto topUpHeadHints = [&]
     {
         const std::vector<BlobRef> & shard_candidates = head_candidates[head_hint_shard];
-        while (next_head_hint < shard_candidates.size() && reads.pending() < reads.window())
+        while (next_head_hint < shard_candidates.size() && reads.pendingHeads() < reads.window())
             reads.hintHead(layout.blobKey(shard_candidates[next_head_hint++]));
     };
 
@@ -1879,14 +2029,10 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         });
         Meta adjusted = *observed;
         adjusted.size = retiredLogicalSize(ObjectKind::Blob, observed->size, store->poolMeta().blob_header_len);
-        /// This candidate unconditionally becomes a fresh `RetiredEntry` in `closeBlob` (the ONLY
-        /// caller of `head_blob`) whenever this lambda returns a value — so this is exactly the round's
-        /// side-effecting condemn site. Write the meta Condemned so the writer's point-read gate
-        /// sees it; a successful write records the in-process (hash, token) confirmation the graduation
-        /// gate consumes (`scheduleCondemnMarkerWrite` captures everything BY VALUE — never by reference
-        /// to `cur_blob`, which the fold's tight streaming loop mutates while the job is queued).
-        meta_writer->scheduleCondemnMarkerWrite(ref, PersistedEtag::capture(observed->etag),
-                                                condemn_round, adjusted.size);
+        /// This candidate always becomes a fresh `RetiredEntry` in `closeBlob` (the only caller of
+        /// `head_blob`), so this is the round's side-effecting condemn site. The job captures everything by
+        /// value: the fold mutates `cur_blob` while the job is queued.
+        meta_writer->scheduleCondemnMarkerWrite(ref, condemn_round, adjusted.size);
         return adjusted;
     };
 
@@ -1914,43 +2060,37 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         return hr;
     };
 
-    /// Graduation gate (triage 2026-07-17 §3.4): the merge consults this before publishing an entry
-    /// delete_pending. Confirmation sources, in order: the in-process (hash, token) record left by a
-    /// successful `writeCondemnedMeta` completion, then ONE synchronous `loadMeta` re-check — a durable
-    /// `Condemned` meta observed NOW is sufficient evidence, because a writer that same-token adopted
-    /// must have observed a non-Condemned meta EARLIER, its edge (EDGE-BEFORE-OBSERVE) landed before the
-    /// meta turned Condemned, and the redelete only fires from a LATER fold whose cut postdates this
-    /// round — that fold sees the edge and spares. (`BlobMeta` carries no token, so the re-check is
-    /// per-hash by design; the two-phase pipeline + the exact-token delete carry the rest.) No durable
-    /// evidence => count the carry, RETRY the marker write (liveness: a swallowed write would otherwise
-    /// carry forever), and refuse — never throw (an unreadable meta is missing evidence, not a wedge).
+    /// Marker keys admitted to a graduation read and not yet taken: every outstanding hint and the entry at the
+    /// gate. With `graduations_used` it never exceeds the graduation budget.
+    std::unordered_set<String> graduation_reserved;
+
+    /// Graduation gate. Publishing `delete_pending` authorizes an irreversible delete, and the marker is the
+    /// writer's adopt gate, so the marker is read every time, after the round's cut. A writer that adopted saw
+    /// a non-`Condemned` marker before this read; its edge is then in the delete round's cut and spares the
+    /// entry. A refusal carries the entry and rewrites the marker; a failed read is missing evidence and
+    /// never wedges the round.
     const auto confirm_condemned_marker = [&](const RetiredEntry & entry) -> bool
     {
-        if (meta_writer->condemnMarkerConfirmedInProcess(entry.ref, entry.token))
-            return true;
+        const String key = layout.blobMetaKey(entry.ref);
+        graduation_reserved.erase(key);
         try
         {
-            if (const auto lm = loadMeta(op, layout, entry.ref); lm && lm->meta.state == MetaState::Condemned)
-            {
-                meta_writer->noteCondemnMarkerDurable(entry.ref, entry.token);   /// memoize for a round-CAS-abort replay
+            /// An older round may be another incarnation's marker, which that incarnation's delete job may remove.
+            if (const auto lm = decodeLoadedMeta(reads.takeRead(key));
+                lm && lm->meta.state == MetaState::Condemned && lm->meta.condemn_round >= entry.condemn_round)
                 return true;
-            }
         }
         catch (...)
         {
             ProfileEvents::increment(ProfileEvents::CASGCMetaWriteAnomaly);
             tryLogCurrentException(logger,
-                "CAS gc: condemn-marker re-check failed to read the meta (treated as missing evidence; "
-                "the entry is carried, never wedges the round)");
+                "CAS gc: the graduation gate failed to read the condemn marker (the entry is carried; "
+                "never wedges the round)");
         }
         ProfileEvents::increment(ProfileEvents::CASGCCondemnMarkerUnconfirmedCarry);
-        /// Accepted race: this retry writes `Condemned` per-hash, with no token check. If a writer
-        /// resurrected this exact hash under a FRESH token between the original swallowed write and this
-        /// retry, the retry stamps `Condemned` over that writer's live, uncondemned incarnation. This is
-        /// never destructive -- the eventual exact-token delete is a no-op against the fresh token
-        /// (it finds a different incarnation, or none) -- worst case the resurrecting writer's later
-        /// same-token adopter sees stale `Condemned` metadata and republishes once unnecessarily.
-        meta_writer->scheduleCondemnMarkerWrite(entry.ref, entry.token, entry.condemn_round, entry.size);
+        /// This round, not the entry's: a publisher's late `Clean If-Match` names the bytes it read, and on S3
+        /// an entry-round rewrite recreates exactly those bytes.
+        meta_writer->scheduleCondemnMarkerWrite(entry.ref, condemn_round, entry.size);
         return false;
     };
 
@@ -2055,7 +2195,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// position, this epoch's next positions, and a decoded log's manifest edges -- so the phase's round
     /// trips overlap instead of running strictly one after another. Every take happens where the inline
     /// read happened, in the same order, and increments the same counters, which is why this row's
-    /// semantic metrics are identical at any `gc_read_concurrency`. Its S3 VERB counts are not: a request
+    /// semantic metrics are identical at any `gc_io_concurrency`. Its S3 VERB counts are not: a request
     /// a worker performed lands on that worker's ProfileEvents, the same gap `meta_pool_wait` has always
     /// had. Read `CASGCReadAheadHit`/`Miss`/`Wasted` on this row for the read-ahead's own behaviour.
     std::optional<GcPhaseTimer> intake_timer;
@@ -3267,7 +3407,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             /// cut and `_ckpt` frontier the round's own universe came from -- which is exactly what an
             /// authoritative universe means, and is why this is the gate's term and not a separate one.
             universe_authoritative,
-            &work_budget, read_pool.get(), store->poolConfig().gc_read_concurrency);
+            &work_budget, io_pool.get(), store->poolConfig().gc_io_concurrency);
         for (const ManifestSweepResult::Nomination & nomination : result.orphan_sweep.nominations)
             orphan_source_retirements.insert(
                 orphan_source_retirements.end(),
@@ -3292,6 +3432,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
     /// the sweep, and a retirement is a removal like any other. The round's cut is frozen well before
     /// this point -- intake has finished and `deltas` has taken its final form -- so no HEAD is issued
     /// before the round knows what it folded.
+    std::set<BlobRef> touched_blobs;
     {
         std::map<std::pair<BlobRef, UInt128>, bool> last_verdict_is_remove;
         for (const BlobDelta & delta : deltas)
@@ -3302,11 +3443,59 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
         std::set<BlobRef> removed;
         std::set<BlobRef> surviving_add;
         for (const auto & [edge, is_remove] : last_verdict_is_remove)
+        {
+            /// Only the graduation read-ahead reads the set; the sequential setting has none.
+            if (reads.window() > 0)
+                touched_blobs.insert(edge.first);
             (is_remove ? removed : surviving_add).insert(edge.first);
+        }
         for (const BlobRef & ref : removed)
             if (!surviving_add.contains(ref))
                 head_candidates[blobShard(ref, state.gc_shards)].push_back(ref);
     }
+
+    /// Graduation read-ahead. A carried row that no delta or retirement touches this round has no edge and is
+    /// not superseded, so it reaches the gate; its read is hinted once the budget admits it. Hints are issued in
+    /// the merge, after intake, and the fold writes no marker of a hinted hash before the gate takes the read.
+    const auto graduationBudgetFull = [&]
+    {
+        return work_budget.max_graduations != 0
+            && work_budget.graduations_used + graduation_reserved.size() >= work_budget.max_graduations;
+    };
+    const GraduationReadHints graduation_hints{
+        .admit = [&](const BlobRef & ref)
+        {
+            const String key = layout.blobMetaKey(ref);
+            if (graduation_reserved.contains(key))
+                return true;
+            if (graduationBudgetFull())
+                return false;
+            if (graduation_reserved.size() < reads.window())
+                reads.hintRead(key);
+            graduation_reserved.insert(key);
+            return true;
+        },
+        .offer = [&](const BlobRef & ref, const CondemnedRow & row)
+        {
+            if (row.delete_pending || row.condemn_round >= current_round || suppress_destructive)
+                return true;
+            /// A touched row may still reach the gate; reserving past it would let later rows take its budget slot.
+            if (touched_blobs.contains(ref))
+                return false;
+            if (graduationBudgetFull() || graduation_reserved.size() >= reads.window())
+                return false;
+            if (const String key = layout.blobMetaKey(ref); graduation_reserved.insert(key).second)
+                reads.hintRead(key);
+            return true;
+        }};
+    const GraduationReadHints * graduation_reads = reads.window() > 0 ? &graduation_hints : nullptr;
+    /// A reservation left after a shard's merge belongs to no gate.
+    const auto discardGraduationReads = [&]
+    {
+        for (const String & key : graduation_reserved)
+            reads.discardRead(key);
+        graduation_reserved.clear();
+    };
 
     if (state.gc_shards == 1)
     {
@@ -3332,7 +3521,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                                      confirm_condemned_marker,
                                      result.retired_merge.data(), suppress_destructive,
                                      &ledger.applied, std::move(orphan_source_retirements),
-                                     &work_budget);
+                                     &work_budget, graduation_reads);
+            discardGraduationReads();
             result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
         }
     }
@@ -3376,7 +3566,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 confirm_condemned_marker,
                 &result.retired_merge[shard], suppress_destructive,
                 &ledger.applied, std::move(retirement_buckets[shard]),
-                &work_budget);
+                &work_budget, graduation_reads);
+            discardGraduationReads();
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
             result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
@@ -4052,7 +4243,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// them one at a time, exactly as it did before: a rebuild walks a plan it already holds rather
     /// than discovering its next key from the body it just read, so a lookahead would have nothing to
     /// hide behind.
-    GcReadAhead reads(op, store->openRequests(), *read_pool, store->poolConfig().gc_read_concurrency);
+    GcReadAhead reads(op, store->openRequests(), *io_pool, store->poolConfig().gc_io_concurrency);
 
     /// Read bookkeeping health before the lease (the lease acquire on an absent state CREATES a
     /// bootstrap body, which must not make scenario (а) look healthy). A generation-0 ref-baseline
