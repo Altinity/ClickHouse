@@ -565,6 +565,35 @@ void Reader::prepareBloomFilterCondition()
 
 void Reader::initializePrefetches()
 {
+    /// One S3 GET is one contiguous range. Contiguous bloom filters (ClickHouse writer) are read together.
+    /// A small file with many filters is read once, and later column reads reuse that buffer.
+    const size_t coalesce_max = options.format.parquet.bloom_filter_coalesce_max_bytes;
+    if (coalesce_max > 0)
+    {
+        size_t bloom_count = 0;
+        for (const RowGroup & row_group : row_groups)
+        {
+            if (!row_group.need_to_process)
+                continue;
+            for (size_t column_idx = 0; column_idx < primitive_columns.size(); ++column_idx)
+            {
+                if (!primitive_columns[column_idx].use_bloom_filter)
+                    continue;
+                const auto & meta = row_group.columns[column_idx].meta->meta_data;
+                if (meta.__isset.bloom_filter_offset && meta.__isset.bloom_filter_length && meta.bloom_filter_length > 0)
+                    ++bloom_count;
+            }
+        }
+        if (bloom_count >= 2)
+        {
+            const size_t file_size = prefetcher.getFileSize();
+            const size_t seek = options.min_bytes_for_seek;
+            const bool whole_file = file_size <= coalesce_max && seek > 0 && bloom_count >= (file_size + seek - 1) / seek;
+            prefetcher.configureCoalescing(whole_file ? file_size : coalesce_max, whole_file, whole_file);
+        }
+    }
+    const uint8_t bloom_group = prefetcher.bloomFilterCoalesceGroup();
+
     bool use_offset_index = options.format.parquet.use_offset_index || format_filter_info->prewhere_info || format_filter_info->row_level_filter
         || std::any_of(primitive_columns.begin(), primitive_columns.end(), [](const auto & c) { return c.column_index_condition; });
     bool need_to_find_bloom_filter_lengths_the_hard_way = false;
@@ -618,13 +647,13 @@ void Reader::initializePrefetches()
                     column.bloom_filter_data_bytes = len;
                     column.bloom_filter_data_prefetch = prefetcher.registerRange(
                         size_t(column.meta->meta_data.bloom_filter_offset),
-                        len, /*likely_to_be_used=*/ false);
+                        len, /*likely_to_be_used=*/ false, bloom_group);
                 }
                 /// bloom_filter_header_prefetch and bloom_filter_data_prefetch overlap, that's ok.
                 column.use_bloom_filter = true;
                 column.bloom_filter_header_prefetch = prefetcher.registerRange(
                     size_t(column.meta->meta_data.bloom_filter_offset),
-                    max_header_length, /*likely_to_be_used=*/ true);
+                    max_header_length, /*likely_to_be_used=*/ true, bloom_group);
             }
 
             /// Offset index.
@@ -703,7 +732,7 @@ void Reader::initializePrefetches()
 
                 column.bloom_filter_data_bytes = end - offset;
                 column.bloom_filter_data_prefetch = prefetcher.registerRange(
-                    offset, end - offset, /*likely_to_be_used=*/ false);
+                    offset, end - offset, /*likely_to_be_used=*/ false, bloom_group);
             }
         }
     }

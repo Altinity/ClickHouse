@@ -40,7 +40,23 @@ public:
     /// (We use overlap to simplify bloom filter header reading a little.)
     /// If likely_to_be_used is true, Prefetcher will be more eager to piggy-back this range when
     /// reading other ranges.
-    PrefetchHandle registerRange(size_t offset, size_t length, bool likely_to_be_used);
+    /// `coalesce_group` != 0: this range may be read together with other ranges of the same group.
+    /// See configureCoalescing.
+    PrefetchHandle registerRange(size_t offset, size_t length, bool likely_to_be_used, uint8_t coalesce_group = 0);
+
+    /// Subsequent ranges in one group are read in one request, up to `span_limit` bytes.
+    /// `across_gaps` also merges ranges farther apart than min_bytes_for_seek (a small file, one read).
+    /// `for_all_ranges` puts every range into that group, so later column reads reuse the same buffer.
+    void configureCoalescing(size_t span_limit, bool across_gaps, bool for_all_ranges)
+    {
+        coalesce_group_span_limit = span_limit;
+        coalesce_group_across_gaps = across_gaps;
+        coalesce_group_for_all_ranges = for_all_ranges ? 1 : 0;
+    }
+
+    /// Group id to pass to registerRange for bloom-filter ranges. 0 if coalescing is off.
+    /// When every range is already in the group, this is also non-zero so bloom ranges match.
+    uint8_t bloomFilterCoalesceGroup() const { return coalesce_group_span_limit > 0 ? 1 : 0; }
 
     /// Called at most once, after all registerRange calls and before all enqueue/getRangeData calls.
     void finalizeRanges();
@@ -98,6 +114,8 @@ private:
         size_t range_idx = UINT64_MAX;
         size_t length = 0;
         size_t task_offset = 0;
+        /// Non-zero: merge with other ranges of this group. See configureCoalescing.
+        uint8_t coalesce_group = 0;
     };
 
     /// Range that the user wants, before coalescing. Overlapping ranges are allowed, but are not
@@ -151,6 +169,8 @@ private:
         std::atomic<State> state {State::Scheduled};
         /// How many RequestState-s in HasTask state point to this Task.
         std::atomic<size_t> refcount {};
+        /// The first prefetch of a coalesced group charges `length` bytes once.
+        std::atomic<bool> coalesce_memory_charged {false};
         /// Notified when the state changes from Running to Done or Exception.
         CompletionNotification completion;
         std::exception_ptr exception;
@@ -182,6 +202,9 @@ private:
     size_t file_size{};
     size_t min_bytes_for_seek{};
     size_t bytes_per_read_task{};
+    size_t coalesce_group_span_limit = 0;
+    bool coalesce_group_across_gaps = false;
+    uint8_t coalesce_group_for_all_ranges = 0;
 
     std::shared_ptr<ShutdownHelper> shutdown = std::make_shared<ShutdownHelper>();
 

@@ -347,6 +347,8 @@ struct FormatSettings
         bool case_insensitive_column_matching = false;
         bool filter_push_down = true;
         bool bloom_filter_push_down = true;
+        /// 0 disables coalescing bloom-filter reads. See input_format_parquet_bloom_filter_coalesce_max_bytes.
+        size_t bloom_filter_coalesce_max_bytes = 64 * 1024 * 1024;
         bool page_filter_push_down = true;
         bool use_offset_index = true;
 
