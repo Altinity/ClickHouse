@@ -13,6 +13,7 @@
 #include <chrono>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -1082,29 +1083,71 @@ TEST(CASMountAwaitExpiry, ForeignUuidFailsClosedImmediately)
     EXPECT_EQ(sleeps, 0);                                            // never waits across UUIDs
 }
 
-/// rev.6: the predecessor's own stamped `expires_at_ms` (however skewed) is NEVER consulted for the
-/// reclaim decision any more — the wait is bounded purely by OUR OWN `ttl_ms`-derived threshold. A
-/// prior incarnation minted with an absurdly large `ttl` (so its own stamp claims aliveness for
-/// ~100000ms) still reclaims within the SAME small threshold as any other case, because that stamp is
-/// never read for timing.
-TEST(CASMountAwaitExpiry, SkewedFarFutureExpiryHasNoEffectOnObservationThreshold)
+namespace
 {
-    auto b = std::make_shared<InMemoryBackend>();
-    Layout l("p");
-    Ops ops(b);
-    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100000).kind, MountClaimResult::Claimed);
-
-    uint64_t wall = 1000;
+/// Restart reclaim as this server with a 30 s lease and a 1 s poll. Returns the observer clock at the
+/// reclaim and records every threshold `on_wait_start` reports.
+uint64_t reclaimAsShortLeaseObserver(Ops & ops, const Layout & l, std::vector<uint64_t> & thresholds)
+{
     uint64_t mono = 0;
-    auto now_fn = [&] { return wall; };
-    auto mono_fn = [&] { return mono; };
-    auto sleep_fn = [&](uint64_t ms) { wall += ms; mono += ms; };
-
     const auto r = claimMountAwaitingExpiry(
-        ops.op, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, mono_fn, /*ttl*/ 100, /*poll*/ 20, sleep_fn);
+        ops.op, l, "r", UInt128(1), /*our_epoch*/ 8, [] { return uint64_t{1000}; }, [&] { return mono; },
+        /*ttl*/ 30'000, /*poll*/ 1'000, [&](uint64_t ms) { mono += ms; },
+        [&](const MountLease &, uint64_t threshold_ms) { thresholds.push_back(threshold_ms); });
     EXPECT_EQ(r.kind, MountClaimResult::Claimed);
-    EXPECT_LE(mono, 100u + 100u / 20 + 20u + 20u);      // bounded by OUR threshold, not the predecessor's stamp
-    EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 8u);   // reclaimed
+    EXPECT_EQ(r.prior, MountPriorState::UncleanObserved);
+    return mono;
+}
+}
+
+TEST(CASMountAwaitExpiry, HolderDeclaringALongerLeaseIsWaitedOutInFull)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    Layout l("p");
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 60'000).kind, MountClaimResult::Claimed);
+    std::vector<uint64_t> thresholds;
+    EXPECT_EQ(reclaimAsShortLeaseObserver(ops, l, thresholds), 64'000u)
+        << "reclaimed before the predecessor's declared lease ran out";
+    EXPECT_EQ(thresholds, std::vector<uint64_t>{64'000});
+}
+
+/// A shorter declared lease (10 s), a missing start stamp, equal stamps, an expiry before the start.
+TEST(CASMountAwaitExpiry, ShorterOrUnusableDeclaredLeaseWaitsTheObserversOwn)
+{
+    const std::vector<std::pair<uint64_t, uint64_t>> stamps{{1'000, 11'000}, {0, 60'000}, {5'000, 5'000}, {70'000, 10'000}};
+    for (const auto & [started, expires] : stamps)
+    {
+        SCOPED_TRACE(fmt::format("started_at_ms={} expires_at_ms={}", started, expires));
+        Ops ops(std::make_shared<InMemoryBackend>());
+        Layout l("p");
+        const MountLease m{.server_uuid = UInt128(1), .writer_epoch = 7, .hostname = "h", .pid = 1,
+            .started_at_ms = started, .seq = 1, .expires_at_ms = expires, .write_attempt_id = UInt128(1)};
+        mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(m), Retry::standard()), "seeded mount");
+        std::vector<uint64_t> thresholds;
+        EXPECT_EQ(reclaimAsShortLeaseObserver(ops, l, thresholds), 33'000u);
+        EXPECT_EQ(thresholds, std::vector<uint64_t>{32'500});
+    }
+}
+
+/// The certificates of death need no wait, whatever lease the body declares.
+TEST(CASMountAwaitExpiry, FencedAndFarewellSlotsReclaimWithoutWaitingWhateverTheyDeclare)
+{
+    for (const bool fenced : {true, false})
+    {
+        Ops ops(std::make_shared<InMemoryBackend>());
+        Layout l("p");
+        MountLease m{.server_uuid = UInt128(1), .writer_epoch = 7, .hostname = "h", .pid = 1,
+            .started_at_ms = 1000, .seq = 1, .expires_at_ms = 61'000, .write_attempt_id = UInt128(1)};
+        m.gc_fenced = fenced;
+        m.min_active_build_sequence = fenced ? 0 : std::numeric_limits<uint64_t>::max();
+        mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(m), Retry::standard()), "seeded mount");
+        int sleeps = 0;
+        const auto r = claimMountAwaitingExpiry(ops.op, l, "r", UInt128(1), 8, [] { return uint64_t{1000}; },
+            [] { return uint64_t{0}; }, 30'000, 1'000, [&](uint64_t) { ++sleeps; });
+        EXPECT_EQ(r.kind, MountClaimResult::Claimed);
+        EXPECT_EQ(r.prior, fenced ? MountPriorState::Fenced : MountPriorState::Clean);
+        EXPECT_EQ(sleeps, 0);
+    }
 }
 
 TEST(CASMountClaim, UnsafeAuthorizationIsTokenExact)
@@ -1502,22 +1545,25 @@ namespace
 /// Rev.6 §token-stability observation removed the wall clock from the fence DECISION; `kNowMs` below
 /// is threaded through only as `computeHeartbeatFloor`'s audit-only `now_ms`.
 constexpr uint64_t kNowMs = 1'000'000;
-/// The fence-out threshold measured on the LEADER's OWN monotonic clock (`mono_ms_fn`), independent
-/// of any lease's stamped `expires_at_ms`.
-constexpr uint64_t kStableThresholdMs = 10'000;
+/// The observing leader's own lease and step, and the threshold they give a body that declares nothing.
+constexpr uint64_t kObserverLeaseMs = 30'000;
+constexpr uint64_t kCadenceMs = 1'000;
+constexpr uint64_t kStableThresholdMs = 32'500;
+constexpr std::string_view kLeaseMismatchMarker = "declares a lease";
 
 /// Seed one mount body under mountKey(srid) via the on-storage codec — the same interface the renewer
 /// writes through.
 MountLease seedMount(
     CasOperation & op, const Layout & l, const String & srid,
-    uint64_t expires_at_ms, bool gc_fenced, uint64_t min_active_build_sequence, uint64_t seq = 1)
+    uint64_t expires_at_ms, bool gc_fenced, uint64_t min_active_build_sequence, uint64_t seq = 1,
+    uint64_t started_at_ms = kNowMs)
 {
     MountLease m;
     m.server_uuid = UInt128(srid.back());   // distinct per srid; content is irrelevant to the gate
     m.writer_epoch = 1;
     m.hostname = "h-" + srid;
     m.pid = 100;
-    m.started_at_ms = kNowMs;
+    m.started_at_ms = started_at_ms;
     m.seq = seq;
     m.expires_at_ms = expires_at_ms;
     m.min_active_build_sequence = min_active_build_sequence;
@@ -1560,8 +1606,9 @@ TEST(CASHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
+    std::set<String> warned;
     const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, /*now_ms*/ kNowMs, frozenClock(0),
-                                                         kStableThresholdMs, obs);
+                                                         kObserverLeaseMs, kCadenceMs, obs, warned);
 
     EXPECT_EQ(floor.fenced_now, 0u);
     EXPECT_EQ(floor.live, 1u);
@@ -1577,7 +1624,8 @@ TEST(CASHeartbeatFloor, StableIncarnationPastThresholdIsFenced)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
+    std::set<String> warned;
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
     EXPECT_EQ(floor_before.fenced_now, 0u);
 
     const MountLease before = decodeMountLease(ops.op.read(l.mountKey("s1"), Retry::standard())->bytes);
@@ -1585,7 +1633,7 @@ TEST(CASHeartbeatFloor, StableIncarnationPastThresholdIsFenced)
     /// No renewal in between: the SAME incarnation, observed since mono 0, is now stable for the full
     /// threshold on the leader's own clock.
     const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
-                                                          kStableThresholdMs, obs);
+                                                          kObserverLeaseMs, kCadenceMs, obs, warned);
 
     EXPECT_EQ(floor2.fenced_now, 1u);
     EXPECT_EQ(floor2.fenced_srids, std::vector<String>{"s1"});
@@ -1602,7 +1650,8 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
+    std::set<String> warned;
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
     ASSERT_TRUE(obs.contains("s1"));
     const Etag first_etag = obs.at("s1").etag;
 
@@ -1611,7 +1660,7 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     EXPECT_NE(renewed_etag, first_etag);
 
     const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
-                                                          kStableThresholdMs, obs);
+                                                          kObserverLeaseMs, kCadenceMs, obs, warned);
 
     EXPECT_EQ(floor2.fenced_now, 0u);
     ASSERT_TRUE(obs.contains("s1"));
@@ -1633,7 +1682,8 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     seedMount(ops.op, l, "s2", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
+    std::set<String> warned;
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
     ASSERT_TRUE(obs.contains("s1"));
     ASSERT_TRUE(obs.contains("s2"));
 
@@ -1645,7 +1695,7 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     renewMount(ops.op, l, "s1");
     ASSERT_EQ(ops.op.removeCurrent(l.mountKey("s2"), Retry::standard()), Removal::Removed);
 
-    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs), kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs), kObserverLeaseMs, kCadenceMs, obs, warned);
     EXPECT_TRUE(obs.contains("s1"));
     EXPECT_FALSE(obs.contains("s2"))
         << "a srid removed from the LIST entirely must be pruned from obs, not linger forever";
@@ -1670,9 +1720,10 @@ TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
               /*min_active_build_sequence*/ std::numeric_limits<uint64_t>::max());
 
     MountObservationMap obs;
+    std::set<String> warned;
 
     /// Round 1 (mono 0): first sight of every non-terminal mount — nothing is fence-eligible yet.
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
     EXPECT_EQ(floor_before.live, 3u);            // s1, s2, s3: observation just started
     EXPECT_EQ(floor_before.terminated, 1u);      // s5
     EXPECT_EQ(floor_before.fenced_now, 0u);
@@ -1690,7 +1741,7 @@ TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
     /// Round 2 (mono == threshold): s1/s2's renewed incarnations restart their observation (still
     /// live); s3's original incarnation has now held stable for the full threshold -> fenced.
     const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
-                                                          kStableThresholdMs, obs);
+                                                          kObserverLeaseMs, kCadenceMs, obs, warned);
 
     EXPECT_EQ(floor2.live, 2u);            // s1, s2: renewed, observation restarted
     EXPECT_EQ(floor2.terminated, 1u);      // s5
@@ -1765,9 +1816,10 @@ TEST(CASHeartbeatFloor, FenceOutLosesTheIncarnationRaceAndReclassifiesLive)
     seedMount(ops.op, l, "s1", /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
+    std::set<String> warned;
     /// Round 1: first sight, observation starts — never reaches the fence-out path (the race
     /// decorator stays armed for round 2).
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
     EXPECT_EQ(floor_before.fenced_now, 0u);
 
     /// Round 2: the incarnation has been stable past threshold, so the function attempts the
@@ -1775,7 +1827,7 @@ TEST(CASHeartbeatFloor, FenceOutLosesTheIncarnationRaceAndReclassifiesLive)
     /// and the re-decision reclassifies the slot as live (observation restarted on the new
     /// incarnation) — never fenced.
     const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
-                                                          kStableThresholdMs, obs);
+                                                          kObserverLeaseMs, kCadenceMs, obs, warned);
 
     EXPECT_EQ(floor2.fenced_now, 0u);
     EXPECT_EQ(floor2.live, 1u);
@@ -1840,20 +1892,21 @@ TEST(CASHeartbeatFloor, ConfirmingCallDecidesOnItsEntrySample)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
     const auto clock = [&mono] { return mono; };
     MountObservationMap obs;
+    std::set<String> warned;
 
-    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned);
     ASSERT_EQ(obs.at("s1").first_seen_mono_ms, 0u);
 
     /// The call starts one millisecond short of the threshold; its walk passes the threshold many times.
     mono = kStableThresholdMs - 1;
     b->read_cost_ms = 10 * kStableThresholdMs;
-    const HeartbeatFloor slow = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    const HeartbeatFloor slow = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned);
     EXPECT_EQ(slow.fenced_now, 0u);
     EXPECT_EQ(slow.live, 1u);
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, 0u) << "an unchanged token keeps its first sighting";
 
     b->read_cost_ms = 0;
-    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u);
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned).fenced_now, 1u);
 }
 
 TEST(CASHeartbeatFloor, FailedSlotReadKeepsTheWatch)
@@ -1865,19 +1918,20 @@ TEST(CASHeartbeatFloor, FailedSlotReadKeepsTheWatch)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
     const auto clock = [&mono] { return mono; };
     MountObservationMap obs;
+    std::set<String> warned;
 
-    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned);
     ASSERT_EQ(obs.at("s1").first_seen_mono_ms, 0u);
 
     mono = kStableThresholdMs / 2;
     b->fail_slot_reads = true;
-    EXPECT_ANY_THROW(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs));
+    EXPECT_ANY_THROW(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned));
     ASSERT_TRUE(obs.contains("s1"));
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, 0u);
 
     b->fail_slot_reads = false;
     mono = kStableThresholdMs;
-    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u)
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned).fenced_now, 1u)
         << "a failed read restarted the observation";
 }
 
@@ -1888,13 +1942,14 @@ TEST(CASHeartbeatFloor, SampleOlderThanTheSightingNeverFences)
     Ops ops(b);
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
     MountObservationMap obs;
+    std::set<String> warned;
 
-    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs), kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs), kObserverLeaseMs, kCadenceMs, obs, warned);
     ASSERT_EQ(obs.at("s1").first_seen_mono_ms, kStableThresholdMs);
 
     /// A clock that went back: the unsigned difference would wrap past any threshold.
     const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs - 1),
-                                                       kStableThresholdMs, obs);
+                                                       kObserverLeaseMs, kCadenceMs, obs, warned);
     EXPECT_EQ(floor.fenced_now, 0u);
     EXPECT_EQ(floor.live, 1u);
 }
@@ -1913,22 +1968,23 @@ TEST(CASHeartbeatFloor, FirstSightingCountsFromAfterItsRead)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
     const auto clock = [&mono] { return mono; };
     MountObservationMap obs;
+    std::set<String> warned;
 
     /// The call starts at 0 and reaches the slot at `kWalkMs`.
     b->read_cost_ms = kWalkMs;
-    ASSERT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 0u);
+    ASSERT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned).fenced_now, 0u);
     ASSERT_TRUE(obs.contains("s1"));
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kWalkMs);
 
     /// One threshold after the first call started, less than one after its read.
     b->read_cost_ms = 0;
     mono = kStableThresholdMs;
-    const HeartbeatFloor early = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    const HeartbeatFloor early = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned);
     EXPECT_EQ(early.fenced_now, 0u) << "fenced a token watched for less than the threshold";
     EXPECT_EQ(early.live, 1u);
 
     mono = kWalkMs + kStableThresholdMs;
-    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u);
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned).fenced_now, 1u);
 }
 
 TEST(CASHeartbeatFloor, RedecisionAfterARefusedFenceCountsFromItsRead)
@@ -1940,8 +1996,9 @@ TEST(CASHeartbeatFloor, RedecisionAfterARefusedFenceCountsFromItsRead)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
     const auto clock = [&mono] { return mono; };
     MountObservationMap obs;
+    std::set<String> warned;
 
-    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned);
     ASSERT_TRUE(obs.contains("s1"));
     const Etag first = obs.at("s1").etag;
 
@@ -1950,7 +2007,7 @@ TEST(CASHeartbeatFloor, RedecisionAfterARefusedFenceCountsFromItsRead)
     mono = kStableThresholdMs;
     b->read_cost_ms = kWalkMs;
     b->renew_before_next_fence = true;
-    const HeartbeatFloor refused = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    const HeartbeatFloor refused = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned);
     ASSERT_FALSE(b->renew_before_next_fence) << "the call never attempted the fence-out";
     ASSERT_EQ(refused.fenced_now, 0u);
     ASSERT_EQ(refused.live, 1u);
@@ -1964,11 +2021,11 @@ TEST(CASHeartbeatFloor, RedecisionAfterARefusedFenceCountsFromItsRead)
     /// One threshold after that call started, less than one after its re-read.
     b->read_cost_ms = 0;
     mono = 2 * kStableThresholdMs;
-    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 0u)
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned).fenced_now, 0u)
         << "fenced the renewed token before it was watched for the threshold";
 
     mono = reread_at + kStableThresholdMs;
-    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u);
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kObserverLeaseMs, kCadenceMs, obs, warned).fenced_now, 1u);
 }
 
 TEST(CASHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
@@ -1978,12 +2035,233 @@ TEST(CASHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
 
     Ops ops(b);
     MountObservationMap obs;
-    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
+    std::set<String> warned;
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
 
     EXPECT_EQ(floor.live, 0u);
     EXPECT_EQ(floor.terminated, 0u);
     EXPECT_EQ(floor.fenced_now, 0u);
     EXPECT_EQ(floor.already_fenced, 0u);
+}
+
+namespace
+{
+HeartbeatFloor floorAt(Ops & ops, const Layout & l, uint64_t mono_ms, MountObservationMap & obs, std::set<String> & warned)
+{
+    return computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(mono_ms), kObserverLeaseMs, kCadenceMs, obs, warned);
+}
+}
+
+/// The body declares 60 s against the observer's 30 s: 60 s + 3 s + the 1 s step.
+TEST(CASHeartbeatFloor, HolderDeclaringALongerLeaseIsWatchedForThatLease)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    Layout l("p");
+    seedMount(ops.op, l, "s1", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    MountObservationMap obs;
+    std::set<String> warned;
+    floorAt(ops, l, 0, obs, warned);
+    EXPECT_EQ(floorAt(ops, l, kStableThresholdMs, obs, warned).fenced_now, 0u)
+        << "fenced after the observer's own lease while the declared lease still ran";
+    EXPECT_EQ(floorAt(ops, l, 63'999, obs, warned).fenced_now, 0u);
+    EXPECT_EQ(floorAt(ops, l, 64'000, obs, warned).fenced_now, 1u);
+}
+
+/// A shorter declared lease, a missing start stamp, equal stamps, an expiry before the start.
+TEST(CASHeartbeatFloor, ShorterOrUnusableDeclaredLeaseIsWatchedForTheObserversOwn)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    Layout l("p");
+    seedMount(ops.op, l, "s1", /*expires*/ kNowMs + 10'000, false, 0);
+    seedMount(ops.op, l, "s2", /*expires*/ 60'000, false, 0, /*seq*/ 1, /*started_at_ms*/ 0);
+    seedMount(ops.op, l, "s3", /*expires*/ kNowMs, false, 0);
+    seedMount(ops.op, l, "s4", /*expires*/ kNowMs - 1, false, 0);
+    MountObservationMap obs;
+    std::set<String> warned;
+    floorAt(ops, l, 0, obs, warned);
+    EXPECT_EQ(floorAt(ops, l, kStableThresholdMs - 1, obs, warned).fenced_now, 0u);
+    EXPECT_EQ(floorAt(ops, l, kStableThresholdMs, obs, warned).fenced_now, 4u);
+}
+
+/// `gc_fenced` and farewell slots stay terminal whatever lease they declare: no observation, no write.
+TEST(CASHeartbeatFloor, TerminalSlotsAreExcludedWhateverTheyDeclare)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    Layout l("p");
+    seedMount(ops.op, l, "s1", /*expires*/ kNowMs + 60'000, /*fenced*/ true, 0);
+    seedMount(ops.op, l, "s2", /*expires*/ kNowMs + 60'000, false, std::numeric_limits<uint64_t>::max());
+    MountObservationMap obs;
+    std::set<String> warned;
+    const HeartbeatFloor floor = floorAt(ops, l, 0, obs, warned);
+    EXPECT_EQ(floor.already_fenced, 1u);
+    EXPECT_EQ(floor.terminated, 1u);
+    EXPECT_TRUE(obs.empty());
+}
+
+TEST(CASMountObservationThreshold, LongerOfOwnAndDeclaredLeasePlusDriftAndStep)
+{
+    EXPECT_EQ(mountObservationThresholdMs(30'000, 0, 1'000), 32'500u);
+    EXPECT_EQ(mountObservationThresholdMs(30'000, 10'000, 1'000), 32'500u);
+    EXPECT_EQ(mountObservationThresholdMs(30'000, 60'000, 1'000), 64'000u);
+}
+
+TEST(CASMountObservationThreshold, SaturatesInsteadOfWrapping)
+{
+    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+    /// `20 * (max / 21)` plus its twentieth is `max - 15`: the step alone decides the overflow.
+    EXPECT_EQ(mountObservationThresholdMs(0, 20 * (max / 21), 14), max - 1);
+    EXPECT_EQ(mountObservationThresholdMs(0, 20 * (max / 21), 16), max);
+    EXPECT_EQ(mountObservationThresholdMs(30'000, max - 10, 0), max);
+}
+
+TEST(CASMountObservationThreshold, DeclaredLeaseIsThePositiveStampInterval)
+{
+    MountLease m;
+    m.started_at_ms = 1'000;
+    m.expires_at_ms = 61'000;
+    EXPECT_EQ(declaredMountLeaseMs(m), 60'000u);
+    m.started_at_ms = 0;
+    EXPECT_EQ(declaredMountLeaseMs(m), 0u) << "a body without the start stamp";
+    m.started_at_ms = 61'000;
+    EXPECT_EQ(declaredMountLeaseMs(m), 0u) << "a farewell stamps both equal";
+    m.started_at_ms = 70'000;
+    EXPECT_EQ(declaredMountLeaseMs(m), 0u) << "expiry before start";
+}
+
+TEST(CASHeartbeatFloor, HolderWithADifferentLeaseIsWarnedAboutWithoutChangingTheClassification)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const String before = ops.op.read(l.mountKey("s1"), Retry::standard())->bytes;
+
+    DB::Cas::tests::ScopedLogCapture capture("CasHeartbeatFloor", "warning");
+    MountObservationMap obs;
+    std::set<String> warned;
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
+
+    EXPECT_EQ(capture.count(
+        "This server is configured with cas_mount_lease_ttl_ms=30000 but the holder of slot s1 "
+        "(hostname=h-s1, pid=100) declares a lease of 60000 ms. Observers wait for the longer of the two; "
+        "a longer lease on one server delays recovery after that server's crash."), 1u)
+        << capture.captured();
+    EXPECT_EQ(floor.live, 1u);
+    EXPECT_EQ(floor.fenced_now, 0u);
+    EXPECT_EQ(ops.op.read(l.mountKey("s1"), Retry::standard())->bytes, before);
+    EXPECT_EQ(warned, std::set<String>{"s1"});
+}
+
+TEST(CASHeartbeatFloor, HolderWithTheSameLeaseIsNotWarnedAbout)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ kNowMs + kObserverLeaseMs, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+
+    DB::Cas::tests::ScopedLogCapture capture("CasHeartbeatFloor", "warning");
+    MountObservationMap obs;
+    std::set<String> warned;
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
+
+    EXPECT_EQ(capture.count(kLeaseMismatchMarker), 0u) << capture.captured();
+    EXPECT_TRUE(warned.empty());
+}
+
+TEST(CASHeartbeatFloor, FarewellBodyIsNotWarnedAbout)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    /// What `MountLeaseRenewer::terminate` writes: both stamps equal, farewell sentinel.
+    seedMount(ops.op, l, "s1", /*expires*/ kNowMs, /*fenced*/ false,
+              /*min_active_build_sequence*/ std::numeric_limits<uint64_t>::max());
+
+    DB::Cas::tests::ScopedLogCapture capture("CasHeartbeatFloor", "warning");
+    MountObservationMap obs;
+    std::set<String> warned;
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
+
+    EXPECT_EQ(floor.terminated, 1u);
+    EXPECT_EQ(capture.count(kLeaseMismatchMarker), 0u) << capture.captured();
+}
+
+/// Both slots keep a 60 s body that differs from the observer's 30 s, but a fenced or departed holder
+/// cannot delay anything, so naming it would only alarm the operator.
+TEST(CASHeartbeatFloor, TerminalSlotsWithADifferentLeaseAreNotWarnedAbout)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    Layout l("p");
+    seedMount(ops.op, l, "s1", /*expires*/ kNowMs + 60'000, /*fenced*/ true, /*min_active_build_sequence*/ 0);
+    seedMount(ops.op, l, "s2", /*expires*/ kNowMs + 60'000, /*fenced*/ false,
+              /*min_active_build_sequence*/ std::numeric_limits<uint64_t>::max());
+
+    DB::Cas::tests::ScopedLogCapture capture("CasHeartbeatFloor", "warning");
+    MountObservationMap obs;
+    std::set<String> warned;
+    const HeartbeatFloor floor = floorAt(ops, l, 0, obs, warned);
+
+    EXPECT_EQ(floor.already_fenced, 1u);
+    EXPECT_EQ(floor.terminated, 1u);
+    EXPECT_EQ(capture.count(kLeaseMismatchMarker), 0u) << capture.captured();
+    EXPECT_TRUE(warned.empty());
+}
+
+TEST(CASHeartbeatFloor, MissingStartStampIsNotWarnedAbout)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    /// A body without `started_at_ms` decodes it as 0; the interval to `expires_at_ms` means nothing.
+    seedMount(ops.op, l, "s1", /*expires*/ 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0,
+              /*seq*/ 1, /*started_at_ms*/ 0);
+
+    DB::Cas::tests::ScopedLogCapture capture("CasHeartbeatFloor", "warning");
+    MountObservationMap obs;
+    std::set<String> warned;
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
+
+    EXPECT_EQ(capture.count(kLeaseMismatchMarker), 0u) << capture.captured();
+}
+
+TEST(CASHeartbeatFloor, LeaseMismatchIsWarnedOncePerServerRootId)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    seedMount(ops.op, l, "s2", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+
+    DB::Cas::tests::ScopedLogCapture capture("CasHeartbeatFloor", "warning");
+    MountObservationMap obs;
+    std::set<String> warned;
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
+    /// A renewal gives s1 a new incarnation; the next round reads both bodies again.
+    renewMount(ops.op, l, "s1");
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(1), kObserverLeaseMs, kCadenceMs, obs, warned);
+
+    EXPECT_EQ(capture.count(kLeaseMismatchMarker), 2u) << capture.captured();
+    EXPECT_EQ(capture.count("holder of slot s1 ("), 1u) << capture.captured();
+    EXPECT_EQ(capture.count("holder of slot s2 ("), 1u) << capture.captured();
+}
+
+TEST(CASHeartbeatFloor, UnseenSridPrunedFromLeaseMismatchWarned)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    seedMount(ops.op, l, "s2", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+
+    MountObservationMap obs;
+    std::set<String> warned;
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
+    ASSERT_EQ(warned, (std::set<String>{"s1", "s2"}));
+
+    ASSERT_EQ(ops.op.removeCurrent(l.mountKey("s2"), Retry::standard()), Removal::Removed);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(1), kObserverLeaseMs, kCadenceMs, obs, warned);
+
+    EXPECT_EQ(warned, std::set<String>{"s1"});
 }
 
 /// ---- Task 1 (Phase 2): `listMounts` — read-only mount-slot enumeration for introspection ----

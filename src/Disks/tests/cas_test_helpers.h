@@ -27,6 +27,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Common/Exception.h>
+#include <Common/Logger.h>
 #include <Common/SipHash.h>
 #include <Common/thread_local_rng.h>
 
@@ -40,7 +41,9 @@
 /// For `ChunkFaultBackend`'s `DefiniteFailure` mode, which needs a real S3-classified error, and for
 /// the ambiguity it raises otherwise.
 #include <IO/S3Common.h>
+#include <Poco/AutoPtr.h>
 #include <Poco/Exception.h>
+#include <Poco/StreamChannel.h>
 
 #include <algorithm>
 #include <atomic>
@@ -53,8 +56,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -93,6 +98,49 @@ inline DB::Cas::CasRequests openRequestsForTest(DB::Cas::Backend & backend)
 {
     return openRequestsForTest(DB::Cas::BackendPtr(std::shared_ptr<void>(), &backend));
 }
+
+/// Routes one logger into memory at `level` for the scope, then restores its channel and level.
+class ScopedLogCapture
+{
+public:
+    ScopedLogCapture(const String & logger_name, const String & level)
+        : logger(getLogger(logger_name))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel(), /*shared=*/true)
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel(level);
+    }
+
+    ~ScopedLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    ScopedLogCapture(const ScopedLogCapture &) = delete;
+    ScopedLogCapture & operator=(const ScopedLogCapture &) = delete;
+
+    String captured() const { return stream.str(); }
+
+    size_t count(std::string_view needle) const
+    {
+        const String haystack = captured();
+        size_t n = 0;
+        for (size_t pos = 0; (pos = haystack.find(needle, pos)) != String::npos; pos += needle.size())
+            ++n;
+        return n;
+    }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    /// `shared=true`: the parked channel is not ours, so take a reference instead of stealing one.
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
 
 /// An open-fence operation together with the `CasRequests` it refers to, for a fixture that holds a
 /// backend and needs to call a production entry point taking a `CasOperation &`. Neither copyable nor

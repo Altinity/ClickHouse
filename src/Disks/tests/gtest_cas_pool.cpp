@@ -2521,9 +2521,11 @@ TEST(CASMountOpenWaits, UncleanOpenPaysOnlyTheObservationWindow)
         }));
     ASSERT_TRUE(store);
 
-    /// The token-stability observation window is paid in full, pinned to the exact configured
-    /// formula (`mountObservationThresholdMs`): threshold_ms = ttl_ms + ttl_ms/20 + poll_interval_ms
-    /// = 500 + 25 + 50 = 575 ms, where poll_interval_ms = max(1, mount_renew_period/2) = 50 ms. The
+    /// The token-stability observation window is paid in full, pinned to the exact
+    /// formula (`mountObservationThresholdMs`). The predecessor declares the same lease, so own and
+    /// declared coincide:
+    /// threshold_ms = ttl_ms + ttl_ms/20 + poll_interval_ms = 500 + 25 + 50 = 575 ms, where
+    /// poll_interval_ms = max(1, mount_renew_period/2) = 50 ms. The
     /// loop only re-checks the threshold between polls, so the observed wait rounds UP to the next
     /// whole poll: ceil(575 / 50) * 50 = 600 ms, i.e. exactly 12 polls of 50 ms each -- because this
     /// predecessor's death was never certified, only observed.

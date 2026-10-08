@@ -96,7 +96,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_blob_hash` | `cityhash128` | Pool blob content-hash function (`cityhash128` \| `xxh3-128` \| `sha256`). Recorded in the pool at creation; a mismatching config is refused at mount |
 | `cas_blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool. One-way: once admitted, the pool carries both algorithms permanently |
 | `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Only the preflight probe is skipped — the conditional-write correctness check still runs on every writable mount. **Not available on a writable generation-token (GCS) disk**, which refuses to mount with it: there, the probe battery is the only proof that a token-exact delete carries its generation precondition. Mount such a disk read-only if you need to defer the check |
-| `cas_mount_lease_ttl_ms` | `30000` | Milliseconds for which a mount lease remains valid after a successful claim or renewal (≥ 1). Lower values shorten stale-mount recovery but reduce tolerance for object-storage and scheduling delays |
+| `cas_mount_lease_ttl_ms` | `30000` | How long this server may write after its last confirmed renewal; every other server waits at least this long before fencing or reclaiming its slot (≥ 1). Lower values shorten recovery after this server's crash but reduce tolerance for object-storage and scheduling delays |
 | `cas_mount_renew_period_ms` | `10000` | Milliseconds between background mount-lease renewals (≥ 1). It must leave enough time for two attempt envelopes (a renewal write and its settlement read) and the lease safety margin before the TTL expires: `period + 2 × envelope + margin < TTL` |
 | `cas_gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
 | `cas_gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
@@ -112,17 +112,15 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_unsafe_remount_no_delay` | `0` | Reclaim a mount slot that carries this server's own uuid at once after a hard restart, without observing the slot's token for the lease TTL. Unsafe whenever two processes can hold the same `server_uuid` (a copied uuid file, a stalled predecessor). After such a reclaim the predecessor can still start conditional writes until its own cutoff (`confirmed deadline − cas_lease_safety_margin_ms − 2 × envelope`) or until its next renewal meets the token guard, and a request it already sent may still materialize later. That is not a data hazard: ref-log keys carry `(writer_epoch, sequence)` and creates are conditional, so two writers can never commit different bodies to one key, and recovery's epoch seal settles any straggler (recovery fails closed after 64 successive seal-create attempts displaced by newly materializing old-epoch transactions). The exposure is availability, not data. Intended for test stands and deployments that guarantee one process per uuid |
 | `cas_staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount |
 
-All servers sharing a pool must run the same `cas_mount_lease_ttl_ms` and `cas_mount_renew_period_ms`.
-Startup reclaim and GC's fence-out both judge liveness by the mount slot's write token holding stable
-on the observer's own `CLOCK_BOOTTIME`, using the observer's own threshold — nothing about a writer's
-timing travels on the wire. Startup observes `cas_mount_lease_ttl_ms + floor(cas_mount_lease_ttl_ms /
-20) + max(1, floor(cas_mount_renew_period_ms / 2))`; GC observes `cas_mount_lease_ttl_ms +
-floor(cas_mount_lease_ttl_ms / 20) + cas_mount_renew_period_ms`. A pool member or GC leader
-configured with a shorter threshold than its peers can therefore fence out a healthy peer whose
-token-update gap exceeds that shorter threshold — a peer renewing frequently stays live, one that
-missed a renewal does not. Change these values only with every member of the pool stopped: a
-graceful restart removes only that member's own startup observation and does not make mixed
-thresholds safe.
+Both settings are local. Startup reclaim and GC's fence-out judge liveness by the mount slot's write
+token holding stable on the observer's own `CLOCK_BOOTTIME` for `L + floor(L / 20) + step`. `L` is the
+longer of the observer's `cas_mount_lease_ttl_ms` and the lease the holder's body declares
+(`expires_at_ms − started_at_ms`; a body without stamps or with a non-positive interval declares
+nothing). Startup's step is `max(1, floor(cas_mount_renew_period_ms / 2))` and GC's is
+`cas_mount_renew_period_ms`, both the observer's own. Mixed values are therefore safe in any order;
+a longer lease on one server delays recovery after that server's crash. A server built without this
+rule waits only its own lease, so keep the values equal until every server of the pool runs a build
+with it.
 
 A shorter TTL reduces the tolerance for object-storage delays; a shorter renewal period increases it
 (renewal starts earlier) at the cost of more background traffic. With the defaults,

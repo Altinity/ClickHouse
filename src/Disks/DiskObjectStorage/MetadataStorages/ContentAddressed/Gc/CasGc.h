@@ -1009,6 +1009,9 @@ private:
     /// leader (after a steal, or a process restart) starts empty, which only delays fencing an
     /// already-dead mount by one extra round (safe: never fences early).
     MountObservationMap mount_obs;
+    /// Srids `computeHeartbeatFloor` already warned about for a lease length different from ours.
+    /// In-memory: a new leader names each mismatched holder once more.
+    std::set<String> lease_mismatch_warned;
 
     /// Throttle for the orphan sweep's retention rollup. The premise retains on any pass whose epochs are
     /// not closed-and-folded, so an unconditional `LOG_INFO` would repeat the same sentence for as long as
