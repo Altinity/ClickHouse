@@ -1,0 +1,1068 @@
+: "1000 lines shown — 58.14% (2min 30sec) of 4min 18sec"
+Total bytes processed: "373  kB"
+Common labels: {"app":"clickhouse-operator","clickhouse_altinity_com_app":"chop","clickhouse_altinity_com_chop":"0.27.2","clickhouse_altinity_com_chop_commit":"c712654","clickhouse_altinity_com_chop_date":"2026-07-23T09.39.52","job":"demo/clickhouse-operator","namespace":"demo","node_name":"ip-10-129-57-55.ec2.internal","pod":"clickhouse-operator-55c445467f-gbqks","pod_template_hash":"55c445467f","stream":"stderr","topology_kubernetes_io_region":"us-east-1","topology_kubernetes_io_zone":"us-east-1a"}
+
+
+1790350622692	2026-09-25T15:37:02.692Z	I0925 15:37:02.692503       1 exporter.go:78] Collect started
+1790350622692	2026-09-25T15:37:02.692Z	I0925 15:37:02.692529       1 exporter.go:87] Launching host collectors [41.272µs]
+1790350622692	2026-09-25T15:37:02.692Z	I0925 15:37:02.692672       1 collector.go:133] Querying detached parts for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622693	2026-09-25T15:37:02.693Z	I0925 15:37:02.692993       1 collector.go:133] Querying detached parts for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622693	2026-09-25T15:37:02.693Z	I0925 15:37:02.693458       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350622693	2026-09-25T15:37:02.693Z	I0925 15:37:02.693601       1 collector.go:55] Querying system metrics for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622693	2026-09-25T15:37:02.693Z	I0925 15:37:02.693701       1 collector.go:70] Querying table sizes for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622693	2026-09-25T15:37:02.693Z	I0925 15:37:02.693760       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622694	2026-09-25T15:37:02.694Z	I0925 15:37:02.694113       1 collector.go:118] Querying disks for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622694	2026-09-25T15:37:02.694Z	I0925 15:37:02.694450       1 collector.go:70] Querying table sizes for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622695	2026-09-25T15:37:02.695Z	I0925 15:37:02.694950       1 collector.go:118] Querying disks for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622695	2026-09-25T15:37:02.695Z	I0925 15:37:02.694310       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350622695	2026-09-25T15:37:02.695Z	I0925 15:37:02.694613       1 collector.go:88] Querying system replicas for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622695	2026-09-25T15:37:02.695Z	I0925 15:37:02.693941       1 collector.go:103] Querying mutations for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622696	2026-09-25T15:37:02.696Z	I0925 15:37:02.693948       1 collector.go:118] Querying disks for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622696	2026-09-25T15:37:02.696Z	I0925 15:37:02.693982       1 collector.go:133] Querying detached parts for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622696	2026-09-25T15:37:02.696Z	I0925 15:37:02.694027       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622697	2026-09-25T15:37:02.697Z	I0925 15:37:02.694053       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622697	2026-09-25T15:37:02.697Z	I0925 15:37:02.694081       1 collector.go:133] Querying detached parts for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622698	2026-09-25T15:37:02.698Z	I0925 15:37:02.694088       1 collector.go:55] Querying system metrics for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622698	2026-09-25T15:37:02.698Z	I0925 15:37:02.694093       1 collector.go:70] Querying table sizes for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622698	2026-09-25T15:37:02.698Z	I0925 15:37:02.694100       1 collector.go:88] Querying system replicas for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622698	2026-09-25T15:37:02.698Z	I0925 15:37:02.694107       1 collector.go:103] Querying mutations for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622699	2026-09-25T15:37:02.699Z	I0925 15:37:02.694106       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350622699	2026-09-25T15:37:02.699Z	I0925 15:37:02.699258       1 collector.go:123] Extracted [4.0998ms] 1 disks for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622699	2026-09-25T15:37:02.699Z	I0925 15:37:02.694344       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350622700	2026-09-25T15:37:02.700Z	I0925 15:37:02.694350       1 collector.go:103] Querying mutations for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350622700	2026-09-25T15:37:02.700Z	I0925 15:37:02.694355       1 collector.go:118] Querying disks for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350622700	2026-09-25T15:37:02.700Z	I0925 15:37:02.700411       1 collector.go:93] Extracted [4.652001ms] 0 system replicas for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622700	2026-09-25T15:37:02.700Z	I0925 15:37:02.694385       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622701	2026-09-25T15:37:02.701Z	I0925 15:37:02.694420       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622701	2026-09-25T15:37:02.701Z	I0925 15:37:02.693931       1 collector.go:88] Querying system replicas for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622701	2026-09-25T15:37:02.701Z	I0925 15:37:02.694427       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622701	2026-09-25T15:37:02.701Z	I0925 15:37:02.694433       1 collector.go:103] Querying mutations for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622702	2026-09-25T15:37:02.702Z	I0925 15:37:02.694440       1 collector.go:118] Querying disks for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622702	2026-09-25T15:37:02.702Z	I0925 15:37:02.694445       1 collector.go:55] Querying system metrics for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622702	2026-09-25T15:37:02.702Z	I0925 15:37:02.694621       1 collector.go:103] Querying mutations for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622702	2026-09-25T15:37:02.702Z	I0925 15:37:02.694626       1 collector.go:118] Querying disks for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622703	2026-09-25T15:37:02.703Z	I0925 15:37:02.694649       1 collector.go:55] Querying system metrics for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622703	2026-09-25T15:37:02.703Z	I0925 15:37:02.694655       1 collector.go:70] Querying table sizes for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622703	2026-09-25T15:37:02.703Z	I0925 15:37:02.694661       1 collector.go:88] Querying system replicas for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622703	2026-09-25T15:37:02.703Z	I0925 15:37:02.694666       1 collector.go:103] Querying mutations for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622703	2026-09-25T15:37:02.703Z	I0925 15:37:02.694672       1 collector.go:118] Querying disks for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622704	2026-09-25T15:37:02.704Z	I0925 15:37:02.694678       1 collector.go:55] Querying system metrics for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622704	2026-09-25T15:37:02.704Z	I0925 15:37:02.694688       1 collector.go:70] Querying table sizes for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622704	2026-09-25T15:37:02.704Z	I0925 15:37:02.694693       1 collector.go:88] Querying system replicas for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622704	2026-09-25T15:37:02.704Z	I0925 15:37:02.694698       1 collector.go:103] Querying mutations for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622704	2026-09-25T15:37:02.704Z	I0925 15:37:02.694703       1 collector.go:118] Querying disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622704	2026-09-25T15:37:02.704Z	I0925 15:37:02.694710       1 collector.go:55] Querying system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622704	2026-09-25T15:37:02.704Z	I0925 15:37:02.694714       1 collector.go:70] Querying table sizes for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622704	2026-09-25T15:37:02.704Z	I0925 15:37:02.694720       1 collector.go:88] Querying system replicas for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622705	2026-09-25T15:37:02.705Z	I0925 15:37:02.694725       1 collector.go:103] Querying mutations for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622705	2026-09-25T15:37:02.705Z	I0925 15:37:02.700824       1 collector.go:138] Extracted [7.737067ms] 1 detached parts info for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622708	2026-09-25T15:37:02.708Z	I0925 15:37:02.701058       1 collector.go:123] Extracted [4.62915ms] 2 disks for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622709	2026-09-25T15:37:02.709Z	I0925 15:37:02.701589       1 collector.go:138] Extracted [8.866109ms] 0 detached parts info for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622709	2026-09-25T15:37:02.709Z	I0925 15:37:02.702525       1 collector.go:123] Extracted [8.064027ms] 2 disks for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622709	2026-09-25T15:37:02.709Z	I0925 15:37:02.703124       1 collector.go:138] Extracted [6.517104ms] 0 detached parts info for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622709	2026-09-25T15:37:02.709Z	I0925 15:37:02.703196       1 collector.go:138] Extracted [5.29628ms] 0 detached parts info for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622709	2026-09-25T15:37:02.709Z	I0925 15:37:02.703643       1 collector.go:75] Extracted [8.909111ms] 34 table sizes for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622709	2026-09-25T15:37:02.709Z	I0925 15:37:02.703791       1 collector.go:108] Extracted [7.780127ms] 0 mutations for chi-github-github-0-0.demo.svc.cluster.local.
+1790350622709	2026-09-25T15:37:02.709Z	I0925 15:37:02.708828       1 collector.go:60] Extracted [15.204233ms] 1096 system metrics for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622710	2026-09-25T15:37:02.710Z	I0925 15:37:02.710689       1 collector.go:138] Extracted [13.659862ms] 0 detached parts info for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622711	2026-09-25T15:37:02.711Z	I0925 15:37:02.711133       1 collector.go:93] Extracted [12.396281ms] 0 system replicas for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622712	2026-09-25T15:37:02.712Z	I0925 15:37:02.712154       1 collector.go:123] Extracted [11.775903ms] 1 disks for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350622712	2026-09-25T15:37:02.712Z	I0925 15:37:02.712641       1 collector.go:108] Extracted [6.346872ms] 0 mutations for chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622713	2026-09-25T15:37:02.713Z	I0925 15:37:02.713234       1 collector.go:93] Extracted [7.605973ms] 0 system replicas for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622715	2026-09-25T15:37:02.715Z	I0925 15:37:02.715061       1 collector.go:75] Extracted [12.799369ms] 82 table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622727	2026-09-25T15:37:02.727Z	I0925 15:37:02.727862       1 collector.go:108] Extracted [28.928267ms] 0 mutations for chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622728	2026-09-25T15:37:02.728Z	I0925 15:37:02.728356       1 collector.go:138] Extracted [30.916014ms] 0 detached parts info for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622728	2026-09-25T15:37:02.728Z	I0925 15:37:02.728784       1 collector.go:93] Extracted [29.048416ms] 0 system replicas for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350622729	2026-09-25T15:37:02.729Z	I0925 15:37:02.729321       1 collector.go:108] Extracted [29.200885ms] 0 mutations for chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350622731	2026-09-25T15:37:02.731Z	I0925 15:37:02.730929       1 collector.go:75] Extracted [35.529187ms] 130 table sizes for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350622756	2026-09-25T15:37:02.756Z	I0925 15:37:02.756749       1 collector.go:93] Extracted [50.8601ms] 0 system replicas for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622757	2026-09-25T15:37:02.757Z	I0925 15:37:02.757710       1 collector.go:123] Extracted [51.636195ms] 1 disks for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622760	2026-09-25T15:37:02.760Z	I0925 15:37:02.760103       1 collector.go:108] Extracted [53.074958ms] 0 mutations for chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622760	2026-09-25T15:37:02.760Z	I0925 15:37:02.760710       1 collector.go:93] Extracted [52.741869ms] 0 system replicas for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622761	2026-09-25T15:37:02.761Z	I0925 15:37:02.761114       1 collector.go:93] Extracted [54.169299ms] 0 system replicas for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622762	2026-09-25T15:37:02.762Z	I0925 15:37:02.761935       1 collector.go:60] Extracted [54.225537ms] 1059 system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622766	2026-09-25T15:37:02.766Z	I0925 15:37:02.765868       1 collector.go:60] Extracted [63.251622ms] 1183 system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622775	2026-09-25T15:37:02.775Z	I0925 15:37:02.775809       1 collector.go:108] Extracted [68.229246ms] 0 mutations for chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622776	2026-09-25T15:37:02.776Z	I0925 15:37:02.776396       1 collector.go:138] Extracted [82.264765ms] 0 detached parts info for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622777	2026-09-25T15:37:02.777Z	I0925 15:37:02.777046       1 collector.go:108] Extracted [71.034605ms] 0 mutations for chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350622779	2026-09-25T15:37:02.779Z	I0925 15:37:02.779080       1 collector.go:75] Extracted [71.67145ms] 19 table sizes for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622779	2026-09-25T15:37:02.779Z	I0925 15:37:02.779808       1 collector.go:75] Extracted [81.396279ms] 119 table sizes for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622780	2026-09-25T15:37:02.780Z	I0925 15:37:02.780725       1 collector.go:60] Extracted [73.507868ms] 870 system metrics for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622782	2026-09-25T15:37:02.782Z	I0925 15:37:02.782498       1 collector.go:75] Extracted [88.727642ms] 202 table sizes for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350622787	2026-09-25T15:37:02.787Z	I0925 15:37:02.787023       1 collector.go:75] Extracted [80.190234ms] 20 table sizes for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622788	2026-09-25T15:37:02.788Z	I0925 15:37:02.788086       1 collector.go:108] Extracted [79.87243ms] 0 mutations for chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622788	2026-09-25T15:37:02.788Z	I0925 15:37:02.788537       1 collector.go:123] Extracted [81.392439ms] 1 disks for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622789	2026-09-25T15:37:02.789Z	I0925 15:37:02.789708       1 collector.go:60] Extracted [91.653461ms] 1041 system metrics for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350622810	2026-09-25T15:37:02.810Z	I0925 15:37:02.810388       1 collector.go:60] Extracted [104.256652ms] 883 system metrics for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622818	2026-09-25T15:37:02.818Z	I0925 15:37:02.818644       1 collector.go:123] Extracted [112.257672ms] 1 disks for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350622819	2026-09-25T15:37:02.819Z	I0925 15:37:02.819500       1 collector.go:75] Extracted [111.622263ms] 69 table sizes for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350622819	2026-09-25T15:37:02.819Z	I0925 15:37:02.819826       1 collector.go:93] Extracted [112.332306ms] 0 system replicas for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622820	2026-09-25T15:37:02.820Z	I0925 15:37:02.820063       1 collector.go:123] Extracted [112.425263ms] 1 disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350622823	2026-09-25T15:37:02.823Z	I0925 15:37:02.823332       1 collector.go:60] Extracted [116.720674ms] 865 system metrics for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350622834	2026-09-25T15:37:02.834Z	I0925 15:37:02.834659       1 collector.go:60] Extracted [135.509496ms] 1223 system metrics for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350623559	2026-09-25T15:37:03.559Z	I0925 15:37:03.558853       1 collector.go:138] Extracted [865.329043ms] 6 detached parts info for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350623559	2026-09-25T15:37:03.559Z	I0925 15:37:03.559128       1 exporter.go:80] Collect completed [866.640518ms]
+1790350652691	2026-09-25T15:37:32.691Z	I0925 15:37:32.691736       1 exporter.go:78] Collect started
+1790350652691	2026-09-25T15:37:32.691Z	I0925 15:37:32.691762       1 exporter.go:87] Launching host collectors [41.518µs]
+1790350652692	2026-09-25T15:37:32.692Z	I0925 15:37:32.692129       1 collector.go:133] Querying detached parts for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652692	2026-09-25T15:37:32.692Z	I0925 15:37:32.692665       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652692	2026-09-25T15:37:32.692Z	I0925 15:37:32.692846       1 collector.go:55] Querying system metrics for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652693	2026-09-25T15:37:32.693Z	I0925 15:37:32.693002       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652693	2026-09-25T15:37:32.693Z	I0925 15:37:32.693279       1 collector.go:70] Querying table sizes for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652693	2026-09-25T15:37:32.693Z	I0925 15:37:32.693485       1 collector.go:133] Querying detached parts for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652693	2026-09-25T15:37:32.693Z	I0925 15:37:32.693789       1 collector.go:88] Querying system replicas for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652693	2026-09-25T15:37:32.693Z	I0925 15:37:32.693877       1 collector.go:103] Querying mutations for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652694	2026-09-25T15:37:32.694Z	I0925 15:37:32.694129       1 collector.go:103] Querying mutations for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652694	2026-09-25T15:37:32.694Z	I0925 15:37:32.694301       1 collector.go:55] Querying system metrics for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652694	2026-09-25T15:37:32.694Z	I0925 15:37:32.694489       1 collector.go:118] Querying disks for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652694	2026-09-25T15:37:32.694Z	I0925 15:37:32.694764       1 collector.go:55] Querying system metrics for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652695	2026-09-25T15:37:32.695Z	I0925 15:37:32.693393       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652695	2026-09-25T15:37:32.695Z	I0925 15:37:32.695158       1 collector.go:103] Querying mutations for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652695	2026-09-25T15:37:32.695Z	I0925 15:37:32.693831       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350652695	2026-09-25T15:37:32.695Z	I0925 15:37:32.695457       1 collector.go:55] Querying system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652695	2026-09-25T15:37:32.695Z	I0925 15:37:32.695530       1 collector.go:70] Querying table sizes for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652695	2026-09-25T15:37:32.695Z	I0925 15:37:32.695773       1 collector.go:88] Querying system replicas for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652696	2026-09-25T15:37:32.696Z	I0925 15:37:32.693805       1 collector.go:133] Querying detached parts for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652696	2026-09-25T15:37:32.696Z	I0925 15:37:32.696209       1 collector.go:103] Querying mutations for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652696	2026-09-25T15:37:32.696Z	I0925 15:37:32.696634       1 collector.go:118] Querying disks for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652696	2026-09-25T15:37:32.696Z	I0925 15:37:32.694161       1 collector.go:118] Querying disks for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652696	2026-09-25T15:37:32.696Z	I0925 15:37:32.693849       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652696	2026-09-25T15:37:32.696Z	I0925 15:37:32.694523       1 collector.go:88] Querying system replicas for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652696	2026-09-25T15:37:32.696Z	I0925 15:37:32.694530       1 collector.go:103] Querying mutations for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652696	2026-09-25T15:37:32.696Z	I0925 15:37:32.694535       1 collector.go:118] Querying disks for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652696	2026-09-25T15:37:32.696Z	I0925 15:37:32.695081       1 collector.go:70] Querying table sizes for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652696	2026-09-25T15:37:32.696Z	I0925 15:37:32.695092       1 collector.go:88] Querying system replicas for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652697	2026-09-25T15:37:32.697Z	I0925 15:37:32.694514       1 collector.go:70] Querying table sizes for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652697	2026-09-25T15:37:32.697Z	I0925 15:37:32.695426       1 collector.go:118] Querying disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652697	2026-09-25T15:37:32.697Z	I0925 15:37:32.693837       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652697	2026-09-25T15:37:32.697Z	I0925 15:37:32.693842       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652697	2026-09-25T15:37:32.697Z	I0925 15:37:32.697641       1 collector.go:55] Querying system metrics for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652698	2026-09-25T15:37:32.698Z	I0925 15:37:32.697961       1 collector.go:70] Querying table sizes for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652698	2026-09-25T15:37:32.698Z	I0925 15:37:32.698469       1 collector.go:55] Querying system metrics for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652698	2026-09-25T15:37:32.698Z	I0925 15:37:32.698764       1 collector.go:103] Querying mutations for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350652699	2026-09-25T15:37:32.699Z	I0925 15:37:32.698680       1 collector.go:70] Querying table sizes for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652699	2026-09-25T15:37:32.699Z	I0925 15:37:32.698963       1 collector.go:118] Querying disks for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350652700	2026-09-25T15:37:32.700Z	I0925 15:37:32.698197       1 collector.go:103] Querying mutations for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652700	2026-09-25T15:37:32.700Z	I0925 15:37:32.698212       1 collector.go:118] Querying disks for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652700	2026-09-25T15:37:32.700Z	I0925 15:37:32.698690       1 collector.go:88] Querying system replicas for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652701	2026-09-25T15:37:32.701Z	I0925 15:37:32.698695       1 collector.go:103] Querying mutations for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652701	2026-09-25T15:37:32.701Z	I0925 15:37:32.698702       1 collector.go:118] Querying disks for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652701	2026-09-25T15:37:32.701Z	I0925 15:37:32.698709       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350652701	2026-09-25T15:37:32.701Z	I0925 15:37:32.698186       1 collector.go:88] Querying system replicas for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652701	2026-09-25T15:37:32.701Z	I0925 15:37:32.698716       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350652702	2026-09-25T15:37:32.702Z	I0925 15:37:32.693420       1 collector.go:133] Querying detached parts for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652702	2026-09-25T15:37:32.702Z	I0925 15:37:32.698722       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350652702	2026-09-25T15:37:32.702Z	I0925 15:37:32.702597       1 collector.go:93] Extracted [6.697274ms] 0 system replicas for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652703	2026-09-25T15:37:32.703Z	I0925 15:37:32.703773       1 collector.go:108] Extracted [9.775382ms] 0 mutations for chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652706	2026-09-25T15:37:32.706Z	I0925 15:37:32.706546       1 collector.go:123] Extracted [5.179316ms] 2 disks for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652708	2026-09-25T15:37:32.708Z	I0925 15:37:32.707381       1 collector.go:75] Extracted [11.800896ms] 69 table sizes for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652708	2026-09-25T15:37:32.708Z	I0925 15:37:32.707464       1 collector.go:123] Extracted [12.846992ms] 1 disks for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652708	2026-09-25T15:37:32.708Z	I0925 15:37:32.707533       1 collector.go:93] Extracted [13.615004ms] 0 system replicas for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652708	2026-09-25T15:37:32.708Z	I0925 15:37:32.707596       1 collector.go:138] Extracted [14.557657ms] 0 detached parts info for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652709	2026-09-25T15:37:32.709Z	I0925 15:37:32.709711       1 collector.go:108] Extracted [13.407553ms] 0 mutations for chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652710	2026-09-25T15:37:32.710Z	I0925 15:37:32.710276       1 collector.go:93] Extracted [9.283112ms] 0 system replicas for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652711	2026-09-25T15:37:32.711Z	I0925 15:37:32.710997       1 collector.go:108] Extracted [16.739398ms] 0 mutations for chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652711	2026-09-25T15:37:32.711Z	I0925 15:37:32.711623       1 collector.go:123] Extracted [10.811286ms] 1 disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652712	2026-09-25T15:37:32.712Z	I0925 15:37:32.712755       1 collector.go:138] Extracted [20.529675ms] 0 detached parts info for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652713	2026-09-25T15:37:32.713Z	I0925 15:37:32.713179       1 collector.go:123] Extracted [13.268032ms] 1 disks for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350652713	2026-09-25T15:37:32.713Z	I0925 15:37:32.713628       1 collector.go:108] Extracted [12.498042ms] 0 mutations for chi-github-github-0-0.demo.svc.cluster.local.
+1790350652718	2026-09-25T15:37:32.718Z	I0925 15:37:32.718354       1 collector.go:60] Extracted [24.034632ms] 865 system metrics for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652723	2026-09-25T15:37:32.723Z	I0925 15:37:32.723499       1 collector.go:60] Extracted [25.716596ms] 1041 system metrics for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652728	2026-09-25T15:37:32.728Z	I0925 15:37:32.728689       1 collector.go:75] Extracted [28.051003ms] 20 table sizes for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652732	2026-09-25T15:37:32.732Z	I0925 15:37:32.732631       1 collector.go:93] Extracted [30.189766ms] 0 system replicas for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350652733	2026-09-25T15:37:32.733Z	I0925 15:37:32.733238       1 collector.go:75] Extracted [32.763615ms] 19 table sizes for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652736	2026-09-25T15:37:32.736Z	I0925 15:37:32.736488       1 collector.go:138] Extracted [40.457745ms] 1 detached parts info for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652737	2026-09-25T15:37:32.737Z	I0925 15:37:32.737222       1 collector.go:138] Extracted [42.08425ms] 0 detached parts info for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652738	2026-09-25T15:37:32.738Z	I0925 15:37:32.737966       1 collector.go:75] Extracted [44.468783ms] 34 table sizes for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652744	2026-09-25T15:37:32.744Z	I0925 15:37:32.744038       1 collector.go:60] Extracted [46.89741ms] 1183 system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652750	2026-09-25T15:37:32.750Z	I0925 15:37:32.749874       1 collector.go:93] Extracted [48.103711ms] 0 system replicas for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652790	2026-09-25T15:37:32.790Z	I0925 15:37:32.750318       1 collector.go:108] Extracted [55.139702ms] 0 mutations for chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652791	2026-09-25T15:37:32.791Z	I0925 15:37:32.750543       1 collector.go:123] Extracted [50.937575ms] 1 disks for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652791	2026-09-25T15:37:32.791Z	I0925 15:37:32.750737       1 collector.go:138] Extracted [48.452964ms] 0 detached parts info for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652791	2026-09-25T15:37:32.791Z	I0925 15:37:32.750924       1 collector.go:108] Extracted [50.751645ms] 0 mutations for chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652791	2026-09-25T15:37:32.791Z	I0925 15:37:32.751129       1 collector.go:93] Extracted [51.146889ms] 0 system replicas for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652792	2026-09-25T15:37:32.792Z	I0925 15:37:32.751334       1 collector.go:93] Extracted [50.757176ms] 0 system replicas for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652792	2026-09-25T15:37:32.792Z	I0925 15:37:32.751551       1 collector.go:123] Extracted [51.310468ms] 1 disks for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350652795	2026-09-25T15:37:32.795Z	I0925 15:37:32.795768       1 collector.go:60] Extracted [100.28373ms] 1059 system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350652797	2026-09-25T15:37:32.797Z	I0925 15:37:32.797788       1 collector.go:75] Extracted [98.331069ms] 202 table sizes for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652801	2026-09-25T15:37:32.801Z	I0925 15:37:32.801863       1 collector.go:60] Extracted [109.000225ms] 883 system metrics for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350652821	2026-09-25T15:37:32.821Z	I0925 15:37:32.754534       1 collector.go:123] Extracted [54.832016ms] 1 disks for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652821	2026-09-25T15:37:32.821Z	I0925 15:37:32.754659       1 collector.go:93] Extracted [54.80018ms] 0 system replicas for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652821	2026-09-25T15:37:32.821Z	I0925 15:37:32.754782       1 collector.go:123] Extracted [54.068844ms] 2 disks for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652821	2026-09-25T15:37:32.821Z	I0925 15:37:32.758307       1 collector.go:60] Extracted [63.525422ms] 870 system metrics for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350652822	2026-09-25T15:37:32.822Z	I0925 15:37:32.763359       1 collector.go:60] Extracted [64.615521ms] 1096 system metrics for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350652822	2026-09-25T15:37:32.822Z	I0925 15:37:32.763536       1 collector.go:138] Extracted [70.03387ms] 0 detached parts info for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652822	2026-09-25T15:37:32.822Z	I0925 15:37:32.773716       1 collector.go:60] Extracted [71.994391ms] 1223 system metrics for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350652822	2026-09-25T15:37:32.822Z	I0925 15:37:32.775286       1 collector.go:138] Extracted [82.602066ms] 0 detached parts info for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652823	2026-09-25T15:37:32.823Z	I0925 15:37:32.777103       1 collector.go:75] Extracted [79.617587ms] 82 table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350652838	2026-09-25T15:37:32.838Z	I0925 15:37:32.777424       1 collector.go:108] Extracted [77.099318ms] 0 mutations for chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652849	2026-09-25T15:37:32.849Z	I0925 15:37:32.780098       1 collector.go:75] Extracted [81.868908ms] 119 table sizes for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350652903	2026-09-25T15:37:32.903Z	I0925 15:37:32.903747       1 collector.go:108] Extracted [204.689899ms] 0 mutations for chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350652905	2026-09-25T15:37:32.905Z	I0925 15:37:32.905346       1 collector.go:75] Extracted [203.322202ms] 130 table sizes for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350653558	2026-09-25T15:37:33.558Z	I0925 15:37:33.558645       1 collector.go:138] Extracted [863.195919ms] 6 detached parts info for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350653559	2026-09-25T15:37:33.559Z	I0925 15:37:33.558967       1 exporter.go:80] Collect completed [867.244478ms]
+1790350682695	2026-09-25T15:38:02.695Z	I0925 15:38:02.695131       1 exporter.go:78] Collect started
+1790350682695	2026-09-25T15:38:02.695Z	I0925 15:38:02.695156       1 exporter.go:87] Launching host collectors [41.034µs]
+1790350682695	2026-09-25T15:38:02.695Z	I0925 15:38:02.695222       1 collector.go:133] Querying detached parts for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682695	2026-09-25T15:38:02.695Z	I0925 15:38:02.695397       1 collector.go:133] Querying detached parts for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682695	2026-09-25T15:38:02.695Z	I0925 15:38:02.695421       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350682695	2026-09-25T15:38:02.695Z	I0925 15:38:02.695558       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682695	2026-09-25T15:38:02.695Z	I0925 15:38:02.695687       1 collector.go:133] Querying detached parts for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682696	2026-09-25T15:38:02.696Z	I0925 15:38:02.695982       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682696	2026-09-25T15:38:02.696Z	I0925 15:38:02.696190       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682696	2026-09-25T15:38:02.696Z	I0925 15:38:02.696395       1 collector.go:133] Querying detached parts for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682696	2026-09-25T15:38:02.696Z	I0925 15:38:02.696722       1 collector.go:55] Querying system metrics for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682697	2026-09-25T15:38:02.697Z	I0925 15:38:02.697047       1 collector.go:70] Querying table sizes for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682697	2026-09-25T15:38:02.697Z	I0925 15:38:02.697336       1 collector.go:88] Querying system replicas for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682697	2026-09-25T15:38:02.697Z	I0925 15:38:02.697555       1 collector.go:103] Querying mutations for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682697	2026-09-25T15:38:02.697Z	I0925 15:38:02.697780       1 collector.go:118] Querying disks for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682698	2026-09-25T15:38:02.698Z	I0925 15:38:02.697981       1 collector.go:55] Querying system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682698	2026-09-25T15:38:02.698Z	I0925 15:38:02.698249       1 collector.go:70] Querying table sizes for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682698	2026-09-25T15:38:02.698Z	I0925 15:38:02.698429       1 collector.go:55] Querying system metrics for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682698	2026-09-25T15:38:02.698Z	I0925 15:38:02.698641       1 collector.go:88] Querying system replicas for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682698	2026-09-25T15:38:02.698Z	I0925 15:38:02.698843       1 collector.go:103] Querying mutations for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682699	2026-09-25T15:38:02.699Z	I0925 15:38:02.698964       1 collector.go:118] Querying disks for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682699	2026-09-25T15:38:02.699Z	I0925 15:38:02.698845       1 collector.go:70] Querying table sizes for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682699	2026-09-25T15:38:02.699Z	I0925 15:38:02.699322       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350682699	2026-09-25T15:38:02.699Z	I0925 15:38:02.699565       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350682699	2026-09-25T15:38:02.699Z	I0925 15:38:02.699747       1 collector.go:103] Querying mutations for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682700	2026-09-25T15:38:02.700Z	I0925 15:38:02.699978       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350682700	2026-09-25T15:38:02.700Z	I0925 15:38:02.700196       1 collector.go:103] Querying mutations for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350682700	2026-09-25T15:38:02.700Z	I0925 15:38:02.700389       1 collector.go:118] Querying disks for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350682700	2026-09-25T15:38:02.700Z	I0925 15:38:02.698854       1 collector.go:88] Querying system replicas for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682700	2026-09-25T15:38:02.700Z	I0925 15:38:02.700740       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682701	2026-09-25T15:38:02.701Z	I0925 15:38:02.700996       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682701	2026-09-25T15:38:02.701Z	I0925 15:38:02.701313       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682701	2026-09-25T15:38:02.701Z	I0925 15:38:02.701546       1 collector.go:103] Querying mutations for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682701	2026-09-25T15:38:02.701Z	I0925 15:38:02.701706       1 collector.go:118] Querying disks for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682702	2026-09-25T15:38:02.702Z	I0925 15:38:02.702004       1 collector.go:55] Querying system metrics for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682702	2026-09-25T15:38:02.702Z	I0925 15:38:02.702278       1 collector.go:70] Querying table sizes for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682702	2026-09-25T15:38:02.702Z	I0925 15:38:02.702465       1 collector.go:88] Querying system replicas for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682702	2026-09-25T15:38:02.702Z	I0925 15:38:02.702629       1 collector.go:103] Querying mutations for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682702	2026-09-25T15:38:02.702Z	I0925 15:38:02.702784       1 collector.go:118] Querying disks for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682703	2026-09-25T15:38:02.703Z	I0925 15:38:02.703228       1 collector.go:55] Querying system metrics for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682703	2026-09-25T15:38:02.703Z	I0925 15:38:02.703427       1 collector.go:70] Querying table sizes for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682703	2026-09-25T15:38:02.703Z	I0925 15:38:02.703778       1 collector.go:88] Querying system replicas for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682704	2026-09-25T15:38:02.704Z	I0925 15:38:02.704087       1 collector.go:103] Querying mutations for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682704	2026-09-25T15:38:02.704Z	I0925 15:38:02.704392       1 collector.go:118] Querying disks for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682705	2026-09-25T15:38:02.705Z	I0925 15:38:02.704960       1 collector.go:55] Querying system metrics for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682705	2026-09-25T15:38:02.705Z	I0925 15:38:02.705531       1 collector.go:70] Querying table sizes for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682705	2026-09-25T15:38:02.705Z	I0925 15:38:02.705868       1 collector.go:88] Querying system replicas for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682706	2026-09-25T15:38:02.706Z	I0925 15:38:02.706355       1 collector.go:103] Querying mutations for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682706	2026-09-25T15:38:02.706Z	I0925 15:38:02.706638       1 collector.go:118] Querying disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682707	2026-09-25T15:38:02.707Z	I0925 15:38:02.704182       1 collector.go:138] Extracted [8.944517ms] 0 detached parts info for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682707	2026-09-25T15:38:02.707Z	I0925 15:38:02.699996       1 collector.go:118] Querying disks for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682708	2026-09-25T15:38:02.708Z	I0925 15:38:02.707967       1 collector.go:93] Extracted [10.531539ms] 0 system replicas for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682708	2026-09-25T15:38:02.708Z	I0925 15:38:02.708355       1 collector.go:123] Extracted [10.451103ms] 2 disks for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682710	2026-09-25T15:38:02.710Z	I0925 15:38:02.709823       1 collector.go:123] Extracted [7.022461ms] 1 disks for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682710	2026-09-25T15:38:02.710Z	I0925 15:38:02.710593       1 collector.go:138] Extracted [15.183187ms] 1 detached parts info for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682711	2026-09-25T15:38:02.711Z	I0925 15:38:02.711095       1 collector.go:93] Extracted [8.611829ms] 0 system replicas for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682713	2026-09-25T15:38:02.713Z	I0925 15:38:02.712121       1 collector.go:93] Extracted [13.449875ms] 0 system replicas for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682713	2026-09-25T15:38:02.713Z	I0925 15:38:02.712299       1 collector.go:123] Extracted [5.577489ms] 1 disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682713	2026-09-25T15:38:02.713Z	I0925 15:38:02.712745       1 collector.go:108] Extracted [15.051945ms] 0 mutations for chi-github-github-0-0.demo.svc.cluster.local.
+1790350682713	2026-09-25T15:38:02.713Z	I0925 15:38:02.713590       1 collector.go:123] Extracted [14.557247ms] 1 disks for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682714	2026-09-25T15:38:02.714Z	I0925 15:38:02.714220       1 collector.go:93] Extracted [8.056635ms] 0 system replicas for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682715	2026-09-25T15:38:02.715Z	I0925 15:38:02.715166       1 collector.go:108] Extracted [12.522732ms] 0 mutations for chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682715	2026-09-25T15:38:02.715Z	I0925 15:38:02.715819       1 collector.go:138] Extracted [20.116626ms] 0 detached parts info for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682716	2026-09-25T15:38:02.716Z	I0925 15:38:02.713618       1 collector.go:93] Extracted [9.776465ms] 0 system replicas for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682719	2026-09-25T15:38:02.719Z	I0925 15:38:02.718918       1 collector.go:60] Extracted [22.081488ms] 1096 system metrics for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682722	2026-09-25T15:38:02.722Z	I0925 15:38:02.722185       1 collector.go:60] Extracted [24.180907ms] 1059 system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682729	2026-09-25T15:38:02.729Z	I0925 15:38:02.729125       1 collector.go:123] Extracted [21.689428ms] 2 disks for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682729	2026-09-25T15:38:02.729Z	I0925 15:38:02.729900       1 collector.go:75] Extracted [26.45663ms] 20 table sizes for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682730	2026-09-25T15:38:02.730Z	I0925 15:38:02.730385       1 collector.go:108] Extracted [26.105432ms] 0 mutations for chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682731	2026-09-25T15:38:02.731Z	I0925 15:38:02.730931       1 collector.go:138] Extracted [34.722161ms] 0 detached parts info for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682731	2026-09-25T15:38:02.731Z	I0925 15:38:02.731653       1 collector.go:75] Extracted [29.355209ms] 34 table sizes for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682733	2026-09-25T15:38:02.733Z	I0925 15:38:02.733896       1 collector.go:60] Extracted [31.873305ms] 883 system metrics for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350682737	2026-09-25T15:38:02.737Z	I0925 15:38:02.737792       1 collector.go:108] Extracted [31.271669ms] 0 mutations for chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682738	2026-09-25T15:38:02.738Z	I0925 15:38:02.738306       1 collector.go:108] Extracted [39.345534ms] 0 mutations for chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682739	2026-09-25T15:38:02.739Z	I0925 15:38:02.738946       1 collector.go:93] Extracted [37.597904ms] 0 system replicas for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682742	2026-09-25T15:38:02.742Z	I0925 15:38:02.742852       1 collector.go:60] Extracted [37.548771ms] 870 system metrics for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682745	2026-09-25T15:38:02.745Z	I0925 15:38:02.745690       1 collector.go:108] Extracted [45.475838ms] 0 mutations for chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350682746	2026-09-25T15:38:02.746Z	I0925 15:38:02.745995       1 collector.go:93] Extracted [45.261519ms] 0 system replicas for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682746	2026-09-25T15:38:02.746Z	I0925 15:38:02.745787       1 collector.go:138] Extracted [49.785117ms] 0 detached parts info for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682746	2026-09-25T15:38:02.746Z	I0925 15:38:02.746296       1 collector.go:123] Extracted [44.549342ms] 1 disks for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682746	2026-09-25T15:38:02.746Z	I0925 15:38:02.746548       1 collector.go:123] Extracted [46.139251ms] 1 disks for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350682746	2026-09-25T15:38:02.746Z	I0925 15:38:02.746758       1 collector.go:75] Extracted [41.13721ms] 19 table sizes for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350682747	2026-09-25T15:38:02.747Z	I0925 15:38:02.747027       1 collector.go:123] Extracted [42.397624ms] 1 disks for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682747	2026-09-25T15:38:02.747Z	I0925 15:38:02.747390       1 collector.go:93] Extracted [47.382271ms] 0 system replicas for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350682754	2026-09-25T15:38:02.754Z	I0925 15:38:02.754090       1 collector.go:60] Extracted [55.54234ms] 1041 system metrics for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682765	2026-09-25T15:38:02.765Z	I0925 15:38:02.765125       1 collector.go:75] Extracted [64.106408ms] 82 table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682767	2026-09-25T15:38:02.767Z	I0925 15:38:02.767490       1 collector.go:108] Extracted [65.92182ms] 0 mutations for chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682767	2026-09-25T15:38:02.767Z	I0925 15:38:02.767844       1 collector.go:108] Extracted [68.005608ms] 0 mutations for chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682771	2026-09-25T15:38:02.771Z	I0925 15:38:02.771266       1 collector.go:60] Extracted [68.014281ms] 865 system metrics for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350682775	2026-09-25T15:38:02.775Z	I0925 15:38:02.775138       1 collector.go:138] Extracted [79.559824ms] 0 detached parts info for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682775	2026-09-25T15:38:02.775Z	I0925 15:38:02.775191       1 collector.go:75] Extracted [76.926207ms] 69 table sizes for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350682775	2026-09-25T15:38:02.775Z	I0925 15:38:02.775748       1 collector.go:138] Extracted [79.338646ms] 0 detached parts info for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682777	2026-09-25T15:38:02.777Z	I0925 15:38:02.777267       1 collector.go:75] Extracted [80.10025ms] 202 table sizes for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350682778	2026-09-25T15:38:02.778Z	I0925 15:38:02.778148       1 collector.go:75] Extracted [78.929207ms] 119 table sizes for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350682778	2026-09-25T15:38:02.778Z	I0925 15:38:02.778750       1 collector.go:75] Extracted [79.160125ms] 130 table sizes for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350682803	2026-09-25T15:38:02.803Z	I0925 15:38:02.803326       1 collector.go:60] Extracted [102.545844ms] 1183 system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350682805	2026-09-25T15:38:02.805Z	I0925 15:38:02.805822       1 collector.go:60] Extracted [106.446135ms] 1223 system metrics for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350683567	2026-09-25T15:38:03.567Z	I0925 15:38:03.566747       1 collector.go:138] Extracted [871.310281ms] 6 detached parts info for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350683567	2026-09-25T15:38:03.567Z	I0925 15:38:03.567111       1 exporter.go:80] Collect completed [871.994356ms]
+1790350686891	2026-09-25T15:38:06.891Z	I0925 15:38:06.891566       1 controller.go:651] ENQUEUE new ReconcileCHI cmd=update for demo/otel
+1790350686891	2026-09-25T15:38:06.891Z	I0925 15:38:06.891688       1 worker.go:319] worker.go:319:updateCHI():start:CHI:demo/otel
+1790350686933	2026-09-25T15:38:06.933Z	W0925 15:38:06.933315       1 warnings.go:70] metadata.finalizers: "finalizer.clickhouseinstallation.altinity.com": prefer a domain-qualified finalizer name including a path (/) to avoid accidental conflicts with other finalizer writers
+1790350686935	2026-09-25T15:38:06.935Z	I0925 15:38:06.935790       1 worker.go:323] updateCHI():CHI:demo/otel:finalizer installed, let's restart reconcile cycle. CHI: demo/otel
+1790350686935	2026-09-25T15:38:06.935Z	I0925 15:38:06.935827       1 worker.go:324] updateCHI():CHI:demo/otel:---------------------------------------------------------------------
+1790350686935	2026-09-25T15:38:06.935Z	I0925 15:38:06.935872       1 worker.go:369] worker.go:320:updateCHI():end:CHI:demo/otel
+1790350686952	2026-09-25T15:38:06.952Z	I0925 15:38:06.951968       1 controller.go:651] ENQUEUE new ReconcileCHI cmd=update for demo/otel
+1790350686952	2026-09-25T15:38:06.952Z	I0925 15:38:06.952105       1 worker.go:319] worker.go:319:updateCHI():start:CHI:demo/otel
+1790350686952	2026-09-25T15:38:06.952Z	I0925 15:38:06.952147       1 worker.go:327] updateCHI():CHI:demo/otel:finalizer in place, proceed to reconcile cycle. CHI: demo/otel
+1790350686976	2026-09-25T15:38:06.976Z	I0925 15:38:06.975859       1 worker-status-helpers.go:187] Operator IPs to process CHI: otel. Previous: 10.129.57.60 Cur: 10.129.57.60
+1790350686976	2026-09-25T15:38:06.976Z	I0925 15:38:06.975886       1 worker-status-helpers.go:196] Operator IPs are the same as on previous reconcile of the CHI: otel
+1790350686976	2026-09-25T15:38:06.976Z	I0925 15:38:06.975894       1 worker-status-helpers.go:204] Operator is not just started. May not be clean restart
+1790350686988	2026-09-25T15:38:06.988Z	I0925 15:38:06.988661       1 worker-reconciler-chi.go:54] reconcileCR():CHI:demo/otel:isAfterFinalizerInstalled - continue reconcile-1
+1790350686988	2026-09-25T15:38:06.988Z	I0925 15:38:06.988703       1 worker-reconciler-chi.go:60] worker-reconciler-chi.go:60:reconcileCR():start:CHI:demo/otel
+1790350686989	2026-09-25T15:38:06.989Z	I0925 15:38:06.988959       1 worker.go:573] createTemplatedCR():CHI:demo/otel:CR has an ancestor, use it as a base for reconcile. CR: demo/otel
+1790350686989	2026-09-25T15:38:06.989Z	I0925 15:38:06.989012       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350686989	2026-09-25T15:38:06.989Z	I0925 15:38:06.989176       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350686989	2026-09-25T15:38:06.989Z	I0925 15:38:06.989221       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350686989	2026-09-25T15:38:06.989Z	I0925 15:38:06.989257       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350686989	2026-09-25T15:38:06.989Z	I0925 15:38:06.989399       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350686989	2026-09-25T15:38:06.989Z	I0925 15:38:06.989478       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350686989	2026-09-25T15:38:06.989Z	I0925 15:38:06.989607       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350686994	2026-09-25T15:38:06.994Z	I0925 15:38:06.994068       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350686994	2026-09-25T15:38:06.994Z	I0925 15:38:06.994102       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350686994	2026-09-25T15:38:06.994Z	I0925 15:38:06.994112       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350686994	2026-09-25T15:38:06.994Z	I0925 15:38:06.994149       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350686994	2026-09-25T15:38:06.994Z	I0925 15:38:06.994188       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350686994	2026-09-25T15:38:06.994Z	I0925 15:38:06.994327       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350686994	2026-09-25T15:38:06.994Z	I0925 15:38:06.994348       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350687026	2026-09-25T15:38:07.026Z	I0925 15:38:07.025903       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-0
+1790350687026	2026-09-25T15:38:07.026Z	I0925 15:38:07.025942       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-0
+1790350687034	2026-09-25T15:38:07.034Z	I0925 15:38:07.034720       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-1
+1790350687034	2026-09-25T15:38:07.034Z	I0925 15:38:07.034823       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-1
+1790350687056	2026-09-25T15:38:07.056Z	I0925 15:38:07.056708       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: * matches: true
+1790350687056	2026-09-25T15:38:07.056Z	I0925 15:38:07.056773       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: >= 23.3 matches: true
+1790350687056	2026-09-25T15:38:07.056Z	I0925 15:38:07.056796       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: >= 23.5 matches: true
+1790350687071	2026-09-25T15:38:07.071Z	I0925 15:38:07.071669       1 worker-reconciler-chi.go:187] CHI:demo/otel:IPs of the CR demo/otel: len: 2 [10.129.57.229 10.129.57.133]
+1790350687071	2026-09-25T15:38:07.071Z	I0925 15:38:07.071717       1 worker.go:573] createTemplatedCR():CHI:demo/otel:CR has an ancestor, use it as a base for reconcile. CR: demo/otel
+1790350687072	2026-09-25T15:38:07.072Z	I0925 15:38:07.071803       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350687072	2026-09-25T15:38:07.072Z	I0925 15:38:07.071857       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350687072	2026-09-25T15:38:07.072Z	I0925 15:38:07.071885       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350687072	2026-09-25T15:38:07.072Z	I0925 15:38:07.071923       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350687072	2026-09-25T15:38:07.072Z	I0925 15:38:07.071952       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350687072	2026-09-25T15:38:07.072Z	I0925 15:38:07.071998       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350687072	2026-09-25T15:38:07.072Z	I0925 15:38:07.072011       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350687081	2026-09-25T15:38:07.081Z	I0925 15:38:07.081133       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350687081	2026-09-25T15:38:07.081Z	I0925 15:38:07.081175       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350687081	2026-09-25T15:38:07.081Z	I0925 15:38:07.081188       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350687081	2026-09-25T15:38:07.081Z	I0925 15:38:07.081242       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350687081	2026-09-25T15:38:07.081Z	I0925 15:38:07.081260       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350687081	2026-09-25T15:38:07.081Z	I0925 15:38:07.081333       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350687081	2026-09-25T15:38:07.081Z	I0925 15:38:07.081399       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350687112	2026-09-25T15:38:07.112Z	I0925 15:38:07.112720       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-0
+1790350687112	2026-09-25T15:38:07.112Z	I0925 15:38:07.112757       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-0
+1790350687121	2026-09-25T15:38:07.121Z	I0925 15:38:07.120926       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-1
+1790350687121	2026-09-25T15:38:07.121Z	I0925 15:38:07.120967       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-1
+1790350687141	2026-09-25T15:38:07.141Z	I0925 15:38:07.141371       1 worker-reconciler-chi.go:250] logSWVersion():Host:0-0[0/0]:demo/otel:Host software version: 0-0 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350687141	2026-09-25T15:38:07.141Z	I0925 15:38:07.141606       1 worker-reconciler-chi.go:250] logSWVersion():Host:0-1[0/1]:demo/otel:Host software version: 0-1 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350687141	2026-09-25T15:38:07.141Z	I0925 15:38:07.141697       1 worker-reconciler-chi.go:253] logSWVersion():CHI:demo/otel:CR software versions min=26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] max=26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350687148	2026-09-25T15:38:07.148Z	I0925 15:38:07.148649       1 worker-reconciler-chi.go:206] CHI:demo/otel:
+ActionPlan start buildCR ---------------------------------------------:
+Diff start -------------------------
+modified spec items num: 1
+diff item [0]:'.Configuration.Files.data["config.d/cas_gc_tuning.xml"].scalar' = '"<clickhouse>\n  <storage_configuration>\n    <disks>\n      <cas>\n        <cas_gc_interval_sec>300</cas_gc_interval_sec>\n        <cas_gc_round_ref_cleanup_budget>0</cas_gc_round_ref_cleanup_budget>\n        <cas_gc_round_graduation_budget>200000</cas_gc...(value truncated for brevity)'
+Diff end -------------------------
+Diff start -------------------------
+prev spec items num: 4
+diff item [0]:'.TaskID' = '"auto-b852e952-e315-42dd-8a56-46e6a164e9a7"'
+diff item [1]:'.Configuration.Files.data["config.d/cas_gc_tuning.xml"].scalar' = '"<clickhouse>\n  <storage_configuration>\n    <disks>\n      <cas>\n        <cas_gc_interval_sec>300</cas_gc_interval_sec>\n        <cas_gc_round_ref_cleanup_budget>200000</cas_gc_round_ref_cleanup_budget>\n        <cas_gc_round_graduation_budget>200000</c...(value truncated for brevity)'
+diff item [2]:'.Configuration.Clusters[0].Layout.Shards[0].Hosts[0].Runtime.Version' = 'nil'
+diff item [3]:'.Configuration.Clusters[0].Layout.Shards[0].Hosts[1].Runtime.Version' = 'nil'
+Diff end -------------------------
+
+ActionPlan end buildCR ---------------------------------------------
+1790350687148	2026-09-25T15:38:07.148Z	I0925 15:38:07.148935       1 worker-reconciler-chi.go:111] reconcileCR():CHI:demo/otel:CR has reconcile work - continue reconcile
+1790350687284	2026-09-25T15:38:07.284Z	I0925 15:38:07.284506       1 worker.go:392] markReconcileStart():CHI:demo/otel:reconcile started, task id: auto-1c2cf16d-7bc8-46e4-b0ed-0221349a17f1
+1790350687296	2026-09-25T15:38:07.296Z	I0925 15:38:07.296503       1 worker-monitoring.go:56] prepareMonitoring():CHI:demo/otel:ensure CHI in monitoring
+1790350687305	2026-09-25T15:38:07.305Z	I0925 15:38:07.305311       1 controller-discoverer.go:38] discovery():CHI:demo/otel:Discovery
+1790350687305	2026-09-25T15:38:07.305Z	I0925 15:38:07.305347       1 controller-discoverer.go:46] discovery():CHI:demo/otel:Discovery
+include: map[clickhouse.altinity.com/app:chop clickhouse.altinity.com/chi:otel clickhouse.altinity.com/namespace:demo]
+exclude: clickhouse.altinity.com/ConfigMap=ChiStorage,clickhouse.altinity.com/app=chop,clickhouse.altinity.com/chi=otel,clickhouse.altinity.com/namespace=demo
+1790350687306	2026-09-25T15:38:07.306Z	I0925 15:38:07.306161       1 registry.go:43] Registry: Add CR (demo/otel): {"namespace":"demo","name":"otel","labels":{"clickhouse.altinity.com/chi":"otel"},"annotations":{"alerts.altinity.cloud/email":"btyshkevich@altinity.com","alerts.altinity.cloud/link":"https://acm.altinity.cloud/cluster/9572","cloud.altinity.com/role":"dev"},"clusters":[{"name":"otel","hosts":[{"name":"0-0","hostname":"chi-otel-otel-0-0.demo.svc.cluster.local.","tcpPort":9000,"tlsPort":9440,"httpPort":8123,"httpsPort":8443},{"name":"0-1","hostname":"chi-otel-otel-0-1.demo.svc.cluster.local.","tcpPort":9000,"tlsPort":9440,"httpPort":8123,"httpsPort":8443}]}]}
+1790350687306	2026-09-25T15:38:07.306Z	I0925 15:38:07.306450       1 controller.go:703] OK update watch (demo/otel): {"namespace":"demo","name":"otel","labels":{"clickhouse.altinity.com/chi":"otel"},"annotations":{"alerts.altinity.cloud/email":"btyshkevich@altinity.com","alerts.altinity.cloud/link":"https://acm.altinity.cloud/cluster/9572","cloud.altinity.com/role":"dev"},"clusters":[{"name":"otel","hosts":[{"name":"0-0","hostname":"chi-otel-otel-0-0.demo.svc.cluster.local.","tcpPort":9000,"tlsPort":9440,"httpPort":8123,"httpsPort":8443},{"name":"0-1","hostname":"chi-otel-otel-0-1.demo.svc.cluster.local.","tcpPort":9000,"tlsPort":9440,"httpPort":8123,"httpsPort":8443}]}]}
+1790350687351	2026-09-25T15:38:07.351Z	I0925 15:38:07.350957       1 controller-discoverer.go:91] discoveryConfigMaps():CHI:demo/otel:Register ConfigMap in Discovery demo/chi-otel-common-configd
+1790350687351	2026-09-25T15:38:07.351Z	I0925 15:38:07.350998       1 controller-discoverer.go:91] discoveryConfigMaps():CHI:demo/otel:Register ConfigMap in Discovery demo/chi-otel-common-usersd
+1790350687351	2026-09-25T15:38:07.351Z	I0925 15:38:07.351013       1 controller-discoverer.go:91] discoveryConfigMaps():CHI:demo/otel:Register ConfigMap in Discovery demo/chi-otel-deploy-confd-otel-0-0
+1790350687351	2026-09-25T15:38:07.351Z	I0925 15:38:07.351029       1 controller-discoverer.go:91] discoveryConfigMaps():CHI:demo/otel:Register ConfigMap in Discovery demo/chi-otel-deploy-confd-otel-0-1
+1790350687351	2026-09-25T15:38:07.351Z	I0925 15:38:07.351044       1 controller-discoverer.go:89] discoveryConfigMaps():CHI:demo/otel:Exclude ConfigMap from Discovery demo/chi-storage-otel
+1790350687393	2026-09-25T15:38:07.393Z	I0925 15:38:07.392831       1 controller-discoverer.go:58] discovery():CHI:demo/otel:Discovery found 6 objects
+1790350687402	2026-09-25T15:38:07.402Z	I0925 15:38:07.402767       1 worker.go:544] CHI:demo/otel:Add host as FOUND via host because host has an ancestor. Host: 0-0
+1790350687414	2026-09-25T15:38:07.414Z	I0925 15:38:07.414295       1 worker.go:544] CHI:demo/otel:Add host as FOUND via host because host has an ancestor. Host: 0-1
+1790350687414	2026-09-25T15:38:07.414Z	I0925 15:38:07.414327       1 worker.go:564] Host:0-0[0/0]:demo/otel:Host status: found. Host: ns:demo|chi:otel|clu:otel|sha:0|rep:0|host:0-0
+1790350687414	2026-09-25T15:38:07.414Z	I0925 15:38:07.414339       1 worker.go:564] Host:0-1[0/1]:demo/otel:Host status: found. Host: ns:demo|chi:otel|clu:otel|sha:0|rep:1|host:0-1
+1790350687414	2026-09-25T15:38:07.414Z	I0925 15:38:07.414423       1 worker-reconciler-chi.go:272] CHI:demo/otel:Unable to use full fan-out mode. Counters: found: 2 . CR: demo/otel
+1790350687414	2026-09-25T15:38:07.414Z	I0925 15:38:07.414476       1 worker-status-helpers.go:300] RemoteServersOptions: exclude hosts: [], attributes: status: requested, tags: 
+1790350687784	2026-09-25T15:38:07.784Z	I0925 15:38:07.783955       1 worker-config-map.go:70] updateConfigMap():CHI:demo/otel:Update ConfigMap demo/chi-otel-common-configd
+1790350688375	2026-09-25T15:38:08.375Z	I0925 15:38:08.374897       1 worker-config-map.go:70] updateConfigMap():CHI:demo/otel:Update ConfigMap demo/chi-otel-common-usersd
+1790350688771	2026-09-25T15:38:08.771Z	I0925 15:38:08.771609       1 worker-service.go:40] reconcileService():CHI:demo/otel:Service found: demo/clickhouse-otel-443. Will try to update
+1790350688976	2026-09-25T15:38:08.976Z	I0925 15:38:08.976097       1 worker-service.go:182] updateService():CHI:demo/otel:Update Service success: demo/clickhouse-otel-443
+1790350689178	2026-09-25T15:38:09.178Z	I0925 15:38:09.178740       1 worker-service.go:61] reconcileService():CHI:demo/otel:Service reconcile successful: demo/clickhouse-otel-443
+1790350689401	2026-09-25T15:38:09.401Z	I0925 15:38:09.400980       1 worker-pdb.go:36] PDB updated: demo/chi-otel-otel
+1790350689401	2026-09-25T15:38:09.401Z	I0925 15:38:09.401061       1 worker-zk-integration.go:49] reconcileClusterZookeeperRootPath():CHI:demo/otel:Confirm ZK is configured for cluster demo/otel/otel
+1790350689573	2026-09-25T15:38:09.573Z	I0925 15:38:09.573391       1 export.go:83] zk path to be verified: /clickhouse/otel_9572
+2026/09/25 15:38:09 connected to 172.20.45.72:2181
+2026/09/25 15:38:09 authenticated: id=72412356296704036, timeout=10000
+1790350689583	2026-09-25T15:38:09.583Z	I0925 15:38:09.583568       1 export.go:83] zk conn: session for addr zookeeper-c7333-0:2181 event: {EventSession StateHasSession  <nil> 172.20.45.72:2181}
+2026/09/25 15:38:09 re-submitting `0` credentials after reconnect
+1790350689585	2026-09-25T15:38:09.585Z	I0925 15:38:09.584856       1 export.go:83] zk path already exists: /clickhouse
+1790350689586	2026-09-25T15:38:09.586Z	I0925 15:38:09.586054       1 export.go:83] zk path already exists: /clickhouse/otel_9572
+2026/09/25 15:38:09 recv loop terminated: EOF
+2026/09/25 15:38:09 send loop terminated: <nil>
+1790350689588	2026-09-25T15:38:09.588Z	I0925 15:38:09.588691       1 worker-zk-integration.go:57] reconcileClusterZookeeperRootPath():CHI:demo/otel:ZK is configured for cluster demo/otel/otel
+1790350689588	2026-09-25T15:38:09.588Z	I0925 15:38:09.588729       1 export.go:83] zk conn: session for addr zookeeper-c7333-0:2181 ended: {EventSession StateDisconnected  <nil> 172.20.45.72:2181}
+1790350689773	2026-09-25T15:38:09.773Z	I0925 15:38:09.772978       1 worker-reconciler-chi.go:862] worker-reconciler-chi.go:862:reconcileClusterShardsAndHosts():start:reconcileClusterShardsAndHosts start
+1790350689773	2026-09-25T15:38:09.773Z	I0925 15:38:09.773018       1 worker-reconciler-helper.go:95] not found ReconcileShardsAndHostsOptionsCtxKey, use empty opts
+1790350689773	2026-09-25T15:38:09.773Z	I0925 15:38:09.773026       1 worker-reconciler-chi.go:877] starting first shard separately
+1790350689773	2026-09-25T15:38:09.773Z	I0925 15:38:09.773106       1 worker-reconciler-chi.go:958] reconcileHost():Host:0-0[0/0]:demo/otel:Reconcile host: 0-0. App version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350689773	2026-09-25T15:38:09.773Z	I0925 15:38:09.773130       1 worker-wait-exclude-include-restart.go:80] worker-wait-exclude-include-restart.go:80:excludeHost():start:Host:0-0[0/0]:demo/otel:exclude host start
+1790350689773	2026-09-25T15:38:09.773Z	I0925 15:38:09.773629       1 export.go:83] versionConstraint host: 0-0 version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: * matches: true
+1790350689774	2026-09-25T15:38:09.774Z	I0925 15:38:09.773963       1 export.go:83] versionConstraint host: 0-0 version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: 21.* matches: false
+1790350689774	2026-09-25T15:38:09.774Z	I0925 15:38:09.773982       1 export.go:83] ChangeRequiresReboot isSettingsChangeRequiresReboot(files global): true
+1790350689774	2026-09-25T15:38:09.774Z	I0925 15:38:09.774011       1 worker.go:190] shouldForceRestartHost():Host:0-0[0/0]:demo/otel:Config change(s) require host restart. Host: 0-0
+1790350689774	2026-09-25T15:38:09.774Z	I0925 15:38:09.774028       1 worker-wait-exclude-include-restart.go:386] shouldExcludeHost():Host:0-0[0/0]:demo/otel:Host should be restarted, need to exclude. Host/shard/cluster: 0/0/otel
+1790350689774	2026-09-25T15:38:09.774Z	I0925 15:38:09.774040       1 worker-wait-exclude-include-restart.go:93] excludeHost():Host:0-0[0/0]:demo/otel:Exclude host from cluster. Host/shard/cluster: 0/0/otel
+1790350690211	2026-09-25T15:38:10.211Z	I0925 15:38:10.211212       1 worker-boilerplate.go:133] processReconcileEndpointSlice():unknown:Reconcile EndpointSlice. demo/clickhouse-otel-443-6m245 Transition: '10.129.57.133,10.129.57.229'=>'10.129.57.133'
+1790350690580	2026-09-25T15:38:10.580Z	I0925 15:38:10.580515       1 worker.go:573] createTemplatedCR():CHI:demo/otel:CR has an ancestor, use it as a base for reconcile. CR: demo/otel
+1790350690580	2026-09-25T15:38:10.580Z	I0925 15:38:10.580560       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350690580	2026-09-25T15:38:10.580Z	I0925 15:38:10.580573       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350690580	2026-09-25T15:38:10.580Z	I0925 15:38:10.580583       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350690580	2026-09-25T15:38:10.580Z	I0925 15:38:10.580593       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350690580	2026-09-25T15:38:10.580Z	I0925 15:38:10.580669       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350690580	2026-09-25T15:38:10.580Z	I0925 15:38:10.580831       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350690580	2026-09-25T15:38:10.580Z	I0925 15:38:10.580893       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350690585	2026-09-25T15:38:10.585Z	I0925 15:38:10.585107       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350690585	2026-09-25T15:38:10.585Z	I0925 15:38:10.585146       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350690585	2026-09-25T15:38:10.585Z	I0925 15:38:10.585158       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350690585	2026-09-25T15:38:10.585Z	I0925 15:38:10.585168       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350690585	2026-09-25T15:38:10.585Z	I0925 15:38:10.585181       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350690585	2026-09-25T15:38:10.585Z	I0925 15:38:10.585244       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350690585	2026-09-25T15:38:10.585Z	I0925 15:38:10.585306       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350690634	2026-09-25T15:38:10.634Z	I0925 15:38:10.634785       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-0
+1790350690635	2026-09-25T15:38:10.635Z	I0925 15:38:10.634828       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-0
+1790350690667	2026-09-25T15:38:10.667Z	I0925 15:38:10.667152       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-1
+1790350690667	2026-09-25T15:38:10.667Z	I0925 15:38:10.667188       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-1
+1790350690696	2026-09-25T15:38:10.696Z	I0925 15:38:10.695992       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: * matches: true
+1790350690696	2026-09-25T15:38:10.696Z	I0925 15:38:10.696236       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: >= 23.3 matches: true
+1790350690696	2026-09-25T15:38:10.696Z	I0925 15:38:10.696370       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: >= 23.5 matches: true
+1790350690778	2026-09-25T15:38:10.778Z	I0925 15:38:10.778492       1 worker-wait-exclude-include-restart.go:286] descendHostInClickHouseCluster():Host:0-0[0/0]:demo/otel:going to descent host. Host/shard/cluster: 0/0/otel
+1790350690779	2026-09-25T15:38:10.779Z	I0925 15:38:10.778516       1 worker-status-helpers.go:300] RemoteServersOptions: exclude hosts: [], attributes: status: requested, tags: 
+1790350691377	2026-09-25T15:38:11.377Z	I0925 15:38:11.376905       1 worker-reconciler-chi.go:187] CHI:demo/otel:IPs of the CR demo/otel: len: 2 [10.129.57.229 10.129.57.133]
+1790350691377	2026-09-25T15:38:11.377Z	I0925 15:38:11.376948       1 worker.go:573] createTemplatedCR():CHI:demo/otel:CR has an ancestor, use it as a base for reconcile. CR: demo/otel
+1790350691377	2026-09-25T15:38:11.377Z	I0925 15:38:11.377054       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350691377	2026-09-25T15:38:11.377Z	I0925 15:38:11.377108       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350691377	2026-09-25T15:38:11.377Z	I0925 15:38:11.377232       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350691377	2026-09-25T15:38:11.377Z	I0925 15:38:11.377250       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350691377	2026-09-25T15:38:11.377Z	I0925 15:38:11.377277       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350691377	2026-09-25T15:38:11.377Z	I0925 15:38:11.377333       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350691377	2026-09-25T15:38:11.377Z	I0925 15:38:11.377384       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350691381	2026-09-25T15:38:11.381Z	I0925 15:38:11.381847       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350691382	2026-09-25T15:38:11.382Z	I0925 15:38:11.381882       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350691382	2026-09-25T15:38:11.382Z	I0925 15:38:11.381895       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350691382	2026-09-25T15:38:11.382Z	I0925 15:38:11.381907       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350691382	2026-09-25T15:38:11.382Z	I0925 15:38:11.381949       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350691382	2026-09-25T15:38:11.382Z	I0925 15:38:11.381985       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350691382	2026-09-25T15:38:11.382Z	I0925 15:38:11.381998       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350691421	2026-09-25T15:38:11.421Z	I0925 15:38:11.421334       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-0
+1790350691421	2026-09-25T15:38:11.421Z	I0925 15:38:11.421374       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-0
+1790350691432	2026-09-25T15:38:11.432Z	I0925 15:38:11.432051       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-1
+1790350691432	2026-09-25T15:38:11.432Z	I0925 15:38:11.432091       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-1
+1790350691457	2026-09-25T15:38:11.457Z	I0925 15:38:11.455455       1 worker-reconciler-chi.go:250] logSWVersion():Host:0-0[0/0]:demo/otel:Host software version: 0-0 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350691457	2026-09-25T15:38:11.457Z	I0925 15:38:11.455561       1 worker-reconciler-chi.go:250] logSWVersion():Host:0-1[0/1]:demo/otel:Host software version: 0-1 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350691457	2026-09-25T15:38:11.457Z	I0925 15:38:11.455573       1 worker-reconciler-chi.go:253] logSWVersion():CHI:demo/otel:CR software versions min=26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] max=26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350691465	2026-09-25T15:38:11.465Z	I0925 15:38:11.464949       1 worker-reconciler-chi.go:206] CHI:demo/otel:
+ActionPlan start buildCR ---------------------------------------------:
+Diff start -------------------------
+modified spec items num: 1
+diff item [0]:'.Configuration.Files.data["config.d/cas_gc_tuning.xml"].scalar' = '"<clickhouse>\n  <storage_configuration>\n    <disks>\n      <cas>\n        <cas_gc_interval_sec>300</cas_gc_interval_sec>\n        <cas_gc_round_ref_cleanup_budget>0</cas_gc_round_ref_cleanup_budget>\n        <cas_gc_round_graduation_budget>200000</cas_gc...(value truncated for brevity)'
+Diff end -------------------------
+Diff start -------------------------
+prev spec items num: 4
+diff item [0]:'.TaskID' = '"auto-b852e952-e315-42dd-8a56-46e6a164e9a7"'
+diff item [1]:'.Configuration.Files.data["config.d/cas_gc_tuning.xml"].scalar' = '"<clickhouse>\n  <storage_configuration>\n    <disks>\n      <cas>\n        <cas_gc_interval_sec>300</cas_gc_interval_sec>\n        <cas_gc_round_ref_cleanup_budget>200000</cas_gc_round_ref_cleanup_budget>\n        <cas_gc_round_graduation_budget>200000</c...(value truncated for brevity)'
+diff item [2]:'.Configuration.Clusters[0].Layout.Shards[0].Hosts[0].Runtime.Version' = 'nil'
+diff item [3]:'.Configuration.Clusters[0].Layout.Shards[0].Hosts[1].Runtime.Version' = 'nil'
+Diff end -------------------------
+
+ActionPlan end buildCR ---------------------------------------------
+1790350691576	2026-09-25T15:38:11.576Z	I0925 15:38:11.576257       1 worker-config-map.go:70] updateConfigMap():CHI:demo/otel:Update ConfigMap demo/chi-otel-common-configd
+1790350691972	2026-09-25T15:38:11.972Z	I0925 15:38:11.972769       1 task.go:106] WaitForConfigMapPropagation():Host:0-0[0/0]:demo/otel:Going to wait for ConfigMap propagation for: 9.99998633s [elapsed/timeout: 13.67µs/10s]
+1790350692174	2026-09-25T15:38:12.174Z	I0925 15:38:12.174631       1 worker-config-map.go:70] updateConfigMap():CHI:demo/otel:Update ConfigMap demo/chi-otel-common-usersd
+1790350692985	2026-09-25T15:38:12.985Z	I0925 15:38:12.984930       1 worker-boilerplate.go:133] processReconcileEndpointSlice():unknown:Reconcile EndpointSlice. demo/clickhouse-otel-xmpmj Transition: '10.129.57.133,10.129.57.229'=>'10.129.57.133'
+1790350693187	2026-09-25T15:38:13.187Z	I0925 15:38:13.187163       1 worker.go:573] createTemplatedCR():CHI:demo/otel:CR has an ancestor, use it as a base for reconcile. CR: demo/otel
+1790350693187	2026-09-25T15:38:13.187Z	I0925 15:38:13.187218       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350693187	2026-09-25T15:38:13.187Z	I0925 15:38:13.187231       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350693187	2026-09-25T15:38:13.187Z	I0925 15:38:13.187241       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350693187	2026-09-25T15:38:13.187Z	I0925 15:38:13.187258       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350693187	2026-09-25T15:38:13.187Z	I0925 15:38:13.187275       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350693187	2026-09-25T15:38:13.187Z	I0925 15:38:13.187315       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350693187	2026-09-25T15:38:13.187Z	I0925 15:38:13.187327       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350693192	2026-09-25T15:38:13.192Z	I0925 15:38:13.192070       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350693192	2026-09-25T15:38:13.192Z	I0925 15:38:13.192106       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350693192	2026-09-25T15:38:13.192Z	I0925 15:38:13.192120       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350693192	2026-09-25T15:38:13.192Z	I0925 15:38:13.192132       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350693192	2026-09-25T15:38:13.192Z	I0925 15:38:13.192150       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350693192	2026-09-25T15:38:13.192Z	I0925 15:38:13.192181       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350693192	2026-09-25T15:38:13.192Z	I0925 15:38:13.192198       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350693227	2026-09-25T15:38:13.227Z	I0925 15:38:13.227821       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-0
+1790350693228	2026-09-25T15:38:13.228Z	I0925 15:38:13.227860       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-0
+1790350693242	2026-09-25T15:38:13.242Z	I0925 15:38:13.242053       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-1
+1790350693242	2026-09-25T15:38:13.242Z	I0925 15:38:13.242106       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-1
+1790350693274	2026-09-25T15:38:13.274Z	I0925 15:38:13.274339       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: * matches: true
+1790350693274	2026-09-25T15:38:13.274Z	I0925 15:38:13.274407       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: >= 23.3 matches: true
+1790350693274	2026-09-25T15:38:13.274Z	I0925 15:38:13.274425       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: >= 23.5 matches: true
+1790350693577	2026-09-25T15:38:13.577Z	I0925 15:38:13.577391       1 worker-reconciler-chi.go:187] CHI:demo/otel:IPs of the CR demo/otel: len: 2 [10.129.57.229 10.129.57.133]
+1790350693577	2026-09-25T15:38:13.577Z	I0925 15:38:13.577437       1 worker.go:573] createTemplatedCR():CHI:demo/otel:CR has an ancestor, use it as a base for reconcile. CR: demo/otel
+1790350693577	2026-09-25T15:38:13.577Z	I0925 15:38:13.577512       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350693577	2026-09-25T15:38:13.577Z	I0925 15:38:13.577534       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350693577	2026-09-25T15:38:13.577Z	I0925 15:38:13.577546       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350693577	2026-09-25T15:38:13.577Z	I0925 15:38:13.577557       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350693577	2026-09-25T15:38:13.577Z	I0925 15:38:13.577569       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350693577	2026-09-25T15:38:13.577Z	I0925 15:38:13.577597       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350693577	2026-09-25T15:38:13.577Z	I0925 15:38:13.577609       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350693582	2026-09-25T15:38:13.582Z	I0925 15:38:13.581930       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350693582	2026-09-25T15:38:13.582Z	I0925 15:38:13.581965       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350693582	2026-09-25T15:38:13.582Z	I0925 15:38:13.581976       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350693582	2026-09-25T15:38:13.582Z	I0925 15:38:13.582003       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350693582	2026-09-25T15:38:13.582Z	I0925 15:38:13.582018       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350693582	2026-09-25T15:38:13.582Z	I0925 15:38:13.582053       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350693582	2026-09-25T15:38:13.582Z	I0925 15:38:13.582064       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350693622	2026-09-25T15:38:13.622Z	I0925 15:38:13.622353       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-0
+1790350693622	2026-09-25T15:38:13.622Z	I0925 15:38:13.622391       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-0
+1790350693631	2026-09-25T15:38:13.631Z	I0925 15:38:13.631814       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-1
+1790350693631	2026-09-25T15:38:13.631Z	I0925 15:38:13.631855       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-1
+1790350693657	2026-09-25T15:38:13.657Z	I0925 15:38:13.656818       1 worker-reconciler-chi.go:250] logSWVersion():Host:0-0[0/0]:demo/otel:Host software version: 0-0 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350693657	2026-09-25T15:38:13.657Z	I0925 15:38:13.656944       1 worker-reconciler-chi.go:250] logSWVersion():Host:0-1[0/1]:demo/otel:Host software version: 0-1 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350693657	2026-09-25T15:38:13.657Z	I0925 15:38:13.656962       1 worker-reconciler-chi.go:253] logSWVersion():CHI:demo/otel:CR software versions min=26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] max=26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350693665	2026-09-25T15:38:13.665Z	I0925 15:38:13.664928       1 worker-reconciler-chi.go:206] CHI:demo/otel:
+ActionPlan start buildCR ---------------------------------------------:
+Diff start -------------------------
+modified spec items num: 1
+diff item [0]:'.Configuration.Files.data["config.d/cas_gc_tuning.xml"].scalar' = '"<clickhouse>\n  <storage_configuration>\n    <disks>\n      <cas>\n        <cas_gc_interval_sec>300</cas_gc_interval_sec>\n        <cas_gc_round_ref_cleanup_budget>0</cas_gc_round_ref_cleanup_budget>\n        <cas_gc_round_graduation_budget>200000</cas_gc...(value truncated for brevity)'
+Diff end -------------------------
+Diff start -------------------------
+prev spec items num: 4
+diff item [0]:'.TaskID' = '"auto-b852e952-e315-42dd-8a56-46e6a164e9a7"'
+diff item [1]:'.Configuration.Files.data["config.d/cas_gc_tuning.xml"].scalar' = '"<clickhouse>\n  <storage_configuration>\n    <disks>\n      <cas>\n        <cas_gc_interval_sec>300</cas_gc_interval_sec>\n        <cas_gc_round_ref_cleanup_budget>200000</cas_gc_round_ref_cleanup_budget>\n        <cas_gc_round_graduation_budget>200000</c...(value truncated for brevity)'
+diff item [2]:'.Configuration.Clusters[0].Layout.Shards[0].Hosts[0].Runtime.Version' = 'nil'
+diff item [3]:'.Configuration.Clusters[0].Layout.Shards[0].Hosts[1].Runtime.Version' = 'nil'
+Diff end -------------------------
+
+ActionPlan end buildCR ---------------------------------------------
+1790350693972	2026-09-25T15:38:13.972Z	I0925 15:38:13.972165       1 worker-config-map.go:70] updateConfigMap():CHI:demo/otel:Update ConfigMap demo/chi-otel-common-usersd
+1790350701973	2026-09-25T15:38:21.973Z	I0925 15:38:21.973537       1 task.go:112] WaitForConfigMapPropagation():Host:0-0[0/0]:demo/otel:Wait completed for: 9.99998633s  of timeout: 10s]
+1790350701973	2026-09-25T15:38:21.973Z	I0925 15:38:21.973569       1 worker-wait-exclude-include-restart.go:99] worker-wait-exclude-include-restart.go:81:excludeHost():end:Host:0-0[0/0]:demo/otel:exclude host end
+1790350701973	2026-09-25T15:38:21.973Z	I0925 15:38:21.973588       1 worker-wait-exclude-include-restart.go:104] worker-wait-exclude-include-restart.go:104:completeQueries():start:Host:0-0[0/0]:demo/otel:complete queries start
+1790350701973	2026-09-25T15:38:21.973Z	I0925 15:38:21.973624       1 worker-wait-exclude-include-restart.go:453] shouldWaitQueries():Host:0-0[0/0]:demo/otel:Will wait for queries to complete on a host according to CHOp config '.reconcile.host.wait.queries' setting. Host/shard/cluster: 0/0/otel
+1790350701973	2026-09-25T15:38:21.973Z	I0925 15:38:21.973737       1 cluster.go:85] Run query on: chi-otel-otel-0-0.demo.svc.cluster.local. of [chi-otel-otel-0-0.demo.svc.cluster.local.]
+1790350701979	2026-09-25T15:38:21.979Z	I0925 15:38:21.979402       1 worker-status-helpers.go:173] active queries 3 host: 0-0
+1790350706980	2026-09-25T15:38:26.980Z	I0925 15:38:26.980264       1 cluster.go:85] Run query on: chi-otel-otel-0-0.demo.svc.cluster.local. of [chi-otel-otel-0-0.demo.svc.cluster.local.]
+1790350706983	2026-09-25T15:38:26.983Z	I0925 15:38:26.983743       1 worker-status-helpers.go:173] active queries 1 host: 0-0
+1790350706983	2026-09-25T15:38:26.983Z	I0925 15:38:26.983785       1 poller.go:80] Poll():demo/0-0:OK demo/0-0
+1790350706983	2026-09-25T15:38:26.983Z	I0925 15:38:26.983794       1 worker-wait-exclude-include-restart.go:108] worker-wait-exclude-include-restart.go:105:completeQueries():end:Host:0-0[0/0]:demo/otel:complete queries end
+1790350706999	2026-09-25T15:38:26.999Z	I0925 15:38:26.999008       1 worker-config-map.go:70] updateConfigMap():CHI:demo/otel:Update ConfigMap demo/chi-otel-deploy-confd-otel-0-0
+1790350707006	2026-09-25T15:38:27.006Z	I0925 15:38:27.006121       1 worker-reconciler-chi.go:1044] reconcileHostMain():Host:0-0[0/0]:demo/otel:Reconcile PVCs and data loss for host: 0-0
+1790350707012	2026-09-25T15:38:27.012Z	I0925 15:38:27.012213       1 storage-reconciler.go:283] storage-reconciler.go:283:reconcilePVC():start:Host:0-0[0/0]:demo/otel:reconcile PVC (demo/default-1-1-chi-otel-otel-0-0-0/0-0)
+1790350707035	2026-09-25T15:38:27.035Z	I0925 15:38:27.035403       1 storage-reconciler.go:303] storage-reconciler.go:284:reconcilePVC():end:Host:0-0[0/0]:demo/otel:reconcile PVC (demo/default-1-1-chi-otel-otel-0-0-0/0-0)
+1790350707041	2026-09-25T15:38:27.041Z	I0925 15:38:27.041091       1 storage-reconciler.go:283] storage-reconciler.go:283:reconcilePVC():start:Host:0-0[0/0]:demo/otel:reconcile PVC (demo/default-1-1-chi-otel-otel-0-0-0/0-0)
+1790350707060	2026-09-25T15:38:27.060Z	I0925 15:38:27.060496       1 storage-reconciler.go:303] storage-reconciler.go:284:reconcilePVC():end:Host:0-0[0/0]:demo/otel:reconcile PVC (demo/default-1-1-chi-otel-otel-0-0-0/0-0)
+1790350707067	2026-09-25T15:38:27.067Z	I0925 15:38:27.067381       1 worker-service.go:40] reconcileService():CHI:demo/otel:Service found: demo/chi-otel-otel-0-0. Will try to update
+1790350707195	2026-09-25T15:38:27.195Z	I0925 15:38:27.195381       1 worker-service.go:182] updateService():CHI:demo/otel:Update Service success: demo/chi-otel-otel-0-0
+1790350707392	2026-09-25T15:38:27.392Z	I0925 15:38:27.392483       1 worker-service.go:61] reconcileService():CHI:demo/otel:Service reconcile successful: demo/chi-otel-otel-0-0
+1790350707392	2026-09-25T15:38:27.392Z	I0925 15:38:27.392517       1 worker-reconciler-chi.go:765] reconcileHostService():Host:0-0[0/0]:demo/otel:DONE Reconcile service of the host: 0-0
+1790350707392	2026-09-25T15:38:27.392Z	I0925 15:38:27.392547       1 worker-reconciler-chi.go:540] worker-reconciler-chi.go:540:reconcileHostStatefulSet():start:Host:0-0[0/0]:demo/otel:reconcile StatefulSet start
+1790350707392	2026-09-25T15:38:27.392Z	I0925 15:38:27.392573       1 worker-reconciler-chi.go:543] reconcileHostStatefulSet():Host:0-0[0/0]:demo/otel:Reconcile host STS: 0-0. App version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350707400	2026-09-25T15:38:27.400Z	I0925 15:38:27.400296       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-0
+1790350707400	2026-09-25T15:38:27.400Z	I0925 15:38:27.400335       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-0
+1790350707400	2026-09-25T15:38:27.400Z	W0925 15:38:27.400391       1 worker-reconciler-chi.go:1124] prepareStsReconcileOptsWaitSection():Host:0-0[0/0]:demo/otel:Setting option SetWaitUntilReady
+1790350707401	2026-09-25T15:38:27.401Z	I0925 15:38:27.401024       1 export.go:83] versionConstraint host: 0-0 version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: * matches: true
+1790350707401	2026-09-25T15:38:27.401Z	I0925 15:38:27.401476       1 export.go:83] versionConstraint host: 0-0 version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: 21.* matches: false
+1790350707401	2026-09-25T15:38:27.401Z	I0925 15:38:27.401499       1 export.go:83] ChangeRequiresReboot isSettingsChangeRequiresReboot(files global): true
+1790350707401	2026-09-25T15:38:27.401Z	I0925 15:38:27.401528       1 worker.go:190] shouldForceRestartHost():Host:0-0[0/0]:demo/otel:Config change(s) require host restart. Host: 0-0
+1790350707401	2026-09-25T15:38:27.401Z	I0925 15:38:27.401563       1 worker-reconciler-chi.go:555] reconcileHostStatefulSet():Host:0-0[0/0]:demo/otel:Reconcile host STS force restart: 0-0
+1790350707401	2026-09-25T15:38:27.401Z	I0925 15:38:27.401577       1 worker-reconciler-chi.go:646] hostForceRestart():Host:0-0[0/0]:demo/otel:Reconcile host. Force restart: 0-0
+1790350707401	2026-09-25T15:38:27.401Z	I0925 15:38:27.401594       1 worker-reconciler-chi.go:665] hostSoftwareRestart():Host:0-0[0/0]:demo/otel:Host software restart start. Host: 0-0
+1790350707592	2026-09-25T15:38:27.592Z	I0925 15:38:27.592149       1 schemer.go:188] HostShutdown():Host:0-0[0/0]:demo/otel:Host shutdown: 0-0
+1790350707596	2026-09-25T15:38:27.596Z	I0925 15:38:27.596384       1 worker-reconciler-chi.go:680] hostSoftwareRestart():Host:0-0[0/0]:demo/otel:Host software shutdown ok. Host: 0-0
+1790350708308	2026-09-25T15:38:28.308Z	I0925 15:38:28.307890       1 worker-boilerplate.go:133] processReconcileEndpointSlice():unknown:Reconcile EndpointSlice. demo/chi-otel-otel-0-0-x4cn8 Transition: '10.129.57.229'=>''
+1790350708337	2026-09-25T15:38:28.337Z	I0925 15:38:28.337798       1 worker.go:573] createTemplatedCR():CHI:demo/otel:CR has an ancestor, use it as a base for reconcile. CR: demo/otel
+1790350708337	2026-09-25T15:38:28.337Z	I0925 15:38:28.337841       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350708337	2026-09-25T15:38:28.337Z	I0925 15:38:28.337854       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350708337	2026-09-25T15:38:28.337Z	I0925 15:38:28.337864       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350708337	2026-09-25T15:38:28.337Z	I0925 15:38:28.337877       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350708337	2026-09-25T15:38:28.337Z	I0925 15:38:28.337890       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350708338	2026-09-25T15:38:28.338Z	I0925 15:38:28.337997       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350708338	2026-09-25T15:38:28.338Z	I0925 15:38:28.338035       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350708344	2026-09-25T15:38:28.344Z	I0925 15:38:28.342770       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350708344	2026-09-25T15:38:28.344Z	I0925 15:38:28.342870       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350708344	2026-09-25T15:38:28.344Z	I0925 15:38:28.342900       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350708344	2026-09-25T15:38:28.344Z	I0925 15:38:28.342945       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350708344	2026-09-25T15:38:28.344Z	I0925 15:38:28.342974       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350708344	2026-09-25T15:38:28.344Z	I0925 15:38:28.343032       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350708344	2026-09-25T15:38:28.344Z	I0925 15:38:28.343068       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350708374	2026-09-25T15:38:28.374Z	I0925 15:38:28.374569       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-0
+1790350708374	2026-09-25T15:38:28.374Z	I0925 15:38:28.374608       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-0
+1790350708382	2026-09-25T15:38:28.382Z	I0925 15:38:28.382420       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-1
+1790350708382	2026-09-25T15:38:28.382Z	I0925 15:38:28.382467       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-1
+1790350708405	2026-09-25T15:38:28.405Z	I0925 15:38:28.405059       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: * matches: true
+1790350708405	2026-09-25T15:38:28.405Z	I0925 15:38:28.405129       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: >= 23.3 matches: true
+1790350708405	2026-09-25T15:38:28.405Z	I0925 15:38:28.405150       1 export.go:83] versionConstraint chi: otel version: 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] constraint: >= 23.5 matches: true
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.419981       1 worker-reconciler-chi.go:187] CHI:demo/otel:IPs of the CR demo/otel: len: 2 [10.129.57.229 10.129.57.133]
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.420025       1 worker.go:573] createTemplatedCR():CHI:demo/otel:CR has an ancestor, use it as a base for reconcile. CR: demo/otel
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.420165       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.420184       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.420194       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.420204       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.420220       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.420264       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.420275       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.424568       1 chi.go:64] prepareListOfAutoTemplates():CHI:demo/otel:Found auto-templates num: 2
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.424607       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/https-port-template 
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.424619       1 chi.go:66] prepareListOfAutoTemplates():CHI:demo/otel:Adding auto-template to the list of applicable templates: demo/macro-in-yaml-macro 
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.424631       1 chi.go:57] prepareListOfTemplates():CHI:demo/otel:Found applicable templates num: 2
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.424644       1 chi.go:136] findApplicableTemplate():unknown:Apply template: 'demo/https-port-template'. Selector: 'map[]' matches labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.424681       1 chi.go:125] findApplicableTemplate():unknown:Skip template: 'demo/macro-in-yaml-macro'. Selector: 'map[clickhouse.altinity.com/chi:test-macro]' does not match labels: 'map[clickhouse.altinity.com/chi:otel]'
+1790350708425	2026-09-25T15:38:28.425Z	I0925 15:38:28.424696       1 chi.go:36] ApplyTemplates():CHI:demo/otel:Applied templates num: 1
+1790350708466	2026-09-25T15:38:28.466Z	I0925 15:38:28.466203       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-0
+1790350708466	2026-09-25T15:38:28.466Z	I0925 15:38:28.466243       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-0
+1790350708474	2026-09-25T15:38:28.474Z	I0925 15:38:28.474008       1 statefulset-reconciler.go:103] unknown:Have StatefulSet available, try to perform label-based comparison for sts: demo/chi-otel-otel-0-1
+1790350708474	2026-09-25T15:38:28.474Z	I0925 15:38:28.474048       1 object-status.go:47] GetObjectStatusFromMetas():unknown:cur and new objects are equal based on object version label. Update of the object is not required. Object: demo/chi-otel-otel-0-1
+1790350708495	2026-09-25T15:38:28.495Z	I0925 15:38:28.495272       1 worker-reconciler-chi.go:250] logSWVersion():Host:0-0[0/0]:demo/otel:Host software version: 0-0 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350708496	2026-09-25T15:38:28.496Z	I0925 15:38:28.495304       1 worker-reconciler-chi.go:250] logSWVersion():Host:0-1[0/1]:demo/otel:Host software version: 0-1 26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350708496	2026-09-25T15:38:28.496Z	I0925 15:38:28.495312       1 worker-reconciler-chi.go:253] logSWVersion():CHI:demo/otel:CR software versions min=26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001'] max=26.6.4[26.6.4.20001/parsed from the tag: '26.6.4.20001']
+1790350708507	2026-09-25T15:38:28.507Z	I0925 15:38:28.507040       1 worker-reconciler-chi.go:206] CHI:demo/otel:
+ActionPlan start buildCR ---------------------------------------------:
+Diff start -------------------------
+modified spec items num: 1
+diff item [0]:'.Configuration.Files.data["config.d/cas_gc_tuning.xml"].scalar' = '"<clickhouse>\n  <storage_configuration>\n    <disks>\n      <cas>\n        <cas_gc_interval_sec>300</cas_gc_interval_sec>\n        <cas_gc_round_ref_cleanup_budget>0</cas_gc_round_ref_cleanup_budget>\n        <cas_gc_round_graduation_budget>200000</cas_gc...(value truncated for brevity)'
+Diff end -------------------------
+Diff start -------------------------
+prev spec items num: 4
+diff item [0]:'.Configuration.Clusters[0].Layout.Shards[0].Hosts[0].Runtime.Version' = 'nil'
+diff item [1]:'.Configuration.Clusters[0].Layout.Shards[0].Hosts[1].Runtime.Version' = 'nil'
+diff item [2]:'.TaskID' = '"auto-b852e952-e315-42dd-8a56-46e6a164e9a7"'
+diff item [3]:'.Configuration.Files.data["config.d/cas_gc_tuning.xml"].scalar' = '"<clickhouse>\n  <storage_configuration>\n    <disks>\n      <cas>\n        <cas_gc_interval_sec>300</cas_gc_interval_sec>\n        <cas_gc_round_ref_cleanup_budget>200000</cas_gc_round_ref_cleanup_budget>\n        <cas_gc_round_graduation_budget>200000</c...(value truncated for brevity)'
+Diff end -------------------------
+
+ActionPlan end buildCR ---------------------------------------------
+1790350708792	2026-09-25T15:38:28.792Z	I0925 15:38:28.792554       1 worker-config-map.go:70] updateConfigMap():CHI:demo/otel:Update ConfigMap demo/chi-otel-common-usersd
+1790350712692	2026-09-25T15:38:32.692Z	I0925 15:38:32.691938       1 exporter.go:78] Collect started
+1790350712692	2026-09-25T15:38:32.692Z	I0925 15:38:32.691962       1 exporter.go:87] Launching host collectors [39.5µs]
+1790350712692	2026-09-25T15:38:32.692Z	I0925 15:38:32.692037       1 collector.go:133] Querying detached parts for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712692	2026-09-25T15:38:32.692Z	I0925 15:38:32.692215       1 collector.go:133] Querying detached parts for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712692	2026-09-25T15:38:32.692Z	I0925 15:38:32.692364       1 collector.go:133] Querying detached parts for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712692	2026-09-25T15:38:32.692Z	I0925 15:38:32.692667       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350712692	2026-09-25T15:38:32.692Z	I0925 15:38:32.692851       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350712693	2026-09-25T15:38:32.693Z	I0925 15:38:32.692981       1 collector.go:133] Querying detached parts for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712693	2026-09-25T15:38:32.693Z	I0925 15:38:32.693194       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712693	2026-09-25T15:38:32.693Z	I0925 15:38:32.693374       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712693	2026-09-25T15:38:32.693Z	I0925 15:38:32.693520       1 collector.go:55] Querying system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712693	2026-09-25T15:38:32.693Z	I0925 15:38:32.693663       1 collector.go:70] Querying table sizes for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712693	2026-09-25T15:38:32.693Z	I0925 15:38:32.693889       1 collector.go:88] Querying system replicas for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712694	2026-09-25T15:38:32.694Z	I0925 15:38:32.694008       1 collector.go:103] Querying mutations for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712694	2026-09-25T15:38:32.694Z	I0925 15:38:32.694076       1 collector.go:118] Querying disks for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712694	2026-09-25T15:38:32.694Z	I0925 15:38:32.694233       1 collector.go:55] Querying system metrics for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712694	2026-09-25T15:38:32.694Z	I0925 15:38:32.694360       1 collector.go:70] Querying table sizes for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712694	2026-09-25T15:38:32.694Z	I0925 15:38:32.694556       1 collector.go:88] Querying system replicas for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712694	2026-09-25T15:38:32.694Z	I0925 15:38:32.694703       1 collector.go:103] Querying mutations for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712694	2026-09-25T15:38:32.694Z	I0925 15:38:32.694870       1 collector.go:55] Querying system metrics for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712695	2026-09-25T15:38:32.695Z	I0925 15:38:32.695005       1 collector.go:70] Querying table sizes for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712695	2026-09-25T15:38:32.695Z	I0925 15:38:32.695076       1 collector.go:88] Querying system replicas for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712695	2026-09-25T15:38:32.695Z	I0925 15:38:32.695138       1 collector.go:103] Querying mutations for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712695	2026-09-25T15:38:32.695Z	I0925 15:38:32.695224       1 collector.go:118] Querying disks for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712695	2026-09-25T15:38:32.695Z	I0925 15:38:32.695343       1 collector.go:103] Querying mutations for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712695	2026-09-25T15:38:32.695Z	I0925 15:38:32.695726       1 collector.go:88] Querying system replicas for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712696	2026-09-25T15:38:32.696Z	I0925 15:38:32.695950       1 collector.go:103] Querying mutations for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712696	2026-09-25T15:38:32.696Z	I0925 15:38:32.696116       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350712696	2026-09-25T15:38:32.696Z	I0925 15:38:32.696316       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350712696	2026-09-25T15:38:32.696Z	I0925 15:38:32.696445       1 collector.go:118] Querying disks for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350712696	2026-09-25T15:38:32.696Z	I0925 15:38:32.696534       1 collector.go:118] Querying disks for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350712696	2026-09-25T15:38:32.696Z	I0925 15:38:32.696692       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.696315       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.697153       1 collector.go:55] Querying system metrics for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.695368       1 collector.go:70] Querying table sizes for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.695375       1 collector.go:88] Querying system replicas for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.695380       1 collector.go:103] Querying mutations for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.695396       1 collector.go:118] Querying disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.695525       1 collector.go:118] Querying disks for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.695627       1 collector.go:55] Querying system metrics for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.695634       1 collector.go:70] Querying table sizes for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.696045       1 collector.go:118] Querying disks for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.696324       1 collector.go:103] Querying mutations for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.696525       1 collector.go:103] Querying mutations for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350712697	2026-09-25T15:38:32.697Z	I0925 15:38:32.697653       1 collector.go:70] Querying table sizes for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712698	2026-09-25T15:38:32.698Z	I0925 15:38:32.698074       1 collector.go:88] Querying system replicas for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712698	2026-09-25T15:38:32.698Z	I0925 15:38:32.694781       1 collector.go:118] Querying disks for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712698	2026-09-25T15:38:32.698Z	I0925 15:38:32.695361       1 collector.go:55] Querying system metrics for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712699	2026-09-25T15:38:32.699Z	I0925 15:38:32.696029       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350712699	2026-09-25T15:38:32.699Z	I0925 15:38:32.699141       1 collector.go:138] Extracted [7.095282ms] 0 detached parts info for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712699	2026-09-25T15:38:32.699Z	I0925 15:38:32.696496       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350712701	2026-09-25T15:38:32.701Z	E0925 15:38:32.701005       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL:   SELECT
+1790350712701	2026-09-25T15:38:32.701Z	      name,
+1790350712701	2026-09-25T15:38:32.701Z	         toString(free_space)  AS free_space,
+1790350712701	2026-09-25T15:38:32.701Z	toString(total_space) AS total_space
+1790350712701	2026-09-25T15:38:32.701Z	     FROM system.disks
+1790350712701	2026-09-25T15:38:32.701Z	     WHERE type IN ('local','Local')
+1790350712701	2026-09-25T15:38:32.701Z	W0925 15:38:32.701029       1 collector.go:127] Error [4.480177ms] querying system.disks for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350712701	2026-09-25T15:38:32.701Z	E0925 15:38:32.701138       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL: SELECT
+1790350712701	2026-09-25T15:38:32.701Z		database,
+1790350712701	2026-09-25T15:38:32.701Z		table,
+1790350712701	2026-09-25T15:38:32.701Z		toString(active)                       AS active,
+1790350712701	2026-09-25T15:38:32.701Z		toString(uniq(partition))              AS partitions,
+1790350712701	2026-09-25T15:38:32.701Z		toString(count())                      AS parts,
+1790350712701	2026-09-25T15:38:32.701Z		toString(sum(bytes))                   AS bytes,
+1790350712701	2026-09-25T15:38:32.701Z		toString(sum(data_uncompressed_bytes)) AS uncompressed_bytes,
+1790350712701	2026-09-25T15:38:32.701Z		toString(sum(rows))                    AS rows,
+1790350712701	2026-09-25T15:38:32.701Z	       toString(sum(bytes_on_disk))           AS metric_DiskDataBytes,
+1790350712701	2026-09-25T15:38:32.701Z	       toString(sum(primary_key_bytes_in_memory_allocated)) AS metric_MemoryPrimaryKeyBytesAllocated
+1790350712701	2026-09-25T15:38:32.701Z	FROM system.parts
+1790350712701	2026-09-25T15:38:32.701Z	GROUP BY active, database, table
+1790350712701	2026-09-25T15:38:32.701Z	W0925 15:38:32.701148       1 collector.go:81] Error [4.816302ms] querying system.parts for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350712701	2026-09-25T15:38:32.701Z	E0925 15:38:32.701816       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL:   	SELECT
+1790350712701	2026-09-25T15:38:32.701Z	      	concat('metric.', metric) AS metric,
+1790350712701	2026-09-25T15:38:32.701Z	      	toString(value)           AS value,
+1790350712701	2026-09-25T15:38:32.701Z	      	''                        AS description,
+1790350712701	2026-09-25T15:38:32.701Z	      	'gauge'                   AS type
+1790350712701	2026-09-25T15:38:32.701Z	  	FROM merge('system','^(metrics|custom_metrics)$')
+1790350712701	2026-09-25T15:38:32.701Z	   UNION ALL
+1790350712701	2026-09-25T15:38:32.701Z	  	SELECT
+1790350712701	2026-09-25T15:38:32.701Z	      	concat('metric.', metric) AS metric,
+1790350712701	2026-09-25T15:38:32.701Z	      	toString(value)           AS value,
+1790350712701	2026-09-25T15:38:32.701Z	      	''                        AS description,
+1790350712701	2026-09-25T15:38:32.701Z	      	'gauge'                   AS type
+1790350712701	2026-09-25T15:38:32.701Z	  	FROM system.asynchronous_metrics
+1790350712701	2026-09-25T15:38:32.701Z	   UNION ALL
+1790350712701	2026-09-25T15:38:32.701Z	   SELECT
+1790350712701	2026-09-25T15:38:32.701Z	       concat('event.', event)   AS metric,
+1790350712701	2026-09-25T15:38:32.701Z	       toString(value)           AS value,
+1790350712701	2026-09-25T15:38:32.701Z	       ''                        AS description,
+1790350712701	2026-09-25T15:38:32.701Z	       'counter'                 AS type
+1790350712701	2026-09-25T15:38:32.701Z	   FROM system.events
+1790350712701	2026-09-25T15:38:32.701Z	   UNION ALL
+1790350712701	2026-09-25T15:38:32.701Z	   SELECT
+1790350712701	2026-09-25T15:38:32.701Z	       'metric.MemoryDictionaryBytesAllocated'  AS metric,
+1790350712701	2026-09-25T15:38:32.701Z	       toString(sum(bytes_allocated))           AS value,
+1790350712701	2026-09-25T15:38:32.701Z	       'Memory size allocated for dictionaries' AS description,
+1790350712701	2026-09-25T15:38:32.701Z	       'gauge'                                  AS type
+1790350712701	2026-09-25T15:38:32.701Z	   FROM system.dictionaries
+1790350712701	2026-09-25T15:38:32.701Z	   UNION ALL
+1790350712701	2026-09-25T15:38:32.701Z	   SELECT
+1790350712701	2026-09-25T15:38:32.701Z	          'metric.LongestRunningQuery' AS metric,
+1790350712701	2026-09-25T15:38:32.701Z	          toString(max(elapsed))       AS value,
+1790350712701	2026-09-25T15:38:32.701Z	          'Longest running query time' AS description,
+1790350712701	2026-09-25T15:38:32.701Z	          'gauge'                      AS type
+1790350712701	2026-09-25T15:38:32.701Z	   FROM system.processes
+1790350712701	2026-09-25T15:38:32.701Z	UNION ALL
+1790350712702	2026-09-25T15:38:32.702Z	SELECT
+1790350712702	2026-09-25T15:38:32.702Z	          'metric.ChangedSettingsHash'                  AS metric,
+1790350712702	2026-09-25T15:38:32.702Z	          toString(groupBitXor(cityHash64(name,value))) AS value,
+1790350712702	2026-09-25T15:38:32.702Z	          'Control sum for changed settings'            AS description,
+1790350712702	2026-09-25T15:38:32.702Z	          'gauge'                                       AS type
+1790350712702	2026-09-25T15:38:32.702Z	FROM system.settings WHERE changed
+1790350712702	2026-09-25T15:38:32.702Z	UNION ALL
+1790350712702	2026-09-25T15:38:32.702Z	SELECT
+1790350712702	2026-09-25T15:38:32.702Z	    concat('metric.SystemErrors_',name) AS metric,
+1790350712702	2026-09-25T15:38:32.702Z	    toString(sum(value))                AS value,
+1790350712702	2026-09-25T15:38:32.702Z	    'Error counter from system.errors'  AS description,
+1790350712702	2026-09-25T15:38:32.702Z		'counter'                           AS type
+1790350712702	2026-09-25T15:38:32.702Z	FROM system.errors
+1790350712702	2026-09-25T15:38:32.702Z	      GROUP BY name
+1790350712702	2026-09-25T15:38:32.702Z	W0925 15:38:32.701837       1 collector.go:64] Error [5.69758ms] querying system.metrics for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350712702	2026-09-25T15:38:32.702Z	E0925 15:38:32.701960       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL: SELECT
+1790350712702	2026-09-25T15:38:32.702Z		count() AS detached_parts,
+1790350712702	2026-09-25T15:38:32.702Z		database,
+1790350712702	2026-09-25T15:38:32.702Z		table,
+1790350712702	2026-09-25T15:38:32.702Z		disk,
+1790350712702	2026-09-25T15:38:32.702Z		if(coalesce(reason,'unknown')='','detached_by_user',coalesce(reason,'unknown')) AS detach_reason
+1790350712702	2026-09-25T15:38:32.702Z	FROM system.detached_parts
+1790350712702	2026-09-25T15:38:32.702Z	GROUP BY
+1790350712702	2026-09-25T15:38:32.702Z		database,
+1790350712702	2026-09-25T15:38:32.702Z		table,
+1790350712702	2026-09-25T15:38:32.702Z		disk,
+1790350712702	2026-09-25T15:38:32.702Z		reason
+1790350712702	2026-09-25T15:38:32.702Z	  
+1790350712702	2026-09-25T15:38:32.702Z	W0925 15:38:32.701967       1 collector.go:142] Error [9.289348ms] querying system.detached_parts for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350712702	2026-09-25T15:38:32.702Z	E0925 15:38:32.702198       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL: SELECT
+1790350712702	2026-09-25T15:38:32.702Z		database,
+1790350712702	2026-09-25T15:38:32.702Z		table,
+1790350712702	2026-09-25T15:38:32.702Z		count()          AS mutations,
+1790350712702	2026-09-25T15:38:32.702Z		sum(parts_to_do) AS parts_to_do
+1790350712702	2026-09-25T15:38:32.702Z	FROM system.mutations
+1790350712702	2026-09-25T15:38:32.702Z	WHERE is_done = 0
+1790350712702	2026-09-25T15:38:32.702Z	GROUP BY database, table
+1790350712702	2026-09-25T15:38:32.702Z	W0925 15:38:32.702206       1 collector.go:112] Error [4.817812ms] querying system.mutations for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350712702	2026-09-25T15:38:32.702Z	I0925 15:38:32.702166       1 collector.go:93] Extracted [7.080874ms] 0 system replicas for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712702	2026-09-25T15:38:32.702Z	I0925 15:38:32.702792       1 collector.go:138] Extracted [9.794394ms] 0 detached parts info for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712703	2026-09-25T15:38:32.703Z	I0925 15:38:32.703120       1 collector.go:108] Extracted [8.298851ms] 0 mutations for chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712703	2026-09-25T15:38:32.703Z	I0925 15:38:32.703303       1 collector.go:138] Extracted [10.09289ms] 0 detached parts info for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712703	2026-09-25T15:38:32.703Z	I0925 15:38:32.703538       1 collector.go:108] Extracted [9.522104ms] 0 mutations for chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712703	2026-09-25T15:38:32.703Z	I0925 15:38:32.703759       1 collector.go:138] Extracted [10.376945ms] 0 detached parts info for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712704	2026-09-25T15:38:32.704Z	I0925 15:38:32.704066       1 collector.go:123] Extracted [8.832722ms] 1 disks for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712705	2026-09-25T15:38:32.705Z	I0925 15:38:32.703790       1 collector.go:108] Extracted [8.64575ms] 0 mutations for chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712705	2026-09-25T15:38:32.705Z	I0925 15:38:32.704501       1 collector.go:123] Extracted [10.392191ms] 1 disks for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712705	2026-09-25T15:38:32.705Z	I0925 15:38:32.704929       1 collector.go:93] Extracted [10.981495ms] 0 system replicas for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712705	2026-09-25T15:38:32.705Z	I0925 15:38:32.705132       1 collector.go:75] Extracted [10.108578ms] 20 table sizes for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712705	2026-09-25T15:38:32.705Z	E0925 15:38:32.705908       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL: SELECT
+1790350712705	2026-09-25T15:38:32.705Z		database,
+1790350712706	2026-09-25T15:38:32.706Z		table,
+1790350712706	2026-09-25T15:38:32.706Z		'1' AS session_expired
+1790350712706	2026-09-25T15:38:32.706Z	FROM system.replicas
+1790350712706	2026-09-25T15:38:32.706Z	WHERE is_session_expired
+1790350712706	2026-09-25T15:38:32.706Z	W0925 15:38:32.705929       1 collector.go:97] Error [6.325817ms] querying system.replicas for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350712706	2026-09-25T15:38:32.706Z	I0925 15:38:32.706322       1 collector.go:93] Extracted [10.475613ms] 0 system replicas for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712711	2026-09-25T15:38:32.711Z	I0925 15:38:32.711145       1 collector.go:60] Extracted [17.588684ms] 1059 system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712713	2026-09-25T15:38:32.713Z	I0925 15:38:32.713774       1 collector.go:60] Extracted [18.87153ms] 865 system metrics for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350712721	2026-09-25T15:38:32.721Z	I0925 15:38:32.721770       1 collector.go:138] Extracted [29.390352ms] 1 detached parts info for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712722	2026-09-25T15:38:32.722Z	I0925 15:38:32.722283       1 collector.go:138] Extracted [30.042401ms] 0 detached parts info for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712722	2026-09-25T15:38:32.722Z	I0925 15:38:32.722592       1 collector.go:93] Extracted [28.012374ms] 0 system replicas for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712723	2026-09-25T15:38:32.723Z	I0925 15:38:32.723479       1 collector.go:75] Extracted [29.794613ms] 69 table sizes for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350712723	2026-09-25T15:38:32.723Z	I0925 15:38:32.723886       1 collector.go:93] Extracted [26.857601ms] 0 system replicas for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350712724	2026-09-25T15:38:32.724Z	I0925 15:38:32.724537       1 collector.go:123] Extracted [23.985336ms] 2 disks for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712729	2026-09-25T15:38:32.729Z	I0925 15:38:32.729149       1 collector.go:60] Extracted [34.895003ms] 1041 system metrics for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712736	2026-09-25T15:38:32.736Z	I0925 15:38:32.736813       1 collector.go:108] Extracted [40.739503ms] 0 mutations for chi-github-github-0-0.demo.svc.cluster.local.
+1790350712737	2026-09-25T15:38:32.737Z	I0925 15:38:32.737357       1 collector.go:123] Extracted [40.818036ms] 1 disks for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350712743	2026-09-25T15:38:32.743Z	I0925 15:38:32.743004       1 collector.go:123] Extracted [42.889902ms] 2 disks for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712744	2026-09-25T15:38:32.744Z	I0925 15:38:32.744266       1 collector.go:93] Extracted [46.145176ms] 0 system replicas for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712745	2026-09-25T15:38:32.745Z	I0925 15:38:32.745313       1 collector.go:123] Extracted [46.728088ms] 1 disks for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712746	2026-09-25T15:38:32.746Z	I0925 15:38:32.746248       1 collector.go:123] Extracted [46.191133ms] 1 disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712753	2026-09-25T15:38:32.753Z	I0925 15:38:32.753274       1 collector.go:108] Extracted [57.628457ms] 0 mutations for chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712754	2026-09-25T15:38:32.754Z	I0925 15:38:32.754571       1 collector.go:138] Extracted [61.697358ms] 0 detached parts info for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350712758	2026-09-25T15:38:32.758Z	I0925 15:38:32.758030       1 collector.go:60] Extracted [58.228798ms] 883 system metrics for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350712781	2026-09-25T15:38:32.781Z	I0925 15:38:32.781280       1 collector.go:60] Extracted [82.648976ms] 870 system metrics for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712795	2026-09-25T15:38:32.795Z	I0925 15:38:32.795780       1 collector.go:60] Extracted [95.498815ms] 1096 system metrics for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712802	2026-09-25T15:38:32.802Z	I0925 15:38:32.802207       1 poller.go:80] Poll():demo/0-0:OK demo/0-0
+1790350712802	2026-09-25T15:38:32.802Z	I0925 15:38:32.802458       1 worker-reconciler-chi.go:688] hostSoftwareRestart():Host:0-0[0/0]:demo/otel:Host software restart ok. Host: 0-0
+1790350712803	2026-09-25T15:38:32.803Z	I0925 15:38:32.803828       1 collector.go:108] Extracted [103.813749ms] 0 mutations for chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712804	2026-09-25T15:38:32.804Z	I0925 15:38:32.804185       1 collector.go:75] Extracted [104.275733ms] 19 table sizes for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712805	2026-09-25T15:38:32.805Z	I0925 15:38:32.805488       1 collector.go:60] Extracted [108.769407ms] 1186 system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350712805	2026-09-25T15:38:32.805Z	I0925 15:38:32.805852       1 collector.go:93] Extracted [105.898726ms] 0 system replicas for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350712807	2026-09-25T15:38:32.807Z	I0925 15:38:32.807061       1 collector.go:75] Extracted [112.687323ms] 119 table sizes for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350712827	2026-09-25T15:38:32.827Z	I0925 15:38:32.826806       1 collector.go:75] Extracted [126.354169ms] 202 table sizes for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350712835	2026-09-25T15:38:32.835Z	I0925 15:38:32.835656       1 collector.go:75] Extracted [137.847306ms] 34 table sizes for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350713142	2026-09-25T15:38:33.142Z	I0925 15:38:33.142135       1 collector.go:108] Extracted [441.493178ms] 0 mutations for chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350713144	2026-09-25T15:38:33.144Z	I0925 15:38:33.144095       1 collector.go:75] Extracted [444.93905ms] 83 table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350713155	2026-09-25T15:38:33.155Z	I0925 15:38:33.155817       1 exporter.go:80] Collect completed [463.888677ms]
+1790350742692	2026-09-25T15:39:02.692Z	I0925 15:39:02.692606       1 exporter.go:78] Collect started
+1790350742692	2026-09-25T15:39:02.692Z	I0925 15:39:02.692632       1 exporter.go:87] Launching host collectors [46.917µs]
+1790350742692	2026-09-25T15:39:02.692Z	I0925 15:39:02.692769       1 collector.go:133] Querying detached parts for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742693	2026-09-25T15:39:02.693Z	I0925 15:39:02.693298       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350742693	2026-09-25T15:39:02.693Z	I0925 15:39:02.693668       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742693	2026-09-25T15:39:02.693Z	I0925 15:39:02.693915       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350742694	2026-09-25T15:39:02.694Z	I0925 15:39:02.694160       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350742694	2026-09-25T15:39:02.694Z	I0925 15:39:02.694316       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742694	2026-09-25T15:39:02.694Z	I0925 15:39:02.694521       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742694	2026-09-25T15:39:02.694Z	I0925 15:39:02.694676       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742695	2026-09-25T15:39:02.695Z	I0925 15:39:02.694929       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742695	2026-09-25T15:39:02.695Z	I0925 15:39:02.695174       1 collector.go:133] Querying detached parts for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742695	2026-09-25T15:39:02.695Z	I0925 15:39:02.694169       1 collector.go:133] Querying detached parts for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742695	2026-09-25T15:39:02.695Z	I0925 15:39:02.695592       1 collector.go:133] Querying detached parts for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742695	2026-09-25T15:39:02.695Z	I0925 15:39:02.695853       1 collector.go:55] Querying system metrics for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742696	2026-09-25T15:39:02.696Z	I0925 15:39:02.696111       1 collector.go:70] Querying table sizes for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742696	2026-09-25T15:39:02.696Z	I0925 15:39:02.696466       1 collector.go:88] Querying system replicas for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742696	2026-09-25T15:39:02.696Z	E0925 15:39:02.696639       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL:   	SELECT
+1790350742696	2026-09-25T15:39:02.696Z	      	concat('metric.', metric) AS metric,
+1790350742696	2026-09-25T15:39:02.696Z	      	toString(value)           AS value,
+1790350742696	2026-09-25T15:39:02.696Z	      	''                        AS description,
+1790350742696	2026-09-25T15:39:02.696Z	      	'gauge'                   AS type
+1790350742696	2026-09-25T15:39:02.696Z	  	FROM merge('system','^(metrics|custom_metrics)$')
+1790350742696	2026-09-25T15:39:02.696Z	   UNION ALL
+1790350742696	2026-09-25T15:39:02.696Z	  	SELECT
+1790350742696	2026-09-25T15:39:02.696Z	      	concat('metric.', metric) AS metric,
+1790350742696	2026-09-25T15:39:02.696Z	      	toString(value)           AS value,
+1790350742696	2026-09-25T15:39:02.696Z	      	''                        AS description,
+1790350742696	2026-09-25T15:39:02.696Z	      	'gauge'                   AS type
+1790350742696	2026-09-25T15:39:02.696Z	  	FROM system.asynchronous_metrics
+1790350742696	2026-09-25T15:39:02.696Z	   UNION ALL
+1790350742696	2026-09-25T15:39:02.696Z	   SELECT
+1790350742696	2026-09-25T15:39:02.696Z	       concat('event.', event)   AS metric,
+1790350742696	2026-09-25T15:39:02.696Z	       toString(value)           AS value,
+1790350742696	2026-09-25T15:39:02.696Z	       ''                        AS description,
+1790350742696	2026-09-25T15:39:02.696Z	       'counter'                 AS type
+1790350742696	2026-09-25T15:39:02.696Z	   FROM system.events
+1790350742696	2026-09-25T15:39:02.696Z	   UNION ALL
+1790350742696	2026-09-25T15:39:02.696Z	   SELECT
+1790350742696	2026-09-25T15:39:02.696Z	       'metric.MemoryDictionaryBytesAllocated'  AS metric,
+1790350742696	2026-09-25T15:39:02.696Z	       toString(sum(bytes_allocated))           AS value,
+1790350742696	2026-09-25T15:39:02.696Z	       'Memory size allocated for dictionaries' AS description,
+1790350742696	2026-09-25T15:39:02.696Z	       'gauge'                                  AS type
+1790350742696	2026-09-25T15:39:02.696Z	   FROM system.dictionaries
+1790350742696	2026-09-25T15:39:02.696Z	   UNION ALL
+1790350742696	2026-09-25T15:39:02.696Z	   SELECT
+1790350742696	2026-09-25T15:39:02.696Z	          'metric.LongestRunningQuery' AS metric,
+1790350742696	2026-09-25T15:39:02.696Z	          toString(max(elapsed))       AS value,
+1790350742696	2026-09-25T15:39:02.696Z	          'Longest running query time' AS description,
+1790350742696	2026-09-25T15:39:02.696Z	          'gauge'                      AS type
+1790350742696	2026-09-25T15:39:02.696Z	   FROM system.processes
+1790350742696	2026-09-25T15:39:02.696Z	UNION ALL
+1790350742696	2026-09-25T15:39:02.696Z	SELECT
+1790350742696	2026-09-25T15:39:02.696Z	          'metric.ChangedSettingsHash'                  AS metric,
+1790350742696	2026-09-25T15:39:02.696Z	          toString(groupBitXor(cityHash64(name,value))) AS value,
+1790350742696	2026-09-25T15:39:02.696Z	          'Control sum for changed settings'            AS description,
+1790350742696	2026-09-25T15:39:02.696Z	          'gauge'                                       AS type
+1790350742696	2026-09-25T15:39:02.696Z	FROM system.settings WHERE changed
+1790350742696	2026-09-25T15:39:02.696Z	UNION ALL
+1790350742696	2026-09-25T15:39:02.696Z	SELECT
+1790350742696	2026-09-25T15:39:02.696Z	    concat('metric.SystemErrors_',name) AS metric,
+1790350742696	2026-09-25T15:39:02.696Z	    toString(sum(value))                AS value,
+1790350742696	2026-09-25T15:39:02.696Z	    'Error counter from system.errors'  AS description,
+1790350742696	2026-09-25T15:39:02.696Z		'counter'                           AS type
+1790350742696	2026-09-25T15:39:02.696Z	FROM system.errors
+1790350742696	2026-09-25T15:39:02.696Z	      GROUP BY name
+1790350742696	2026-09-25T15:39:02.696Z	W0925 15:39:02.696654       1 collector.go:64] Error [2.68252ms] querying system.metrics for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350742697	2026-09-25T15:39:02.697Z	E0925 15:39:02.697035       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL: SELECT
+1790350742697	2026-09-25T15:39:02.697Z		count() AS detached_parts,
+1790350742697	2026-09-25T15:39:02.697Z		database,
+1790350742697	2026-09-25T15:39:02.697Z		table,
+1790350742697	2026-09-25T15:39:02.697Z		disk,
+1790350742697	2026-09-25T15:39:02.697Z		if(coalesce(reason,'unknown')='','detached_by_user',coalesce(reason,'unknown')) AS detach_reason
+1790350742697	2026-09-25T15:39:02.697Z	FROM system.detached_parts
+1790350742697	2026-09-25T15:39:02.697Z	GROUP BY
+1790350742697	2026-09-25T15:39:02.697Z		database,
+1790350742697	2026-09-25T15:39:02.697Z		table,
+1790350742697	2026-09-25T15:39:02.697Z		disk,
+1790350742697	2026-09-25T15:39:02.697Z		reason
+1790350742697	2026-09-25T15:39:02.697Z	  
+1790350742697	2026-09-25T15:39:02.697Z	W0925 15:39:02.697346       1 collector.go:142] Error [3.988801ms] querying system.detached_parts for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350742697	2026-09-25T15:39:02.697Z	I0925 15:39:02.697416       1 collector.go:55] Querying system metrics for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742697	2026-09-25T15:39:02.697Z	I0925 15:39:02.695260       1 collector.go:103] Querying mutations for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742697	2026-09-25T15:39:02.697Z	I0925 15:39:02.694327       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350742697	2026-09-25T15:39:02.697Z	I0925 15:39:02.697059       1 collector.go:103] Querying mutations for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742698	2026-09-25T15:39:02.698Z	I0925 15:39:02.697858       1 collector.go:118] Querying disks for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742698	2026-09-25T15:39:02.698Z	I0925 15:39:02.695001       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742699	2026-09-25T15:39:02.699Z	I0925 15:39:02.694341       1 collector.go:118] Querying disks for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350742699	2026-09-25T15:39:02.699Z	I0925 15:39:02.694335       1 collector.go:103] Querying mutations for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350742699	2026-09-25T15:39:02.699Z	I0925 15:39:02.697094       1 collector.go:118] Querying disks for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742700	2026-09-25T15:39:02.700Z	I0925 15:39:02.697124       1 collector.go:55] Querying system metrics for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742700	2026-09-25T15:39:02.700Z	I0925 15:39:02.697132       1 collector.go:70] Querying table sizes for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742701	2026-09-25T15:39:02.701Z	I0925 15:39:02.697138       1 collector.go:88] Querying system replicas for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742701	2026-09-25T15:39:02.701Z	I0925 15:39:02.697224       1 collector.go:103] Querying mutations for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742701	2026-09-25T15:39:02.701Z	I0925 15:39:02.697231       1 collector.go:118] Querying disks for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742701	2026-09-25T15:39:02.701Z	I0925 15:39:02.697263       1 collector.go:55] Querying system metrics for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742701	2026-09-25T15:39:02.701Z	E0925 15:39:02.701837       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL: SELECT
+1790350742701	2026-09-25T15:39:02.701Z		database,
+1790350742701	2026-09-25T15:39:02.701Z		table,
+1790350742701	2026-09-25T15:39:02.701Z		count()          AS mutations,
+1790350742701	2026-09-25T15:39:02.701Z		sum(parts_to_do) AS parts_to_do
+1790350742701	2026-09-25T15:39:02.701Z	FROM system.mutations
+1790350742701	2026-09-25T15:39:02.701Z	WHERE is_done = 0
+1790350742701	2026-09-25T15:39:02.701Z	GROUP BY database, table
+1790350742701	2026-09-25T15:39:02.701Z	W0925 15:39:02.701857       1 collector.go:112] Error [2.2271ms] querying system.mutations for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350742702	2026-09-25T15:39:02.702Z	I0925 15:39:02.697269       1 collector.go:70] Querying table sizes for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742702	2026-09-25T15:39:02.702Z	E0925 15:39:02.702394       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL:   SELECT
+1790350742702	2026-09-25T15:39:02.702Z	      name,
+1790350742702	2026-09-25T15:39:02.702Z	         toString(free_space)  AS free_space,
+1790350742702	2026-09-25T15:39:02.702Z	toString(total_space) AS total_space
+1790350742702	2026-09-25T15:39:02.702Z	     FROM system.disks
+1790350742702	2026-09-25T15:39:02.702Z	     WHERE type IN ('local','Local')
+1790350742702	2026-09-25T15:39:02.702Z	W0925 15:39:02.702411       1 collector.go:127] Error [2.920502ms] querying system.disks for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350742702	2026-09-25T15:39:02.702Z	I0925 15:39:02.697274       1 collector.go:88] Querying system replicas for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742702	2026-09-25T15:39:02.702Z	E0925 15:39:02.702665       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL: SELECT
+1790350742702	2026-09-25T15:39:02.702Z		database,
+1790350742702	2026-09-25T15:39:02.702Z		table,
+1790350742702	2026-09-25T15:39:02.702Z		'1' AS session_expired
+1790350742702	2026-09-25T15:39:02.702Z	FROM system.replicas
+1790350742702	2026-09-25T15:39:02.702Z	WHERE is_session_expired
+1790350742702	2026-09-25T15:39:02.702Z	W0925 15:39:02.702682       1 collector.go:97] Error [3.754264ms] querying system.replicas for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350742702	2026-09-25T15:39:02.702Z	I0925 15:39:02.697285       1 collector.go:103] Querying mutations for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742703	2026-09-25T15:39:02.703Z	I0925 15:39:02.703058       1 collector.go:138] Extracted [7.777298ms] 0 detached parts info for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742703	2026-09-25T15:39:02.703Z	I0925 15:39:02.697291       1 collector.go:118] Querying disks for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742703	2026-09-25T15:39:02.703Z	E0925 15:39:02.697336       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL: SELECT
+1790350742703	2026-09-25T15:39:02.703Z		database,
+1790350742703	2026-09-25T15:39:02.703Z		table,
+1790350742703	2026-09-25T15:39:02.703Z		toString(active)                       AS active,
+1790350742703	2026-09-25T15:39:02.703Z		toString(uniq(partition))              AS partitions,
+1790350742703	2026-09-25T15:39:02.703Z		toString(count())                      AS parts,
+1790350742703	2026-09-25T15:39:02.703Z		toString(sum(bytes))                   AS bytes,
+1790350742703	2026-09-25T15:39:02.703Z		toString(sum(data_uncompressed_bytes)) AS uncompressed_bytes,
+1790350742703	2026-09-25T15:39:02.703Z		toString(sum(rows))                    AS rows,
+1790350742703	2026-09-25T15:39:02.703Z	       toString(sum(bytes_on_disk))           AS metric_DiskDataBytes,
+1790350742703	2026-09-25T15:39:02.703Z	       toString(sum(primary_key_bytes_in_memory_allocated)) AS metric_MemoryPrimaryKeyBytesAllocated
+1790350742703	2026-09-25T15:39:02.703Z	FROM system.parts
+1790350742703	2026-09-25T15:39:02.703Z	GROUP BY active, database, table
+1790350742703	2026-09-25T15:39:02.703Z	W0925 15:39:02.703456       1 collector.go:81] Error [9.254082ms] querying system.parts for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350742703	2026-09-25T15:39:02.703Z	I0925 15:39:02.697562       1 collector.go:70] Querying table sizes for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742704	2026-09-25T15:39:02.704Z	I0925 15:39:02.704376       1 collector.go:138] Extracted [11.596694ms] 1 detached parts info for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742704	2026-09-25T15:39:02.704Z	I0925 15:39:02.697570       1 collector.go:88] Querying system replicas for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742704	2026-09-25T15:39:02.704Z	I0925 15:39:02.697577       1 collector.go:103] Querying mutations for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742705	2026-09-25T15:39:02.705Z	I0925 15:39:02.697584       1 collector.go:118] Querying disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742705	2026-09-25T15:39:02.705Z	I0925 15:39:02.697590       1 collector.go:55] Querying system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742705	2026-09-25T15:39:02.705Z	I0925 15:39:02.697594       1 collector.go:70] Querying table sizes for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742705	2026-09-25T15:39:02.705Z	I0925 15:39:02.705770       1 collector.go:138] Extracted [10.4001ms] 0 detached parts info for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742706	2026-09-25T15:39:02.706Z	I0925 15:39:02.697599       1 collector.go:88] Querying system replicas for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742706	2026-09-25T15:39:02.706Z	I0925 15:39:02.697605       1 collector.go:103] Querying mutations for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742706	2026-09-25T15:39:02.706Z	I0925 15:39:02.697629       1 collector.go:118] Querying disks for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742706	2026-09-25T15:39:02.706Z	I0925 15:39:02.697710       1 collector.go:55] Querying system metrics for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742707	2026-09-25T15:39:02.707Z	I0925 15:39:02.697716       1 collector.go:70] Querying table sizes for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742707	2026-09-25T15:39:02.707Z	I0925 15:39:02.697722       1 collector.go:88] Querying system replicas for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742707	2026-09-25T15:39:02.707Z	I0925 15:39:02.697729       1 collector.go:103] Querying mutations for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742708	2026-09-25T15:39:02.708Z	I0925 15:39:02.695269       1 collector.go:118] Querying disks for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742708	2026-09-25T15:39:02.708Z	I0925 15:39:02.705594       1 collector.go:138] Extracted [11.131625ms] 0 detached parts info for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742708	2026-09-25T15:39:02.708Z	I0925 15:39:02.708779       1 collector.go:123] Extracted [8.903959ms] 2 disks for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742708	2026-09-25T15:39:02.708Z	I0925 15:39:02.708916       1 collector.go:108] Extracted [10.059626ms] 0 mutations for chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742709	2026-09-25T15:39:02.709Z	I0925 15:39:02.709311       1 collector.go:93] Extracted [14.151993ms] 0 system replicas for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742710	2026-09-25T15:39:02.710Z	I0925 15:39:02.709979       1 collector.go:123] Extracted [12.109009ms] 2 disks for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742710	2026-09-25T15:39:02.710Z	I0925 15:39:02.710551       1 collector.go:138] Extracted [14.835476ms] 0 detached parts info for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742711	2026-09-25T15:39:02.711Z	I0925 15:39:02.710579       1 collector.go:138] Extracted [12.357971ms] 0 detached parts info for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742711	2026-09-25T15:39:02.711Z	I0925 15:39:02.711788       1 collector.go:93] Extracted [10.816964ms] 0 system replicas for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742712	2026-09-25T15:39:02.712Z	I0925 15:39:02.712266       1 collector.go:108] Extracted [14.485919ms] 0 mutations for chi-github-github-0-0.demo.svc.cluster.local.
+1790350742712	2026-09-25T15:39:02.712Z	I0925 15:39:02.712890       1 collector.go:93] Extracted [16.254439ms] 0 system replicas for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742715	2026-09-25T15:39:02.715Z	I0925 15:39:02.715627       1 collector.go:60] Extracted [19.63229ms] 1096 system metrics for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742718	2026-09-25T15:39:02.718Z	I0925 15:39:02.718757       1 collector.go:60] Extracted [20.119604ms] 870 system metrics for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742730	2026-09-25T15:39:02.730Z	I0925 15:39:02.730727       1 collector.go:93] Extracted [23.010371ms] 0 system replicas for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742731	2026-09-25T15:39:02.731Z	I0925 15:39:02.731433       1 collector.go:123] Extracted [23.283981ms] 1 disks for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742732	2026-09-25T15:39:02.732Z	I0925 15:39:02.732011       1 collector.go:108] Extracted [30.825791ms] 0 mutations for chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742733	2026-09-25T15:39:02.733Z	I0925 15:39:02.733170       1 collector.go:123] Extracted [29.907762ms] 1 disks for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742737	2026-09-25T15:39:02.737Z	I0925 15:39:02.737856       1 collector.go:60] Extracted [32.490441ms] 1059 system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742746	2026-09-25T15:39:02.746Z	I0925 15:39:02.746698       1 collector.go:75] Extracted [46.074324ms] 34 table sizes for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742749	2026-09-25T15:39:02.749Z	I0925 15:39:02.749429       1 collector.go:60] Extracted [54.884686ms] 1189 system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742756	2026-09-25T15:39:02.756Z	I0925 15:39:02.755991       1 collector.go:75] Extracted [53.847846ms] 19 table sizes for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742762	2026-09-25T15:39:02.762Z	I0925 15:39:02.762348       1 collector.go:123] Extracted [57.175064ms] 1 disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742763	2026-09-25T15:39:02.763Z	I0925 15:39:02.763020       1 collector.go:108] Extracted [60.061769ms] 0 mutations for chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742764	2026-09-25T15:39:02.764Z	I0925 15:39:02.764142       1 collector.go:123] Extracted [57.399106ms] 1 disks for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742764	2026-09-25T15:39:02.764Z	I0925 15:39:02.764526       1 collector.go:138] Extracted [70.843049ms] 0 detached parts info for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742764	2026-09-25T15:39:02.764Z	I0925 15:39:02.764584       1 collector.go:93] Extracted [61.950447ms] 0 system replicas for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742765	2026-09-25T15:39:02.765Z	I0925 15:39:02.764975       1 collector.go:123] Extracted [63.540159ms] 1 disks for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742765	2026-09-25T15:39:02.765Z	I0925 15:39:02.765471       1 collector.go:108] Extracted [57.525933ms] 0 mutations for chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742767	2026-09-25T15:39:02.767Z	I0925 15:39:02.767106       1 collector.go:75] Extracted [70.872958ms] 202 table sizes for host chi-github-github-0-0.demo.svc.cluster.local.
+1790350742768	2026-09-25T15:39:02.768Z	I0925 15:39:02.768449       1 collector.go:60] Extracted [66.753291ms] 865 system metrics for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350742776	2026-09-25T15:39:02.776Z	I0925 15:39:02.776804       1 collector.go:75] Extracted [82.095741ms] 83 table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350742792	2026-09-25T15:39:02.792Z	I0925 15:39:02.792290       1 collector.go:60] Extracted [92.089701ms] 883 system metrics for host chi-stable-stable-0-0.demo.svc.cluster.local.
+1790350742815	2026-09-25T15:39:02.815Z	I0925 15:39:02.815506       1 collector.go:60] Extracted [108.478819ms] 1041 system metrics for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742842	2026-09-25T15:39:02.842Z	I0925 15:39:02.842582       1 collector.go:108] Extracted [137.651791ms] 0 mutations for chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742843	2026-09-25T15:39:02.843Z	I0925 15:39:02.843316       1 collector.go:93] Extracted [138.657107ms] 0 system replicas for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742844	2026-09-25T15:39:02.844Z	I0925 15:39:02.844062       1 collector.go:75] Extracted [138.378024ms] 69 table sizes for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742855	2026-09-25T15:39:02.855Z	I0925 15:39:02.855482       1 collector.go:75] Extracted [151.791058ms] 19 table sizes for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350742868	2026-09-25T15:39:02.868Z	I0925 15:39:02.867931       1 collector.go:75] Extracted [160.541268ms] 119 table sizes for host chi-clickhouse101-clickhouse101-0-0.demo.svc.cluster.local.
+1790350742879	2026-09-25T15:39:02.879Z	I0925 15:39:02.879294       1 collector.go:108] Extracted [172.771016ms] 0 mutations for chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742897	2026-09-25T15:39:02.897Z	I0925 15:39:02.897113       1 collector.go:93] Extracted [190.903121ms] 0 system replicas for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350742979	2026-09-25T15:39:02.979Z	I0925 15:39:02.979045       1 exporter.go:80] Collect completed [286.452849ms]
+1790350772692	2026-09-25T15:39:32.692Z	I0925 15:39:32.691772       1 exporter.go:78] Collect started
+1790350772692	2026-09-25T15:39:32.692Z	I0925 15:39:32.691798       1 exporter.go:87] Launching host collectors [32.181µs]
+1790350772692	2026-09-25T15:39:32.692Z	I0925 15:39:32.691977       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350772692	2026-09-25T15:39:32.692Z	I0925 15:39:32.692846       1 collector.go:118] Querying disks for host chi-swarm-swarm-1-0.demo.svc.cluster.local.
+1790350772693	2026-09-25T15:39:32.693Z	I0925 15:39:32.692467       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350772693	2026-09-25T15:39:32.693Z	I0925 15:39:32.693311       1 collector.go:88] Querying system replicas for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350772693	2026-09-25T15:39:32.693Z	I0925 15:39:32.693525       1 collector.go:55] Querying system metrics for host chi-antalya-antalya-0-0.demo.svc.cluster.local.
+1790350772694	2026-09-25T15:39:32.694Z	I0925 15:39:32.692345       1 collector.go:133] Querying detached parts for host chi-swarm-swarm-0-0.demo.svc.cluster.local.
+1790350772694	2026-09-25T15:39:32.694Z	I0925 15:39:32.692426       1 collector.go:133] Querying detached parts for host chi-otel-otel-0-0.demo.svc.cluster.local.
+1790350772694	2026-09-25T15:39:32.694Z	I0925 15:39:32.692433       1 collector.go:55] Querying system metrics for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350772694	2026-09-25T15:39:32.694Z	I0925 15:39:32.692439       1 collector.go:70] Querying table sizes for host chi-otel-otel-0-1.demo.svc.cluster.local.
+1790350772695	2026-09-25T15:39:32.695Z	E0925 15:39:32.695085       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL: SELECT
+1790350772695	2026-09-25T15:39:32.695Z		database,
+1790350772695	2026-09-25T15:39:32.695Z		table,
+1790350772695	2026-09-25T15:39:32.695Z		'1' AS session_expired
+1790350772695	2026-09-25T15:39:32.695Z	FROM system.replicas
+1790350772695	2026-09-25T15:39:32.695Z	WHERE is_session_expired
+1790350772695	2026-09-25T15:39:32.695Z	W0925 15:39:32.695249       1 collector.go:97] Error [1.488839ms] querying system.replicas for host chi-otel-otel-0-0.demo.svc.cluster.local. err: doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused
+1790350772695	2026-09-25T15:39:32.695Z	E0925 15:39:32.695480       1 connection.go:321] QueryContext():FAILED Query(http://clickhouse_operator:***@chi-otel-otel-0-0.demo.svc.cluster.local.:8123) doRequest: transport failed to send a request to ClickHouse: dial tcp 172.20.242.24:8123: connect: connection refused for SQL: SELECT
+1790350772695	2026-09-25T15:39:32.695Z		database,
+1790350772695	2026-09-25T15:39:32.695Z		table,
+1790350772695	2026-09-25T15:39:32.695Z		toString(active)                       AS active,
+1790350772695	2026-09-25T15:39:32.695Z		toString(uniq(partition))              AS partitions,
+1790350772695	2026-09-25T15:39:32.695Z		toString(count())                      AS parts,
+1790350772695	2026-09-25T15:39:32.695Z		toString(sum(bytes))                   AS bytes,
+1790350772695	2026-09-25T15:39:32.695Z		toString(sum(data_uncompressed_bytes)) AS uncompressed_bytes,
+1790350772695	2026-09-25T15:39:32.695Z		toString(sum(rows))                    AS rows,
+1790350772695	2026-09-25T15:39:32.695Z	       toString(sum(bytes_on_disk))           AS metric_DiskDataBytes,

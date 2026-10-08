@@ -1,0 +1,6 @@
+=== cas format byte/cap report (n=1000) ===
+cas_run            decompressed=     94103 bytes (n=1000)  stored=n/a (PinnedRaw, never compressed)  max_n_under_object_cap=n/a (object_cap=0: streamed one line at a time, never materialized whole)
+cas_ref_snap       decompressed=     94934 bytes (n=1000)  stored=3938 bytes (zstd)  max_n_under_object_cap=660207
+cas_part_manifest  decompressed=    101819 bytes (n=1000)  stored=3285 bytes (zstd)  max_n_under_object_cap=2622258
+cas_fold_seal      decompressed=     93880 bytes (n=1000)  stored=n/a (stored raw, no compression)  max_n_under_object_cap=2881746
+cas_ref_catalog    decompressed=     94185 bytes (n=1000)  stored=n/a (stored raw, no compression)  max_n_under_object_cap=2851448

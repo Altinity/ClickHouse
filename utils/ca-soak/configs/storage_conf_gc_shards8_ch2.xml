@@ -1,0 +1,44 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- gc_shards=8 variant for ch2: exercises Phase-4 sharded fold (blobs scatter across 2
+                 target shards; two replicas can reduce disjoint shards; one coordinator owns the
+                 global fence/seal). Identical to storage_conf_ch2.xml except gc_shards=8 and a
+                 more aggressive gc_interval_sec=2 for scenario runs. -->
+            <ca>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_server_root_id>ca_soak_ch2</cas_server_root_id>
+                <!-- Background reachability GC enabled on both servers, running aggressively. -->
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>2</cas_gc_interval_sec>
+                <!-- #4: widen shard fanout (default 8) so manifest CAS writes spread across more
+                     keys — drops per-key 64-permit congestion (503) and per-key overwrite-orphan
+                     pileup. Creation-time; the fresh per-run pool picks it up. -->
+                <!-- Phase-4 sharded fold: 2 blob-target reducer shards. Blobs hash-route to either
+                     gc/gen/<gen>/blob_target/0/ or gc/gen/<gen>/blob_target/1/; the two replicas
+                     can reduce disjoint shards. One coordinator owns the global fence+seal.
+                     Creation-time only (GcState::snap_shards written on first-ever acquire). -->
+                <cas_gc_shards>8</cas_gc_shards>
+                <!-- B187: rustfs honors Expect: 100-continue, so negotiate it for ALL conditional
+                     blob PUTs >= 64 KiB (not just the default >= 1 MiB). -->
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+            </ca>
+
+            <!-- Read-only fsck view over the SAME endpoint. -->
+        </disks>
+        <policies>
+            <ca>
+                <volumes>
+                    <main>
+                        <disk>ca</disk>
+                    </main>
+                </volumes>
+            </ca>
+        </policies>
+    </storage_configuration>
+</clickhouse>

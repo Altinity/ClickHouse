@@ -1,0 +1,380 @@
+# CA soak S12 ten-replica variant.
+#
+# Ten ClickHouse services (ch1..ch10) sharing ONE CA pool on RustFS, coordinated by a single-node
+# Keeper. Each service mounts its own per-node storage_conf (different server_root_id) and macros
+# (different {replica} macro) but all point at the same pool endpoint.
+#
+# To avoid the CA capability-probe race (two servers probing the same _probe/token key concurrently
+# get a 412 on the second prober), each node is gated on the previous node's health check: ch2
+# waits for ch1, ch3 waits for ch2, …, ch10 waits for ch9.
+#
+# Host-port mapping: ch1=8123, ch2=8124, ch3=8125, ch4=8126, ch5=8127,
+#                    ch6=8128, ch7=8129, ch8=8130, ch9=8131, ch10=8132.
+#
+# WARNING — harness wiring incomplete: the Cluster class in soak/cluster.py is hardcoded to
+# two nodes (node1/node2).  S12 keeps needs_infra set until a multi-node Cluster abstraction
+# is added.  This compose file exists so the infrastructure half is ready; see
+# scenarios/BACKLOG.md entry NEEDS-INFRA-S12 for the harness-wiring spec.
+#
+# Use via:
+#   docker compose -f docker-compose-10replicas.yml up -d / down -v
+
+services:
+  rustfs1:
+    image: rustfs/rustfs:1.0.0-rc.3
+    command: server --address 0.0.0.0:11121
+    env_file: configs/rustfs.env
+    expose:
+      - "11121"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  createbucket:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      - rustfs1
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set carustfs http://rustfs1:11121 clickhouse clickhouse; do
+        echo 'waiting for rustfs...'; sleep 1;
+      done;
+      /usr/bin/mc mb --ignore-existing carustfs/test;
+      until /usr/bin/mc ls carustfs/test >/dev/null 2>&1; do
+        echo 'waiting for bucket to become visible...'; sleep 1;
+      done;
+      echo 'bucket ready';
+      "
+
+  keeper1:
+    image: clickhouse/clickhouse-server:25.8
+    entrypoint: ["/usr/bin/clickhouse", "keeper", "--config-file", "/etc/clickhouse-keeper/keeper.xml"]
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/keeper.xml:/etc/clickhouse-keeper/keeper.xml:ro
+    expose:
+      - "9181"
+
+  ch1:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+    mem_limit: 8g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_ch1.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/fsck_only_ca.xml:/etc/clickhouse-server/fsck-only.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./logs/ch1:/var/log/clickhouse-server
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch2:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+      ch1:
+        condition: service_healthy
+    mem_limit: 8g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_ch2.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node2.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./logs/ch2:/var/log/clickhouse-server
+    ports:
+      - "8124:8123"
+      - "9002:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch3:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+      ch2:
+        condition: service_healthy
+    mem_limit: 8g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_10replicas_ch3.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node3.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./logs/ch3:/var/log/clickhouse-server
+    ports:
+      - "8125:8123"
+      - "9003:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch4:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+      ch3:
+        condition: service_healthy
+    mem_limit: 8g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_10replicas_ch4.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node4.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./logs/ch4:/var/log/clickhouse-server
+    ports:
+      - "8126:8123"
+      - "9004:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch5:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+      ch4:
+        condition: service_healthy
+    mem_limit: 8g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_10replicas_ch5.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node5.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./logs/ch5:/var/log/clickhouse-server
+    ports:
+      - "8127:8123"
+      - "9005:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch6:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+      ch5:
+        condition: service_healthy
+    mem_limit: 8g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_10replicas_ch6.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node6.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./logs/ch6:/var/log/clickhouse-server
+    ports:
+      - "8128:8123"
+      - "9006:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch7:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+      ch6:
+        condition: service_healthy
+    mem_limit: 8g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_10replicas_ch7.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node7.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./logs/ch7:/var/log/clickhouse-server
+    ports:
+      - "8129:8123"
+      - "9007:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch8:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+      ch7:
+        condition: service_healthy
+    mem_limit: 8g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_10replicas_ch8.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node8.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./logs/ch8:/var/log/clickhouse-server
+    ports:
+      - "8130:8123"
+      - "9008:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch9:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+      ch8:
+        condition: service_healthy
+    mem_limit: 8g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_10replicas_ch9.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node9.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./logs/ch9:/var/log/clickhouse-server
+    ports:
+      - "8131:8123"
+      - "9009:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch10:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+      ch9:
+        condition: service_healthy
+    mem_limit: 8g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_10replicas_ch10.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node10.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./logs/ch10:/var/log/clickhouse-server
+    ports:
+      - "8132:8123"
+      - "9010:9000"

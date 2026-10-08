@@ -1,0 +1,29 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- S12 10-replica variant, node 3. Identical to storage_conf_ch1.xml except
+                 server_root_id=ca_soak_ch3. -->
+            <ca>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_server_root_id>ca_soak_ch3</cas_server_root_id>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>10</cas_gc_interval_sec>
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+            </ca>
+        </disks>
+        <policies>
+            <ca>
+                <volumes>
+                    <main>
+                        <disk>ca</disk>
+                    </main>
+                </volumes>
+            </ca>
+        </policies>
+    </storage_configuration>
+</clickhouse>

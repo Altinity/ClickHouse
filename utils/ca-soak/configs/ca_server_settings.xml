@@ -1,0 +1,5 @@
+<clickhouse>
+    <!-- S18 (FREEZE/UNFREEZE scenario): SYSTEM UNFREEZE is disabled by default; the scenario needs
+         it to clean up its named snapshots. -->
+    <enable_system_unfreeze>1</enable_system_unfreeze>
+</clickhouse>

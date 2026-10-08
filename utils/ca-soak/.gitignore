@@ -1,0 +1,15 @@
+# Per-run docker logs preserved by scripts/run_phase1.sh before teardown.
+logs/
+# S41 isolated-stack (docker-compose-s41.yml) per-run server logs.
+logs_s41/
+# Scratch / downloaded artifacts.
+tmp/
+# Structured failure reproducer dumped by soak.run on a failed run.
+failure.json
+__pycache__/
+# Live AWS credentials for the real-S3 validation (docker-compose-awss3.yml). NEVER commit.
+configs/aws.env
+# Live GCS HMAC credentials for the real-GCS validation (docker-compose-gcs.yml). NEVER commit.
+configs/gcs.env
+# Rendered by framework.cluster_boot.render_tuned_config (soak-matrix config sweeps); run artifact.
+configs/storage_conf_tuned_ch*.xml

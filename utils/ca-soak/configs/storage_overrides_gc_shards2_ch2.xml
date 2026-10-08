@@ -1,0 +1,12 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <ca>
+                <cas_server_root_id>ca_soak_gc2_ch2</cas_server_root_id>
+            </ca>
+            <ca_ro>
+                <cas_server_root_id>ca_soak_gc2_ch2</cas_server_root_id>
+            </ca_ro>
+        </disks>
+    </storage_configuration>
+</clickhouse>

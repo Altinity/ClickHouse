@@ -1,0 +1,42 @@
+=== Diff Mode ===
+Match method: mangled_symbol
+
+--- Before ---
+Binary: ~/workspace/ClickHouse/cas-p2-before/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
+Function: DB::Cas::decodeRefCatalog(std::__1::basic_string_view<char, std::__1::char_traits<char> >)
+Build ID: 58769b4ef09b1f1b...
+Instructions: 1332  Bytes: 7085
+Spill: 27.1%  Branch: 16.2%  Call: 8.3%
+Blocks: 280  Loops: 5
+
++++ After +++
+Binary: build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
+Function: DB::Cas::decodeRefCatalog(std::__1::basic_string_view<char, std::__1::char_traits<char> >)
+Build ID: 8132ee5914cbf4d9...
+Instructions: 1342  Bytes: 6952
+Spill: 26.4%  Branch: 16.0%  Call: 8.3%
+Blocks: 280  Loops: 4
+
+=== Deltas ===
+  instruction_count: +10
+  byte_size: -133
+  branch_count: -1
+  call_count: +1
+  spill_store_count: -3
+  spill_load_count: -4
+  spill_density: -0.72%
+  branch_density: -0.20%
+  call_density: +0.01%
+  block_count: 0
+  loop_count: -1
+
+=== Timing ===
+  probe: 16ms
+  inspect_before: 5ms
+  resolve_before: 220ms
+  disassemble_before: 82ms
+  inspect_after: 7ms
+  resolve_after: 230ms
+  disassemble_after: 84ms
+  diff_total: 629ms
+

@@ -1,0 +1,9 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <ca>
+                <cas_gc_interval_sec>300</cas_gc_interval_sec>
+            </ca>
+        </disks>
+    </storage_configuration>
+</clickhouse>

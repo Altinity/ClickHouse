@@ -1,0 +1,48 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- Writable content-addressed disk over the shared RustFS pool. Both ch1 and ch2 load
+                 this same config, so they mount the SAME pool (one bucket path = single source of
+                 truth). RustFS is required (not MinIO) because the CA capability probe demands a
+                 store that ENFORCES conditional ops (wrong-token DELETE must fail with 412). -->
+            <ca>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <endpoint>http://s3proxy:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_server_root_id>ca_soak_ch1</cas_server_root_id>
+                <!-- Background reachability GC enabled on both servers, running aggressively. -->
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>10</cas_gc_interval_sec>
+                <!-- #4: widen shard fanout (default 8) so manifest CAS writes spread across more
+                     keys — drops per-key 64-permit congestion (503) and per-key overwrite-orphan
+                     pileup. Creation-time; the fresh per-run pool picks it up. -->
+                <!-- B187: rustfs honors Expect: 100-continue, so negotiate it for ALL conditional
+                     blob PUTs >= 64 KiB (not just the default >= 1 MiB). A dedup-hit conditional PUT
+                     (If-None-Match:* on an existing blob) then gets a clean early 412 instead of
+                     rustfs closing mid-body -> a transport Broken pipe -> the 500x5s retry storm that
+                     wedges the merge finalize. 64 KiB still spares the high-volume tiny manifest casPuts. -->
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+            </ca>
+
+            <!-- The read-only fsck view (ca_ro) is DELIBERATELY NOT here. A ca_ro disk over the SAME
+                 pool makes MergeTree part discovery find every part twice and fail table load with
+                 UNKNOWN_DISK on any server restart with CA tables attached (ROADMAP "Read-only fsck
+                 shadow disk breaks table load on restart"; confirmed on the RustFS stand 2026-07-06).
+                 It lives in `configs/fsck_only_ca.xml`, mounted at /etc/clickhouse-server/fsck-only.xml
+                 (OUTSIDE config.d), and is used only by `clickhouse disks -C .../fsck-only.xml`
+                 (soak/fsck.py). -->
+        </disks>
+        <policies>
+            <ca>
+                <volumes>
+                    <main>
+                        <disk>ca</disk>
+                    </main>
+                </volumes>
+            </ca>
+        </policies>
+    </storage_configuration>
+</clickhouse>
