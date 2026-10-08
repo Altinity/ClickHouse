@@ -53,11 +53,6 @@ bool DataSourceDescription::sameKind(const DataSourceDescription & other) const
         == std::tie(other.type, other.object_storage_type, other_description);
 }
 
-bool DataSourceDescription::canUseNativeCopyWith(const DataSourceDescription & other) const
-{
-    return files_are_whole_objects && other.files_are_whole_objects && sameKind(other);
-}
-
 String DataSourceDescription::name() const
 {
     switch (type)
@@ -73,9 +68,8 @@ String DataSourceDescription::name() const
 
 String DataSourceDescription::toString() const
 {
-    return fmt::format(
-        "{} (description = '{}', is_encrypted = {}, is_cached = {}, zookeeper_name = '{}', files_are_whole_objects = {})",
-        name(), description, is_encrypted, is_cached, zookeeper_name, files_are_whole_objects);
+    return fmt::format("{} (description = '{}', is_encrypted = {}, is_cached = {}, zookeeper_name = '{}')",
+                       name(), description, is_encrypted, is_cached, zookeeper_name);
 }
 
 ObjectStorageType objectStorageTypeFromString(const std::string & type)
