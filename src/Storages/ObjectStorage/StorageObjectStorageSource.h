@@ -191,6 +191,11 @@ public:
 private:
     ObjectInfoPtr createObjectInfoInArchive(const std::string & path_to_archive, const std::string & path_in_archive);
 
+    /// Fetch the next object. When `wait_for_retry` is set, a `retry_after_us` response is waited out
+    /// on this thread and another task is requested. The constructor prefetch passes false so one
+    /// waiting slot cannot hold back tasks the other slots already received.
+    ObjectInfoPtr takeNextObject(bool wait_for_retry);
+
     /// For Iceberg objects: resolve which storage the file lives in (possibly a secondary storage)
     /// from the raw metadata path and record it on the object. No-op for non-Iceberg objects.
     void resolveIcebergObjectStorageIfNeeded(const ObjectInfoPtr & object);

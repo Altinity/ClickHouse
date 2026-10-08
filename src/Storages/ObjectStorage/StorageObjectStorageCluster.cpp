@@ -9,6 +9,7 @@
 #include <Interpreters/Context.h>
 #include <TableFunctions/TableFunctionFactory.h>
 
+#include <Core/AntalyaProtocol.h>
 #include <Core/Settings.h>
 #include <Formats/FormatFactory.h>
 #include <Parsers/ASTSelectQuery.h>
@@ -51,6 +52,7 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
     extern const int INVALID_SETTING_VALUE;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace FailPoints
@@ -118,6 +120,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     , object_storage(object_storage_)
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
+    configuration->check(context_);
 
     const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto");
     const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && catalog;
@@ -183,7 +186,6 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
     else
         validateSupportedColumns(columns, *configuration);
-    configuration->check(context_);
 
     const bool need_resolve_sample_path = context_->getSettingsRef()[Setting::use_hive_partitioning]
         && !configuration->isDataLakeConfiguration()
@@ -627,16 +629,23 @@ public:
         task_distributor.rescheduleTasksFromReplica(number_of_current_replica);
     }
 
-    ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica) const override
+    ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica, UInt64 antalya_protocol_version) const override
     {
         fiu_do_on(FailPoints::storage_cluster_read_sleep,
         {
             sleepForSeconds(10);
         });
 
-        auto task = task_distributor.getNextTask(number_of_current_replica);
-        if (task)
-            return std::make_shared<ClusterFunctionReadTaskResponse>(std::move(task), context);
+        const bool worker_supports_task_retry = antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS;
+        auto task = task_distributor.getNextTask(number_of_current_replica, worker_supports_task_retry);
+        if (task.retry_after_us)
+        {
+            auto response = std::make_shared<ClusterFunctionReadTaskResponse>();
+            response->retry_after_us = task.retry_after_us;
+            return response;
+        }
+        if (task.object)
+            return std::make_shared<ClusterFunctionReadTaskResponse>(std::move(task.object), context);
         return std::make_shared<ClusterFunctionReadTaskResponse>();
     }
 
@@ -730,7 +739,7 @@ bool StorageObjectStorageCluster::isClusterSupported() const
     return configuration->isClusterSupported();
 }
 
-SinkToStoragePtr StorageObjectStorageCluster::writeFallBackToPure(
+SinkToStoragePtr StorageObjectStorageCluster::write(
     const ASTPtr & query,
     const StorageMetadataPtr & metadata_snapshot,
     ContextPtr context,
@@ -874,7 +883,7 @@ StorageMetadataHandle StorageObjectStorageCluster::getInMemoryMetadataPtr(Contex
     return IStorageCluster::getInMemoryMetadataPtr(context, bypass_metadata_cache);
 }
 
-IDataLakeMetadata * StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
+std::shared_ptr<IDataLakeMetadata> StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
 {
     if (getClusterName(query_context).empty())
         return pure_storage->getExternalMetadata(query_context);
