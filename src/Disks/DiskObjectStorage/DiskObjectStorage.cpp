@@ -59,6 +59,7 @@ namespace ErrorCodes
 {
     extern const int INCORRECT_DISK_INDEX;
     extern const int CANNOT_RMDIR;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace
@@ -331,7 +332,8 @@ void DiskObjectStorage::copyFile( /// NOLINT
     const std::function<void()> & cancellation_hook)
 {
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorage::copyFile");
-    if (getDataSourceDescription() == to_disk.getDataSourceDescription())
+    if (getDataSourceDescription() == to_disk.getDataSourceDescription()
+        && !isContentAddressed() && !to_disk.isContentAddressed())
     {
         /// It may use s3-server-side copy
         auto & to_disk_object_storage = dynamic_cast<DiskObjectStorage &>(to_disk);
@@ -878,12 +880,16 @@ void DiskObjectStorage::prepareRead(
     if (metadata_storage->isContentAddressed())
     {
         const auto * ca = dynamic_cast<const IContentAddressedExchange *>(metadata_storage.get());
-        if (ca)
-        {
-            if (ca->prepareInManifestRead(path, settings, pipeline))
-                return;
-            ca_blob_view = ca->getBlobViewPlan(path);
-        }
+        if (!ca)
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Metadata storage of disk {} reports itself content-addressed but does not implement "
+                "IContentAddressedExchange, so the payload window of {} cannot be resolved",
+                getName(), path);
+
+        if (ca->prepareInManifestRead(path, settings, pipeline))
+            return;
+        ca_blob_view = ca->getBlobViewPlan(path);
     }
 
     const auto storage_objects = ca_blob_view

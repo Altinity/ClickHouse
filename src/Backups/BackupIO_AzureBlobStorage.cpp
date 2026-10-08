@@ -126,7 +126,8 @@ void BackupReaderAzureBlobStorage::copyFileToDisk(const String & path_in_backup,
     auto destination_data_source_description = destination_disk->getDataSourceDescription();
     LOG_TRACE(log, "Source description {}, destination description {}", data_source_description.description, destination_data_source_description.description);
     if (destination_data_source_description.object_storage_type == ObjectStorageType::Azure
-        && destination_data_source_description.is_encrypted == encrypted_in_backup)
+        && destination_data_source_description.is_encrypted == encrypted_in_backup
+        && !destination_disk->isContentAddressed())
     {
         LOG_TRACE(log, "Copying {} from AzureBlobStorage to disk {}", path_in_backup, destination_disk->getName());
         auto write_blob_function = [&](const Strings & dst_blob_path, WriteMode mode, const std::optional<ObjectAttributes> &) -> size_t
@@ -203,7 +204,8 @@ void BackupWriterAzureBlobStorage::copyFileFromDisk(
     auto source_data_source_description = src_disk->getDataSourceDescription();
     LOG_TRACE(log, "Source description {}, destination description {}", source_data_source_description.description, data_source_description.description);
     if (source_data_source_description.object_storage_type == ObjectStorageType::Azure
-        && source_data_source_description.is_encrypted == copy_encrypted)
+        && source_data_source_description.is_encrypted == copy_encrypted
+        && !src_disk->isContentAddressed())
     {
         /// getBlobPath() can return more than 2 elements if the file is stored as multiple objects in AzureBlobStorage container.
         /// In this case we can't use the native copy.

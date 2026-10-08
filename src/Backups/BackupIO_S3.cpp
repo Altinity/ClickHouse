@@ -16,6 +16,8 @@
 #include <IO/S3/Credentials.h>
 #include <IO/S3/getObjectInfo.h>
 #include <Disks/IDisk.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 
 #include <Poco/Util/AbstractConfiguration.h>
 
@@ -462,7 +464,8 @@ void BackupReaderS3::copyToDiskImpl(const String & path_in_backup, size_t offset
     /// We don't check for `has_throttling` here because the native copy almost doesn't use network.
     auto destination_data_source_description = destination_disk->getDataSourceDescription();
     if (destination_data_source_description.sameKind(data_source_description)
-        && (destination_data_source_description.is_encrypted == encrypted_in_backup))
+        && (destination_data_source_description.is_encrypted == encrypted_in_backup)
+        && !destination_disk->isContentAddressed())
     {
         LOG_TRACE(log, "Copying {} from S3 to disk {}", path_in_backup, destination_disk->getName());
         auto write_blob_function = [&](const Strings & blob_path, WriteMode mode, const std::optional<ObjectAttributes> & object_attributes) -> size_t
@@ -572,6 +575,40 @@ void BackupWriterS3::copyFileFromDisk(
         /// In this case we can't use the native copy.
         if (auto blob_path = src_disk->getBlobPath(src_path); blob_path.size() == 2)
         {
+            std::optional<IContentAddressedExchange::BlobViewPlan> ca_plan;
+            if (src_disk->isContentAddressed())
+            {
+                if (blob_path[0].empty())
+                {
+                    LOG_TRACE(
+                        log,
+                        "Copying file {} from content-addressed disk {} to S3 through buffers: the file is stored in the manifest",
+                        src_path,
+                        src_disk->getName());
+                    BackupWriterDefault::copyFileFromDisk(path_in_backup, src_disk, src_path, copy_encrypted, start_pos, length);
+                    return;
+                }
+
+                auto * ca = tryGetContentAddressedExchange(src_disk);
+                if (!ca)
+                    throw Exception(
+                        ErrorCodes::LOGICAL_ERROR,
+                        "Disk {} is content-addressed but does not implement IContentAddressedExchange",
+                        src_disk->getName());
+
+                ca_plan = ca->getBlobViewPlan(src_path);
+                if (!ca_plan)
+                {
+                    LOG_TRACE(
+                        log,
+                        "Copying file {} from content-addressed disk {} to S3 through buffers: the file is not a blob",
+                        src_path,
+                        src_disk->getName());
+                    BackupWriterDefault::copyFileFromDisk(path_in_backup, src_disk, src_path, copy_encrypted, start_pos, length);
+                    return;
+                }
+            }
+
             LOG_TRACE(log, "Copying file {} from disk {} to S3", src_path, src_disk->getName());
 
             auto src_client = disk_client_factory.getOrCreate(src_disk);
@@ -579,6 +616,9 @@ void BackupWriterS3::copyFileFromDisk(
             auto create_read_buffer = [&, this]
             {
                 LOG_TRACE(log, "Falling back to copy file {} from disk {} to S3 through buffers", src_path, src_disk->getName());
+
+                if (ca_plan)
+                    return src_disk->getObjectStorage()->readObject(ca_plan->object, read_settings);
 
                 if (copy_encrypted)
                     return src_disk->readEncryptedFile(src_path, read_settings);
@@ -589,9 +629,10 @@ void BackupWriterS3::copyFileFromDisk(
             /// A copy is whole-object only if it covers the entire source; `start_pos != 0` is not a sound
             /// test, because a prefix [0, length) of a bigger file is a range too. `length` counts the bytes
             /// actually copied, so an encrypted source must be measured with its encrypted size.
-            const size_t source_size
-                = copy_encrypted ? src_disk->getEncryptedFileSize(src_path) : src_disk->getFileSize(src_path);
-            const bool whole_object = (start_pos == 0) && (length == source_size);
+            const size_t src_offset = ca_plan ? ca_plan->payload_offset + start_pos : start_pos;
+            const size_t source_size = ca_plan ? ca_plan->object.bytes_size
+                : (copy_encrypted ? src_disk->getEncryptedFileSize(src_path) : src_disk->getFileSize(src_path));
+            const bool whole_object = (src_offset == 0) && (length == source_size);
 
             if (whole_object)
                 copyS3File(
@@ -601,7 +642,7 @@ void BackupWriterS3::copyFileFromDisk(
                     s3_settings.request_settings, read_settings, blob_storage_log, runner, create_read_buffer);
             else
                 copyS3FileRange(
-                    src_client, /* src_bucket */ blob_path[1], /* src_key */ blob_path[0], start_pos, length,
+                    src_client, /* src_bucket */ blob_path[1], /* src_key */ blob_path[0], src_offset, length,
                     /* src_object_size= */ source_size,
                     /* dest_s3_client */ client, /* dest_bucket */ s3_uri.bucket,
                     /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
