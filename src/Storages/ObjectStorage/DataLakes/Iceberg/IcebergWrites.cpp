@@ -725,6 +725,8 @@ void generateManifestFile(
 
     auto adapter = std::make_unique<OutputStreamWriteBufferAdapter>(buf);
     avro::DataFileWriter<avro::GenericDatum> writer(std::move(adapter), schema);
+    /// Avro C++ `toJson` drops unknown logical types such as Iceberg `timestamp-nanos`.
+    writer.setMetadata("avro.schema", schema_representation);
     writer.setMetadata(Iceberg::f_schema, json_representation);
     writer.setMetadata(Iceberg::f_format_version, std::to_string(version));
 
