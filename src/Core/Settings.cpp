@@ -5554,9 +5554,9 @@ Possible values:
 - manifest_file_entry - Everything above + traversed avro manifest files entries.
 )", 0) \
     \
-    DECLARE(Bool, iceberg_delete_data_on_drop, false, R"(
-Whether to delete all iceberg files on drop or not.
-)", 0) \
+    DECLARE_WITH_ALIAS(Bool, data_lake_delete_data_on_drop, false, R"(
+Whether to delete the underlying data files when dropping a data lake table. For catalog databases the catalog is asked to purge the data (`purgeRequested=true`); for self-managed tables ClickHouse removes the files directly.
+)", 0, iceberg_delete_data_on_drop) \
     DECLARE(Int64, iceberg_expire_default_min_snapshots_to_keep, 1, R"(
 Default value for Iceberg table property `history.expire.min-snapshots-to-keep` used by `expire_snapshots` when that property is absent.
 )", 0) \
@@ -7657,6 +7657,10 @@ Allow experimental database engine DataLakeCatalog with catalog_type = 'iceberg'
 
 Cloud default value: `1`.
 )", BETA, allow_database_iceberg) \
+    DECLARE(Bool, datalake_ignore_unsupported_table_properties, false, R"(
+Allow `CREATE TABLE`, `CREATE TABLE ... AS`, and `SHOW CREATE TABLE` in a `DataLakeCatalog` database to omit unsupported table properties, including explicitly specified and inherited properties. Supported properties are preserved. By default, properties that cannot be represented cause an exception.
+This setting does not suppress invalid expressions, unknown columns, invalid transform arguments, or incompatible storage engines, endpoints, and credentials.
+)", BETA) \
     DECLARE_WITH_ALIAS(Bool, allow_experimental_database_unity_catalog, true, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'unity'
 
@@ -8353,6 +8357,12 @@ Trigger processor to spill data into external storage adpatively. grace join is 
 )", EXPERIMENTAL) \
     DECLARE(String, object_storage_cluster, "", R"(
 Cluster to make distributed requests to object storages with alternative syntax.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, object_storage_cluster_fallback_to_local_if_empty, false, R"(
+Execute the read locally if 'object_storage_cluster' is set but the cluster is empty or unknown.
+Does not apply to explicit *Cluster table functions, to 'object_storage_remote_initiator_cluster', or to writes.
+With remote initiator + remote_initiator_cluster, the initiator sends plain s3()/iceberg() and passes
+object_storage_cluster as a query setting so the remote can resolve or fall back (OSC may be unknown locally).
 )", EXPERIMENTAL) \
     DECLARE(UInt64, object_storage_max_nodes, 0, R"(
 Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.

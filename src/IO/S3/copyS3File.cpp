@@ -640,8 +640,32 @@ namespace
         void performCopy()
         {
             LOG_TEST(log, "Copy object {} to {} using native copy", src_key, dest_key);
-            bool use_single_operation_copy = !supports_multipart_copy || !request_settings[S3RequestSetting::allow_multipart_copy]
-                || (size <= request_settings[S3RequestSetting::max_single_operation_copy_size]);
+
+            const bool multipart_copy_available
+                = supports_multipart_copy && request_settings[S3RequestSetting::allow_multipart_copy];
+
+            if (offset != 0 && !multipart_copy_available)
+            {
+                if (!allow_fallback)
+                    throw Exception(
+                        ErrorCodes::NOT_IMPLEMENTED,
+                        "Cannot copy a byte range of object {} server-side: only UploadPartCopy can express a "
+                        "range, and multipart copy is unavailable",
+                        src_key);
+
+                LOG_DEBUG(
+                    log,
+                    "Multipart copy is unavailable, so the byte range [{}, {}) of {} cannot be copied "
+                    "server-side, will copy through the server instead",
+                    offset,
+                    offset + size,
+                    src_key);
+                fallback_method();
+                return;
+            }
+
+            const bool use_single_operation_copy = offset == 0
+                && (!multipart_copy_available || (size <= request_settings[S3RequestSetting::max_single_operation_copy_size]));
 
             if (use_single_operation_copy)
                 performSingleOperationCopy();

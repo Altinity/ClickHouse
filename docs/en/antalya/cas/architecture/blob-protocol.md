@@ -143,15 +143,15 @@ sequenceDiagram
     end
 
     Note over GC: round n+1 -- graduation, only if still zero
-    GC->>S3: re-verify in-degree, requires confirmed durable Condemned evidence for hash+token t1
-    Note over GC: publishes delete_pending
+    GC->>S3: re-verify in-degree, then GET .meta
+    Note over GC: Condemned at round n or newer -- publishes delete_pending
 
     Note over GC: round n+2 -- the single content-delete site
     GC->>S3: deleteExact(blob, t1)
     alt writer republished
         S3-->>GC: TokenMismatch -- nothing deleted, blob is live at t2
     else genuinely dead
-        S3-->>GC: Deleted -- then drop the .meta
+        S3-->>GC: Deleted -- then drop the .meta only while it is still Condemned at round n or older
     end
 ```
 
@@ -170,9 +170,13 @@ Why this closes the race in both directions:
   `TokenMismatch` and reclaims nothing — the delete names an exact incarnation, never "the object
   at this key".
 - The delete lags condemnation by at least two full rounds, and publishing the one edge that
-  authorizes an irreversible delete requires confirmed durable `Condemned` evidence for that
-  exact `(hash, token)` pair. Without it `GC` never throws — it carries the entry and retries the
-  marker write on the next round.
+  authorizes an irreversible delete requires reading the blob's `.meta` and finding it `Condemned`
+  at the entry's round or newer. A `Clean`, absent, older-round or unreadable marker never
+  graduates the entry: `GC` does not throw, it carries the entry and rewrites the marker at the
+  current round.
+- The delete job removes the `.meta` only while it is still `Condemned` at the entry's round or
+  older, and conditionally on the version it read. A marker rewritten `Clean` by a writer, or
+  condemned again at a later round, stays.
 
 Both directions degrade to a spurious re-upload or a no-op delete. Neither can lose data or leave
 a dangling manifest entry.

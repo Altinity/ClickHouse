@@ -380,13 +380,13 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
     {
         const String meta = readLine(in, line_cap, "fold seal");
         ReadBufferFromMemory m(meta.data(), meta.size());
-        JsonObjectReader r(m, KeyStrictness::Strict, "fold seal");
+        JsonObjectReader r(m, "fold seal");
         String key;
         while (r.nextKey(key))
         {
             if (key == FoldSealWire::generation) seal.generation = r.readU64String();
             else if (key == FoldSealWire::parent_generation) seal.parent_generation = r.readU64String();
-            else r.skipUnknown(key);   /// Strict => any unknown key is CORRUPTED_DATA
+            else r.skipUnknown(key);
         }
     }
 
@@ -400,7 +400,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
     {
         readLineInto(in, row_line, line_cap, "fold seal");
         ReadBufferFromMemory l(row_line.data(), row_line.size());
-        row_reader.reset(l, KeyStrictness::Strict, "fold seal");
+        row_reader.reset(l, "fold seal");
         JsonObjectReader & r = row_reader;
         String key;
         if (!r.nextKey(key))
@@ -409,8 +409,8 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
         if (key == "n")
         {
             const uint64_t n = r.readU64Number();
-            if (r.nextKey(key))
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: trailer has extra keys");
+            while (r.nextKey(key))
+                r.skipUnknown(key);
             if (!l.eof() || !in.eof())
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: bytes after trailer");
             if (n != seen)
@@ -458,7 +458,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 else if (key == FoldSealWire::retry_round) hold_next_retry_round = r.readU64String();
                 else if (key == FoldSealWire::remove_epoch) remove_txn_epoch = r.readU64String();
                 else if (key == FoldSealWire::remove_seq) remove_txn_sequence = r.readU64String();
-                else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown ref_life key '{}'", key);
+                else r.skipUnknown(key);
             }
 
             if (!life_id || *life_id == 0)
@@ -539,7 +539,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 else if (key == FoldSealWire::checksum) checksum = r.readHex128();
                 else if (key == FoldSealWire::shard) shard = r.readU64Number();
                 else if (key == FoldSealWire::key_generation) generation = r.readU64String();
-                else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown run key '{}'", key);
+                else r.skipUnknown(key);
             }
             if (!run_key || !checksum || !shard || !generation)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -559,7 +559,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
                 else if (key == FoldSealWire::condemned_total) condemned_total = r.readU64Number();
                 else if (key == FoldSealWire::pending_total) pending_total = r.readU64Number();
                 else if (key == FoldSealWire::oldest_round) oldest_nonpending_condemn_round = r.readU64String();
-                else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown condemned key '{}'", key);
+                else r.skipUnknown(key);
             }
             if (!shard || !condemned_total || !pending_total || !oldest_nonpending_condemn_round)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,

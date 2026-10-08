@@ -380,6 +380,11 @@ public:
     virtual void removeObjectsIfExistUnderProfile(
         const StoredObjects & objects, const ObjectStorageControlRequest & request);
 
+    /// The most objects one `removeObjectsIfExistUnderProfile` call sends as one request; at least 1.
+    /// Callers cut their batches to this size, so one call stays one storage request. The default
+    /// suits a storage without a batch delete.
+    virtual size_t batchDeleteKeyLimit() const { return 1; }
+
     /// Copy object with different attributes if required
     virtual void copyObject( /// NOLINT
         const StoredObject & object_from,
