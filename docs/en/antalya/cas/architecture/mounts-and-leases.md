@@ -238,6 +238,11 @@ including while an older generation is active. Before renewer replacement, remou
 is in flight. A successful remount handles only its snapshotted generation; a newer request is
 processed before renewal resumes.
 
+The renewal worker does not fail on the server memory limit. Its allocations still count toward
+`max_server_memory_usage`, but a server above that limit keeps renewing its mount lease. A
+`std::bad_alloc` still ends the renewal. Conditional writes upload on the thread that issues them. Their
+write buffer opens at the object's size, capped at 1 MiB, and grows for a larger object.
+
 **Clean unmount:** request stop and join both persistent workers, drain the ref lanes, and only if
 the drain *certified* quiescence call `MountLeaseRenewer::release` on an `Active` renewer to write the
 terminal farewell (`expires_at_ms` already expired, `min_active_build_sequence = UINT64_MAX`). That sentinel is what

@@ -1,7 +1,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Common/Exception.h>
+<<<<<<< HEAD
 #include <Common/ProfileEvents.h>
+=======
+#include <Common/LockMemoryExceptionInThread.h>
+>>>>>>> d76b59f92952 (Merge pull request #2511 from Altinity/fix/antalya-26.6/cas-renewal-memory-guard)
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
@@ -644,6 +648,9 @@ void CasMountRuntime::startBackgroundWorkers(std::chrono::milliseconds period)
 void CasMountRuntime::renewalLoop()
 {
     setThreadName(ThreadName::CAS_LEASE_RENEWER);
+    /// The tracker still counts this thread's allocations but never throws on them: a renewal must not
+    /// fail on the server memory limit. `Global`, because a `User`-level lock leaves that limit enforced.
+    LockMemoryExceptionInThread memory_exception_lock(VariableContext::Global);
     {
         std::unique_lock lock(driver_mutex);
         driver_cv.wait(lock, [this] { return worker_loops_released; });

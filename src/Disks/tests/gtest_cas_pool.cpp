@@ -11,6 +11,10 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
+#include <Common/CurrentMemoryTracker.h>
+#include <Common/CurrentThread.h>
+#include <Common/MemoryTracker.h>
+#include <base/scope_guard.h>
 #include <Common/logger_useful.h>
 #include <Poco/Exception.h>
 #include <Poco/StreamChannel.h>
@@ -21,6 +25,7 @@
 #include <latch>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -37,6 +42,7 @@ extern const int UNKNOWN_FORMAT_VERSION;
 extern const int FILE_DOESNT_EXIST;
 extern const int UNKNOWN_EXCEPTION;
 extern const int NETWORK_ERROR;
+extern const int MEMORY_LIMIT_EXCEEDED;
 }
 
 namespace ProfileEvents
@@ -2008,6 +2014,8 @@ public:
         LandThenThrow,
         BlockThenDelegate,
         BlockThenThrow,
+        ThrowMemoryLimitExceeded,
+        ThrowBadAlloc,
     };
 
     Fault fault = Fault::None;
@@ -2033,6 +2041,10 @@ public:
                 throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "runtime renewal barrier is absent");
             barrier->arriveAndWait();
         }
+        if (current == Fault::ThrowMemoryLimitExceeded)
+            throw DB::Exception(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, "injected memory limit exceeded on the renewal request");
+        if (current == Fault::ThrowBadAlloc)
+            throw std::bad_alloc();
         if (current == Fault::ThrowBefore || current == Fault::BlockThenThrow)
         {
             if (before_throw)
@@ -3570,6 +3582,208 @@ TEST(CASPoolRemount, TeardownJoinsBothWorkersBeforeRelease)
     runtime.finishTeardown(true);
     EXPECT_EQ(decodeMountLease(readObj(*backend, layout.mountKey("test"))->bytes).min_active_build_sequence,
               std::numeric_limits<uint64_t>::max());
+}
+
+/// The memory guard on the lease thread does not absorb `std::bad_alloc`: the renewal ends terminally
+/// and the mount lease is lost.
+TEST(CASMountRuntime, BadAllocInsideTheRenewalStaysTerminal)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-bad-alloc");
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
+
+    String outcome;
+    String classification;
+    DB::Cas::tests::ManualBarrier reported;
+    CasEventSink sink = [&](CasEvent event)
+    {
+        if (event.type != CasEventType::WatermarkRenew || !outcome.empty())
+            return;
+        outcome = event.outcome;
+        classification = event.detail["classification"];
+        reported.arriveAndWait();
+    };
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{.mount_lease_ttl_ms = std::chrono::milliseconds(1000), .background_watermark = true,
+                    .boot_ms_fn = [&] { return boot_ms; }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    /// Declared after the runtime so it runs first: a failed expectation must not leave the lease thread
+    /// parked on the barrier while the runtime's destructor joins it.
+    SCOPE_EXIT({ reported.release(); });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(uuid, 1, anchor + 1000);
+    const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+
+    backend->fault = RuntimeRenewBackend::Fault::ThrowBadAlloc;
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+
+    reported.waitUntilArrived();
+    EXPECT_EQ(outcome, "failed");
+    EXPECT_EQ(classification, "deterministic_failure");
+    EXPECT_FALSE(runtime.mayMutate());
+    EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::TransientNotLive);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), leases_lost_before + 1);
+
+    reported.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
+}
+
+namespace
+{
+
+/// Larger than the untracked batch a thread keeps before it reports to its tracker, so the allocation
+/// reaches the trackers at once.
+constexpr Int64 kOverLimitAllocationBytes = 8 * 1024 * 1024;
+
+struct OverLimitAllocation
+{
+    /// What the tracker threw; empty when it did not throw.
+    String failure;
+    /// How much this thread's own tracker grew by the allocation.
+    Int64 counted = 0;
+};
+
+/// One allocation through the enforcing tracker path while a `Global`-level tracker above this thread is
+/// over its hard limit. That tracker is spliced in between this thread's tracker and its parent rather than
+/// lowering `total_memory_tracker`'s limit, so no other thread's allocation can hit the limit.
+OverLimitAllocation allocateOverTheGlobalLimit()
+{
+    DB::CurrentThread::flushUntrackedMemory();
+    MemoryTracker & thread_tracker = *DB::CurrentThread::getMemoryTracker();
+    MemoryTracker * const parent = thread_tracker.getParent();
+    MemoryTracker over_limit(parent, VariableContext::Global);
+    over_limit.setHardLimit(1);
+    thread_tracker.setParent(&over_limit);
+    SCOPE_EXIT({ thread_tracker.setParent(parent); });
+
+    OverLimitAllocation result;
+    const Int64 before = thread_tracker.get();
+    try
+    {
+        std::ignore = CurrentMemoryTracker::alloc(kOverLimitAllocationBytes);
+    }
+    catch (...)
+    {
+        result.failure = DB::getCurrentExceptionMessage(/*with_stacktrace=*/false);
+        return result;
+    }
+    result.counted = thread_tracker.get() - before;
+    std::ignore = CurrentMemoryTracker::free(kOverLimitAllocationBytes);
+    return result;
+}
+
+}
+
+/// With a `Global`-level tracker over its hard limit, allocations on the lease thread at the loop head
+/// (before the admission section), before the request, inside it and while its result is consumed do not
+/// throw and are still counted. The thread goes on
+/// to its next renewal and the mount stays live. A `MEMORY_LIMIT_EXCEEDED` from the first attempt is
+/// retried.
+TEST(CASMountRuntime, GlobalMemoryLimitDoesNotEndTheLeaseThread)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-global-memory-limit");
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*DB::Cas::tests::OperationForTest(backend), layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
+
+    std::atomic<uint32_t> admissions{0};
+    std::optional<OverLimitAllocation> loop_head;
+    OverLimitAllocation before_request;
+    DB::Cas::tests::ManualBarrier second_admission;
+    std::optional<OverLimitAllocation> inside_request;
+    std::optional<OverLimitAllocation> while_consumed;
+    String outcome;
+    String attempts_sent;
+    String classification;
+    DB::Cas::tests::ManualBarrier reported;
+    CasEventSink sink = [&](CasEvent event)
+    {
+        if (event.type != CasEventType::WatermarkRenew || while_consumed)
+            return;
+        while_consumed = allocateOverTheGlobalLimit();
+        outcome = event.outcome;
+        attempts_sent = event.detail["attempts_sent"];
+        classification = event.detail["classification"];
+        reported.arriveAndWait();
+    };
+
+    RuntimeUnderTest runtime_holder(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return boot_ms; },
+            .renewal_before_driver_lock_hook_for_test = [&]
+            {
+                if (!loop_head)
+                    loop_head = allocateOverTheGlobalLimit();
+            },
+            .renewal_admitted_hook_for_test = [&]
+            {
+                const uint32_t admission = ++admissions;
+                if (admission == 1)
+                    before_request = allocateOverTheGlobalLimit();
+                else if (admission == 2)
+                    second_admission.arriveAndWait();
+            }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    /// Declared after the runtime so it runs first: a failed expectation must not leave the lease thread
+    /// parked on a barrier while the runtime's destructor joins it.
+    SCOPE_EXIT({
+        reported.release();
+        second_admission.release();
+    });
+    CasMountRuntime & runtime = *runtime_holder;
+    runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startRenewer();
+    runtime.armMountFence(uuid, 1, anchor + 1000);
+    const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+
+    /// Armed only now: `startRenewer` renews on this thread, and these must run on the lease thread.
+    backend->after_commit = [&]
+    {
+        if (!inside_request)
+            inside_request = allocateOverTheGlobalLimit();
+    };
+    backend->fault = RuntimeRenewBackend::Fault::ThrowMemoryLimitExceeded;
+    runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
+
+    reported.waitUntilArrived();
+    EXPECT_EQ(outcome, "recovered") << "a memory-limit exception inside the request must be retried";
+    EXPECT_EQ(attempts_sent, "2");
+    EXPECT_EQ(classification, "committed_after_retry");
+    reported.release();
+
+    /// The worker is admitted for its next renewal: the thread outlived the over-limit allocations.
+    second_admission.waitUntilArrived();
+    EXPECT_TRUE(runtime.mayMutate());
+    EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::Live);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), leases_lost_before);
+
+    ASSERT_TRUE(loop_head.has_value());
+    EXPECT_EQ(loop_head->failure, "") << "the allocation at the loop head threw";
+    EXPECT_EQ(loop_head->counted, kOverLimitAllocationBytes);
+    EXPECT_EQ(before_request.failure, "") << "the allocation before the request threw";
+    EXPECT_EQ(before_request.counted, kOverLimitAllocationBytes);
+    ASSERT_TRUE(inside_request.has_value());
+    EXPECT_EQ(inside_request->failure, "") << "the allocation inside the request threw";
+    EXPECT_EQ(inside_request->counted, kOverLimitAllocationBytes);
+    ASSERT_TRUE(while_consumed.has_value());
+    EXPECT_EQ(while_consumed->failure, "") << "the allocation while the result was consumed threw";
+    EXPECT_EQ(while_consumed->counted, kOverLimitAllocationBytes);
+
+    second_admission.release();
+    runtime.stopBackgroundWorkers();
+    runtime.finishTeardown(false);
 }
 
 TEST(CASPoolRemount, NaturalTerminalTransitionMakesBothPersistentWorkersSelfExit)
