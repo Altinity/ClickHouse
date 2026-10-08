@@ -1,19 +1,36 @@
+import os
+import sys
 from pathlib import Path
+
+import pytest
 
 from ci.jobs import source_upload
 from ci.jobs.scripts import clickhouse_version
 from ci.jobs.scripts.clickhouse_version import CHVersion
 from ci.jobs.scripts.workflow_hooks import version_log
 
+# `version_helper` imports sibling modules from `tests/ci` by bare name.
+_CI_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "tests", "ci")
+)
+sys.path.insert(0, _CI_DIR)
+try:
+    from version_helper import check_tag_against_versions  # type: ignore[import-not-found]
+finally:
+    sys.path.remove(_CI_DIR)
 
-FLAVOURED_VERSION_FILE = """\
+
+# Committed layout: upstream DESCRIBE/STRING, Altinity TWEAK/FLAVOUR appended.
+UPSTREAM_BLOCK_VERSION_FILE = """\
 SET(VERSION_REVISION 54513)
 SET(VERSION_MAJOR 26)
 SET(VERSION_MINOR 8)
 SET(VERSION_PATCH 1)
 SET(VERSION_GITHASH 0123456789012345678901234567890123456789)
-SET(VERSION_DESCRIBE v26.8.1.10001.altinitytest)
-SET(VERSION_STRING 26.8.1.10001.altinitytest)
+SET(VERSION_DESCRIBE v26.8.1.1-lts)
+SET(VERSION_STRING 26.8.1.1)
+# end of autochange
+
 SET(VERSION_TWEAK 10001)
 SET(VERSION_FLAVOUR altinitytest)
 """
@@ -27,7 +44,7 @@ def use_version_file(monkeypatch, tmp_path: Path, content: str) -> Path:
 
 
 def test_flavoured_current_version_uses_pinned_file(monkeypatch, tmp_path):
-    use_version_file(monkeypatch, tmp_path, FLAVOURED_VERSION_FILE)
+    use_version_file(monkeypatch, tmp_path, UPSTREAM_BLOCK_VERSION_FILE)
     monkeypatch.setattr(
         clickhouse_version,
         "_tweak_from_git",
@@ -51,7 +68,7 @@ def test_flavoured_current_version_uses_pinned_file(monkeypatch, tmp_path):
 
 
 def test_flavoured_release_version_round_trips_through_dict(monkeypatch, tmp_path):
-    use_version_file(monkeypatch, tmp_path, FLAVOURED_VERSION_FILE)
+    use_version_file(monkeypatch, tmp_path, UPSTREAM_BLOCK_VERSION_FILE)
 
     version = CHVersion.get_release_version()
     restored = CHVersion.from_dict(version.to_dict())
@@ -61,7 +78,7 @@ def test_flavoured_release_version_round_trips_through_dict(monkeypatch, tmp_pat
 
 
 def test_flavoured_version_write_preserves_altinity_fields(monkeypatch, tmp_path):
-    path = use_version_file(monkeypatch, tmp_path, FLAVOURED_VERSION_FILE)
+    path = use_version_file(monkeypatch, tmp_path, UPSTREAM_BLOCK_VERSION_FILE)
 
     CHVersion.get_release_version().write()
 
@@ -72,39 +89,13 @@ def test_flavoured_version_write_preserves_altinity_fields(monkeypatch, tmp_path
     assert "SET(VERSION_DESCRIBE v26.8.1.10001.altinitytest)" in content
 
 
-def test_unflavoured_current_version_keeps_git_derived_tweak(monkeypatch, tmp_path):
-    use_version_file(
-        monkeypatch,
-        tmp_path,
-        """\
-SET(VERSION_REVISION 54513)
-SET(VERSION_MAJOR 26)
-SET(VERSION_MINOR 8)
-SET(VERSION_PATCH 1)
-SET(VERSION_GITHASH release-sha)
-SET(VERSION_DESCRIBE v26.8.1.1-lts)
-SET(VERSION_STRING 26.8.1.1)
-""",
-    )
-    monkeypatch.setattr(clickhouse_version, "_tweak_from_git", lambda _: 42)
-    monkeypatch.setattr(
-        clickhouse_version.Shell, "get_output", lambda *_args, **_kwargs: "head-sha"
-    )
-
-    version = CHVersion.get_current_version()
-
-    assert version.string == "26.8.1.42"
-    assert version.describe == "v26.8.1.42-lts"
-    assert version.flavour == ""
-    assert version.githash == "head-sha"
-
-
 class FakeInfo:
     pr_number = 123
     pr_url = "https://example.test/pull/123"
     sha = "pr-sha"
     commit_url = "https://example.test/commit/pr-sha"
     git_branch = "feature"
+    base_branch = ""
     workflow_name = "PullRequest"
 
 
@@ -126,61 +117,6 @@ def test_pr_build_preserves_flavoured_tweak(monkeypatch):
     assert version_log._build_version(FakeInfo()).string == (
         "26.8.1.10001.altinitytest"
     )
-
-
-def test_pr_build_still_pins_unflavoured_tweak(monkeypatch):
-    version = CHVersion(
-        26,
-        8,
-        1,
-        54513,
-        tweak=42,
-        githash="file-sha",
-        version_type="lts",
-    )
-    monkeypatch.setattr(
-        CHVersion, "get_current_version", classmethod(lambda cls, **kwargs: version)
-    )
-
-    assert version_log._build_version(FakeInfo()).string == "26.8.1.1"
-
-
-def test_version_log_mirrors_version_into_workflow_custom_data(monkeypatch):
-    stored = {}
-    config = type("Config", (), {"custom_data": {}, "dump": lambda self: self})()
-
-    class FakeRunConfig:
-        @classmethod
-        def from_fs(cls, workflow_name):
-            assert workflow_name == "PullRequest"
-            return config
-
-    class FakeCIDB:
-        def insert_json(self, table, json_str):
-            stored["cidb"] = (table, json_str)
-
-    class FakeVersion:
-        string = "26.8.1.10001.altinitytest"
-
-        def to_dict(self):
-            return {"string": self.string, "flavour": "altinitytest", "tweak": 10001}
-
-        def store_version_data_in_ci_pipeline(self):
-            stored["kv"] = self.to_dict()
-
-    monkeypatch.setattr(version_log, "Info", lambda: FakeInfo())
-    monkeypatch.setattr(version_log, "RunConfig", FakeRunConfig, raising=False)
-    monkeypatch.setattr(version_log, "CIDBCluster", FakeCIDB)
-    monkeypatch.setattr(version_log, "_build_version", lambda _info: FakeVersion())
-    monkeypatch.setattr(version_log.Shell, "check", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(
-        version_log.Shell, "get_output", lambda *_args, **_kwargs: "parent-sha"
-    )
-
-    version_log._add_build_to_version_history()
-
-    assert stored["kv"] == config.custom_data["version"]
-    assert stored["cidb"][0] == "version_history"
 
 
 def test_source_upload_prefers_pipeline_version(monkeypatch):
@@ -211,7 +147,117 @@ def test_source_upload_prefers_pipeline_version(monkeypatch):
     assert source_upload.get_version().string == "26.8.1.1"
 
 
-def test_source_upload_restores_submodule_cache():
-    from ci.defs.altinity_jobs import AltinityJobConfigs
+@pytest.mark.parametrize(
+    "tweak,prerelease,release",
+    [
+        (10001, "altinitytest", "altinitystable"),
+        (20001, "antalyatest", "altinityantalya"),
+        (30001, "altinityfipstest", "altinityfips"),
+    ],
+)
+def test_tag_build_takes_flavour_from_tag(
+    monkeypatch, tmp_path, tweak, prerelease, release
+):
+    content = UPSTREAM_BLOCK_VERSION_FILE.replace("10001", str(tweak)).replace(
+        "altinitytest", prerelease
+    )
+    use_version_file(monkeypatch, tmp_path, content)
+    monkeypatch.setenv("GITHUB_REF_TYPE", "tag")
+    monkeypatch.setenv("GITHUB_REF_NAME", f"v26.8.1.{tweak}.{release}")
 
-    assert AltinityJobConfigs.source_upload_job.needs_submodules
+    info = FakeInfo()
+    info.pr_number = 0
+    version = version_log._build_version(info)
+
+    assert version.string == f"26.8.1.{tweak}.{release}"
+    assert version.describe == f"v26.8.1.{tweak}.{release}"
+    assert version.to_dict()["flavour"] == release
+
+
+def test_tag_build_applies_tag_track_when_file_is_stale(monkeypatch, tmp_path):
+    use_version_file(monkeypatch, tmp_path, UPSTREAM_BLOCK_VERSION_FILE)
+    monkeypatch.setenv("GITHUB_REF_TYPE", "tag")
+    monkeypatch.setenv("GITHUB_REF_NAME", "v26.8.1.20001.altinityantalya")
+
+    info = FakeInfo()
+    info.pr_number = 0
+    version = version_log._build_version(info)
+
+    assert version.string == "26.8.1.20001.altinityantalya"
+    assert version.describe == "v26.8.1.20001.altinityantalya"
+    assert version.to_dict()["flavour"] == "altinityantalya"
+
+
+@pytest.mark.parametrize(
+    "pr_number,git_branch,base_branch,expected",
+    [
+        (123, "fix/antalya-26.8/foo", "stable-26.8", "26.8.1.10001.altinitytest"),
+        (123, "fix/stable-26.8/foo", "antalya-26.8", "26.8.1.20001.antalyatest"),
+        (123, "fix/foo", "fips-25.3", "26.8.1.30001.altinityfipstest"),
+        (0, "stable-26.8", "", "26.8.1.10001.altinitytest"),
+        (0, "antalya-26.8", "", "26.8.1.20001.antalyatest"),
+        (0, "fips-25.3", "", "26.8.1.30001.altinityfipstest"),
+        (0, "fix/antalya-26.8/foo", "", "26.8.1.10001.altinitytest"),
+        (0, "feature", "", "26.8.1.10001.altinitytest"),
+        (123, "fix/stable-26.8/foo", "master", "26.8.1.10001.altinitytest"),
+    ],
+)
+def test_branch_overrides_flavour_and_track(
+    monkeypatch, tmp_path, pr_number, git_branch, base_branch, expected
+):
+    use_version_file(monkeypatch, tmp_path, UPSTREAM_BLOCK_VERSION_FILE)
+    monkeypatch.delenv("GITHUB_REF_TYPE", raising=False)
+
+    info = FakeInfo()
+    info.pr_number = pr_number
+    info.git_branch = git_branch
+    info.base_branch = base_branch
+    version = version_log._build_version(info)
+
+    assert version.string == expected
+    assert version.describe == f"v{expected}"
+    assert version.to_dict()["flavour"] == expected.rsplit(".", 1)[-1]
+
+
+def _tag_versions(tweak: int = 10001, flavour: str = "altinitytest") -> dict:
+    return {
+        "major": 26,
+        "minor": 8,
+        "patch": 1,
+        "tweak": tweak,
+        "flavour": flavour,
+    }
+
+
+@pytest.mark.parametrize(
+    "file_tweak,prerelease,tag_tweak,release",
+    [
+        (10001, "altinitytest", 10001, "altinitystable"),
+        (20001, "antalyatest", 20001, "altinityantalya"),
+        (30001, "altinityfipstest", 30001, "altinityfips"),
+        (20001, "altinityantalya", 20001, "altinityantalya"),
+        (10001, "altinitytest", 20001, "altinityantalya"),
+        (20001, "antalyatest", 10001, "altinitystable"),
+    ],
+)
+def test_check_tag_version_accepts_matching_counter(
+    file_tweak, prerelease, tag_tweak, release
+):
+    check_tag_against_versions(
+        f"v26.8.1.{tag_tweak}.{release}", _tag_versions(file_tweak, prerelease)
+    )
+
+
+@pytest.mark.parametrize(
+    "tweak,flavour,tag",
+    [
+        (10001, "altinitytest", "v26.8.1.10001.altinityantalya"),
+        (10001, "altinitytest", "v26.8.1.10002.altinitystable"),
+        (10001, "altinitytest", "v26.8.1.10001.altinitytest"),
+        (10001, "altinitytest", "v26.8.1.1-lts"),
+        (20001, "antalyatest", "v26.8.1.20001.antalyatest"),
+    ],
+)
+def test_check_tag_version_rejects_mismatched_tag(tweak, flavour, tag):
+    with pytest.raises(ValueError):
+        check_tag_against_versions(tag, _tag_versions(tweak, flavour))

@@ -83,7 +83,8 @@ def _version_type_from_describe(versions: dict) -> str:
     flavoured versions."""
     describe = str(versions.get("describe", ""))
     flavour = str(versions.get("flavour") or "")
-    if flavour and describe == f"v{versions.get('string', '')}":
+    # NOTE (strtgbb): VERSION_DESCRIBE is left as is to avoid merge conflicts
+    if flavour:
         return flavour
     return describe.rsplit("-", 1)[1] if "-" in describe else ""
 

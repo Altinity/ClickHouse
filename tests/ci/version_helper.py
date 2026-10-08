@@ -298,16 +298,61 @@ def read_versions(versions_path: Union[Path, str] = FILE_WITH_VERSION_PATH) -> V
     return versions
 
 
+# Pre-release flavour (VERSION_FLAVOUR) → release flavour (tag)
+ALTINITY_RELEASE_BY_PRERELEASE = {
+    "altinitytest": "altinitystable",
+    "antalyatest": "altinityantalya",
+    "altinityfipstest": "altinityfips",
+}
+
+ALTINITY_TRACK_BY_FLAVOUR = {
+    "altinitystable": 1,
+    "altinityantalya": 2,
+    "altinityfips": 3,
+}
+
+
+def check_tag_against_versions(tag: str, versions: VERSIONS) -> None:
+    # NOTE (strtgbb): Altinity tags are v<major>.<minor>.<patch>.<tweak>.<flavour>.
+    # Flavour and the tweak's track digit come from the tag; the file supplies
+    # major/minor/patch and the release counter (tweak % 10000) only.
+    expected_prefix = (
+        f"v{versions['major']}.{versions['minor']}.{versions['patch']}."
+    )
+    if not tag.startswith(expected_prefix):
+        raise ValueError(
+            f"Tag [{tag}] does not start with [{expected_prefix}]"
+        )
+    try:
+        tag_tweak_str, tag_flavour = tag[len(expected_prefix) :].split(".", 1)
+        tag_tweak = int(tag_tweak_str)
+    except ValueError:
+        raise ValueError(
+            f"Tag [{tag}] is not v<major>.<minor>.<patch>.<tweak>.<flavour>"
+        )
+    track = ALTINITY_TRACK_BY_FLAVOUR.get(tag_flavour)
+    if track is None:
+        raise ValueError(
+            f"Tag [{tag}] flavour [{tag_flavour}] is not one of "
+            f"{sorted(ALTINITY_TRACK_BY_FLAVOUR)}"
+        )
+    if tag_tweak // 10000 != track:
+        raise ValueError(
+            f"Tag [{tag}] tweak [{tag_tweak}] does not match the "
+            f"{track}xxxx track for flavour [{tag_flavour}]"
+        )
+    file_tweak = int(versions["tweak"])
+    if tag_tweak % 10000 != file_tweak % 10000:
+        raise ValueError(
+            f"Tag [{tag}] counter [{tag_tweak % 10000}] does not match "
+            f"VERSION_TWEAK [{file_tweak}] counter [{file_tweak % 10000}]"
+        )
+
+
 def check_tag_version(
     tag: str, versions_path: Union[Path, str] = FILE_WITH_VERSION_PATH
 ) -> None:
-    expected_tag = read_versions(versions_path)["describe"]
-    if tag != expected_tag:
-        raise ValueError(
-            f"Tag [{tag}] does not match VERSION_DESCRIBE [{expected_tag}] "
-            f"in {versions_path}"
-        )
-
+    check_tag_against_versions(tag, read_versions(versions_path))
     print(f"Tag [{tag}] matches {versions_path}")
 
 
@@ -541,7 +586,7 @@ def main():
     parser.add_argument(
         "--check-tag",
         action="store_true",
-        help="check that GITHUB_REF_NAME matches VERSION_DESCRIBE and exit",
+        help="check that GITHUB_REF_NAME matches the version parts and exit",
     )
     args = parser.parse_args()
 
