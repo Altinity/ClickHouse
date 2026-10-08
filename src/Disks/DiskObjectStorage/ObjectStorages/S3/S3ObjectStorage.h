@@ -5,11 +5,8 @@
 #if USE_AWS_S3
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
-<<<<<<< HEAD
 #include <atomic>
-=======
 #include <map>
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -50,13 +47,9 @@ private:
         bool client_restricts_server_credentials_ = true)
         : uri(uri_)
         , disk_name(disk_name_)
-<<<<<<< HEAD
-        , client(std::move(client_))
-        , client_restricts_server_credentials(client_restricts_server_credentials_)
-=======
         , client_slot(std::make_shared<MultiVersion<S3::Client>>(std::move(client_)))
         , client(*client_slot)
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
+        , client_restricts_server_credentials(client_restricts_server_credentials_)
         , s3_settings(std::move(s3_settings_))
         , s3_capabilities(s3_capabilities_)
         , key_generator(std::move(key_generator_))
@@ -258,16 +251,6 @@ private:
 
     std::string disk_name;
 
-<<<<<<< HEAD
-    mutable MultiVersion<S3::Client> client;
-    /// The user-query credential restriction mode the current `client` was built under (initialized by the
-    /// caller from the policy used to build the initial client -- e.g. a table created with the opt-in starts
-    /// `false`). `applyNewSettings` rebuilds the client when a session with a different restriction mode accesses
-    /// the storage, so a restricted session never reuses a credentialed client built for an opt-in session (and
-    /// vice versa). Defaults to restricted (the server default) for callers that do not pass an explicit value.
-    /// Atomic: `applyNewSettings` can run concurrently on a shared storage.
-    mutable std::atomic<bool> client_restricts_server_credentials = true;
-=======
     /// The slot this disk's client lives in, and the only thing a credential refresh installs into.
     /// Held by `shared_ptr` so a read buffer -- which can outlive this storage -- carries the SLOT
     /// rather than a pointer to the storage: a refresh that arrives late then replaces a client
@@ -278,7 +261,13 @@ private:
     /// (the credential-refresh lambda handed to a read buffer that can outlive this object) captures
     /// `client_slot` directly instead.
     MultiVersion<S3::Client> & client;
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
+    /// The user-query credential restriction mode the current `client` was built under (initialized by the
+    /// caller from the policy used to build the initial client -- e.g. a table created with the opt-in starts
+    /// `false`). `applyNewSettings` rebuilds the client when a session with a different restriction mode accesses
+    /// the storage, so a restricted session never reuses a credentialed client built for an opt-in session (and
+    /// vice versa). Defaults to restricted (the server default) for callers that do not pass an explicit value.
+    /// Atomic: `applyNewSettings` can run concurrently on a shared storage.
+    mutable std::atomic<bool> client_restricts_server_credentials = true;
     MultiVersion<S3Settings> s3_settings;
     S3Capabilities s3_capabilities;
 

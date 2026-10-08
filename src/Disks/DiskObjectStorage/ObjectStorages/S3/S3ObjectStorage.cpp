@@ -187,11 +187,8 @@ public:
         , request(std::make_unique<S3::ListObjectsV2Request>())
         , with_tags(with_tags_)
         , start_after_set(start_after_.has_value() && !start_after_->empty())
-<<<<<<< HEAD
         , description(fmt::format("Bucket: {}, Prefix: {}", bucket_, path_prefix))
-=======
         , attempt_seed(attempt_seed_)
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
     {
         request->SetBucket(bucket_);
         request->SetPrefix(path_prefix);
@@ -199,7 +196,7 @@ public:
         if (start_after_set)
             request->SetStartAfter(*start_after_);
         if (attempt_seed != 0)
-            S3::setClickhouseAttemptNumber(*request, attempt_seed);
+            S3::setClickHouseAttemptNumber(*request, attempt_seed);
     }
 
     ~S3IteratorAsync() override
@@ -240,7 +237,7 @@ private:
                 paginated_request->SetMaxKeys(request->GetMaxKeys());
                 paginated_request->SetContinuationToken(next_continuation_token);
                 if (attempt_seed != 0)
-                    S3::setClickhouseAttemptNumber(*paginated_request, attempt_seed);
+                    S3::setClickHouseAttemptNumber(*paginated_request, attempt_seed);
                 request = std::move(paginated_request);
                 start_after_set = false;
             }
@@ -278,11 +275,8 @@ private:
     std::unique_ptr<S3::ListObjectsV2Request> request;
     const bool with_tags;
     bool start_after_set;
-<<<<<<< HEAD
     const std::string description;
-=======
     const size_t attempt_seed;
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
 };
 
 }
@@ -380,20 +374,14 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
         /* offset */0,
         /* read_until_position */0,
         restrict_seek,
-<<<<<<< HEAD
         /// `bytes_size` may be `StoredObject::UnknownSize` for an object whose size is not known
         /// (for example an HTTP source that omits `Content-Length`). It is a sentinel, not a real
         /// size, so it must map to `std::nullopt` (read to EOF) just like the legacy `0` value —
         /// otherwise `ReadBufferFromS3` treats it as a real size and issues ranged reads forever.
         (object.bytes_size && object.bytes_size != StoredObject::UnknownSize) ? std::optional<size_t>(object.bytes_size) : std::nullopt,
-        credentials_refresh_callback,
+        refresh_callback,
         std::move(blob_storage_log),
         object.etag);
-=======
-        object.bytes_size ? std::optional<size_t>(object.bytes_size) : std::nullopt,
-        refresh_callback,
-        std::move(blob_storage_log));
->>>>>>> c3ae984b1ba (Merge pull request #2300 from Altinity/feature/antalya-26.6/CAS-improvements)
 }
 
 SmallObjectDataWithMetadata S3ObjectStorage::readSmallObjectAndGetObjectMetadata( /// NOLINT
@@ -651,7 +639,7 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatchesImpl(
     /// mode, so a GCS-native client can send the generation token this etag actually encodes.
     request.setNativeConditional();
     if (attempt_seed != 0)
-        S3::setClickhouseAttemptNumber(request, attempt_seed);
+        S3::setClickHouseAttemptNumber(request, attempt_seed);
 
     ProfileEvents::increment(ProfileEvents::DiskS3DeleteObjects);
 
@@ -744,7 +732,7 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
     request.SetBucket(uri.bucket);
     request.SetDelete(std::move(to_delete));
     if (attempt_seed != 0)
-        S3::setClickhouseAttemptNumber(request, attempt_seed);
+        S3::setClickHouseAttemptNumber(request, attempt_seed);
 
     ProfileEvents::increment(ProfileEvents::DiskS3DeleteObjects);
     auto outcome = used_client->DeleteObjects(request);

@@ -43,7 +43,7 @@ namespace
         req.setNativeConditional(request_mode == ObjectStorageRequestMode::NativeConditional);
 
         if (attempt_seed != 0)
-            S3::setClickhouseAttemptNumber(req, attempt_seed);
+            S3::setClickHouseAttemptNumber(req, attempt_seed);
 
         return client.HeadObject(req);
     }

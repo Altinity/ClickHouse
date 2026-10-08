@@ -64,7 +64,7 @@ namespace ProfileEvents
     extern const Event S3WriteRequestsErrors;
 }
 
-/// Parses the `attempt=N` value `S3::setClickhouseAttemptNumber` writes into the `clickhouse-request`
+/// Parses the `attempt=N` value `S3::setClickHouseAttemptNumber` writes into the `clickhouse-request`
 /// header, straight off the wire header a real HTTP server received -- mirrors
 /// `S3::getAttemptFromInfo`/`getOrEmpty` (both `static` in `Requests.cpp`, not exported), 1 when the
 /// header is missing.

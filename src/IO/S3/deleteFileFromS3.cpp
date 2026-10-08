@@ -35,7 +35,7 @@ void deleteFileFromS3(
     request.SetBucket(bucket);
     request.SetKey(key);
     if (attempt_seed != 0)
-        S3::setClickhouseAttemptNumber(request, attempt_seed);
+        S3::setClickHouseAttemptNumber(request, attempt_seed);
 
     ProfileEvents::increment(ProfileEvents::S3DeleteObjects);
     if (profile_event && *profile_event != ProfileEvents::S3DeleteObjects)

@@ -754,7 +754,7 @@ S3::PutObjectRequest WriteBufferFromS3::getPutRequest(PartData & data)
     req.SetContentType("binary/octet-stream");
 
     if (write_settings.object_storage_attempt_number != 0)
-        S3::setClickhouseAttemptNumber(req, write_settings.object_storage_attempt_number);
+        S3::setClickHouseAttemptNumber(req, write_settings.object_storage_attempt_number);
 
     client_ptr->setKMSHeaders(req);
 
