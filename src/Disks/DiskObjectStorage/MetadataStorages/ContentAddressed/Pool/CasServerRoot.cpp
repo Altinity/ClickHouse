@@ -1017,11 +1017,18 @@ MountClaimResult claimMountAwaitingExpiry(
     }
 }
 
+bool MountIncarnationObservation::heldFor(uint64_t threshold_ms, uint64_t sample_ms) const
+{
+    return sample_ms >= first_seen_mono_ms && sample_ms - first_seen_mono_ms >= threshold_ms;
+}
+
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
-                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
-                                     MountObservationMap & obs)
+                                     const std::function<uint64_t()> & mono_ms_fn,
+                                     uint64_t stable_threshold_ms, MountObservationMap & obs)
 {
     HeartbeatFloor floor;
+    /// Taken before any read: it can confirm that a token held, never date a sighting.
+    const uint64_t round_start_ms = mono_ms_fn();
 
     /// `obs` is keyed by every srid this leader has EVER observed, but a
     /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CAS
@@ -1083,12 +1090,13 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
                 const bool stable = it != obs.end() && it->second.etag == observed->etag
-                    && mono_now_ms - it->second.first_seen_mono_ms >= stable_threshold_ms;
+                    && it->second.heldFor(stable_threshold_ms, round_start_ms);
 
                 if (!stable)
                 {
+                    /// A sample from before this read would count the walk to the slot as time watched.
                     if (it == obs.end() || it->second.etag != observed->etag)
-                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_now_ms});
+                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_ms_fn()});
                     ++floor.live;
                     return std::nullopt;
                 }
