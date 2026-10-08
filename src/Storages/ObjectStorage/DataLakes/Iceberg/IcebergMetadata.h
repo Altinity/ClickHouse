@@ -280,6 +280,10 @@ private:
     std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
     KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
 
+    /// Refuse `operation` while the table root is deeper than the queried path, because anything
+    /// scoped to the queried path reaches beyond this table there.
+    void checkTableRootIsQueriedPath(std::string_view operation) const;
+
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
     mutable std::shared_ptr<SecondaryStorages> secondary_storages;

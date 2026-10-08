@@ -147,6 +147,22 @@ namespace FailPoints
 namespace
 {
 
+/// Translate the database-layer `TablesFilter` into the catalog-layer
+/// `TableNameFilter` so the catalog can restrict which namespaces it lists.
+DataLake::TableNameFilter toCatalogTableNameFilter(const TablesFilter & tables_filter)
+{
+    switch (tables_filter.kind)
+    {
+        case TablesFilter::Kind::None:
+            return {DataLake::TableNameFilter::Kind::All, {}};
+        case TablesFilter::Kind::Equals:
+            return {DataLake::TableNameFilter::Kind::Equals, tables_filter.pattern};
+        case TablesFilter::Kind::Like:
+            return {DataLake::TableNameFilter::Kind::Like, tables_filter.pattern};
+    }
+    return {DataLake::TableNameFilter::Kind::All, {}};
+}
+
 String getLocationScheme(const std::shared_ptr<DataLake::ICatalog> & catalog)
 {
     if (auto storage_type = catalog->getStorageType(); storage_type.has_value())
@@ -1084,6 +1100,15 @@ DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIterator(
     const FilterByNameFunction & filter_by_table_name,
     bool skip_not_loaded) const
 {
+    return getTablesIteratorWithHint(context_, filter_by_table_name, skip_not_loaded, /*tables_filter*/ {});
+}
+
+DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIteratorWithHint(
+    ContextPtr context_,
+    const FilterByNameFunction & filter_by_table_name,
+    bool skip_not_loaded,
+    const TablesFilter & tables_filter) const
+{
     Tables tables;
     DB::Names iceberg_tables;
 
@@ -1096,7 +1121,7 @@ DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIterator(
             throw Exception(ErrorCodes::DATALAKE_DATABASE_ERROR, "Injected catalog listing failure");
         });
 
-        iceberg_tables = getCatalog()->getTables();
+        iceberg_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter));
     }
     catch (...)
     {
@@ -1183,7 +1208,16 @@ DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIterator(
 std::vector<LightWeightTableDetails> DatabaseDataLake::getLightweightTablesIterator(
     ContextPtr context_,
     const FilterByNameFunction & filter_by_table_name,
-    bool /*skip_not_loaded*/) const
+    bool skip_not_loaded) const
+{
+    return getLightweightTablesIteratorWithHint(context_, filter_by_table_name, skip_not_loaded, /*tables_filter*/ {});
+}
+
+std::vector<LightWeightTableDetails> DatabaseDataLake::getLightweightTablesIteratorWithHint(
+    ContextPtr context_,
+    const FilterByNameFunction & filter_by_table_name,
+    bool /*skip_not_loaded*/,
+    const TablesFilter & tables_filter) const
 {
     DB::Names iceberg_tables;
     std::vector<LightWeightTableDetails> result;
@@ -1197,7 +1231,7 @@ std::vector<LightWeightTableDetails> DatabaseDataLake::getLightweightTablesItera
             throw Exception(ErrorCodes::DATALAKE_DATABASE_ERROR, "Injected catalog listing failure");
         });
 
-        iceberg_tables = getCatalog()->getTables();
+        iceberg_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter));
     }
     catch (...)
     {

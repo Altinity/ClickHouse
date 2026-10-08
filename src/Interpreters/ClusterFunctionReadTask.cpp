@@ -44,13 +44,8 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
     if (context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization])
         file_meta_info = object->relative_path_with_metadata.file_meta_info;
 
-    if (object->relative_path_with_metadata.getCommand().isValid())
-        path = object->relative_path_with_metadata.getCommand().toString();
-    else
-    {
-        const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
-        path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
-    }
+    const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
+    path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
 
     file_bucket_info = object->file_bucket_info;
 }
@@ -194,12 +189,22 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
         }
     }
 
-    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO)
+    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS)
     {
         if (file_meta_info && *file_meta_info)
         {
             writeVarUInt(1, out);
             (*file_meta_info)->serialize(out);
+        }
+        else
+        {
+            writeVarUInt(0, out);
+        }
+
+        if (retry_after_us)
+        {
+            writeVarUInt(1, out);
+            writeVarUInt(*retry_after_us, out);
         }
         else
         {
@@ -260,12 +265,21 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in, size_t antaly
         }
     }
 
-    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO)
+    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS)
     {
         UInt64 has_file_meta_info = 0;
         readVarUInt(has_file_meta_info, in);
         if (has_file_meta_info)
             file_meta_info = std::make_shared<DataFileMetaInfo>(DataFileMetaInfo::deserialize(in));
+
+        UInt64 has_retry_after_us = 0;
+        readVarUInt(has_retry_after_us, in);
+        if (has_retry_after_us)
+        {
+            UInt64 retry = 0;
+            readVarUInt(retry, in);
+            retry_after_us = retry;
+        }
     }
 }
 

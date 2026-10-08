@@ -155,7 +155,7 @@ public:
 
     ~UrlTaskIterator() override = default;
 
-    ClusterFunctionReadTaskResponsePtr operator()(size_t /* number_of_current_replica */) const override
+    ClusterFunctionReadTaskResponsePtr operator()(size_t /* number_of_current_replica */, UInt64 /* antalya_protocol_version */) const override
     {
         auto url = iterator.next();
         if (url.empty())

@@ -64,6 +64,7 @@ public:
     virtual String getClusterName(ContextPtr /* context */) const { return getOriginalClusterName(); }
 
 protected:
+    virtual void updateBeforeRead(const ContextPtr &) {}
     virtual void updateQueryToSendIfNeeded(
         ASTPtr & /*query*/,
         const StorageSnapshotPtr & /*storage_snapshot*/,
