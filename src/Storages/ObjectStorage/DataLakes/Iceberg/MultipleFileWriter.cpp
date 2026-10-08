@@ -190,10 +190,6 @@ MultipleFileWriter::MultipleFileWriter(
     , sample_block(sample_block_)
     , new_file_path_callback(std::move(new_file_path_callback_))
 {
-<<<<<<< HEAD
-=======
-    column_mapper->setStorageColumnEncoding(Iceberg::IcebergSchemaProcessor::traverseSchema(schema_));
-
     written_column_types.reserve(sample_block->columns());
     for (const auto & column : *sample_block)
     {
@@ -219,7 +215,6 @@ MultipleFileWriter::MultipleFileWriter(
         }
         filtered_sample_block = std::make_shared<const Block>(std::move(filtered));
     }
->>>>>>> 6f847351d74 (Merge pull request #2363 from Altinity/iceberg_unknown_data_type)
 }
 
 void MultipleFileWriter::startNewFile()

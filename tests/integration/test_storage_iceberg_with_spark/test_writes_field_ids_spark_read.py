@@ -1,15 +1,11 @@
 import glob
 
-<<<<<<< HEAD
 import pytest
 
-=======
->>>>>>> 6f847351d74 (Merge pull request #2363 from Altinity/iceberg_unknown_data_type)
 from helpers.iceberg_utils import (
     create_iceberg_table,
     get_uuid_str,
     default_download_directory,
-<<<<<<< HEAD
     default_upload_directory,
 )
 
@@ -80,11 +76,6 @@ def test_writes_field_ids_spark_read_after_rename(
     ]
 
 
-=======
-)
-
-
->>>>>>> 6f847351d74 (Merge pull request #2363 from Altinity/iceberg_unknown_data_type)
 def _avro_field_ids(node_schema):
     """Collect every {path: field-id} pair from an avro record schema tree,
     descending through array/map wrappers exactly like the writer does."""
@@ -112,7 +103,6 @@ def _avro_field_ids(node_schema):
     return result
 
 
-<<<<<<< HEAD
 # Regression for the wrapped-nested Avro case (bot review on #109994): the Avro
 # field-id writer must descend through array / union wrappers to reach a record
 # nested inside e.g. Array(Tuple(...)). The previous writer stopped at the first
@@ -411,8 +401,6 @@ def test_writes_field_ids_avro_binary_vs_string(started_cluster_iceberg_with_spa
     assert [(r.id, r.s, bytes(r.b)) for r in rows] == [(1, "hello", bytes.fromhex("DEADBEEF"))]
 
 
-=======
->>>>>>> 6f847351d74 (Merge pull request #2363 from Altinity/iceberg_unknown_data_type)
 def _avro_metadata_schemas(path):
     """Return (manifest_list_schema, [manifest_schemas]) writer schemas from the
     Avro files under path/metadata/. Manifest lists are the snap-*.avro files;

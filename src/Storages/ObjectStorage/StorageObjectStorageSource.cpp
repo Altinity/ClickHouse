@@ -1731,18 +1731,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
     /// Add ExtractColumnsTransform to extract requested columns/subcolumns
     /// from chunk read by IInputFormat.
-<<<<<<< HEAD
-=======
-    NamesAndTypesList columns_to_extract = requested_columns_copy;
-    for (const auto & column_name : row_lineage_columns)
-        columns_to_extract.emplace_back(column_name, rowLineageColumnType());
-
     /// Tuple element reads request nested fields like `t.a` as separate columns. If the data lake
     /// schema transform has rebuilt the whole `t` instead (e.g. the file was written before `t`
     /// was added), extract `t.a` as a subcolumn of `t`.
     const Block & extract_header = builder.getHeader();
     bool need_materialize = false;
-    for (auto & column : columns_to_extract)
+    for (auto & column : requested_columns_copy)
     {
         const String name_in_storage = column.getNameInStorage();
         if (extract_header.has(name_in_storage))
@@ -1771,7 +1765,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         });
     }
 
->>>>>>> 6f847351d74 (Merge pull request #2363 from Altinity/iceberg_unknown_data_type)
     builder.addSimpleTransform([&](const SharedHeader & header)
     {
         return std::make_shared<ExtractColumnsTransform>(header, requested_columns_copy);
