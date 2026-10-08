@@ -833,7 +833,7 @@ External clients that don't use SSH auth never see packets 11, 12, or 18 — the
 | 6    | KeepAlive                 | not specified       | Connection keepalive |
 | 7    | Scalar                    | not specified       | Scalar data block |
 | 8    | IgnoredPartUUIDs          | not specified       | Parts to exclude from query |
-| 9    | ReadTaskResponse          | not specified       | S3 cluster read response. When both peers negotiated [Antalya protocol](/antalya/protocol) version 2 or newer, the initiator appends optional Iceberg column statistics after the upstream payload. |
+| 9    | ReadTaskResponse          | not specified       | S3 cluster read response. When both peers negotiated [Antalya protocol](/antalya/protocol) version 2 or newer, the initiator appends optional Iceberg column statistics and then optional `retry_after_us` for `lock_object_storage_task_distribution_ms` after the upstream payload. If any worker negotiated a lower Antalya version, `retry_after_us` is omitted and that setting is ignored for the query. |
 | 10   | MergeTreeReadTaskResponse | not specified       | Parallel read task response |
 | 11   | SSHChallengeRequest       | [SSH auth](#ssh-authentication) | SSH auth challenge request |
 | 12   | SSHChallengeResponse      | [SSH auth](#ssh-authentication) | SSH auth challenge response |
