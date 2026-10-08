@@ -537,7 +537,6 @@ bool UnityCatalog::isNamespaceAllowed(const std::string & namespace_) const
     return allowed_namespaces.contains("*") || allowed_namespaces.contains(namespace_);
 }
 
-/// getCredentialsConfigurationCallback method is supported only for S3 storage
 ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(const DB::StorageID & table_id)
 {
     if (!table_id.hasUUID())
@@ -548,10 +547,14 @@ ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCa
 
     const String unity_table_id = toString(table_id.uuid);
 
-    return [this, unity_table_id] () -> std::shared_ptr<IStorageCredentials>    {
+    return [this, unity_table_id] () -> std::shared_ptr<IStorageCredentials>
+    {
         LOG_DEBUG(log, "Update credentials in the catalog");
 
-        return parseS3Credentials(requestReadCredentials(unity_table_id));
+        auto response = requestReadCredentials(unity_table_id);
+        if (hasValueAndItsNotNone("azure_user_delegation_sas", response))
+            return parseAzureCredentials(response);
+        return parseS3Credentials(response);
     };
 }
 

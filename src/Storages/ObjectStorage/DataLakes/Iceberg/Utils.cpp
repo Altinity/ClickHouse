@@ -591,6 +591,13 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
 {
     switch (type->getTypeId())
     {
+        case TypeIndex::UInt8:
+        {
+            if (isBool(type))
+                return {"boolean", true};
+            return {"int", true};
+        }
+        case TypeIndex::Int8:
         case TypeIndex::UInt16:
         case TypeIndex::Int16:
         case TypeIndex::UInt32:
@@ -623,7 +630,13 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
         case TypeIndex::Decimal64:
         case TypeIndex::Decimal128:
         case TypeIndex::Decimal256:
-            return {fmt::format("decimal({}, {})", getDecimalPrecision(*type), getDecimalScale(*type)), true};
+        {
+            auto precision = getDecimalPrecision(*type);
+            if (precision > 38)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Iceberg decimal type supports precision up to 38, got {}", precision);
+            return {"decimal(" + std::to_string(precision) + ", " + std::to_string(getDecimalScale(*type)) + ")", true};
+        }
         case TypeIndex::Tuple:
         {
             auto type_tuple = std::static_pointer_cast<const DataTypeTuple>(type);

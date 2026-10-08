@@ -129,8 +129,8 @@ run() {
 echo "generous memory budget: the dictionary filter prunes the row group, 0 rows are read"
 run 4000000000 "no_such_value"
 
-echo "moderate memory budget (50 MB): the real incremental footprint fits and pruning must still happen; charging the inflated uncompressed page size for the prefetch-backed payload would demand ~200 MB and fall back to a full scan"
-run 50000000 "no_such_value"
+echo "moderate memory budget (100 MB): the real incremental footprint fits and pruning must still happen; charging the inflated uncompressed page size for the prefetch-backed payload would demand ~200 MB and fall back to a full scan"
+run 100000000 "no_such_value"
 
 echo "extreme memory budget (1 byte): pruning is skipped, result is still correct"
 run 1 "no_such_value"

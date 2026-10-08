@@ -704,12 +704,15 @@ def test_writes_decimal_partition_same_shape(started_cluster_iceberg_with_spark,
 
 @pytest.mark.parametrize("storage_type", ["s3", "local"])
 def test_writes_decimal_wide_minmax_pruning(started_cluster_iceberg_with_spark, storage_type):
-    """Min/max statistics of `Decimal128` and `Decimal256` columns must be consumable by the reader.
+    """Min/max statistics of `Decimal128` columns must be consumable by the reader.
 
     The bounds are longer than 8 bytes, which the bound deserializer used to reject, silently
     disabling `IcebergMinMaxIndexPrunedFiles` for these widths. `control` carries the same
     magnitudes in a type whose bounds are known to prune, to tell a decimal-specific gap apart
     from a table that simply cannot be pruned.
+
+    Upstream covers `Decimal256` here too; this branch refuses a decimal wider than the Iceberg
+    spec limit of precision 38, so such a column cannot be written through this path.
     """
     instance = started_cluster_iceberg_with_spark.instances["node1"]
     TABLE_NAME = "test_writes_decimal_wide_minmax_" + storage_type + "_" + get_uuid_str()
@@ -719,18 +722,18 @@ def test_writes_decimal_wide_minmax_pruning(started_cluster_iceberg_with_spark, 
         instance,
         TABLE_NAME,
         started_cluster_iceberg_with_spark,
-        "(d128 Decimal(38, 10), d256 Decimal(76, 20), control Int64)",
+        "(d128 Decimal(38, 10), control Int64)",
         2,
     )
 
     # One file per insert, so the min/max bounds of every file cover exactly one row.
-    for d128, d256, control in [
-        ("1.5", "1.5", "1"),
-        ("9999999999999999999999999999.5", "99999999999999999999999999999999999999999999999999999999.5", "500"),
-        ("-9999999999999999999999999999.5", "-99999999999999999999999999999999999999999999999999999999.5", "-500"),
+    for d128, control in [
+        ("1.5", "1"),
+        ("9999999999999999999999999999.5", "500"),
+        ("-9999999999999999999999999999.5", "-500"),
     ]:
         instance.query(
-            f"INSERT INTO {TABLE_NAME} VALUES ({d128}, {d256}, {control})",
+            f"INSERT INTO {TABLE_NAME} VALUES ({d128}, {control})",
             settings={"allow_insert_into_iceberg": 1},
         )
 
@@ -763,8 +766,6 @@ def test_writes_decimal_wide_minmax_pruning(started_cluster_iceberg_with_spark, 
         "WHERE control < -100",
         "WHERE d128 > 1000000",
         "WHERE d128 < -1000000",
-        "WHERE d256 > 1000000",
-        "WHERE d256 < -1000000",
     ]
     measured = {
         predicate: measure(predicate, index) for index, predicate in enumerate(predicates)
@@ -778,5 +779,3 @@ def test_writes_decimal_wide_minmax_pruning(started_cluster_iceberg_with_spark, 
     assert measured["WHERE control < -100"][2] == 2
     assert measured["WHERE d128 > 1000000"][2] == 2
     assert measured["WHERE d128 < -1000000"][2] == 2
-    assert measured["WHERE d256 > 1000000"][2] == 2
-    assert measured["WHERE d256 < -1000000"][2] == 2

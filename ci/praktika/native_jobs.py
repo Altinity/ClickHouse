@@ -292,6 +292,8 @@ def _prepare_submodule_cache(workflow, workflow_config: RunConfig) -> Result:
                 no_strict=True,
             )
             Shell.check(f"rm -f {archive_path}")
+            if not created and not S3.head_object(s3_path):
+                raise RuntimeError(f"failed to upload submodule cache {s3_path}")
             info = (
                 f"cache miss, created: {cache_hash}"
                 if created
@@ -302,10 +304,12 @@ def _prepare_submodule_cache(workflow, workflow_config: RunConfig) -> Result:
         workflow_config.dump()
         status = Result.Status.OK
     except Exception as e:
-        print(f"WARNING: Submodule cache failed: {e}")
+        print(f"ERROR: Submodule cache failed: {e}")
         traceback.print_exc()
         info = f"{e}\n{traceback.format_exc()}"
-        status = Result.Status.OK  # non-fatal, jobs fall back to GitHub clone
+        # Do not continue with an empty submodule_cache_hash. Builds would
+        # skip the restore and clone the same pins themselves.
+        status = Result.Status.FAIL
 
     return Result.create_from(
         name="Submodule Cache",

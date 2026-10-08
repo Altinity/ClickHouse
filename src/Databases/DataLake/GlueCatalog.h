@@ -4,6 +4,7 @@
 #if USE_AWS_S3 && USE_AVRO
 
 #include <aws/core/auth/AWSCredentials.h>
+#include <aws/glue/model/Column.h>
 #include <Databases/DataLake/ICatalog.h>
 #include <Interpreters/Context_fwd.h>
 #include <Poco/JSON/Object.h>
@@ -80,7 +81,9 @@ public:
         const String & table_name,
         const String & new_metadata_path,
         Poco::JSON::Object::Ptr new_schema,
-        Int32 previous_schema_id) const override;
+        Int32 previous_schema_id,
+        Int32 new_last_column_id,
+        Poco::JSON::Object::Ptr metadata = nullptr) const override;
 
     void dropTable(const String & namespace_name, const String & table_name, bool delete_data) const override;
 
@@ -129,6 +132,18 @@ private:
     };
 
     ObjectStorageWithPath createObjectStorageForEarlyTableAccess(const String & s3_location, const TableMetadata & table_metadata) const;
+
+    /// Fetches and caches the parsed Iceberg metadata JSON for `metadata_uri`.
+    /// Returns the cached object on subsequent calls for the same URI.
+    Poco::JSON::Object::Ptr getOrFetchMetadataObject(const String & metadata_uri, const TableMetadata & table_metadata) const;
+
+    /// Shared implementation for updateMetadata / updateSchema that optionally
+    /// sets StorageDescriptor columns in the Glue UpdateTable call.
+    bool updateTableInGlue(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        const std::vector<Aws::Glue::Model::Column> & columns = {}) const;
 
     mutable DB::CacheBase<String, Poco::JSON::Object::Ptr> metadata_objects;
 };
