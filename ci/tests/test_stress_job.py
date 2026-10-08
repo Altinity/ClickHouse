@@ -35,11 +35,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from ci.jobs.stress_job import (
-<<<<<<< HEAD
     ensure_ripgrep_installed,
-=======
     get_additional_envs,
->>>>>>> 66a2ea5ccd7 (Merge pull request #2292 from Altinity/enable-cas-s3-stress)
     process_results,
     read_test_results,
     sanitize_test_result_line,
