@@ -599,7 +599,7 @@ static void extendSchemaForPartitions(
 
     for (size_t i = 0; i < partition_columns.size(); ++i)
     {
-        Int32 field_id = spec_has_all_ids
+        const Int32 field_id = spec_has_all_ids
             ? partition_spec_fields->getObject(static_cast<UInt32>(i))->getValue<Int32>(Iceberg::f_field_id)
             : static_cast<Int32>(1000 + i);
 
