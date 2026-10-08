@@ -825,10 +825,10 @@ TEST(CASBackend, ConditionalPutRunsOnTheCallingThread)
     {
         try
         {
-            const uint64_t before = DB::CurrentThread::getProfileEvents()[ProfileEvents::S3PutObject].load();
+            const uint64_t before = DB::CurrentThread::getProfileEvents()[ProfileEvents::S3PutObject];
             auto op = requests.admit();
             committed = std::holds_alternative<DB::Cas::Committed>(op.create("put-key", "body", DB::Cas::Retry::once()));
-            puts_on_calling_thread = DB::CurrentThread::getProfileEvents()[ProfileEvents::S3PutObject].load() - before;
+            puts_on_calling_thread = DB::CurrentThread::getProfileEvents()[ProfileEvents::S3PutObject] - before;
         }
         catch (...)
         {

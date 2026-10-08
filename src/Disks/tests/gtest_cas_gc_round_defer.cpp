@@ -472,14 +472,14 @@ TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     ASSERT_TRUE(folded.acquired_lease);
     ASSERT_FALSE(folded.deferred)
         << "gc_fold_max_defer_rounds=1 forces the round immediately following one DEFER to fold";
-    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
-        << "the authoritative fold must run the janitor exactly once, not once per call site";
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 2u)
+        << "one janitor run, not one per call site: the page that deletes, then one from the stream start";
     const auto folded_cleanup = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
     {
         return phase.phase == "namespace_cleanup";
     });
     ASSERT_NE(folded_cleanup, phases.end());
-    EXPECT_EQ(folded_cleanup->metrics.at("janitor_pages"), 1u);
+    EXPECT_EQ(folded_cleanup->metrics.at("janitor_pages"), 2u);
     EXPECT_GE(folded_cleanup->metrics.at("janitor_keys"), 1u);
     EXPECT_EQ(folded_cleanup->metrics.at("janitor_deleted"), 1u);
     EXPECT_EQ(static_cast<uint64_t>(op.head(key_a, Retry::once()).has_value()) + static_cast<uint64_t>(op.head(key_b, Retry::once()).has_value()), 0u)

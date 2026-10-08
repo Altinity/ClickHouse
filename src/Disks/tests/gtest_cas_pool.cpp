@@ -3618,7 +3618,7 @@ TEST(CASMountRuntime, BadAllocInsideTheRenewalStaysTerminal)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+    const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost];
 
     backend->fault = RuntimeRenewBackend::Fault::ThrowBadAlloc;
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
@@ -3628,7 +3628,7 @@ TEST(CASMountRuntime, BadAllocInsideTheRenewalStaysTerminal)
     EXPECT_EQ(classification, "deterministic_failure");
     EXPECT_FALSE(runtime.mayMutate());
     EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::TransientNotLive);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), leases_lost_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost], leases_lost_before + 1);
 
     reported.release();
     runtime.stopBackgroundWorkers();
@@ -3746,7 +3746,7 @@ TEST(CASMountRuntime, GlobalMemoryLimitDoesNotEndTheLeaseThread)
     runtime.installRenewer(uuid, 1, [&] { return wall_ms; });
     const uint64_t anchor = runtime.startRenewer();
     runtime.armMountFence(uuid, 1, anchor + 1000);
-    const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+    const uint64_t leases_lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost];
 
     /// Armed only now: `startRenewer` renews on this thread, and these must run on the lease thread.
     backend->after_commit = [&]
@@ -3767,7 +3767,7 @@ TEST(CASMountRuntime, GlobalMemoryLimitDoesNotEndTheLeaseThread)
     second_admission.waitUntilArrived();
     EXPECT_TRUE(runtime.mayMutate());
     EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::Live);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), leases_lost_before);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost], leases_lost_before);
 
     ASSERT_TRUE(loop_head.has_value());
     EXPECT_EQ(loop_head->failure, "") << "the allocation at the loop head threw";
