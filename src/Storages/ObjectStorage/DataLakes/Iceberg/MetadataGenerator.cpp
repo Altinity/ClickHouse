@@ -826,11 +826,6 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
     new_field->set(Iceberg::f_required, new_type.second);
     new_field->set(Iceberg::f_type, new_type.first);
 
-<<<<<<< HEAD
-    current_schema->getArray(Iceberg::f_fields)->add(new_field);
-=======
-    metadata_object->set(Iceberg::f_last_column_id, last_column_id + 1);
-
     if (first || !after_column.empty())
     {
         Poco::JSON::Array::Ptr new_fields = new Poco::JSON::Array;
@@ -862,7 +857,6 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
         existing_fields->add(new_field);
     }
 
->>>>>>> 9c2cfbfd195 (Merge pull request #2289 from Altinity/2091-support-firstafter-keywords-for-alter-table-modify-column-in-iceberg-tables)
     current_schema->set(Iceberg::f_schema_id, next_schema_id);
     metadata_object->set(Iceberg::f_current_schema_id, next_schema_id);
     metadata_object->getArray(Iceberg::f_schemas)->add(current_schema);
