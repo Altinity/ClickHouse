@@ -628,11 +628,8 @@ namespace
             ThreadPoolCallbackRunnerUnsafe<void> schedule_,
             BlobStorageLogWriterPtr blob_storage_log_,
             std::function<void()> fallback_method_,
-<<<<<<< HEAD
-            bool is_ranged_copy_)
-=======
+            bool is_ranged_copy_,
             bool allow_fallback_ = true)
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
             : UploadHelper(
                 client_ptr_,
                 dest_bucket_,
@@ -932,7 +929,8 @@ namespace
         ThreadPoolCallbackRunnerUnsafe<void> schedule,
         const CreateReadBuffer & fallback_file_reader,
         const std::optional<ObjectAttributes> & object_metadata,
-        bool is_ranged_copy)
+        bool is_ranged_copy,
+        ObjectStorageCopyMode copy_mode)
     {
         if (!dest_s3_client)
             dest_s3_client = src_s3_client;
@@ -954,6 +952,11 @@ namespace
 
         if (!settings[S3RequestSetting::allow_native_copy])
         {
+            if (copy_mode == ObjectStorageCopyMode::NativeOnly)
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "Native-only S3 object copy is unavailable because allow_native_copy is disabled");
+
             LOG_TRACE(getLogger("copyS3File"), "Native copy is disable for {}", src_key);
             fallback_method();
             return;
@@ -974,7 +977,8 @@ namespace
             schedule,
             blob_storage_log,
             std::move(fallback_method),
-            is_ranged_copy};
+            is_ranged_copy,
+            /*allow_fallback=*/copy_mode == ObjectStorageCopyMode::Default};
         helper.performCopy();
     }
 }
@@ -991,50 +995,12 @@ void copyS3File(
     const ReadSettings & read_settings,
     BlobStorageLogWriterPtr blob_storage_log,
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
-<<<<<<< HEAD
     const CreateReadBuffer & fallback_file_reader,
-    const std::optional<ObjectAttributes> & object_metadata)
-{
-    copyS3FileImpl(
-        std::move(src_s3_client),
-=======
-    const CreateReadBuffer& fallback_file_reader,
     const std::optional<ObjectAttributes> & object_metadata,
     ObjectStorageCopyMode copy_mode)
 {
-    if (!dest_s3_client)
-        dest_s3_client = src_s3_client;
-
-    std::function<void()> fallback_method = [&] mutable
-    {
-        copyDataToS3File(
-            fallback_file_reader,
-            src_offset,
-            src_size,
-            dest_s3_client,
-            dest_bucket,
-            dest_key,
-            settings,
-            blob_storage_log,
-            schedule,
-            object_metadata);
-    };
-
-    if (!settings[S3RequestSetting::allow_native_copy])
-    {
-        if (copy_mode == ObjectStorageCopyMode::NativeOnly)
-            throw Exception(
-                ErrorCodes::NOT_IMPLEMENTED,
-                "Native-only S3 object copy is unavailable because allow_native_copy is disabled");
-
-        LOG_TRACE(getLogger("copyS3File"), "Native copy is disable for {}", src_key);
-        fallback_method();
-        return;
-    }
-
-    CopyFileHelper helper{
-        src_s3_client,
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+    copyS3FileImpl(
+        std::move(src_s3_client),
         src_bucket,
         src_key,
         /* src_offset= */ 0,
@@ -1049,8 +1015,8 @@ void copyS3File(
         std::move(schedule),
         fallback_file_reader,
         object_metadata,
-<<<<<<< HEAD
-        /* is_ranged_copy= */ false);
+        /* is_ranged_copy= */ false,
+        copy_mode);
 }
 
 void copyS3FileRange(
@@ -1086,14 +1052,8 @@ void copyS3FileRange(
         std::move(schedule),
         fallback_file_reader,
         object_metadata,
-        /* is_ranged_copy= */ true);
-=======
-        schedule,
-        blob_storage_log,
-        std::move(fallback_method),
-        /*allow_fallback=*/copy_mode == ObjectStorageCopyMode::Default};
-    helper.performCopy();
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+        /* is_ranged_copy= */ true,
+        ObjectStorageCopyMode::Default);
 }
 
 }

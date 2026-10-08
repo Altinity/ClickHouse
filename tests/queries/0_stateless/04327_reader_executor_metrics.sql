@@ -1,20 +1,12 @@
-<<<<<<< HEAD
--- Tags: no-distributed-cache, no-encrypted-storage, no-parallel-replicas
--- Like 04316, the executor falls back on the distributed cache and decryption
--- (which can't be disabled from the test), so its metrics would not be emitted on
--- those storage configs. Skip them; the test still runs on local disk and plain
--- object storage where the executor engages.
---   no-parallel-replicas: the counters are incremented on whichever replica reads the
---   mark, so the initiator's `query_log` row does not carry them.
-=======
--- Tags: no-distributed-cache, no-encrypted-storage, no-cas-storage
+-- Tags: no-distributed-cache, no-encrypted-storage, no-parallel-replicas, no-cas-storage
 -- Like 04316, the executor falls back on the distributed cache and decryption
 -- (which can't be disabled from the test), so its metrics would not be emitted on
 -- those storage configs. Skip them; the test still runs on local disk and plain
 -- object storage where the executor engages. Content-addressed storage always
 -- adds a `file_view` stage (byte window inside a shared blob), which the
 -- executor falls back on the same way -- see `ReadPipeline::tryBuildReaderExecutor`.
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+--   no-parallel-replicas: the counters are incremented on whichever replica reads the
+--   mark, so the initiator's `query_log` row does not carry them.
 --
 -- Checks that the experimental ReaderExecutor emits its observability metrics.
 -- Reads a MergeTree table with `use_reader_executor = 1` and verifies, via the

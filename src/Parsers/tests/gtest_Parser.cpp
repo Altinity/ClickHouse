@@ -845,7 +845,6 @@ INSTANTIATE_TEST_SUITE_P(ParserRenameQuery, ParserTest,
         }
 })));
 
-<<<<<<< HEAD
 #ifdef DEBUG_OR_SANITIZER_BUILD
 /// Regression test for the UBSan "member call on null pointer of type DB::IAST" at
 /// ASTRenameQuery::formatQueryImpl (RENAME DATABASE branch). A RENAME DATABASE node always
@@ -881,7 +880,7 @@ TEST(ParserRenameQueryDeathTest, FormatNullToDatabaseAborts)
     EXPECT_DEATH(ast->formatWithSecretsOneLine(), "elements.at\\(0\\).to.database");
 }
 #endif
-=======
+
 // SYSTEM CAS DROP POOL MEMBER: srid and disk are both required quoted string literals
 // (an srid is an opaque server-root path, not identifier-shaped); ON CLUSTER round-trips as a bare
 // identifier (ASTQueryWithOnCluster::formatOnCluster uses backQuoteIfNeed, no quoting needed for a
@@ -924,7 +923,6 @@ INSTANTIATE_TEST_SUITE_P(ParserSystemQuery, ParserTest,
             "SYSTEM CAS GC RUN ON CLUSTER my_cluster disk1"
         },
 })));
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
 static constexpr size_t kDummyMaxQuerySize = 256 * 1024;
 static constexpr size_t kDummyMaxParserDepth = 256;

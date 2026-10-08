@@ -139,7 +139,6 @@ public:
     /// Truncate file to the target size.
     virtual void truncateFile(const std::string & src_path, size_t size) = 0;
 
-<<<<<<< HEAD
     /// Increment the reference count of a data blob shared between metadata files.
     virtual void incrementBlobRefCount(const std::string & /* blob */)
     {
@@ -151,7 +150,7 @@ public:
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Blob reference counting is not implemented for this disk transaction");
     }
-=======
+
     /// In-flight read-your-writes for a part being assembled by THIS transaction (B59). Forwarded to the
     /// metadata transaction by object-storage disk transactions; default (e.g. local disk) is no in-flight
     /// visibility, so a reader falls through to the committed path.
@@ -168,7 +167,6 @@ public:
     /// STAGED directly under `path` (one level, the directory prefix stripped). Forwarded to the metadata
     /// transaction; default (e.g. local disk) is empty.
     virtual std::vector<std::string> listInFlightDirectory(const std::string & /*path*/) const { return {}; }
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 };
 
 using DiskTransactionPtr = std::shared_ptr<IDiskTransaction>;

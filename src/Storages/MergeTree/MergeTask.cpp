@@ -594,21 +594,16 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
         std::optional<MergeTreeDataPartBuilder> builder;
         if (global_ctx->parent_part)
         {
-<<<<<<< HEAD
-            /// Non-initializing, so nothing is seeded from an existing directory.
-            auto data_part_storage = global_ctx->parent_part->getDataPartStorage().getProjectionNoInitialize(local_tmp_part_basename,  /* use parent transaction */ false);
-            builder.emplace(*global_ctx->data, global_ctx->future_part->name, data_part_storage, getReadSettings(), PartDirIntent::CreateFresh);
-=======
             /// On a content-addressed disk a part is one atomic unit (one manifest + one ref), so the
             /// projection sub-part must be written through the PARENT part's whole-part transaction --
             /// mirroring the INSERT path -- for its files to land in the parent manifest and survive a
             /// reload. On any other disk the projection keeps its own sub-transaction, as before.
             global_ctx->projection_uses_parent_transaction
                 = global_ctx->parent_part->getDataPartStorage().isContentAddressed();
-            auto data_part_storage = global_ctx->parent_part->getDataPartStorage().getProjection(
+            /// Non-initializing, so nothing is seeded from an existing directory.
+            auto data_part_storage = global_ctx->parent_part->getDataPartStorage().getProjectionNoInitialize(
                 local_tmp_part_basename, /* use_parent_transaction */ global_ctx->projection_uses_parent_transaction);
-            builder.emplace(*global_ctx->data, global_ctx->future_part->name, data_part_storage, getReadSettings());
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+            builder.emplace(*global_ctx->data, global_ctx->future_part->name, data_part_storage, getReadSettings(), PartDirIntent::CreateFresh);
             builder->withParentPart(global_ctx->parent_part);
         }
         else

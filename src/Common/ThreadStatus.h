@@ -96,9 +96,6 @@ public:
 
     const Int32 os_threads_nice_value;
 
-<<<<<<< HEAD
-    MemorySpillSchedulerPtr memory_spill_scheduler;
-=======
     /// A borrowed child group (materialized view / async-insert flush) parents its `memory_tracker`
     /// and `performance_counters` at the parent group's trackers via RAW pointers. Retain a shared_ptr
     /// to the parent so those trackers cannot be freed while any thread is still attached to this child
@@ -107,8 +104,7 @@ public:
     /// a top-level query/background group, whose parent is a process-lifetime tracker (user/total/background).
     ThreadGroupPtr parent_thread_group;
 
-    MemorySpillScheduler::Ptr memory_spill_scheduler;
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+    MemorySpillSchedulerPtr memory_spill_scheduler;
     ProfileEvents::Counters performance_counters{VariableContext::Process};
     MemoryTracker memory_tracker{VariableContext::Process};
 

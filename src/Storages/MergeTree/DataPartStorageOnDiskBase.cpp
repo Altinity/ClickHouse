@@ -599,27 +599,19 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     if (save_metadata_callback)
         save_metadata_callback(disk);
 
-<<<<<<< HEAD
     /// Also remove any leftover `txn_version.txt.tmp`: leaving it without the main file makes the
     /// cloned/frozen part load as a rolled-back transaction (see `VersionMetadataOnDisk::loadMetadata`)
     /// and get discarded as `Outdated`. Remove the temporary file before the main file so the cleanup
     /// is fail-closed: a failure between the two removals leaves a valid `txn_version.txt` rather than
     /// the dangerous tmp-only state.
-    if (params.external_transaction)
-    {
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
-        if (!params.keep_metadata_version)
-            params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
-        IMergeTreeDataPart::writeInvalidatedSystemColumnsFile(*params.external_transaction, fs::path(to) / dir_path, params.invalidated_columns_to_write, write_settings);
-=======
     if (clone_transaction)
     {
         clone_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
+        clone_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
         clone_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
         if (!params.keep_metadata_version)
             clone_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
+        IMergeTreeDataPart::writeInvalidatedSystemColumnsFile(*clone_transaction, fs::path(to) / dir_path, params.invalidated_columns_to_write, write_settings);
 
         /// When the caller wants a fresh metadata version written into the clone (the Replicated queue
         /// clone path — `executeReplaceRange`/`replacePartitionFrom`/`movePartitionToTable` set
@@ -641,7 +633,6 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
             writeText(*params.metadata_version_to_write, *out_metadata);
             out_metadata->finalize();
         }
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     }
     else
     {
@@ -653,20 +644,18 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
         IMergeTreeDataPart::writeInvalidatedSystemColumnsFile(*disk, fs::path(to) / dir_path, params.invalidated_columns_to_write, write_settings);
     }
 
-<<<<<<< HEAD
     /// Make the hardlink clone durable (the Backup loop above fsyncs nothing). This runs
     /// synchronously before freeze returns, so a caller that afterwards makes a destructive change
     /// (e.g. DETACH commits a covering empty part and drops the source) sees the clone already on
     /// disk. See the commit message / #111382 for the full rationale.
     if (params.fsync_part_directory && !params.external_transaction && !disk->isRemote())
         fsyncFrozenCloneTree(*disk, fs::path(to) / dir_path);
-=======
+
     /// Commit the self-created transaction (the whole-part clone commit point for CA). An external
     /// transaction is committed by its owner, as before. Before the arena scope below, so the commit's
     /// own allocations are not attributed to the MergeTree arena.
     if (owned_transaction)
         owned_transaction->commit();
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
     /// The SingleDiskVolume and the DataPartStorageOnDiskFull built by `create` are stored on the
     /// frozen part for its whole lifetime; route them into the dedicated MergeTree arena, like the
@@ -791,21 +780,11 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
     if (save_metadata_callback)
         save_metadata_callback(dst_disk);
 
-<<<<<<< HEAD
     /// Also remove any leftover `txn_version.txt.tmp`: leaving it without the main file makes the
     /// cloned/frozen part load as a rolled-back transaction (see `VersionMetadataOnDisk::loadMetadata`)
     /// and get discarded as `Outdated`. Remove the temporary file before the main file so the cleanup
     /// is fail-closed: a failure between the two removals leaves a valid `txn_version.txt` rather than
     /// the dangerous tmp-only state.
-    if (params.external_transaction)
-    {
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
-        if (!params.keep_metadata_version)
-            params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
-        IMergeTreeDataPart::writeInvalidatedSystemColumnsFile(*params.external_transaction, fs::path(to) / dir_path, params.invalidated_columns_to_write, write_settings);
-=======
     /// These removals belong to the clone. On the content-addressed arm they MUST go through the same
     /// transaction: sent straight to the disk they would autocommit, which is exactly the
     /// one-publish-per-file behaviour the single transaction above exists to prevent.
@@ -814,9 +793,11 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
         try
         {
             clone_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
+            clone_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TMP_TXN_VERSION_METADATA_FILE_NAME);
             clone_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
             if (!params.keep_metadata_version)
                 clone_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
+            IMergeTreeDataPart::writeInvalidatedSystemColumnsFile(*clone_transaction, fs::path(to) / dir_path, params.invalidated_columns_to_write, write_settings);
             if (owned_transaction)
                 owned_transaction->commit();
         }
@@ -826,7 +807,6 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
                 owned_transaction->undo();
             throw;
         }
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     }
     else
     {

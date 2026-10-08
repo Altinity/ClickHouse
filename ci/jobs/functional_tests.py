@@ -158,13 +158,9 @@ OPTIONS_TO_INSTALL_ARGUMENTS = {
     "old analyzer": "--analyzer",
     "WasmEdge": "--wasm-engine wasmedge",
     "s3 storage": "--s3-storage",
-<<<<<<< HEAD
-    "DBReplicated": "--db-replicated",
-=======
     "cas storage": "--cas-storage",
     "cas s3 storage": "--cas-s3-storage",
-    "DatabaseReplicated": "--db-replicated",
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
+    "DBReplicated": "--db-replicated",
     "DatabaseOrdinary": "--db-ordinary",
     "wide parts enabled": "--wide-parts",
     "ParallelReplicas": "--parallel-rep",
@@ -995,7 +991,6 @@ def main():
         setup_notes = []
 
         def start():
-<<<<<<< HEAD
             # `from_commands_run` captures this closure's stdout into the step
             # Result.info (hence CIDB test_context_raw) only when it returns a
             # failing value. Print a concise "SETUP FAILURE: <sub-step>" marker
@@ -1005,6 +1000,15 @@ def main():
             if not (CH.start_seaweedfs(test_type="stateless") and CH.start_azurite()):
                 print("SETUP FAILURE: seaweedfs/azurite did not start")
                 return False
+            if is_cas_s3:
+                # The CA-over-S3 pool lives on RustFS (M-W D-W8): the incarnation pool
+                # needs ENFORCED conditional deletes, which MinIO OSS lacks (the
+                # fail-closed capability probe rejects it). start_rustfs wipes its data
+                # dir per run, so no pool state bleeds between runs (the local-CA
+                # analogue is the per-run server-store wipe). MinIO keeps the non-CA
+                # s3 disks.
+                if not CH.start_rustfs():
+                    return False
             if not CH.start():
                 print("SETUP FAILURE: clickhouse-server process did not start")
                 return False
@@ -1013,26 +1017,6 @@ def main():
                 # timeout; the marker just names the sub-step for triage.
                 print("SETUP FAILURE: clickhouse-server not ready (wait_ready)")
                 return False
-=======
-            res = CH.start_minio(test_type="stateless") and CH.start_azurite()
-            if res and is_cas_s3:
-                # The CA-over-S3 pool lives on RustFS (M-W D-W8): the incarnation pool
-                # needs ENFORCED conditional deletes, which MinIO OSS lacks (the
-                # fail-closed capability probe rejects it). start_rustfs wipes its data
-                # dir per run, so no pool state bleeds between runs (the local-CA
-                # analogue is the per-run server-store wipe). MinIO keeps the non-CA
-                # s3 disks.
-                res = CH.start_rustfs()
-            res = res and CH.start()
-            res = res and CH.wait_ready()
-            if res:
-                if not CH.start_kafka():
-                    info.add_workflow_warning("Failed to start Kafka")
-                    print("Failed to start Kafka")
-                    # Fail fast on infra setup errors so we don't burn time
-                    # triaging Kafka/Avro test failures caused by a broken setup.
-                    return False
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
             if not CH.start_kafka():
                 info.add_workflow_warning("Failed to start Kafka")

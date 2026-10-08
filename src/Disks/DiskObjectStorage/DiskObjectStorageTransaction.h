@@ -40,8 +40,8 @@ protected:
     std::vector<std::function<void(MetadataTransactionPtr tx)>> operations_to_execute;
     std::unordered_map<Location, StoredObjects> written_blobs;
 
-    /// Execute the operation right away if the metadata storage applies operations eagerly,
-    /// otherwise queue it until commit.
+    /// Execute the operation right away if the metadata storage applies operations eagerly
+    /// (or its transaction is an eager staging overlay, e.g. CA), otherwise queue it until commit.
     void addOperation(std::function<void(MetadataTransactionPtr tx)> op);
 
 public:
@@ -143,17 +143,6 @@ protected:
         const std::string & to_file_path,
         const ReadSettings & read_settings,
         const WriteSettings & write_settings);
-
-    /// [TXN-ONE-PIPELINE] Route one metadata effect either into the FIFO replay queue (ordinary object
-    /// storage) or straight to the metadata transaction at call time (eager staging overlay, e.g. CA).
-    template <typename Operation>
-    void dispatch(Operation && operation)
-    {
-        if (metadata_storage->transactionIsStagingOverlay())
-            operation(metadata_transaction);
-        else
-            operations_to_execute.emplace_back(std::forward<Operation>(operation));
-    }
 
 private:
     std::unique_ptr<WriteBufferFromFileBase> writeFileImpl( /// NOLINT

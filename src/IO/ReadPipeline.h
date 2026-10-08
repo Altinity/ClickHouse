@@ -161,7 +161,6 @@ public:
     /// read from the encryption header. It must return the decryption key.
     void needDecryption(String path, size_t buffer_size, KeyFinderFunc key_finder);
 
-<<<<<<< HEAD
     /// Let the `ReaderExecutor` path reuse held source connections, bounded by this limit. When it is
     /// not set, the executor uses the stateless one-shot path.
     void needLongConnectionLimit(std::shared_ptr<LongConnectionLimit> limit);
@@ -170,7 +169,7 @@ public:
     /// disks on random-object-key backends (see `DiskEncrypted::prepareRead`). Deterministic-path
     /// backends and url or external reads leave it null, so a reused key cannot serve a stale header.
     void needEncryptionHeaderCache(std::shared_ptr<EncryptionHeaderCache> cache) { encryption_header_cache = std::move(cache); }
-=======
+
     /// -- File view stage --
     /// Exposes ONLY the byte window [left_bound, right_bound) of the underlying chain as a
     /// standalone file named `file_name` (ReadBufferFromFileView). Used by content-addressed
@@ -179,7 +178,6 @@ public:
     /// seeks and right bounds are translated and forwarded down the standard chain — but
     /// inside decryption, which operates on logical-file bytes.
     void needFileView(String file_name, size_t left_bound, size_t right_bound);
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
     /// -- Build the final ReadBuffer chain --
     /// Uses the ReadSettings stored in the source stage.
@@ -254,12 +252,9 @@ private:
     std::optional<DistributedCacheStage> distributed_cache;
     std::optional<AsyncPrefetchStage> async_prefetch;
     VectorWithMemoryTracking<DecryptionStage> decryption_stages;
-<<<<<<< HEAD
     /// Global encryption-header cache for the executor; null unless a random-object-key disk set it.
     std::shared_ptr<EncryptionHeaderCache> encryption_header_cache;
-=======
     std::optional<FileViewStage> file_view;
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
     LoggerPtr log = getLogger("ReadPipeline");
 

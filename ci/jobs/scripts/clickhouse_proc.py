@@ -1396,21 +1396,11 @@ fi
 
         self.restore_system_metadata_files_from_remote_database_disk()
 
-<<<<<<< HEAD
         # Caches created via the disk() function live one level deeper, under
         # disks/<name>/status.
         cache_status_files = glob.glob(
             f"{self.ch_var_lib_dir}/filesystem_caches/*/status"
         ) + glob.glob(f"{self.ch_var_lib_dir}/filesystem_caches/disks/*/status")
-=======
-        # `**`, not `*`: dynamic cache disks created by tests nest their path, e.g.
-        # `filesystem_caches/disks/cache_03517/status` — a one-level glob missed exactly that file,
-        # and the scrape died on its flock (`StatusFile.cpp` "Another server instance ... is already
-        # running") when the server had not released it.
-        cache_status_files = glob.glob(
-            f"{self.ch_var_lib_dir}/filesystem_caches/**/status", recursive=True
-        )
->>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         if cache_status_files:
             print(
                 f"WARNING: Server died? Removing cache status files: {cache_status_files}"
