@@ -298,6 +298,13 @@ def read_versions(versions_path: Union[Path, str] = FILE_WITH_VERSION_PATH) -> V
     return versions
 
 
+# Pre-release flavour (VERSION_FLAVOUR) → release flavour (tag)
+ALTINITY_RELEASE_BY_PRERELEASE = {
+    "altinitytest": "altinitystable",
+    "antalyatest": "altinityantalya",
+    "altinityfipstest": "altinityfips",
+}
+
 ALTINITY_TRACK_BY_FLAVOUR = {
     "altinitystable": 1,
     "altinityantalya": 2,
@@ -316,18 +323,26 @@ def check_tag_against_versions(tag: str, versions: VERSIONS) -> None:
         raise ValueError(
             f"Tag [{tag}] does not start with [{expected_prefix}]"
         )
-    flavour = tag[len(expected_prefix) :]
-    track = ALTINITY_TRACK_BY_FLAVOUR.get(flavour)
+    tag_flavour = tag[len(expected_prefix) :]
+    track = ALTINITY_TRACK_BY_FLAVOUR.get(tag_flavour)
     if track is None:
         raise ValueError(
-            f"Tag [{tag}] flavour [{flavour}] is not one of "
+            f"Tag [{tag}] flavour [{tag_flavour}] is not one of "
             f"{sorted(ALTINITY_TRACK_BY_FLAVOUR)}"
         )
     if int(versions["tweak"]) // 10000 != track:
         raise ValueError(
             f"Tag [{tag}] tweak [{versions['tweak']}] does not match the "
-            f"{track}xxxx track for flavour [{flavour}]"
+            f"{track}xxxx track for flavour [{tag_flavour}]"
         )
+    file_flavour = str(versions.get("flavour") or "")
+    if file_flavour:
+        expected_release = ALTINITY_RELEASE_BY_PRERELEASE.get(file_flavour, file_flavour)
+        if tag_flavour != expected_release:
+            raise ValueError(
+                f"Tag [{tag}] flavour [{tag_flavour}] does not match "
+                f"VERSION_FLAVOUR [{file_flavour}] (expected [{expected_release}])"
+            )
 
 
 def check_tag_version(

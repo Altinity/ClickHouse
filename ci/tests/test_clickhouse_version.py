@@ -146,45 +146,69 @@ def test_source_upload_prefers_pipeline_version(monkeypatch):
     assert source_upload.get_version().string == "26.8.1.1"
 
 
-def test_tag_build_takes_flavour_from_tag(monkeypatch, tmp_path):
-    use_version_file(monkeypatch, tmp_path, UPSTREAM_BLOCK_VERSION_FILE)
+@pytest.mark.parametrize(
+    "tweak,prerelease,release",
+    [
+        (10001, "altinitytest", "altinitystable"),
+        (20001, "antalyatest", "altinityantalya"),
+        (30001, "altinityfipstest", "altinityfips"),
+    ],
+)
+def test_tag_build_takes_flavour_from_tag(
+    monkeypatch, tmp_path, tweak, prerelease, release
+):
+    content = UPSTREAM_BLOCK_VERSION_FILE.replace("10001", str(tweak)).replace(
+        "altinitytest", prerelease
+    )
+    use_version_file(monkeypatch, tmp_path, content)
     monkeypatch.setenv("GITHUB_REF_TYPE", "tag")
-    monkeypatch.setenv("GITHUB_REF_NAME", "v26.8.1.10001.altinitystable")
+    monkeypatch.setenv("GITHUB_REF_NAME", f"v26.8.1.{tweak}.{release}")
 
     info = FakeInfo()
     info.pr_number = 0
     version = version_log._build_version(info)
 
-    assert version.string == "26.8.1.10001.altinitystable"
-    assert version.describe == "v26.8.1.10001.altinitystable"
-    assert version.to_dict()["flavour"] == "altinitystable"
+    assert version.string == f"26.8.1.{tweak}.{release}"
+    assert version.describe == f"v26.8.1.{tweak}.{release}"
+    assert version.to_dict()["flavour"] == release
 
 
-def _tag_versions(tweak: int = 10001) -> dict:
-    return {"major": 26, "minor": 8, "patch": 1, "tweak": tweak}
-
-
-@pytest.mark.parametrize(
-    "tweak,flavour",
-    [
-        (10001, "altinitystable"),
-        (20001, "altinityantalya"),
-        (30001, "altinityfips"),
-    ],
-)
-def test_check_tag_version_accepts_matching_track(tweak, flavour):
-    check_tag_against_versions(f"v26.8.1.{tweak}.{flavour}", _tag_versions(tweak))
+def _tag_versions(tweak: int = 10001, flavour: str = "altinitytest") -> dict:
+    return {
+        "major": 26,
+        "minor": 8,
+        "patch": 1,
+        "tweak": tweak,
+        "flavour": flavour,
+    }
 
 
 @pytest.mark.parametrize(
-    "tag",
+    "tweak,prerelease,release",
     [
-        "v26.8.1.10001.altinityantalya",
-        "v26.8.1.10002.altinitystable",
-        "v26.8.1.10001.altinitytest",
-        "v26.8.1.1-lts",
+        (10001, "altinitytest", "altinitystable"),
+        (20001, "antalyatest", "altinityantalya"),
+        (30001, "altinityfipstest", "altinityfips"),
+        (20001, "altinityantalya", "altinityantalya"),
     ],
 )
-def test_check_tag_version_rejects_mismatched_tag(tag):
+def test_check_tag_version_accepts_matching_track(tweak, prerelease, release):
+    check_tag_against_versions(
+        f"v26.8.1.{tweak}.{release}", _tag_versions(tweak, prerelease)
+    )
+
+
+@pytest.mark.parametrize(
+    "tweak,flavour,tag",
+    [
+        (10001, "altinitytest", "v26.8.1.10001.altinityantalya"),
+        (10001, "altinitytest", "v26.8.1.10002.altinitystable"),
+        (10001, "altinitytest", "v26.8.1.10001.altinitytest"),
+        (10001, "altinitytest", "v26.8.1.1-lts"),
+        (20001, "altinitytest", "v26.8.1.20001.altinityantalya"),
+        (20001, "antalyatest", "v26.8.1.20001.antalyatest"),
+    ],
+)
+def test_check_tag_version_rejects_mismatched_tag(tweak, flavour, tag):
     with pytest.raises(ValueError):
-        check_tag_against_versions(tag, _tag_versions())
+        check_tag_against_versions(tag, _tag_versions(tweak, flavour))

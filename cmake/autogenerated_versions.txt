@@ -11,6 +11,15 @@ SET(VERSION_DESCRIBE v26.8.11.1-lts)
 SET(VERSION_STRING 26.8.11.1)
 # end of autochange
 
+# Note (strtgbb): 
+# Do not customize VERSION_DESCRIBE or VERSION_STRING
+# They will be overwritten at compile time
+# Only modify the below
+
 SET(VERSION_TWEAK 10001)
 SET(VERSION_FLAVOUR altinitytest)
 
+# Pre-release flavour (this file) → release flavour (tag):
+#   altinitytest     → altinitystable
+#   antalyatest      → altinityantalya
+#   altinityfipstest → altinityfips
