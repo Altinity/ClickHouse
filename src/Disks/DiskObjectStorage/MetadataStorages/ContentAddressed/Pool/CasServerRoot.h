@@ -71,6 +71,7 @@ struct MountRenewOperationEnvironment
     /// `NotAttempted` rather than terminal only when this node had already been asked to stop --
     /// sampling it afterwards would read a flag that the refusal itself may have set.
     std::function<bool()> cancelled;
+    RequestObserver requests;
 };
 
 /// Validate a `server_root_id` — the explicit, configured identity of the content-addressed layout
