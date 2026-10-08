@@ -766,8 +766,9 @@ void generateManifestFile(
 
     auto adapter = std::make_unique<OutputStreamWriteBufferAdapter>(buf);
     avro::DataFileWriter<avro::GenericDatum> writer(std::move(adapter), schema);
-    /// avro-cpp's compiled schema loses the Iceberg field-id/element-id attributes; write the
-    /// original id-carrying JSON as the avro.schema header so external readers can plan a scan.
+    /// avro-cpp's compiled schema loses Iceberg field-id attributes, and `toJson` drops
+    /// unknown logical types such as `timestamp-nanos`. Write the original JSON as the
+    /// `avro.schema` header so external readers keep both.
     writer.setMetadata(Iceberg::f_avro_schema, schema_representation);
     writer.setMetadata(Iceberg::f_schema, json_representation);
     writer.setMetadata(Iceberg::f_schema_id, std::to_string(schema_object_to_write->getValue<Int32>(Iceberg::f_schema_id)));
