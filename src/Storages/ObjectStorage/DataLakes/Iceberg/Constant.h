@@ -33,6 +33,8 @@ DEFINE_ICEBERG_FIELD(name);
 DEFINE_ICEBERG_FIELD(required);
 DEFINE_ICEBERG_FIELD(schema);
 DEFINE_ICEBERG_FIELD(schemas);
+/// The Avro file-header metadata key that stores the writer schema (Avro spec, "avro.schema").
+DEFINE_ICEBERG_FIELD_ALIAS(avro_schema, avro.schema);
 DEFINE_ICEBERG_FIELD(sequence_number);
 DEFINE_ICEBERG_FIELD(snapshots);
 DEFINE_ICEBERG_FIELD(status);
@@ -49,6 +51,7 @@ DEFINE_ICEBERG_FIELD(logicalType); /// this field has a camelCase name
 DEFINE_ICEBERG_FIELD(transform);
 DEFINE_ICEBERG_FIELD(direction);
 
+DEFINE_ICEBERG_FIELD(unknown);
 DEFINE_ICEBERG_FIELD(uuid);
 DEFINE_ICEBERG_FIELD(value);
 DEFINE_ICEBERG_FIELD(manifest_length);

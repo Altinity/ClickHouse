@@ -9,6 +9,7 @@
 #include <aws/glue/GlueClient.h>
 #include <aws/glue/model/GetTablesRequest.h>
 #include <aws/glue/model/GetTableRequest.h>
+#include <aws/glue/model/GetDatabaseRequest.h>
 #include <aws/glue/model/GetDatabasesRequest.h>
 #include <aws/glue/model/CreateTableRequest.h>
 #include <aws/glue/model/DeleteTableRequest.h>
@@ -49,9 +50,11 @@
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Common/FailPoint.h>
+#include <Common/scope_guard_safe.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/ProxyConfigurationResolverProvider.h>
@@ -63,6 +66,8 @@ namespace DB::ErrorCodes
     extern const int FAULT_INJECTED;
     extern const int CATALOG_NAMESPACE_DISABLED;
     extern const int CATALOG_USER_TOKEN_NOT_AVAILABLE;
+    extern const int NOT_IMPLEMENTED;
+    extern const int S3_ERROR;
 }
 
 namespace DB::FailPoints
@@ -492,6 +497,11 @@ DB::Names GlueCatalog::getTablesForDatabase(const AuthenticatedClient & client, 
         }
         else
         {
+            /// The database is absent from Glue, so it contributes no tables. The error names the database, so
+            /// any pages already collected belong to a database that is gone and are dropped too.
+            if (outcome.GetError().GetErrorType() == Aws::Glue::GlueErrors::ENTITY_NOT_FOUND)
+                return {};
+
             throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Exception calling GetTables {}", outcome.GetError().GetMessage());
         }
         if (limit != 0 && result.size() >= limit)
@@ -515,6 +525,17 @@ DB::Names GlueCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) c
     return result;
 }
 
+DataLake::ICatalog::Namespaces GlueCatalog::getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    /// Glue databases are flat — they cannot contain nested namespaces.
+    return getDatabases(getClient(auth_token), "");
+}
+
+DB::Names GlueCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    return getTablesForDatabase(getClient(auth_token), namespace_name);
+}
+
 bool GlueCatalog::existsTable(const std::string & database_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     auto client = getClient(auth_token);
@@ -526,10 +547,22 @@ bool GlueCatalog::existsTable(const std::string & database_name, const std::stri
     request.SetDatabaseName(database_name);
     request.SetName(table_name);
 
-    ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTable);
-    auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTableMicroseconds);
-    auto outcome = client.client->GetTable(request);
-    return outcome.IsSuccess();
+    Aws::Glue::Model::GetTableOutcome outcome;
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogGetTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogGetTableMicroseconds);
+        outcome = client.client->GetTable(request);
+    }
+    if (outcome.IsSuccess())
+        return true;
+
+    if (outcome.GetError().GetErrorType() == Aws::Glue::GlueErrors::ENTITY_NOT_FOUND)
+        return false;
+
+    throw DB::Exception(
+        DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+        "Exception calling GetTable for table {}: {}",
+        database_name + "." + table_name, outcome.GetError().GetMessage());
 }
 
 bool GlueCatalog::tryGetTableMetadata(
@@ -582,7 +615,7 @@ bool GlueCatalog::tryGetTableMetadata(
         auto setup_specific_properties = [&]
         {
             const auto & table_params = table_outcome.GetParameters();
-            if (table_params.contains("metadata_location"))
+            if (table_params.contains("metadata_location") && !table_params.at("metadata_location").empty())
             {
                 result.setDataLakeSpecificProperties(DataLakeSpecificProperties{.iceberg_metadata_file_location = table_params.at("metadata_location")});
             }
@@ -665,6 +698,17 @@ bool GlueCatalog::tryGetTableMetadata(
                 }
             }
             result.setSchema(schema);
+        }
+
+        if (result.requiresPartitionAndSortingKeys() && result.isDefaultReadableTable())
+        {
+            if (!result.getDataLakeSpecificProperties().has_value())
+                setup_specific_properties();
+            if (result.isDefaultReadableTable())
+            {
+                auto [partition_by, order_by, unsupported_properties] = DB::Iceberg::getPartitionAndSortingKeyASTsFromMetadata(getIcebergMetadataObject(client, result));
+                result.setPartitionAndSortingKeys(std::move(partition_by), std::move(order_by), std::move(unsupported_properties));
+            }
         }
     }
     else
@@ -769,12 +813,16 @@ String GlueCatalog::getActualTimestampType(
     const TableMetadata & table_metadata,
     const String & glue_column_type) const
 {
+    return resolveTimestampTypeFromMetadata(getIcebergMetadataObject(client, table_metadata), column_name, glue_column_type);
+}
+
+Poco::JSON::Object::Ptr GlueCatalog::getIcebergMetadataObject(const AuthenticatedClient & client, const TableMetadata & table_metadata) const
+{
     auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
     if (!table_specific_properties.has_value())
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Failed to read table metadata, reason why table is unreadable: {}", table_metadata.getReasonWhyTableIsUnreadable());
 
-    auto metadata_object = getOrFetchMetadataObject(client, table_specific_properties->iceberg_metadata_file_location, table_metadata);
-    return resolveTimestampTypeFromMetadata(metadata_object, column_name, glue_column_type);
+    return getOrFetchMetadataObject(client, table_specific_properties->iceberg_metadata_file_location, table_metadata);
 }
 
 String GlueCatalog::resolveTimestampTypeFromMetadata(
@@ -883,6 +931,21 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
 {
     auto client = getClient(auth_token);
 
+    Aws::Glue::Model::GetDatabaseRequest get_request;
+    get_request.SetName(namespace_name);
+
+    auto get_outcome = client.client->GetDatabase(get_request);
+    if (get_outcome.IsSuccess())
+        return;
+
+    if (get_outcome.GetError().GetErrorType() != Aws::Glue::GlueErrors::ENTITY_NOT_FOUND)
+    {
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+            "Exception calling GetDatabase for namespace {}: {}",
+            namespace_name, get_outcome.GetError().GetMessage());
+    }
+
     Aws::Glue::Model::CreateDatabaseRequest create_request;
     Aws::Glue::Model::DatabaseInput db_input;
     db_input.SetName(namespace_name);
@@ -900,7 +963,14 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     }
 }
 
-void GlueCatalog::createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content, const DB::ForwardedAuthTokenPtr & auth_token) const
+bool GlueCatalog::createTable(
+    const String & namespace_name,
+    const String & table_name,
+    const String & new_metadata_path,
+    Poco::JSON::Object::Ptr metadata_content,
+    DB::CompressionMethod metadata_compression_method,
+    bool if_not_exists,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     auto client = getClient(auth_token);
 
@@ -909,6 +979,97 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
             "Failed to create table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
 
+    String effective_metadata_path = new_metadata_path;
+
+    DB::ObjectStoragePtr written_metadata_storage;
+    String written_metadata_file;
+
+    bool registered = false;
+    SCOPE_EXIT_SAFE({
+        if (registered || !written_metadata_storage)
+            return;
+
+        Aws::Glue::Model::GetTableRequest get_request;
+        get_request.SetDatabaseName(namespace_name);
+        get_request.SetName(table_name);
+        auto get_outcome = client.client->GetTable(get_request);
+
+        if (get_outcome.IsSuccess())
+        {
+            const auto & table_parameters = get_outcome.GetResult().GetTable().GetParameters();
+            auto it = table_parameters.find("metadata_location");
+            if (it != table_parameters.end() && it->second == effective_metadata_path)
+            {
+                LOG_INFO(
+                    log,
+                    "Table {}.{} is registered in the Glue catalog and points at {}, keeping that file",
+                    namespace_name,
+                    table_name,
+                    effective_metadata_path);
+                return;
+            }
+        }
+        else if (get_outcome.GetError().GetErrorType() != Aws::Glue::GlueErrors::ENTITY_NOT_FOUND)
+        {
+            LOG_WARNING(
+                log,
+                "Cannot tell whether table {}.{} was registered in the Glue catalog: {}. "
+                "Keeping the staged initial metadata file {}",
+                namespace_name,
+                table_name,
+                get_outcome.GetError().GetMessage(),
+                written_metadata_file);
+            return;
+        }
+
+        LOG_INFO(
+            log,
+            "Table {}.{} was not registered in the Glue catalog, removing the staged initial metadata file {}",
+            namespace_name,
+            table_name,
+            written_metadata_file);
+        written_metadata_storage->removeObjectIfExists(DB::StoredObject(written_metadata_file));
+    });
+
+    if (effective_metadata_path.empty() && metadata_content && metadata_content->has("location"))
+    {
+        String table_location = metadata_content->getValue<String>("location");
+        while (table_location.ends_with('/'))
+            table_location = table_location.substr(0, table_location.size() - 1);
+
+        TableMetadata dummy_metadata;
+        auto [object_storage, bucket_name, table_path] = createObjectStorageForEarlyTableAccess(client, table_location, dummy_metadata);
+
+        /// Name the file exactly like `IcebergMetadata::createInitial` does.
+        String compression_suffix = DB::toContentEncodingName(metadata_compression_method);
+        if (!compression_suffix.empty())
+            compression_suffix = "." + compression_suffix;
+
+        String metadata_filename = fmt::format("{}/metadata/v1{}.metadata.json", table_path, compression_suffix);
+
+        std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+        Poco::JSON::Stringifier::stringify(metadata_content, oss, 4);
+        String metadata_str = DB::removeEscapedSlashes(oss.str());
+
+        try
+        {
+            DB::Iceberg::writeMessageToFile(metadata_str, metadata_filename, object_storage, getContext(), "*", "", metadata_compression_method);
+        }
+        catch (const DB::Exception & e)
+        {
+            /// The write is guarded by `If-None-Match: *`, so S3 answers `PreconditionFailed` once the
+            /// initial metadata file is there - someone else created this table first.
+            if (if_not_exists && e.code() == DB::ErrorCodes::S3_ERROR && e.message().contains("PreconditionFailed"))
+                return false;
+            throw;
+        }
+
+        written_metadata_storage = object_storage;
+        written_metadata_file = metadata_filename;
+
+        effective_metadata_path = "s3://" + bucket_name + "/" + metadata_filename;
+    }
+
     Aws::Glue::Model::CreateTableRequest request;
     request.SetDatabaseName(namespace_name);
 
@@ -916,12 +1077,15 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
     table_input.SetName(table_name);
 
     Aws::Glue::Model::StorageDescriptor sd;
-    fs::path original_path = new_metadata_path;
+    if (!effective_metadata_path.empty())
+    {
+        fs::path original_path = effective_metadata_path;
 
-    fs::path parent = original_path.parent_path();
-    fs::path grandparent = parent.parent_path();
+        fs::path parent = original_path.parent_path();
+        fs::path grandparent = parent.parent_path();
 
-    sd.SetLocation(grandparent.c_str());
+        sd.SetLocation(grandparent.c_str());
+    }
 
     if (metadata_content)
     {
@@ -933,7 +1097,7 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
     table_input.SetTableType("ICEBERG");
 
     Aws::Map<Aws::String, Aws::String> parameters;
-    parameters["metadata_location"] = new_metadata_path;
+    parameters["metadata_location"] = effective_metadata_path;
     parameters["table_type"] = "ICEBERG";
 
     table_input.SetParameters(parameters);
@@ -949,7 +1113,15 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
     }
 
     if (!response.IsSuccess())
-        throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not create metadata in glue catalog: {}", response.GetError().GetMessage());
+    {
+        if (if_not_exists && response.GetError().GetErrorType() == Aws::Glue::GlueErrors::ALREADY_EXISTS)
+            return false;
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not create metadata in glue catalog: {}", response.GetError().GetMessage());
+    }
+
+    registered = true;
+    return true;
 }
 
 bool GlueCatalog::updateTableInGlue(
@@ -1026,7 +1198,12 @@ bool GlueCatalog::updateSchema(
     return updateTableInGlue(namespace_name, table_name, new_metadata_path, auth_token, columns);
 }
 
-void GlueCatalog::dropTable(const String & namespace_name, const String & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const
+void GlueCatalog::dropTable(
+    const String & namespace_name,
+    const String & table_name,
+    bool purge,
+    bool if_exists,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     auto client = getClient(auth_token);
 
@@ -1034,6 +1211,20 @@ void GlueCatalog::dropTable(const String & namespace_name, const String & table_
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to drop table {}, namespace {} is filtered by `namespaces` database parameter",
             table_name, namespace_name);
+
+    /// Glue's `DeleteTable` removes only the catalog entry; the client-side purge of the data files is
+    /// not implemented.
+    /// TODO: implement the client-side purge so `data_lake_delete_data_on_drop` can be honored for Glue.
+    if (purge)
+    {
+        if (if_exists && !existsTable(namespace_name, table_name, auth_token))
+            return;
+
+        throw DB::Exception(
+            DB::ErrorCodes::NOT_IMPLEMENTED,
+            "data_lake_delete_data_on_drop is not supported for the Glue catalog: dropping only removes the Glue "
+            "catalog entry and does not delete the underlying data files");
+    }
 
     Aws::Glue::Model::DeleteTableRequest request;
     request.SetDatabaseName(namespace_name);
@@ -1047,7 +1238,8 @@ void GlueCatalog::dropTable(const String & namespace_name, const String & table_
         response = client.client->DeleteTable(request);
     }
 
-    if (!response.IsSuccess())
+    if (!response.IsSuccess()
+        && !(if_exists && response.GetError().GetErrorType() == Aws::Glue::GlueErrors::ENTITY_NOT_FOUND))
         throw DB::Exception(
             DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
             "Can not delete table from glue catalog: {}",

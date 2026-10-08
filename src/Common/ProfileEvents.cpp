@@ -1377,6 +1377,7 @@ The server successfully detected this situation and will download merged part fr
     \
     M(ConnectionPoolIsFullMicroseconds, "Total time spent waiting for a slot in connection pool.", ValueType::Microseconds) \
     M(AsyncLoaderWaitMicroseconds, "Total time a query was waiting for async loader jobs.", ValueType::Microseconds) \
+    M(AsyncLoaderSpawnFailures, "Number of times the async loader could not spawn a worker because the global thread pool could not provide a thread. Queued jobs are then run by a worker the pool already has: one that is running, or one resuming from a wait on a job of another pool.", ValueType::Number) \
     \
     M(DistrCacheServerSwitches, "Distributed Cache read buffer event. Number of server switches between distributed cache servers in read/write-through cache", ValueType::Number) \
     M(DistrCacheReadMicroseconds, "Distributed Cache read buffer event. Time spent reading from distributed cache", ValueType::Microseconds) \
@@ -1732,7 +1733,7 @@ The server successfully detected this situation and will download merged part fr
     M(ObjectStorageListObjectsCacheHits, "Number of times object storage list objects operation hit the cache.", ValueType::Number) \
     M(ObjectStorageListObjectsCacheMisses, "Number of times object storage list objects operation miss the cache.", ValueType::Number) \
     M(ObjectStorageListObjectsCacheExactMatchHits, "Number of times object storage list objects operation hit the cache with an exact match.", ValueType::Number) \
-    M(ObjectStorageListObjectsCachePrefixMatchHits, "Number of times object storage list objects operation miss the cache using prefix matching.", ValueType::Number) \
+    M(ObjectStorageListObjectsCachePrefixMatchHits, "Number of times object storage list objects operation hit the cache using prefix matching.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsVended, "Number of table metadata requests to REST catalog asking to vend storage credentials.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsCacheHits, "Number of table metadata requests to REST catalog reusing cached storage credentials.", ValueType::Number) \
     M(DataLakeRestCatalogTokenExchange, "Number of RFC 8693 token exchanges performed to obtain a session token for the querying user.", ValueType::Number) \

@@ -44,6 +44,8 @@ public:
 
     DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
+    Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const override;
+
     bool existsTable(const std::string & database_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void getTableMetadata(
@@ -71,7 +73,14 @@ public:
         return DB::DatabaseDataLakeCatalogType::GLUE;
     }
 
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content, const DB::ForwardedAuthTokenPtr & auth_token) const override;
+    bool createTable(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr metadata_content,
+        DB::CompressionMethod metadata_compression_method,
+        bool if_not_exists,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void createNamespaceIfNotExists(const String & namespace_name, const String & location, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
@@ -87,7 +96,12 @@ public:
         Poco::JSON::Object::Ptr metadata,
         const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    void dropTable(const String & namespace_name, const String & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
+    void dropTable(
+        const String & namespace_name,
+        const String & table_name,
+        bool purge,
+        bool if_exists,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     /// Returns a callback that re-vends fresh AWS credentials from the configured
     /// credentials provider chain. Invoked by `ReadBufferFromS3` when an S3 call
@@ -131,6 +145,7 @@ private:
 
     DataLake::ICatalog::Namespaces getDatabases(const AuthenticatedClient & client, const std::string & prefix, size_t limit = 0) const;
     DB::Names getTablesForDatabase(const AuthenticatedClient & client, const std::string & db_name, size_t limit = 0) const;
+    DB::Names listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
     void setCredentials(const AuthenticatedClient & client, TableMetadata & metadata) const;
 
     /// The Glue catalog does not store detailed information about the types of timestamp columns, such as whether the column is timestamp or timestamptz.
@@ -141,6 +156,8 @@ private:
         const String & column_name,
         const TableMetadata & table_metadata,
         const String & glue_column_type) const;
+
+    Poco::JSON::Object::Ptr getIcebergMetadataObject(const AuthenticatedClient & client, const TableMetadata & table_metadata) const;
 
     String resolveMetadataPathFromTableLocation(
         const AuthenticatedClient & client, const String & table_location, const TableMetadata & table_metadata) const;

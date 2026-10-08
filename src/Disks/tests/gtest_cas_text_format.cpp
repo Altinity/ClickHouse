@@ -84,11 +84,9 @@ TEST(CASFormatTraits, CompleteUniqueAndGated)
     /// CASFormatTraitsDeathTest below proves the abort positively in those builds instead.
     EXPECT_THROW(traitsFor(FormatId::Roster), DB::Exception);
 #endif
-    /// Deterministic formats are pinned raw + strict; spot-check the two.
+    /// Deterministic formats are pinned raw; spot-check the two.
     EXPECT_EQ(traitsFor(FormatId::RunFile).compression, CompressionPolicy::PinnedRaw);
-    EXPECT_EQ(traitsFor(FormatId::RunFile).strictness, KeyStrictness::Strict);
     EXPECT_EQ(traitsFor(FormatId::FoldSeal).compression, CompressionPolicy::PinnedRaw);
-    EXPECT_EQ(traitsFor(FormatId::FoldSeal).strictness, KeyStrictness::Strict);
     /// .zst key suffix is exactly the Always set (can-grow-large types).
     EXPECT_EQ(storedSuffix(FormatId::RefSnapshot), ".zst");
     EXPECT_EQ(storedSuffix(FormatId::RefLog), ".zst");
@@ -128,7 +126,7 @@ TEST(CASJsonVocab, WriteAndReadBack)
     EXPECT_EQ(rendered.substr(0, 45), R"({"tag":"000102030405060708090a0b0c0d0e0f","se)");
 
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
-    JsonObjectReader r(in, KeyStrictness::Strict, "test");
+    JsonObjectReader r(in, "test");
     String key;
     ASSERT_TRUE(r.nextKey(key)); EXPECT_EQ(key, "tag");
     EXPECT_EQ(r.readHex128(), hexToU128("000102030405060708090a0b0c0d0e0f"));
@@ -153,7 +151,7 @@ TEST(CASJsonVocab, WordArrayFieldAndReaderRejectInvalidValues)
     const auto read = [](std::string_view text)
     {
         DB::ReadBufferFromMemory in(text.data(), text.size());
-        JsonObjectReader r(in, KeyStrictness::Tolerant, "test");
+        JsonObjectReader r(in, "test");
         String key;
         EXPECT_TRUE(r.nextKey(key));
         return r.readStringArray();
@@ -165,50 +163,45 @@ TEST(CASJsonVocab, WordArrayFieldAndReaderRejectInvalidValues)
 
 TEST(CASJsonVocab, FailClosedRules)
 {
-    auto reader = [](std::string_view text, KeyStrictness s, auto && consume)
+    auto reader = [](std::string_view text, auto && consume)
     {
         DB::ReadBufferFromMemory in(text.data(), text.size());
-        JsonObjectReader r(in, s, "test");
+        JsonObjectReader r(in, "test");
         consume(r);
     };
     /// duplicate key
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"a":1,"a":2})", KeyStrictness::Tolerant, [](auto & r)
+    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"a":1,"a":2})", [](auto & r)
     {
         String k;
         while (r.nextKey(k)) r.readU64Number();
     }); });
-    /// unknown key: Tolerant skips (nested value), Strict rejects
-    reader(R"({"zz":{"deep":[1,2]},"n":5})", KeyStrictness::Tolerant, [](auto & r)
+    /// unknown ordinary key: skipped, including a nested value
+    reader(R"({"zz":{"deep":[1,2]},"n":5})", [](auto & r)
     {
         String k;
         ASSERT_TRUE(r.nextKey(k)); r.skipUnknown(k);
         ASSERT_TRUE(r.nextKey(k)); EXPECT_EQ(r.readU64Number(), 5u);
         EXPECT_FALSE(r.nextKey(k));
     });
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"zz":1})", KeyStrictness::Strict, [](auto & r)
-    {
-        String k;
-        ASSERT_TRUE(r.nextKey(k)); r.skipUnknown(k);
-    }); });
-    /// critical key fails closed regardless of strictness
-    expectCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { reader(R"({"!x":1})", KeyStrictness::Tolerant, [](auto & r)
+    /// critical key fails closed
+    expectCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { reader(R"({"!x":1})", [](auto & r)
     {
         String k;
         ASSERT_TRUE(r.nextKey(k)); r.skipUnknown(k);
     }); });
     /// whitespace is not canonical
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({ "a":1})", KeyStrictness::Tolerant, [](auto & r)
+    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({ "a":1})", [](auto & r)
     {
         String k;
         r.nextKey(k);
     }); });
     /// bad hex width / junk in u64 string
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"digest":"0102"})", KeyStrictness::Tolerant, [](auto & r)
+    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"digest":"0102"})", [](auto & r)
     {
         String k;
         r.nextKey(k); r.readHex128();
     }); });
-    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"u64_string_field":"12x"})", KeyStrictness::Tolerant, [](auto & r)
+    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { reader(R"({"u64_string_field":"12x"})", [](auto & r)
     {
         String k;
         r.nextKey(k); r.readU64String();

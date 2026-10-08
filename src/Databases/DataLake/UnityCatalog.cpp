@@ -106,6 +106,17 @@ DB::Names UnityCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token
     return result;
 }
 
+DataLake::ICatalog::Namespaces UnityCatalog::getNamespaces(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
+{
+    /// Unity schemas are flat — they cannot contain nested namespaces.
+    return getSchemas("");
+}
+
+DB::Names UnityCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
+{
+    return getTablesForSchema(namespace_name);
+}
+
 void UnityCatalog::getTableMetadata(
     const std::string & namespace_name,
     const std::string & table_name,

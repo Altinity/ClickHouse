@@ -36,6 +36,8 @@ public:
 
     DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
+    Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const override;
+
     bool existsTable(const std::string & namespace_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void getTableMetadata(
@@ -59,6 +61,8 @@ private:
 
     template <typename Func>
     void executeWithRetry(Func && func) const;
+
+    DB::Names listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     String base_url;
 

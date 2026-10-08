@@ -45,6 +45,7 @@
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Server/HTTP/HTMLForm.h>
 #include <Formats/FormatFactory.h>
 
@@ -206,6 +207,22 @@ String encodeNamespaceForURI(const String & namespace_name)
     return encoded;
 }
 
+/// Per Iceberg REST spec, `namespace` is a JSON array of segments. Split `ns.a.b` on dots.
+Poco::JSON::Array::Ptr namespaceToJSONArray(const String & namespace_name)
+{
+    Poco::JSON::Array::Ptr segments = new Poco::JSON::Array;
+    size_t start = 0;
+    while (start <= namespace_name.size())
+    {
+        size_t dot = namespace_name.find('.', start);
+        if (dot == String::npos)
+            dot = namespace_name.size();
+        segments->add(namespace_name.substr(start, dot - start));
+        start = dot + 1;
+    }
+    return segments;
+}
+
 std::unordered_set<std::string> getAllowedBigLakeMetadataServiceHosts(
     const Poco::Util::AbstractConfiguration & config)
 {
@@ -220,7 +237,6 @@ std::unordered_set<std::string> getAllowedBigLakeMetadataServiceHosts(
         allowed.insert(config.getString(std::string(SECTION) + "." + key));
     return allowed;
 }
-
 
 }
 
@@ -321,9 +337,7 @@ Poco::JSON::Object::Ptr buildUpdateSchemaRequestBody(
     {
         Poco::JSON::Object::Ptr identifier = new Poco::JSON::Object;
         identifier->set("name", table_name);
-        Poco::JSON::Array::Ptr namespaces = new Poco::JSON::Array;
-        namespaces->add(namespace_name);
-        identifier->set("namespace", namespaces);
+        identifier->set("namespace", namespaceToJSONArray(namespace_name));
         request_body->set("identifier", identifier);
     }
 
@@ -402,27 +416,26 @@ Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
     {
         Poco::JSON::Object::Ptr identifier = new Poco::JSON::Object;
         identifier->set("name", table_name);
-        Poco::JSON::Array::Ptr namespaces = new Poco::JSON::Array;
-        namespaces->add(namespace_name);
-        identifier->set("namespace", namespaces);
+        identifier->set("namespace", namespaceToJSONArray(namespace_name));
 
         request_body->set("identifier", identifier);
     }
 
-    if (new_snapshot->has("parent-snapshot-id"))
     {
-        auto parent_snapshot_id = new_snapshot->getValue<Int64>("parent-snapshot-id");
-        if (parent_snapshot_id != -1)
-        {
-            Poco::JSON::Object::Ptr requirement = new Poco::JSON::Object;
-            requirement->set("type", "assert-ref-snapshot-id");
-            requirement->set("ref", "main");
-            requirement->set("snapshot-id", parent_snapshot_id);
+        Poco::JSON::Object::Ptr requirement = new Poco::JSON::Object;
+        requirement->set("type", "assert-ref-snapshot-id");
+        requirement->set("ref", "main");
 
-            Poco::JSON::Array::Ptr requirements = new Poco::JSON::Array;
-            requirements->add(requirement);
-            request_body->set("requirements", requirements);
+        if (new_snapshot->has("parent-snapshot-id"))
+        {
+            auto parent_snapshot_id = new_snapshot->getValue<Int64>("parent-snapshot-id");
+            if (parent_snapshot_id != -1)
+                requirement->set("snapshot-id", parent_snapshot_id);
         }
+
+        Poco::JSON::Array::Ptr requirements = new Poco::JSON::Array;
+        requirements->add(requirement);
+        request_body->set("requirements", requirements);
     }
 
     Poco::JSON::Array::Ptr updates = new Poco::JSON::Array;
@@ -1353,6 +1366,11 @@ std::optional<StorageType> RestCatalog::getStorageType() const
     return parseStorageTypeFromLocation(state_snapshot->config.default_base_location);
 }
 
+String RestCatalog::getDefaultBaseLocation() const
+{
+    return state.get()->config.default_base_location;
+}
+
 DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
     const CatalogState & catalog_state,
     UInt64 generation,
@@ -1441,10 +1459,9 @@ bool RestCatalog::empty(const DB::ForwardedAuthTokenPtr & auth_token) const
         if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
             return false;
 
-        const auto tables = getTablesInNamespace(namespace_name, auth_token, /* limit */1);
+        const auto tables = listTablesInNamespace(namespace_name, auth_token, /* limit */1);
         if (!tables.empty())
             found_table = true;
-
         return found_table;
     };
 
@@ -1473,7 +1490,7 @@ DB::Names RestCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) c
             runner.enqueueAndKeepTrack(
             [=, &tables, &mutex, this]
             {
-                auto tables_in_namespace = getTablesInNamespace(current_namespace, auth_token);
+                auto tables_in_namespace = listTablesInNamespace(current_namespace, auth_token);
                 std::lock_guard lock(mutex);
                 std::move(tables_in_namespace.begin(), tables_in_namespace.end(), std::back_inserter(tables));
             });
@@ -1493,6 +1510,28 @@ DB::Names RestCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) c
     return tables;
 }
 
+RestCatalog::Namespaces RestCatalog::getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    /// Enumerate the whole namespace tree (every node at every level). Used by
+    /// the `getTables(const TableNameFilter &)` namespace push-down.
+    loadConfigIfNeeded(auth_token);
+
+    Namespaces namespaces;
+    getNamespacesRecursive(
+        /* base_namespace */"", /// Empty base namespace means starting from root.
+        namespaces,
+        /* stop_condition */{},
+        /* execute_func */{},
+        auth_token);
+    return namespaces;
+}
+
+DB::Names RestCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const
+{
+    loadConfigIfNeeded(auth_token);
+    return listTablesInNamespace(namespace_name, auth_token);
+}
+
 void RestCatalog::getNamespacesRecursive(
     const std::string & base_namespace,
     Namespaces & result,
@@ -1502,7 +1541,7 @@ void RestCatalog::getNamespacesRecursive(
 {
     checkStackSize();
 
-    auto namespaces = getNamespaces(base_namespace, auth_token);
+    auto namespaces = listChildNamespaces(base_namespace, auth_token);
     result.reserve(result.size() + namespaces.size());
     result.insert(result.end(), namespaces.begin(), namespaces.end());
 
@@ -1555,7 +1594,7 @@ Poco::URI::QueryParameters RestCatalog::createParentNamespaceParams(const std::s
     return {{"parent", parent_param}};
 }
 
-RestCatalog::Namespaces RestCatalog::getNamespaces(const std::string & base_namespace, const DB::ForwardedAuthTokenPtr & auth_token) const
+RestCatalog::Namespaces RestCatalog::listChildNamespaces(const std::string & base_namespace, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     const auto state_snapshot = getStateSnapshot();
 
@@ -1693,7 +1732,7 @@ RestCatalog::Namespaces RestCatalog::parseNamespaces(DB::ReadBuffer & buf, const
         /// just burns O(pages) REST calls per parent namespace without ever
         /// contributing to the result. Treat the first page as terminal by
         /// leaving `next_page_token` empty (already cleared at function entry)
-        /// so the outer `getNamespaces` loop returns immediately.
+        /// so the outer `listChildNamespaces` loop returns immediately.
         const bool biglake_drops_all_entries
             = getCatalogType() == DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE
             && !base_namespace.empty();
@@ -1713,7 +1752,7 @@ RestCatalog::Namespaces RestCatalog::parseNamespaces(DB::ReadBuffer & buf, const
     }
 }
 
-DB::Names RestCatalog::getTablesInNamespace(const std::string & base_namespace, const DB::ForwardedAuthTokenPtr & auth_token, size_t limit) const
+DB::Names RestCatalog::listTablesInNamespace(const std::string & base_namespace, const DB::ForwardedAuthTokenPtr & auth_token, size_t limit) const
 {
     if (!allowed_namespaces.isNamespaceAllowed(base_namespace, /*nested*/ false))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
@@ -2061,6 +2100,12 @@ bool RestCatalog::getTableMetadataImpl(
         result.setSchema(*schema);
     }
 
+    if (result.requiresPartitionAndSortingKeys())
+    {
+        auto [partition_by, order_by, unsupported_properties] = DB::Iceberg::getPartitionAndSortingKeyASTsFromMetadata(metadata_object);
+        result.setPartitionAndSortingKeys(std::move(partition_by), std::move(order_by), std::move(unsupported_properties));
+    }
+
     if (want_credentials && result.isDefaultReadableTable())
     {
         if (cached_credentials)
@@ -2223,11 +2268,9 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     const std::string endpoint = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT).generic_string();
 
     Poco::JSON::Object::Ptr request_body = new Poco::JSON::Object;
-    {
-        Poco::JSON::Array::Ptr namespaces = new Poco::JSON::Array;
-        namespaces->add(namespace_name);
-        request_body->set("namespace", namespaces);
-    }
+    request_body->set("namespace", namespaceToJSONArray(namespace_name));
+
+    if (!location.empty())
     {
         Poco::JSON::Object::Ptr properties = new Poco::JSON::Object;
         properties->set("location", location);
@@ -2248,7 +2291,14 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     }
 }
 
-void RestCatalog::createTable(const String & namespace_name, const String & table_name, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr metadata_content, const DB::ForwardedAuthTokenPtr & auth_token) const
+bool RestCatalog::createTable(
+    const String & namespace_name,
+    const String & table_name,
+    const String & /*new_metadata_path*/,
+    Poco::JSON::Object::Ptr metadata_content,
+    DB::CompressionMethod /*metadata_compression_method*/,
+    bool if_not_exists,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     loadConfigIfNeeded(auth_token);
 
@@ -2256,12 +2306,15 @@ void RestCatalog::createTable(const String & namespace_name, const String & tabl
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
             "Failed to create table {}, namespace {} is filtered by `namespaces` database parameter", table_name, namespace_name);
 
+    const String location = metadata_content->getValue<String>("location");
+
     const auto state_snapshot = getStateSnapshot();
     const std::string endpoint = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables").generic_string();
 
     Poco::JSON::Object::Ptr request_body = new Poco::JSON::Object;
     request_body->set("name", table_name);
-    request_body->set("location", metadata_content->getValue<String>("location"));
+    if (!managesTableLocation())
+        request_body->set("location", location);
     {
         Poco::JSON::Object::Ptr initial_schema = metadata_content->getArray("schemas")->getObject(0);
         Poco::JSON::Array::Ptr identifier_fields = new Poco::JSON::Array;
@@ -2270,13 +2323,21 @@ void RestCatalog::createTable(const String & namespace_name, const String & tabl
     }
     request_body->set("partition-spec", metadata_content->getArray("partition-specs")->get(0));
 
+    if (metadata_content->has("sort-orders"))
     {
-        Poco::JSON::Object::Ptr write_order = new Poco::JSON::Object;
-        write_order->set("order-id", 0);
-        Poco::JSON::Array::Ptr fields = new Poco::JSON::Array;
-        write_order->set("fields", fields);
-        request_body->set("write-order", write_order);
+        if (auto sort_orders = metadata_content->getArray("sort-orders"); sort_orders->size() > 0)
+        {
+            auto sort_order = sort_orders->getObject(0);
+            auto fields = sort_order->getArray("fields");
+            if (fields && fields->size() > 0)
+            {
+                if (sort_order->getValue<int>("order-id") == 0)
+                    sort_order->set("order-id", 1);
+                request_body->set("write-order", sort_order);
+            }
+        }
     }
+
     request_body->set("stage-create", false);
     Poco::JSON::Object::Ptr properties = new Poco::JSON::Object;
 
@@ -2293,8 +2354,12 @@ void RestCatalog::createTable(const String & namespace_name, const String & tabl
     }
     catch (const DB::HTTPException & ex)
     {
+        if (if_not_exists && ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTPStatus::HTTP_CONFLICT)
+            return false;
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to create table {}", ex.displayText());
     }
+
+    return true;
 }
 
 
@@ -2376,7 +2441,12 @@ bool RestCatalog::updateSchema(
     return true;
 }
 
-void RestCatalog::dropTable(const String & namespace_name, const String & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const
+void RestCatalog::dropTable(
+    const String & namespace_name,
+    const String & table_name,
+    bool purge,
+    bool if_exists,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     loadConfigIfNeeded(auth_token);
 
@@ -2386,9 +2456,9 @@ void RestCatalog::dropTable(const String & namespace_name, const String & table_
             table_name, namespace_name);
 
     const auto state_snapshot = getStateSnapshot();
-    const std::string endpoint
-        = (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables" / table_name).generic_string()
-        + "?purgeRequested=False";
+    const std::string base_endpoint =
+        (base_url / state_snapshot->config.prefix / NAMESPACES_ENDPOINT / encodeNamespaceForURI(namespace_name) / "tables" / table_name).generic_string();
+    const std::string endpoint = fmt::format("{}?purgeRequested={}", base_endpoint, purge ? "true" : "false");
 
     Poco::JSON::Object::Ptr request_body = nullptr;
     try
@@ -2400,6 +2470,8 @@ void RestCatalog::dropTable(const String & namespace_name, const String & table_
     }
     catch (const DB::HTTPException & ex)
     {
+        if (if_exists && ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTPStatus::HTTP_NOT_FOUND)
+            return;
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to drop table {}", ex.displayText());
     }
 }

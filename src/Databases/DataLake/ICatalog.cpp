@@ -1,10 +1,14 @@
 #include <Databases/DataLake/ICatalog.h>
 #include <Databases/DataLake/DatabaseDataLakeSettings.h>
 #include <Common/Exception.h>
+#include <Common/StringUtils.h>
 #include <Common/logger_useful.h>
 #include <Poco/String.h>
 
+#include <algorithm>
 #include <filesystem>
+#include <iterator>
+#include <tuple>
 
 #include <Common/FailPoint.h>
 #include <Poco/URI.h>
@@ -89,6 +93,25 @@ StorageType parseStorageTypeFromString(const std::string & type)
     }
 
     return *storage_type;
+}
+
+std::string storageTypeToScheme(StorageType type)
+{
+    switch (type)
+    {
+        case StorageType::S3:
+            return "s3";
+        case StorageType::Azure:
+            return "abfss";
+        case StorageType::Local:
+            return "file";
+        case StorageType::HDFS:
+            return "hdfs";
+        case StorageType::Other:
+            throw DB::Exception(
+                DB::ErrorCodes::BAD_ARGUMENTS,
+                "Cannot determine URI scheme for storage type 'Other'");
+    }
 }
 
 void TableMetadata::setLocation(const std::string & location_)
@@ -271,6 +294,32 @@ std::optional<DataLakeSpecificProperties> TableMetadata::getDataLakeSpecificProp
     return data_lake_specific_metadata;
 }
 
+void TableMetadata::setPartitionAndSortingKeys(DB::ASTPtr partition_by_, DB::ASTPtr order_by_, std::string unsupported_properties_)
+{
+    if (!with_partition_and_sorting_keys)
+        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Partition and sorting keys were not requested");
+
+    partition_by = std::move(partition_by_);
+    order_by = std::move(order_by_);
+    unsupported_properties = std::move(unsupported_properties_);
+}
+
+DB::ASTPtr TableMetadata::getPartitionBy() const
+{
+    if (!with_partition_and_sorting_keys)
+        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Partition and sorting keys were not requested");
+
+    return partition_by;
+}
+
+DB::ASTPtr TableMetadata::getOrderBy() const
+{
+    if (!with_partition_and_sorting_keys)
+        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Partition and sorting keys were not requested");
+
+    return order_by;
+}
+
 StorageType TableMetadata::getStorageType() const
 {
     if (!storage_type_str.empty())
@@ -367,9 +416,67 @@ void ICatalog::validateForwardedToken(
             catalog_description);
 }
 
-void ICatalog::createTable(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*metadata_content*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
+DB::Names ICatalog::getTables(const TableNameFilter & filter, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "createTable is not implemented");
+    switch (filter.kind)
+    {
+        case TableNameFilter::Kind::All:
+            return getTables(auth_token);
+
+        case TableNameFilter::Kind::Equals:
+        {
+            /// `name = 'ns.table'` -> list only namespace `ns`; the outer filter keeps the exact row.
+            const auto pos = filter.value.rfind('.');
+            if (pos == std::string::npos)
+                return getTables(auth_token);
+            return listTablesInNamespaceDirect(filter.value.substr(0, pos), auth_token);
+        }
+
+        case TableNameFilter::Kind::Like:
+        {
+            /// Every table name matching `pattern` must start with the pattern's
+            /// fixed prefix — the literal part before the first LIKE wildcard
+            /// (`%`/`_`) — extracted here the same way `KeyCondition` prunes ranges.
+            /// A namespace `N` can hold such a table (full name `N + "." + <...>`)
+            /// only if `N + "."` and the fixed prefix are consistent, i.e. one is a
+            /// prefix of the other. This never rejects a namespace `LIKE` could match
+            /// (the fixed prefix is a *necessary* prefix of any match), so no
+            /// `system.tables` row is dropped; a looser match only costs an extra
+            /// table listing.
+            const String fixed_prefix = std::get<0>(extractFixedPrefixFromLikePattern(filter.value, /*requires_perfect_prefix*/ false));
+
+            /// A leading wildcard (e.g. `%foo%`) yields an empty prefix, so we must list all namespaces and tables.
+            /// Calling getTables() is better as its parallel.
+            if (fixed_prefix.empty())
+                return getTables(auth_token);
+
+            DB::Names result;
+            for (const auto & namespace_name : getNamespaces(auth_token))
+            {
+                const std::string namespace_prefix = namespace_name + ".";
+                if (!startsWith(namespace_prefix, fixed_prefix) && !startsWith(fixed_prefix, namespace_prefix))
+                    continue;
+                auto tables = listTablesInNamespaceDirect(namespace_name, auth_token);
+                std::move(tables.begin(), tables.end(), std::back_inserter(result));
+            }
+            return result;
+        }
+    }
+    return {};
+}
+
+bool ICatalog::createTable(
+    const String & /*namespace_name*/,
+    const String & /*table_name*/,
+    const String & /*new_metadata_path*/,
+    Poco::JSON::Object::Ptr /*metadata_content*/,
+    DB::CompressionMethod /*metadata_compression_method*/,
+    bool /*if_not_exists*/,
+    const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
+{
+    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
+        "CREATE TABLE is not supported for this DataLakeCatalog catalog type; "
+        "it is available only for Iceberg REST (including OneLake, BigLake, Delta Sharing) and Glue catalogs");
 }
 
 void ICatalog::createNamespaceIfNotExists(const String & /*namespace_name*/, const String & /*location*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
@@ -395,9 +502,16 @@ bool ICatalog::updateSchema(
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "updateSchema is not implemented");
 }
 
-void ICatalog::dropTable(const String & /*namespace_name*/, const String & /*table_name*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
+void ICatalog::dropTable(
+    const String & /*namespace_name*/,
+    const String & /*table_name*/,
+    bool /*purge*/,
+    bool /*if_exists*/,
+    const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
-    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "dropTable is not implemented");
+    throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
+        "DROP TABLE is not supported for this DataLakeCatalog catalog type; "
+        "it is available only for Iceberg REST (including OneLake, BigLake, Delta Sharing) and Glue catalogs");
 }
 
 ICatalog::PreparedSettingsChangesPtr ICatalog::prepareSettingsChanges(
