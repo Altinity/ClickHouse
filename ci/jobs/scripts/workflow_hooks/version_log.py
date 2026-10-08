@@ -9,6 +9,39 @@ from ci.jobs.scripts.cidb_cluster import CIDBCluster
 from ci.jobs.scripts.clickhouse_version import CHVersion
 
 
+# NOTE (strtgbb): release flavour → tweak track. Pre-release flavours pair as
+# altinitytest/altinitystable, antalyatest/altinityantalya, altinityfipstest/altinityfips.
+_TRACK_BY_RELEASE_FLAVOUR = {
+    "altinitystable": 1,
+    "altinityantalya": 2,
+    "altinityfips": 3,
+}
+
+
+def _track_from_branch(branch):
+    """(track, pre-release flavour) from a release-branch name, or None.
+
+    PRs use the base branch; pushes use the branch. `fips-` / `antalya-` /
+    `stable-` prefixes select the track (`fips-` first). Anything else keeps
+    the file values."""
+    if not branch:
+        return None
+    if branch.startswith("fips-"):
+        return 3, "altinityfipstest"
+    if branch.startswith("antalya-"):
+        return 2, "antalyatest"
+    if branch.startswith("stable-"):
+        return 1, "altinitytest"
+    return None
+
+
+def _apply_track(version, track, flavour):
+    version.flavour = flavour
+    return version.with_tweak(track * 10000 + version.tweak % 10000).with_description(
+        flavour
+    )
+
+
 def _build_version(info):
     """The build version recorded for this run.
 
@@ -17,14 +50,27 @@ def _build_version(info):
     close/reopen and re-runs of the same PR as `master` advances. Artifacts are
     keyed by the head SHA, so an unpinned tweak would store diverging version
     strings under one artifact prefix. Flavoured Altinity versions keep the
-    explicit tweak committed in the version file."""
+    explicit tweak committed in the version file. When the branch identifies a
+    track, CI replaces the flavour and the tweak's leading digit; the counter
+    (`tweak % 10000`) stays as committed."""
     version = CHVersion.get_current_version(no_strict=True)
     if info.pr_number != 0 and not version.flavour:
         version = version.with_tweak(1)
-    # NOTE (strtgbb): get the release flavour from the tag, validated with the --check-tag pre-hook
-    if version.flavour and os.getenv("GITHUB_REF_TYPE") == "tag":
-        version.flavour = os.getenv("GITHUB_REF_NAME", "").rsplit(".", 1)[-1]
-        version = version.with_description(version.flavour)
+    if not version.flavour:
+        return version
+    # NOTE (strtgbb): tag flavour and track come from the tag; --check-tag
+    # validates the counter. Otherwise the branch overrides a stale file.
+    if os.getenv("GITHUB_REF_TYPE") == "tag":
+        flavour = os.getenv("GITHUB_REF_NAME", "").rsplit(".", 1)[-1]
+        track = _TRACK_BY_RELEASE_FLAVOUR.get(flavour)
+        if track is None:
+            version.flavour = flavour
+            return version.with_description(flavour)
+        return _apply_track(version, track, flavour)
+    branch = info.base_branch if info.pr_number != 0 else info.git_branch
+    derived = _track_from_branch(branch)
+    if derived:
+        version = _apply_track(version, *derived)
     return version
 
 

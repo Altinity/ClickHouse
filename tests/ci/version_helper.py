@@ -313,36 +313,40 @@ ALTINITY_TRACK_BY_FLAVOUR = {
 
 
 def check_tag_against_versions(tag: str, versions: VERSIONS) -> None:
-    # NOTE (strtgbb): Altinity tags are v<major>.<minor>.<patch>.<tweak>.<flavour>;
-    # the release flavour comes from the tag, and the tweak's first digit varies by track
+    # NOTE (strtgbb): Altinity tags are v<major>.<minor>.<patch>.<tweak>.<flavour>.
+    # Flavour and the tweak's track digit come from the tag; the file supplies
+    # major/minor/patch and the release counter (tweak % 10000) only.
     expected_prefix = (
-        f"v{versions['major']}.{versions['minor']}.{versions['patch']}"
-        f".{versions['tweak']}."
+        f"v{versions['major']}.{versions['minor']}.{versions['patch']}."
     )
     if not tag.startswith(expected_prefix):
         raise ValueError(
             f"Tag [{tag}] does not start with [{expected_prefix}]"
         )
-    tag_flavour = tag[len(expected_prefix) :]
+    try:
+        tag_tweak_str, tag_flavour = tag[len(expected_prefix) :].split(".", 1)
+        tag_tweak = int(tag_tweak_str)
+    except ValueError:
+        raise ValueError(
+            f"Tag [{tag}] is not v<major>.<minor>.<patch>.<tweak>.<flavour>"
+        )
     track = ALTINITY_TRACK_BY_FLAVOUR.get(tag_flavour)
     if track is None:
         raise ValueError(
             f"Tag [{tag}] flavour [{tag_flavour}] is not one of "
             f"{sorted(ALTINITY_TRACK_BY_FLAVOUR)}"
         )
-    if int(versions["tweak"]) // 10000 != track:
+    if tag_tweak // 10000 != track:
         raise ValueError(
-            f"Tag [{tag}] tweak [{versions['tweak']}] does not match the "
+            f"Tag [{tag}] tweak [{tag_tweak}] does not match the "
             f"{track}xxxx track for flavour [{tag_flavour}]"
         )
-    file_flavour = str(versions.get("flavour") or "")
-    if file_flavour:
-        expected_release = ALTINITY_RELEASE_BY_PRERELEASE.get(file_flavour, file_flavour)
-        if tag_flavour != expected_release:
-            raise ValueError(
-                f"Tag [{tag}] flavour [{tag_flavour}] does not match "
-                f"VERSION_FLAVOUR [{file_flavour}] (expected [{expected_release}])"
-            )
+    file_tweak = int(versions["tweak"])
+    if tag_tweak % 10000 != file_tweak % 10000:
+        raise ValueError(
+            f"Tag [{tag}] counter [{tag_tweak % 10000}] does not match "
+            f"VERSION_TWEAK [{file_tweak}] counter [{file_tweak % 10000}]"
+        )
 
 
 def check_tag_version(

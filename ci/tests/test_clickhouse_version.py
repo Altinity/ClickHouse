@@ -95,6 +95,7 @@ class FakeInfo:
     sha = "pr-sha"
     commit_url = "https://example.test/commit/pr-sha"
     git_branch = "feature"
+    base_branch = ""
     workflow_name = "PullRequest"
 
 
@@ -173,6 +174,51 @@ def test_tag_build_takes_flavour_from_tag(
     assert version.to_dict()["flavour"] == release
 
 
+def test_tag_build_applies_tag_track_when_file_is_stale(monkeypatch, tmp_path):
+    use_version_file(monkeypatch, tmp_path, UPSTREAM_BLOCK_VERSION_FILE)
+    monkeypatch.setenv("GITHUB_REF_TYPE", "tag")
+    monkeypatch.setenv("GITHUB_REF_NAME", "v26.8.1.20001.altinityantalya")
+
+    info = FakeInfo()
+    info.pr_number = 0
+    version = version_log._build_version(info)
+
+    assert version.string == "26.8.1.20001.altinityantalya"
+    assert version.describe == "v26.8.1.20001.altinityantalya"
+    assert version.to_dict()["flavour"] == "altinityantalya"
+
+
+@pytest.mark.parametrize(
+    "pr_number,git_branch,base_branch,expected",
+    [
+        (123, "fix/antalya-26.8/foo", "stable-26.8", "26.8.1.10001.altinitytest"),
+        (123, "fix/stable-26.8/foo", "antalya-26.8", "26.8.1.20001.antalyatest"),
+        (123, "fix/foo", "fips-25.3", "26.8.1.30001.altinityfipstest"),
+        (0, "stable-26.8", "", "26.8.1.10001.altinitytest"),
+        (0, "antalya-26.8", "", "26.8.1.20001.antalyatest"),
+        (0, "fips-25.3", "", "26.8.1.30001.altinityfipstest"),
+        (0, "fix/antalya-26.8/foo", "", "26.8.1.10001.altinitytest"),
+        (0, "feature", "", "26.8.1.10001.altinitytest"),
+        (123, "fix/stable-26.8/foo", "master", "26.8.1.10001.altinitytest"),
+    ],
+)
+def test_branch_overrides_flavour_and_track(
+    monkeypatch, tmp_path, pr_number, git_branch, base_branch, expected
+):
+    use_version_file(monkeypatch, tmp_path, UPSTREAM_BLOCK_VERSION_FILE)
+    monkeypatch.delenv("GITHUB_REF_TYPE", raising=False)
+
+    info = FakeInfo()
+    info.pr_number = pr_number
+    info.git_branch = git_branch
+    info.base_branch = base_branch
+    version = version_log._build_version(info)
+
+    assert version.string == expected
+    assert version.describe == f"v{expected}"
+    assert version.to_dict()["flavour"] == expected.rsplit(".", 1)[-1]
+
+
 def _tag_versions(tweak: int = 10001, flavour: str = "altinitytest") -> dict:
     return {
         "major": 26,
@@ -184,17 +230,21 @@ def _tag_versions(tweak: int = 10001, flavour: str = "altinitytest") -> dict:
 
 
 @pytest.mark.parametrize(
-    "tweak,prerelease,release",
+    "file_tweak,prerelease,tag_tweak,release",
     [
-        (10001, "altinitytest", "altinitystable"),
-        (20001, "antalyatest", "altinityantalya"),
-        (30001, "altinityfipstest", "altinityfips"),
-        (20001, "altinityantalya", "altinityantalya"),
+        (10001, "altinitytest", 10001, "altinitystable"),
+        (20001, "antalyatest", 20001, "altinityantalya"),
+        (30001, "altinityfipstest", 30001, "altinityfips"),
+        (20001, "altinityantalya", 20001, "altinityantalya"),
+        (10001, "altinitytest", 20001, "altinityantalya"),
+        (20001, "antalyatest", 10001, "altinitystable"),
     ],
 )
-def test_check_tag_version_accepts_matching_track(tweak, prerelease, release):
+def test_check_tag_version_accepts_matching_counter(
+    file_tweak, prerelease, tag_tweak, release
+):
     check_tag_against_versions(
-        f"v26.8.1.{tweak}.{release}", _tag_versions(tweak, prerelease)
+        f"v26.8.1.{tag_tweak}.{release}", _tag_versions(file_tweak, prerelease)
     )
 
 
@@ -205,7 +255,6 @@ def test_check_tag_version_accepts_matching_track(tweak, prerelease, release):
         (10001, "altinitytest", "v26.8.1.10002.altinitystable"),
         (10001, "altinitytest", "v26.8.1.10001.altinitytest"),
         (10001, "altinitytest", "v26.8.1.1-lts"),
-        (20001, "altinitytest", "v26.8.1.20001.altinityantalya"),
         (20001, "antalyatest", "v26.8.1.20001.antalyatest"),
     ],
 )
