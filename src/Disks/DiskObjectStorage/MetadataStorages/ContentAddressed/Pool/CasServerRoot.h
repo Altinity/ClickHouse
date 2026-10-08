@@ -346,13 +346,16 @@ MountClaimResult claimMountAwaitingExpiry(
 
 /// One `server_root_id`'s cross-round incarnation-stability observation,
 /// owned by the GC leader instance (`Cas::Gc::mount_obs`) and threaded through consecutive
-/// `computeHeartbeatFloor` calls — one GC round is one observation tick. Mirrors
-/// `claimMountAwaitingExpiry`'s observation loop, but at heartbeat-gate granularity rather than a
-/// tight poll loop.
+/// `computeHeartbeatFloor` calls. `first_seen_mono_ms` is the reading taken when the slot read
+/// that first returned `etag` came back.
 struct MountIncarnationObservation
 {
     Etag etag;
     uint64_t first_seen_mono_ms = 0;
+
+    /// `sample_ms` is taken before the read that confirmed `etag`. A sample older than the sighting
+    /// says nothing about how long the token held, so it never counts as held.
+    bool heldFor(uint64_t threshold_ms, uint64_t sample_ms) const;
 };
 
 /// Keyed by `server_root_id`. In-memory only: a fresh leader (after a steal, or a process restart)
@@ -371,8 +374,8 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 ///     terminated marker;
 ///   - otherwise, observation-based liveness (the same
 ///     principle `claimMountAwaitingExpiry` uses for a mount's OWN reopen, applied here to the GC's
-///     fence-out): `obs` remembers, per srid, the incarnation last seen and the leader's OWN
-///     monotonic clock reading (`mono_now_ms`) at the moment it first saw it. A body whose
+///     fence-out): `obs` remembers, per srid, the incarnation last seen and the reading of the
+///     leader's OWN monotonic clock (`mono_ms_fn`) when it first saw it. A body whose
 ///     CURRENT incarnation differs from (or is absent from) `obs` is (re)started fresh — counted `live`,
 ///     never fenced this call, regardless of what its stamped `expires_at_ms` claims (a bare
 ///     wall-clock stamp is never trusted — see `claimMount`'s "certificate of death" doc). Only once
@@ -386,8 +389,9 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 ///
 /// `now_ms` is WALL clock, used only for the audit/diagnostic log line — it never participates in the
 /// fence decision (mirrors `claimMountAwaitingExpiry`'s `now_ms_fn` vs `mono_ms_fn` split).
-/// `mono_now_ms` is the OBSERVATION clock: the caller's OWN monotonic reading, never compared against
-/// any other node's clock. `obs` is owned by the caller and threaded across consecutive calls (one GC
+/// `mono_ms_fn` is the OBSERVATION clock: the caller's OWN monotonic clock, never compared against
+/// any other node's clock. It is sampled once at entry for the stability test and after the read for
+/// each sighting. `obs` is owned by the caller and threaded across consecutive calls (one GC
 /// leader instance, `Cas::Gc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
 /// fencing one round, never fences early).
 ///
@@ -407,8 +411,8 @@ struct HeartbeatFloor
 };
 
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
-                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
-                                     MountObservationMap & obs);
+                                     const std::function<uint64_t()> & mono_ms_fn,
+                                     uint64_t stable_threshold_ms, MountObservationMap & obs);
 
 /// One `gc/server-roots/<srid>/mount` slot whose holder is not provably finished with the prefix.
 struct NonTerminalMountSlot

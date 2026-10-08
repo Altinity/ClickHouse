@@ -1017,6 +1017,102 @@ void runExpiredMountFenceOutScenario(const PoolConfig & config)
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, layout, blob));
 }
 
+/// Advances the GC's observer clock by `read_cost_ms` on every read of `watched_key`, so a GC call
+/// spends that long between its entry sample and the read it decides on. Atomics because the round's
+/// read-ahead pool reads other keys through this backend on other threads.
+class SlotReadClockBackend : public InMemoryBackend
+{
+public:
+    String watched_key;
+    std::atomic<uint64_t> mono{0};
+    std::atomic<uint64_t> read_cost_ms{0};
+    std::atomic<uint64_t> last_read_done_at{0};
+    std::atomic<size_t> watched_reads{0};
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (key == watched_key)
+        {
+            last_read_done_at = mono += read_cost_ms.load();
+            ++watched_reads;
+        }
+        return InMemoryBackend::read(key, access);
+    }
+};
+
+enum class SightingCall : uint8_t
+{
+    Round,
+    Rebuild,
+};
+
+void runSlowWalkSightingScenario(SightingCall sighting_call)
+{
+    auto backend = std::make_shared<SlotReadClockBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const Layout & layout = store->layout();
+    const String srid2 = "stale-server";
+    backend->watched_key = layout.mountKey(srid2);
+
+    const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
+    const uint64_t threshold_ms = mountObservationThresholdMs(
+        ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
+    /// Longer than `threshold - TTL`: a sighting credited from before this walk fences a holder
+    /// whose last renewal still gives it authority.
+    const uint64_t walk_ms = threshold_ms - ttl_ms + 1'000;
+
+    Gc gc(store, kGc, [] { return uint64_t{1'000'000}; }, [backend] { return backend->mono.load(); });
+
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    writeBlobBody(*backend, layout, DB::UInt128(7));
+    writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", DB::UInt128(7))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+
+    /// The rebuild needs a state to rebuild; one round before the slot exists leaves the rebuild as
+    /// the call that first sees it.
+    if (sighting_call == SightingCall::Rebuild)
+        gc.runRegularRound();
+
+    /// Claims once and never renews: a live-shaped body whose token never changes.
+    CasRequests renewer_requests = openRequestsForTest(backend);
+    MountLeaseRenewer srid2_renewer(renewer_requests, renewer_requests, layout, srid2, DB::UInt128(0x2222),
+        /*writer_epoch=*/1,
+        std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
+        std::chrono::milliseconds(0), [] { return 0u; });
+    srid2_renewer.start();
+    backend->watched_reads = 0;
+
+    backend->read_cost_ms = walk_ms;
+    if (sighting_call == SightingCall::Round)
+    {
+        const RoundReport first = gc.runRegularRound();
+        ASSERT_EQ(first.fence_outs, 0u);
+    }
+    else
+    {
+        const RebuildReport rebuilt = gc.rebuildBaseline(/*force*/ true);
+        ASSERT_TRUE(rebuilt.performed) << rebuilt.refusal;
+    }
+    ASSERT_EQ(backend->watched_reads.load(), 1u);
+    const uint64_t sighted_at = backend->last_read_done_at.load();
+    ASSERT_EQ(sighted_at, walk_ms);
+    backend->read_cost_ms = 0;
+
+    /// One threshold after the sighting call started, less than one after its read. The store's own
+    /// mount renews before each round so only srid2 can be fenced.
+    store->renewWatermarkOnce();
+    backend->mono = threshold_ms;
+    const RoundReport early = gc.runRegularRound();
+    EXPECT_EQ(early.fence_outs, 0u) << "fenced a token watched for less than the threshold";
+
+    store->renewWatermarkOnce();
+    backend->mono = sighted_at + threshold_ms;
+    const RoundReport due = gc.runRegularRound();
+    EXPECT_EQ(due.fence_outs, 1u);
+    EXPECT_TRUE(decodeMountLease(readObj(*backend, backend->watched_key)->bytes).gc_fenced);
+}
+
 }
 
 TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
@@ -1034,6 +1130,16 @@ TEST(CASGcFenceOut, ThresholdUnchangedByUnsafeKnob)
 {
     runExpiredMountFenceOutScenario(
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .unsafe_remount_no_delay = true});
+}
+
+TEST(CASGcFenceOut, RoundCountsASightingFromAfterItsRead)
+{
+    runSlowWalkSightingScenario(SightingCall::Round);
+}
+
+TEST(CASGcFenceOut, RebuildCountsASightingFromAfterItsRead)
+{
+    runSlowWalkSightingScenario(SightingCall::Rebuild);
 }
 
 /// fix-round F6 (author-review: `Gc`'s own `mono_ms_fn` used to default to the RAW static `Pool::
