@@ -222,6 +222,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"object_storage_propagate_credentials_to_other_storages", false, false, "New setting, allowing to reuse the base storage's `S3` credentials for a secondary object storage, even if the target endpoint differs from the base one. Disabled by default. Ignored while `s3_allow_server_credentials_in_user_queries` is disabled."},
             {"datalake_ignore_unsupported_table_properties", false, false, "New setting: allow `CREATE TABLE` and `SHOW CREATE TABLE` in a `DataLakeCatalog` to omit unsupported table properties."},
             {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
+            {"input_format_parquet_bloom_filter_coalesce_max_bytes", 0, 64 * 1024 * 1024, "Read contiguous Parquet bloom filters, or a small file that has many of them, in one request."},
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
         });
         addSettingsChanges(settings_changes_history, "26.6",

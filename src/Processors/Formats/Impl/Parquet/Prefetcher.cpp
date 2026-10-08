@@ -129,13 +129,14 @@ void Prefetcher::readSync(char * to, size_t n, size_t offset)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Unexpected eof: offset {}, length {}, bytes read {}, expected file size {}", offset, n, nread, file_size);
 }
 
-PrefetchHandle Prefetcher::registerRange(size_t offset, size_t length, bool likely_to_be_used)
+PrefetchHandle Prefetcher::registerRange(size_t offset, size_t length, bool likely_to_be_used, uint8_t coalesce_group)
 {
     chassert(!ranges_finalized.load(std::memory_order_relaxed));
     if (offset > file_size || length > file_size - offset)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Range out of bounds: offset {}, length {}, file size {}", offset, length, file_size);
     RequestState & req = requests.emplace_back();
     req.length = length;
+    req.coalesce_group = coalesce_group_for_all_ranges ? coalesce_group_for_all_ranges : coalesce_group;
     req.allow_incidental_read.store(likely_to_be_used || length < min_bytes_for_seek, std::memory_order_relaxed);
     range_sets[0].ranges.push_back(RangeState {.request = &req, .start = offset, .end = offset + length});
     return PrefetchHandle(&req);
@@ -179,11 +180,16 @@ void Prefetcher::startPrefetch(const std::vector<PrefetchHandle *> & requests_to
         chassert(req);
         pickRangesAndCreateTaskIfNotExists(req, *handle, /*splitting=*/ false, 0, 0, std::unique_lock(mutex));
         chassert(req->state.load(std::memory_order_relaxed) == RequestState::State::HasTask);
-        const Task * task = req->task;
+        Task * task = req->task;
 
         if (!handle->memory)
         {
             size_t memory_usage = static_cast<size_t>(static_cast<double>(req->length) * task->memory_amplification);
+            /// A coalesced bloom-filter (or whole-file) read is much larger than the range that started it.
+            bool already_charged = false;
+            if (req->coalesce_group != 0 && task->length > memory_usage
+                && task->coalesce_memory_charged.compare_exchange_strong(already_charged, true, std::memory_order_relaxed))
+                memory_usage = task->length;
             handle->memory = MemoryUsageToken(memory_usage, diff);
         }
     }
@@ -328,9 +334,15 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     for (size_t idx = range_idx; idx > 0; --idx)
     {
         const RangeState & r = ranges[idx - 1];
-        if (r.end + min_bytes_for_seek <= start_offset || // short gap
-            r.start + bytes_per_read_task <= initial_offset || // task not too big
-            !r.request->allow_incidental_read.load(std::memory_order_relaxed)) // range wants to be coalesced
+        const bool same_group = initial_req->coalesce_group != 0 && r.request->coalesce_group == initial_req->coalesce_group;
+        /// Bloom-filter groups stay inside the group, so a filter is not merged with the column data next to it.
+        /// `across_gaps` is the small-file path: one read covers the whole object.
+        const size_t gap_limit = (same_group && coalesce_group_across_gaps) ? coalesce_group_span_limit : min_bytes_for_seek;
+        const size_t span_limit = same_group ? std::max(coalesce_group_span_limit, bytes_per_read_task) : bytes_per_read_task;
+        if ((initial_req->coalesce_group != 0 && !same_group) ||
+            r.end + gap_limit <= start_offset || // short gap
+            r.start + span_limit <= initial_offset || // task not too big
+            (!same_group && !r.request->allow_incidental_read.load(std::memory_order_relaxed))) // range wants to be coalesced
             break;
 
         const auto s = r.request->state.load(std::memory_order_relaxed);
@@ -363,9 +375,13 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     for (size_t idx = range_idx + 1; idx < ranges.size(); ++idx)
     {
         const RangeState & r = ranges[end_idx];
-        if (end_offset + min_bytes_for_seek <= r.start ||
-            initial_offset + bytes_per_read_task <= r.end ||
-            !r.request->allow_incidental_read.load(std::memory_order_relaxed))
+        const bool same_group = initial_req->coalesce_group != 0 && r.request->coalesce_group == initial_req->coalesce_group;
+        const size_t gap_limit = (same_group && coalesce_group_across_gaps) ? coalesce_group_span_limit : min_bytes_for_seek;
+        const size_t span_limit = same_group ? std::max(coalesce_group_span_limit, bytes_per_read_task) : bytes_per_read_task;
+        if ((initial_req->coalesce_group != 0 && !same_group) ||
+            end_offset + gap_limit <= r.start ||
+            initial_offset + span_limit <= r.end ||
+            (!same_group && !r.request->allow_incidental_read.load(std::memory_order_relaxed)))
             break;
 
         const auto s = r.request->state.load(std::memory_order_relaxed);
