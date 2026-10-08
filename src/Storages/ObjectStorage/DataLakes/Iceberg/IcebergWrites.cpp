@@ -560,7 +560,11 @@ IcebergSerializedFileStats serializeDataFileStats(
 static void extendSchemaForPartitions(
     String & schema,
     const std::vector<String> & partition_columns,
+<<<<<<< HEAD
     const DataTypes & partition_types,
+=======
+    const std::vector<DataTypePtr> & partition_types,
+>>>>>>> 6f847351d74 (Merge pull request #2363 from Altinity/iceberg_unknown_data_type)
     const Poco::JSON::Array::Ptr & partition_spec_fields)
 {
     /// Iceberg projects the manifest `partition` values onto the spec by field-id, so reuse
@@ -600,7 +604,11 @@ static void extendSchemaForPartitions(
 
     for (size_t i = 0; i < partition_columns.size(); ++i)
     {
+<<<<<<< HEAD
         Int32 field_id = spec_has_all_ids
+=======
+        const Int32 field_id = spec_has_all_ids
+>>>>>>> 6f847351d74 (Merge pull request #2363 from Altinity/iceberg_unknown_data_type)
             ? partition_spec_fields->getObject(static_cast<UInt32>(i))->getValue<Int32>(Iceberg::f_field_id)
             : static_cast<Int32>(1000 + i);
 
