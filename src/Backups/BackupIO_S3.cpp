@@ -719,12 +719,13 @@ bool BackupWriterS3::tryNativeCopyFromContentAddressedDisk(
         src_path,
         src_disk->getName());
 
-    copyS3File(
+    copyS3FileRange(
         std::move(src_client),
         src_bucket,
         /* src_key */ plan->object.remote_path,
         src_offset,
         length,
+        /* src_object_size */ plan->object.bytes_size,
         /* dest_s3_client */ client,
         /* dest_bucket */ s3_uri.bucket,
         /* dest_key */ fs::path(s3_uri.key) / path_in_backup,
