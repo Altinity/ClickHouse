@@ -95,7 +95,7 @@ TEST(CASWireVocab, SiblingFieldsWriteAndReadBack)
         R"({"token_type":"etag","token":"etag-abc\"x","algo":"ch128","digest":"00112233445566778899aabbccddeeff"})");
 
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
-    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    JsonObjectReader r(in, "t");
     String key;
     String tv;
     String ha;
@@ -130,7 +130,7 @@ TEST(CASWireVocab, MatchAndBuildRoundTripsABlobRef)
     using namespace DB::Cas;
     const String rendered = R"({"algo":"ch128","digest":"00112233445566778899aabbccddeeff"})";
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
-    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    JsonObjectReader r(in, "t");
     BlobRefFields fields;
     String key;
     while (r.nextKey(key))
@@ -173,7 +173,7 @@ TEST(CASWireVocab, MatchManifestRefFieldsAndBuildRefRoundTripInAnyKeyOrder)
     /// would fail to parse this literal.
     const String rendered = R"({"ord":3,"epoch":"7","build":"9"})";
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
-    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    JsonObjectReader r(in, "t");
     ManifestRefFields fields;
     String key;
     while (r.nextKey(key))
@@ -198,7 +198,7 @@ TEST(CASWireVocab, MatchTokenFieldsConsumesSemanticKeysAndLeavesUnrelatedKeyUnma
     using namespace DB::Cas;
     const String rendered = R"({"token_type":"etag","token":"abc","zz":1})";
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
-    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    JsonObjectReader r(in, "t");
     TokenFields fields;
     String key;
     bool saw_unmatched = false;
@@ -220,7 +220,7 @@ TEST(CASWireVocab, TokenFieldsBuildsInAnyKeyOrderAndRequiresBothFields)
 {
     const String rendered = R"({"token":"abc","token_type":"etag"})";
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
-    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    JsonObjectReader r(in, "t");
     TokenFields fields;
     String key;
     while (r.nextKey(key))
@@ -242,7 +242,7 @@ TEST(CASWireVocab, OldManifestEpochKeyDoesNotAliasTheSemanticKey)
 {
     const String rendered = R"({"me":"1","build":"2","ord":3})";
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
-    JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
+    JsonObjectReader r(in, "t");
     ManifestRefFields fields;
     String key;
     while (r.nextKey(key))
@@ -281,7 +281,7 @@ TEST(CASPersistedEtag, RoundTripsThroughEveryFormatAndNeverBecomesAnIncarnation)
         closeObject(out, first);
         const String rendered = std::move(out).take();
         DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
-        JsonObjectReader r(in, KeyStrictness::Strict, "t");
+        JsonObjectReader r(in, "t");
         TokenFields fields;
         String key;
         while (r.nextKey(key))

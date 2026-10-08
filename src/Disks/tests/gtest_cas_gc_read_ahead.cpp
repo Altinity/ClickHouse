@@ -6,22 +6,27 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/tests/cas_gc_marker_test_support.h>
 #include <Disks/tests/cas_test_helpers.h>
 
 #include <Common/CurrentMetrics.h>
 #include <Common/ThreadPool.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace CurrentMetrics
 {
@@ -35,6 +40,7 @@ using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::openRequestsForTest;
 using DB::Cas::tests::u128Of;
+using namespace DB::Cas::tests;
 
 namespace
 {
@@ -550,4 +556,699 @@ TEST(CASGCReadAhead, WorkerReadFaultFailsTheRoundAndTheNextRoundRecovers)
     store->renewWatermarkOnce();
     const RoundReport recovered = gc.runRegularRound();
     EXPECT_TRUE(recovered.acquired_lease);
+}
+
+namespace
+{
+
+/// What one graduation round read and wrote for a cohort of ten condemned blobs.
+struct GraduationRoundCounts
+{
+    uint64_t graduated = 0;
+    uint64_t gets = 0;      /// `.meta` GETs of the cohort: the gate's and the retries'
+    uint64_t writes = 0;    /// `.meta` writes of the cohort: the retries'
+    uint64_t wasted = 0;
+    std::map<String, uint64_t> gets_by_key;
+};
+
+enum class CohortTwist
+{
+    None,
+    TwoClean,           /// the two smallest refs read `Clean` at the gate
+    OneReReferenced,    /// the smallest ref gains an owner before the round
+    Suppressed,         /// the round's universe is not authoritative
+};
+
+/// Condemns ten blobs, rebuilds the `Gc` so nothing in process stands in for a read, applies `twist`, and
+/// measures the round due to graduate them under a graduation budget of three.
+void measureGraduationRound(uint64_t concurrency, CohortTwist twist, GraduationRoundCounts & out)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openGatePool(backend, concurrency, /*graduation_budget*/ 3);
+    const Layout & layout = store->layout();
+    std::vector<UInt128> hashes;
+    for (uint64_t i = 1; i <= 10; ++i)
+        hashes.push_back(DB::UInt128(0x5000 + i));
+    {
+        Gc gc(store, kGc);
+        uint64_t c = 0;
+        ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "cohort", 1, hashes, c));
+    }
+
+    std::vector<BlobRef> refs;
+    for (const UInt128 & hash : hashes)
+        refs.push_back(gateRef(hash));
+    std::sort(refs.begin(), refs.end());
+    if (twist == CohortTwist::TwoClean)
+        for (size_t i = 0; i < 2; ++i)
+            ASSERT_NO_FATAL_FAILURE(setMarker(*backend, layout, refs[i], cleanMarker()));
+    if (twist == CohortTwist::OneReReferenced)
+        publishBlobs(*backend, layout, "again", 2, {refs[0].digest.toU128()});
+    store->renewWatermarkOnce();
+
+    Gc gc(store, kGc);
+    backend->resetCounts();
+    const uint64_t wasted_before = readAheadWasted();
+    const RoundReport report = runGateRound(store, gc,
+        twist == CohortTwist::Suppressed ? UniversePolicy::StageA_Suppressed : UniversePolicy::Authoritative);
+
+    out.graduated = report.graduated;
+    out.wasted = readAheadWasted() - wasted_before;
+    for (const BlobRef & ref : refs)
+    {
+        const String key = layout.blobMetaKey(ref);
+        out.gets += backend->getCount(key);
+        out.writes += backend->writeCount(key);
+        out.gets_by_key[key] = backend->getCount(key);
+    }
+}
+
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadRequestCounts)
+{
+    struct Expected
+    {
+        CohortTwist twist;
+        uint64_t graduated;
+        uint64_t gets;
+        uint64_t writes;
+    };
+    for (const Expected & expected : {Expected{CohortTwist::None, 3, 3, 0},
+                                      Expected{CohortTwist::TwoClean, 3, 7, 2},
+                                      Expected{CohortTwist::OneReReferenced, 3, 3, 0},
+                                      Expected{CohortTwist::Suppressed, 0, 0, 0}})
+    {
+        SCOPED_TRACE(static_cast<int>(expected.twist));
+        GraduationRoundCounts sequential;
+        GraduationRoundCounts ahead;
+        ASSERT_NO_FATAL_FAILURE(measureGraduationRound(1, expected.twist, sequential));
+        ASSERT_NO_FATAL_FAILURE(measureGraduationRound(8, expected.twist, ahead));
+
+        EXPECT_EQ(ahead.graduated, expected.graduated);
+        EXPECT_EQ(ahead.gets, expected.gets) << "5 gate reads and 2 retry reads when two refuse; 3 otherwise";
+        EXPECT_EQ(ahead.writes, expected.writes);
+        EXPECT_EQ(ahead.wasted, 0u);
+        EXPECT_EQ(ahead.gets_by_key, sequential.gets_by_key);
+        EXPECT_EQ(ahead.graduated, sequential.graduated);
+        EXPECT_EQ(ahead.writes, sequential.writes);
+    }
+}
+
+namespace
+{
+
+/// Journals every GET in arrival order, so a test can place the gate's marker read after the round's cut.
+class GetJournalBackend : public CountingBackend
+{
+public:
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        {
+            std::lock_guard lock(journal_mutex);
+            journal.push_back(key);
+        }
+        return CountingBackend::read(key, access);
+    }
+
+    std::vector<String> takeJournal()
+    {
+        std::lock_guard lock(journal_mutex);
+        return std::exchange(journal, {});
+    }
+
+private:
+    std::mutex journal_mutex;
+    std::vector<String> journal;
+};
+
+/// Once armed, rewrites `key` with `replacement` right after a GET of it returns, with no backend lock held:
+/// the value the reader got is stale by the time it arrives.
+class ReadCompletionHookBackend : public CountingBackend
+{
+public:
+    void armAfterRead(const String & key, String replacement)
+    {
+        std::lock_guard lock(hook_mutex);
+        hooked_key = key;
+        replacement_bytes = std::move(replacement);
+        armed = true;
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        auto raw = CountingBackend::read(key, access);
+        std::optional<String> rewrite;
+        {
+            std::lock_guard lock(hook_mutex);
+            if (armed && raw && key == hooked_key)
+            {
+                armed = false;
+                rewrite = replacement_bytes;
+            }
+        }
+        if (rewrite)
+            (void)InMemoryBackend::write(key, *rewrite, raw->value, access);
+        return raw;
+    }
+
+private:
+    std::mutex hook_mutex;
+    String hooked_key;
+    String replacement_bytes;
+    bool armed = false;
+};
+
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadReadsEachRound)
+{
+    auto backend = std::make_shared<GetJournalBackend>();
+    auto store = openGatePool(backend, /*io_concurrency*/ 8);
+    const Layout & layout = store->layout();
+    const UInt128 hash = DB::UInt128(0x3001);
+    const BlobRef x = gateRef(hash);
+    const String meta_key = layout.blobMetaKey(x);
+    Gc gc(store, kGc);
+    uint64_t c = 0;
+    ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "tbl", 1, {hash}, c));
+    ASSERT_NO_FATAL_FAILURE(setMarker(*backend, layout, x, cleanMarker()));
+
+    /// An unrelated publication gives each measured round ref-log reads to order the gate's read against.
+    uint64_t noise = 100;
+    const auto roundAfterPublication = [&]
+    {
+        ++noise;
+        publishBlobs(*backend, layout, "noise" + std::to_string(noise), noise, {DB::UInt128(0x3100 + noise)});
+        store->renewWatermarkOnce();
+        backend->resetCounts();
+        backend->takeJournal();
+        const RoundReport report = runGateRound(store, gc);
+        return std::make_pair(report, backend->takeJournal());
+    };
+    const auto expectReadAfterCut = [&](const std::vector<String> & journal)
+    {
+        const auto meta_at = std::find(journal.begin(), journal.end(), meta_key);
+        ASSERT_NE(meta_at, journal.end());
+        const auto last_log = std::find_if(journal.rbegin(), journal.rend(),
+                                           [](const String & key) { return key.contains("/_log/"); });
+        ASSERT_NE(last_log, journal.rend()) << "the round read no ref log";
+        const size_t last_log_at = static_cast<size_t>(journal.rend() - last_log) - 1;
+        EXPECT_LT(last_log_at, static_cast<size_t>(meta_at - journal.begin()))
+            << "the gate read the marker before its round's cut";
+    };
+
+    const auto [refused, refused_journal] = roundAfterPublication();
+    EXPECT_EQ(refused.graduated, 0u);
+    EXPECT_EQ(backend->getCount(meta_key), 2u) << "the gate's read and the retry's read";
+    EXPECT_EQ(backend->writeCount(meta_key), 1u);
+    expectReadAfterCut(refused_journal);
+    const auto marker = markerOf(*backend, layout, x);
+    ASSERT_TRUE(marker.has_value());
+    EXPECT_EQ(marker->meta.condemn_round, c + 1);
+
+    const auto [accepted, accepted_journal] = roundAfterPublication();
+    EXPECT_EQ(accepted.graduated, 1u);
+    EXPECT_EQ(backend->getCount(meta_key), 1u) << "every round reads the marker again";
+    expectReadAfterCut(accepted_journal);
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadDecidesOnTheFetchedValue)
+{
+    for (const uint64_t concurrency : std::initializer_list<uint64_t>{1, 8})
+    {
+        SCOPED_TRACE(concurrency);
+        auto backend = std::make_shared<ReadCompletionHookBackend>();
+        auto store = openGatePool(backend, concurrency);
+        const Layout & layout = store->layout();
+        const UInt128 hash = DB::UInt128(0x3101);
+        const BlobRef x = gateRef(hash);
+        const String meta_key = layout.blobMetaKey(x);
+        Gc gc(store, kGc);
+        uint64_t c = 0;
+        ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "tbl", 1, {hash}, c));
+
+        backend->resetCounts();
+        backend->armAfterRead(meta_key, encodeBlobMeta(cleanMarker()));
+        EXPECT_EQ(runGateRound(store, gc).graduated, 1u) << "the gate did not decide on the value it fetched";
+        EXPECT_EQ(backend->getCount(meta_key), 1u);
+        const auto after = markerOf(*backend, layout, x);
+        ASSERT_TRUE(after.has_value());
+        EXPECT_EQ(after->meta.state, MetaState::Clean) << "the hook never fired";
+    }
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadSurfacesAReadError)
+{
+    for (const uint64_t concurrency : std::initializer_list<uint64_t>{1, 8})
+    {
+        SCOPED_TRACE(concurrency);
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openGatePool(backend, concurrency);
+        const Layout & layout = store->layout();
+        const UInt128 hash = DB::UInt128(0x3201);
+        const String meta_key = layout.blobMetaKey(gateRef(hash));
+        Gc gc(store, kGc);
+        uint64_t c = 0;
+        ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "tbl", 1, {hash}, c));
+
+        backend->failNextReadWith(meta_key, std::make_exception_ptr(std::runtime_error("injected marker read fault")));
+        const uint64_t anomalies_before = metaWriteAnomalies();
+        const uint64_t carries_before = unconfirmedCarries();
+        RoundReport report;
+        ASSERT_NO_THROW(report = runGateRound(store, gc));
+        EXPECT_EQ(report.graduated, 0u) << "graduated without reading the marker";
+        EXPECT_EQ(metaWriteAnomalies() - anomalies_before, 1u);
+        EXPECT_EQ(unconfirmedCarries() - carries_before, 1u);
+        EXPECT_EQ(committedGcRound(*backend, layout), c + 1) << "a failed marker read failed the round";
+        EXPECT_EQ(runGateRound(store, gc).graduated, 1u);
+    }
+}
+
+namespace
+{
+
+/// Parks the first GET of a watched key until `quorum` more GETs of watched keys arrive, or a bounded wait ends.
+/// Serial reads never release it; overlapping ones do.
+class ParkFirstWatchedReadBackend : public CountingBackend
+{
+public:
+    void watch(std::set<String> keys, size_t quorum_)
+    {
+        std::lock_guard lock(park_mutex);
+        watched = std::move(keys);
+        quorum = quorum_;
+        armed = true;
+    }
+
+    bool timedOut() const
+    {
+        std::lock_guard lock(park_mutex);
+        return timed_out;
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        {
+            std::unique_lock lock(park_mutex);
+            if (armed && watched.contains(key))
+            {
+                if (!parked)
+                {
+                    parked = true;
+                    if (!arrived.wait_for(lock, std::chrono::seconds(10), [&] { return arrivals >= quorum; }))
+                        timed_out = true;
+                    armed = false;
+                }
+                else
+                {
+                    ++arrivals;
+                    arrived.notify_all();
+                }
+            }
+        }
+        return CountingBackend::read(key, access);
+    }
+
+private:
+    mutable std::mutex park_mutex;
+    std::condition_variable arrived;
+    std::set<String> watched;
+    size_t quorum = 0;
+    size_t arrivals = 0;
+    bool armed = false;
+    bool parked = false;
+    bool timed_out = false;
+};
+
+std::vector<UInt128> hashRange(uint64_t base, uint64_t count)
+{
+    std::vector<UInt128> out;
+    for (uint64_t i = 1; i <= count; ++i)
+        out.push_back(DB::UInt128(base + i));
+    return out;
+}
+
+/// `.meta` GETs per key over `hashes`.
+std::map<String, uint64_t> markerGets(const CountingBackend & backend, const Layout & layout, const std::vector<UInt128> & hashes)
+{
+    std::map<String, uint64_t> out;
+    for (const UInt128 & hash : hashes)
+        out[layout.blobMetaKey(gateRef(hash))] = backend.getCount(layout.blobMetaKey(gateRef(hash)));
+    return out;
+}
+
+struct SupersedeRun
+{
+    std::vector<uint64_t> graduated;
+    std::map<String, uint64_t> superseded_gets;
+    uint64_t wasted = 0;
+};
+
+/// Twenty condemned blobs; before each of three rounds a writer republishes ten of them under a new token and
+/// drops them again, so those ten are superseded every round.
+void runSupersedeRounds(uint64_t concurrency, SupersedeRun & out)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openGatePool(backend, concurrency);
+    const Layout & layout = store->layout();
+    const std::vector<UInt128> cohort = hashRange(0x6000, 20);
+    const std::vector<UInt128> superseded(cohort.begin() + 10, cohort.end());
+    Gc gc(store, kGc);
+    uint64_t c = 0;
+    ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "cohort", 1, cohort, c));
+
+    backend->resetCounts();
+    const uint64_t wasted_before = readAheadWasted();
+    for (uint64_t round = 0; round < 3; ++round)
+    {
+        for (const UInt128 & hash : superseded)
+            displaceBlobToken(*backend, layout, gateRef(hash));
+        const String ref_name = "touch" + std::to_string(round);
+        const ManifestRef touch = publishBlobs(*backend, layout, ref_name, 10 + round, superseded);
+        dropBlobs(*backend, layout, ref_name, touch);
+        store->renewWatermarkOnce();
+        out.graduated.push_back(runGateRound(store, gc).graduated);
+    }
+    out.wasted = readAheadWasted() - wasted_before;
+    out.superseded_gets = markerGets(*backend, layout, superseded);
+}
+
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadSkipsSupersededEntries)
+{
+    SupersedeRun sequential;
+    SupersedeRun ahead;
+    ASSERT_NO_FATAL_FAILURE(runSupersedeRounds(1, sequential));
+    ASSERT_NO_FATAL_FAILURE(runSupersedeRounds(8, ahead));
+
+    EXPECT_EQ(ahead.superseded_gets, sequential.superseded_gets) << "a superseded entry's marker was read ahead";
+    EXPECT_EQ(ahead.wasted, 0u);
+    EXPECT_EQ(ahead.graduated, sequential.graduated);
+    EXPECT_EQ(sequential.graduated.front(), 10u);
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadIgnoresUnusedHeadHints)
+{
+    auto backend = std::make_shared<ParkFirstWatchedReadBackend>();
+    auto store = openGatePool(backend, /*io_concurrency*/ 8);
+    const Layout & layout = store->layout();
+
+    /// Roles by key order: the smallest blob is condemned fresh in the measured round, so its HEAD tops the head
+    /// hints up with `kept` (which keep an edge, so nobody takes them) before any graduation candidate settles.
+    std::vector<BlobRef> refs;
+    for (const UInt128 & hash : hashRange(0x7000, 61))
+        refs.push_back(gateRef(hash));
+    std::sort(refs.begin(), refs.end());
+    const auto hashesOf = [&](size_t from, size_t to)
+    {
+        std::vector<UInt128> out;
+        for (size_t i = from; i < to; ++i)
+            out.push_back(refs[i].digest.toU128());
+        return out;
+    };
+    const std::vector<UInt128> fresh = hashesOf(0, 1);
+    const std::vector<UInt128> graduating = hashesOf(1, 21);
+    const std::vector<UInt128> kept = hashesOf(21, 61);
+
+    const ManifestRef kept_a = publishBlobs(*backend, layout, "kept_a", 1, kept);
+    publishBlobs(*backend, layout, "kept_b", 2, kept);
+    {
+        Gc gc(store, kGc);
+        uint64_t c = 0;
+        ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "graduating", 3, graduating, c));
+    }
+    const ManifestRef fresh_manifest = publishBlobs(*backend, layout, "fresh", 4, fresh);
+    dropBlobs(*backend, layout, "fresh", fresh_manifest);
+    dropBlobs(*backend, layout, "kept_a", kept_a);
+    store->renewWatermarkOnce();
+
+    std::set<String> graduation_keys;
+    for (const UInt128 & hash : graduating)
+        graduation_keys.insert(layout.blobMetaKey(gateRef(hash)));
+    backend->watch(graduation_keys, /*quorum*/ 8);
+
+    Gc gc(store, kGc);
+    const uint64_t wasted_before = readAheadWasted();
+    const RoundReport report = runGateRound(store, gc);
+    EXPECT_FALSE(backend->timedOut()) << "the graduation reads never overlapped";
+    EXPECT_EQ(report.graduated, 20u);
+    EXPECT_EQ(report.condemned, 1u);
+    EXPECT_GE(readAheadWasted() - wasted_before, 31u) << "the fixture must leave the head window full of untaken hints";
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadAcrossShards)
+{
+    std::vector<std::map<String, uint64_t>> gets;
+    for (const uint64_t concurrency : std::initializer_list<uint64_t>{1, 8})
+    {
+        SCOPED_TRACE(concurrency);
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openGatePool(backend, concurrency, /*graduation_budget*/ 10, {}, /*gc_shards*/ 4);
+        const Layout & layout = store->layout();
+        /// The shard is chosen by the digest's high 64 bits, so spread the cohort over them.
+        std::vector<UInt128> cohort = hashRange(0x8000, 40);
+        for (size_t i = 0; i < cohort.size(); ++i)
+            cohort[i] = (UInt128(i) << 64) + cohort[i];
+        std::set<uint64_t> shards;
+        for (const UInt128 & hash : cohort)
+            shards.insert(blobShard(gateRef(hash), 4));
+        ASSERT_GT(shards.size(), 1u) << "the cohort must span shards";
+        {
+            Gc gc(store, kGc);
+            uint64_t c = 0;
+            ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "cohort", 1, cohort, c));
+        }
+
+        Gc gc(store, kGc);
+        backend->resetCounts();
+        const uint64_t wasted_before = readAheadWasted();
+        EXPECT_EQ(runGateRound(store, gc).graduated, 10u);
+        const auto by_key = markerGets(*backend, layout, cohort);
+        uint64_t total = 0;
+        for (const auto & [key, n] : by_key)
+            total += n;
+        EXPECT_EQ(total, 10u) << "the shards together read past the shared budget";
+        EXPECT_EQ(readAheadWasted() - wasted_before, 0u);
+        gets.push_back(by_key);
+    }
+    EXPECT_EQ(gets[0], gets[1]);
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadReadsALargeCohortOnce)
+{
+    std::vector<std::map<String, uint64_t>> gets;
+    for (const uint64_t concurrency : std::initializer_list<uint64_t>{1, 8})
+    {
+        SCOPED_TRACE(concurrency);
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openGatePool(backend, concurrency);
+        const Layout & layout = store->layout();
+        const std::vector<UInt128> cohort = hashRange(0x8800, 100);
+        Gc gc(store, kGc);
+        uint64_t c = 0;
+        ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "cohort", 1, cohort, c));
+
+        backend->resetCounts();
+        const uint64_t wasted_before = readAheadWasted();
+        EXPECT_EQ(runGateRound(store, gc).graduated, 100u);
+        const auto by_key = markerGets(*backend, layout, cohort);
+        for (const auto & [key, n] : by_key)
+            EXPECT_EQ(n, 1u) << key;
+        EXPECT_EQ(readAheadWasted() - wasted_before, 0u);
+        gets.push_back(by_key);
+    }
+    EXPECT_EQ(gets[0], gets[1]);
+}
+
+namespace
+{
+
+/// Samples, at the start of every watched read, how many jobs the process's thread pools hold queued or
+/// running beyond `baseline`: the read-ahead's outstanding hints. The pool has fewer threads than the window,
+/// so requests inside the backend cannot show the bound; each read takes `latency` so the scan has issued
+/// its hints before the first reads finish.
+class OutstandingHintsBackend : public CountingBackend
+{
+public:
+    void watch(std::set<String> keys, std::chrono::microseconds latency_)
+    {
+        std::lock_guard lock(sample_mutex);
+        watched = std::move(keys);
+        latency = latency_;
+        baseline = CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled);
+        armed = true;
+    }
+
+    int64_t peakOutstanding() const
+    {
+        std::lock_guard lock(sample_mutex);
+        return peak;
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        std::chrono::microseconds delay{0};
+        {
+            std::lock_guard lock(sample_mutex);
+            if (armed && watched.contains(key))
+            {
+                peak = std::max<int64_t>(peak, CurrentMetrics::get(CurrentMetrics::LocalThreadScheduled) - baseline);
+                delay = latency;
+            }
+        }
+        std::this_thread::sleep_for(delay);
+        return CountingBackend::read(key, access);
+    }
+
+private:
+    mutable std::mutex sample_mutex;
+    std::set<String> watched;
+    std::chrono::microseconds latency{0};
+    int64_t baseline = 0;
+    int64_t peak = 0;
+    bool armed = false;
+};
+
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadHintsAtMostAWindowAhead)
+{
+    auto backend = std::make_shared<OutstandingHintsBackend>();
+    auto store = openGatePool(backend, /*io_concurrency*/ 8);
+    const Layout & layout = store->layout();
+    const std::vector<UInt128> cohort = hashRange(0x8900, 200);
+    Gc gc(store, kGc);
+    uint64_t c = 0;
+    ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "cohort", 1, cohort, c));
+
+    std::set<String> meta_keys;
+    for (const UInt128 & hash : cohort)
+        meta_keys.insert(layout.blobMetaKey(gateRef(hash)));
+    backend->watch(meta_keys, std::chrono::milliseconds(2));
+
+    const uint64_t io_concurrency = 8;
+    const uint64_t window = 4 * io_concurrency;
+    EXPECT_EQ(runGateRound(store, gc).graduated, cohort.size());
+    EXPECT_GT(backend->peakOutstanding(), 1) << "no read was ever hinted ahead of its gate";
+    /// A worker still counts as scheduled between its set_value and its exit, after take() freed the slot and the
+    /// round hinted a replacement, so the sample may run one past the window per worker.
+    EXPECT_LE(backend->peakOutstanding(), static_cast<int64_t>(window + io_concurrency)) << "hints ran past the read-ahead window";
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadNeverHintsPendingRows)
+{
+    std::vector<std::map<String, uint64_t>> gets;
+    for (const uint64_t concurrency : std::initializer_list<uint64_t>{1, 8})
+    {
+        SCOPED_TRACE(concurrency);
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openGatePool(backend, concurrency);
+        const Layout & layout = store->layout();
+        const std::vector<UInt128> eligible = hashRange(0x9100, 10);
+        const std::vector<UInt128> pending = hashRange(0x9200, 10);
+        const ManifestRef eligible_manifest = publishBlobs(*backend, layout, "eligible", 1, eligible);
+        Gc gc(store, kGc);
+        uint64_t c = 0;
+        ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "pending", 2, pending, c));
+        dropBlobs(*backend, layout, "eligible", eligible_manifest);
+        store->renewWatermarkOnce();
+        const RoundReport setup = runGateRound(store, gc);
+        ASSERT_EQ(setup.graduated, 10u);
+        ASSERT_EQ(setup.condemned, 10u);
+
+        backend->resetCounts();
+        const uint64_t wasted_before = readAheadWasted();
+        const RoundReport report = runGateRound(store, gc);
+        EXPECT_EQ(report.redeleted, 10u);
+        EXPECT_EQ(report.graduated, 10u);
+        EXPECT_EQ(readAheadWasted() - wasted_before, 0u) << "a pending row was hinted and never taken";
+        auto by_key = markerGets(*backend, layout, pending);
+        by_key.merge(markerGets(*backend, layout, eligible));
+        gets.push_back(by_key);
+    }
+    EXPECT_EQ(gets[0], gets[1]);
+}
+
+TEST(CASGCReadAhead, GraduationReadAheadTouchedRowKeepsItsBudgetSlot)
+{
+    std::vector<std::map<String, uint64_t>> gets;
+    for (const uint64_t concurrency : std::initializer_list<uint64_t>{1, 8})
+    {
+        SCOPED_TRACE(concurrency);
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openGatePool(backend, concurrency, /*graduation_budget*/ 3);
+        const Layout & layout = store->layout();
+
+        /// A, T, B, C in key order. T is published and dropped again within one round under its own token:
+        /// net-zero deltas, so T is touched yet not superseded, and still reaches the gate.
+        std::vector<BlobRef> refs;
+        for (const UInt128 & hash : hashRange(0x9300, 4))
+            refs.push_back(gateRef(hash));
+        std::sort(refs.begin(), refs.end());
+        std::vector<UInt128> cohort;
+        for (const BlobRef & ref : refs)
+            cohort.push_back(ref.digest.toU128());
+
+        Gc gc(store, kGc);
+        uint64_t c = 0;
+        ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "cohort", 1, cohort, c));
+        const std::vector<UInt128> touched{cohort[1]};
+        const ManifestRef touch = publishBlobs(*backend, layout, "touch", 10, touched);
+        dropBlobs(*backend, layout, "touch", touch);
+        store->renewWatermarkOnce();
+
+        backend->resetCounts();
+        EXPECT_EQ(runGateRound(store, gc).graduated, 3u);
+        const auto by_key = markerGets(*backend, layout, cohort);
+        EXPECT_EQ(by_key.at(layout.blobMetaKey(refs[0])), 1u) << "A";
+        EXPECT_EQ(by_key.at(layout.blobMetaKey(refs[1])), 1u) << "T";
+        EXPECT_EQ(by_key.at(layout.blobMetaKey(refs[2])), 1u) << "B";
+        EXPECT_EQ(by_key.at(layout.blobMetaKey(refs[3])), 0u) << "C";
+        gets.push_back(by_key);
+    }
+    EXPECT_EQ(gets[0], gets[1]);
+}
+
+TEST(CASGCReadAhead, OutstandingGraduationReadsDoNotStopHeadHints)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openGatePool(backend, /*io_concurrency*/ 8);
+    const Layout & layout = store->layout();
+
+    /// Key order: five graduating rows, the fresh condemn, forty `kept` blobs (head candidates nobody takes),
+    /// then thirty-five more graduating rows. When the fresh HEAD is taken, graduation reads fill the window,
+    /// so a head throttle that counted them would hint nothing past the fresh blob.
+    std::vector<BlobRef> refs;
+    for (const UInt128 & hash : hashRange(0xA000, 81))
+        refs.push_back(gateRef(hash));
+    std::sort(refs.begin(), refs.end());
+    std::vector<UInt128> graduating;
+    std::vector<UInt128> fresh;
+    std::vector<UInt128> kept;
+    for (size_t i = 0; i < refs.size(); ++i)
+    {
+        const UInt128 hash = refs[i].digest.toU128();
+        (i == 5 ? fresh : (i < 46 && i > 5 ? kept : graduating)).push_back(hash);
+    }
+
+    const ManifestRef kept_a = publishBlobs(*backend, layout, "kept_a", 1, kept);
+    publishBlobs(*backend, layout, "kept_b", 2, kept);
+    {
+        Gc gc(store, kGc);
+        uint64_t c = 0;
+        ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "graduating", 3, graduating, c));
+    }
+    const ManifestRef fresh_manifest = publishBlobs(*backend, layout, "fresh", 4, fresh);
+    dropBlobs(*backend, layout, "fresh", fresh_manifest);
+    dropBlobs(*backend, layout, "kept_a", kept_a);
+    store->renewWatermarkOnce();
+
+    Gc gc(store, kGc);
+    const uint64_t wasted_before = readAheadWasted();
+    const RoundReport report = runGateRound(store, gc);
+    EXPECT_EQ(report.graduated, 40u);
+    EXPECT_EQ(report.condemned, 1u);
+    EXPECT_GE(readAheadWasted() - wasted_before, 20u) << "outstanding graduation reads kept the head hints from being issued";
 }

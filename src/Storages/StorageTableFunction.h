@@ -85,6 +85,13 @@ public:
             nested->drop();
     }
 
+    void prepareForDrop(ContextPtr query_context) override
+    {
+        std::lock_guard lock{nested_mutex};
+        if (nested)
+            nested->prepareForDrop(query_context);
+    }
+
     void read(
             QueryPlan & query_plan,
             const Names & column_names,
@@ -149,6 +156,10 @@ public:
 
     bool isView() const override { return false; }
     void checkTableCanBeDropped([[ maybe_unused ]] ContextPtr query_context) const override {}
+    /// Table functions store no data on disk, so there is nothing for the size guard to
+    /// reject. Override (instead of inheriting StorageProxy's forward) to avoid loading
+    /// the nested table, matching `checkTableCanBeDropped` above.
+    void checkTableSizeBelowDropLimit([[ maybe_unused ]] ContextPtr query_context) const override {}
 
 private:
     mutable std::recursive_mutex nested_mutex;

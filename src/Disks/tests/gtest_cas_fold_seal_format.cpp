@@ -8,7 +8,7 @@
 
 using namespace DB::Cas;
 
-namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; extern const int LOGICAL_ERROR; }
+namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; extern const int LOGICAL_ERROR; extern const int UNKNOWN_FORMAT_VERSION; }
 
 namespace
 {
@@ -215,6 +215,39 @@ TEST(CASFoldSealFormat, RejectsUnexpectedGeneration)
         [&] { decodeFoldSeal(encoded, /*expected_generation=*/6); }, "unexpected generation");
     EXPECT_EQ(decodeFoldSeal(encoded, /*expected_generation=*/5).generation, 5);
     EXPECT_EQ(decodeFoldSeal(encoded).generation, 5);
+}
+
+namespace
+{
+CasFoldSeal sealWithEveryRowKind()
+{
+    CasFoldSeal seal;
+    seal.generation = 5;
+    seal.parent_generation = 4;
+    seal.ref_lives[UInt128{1}].coverage = RefCoverage{.classification = CoverageClass::Folded, .last_folded_ref_id = RefTxnId{7, 11}};
+    seal.blob_target_runs.push_back(RunRef{.key = "r0", .checksum = UInt128(0x0f), .shard = 0, .key_generation = 5});
+    seal.condemned_summary[0] = CondemnedSummary{.condemned_total = 3, .pending_total = 1, .oldest_nonpending_condemn_round = 4};
+    return seal;
+}
+}
+
+/// Every line of the object (meta, each row kind, trailer) skips an unknown ordinary key.
+TEST(CASFoldSealFormat, UnknownOrdinaryKeyIsSkippedOnEveryLine)
+{
+    const CasFoldSeal seal = sealWithEveryRowKind();
+    const String encoded = encodeFoldSeal(seal);
+    ASSERT_EQ(cas_battery_detail::lineCount(encoded), 6u);
+    for (size_t line = 1; line < 6; ++line)
+        EXPECT_EQ(decodeFoldSeal(cas_battery_detail::withExtraKeyInLine(encoded, line, "zz")), seal) << "line " << line;
+}
+
+/// Every line of the object fails with the version code on an unknown `!`-prefixed key.
+TEST(CASFoldSealFormat, UnknownCriticalKeyIsUnknownFormatVersionOnEveryLine)
+{
+    const String encoded = encodeFoldSeal(sealWithEveryRowKind());
+    for (size_t line = 1; line < 6; ++line)
+        cas_battery_detail::expectCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+            [&] { decodeFoldSeal(cas_battery_detail::withExtraKeyInLine(encoded, line, "!zz")); }, fmt::format("line {}", line));
 }
 
 TEST(CASFoldSeal, EncodingIsByteDeterministic)
