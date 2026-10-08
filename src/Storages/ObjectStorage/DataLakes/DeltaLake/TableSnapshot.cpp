@@ -250,6 +250,15 @@ public:
                             "scan");
                     }
                 }
+                else
+                {
+                    LOG_DEBUG(
+                        log,
+                        "Clustering predicate fallback: restricted filter DAG is trivial "
+                        "(no function nodes remain after restricting to clustering columns: {}). "
+                        "Skipping fallback — full scan will be used.",
+                        fmt::join(clustering_columns, ", "));
+                }
             }
         }
         else
@@ -758,6 +767,7 @@ TableSnapshot::SnapshotStats TableSnapshot::getSnapshotStats() const
         /// Invalidate the cached engine so `initOrUpdateSnapshot` rebuilds with the
         /// freshened credentials, then re-run the stats scan against the new engine.
         kernel_snapshot_state.reset();
+        clustering_columns.reset();
         initOrUpdateSnapshot();
         snapshot_stats = getSnapshotStatsImpl();
     }
