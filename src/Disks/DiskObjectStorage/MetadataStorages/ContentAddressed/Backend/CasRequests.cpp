@@ -658,6 +658,7 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
 {
     const Retry::Bound bound = policy.bind(owner.now_ms());
     bool refresh_attempted = false;
+    std::optional<SentinelProbeResult> last_probe;
     for (uint32_t attempt = 1;; ++attempt)
     {
         const uint64_t reservation = reservedFor(0, 1);
@@ -667,10 +668,14 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
             case Gate::NoBudget:  giveUpReadNoBudget("probeSentinel", key, "for one more request");
             case Gate::Ok: break;
         }
-        /// Before the first attempt nothing has been probed, so the caller is told the request never
-        /// happened rather than being handed an outcome no request produced.
         if (!fits(reservation, bound))
+        {
+            /// A pause that fit can still end on the boundary. Once a probe has run, its outcome is the
+            /// answer; before the first one the caller is told no request happened.
+            if (last_probe)
+                return *last_probe;
             giveUpReadDeadline("probeSentinel", key, bound, attempt - 1);
+        }
 
         detail::recordAttempt();
         SentinelProbeResult result{ProbeOutcome::Indeterminate, std::nullopt};
@@ -712,6 +717,7 @@ SentinelProbeResult CasOperation::probeSentinel(const String & key, const Retry 
         /// more than a give-up exception could say. Every consumer treats `Indeterminate` fail-closed.
         if (!fits(needed, bound))
             return result;
+        last_probe = std::move(result);
         detail::recordReissue();
         owner.sleep_ms(pause_ms);
     }
