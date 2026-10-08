@@ -1629,7 +1629,11 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         ///
         /// `getSetting` and `rowNumberInAllBlocks` are non-deterministic but must NOT be shared: the cache
         /// is global across scopes, and e.g. `SETTINGS` can change `getSetting`'s result for every scope.
+        ///
+        /// Server constants (`hostName`, `serverUUID`, ...) capture `Context::isDistributed` when built.
+        /// A local `UNION` branch and a later cluster branch must not share that instance.
         if (function && !function->isDeterministic()
+            && !function->isServerConstant()
             && function_name != "getSetting" && function_name != "rowNumberInAllBlocks")
         {
             auto hash = function_node_ptr->getTreeHash();
