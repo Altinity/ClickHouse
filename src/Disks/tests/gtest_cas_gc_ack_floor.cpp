@@ -940,8 +940,8 @@ void runExpiredMountFenceOutScenario(const PoolConfig & config)
     srid2_renewer.start();
     ASSERT_FALSE(decodeMountLease(readObj(*backend, layout.mountKey(srid2))->bytes).gc_fenced);
 
-    // The fence-out threshold on the GC leader's OWN monotonic clock — mirrors the production formula
-    // in `Gc::runRegularRound` (ttl + 5% drift allowance + one round's worth of renewal slack).
+    // The fence-out threshold on the GC leader's OWN monotonic clock. The holder declares 100 ms, shorter
+    // than the observer's lease, so L is the observer's own: `L + L/20 + step`, step the renewal period.
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
     const uint64_t threshold_ms = ttl_ms + ttl_ms / 20
         + static_cast<uint64_t>(store->poolConfig().mount_renew_period.count());
@@ -1056,7 +1056,7 @@ void runSlowWalkSightingScenario(SightingCall sighting_call)
 
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
     const uint64_t threshold_ms = mountObservationThresholdMs(
-        ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
+        ttl_ms, /*declared_lease_ms=*/0, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
     /// Longer than `threshold - TTL`: a sighting credited from before this walk fences a holder
     /// whose last renewal still gives it authority.
     const uint64_t walk_ms = threshold_ms - ttl_ms + 1'000;
@@ -1113,6 +1113,52 @@ void runSlowWalkSightingScenario(SightingCall sighting_call)
     EXPECT_TRUE(decodeMountLease(readObj(*backend, backend->watched_key)->bytes).gc_fenced);
 }
 
+/// Defaults give the observer 30 s + 1.5 s + 10 s = 41.5 s; the holder's 60 s gives 73 s.
+void runLongerDeclaredLeaseScenario(SightingCall early_call)
+{
+    uint64_t mono = 0;
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const Layout & layout = store->layout();
+    ASSERT_EQ(store->poolConfig().mount_lease_ttl_ms.count(), 30'000);
+    ASSERT_EQ(store->poolConfig().mount_renew_period.count(), 10'000);
+    Gc gc(store, kGc, [] { return uint64_t{1'000'000}; }, [&mono] { return mono; });
+
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    writeBlobBody(*backend, layout, DB::UInt128(7));
+    writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", DB::UInt128(7))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+
+    /// Claims once with a 60 s lease and never renews.
+    const String holder_srid = "long-lease-server";
+    CasRequests renewer_requests = openRequestsForTest(backend);
+    MountLeaseRenewer holder(renewer_requests, renewer_requests, layout, holder_srid, DB::UInt128(0x3333),
+        /*writer_epoch=*/1, std::chrono::milliseconds(60'000), [] { return 1000u; }, [] { return 0u; }, {},
+        std::chrono::milliseconds(0), [] { return 0u; });
+    holder.start();
+    const auto holder_fenced = [&]
+    { return decodeMountLease(readObj(*backend, layout.mountKey(holder_srid))->bytes).gc_fenced; };
+
+    ASSERT_EQ(gc.runRegularRound().fence_outs, 0u);
+    /// The store's own slot renews before each decision so only the holder can be fenced.
+    store->renewWatermarkOnce();
+    mono = 41'500;
+    if (early_call == SightingCall::Round)
+        EXPECT_EQ(gc.runRegularRound().fence_outs, 0u);
+    else
+        ASSERT_TRUE(gc.rebuildBaseline(/*force*/ true).performed);
+    EXPECT_FALSE(holder_fenced()) << "fenced after the observer's own lease while the declared lease still ran";
+
+    store->renewWatermarkOnce();
+    mono = 72'999;
+    EXPECT_EQ(gc.runRegularRound().fence_outs, 0u);
+    store->renewWatermarkOnce();
+    mono = 73'000;
+    EXPECT_EQ(gc.runRegularRound().fence_outs, 1u);
+    EXPECT_TRUE(holder_fenced());
+}
+
 }
 
 TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
@@ -1120,8 +1166,9 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
     runExpiredMountFenceOutScenario(PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
-/// GC's fence-out threshold (`ttl + 5% drift allowance + one round's worth of renewal slack`, computed in
-/// `Gc::runRegularRound`) never reads `PoolConfig::unsafe_remount_no_delay` -- that knob is consulted only
+/// GC's fence-out threshold (`L + L/20 + step`; the holder's 100 ms lease is shorter than the observer's, so L
+/// is the observer's own and the step is the renewal period) never reads `PoolConfig::unsafe_remount_no_delay`
+/// -- that knob is consulted only
 /// by `Pool::mountWritable`'s own reclaim decision, never by GC's heartbeat-floor observation. Runs the
 /// IDENTICAL three-round scenario as `ExpiredMountFencedOutAndExcluded` with the knob turned on, and
 /// asserts the SAME round-by-round fence-out counts -- including the one-millisecond-short discriminator
@@ -1140,6 +1187,16 @@ TEST(CASGcFenceOut, RoundCountsASightingFromAfterItsRead)
 TEST(CASGcFenceOut, RebuildCountsASightingFromAfterItsRead)
 {
     runSlowWalkSightingScenario(SightingCall::Rebuild);
+}
+
+TEST(CASGcFenceOut, RoundWaitsForTheHoldersLongerLease)
+{
+    runLongerDeclaredLeaseScenario(SightingCall::Round);
+}
+
+TEST(CASGcFenceOut, RebuildWaitsForTheHoldersLongerLease)
+{
+    runLongerDeclaredLeaseScenario(SightingCall::Rebuild);
 }
 
 /// fix-round F6 (author-review: `Gc`'s own `mono_ms_fn` used to default to the RAW static `Pool::
@@ -1650,3 +1707,41 @@ TEST(CASGCRetire, OutcomeLogUnobservedConflictDoesNotReportItVanished)
     EXPECT_TRUE(refusal_reached) << "no round ever wrote an outcome log, so the arm was never reached";
 }
 #endif
+
+/// The round passes the pool's own lease: the store's slot, renewed with that lease, is not named;
+/// a holder renewing with 100 ms is named once across two rounds.
+TEST(CASGCLeaseMismatch, RoundWarnsOnceAboutAHolderWithADifferentLease)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const Layout & layout = store->layout();
+
+    const String holder_srid = "short-lease-server";
+    CasRequests renewer_requests = openRequestsForTest(backend);
+    MountLeaseRenewer holder(renewer_requests, renewer_requests, layout, holder_srid, DB::UInt128(0x2222),
+        /*writer_epoch=*/1,
+        std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; }, {},
+        std::chrono::milliseconds(0), [] { return 0u; });
+    holder.start();
+
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(7);
+    writeBlobBody(*backend, layout, blob);
+    writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+
+    uint64_t gc_now = 1'000'000;
+    uint64_t gc_mono = 0;
+    Gc gc(store, kGc, [&] { return gc_now; }, [&] { return gc_mono; });
+
+    ScopedLogCapture capture("CasHeartbeatFloor", "warning");
+    gc.runRegularRound();
+    gc_mono = 1;
+    gc.runRegularRound();
+
+    EXPECT_EQ(capture.count("declares a lease"), 1u) << capture.captured();
+    EXPECT_EQ(capture.count("This server is configured with cas_mount_lease_ttl_ms=30000 but the holder of slot "
+                            "short-lease-server (hostname="), 1u) << capture.captured();
+    EXPECT_EQ(capture.count("declares a lease of 100 ms."), 1u) << capture.captured();
+}

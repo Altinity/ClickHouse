@@ -9,6 +9,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
 #include <Core/UUID.h>
+#include <base/arithmeticOverflow.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
@@ -918,9 +919,8 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
         " - LIVENESS: this wait judges the holder alive by its write token holding stable on THIS server's\n"
         "   own clock for the full observation threshold; the stamped expires_at_ms above never enters that\n"
         "   judgment on its own -- it is a writer-stamped diagnostic (also shown in system.cas_mounts), not\n"
-        "   an authorization. Every server sharing this pool must run the SAME cas_mount_lease_ttl_ms and\n"
-        "   cas_mount_renew_period_ms: a server configured with a shorter threshold than its peers can fence\n"
-        "   out a healthy one.\n"
+        "   an authorization. The threshold uses the longer of this server's cas_mount_lease_ttl_ms and the\n"
+        "   lease the holder's body declares (expires_at_ms - started_at_ms).\n"
         " - If the local ClickHouse uuid file was regenerated, restore the old uuid file, or remove the stale\n"
         "   owner object gc/server-roots/{}/owner only after verifying no server uses this root.\n"
         " - As a LAST RESORT, after verifying that NO server is writing this root, manually delete the mount\n"
@@ -932,9 +932,22 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
         srid, identity, srid, srid);
 }
 
-uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms)
+uint64_t declaredMountLeaseMs(const MountLease & m)
 {
-    return ttl_ms + ttl_ms / 20 + cadence_ms;
+    if (m.started_at_ms == 0 || m.expires_at_ms <= m.started_at_ms)
+        return 0;
+    return m.expires_at_ms - m.started_at_ms;
+}
+
+uint64_t mountObservationThresholdMs(uint64_t own_lease_ms, uint64_t declared_lease_ms, uint64_t cadence_ms)
+{
+    const uint64_t lease_ms = std::max(own_lease_ms, declared_lease_ms);
+    uint64_t threshold_ms = 0;
+    /// A wrapped sum would fence early; waiting forever is the safe side.
+    if (common::addOverflow(lease_ms, lease_ms / 20, threshold_ms)
+        || common::addOverflow(threshold_ms, cadence_ms, threshold_ms))
+        return std::numeric_limits<uint64_t>::max();
+    return threshold_ms;
 }
 
 MountClaimResult claimMountAwaitingExpiry(
@@ -949,13 +962,9 @@ MountClaimResult claimMountAwaitingExpiry(
     /// A zero poll interval would spin; a single-ms floor keeps the loop a real (bounded) wait.
     const uint64_t poll = poll_interval_ms == 0 ? 1 : poll_interval_ms;
 
-    /// Rate-bound observation threshold: the full lease TTL, plus a 5% allowance for clock-rate
-    /// mismatch between the holder's and our own local clock, plus one poll interval for observation
-    /// discreteness. It is measured only with OUR OWN clock (`mono_ms_fn`); no cross-node wall-clock
-    /// comparison participates in this loop. `poll` here is half the renewal period (the caller's own
-    /// poll cadence), so this threshold is close to, but not identical to, GC's heartbeat fence-out
-    /// threshold, which passes the full renewal period into the same shared helper.
-    const uint64_t threshold_ms = mountObservationThresholdMs(ttl_ms, poll);
+    /// Set when an observation starts, from the observed body; one token is one body, so the threshold
+    /// of an observation never changes.
+    uint64_t threshold_ms = 0;
 
     std::optional<Etag> observed;
     uint64_t observed_since = 0;
@@ -1005,7 +1014,10 @@ MountClaimResult claimMountAwaitingExpiry(
                 return r;
             observed = *current_etag;
             observed_since = mono_ms_fn();
-            if (on_wait_start && r.body)
+            if (!r.body)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount '{}': observed a mount token without its body", srid);
+            threshold_ms = mountObservationThresholdMs(ttl_ms, declaredMountLeaseMs(*r.body), poll);
+            if (on_wait_start)
                 on_wait_start(*r.body, threshold_ms);
             LOG_INFO(getLogger("CasMountLease"),
                 "Attempting to mount content-addressed server root {} after node change or hard "
@@ -1022,9 +1034,28 @@ bool MountIncarnationObservation::heldFor(uint64_t threshold_ms, uint64_t sample
     return sample_ms >= first_seen_mono_ms && sample_ms - first_seen_mono_ms >= threshold_ms;
 }
 
+namespace
+{
+/// The setting is local, so different values are legal; a longer one slows recovery after its holder's
+/// crash, which the operator should know about.
+void warnOnceIfHolderLeaseDiffers(
+    const String & srid, const MountLease & holder, uint64_t observer_lease_ms, std::set<String> & warned)
+{
+    const uint64_t declared_ms = declaredMountLeaseMs(holder);
+    if (declared_ms == 0 || declared_ms == observer_lease_ms || !warned.insert(srid).second)
+        return;
+    LOG_WARNING(getLogger("CasHeartbeatFloor"),
+        "This server is configured with cas_mount_lease_ttl_ms={} but the holder of slot {} (hostname={}, pid={}) "
+        "declares a lease of {} ms. Observers wait for the longer of the two; a longer lease on one server "
+        "delays recovery after that server's crash.",
+        observer_lease_ms, srid, holder.hostname, holder.pid, declared_ms);
+}
+}
+
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
                                      const std::function<uint64_t()> & mono_ms_fn,
-                                     uint64_t stable_threshold_ms, MountObservationMap & obs)
+                                     uint64_t observer_lease_ms, uint64_t cadence_ms, MountObservationMap & obs,
+                                     std::set<String> & lease_mismatch_warned)
 {
     HeartbeatFloor floor;
     /// Taken before any read: it can confirm that a token held, never date a sighting.
@@ -1059,6 +1090,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
         /// holder's own renewal installed, and the observation check below then sees the new
         /// incarnation and restarts the window -- which counts the slot `live` and declines the write.
         /// That is why no arm that counts a slot ever also asks for a fence-out body.
+        uint64_t threshold_ms = 0;
         WriteResult fenced_out = op.readModifyWrite(key,
             [&](const std::optional<Object> & observed) -> std::optional<String>
             {
@@ -1083,6 +1115,9 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                     return std::nullopt;
                 }
 
+                warnOnceIfHolderLeaseDiffers(srid, m, observer_lease_ms, lease_mismatch_warned);
+                threshold_ms = mountObservationThresholdMs(observer_lease_ms, declaredMountLeaseMs(m), cadence_ms);
+
                 /// Observation-based liveness: stable ONLY if the SAME incarnation was already being
                 /// watched and has now held for the full threshold on our OWN monotonic clock. Anything
                 /// else — no prior observation, or a changed incarnation (a live renewal, including one
@@ -1090,7 +1125,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
                 const bool stable = it != obs.end() && it->second.etag == observed->etag
-                    && it->second.heldFor(stable_threshold_ms, round_start_ms);
+                    && it->second.heldFor(threshold_ms, round_start_ms);
 
                 if (!stable)
                 {
@@ -1119,7 +1154,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 "CAS GC fenced out mount lease for content-addressed server root {} at "
                 "wall-clock ms {}: its write incarnation held unchanged for >= {} ms on the GC "
                 "leader's own monotonic clock (token-stability observation)",
-                srid, now_ms, stable_threshold_ms);
+                srid, now_ms, threshold_ms);
             return true;
         }
         /// Declined: the decision above already classified and counted this slot, and asked for no
@@ -1130,9 +1165,10 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
         return true;
     }, Retry::standard());
 
-    /// Prune every `obs` entry for a srid this pass's walk never saw at all.
+    /// Prune every `obs` and `lease_mismatch_warned` entry for a srid this pass's walk never saw at all.
     for (auto it = obs.begin(); it != obs.end(); )
         it = seen_srids.contains(it->first) ? std::next(it) : obs.erase(it);
+    std::erase_if(lease_mismatch_warned, [&](const String & s) { return !seen_srids.contains(s); });
 
     return floor;
 }

@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -304,9 +305,9 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
 ///     OR a genuinely live twin — the two are indistinguishable from a bare read) is resolved by
 ///     WATCHING the lease's incarnation on OUR OWN clock (`mono_ms_fn`), NEVER by comparing the
 ///     lease's stamped `expires_at_ms` against any clock: once the observed incarnation has held stable for
-///     the full rate-bound threshold (`ttl_ms + ttl_ms / 20 + poll_interval_ms` — the lease TTL, a 5%
-///     clock-drift allowance, and one poll interval of discreteness. This rate bound ensures that a
-///     holder which last renewed before the observation began can no longer be within its lease.
+///     the threshold `mountObservationThresholdMs(ttl_ms, declaredMountLeaseMs(body), poll_interval_ms)` —
+///     after it, a holder that last renewed before the observation began is outside its own lease,
+///     whichever lease it runs;
 ///     that incarnation is handed to `claimMount` as `proven_dead_incarnation`, which then reclaims
 ///     incarnation-guarded (`prior = UncleanObserved`). If the incarnation changes DURING the wait (the
 ///     holder renewed, or a genuine twin is alive) the observation RESTARTS from the new one; bounded to
@@ -319,14 +320,16 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
 /// tests drive fake clocks with no real sleeping. `on_wait_start` (default no-op) fires once per
 /// observation-window start (including restarts), with the currently-observed lease and the
 /// threshold, for an operator-visible startup log.
-/// All callers share this one formula, not duplicated arithmetic, so a future fix or an added term
-/// applies everywhere at once -- but the callers deliberately pass DIFFERENT `cadence_ms` values, so
-/// the resulting thresholds are close, not identical: the startup reopen wait below passes half the
-/// renewal period (`max(1, floor(mount_renew_period_ms / 2))`), while GC's heartbeat fence-out
-/// (`Gc/CasGc.cpp`) passes the full renewal period. `cadence_ms` is the caller's own poll or
-/// heartbeat interval; the additional interval accounts for observation discreteness, while
-/// `ttl_ms / 20` allows for a five-percent clock-rate difference.
-uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms);
+/// The lease a mount body declares: `expires_at_ms - started_at_ms` when `started_at_ms` is set and the
+/// interval is positive, else 0. A body without the stamps decodes them as 0; a farewell stamps them equal.
+uint64_t declaredMountLeaseMs(const MountLease & m);
+
+/// How long an observer watches one slot's token on its own clock before treating the holder as dead:
+/// `L + L / 20 + cadence_ms` with `L = max(own_lease_ms, declared_lease_ms)`, saturating at `UINT64_MAX`.
+/// The longer lease wins: a holder may write for its own lease after its last confirmed renewal,
+/// whatever the observer's lease is. `L / 20` allows a five-percent clock-rate difference; `cadence_ms`
+/// is the observer's own poll step (restart reclaim: `max(1, mount_renew_period / 2)`; GC: the period).
+uint64_t mountObservationThresholdMs(uint64_t own_lease_ms, uint64_t declared_lease_ms, uint64_t cadence_ms);
 
 /// Bounded number of observation restarts `claimMountAwaitingExpiry` allows before giving up on a
 /// same-uuid slot whose write-token keeps changing (see the function comment above): each restart
@@ -379,7 +382,8 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 ///     CURRENT incarnation differs from (or is absent from) `obs` is (re)started fresh — counted `live`,
 ///     never fenced this call, regardless of what its stamped `expires_at_ms` claims (a bare
 ///     wall-clock stamp is never trusted — see `claimMount`'s "certificate of death" doc). Only once
-///     the SAME incarnation has held for `>= stable_threshold_ms` OF THE LEADER'S OWN CLOCK does the body
+///     the SAME incarnation has held, on the leader's own clock, for
+///     `mountObservationThresholdMs(observer_lease_ms, declaredMountLeaseMs(body), cadence_ms)` does the body
 ///     become FENCE-eligible;
 ///   - FENCE-eligible → one incarnation-guarded `replace` preserving the WHOLE body, setting
 ///     `gc_fenced = true` and `seq + 1`. On `Committed` → excluded (`fenced_now`); on `Conflict`
@@ -394,6 +398,9 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 /// each sighting. `obs` is owned by the caller and threaded across consecutive calls (one GC
 /// leader instance, `Cas::Gc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
 /// fencing one round, never fences early).
+/// A body whose declared lease is non-zero and differs from `observer_lease_ms` is named in one `WARNING`
+/// per srid; `lease_mismatch_warned` holds the srids already named and is pruned like `obs`. The check
+/// never changes a classification or a write.
 ///
 /// The fence-out is BOTH safety and liveness. Safety: a sleeper's later renewal permanently fails
 /// (its `replace` now mismatches the fenced incarnation → `tripMountLost`), so it can never re-arm
@@ -412,7 +419,8 @@ struct HeartbeatFloor
 
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
                                      const std::function<uint64_t()> & mono_ms_fn,
-                                     uint64_t stable_threshold_ms, MountObservationMap & obs);
+                                     uint64_t observer_lease_ms, uint64_t cadence_ms, MountObservationMap & obs,
+                                     std::set<String> & lease_mismatch_warned);
 
 /// One `gc/server-roots/<srid>/mount` slot whose holder is not provably finished with the prefix.
 struct NonTerminalMountSlot

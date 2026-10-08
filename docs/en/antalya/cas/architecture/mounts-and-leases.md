@@ -119,22 +119,23 @@ inside authority already proved by the last confirmed lease.
 
 GC's own view of a dead server is symmetric and clock-skew-immune: a slot becomes fence-eligible
 only after the leader observes the *same* renewal token hold stable, on its own monotonic clock,
-for `TTL + floor(TTL/20) + period` — close to, but not identical to, the threshold a re-mounting
-server uses to wait out a predecessor, which observes `TTL + floor(TTL/20) + max(1,
-floor(period/2))`. Both thresholds are evaluated purely on the observer's own clock and its own
-configured `TTL`/`period`; nothing about the writer's timing travels on the wire. The stamped
-`expires_at_ms` never participates in either decision — it is a writer-stamped diagnostic used by
-`system.cas_mounts` and by the non-authoritative decommission epoch-recovery precheck, never an
-authorization; local fencing is derived instead from the confirmed request's pre-I/O `BOOTTIME`
+for `L + floor(L/20) + period`. `L` is the longer of the leader's own `cas_mount_lease_ttl_ms` and the
+lease the slot's body declares (`expires_at_ms − started_at_ms`). A body without stamps, or with a
+non-positive interval (a farewell), declares nothing. A re-mounting server waits out a predecessor the
+same way with the step `max(1, floor(period/2))`. `period` is always the observer's own. The two stamps
+are compared only with each other, never with the observer's clock. `expires_at_ms` alone is a
+writer-stamped diagnostic used by `system.cas_mounts` and the non-authoritative decommission
+epoch-recovery precheck. Local fencing is derived from the confirmed request's pre-I/O `BOOTTIME`
 anchor plus the TTL, and wall-clock `now` stays audit-only.
 
-Every server sharing a pool must therefore run the identical `cas_mount_lease_ttl_ms` and
-`cas_mount_renew_period_ms`: a member or GC leader configured with a shorter threshold than its
-peers can fence out a healthy peer whose token-update gap merely exceeds that shorter threshold —
-a peer renewing frequently stays live, one that missed a renewal does not. Change these values only
-with every member of the pool stopped; a graceful restart removes only that member's own startup
-observation and does not make mixed thresholds safe. With the defaults (TTL 30 s, period 10 s,
-margin 2 s), `TTL − margin − period − 2 × envelope = 4 s` is the scheduling-lateness budget before
+`cas_mount_lease_ttl_ms` is local to each server. It is how long this server may write after its last
+confirmed renewal, and every other server waits at least this long before fencing or reclaiming its
+slot. Mixed values are safe, and so is changing the value one server at a time in any order. A longer
+lease on one server delays recovery after that server's crash, and the GC leader logs one `WARNING` per
+slot whose declared lease differs from its own. A server built without this rule waits only its own
+lease: keep the values equal until every server of the pool runs a build with the rule.
+
+With the defaults (TTL 30 s, period 10 s, margin 2 s), `TTL − margin − period − 2 × envelope = 4 s` is the scheduling-lateness budget before
 the first renewal attempt of a period can begin, where `envelope = attempt_timeout + 2 × cap` and
 `cap` is `attempt_timeout` when the disk's `connect_timeout_ms` is `0`, else
 `min(connect_timeout_ms, attempt_timeout)` (7 s with defaults).
@@ -175,7 +176,7 @@ a `MountClaimResult::Kind` together with a `MountPriorState` describing which ce
 | `None` | no reclaim needed (fresh claim or same-epoch refresh) |
 | `Clean` | the predecessor's own graceful farewell (`min_active_build_sequence == UINT64_MAX`) |
 | `Fenced` | GC's own threshold-gated fence-out (`gc_fenced`) |
-| `UncleanObserved` | this claimant's own token-stability observation held for the full `TTL + drift` window |
+| `UncleanObserved` | this claimant's own token-stability observation held for the full observation threshold (the longer of the two leases, plus drift and step) |
 | `UncleanUnsafe` | the operator's explicit `cas_unsafe_remount_no_delay` authorization carried the slot's exact token — not a certificate of death |
 
 ## Behavioral mount-slot model {#mount-state-machines}

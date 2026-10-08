@@ -696,24 +696,19 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
 
     /// Etag-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
-    /// rounds via `new_round`, not on heartbeat acks). Fencing no longer trusts a predecessor's stamped
-    /// `expires_at_ms` against our wall clock — it
-    /// fences ONLY once `mount_obs` has watched the mount's write-token hold unchanged for the full
-    /// threshold on THIS leader's own monotonic clock (shares `claimMountAwaitingExpiry`'s
-    /// `TTL + Drift` formula for a mount's own reopen wait, but with the full renewal period as the
-    /// cadence term below instead of half of it, so the two thresholds are close, not identical).
+    /// rounds via `new_round`, not on heartbeat acks). A slot is fenced only after `mount_obs` has
+    /// watched its token hold unchanged on this leader's own monotonic clock for
+    /// `mountObservationThresholdMs` over the longer of this server's lease and the one the slot
+    /// declares, with the full renewal period as the step.
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
-    /// The formula is shared with `claimMountAwaitingExpiry` via
-    /// `mountObservationThresholdMs` -- see its doc comment (CasServerRoot.h).
-    const uint64_t stable_threshold_ms = mountObservationThresholdMs(
-        ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
+    const uint64_t renew_period_ms = static_cast<uint64_t>(store->poolConfig().mount_renew_period.count());
 
     /// PHASE 3/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
     /// PUT per newly-fenced mount.
     {
         GcPhaseTimer t(phase_sink, "heartbeat_floor");
         const HeartbeatFloor floor = computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn,
-                                                           stable_threshold_ms, mount_obs);
+                                                           ttl_ms, renew_period_ms, mount_obs, lease_mismatch_warned);
         report.fence_outs = floor.fenced_now;
         if (floor.fenced_now > 0)
             ProfileEvents::increment(ProfileEvents::CASGCHeartbeatFenceOuts, floor.fenced_now);
@@ -4759,11 +4754,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// returned classification counts are not needed for the round mint — graduation paces on rounds).
     /// Use the same threshold/`mount_obs` as the regular round.
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
-    /// Share the identical formula with `claimMountAwaitingExpiry` via
-    /// `mountObservationThresholdMs` -- see its doc comment (CasServerRoot.h).
-    const uint64_t stable_threshold_ms = mountObservationThresholdMs(
-        ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
-    computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn, stable_threshold_ms, mount_obs);
+    const uint64_t renew_period_ms = static_cast<uint64_t>(store->poolConfig().mount_renew_period.count());
+    computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn, ttl_ms, renew_period_ms, mount_obs, lease_mismatch_warned);
 
     /// Retired-in-snapshot: the rebuilt seal's `condemned_summary` must be TOTAL over gc_shards so a
     /// subsequent regular round reads graduation/carry decisions zero-I/O off it (and its `carryParentRefs`
