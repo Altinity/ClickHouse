@@ -108,6 +108,9 @@ struct MountConfig
     /// Test-only override of the renewal's liveness predicate, for exact pre/post-send gate
     /// interleavings. FALSE ends the renewal exactly as a lost fence does.
     std::function<bool()> renewal_live_for_test = {};
+    /// Deterministic test interposition on the renewing thread right after `DriverLease::finish`
+    /// returned driver ownership, before the result is consumed. Runs without `driver_mutex`.
+    std::function<void(const MountRenewResult &)> renewal_finished_hook_for_test = {};
 };
 
 /// Local, in-memory write fence. It is deliberately not checked by reading the object store for every
@@ -134,6 +137,14 @@ struct MountFence
     std::atomic<bool> lost{false};
 };
 
+/// The current logical renewal of the mount lease so far, or the last one once it ended.
+struct RenewalProgress
+{
+    bool in_progress = false;
+    uint32_t attempts_sent = 0;
+    std::optional<String> last_error;
+};
+
 /// Owns the live writer-incarnation mechanics shared by the pool's mount and recovery orchestration:
 /// the `MountLeaseRenewer`, local `MountFence`, build watermark and in-flight build registry,
 /// `live_writer_epoch`, unclean-boundary marker, and both persistent workers. `Pool` retains the higher-level
@@ -146,10 +157,11 @@ class CasMountRuntime
 public:
     CasMountRuntime(
         BackendPtr backend_ptr_,
-        /// The two planes the `MountLeaseRenewer` runs on: renewals under the mount fence, the farewell
-        /// on an open one. Owned by `Pool` and outliving this runtime.
+        /// The two planes the `MountLeaseRenewer` runs on: bounded renewals under the mount fence; the
+        /// claim, the remount re-anchor and the farewell on the open-fence lease plane. Owned by `Pool`
+        /// and outliving this runtime.
         CasRequests & mount_requests_,
-        CasRequests & farewell_requests_,
+        CasRequests & lease_requests_,
         const Layout & layout_,
         MountConfig config_,
         String server_root_id_,
@@ -172,6 +184,8 @@ public:
     /// Renew the merged mount heartbeat once, including its build-watermark floor. A read-only runtime
     /// has no renewer and fails with a logical exception rather than fabricating a heartbeat.
     void renewWatermarkOnce();
+    /// Takes only its own lock, so a renewal stuck in a request never holds up the reader.
+    RenewalProgress renewalProgress() const;
 
     /// ---- local write fence ----
     /// Return whether a mutable operation may start under the locally observed lease state.
@@ -309,6 +323,10 @@ public:
     /// it cannot plausibly finish before the fence expires.
     bool refAppendFenceOk() const;
 
+    /// The confirmed deadline, once it has passed while the pool is `Live` and the fence is not lost: the
+    /// lease expired and the renewal keeps retrying. Empty otherwise. I/O-free.
+    std::optional<uint64_t> leaseExpiredAtBootMs() const;
+
     /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
     /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
     /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
@@ -409,7 +427,8 @@ private:
     public:
         DriverLease(CasMountRuntime & runtime_, RenewalDriverState active_);
         ~DriverLease();
-        RenewalDriverState finish(RenewalDriverState ordinary_destination, const MountRenewResult * result = nullptr);
+        RenewalDriverState finish(RenewalDriverState ordinary_destination,
+            const MountRenewResult * result = nullptr, const MountLeaseRenewer * renewer = nullptr);
 
     private:
         CasMountRuntime & runtime;
@@ -442,6 +461,13 @@ private:
         RenewalDriverState active_state,
         RenewalDriverState returned_state,
         bool propagate_failure);
+    /// Publish a committed renewal's deadline, its start plus the lease. Requires `driver_mutex`.
+    void publishRenewedDeadline(uint64_t attempt_start_boot_ms);
+    /// One `WARNING` per expiry, at the first renewal attempt after it.
+    void warnOnceIfLeaseExpired() noexcept;
+    /// The background renewal's wait after a credential refusal. Wakes on stop and on a park request;
+    /// `MountConfig::wait_sleep_fn` replaces it in tests.
+    void waitBeforeNextRenewalCall(uint64_t ms);
     void renewalLoop();
     void remountLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);
@@ -457,7 +483,7 @@ private:
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
     BackendPtr backend_ptr;
     CasRequests & mount_requests;
-    CasRequests & farewell_requests;
+    CasRequests & lease_requests;
     const Layout & layout;
     MountConfig config;
     String server_root_id;
@@ -508,6 +534,9 @@ private:
     uint64_t remount_handled_generation = 0;
     ThreadFromGlobalPool renewal_worker;
     ThreadFromGlobalPool remount_worker;
+    /// A leaf lock, never held across I/O.
+    mutable std::mutex renewal_progress_mutex;
+    RenewalProgress renewal_progress;
     /// Counted entries into `scheduleRemount`; retained as a test-only observability seam.
     std::atomic<uint64_t> schedule_remount_calls_for_test{0};
 
@@ -519,6 +548,7 @@ private:
     /// Fence-generation token (rev.7 [C2]): bumped by `tripMountLost` and `armMountFence`. See
     /// `fenceGeneration`/`checkFenceOrThrow`.
     std::atomic<uint64_t> fence_generation{0};
+    std::atomic<bool> lease_expiry_warned{false};
     std::function<void()> arm_mount_fence_interposition_hook_for_test;
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions

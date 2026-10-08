@@ -81,14 +81,17 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   after a flat pause and settled by the reissue's own answer (a 2xx) or by the exact `GET` that
   follows its `412`. The renewer adopts the result only when the complete body, including `write_attempt_id`,
   equals its immutable request. If the predecessor token is still current, another identical `PUT`
-  may follow bounded backoff. A same-pair twin, GC-fenced body, successor, foreign holder, or absent
+  follows after a pause. A same-pair twin, GC-fenced body, successor, foreign holder, or absent
   body is never treated as this renewal.
-- **Absolute deadline.** Renewal uses `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`, so a VM resumed from
-  suspend correctly observes itself expired. Its absolute deadline is the minimum of the existing
-  request-operation budget and the last confirmed lease deadline minus the safety margin. The
-  controller checks that one attempt envelope still fits before each backend `PUT` or resolving
-  `GET`, after each interruptible backoff, and before accepting success. A retry, `GET`, response
-  timestamp, or wall-clock step never extends authority.
+- **Deadline from the start.** Renewal uses `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`, so a VM resumed
+  from suspend correctly observes itself expired. A confirmed renewal sets the deadline to its own
+  start plus the lease; a retry, `GET`, response timestamp, or wall-clock step never moves it. The
+  background renewal has no deadline of its own: it retries one body every 0.8–1.2 s (measured from
+  the start of the previous attempt) until the store answers about the slot, or until a stop, a
+  remount park request, a lost fence or a pool leaving `Live` ends it. A
+  refusal (`AccessDenied`, `MalformedXML`, …) sends the same body again, one renewal period later for
+  a credential refusal. The startup re-anchor and the remount re-anchor stay bounded by the last
+  confirmed lease minus the safety margin.
 - **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
   10 s), with TTL `cas_mount_lease_ttl_ms` (default 30 s, TTL/3 renewal ratio). The next beat is anchored
   at the committed body's pre-I/O BOOTTIME start. A slow recovery therefore causes an immediate
@@ -103,19 +106,27 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
 
 **Losing the lease is neither read-only mode nor a process abort.** `MountLeaseRenewer` is a
 synchronous durable-slot state machine. A committed result advances its token, sequence, confirmed
-BOOTTIME deadline, and cadence anchor. Any admitted deterministic failure, confirmed conflict, or
-ambiguity left at the deadline/attempt limit moves it to `RenewalTerminal`; it cannot mint another
+BOOTTIME deadline, and cadence anchor. A deterministic failure, a confirmed conflict, or, for a
+bounded renewal, ambiguity left at its deadline moves it to `RenewalTerminal`; it cannot mint another
 body or publish a clean farewell. Owner cancellation before any request is the only
 `NotAttempted` result and leaves clean release possible. Cancellation after a request was sent is
 terminal because that request may still land.
+
+**An expired lease is a pause.** While the store does not answer, writes stop being admitted once the
+remaining lease cannot cover them, and the lease expires at its deadline. `system.cas_mounts` then
+shows `lifecycle = 'not_live'` and `lifecycle_reason = 'lease_expired'`, and the server logs one
+`WARNING`: `CAS mount lease of '<server_root_id>' expired <N> ms ago under writer_epoch <E>`. Nothing
+is remounted. The first confirmed renewal whose start plus the lease is still ahead resumes writes
+under the same `writer_epoch`; a renewal confirmed later than that leaves writes paused, and the next
+one starts at once.
 
 After the renewer call returns, `CasMountRuntime` consumes the result. A terminal result trips the
 local fence (latches `lost`, bumps the fence generation, moves the in-process runtime to
 `TransientNotLive`) and latches one self-remount generation. A confirmed foreign/successor or
 same-pair conflict remains a typed fail-closed error; it is never adopted. A real fence still costs
 only an epoch: recovery reclaims with a fresh one, bounded at three whole-chain attempts. This is the
-general CAS posture: doubt about the source fails closed, while transport ambiguity may retry only
-inside authority already proved by the last confirmed lease.
+general CAS posture: doubt about the source fails closed, while transport ambiguity is retried until a
+definitive answer and writes are admitted only inside the last confirmed lease.
 
 GC's own view of a dead server is symmetric and clock-skew-immune: a slot becomes fence-eligible
 only after the leader observes the *same* renewal token hold stable, on its own monotonic clock,
@@ -269,6 +280,7 @@ becomes `state = 'corrupt'`, never an exception). Shows every `server_root_id` i
 | `state` | one of `live`, `expired`, `terminated`, `fenced`, `corrupt` |
 | `is_leader`, `pending_reclaim`, `last_success_age_seconds`, `wedged_namespace_count` | GC health, process-local; **`NULL` on every peer row** — a process-local fact must never be stamped onto another server's row |
 | `lifecycle`, `lifecycle_reason`, `lifecycle_detail`, `lifecycle_since` | the SQL surface for the in-process `PoolLifecycle` runtime above: `lifecycle` is one of `live`, `not_live`, `identity_lost`, `vanished`, `constructing`, `shutdown`; `lifecycle_reason` distinguishes `replaced` from `forgotten` for a `vanished` disk; `lifecycle_detail` carries the full diagnosis text; `lifecycle_since` is when the current non-live state began (`NULL` while live) |
+| `renewal_in_progress`, `renewal_attempts`, `last_renewal_error` | the running (or last) lease renewal: conditional `PUT`s sent so far and the last failed request, updated per attempt; **`NULL` on every peer row** |
 
 The lifecycle snapshot is I/O-free and ungated, so a not-live, never-started, or vanished disk
 still produces a row instead of silently disappearing from the table.

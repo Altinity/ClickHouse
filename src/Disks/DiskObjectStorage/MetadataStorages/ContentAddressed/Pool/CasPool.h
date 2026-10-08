@@ -256,10 +256,10 @@ struct PoolConfig
     /// boot clock (`Pool::bootMs`); injected by tests to drive the fence deadline deterministically.
     std::function<uint64_t()> boot_ms_fn = {};
 
-    /// The inter-attempt sleep for the mount, farewell and GC request planes (`mount_requests`,
-    /// `farewell_requests`, `gc_requests`), installed at their CONSTRUCTION -- before this `Pool` has
+    /// The inter-attempt sleep for the mount, lease and GC request planes (`mount_requests`,
+    /// `lease_requests`, `gc_requests`), installed at their CONSTRUCTION -- before this `Pool` has
     /// claimed or read anything. Empty = each plane's own production default (an interruptible real
-    /// sleep for the mount and GC planes, `CasRequests`'s own real sleep for the farewell plane). A test
+    /// sleep for the mount and GC planes, `CasRequests`'s own real sleep for the lease plane). A test
     /// that also freezes `boot_ms_fn` must supply a matching sleep here: a retry loop bound to a clock
     /// that only moves when this function is called would otherwise retry forever against a REAL sleep
     /// that never calls it, because the deadline it measures against never appears to elapse.
@@ -543,8 +543,11 @@ public:
         PoolLifecycle lifecycle = PoolLifecycle::Live;
         String detail;
         time_t since = 0;
+        /// `Live`, but the lease expired; `since` is then the deadline that passed.
+        bool lease_expired = false;
     };
     LifecycleSnapshot lifecycleSnapshot() const;
+    RenewalProgress renewalProgress() const { return mount_runtime.renewalProgress(); }
 
     /// `SYSTEM CAS FORGET` — the operator force-Vanish (spec §5). Drives THIS pool to
     /// `Vanished(forgotten)` with the fence-first protocol, node-locally, regardless of the current
@@ -759,11 +762,9 @@ public:
     /// operation admitted here is refused the moment the fence trips, is re-armed under a fresh lease
     /// incarnation, or runs out of room before the lease expires.
     CasRequests & mountRequests() { return mount_requests; }
-    /// The farewell plane, on an open fence -- shared with the mount-lease renewer's own claim/adopt,
-    /// not only its release: a self-remount claims with the fence already latched lost, so gating the
-    /// claim on the fence could never reclaim, and refusing the farewell because the mount fence has
-    /// already run down would leave the slot looking live until GC fences it out.
-    CasRequests & farewellRequests() { return farewell_requests; }
+    /// The lease plane, on an open fence: the renewer's claim and adoption, the remount re-anchor and
+    /// the farewell. None of them may be refused for want of the lease they establish or hand back.
+    CasRequests & leaseRequests() { return lease_requests; }
     /// The open-fence plane: GC, the offline tools, this pool's own reads, and the bootstrap-control
     /// claims. None of them hold a mount lease -- the claims are what ESTABLISHES one, so gating them
     /// on the fence would make a self-remount, which runs with the fence latched lost, unable ever to
@@ -1207,7 +1208,7 @@ private:
     /// config they take their clock from. `mutable` because issuing a request is not a change to the
     /// pool: a `const` observer still has to read the store.
     mutable CasRequests mount_requests;
-    mutable CasRequests farewell_requests;
+    mutable CasRequests lease_requests;
     mutable CasRequests gc_requests;
 
     std::shared_ptr<DetachedRegistryState> detached_work = std::make_shared<DetachedRegistryState>();

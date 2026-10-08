@@ -54,8 +54,9 @@ struct Declined  { Observation seen; };
 struct Conflict  { Observation seen; uint32_t attempts_sent = 0; bool any_ambiguous = false; };
 /// The store itself refused the request (not a lost precondition) -- `store_error` is a ClickHouse
 /// error code and `message` explains it. `attempts_sent` is the same count `Conflict` carries, for
-/// the same reason.
-struct Refused   { int store_error; String message; uint32_t attempts_sent = 0; };
+/// the same reason. `credential` is true when the refusal is of the class a fresh credential could fix
+/// (`isRefreshableCredentialError`) and the one refresh the call allowed did not help.
+struct Refused   { int store_error; String message; uint32_t attempts_sent = 0; bool credential = false; };
 /// No attempt landed and none can be proven safe to keep making.
 struct GaveUp
 {

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 namespace DB::Cas
@@ -23,6 +24,12 @@ struct Retry
     /// iterations a fresh window. Empty for a single verb, which gets its window from where it is
     /// called.
     std::optional<uint64_t> policy_deadline_ms = std::nullopt;
+    /// When set, a reissue in `CasOperation`'s write and read loops waits until a draw from [0.8, 1.2]
+    /// of this has passed since the failed attempt started, instead of the growing backoff. A
+    /// first-attempt fuse timeout is still reissued at once.
+    std::optional<uint64_t> attempt_spacing_ms = std::nullopt;
+
+    static constexpr uint64_t kDefinitiveAttemptSpacingMs = 1'000;
 
     /// Full jitter: uniform(0, min(5000, 200 << (attempt-1))) milliseconds. `attempt` is 1-based;
     /// `attempt == 0` returns 0.
@@ -53,6 +60,18 @@ struct Retry
     }
     /// The standard policy, but at most one attempt is ever sent.
     static Retry once() { return {.window_ms = 90'000, .lease_deadline_ms = std::nullopt, .single_attempt = true}; }
+    /// No window and no lease bound: the operation ends on a definitive answer, or when the fence or the
+    /// caller's liveness refuses. Reissues are spaced by `kDefinitiveAttemptSpacingMs`.
+    static Retry untilDefinitive()
+    {
+        return {.window_ms = std::numeric_limits<uint64_t>::max(), .lease_deadline_ms = std::nullopt,
+                .single_attempt = false, .attempt_spacing_ms = kDefinitiveAttemptSpacingMs};
+    }
+    /// `spacing_draw_ms` minus what the failed attempt took, not below 0. A sample before the start
+    /// counts as no time taken.
+    static uint64_t spacedPause(uint64_t spacing_draw_ms, uint64_t attempt_started_ms, uint64_t now_ms);
+    /// A uniform draw in [0.8, 1.2] of `attempt_spacing_ms_`, saturating at the top of the range.
+    static uint64_t drawSpacing(uint64_t attempt_spacing_ms_);
 
     /// This policy, made single-attempt. A frozen loop policy keeps its absolute deadline through it,
     /// which is what lets a loop send an unrepeatable request under the same bound as the rest.

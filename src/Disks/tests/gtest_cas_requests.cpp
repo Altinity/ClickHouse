@@ -34,6 +34,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <functional>
@@ -579,6 +580,51 @@ TEST(CASRetry, BindSaturatesAndLeavesAnEqualLeaseOffTheLeaseSource)
     EXPECT_TRUE(lease.lease_bound);
 }
 
+TEST(CASRetrySpacing, UntilDefinitiveHasNoDeadlineAndSpacesItsAttempts)
+{
+    constexpr uint64_t largest = std::numeric_limits<uint64_t>::max();
+    const Retry policy = Retry::untilDefinitive();
+    EXPECT_FALSE(policy.lease_deadline_ms.has_value());
+    EXPECT_FALSE(policy.single_attempt);
+    EXPECT_EQ(policy.attempt_spacing_ms, std::optional<uint64_t>(1'000));
+    for (const uint64_t now : {uint64_t{0}, uint64_t{1'000'000}, largest - 1, largest})
+    {
+        const Retry::Bound bound = policy.bind(now);
+        EXPECT_EQ(bound.deadline_ms, largest) << "now " << now;
+        EXPECT_FALSE(bound.lease_bound) << "now " << now;
+    }
+    EXPECT_FALSE(Retry::standard().attempt_spacing_ms.has_value());
+    EXPECT_FALSE(Retry::untilLeaseSafe(2'000'000, 2'000).attempt_spacing_ms.has_value());
+}
+
+TEST(CASRetrySpacing, SpacedPauseWaitsOutTheRestOfTheDraw)
+{
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 5'000), 1'000u);
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 5'300), 700u);
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 6'000), 0u);
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 10'000), 0u);
+    EXPECT_EQ(Retry::spacedPause(1'000, 5'000, 4'000), 1'000u);
+}
+
+TEST(CASRetrySpacing, DrawIsWithinAFifthOfTheSpacing)
+{
+    bool low = false;
+    bool high = false;
+    for (int i = 0; i < 2'000; ++i)
+    {
+        const uint64_t draw = Retry::drawSpacing(1'000);
+        ASSERT_GE(draw, 800u);
+        ASSERT_LE(draw, 1'200u);
+        low = low || draw < 850;
+        high = high || draw > 1'150;
+    }
+    /// The bounds alone cannot tell a draw from a constant.
+    EXPECT_TRUE(low);
+    EXPECT_TRUE(high);
+    constexpr uint64_t largest = std::numeric_limits<uint64_t>::max();
+    EXPECT_GE(Retry::drawSpacing(largest), largest - largest / 5) << "the top of the range must not wrap";
+}
+
 TEST(CASRequests, CreateThenReplaceThenRemove)
 {
     FakeClock clock;
@@ -690,6 +736,110 @@ TEST(CASRequests, AmbiguousCreateThatNeverLandedIsReissued)
     EXPECT_EQ(committed->attempts_sent, 2u);
     EXPECT_EQ(backend->getTotal(), 1u);     /// the resolve proved absence, and only then did a reissue follow
     EXPECT_EQ(clock.sleeps.size(), 1u);
+}
+
+namespace
+{
+
+/// Each guarded write takes `write_ms` on the injected clock and, while `failing` is positive, throws a
+/// transport timeout after it.
+class SlowFailingWrites final : public CountingBackend
+{
+public:
+    explicit SlowFailingWrites(FakeClock & clock_) : clock(clock_) {}
+
+    std::expected<String, Backend::RawConflict> write(const String & key, const String & bytes,
+        const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (expected_value)
+        {
+            clock.now += write_ms;
+            if (failing > 0)
+            {
+                --failing;
+                throw Poco::TimeoutException("injected write timeout");
+            }
+        }
+        return CountingBackend::write(key, bytes, expected_value, access);
+    }
+
+    uint64_t write_ms = 0;
+    int failing = 0;
+
+private:
+    FakeClock & clock;
+};
+
+}
+
+/// Unclear writes are reissued past the standard 90 s window, each a spacing draw after the previous
+/// attempt started, and the read that settles each one is sent at once.
+TEST(CASRequestsSpacing, UnclearWritesAreReissuedPastAnyWindowOneSpacingApart)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<SlowFailingWrites>(clock);
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "seed");
+    constexpr int failures = 120;
+    backend->write_ms = 300;
+    backend->failing = failures;
+    const uint64_t gets_before = backend->getTotal();
+    const uint64_t start = clock.now;
+
+    const WriteResult result = op.replace("k", "v2", seen, Retry::untilDefinitive());
+
+    const auto * committed = std::get_if<Committed>(&result);
+    ASSERT_NE(committed, nullptr);
+    EXPECT_EQ(committed->attempts_sent, failures + 1u);
+    EXPECT_GT(clock.now - start, 90'000u);
+    ASSERT_EQ(clock.sleeps.size(), static_cast<size_t>(failures));
+    for (const uint64_t pause : clock.sleeps)
+    {
+        EXPECT_GE(pause, 500u);
+        EXPECT_LE(pause, 900u);
+    }
+    EXPECT_EQ(backend->getTotal() - gets_before, static_cast<uint64_t>(failures)) << "one settling read per unclear attempt";
+}
+
+TEST(CASRequestsSpacing, ReadRetriesAreSpaced)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<CountingBackend>();
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    (void)orThrow(op.create("k", "v", Retry::standard()), "seed");
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("injected read failure")));
+    backend->failNextReadWith("k", std::make_exception_ptr(Poco::TimeoutException("injected read failure")));
+
+    const auto object = op.read("k", Retry::untilDefinitive());
+
+    ASSERT_TRUE(object.has_value());
+    ASSERT_EQ(clock.sleeps.size(), 2u);
+    for (const uint64_t pause : clock.sleeps)
+    {
+        EXPECT_GE(pause, 800u);
+        EXPECT_LE(pause, 1'200u);
+    }
+}
+
+/// Golden: a policy without spacing keeps the growing backoff.
+TEST(CASRequestsSpacing, AStandardPolicyKeepsItsGrowingBackoff)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<SlowFailingWrites>(clock);
+    auto requests = makeRequests(backend, clock);
+    auto op = requests.admit();
+    const Etag seen = *orThrow(op.create("k", "v1", Retry::standard()), "seed");
+    backend->failing = 3;
+
+    const WriteResult result = op.replace("k", "v2", seen, Retry::standard());
+
+    ASSERT_TRUE(std::holds_alternative<Committed>(result));
+    ASSERT_EQ(clock.sleeps.size(), 3u);
+    EXPECT_LE(clock.sleeps[0], 200u);
+    EXPECT_LE(clock.sleeps[1], 400u);
+    EXPECT_LE(clock.sleeps[2], 800u);
 }
 
 /// The engine's own attempt number reaches the transport through `TransportAccess::attemptNo()`, for

@@ -48,6 +48,10 @@ bool isFirstAttemptFuseTimeout(const std::exception & e, size_t attempt_no);
 /// same failure and buries the root cause behind a retryable exception. The set is `LOGICAL_ERROR`,
 /// `NOT_IMPLEMENTED`, `BAD_ARGUMENTS` and `CORRUPTED_DATA`.
 bool isDeterministicLocalFailure(int code);
+/// An exception the store or the transport raised, as opposed to a local fault.
+bool isStoreAnswer(const std::exception & e);
+/// `VERB key: refused|transport code message`; `code` is the store's error name when it sent one.
+String describeRequestFailure(std::string_view verb, const String & key, const std::exception & e);
 
 /// Throw the recoverable "CAS write could not be committed, retry later" condition.
 ///
@@ -131,6 +135,15 @@ struct ListPage
 };
 /// The walk's callback: FALSE stops the walk.
 using ListedKeyFn = std::function<bool(const ListedKey &)>;
+
+/// Live progress of one operation, called on its thread inside the engine's retry loops; must not throw.
+struct RequestObserver
+{
+    /// A conditional write is about to send its `attempts_sent`-th physical attempt.
+    std::function<void(uint32_t attempts_sent)> on_write_attempt;
+    /// A conditional `PUT` or a body `GET` failed with a store answer (`isStoreAnswer`).
+    std::function<void(std::string_view verb, const String & key, const std::exception & e)> on_failure;
+};
 
 namespace detail
 {
@@ -256,6 +269,7 @@ public:
     /// The verdict point: is this operation still admitted? For the sites that guard a decision rather
     /// than a request.
     bool admitted() const { return gate(0) == Gate::Ok; }
+    void observeRequests(RequestObserver observer_) { observer = std::move(observer_); }
 
     /// The write lane for keys several writers of this pool share.
     CasHotKeys & hotKeys() const { return *owner.hot_keys; }
@@ -340,6 +354,8 @@ private:
         Observation last_seen = NotObserved{};
         uint32_t reissues = 0;
         bool refresh_attempted = false;
+        /// When the latest attempt was sent; sampled only under `Retry::attempt_spacing_ms`.
+        uint64_t attempt_started_ms = 0;
     };
 
     /// Why a read-class request stopped without an answer. Every give-up below throws the same
@@ -405,19 +421,29 @@ private:
     std::optional<WriteResult> gatedPause(uint64_t pause_ms, uint32_t envelopes, WriteState & state,
                                          const Retry::Bound & bound, void (*record)(), bool should_sleep);
     /// Admission, then the jittered sleep. A value means the call ended during it; nullopt means the
-    /// caller may send another attempt.
-    std::optional<WriteResult> pauseAndReissue(WriteState & state, const Retry::Bound & bound);
+    /// caller may send another attempt. Under `Retry::attempt_spacing_ms` this and the two siblings
+    /// below sleep the spaced pause instead.
+    std::optional<WriteResult> pauseAndReissue(WriteState & state, const Retry & policy, const Retry::Bound & bound);
     /// The sibling for a clean lost race: the same admission and the same reservation, a flat
     /// `Retry::conflictBackoff` sleep, and `state.reissues` untouched, so a transport fault that follows
     /// starts its own schedule at the beginning.
-    std::optional<WriteResult> pauseForConflict(WriteState & state, const Retry::Bound & bound);
+    std::optional<WriteResult> pauseForConflict(WriteState & state, const Retry & policy, const Retry::Bound & bound);
     /// The sibling for a failure text that named a failed connection. The same admission and the same
     /// reservation, a flat `kConnectHintPauseMs` sleep, and `state.reissues` untouched.
-    std::optional<WriteResult> pauseFlat(WriteState & state, const Retry::Bound & bound);
+    std::optional<WriteResult> pauseFlat(WriteState & state, const Retry & policy, const Retry::Bound & bound);
     /// The sibling for a first-attempt fuse timeout: the same admission and the same reservation, NO
     /// sleep at all, and `state.reissues` untouched -- the fuse is a connection-quality answer about a
     /// fresh connection, not a store fault, so nothing here is paced against it.
     std::optional<WriteResult> reissueAtOnce(WriteState & state, const Retry::Bound & bound);
+    /// The pause before a reissue: `unspaced_ms()`, or under `Retry::attempt_spacing_ms` what is left of a
+    /// fresh draw since `attempt_started_ms`.
+    template <typename UnspacedPause>
+    uint64_t reissuePause(const Retry & policy, uint64_t attempt_started_ms, UnspacedPause && unspaced_ms) const
+    {
+        if (!policy.attempt_spacing_ms)
+            return unspaced_ms();
+        return Retry::spacedPause(Retry::drawSpacing(*policy.attempt_spacing_ms), attempt_started_ms, owner.now_ms());
+    }
 
     /// `sleep_ms` plus `envelopes` attempt reservations, saturating.
     uint64_t reservedFor(uint64_t sleep_ms, uint32_t envelopes) const;
@@ -445,6 +471,7 @@ private:
     /// Written immediately before a read-class give-up throws, cleared and read only by the resolve
     /// read that swallows it. Every other caller lets the exception carry the verdict.
     std::optional<ReadStop> last_read_stop;
+    RequestObserver observer;
 };
 
 template <typename Fn>
@@ -452,6 +479,7 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
                             const Retry::Bound & bound, Fn && once)
 {
     bool refresh_attempted = false;
+    uint64_t attempt_started_ms = 0;
     /// Two counters, deliberately kept separate: `attempt_no` is the PHYSICAL attempt count handed to
     /// the transport (so a reissue is seen as attempt >= 2); `ordinary_reissues` is the
     /// exponential-backoff index. They advance together on an ordinary failure, but the first-attempt
@@ -469,6 +497,8 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         if (!fits(reservation, bound))
             giveUpReadDeadline(verb, subject, bound, attempt_no - 1);
 
+        if (policy.attempt_spacing_ms)
+            attempt_started_ms = owner.now_ms();
         detail::recordAttempt();
         try
         {
@@ -476,6 +506,8 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
         }
         catch (const std::exception & e)
         {
+            if (observer.on_failure && verb == "read" && isStoreAnswer(e))
+                observer.on_failure("GET", subject, e);
             bool refreshed = false;
             if (refreshAndClassifyReadFault(e, refresh_attempted, refreshed))
                 throw;
@@ -509,7 +541,9 @@ auto CasOperation::readLoop(std::string_view verb, const String & subject, const
             }
         }
 
-        const uint64_t pause_ms = Retry::backoff(++ordinary_reissues);
+        ++ordinary_reissues;
+        const uint64_t pause_ms = reissuePause(
+            policy, attempt_started_ms, [ordinary_reissues] { return Retry::backoff(ordinary_reissues); });
         const uint64_t needed = reservedFor(pause_ms, 1);
         switch (gate(needed))
         {
