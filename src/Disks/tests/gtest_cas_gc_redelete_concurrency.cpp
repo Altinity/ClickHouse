@@ -203,7 +203,8 @@ PoolPtr openPoolWithIoConcurrency(
     uint64_t gc_shards = 1,
     uint64_t outcome_entry_budget = 0,
     CasEventSink event_sink = {},
-    std::optional<size_t> refuse_at_for_test = std::nullopt)
+    std::optional<size_t> refuse_at_for_test = std::nullopt,
+    uint64_t gc_bulk_delete_chunk_keys = kBulkDeleteMaxKeys)
 {
     PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.gc_io_concurrency = concurrency;
@@ -211,6 +212,7 @@ PoolPtr openPoolWithIoConcurrency(
     config.gc_round_outcome_entry_budget = outcome_entry_budget;
     config.event_sink = std::move(event_sink);
     config.gc_io_pool_refuse_at_for_test = refuse_at_for_test;
+    config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     return Pool::open(std::move(backend), std::move(config));
 }
 
@@ -379,6 +381,25 @@ TEST(CASGCRedeleteConcurrency, ParallelRedeleteReclaimsEveryBlob)
     EXPECT_EQ(redelete_failed, 0u);
     EXPECT_EQ(rows->total("jobs_scheduled"), kBlobs);
     EXPECT_EQ(rows->total("jobs_failed"), 0u);
+}
+
+TEST(CASGCRedeleteConcurrency, ConditionalDeleteBatchesAreRecorded)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, std::nullopt, 2);
+    Gc gc(store, kGc);
+    publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kReplacedBlob));
+
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows));
+    const RoundReport rep = runRegularRoundReclaiming(gc);
+    store->renewWatermarkOnce();
+
+    EXPECT_EQ(rep.deleted, kBlobs);
+    ASSERT_EQ(rows->rows.size(), 1u);
+    EXPECT_EQ(rows->total("delete_batches"), 3u);
 }
 
 TEST(CASGCRedeleteConcurrency, BlobDeletesActuallyOverlap)
