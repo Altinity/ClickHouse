@@ -43,7 +43,7 @@ private:
         UInt64 remote = 0;
     };
     /// stepFunction and flushBufferToLog may be executed concurrently, hence the mutex
-    std::vector<ValuePair> previous_values TSA_GUARDED_BY(previous_values_mutex) = std::vector<ValuePair>(ErrorCodes::end());
+    std::vector<ValuePair> previous_values TSA_GUARDED_BY(previous_values_mutex) = std::vector<ValuePair>(ErrorCodes::size());
     mutable std::mutex previous_values_mutex;
 };
 
