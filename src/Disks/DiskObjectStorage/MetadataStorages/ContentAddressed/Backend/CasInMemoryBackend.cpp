@@ -326,6 +326,20 @@ void InMemoryBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys
     }
 }
 
+std::vector<Backend::RawRemoval> InMemoryBackend::removeManyByConditional(
+    const std::vector<RawConditionalRemove> & removals, TransportAccess &)
+{
+    for (const RawConditionalRemove & removal : removals)
+        checkExpectedValue(removal.key, removal.expected_token);
+
+    std::lock_guard lock(mutex_);
+    std::vector<RawRemoval> results;
+    results.reserve(removals.size());
+    for (const RawConditionalRemove & removal : removals)
+        results.push_back(applyDelete(removal.key, removal.expected_token));
+    return results;
+}
+
 void InMemoryBackend::failNextBulkRemoveWith(std::exception_ptr error)
 {
     std::lock_guard lock(mutex_);

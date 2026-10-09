@@ -51,6 +51,8 @@ public:
     /// `hold_deletes_` exactly as `remove` does: a held delete is queued and lands only on
     /// `landPendingDelete`.
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override;
     /// The next `removeManyWriteOnce` throws `error` instead of deleting anything; one-shot, like
     /// `failNextWriteWith`.
     void failNextBulkRemoveWith(std::exception_ptr error);
@@ -62,6 +64,7 @@ public:
 
     /// The emulation deletes keys one by one under its lock, so the CAS maximum is the only bound.
     size_t bulkDeleteKeyLimit() const override { return kBulkDeleteMaxKeys; }
+    size_t conditionalBatchDeleteKeyLimit() const override { return kBulkDeleteMaxKeys; }
 
     /// Creates the key when `expected_value` is empty, or replaces the incarnation it names. A
     /// refused precondition leaves the store unchanged. Value enforcement can be disabled with

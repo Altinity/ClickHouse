@@ -130,6 +130,8 @@ public:
     /// carried, the request counter says how many requests it took. Out of line, like `publish`, so
     /// the header need not declare the `CASBulkDeleteRequests` extern.
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override;
 
     /// Count a create and a replacement separately, and each of them separately from its refusal:
     /// they cost the same one request, but a pool whose creates are mostly refused and one whose
@@ -162,6 +164,7 @@ public:
     uint64_t attemptTimeoutMs() const override { return inner->attemptTimeoutMs(); }
     uint64_t attemptEnvelopeMs() const override { return inner->attemptEnvelopeMs(); }
     size_t bulkDeleteKeyLimit() const override { return inner->bulkDeleteKeyLimit(); }
+    size_t conditionalBatchDeleteKeyLimit() const override { return inner->conditionalBatchDeleteKeyLimit(); }
     bool refreshCredentials() override { return inner->refreshCredentials(); }
 
 private:

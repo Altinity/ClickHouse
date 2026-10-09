@@ -141,6 +141,26 @@ TEST(CASBulkDeleteBackend, InstrumentedCountsOneRequestAndOneDeletePerKeyClass)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRootDelete].load() - root_before, 1u);
 }
 
+TEST(CASConditionalBatchDeleteBackend, InstrumentedBackendForwardsMultiKeyConditionalRemove)
+{
+    auto inner = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<InstrumentedBackend>(inner);
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const String first_key = "p/conditional/instrumented/first";
+    const String second_key = "p/conditional/instrumented/second";
+    const Etag first_token = std::get<Committed>(op.create(first_key, "v1", Retry::once())).etag;
+    const Etag second_token = std::get<Committed>(op.create(second_key, "v1", Retry::once())).etag;
+
+    EXPECT_EQ(backend->conditionalBatchDeleteKeyLimit(), kBulkDeleteMaxKeys);
+    const std::vector<Removal> results = op.removeManyByConditional(
+        {{first_key, first_token}, {second_key, second_token}}, Retry::once());
+
+    EXPECT_EQ(results, (std::vector<Removal>{Removal::Removed, Removal::Removed}));
+    EXPECT_FALSE(op.head(first_key, Retry::once()).has_value());
+    EXPECT_FALSE(op.head(second_key, Retry::once()).has_value());
+}
+
 #if USE_AWS_S3
 TEST(CASBulkDeleteBackend, ThrottlingBackendForwardsStorageLimit)
 {
