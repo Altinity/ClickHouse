@@ -195,6 +195,9 @@ When reading Parquet files, skip whole row groups based on the WHERE expressions
     DECLARE(UInt64, input_format_parquet_bloom_filter_coalesce_max_bytes, 64 * 1024 * 1024, R"(
 Max bytes of one read when loading Parquet bloom filters. Contiguous bloom filters are read together up to this size. If the file itself is not larger than this and it has enough bloom filters that separate reads would cost more than reading the file, the whole file is read once. 0 keeps a separate read per bloom filter.
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_footer_read_size, 0, R"(
+Size (in bytes) of the initial tail read that fetches the Parquet footer (`FileMetaData`) when opening a file with reader v3. `0` (default) sizes the read adaptively to the file - 1% of the file size, clamped to `[128 KiB, 2 MiB]` - so it usually covers the whole footer in a single read even for wide files with hundreds of columns. Set a non-zero value to force a fixed initial read size instead of the adaptive one; this is useful for very high-latency object storage where reading a larger tail up front avoids a second round trip. The value is clamped to the file size.
+)", 0) \
     DECLARE(Bool, input_format_parquet_enable_json_parsing, true, R"(
 When reading Parquet files, parse JSON columns as ClickHouse JSON Column.
 )", 0) \
