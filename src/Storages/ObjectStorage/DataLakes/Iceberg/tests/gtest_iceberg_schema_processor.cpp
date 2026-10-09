@@ -89,6 +89,11 @@ TEST(IcebergSchemaProcessor, GetSimpleTypeTimestamptzNs)
 {
     auto type = IcebergSchemaProcessor::getSimpleType("timestamptz_ns", getContext().context);
     EXPECT_EQ(type->getName(), "DateTime64(9, 'UTC')");
+
+    auto context = DB::Context::createCopy(getContext().context);
+    context->setSetting("iceberg_timezone_for_timestamptz", String("Europe/Berlin"));
+    type = IcebergSchemaProcessor::getSimpleType("timestamptz_ns", context);
+    EXPECT_EQ(type->getName(), "DateTime64(9, 'Europe/Berlin')");
 }
 
 TEST(IcebergSchemaProcessor, GetSimpleTypeString)
