@@ -706,9 +706,9 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
         e.reason = "stageManifest: part-manifest body written";
     });
 
-    staged_manifest_proofs.emplace(
+    staged_manifests.emplace(
         id,
-        StagedManifestProof{manifest_incarnation, std::move(blob_dependencies)});
+        StagedManifest{manifest_incarnation, std::move(blob_dependencies)});
     return id;
 }
 
@@ -725,13 +725,13 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
 
     /// A3 mint-tightening (ABA barrier for the relink confirm's exact-`ManifestRef` equality): an
     /// unowned `ManifestId` may enter ownership only from the transaction that freshly staged it.
-    /// Evaluated HERE (synchronously, off this transaction's own private `staged_manifest_proofs` --
+    /// Evaluated HERE (synchronously, off this transaction's own private `staged_manifests` --
     /// never mutated concurrently, so no snapshot races) rather than read live inside the closure
     /// below, because it does not depend on ledger state at all. The bool is captured BY VALUE into
     /// the closure -- consistent with every other capture there -- rather than capturing `this`,
     /// which would let a closure that outlives this stack (see the capture comment below) dereference
     /// a dead transaction. Enforcement, however, is NOT done here: see the closure for why.
-    const bool id_staged_by_this_txn = staged_manifest_proofs.contains(id);
+    const bool id_staged_by_this_txn = staged_manifests.contains(id);
 
     /// One `owner_transition` create-precommit op.
     /// No body HEAD — a missing body is a legal fail-closed, non-activating intent, unchanged from the
@@ -835,7 +835,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             id.root_namespace.string(), target_ns.string());
 
     std::vector<BlobRef> manifest_blob_dependencies;
-    if (const auto staged = staged_manifest_proofs.find(id); staged != staged_manifest_proofs.end())
+    if (const auto staged = staged_manifests.find(id); staged != staged_manifests.end())
     {
         manifest_blob_dependencies = staged->second.blob_dependencies;
     }
@@ -1113,7 +1113,7 @@ void PartWriteTxn::abandon()
                 e.outcome = "cancelled";
                 e.reason = "cancelForNamespaceRemoval: owning namespace removed (dropNamespace); best-effort "
                            "deleted staged _manifests debris; precommit body (if any) left for GC";
-                e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifest_proofs.size())}};
+                e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
             });
         }
         catch (...)
@@ -1215,7 +1215,7 @@ void PartWriteTxn::abandon()
             e.outcome = "abandoned";
             e.reason = "abandon: appended a precommit-removal event for the live precommit (body left for GC); "
                        "best-effort deleted the never-precommitted _manifests debris; remainder reaped by the orphan sweep";
-            e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifest_proofs.size())}};
+            e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
         });
     }
     catch (...)
@@ -1238,23 +1238,23 @@ void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
     /// while keeping it is not: an unreferenced body is ordinary orphan-sweep debris.
     const bool precommit_attempted = precommit_state != PrecommitState::NotAttempted;
     CasOperation op = store->mountRequests().admit();
-    for (const auto & [id, proof] : staged_manifest_proofs)
+    for (const auto & [id, staged] : staged_manifests)
     {
         if (precommit_attempted && id.ref == precommit_manifest && id.root_namespace == precommit_target_ns)
             continue;   /// the (possibly) live precommit body — left for GC (delete-after-sealed-decrements)
         try
         {
-            const Removal removal = op.remove(proof.incarnation.key(), proof.incarnation, Retry::standard());
+            const Removal removal = op.remove(staged.incarnation.key(), staged.incarnation, Retry::standard());
             if (removal != Removal::Removed)
                 LOG_DEBUG(getLogger("CasPartWriteTxn"),
                     "abandon: staged manifest {} was not removed ({}), left for the orphan sweep",
-                    proof.incarnation.key(), removal == Removal::Gone ? "gone" : "incarnation mismatch");
+                    staged.incarnation.key(), removal == Removal::Gone ? "gone" : "incarnation mismatch");
         }
         catch (...)
         {
             /// Best-effort cleanup: the GC backstop sweep is the durable guarantee.
             tryLogCurrentException(getLogger("CasPartWriteTxn"),
-                fmt::format("abandon: staged manifest {} cleanup failed, left for the orphan sweep", proof.incarnation.key()),
+                fmt::format("abandon: staged manifest {} cleanup failed, left for the orphan sweep", staged.incarnation.key()),
                 LogsLevel::debug);
         }
     }

@@ -207,7 +207,7 @@ public:
     /// write returns and therefore before any owner transition is published. After a successful write it retains
     /// only the confirmed incarnation and blob dependencies needed by `promote`; on retry the caller re-stages
     /// from source. Every call uses a fresh manifest ordinal.
-    /// The recorded proof is the A3 ownership barrier of `precommitAdd`, the no-read path of `promote`,
+    /// The recorded `StagedManifest` is the A3 ownership barrier of `precommitAdd`, the no-read path of `promote`,
     /// and the exact-incarnation target of best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
@@ -233,7 +233,7 @@ public:
     /// ref-log entry.
     ///  1. `Materialized` leaves are already protected by the durable precommit edge, so no writer-side retired-view
     ///     refresh is needed;
-    ///  2. consume this transaction's staged proof, or stream-read and validate a manifest not staged here;
+    ///  2. use this transaction's `StagedManifest`, or stream-read and validate a manifest not staged here;
     ///  3. `TrustedManifest` leaves use the durable source-manifest edge with no per-file HEAD/loadMeta
     ///     probe; a genuinely absent trusted blob is an invariant violation caught by fsck, not here;
     ///  4. a body-absent or invalid manifest not staged here ⇒ retry-later exception before the append;
@@ -340,7 +340,7 @@ private:
     /// dependencies are blob-only, so `ObjectKind` is not part of the key.
     using DepKey = BlobRef;
 
-    struct StagedManifestProof
+    struct StagedManifest
     {
         Etag incarnation;
         std::vector<BlobRef> blob_dependencies;
@@ -396,7 +396,7 @@ private:
     /// Entries are never erased while the transaction lives: membership is the A3 ABA barrier checked
     /// by `precommitAdd` and the reason `promote` may skip the body read. Erasing an entry (for example
     /// after cleanup or after promote) would silently weaken both.
-    std::unordered_map<ManifestId, StagedManifestProof> staged_manifest_proofs;
+    std::unordered_map<ManifestId, StagedManifest> staged_manifests;
 
     std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)
 

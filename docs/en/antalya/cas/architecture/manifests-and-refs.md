@@ -55,8 +55,8 @@ before any owner transition names it. Rewriting a part therefore writes a **new*
 the **same** blobs and moves the ref in one ref-log record — a repoint, covered in full on the
 [part-lifecycle page](/antalya/cas/architecture/part-lifecycle#repoint).
 
-The writer retains a compact proof after its own successful `stageManifest`: the confirmed object
-incarnation and the ordered blob dependencies. The matching `promote` consumes this proof without
+The writer retains a compact record after its own successful `stageManifest`: the confirmed object
+incarnation and the ordered blob dependencies. The matching `promote` uses this record without
 reading the immutable body back. Promotion of a manifest not staged by that `PartWriteTxn` still
 performs an exact `GET` and validates `RefMatchesBody` and `ManifestNamespaceMatches` fail-closed.
 

@@ -53,7 +53,7 @@ sequenceDiagram
     end
     PW->>PW: merge upload results on the owning thread, one no-throw swap
     TX->>PW: promote
-    PW->>PW: validate the staged manifest proof and blob dependencies
+    PW->>PW: check the staged manifest record and blob dependencies
     PW->>S3: append ref-log txn: retire old committed, Precommit to Committed, SetPublishedAt
     Note over PW: commit durable, then retire the build sequence
     end
