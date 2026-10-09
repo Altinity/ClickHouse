@@ -79,6 +79,9 @@ RUN mkdir -p "${DEFAULT_DATA_DIR}" "${DEFAULT_LOG_DIR}" "${DEFAULT_CONFIG_DIR}" 
     && chown root:clickhouse "${DEFAULT_LOG_DIR}" \
     && chmod ugo+Xrw -R "${DEFAULT_DATA_DIR}" "${DEFAULT_LOG_DIR}" "${DEFAULT_CONFIG_DIR}"
 
+RUN apk update
+RUN apk add --upgrade libssl3 libcrypto3
+
 # /var/lib/clickhouse is necessary due to the current default configuration for Keeper
 VOLUME "${DEFAULT_DATA_DIR}" /var/lib/clickhouse
 EXPOSE 2181 10181 44444 9181
