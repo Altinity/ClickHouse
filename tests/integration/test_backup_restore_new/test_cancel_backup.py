@@ -30,7 +30,7 @@ node = cluster.add_instance(
     with_rustfs=True,
 )
 
-CAS_POOL_PREFIXES = ["backup_restore_new/blobs/", "backup_restore_new/parts/"]
+CAS_POOL_PREFIXES = ["backup_restore_new/blobs/"]
 
 
 @pytest.fixture(scope="module", autouse=True)
