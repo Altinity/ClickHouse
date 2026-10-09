@@ -164,6 +164,20 @@ DataFileMetaInfo::DataFileMetaInfo(
 
         columns_info[i_name->second] = {column.second.rows_count, column.second.nulls_count, hyperrectangle};
     }
+
+    /// Missing metrics do not mean the column is absent from the file. Record every column of the
+    /// file schema so the read optimization substitutes NULL only for columns added after the file
+    /// was written. `emplace` keeps the statistics already stored above.
+    if (schema_processor.hasClickhouseTableSchemaById(file_schema_id))
+    {
+        const auto fields = schema_processor.getIcebergTableSchemaById(file_schema_id)->getArray(Iceberg::f_fields);
+        for (size_t i = 0; i < fields->size(); ++i)
+        {
+            const auto field_id = fields->getObject(static_cast<UInt32>(i))->getValue<Int32>(Iceberg::f_id);
+            if (const auto table_field = schema_processor.tryGetFieldCharacteristics(table_schema_id, field_id))
+                columns_info.emplace(table_field->getNameInStorage(), ColumnInfo{});
+        }
+    }
 #else
     (void)schema_processor;
     (void)table_schema_id;
