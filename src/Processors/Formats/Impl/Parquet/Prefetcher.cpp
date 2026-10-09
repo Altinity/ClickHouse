@@ -185,12 +185,24 @@ void Prefetcher::startPrefetch(const std::vector<PrefetchHandle *> & requests_to
         if (!handle->memory)
         {
             size_t memory_usage = static_cast<size_t>(static_cast<double>(req->length) * task->memory_amplification);
-            /// A coalesced bloom-filter (or whole-file) read is much larger than the range that started it.
-            bool already_charged = false;
-            if (req->coalesce_group != 0 && task->length > memory_usage
-                && task->coalesce_memory_charged.compare_exchange_strong(already_charged, true, std::memory_order_relaxed))
-                memory_usage = task->length;
-            handle->memory = MemoryUsageToken(memory_usage, diff);
+            /// A coalesced buffer outlives the handle that started it: the bloom-filter header is reset
+            /// as soon as it is parsed, while the other headers and block handles still pin `buf`.
+            /// Charge the buffer on the task until the last of those handles drops it.
+            if (req->coalesce_group != 0 || task->coalesce_memory_state.load(std::memory_order_acquire) == 1)
+            {
+                if (req->coalesce_group != 0 && task->length > 0)
+                {
+                    uint8_t expected = 0;
+                    if (task->coalesce_memory_state.compare_exchange_strong(expected, 2, std::memory_order_acq_rel))
+                    {
+                        task->coalesce_memory = MemoryUsageToken(task->length, diff);
+                        task->coalesce_memory_state.store(1, std::memory_order_release);
+                    }
+                }
+                memory_usage = 0;
+            }
+            if (memory_usage != 0)
+                handle->memory = MemoryUsageToken(memory_usage, diff);
         }
     }
 }
@@ -424,19 +436,32 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     }
 
     chassert(actual_refcount > 0);
-    decreaseTaskRefcount(&task, initial_refcount - actual_refcount);
+    decreaseTaskRefcount(&task, initial_refcount - actual_refcount, nullptr);
 
     lock.unlock();
 
     scheduleTask(&task);
 }
 
-void Prefetcher::decreaseTaskRefcount(Task * task, size_t amount)
+void Prefetcher::decreaseTaskRefcount(Task * task, size_t amount, MemoryUsageDiff * diff)
 {
     size_t c = task->refcount.fetch_sub(amount, std::memory_order_acq_rel);
     chassert(c >= amount);
     if (c != amount)
         return;
+
+    /// Last handle. Drop the coalesced-buffer charge together with the buffer itself.
+    if (task->coalesce_memory_state.load(std::memory_order_acquire) == 1)
+    {
+        if (diff)
+            task->coalesce_memory.reset(diff);
+        else
+        {
+            /// Shutdown abandons per-stage accounting; drop the token without recording it.
+            MemoryUsageToken dropped(std::move(task->coalesce_memory));
+            (void)dropped;
+        }
+    }
 
     if (task->state.exchange(Task::State::Deallocated) != Task::State::Running)
     {
@@ -623,7 +648,7 @@ void PrefetchHandle::reset(MemoryUsageDiff * diff)
         memory.reset(diff);
 
     if (request->state.exchange(RequestState::State::Cancelled) == RequestState::State::HasTask)
-        Prefetcher::decreaseTaskRefcount(request->task, 1);
+        Prefetcher::decreaseTaskRefcount(request->task, 1, diff);
 
     request = nullptr;
 }

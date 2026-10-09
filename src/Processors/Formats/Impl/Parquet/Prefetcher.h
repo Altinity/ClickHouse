@@ -169,8 +169,10 @@ private:
         std::atomic<State> state {State::Scheduled};
         /// How many RequestState-s in HasTask state point to this Task.
         std::atomic<size_t> refcount {};
-        /// The first prefetch of a coalesced group charges `length` bytes once.
-        std::atomic<bool> coalesce_memory_charged {false};
+        /// Coalesced reads charge `length` once, for as long as `buf` stays pinned by any handle.
+        /// 0 = not charged, 1 = `coalesce_memory` is published.
+        std::atomic<uint8_t> coalesce_memory_state {0};
+        MemoryUsageToken coalesce_memory;
         /// Notified when the state changes from Running to Done or Exception.
         CompletionNotification completion;
         std::exception_ptr exception;
@@ -227,7 +229,9 @@ private:
     /// If splitting, the request is being cancelled and replaced by a smaller range
     /// (splitAndPrefetchRange), and only subrange [subrange_start, subrange_end) needs to be read.
     void pickRangesAndCreateTaskIfNotExists(RequestState *, const PrefetchHandle &, bool splitting, size_t start_offset, size_t end_offset, std::unique_lock<std::mutex> lock);
-    static void decreaseTaskRefcount(Task * task, size_t amount);
+    /// `diff` records the release of a coalesced-buffer charge when the last reference drops.
+    /// Nullptr on shutdown, where that accounting is abandoned with the reader.
+    static void decreaseTaskRefcount(Task * task, size_t amount, MemoryUsageDiff * diff);
     void scheduleTask(Task * task);
     Task::State runTask(Task * task);
     [[noreturn]] void rethrowException(Task * task);
