@@ -1085,7 +1085,7 @@ void generateManifestList(
     // file manually so we can embed the full schema JSON with field-ids intact,
     // without triggering the DataFileWriter constructor's eager writeHeader()
     // which commits encoder state before we can override avro.schema.
-    if (manifest_entry_names.empty() && !use_previous_snapshots)
+    if (manifest_entry_names.empty() && !use_previous_snapshots && carry_forward_manifest_paths.empty())
     {
         // For an empty manifest list (e.g. after TRUNCATE), we write a minimal valid
         // Avro Object Container File manually rather than using avro::DataFileWriter.
