@@ -763,6 +763,7 @@ private:
         RoundReport & report;
         std::map<uint64_t, OutcomeLog> & outcomes;
         uint64_t & jobs_scheduled;
+        uint64_t & delete_batches;
     };
 
     static RedeleteIo performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op);

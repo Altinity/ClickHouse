@@ -734,7 +734,10 @@ void Gc::redeleteBlobs(
     for (size_t i = 0; i < scheduled; ++i)
         if (!io_errors[i] && io_results[i].expected_token)
             matched.push_back(i);
-    const size_t chunk_keys = std::max<size_t>(1, std::min(kBulkDeleteMaxKeys, store->poolBackendPtr()->conditionalBatchDeleteKeyLimit()));
+    const size_t chunk_keys = std::clamp<size_t>(
+        std::min<uint64_t>(store->poolConfig().gc_bulk_delete_chunk_keys, store->poolBackendPtr()->conditionalBatchDeleteKeyLimit()),
+        1,
+        kBulkDeleteMaxKeys);
     ThreadPoolCallbackRunnerLocal<void> delete_runner(pool, ThreadName::CAS_GC_REDELETE);
     std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> delete_handles;
     for (size_t begin = 0; begin < matched.size(); begin += chunk_keys)
@@ -755,6 +758,7 @@ void Gc::redeleteBlobs(
                 for (size_t pos = begin; pos < end; ++pos)
                     io_results[matched[pos]].del = results[pos - begin];
             }));
+        ++ctx.delete_batches;
     }
     ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(delete_handles);
     for (size_t chunk = 0; chunk < delete_handles.size(); ++chunk)
@@ -1102,10 +1106,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     const uint64_t graduated_before = report.graduated;
     const uint64_t redelete_failed_before = report.redelete_failed;
     uint64_t redelete_jobs_scheduled = 0;
+    uint64_t redelete_delete_batches = 0;
     const auto record_redelete_job_metrics = [&]
     {
         pending_deletes_timer->metric("jobs_scheduled", redelete_jobs_scheduled);
         pending_deletes_timer->metric("jobs_failed", report.redelete_failed - redelete_failed_before);
+        pending_deletes_timer->metric("delete_batches", redelete_delete_batches);
     };
     SCOPE_EXIT_SAFE({
         if (pending_deletes_timer)
@@ -1139,7 +1145,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             .round_work_budget = round_work_budget,
             .report = report,
             .outcomes = outcomes,
-            .jobs_scheduled = redelete_jobs_scheduled};
+            .jobs_scheduled = redelete_jobs_scheduled,
+            .delete_batches = redelete_delete_batches};
         redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
         for (const RetiredEntry & entry : merge.spared)
         {
