@@ -97,6 +97,16 @@ bool isDeterministicBlobPublicationFailure(const std::exception & error)
     return dynamic_cast<const Poco::Exception *>(&error) == nullptr;
 }
 
+std::vector<BlobRef> blobDependenciesOf(const std::vector<ManifestEntry> & entries)
+{
+    std::vector<BlobRef> dependencies;
+    dependencies.reserve(entries.size());
+    for (const ManifestEntry & entry : entries)
+        if (entry.placement == EntryPlacement::Blob)
+            dependencies.push_back(entry.ref);
+    return dependencies;
+}
+
 }
 
 /// The pool-wide content-hash convention, with the selected `algo`: `Cas::blobHashHexOneShot` uses the same
@@ -638,11 +648,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
             "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded_text.size(), kMaxManifestEncodedBytes);
     const String encoded = sealObject(FormatId::PartManifest, encoded_text);
 
-    std::vector<BlobRef> blob_dependencies;
-    blob_dependencies.reserve(body.entries.size());
-    for (const ManifestEntry & entry : body.entries)
-        if (entry.placement == EntryPlacement::Blob)
-            blob_dependencies.push_back(entry.ref);
+    std::vector<BlobRef> blob_dependencies = blobDependenciesOf(body.entries);
 
     const ManifestId id{owning_ns, ref};
     const String key = store->layout().manifestKey(id);
@@ -846,10 +852,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             throwCasWriteRetryLater(fmt::format("promote: RefMatchesBody failed for {}", manifest_key));
         if (!manifestNamespaceMatches(target_ns, body))
             throwCasWriteRetryLater(fmt::format("promote: ManifestNamespaceMatches failed for {}", manifest_key));
-        manifest_blob_dependencies.reserve(body.entries.size());
-        for (const ManifestEntry & entry : body.entries)
-            if (entry.placement == EntryPlacement::Blob)
-                manifest_blob_dependencies.push_back(entry.ref);
+        manifest_blob_dependencies = blobDependenciesOf(body.entries);
     }
 
     /// Blob readiness is checked inside the append closure below, after owner liveness. It consumes
@@ -1241,11 +1244,18 @@ void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
             continue;   /// the (possibly) live precommit body — left for GC (delete-after-sealed-decrements)
         try
         {
-            op.remove(proof.incarnation.key(), proof.incarnation, Retry::standard());
+            const Removal removal = op.remove(proof.incarnation.key(), proof.incarnation, Retry::standard());
+            if (removal != Removal::Removed)
+                LOG_DEBUG(getLogger("CasPartWriteTxn"),
+                    "abandon: staged manifest {} was not removed ({}), left for the orphan sweep",
+                    proof.incarnation.key(), removal == Removal::Gone ? "gone" : "incarnation mismatch");
         }
-        catch (...) // NOLINT(bugprone-empty-catch)
+        catch (...)
         {
             /// Best-effort cleanup: the GC backstop sweep is the durable guarantee.
+            tryLogCurrentException(getLogger("CasPartWriteTxn"),
+                fmt::format("abandon: staged manifest {} cleanup failed, left for the orphan sweep", proof.incarnation.key()),
+                LogsLevel::debug);
         }
     }
 }
