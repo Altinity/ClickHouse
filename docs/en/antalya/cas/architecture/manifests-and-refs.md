@@ -56,9 +56,18 @@ the **same** blobs and moves the ref in one ref-log record — a repoint, covere
 [part-lifecycle page](/antalya/cas/architecture/part-lifecycle#repoint).
 
 The writer retains a compact record after its own successful `stageManifest`: the confirmed object
-incarnation and the ordered blob dependencies. The matching `promote` uses this record without
+incarnation and the blob dependencies in the order the caller passed the entries. The encoded body
+sorts entries by path, so this order can differ from a decoded body. Only the order of dependency
+checks and `BlobReuseAdopt` events depends on it. The matching `promote` uses this record without
 reading the immutable body back. Promotion of a manifest not staged by that `PartWriteTxn` still
 performs an exact `GET` and validates `RefMatchesBody` and `ManifestNamespaceMatches` fail-closed.
+
+The record only shows that the body existed when the conditional create was confirmed. Inside the
+protocol nothing deletes it before `promote`: the orphan sweep does not touch the prefix of a
+build sequence that is still active. A body removed outside the protocol (a bucket lifecycle or
+expiry rule on `cas/manifests/`, a manual delete) is not detected by `promote`, which commits the
+ref anyway. The read path then fails with `FILE_DOESNT_EXIST`, and `fsck` reports the reference
+as dangling. Do not put lifecycle or expiry rules on the pool prefix.
 
 ## Manifest lifecycle and the orphan sweep {#manifest-lifecycle}
 
