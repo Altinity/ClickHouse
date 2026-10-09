@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
@@ -7,7 +8,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <set>
 #include <span>
 #include <vector>
 
@@ -203,8 +203,9 @@ public:
     /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.zst` via the pool's shared request
     /// controller. It uses budgeted attempts with resolve-before-reissue and performs no preliminary HEAD,
     /// because `manifest_ordinal` is monotone within this build. It enforces manifest-size caps before the body
-    /// write returns and therefore before any owner transition is published. The body is not retained after a
-    /// successful write; on retry the caller re-stages from source. Every call uses a fresh manifest ordinal.
+    /// write returns and therefore before any owner transition is published. After a successful write it retains
+    /// only the confirmed incarnation and blob dependencies needed by `promote`; on retry the caller re-stages
+    /// from source. Every call uses a fresh manifest ordinal.
     /// The id is recorded for best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
@@ -228,7 +229,7 @@ public:
     /// ref-log entry.
     ///  1. `Materialized` leaves are already protected by the durable precommit edge, so no writer-side retired-view
     ///     refresh is needed;
-    ///  2. stream-read the precommit manifest body; validate RefMatchesBody / ManifestNamespaceMatches;
+    ///  2. consume this transaction's staged proof, or stream-read and validate a manifest not staged here;
     ///  3. `TrustedManifest` leaves use the durable source-manifest edge with no per-file HEAD/loadMeta
     ///     probe; a genuinely absent trusted blob is an invariant violation caught by fsck, not here;
     ///  4. a body-absent precommit or lost owner-liveness ⇒ ABORTED; a missing dependency proof ⇒
@@ -333,6 +334,12 @@ private:
     /// dependencies are blob-only, so `ObjectKind` is not part of the key.
     using DepKey = BlobRef;
 
+    struct StagedManifestProof
+    {
+        Etag incarnation;
+        std::vector<BlobRef> blob_dependencies;
+    };
+
     /// Own the complete bounded `HEAD`/metadata/publication/reconciliation state machine. Build-neutral:
     /// returns the materialized dependency and diagnostics without folding into `deps`.
     BlobUploadResult ensureBlobPresent(const BlobUploadRequest & req) const;
@@ -381,12 +388,13 @@ private:
 
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
-    /// Every `ManifestId` this transaction has minted via `stageManifest`, checked by `precommitAdd`:
+    /// Every `ManifestId` this transaction has minted via `stageManifest`, with the proof consumed by `promote`
+    /// and checked by `precommitAdd`:
     /// an unowned id may enter ownership only from the transaction that freshly staged it. Kept separate from
     /// `staged_manifests` above -- that vector's role (best-effort abandon cleanup) is unrelated and
-    /// could change independently; this set exists purely as the ABA barrier's identity check, so it
-    /// stays correct even if the cleanup vector's contents or lifetime ever change.
-    std::set<ManifestId> staged_manifest_ids;
+    /// could change independently; this map also supplies the ABA barrier's identity check, so it stays
+    /// correct even if the cleanup vector's contents or lifetime ever change.
+    std::map<ManifestId, StagedManifestProof> staged_manifest_proofs;
 
     std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)
 
