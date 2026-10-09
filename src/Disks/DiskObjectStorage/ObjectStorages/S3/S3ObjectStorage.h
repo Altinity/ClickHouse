@@ -128,6 +128,9 @@ public:
     ConditionalRemoveResult removeObjectIfTokenMatches(
         const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request) override;
 
+    std::vector<ConditionalRemoveResult> removeObjectsIfTokensMatch(
+        const std::vector<ConditionalRemoveObject> & objects, const ObjectStorageControlRequest & request) override;
+
     /// One `DeleteObjects` for the given objects (the caller chunks to at most 1000); absence is success.
     /// Exactly one object is always a plain `DeleteObject` instead (never gated on `s3_capabilities`: a
     /// single physical request per call, so there is nothing here for that capability to say no to).

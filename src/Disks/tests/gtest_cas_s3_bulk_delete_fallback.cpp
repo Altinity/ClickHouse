@@ -199,6 +199,17 @@ void sendDeleteObjectsResult(Poco::Net::HTTPServerResponse & response, const std
     sendXml(response, Poco::Net::HTTPResponse::HTTP_OK, body);
 }
 
+void sendConditionalDeleteObjectsResult(Poco::Net::HTTPServerResponse & response)
+{
+    const std::string body =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+        "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+        "<Deleted><Key>first</Key></Deleted>"
+        "<Error><Key>second</Key><Code>PreconditionFailed</Code><Message>stale</Message></Error>"
+        "</DeleteResult>";
+    sendXml(response, Poco::Net::HTTPResponse::HTTP_OK, body);
+}
+
 std::shared_ptr<DB::S3ObjectStorage> makeStorageForTest(
     const std::string & endpoint, const DB::S3Capabilities & capabilities, std::optional<uint64_t> objects_chunk_size_to_delete = {})
 {
@@ -292,6 +303,27 @@ TEST(S3BulkDeleteFallback, PerKeyErrorsWithinASuccessfulBatchAreUnchanged)
     /// batch response, no fallback is expected here.
     EXPECT_EQ(server.countMethod("POST"), 1u);
     EXPECT_EQ(server.countMethod("DELETE"), 0u);
+}
+
+TEST(CASS3ConditionalBatchDelete, ReturnsPerKeyOutcomesInInputOrder)
+{
+    (void)contextForTest();
+
+    ScriptedS3Server server([](const Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response)
+    {
+        ASSERT_EQ(request.getMethod(), "POST");
+        sendConditionalDeleteObjectsResult(response);
+    });
+    auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
+
+    const auto results = storage->removeObjectsIfTokensMatch(
+        {{DB::StoredObject("first"), "etag-first"}, {DB::StoredObject("second"), "etag-second"}},
+        DB::ObjectStorageControlRequest{});
+
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(results[0].outcome, DB::ConditionalRemoveOutcome::Removed);
+    EXPECT_EQ(results[1].outcome, DB::ConditionalRemoveOutcome::TokenMismatch);
+    EXPECT_EQ(server.countMethod("POST"), 1u);
 }
 
 TEST(S3BulkDeleteFallback, UnsupportedBatchReplyRecordsCapabilityFalseAndThrowsNotImplemented)
