@@ -1493,6 +1493,25 @@ TEST(CASPartWriteTxn, AbandonRemovesStagedDebrisAndDisables)
         "has been abandoned");
 }
 
+TEST(CASPartWriteTxn, AbandonDeletesStagedManifestWithoutHead)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto counting = std::make_shared<KeyCountingBackend>(backend);
+    auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const RootNamespace ns{"srv1/abandon-without-head"};
+    auto build = startBuildFor(store, ns, "part");
+
+    const ManifestId id = build->stageManifest({});
+    const String manifest_key = store->layout().manifestKey(id);
+    const size_t heads_before = counting->headCountFor(manifest_key);
+
+    build->abandon();
+
+    EXPECT_EQ(counting->headCountFor(manifest_key) - heads_before, 0u);
+    OperationForTest op(*backend);
+    EXPECT_FALSE((*op).head(manifest_key, Retry::once()).has_value());
+}
+
 TEST(CASPartWriteTxn, PublishHappyPathRoundTrip)
 {
     auto b = std::make_shared<InMemoryBackend>();
