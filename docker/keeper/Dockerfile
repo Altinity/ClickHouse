@@ -12,7 +12,7 @@ RUN arch=${TARGETARCH:-amd64} \
     && ln -s "${rarch}-linux-gnu" /lib/linux-gnu
 
 
-FROM alpine:3.21.7
+FROM alpine
 
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
@@ -79,8 +79,7 @@ RUN mkdir -p "${DEFAULT_DATA_DIR}" "${DEFAULT_LOG_DIR}" "${DEFAULT_CONFIG_DIR}" 
     && chown root:clickhouse "${DEFAULT_LOG_DIR}" \
     && chmod ugo+Xrw -R "${DEFAULT_DATA_DIR}" "${DEFAULT_LOG_DIR}" "${DEFAULT_CONFIG_DIR}"
 
-RUN apk update
-RUN apk add --upgrade libssl3 libcrypto3
+RUN apk update && apk upgrade --no-cache
 
 # /var/lib/clickhouse is necessary due to the current default configuration for Keeper
 VOLUME "${DEFAULT_DATA_DIR}" /var/lib/clickhouse
