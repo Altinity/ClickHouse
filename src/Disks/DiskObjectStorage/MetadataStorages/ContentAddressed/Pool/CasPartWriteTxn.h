@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
@@ -7,7 +8,6 @@
 #include <map>
 #include <memory>
 #include <optional>
-#include <set>
 #include <span>
 #include <vector>
 
@@ -208,13 +208,6 @@ public:
     /// The id is recorded for best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
-    /// Add this transaction's precommit owner intent; there is no `_precommits` namespace. One
-    /// `appendRefOps` call appending an OwnerTransition `RefOp` (new_binding = {Precommit,
-    /// final_ref_name, id.ref}) to final_ref_name's ref-log entry, so the later promote is an atomic
-    /// owner move over that same entry. Needs NO body-exists HEAD as a safety authority: GC and
-    /// promotion handle a missing precommit manifest body by failing closed (a missing-body precommit
-    /// is a non-activating, non-promotable intent).
-    ///
     /// A3 mint-tightening: `id` must either be one THIS transaction minted via `stageManifest`, or
     /// already be `final_ref_name`'s current committed manifest (the idempotent re-drive -- see the
     /// closure in the .cpp). Any other id names a manifest this transaction never staged and does not
@@ -226,19 +219,6 @@ public:
 
     /// Atomically promote the precommit to the committed ref with one `appendRefOps` call on the target ref's
     /// ref-log entry.
-    ///  1. `Materialized` leaves are already protected by the durable precommit edge, so no writer-side retired-view
-    ///     refresh is needed;
-    ///  2. stream-read the precommit manifest body; validate RefMatchesBody / ManifestNamespaceMatches;
-    ///  3. `TrustedManifest` leaves use the durable source-manifest edge with no per-file HEAD/loadMeta
-    ///     probe; a genuinely absent trusted blob is an invariant violation caught by fsck, not here;
-    ///  4. a body-absent precommit or lost owner-liveness ⇒ ABORTED; a missing dependency proof ⇒
-    ///     LOGICAL_ERROR (fail closed);
-    ///  5. atomically replace precommit(build_id) owner with committed(final_ref_name) owner by appending
-    ///     ONE pure-move `RefOp` (old_binding={Precommit,final_ref_name,T}, new_binding={Committed,final_ref_name,T},
-    ///     same manifest_ref T) and setting refs[final_ref_name];
-    ///  6. promotion never emits blob deltas. A missing-body precommit
-    ///     is non-activating and was rejected at step 4 (the writer re-stages with a fresh ManifestId).
-    ///
     /// PROCESS-RESTART INVARIANT: a `PartWriteTxn` is a plain in-memory C++ object owned by the wiring's
     /// `ContentAddressedTransaction` — it is NEVER persisted and NEVER resumed across a process
     /// restart. There is no "replay a precommit" code path anywhere in the core: `promote` is called
@@ -336,6 +316,12 @@ private:
     /// dependencies are blob-only, so `ObjectKind` is not part of the key.
     using DepKey = BlobRef;
 
+    struct StagedManifest
+    {
+        Etag incarnation;
+        std::vector<BlobRef> blob_dependencies;
+    };
+
     /// Own the complete bounded `HEAD`/metadata/publication/reconciliation state machine. Build-neutral:
     /// returns the materialized dependency and diagnostics without folding into `deps`.
     BlobUploadResult ensureBlobPresent(const BlobUploadRequest & req) const;
@@ -384,12 +370,7 @@ private:
 
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
-    /// Every `ManifestId` this transaction has minted via `stageManifest`, checked by `precommitAdd`:
-    /// an unowned id may enter ownership only from the transaction that freshly staged it. Kept separate from
-    /// `staged_manifests` above -- that vector's role (best-effort abandon cleanup) is unrelated and
-    /// could change independently; this set exists purely as the ABA barrier's identity check, so it
-    /// stays correct even if the cleanup vector's contents or lifetime ever change.
-    std::set<ManifestId> staged_manifest_ids;
+    std::map<ManifestId, StagedManifest> staged_manifest_ids;
 
     std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)
 
