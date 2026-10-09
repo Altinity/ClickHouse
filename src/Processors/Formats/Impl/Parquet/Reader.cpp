@@ -588,7 +588,10 @@ void Reader::initializePrefetches()
                 if (!primitive_columns[column_idx].use_bloom_filter)
                     continue;
                 const auto & meta = row_group.columns[column_idx].meta->meta_data;
-                if (meta.__isset.bloom_filter_offset && meta.__isset.bloom_filter_length && meta.bloom_filter_length > 0)
+                /// `bloom_filter_length` is optional (Parquet 2.10). An offset without it is still a
+                /// filter; the hard-way path below derives the length and registers that range.
+                const bool length_missing_or_positive = !meta.__isset.bloom_filter_length || meta.bloom_filter_length > 0;
+                if (meta.__isset.bloom_filter_offset && length_missing_or_positive)
                     ++bloom_count;
             }
         }
