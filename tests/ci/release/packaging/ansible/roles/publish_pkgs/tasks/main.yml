@@ -85,29 +85,23 @@
     metadata: "Content-Type=text/plain"
     mode: put
 
-- name: Update CloudFront distribution
-  community.aws.cloudfront_distribution:
-    region: "{{ aws_region }}"
-    state: present
-    caller_reference: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.CallerReference }}"
-    origins:
-      - id: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Origins.Items[0].Id }}"
-        domain_name: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Origins.Items[0].DomainName }}"
-        origin_path: "/{{ new_cloudfront_origin_path | default(omit) }}"
-        custom_origin_config:
-          origin_protocol_policy: "http-only"
-    aliases:
-      - "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Aliases.Items[0] }}"
-    viewer_certificate:
-      acm_certificate_arn: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.ViewerCertificate.ACMCertificateArn }}"
-      ssl_support_method: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.ViewerCertificate.SSLSupportMethod }}"
-    logging:
-      bucket: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.Bucket }}"
-      enabled: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.Enabled }}"
-      include_cookies: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.IncludeCookies }}"
-      prefix: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.Prefix }}"
+- name: Update CloudFront origin path
   when: 'not (push_to_active|default(false)|bool)'
-  register: distribution
+  shell: |
+    set -euo pipefail
+    DIST_ID="{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }}"
+    ORIGIN_PATH="/{{ new_cloudfront_origin_path }}"
+    aws cloudfront get-distribution-config --id "$DIST_ID" > /tmp/cf-origin-path-config.json
+    DIST_ETAG=$(jq -r '.ETag' /tmp/cf-origin-path-config.json)
+    jq --arg path "$ORIGIN_PATH" \
+      '.DistributionConfig | .Origins.Items[0].OriginPath = $path' \
+      /tmp/cf-origin-path-config.json > /tmp/cf-origin-path-new-config.json
+    aws cloudfront update-distribution \
+      --id "$DIST_ID" \
+      --if-match "$DIST_ETAG" \
+      --distribution-config file:///tmp/cf-origin-path-new-config.json
+  args:
+    executable: /bin/bash
 
 - name: Set CloudFront Function name
   set_fact:
