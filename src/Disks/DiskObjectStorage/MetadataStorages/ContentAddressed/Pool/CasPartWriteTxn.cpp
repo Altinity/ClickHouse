@@ -888,7 +888,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         /// references). The ref-lane leadership guard is the real fix; both residual by-reference captures
         /// are safe because the guard guarantees the closure is never invoked after this frame unwinds.
         [this, final_ref_name, id, promote_build_id, allow_repoint,
-         manifest_blob_dependencies = std::move(manifest_blob_dependencies), &repoint_old, &created]
+         manifest_dependencies = std::move(manifest_blob_dependencies), &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>
         {
             created = !state.getCommitted().contains(final_ref_name);
@@ -931,7 +931,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// build's precommit edge is durable — matching the relink trust model (ordinary
             /// ReplicatedMergeTree interserver trust). A genuinely-absent adopted blob is an invariant
             /// violation caught by fsck, not here.
-            for (const BlobRef & ref : manifest_blob_dependencies)
+            for (const BlobRef & ref : manifest_dependencies)
             {
                 const auto proof = dependencyProof(ref);
                 if (!proof)
