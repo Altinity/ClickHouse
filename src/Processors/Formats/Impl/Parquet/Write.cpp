@@ -27,6 +27,9 @@
 #include <Core/Block.h>
 #include <DataTypes/DataTypeCustom.h>
 
+#include <algorithm>
+#include <bit>
+
 #if USE_SNAPPY
 #include <snappy.h>
 #endif
@@ -376,6 +379,45 @@ struct ConverterEnumAsString
         }
         return buf.data();
     }
+};
+
+struct ConverterUUID
+{
+    using Statistics = StatisticsFixedStringRef;
+
+    const ColumnVector<UUID> & column;
+    PODArray<parquet::FixedLenByteArray> buf;
+    PODArray<UUID> swapped_buf;
+
+    explicit ConverterUUID(const ColumnPtr & c) : column(assert_cast<const ColumnVector<UUID> &>(*c)) {}
+
+    const parquet::FixedLenByteArray * getBatch(size_t offset, size_t count)
+    {
+        buf.resize(count);
+        swapped_buf.resize(count);
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            UUID res = column.getData()[offset + i];
+            auto * bytes = reinterpret_cast<uint8_t *>(&res);
+
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                std::reverse(bytes, bytes + 8);
+                std::reverse(bytes + 8, bytes + 16);
+            }
+            else
+            {
+                std::swap_ranges(bytes, bytes + 8, bytes + 8);
+            }
+
+            swapped_buf[i] = res;
+            buf[i].ptr = reinterpret_cast<const uint8_t *>(&swapped_buf[i]);
+        }
+        return buf.data();
+    }
+
+    size_t fixedStringSize() { return 16; }
 };
 
 struct ConverterFixedString
@@ -1168,6 +1210,13 @@ void writeColumnChunkBody(
         case TypeIndex::Int256:  F(Int256); break;
         case TypeIndex::IPv6:    F(IPv6); break;
         #undef F
+
+        case TypeIndex::UUID:
+            writeColumnImpl<parquet::FLBAType>(s,
+                options,
+                out,
+                ConverterUUID(s.primitive_column));
+        break;
 
         #define D(source_type) \
             writeColumnImpl<parquet::FLBAType>( \
