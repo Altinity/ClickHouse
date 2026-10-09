@@ -18,9 +18,11 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <array>
 #include <ctime>
 #include <limits>
+#include <set>
 #include <utility>
 
 namespace ProfileEvents
@@ -611,6 +613,57 @@ void CasOperation::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, c
         owner.backend->removeManyWriteOnce(keys, access);
         return true;
     });
+}
+
+std::vector<Removal> CasOperation::removeManyByConditional(
+    const std::vector<ConditionalRemove> & removals, const Retry & policy)
+{
+    const size_t limit = std::min(kBulkDeleteMaxKeys, owner.backend->conditionalBatchDeleteKeyLimit());
+    if (removals.size() > limit)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS removeManyByConditional: {} keys in one chunk, the limit is {}; the consumer chunks its input",
+            removals.size(), limit);
+    if (removals.empty())
+        return {};
+
+    std::set<String> keys;
+    std::vector<Backend::RawConditionalRemove> raw_removals;
+    raw_removals.reserve(removals.size());
+    for (const ConditionalRemove & removal : removals)
+    {
+        if (!keys.emplace(removal.key).second)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS removeManyByConditional: duplicate key '{}' in one chunk", removal.key);
+        raw_removals.push_back({removal.key, owner.valueFor(removal.key, removal.expected_token)});
+    }
+
+    const Retry::Bound bound = policy.bind(owner.now_ms());
+    const String subject = fmt::format("{} (+{} keys)", removals.front().key, removals.size() - 1);
+    const std::vector<Backend::RawRemoval> raw_results = readLoop(
+        "removeManyByConditional", subject, policy, bound, [&](auto & access)
+        {
+            return owner.backend->removeManyByConditional(raw_removals, access);
+        });
+    if (raw_results.size() != removals.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS removeManyByConditional: backend returned {} results for {} keys", raw_results.size(), removals.size());
+
+    std::vector<Removal> results;
+    results.reserve(raw_results.size());
+    for (const Backend::RawRemoval raw : raw_results)
+    {
+        switch (raw)
+        {
+            case Backend::RawRemoval::Removed: results.push_back(Removal::Removed); break;
+            case Backend::RawRemoval::Gone: results.push_back(Removal::Gone); break;
+            case Backend::RawRemoval::Mismatch: results.push_back(Removal::Mismatch); break;
+            case Backend::RawRemoval::DeleteMarker:
+                throw Exception(ErrorCodes::CAS_DELETE_MARKER,
+                    "CAS conditional batch removal archived a noncurrent version instead of reclaiming an object: "
+                    "the bucket has object versioning enabled");
+        }
+    }
+    return results;
 }
 
 Removal CasOperation::remove(const String & key, const Etag & seen, const Retry & policy)

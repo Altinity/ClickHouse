@@ -584,7 +584,12 @@ Gc::RedeleteIo Gc::performRedeleteIo(const RetiredEntry & entry, const Layout & 
     /// already gone.
     const std::optional<Meta> observed = op.head(io.blob_key, Retry::standard());
     if (observed)
-        io.del = entry.token.matches(observed->etag) ? op.remove(io.blob_key, observed->etag, Retry::standard()) : Removal::Mismatch;
+    {
+        if (entry.token.matches(observed->etag))
+            io.expected_token = observed->etag;
+        else
+            io.del = Removal::Mismatch;
+    }
     return io;
 }
 
@@ -722,6 +727,52 @@ void Gc::redeleteBlobs(
             {
                 io_errors[i] = std::current_exception();
             }
+        }
+    }
+
+    std::vector<size_t> matched;
+    for (size_t i = 0; i < scheduled; ++i)
+        if (!io_errors[i] && io_results[i].expected_token)
+            matched.push_back(i);
+    const size_t chunk_keys = std::clamp<size_t>(
+        std::min<uint64_t>(store->poolConfig().gc_bulk_delete_chunk_keys, store->poolBackendPtr()->conditionalBatchDeleteKeyLimit()),
+        1,
+        kBulkDeleteMaxKeys);
+    ThreadPoolCallbackRunnerLocal<void> delete_runner(pool, ThreadName::CAS_GC_REDELETE);
+    std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> delete_handles;
+    for (size_t begin = 0; begin < matched.size(); begin += chunk_keys)
+    {
+        const size_t end = std::min(matched.size(), begin + chunk_keys);
+        std::vector<ConditionalRemove> removals;
+        removals.reserve(end - begin);
+        for (size_t pos = begin; pos < end; ++pos)
+        {
+            const size_t index = matched[pos];
+            removals.push_back({io_results[index].blob_key, *io_results[index].expected_token});
+        }
+        delete_handles.emplace_back(delete_runner.enqueueAndGiveOwnership(
+            [begin, end, chunk_removals = std::move(removals), &matched, &io_results, pool_store = store, resumed_generation = op.generation()]
+            {
+                CasOperation job_op = pool_store->openRequests().resume(resumed_generation);
+                const auto results = job_op.removeManyByConditional(chunk_removals, Retry::standard());
+                for (size_t pos = begin; pos < end; ++pos)
+                    io_results[matched[pos]].del = results[pos - begin];
+            }));
+        ++ctx.delete_batches;
+    }
+    ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(delete_handles);
+    for (size_t chunk = 0; chunk < delete_handles.size(); ++chunk)
+    {
+        try
+        {
+            delete_handles[chunk]->future.get();
+        }
+        catch (...)
+        {
+            const size_t begin = chunk * chunk_keys;
+            const size_t end = std::min(matched.size(), begin + chunk_keys);
+            for (size_t pos = begin; pos < end; ++pos)
+                io_errors[matched[pos]] = std::current_exception();
         }
     }
 
@@ -1055,10 +1106,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     const uint64_t graduated_before = report.graduated;
     const uint64_t redelete_failed_before = report.redelete_failed;
     uint64_t redelete_jobs_scheduled = 0;
+    uint64_t redelete_delete_batches = 0;
     const auto record_redelete_job_metrics = [&]
     {
         pending_deletes_timer->metric("jobs_scheduled", redelete_jobs_scheduled);
         pending_deletes_timer->metric("jobs_failed", report.redelete_failed - redelete_failed_before);
+        pending_deletes_timer->metric("delete_batches", redelete_delete_batches);
     };
     SCOPE_EXIT_SAFE({
         if (pending_deletes_timer)
@@ -1092,7 +1145,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             .round_work_budget = round_work_budget,
             .report = report,
             .outcomes = outcomes,
-            .jobs_scheduled = redelete_jobs_scheduled};
+            .jobs_scheduled = redelete_jobs_scheduled,
+            .delete_batches = redelete_delete_batches};
         redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
         for (const RetiredEntry & entry : merge.spared)
         {

@@ -82,6 +82,15 @@ public:
         return InMemoryBackend::remove(key, expected_value, access);
     }
 
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        for (const RawConditionalRemove & removal : removals)
+            if (takeFault(remove_keys, removal.key))
+                throw std::runtime_error("injected worker remove fault for key " + removal.key);
+        return InMemoryBackend::removeManyByConditional(removals, access);
+    }
+
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (takeFault(head_keys, key))
@@ -165,6 +174,16 @@ public:
         return result;
     }
 
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        std::vector<RawRemoval> results;
+        results.reserve(removals.size());
+        for (const RawConditionalRemove & removal : removals)
+            results.push_back(remove(removal.key, removal.expected_token, access));
+        return results;
+    }
+
 private:
     std::set<String> blob_keys;
     size_t k_overlap = 1;
@@ -184,7 +203,8 @@ PoolPtr openPoolWithIoConcurrency(
     uint64_t gc_shards = 1,
     uint64_t outcome_entry_budget = 0,
     CasEventSink event_sink = {},
-    std::optional<size_t> refuse_at_for_test = std::nullopt)
+    std::optional<size_t> refuse_at_for_test = std::nullopt,
+    uint64_t gc_bulk_delete_chunk_keys = kBulkDeleteMaxKeys)
 {
     PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.gc_io_concurrency = concurrency;
@@ -192,6 +212,7 @@ PoolPtr openPoolWithIoConcurrency(
     config.gc_round_outcome_entry_budget = outcome_entry_budget;
     config.event_sink = std::move(event_sink);
     config.gc_io_pool_refuse_at_for_test = refuse_at_for_test;
+    config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
     return Pool::open(std::move(backend), std::move(config));
 }
 
@@ -362,6 +383,25 @@ TEST(CASGCRedeleteConcurrency, ParallelRedeleteReclaimsEveryBlob)
     EXPECT_EQ(rows->total("jobs_failed"), 0u);
 }
 
+TEST(CASGCRedeleteConcurrency, ConditionalDeleteBatchesAreRecorded)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, std::nullopt, 2);
+    Gc gc(store, kGc);
+    publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kReplacedBlob));
+
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows));
+    const RoundReport rep = runRegularRoundReclaiming(gc);
+    store->renewWatermarkOnce();
+
+    EXPECT_EQ(rep.deleted, kBlobs);
+    ASSERT_EQ(rows->rows.size(), 1u);
+    EXPECT_EQ(rows->total("delete_batches"), 3u);
+}
+
 TEST(CASGCRedeleteConcurrency, BlobDeletesActuallyOverlap)
 {
     auto backend = std::make_shared<BlobRemoveWitnessBackend>();
@@ -521,6 +561,21 @@ public:
 
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
+        injectReplacement(key, access);
+        return InMemoryBackend::remove(key, expected_value, access);
+    }
+
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        for (const RawConditionalRemove & removal : removals)
+            injectReplacement(removal.key, access);
+        return InMemoryBackend::removeManyByConditional(removals, access);
+    }
+
+private:
+    void injectReplacement(const String & key, TransportAccess & access)
+    {
         if (armed.load() && key == raced_key && armed.exchange(false))
         {
             raced_on_worker.store(std::this_thread::get_id() != owner);
@@ -528,10 +583,8 @@ public:
             if (current)
                 replacement_committed.store(InMemoryBackend::write(key, current->bytes, current->value, access).has_value());
         }
-        return InMemoryBackend::remove(key, expected_value, access);
     }
 
-private:
     String raced_key;
     std::thread::id owner;
     std::atomic<bool> armed{false};

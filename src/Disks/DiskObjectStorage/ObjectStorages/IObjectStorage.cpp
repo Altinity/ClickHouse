@@ -63,6 +63,17 @@ ObjectStorageIteratorPtr IObjectStorage::iterate(
     return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
 }
 
+std::vector<ConditionalRemoveResult> IObjectStorage::removeObjectsIfTokensMatch(
+    const std::vector<ConditionalRemoveObject> & objects, const ObjectStorageControlRequest & request)
+{
+    if (objects.size() > 1)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Conditional batch object removal is not implemented for {} object storage", getName());
+    if (objects.empty())
+        return {};
+    return {removeObjectIfTokenMatches(objects.front().object, objects.front().expected_token, request)};
+}
+
 ObjectStorageIteratorPtr IObjectStorage::iterate(
     const std::string & path_prefix,
     size_t max_keys,
