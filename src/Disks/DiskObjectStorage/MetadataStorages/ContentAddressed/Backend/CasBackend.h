@@ -226,6 +226,7 @@ public:
     virtual size_t bulkDeleteKeyLimit() const { return 1; }
 
     virtual size_t conditionalBatchDeleteKeyLimit() const { return 1; }
+    virtual void pinConditionalBatchDeleteSupport(bool) {}
 
     /// Authoritative, cache-bypassing probe of one key -- see `ProbeOutcome`. DEFAULT (used by every
     /// backend without sharper raw-error evidence, e.g. `InMemoryBackend`): derived from `head`/`read`

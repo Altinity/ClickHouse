@@ -144,6 +144,7 @@ TEST(CASBulkDeleteBackend, InstrumentedCountsOneRequestAndOneDeletePerKeyClass)
 TEST(CASConditionalBatchDeleteBackend, InstrumentedBackendForwardsMultiKeyConditionalRemove)
 {
     auto inner = std::make_shared<InMemoryBackend>();
+    inner->pinConditionalBatchDeleteSupport(true);
     auto backend = std::make_shared<InstrumentedBackend>(inner);
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();

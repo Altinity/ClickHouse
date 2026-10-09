@@ -744,6 +744,7 @@ private:
     struct RedeleteIo
     {
         String blob_key;
+        std::optional<Etag> expected_token;
         Removal del = Removal::Gone;
     };
 

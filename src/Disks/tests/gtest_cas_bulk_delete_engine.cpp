@@ -79,6 +79,7 @@ TEST(CASBulkDeleteEngine, AnEmptyChunkIsNoRequest)
 TEST(CASConditionalBatchDeleteEngine, ReturnsMixedOutcomesInInputOrder)
 {
     auto backend = std::make_shared<InMemoryBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
     const String removed_key = "p/conditional/removed";
@@ -127,6 +128,7 @@ TEST(CASBulkDeleteEngineDeathTest, MoreThanOneThousandKeysIsACallerBug)
 TEST(CASConditionalBatchDeleteEngine, MoreThanOneThousandKeysIsRejectedEvenIfBackendReportsALargerLimit)
 {
     auto backend = std::make_shared<UnlimitedConditionalBatchBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
     std::vector<ConditionalRemove> removals;

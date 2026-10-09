@@ -82,6 +82,15 @@ public:
         return InMemoryBackend::remove(key, expected_value, access);
     }
 
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        for (const RawConditionalRemove & removal : removals)
+            if (takeFault(remove_keys, removal.key))
+                throw std::runtime_error("injected worker remove fault for key " + removal.key);
+        return InMemoryBackend::removeManyByConditional(removals, access);
+    }
+
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (takeFault(head_keys, key))
@@ -163,6 +172,16 @@ public:
             --in_flight;
         }
         return result;
+    }
+
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        std::vector<RawRemoval> results;
+        results.reserve(removals.size());
+        for (const RawConditionalRemove & removal : removals)
+            results.push_back(remove(removal.key, removal.expected_token, access));
+        return results;
     }
 
 private:
@@ -521,6 +540,21 @@ public:
 
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
+        injectReplacement(key, access);
+        return InMemoryBackend::remove(key, expected_value, access);
+    }
+
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        for (const RawConditionalRemove & removal : removals)
+            injectReplacement(removal.key, access);
+        return InMemoryBackend::removeManyByConditional(removals, access);
+    }
+
+private:
+    void injectReplacement(const String & key, TransportAccess & access)
+    {
         if (armed.load() && key == raced_key && armed.exchange(false))
         {
             raced_on_worker.store(std::this_thread::get_id() != owner);
@@ -528,10 +562,8 @@ public:
             if (current)
                 replacement_committed.store(InMemoryBackend::write(key, current->bytes, current->value, access).has_value());
         }
-        return InMemoryBackend::remove(key, expected_value, access);
     }
 
-private:
     String raced_key;
     std::thread::id owner;
     std::atomic<bool> armed{false};
