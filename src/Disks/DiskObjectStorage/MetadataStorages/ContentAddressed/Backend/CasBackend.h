@@ -20,6 +20,11 @@
 #include <variant>
 #include <vector>
 
+namespace DB::ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
+}
+
 namespace DB::Cas
 {
 
@@ -169,6 +174,11 @@ public:
     /// `DeleteMarker` is a removal that did NOT reclaim: a versioned bucket archived a noncurrent
     /// version instead. Distinct from `Removed` because reclaiming the storage is the point.
     enum class RawRemoval : uint8_t { Removed, Gone, Mismatch, DeleteMarker };
+    struct RawConditionalRemove
+    {
+        String key;
+        String expected_token;
+    };
 
     /// Reads the whole object, or nullopt when the key is absent.
     virtual std::optional<Raw>     read  (const String & key, TransportAccess &) = 0;
@@ -201,9 +211,21 @@ public:
     /// absence is success.
     virtual void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &) = 0;
 
+    virtual std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access)
+    {
+        if (removals.size() > 1)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Conditional batch removal is not implemented by this backend");
+        if (removals.empty())
+            return {};
+        return {remove(removals.front().key, removals.front().expected_token, access)};
+    }
+
     /// The most keys one `removeManyWriteOnce` sends to the storage as one request; at least 1. A decorator
     /// must forward it: the default of 1 would turn every batch below it into one-key requests.
     virtual size_t bulkDeleteKeyLimit() const { return 1; }
+
+    virtual size_t conditionalBatchDeleteKeyLimit() const { return 1; }
 
     /// Authoritative, cache-bypassing probe of one key -- see `ProbeOutcome`. DEFAULT (used by every
     /// backend without sharper raw-error evidence, e.g. `InMemoryBackend`): derived from `head`/`read`

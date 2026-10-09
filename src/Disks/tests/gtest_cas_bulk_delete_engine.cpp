@@ -34,6 +34,12 @@ std::vector<WriteOnceKey> manifestKeys(uint32_t count)
     return keys;
 }
 
+class UnlimitedConditionalBatchBackend : public InMemoryBackend
+{
+public:
+    size_t conditionalBatchDeleteKeyLimit() const override { return kBulkDeleteMaxKeys + 1; }
+};
+
 }
 
 TEST(CASBulkDeleteEngine, AFailedAttemptReissuesTheWholeChunkAndAlreadyDeletedKeysAreSuccess)
@@ -70,6 +76,34 @@ TEST(CASBulkDeleteEngine, AnEmptyChunkIsNoRequest)
     EXPECT_EQ(backend->bulkRemoveCalls(), 0u);
 }
 
+TEST(CASConditionalBatchDeleteEngine, ReturnsMixedOutcomesInInputOrder)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    const String removed_key = "p/conditional/removed";
+    const String replaced_key = "p/conditional/replaced";
+    const String gone_key = "p/conditional/gone";
+
+    const Etag removed_token = std::get<Committed>(op.create(removed_key, "v1", Retry::once())).etag;
+    const Etag stale_token = std::get<Committed>(op.create(replaced_key, "v1", Retry::once())).etag;
+    const Etag gone_token = std::get<Committed>(op.create(gone_key, "v1", Retry::once())).etag;
+    ASSERT_TRUE(std::holds_alternative<Committed>(op.replace(replaced_key, "v2", stale_token, Retry::once())));
+    ASSERT_EQ(op.remove(gone_key, gone_token, Retry::once()), Removal::Removed);
+
+    const std::vector<Removal> results = op.removeManyByConditional(
+        {{removed_key, removed_token}, {replaced_key, stale_token}, {gone_key, gone_token}}, Retry::once());
+
+    ASSERT_EQ(results.size(), 3u);
+    EXPECT_EQ(results[0], Removal::Removed);
+    EXPECT_EQ(results[1], Removal::Mismatch);
+    EXPECT_EQ(results[2], Removal::Gone);
+    EXPECT_FALSE(op.head(removed_key, Retry::once()).has_value());
+    const auto replaced = op.read(replaced_key, Retry::once());
+    ASSERT_TRUE(replaced.has_value());
+    EXPECT_EQ(replaced->bytes, "v2");
+}
+
 TEST(CASBulkDeleteEngine, ExactlyOneThousandKeysIsOneRequest)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -89,3 +123,19 @@ TEST(CASBulkDeleteEngineDeathTest, MoreThanOneThousandKeysIsACallerBug)
     EXPECT_EQ(backend->bulkRemoveCalls(), 0u);
 }
 #endif
+
+TEST(CASConditionalBatchDeleteEngine, MoreThanOneThousandKeysIsRejectedEvenIfBackendReportsALargerLimit)
+{
+    auto backend = std::make_shared<UnlimitedConditionalBatchBackend>();
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    std::vector<ConditionalRemove> removals;
+    removals.reserve(kBulkDeleteMaxKeys + 1);
+    for (size_t i = 0; i <= kBulkDeleteMaxKeys; ++i)
+    {
+        const String key = "p/conditional/limit/" + std::to_string(i);
+        removals.push_back({key, std::get<Committed>(op.create(key, "v", Retry::once())).etag});
+    }
+
+    EXPECT_THROW(op.removeManyByConditional(removals, Retry::once()), DB::Exception);
+}
