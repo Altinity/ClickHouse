@@ -700,7 +700,6 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
         e.reason = "stageManifest: part-manifest body written";
     });
 
-    staged_manifests.push_back(id);
     staged_manifest_proofs.emplace(
         id,
         StagedManifestProof{manifest_incarnation, std::move(blob_dependencies)});
@@ -829,18 +828,14 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             "promote: manifest namespace '{}' != target namespace '{}'",
             id.root_namespace.string(), target_ns.string());
 
-    const String manifest_key = store->layout().manifestKey(id);
     std::vector<BlobRef> manifest_blob_dependencies;
     if (const auto staged = staged_manifest_proofs.find(id); staged != staged_manifest_proofs.end())
     {
-        if (staged->second.incarnation.key() != manifest_key)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "promote: staged manifest proof names key '{}', expected '{}'",
-                staged->second.incarnation.key(), manifest_key);
         manifest_blob_dependencies = staged->second.blob_dependencies;
     }
     else
     {
+        const String manifest_key = store->layout().manifestKey(id);
         CasOperation op = store->mountRequests().admit();
         const auto body_got = op.read(manifest_key, Retry::standard());
         if (!body_got)
@@ -1115,7 +1110,7 @@ void PartWriteTxn::abandon()
                 e.outcome = "cancelled";
                 e.reason = "cancelForNamespaceRemoval: owning namespace removed (dropNamespace); best-effort "
                            "deleted staged _manifests debris; precommit body (if any) left for GC";
-                e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
+                e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifest_proofs.size())}};
             });
         }
         catch (...)
@@ -1217,7 +1212,7 @@ void PartWriteTxn::abandon()
             e.outcome = "abandoned";
             e.reason = "abandon: appended a precommit-removal event for the live precommit (body left for GC); "
                        "best-effort deleted the never-precommitted _manifests debris; remainder reaped by the orphan sweep";
-            e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
+            e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifest_proofs.size())}};
         });
     }
     catch (...)
@@ -1240,15 +1235,13 @@ void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
     /// while keeping it is not: an unreferenced body is ordinary orphan-sweep debris.
     const bool precommit_attempted = precommit_state != PrecommitState::NotAttempted;
     CasOperation op = store->mountRequests().admit();
-    for (const ManifestId & id : staged_manifests)
+    for (const auto & [id, proof] : staged_manifest_proofs)
     {
         if (precommit_attempted && id.ref == precommit_manifest && id.root_namespace == precommit_target_ns)
             continue;   /// the (possibly) live precommit body — left for GC (delete-after-sealed-decrements)
         try
         {
-            const String key = store->layout().manifestKey(id);
-            if (const auto observed = op.head(key, Retry::standard()))
-                op.remove(key, observed->etag, Retry::standard());
+            op.remove(proof.incarnation.key(), proof.incarnation, Retry::standard());
         }
         catch (...) // NOLINT(bugprone-empty-catch)
         {

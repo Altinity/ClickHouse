@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace DB { class WriteBuffer; }
@@ -386,15 +387,7 @@ private:
     String precommit_final_ref;
     ManifestRef precommit_manifest;
 
-    std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
-
-    /// Every `ManifestId` this transaction has minted via `stageManifest`, with the proof consumed by `promote`
-    /// and checked by `precommitAdd`:
-    /// an unowned id may enter ownership only from the transaction that freshly staged it. Kept separate from
-    /// `staged_manifests` above -- that vector's role (best-effort abandon cleanup) is unrelated and
-    /// could change independently; this map also supplies the ABA barrier's identity check, so it stays
-    /// correct even if the cleanup vector's contents or lifetime ever change.
-    std::map<ManifestId, StagedManifestProof> staged_manifest_proofs;
+    std::unordered_map<ManifestId, StagedManifestProof> staged_manifest_proofs;
 
     std::map<DepKey, BlobDepRecord> deps;                 /// dependencies recorded by this build (blobs only)
 
