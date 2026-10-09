@@ -44,6 +44,8 @@
 #include <aws/s3/model/Tag.h>
 #include <aws/s3/model/Tagging.h>
 
+#include <unordered_set>
+
 namespace ProfileEvents
 {
     extern const Event S3ListObjects;
@@ -651,6 +653,28 @@ std::vector<ConditionalRemoveResult> S3ObjectStorage::removeObjectsIfTokensMatch
     const auto outcome = clientForRetryProfile(request)->DeleteObjects(request_s3);
     if (!outcome.IsSuccess())
         throw S3Exception(outcome.GetError().GetErrorType(), "{} while conditionally removing objects from S3", outcome.GetError().GetMessage());
+
+    std::unordered_set<String> expected_keys;
+    expected_keys.reserve(objects.size());
+    for (const ConditionalRemoveObject & object : objects)
+        expected_keys.insert(object.object.remote_path);
+
+    std::unordered_set<String> response_keys;
+    response_keys.reserve(objects.size());
+    for (const auto & deleted : outcome.GetResult().GetDeleted())
+    {
+        const String key = deleted.GetKey();
+        if (!expected_keys.contains(key) || !response_keys.insert(key).second)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "S3 conditional DeleteObjects response has unexpected or duplicate key {}", key);
+    }
+    for (const auto & error : outcome.GetResult().GetErrors())
+    {
+        const String key = error.GetKey();
+        if (!expected_keys.contains(key) || !response_keys.insert(key).second)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "S3 conditional DeleteObjects response has unexpected or duplicate key {}", key);
+    }
+    if (response_keys.size() != objects.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "S3 conditional DeleteObjects response omitted keys");
 
     std::vector<ConditionalRemoveResult> results;
     results.reserve(objects.size());
