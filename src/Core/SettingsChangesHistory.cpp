@@ -48,12 +48,14 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
+            {"delta_lake_clustering_predicate_fallback", false, true, "New setting to enable clustering-aware predicate fallback for Delta Lake tables with Liquid Clustering."},
             {"data_lake_delete_data_on_drop", false, false, "New setting that unifies dropping of data lake data; the released `iceberg_delete_data_on_drop` is kept as an alias for it."},
             {"datalake_ignore_unsupported_table_properties", false, false, "New setting: allow `CREATE TABLE` and `SHOW CREATE TABLE` in a `DataLakeCatalog` to omit unsupported table properties."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",
         {
+            {"delta_lake_clustering_predicate_fallback", false, true, "New setting to enable clustering-aware predicate fallback for Delta Lake tables with Liquid Clustering."},
             {"analyzer_compatibility_multiple_joins_qualify_column_names", false, false, "New compatibility setting. When enabled, the analyzer mimics the old analyzer's qualified result column names for queries whose FROM clause has two or more JOINs."},
             {"analyzer_compatibility_apply_final_to_all_joined_tables", true, false, "Fixed a bug in the analyzer where FINAL on the left-most table of a JOIN was incorrectly applied to the other joined tables as well. previous_value=true so `compatibility` with versions before 26.6 restores the old behavior."},
             {"analyzer_compatibility_allow_non_aggregate_in_having", false, false, "New compatibility setting. When enabled, the new analyzer mimics the legacy `HAVING`-to-`WHERE` rewrite for non-aggregate AND-conjuncts instead of raising `NOT_AN_AGGREGATE`."},
