@@ -649,8 +649,11 @@ std::vector<ConditionalRemoveResult> S3ObjectStorage::removeObjectsIfTokensMatch
     request_s3.SetDelete(std::move(delete_request));
     if (request.attempt_number != 0)
         S3::setClickhouseAttemptNumber(request_s3, request.attempt_number);
-    ProfileEvents::increment(ProfileEvents::DiskS3DeleteObjects);
-    const auto outcome = clientForRetryProfile(request)->DeleteObjects(request_s3);
+    const auto outcome = refreshAndRetryOnExpiredCredentials([&]
+    {
+        ProfileEvents::increment(ProfileEvents::DiskS3DeleteObjects);
+        return clientForRetryProfile(request)->DeleteObjects(request_s3);
+    });
     if (!outcome.IsSuccess())
         throw S3Exception(outcome.GetError().GetErrorType(), "{} while conditionally removing objects from S3", outcome.GetError().GetMessage());
 
