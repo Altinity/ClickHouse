@@ -455,6 +455,38 @@ TEST(CASPartWriteTxn, PromoteOwnStagedManifestDoesNotReadBody)
     EXPECT_EQ(counting->getCountFor(manifest_key) - gets_before, 0u);
 }
 
+TEST(CASPartWriteTxn, PromoteOwnStagedManifestChecksBlobDependenciesWithoutBodyRead)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto counting = std::make_shared<KeyCountingBackend>(backend);
+    auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const RootNamespace ns{"srv1/promote-staged-deps"};
+    auto build = startBuildFor(store, ns, "part");
+
+    ManifestEntry inline_entry;
+    inline_entry.path = "small";
+    inline_entry.placement = EntryPlacement::Inline;
+    inline_entry.inline_bytes = "abc";
+    const ManifestId id = build->stageManifest(
+        {inline_entry, blobManifestEntry("a.bin", "blob-a"), blobManifestEntry("b.bin", "blob-b")});
+    build->precommitAdd(ns, "part", id);
+    build->putBlob(idOf("blob-a"), BlobSource::fromString("blob-a"));
+
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->promote(ns, "part", build->buildId(), id);
+        },
+        "no dependency proof");
+
+    build->putBlob(idOf("blob-b"), BlobSource::fromString("blob-b"));
+    const String manifest_key = store->layout().manifestKey(id);
+    const size_t gets_before = counting->getCountFor(manifest_key);
+    EXPECT_TRUE(build->promote(ns, "part", build->buildId(), id));
+    EXPECT_EQ(counting->getCountFor(manifest_key) - gets_before, 0u);
+    EXPECT_TRUE(store->resolveRef(ns, "part").has_value());
+}
+
 /// B171: the `cas_owner` owner-triple stamping (`PartWriteTxn::ownerMeta`) was DELETED — protection is now
 /// the build-root precommit edge (reachability), not revocable object metadata GC reads per-candidate.
 /// The old `CASPartWriteTxn.BlobCarriesOwnerTripleInMetadata` asserted that stamping; its coverage is replaced
@@ -1510,6 +1542,31 @@ TEST(CASPartWriteTxn, AbandonDeletesStagedManifestWithoutHead)
     EXPECT_EQ(counting->headCountFor(manifest_key) - heads_before, 0u);
     OperationForTest op(*backend);
     EXPECT_FALSE((*op).head(manifest_key, Retry::once()).has_value());
+}
+
+TEST(CASPartWriteTxn, AbandonKeepsPrecommitBodyAndRemovesOtherStagedWithoutHead)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto counting = std::make_shared<KeyCountingBackend>(backend);
+    auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const RootNamespace ns{"srv1/abandon-keeps-precommit"};
+    auto build = startBuildFor(store, ns, "part");
+
+    const ManifestId owner = build->stageManifest({});
+    build->precommitAdd(ns, "part", owner);
+    const ManifestId other = build->stageManifest({});
+    const String owner_key = store->layout().manifestKey(owner);
+    const String other_key = store->layout().manifestKey(other);
+    const size_t owner_heads_before = counting->headCountFor(owner_key);
+    const size_t other_heads_before = counting->headCountFor(other_key);
+
+    build->abandon();
+
+    EXPECT_EQ(counting->headCountFor(owner_key) - owner_heads_before, 0u);
+    EXPECT_EQ(counting->headCountFor(other_key) - other_heads_before, 0u);
+    OperationForTest op(*backend);
+    EXPECT_TRUE((*op).head(owner_key, Retry::once()).has_value());
+    EXPECT_FALSE((*op).head(other_key, Retry::once()).has_value());
 }
 
 TEST(CASPartWriteTxn, PublishHappyPathRoundTrip)
