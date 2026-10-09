@@ -584,7 +584,12 @@ Gc::RedeleteIo Gc::performRedeleteIo(const RetiredEntry & entry, const Layout & 
     /// already gone.
     const std::optional<Meta> observed = op.head(io.blob_key, Retry::standard());
     if (observed)
-        io.del = entry.token.matches(observed->etag) ? op.remove(io.blob_key, observed->etag, Retry::standard()) : Removal::Mismatch;
+    {
+        if (entry.token.matches(observed->etag))
+            io.expected_token = observed->etag;
+        else
+            io.del = Removal::Mismatch;
+    }
     return io;
 }
 
@@ -722,6 +727,48 @@ void Gc::redeleteBlobs(
             {
                 io_errors[i] = std::current_exception();
             }
+        }
+    }
+
+    std::vector<size_t> matched;
+    for (size_t i = 0; i < scheduled; ++i)
+        if (!io_errors[i] && io_results[i].expected_token)
+            matched.push_back(i);
+    const size_t chunk_keys = std::max<size_t>(1, std::min(kBulkDeleteMaxKeys, store->poolBackendPtr()->conditionalBatchDeleteKeyLimit()));
+    ThreadPoolCallbackRunnerLocal<void> delete_runner(pool, ThreadName::CAS_GC_REDELETE);
+    std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> delete_handles;
+    for (size_t begin = 0; begin < matched.size(); begin += chunk_keys)
+    {
+        const size_t end = std::min(matched.size(), begin + chunk_keys);
+        std::vector<ConditionalRemove> removals;
+        removals.reserve(end - begin);
+        for (size_t pos = begin; pos < end; ++pos)
+        {
+            const size_t index = matched[pos];
+            removals.push_back({io_results[index].blob_key, *io_results[index].expected_token});
+        }
+        delete_handles.emplace_back(delete_runner.enqueueAndGiveOwnership(
+            [begin, end, chunk_removals = std::move(removals), &matched, &io_results, pool_store = store, resumed_generation = op.generation()]
+            {
+                CasOperation job_op = pool_store->openRequests().resume(resumed_generation);
+                const auto results = job_op.removeManyByConditional(chunk_removals, Retry::standard());
+                for (size_t pos = begin; pos < end; ++pos)
+                    io_results[matched[pos]].del = results[pos - begin];
+            }));
+    }
+    ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(delete_handles);
+    for (size_t chunk = 0; chunk < delete_handles.size(); ++chunk)
+    {
+        try
+        {
+            delete_handles[chunk]->future.get();
+        }
+        catch (...)
+        {
+            const size_t begin = chunk * chunk_keys;
+            const size_t end = std::min(matched.size(), begin + chunk_keys);
+            for (size_t pos = begin; pos < end; ++pos)
+                io_errors[matched[pos]] = std::current_exception();
         }
     }
 

@@ -1009,6 +1009,18 @@ size_t ObjectStorageBackend::bulkDeleteKeyLimit() const
     return mode == Mode::Native ? object_storage->batchDeleteKeyLimit() : kBulkDeleteMaxKeys;
 }
 
+size_t ObjectStorageBackend::conditionalBatchDeleteKeyLimit() const
+{
+    if (mode != Mode::Native || !conditional_batch_delete_supported.load())
+        return 1;
+    return object_storage->batchDeleteKeyLimit();
+}
+
+void ObjectStorageBackend::pinConditionalBatchDeleteSupport(bool supported)
+{
+    conditional_batch_delete_supported.store(supported);
+}
+
 void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access)
 {
     if (keys.empty())
@@ -1034,6 +1046,48 @@ void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> &
         object_storage->removeObjectIfExists(StoredObject(emuPath(key.str())));
         emuForgetDeletedToken(key.str());
     }
+}
+
+std::vector<Backend::RawRemoval> ObjectStorageBackend::removeManyByConditional(
+    const std::vector<RawConditionalRemove> & removals, TransportAccess & access)
+{
+    if (removals.empty())
+        return {};
+    if (mode != Mode::Native)
+    {
+        std::vector<RawRemoval> results;
+        results.reserve(removals.size());
+        for (const RawConditionalRemove & removal : removals)
+            results.push_back(removeUnder(removal.key, removal.expected_token, controlRequest(access.attemptNo())));
+        return results;
+    }
+
+    std::vector<ConditionalRemoveObject> objects;
+    objects.reserve(removals.size());
+    for (const RawConditionalRemove & removal : removals)
+    {
+        if (!isValidTokenValue(dialect(), removal.expected_token))
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS backend: malformed conditional removal token for {}", removal.key);
+        objects.push_back({StoredObject(removal.key), removal.expected_token});
+    }
+    const auto storage_results = object_storage->removeObjectsIfTokensMatch(objects, controlRequest(access.attemptNo()));
+    if (storage_results.size() != removals.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS backend: conditional batch removal returned {} results for {} keys", storage_results.size(), removals.size());
+
+    std::vector<RawRemoval> results;
+    results.reserve(storage_results.size());
+    for (const ConditionalRemoveResult & result : storage_results)
+    {
+        switch (result.outcome)
+        {
+            case ConditionalRemoveOutcome::Removed:
+                results.push_back(result.created_delete_marker ? RawRemoval::DeleteMarker : RawRemoval::Removed);
+                break;
+            case ConditionalRemoveOutcome::TokenMismatch: results.push_back(RawRemoval::Mismatch); break;
+            case ConditionalRemoveOutcome::NotFound: results.push_back(RawRemoval::Gone); break;
+        }
+    }
+    return results;
 }
 
 Backend::RawListPage ObjectStorageBackend::list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access)

@@ -101,10 +101,14 @@ public:
     /// under the control-plane profile; `EmulatedSingleProcess` deletes each present key under the
     /// emulation lock with the same token bookkeeping as the single-key delete.
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override;
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override;
 
     /// Native: the object storage's own limit. Emulated: `kBulkDeleteMaxKeys`, since this backend deletes
     /// the keys one by one under its emulation lock.
     size_t bulkDeleteKeyLimit() const override;
+    size_t conditionalBatchDeleteKeyLimit() const override;
+    void pinConditionalBatchDeleteSupport(bool supported) override;
     /// Native mints its store's own dialect (ETag or GCS generation); the emulated adapter mints its
     /// own values.
     Dialect dialect() const override { return mode == Mode::Native ? native_token_type : Dialect::Emulated; }
@@ -214,6 +218,7 @@ public:
 private:
     const ObjectStoragePtr object_storage;
     const Mode mode;
+    std::atomic_bool conditional_batch_delete_supported = false;
     Dialect native_token_type = Dialect::ETag;
     /// See the constructor: what the READ-class requests (read, head, list, remove) carry.
     const bool single_attempt_control_plane;

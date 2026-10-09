@@ -64,7 +64,8 @@ public:
 
     /// The emulation deletes keys one by one under its lock, so the CAS maximum is the only bound.
     size_t bulkDeleteKeyLimit() const override { return kBulkDeleteMaxKeys; }
-    size_t conditionalBatchDeleteKeyLimit() const override { return kBulkDeleteMaxKeys; }
+    size_t conditionalBatchDeleteKeyLimit() const override { return conditional_batch_delete_supported ? kBulkDeleteMaxKeys : 1; }
+    void pinConditionalBatchDeleteSupport(bool supported) override { conditional_batch_delete_supported = supported; }
 
     /// Creates the key when `expected_value` is empty, or replaces the incarnation it names. A
     /// refused precondition leaves the store unchanged. Value enforcement can be disabled with
@@ -230,6 +231,7 @@ private:
     std::vector<std::exception_ptr> armed_bulk_remove_failures_;
     std::function<void()> before_bulk_remove_hook_;
     size_t bulk_remove_calls_ = 0;
+    std::atomic_bool conditional_batch_delete_supported = false;
 };
 
 }
