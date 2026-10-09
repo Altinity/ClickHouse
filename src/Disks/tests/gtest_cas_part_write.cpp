@@ -438,6 +438,23 @@ TEST(CASPartWriteTxn, StageManifestUsesPerBuildOrdinals)
     EXPECT_EQ(next.ref.manifest_ordinal, 1u);
 }
 
+TEST(CASPartWriteTxn, PromoteOwnStagedManifestDoesNotReadBody)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto counting = std::make_shared<KeyCountingBackend>(backend);
+    auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const RootNamespace ns{"srv1/no-promote-manifest-get"};
+    auto build = startBuildFor(store, ns, "part");
+
+    const ManifestId id = build->stageManifest({});
+    build->precommitAdd(ns, "part", id);
+
+    const String manifest_key = store->layout().manifestKey(id);
+    const size_t gets_before = counting->getCountFor(manifest_key);
+    EXPECT_TRUE(build->promote(ns, "part", build->buildId(), id));
+    EXPECT_EQ(counting->getCountFor(manifest_key) - gets_before, 0u);
+}
+
 /// B171: the `cas_owner` owner-triple stamping (`PartWriteTxn::ownerMeta`) was DELETED — protection is now
 /// the build-root precommit edge (reachability), not revocable object metadata GC reads per-candidate.
 /// The old `CASPartWriteTxn.BlobCarriesOwnerTripleInMetadata` asserted that stamping; its coverage is replaced
