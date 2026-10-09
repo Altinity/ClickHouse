@@ -152,8 +152,8 @@ bool allowEarlyConstantFolding(const ActionsDAG & actions, const Settings & sett
     return true;
 }
 
-/// A folded server constant (`hostName()`, `tcpPort()`, ...) must stay a GROUP BY key.
-/// Its value differs per shard. Dropping it makes the initiator look up a missing column.
+/// True when `node` folds a server constant such as `hostName` or `tcpPort`.
+/// `__getScalar` is excluded: the initiator evaluates it and sends one value to every shard.
 bool containsServerConstant(const ActionsDAG::Node * node)
 {
     std::stack<const ActionsDAG::Node *> stack;
@@ -357,6 +357,9 @@ void ExpressionAnalyzer::analyzeAggregation(ActionsDAG & temp_actions)
             else
                 group_by_kind = GroupByKind::ORDINARY;
             bool use_nulls = group_by_kind != GroupByKind::ORDINARY && getContext()->getSettingsRef()[Setting::group_by_use_nulls];
+            /// Cluster table function workers leave `distributed_depth` at 0, same as a local query.
+            /// `SECONDARY_QUERY` is what distinguishes them: a server constant differs per shard only there.
+            const bool is_secondary_query = getContext()->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
 
             /// For GROUPING SETS with multiple groups we always add virtual __grouping_set column
             /// With set number, which is used as an additional key at the stage of merging aggregating data.
@@ -393,8 +396,9 @@ void ExpressionAnalyzer::analyzeAggregation(ActionsDAG & temp_actions)
                         if (getContext()->getClientInfo().distributed_depth == 0 || settings.distributed_group_by_no_merge > 0)
                         {
                             /// Constant expressions have non-null column pointer at this stage.
-                            /// Server constants stay: they are different on each shard.
-                            if (node->column && !containsServerConstant(node))
+                            /// A server constant stays only on a secondary query, where each shard has its own value.
+                            /// A local query has one value, so the key is removed with other constants.
+                            if (node->column && !(is_secondary_query && containsServerConstant(node)))
                             {
                                 select_query->group_by_with_constant_keys = true;
 
@@ -448,8 +452,9 @@ void ExpressionAnalyzer::analyzeAggregation(ActionsDAG & temp_actions)
                     if (getContext()->getClientInfo().distributed_depth == 0 || settings.distributed_group_by_no_merge > 0)
                     {
                         /// Constant expressions have non-null column pointer at this stage.
-                        /// Server constants stay: they are different on each shard.
-                        if (node->column && !containsServerConstant(node))
+                        /// A server constant stays only on a secondary query, where each shard has its own value.
+                        /// A local query has one value, so the key is removed with other constants.
+                        if (node->column && !(is_secondary_query && containsServerConstant(node)))
                         {
                             select_query->group_by_with_constant_keys = true;
 
