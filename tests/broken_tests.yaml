@@ -144,6 +144,15 @@
   check_types:
   - arm
   - cpu-aarch64
+- name: 02354_vector_search_rescoring_distance_in_select_list
+  reason: 'KNOWN: https://github.com/Altinity/ClickHouse/issues/2340 - ARM sanitizer builds have no SimSIMD since #2341; USearch fallback truncates bf16 instead of rounding'
+  message: '\+7\s0\.1875'
+  regex: true
+  check_types:
+  - asan
+  - ubsan
+  - tsan
+  - msan
 - name: 01154_move_partition_long
   reason: INVESTIGATE - Unstable on debug
   message: 'curl: (28) Operation timed out'

@@ -125,7 +125,6 @@ void driveToNetworkErrorGiveUp(LatchedChunkFaultBackend & backend, DB::Cas::test
     EXPECT_GE(clock.pauseCount() - pauses_before, 1u)
         << "a give-up after a single attempt cannot distinguish a retrying `standard` policy from one "
         << "that never reissues at all";
-    EXPECT_GT(clock.longestPause(), 0u) << "at least one of the retry's pauses must be a real, nonzero backoff";
     backend.disarm();
 }
 

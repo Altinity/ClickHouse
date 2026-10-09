@@ -14,15 +14,21 @@ upstream ClickHouse cannot reach, defined in `src/Core/AntalyaProtocol.h`. Both 
 the name string of their `Hello`, on every connection:
 
 ```text
-client -> server   "ClickHouse client (antalya:1)"
-server -> client   "ClickHouse (antalya:1)"
+client -> server   "ClickHouse client (antalya:2)"
+server -> client   "ClickHouse (antalya:2)"
 ```
 
 Each side parses the peer's suffix, caps the value with `min(own, peer)` and keeps the result. `0`
 means the peer is not an Antalya build. Negotiation is per hop and not transitive: initiator to
 worker and worker to worker negotiate independently.
 
-Version 1 is the advertisement itself. Nothing is gated on it yet.
+Version 1 is the advertisement itself.
+
+Version 2 appends two optional fields to `ReadTaskResponse`, after the upstream cluster-processing
+payload. The first is Iceberg column statistics (`DataFileMetaInfo`). The second is `retry_after_us`,
+sent when `lock_object_storage_task_distribution_ms` asks a worker to wait before taking another
+node's file. If any worker negotiated a lower version, the initiator ignores that setting for the
+query and assigns files immediately, so every task path stays an object key.
 
 ## Adding an Antalya-only wire change {#adding-a-wire-change}
 

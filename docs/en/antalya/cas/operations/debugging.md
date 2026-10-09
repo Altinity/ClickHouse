@@ -242,7 +242,7 @@ mount.
 | `cas-fsck [--detail] [--timeout N] [--namespace PREFIX] [--partial]` | The same reachability scan as `SYSTEM CAS FSCK`, offline. `--detail` adds a per-object `<class>\t<key>\t<size>` listing (`reachable`, `dangling`, `unreachable`, `pending-gc`, `awaiting-gc`, `unaccounted`, `stale-edge`, `corrupted-run`, `chain-broken`, `unchecked`, `lifeless-key`, `janitor-pending`) — the only way to get per-object, not just per-pool, findings. `--timeout`/`--partial` bound a scan on a large pool |
 | `cas-gc-dryrun` | Previews the next round's deletes, read-only, no lease. Over-reports away from quiescence (does not fold new owner events) — a diagnostic only, never a delete source |
 | `cas-inspect '<raw-object-key>'` | Decodes one raw object-storage key (as printed by `cas-fsck`/`cas-gc-dryrun`) straight to JSON |
-| `cas-gc-rebuild [--force]` | Disaster recovery: rebuilds a `gc/state` baseline from raw owner state after the GC guard has refused every regular round. `--force` bypasses only the healthy-state refusal, never a competing leader or a failed `CAS`. See [`SYSTEM CAS GC REBUILD`](/sql-reference/statements/system#system-cas-gc-rebuild) for the destructive-tool caveats |
+| `cas-gc-rebuild [--force]` | Disaster recovery: rebuilds a `gc/state` baseline from raw owner state after the GC guard has refused every regular round. `--force` bypasses only the healthy-state refusal, never a competing leader or a failed `CAS`. See [`SYSTEM CAS GC REBUILD`](/sql-reference/statements/system#system-cas-gc-rebuild) for the destructive-tool caveats. Before rebuilding a lost `gc/state`, stop or restart every server of the pool; a request sent before a server stopped can still reach the object store afterwards, and this rule does not cover it. |
 
 ```bash
 clickhouse-disks -C config.xml --disk cas cas-fsck --detail
@@ -254,6 +254,19 @@ clickhouse-disks -C config.xml --disk cas cas-gc-rebuild --force
 `cas-drop-member` — the offline twin of `SYSTEM CAS DROP POOL MEMBER` — is covered on the
 [migration page](/antalya/cas/operations/migration#decommission) alongside the SQL form, since
 decommissioning a pool member is a migration/scale-down operation, not an incident-time tool.
+
+## Upgrading a pool with GC enabled {#upgrade-gc}
+
+`cas_gc_enabled` is read once, when the disk is constructed: only a restart applies a change.
+
+1. On every server still on the old version, set `<cas_gc_enabled>false</cas_gc_enabled>` in each CAS disk's
+   configuration and restart the server. It then runs no GC and refuses `SYSTEM CAS GC RUN`, `START` and `REBUILD`.
+2. Only after step 1 has finished on every server, upgrade the servers, removing the setting on each upgraded one.
+3. Never run `SYSTEM CAS GC` commands on, or re-enable GC on, a server still on the old version.
+
+A delete request sent before a restart can still reach the object store later and remove a marker GC relies on,
+so a blob can be lost; nothing bounds when such requests stop. Entries the old version already scheduled for
+deletion are deleted by the upgraded GC without a fresh marker read. Downgrades follow the same procedure.
 
 ## The CLICKHOUSE_USER_FILES gotcha when reproducing a test manually {#user-files-gotcha}
 

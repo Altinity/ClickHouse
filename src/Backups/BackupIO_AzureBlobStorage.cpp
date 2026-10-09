@@ -37,7 +37,15 @@ BackupReaderAzureBlobStorage::BackupReaderAzureBlobStorage(
     const WriteSettings & write_settings_,
     const ContextPtr & context_)
     : BackupReaderDefault(read_settings_, write_settings_, getLogger("BackupReaderAzureBlobStorage"))
-    , data_source_description{DataSourceType::ObjectStorage, ObjectStorageType::Azure, MetadataStorageType::None, connection_params_.getConnectionURL(), false, false, ""}
+    , data_source_description{
+          .type = DataSourceType::ObjectStorage,
+          .object_storage_type = ObjectStorageType::Azure,
+          .metadata_type = MetadataStorageType::None,
+          .description = connection_params_.getConnectionURL(),
+          .is_encrypted = false,
+          .is_cached = false,
+          .zookeeper_name = "",
+          .files_are_whole_objects = true}
     , connection_params(connection_params_)
     , blob_path(blob_path_)
 {
@@ -87,7 +95,9 @@ void BackupReaderAzureBlobStorage::copyFileToDisk(const String & path_in_backup,
     auto destination_data_source_description = destination_disk->getDataSourceDescription();
     LOG_TRACE(log, "Source description {}, destination description {}", data_source_description.description, destination_data_source_description.description);
     if (destination_data_source_description.object_storage_type == ObjectStorageType::Azure
-        && destination_data_source_description.is_encrypted == encrypted_in_backup)
+        && destination_data_source_description.is_encrypted == encrypted_in_backup
+        && destination_data_source_description.files_are_whole_objects
+        && data_source_description.files_are_whole_objects)
     {
         LOG_TRACE(log, "Copying {} from AzureBlobStorage to disk {}", path_in_backup, destination_disk->getName());
         auto write_blob_function = [&](const Strings & dst_blob_path, WriteMode mode, const std::optional<ObjectAttributes> &) -> size_t
@@ -103,7 +113,6 @@ void BackupReaderAzureBlobStorage::copyFileToDisk(const String & path_in_backup,
                 destination_disk->getObjectStorage()->getAzureBlobStorageClient(),
                 connection_params.getContainer(),
                 fs::path(blob_path) / path_in_backup,
-                0,
                 file_size,
                 /* dest_container */ dst_blob_path[1],
                 /* dest_path */ dst_blob_path[0],
@@ -133,7 +142,15 @@ BackupWriterAzureBlobStorage::BackupWriterAzureBlobStorage(
     const ContextPtr & context_,
     bool attempt_to_create_container)
     : BackupWriterDefault(read_settings_, write_settings_, getLogger("BackupWriterAzureBlobStorage"))
-    , data_source_description{DataSourceType::ObjectStorage, ObjectStorageType::Azure, MetadataStorageType::None, connection_params_.getConnectionURL(), false, false, ""}
+    , data_source_description{
+          .type = DataSourceType::ObjectStorage,
+          .object_storage_type = ObjectStorageType::Azure,
+          .metadata_type = MetadataStorageType::None,
+          .description = connection_params_.getConnectionURL(),
+          .is_encrypted = false,
+          .is_cached = false,
+          .zookeeper_name = "",
+          .files_are_whole_objects = true}
     , connection_params(connection_params_)
     , blob_path(blob_path_)
 {
@@ -165,27 +182,44 @@ void BackupWriterAzureBlobStorage::copyFileFromDisk(
     auto source_data_source_description = src_disk->getDataSourceDescription();
     LOG_TRACE(log, "Source description {}, destination description {}", source_data_source_description.description, data_source_description.description);
     if (source_data_source_description.object_storage_type == ObjectStorageType::Azure
-        && source_data_source_description.is_encrypted == copy_encrypted)
+        && source_data_source_description.is_encrypted == copy_encrypted
+        && source_data_source_description.files_are_whole_objects
+        && data_source_description.files_are_whole_objects)
     {
         /// getBlobPath() can return more than 2 elements if the file is stored as multiple objects in AzureBlobStorage container.
         /// In this case we can't use the native copy.
         if (auto src_blob_path = src_disk->getBlobPath(src_path); src_blob_path.size() == 2)
         {
-            LOG_TRACE(log, "Copying file {} from disk {} to AzureBlobStorage", src_path, src_disk->getName());
-            copyAzureBlobStorageFile(
-                src_disk->getObjectStorage()->getAzureBlobStorageClient(),
-                client,
-                /* src_container */ src_blob_path[1],
-                /* src_path */ src_blob_path[0],
-                start_pos,
-                length,
-                connection_params.getContainer(),
-                fs::path(blob_path) / path_in_backup,
-                settings,
-                read_settings,
-                std::optional<ObjectAttributes>(),
-                threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::AZURE_BACKUP_WRITER));
-            return; /// copied!
+            /// The Azure-to-Azure copy transfers the whole source blob, so it can be used only when the
+            /// request covers the entire source. `start_pos != 0` is not a sound test, because a prefix
+            /// [0, length) of a bigger file is a range too. `length` counts the bytes actually copied,
+            /// so an encrypted source must be measured with its encrypted size.
+            const size_t source_size
+                = copy_encrypted ? src_disk->getEncryptedFileSize(src_path) : src_disk->getFileSize(src_path);
+
+            if ((start_pos == 0) && (length == source_size))
+            {
+                LOG_TRACE(log, "Copying file {} from disk {} to AzureBlobStorage", src_path, src_disk->getName());
+                copyAzureBlobStorageFile(
+                    src_disk->getObjectStorage()->getAzureBlobStorageClient(),
+                    client,
+                    /* src_container */ src_blob_path[1],
+                    /* src_path */ src_blob_path[0],
+                    length,
+                    connection_params.getContainer(),
+                    fs::path(blob_path) / path_in_backup,
+                    settings,
+                    read_settings,
+                    std::optional<ObjectAttributes>(),
+                    threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::AZURE_BACKUP_WRITER));
+                return; /// copied!
+            }
+
+            LOG_TRACE(
+                log,
+                "Copying the range [{}, {}) of file {} of size {} from disk {} through buffers: "
+                "an Azure-to-Azure copy cannot copy a part of a blob",
+                start_pos, start_pos + length, src_path, source_size, src_disk->getName());
         }
     }
 
@@ -201,7 +235,6 @@ void BackupWriterAzureBlobStorage::copyFile(const String & destination, const St
        client,
        connection_params.getContainer(),
        fs::path(blob_path)/ source,
-       0,
        size,
        /* dest_container */ connection_params.getContainer(),
        /* dest_path */ fs::path(blob_path) / destination,

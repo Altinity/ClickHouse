@@ -132,12 +132,9 @@ RefCkpt decodeRefCkpt(std::string_view data)
     expectHeaderLine(in, FormatId::RefCkpt);
     const String body = readLine(in, traitsFor(FormatId::RefCkpt).line_cap, "cas_ref_ckpt");
     ReadBufferFromMemory body_in(body.data(), body.size());
-    /// STRICT: an unknown ordinary key is `CORRUPTED_DATA` and a `!`-prefixed one is
-    /// `UNKNOWN_FORMAT_VERSION`. `_ckpt` is a control object whose every field changes what cleanup is
-    /// allowed to delete, so a reader that silently ignored a key it did not understand would be
-    /// deciding deletions from a body it only partially read. Duplicate keys are rejected by
-    /// `JsonObjectReader` itself.
-    JsonObjectReader r(body_in, KeyStrictness::Strict, "cas_ref_ckpt");
+    /// A field that changes what cleanup may delete is written `!`-prefixed, so an old reader fails
+    /// instead of half-reading.
+    JsonObjectReader r(body_in, "cas_ref_ckpt");
 
     RefCkpt ckpt;
     std::optional<uint64_t> snapshot_epoch;
