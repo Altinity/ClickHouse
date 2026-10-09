@@ -256,10 +256,10 @@ struct PoolConfig
     /// boot clock (`Pool::bootMs`); injected by tests to drive the fence deadline deterministically.
     std::function<uint64_t()> boot_ms_fn = {};
 
-    /// The inter-attempt sleep for the mount, farewell and GC request planes (`mount_requests`,
+    /// The inter-attempt sleep for the request planes (`mount_requests`, `lease_requests`,
     /// `farewell_requests`, `gc_requests`), installed at their CONSTRUCTION -- before this `Pool` has
     /// claimed or read anything. Empty = each plane's own production default (an interruptible real
-    /// sleep for the mount and GC planes, `CasRequests`'s own real sleep for the farewell plane). A test
+    /// sleep for the mount, lease and GC planes, `CasRequests`'s own real sleep for the farewell plane). A test
     /// that also freezes `boot_ms_fn` must supply a matching sleep here: a retry loop bound to a clock
     /// that only moves when this function is called would otherwise retry forever against a REAL sleep
     /// that never calls it, because the deadline it measures against never appears to elapse.
@@ -531,18 +531,21 @@ public:
     /// truth-absent on removes/enumeration — is `checkOpAdmitted`; this covers only the terminal states.
     void throwIfLifecycleTerminal() const;
 
-    /// A non-gated, I/O-free lifecycle snapshot for `system.cas_mounts` (spec §7,
-    /// Factory class). Reads only the runtime's atomics — NO backend op — so it is truthful in EVERY
-    /// state, including the terminal ones the store()-class surface refuses. `detail` is the same [D5]
-    /// reason text `throwIfLifecycleTerminal` throws (empty while `Live`/`TransientNotLive`), which spec §1
-    /// requires appear verbatim in the snapshot; `since` is the wall-clock second the current non-`Live`
-    /// state was entered (0 while `Live`). The metadata-storage layer maps `lifecycle` to the operator
-    /// vocabulary and derives the enum-clean sub-state word separately (see `CasLifecycleSnapshot`).
+    /// A non-gated, I/O-free lifecycle snapshot for `system.cas_mounts`. Reads only the runtime's
+    /// atomics, no backend op, so it is truthful in every state, including the terminal ones the
+    /// store()-class surface refuses. `detail` is the same reason text `throwIfLifecycleTerminal` throws
+    /// (empty while `Live`/`TransientNotLive` unless `lease_expired`), verbatim; `since` is the
+    /// wall-clock second the current non-`Live` state was entered (0 while `Live` unless `lease_expired`).
+    /// The metadata-storage layer maps `lifecycle` to the operator vocabulary and derives the enum-clean
+    /// sub-state word separately (see `CasLifecycleSnapshot`).
     struct LifecycleSnapshot
     {
         PoolLifecycle lifecycle = PoolLifecycle::Live;
         String detail;
         time_t since = 0;
+        /// The lifecycle is `Live` but this server's lease expired and no renewal has restored it yet.
+        /// `detail` is then the last failed renewal request and `since` the expired deadline.
+        bool lease_expired = false;
     };
     LifecycleSnapshot lifecycleSnapshot() const;
 
@@ -754,7 +757,7 @@ public:
     const PoolMeta & poolMeta() const { return meta; }
     const Layout & layout() const { return pool_layout; }
 
-    /// ---- the three request planes ----
+    /// ---- request planes ----
     /// The mount plane: the durable writes whose right to land IS this node's mount lease. An
     /// operation admitted here is refused the moment the fence trips, is re-armed under a fresh lease
     /// incarnation, or runs out of room before the lease expires.
@@ -1072,10 +1075,10 @@ public:
         ref_ledger.setSnapshotBeforeCkptCasHookForTest(std::move(hook));
     }
 
-    /// Test-only: replace the inter-attempt backoff sleep (e.g. with a clock-advancing no-op) on all
-    /// three request planes and on ref-table recovery, for tests that drive a persistent write fault to
+    /// Test-only: replace the inter-attempt backoff sleep (e.g. with a clock-advancing no-op) on every
+    /// request plane and on ref-table recovery, for tests that drive a persistent write fault to
     /// exhaustion through a fully wired Pool/disk and must not serve the production sleeps for real.
-    /// Call before driving traffic. On the three request planes an empty function restores each plane's
+    /// Call before driving traffic. On the request planes an empty function restores each plane's
     /// own default, the mount plane's interruptible sleep included.
     ///
     /// It does NOT bound a reissue the engine refuses to start: the engine's inter-attempt backoff is
@@ -1084,7 +1087,7 @@ public:
     /// clock, not the sleep.
     void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
 
-    /// Test-only: replace the request engine's clock on all three planes. A test driving a PERSISTENT
+    /// Test-only: replace the request engine's clock on every plane. A test driving a PERSISTENT
     /// transient fault must run the retry window on a clock it advances; the sleep seam alone cannot
     /// bound it, because a read the engine keeps reissuing is bounded by the policy deadline and the
     /// deadline is read from this clock.
@@ -1172,9 +1175,9 @@ private:
         return std::forward<Mutation>(mutation)();
     }
 
-    /// The mount plane's inter-attempt sleep: interruptible, so a parked or stopping renewal is not
-    /// held for a whole capped backoff. Named rather than inlined because the test seam has to be able
-    /// to put it back.
+    /// The mount plane's inter-attempt sleep: woken only by a stop of the workers, so a stopping renewal
+    /// is not held for a whole capped backoff. A park or a remount request does not wake it; the wait
+    /// runs out. Named rather than inlined because the test seam has to be able to put it back.
     std::function<void(uint64_t)> mountPlaneSleepFn()
     {
         return [this](uint64_t ms) { mount_runtime.sleepInterruptibly(ms); };
@@ -1198,17 +1201,20 @@ private:
     PoolConfig config;
     PoolMeta meta;
 
-    /// The pool's write lane for keys several of its writers share, declared before the three planes
+    /// The pool's write lane for keys several of its writers share, declared before the planes
     /// that carry a pointer to it, so it outlives every operation they admit. `mutable` for the same
     /// reason the planes are.
     mutable CasHotKeys hot_keys;
 
-    /// The three planes' engines, declared before every component that is handed one and after the
+    /// The planes' engines, declared before every component that is handed one and after the
     /// config they take their clock from. `mutable` because issuing a request is not a change to the
     /// pool: a `const` observer still has to read the store.
     mutable CasRequests mount_requests;
     mutable CasRequests farewell_requests;
     mutable CasRequests gc_requests;
+    /// The worker renewal's plane: no lease budget, because the renewal keeps trying after the lease
+    /// expired; a stop, a park or a terminal lifecycle ends it through its liveness.
+    mutable CasRequests lease_requests;
 
     std::shared_ptr<DetachedRegistryState> detached_work = std::make_shared<DetachedRegistryState>();
 

@@ -61,6 +61,25 @@ struct MountRenewResult
     std::exception_ptr failure;
 };
 
+/// How far a renewal may retry.
+enum class MountRenewPolicy : uint8_t
+{
+    LeaseBound,        /// startup, remount and direct renewals: `Retry::untilLeaseSafe`
+    UntilDefinitive,   /// the background worker: `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`
+};
+
+/// The spacing of an `UntilDefinitive` renewal's retries.
+inline constexpr uint64_t kMountRenewRetrySpacingMs = 1000;
+
+/// One physical request of a renewal, reported as it happens: a `PUT` sent (`failed` false), a `PUT`
+/// that failed, or a failed read that settles a `PUT` (both `failed` true).
+struct MountRenewRequestEvent
+{
+    uint32_t request_no = 0;        /// 1-based count of `PUT`s sent by this renewal
+    bool failed = false;
+    String failure_text;            /// empty unless `failed`
+};
+
 struct MountRenewOperationEnvironment
 {
     std::function<uint64_t()> boot_ms;
@@ -71,6 +90,10 @@ struct MountRenewOperationEnvironment
     /// `NotAttempted` rather than terminal only when this node had already been asked to stop --
     /// sampling it afterwards would read a flag that the refusal itself may have set.
     std::function<bool()> cancelled;
+    MountRenewPolicy policy = MountRenewPolicy::LeaseBound;
+    /// Called on the renewing thread for each `PUT` sent, each failed `PUT` and each failed resolve read.
+    /// May be empty. What it throws is ignored.
+    std::function<void(const MountRenewRequestEvent &)> on_request;
 };
 
 /// Validate a `server_root_id` — the explicit, configured identity of the content-addressed layout
@@ -344,21 +367,25 @@ MountClaimResult claimMountAwaitingExpiry(
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {},
     const CasEventSink & sink = {});
 
-/// One `server_root_id`'s cross-round incarnation-stability observation,
-/// owned by the GC leader instance (`Cas::Gc::mount_obs`) and threaded through consecutive
-/// `computeHeartbeatFloor` calls — one GC round is one observation tick. Mirrors
-/// `claimMountAwaitingExpiry`'s observation loop, but at heartbeat-gate granularity rather than a
-/// tight poll loop.
-struct MountIncarnationObservation
+/// One observed token and the instant it was first seen, on the observer's own monotonic clock.
+struct TokenWatch
 {
-    Etag etag;
+    Etag token;
     uint64_t first_seen_mono_ms = 0;
+
+    /// `sample_after_read_ms` is a clock sample taken after the read that returned `token_`. An earlier
+    /// sample would count the time the read took as time watched.
+    static TokenWatch sighted(Etag token_, uint64_t sample_after_read_ms);
+
+    /// True when the token has been watched for at least `threshold_ms`. `sample_before_read_ms` is a
+    /// clock sample taken before the read that confirmed the token; false when it precedes the sighting.
+    bool stableFor(uint64_t threshold_ms, uint64_t sample_before_read_ms) const;
 };
 
 /// Keyed by `server_root_id`. In-memory only: a fresh leader (after a steal, or a process restart)
 /// starts with an empty map, which only delays fencing an already-dead mount by one extra round while
 /// it (re)establishes the observation — safe (never fences early), never unsafe.
-using MountObservationMap = std::map<String, MountIncarnationObservation>;
+using MountObservationMap = std::map<String, TokenWatch>;
 
 /// GC heartbeat gate (GC round protocol step 1). Run by the GC leader at the top of a round: LIST
 /// `gc/server-roots/` (O(servers), single-digit counts), GET each mount body, and classify + fence out
@@ -371,8 +398,7 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 ///     terminated marker;
 ///   - otherwise, observation-based liveness (the same
 ///     principle `claimMountAwaitingExpiry` uses for a mount's OWN reopen, applied here to the GC's
-///     fence-out): `obs` remembers, per srid, the incarnation last seen and the leader's OWN
-///     monotonic clock reading (`mono_now_ms`) at the moment it first saw it. A body whose
+///     fence-out): `obs` holds, per srid, a `TokenWatch` of the incarnation last seen. A body whose
 ///     CURRENT incarnation differs from (or is absent from) `obs` is (re)started fresh — counted `live`,
 ///     never fenced this call, regardless of what its stamped `expires_at_ms` claims (a bare
 ///     wall-clock stamp is never trusted — see `claimMount`'s "certificate of death" doc). Only once
@@ -386,8 +412,9 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 ///
 /// `now_ms` is WALL clock, used only for the audit/diagnostic log line — it never participates in the
 /// fence decision (mirrors `claimMountAwaitingExpiry`'s `now_ms_fn` vs `mono_ms_fn` split).
-/// `mono_now_ms` is the OBSERVATION clock: the caller's OWN monotonic reading, never compared against
-/// any other node's clock. `obs` is owned by the caller and threaded across consecutive calls (one GC
+/// `mono_ms_fn` is the OBSERVATION clock: the caller's OWN monotonic clock, never compared against
+/// any other node's clock. It is sampled once at entry for the stability test and again after the read
+/// for every sighting. `obs` is owned by the caller and threaded across consecutive calls (one GC
 /// leader instance, `Cas::Gc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
 /// fencing one round, never fences early).
 ///
@@ -407,7 +434,7 @@ struct HeartbeatFloor
 };
 
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
-                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
+                                     const std::function<uint64_t()> & mono_ms_fn, uint64_t stable_threshold_ms,
                                      MountObservationMap & obs);
 
 /// One `gc/server-roots/<srid>/mount` slot whose holder is not provably finished with the prefix.
@@ -522,17 +549,20 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 ///   - foreign uuid → fail closed;
 ///   - absent → `create`; expired-our-uuid (any epoch) → `replace` reclaim.
 ///
-/// PLANES. Only the RENEWAL is admitted under the mount fence, because only a renewal writes under
-/// authority the fence is tracking. The claim and the farewell are admitted off it: a self-remount
-/// claims with the fence already latched lost, so a claim gated on the fence could never reclaim, and
-/// a farewell refused because the fence has run down would leave the slot looking live until GC
-/// fences it out. Neither is unguarded: a claim's safety is its own conditional write, and a caller
-/// that has shutdown facts hands them over as a `Liveness`.
+/// PLANES. A bounded renewal is admitted under the mount fence, because it writes under the authority
+/// the fence tracks. The worker's renewal (`UntilDefinitive`) runs on a plane with no lease budget: it
+/// keeps trying after the lease expired, and a stop, a park or a terminal lifecycle reaches it through
+/// its liveness. The claim and the farewell are admitted off the fence: a self-remount claims with the
+/// fence already latched lost, so a claim gated on the fence could never reclaim, and a farewell
+/// refused because the fence has run down would leave the slot looking live until GC fences it out.
+/// Neither is unguarded: a claim's safety is its own conditional write, and a caller that has shutdown
+/// facts hands them over as a `Liveness`.
 class MountLeaseRenewer
 {
 public:
     MountLeaseRenewer(
-        CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
+        CasRequests & mount_requests_, CasRequests & open_requests_, CasRequests & worker_requests_,
+        const Layout & layout_,
         const String & srid_, UInt128 server_uuid_,
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
         std::function<uint64_t()> min_active_build_sequence_fn_,
@@ -545,7 +575,9 @@ public:
     /// Adopt the already-claimed mount. Returns the exact pre-I/O BOOTTIME anchor. `liveness` carries
     /// the caller's shutdown terms; the mount fence is deliberately not consulted here.
     uint64_t start(Liveness liveness = {});
-    /// The steady-state renewal, admitted under the mount fence.
+    /// The steady-state renewal. `LeaseBound` runs under the mount fence with `Retry::untilLeaseSafe`;
+    /// `UntilDefinitive` runs on the worker plane with `Retry::untilDefinitive(kMountRenewRetrySpacingMs)`
+    /// and ends on a definitive answer, a deterministic local failure, or when `environment.live` refuses.
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
     /// The remount's re-anchor, which is bootstrap control rather than steady state: a remount renews
     /// BEFORE it arms the fence for the new incarnation, so the fence is still latched lost and an
@@ -573,6 +605,8 @@ private:
 
     CasRequests & mount_requests;
     CasRequests & open_requests;
+    /// The plane of an `UntilDefinitive` renewal: no lease budget, and a sleep a stop wakes.
+    CasRequests & worker_requests;
     String key;
 
     String srid;

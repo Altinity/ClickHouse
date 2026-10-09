@@ -7,6 +7,7 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -234,4 +235,36 @@ TEST(CASLifecycleSnapshot, NaturalIdentityLostMatchesThrowDetail)
     EXPECT_NE(thrown.find(snap.detail), std::string::npos)
         << "snapshot detail and the typed error must not drift\n  detail: " << snap.detail
         << "\n  thrown: " << thrown;
+}
+
+/// An expired lease, while the lifecycle enum stays `Live`: `not_live` / `lease_expired`, `since` is the
+/// deadline as wall time, and a deadline back in the future returns the row to `live`.
+TEST(CASLifecycleSnapshot, ExpiredLeaseIsNotLiveUntilRestored)
+{
+    auto storage = openSnapshotStorage();
+    commitOnePart(*storage);
+    auto pool = storage->store();
+    const auto wall_now_s = []
+    {
+        return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    };
+
+    const int64_t before_s = wall_now_s();
+    pool->setMountDeadline(pool->bootMsNow() - 5'000);
+    const CasLifecycleSnapshot expired = storage->lifecycleSnapshot();
+    const int64_t after_s = wall_now_s();
+
+    EXPECT_EQ(expired.lifecycle, "not_live");
+    EXPECT_EQ(expired.reason, "lease_expired");
+    EXPECT_GE(static_cast<int64_t>(expired.since), before_s - 6) << "the deadline passed about 5 s ago";
+    EXPECT_LE(static_cast<int64_t>(expired.since), after_s - 4);
+    EXPECT_TRUE(expired.detail.empty()) << "no renewal request failed, so there is no failure text: " << expired.detail;
+    EXPECT_EQ(pool->lifecycle(), PoolLifecycle::Live) << "the lifecycle enum is not touched";
+
+    pool->setMountDeadline(pool->bootMsNow() + 60'000);
+    const CasLifecycleSnapshot restored = storage->lifecycleSnapshot();
+    EXPECT_EQ(restored.lifecycle, "live");
+    EXPECT_TRUE(restored.reason.empty()) << restored.reason;
+    EXPECT_EQ(restored.since, 0);
 }

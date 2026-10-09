@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 
 namespace DB::Cas
@@ -105,8 +106,8 @@ struct MountConfig
     std::function<void()> terminal_publication_driver_lock_acquired_hook_for_test = {};
     /// Deterministic failure injection at the vanished-reason preparation boundary.
     std::function<void()> vanished_reason_prepare_hook_for_test = {};
-    /// Test-only override of the renewal's liveness predicate, for exact pre/post-send gate
-    /// interleavings. FALSE ends the renewal exactly as a lost fence does.
+    /// Test-only extra liveness condition, for exact pre/post-send gate interleavings. It is ANDed with
+    /// the ordinary predicate, so a stop still ends the renewal. FALSE ends it exactly as a lost fence does.
     std::function<bool()> renewal_live_for_test = {};
 };
 
@@ -146,10 +147,12 @@ class CasMountRuntime
 public:
     CasMountRuntime(
         BackendPtr backend_ptr_,
-        /// The two planes the `MountLeaseRenewer` runs on: renewals under the mount fence, the farewell
-        /// on an open one. Owned by `Pool` and outliving this runtime.
+        /// The planes the `MountLeaseRenewer` runs on: a bounded renewal under the mount fence, the
+        /// claim and the farewell on an open one, and the worker's renewal on `lease_requests_`, which
+        /// has no lease budget and whose sleep a stop wakes. Owned by `Pool` and outliving this runtime.
         CasRequests & mount_requests_,
         CasRequests & farewell_requests_,
+        CasRequests & lease_requests_,
         const Layout & layout_,
         MountConfig config_,
         String server_root_id_,
@@ -309,6 +312,25 @@ public:
     /// it cannot plausibly finish before the fence expires.
     bool refAppendFenceOk() const;
 
+    /// ---- lease expiry ----
+    /// The instant this server's confirmed lease expired, on the fence clock, while it stays expired:
+    /// the lifecycle is `Live`, the fence is not lost and `bootMsNow` has reached the deadline. A
+    /// renewal that commits with a start more than a TTL ago does not end the expiry, so the first expired
+    /// deadline is kept until a renewal restores the lease. Empty otherwise.
+    std::optional<uint64_t> leaseExpiredSinceBootMs() const;
+    /// Text of the last failed request of the worker's renewal; empty when no request failed since the
+    /// last renewal that left the lease unexpired.
+    String lastRenewFailure() const;
+    /// The condition text for a request admitted under `admitted_generation` that is refused only
+    /// because the lease expired; empty when the refusal has any other cause or there is none.
+    std::optional<String> leaseExpiredRefusal(uint64_t admitted_generation) const;
+    /// Counts each `PUT` of the worker's renewal as it is sent and keeps the text of every failed
+    /// `PUT` or resolve read. Runs on the renewing thread.
+    void noteRenewRequest(const MountRenewRequestEvent & event) noexcept;
+
+    /// Writes one `WARNING` per lease expiry, at the first request event after it. Lease thread only.
+    void warnOnceIfLeaseExpired(const MountRenewRequestEvent & event) noexcept;
+
     /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
     /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
     /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
@@ -322,10 +344,11 @@ public:
             || lifecycle() == PoolLifecycle::IdentityLost;
     }
 
-    /// The inter-attempt sleep the mount plane runs on. A plain sleep would hold a parked or stopping
-    /// renewal for the whole capped backoff; this one wakes on the same stop signal the workers watch.
-    /// It shortens a stop, not a fence loss: the fence cannot see a stop request, so a woken operation
-    /// still reissues unless its own liveness predicate refuses.
+    /// The inter-attempt sleep the mount plane runs on. A plain sleep would hold a stopping renewal
+    /// for the whole capped backoff; this one wakes on the same stop signal the workers watch.
+    /// A park or a remount request does not wake it: the wait runs out, at most one spacing draw for
+    /// the background renewal. It shortens a stop, not a fence loss: the fence cannot see a stop request,
+    /// so a woken operation still reissues unless its own liveness predicate refuses.
     void sleepInterruptibly(uint64_t ms);
 
     /// The mount fence's admission verdict, as `Fence::admit` expects it: may a request admitted under
@@ -434,9 +457,14 @@ private:
     uint64_t renewRenewerOnce(
         AdmittedRenewerCall call,
         RenewalDriverState active,
-        bool propagate_failure,
-        bool worker_call);
+        bool propagate_failure);
     MountRenewOperationEnvironment renewalEnvironment(bool worker_call);
+    std::optional<uint64_t> leaseExpiredAt(uint64_t now_boot_ms) const;
+    /// Publishes a committed renewal's deadline. A deadline in the future ends the current run of
+    /// trouble: it clears the failure text and, when the lease was expired, counts and logs the
+    /// restore. Returns how long the lease had been expired when this deadline restores it; empty
+    /// when it was not expired or is still expired.
+    std::optional<uint64_t> publishRenewedDeadline(uint64_t deadline_boot_ms);
     void consumeRenewResult(
         const MountRenewResult & result,
         RenewalDriverState active_state,
@@ -445,8 +473,9 @@ private:
     void renewalLoop();
     void remountLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);
-    /// The renewal's liveness: facts the mount fence cannot see -- a shutdown request, a parked or
-    /// park-requested driver, a pool that left `Live`. FALSE ends the renewal.
+    /// The renewal's liveness: a shutdown request and, for the worker, a parked or park-requested
+    /// driver, a pool that left `Live`, or a lost fence -- the worker's plane has no fence of its own.
+    /// FALSE ends the renewal.
     bool renewalLive(bool worker_call) const;
     /// Whether this node has already been asked to stop. Sampled ONCE, before the write, so a refusal
     /// caused by the stop cannot be mistaken for one that preceded it.
@@ -458,6 +487,7 @@ private:
     BackendPtr backend_ptr;
     CasRequests & mount_requests;
     CasRequests & farewell_requests;
+    CasRequests & lease_requests;
     const Layout & layout;
     MountConfig config;
     String server_root_id;
@@ -520,6 +550,14 @@ private:
     /// `fenceGeneration`/`checkFenceOrThrow`.
     std::atomic<uint64_t> fence_generation{0};
     std::function<void()> arm_mount_fence_interposition_hook_for_test;
+    /// The first expired deadline of an expiry that a renewal committed past did not end. `UINT64_MAX`
+    /// when there is none. Written by the renewal consumer and by `armMountFence`.
+    std::atomic<uint64_t> lease_expired_at_boot_ms{std::numeric_limits<uint64_t>::max()};
+    mutable std::mutex renew_failure_mutex;
+    String last_renew_failure;
+    /// The expiry instant `warnOnceIfLeaseExpired` last wrote a line for. A renewal that commits past
+    /// its own deadline keeps the instant, so the same expiry is not reported twice.
+    std::atomic<uint64_t> lease_expiry_warned_at_boot_ms{std::numeric_limits<uint64_t>::max()};
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
     /// (`noteLeaseLost`/`noteRemounted`) are lock-free compare-exchanges guarded by their exact

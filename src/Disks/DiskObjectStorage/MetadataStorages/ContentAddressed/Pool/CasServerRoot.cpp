@@ -8,6 +8,7 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
+#include <Poco/Exception.h>
 #include <Core/UUID.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
@@ -45,7 +46,7 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-void reportMountRenewCompletion(const MountRenewResult & result) noexcept;
+void reportMountRenewCompletion(const MountRenewResult & result, std::optional<uint64_t> expired_ms) noexcept;
 void configureMountRenewObservability(
     const String * server_root_id, const CasEventSink * event_sink, bool deferred) noexcept;
 void deliverDeferredMountRenewObservability(uint64_t remount_attempt_no) noexcept;
@@ -131,6 +132,8 @@ struct MountRenewObservabilityContext
     MountRenewTerminalClassification terminal_classification = MountRenewTerminalClassification::Unclassified;
     uint32_t attempts_sent = 0;
     bool resolved_by_read = false;
+    /// How long the lease had been expired when this renewal restored it; empty unless it did.
+    std::optional<uint64_t> expired_ms = std::nullopt;
 };
 
 static_assert(std::is_trivially_copyable_v<MountRenewObservabilityContext>);
@@ -293,9 +296,12 @@ void emitMountRenewEvent(
         CasEvent event;
         event.type = CasEventType::WatermarkRenew;
         event.outcome = String{outcome};
-        event.reason = outcome == "recovered"
-            ? "CAS mount renewal recovered before its confirmed lease-safety deadline"
-            : "CAS mount renewal ended without retained authority and fenced the mount";
+        if (outcome != "recovered")
+            event.reason = "CAS mount renewal ended without retained authority and fenced the mount";
+        else if (context.expired_ms)
+            event.reason = "CAS mount renewal restored a lease that had expired";
+        else
+            event.reason = "CAS mount renewal committed after a retry or a resolving read";
         event.detail = {
             {"server_root_id", *context.server_root_id},
             {"writer_epoch", std::to_string(context.writer_epoch)},
@@ -308,6 +314,8 @@ void emitMountRenewEvent(
         };
         if (remount_attempt_no != 0)
             event.detail["remount_attempt_no"] = std::to_string(remount_attempt_no);
+        if (context.expired_ms)
+            event.detail["expired_ms"] = std::to_string(*context.expired_ms);
         (*context.event_sink)(std::move(event));
     }
     catch (...)
@@ -344,30 +352,15 @@ void deliverMountRenewObservability(
         const uint64_t now_boot_ms = defaultBootMs();
         const String write_attempt_id = u128ToHex(context.write_attempt_id).substr(0, 12);
 
-        for (uint32_t attempt_no = 2; attempt_no <= context.attempts_sent; ++attempt_no)
-        {
-            try
-            {
-                LOG_DEBUG(
-                    getLogger("CasMountLeaseRenewer"),
-                    "CAS mount renewal '{}' physical retry attempt {} (writer_epoch={}, seq={})",
-                    *context.server_root_id,
-                    attempt_no,
-                    context.writer_epoch,
-                    context.seq);
-            }
-            catch (...)
-            {
-            }
-        }
-
         const bool recovered = context.outcome == MountRenewOutcome::Committed
-            && (context.attempts_sent > 1 || context.resolved_by_read);
+            && (context.attempts_sent > 1 || context.resolved_by_read || context.expired_ms.has_value());
         if (recovered)
         {
-            const std::string_view classification = context.resolved_by_read
-                ? "committed_by_read"
-                : "committed_after_retry";
+            std::string_view classification = "committed_after_expiry";
+            if (context.resolved_by_read)
+                classification = "committed_by_read";
+            else if (context.attempts_sent > 1)
+                classification = "committed_after_retry";
             emitMountRenewEvent(
                 context,
                 write_attempt_id,
@@ -463,7 +456,7 @@ void configureMountRenewObservability(
     };
 }
 
-void reportMountRenewCompletion(const MountRenewResult & result) noexcept
+void reportMountRenewCompletion(const MountRenewResult & result, std::optional<uint64_t> expired_ms) noexcept
 {
     if (mount_renew_observability.suppressed_depth != 0)
     {
@@ -477,6 +470,7 @@ void reportMountRenewCompletion(const MountRenewResult & result) noexcept
     context->outcome = result.outcome;
     context->attempts_sent = std::max(context->attempts_sent, result.attempts_sent);
     context->resolved_by_read = result.resolved_by_read;
+    context->expired_ms = expired_ms;
     if (context->deferred)
         return;
 
@@ -932,6 +926,16 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
         srid, identity, srid, srid);
 }
 
+TokenWatch TokenWatch::sighted(Etag token_, uint64_t sample_after_read_ms)
+{
+    return TokenWatch{.token = std::move(token_), .first_seen_mono_ms = sample_after_read_ms};
+}
+
+bool TokenWatch::stableFor(uint64_t threshold_ms, uint64_t sample_before_read_ms) const
+{
+    return sample_before_read_ms >= first_seen_mono_ms && sample_before_read_ms - first_seen_mono_ms >= threshold_ms;
+}
+
 uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms)
 {
     return ttl_ms + ttl_ms / 20 + cadence_ms;
@@ -957,15 +961,15 @@ MountClaimResult claimMountAwaitingExpiry(
     /// threshold, which passes the full renewal period into the same shared helper.
     const uint64_t threshold_ms = mountObservationThresholdMs(ttl_ms, poll);
 
-    std::optional<Etag> observed;
-    uint64_t observed_since = 0;
+    std::optional<TokenWatch> watch;
     size_t restarts = 0;
 
     while (true)
     {
-        const bool threshold_met = observed && mono_ms_fn() - observed_since >= threshold_ms;
+        const bool threshold_met = watch && watch->stableFor(threshold_ms, mono_ms_fn());
         MountClaimResult r = claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms,
-            threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{});
+            threshold_met ? std::optional<Etag>(watch->token) : std::nullopt, sink,
+            /*unsafe_reclaim_authorization=*/{});
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
 
@@ -997,14 +1001,13 @@ MountClaimResult claimMountAwaitingExpiry(
             r.body = decodeMountLease(got->bytes);
         }
 
-        if (!observed || *observed != *current_etag)
+        if (!watch || watch->token != *current_etag)
         {
-            if (observed && ++restarts > kMaxObservationRestarts)
+            if (watch && ++restarts > kMaxObservationRestarts)
                 /// The incarnation kept changing across bounded restarts — the holder is genuinely alive
                 /// (actively renewing), not a dead predecessor. Report it rather than waiting forever.
                 return r;
-            observed = *current_etag;
-            observed_since = mono_ms_fn();
+            watch = TokenWatch::sighted(*current_etag, mono_ms_fn());
             if (on_wait_start && r.body)
                 on_wait_start(*r.body, threshold_ms);
             LOG_INFO(getLogger("CasMountLease"),
@@ -1018,10 +1021,12 @@ MountClaimResult claimMountAwaitingExpiry(
 }
 
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
-                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
+                                     const std::function<uint64_t()> & mono_ms_fn, uint64_t stable_threshold_ms,
                                      MountObservationMap & obs)
 {
     HeartbeatFloor floor;
+    /// Taken before any read, so it may confirm that a token held, but never date a sighting.
+    const uint64_t round_start_ms = mono_ms_fn();
 
     /// `obs` is keyed by every srid this leader has EVER observed, but a
     /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CAS
@@ -1082,13 +1087,12 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// raced against our own fence-out attempt) — (re)starts the observation window and
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
-                const bool stable = it != obs.end() && it->second.etag == observed->etag
-                    && mono_now_ms - it->second.first_seen_mono_ms >= stable_threshold_ms;
-
-                if (!stable)
+                const bool watched = it != obs.end() && it->second.token == observed->etag;
+                if (!watched || !it->second.stableFor(stable_threshold_ms, round_start_ms))
                 {
-                    if (it == obs.end() || it->second.etag != observed->etag)
-                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_now_ms});
+                    /// A sample from before this read would count the walk to the slot as time watched.
+                    if (!watched)
+                        obs.insert_or_assign(srid, TokenWatch::sighted(observed->etag, mono_ms_fn()));
                     ++floor.live;
                     return std::nullopt;
                 }
@@ -1305,8 +1309,23 @@ constexpr uint64_t kFarewellBudgetMs = 10'000;
 /// "admission-time arithmetic needs room to actually run, not just to pass at t=0".
 constexpr uint64_t kFarewellSlackMs = 2'000;
 
+namespace
+{
+/// The text of a failed request as an operator should read it: a `DB::Exception`'s message, a Poco
+/// exception's display text (its `what` is only the class name), any other exception's `what`.
+String describeRequestFailure(const std::exception & failure)
+{
+    if (const auto * db_failure = dynamic_cast<const Exception *>(&failure))
+        return db_failure->message();
+    if (const auto * poco_failure = dynamic_cast<const Poco::Exception *>(&failure))
+        return poco_failure->displayText();
+    return failure.what();
+}
+}
+
 MountLeaseRenewer::MountLeaseRenewer(
-    CasRequests & mount_requests_, CasRequests & open_requests_, const Layout & layout_,
+    CasRequests & mount_requests_, CasRequests & open_requests_, CasRequests & worker_requests_,
+    const Layout & layout_,
     const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
     std::function<uint64_t()> min_active_build_sequence_fn_,
@@ -1315,6 +1334,7 @@ MountLeaseRenewer::MountLeaseRenewer(
     std::function<uint64_t()> boot_ms_fn_)
     : mount_requests(mount_requests_)
     , open_requests(open_requests_)
+    , worker_requests(worker_requests_)
     , key(layout_.mountKey(srid_))
     , srid(srid_)
     , server_uuid(server_uuid_)
@@ -1560,7 +1580,8 @@ MountRenewResult MountLeaseRenewer::terminalResult(MountRenewResult result)
 
 MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment & environment)
 {
-    return renewOn(mount_requests, environment);
+    return renewOn(
+        environment.policy == MountRenewPolicy::UntilDefinitive ? worker_requests : mount_requests, environment);
 }
 
 MountRenewResult MountLeaseRenewer::renewForRemount(const MountRenewOperationEnvironment & environment)
@@ -1609,11 +1630,22 @@ MountRenewResult MountLeaseRenewer::renewOn(
     result.attempt_start_boot_ms = attempt_start_boot_ms;
 
     CasOperation op = plane.admit(environment.live);
+    if (environment.on_request)
+        op.setRequestObserver([&on_request = environment.on_request](uint32_t attempt_no, const std::exception * failure)
+        {
+            on_request(MountRenewRequestEvent{
+                .request_no = attempt_no,
+                .failed = failure != nullptr,
+                .failure_text = failure ? describeRequestFailure(*failure) : String{},
+            });
+        });
+    const Retry policy = environment.policy == MountRenewPolicy::UntilDefinitive
+        ? Retry::untilDefinitive(kMountRenewRetrySpacingMs)
+        : Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()));
     std::optional<WriteResult> written;
     try
     {
-        written = op.replace(key, body, precondition(),
-            Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count())));
+        written = op.replace(key, body, precondition(), policy);
     }
     catch (...)
     {
@@ -1748,8 +1780,8 @@ void MountLeaseRenewer::terminate(CasOperation & op)
         : doubled_reservation_ms + kFarewellSlackMs;
     const uint64_t farewell_window_ms = std::max<uint64_t>(kFarewellBudgetMs, two_envelope_reservation_plus_slack_ms);
     /// The derived window alone is not enough: mount-control activity must also never run past the
-    /// point this node's own fence may already be gone (the same rule `renew` enforces via
-    /// `Retry::untilLeaseSafe` above). The precondition on this write already stops it from clobbering
+    /// point this node's own fence may already be gone (the rule a bounded renewal enforces with
+    /// `Retry::untilLeaseSafe`). The precondition on this write already stops it from clobbering
     /// a successor if it DOES land late, but a shutdown holding the process open to retry a write past
     /// its own lease-safe deadline serves no one -- the successor's own reclaim does not wait for it.
     /// `confirmed_deadline_boot_ms` is set at `start()` and kept current by every successful `renew`,
