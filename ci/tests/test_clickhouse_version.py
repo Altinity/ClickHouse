@@ -207,6 +207,7 @@ def test_branch_overrides_flavour_and_track(
 ):
     use_version_file(monkeypatch, tmp_path, UPSTREAM_BLOCK_VERSION_FILE)
     monkeypatch.delenv("GITHUB_REF_TYPE", raising=False)
+    monkeypatch.setattr(version_log, "release_tags", lambda *_args: {})
 
     info = FakeInfo()
     info.pr_number = pr_number
@@ -219,45 +220,103 @@ def test_branch_overrides_flavour_and_track(
     assert version.to_dict()["flavour"] == expected.rsplit(".", 1)[-1]
 
 
-def _tag_versions(tweak: int = 10001, flavour: str = "altinitytest") -> dict:
-    return {
-        "major": 26,
-        "minor": 8,
-        "patch": 1,
-        "tweak": tweak,
-        "flavour": flavour,
+# Tags for 26.8.1, keyed by commit SHA. `123` is an old commit-count tweak.
+# `v26.8.2.*` is a different patch and must not count.
+RELEASE_TAGS = {
+    "v26.8.1.10001.altinitystable": "sha-10001",
+    "v26.8.1.10002.altinitystable": "sha-10002",
+    "v26.8.1.20001.altinityantalya": "sha-20001",
+    "v26.8.1.123.altinitystable": "sha-old",
+    "v26.8.2.10007.altinitystable": "sha-other-patch",
+}
+
+
+@pytest.mark.parametrize(
+    "branch,sha,expected",
+    [
+        ("stable-26.8", "head", "26.8.1.10003.altinitytest"),
+        ("antalya-26.8", "head", "26.8.1.20002.antalyatest"),
+        ("fips-26.8", "head", "26.8.1.30001.altinityfipstest"),
+        ("stable-26.8", "sha-10002", "26.8.1.10002.altinitytest"),
+    ],
+)
+def test_branch_tweak_follows_release_tags(
+    monkeypatch, tmp_path, branch, sha, expected
+):
+    use_version_file(monkeypatch, tmp_path, UPSTREAM_BLOCK_VERSION_FILE)
+    monkeypatch.delenv("GITHUB_REF_TYPE", raising=False)
+    monkeypatch.setattr(version_log, "release_tags", lambda *_args: RELEASE_TAGS)
+
+    info = FakeInfo()
+    info.pr_number = 0
+    info.git_branch = branch
+    info.sha = sha
+
+    assert version_log._build_version(info).string == expected
+
+
+def test_release_tags_uses_peeled_commit(monkeypatch):
+    output = "\n".join(
+        [
+            "tagobj\trefs/tags/v26.8.1.10001.altinitystable",
+            "commit1\trefs/tags/v26.8.1.10001.altinitystable^{}",
+            "commit2\trefs/tags/v26.8.1.20001.altinityantalya",
+        ]
+    )
+    monkeypatch.setattr(
+        clickhouse_version.Shell,
+        "get_res_stdout_stderr",
+        lambda *_args, **_kwargs: (0, output, ""),
+    )
+
+    assert clickhouse_version.release_tags(CHVersion(26, 8, 1, 0)) == {
+        "v26.8.1.10001.altinitystable": "commit1",
+        "v26.8.1.20001.altinityantalya": "commit2",
     }
 
 
-@pytest.mark.parametrize(
-    "file_tweak,prerelease,tag_tweak,release",
-    [
-        (10001, "altinitytest", 10001, "altinitystable"),
-        (20001, "antalyatest", 20001, "altinityantalya"),
-        (30001, "altinityfipstest", 30001, "altinityfips"),
-        (20001, "altinityantalya", 20001, "altinityantalya"),
-        (10001, "altinitytest", 20001, "altinityantalya"),
-        (20001, "antalyatest", 10001, "altinitystable"),
-    ],
-)
-def test_check_tag_version_accepts_matching_counter(
-    file_tweak, prerelease, tag_tweak, release
-):
-    check_tag_against_versions(
-        f"v26.8.1.{tag_tweak}.{release}", _tag_versions(file_tweak, prerelease)
-    )
+def test_release_tags_raises_after_retries(monkeypatch):
+    calls = []
+
+    def failing(*_args, **_kwargs):
+        calls.append(1)
+        return 128, "", "network down"
+
+    monkeypatch.setattr(clickhouse_version.Shell, "get_res_stdout_stderr", failing)
+    monkeypatch.setattr(clickhouse_version.time, "sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError):
+        clickhouse_version.release_tags(CHVersion(26, 8, 1, 0))
+    assert len(calls) == 3
+
+
+TAG_VERSIONS = {"major": 26, "minor": 8, "patch": 1}
 
 
 @pytest.mark.parametrize(
-    "tweak,flavour,tag",
+    "tag,sha",
     [
-        (10001, "altinitytest", "v26.8.1.10001.altinityantalya"),
-        (10001, "altinitytest", "v26.8.1.10002.altinitystable"),
-        (10001, "altinitytest", "v26.8.1.10001.altinitytest"),
-        (10001, "altinitytest", "v26.8.1.1-lts"),
-        (20001, "antalyatest", "v26.8.1.20001.antalyatest"),
+        ("v26.8.1.10003.altinitystable", "head"),
+        ("v26.8.1.20002.altinityantalya", "head"),
+        ("v26.8.1.30001.altinityfips", "head"),
+        ("v26.8.1.10002.altinitystable", "sha-10002"),
     ],
 )
-def test_check_tag_version_rejects_mismatched_tag(tweak, flavour, tag):
+def test_check_tag_version_accepts_next_release(tag, sha):
+    check_tag_against_versions(tag, TAG_VERSIONS, RELEASE_TAGS, sha)
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        "v26.8.1.10002.altinitystable",
+        "v26.8.1.10004.altinitystable",
+        "v26.8.1.10003.altinityantalya",
+        "v26.8.1.10003.altinitytest",
+        "v26.8.1.1-lts",
+        "v26.8.2.10001.altinitystable",
+    ],
+)
+def test_check_tag_version_rejects_wrong_tag(tag):
     with pytest.raises(ValueError):
-        check_tag_against_versions(tag, _tag_versions(tweak, flavour))
+        check_tag_against_versions(tag, TAG_VERSIONS, RELEASE_TAGS, "head")

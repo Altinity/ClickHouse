@@ -298,13 +298,6 @@ def read_versions(versions_path: Union[Path, str] = FILE_WITH_VERSION_PATH) -> V
     return versions
 
 
-# Pre-release flavour (VERSION_FLAVOUR) → release flavour (tag)
-ALTINITY_RELEASE_BY_PRERELEASE = {
-    "altinitytest": "altinitystable",
-    "antalyatest": "altinityantalya",
-    "altinityfipstest": "altinityfips",
-}
-
 ALTINITY_TRACK_BY_FLAVOUR = {
     "altinitystable": 1,
     "altinityantalya": 2,
@@ -312,10 +305,16 @@ ALTINITY_TRACK_BY_FLAVOUR = {
 }
 
 
-def check_tag_against_versions(tag: str, versions: VERSIONS) -> None:
+def check_tag_against_versions(
+    tag: str, versions: VERSIONS, tags: Dict[str, str], sha: str
+) -> None:
     # NOTE (strtgbb): Altinity tags are v<major>.<minor>.<patch>.<tweak>.<flavour>.
-    # Flavour and the tweak's track digit come from the tag; the file supplies
-    # major/minor/patch and the release counter (tweak % 10000) only.
+    # The tweak must be the next unused number on the tag's track. Tags already
+    # on this commit are skipped.
+    # NOTE (strtgbb): import here so this file still loads from tests/ci
+    # without `ci.*` on PYTHONPATH.
+    from ci.jobs.scripts.clickhouse_version import CHVersion, next_release_tweak
+
     expected_prefix = (
         f"v{versions['major']}.{versions['minor']}.{versions['patch']}."
     )
@@ -341,18 +340,31 @@ def check_tag_against_versions(tag: str, versions: VERSIONS) -> None:
             f"Tag [{tag}] tweak [{tag_tweak}] does not match the "
             f"{track}xxxx track for flavour [{tag_flavour}]"
         )
-    file_tweak = int(versions["tweak"])
-    if tag_tweak % 10000 != file_tweak % 10000:
+    expected_tweak = next_release_tweak(
+        tags,
+        CHVersion(versions["major"], versions["minor"], versions["patch"], 0),
+        track,
+        sha,
+    )
+    if tag_tweak != expected_tweak:
         raise ValueError(
-            f"Tag [{tag}] counter [{tag_tweak % 10000}] does not match "
-            f"VERSION_TWEAK [{file_tweak}] counter [{file_tweak % 10000}]"
+            f"Tag [{tag}] tweak [{tag_tweak}] is not the next release on the "
+            f"{track}xxxx track (expected [{expected_tweak}])"
         )
 
 
 def check_tag_version(
     tag: str, versions_path: Union[Path, str] = FILE_WITH_VERSION_PATH
 ) -> None:
-    check_tag_against_versions(tag, read_versions(versions_path))
+    # NOTE (strtgbb): import here so this file still loads from tests/ci
+    # without `ci.*` on PYTHONPATH.
+    from ci.jobs.scripts.clickhouse_version import CHVersion, release_tags
+
+    versions = read_versions(versions_path)
+    tags = release_tags(
+        CHVersion(versions["major"], versions["minor"], versions["patch"], 0)
+    )
+    check_tag_against_versions(tag, versions, tags, os.getenv("GITHUB_SHA", ""))
     print(f"Tag [{tag}] matches {versions_path}")
 
 

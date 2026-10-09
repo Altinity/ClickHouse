@@ -6,24 +6,19 @@ from praktika.runtime import RunConfig
 from praktika.utils import Shell
 
 from ci.jobs.scripts.cidb_cluster import CIDBCluster
-from ci.jobs.scripts.clickhouse_version import CHVersion
-
-
-# NOTE (strtgbb): release flavour → tweak track. Pre-release flavours pair as
-# altinitytest/altinitystable, antalyatest/altinityantalya, altinityfipstest/altinityfips.
-_TRACK_BY_RELEASE_FLAVOUR = {
-    "altinitystable": 1,
-    "altinityantalya": 2,
-    "altinityfips": 3,
-}
+from ci.jobs.scripts.clickhouse_version import (
+    CHVersion,
+    next_release_tweak,
+    release_tags,
+)
 
 
 def _track_from_branch(branch):
-    """(track, pre-release flavour) from a release-branch name, or None.
+    """Track and pre-release flavour from a release-branch name, or None.
 
-    PRs use the base branch; pushes use the branch. `fips-` / `antalya-` /
-    `stable-` prefixes select the track (`fips-` first). Anything else keeps
-    the file values."""
+    PRs use the base branch; pushes use the branch. Prefixes `fips-`,
+    `antalya-`, and `stable-` select the track, in that order. Anything else
+    keeps the file values."""
     if not branch:
         return None
     if branch.startswith("fips-"):
@@ -35,43 +30,36 @@ def _track_from_branch(branch):
     return None
 
 
-def _apply_track(version, track, flavour):
-    version.flavour = flavour
-    return version.with_tweak(track * 10000 + version.tweak % 10000).with_description(
-        flavour
-    )
-
-
 def _build_version(info):
     """The build version recorded for this run.
 
-    In a PR an unflavoured version's tweak is pinned to 1. `HEAD` is the
-    ephemeral merge commit, whose first-parent commit count diverges across
-    close/reopen and re-runs of the same PR as `master` advances. Artifacts are
-    keyed by the head SHA, so an unpinned tweak would store diverging version
-    strings under one artifact prefix. Flavoured Altinity versions keep the
-    explicit tweak committed in the version file. When the branch identifies a
-    track, CI replaces the flavour and the tweak's leading digit; the counter
-    (`tweak % 10000`) stays as committed."""
+    Unflavoured PR builds pin the tweak to 1. `HEAD` is the merge commit, and
+    its first-parent count changes as `master` moves, so an unpinned tweak
+    would store different version strings under one artifact prefix.
+
+    Flavoured builds take flavour and tweak from the tag on a tag push, or
+    from the branch and existing release tags when the branch names a track.
+    Otherwise the committed file values are used."""
     version = CHVersion.get_current_version(no_strict=True)
     if info.pr_number != 0 and not version.flavour:
         version = version.with_tweak(1)
     if not version.flavour:
         return version
-    # NOTE (strtgbb): tag flavour and track come from the tag; --check-tag
-    # validates the counter. Otherwise the branch overrides a stale file.
+    # NOTE (strtgbb): tag pushes take tweak and flavour from the tag.
+    # --check-tag validates the counter. Other runs use the branch.
     if os.getenv("GITHUB_REF_TYPE") == "tag":
-        flavour = os.getenv("GITHUB_REF_NAME", "").rsplit(".", 1)[-1]
-        track = _TRACK_BY_RELEASE_FLAVOUR.get(flavour)
-        if track is None:
-            version.flavour = flavour
-            return version.with_description(flavour)
-        return _apply_track(version, track, flavour)
+        *_, tweak, flavour = os.getenv("GITHUB_REF_NAME", "").split(".")
+        version.flavour = flavour
+        return version.with_tweak(int(tweak)).with_description(flavour)
     branch = info.base_branch if info.pr_number != 0 else info.git_branch
     derived = _track_from_branch(branch)
-    if derived:
-        version = _apply_track(version, *derived)
-    return version
+    if not derived:
+        return version
+    track, flavour = derived
+    tags = release_tags(version)
+    tweak = next_release_tweak(tags, version, track, info.sha)
+    version.flavour = flavour
+    return version.with_tweak(tweak).with_description(flavour)
 
 
 def _add_build_to_version_history():
