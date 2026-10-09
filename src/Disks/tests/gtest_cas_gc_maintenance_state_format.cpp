@@ -46,7 +46,6 @@ TEST(CASGCMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)
     const FormatTraits & traits = traitsFor(FormatId::GcMaintenanceState);
     EXPECT_EQ(traits.type, "cas_gc_maintenance_state");
     EXPECT_EQ(traits.family, TextFamily::Control);
-    EXPECT_EQ(traits.strictness, KeyStrictness::Strict);
     EXPECT_EQ(traits.compression, CompressionPolicy::Never);
     EXPECT_EQ(traits.object_cap, 512 * 1024);
     EXPECT_EQ(traits.line_cap, 512 * 1024);
@@ -65,6 +64,19 @@ TEST(CASGCMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)
     EXPECT_EQ(decodeGcMaintenanceState(encodeGcMaintenanceState(state)), state);
 }
 
+TEST(CASGCMaintenanceStateFormat, SkipsUnknownOrdinaryKey)
+{
+    const String text = "{\"type\":\"cas_gc_maintenance_state\",\"v\":1}\n{\"janitor_cursor\":\"a\",\"extra\":1}\n";
+    EXPECT_EQ(decodeGcMaintenanceState(text), (GcMaintenanceState{.janitor_cursor = "a"}));
+}
+
+TEST(CASGCMaintenanceStateFormat, UnknownCriticalKeyIsUnknownFormatVersion)
+{
+    const String text = "{\"type\":\"cas_gc_maintenance_state\",\"v\":1}\n{\"janitor_cursor\":\"a\",\"!extra\":1}\n";
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [&] { (void)decodeGcMaintenanceState(text); });
+}
+
 TEST(CASGCMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
 {
     const auto bad = [](std::string_view body)
@@ -75,8 +87,6 @@ TEST(CASGCMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
         [&] { (void)decodeGcMaintenanceState(bad("{}\n")); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeGcMaintenanceState(bad("{\"janitor_cursor\":\"a\",\"janitor_cursor\":\"b\"}\n")); });
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { (void)decodeGcMaintenanceState(bad("{\"janitor_cursor\":\"a\",\"extra\":1}\n")); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeGcMaintenanceState(bad("{\"janitor_cursor\":\"a\"}\nx")); });
 

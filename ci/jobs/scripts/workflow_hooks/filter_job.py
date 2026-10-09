@@ -83,6 +83,8 @@ def is_ci_excluded_by_tag(job_name, tag):
 
 # Must match ci.workflows.pull_request.KEEPER_STRESS_PR_NAME
 KEEPER_STRESS_PR_NAME = "Keeper Stress Tests (PR)"
+# Provides CH_ARM_BIN_GH required by the Keeper stress job
+KEEPER_STRESS_BUILD_NAME = "Build (arm_binary)"
 
 
 def _has_keeper_stress_changes(changed_files):
@@ -281,6 +283,11 @@ def should_skip_job(job_name):
     )
     for tag in ci_exclude_tags:
         if is_ci_excluded_by_tag(job_name, tag):
+            # The Keeper stress job is not affected by exclude tags, so keep its binary build
+            if job_name == KEEPER_STRESS_BUILD_NAME and _has_keeper_stress_changes(
+                changed_files
+            ):
+                continue
             return True, f"Skipped, job name includes excluded tag '{tag}'"
 
     # If only CI scripts changed (no product code), run a minimal set of tests

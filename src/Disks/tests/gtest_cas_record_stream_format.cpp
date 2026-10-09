@@ -357,6 +357,46 @@ TEST(CASRecordStream, TruncationAtLineBoundaryFailsClosed)
     EXPECT_THROW(decodeRun(bytes.substr(0, trailer)), DB::Exception);
 }
 
+namespace
+{
+std::vector<SourceEdgeRecord> sampleRunRecords()
+{
+    return {edge(chRef(1), 10), condemned(chRef(2), PersistedEtag{"etag", "e-1"}, 4242, 7, true), zero(chRef(3))};
+}
+}
+
+/// The header, each row and the trailer skip an unknown ordinary key.
+TEST(CASRecordStream, UnknownOrdinaryKeyIsSkippedOnEveryLine)
+{
+    const String bytes = encodeRun(sampleRunRecords());
+    const std::vector<SourceEdgeRecord> expected = decodeRun(bytes);
+    const size_t lines = cas_battery_detail::lineCount(bytes);
+    ASSERT_EQ(lines, 5u);
+    for (size_t line = 0; line < lines; ++line)
+    {
+        const std::vector<SourceEdgeRecord> back = decodeRun(cas_battery_detail::withExtraKeyInLine(bytes, line, "zz"));
+        ASSERT_EQ(back.size(), expected.size()) << "line " << line;
+        for (size_t i = 0; i < back.size(); ++i)
+        {
+            EXPECT_EQ(back[i].ref, expected[i].ref) << "line " << line;
+            EXPECT_EQ(back[i].source_id, expected[i].source_id) << "line " << line;
+            EXPECT_EQ(back[i].marker, expected[i].marker) << "line " << line;
+            EXPECT_EQ(back[i].size, expected[i].size) << "line " << line;
+            EXPECT_EQ(back[i].condemn_round, expected[i].condemn_round) << "line " << line;
+        }
+    }
+}
+
+/// The header, each row and the trailer fail with the version code on an unknown `!`-prefixed key.
+TEST(CASRecordStream, UnknownCriticalKeyIsUnknownFormatVersionOnEveryLine)
+{
+    const String bytes = encodeRun(sampleRunRecords());
+    const size_t lines = cas_battery_detail::lineCount(bytes);
+    for (size_t line = 0; line < lines; ++line)
+        cas_battery_detail::expectCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+            [&] { decodeRun(cas_battery_detail::withExtraKeyInLine(bytes, line, "!zz")); }, fmt::format("line {}", line));
+}
+
 TEST(CASRecordStream, HeaderGates)
 {
     /// Wrong type.

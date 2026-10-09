@@ -31,6 +31,13 @@ public:
 
     std::string getName() const override;
 
+    /// The write is always performed by the initiator.
+    SinkToStoragePtr write(
+        const ASTPtr & query,
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        bool async_insert) override;
+
     bool supportsImport(ContextPtr context) const override;
 
     ImportResult import(
@@ -78,6 +85,8 @@ public:
 
     void drop() override;
 
+    void prepareForDrop(ContextPtr query_context) override;
+
     void dropInnerTableIfAny(bool sync, ContextPtr context) override;
 
     void truncate(
@@ -96,7 +105,7 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
-    IDataLakeMetadata * getExternalMetadata(ContextPtr query_context);
+    std::shared_ptr<IDataLakeMetadata> getExternalMetadata(ContextPtr query_context);
 
     std::shared_ptr<DataLake::ICatalog> getCatalog() const;
 
@@ -197,12 +206,6 @@ private:
         QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
         size_t num_streams) override;
-
-    SinkToStoragePtr writeFallBackToPure(
-        const ASTPtr & query,
-        const StorageMetadataPtr & metadata_snapshot,
-        ContextPtr context,
-        bool async_insert) override;
 
     bool usesObjectStorageClusterSettingSyntax() const override { return !cluster_name_from_function_argument; }
 

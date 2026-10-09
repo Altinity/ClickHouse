@@ -34,6 +34,7 @@
 #include <Processors/Transforms/ExpressionTransform.h>
 #include <Processors/Transforms/ExtractColumnsTransform.h>
 #include <Processors/Transforms/FilterTransform.h>
+#include <Processors/Transforms/MaterializingTransform.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/Cache/SchemaCache.h>
 #include <Storages/HivePartitioningUtils.h>
@@ -278,7 +279,7 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
 
         /// Use the full table location URI (e.g. `s3a://bucket/prefix/table/`) when available
         std::string table_location = configuration->getPathForRead().path;
-        if (auto * metadata = configuration->getExternalMetadata())
+        if (auto metadata = configuration->getExternalMetadata())
             table_location = metadata->getTableLocation();
 
         auto distributed_iterator = std::make_unique<ReadTaskIterator>(
@@ -636,7 +637,7 @@ Chunk StorageObjectStorageSource::generate()
             if (chunk_size && chunk.hasColumns())
             {
                 /// Old delta lake code which needs to be deprecated in favour of DeltaLakeMetadataDeltaKernel.
-                if (dynamic_cast<const DeltaLakeMetadata *>(configuration->getExternalMetadata()))
+                if (std::dynamic_pointer_cast<const DeltaLakeMetadata>(configuration->getExternalMetadata()))
                 {
                     /// This is an awful temporary crutch,
                     /// which will be removed once DeltaKernel is used by default for DeltaLake.
@@ -850,22 +851,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (!object_info)
             return {};
 
-        if (object_info->relative_path_with_metadata.getCommand().isValid())
-        {
-            auto retry_after_us = object_info->relative_path_with_metadata.getCommand().getRetryAfterUs();
-            if (retry_after_us.has_value())
-            {
-                /// TODO: Make asyncronous waiting without sleep in thread
-                /// Now this sleep is on executor node in worker thread
-                /// Does not block query initiator
-                auto wait_time = std::min(Poco::Timestamp::TimeDiff(100000ul), retry_after_us.value());
-                ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
-                sleepForMicroseconds(wait_time);
-                continue;
-            }
-            object_info->relative_path_with_metadata.setFileMetaInfo(object_info->relative_path_with_metadata.getCommand().getFileMetaInfo());
-        }
-
         if (object_info->getPath().empty())
             return {};
         if (!object_info->getObjectMetadata())
@@ -1065,6 +1050,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     if (column_name.starts_with("materialize(") && column_name.ends_with(")"))
                         continue;
 
+                    /// Tuple element reads request nested fields like `t.a`. Writers don't have to store
+                    /// statistics for nested fields (ClickHouse stores them only for top-level columns),
+                    /// so missing statistics don't prove that the field is absent from the file.
+                    if (column_name.contains('.'))
+                        continue;
+
                     /// Skip columns produced by prewhere or row-level filter expressions —
                     /// they are computed at read time, not stored in the file.
                     if (format_filter_info
@@ -1218,14 +1209,32 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             {
                 if (auto mapper = configuration->getColumnMapperForObject(object_info))
                 {
-                    if (format_supports_prewhere)
-                        return std::make_shared<FormatFilterInfo>(
-                            format_filter_info->filter_actions_dag, format_filter_info->context.lock(),
-                            mapper, format_filter_info->row_level_filter, format_filter_info->prewhere_info);
-                    else
-                        return std::make_shared<FormatFilterInfo>(
-                            format_filter_info->filter_actions_dag, format_filter_info->context.lock(),
-                            mapper, nullptr, nullptr);
+                    /// `schema_changed` is true for real schema evolution (a schema-id
+                    /// mismatch: renamed / type-changed columns) AND for current-schema
+                    /// files that merely carry equality deletes. Strip the reader-side
+                    /// filters ONLY for the former: there the old-schema mapper resolves
+                    /// field-ids to the file's OLD names while PREWHERE / row-level filter
+                    /// reference the CURRENT names, so in-reader evaluation matches nothing
+                    /// (re-applied as fallback FilterTransforms after the schema transform
+                    /// renames the columns below). For equality-delete-only files
+                    /// (getSchemaTransformer() == null, no rename) the mapper already yields
+                    /// the current names, so keep the filters in the reader to preserve
+                    /// Parquet row-group / page pruning.
+                    const bool has_schema_transform
+                        = configuration->getSchemaTransformer(context_, object_info) != nullptr;
+                    if (format_supports_prewhere && has_schema_transform)
+                    {
+                        if (format_filter_info->row_level_filter)
+                            stripped_row_level_filter = format_filter_info->row_level_filter;
+                        if (format_filter_info->prewhere_info)
+                            stripped_prewhere_info = format_filter_info->prewhere_info;
+                    }
+                    const bool keep_in_reader = format_supports_prewhere && !has_schema_transform;
+                    return std::make_shared<FormatFilterInfo>(
+                        format_filter_info->filter_actions_dag, format_filter_info->context.lock(),
+                        mapper,
+                        keep_in_reader ? format_filter_info->row_level_filter : nullptr,
+                        keep_in_reader ? format_filter_info->prewhere_info : nullptr);
                 }
             }
 
@@ -1469,6 +1478,40 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     NamesAndTypesList columns_to_extract = requested_columns_copy;
     for (const auto & column_name : row_lineage_columns)
         columns_to_extract.emplace_back(column_name, rowLineageColumnType());
+
+    /// Tuple element reads request nested fields like `t.a` as separate columns. If the data lake
+    /// schema transform has rebuilt the whole `t` instead (e.g. the file was written before `t`
+    /// was added), extract `t.a` as a subcolumn of `t`.
+    const Block & extract_header = builder.getHeader();
+    bool need_materialize = false;
+    for (auto & column : columns_to_extract)
+    {
+        const String name_in_storage = column.getNameInStorage();
+        if (extract_header.has(name_in_storage))
+            continue;
+
+        for (size_t pos = name_in_storage.rfind('.'); pos != String::npos && pos != 0; pos = name_in_storage.rfind('.', pos - 1))
+        {
+            const auto * storage_column = extract_header.findByName(name_in_storage.substr(0, pos));
+            const String subcolumn_name = column.name.substr(pos + 1);
+            if (storage_column && storage_column->type->tryGetSubcolumnType(subcolumn_name))
+            {
+                column = NameAndTypePair(storage_column->name, subcolumn_name, storage_column->type, column.type);
+                /// Subcolumns can't be extracted from a constant column, e.g. the default the schema transform
+                /// supplies for a column missing in the file.
+                need_materialize |= storage_column->column && isColumnConst(*storage_column->column);
+                break;
+            }
+        }
+    }
+
+    if (need_materialize)
+    {
+        builder.addSimpleTransform([](const SharedHeader & header)
+        {
+            return std::make_shared<MaterializingTransform>(header, /*remove_special_representations=*/ false);
+        });
+    }
 
     builder.addSimpleTransform([&](const SharedHeader & header)
     {
@@ -2003,10 +2046,7 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     for (size_t i = 0; i < max_threads_count; ++i)
         objects.push_back(pool_scheduler([this]() -> ObjectInfoPtr
         {
-            auto task = callback();
-            if (!task || task->isEmpty())
-                return nullptr;
-            return task->getObjectInfo();
+            return takeNextObject(/*wait_for_retry=*/ false);
         }, Priority{}));
 
     pool.wait();
@@ -2015,10 +2055,7 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     {
         auto object = object_future.get();
         if (object)
-        {
-            resolveIcebergObjectStorageIfNeeded(object);
             buffer.push_back(object);
-        }
     }
 }
 
@@ -2046,13 +2083,12 @@ void StorageObjectStorageSource::ReadTaskIterator::resolveIcebergObjectStorageIf
 #endif
 }
 
-ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
+ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool wait_for_retry)
 {
-    size_t current_index = index.fetch_add(1, std::memory_order_relaxed);
-
-    ObjectInfoPtr object_info;
-    if (current_index >= buffer.size())
+    while (true)
     {
+        /// Recheck after each `retry_after_us` wait. `SYSTEM STOP SWARM MODE` during that wait
+        /// must not be followed by another task request.
         if (!getContext()->isSwarmModeEnabled())
         {
             LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
@@ -2067,13 +2103,38 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
         if (!task || task->isEmpty())
             return nullptr;
 
-        object_info = task->getObjectInfo();
+        if (task->retry_after_us)
+        {
+            if (!wait_for_retry)
+                return nullptr;
+
+            /// The wait stays on the worker so the initiator thread is not blocked.
+            /// TODO: wait asynchronously instead of sleeping in this thread.
+            auto wait_time = std::min<UInt64>(100000, *task->retry_after_us);
+            ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
+            sleepForMicroseconds(wait_time);
+            continue;
+        }
+
+        auto object_info = task->getObjectInfo();
         resolveIcebergObjectStorageIfNeeded(object_info);
+        return object_info;
+    }
+}
+
+ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
+{
+    size_t current_index = index.fetch_add(1, std::memory_order_relaxed);
+
+    ObjectInfoPtr object_info;
+    if (current_index >= buffer.size())
+    {
+        object_info = takeNextObject(/*wait_for_retry=*/ true);
+        if (!object_info)
+            return nullptr;
     }
     else
-    {
-        object_info =  buffer[current_index];
-    }
+        object_info = buffer[current_index];
 
     if (!is_archive)
         return object_info;

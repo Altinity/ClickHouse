@@ -1,5 +1,7 @@
 #include <AggregateFunctions/registerAggregateFunctions.h>
 
+#include "config.h"
+
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/Combinators/AggregateFunctionCombinatorFactory.h>
 
@@ -61,6 +63,9 @@ void registerAggregateFunctionSumMap(AggregateFunctionFactory &);
 void registerAggregateFunctionsUniq(AggregateFunctionFactory &);
 void registerAggregateFunctionUniqCombined(AggregateFunctionFactory &);
 void registerAggregateFunctionUniqUpTo(AggregateFunctionFactory &);
+#if USE_DATASKETCHES
+void registerAggregateFunctionUniqApacheHLL(AggregateFunctionFactory &);
+#endif
 void registerAggregateFunctionTopK(AggregateFunctionFactory &);
 void registerAggregateFunctionsBitwise(AggregateFunctionFactory &);
 void registerAggregateFunctionsBitmap(AggregateFunctionFactory &);
@@ -174,6 +179,9 @@ void registerAggregateFunctions()
         registerAggregateFunctionsUniq(factory);
         registerAggregateFunctionUniqCombined(factory);
         registerAggregateFunctionUniqUpTo(factory);
+#if USE_DATASKETCHES
+        registerAggregateFunctionUniqApacheHLL(factory);
+#endif
         registerAggregateFunctionTopK(factory);
         registerAggregateFunctionsBitwise(factory);
         registerAggregateFunctionCramersV(factory);

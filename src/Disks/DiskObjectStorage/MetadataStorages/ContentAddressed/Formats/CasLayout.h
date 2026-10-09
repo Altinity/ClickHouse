@@ -158,7 +158,7 @@ public:
     /// not try an uncompressed variant.
     String refLogKey(const NamespaceLifeId & ns_id, const RefTxnId & id) const
     {
-        return namespaceStreamPrefix(ns_id) + "_log/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefLog));
+        return refStreamObjectKey(ns_id.incarnation, RefObjectKind::Log, id);
     }
 
     /// Writer-published table snapshot at `.../_snap/<render>.zst`. The snapshot
@@ -166,7 +166,7 @@ public:
     /// `X` reuses the `RefTxnId` of the last log it covers.
     String refSnapshotKey(const NamespaceLifeId & ns_id, const RefTxnId & id) const
     {
-        return namespaceStreamPrefix(ns_id) + "_snap/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefSnapshot));
+        return refStreamObjectKey(ns_id.incarnation, RefObjectKind::Snap, id);
     }
 
     /// The write-once forms of `refLogKey` and `refSnapshotKey`: the same strings, typed as keys a
@@ -179,6 +179,17 @@ public:
     WriteOnceKey writeOnceRefSnapshotKey(const NamespaceLifeId & ns_id, const RefTxnId & id) const
     {
         return WriteOnceKey(refSnapshotKey(ns_id, id));
+    }
+
+    /// The write-once form of a listed `_log`/`_snap` key that `parseRefObjectKey` accepted. `std::nullopt`
+    /// when `listed_key` is not the canonical key of the parsed identity: a precondition-free delete must
+    /// name only keys this layout writes.
+    std::optional<WriteOnceKey> writeOnceStreamKey(const ParsedRefObjectKey & parsed, std::string_view listed_key) const
+    {
+        String canonical = refStreamObjectKey(parsed.life_id, parsed.kind, parsed.txn_id);
+        if (canonical != listed_key)
+            return std::nullopt;
+        return WriteOnceKey(std::move(canonical));
     }
 
     /// The life's checkpoint object (spec INV-4) at `<prefix>/cas/ns/state/<life_id>/_ckpt`. Unlike
@@ -485,6 +496,13 @@ private:
 
     /// Parses the one physical-id segment after the rest of a life-owned key identified its family.
     NamespaceLifePhysicalId namespaceLifePhysicalIdOf(std::string_view key, std::string_view segment) const;
+
+    String refStreamObjectKey(NamespaceLifePhysicalId life_id, RefObjectKind kind, const RefTxnId & id) const
+    {
+        const bool log = kind == RefObjectKind::Log;
+        return namespaceStreamRootPrefix() + renderIncarnation(life_id) + (log ? "/_log/" : "/_snap/") + renderRefTxnId(id)
+            + String(storedSuffix(log ? FormatId::RefLog : FormatId::RefSnapshot));
+    }
 
     /// Build <prefix>/<namespace>/<first2chars>/<id>.
     /// Throws BAD_ARGUMENTS if id is shorter than 2 characters.

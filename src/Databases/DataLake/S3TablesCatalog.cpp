@@ -33,6 +33,7 @@ namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int DATALAKE_DATABASE_ERROR;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace DB::Setting
@@ -127,10 +128,10 @@ S3TablesCatalog::S3TablesCatalog(
 }
 
 /// S3 Tables only supports a single level of namespaces (no nesting),
-/// so we use flat getNamespaces() instead of the base class's getNamespacesRecursive().
+/// so we use flat listChildNamespaces() instead of the base class's getNamespacesRecursive().
 DB::Names S3TablesCatalog::getTables() const
 {
-    auto namespaces = getNamespaces("");
+    auto namespaces = listChildNamespaces("");
 
     auto & pool = getContext()->getIcebergCatalogThreadpool();
     DB::ThreadPoolCallbackRunnerLocal<void> runner(pool, DB::ThreadName::DATALAKE_REST_CATALOG);
@@ -142,7 +143,7 @@ DB::Names S3TablesCatalog::getTables() const
         runner.enqueueAndKeepTrack(
             [&, ns]
             {
-                auto tables_in_ns = RestCatalog::getTables(ns);
+                auto tables_in_ns = RestCatalog::listTablesInNamespace(ns);
                 std::lock_guard lock(mutex);
                 std::move(tables_in_ns.begin(), tables_in_ns.end(), std::back_inserter(tables));
             });
@@ -217,8 +218,21 @@ ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfiguratio
     };
 }
 
-void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name) const
+void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name, bool delete_data, bool if_exists) const
 {
+    /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-delete.html
+    if (!delete_data)
+    {
+        if (if_exists && !existsTable(namespace_name, table_name))
+            return;
+
+        throw DB::Exception(
+            DB::ErrorCodes::SUPPORT_IS_DISABLED,
+            "S3 Tables cannot drop table {}.{} without deleting its data, and `data_lake_delete_data_on_drop` is disabled. "
+            "Enable `data_lake_delete_data_on_drop` to drop the table together with its data",
+            namespace_name, table_name);
+    }
+
     const auto state_snapshot = state.get();
     const std::string endpoint
         = (base_url / state_snapshot->config.prefix / "namespaces" / namespace_name / "tables" / table_name).string()
@@ -233,10 +247,13 @@ void S3TablesCatalog::dropTable(const String & namespace_name, const String & ta
     }
     catch (const DB::HTTPException & ex)
     {
-        if (ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_NOT_FOUND)
+        /// `404` is returned by the API when the table does not exist - someone else dropped it first.
+        if (if_exists && ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_NOT_FOUND)
+        {
             LOG_DEBUG(log, "S3 Tables: table {}.{} already does not exist (404 on purge-delete)", namespace_name, table_name);
-        else
-            throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to drop table {}", ex.displayText());
+            return;
+        }
+        throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to drop table {}", ex.displayText());
     }
 }
 
