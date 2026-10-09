@@ -359,7 +359,6 @@ class NoTrashChecker:
                 + start_time
                 + "') "
                 + "AND NOT ((name == 'KEEPER_EXCEPTION') AND (last_error_message LIKE '%Fault injection%')) "
-                + "AND NOT ((name == 'S3_ERROR') AND (last_error_message LIKE '%This error is expected for S3 disk%')) "
                 + "AND NOT (name == 'NO_ELEMENTS_IN_CONFIG')"
             )
             errors = errors_query_result.splitlines()
@@ -556,6 +555,7 @@ def test_cancel_restore():
 
         wait_status(initiator, "RESTORED", restore_id=restore_id)
         assert get_num_system_processes(nodes, restore_id=restore_id) == 0
+
 
 # Test that shutdown cancels a running backup and doesn't wait until it finishes.
 def test_shutdown_cancels_backup():
