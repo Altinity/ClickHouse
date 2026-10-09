@@ -842,7 +842,8 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
 
 bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context, bool first, const String & after_column)
 {
-    Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
+    if (type)
+        Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
     auto current_schema = getCurrentSchema();
 
     auto last_column_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);

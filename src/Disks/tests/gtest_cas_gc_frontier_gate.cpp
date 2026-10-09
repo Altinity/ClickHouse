@@ -241,7 +241,7 @@ private:
     std::function<void()> after_read_hook;
 };
 
-class PostFoldUnreadableTerminalBackend final : public CountingBackend
+class DeadCheckpointHeadFailureBackend final : public CountingBackend
 {
 public:
     /// Unhide the names the primitive overrides below would otherwise shadow.
@@ -260,7 +260,7 @@ public:
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (!bypass_fault && key == unreadable_key)
-            throw std::runtime_error("injected post-fold terminal read failure for " + key);
+            throw std::runtime_error("injected dead checkpoint HEAD failure for " + key);
         return CountingBackend::head(key, access);
     }
 
@@ -2821,10 +2821,11 @@ TEST(CASGCFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
 
 /// Once a terminal has folded, a later physical read failure is janitor debt, not lifecycle evidence
 /// loss. Removing this per-key leak handling would either make the signal disappear or let one dead
-/// object prevent the janitor from considering the rest of its page.
-TEST(CASGCFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingProgress)
+/// object prevent the janitor from considering the rest of its page. The unreadable object is the dead
+/// checkpoint: dead `_log`/`_snap` keys are deleted token-free and never read.
+TEST(CASGCFrontierGate, PostFoldUnreadableDeadCheckpointIsCountedWithoutSuppressingProgress)
 {
-    auto backend = std::make_shared<PostFoldUnreadableTerminalBackend>();
+    auto backend = std::make_shared<DeadCheckpointHeadFailureBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     CasRequests requests = openRequestsForTest(backend);
     CasOperation op = requests.admit();
@@ -2876,10 +2877,11 @@ TEST(CASGCFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingPro
 
     dropRefTransition(*backend, layout, progressing, "victim", manifest);
     const String terminal_key = layout.refLogKey(removed_life, RefTxnId{1, 2});
+    const String checkpoint_key = layout.refCkptKey(removed_life);
     const String later_dead_residue = layout.refLogKey(removed_life, RefTxnId{1, 3});
     ASSERT_TRUE(std::holds_alternative<Committed>(
         op.create(later_dead_residue, "dead residue after the folded terminal", Retry::once())));
-    backend->makeUnreadable(terminal_key);
+    backend->makeUnreadable(checkpoint_key);
 
     std::map<String, UInt64> namespace_cleanup;
     const uint64_t leaks_before
@@ -2900,7 +2902,8 @@ TEST(CASGCFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingPro
     EXPECT_EQ(report.manifests_deleted, 1u)
         << "the janitor leak cannot promote itself into pool-wide destructive suppression";
     EXPECT_FALSE(op.head(layout.manifestKey(manifest_id), Retry::once()).has_value());
-    EXPECT_TRUE(backend->existsIgnoringFault(terminal_key));
+    EXPECT_TRUE(backend->existsIgnoringFault(checkpoint_key));
+    EXPECT_FALSE(backend->existsIgnoringFault(terminal_key));
     EXPECT_FALSE(backend->existsIgnoringFault(later_dead_residue))
         << "one unreadable key cannot stop the perpetual janitor from deciding the rest of its page";
     ASSERT_FALSE(namespace_cleanup.empty());
@@ -2909,7 +2912,7 @@ TEST(CASGCFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingPro
         ProfileEvents::global_counters[ProfileEvents::CASGCNamespaceCleanupLeaks].load() - leaks_before,
         1u);
     const String captured = log_capture.captured();
-    EXPECT_NE(captured.find(terminal_key), String::npos);
+    EXPECT_NE(captured.find(checkpoint_key), String::npos);
     EXPECT_NE(captured.find("leak"), String::npos);
 }
 
