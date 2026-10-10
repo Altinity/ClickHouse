@@ -1997,11 +1997,10 @@ MergeMutateSelectedEntryPtr StorageMergeTree::selectPartsToMutate(
 
     auto mutations_end_it = current_mutations_by_version.end();
 
-    /// The block numbers of the lightweight updates that have not written their patch part yet, read
-    /// once for the whole selection: it only has to be a snapshot no older than the parts below.
-    CommittingBlocksSet committing_blocks_snapshot;
-    if (supportsLightweightUpdate())
-        committing_blocks_snapshot = getCommittingBlocks();
+    /// The block numbers still being committed, read once for the whole selection: lightweight updates that
+    /// have not written their patch part yet, and mutations not in `current_mutations_by_version` yet. A block
+    /// allocated after this snapshot is above every registered mutation, so no selection below can skip it.
+    const CommittingBlocksSet committing_blocks_snapshot = getCommittingBlocks();
 
     for (const auto & part : getDataPartsVectorForInternalUsage())
     {
@@ -2180,6 +2179,7 @@ MergeMutateSelectedEntryPtr StorageMergeTree::selectPartsToMutate(
               * entry on a replicated table.
               */
             std::optional<Int64> pending_update_block;
+            std::optional<Int64> unregistered_mutation_block;
             for (const auto & block : committing_blocks_snapshot)
             {
                 if (block.number > new_part_info.getDataVersion())
@@ -2190,6 +2190,25 @@ MergeMutateSelectedEntryPtr StorageMergeTree::selectPartsToMutate(
                     pending_update_block = block.number;
                     break;
                 }
+
+                /// A mutation takes its block number before it is registered. Mutating past it now would
+                /// skip its commands, yet the part's data version would mark it applied.
+                if (block.op == CommittingBlock::Op::Mutation && !current_mutations_by_version.contains(block.number))
+                {
+                    unregistered_mutation_block = block.number;
+                    break;
+                }
+            }
+
+            if (unregistered_mutation_block.has_value())
+            {
+                LOG_DEBUG(
+                    log,
+                    "Will not mutate part {} yet because the mutation with block number {} is not registered",
+                    part->name,
+                    *unregistered_mutation_block);
+                current_parts_postpone_reasons[part->name] = PostponeReasons::UNREGISTERED_MUTATION;
+                continue;
             }
 
             if (pending_update_block.has_value())
