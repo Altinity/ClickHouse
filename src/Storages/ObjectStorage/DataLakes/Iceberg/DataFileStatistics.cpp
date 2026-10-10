@@ -58,8 +58,19 @@ void DataFileStatistics::update(const Chunk & chunk)
     }
 }
 
+void DataFileStatistics::excludeColumns(std::vector<bool> excluded_)
+{
+    chassert(excluded_.size() == field_ids.size());
+    excluded = std::move(excluded_);
+}
+
 void DataFileStatistics::merge(const DataFileStatistics & other)
 {
+    if (excluded.size() < other.excluded.size())
+        excluded.resize(other.excluded.size(), false);
+    for (size_t i = 0; i < other.excluded.size(); ++i)
+        excluded[i] = excluded[i] || other.excluded[i];
+
     if (other.column_sizes.empty())
         return;
 
@@ -94,7 +105,8 @@ std::vector<std::pair<size_t, size_t>> DataFileStatistics::getColumnSizes() cons
     std::vector<std::pair<size_t, size_t>> result;
     for (size_t i = 0; i < column_sizes.size(); ++i)
     {
-        result.push_back({field_ids[i], column_sizes[i]});
+        if (!isExcluded(i))
+            result.push_back({field_ids[i], column_sizes[i]});
     }
     return result;
 }
@@ -104,7 +116,8 @@ std::vector<std::pair<size_t, size_t>> DataFileStatistics::getNullCounts() const
     std::vector<std::pair<size_t, size_t>> result;
     for (size_t i = 0; i < null_counts.size(); ++i)
     {
-        result.push_back({field_ids[i], null_counts[i]});
+        if (!isExcluded(i))
+            result.push_back({field_ids[i], null_counts[i]});
     }
     return result;
 }
@@ -115,7 +128,8 @@ std::vector<std::pair<size_t, Field>> DataFileStatistics::getLowerBounds() const
     std::vector<std::pair<size_t, Field>> result;
     for (size_t i = 0; i < ranges.size(); ++i)
     {
-        result.push_back({field_ids[i], ranges[i].left});
+        if (!isExcluded(i))
+            result.push_back({field_ids[i], ranges[i].left});
     }
     return result;
 }
@@ -125,7 +139,8 @@ std::vector<std::pair<size_t, Field>> DataFileStatistics::getUpperBounds() const
     std::vector<std::pair<size_t, Field>> result;
     for (size_t i = 0; i < ranges.size(); ++i)
     {
-        result.push_back({field_ids[i], ranges[i].right});
+        if (!isExcluded(i))
+            result.push_back({field_ids[i], ranges[i].right});
     }
     return result;
 }

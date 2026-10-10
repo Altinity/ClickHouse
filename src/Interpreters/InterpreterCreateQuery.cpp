@@ -2147,8 +2147,9 @@ void checkForUnsupportedColumns(IStorage & storage, LoadingStrictnessLevel mode,
 
     /// Re-check inferred column types only for a fresh, persisted table: the pre-construction check
     /// does not see inferred columns, and ATTACH/RESTORE, temporary tables and views/dictionaries are
-    /// not subject to this check on load.
-    if (mode <= LoadingStrictnessLevel::CREATE && !is_temporary && !storage.isView() && !storage.isDictionary())
+    /// not subject to this check on load. Data lakes are skipped because their schema may legitimately
+    /// contain `Nullable(Nothing)` (the Iceberg v3 `unknown` type).
+    if (mode <= LoadingStrictnessLevel::CREATE && !is_temporary && !storage.isView() && !storage.isDictionary() && !storage.isDataLake())
         checkAllTypesAreAllowedInTable(metadata_snapshot->getColumns().getAll());
 
     if (mode <= LoadingStrictnessLevel::CREATE && hasColumnsWithDynamicStructure(metadata_snapshot->getColumns()) && !storage.supportsColumnsWithDynamicStructure())
