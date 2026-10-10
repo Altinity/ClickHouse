@@ -17,8 +17,10 @@
 #include <Databases/DataLake/ICatalog.h>
 #include <Storages/MutationCommands.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include <Storages/IPartitionStrategy.h>
 namespace DB
@@ -115,6 +117,15 @@ public:
         const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
 
+    /// Shared `drop` implementation: removes the table from `catalog` (if any) and drops `configuration`,
+    /// deleting the data only if `delete_data_on_drop` was captured as `true` by `prepareForDrop`.
+    static void dropImpl(
+        const std::optional<bool> & delete_data_on_drop,
+        const std::shared_ptr<DataLake::ICatalog> & catalog,
+        const StorageObjectStorageConfigurationPtr & configuration,
+        const StorageID & storage_id,
+        const LoggerPtr & log);
+
     void truncate(
         const ASTPtr & query,
         const StorageMetadataPtr & metadata_snapshot,
@@ -122,6 +133,8 @@ public:
         TableExclusiveLockHolder &) override;
 
     void drop() override;
+
+    void prepareForDrop(ContextPtr query_context) override;
 
     bool supportsPartitionBy() const override { return true; }
 
@@ -290,6 +303,8 @@ protected:
     std::shared_ptr<DataLake::ICatalog> catalog;
     StorageID storage_id;
     BackgroundJobsAssignee background_operations_assignee;
+
+    std::atomic<std::optional<bool>> delete_data_on_drop;
 };
 
 }
