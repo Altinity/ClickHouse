@@ -35,7 +35,7 @@ The full model index (source `.tla` files and proof-run records) lives at
 | `CaGcAckFloorZombie.tla` | `INV_NO_DANGLE` under two fully-interleaved GC leaders | `sab_eagerdelete`: a leader deleting its own fresh (not-yet-pending) graduations — the pre-amendment single-phase behavior — dangles when a deposed leader's pass overlaps a live one |
 | `CaGcRoundDeferCore.tla` | `NoOverDelete` — a deferred round may skip a rebuild only when nothing destructive is pending | `sab_graduate_on_stale`: dropping the "an unfolded delta covers this blob" guard lets a deferred round delete a blob its own unread history still protects |
 | `CaEdgeBeforeObserve.tla` | The writer/`GC` publish order is safe to simplify | `sab_late_edge`: allowing adoption before the precommit closure is durable (the pre-fix order) dangles |
-| `CaGcCondemnMarkerGate.tla` | Graduation requires confirmed durable `Condemned` evidence | Swallowing a failed asynchronous condemn-marker write let a writer adopt a token a later graduation was about to delete |
+| `CaGcCondemnMarkerGate.tla` | Graduation reads the marker and requires `Condemned` at the entry's round or later | Swallowing a failed asynchronous condemn-marker write let a writer adopt a token a later graduation was about to delete |
 | `CaRefTableSnapshotLogCore.tla` | Dense, per-life ref ids with an in-band `_ckpt` recovery frontier | `sab_scanistruth`: trusting a listing as the source of truth for "acked" reproduces the real production incident where a `LIST` omitted two already-durable, already-acknowledged ref entries |
 
 ## Soak and chaos: the empirical oracle {#soak-and-chaos}

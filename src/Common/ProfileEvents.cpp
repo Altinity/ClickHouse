@@ -912,7 +912,7 @@ The server successfully detected this situation and will download merged part fr
     M(CASGCRetiredRedeleted,   "Number of CAS GC pending deletes executed with an exact object token. Growth indicates physical cleanup activity.", ValueType::Number) \
     M(CASGCRetiredRedeleteFailed, "Number of CAS GC pending blob deletes whose HEAD or exact-token DELETE failed. A non-zero value indicates object storage errors; the affected blobs are retried in the next round.", ValueType::Number) \
     M(CASGCUnmatchedRemoveDeltas, "Number of CAS GC in-degree removal deltas that matched no existing source edge. The in-degree model is a set, not a counter, so this is a per-key no-op by design and never causes a false deletion — but a persistent nonzero rate means removal deltas are reaching the reducer without their matching activation, which is a correctness signal.", ValueType::Number) \
-    M(CASGCCondemnMarkerUnconfirmedCarry, "Number of CAS GC retirements delayed because a durable condemn marker could not be confirmed. A non-zero value indicates marker write or read failures and safely postpone deletion.", ValueType::Number) \
+    M(CASGCCondemnMarkerUnconfirmedCarry, "Number of CAS GC retirements delayed because the condemn marker did not confirm: it could not be read or written, it was a readable `Clean`, or it was `Condemned` at an older round than the entry. Deletion is postponed safely.", ValueType::Number) \
     M(CASGCHeartbeatFenceOuts, "Number of CAS GC operations fenced out for expired mounts. A non-zero value indicates stale mounts or heartbeat delays.", ValueType::Number) \
     M(CASGCMetaWriteAnomaly, "Number of CAS GC metadata operations that failed on the bounded metadata pool. A non-zero value indicates backend or pool pressure and may delay metadata convergence.", ValueType::Number) \
     M(CASMetaPut,          "Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates metadata reconciliation or write contention.", ValueType::Number) \
@@ -927,7 +927,7 @@ The server successfully detected this situation and will download merged part fr
     M(CASGCRefWalkPlansBuilt, "Number of complete catalog-authoritative CAS ref walk plans constructed by ordinary GC and rebuild. A regular or rebuilding invocation that reaches the post-LIST catalog cut increments this exactly once, including a round that later defers.", ValueType::Number) \
     M(CASGCUnmatchedAdoptedParentLives, "Number of adopted-parent CAS ref-life rows dropped because the post-LIST catalog cut has no matching physical life. Each occurrence is inert for planning and suppression and is logged with its exact physical life id; a persistent nonzero rate indicates old generation state is outliving catalog removal.", ValueType::Number) \
     M(CASGCStuckRemovals, "Number of adopted CAS GC rounds that observed a Removing namespace at or beyond the diagnostic age threshold without terminal cleanup evidence. Incremented and warned every such round; diagnostic only, with no effect on folding, suppression, appends, or deletion.", ValueType::Number) \
-    M(CASGCNamespaceCleanupLeaks, "Number of dead-life namespace objects whose reclamation the perpetual janitor could not confirm because HEAD or exact-delete failed. Each occurrence is logged with the exact key and remains leak-only: it neither suppresses destructive GC nor blocks catalog lifecycle progress.", ValueType::Number) \
+    M(CASGCNamespaceCleanupLeaks, "Number of dead-life namespace objects whose reclamation the perpetual janitor could not confirm because HEAD, exact-delete or a batch delete failed. Each occurrence is logged with the key, or the first key of the batch, and remains leak-only: it neither suppresses destructive GC nor blocks catalog lifecycle progress.", ValueType::Number) \
     M(CASDetachedWorkDrainTimeouts, "Counts CAS storage teardowns whose bounded wait for detached background work expired with work still in flight. The teardown proceeds, but for that teardown it could not be established that no tracked task still holds the pool. Expected to stay at zero.", ValueType::Number) \
     M(CASEventDroppedContextExpired, "Number of CAS system-log events dropped because the storage's `Context` reference expired before delivery. A non-zero value indicates event production outlived the owning server context.", ValueType::Number) \
     M(CASGCUnappliedFoldedTransactions, "Number of ref transactions a GC round folded and merged but whose blob deltas never reached a shard reducer. Always 0 on a healthy round; a nonzero value fails the round closed, because the round would otherwise advance its fold cursor past a transaction it never applied.", ValueType::Number) \
@@ -1377,6 +1377,7 @@ The server successfully detected this situation and will download merged part fr
     \
     M(ConnectionPoolIsFullMicroseconds, "Total time spent waiting for a slot in connection pool.", ValueType::Microseconds) \
     M(AsyncLoaderWaitMicroseconds, "Total time a query was waiting for async loader jobs.", ValueType::Microseconds) \
+    M(AsyncLoaderSpawnFailures, "Number of times the async loader could not spawn a worker because the global thread pool could not provide a thread. Queued jobs are then run by a worker the pool already has: one that is running, or one resuming from a wait on a job of another pool.", ValueType::Number) \
     \
     M(DistrCacheServerSwitches, "Distributed Cache read buffer event. Number of server switches between distributed cache servers in read/write-through cache", ValueType::Number) \
     M(DistrCacheReadMicroseconds, "Distributed Cache read buffer event. Time spent reading from distributed cache", ValueType::Microseconds) \
@@ -1732,7 +1733,7 @@ The server successfully detected this situation and will download merged part fr
     M(ObjectStorageListObjectsCacheHits, "Number of times object storage list objects operation hit the cache.", ValueType::Number) \
     M(ObjectStorageListObjectsCacheMisses, "Number of times object storage list objects operation miss the cache.", ValueType::Number) \
     M(ObjectStorageListObjectsCacheExactMatchHits, "Number of times object storage list objects operation hit the cache with an exact match.", ValueType::Number) \
-    M(ObjectStorageListObjectsCachePrefixMatchHits, "Number of times object storage list objects operation miss the cache using prefix matching.", ValueType::Number) \
+    M(ObjectStorageListObjectsCachePrefixMatchHits, "Number of times object storage list objects operation hit the cache using prefix matching.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsVended, "Number of table metadata requests to REST catalog asking to vend storage credentials.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsCacheHits, "Number of table metadata requests to REST catalog reusing cached storage credentials.", ValueType::Number) \
     \

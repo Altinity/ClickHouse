@@ -1,5 +1,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 
+#include <Disks/IDisk.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
+
 #include <array>
 
 namespace DB
@@ -165,6 +168,13 @@ std::optional<CasRelinkSourceToken> decodeCasRelinkSourceToken(std::string_view 
         *fields[i] = std::move(*decoded);
     }
     return token;
+}
+
+IContentAddressedExchange * tryGetContentAddressedExchange(const DiskPtr & disk)
+{
+    if (!disk || !disk->isContentAddressed())
+        return nullptr;
+    return dynamic_cast<IContentAddressedExchange *>(disk->getMetadataStorage().get());
 }
 
 }

@@ -120,6 +120,7 @@ extern const int LOGICAL_ERROR;
 extern const int NOT_IMPLEMENTED;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
 extern const int S3_ERROR;
+extern const int FILE_ALREADY_EXISTS;
 extern const int TABLE_ALREADY_EXISTS;
 extern const int SUPPORT_IS_DISABLED;
 extern const int METADATA_MISMATCH;
@@ -145,7 +146,6 @@ extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool allow_experimental_geo_types_in_iceberg;
 extern const SettingsBool allow_iceberg_remove_orphan_files;
 extern const SettingsBool allow_experimental_expire_snapshots;
-extern const SettingsBool iceberg_delete_data_on_drop;
 }
 
 static constexpr size_t MAX_TRANSACTION_RETRIES = 100;
@@ -250,6 +250,7 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
         }
     }
     auto table_path = configuration->getPathForRead().path;
+    auto root_derivation = IcebergPathResolver::deriveTableRoot(table_location, table_path, metadata_file_path);
     return PersistentTableComponents{
         .schema_processor = std::make_shared<IcebergSchemaProcessor>(
             context_, context_->getSettingsRef()[Setting::allow_experimental_geo_types_in_iceberg]),
@@ -259,8 +260,10 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
         .metadata_compression_method = compression_method,
         .table_path = table_path,
         .table_uuid = table_uuid,
-        .path_resolver = IcebergPathResolver(table_location, table_path, configuration->getTypeName(), configuration->getNamespace()),
+        .path_resolver = IcebergPathResolver(
+            table_location, root_derivation.table_root, configuration->getTypeName(), configuration->getNamespace()),
         .common_namespace = configuration->getNamespace(),
+        .table_root_was_derived = root_derivation.relation == IcebergPathResolver::RootRelation::AdoptedDescendant,
     };
 }
 
@@ -512,6 +515,8 @@ IcebergMetadata::getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object,
 bool IcebergMetadata::optimize(
     const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings)
 {
+    checkTableRootIsQueriedPath("OPTIMIZE");
+
     if (context->getSettingsRef()[Setting::allow_experimental_iceberg_compaction])
     {
         const auto sample_block = std::make_shared<const Block>(metadata_snapshot->getSampleBlock());
@@ -651,10 +656,9 @@ IcebergMetadata::getState(const ContextPtr & local_context, const String & metad
     auto metadata_object = getMetadataJSONObject(
         metadata_path, object_storage, persistent_components.metadata_cache, local_context, log, persistent_components.metadata_compression_method, persistent_components.table_uuid);
 
-    auto dump_metadata = [&]()->String { return dumpMetadataObjectToString(metadata_object); };
     insertRowToLogTable(
         local_context,
-        dump_metadata,
+        [&] { return dumpMetadataObjectToString(metadata_object); },
         DB::IcebergMetadataLogLevel::Metadata,
         persistent_components.path_resolver.getTableRoot(),
         Iceberg::IcebergPathFromMetadata::deserialize(metadata_path),
@@ -808,8 +812,25 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
 }
 
 
+void IcebergMetadata::checkTableRootIsQueriedPath(std::string_view operation) const
+{
+    if (!persistent_components.table_root_was_derived)
+        return;
+
+    throw Exception(
+        ErrorCodes::NOT_IMPLEMENTED,
+        "{} is not supported for an Iceberg table whose directory '{}' is below the queried path '{}'. "
+        "Query the table directory itself instead of naming a deeper metadata file with the "
+        "iceberg_metadata_file_path setting.",
+        operation,
+        persistent_components.path_resolver.getTableRoot(),
+        persistent_components.table_path);
+}
+
 void IcebergMetadata::checkMutationIsPossible(const MutationCommands & commands)
 {
+    checkTableRootIsQueriedPath("Mutation");
+
     for (const auto & command : commands)
         if (command.type != MutationCommand::DELETE && command.type != MutationCommand::UPDATE)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Iceberg supports only DELETE and UPDATE mutations");
@@ -817,6 +838,8 @@ void IcebergMetadata::checkMutationIsPossible(const MutationCommands & commands)
 
 void IcebergMetadata::checkAlterIsPossible(const AlterCommands & commands)
 {
+    checkTableRootIsQueriedPath("ALTER");
+
     for (const auto & command : commands)
     {
         if (command.type != AlterCommand::Type::ADD_COLUMN && command.type != AlterCommand::Type::DROP_COLUMN
@@ -828,10 +851,35 @@ void IcebergMetadata::checkAlterIsPossible(const AlterCommands & commands)
                 ErrorCodes::NOT_IMPLEMENTED,
                 "Removing column property '{}' from column '{}' is not supported by Iceberg storage", command.to_remove, command.column_name);
 
-        if (command.type == AlterCommand::Type::MODIFY_COLUMN && !command.data_type)
+        if (command.type == AlterCommand::Type::ADD_COLUMN || command.type == AlterCommand::Type::MODIFY_COLUMN)
+        {
+            /// The Iceberg schema records only the type and the field order, so any other clause would be dropped.
+            const char * unsupported_property = nullptr;
+            if (command.comment)
+                unsupported_property = "comment";
+            else if (command.default_expression)
+                unsupported_property = "default expression";
+            else if (command.codec)
+                unsupported_property = "codec";
+            else if (command.ttl)
+                unsupported_property = "TTL";
+            else if (!command.settings_changes.empty() || !command.settings_resets.empty())
+                unsupported_property = "settings";
+
+            if (unsupported_property)
+                throw Exception(
+                    ErrorCodes::NOT_IMPLEMENTED,
+                    "{} the {} of column '{}' is not supported by Iceberg storage",
+                    command.type == AlterCommand::Type::ADD_COLUMN ? "Setting" : "Changing",
+                    unsupported_property,
+                    command.column_name);
+        }
+
+        if (command.type == AlterCommand::Type::MODIFY_COLUMN && !command.data_type
+            && !command.first && command.after_column.empty())
             throw Exception(
                 ErrorCodes::NOT_IMPLEMENTED,
-                "Modifying column '{}' without changing its type is not supported by Iceberg storage", command.column_name);
+                "Modifying column '{}' without changing its type or position is not supported by Iceberg storage", command.column_name);
     }
 }
 
@@ -879,6 +927,7 @@ Pipe IcebergMetadata::executeCommand(
                 "To allow its usage, enable setting allow_experimental_expire_snapshots");
         }
 
+        checkTableRootIsQueriedPath("expire_snapshots");
         return Iceberg::executeExpireSnapshots(
             args, context, object_storage_, data_lake_settings, persistent_components,
             write_format, catalog_, storage_id.getTableName(), *secondary_storages);
@@ -893,6 +942,7 @@ Pipe IcebergMetadata::executeCommand(
                 "To allow its usage, enable setting allow_iceberg_remove_orphan_files");
         }
 
+        checkTableRootIsQueriedPath("remove_orphan_files");
         return Iceberg::executeRemoveOrphanFiles(
             args, context, object_storage_, data_lake_settings, persistent_components, *secondary_storages);
     }
@@ -917,22 +967,53 @@ void IcebergMetadata::createInitial(
     if (!configuration_ptr)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to create Iceberg table, but storage configuration is expired");
 
-    std::vector<String> metadata_files;
-    try
+    const bool catalog_manages_location = catalog && catalog->managesTableLocation();
+    const bool catalog_writes_metadata_file = catalog && catalog->isTransactional();
+
+    String namespace_name;
+    String table_name;
+    if (catalog)
+        std::tie(namespace_name, table_name) = DataLake::parseTableName(table_id_.getTableName());
+
+    auto throw_leftover_metadata = [&]
     {
-        metadata_files = listFiles(*object_storage, configuration_ptr->getPathForRead().path, "metadata", ".metadata.json");
+        throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS,
+            "The catalog has no table {}.{} registered, but Iceberg metadata files are already present at {}, "
+            "so creating the table there would clash with them. This is usually left behind by a previous "
+            "`DROP TABLE` without `data_lake_delete_data_on_drop`, which keeps the data and metadata in "
+            "place: remove the leftover files, or create the table at a different location",
+            namespace_name, table_name, configuration_ptr->getPathForRead().path);
+    };
+
+    if (catalog_manages_location)
+    {
+        DataLake::TableMetadata existing_table;
+        if (catalog->tryGetTableMetadata(namespace_name, table_name, local_context, existing_table))
+            throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS,
+                "Table {}.{} already exists in the catalog", namespace_name, table_name);
     }
-    catch (const Exception & ex)
+    else
     {
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "NoSuchBucket: {}", ex.what());
-    }
-    if (!metadata_files.empty())
-    {
-        if (if_not_exists)
-            return;
-        else
-            throw Exception(
-                ErrorCodes::TABLE_ALREADY_EXISTS, "Iceberg table with path {} already exists", configuration_ptr->getPathForRead().path);
+        std::vector<String> metadata_files;
+        try
+        {
+            metadata_files = listFiles(*object_storage, configuration_ptr->getPathForRead().path, "metadata", ".metadata.json");
+        }
+        catch (const Exception & ex)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "NoSuchBucket: {}", ex.what());
+        }
+        if (!metadata_files.empty())
+        {
+            if (!catalog)
+            {
+                if (if_not_exists)
+                    return;
+                throw Exception(
+                    ErrorCodes::TABLE_ALREADY_EXISTS, "Iceberg table with path {} already exists", configuration_ptr->getPathForRead().path);
+            }
+            throw_leftover_metadata();
+        }
     }
 
     String location_path = configuration_ptr->getRawPath().path;
@@ -943,7 +1024,8 @@ void IcebergMetadata::createInitial(
             = configuration_ptr->getTypeName() + "://" + configuration_ptr->getNamespace() + "/" + configuration_ptr->getRawPath().path;
 
     auto [metadata_content_object, metadata_content] = createEmptyMetadataFile(
-        location_path, *columns, partition_by, order_by, local_context, configuration_ptr->getDataLakeSettings()[DataLakeStorageSetting::iceberg_format_version]);
+        location_path, *columns, partition_by, order_by, local_context,
+        configuration_ptr->getDataLakeSettings()[DataLakeStorageSetting::iceberg_format_version], /*is_catalog_table=*/ bool(catalog));
     auto compression_method_str = local_context->getSettingsRef()[Setting::iceberg_metadata_compression_method].value;
     auto compression_method = chooseCompressionMethod(compression_method_str, compression_method_str);
 
@@ -951,44 +1033,104 @@ void IcebergMetadata::createInitial(
     if (!compression_suffix.empty())
         compression_suffix = "." + compression_suffix;
 
-    auto filename = fmt::format("{}metadata/v1{}.metadata.json", configuration_ptr->getRawPath().path, compression_suffix);
+    auto table_uuid = metadata_content_object->getValue<String>(Iceberg::f_table_uuid);
+    auto metadata_file_name = catalog_writes_metadata_file
+        ? fmt::format("v1-{}{}.metadata.json", table_uuid, compression_suffix)
+        : fmt::format("v1{}.metadata.json", compression_suffix);
+    auto filename = fmt::format("{}metadata/{}", configuration_ptr->getRawPath().path, metadata_file_name);
 
     if (catalog)
     {
+        /// The namespace default location is the namespace base, not this table's directory.
+        String namespace_location = location_path;
+        while (namespace_location.ends_with('/'))
+            namespace_location.pop_back();
+
+        String namespace_path = namespace_name;
+        std::replace(namespace_path.begin(), namespace_path.end(), '.', '/');
+        if (namespace_location.ends_with("/" + namespace_path + "/" + table_name))
+            namespace_location.resize(namespace_location.size() - table_name.size() - 1);
+        else
+            namespace_location.clear();
+
         /// Register the namespace before any files are written (but after all local
         /// validation, so a rejected CREATE leaves no trace in the catalog): a catalog
         /// that shares its storage view with the data (e.g. SeaweedFS) refuses to create
         /// a namespace over the plain directory those files would leave behind.
-        catalog->createNamespaceIfNotExists(DataLake::parseTableName(table_id_.getTableName()).first, location_path);
+        catalog->createNamespaceIfNotExists(namespace_name, namespace_location);
     }
 
+    if (!catalog_writes_metadata_file)
+    {
+        try
+        {
+            writeMessageToFile(metadata_content, filename, object_storage, local_context, "*", "", compression_method);
+        }
+        catch (const Exception & e)
+        {
+            /// The write uses `If-None-Match: *`, so S3 answers `PreconditionFailed` when the metadata
+            /// file is already there: leftovers from an earlier drop, or a concurrent creation.
+            const bool precondition_failed
+                = (e.code() == ErrorCodes::S3_ERROR && e.message().contains("PreconditionFailed"))
+                || e.code() == ErrorCodes::FILE_ALREADY_EXISTS;
+            if (if_not_exists && precondition_failed)
+            {
+                if (!catalog)
+                    return;
+                throw_leftover_metadata();
+            }
+            throw;
+        }
+    }
+
+    String filename_version_hint;
     try
     {
-        writeMessageToFile(metadata_content, filename, object_storage, local_context, "*", "", compression_method);
+        if (!catalog_writes_metadata_file
+            && configuration_ptr->getDataLakeSettings()[DataLakeStorageSetting::iceberg_use_version_hint].value)
+        {
+            auto version_hint_path = configuration_ptr->getRawPath().path + "metadata/version-hint.text";
+            writeMessageToFile("1", version_hint_path, object_storage, local_context, "*", "");
+            filename_version_hint = version_hint_path;
+        }
     }
-    catch (const Exception & e)
+    catch (...)
     {
-        /// The write uses `If-None-Match: *`, so S3 returns PreconditionFailed when the metadata file
-        /// already exists (e.g. leftover data after `DROP TABLE` with `iceberg_delete_data_on_drop` off,
-        /// or a concurrent creation). When `IF NOT EXISTS` was specified, this is expected.
-        if (if_not_exists && e.code() == ErrorCodes::S3_ERROR
-            && e.message().find("PreconditionFailed") != String::npos)
-            return;
+        if (!catalog_writes_metadata_file)
+        {
+            tryLogCurrentException(__PRETTY_FUNCTION__, "Removing the files of the Iceberg table that failed to be created");
+            object_storage->removeObjectIfExists(StoredObject(filename));
+            if (!filename_version_hint.empty())
+                object_storage->removeObjectIfExists(StoredObject(filename_version_hint));
+        }
         throw;
-    }
-
-    if (configuration_ptr->getDataLakeSettings()[DataLakeStorageSetting::iceberg_use_version_hint].value)
-    {
-        auto filename_version_hint = configuration_ptr->getRawPath().path + "metadata/version-hint.text";
-        writeMessageToFile("1", filename_version_hint, object_storage, local_context, "*", "");
     }
 
     if (catalog)
     {
-        auto catalog_filename = configuration_ptr->getTypeName() + "://" + configuration_ptr->getNamespace() + "/"
-            + configuration_ptr->getRawPath().path + "metadata/v1.metadata.json";
-        const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id_.getTableName());
-        catalog->createTable(namespace_name, table_name, catalog_filename, metadata_content_object);
+        auto catalog_filename
+            = configuration_ptr->getTypeName() + "://" + configuration_ptr->getNamespace() + "/" + filename;
+
+        /// Always ask for a conflict to be reported as `false`, so the files staged above are removed
+        /// before `TABLE_ALREADY_EXISTS` is thrown, with or without `IF NOT EXISTS`.
+        if (!catalog->createTable(namespace_name, table_name, catalog_filename, metadata_content_object, compression_method, /* if_not_exists */ true))
+        {
+            if (!catalog_writes_metadata_file)
+            {
+                LOG_INFO(
+                    getLogger("IcebergMetadata"),
+                    "Table {}.{} was registered in the catalog by another client, removing the initial metadata file {} "
+                    "written by this `CREATE`",
+                    namespace_name,
+                    table_name,
+                    filename);
+                object_storage->removeObjectIfExists(StoredObject(filename));
+                if (!filename_version_hint.empty())
+                    object_storage->removeObjectIfExists(StoredObject(filename_version_hint));
+            }
+            throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS,
+                "Table {}.{} already exists in the catalog", namespace_name, table_name);
+        }
     }
 }
 
@@ -1575,6 +1717,7 @@ SinkToStoragePtr IcebergMetadata::write(
 {
     if (context->getSettingsRef()[Setting::allow_insert_into_iceberg])
     {
+        checkTableRootIsQueriedPath("INSERT");
         return std::make_shared<IcebergStorageSink>(object_storage, configuration, format_settings, sample_block, context, catalog, persistent_components, table_id, secondary_storages);
     }
     else
@@ -1586,16 +1729,29 @@ SinkToStoragePtr IcebergMetadata::write(
     }
 }
 
-void IcebergMetadata::drop(ContextPtr context)
+void IcebergMetadata::drop(bool delete_data)
 {
-    if (!context->getSettingsRef()[Setting::iceberg_delete_data_on_drop].value)
+    if (!delete_data)
         return;
+
+    /// Skipped rather than refused: this runs after the table is already marked as dropped, so
+    /// throwing here only makes `DatabaseCatalog` retry the drop forever.
+    if (persistent_components.table_root_was_derived)
+    {
+        LOG_WARNING(
+            log,
+            "Keeping the data of the Iceberg table at '{}': it is below the queried path '{}', which also covers "
+            "other tables. Drop it while querying the table directory itself to delete the data.",
+            persistent_components.path_resolver.getTableRoot(),
+            persistent_components.table_path);
+        return;
+    }
 
     /// Files outside `table_path` (secondary storage, or base storage elsewhere in the bucket) are only
     /// discoverable through the metadata graph the base wipe below removes, so enumerate them first. Let
     /// a failure propagate rather than wiping the metadata re-enumeration on retry depends on (fail closed).
     auto external_files = Iceberg::collectReachableFiles(
-        object_storage, persistent_components, data_lake_settings, context, log, *secondary_storages).external_files;
+        object_storage, persistent_components, data_lake_settings, Context::getGlobalContextInstance(), log, *secondary_storages).external_files;
 
     /// Delete these files leaf-first (reverse of the traversal's append order) so an interrupted drop
     /// can re-enumerate the rest on retry; batch per storage. Shared files are deleted too, as with `PURGE`.

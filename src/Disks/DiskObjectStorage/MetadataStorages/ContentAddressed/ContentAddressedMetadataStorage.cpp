@@ -2146,17 +2146,15 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
     /// `partAccess()` then `store()` pair (each an independent `pointer_mutex` acquisition) -- see
     /// `poolAccess()`.
     const auto snap = poolAccess();
-    auto view = snap.part_access->getView(r->refKey(), Cas::Freshness::CachedForLoad);
-    if (!view)
+    const auto manifest_view = snap.part_access->getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    if (!manifest_view)
         return std::nullopt;
-    if (const auto * entry = view->findFile(r->file))
+    if (const auto * entry = manifest_view->findFile(r->file))
     {
+        if (entry->placement != Cas::EntryPlacement::Blob)
+            return std::nullopt;
         const auto location = snap.pool->locate(*entry);
         BlobViewPlan plan;
-        /// bytes_size is the readable extent of THIS file's window, NOT the whole blob: a
-        /// right-bounded read stops at payload_end, and a shared blob's bytes beyond it belong
-        /// to other files. The caches key on the physical blob key, so payload ranges are
-        /// shared between every part that references the same blob.
         plan.object = StoredObject(physicalKey(location.key), path, location.offset + location.length);
         plan.payload_offset = location.offset;
         plan.payload_end = location.offset + location.length;

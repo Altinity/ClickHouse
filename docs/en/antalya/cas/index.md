@@ -94,4 +94,5 @@ per disk, so adopting it never requires migrating an existing deployment.
 | [Architecture overview](/antalya/cas/architecture/) | The object model, the Git analogy, and the safety invariants |
 | [Correctness](/antalya/cas/architecture/correctness) | How the design was verified: TLA+ models, counterexamples, soak methodology |
 | [Design history](/antalya/cas/architecture/design-history) | What earlier designs were tried and rejected, and why |
+| [Backup](/antalya/cas/operations/backup) | How `BACKUP` and `RESTORE` behave on a content-addressed disk |
 | [Roadmap](/antalya/cas/roadmap) | What is shipped, planned, and deliberately not pursued |

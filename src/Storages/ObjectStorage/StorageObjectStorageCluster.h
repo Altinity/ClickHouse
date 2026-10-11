@@ -31,6 +31,13 @@ public:
 
     std::string getName() const override;
 
+    /// The write is always performed by the initiator.
+    SinkToStoragePtr write(
+        const ASTPtr & query,
+        const StorageMetadataPtr & metadata_snapshot,
+        ContextPtr context,
+        bool async_insert) override;
+
     bool supportsImport(ContextPtr context) const override;
 
     ImportResult import(
@@ -62,7 +69,11 @@ public:
 
     std::optional<UInt64> totalRows(ContextPtr query_context) const override;
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
-    void setClusterNameInSettings(bool cluster_name_in_settings_) { cluster_name_in_settings = cluster_name_in_settings_; }
+
+    void setClusterNameFromFunctionArgument(bool cluster_name_from_function_argument_)
+    {
+        cluster_name_from_function_argument = cluster_name_from_function_argument_;
+    }
 
     String getClusterName(ContextPtr context) const override;
 
@@ -73,6 +84,8 @@ public:
         ContextPtr context) override;
 
     void drop() override;
+
+    void prepareForDrop(ContextPtr query_context) override;
 
     void dropInnerTableIfAny(bool sync, ContextPtr context) override;
 
@@ -92,7 +105,7 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
-    IDataLakeMetadata * getExternalMetadata(ContextPtr query_context);
+    std::shared_ptr<IDataLakeMetadata> getExternalMetadata(ContextPtr query_context);
 
     std::shared_ptr<DataLake::ICatalog> getCatalog() const;
 
@@ -194,23 +207,20 @@ private:
         size_t max_block_size,
         size_t num_streams) override;
 
-    SinkToStoragePtr writeFallBackToPure(
-        const ASTPtr & query,
-        const StorageMetadataPtr & metadata_snapshot,
-        ContextPtr context,
-        bool async_insert) override;
+    bool usesObjectStorageClusterSettingSyntax() const override { return !cluster_name_from_function_argument; }
 
     /*
     In case the table was created with `object_storage_cluster` setting,
     modify the AST query object so that it uses the table function implementation
-    by mapping the engine name to table function name and setting `object_storage_cluster`.
+    by mapping the engine name to table function name and setting `object_storage_cluster`
+    as a query SETTINGS value (not a table-function argument).
     For table like
     CREATE TABLE table ENGINE=S3(...) SETTINGS object_storage_cluster='cluster'
-    coverts request
+    converts request
     SELECT * FROM table
     to
     SELECT * FROM s3(...) SETTINGS object_storage_cluster='cluster'
-    to make distributed request over cluster 'cluster'.
+    (and optionally to s3Cluster when make_cluster_function is true on the non-deferred path).
     Returns true if cluster name was added to settings.
     */
     bool updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context, bool make_cluster_function);
@@ -218,7 +228,8 @@ private:
     const String engine_name;
     StorageObjectStorageConfigurationPtr configuration;
     const ObjectStoragePtr object_storage;
-    bool cluster_name_in_settings;
+    /// True for explicit *Cluster(...); false for SETTINGS / ENGINE / DataLake paths.
+    bool cluster_name_from_function_argument = false;
 
     /// non-clustered storage to fall back on pure realisation if needed
     std::shared_ptr<StorageObjectStorage> pure_storage;
