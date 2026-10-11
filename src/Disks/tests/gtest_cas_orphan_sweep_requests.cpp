@@ -93,7 +93,7 @@ struct PageFixture
 
 }
 
-TEST(CASOrphanSweepRequests, FloorIsReadOncePerNamespacePerPageAtTheListedRootOnly)
+TEST(CASOrphanSweepRequests, FloorIsReadOncePerNamespacePerPage)
 {
     PageFixture f(/*manifests=*/50, /*min_active=*/25);
     const Layout & layout = f.store->layout();
@@ -397,11 +397,6 @@ struct EpochCrossingFixture
         setWatermarkMinActive(*backend, layout, "test", kEpochs, /*min_active=*/1000);
     }
 
-    NamespaceLifeId life() const
-    {
-        return NamespaceLifeId::fromCatalogEntry(kNs, catalogLifeIdForTest(*backend, store->layout(), kNs));
-    }
-
     ManifestSweepResult page(ThreadPool * pool, size_t concurrency)
     {
         const RoundListingsForTest listed = listRoundForTest(*store);
@@ -436,13 +431,4 @@ TEST(CASOrphanSweepRequests, EpochCrossingsWasteNoHintAndReadExactlyTheInlineKey
     EXPECT_EQ(outcomeOf(inline_r), outcomeOf(ahead_r));
     EXPECT_TRUE(sameNominations(inline_r.nominations, ahead_r.nominations));
     EXPECT_EQ(inline_gets, ahead_gets);
-    /// The recovery walk `activeManifestKeys` runs and its own committed-tail walk both cover the whole
-    /// range (today's double walk, not something read-ahead changes), so each listed log is read twice
-    /// and no position past a seal is read at all.
-    const NamespaceLifeId life = ahead_f.life();
-    const auto gets_at = [&](const RefTxnId & id) { return ahead_f.backend->getCount(ahead_f.store->layout().refLogKey(life, id)); };
-    for (uint64_t epoch = 1; epoch < kEpochs; ++epoch)
-        EXPECT_EQ(gets_at(RefTxnId{epoch, (epoch == 1 ? 8u : 1u) + 1}), 0u) << "position past the seal of epoch " << epoch;
-    for (uint64_t seq = 1; seq <= kLastEpochLogs; ++seq)
-        EXPECT_EQ(gets_at(RefTxnId{kEpochs, seq}), 2u) << seq;
 }

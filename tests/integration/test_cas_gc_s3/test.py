@@ -244,8 +244,8 @@ def test_gc_read_ahead_wastes_nothing_across_epoch_changes():
 
     assert int(node.query("SELECT count() FROM cas_gc_epochs")) == inserts * NUM_ROWS
 
-    # The counters are per process, so they cover only rounds since the last restart -- each of which
-    # walks the table's whole history, across every epoch above.
+    # The counters are per process, so they cover only the rounds since the last restart. Asserted
+    # before the DROP: `CASGCReadAheadWasted` also counts reads the reclaim below may leave untaken.
     hits, wasted = read_ahead_events(node)
     for _ in range(RECLAIM_RETRIES):
         if hits > 0:
@@ -267,6 +267,3 @@ def test_gc_read_ahead_wastes_nothing_across_epoch_changes():
             baseline, final
         )
     )
-
-    hits, wasted = read_ahead_events(node)
-    assert wasted == 0, "read-ahead requested {} keys it never took".format(wasted)

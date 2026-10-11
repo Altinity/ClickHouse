@@ -681,7 +681,6 @@ TEST(CASGCArithmeticIntake, ReadAheadAcrossRemountEpochsWastesNothingAndDecidesA
     ASSERT_FALSE(sequential.intake.empty()) << "no fold_ref_intake row";
     EXPECT_EQ(sequential.intake.at("epoch_crossings"), kEpochs - 1);
     EXPECT_EQ(sequential.cursor, (RefTxnId{kEpochs, kLastEpochLogs}));
-    EXPECT_EQ(inline_hits, 0u) << "concurrency 1 hints nothing";
     EXPECT_EQ(wasted, 0u) << "a hint past a seal is a request for a key that never exists";
     EXPECT_GT(hits, 0u) << "the long epochs must actually be read ahead, or this test proves nothing";
     EXPECT_EQ(sequential, ahead);

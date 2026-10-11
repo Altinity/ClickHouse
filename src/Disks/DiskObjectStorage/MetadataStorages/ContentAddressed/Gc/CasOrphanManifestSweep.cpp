@@ -303,12 +303,12 @@ NamespaceProtection activeManifestKeys(
     }
 
     /// Guards the walk's most recently hinted-but-not-yet-taken range (from `arm`'s `from` up to one
-    /// window) so that an early exit from the loop below -- the work-budget `break`, the corrupted-tail
-    /// `throw`, or the missing-cursor epoch cross -- frees it instead of leaving it pinned against the
-    /// SAME reader for whatever this page reads next (later candidates, later namespaces). An ordinary
-    /// same-epoch advance re-arms it on the new position without discarding: those hints are still
-    /// wanted. A seal crossing discards explicitly, right where the crossing happens, and disarms so
-    /// this guard's own destructor does not repeat it.
+    /// window) so that an early exit from the loop below -- the work-budget `break` or the corrupted-tail
+    /// `throw` -- frees it instead of leaving it pinned against the SAME reader for whatever this page
+    /// reads next (later candidates, later namespaces). Every advance re-arms it on the new position
+    /// without discarding: a same-epoch advance still wants those hints, and an epoch crossing (a seal
+    /// or a missing cursor) has none, since `hintRefLogsWithinEpoch` hints only listed ids and no id
+    /// past a seal is ever listed.
     struct OutstandingHintGuard
     {
         KeyReader & reader;
@@ -324,13 +324,11 @@ NamespaceProtection activeManifestKeys(
             committed_through = committed_through_;
             armed = true;
         }
-        void discardNow()
+        ~OutstandingHintGuard()
         {
             if (armed)
                 discardRefLogHintsOfEpoch(reader, layout, life, from, committed_through);
-            armed = false;
         }
-        ~OutstandingHintGuard() { discardNow(); }
     } outstanding_hints{reader, layout, life};
 
     while (id <= *ckpt.committed_through)
@@ -364,9 +362,6 @@ NamespaceProtection activeManifestKeys(
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS orphan sweep: committed tail log {} is absent under the supplied _ckpt frontier",
                     renderRefTxnId(id));
-            /// The old epoch's hints past this missing cursor do not exist either; discard them before
-            /// crossing, exactly as the seal path below does.
-            outstanding_hints.discardNow();
             id = cross_from_missing_cursor(*prior);
             prior.reset();
             prior_is_seal.reset();
@@ -387,7 +382,6 @@ NamespaceProtection activeManifestKeys(
         {
             if (is_seal)
             {
-                outstanding_hints.discardNow();
                 prior.reset();
                 prior_is_seal.reset();
             }

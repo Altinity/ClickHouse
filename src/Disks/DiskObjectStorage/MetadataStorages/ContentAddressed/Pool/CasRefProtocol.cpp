@@ -1096,12 +1096,7 @@ RecoveredRefTable recoverRefTableDetailedFromAuthority(
 
             if (const std::optional<RefTxnId> next = nextRefLogIdWithinCommittedFrontier(
                     id, is_seal, *grounding.committed_through))
-            {
-                if (is_seal && reader && id.ref_sequence < std::numeric_limits<uint64_t>::max())
-                    discardRefLogHintsOfEpoch(*reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1},
-                                              *grounding.committed_through);
                 id = *next;
-            }
             else
                 break;
         }

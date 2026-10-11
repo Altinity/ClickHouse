@@ -51,9 +51,10 @@ private:
 void hintRefLogsWithinEpoch(KeyReader & reader, const Layout & layout, const NamespaceLifeId & life,
                             RefTxnId first, const RefTxnId & committed_through, const std::set<RefTxnId> & listed);
 
-/// Drops every hint of `first`'s epoch from `first` up to one window: called when a walk crosses an
-/// epoch or leaves it early, so the window is free for whatever it reads next. Discarding an unhinted
-/// key is a no-op, so over-asking by a window is harmless.
+/// Drops every hint of `first`'s epoch from `first` up to one window: called when a walk leaves the
+/// epoch early, so the window is free for whatever it reads next. A seal crossing has nothing to drop:
+/// by the rule above no id past a seal is listed, so none is hinted. Discarding an unhinted key is a
+/// no-op, so over-asking by a window is harmless.
 void discardRefLogHintsOfEpoch(KeyReader & reader, const Layout & layout, const NamespaceLifeId & life,
                                RefTxnId first, const RefTxnId & committed_through);
 
