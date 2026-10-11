@@ -174,7 +174,7 @@ TEST(CASOrphanManifestSweep, EligibleAndUnownedIsDeleted)
     seedConsumedSealCursor(*backend, store->layout(), ns);
     seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
     EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
@@ -224,7 +224,8 @@ TEST(CASOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
     seedConsumedSealCursor(*backend, layout, ns);
 
     std::vector<String> warnings;
-    EXPECT_EQ(sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, &warnings), 0u);
+    EXPECT_EQ(sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5},
+                             listServerRoots(*store), &warnings), 0u);
     EXPECT_TRUE(headExists(*backend, candidate_key));
     ASSERT_FALSE(warnings.empty());
 }
@@ -240,7 +241,7 @@ TEST(CASOrphanManifestSweep, OwnedBodyIsSkipped)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);  // now owned
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
@@ -270,7 +271,7 @@ TEST(CASOrphanManifestSweep, PendingCommittedRemovalBodyIsSkipped)
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);   // dropped: pending committed removal, -1 unsealed
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);   // 6 > 5 => prefix eligible
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})))
         << "a dropped-but-unsealed committed manifest body must survive the sweep (delete-after-sealed-"
            "decrements) — else the removal-fold clamps forever on the missing body (GC-WEDGE-2026-07-10)";
@@ -290,7 +291,7 @@ TEST(CASOrphanManifestSweep, EmitsNoBlobDeltas)
     // The sweep must not advance the in-degree generation: capture it AFTER the fixture's own seal.
     const uint64_t gen_before = currentGenerationOf(*backend, store->layout());
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
     EXPECT_EQ(currentGenerationOf(*backend, store->layout()), gen_before);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
 }
@@ -327,7 +328,7 @@ TEST(CASOrphanManifestSweep, NoWatermarkIsNotAuthority)
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     // No setWatermarkMinActive — no durable fact => not eligible.
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
@@ -479,7 +480,7 @@ TEST(CASOrphanManifestSweep, MissingRequiredCheckpointSuppressesDestructiveDecis
     const CatalogEntry entry = CasRefCatalog::read(op, store->layout()).catalog.entries.front();
     ASSERT_FALSE(readCkpt(op, store->layout(), NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation)));
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
 
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})))
         << "without the exact _ckpt required by a Live catalog row, the sweep must retain rather than "
@@ -664,7 +665,7 @@ TEST(CASOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
     successor.incarnation = DB::UInt128(0xBEEF);
     backend->arm(store->layout(), predecessor, successor);
 
-    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, listServerRoots(*store));
 
     EXPECT_FALSE(backend->didSwitch())
         << "the sweep must not resolve a second catalog cut after it starts using the frozen entry";

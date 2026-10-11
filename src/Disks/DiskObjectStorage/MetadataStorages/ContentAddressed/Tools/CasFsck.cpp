@@ -1095,6 +1095,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     /// never an error. The owner-visible missing-body case is the error above.
     const NamespaceListing manifest_debris_listing = store.listNamespaces(namespace_prefix);
     recordLifelessKeys(manifest_debris_listing);
+    const std::set<String> server_roots = listServerRoots(store);
     for (const String & ns_str : manifest_debris_listing.namespaces)
     {
         const RootNamespace ns{ns_str};
@@ -1115,7 +1116,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 o.kind = ObjectKind::Blob;
                 o.size = sz;
                 o.cls = FsckClass::Unreachable;
-                if (parsed && prefixEligible(store, ns, prefix))
+                if (parsed && prefixEligible(store, ns, prefix, server_roots))
                     o.reachable_from = {"reclaimable-pre-precommit"};
                 else
                     o.reachable_from = {"in-flight-pre-precommit"};
