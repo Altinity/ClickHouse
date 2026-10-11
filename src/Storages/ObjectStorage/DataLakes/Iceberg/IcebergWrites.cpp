@@ -1077,7 +1077,7 @@ void generateManifestList(
     Iceberg::FileContentType content_type,
     bool use_previous_snapshots,
     const std::vector<Iceberg::FileContentType> & per_entry_content_types,
-    const std::vector<ManifestListEntryExistingCounts> & existing_entry_counts,
+    const std::vector<ManifestListEntryCounts> & entry_counts,
     const std::unordered_set<String> & carry_forward_manifest_paths,
     const std::vector<Int64> & entry_partition_spec_ids,
     const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries,
@@ -1092,12 +1092,12 @@ void generateManifestList(
     chassert(
         entry_partition_summaries.empty() || entry_partition_summaries.size() == manifest_entry_names.size(),
         "entry_partition_summaries size does not match number of manifest entries");
-    /// When provided, existing_entry_counts marks a manifest-only rewrite and supplies per-entry counts.
+    /// When provided, entry_counts marks a manifest rewrite and supplies per-entry counts.
     chassert(
-        existing_entry_counts.empty() || existing_entry_counts.size() == manifest_entry_names.size(),
-        "existing_entry_counts size does not match number of manifest entries");
-    const bool manifest_only_rewrite = !existing_entry_counts.empty();
-    if (!manifest_only_rewrite && entry_row_counts.size() != manifest_entry_names.size())
+        entry_counts.empty() || entry_counts.size() == manifest_entry_names.size(),
+        "entry_counts size does not match number of manifest entries");
+    const bool manifest_rewrite = !entry_counts.empty();
+    if (!manifest_rewrite && entry_row_counts.size() != manifest_entry_names.size())
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
             "Iceberg manifest list needs one row count per manifest entry, got {} counts for {} entries",
@@ -1202,7 +1202,7 @@ void generateManifestList(
     Int64 next_first_row_id = 0;
     if (version > 2)
     {
-        if (manifest_only_rewrite)
+        if (manifest_rewrite)
             throw Exception(
                 ErrorCodes::NOT_IMPLEMENTED,
                 "Rewriting an Iceberg manifest list is not supported for format-version 3: the row-lineage "
@@ -1310,11 +1310,11 @@ void generateManifestList(
         if (version > 1)
         {
             entry.field(Iceberg::f_content) = static_cast<Int32>(entry_content);
-            /// For a manifest-only rewrite, min_sequence_number is the per-manifest minimum of the preserved original sequence numbers.
+            /// For a manifest rewrite, min_sequence_number is the per-manifest minimum of the preserved original sequence numbers.
             const Int64 new_sequence_number = new_snapshot->getValue<Int64>(Iceberg::f_metadata_sequence_number);
             entry.field(Iceberg::f_sequence_number) = new_sequence_number;
             entry.field(Iceberg::f_min_sequence_number)
-                = manifest_only_rewrite ? existing_entry_counts[entry_idx].min_sequence_number : new_sequence_number;
+                = manifest_rewrite ? entry_counts[entry_idx].min_sequence_number : new_sequence_number;
         }
 
         auto set_versioned_field = [&](const auto & value, const String & field_name)
@@ -1339,15 +1339,17 @@ void generateManifestList(
         };
         entry.field(Iceberg::f_added_snapshot_id) = new_snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);
         auto summary = new_snapshot->getObject(Iceberg::f_summary);
-        if (manifest_only_rewrite)
+        if (manifest_rewrite)
         {
-            /// Manifest-only rewrite (`replace`): data files already existed, so they are reported as existing, not added.
-            const auto & counts = existing_entry_counts[entry_idx];
-            setVersionedField(entry, 0, Iceberg::f_added_files_count);
-            setVersionedField(entry, counts.existing_files_count, Iceberg::f_existing_files_count);
+            /// The counts must agree with the manifest's entry statuses: a metadata-only
+            /// rewrite (`replace`) preserves lineage and its entries stay EXISTING, while a
+            /// regenerated manifest without lineage emits its entries as ADDED.
+            const auto & counts = entry_counts[entry_idx];
+            setVersionedField(entry, counts.counts_are_added ? counts.files_count : 0, Iceberg::f_added_files_count);
+            setVersionedField(entry, counts.counts_are_added ? 0 : counts.files_count, Iceberg::f_existing_files_count);
             setVersionedField(entry, 0, Iceberg::f_deleted_files_count);
-            setVersionedField(entry, 0, Iceberg::f_added_rows_count);
-            setVersionedField(entry, counts.existing_rows_count, Iceberg::f_existing_rows_count);
+            setVersionedField(entry, counts.counts_are_added ? counts.rows_count : 0, Iceberg::f_added_rows_count);
+            setVersionedField(entry, counts.counts_are_added ? 0 : counts.rows_count, Iceberg::f_existing_rows_count);
             setVersionedField(entry, 0, Iceberg::f_deleted_rows_count);
 
             /// Recompute the `partitions` summary so pruning bounds survive the rewrite (lower_bound == upper_bound per field).
@@ -1846,7 +1848,7 @@ bool IcebergStorageSink::initializeMetadata()
                     Iceberg::FileContentType::DATA,
                     /* use_previous_snapshots = */ true,
                     /* per_entry_content_types = */ {},
-                    /* existing_entry_counts = */ {},
+                    /* entry_counts = */ {},
                     /* carry_forward_manifest_paths = */ {},
                     /* entry_partition_spec_ids = */ {},
                     entry_partition_summaries,

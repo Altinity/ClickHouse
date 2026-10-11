@@ -741,7 +741,7 @@ static bool writeConsolidatedManifestFile(
     std::vector<IcebergPathFromMetadata> consolidated_manifest_paths;
     std::vector<Int64> manifest_entry_sizes;
     /// Parallel to consolidated_manifest_paths: existing (not added) file/row counts, since the referenced data files already exist.
-    std::vector<ManifestListEntryExistingCounts> existing_entry_counts;
+    std::vector<ManifestListEntryCounts> existing_entry_counts;
     /// Parallel to consolidated_manifest_paths: each manifest's partition spec-id.
     std::vector<Int64> entry_partition_spec_ids;
     /// Parallel to consolidated_manifest_paths: each manifest's partition fields (value + type), used to recompute the manifest-list `partitions` summary.
@@ -1041,7 +1041,9 @@ static void writeMetadataFiles(
     Poco::JSON::Object::Ptr initial_metadata_object = plan.initial_metadata_object;
     std::unordered_map<Iceberg::IcebergPathFromMetadata, Iceberg::IcebergPathFromMetadata> manifest_file_renamings;
     std::unordered_map<Iceberg::IcebergPathFromMetadata, Int64> manifest_file_sizes;
-    std::unordered_map<Iceberg::IcebergPathFromMetadata, Int64> manifest_file_row_counts;
+    /// Per rewritten manifest: actual file/row counts of its content, written into the
+    /// manifest-list entries so that metadata row counts stay exact after compaction.
+    std::unordered_map<Iceberg::IcebergPathFromMetadata, ManifestListEntryCounts> manifest_file_counts;
 
     {
         std::unordered_map<std::shared_ptr<ManifestFilePlan>, std::unordered_set<Iceberg::IcebergPathFromMetadata>> grouped_by_manifest_files_result;
@@ -1115,10 +1117,20 @@ static void writeMetadataFiles(
                     file_byte_counts.push_back(0);
                 }
             }
-            Int64 manifest_rows = 0;
-            for (const auto rows : file_row_counts)
-                manifest_rows += static_cast<Int64>(rows);
-            manifest_file_row_counts[manifest_entry->patched_path] = manifest_rows;
+
+            /// Record the manifest's actual content counts for its manifest-list entries. The
+            /// files keep their original data sequence numbers, so min_sequence_number is the
+            /// sequence number of the snapshot whose manifest is being rewritten.
+            {
+                Int64 manifest_rows = 0;
+                for (const auto rows : file_row_counts)
+                    manifest_rows += static_cast<Int64>(rows);
+                const Int64 manifest_min_sequence_number = snapshot->has(Iceberg::f_metadata_sequence_number)
+                    ? snapshot->getValue<Int64>(Iceberg::f_metadata_sequence_number)
+                    : 0;
+                manifest_file_counts[manifest_entry->patched_path]
+                    = {static_cast<Int64>(data_files_vec.size()), manifest_rows, manifest_min_sequence_number, /* counts_are_added */ true};
+            }
             generateManifestFile(
                 metadata_object,
                 partition_columns,
@@ -1175,11 +1187,25 @@ static void writeMetadataFiles(
             }
         }
         std::vector<Int64> per_manifest_sizes;
-        std::vector<Int64> per_manifest_row_counts;
         for (const auto & entry : renamed_manifest_entries)
         {
             per_manifest_sizes.push_back(manifest_file_sizes[entry]);
-            per_manifest_row_counts.push_back(manifest_file_row_counts[entry]);
+        }
+        /// Pass the actual per-manifest counts: without them generateManifestList stamps the
+        /// snapshot summary's `added-records` into EVERY entry, so any consumer summing the
+        /// manifest-list row counts (including our own trivial count) would multiply the
+        /// table's row count by the number of manifests. The regenerated manifests carry no
+        /// entry lineage -- their entries are emitted as ADDED -- so the counts are reported
+        /// as added to keep the manifest-list entries consistent with the manifests they
+        /// point to.
+        std::vector<ManifestListEntryCounts> entry_counts;
+        entry_counts.reserve(renamed_manifest_entries.size());
+        for (const auto & entry : renamed_manifest_entries)
+        {
+            if (auto it = manifest_file_counts.find(entry); it != manifest_file_counts.end())
+                entry_counts.push_back(it->second);
+            else
+                entry_counts.push_back({});
         }
         auto buffer_manifest_list = object_storage->writeObject(
             StoredObject(path_resolver.resolve(renamed_manifest_list)),
@@ -1200,11 +1226,7 @@ static void writeMetadataFiles(
             Iceberg::FileContentType::DATA,
             false,
             /* per_entry_content_types */ {},
-            /* existing_entry_counts */ {},
-            /* carry_forward_manifest_paths */ {},
-            /* entry_partition_spec_ids */ {},
-            /* entry_partition_summaries */ {},
-            per_manifest_row_counts);
+            entry_counts);
         buffer_manifest_list->finalize();
     }
 

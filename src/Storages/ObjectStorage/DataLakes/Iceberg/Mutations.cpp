@@ -593,7 +593,7 @@ static bool writeMetadataFiles(
                     content_type,
                     /* use_previous_snapshots */ true,
                     /* per_entry_content_types */ {},
-                    /* existing_entry_counts */ {},
+                    /* entry_counts */ {},
                     /* carry_forward_manifest_paths */ {},
                     /* entry_partition_spec_ids */ {},
                     entry_partition_summaries,

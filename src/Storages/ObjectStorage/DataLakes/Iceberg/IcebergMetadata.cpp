@@ -2163,7 +2163,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
                 generateManifestList(
                     resolver, metadata, object_storage, *secondary_storages, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true,
                     /* per_entry_content_types */ {},
-                    /* existing_entry_counts */ {},
+                    /* entry_counts */ {},
                     /* carry_forward_manifest_paths */ {},
                     /* entry_partition_spec_ids */ {},
                     /* entry_partition_summaries */ {},

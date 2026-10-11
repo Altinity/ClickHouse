@@ -133,13 +133,22 @@ void generateManifestFile(
     /// describe only its own data file, else the shared `data_file_statistics` is used for every entry.
     const std::vector<const DataFileStatistics *> * per_file_fresh_statistics = nullptr);
 
-/// Per manifest-list entry existing-file/existing-row counts for a manifest-only rewrite, where every referenced data file already existed.
-struct ManifestListEntryExistingCounts
+/// Per manifest-list entry file/row counts for rewritten manifests. Reported as existing
+/// counts when the rewritten manifest preserves entry lineage (a metadata-only rewrite:
+/// its entries stay EXISTING), or as added counts when the manifest is regenerated
+/// without lineage (its entries are emitted as ADDED, and the manifest-list entry must
+/// agree with the manifest it points to).
+struct ManifestListEntryCounts
 {
-    Int64 existing_files_count = 0;
-    Int64 existing_rows_count = 0;
+    Int64 files_count = 0;
+    Int64 rows_count = 0;
     /// Minimum data sequence number across the entries in this manifest, used as the manifest-list `min_sequence_number`.
     Int64 min_sequence_number = 0;
+    /// True when the manifest's entries are ADDED in the snapshot whose manifest list is being
+    /// written, so its counts are reported as added_*. False when the manifest is carried
+    /// forward from an earlier snapshot or contains only pre-existing files (metadata-only
+    /// rewrite), so its counts are reported as existing_*.
+    bool counts_are_added = false;
 };
 
 void generateManifestList(
@@ -155,7 +164,7 @@ void generateManifestList(
     Iceberg::FileContentType content_type,
     bool use_previous_snapshots = true,
     const std::vector<Iceberg::FileContentType> & per_entry_content_types = {},
-    const std::vector<ManifestListEntryExistingCounts> & existing_entry_counts = {},
+    const std::vector<ManifestListEntryCounts> & entry_counts = {},
     const std::unordered_set<String> & carry_forward_manifest_paths = {},
     const std::vector<Int64> & entry_partition_spec_ids = {},
     const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {},
