@@ -46,12 +46,11 @@ void onGcEnumerationPage()
 /// `writer_epoch` and `min_active_build_sequence` are the single durable epoch/floor pair used for eligibility, including
 /// across process replacement and the retired sentinel.
 ///
-/// `listed_server_roots`, when set, is the caller's own LIST of `gc/server-roots/`: a prefix it does not
-/// name has no mount body to read, so only the prefixes it names are tried. A mount younger than that
-/// LIST is then not found, which retains -- the same answer an absent mount gives. Without it (the
-/// direct decommission path, which holds no such LIST) every prefix is tried.
+/// `listed_server_roots` is the caller's own LIST of `gc/server-roots/`: a prefix it does not name has no
+/// mount body to read, so only the prefixes it names are tried. A mount younger than that LIST is then
+/// not found, which retains -- the same answer an absent mount gives -- until the caller's next LIST.
 std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & layout, const RootNamespace & ns,
-                                            const std::set<String> * listed_server_roots = nullptr,
+                                            const std::set<String> & listed_server_roots,
                                             uint64_t * reads = nullptr)
 {
     const String & value = ns.string();
@@ -63,7 +62,7 @@ std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & la
             break;
 
         const String server_root_id = value.substr(0, pos);
-        if (!server_root_id.empty() && (!listed_server_roots || listed_server_roots->contains(server_root_id)))
+        if (!server_root_id.empty() && listed_server_roots.contains(server_root_id))
         {
             if (reads)
                 ++*reads;
@@ -530,9 +529,10 @@ namespace
 /// do not replace that authority check with a frozen-sequence or judged-dead guess. Compare
 /// `writer_epoch` first, then `build_sequence`, so old-epoch
 /// debris drains after a process restart even when its build_sequence is above the current min_active_build_sequence.
-bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & prefix)
+bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & prefix,
+                      const std::set<String> & listed_server_roots)
 {
-    return prefixEligibleUnder(floorForNamespace(op, layout, ns), prefix);
+    return prefixEligibleUnder(floorForNamespace(op, layout, ns, listed_server_roots), prefix);
 }
 
 }
@@ -552,18 +552,28 @@ bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPre
     return w.min_active_build_sequence > prefix.build_sequence;
 }
 
-bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix)
+std::set<String> listServerRoots(Pool & store)
 {
     CasOperation op = store.openRequests().admit();
-    return prefixEligibleOn(op, store.layout(), ns, prefix);
+    std::set<String> server_roots;
+    for (const MountInfo & mount : listMounts(op, store.layout(), /*now_ms=*/0, /*skew_margin_ms=*/0))
+        server_roots.insert(mount.srid);
+    return server_roots;
+}
+
+bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
+                    const std::set<String> & listed_server_roots)
+{
+    CasOperation op = store.openRequests().admit();
+    return prefixEligibleOn(op, store.layout(), ns, prefix, listed_server_roots);
 }
 
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
-                        std::vector<String> * warnings)
+                        const std::set<String> & listed_server_roots, std::vector<String> * warnings)
 {
     const Layout & layout = store.layout();
     CasOperation op = store.openRequests().admit();
-    if (!prefixEligibleOn(op, layout, ns, prefix))
+    if (!prefixEligibleOn(op, layout, ns, prefix, listed_server_roots))
         return 0;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
 
     /// Build the protection view. A missing snapshot body, an invalid transaction, or an incomplete
@@ -768,7 +778,7 @@ ManifestSweepResult planManifestCursorPage(
             if (floor_inserted)
             {
                 ++result.floor_lookups;
-                floor_it->second = floorForNamespace(op, layout, parsed->ns, &listed_server_roots, &result.floor_reads);
+                floor_it->second = floorForNamespace(op, layout, parsed->ns, listed_server_roots, &result.floor_reads);
             }
             if (!prefixEligibleUnder(floor_it->second, parsed->prefix))
             {

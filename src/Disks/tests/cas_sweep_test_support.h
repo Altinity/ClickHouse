@@ -22,16 +22,8 @@ struct RoundListingsForTest
 inline RoundListingsForTest listRoundForTest(Pool & store)
 {
     const Layout & layout = store.layout();
+    RoundListingsForTest listed{.server_roots = listServerRoots(store)};
     CasOperation op = store.openRequests().admit();
-    RoundListingsForTest listed;
-    const String roots = layout.serverRootsPrefix();
-    op.forEachListedKey(roots, [&](const ListedKey & k)
-    {
-        static constexpr std::string_view mount_suffix = "/mount";
-        if (k.key.ends_with(mount_suffix))
-            listed.server_roots.insert(k.key.substr(roots.size(), k.key.size() - roots.size() - mount_suffix.size()));
-        return true;
-    }, Retry::standard());
     op.forEachListedKey(layout.casRefsPrefix(), [&](const ListedKey & k)
     {
         if (const auto parsed = layout.parseRefObjectKey(k.key); parsed && parsed->kind == RefObjectKind::Log)

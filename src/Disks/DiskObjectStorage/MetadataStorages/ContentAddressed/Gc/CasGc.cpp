@@ -851,8 +851,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
 
     /// PHASE 3/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
-    /// PUT per newly-fenced mount. The srids that LIST returned outlive the phase: the orphan sweep
-    /// resolves each namespace's mount from them rather than probing every prefix of its name.
+    /// PUT per newly-fenced mount. The srids that LIST returned outlive the phase: the orphan sweep and
+    /// the fold's dead-precommit check resolve each namespace's mount from them rather than probing
+    /// every prefix of its name.
     std::set<String> listed_server_roots;
     {
         GcPhaseTimer t(phase_sink, "heartbeat_floor");
@@ -2999,7 +3000,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 if (edge.change > 0 && edge.owner_kind == RefOwnerKind::Precommit
                     && prefixEligible(*store, ns,
                            BuildPrefix{.writer_epoch = edge.manifest_id.ref.writer_epoch,
-                                       .build_sequence = edge.manifest_id.ref.build_sequence}))
+                                       .build_sequence = edge.manifest_id.ref.build_sequence},
+                           listed_server_roots))
                 {
                     ProfileEvents::increment(ProfileEvents::CASGCDeadPrecommitSkipped);
                     ++intake_dead_precommits_skipped;
@@ -4841,6 +4843,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// not provably build-dead (the watermark fact) — over-protect. An unowned manifest that later
     /// dies without journal evidence leaks its edges until a future rebuild (documented, bounded,
     /// fsck-visible); provably-dead ones stay excluded (the orphan sweep owns their bodies).
+    const std::set<String> server_roots = listServerRoots(*store);
     for (const String & ns_str : seen_ns)
     {
         const RootNamespace ns{ns_str};
@@ -4855,7 +4858,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             if (!parsed)
                 return true;   /// foreign key shape — debris
             const ManifestRef & mref = parsed->ref;
-            if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}))
+            if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}, server_roots))
                 return true;   /// provably dead — the orphan sweep's territory, never an edge
             const ManifestId id{ns, mref};
             if (foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))

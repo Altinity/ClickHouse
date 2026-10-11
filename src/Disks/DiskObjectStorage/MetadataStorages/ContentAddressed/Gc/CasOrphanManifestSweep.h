@@ -190,13 +190,22 @@ struct ManifestSweepResult
 /// This direct decommission path relies on the caller's held server-root claim/fence: while that claim
 /// is held, a same-server-root rebirth cannot become live between its catalog cut and exact-token delete.
 /// It still rejects every catalog cut with an ambiguous current life id before making any deletion decision.
+/// `listed_server_roots` is as for `prefixEligible`.
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
-                        std::vector<String> * warnings = nullptr);
+                        const std::set<String> & listed_server_roots, std::vector<String> * warnings = nullptr);
+
+/// The server-root ids with a `/mount` key under `gc/server-roots/` (one `listMounts` pass): the
+/// `listed_server_roots` of a caller outside a GC round, which takes it once and passes it to every
+/// `prefixEligible`/`sweepNamespace` call it makes. A GC round passes phase 3's own LIST instead.
+std::set<String> listServerRoots(Pool & store);
 
 /// Whether `prefix` is sweep-eligible by the durable watermark fact alone. The floor is read from the
 /// mount lease identified by the namespace's server-root prefix, not inferred from the manifest key or a
 /// judged-dead heuristic. A missing lease provides no deletion authority, so the prefix is not eligible.
-bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix);
+/// Only the server roots in `listed_server_roots` (the caller's LIST of `gc/server-roots/`) are tried: a
+/// mount younger than that LIST is not found, and so retains, until the caller lists again.
+bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
+                    const std::set<String> & listed_server_roots);
 
 /// The pure half of `prefixEligible`: whether `prefix` is retired under one observation of the mount
 /// floor. `nullopt` (no mount body under any prefix of the namespace) admits nothing. Retirement is
