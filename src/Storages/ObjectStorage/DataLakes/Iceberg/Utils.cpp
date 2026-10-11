@@ -613,6 +613,17 @@ static size_t icebergDecimalRequiredBytes(UInt32 precision)
     return bytes;
 }
 
+void checkUnknownTypeAllowed(const String & column_name, const DataTypePtr & type, Int64 format_version)
+{
+    if (format_version >= 3 || Iceberg::stripNothing(type) == type)
+        return;
+    throw Exception(
+        ErrorCodes::BAD_ARGUMENTS,
+        "Column '{}' of type {} maps to the Iceberg `unknown` type, which requires format version 3, "
+        "but the table uses format version {} (set `iceberg_format_version = 3`)",
+        column_name, type->getName(), format_version);
+}
+
 /// Returns type and required
 std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter)
 {
@@ -653,6 +664,8 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
             return {"string", true};
         case TypeIndex::UUID:
             return {"uuid", true};
+        case TypeIndex::Nothing:
+            return {"unknown", false};
         case TypeIndex::Decimal32:
         case TypeIndex::Decimal64:
         case TypeIndex::Decimal128:
@@ -1180,6 +1193,9 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
     UInt64 format_version,
     bool is_catalog_table)
 {
+    for (const auto & column : columns)
+        checkUnknownTypeAllowed(column.name, column.type, static_cast<Int64>(format_version));
+
     std::unordered_map<String, Int32> column_name_to_source_id;
     static Poco::UUIDGenerator uuid_generator;
 
