@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
 
 namespace DB::ErrorCodes
@@ -264,8 +265,11 @@ TEST(CASOrphanNomination, OnlyCandidatesCostABodyRead)
     }
     f.backend->resetCounts();
 
+    const RoundListingsForTest listed = listRoundForTest(*f.store);
+    f.backend->resetCounts();
     const ManifestSweepResult result = planManifestCursorPage(
-        *f.store, "", /*list_budget=*/100, /*nomination_budget=*/100, /*catalog_recovery_authoritative=*/true, nullptr);
+        *f.store, "", /*list_budget=*/100, /*nomination_budget=*/100, /*catalog_recovery_authoritative=*/true,
+        listed.server_roots, listed.ref_logs, nullptr);
 
     ASSERT_EQ(result.nominations.size(), 1u);
     EXPECT_EQ(f.backend->getCount(layout.manifestKey(f.candidate)), 1u);

@@ -1,10 +1,12 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasNamespaceLifeId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ThreadPool.h>
 #include <base/types.h>
+#include <map>
 #include <optional>
 #include <set>
 #include <utility>
@@ -134,8 +136,9 @@ struct ManifestSweepResult
 
     /// The floor a namespace's builds are judged against is one mount body per server root. A page
     /// resolves it once per namespace (`floor_lookups`); each lookup reads the mount key of every
-    /// `/`-prefix of the namespace until one answers (`floor_reads`), so an absent mount costs the
-    /// whole chain once.
+    /// `/`-prefix of the namespace that the round's LIST of `gc/server-roots/` names, longest first,
+    /// until one answers (`floor_reads`) -- one read for a namespace whose root is listed, none for one
+    /// whose root is not.
     uint64_t floor_lookups = 0;
     uint64_t floor_reads = 0;
 
@@ -217,6 +220,12 @@ bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPre
 /// the affected namespace on THIS page rather than deciding it without a complete protection view;
 /// `nullptr` (the default) reproduces the pre-budget unbounded behavior.
 ///
+/// `listed_server_roots` and `listed_ref_logs` are what the round's own LISTs already returned: the
+/// server-root ids under `gc/server-roots/` that have a `/mount` key (phase 3), and the log ids under
+/// `cas/ns/stream/` per physical life (phase 4). The page asks neither listing for completeness. The
+/// first chooses which mount keys a floor lookup reads; the second chooses which ref-log ids a walk may
+/// hint, so a walk never prefetches the positions past an epoch's seal that do not exist.
+///
 /// `read_pool` and `read_concurrency` (default `nullptr`/1, i.e. every read inline on the caller's
 /// operation) drive the page's read-ahead: with a pool and a concurrency above one, the candidates'
 /// bodies and the catalog-recovery/committed-tail ref-log walks overlap their round trips on `read_pool`
@@ -228,6 +237,8 @@ ManifestSweepResult planManifestCursorPage(
     uint64_t list_budget,
     uint64_t nomination_budget,
     bool catalog_recovery_authoritative,
+    const std::set<String> & listed_server_roots,
+    const std::map<NamespaceLifePhysicalId, std::set<RefTxnId>> & listed_ref_logs,
     GcRoundWorkBudget * work_budget = nullptr,
     ThreadPool * read_pool = nullptr,
     size_t read_concurrency = 1);

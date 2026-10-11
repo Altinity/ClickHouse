@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/tests/cas_sweep_test_support.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ThreadPool.h>
 #include <Common/CurrentMetrics.h>
@@ -26,7 +27,8 @@ namespace ProfileEvents
 
 /// The orphan-manifest sweep's request shape per page. The floor a namespace's builds are judged
 /// against is one mount body per server root, so a page reads it once per namespace, not once per
-/// listed build; the tests below count the mount-key reads and pin the pure eligibility predicate.
+/// listed build, and only at a prefix the round's LIST of `gc/server-roots/` named; the tests below
+/// count the mount-key reads and pin the pure eligibility predicate.
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -35,7 +37,7 @@ namespace
 {
 
 /// A three-segment namespace, the shape a real table gets (`<root>/store/<3hex>/<uuid>@cas@`), so the
-/// floor lookup has three `/`-prefixes to try and two of them miss.
+/// floor lookup has three `/`-prefixes it could try and only the shortest is a server root.
 const RootNamespace kNs{"test/store/465/aa@cas@"};
 
 ManifestRef build(uint64_t seq)
@@ -81,14 +83,17 @@ struct PageFixture
 
     ManifestSweepResult page()
     {
+        const RoundListingsForTest listed = listRoundForTest(*store);
+        backend->resetCounts();
         return planManifestCursorPage(*store, "", /*list_budget=*/1000, /*nomination_budget=*/100,
-                                      /*catalog_recovery_authoritative=*/true, nullptr);
+                                      /*catalog_recovery_authoritative=*/true, listed.server_roots,
+                                      listed.ref_logs, nullptr);
     }
 };
 
 }
 
-TEST(CASOrphanSweepRequests, FloorIsReadOncePerNamespacePerPage)
+TEST(CASOrphanSweepRequests, FloorIsReadOncePerNamespacePerPageAtTheListedRootOnly)
 {
     PageFixture f(/*manifests=*/50, /*min_active=*/25);
     const Layout & layout = f.store->layout();
@@ -96,9 +101,9 @@ TEST(CASOrphanSweepRequests, FloorIsReadOncePerNamespacePerPage)
 
     EXPECT_EQ(result.listed, 50u);
     EXPECT_EQ(result.floor_lookups, 1u);
-    EXPECT_EQ(result.floor_reads, 3u);
-    EXPECT_EQ(f.backend->getCount(layout.mountKey("test/store/465")), 1u);
-    EXPECT_EQ(f.backend->getCount(layout.mountKey("test/store")), 1u);
+    EXPECT_EQ(result.floor_reads, 1u);
+    EXPECT_EQ(f.backend->getCount(layout.mountKey("test/store/465")), 0u) << "not a listed server root";
+    EXPECT_EQ(f.backend->getCount(layout.mountKey("test/store")), 0u) << "not a listed server root";
     EXPECT_EQ(f.backend->getCount(layout.mountKey("test")), 1u);
     /// Builds 1..24 are retired under the floor and reach the premise, which retains them for lack of
     /// coverage; builds 25..50 are active and never get that far.
@@ -116,11 +121,10 @@ TEST(CASOrphanSweepRequests, AbsentFloorRetainsEverythingWithOneLookup)
         ASSERT_TRUE(h.has_value());
         ASSERT_EQ((*op).remove(layout.mountKey("test"), h->etag, Retry::once()), Removal::Removed);
     }
-    f.backend->resetCounts();
     const ManifestSweepResult result = f.page();
 
     EXPECT_EQ(result.floor_lookups, 1u);
-    EXPECT_EQ(result.floor_reads, 3u);
+    EXPECT_EQ(result.floor_reads, 0u) << "no server root is listed, so there is no mount key to read";
     EXPECT_EQ(result.listed, 10u);
     EXPECT_EQ(result.skipped, 10u);
     EXPECT_EQ(result.retained_no_coverage, 0u) << "an absent floor admits nothing, so no key reaches the premise";
@@ -192,9 +196,11 @@ TEST(CASOrphanSweepRequests, MountVanishingMidPageKeepsTheDecisionsOfTheFloorAsR
     for (uint64_t seq = 1; seq <= 50; ++seq)
         writeManifestRaw(*backend, layout, kNs, build(seq), {blobEntryFor("a", DB::UInt128(0x100 + seq))});
     setWatermarkMinActive(*backend, layout, "test", 1, /*min_active=*/25);
+    const RoundListingsForTest listed = listRoundForTest(*store);
     backend->mount_key = layout.mountKey("test");
 
-    const ManifestSweepResult result = planManifestCursorPage(*store, "", 1000, 100, true, nullptr);
+    const ManifestSweepResult result = planManifestCursorPage(
+        *store, "", 1000, 100, true, listed.server_roots, listed.ref_logs, nullptr);
     EXPECT_TRUE(backend->fired);
     EXPECT_EQ(result.floor_lookups, 1u);
     EXPECT_EQ(result.retained_no_coverage, 24u) << "the 24 retired builds were decided under the floor as read";
@@ -272,9 +278,8 @@ bool sameNominations(const std::vector<ManifestSweepResult::Nomination> & a,
 /// cursor sitting in epoch 2 (rule 1) all the same, so they become genuine nominations. `kEpochTwoLogs`
 /// ordinary committed grants after the birth give the committed-tail walk (and the recovery walk, which
 /// starts at this same genesis) a range comfortably longer than one read-ahead window, all inside the
-/// ONE epoch neither walk ever leaves -- unlike the epoch-crossing fixture below, whose hints legitimately
-/// overshoot a seal and so cannot be expected to read the identical key set at every concurrency, this
-/// fixture's GET set is invariant to concurrency, which is what the comparison after it needs.
+/// ONE epoch neither walk ever leaves. The epoch-crossing fixture further below makes the same
+/// comparison across a seal.
 constexpr uint64_t kDebrisManifests = 6;
 constexpr uint64_t kEpochTwoLogs = 80;
 
@@ -320,16 +325,22 @@ struct CandidateFixture
 TEST(CASOrphanSweepRequests, PageIsIdenticalInlineAndWithReadAhead)
 {
     CandidateFixture inline_f;
-    const ManifestSweepResult inline_r = planManifestCursorPage(*inline_f.store, "", 1000, 100, true, nullptr);
+    const RoundListingsForTest inline_listed = listRoundForTest(*inline_f.store);
+    inline_f.backend->resetCounts();
+    const ManifestSweepResult inline_r = planManifestCursorPage(
+        *inline_f.store, "", 1000, 100, true, inline_listed.server_roots, inline_listed.ref_logs, nullptr);
     const auto inline_gets = getsOf(*inline_f.backend);
     ASSERT_EQ(inline_r.nominations.size(), kDebrisManifests)
         << "the fixture must actually produce candidates, or this test proves nothing";
 
     CandidateFixture ahead_f;
+    const RoundListingsForTest ahead_listed = listRoundForTest(*ahead_f.store);
+    ahead_f.backend->resetCounts();
     ThreadPool pool = makeReadPool(4);
     const uint64_t hits_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load();
     const ManifestSweepResult ahead_r = planManifestCursorPage(
-        *ahead_f.store, "", 1000, 100, true, nullptr, &pool, /*read_concurrency=*/16);
+        *ahead_f.store, "", 1000, 100, true, ahead_listed.server_roots, ahead_listed.ref_logs, nullptr, &pool,
+        /*read_concurrency=*/16);
     const uint64_t hits = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load() - hits_before;
     const auto ahead_gets = getsOf(*ahead_f.backend);
 
@@ -340,51 +351,98 @@ TEST(CASOrphanSweepRequests, PageIsIdenticalInlineAndWithReadAhead)
     EXPECT_EQ(inline_gets, ahead_gets);
 }
 
-/// A committed tail that spans two epochs: the walk hints ids past the seal in the old epoch, which
-/// do not exist, discards them at the crossing (at most one window), and hints the new epoch's ids.
-TEST(CASOrphanSweepRequests, EpochCrossingDiscardsAtMostOneWindowAndTheNewEpochIsHinted)
+namespace
 {
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                                                .manifest_sweep_list_budget_keys = 1000,
-                                                .manifest_sweep_delete_budget_keys = 100,
-                                                .gc_fold_max_defer_rounds = 0});
-    const Layout & layout = store->layout();
-    casAdmitEntry(*backend, layout, kNs);
-    /// Epoch 1: birth at {1,1}, six ordinary logs {1,2..7}, seal at {1,8}. Epoch 2: {2,1..40}.
-    publishAt(*backend, layout, kNs, RefTxnId{1, 1}, "t1", /*build_sequence=*/100, DB::UInt128(0x7001), /*birth=*/true);
-    for (uint64_t seq = 2; seq <= 7; ++seq)
-        publishAt(*backend, layout, kNs, RefTxnId{1, seq}, "t" + std::to_string(seq), 100 + seq, DB::UInt128(0x7000 + seq), /*birth=*/false);
-    writeSealAt(*backend, layout, kNs, RefTxnId{1, 8});
-    publishAt(*backend, layout, kNs, RefTxnId{2, 1}, "u1", 200, DB::UInt128(0x8001), /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 8});
-    for (uint64_t seq = 2; seq <= 40; ++seq)
-        publishAt(*backend, layout, kNs, RefTxnId{2, seq}, "u" + std::to_string(seq), 200 + seq, DB::UInt128(0x8000 + seq), /*birth=*/false);
-    writeRecoverableCkptForRawFixture(*backend, layout, kNs, RefCkpt{
-        .life_epoch = 1, .committed_through = RefTxnId{2, 40},
-        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{1, 8}});
-    writeManifestRaw(*backend, layout, kNs, build(1), {blobEntryFor("a", DB::UInt128(0x100))});
-    setWatermarkMinActive(*backend, layout, "test", 2, /*min_active=*/1000);
-    backend->resetCounts();
 
+/// A committed tail that spans several epochs, the shape every table gets from remounts: epoch 1 has a
+/// birth, six ordinary logs and a seal at {1,8}; epochs 2..`kEpochs - 1` hold nothing but their own
+/// seal at sequence 1 (a remount over an idle table); the last epoch has `kLastEpochLogs` ordinary
+/// logs. Every crossing is one a walk learns of only by decoding the seal.
+constexpr uint64_t kEpochs = 6;
+constexpr uint64_t kLastEpochLogs = 40;
+
+struct EpochCrossingFixture
+{
+    std::shared_ptr<CountingBackend> backend = std::make_shared<CountingBackend>();
+    PoolPtr store;
+
+    EpochCrossingFixture()
+    {
+        store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                               .manifest_sweep_list_budget_keys = 1000,
+                                               .manifest_sweep_delete_budget_keys = 100,
+                                               .gc_fold_max_defer_rounds = 0});
+        const Layout & layout = store->layout();
+        casAdmitEntry(*backend, layout, kNs);
+        publishAt(*backend, layout, kNs, RefTxnId{1, 1}, "t1", /*build_sequence=*/100, DB::UInt128(0x7001), /*birth=*/true);
+        for (uint64_t seq = 2; seq <= 7; ++seq)
+            publishAt(*backend, layout, kNs, RefTxnId{1, seq}, "t" + std::to_string(seq), 100 + seq,
+                      DB::UInt128(0x7000 + seq), /*birth=*/false);
+        writeSealAt(*backend, layout, kNs, RefTxnId{1, 8});
+        RefTxnId last_seal{1, 8};
+        for (uint64_t epoch = 2; epoch < kEpochs; ++epoch)
+        {
+            writeSealAt(*backend, layout, kNs, RefTxnId{epoch, 1}, /*prev_epoch_seal=*/last_seal);
+            last_seal = RefTxnId{epoch, 1};
+        }
+        publishAt(*backend, layout, kNs, RefTxnId{kEpochs, 1}, "u1", 200, DB::UInt128(0x8001), /*birth=*/false,
+                  /*prev_epoch_seal=*/last_seal);
+        for (uint64_t seq = 2; seq <= kLastEpochLogs; ++seq)
+            publishAt(*backend, layout, kNs, RefTxnId{kEpochs, seq}, "u" + std::to_string(seq), 200 + seq,
+                      DB::UInt128(0x8000 + seq), /*birth=*/false);
+        writeRecoverableCkptForRawFixture(*backend, layout, kNs, RefCkpt{
+            .life_epoch = 1, .committed_through = RefTxnId{kEpochs, kLastEpochLogs},
+            .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = last_seal});
+        writeManifestRaw(*backend, layout, kNs, build(1), {blobEntryFor("a", DB::UInt128(0x100))});
+        setWatermarkMinActive(*backend, layout, "test", kEpochs, /*min_active=*/1000);
+    }
+
+    NamespaceLifeId life() const
+    {
+        return NamespaceLifeId::fromCatalogEntry(kNs, catalogLifeIdForTest(*backend, store->layout(), kNs));
+    }
+
+    ManifestSweepResult page(ThreadPool * pool, size_t concurrency)
+    {
+        const RoundListingsForTest listed = listRoundForTest(*store);
+        backend->resetCounts();
+        return planManifestCursorPage(*store, "", 1000, 100, true, listed.server_roots, listed.ref_logs, nullptr,
+                                      pool, concurrency);
+    }
+};
+
+}
+
+/// Across every epoch crossing the walks hint only ids the round's LIST returned, so none of the ids
+/// past a seal -- which never exist -- is requested: nothing is wasted, the last epoch is still read
+/// ahead, and the page issues exactly the GETs the inline page issues.
+TEST(CASOrphanSweepRequests, EpochCrossingsWasteNoHintAndReadExactlyTheInlineKeys)
+{
+    EpochCrossingFixture inline_f;
+    const ManifestSweepResult inline_r = inline_f.page(nullptr, 1);
+    const auto inline_gets = getsOf(*inline_f.backend);
+
+    EpochCrossingFixture ahead_f;
+    ThreadPool pool = makeReadPool(4);
     const uint64_t wasted_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted].load();
     const uint64_t hits_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load();
-    ThreadPool pool = makeReadPool(4);
-    const ManifestSweepResult result = planManifestCursorPage(*store, "", 1000, 100, true, nullptr, &pool, 16);
+    const ManifestSweepResult ahead_r = ahead_f.page(&pool, 16);
     const uint64_t wasted = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted].load() - wasted_before;
     const uint64_t hits = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load() - hits_before;
+    const auto ahead_gets = getsOf(*ahead_f.backend);
 
-    /// `publishAt` writes a manifest as a side effect of every call above, so the page's LIST sees
-    /// every one of those (47) plus the one raw manifest -- the fixture is about the hint/discard
-    /// mechanics of the ref-log walks a namespace's first candidate triggers, not about the listing.
-    EXPECT_EQ(result.listed, 48u);
-    /// The SAME reader crosses the epoch twice on this fixture: once inside the recovery walk
-    /// `activeManifestKeys` runs via `recoverRefTableDetailedFromAuthority`, and again in its own
-    /// committed-tail walk over the same {1,1}..{2,40} range (today's pre-existing double walk, not
-    /// something this change introduces) -- so at most two windows are discarded, not one.
-    EXPECT_LE(wasted, 128u) << "at most two windows at concurrency 16: one per walk crossing the epoch";
-    EXPECT_GE(hits, 30u) << "the new epoch's logs were hinted and taken";
-    /// Both walks read epoch 2's logs once each, so every key is read twice -- today's behaviour with
-    /// or without read-ahead, not something the hint/discard rule changes.
-    for (uint64_t seq = 1; seq <= 40; ++seq)
-        EXPECT_EQ(backend->getCount(layout.refLogKey(NamespaceLifeId::fromCatalogEntry(kNs, catalogLifeIdForTest(*backend, layout, kNs)), RefTxnId{2, seq})), 2u) << seq;
+    EXPECT_EQ(wasted, 0u) << "a hint past a seal is a request for a key that never exists";
+    EXPECT_GE(hits, kLastEpochLogs - 1) << "the last epoch's logs were hinted and taken";
+    EXPECT_EQ(outcomeOf(inline_r), outcomeOf(ahead_r));
+    EXPECT_TRUE(sameNominations(inline_r.nominations, ahead_r.nominations));
+    EXPECT_EQ(inline_gets, ahead_gets);
+    /// The recovery walk `activeManifestKeys` runs and its own committed-tail walk both cover the whole
+    /// range (today's double walk, not something read-ahead changes), so each listed log is read twice
+    /// and no position past a seal is read at all.
+    const NamespaceLifeId life = ahead_f.life();
+    const auto gets_at = [&](const RefTxnId & id) { return ahead_f.backend->getCount(ahead_f.store->layout().refLogKey(life, id)); };
+    for (uint64_t epoch = 1; epoch < kEpochs; ++epoch)
+        EXPECT_EQ(gets_at(RefTxnId{epoch, (epoch == 1 ? 8u : 1u) + 1}), 0u) << "position past the seal of epoch " << epoch;
+    for (uint64_t seq = 1; seq <= kLastEpochLogs; ++seq)
+        EXPECT_EQ(gets_at(RefTxnId{kEpochs, seq}), 2u) << seq;
 }

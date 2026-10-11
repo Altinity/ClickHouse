@@ -797,10 +797,12 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
 /// is deliberately no self-resolving compatibility overload: every consumer must pass the row from its
 /// frozen catalog cut explicitly.
 ///
-/// `reader`, when set, fetches the logs; it may prefetch ids of the current epoch and drops them at a
-/// seal. Every decision and every error path is the same with and without it.
+/// `reader`, when set, fetches the logs; it may prefetch ids of the current epoch that are in
+/// `listed_logs` -- the caller's own LIST of this life's stream, still no LIST of this function's --
+/// and drops them at a seal (see `hintRefLogsWithinEpoch`). Every decision and every error path is the
+/// same with and without it.
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
     CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
-    const std::optional<RefCkpt> & ckpt, KeyReader * reader = nullptr);
+    const std::optional<RefCkpt> & ckpt, KeyReader * reader = nullptr, const std::set<RefTxnId> & listed_logs = {});
 
 }

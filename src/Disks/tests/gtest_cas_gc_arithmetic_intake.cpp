@@ -7,8 +7,16 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 
+#include <Common/ProfileEvents.h>
+
 #include <mutex>
 #include <set>
+
+namespace ProfileEvents
+{
+    extern const Event CASGCReadAheadWasted;
+    extern const Event CASGCReadAheadHit;
+}
 
 /// ARITHMETIC REF INTAKE (spec 2026-07-27 "ref chain complete cut" §5).
 ///
@@ -595,4 +603,86 @@ TEST(CASGCArithmeticIntake, WhollyOmittedNamespaceFoldsThroughAuthoritativeCheck
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3}));
     for (uint64_t i = 1; i <= 3; ++i)
         EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(i)), 1) << "blob " << i;
+}
+
+/// READ-AHEAD ACROSS REMOUNT EPOCHS. Every remount closes each table's epoch with a seal, so a mostly
+/// idle table carries one seal-only epoch per remount. The intake hints the next positions of the epoch
+/// it is in and learns where that epoch ends only by decoding its seal, so it hints only ids the
+/// round's LIST returned: across every crossing no hint is wasted, an id the LIST omits is still read
+/// (inline, by exact key), and the round decides exactly what the sequential round decides.
+TEST(CASGCArithmeticIntake, ReadAheadAcrossRemountEpochsWastesNothingAndDecidesAsInline)
+{
+    constexpr uint64_t kEpochs = 7;
+    constexpr uint64_t kFirstEpochLogs = 10;
+    constexpr uint64_t kLastEpochLogs = 40;
+    struct Outcome
+    {
+        std::map<String, UInt64> intake;
+        RefTxnId cursor;
+        std::vector<int64_t> in_degrees;
+        bool operator==(const Outcome &) const = default;
+    };
+    const auto run = [&](uint64_t concurrency, uint64_t & wasted, uint64_t & hits) -> Outcome
+    {
+        auto backend = std::make_shared<HintHoleBackend>();
+        auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                    .gc_fold_max_defer_rounds = 0,
+                                                    .gc_io_concurrency = concurrency});
+        const Layout & layout = store->layout();
+        const RootNamespace ns{"00/aa@cas@"};
+        fixture::admitLive(*backend, layout, ns);
+
+        for (uint64_t seq = 1; seq <= kFirstEpochLogs; ++seq)
+            publishAt(*backend, layout, ns, RefTxnId{1, seq}, "a" + std::to_string(seq), seq, DB::UInt128(seq),
+                      /*birth=*/seq == 1);
+        RefTxnId seal{1, kFirstEpochLogs + 1};
+        writeSealAt(*backend, layout, ns, seal);
+        for (uint64_t epoch = 2; epoch < kEpochs; ++epoch)
+        {
+            writeSealAt(*backend, layout, ns, RefTxnId{epoch, 1}, /*prev_epoch_seal=*/seal);
+            seal = RefTxnId{epoch, 1};
+        }
+        for (uint64_t seq = 1; seq <= kLastEpochLogs; ++seq)
+            publishAt(*backend, layout, ns, RefTxnId{kEpochs, seq}, "b" + std::to_string(seq), 1000 + seq,
+                      DB::UInt128(1000 + seq), /*birth=*/false,
+                      /*prev_epoch_seal=*/seq == 1 ? std::optional<RefTxnId>(seal) : std::nullopt);
+        writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+            .life_epoch = 1,
+            .committed_through = RefTxnId{kEpochs, kLastEpochLogs},
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = seal,
+        });
+        /// One record the LIST omits, mid-way through the last epoch: the hint run stops before it, the
+        /// walk reads it inline, and the run resumes after it.
+        backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{kEpochs, kLastEpochLogs / 2}));
+
+        const uint64_t wasted_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted].load();
+        const uint64_t hits_before = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load();
+        Outcome outcome;
+        outcome.intake = runRoundAndReadIntakeMetrics(store);
+        wasted = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadWasted].load() - wasted_before;
+        hits = ProfileEvents::global_counters[ProfileEvents::CASGCReadAheadHit].load() - hits_before;
+        EXPECT_GT(backend->holesServed(), 0u);
+        outcome.cursor = cursorOf(*backend, layout, ns);
+        for (uint64_t seq = 1; seq <= kFirstEpochLogs; ++seq)
+            outcome.in_degrees.push_back(inDegreeOf(*backend, layout, DB::UInt128(seq)));
+        for (uint64_t seq = 1; seq <= kLastEpochLogs; ++seq)
+            outcome.in_degrees.push_back(inDegreeOf(*backend, layout, DB::UInt128(1000 + seq)));
+        return outcome;
+    };
+
+    uint64_t inline_wasted = 0;
+    uint64_t inline_hits = 0;
+    const Outcome sequential = run(1, inline_wasted, inline_hits);
+    uint64_t wasted = 0;
+    uint64_t hits = 0;
+    const Outcome ahead = run(16, wasted, hits);
+
+    ASSERT_FALSE(sequential.intake.empty()) << "no fold_ref_intake row";
+    EXPECT_EQ(sequential.intake.at("epoch_crossings"), kEpochs - 1);
+    EXPECT_EQ(sequential.cursor, (RefTxnId{kEpochs, kLastEpochLogs}));
+    EXPECT_EQ(inline_hits, 0u) << "concurrency 1 hints nothing";
+    EXPECT_EQ(wasted, 0u) << "a hint past a seal is a request for a key that never exists";
+    EXPECT_GT(hits, 0u) << "the long epochs must actually be read ahead, or this test proves nothing";
+    EXPECT_EQ(sequential, ahead);
 }

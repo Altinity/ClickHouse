@@ -1041,7 +1041,7 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
 
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
     CasOperation & op, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
-    const std::optional<RefCkpt> & ckpt, KeyReader * reader)
+    const std::optional<RefCkpt> & ckpt, KeyReader * reader, const std::set<RefTxnId> & listed_logs)
 {
     /// The frozen catalog row and `_ckpt` supplied by the caller determine every recovery boundary;
     /// this function must not re-read either mutable object, or enumerate the stream, because that
@@ -1073,7 +1073,7 @@ RecoveredRefTable recoverRefTableDetailedFromAuthority(
             const String key = layout.refLogKey(life, id);
             if (reader && id.ref_sequence < std::numeric_limits<uint64_t>::max())
                 hintRefLogsWithinEpoch(*reader, layout, life, RefTxnId{id.writer_epoch, id.ref_sequence + 1},
-                                       *grounding.committed_through);
+                                       *grounding.committed_through, listed_logs);
             const auto got = reader ? reader->take(key) : op.read(key, Retry::standard());
             if (!got)
             {

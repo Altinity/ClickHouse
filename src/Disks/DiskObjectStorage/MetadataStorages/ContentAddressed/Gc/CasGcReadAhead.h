@@ -26,10 +26,11 @@ namespace DB::Cas
 /// durable before the round began (it is a gap whenever it is read), and a manifest body still being
 /// uploaded when the early read lands yields the same hold a slightly earlier sequential read yields
 /// today. Nothing is hinted above `committed_through`, so no request is issued that the sequential
-/// walk would not issue -- with one bounded exception: a ref-log hinting site does not yet know where
-/// an epoch's closing seal is (it learns that only by decoding the log at that position), so it may
-/// hint ids past the seal, inside the SAME epoch, that turn out not to exist. Those are discarded
-/// rather than taken, overshooting by at most one window per epoch crossing, and counted wasted.
+/// walk would not issue. A ref-log hinting site does not know where an epoch's closing seal is (it
+/// learns that only by decoding the log at that position), so it hints only ids the round's LIST of
+/// the stream returned: arithmetic alone would hint a window of ids past the seal that never exist,
+/// once per epoch per walk, and epochs only accumulate. A hint the walk then does not take (a hold, a
+/// spent budget) is discarded rather than taken and counted wasted.
 /// A blob marker is not write-once: the fold hints it only after the round's cut, which is all the
 /// graduation gate needs.
 ///

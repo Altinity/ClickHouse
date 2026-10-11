@@ -4,8 +4,42 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <base/types.h>
 
+#include <map>
+#include <set>
+
 namespace DB::Cas::tests
 {
+
+/// The two LISTs a GC round has already taken when it plans its sweep page -- phase 3's
+/// `gc/server-roots/` and phase 4's `cas/ns/stream/` -- taken here for a test that calls the page
+/// directly, in the shapes `planManifestCursorPage` takes them.
+struct RoundListingsForTest
+{
+    std::set<String> server_roots;
+    std::map<NamespaceLifePhysicalId, std::set<RefTxnId>> ref_logs;
+};
+
+inline RoundListingsForTest listRoundForTest(Pool & store)
+{
+    const Layout & layout = store.layout();
+    CasOperation op = store.openRequests().admit();
+    RoundListingsForTest listed;
+    const String roots = layout.serverRootsPrefix();
+    op.forEachListedKey(roots, [&](const ListedKey & k)
+    {
+        static constexpr std::string_view mount_suffix = "/mount";
+        if (k.key.ends_with(mount_suffix))
+            listed.server_roots.insert(k.key.substr(roots.size(), k.key.size() - roots.size() - mount_suffix.size()));
+        return true;
+    }, Retry::standard());
+    op.forEachListedKey(layout.casRefsPrefix(), [&](const ListedKey & k)
+    {
+        if (const auto parsed = layout.parseRefObjectKey(k.key); parsed && parsed->kind == RefObjectKind::Log)
+            listed.ref_logs[parsed->life_id].insert(parsed->txn_id);
+        return true;
+    }, Retry::standard());
+    return listed;
+}
 
 /// TEST-ONLY variant of the cursor page: plans a page via the production `planManifestCursorPage` and
 /// then exact-token-deletes every nomination immediately, with no source-edge retirement and no
@@ -20,8 +54,10 @@ inline ManifestSweepResult sweepManifestCursorPageForTest(
     uint64_t delete_budget,
     GcRoundWorkBudget * work_budget = nullptr)
 {
+    const RoundListingsForTest listed = listRoundForTest(store);
     ManifestSweepResult result = planManifestCursorPage(
-        store, cursor, list_budget, delete_budget, /*catalog_recovery_authoritative=*/true, work_budget);
+        store, cursor, list_budget, delete_budget, /*catalog_recovery_authoritative=*/true,
+        listed.server_roots, listed.ref_logs, work_budget);
     CasOperation op = store.openRequests().admit();
     for (const ManifestSweepResult::Nomination & nomination : result.nominations)
     {
