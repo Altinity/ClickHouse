@@ -22,7 +22,7 @@ struct RoundListingsForTest
 inline RoundListingsForTest listRoundForTest(Pool & store)
 {
     const Layout & layout = store.layout();
-    RoundListingsForTest listed{.server_roots = listServerRoots(store)};
+    RoundListingsForTest listed{.server_roots = listServerRoots(store), .ref_logs = {}};
     CasOperation op = store.openRequests().admit();
     op.forEachListedKey(layout.casRefsPrefix(), [&](const ListedKey & k)
     {
