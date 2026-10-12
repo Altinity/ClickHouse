@@ -591,6 +591,23 @@ void Gc::observeRetiredBlob(
         redelete_blob_state.del = Removal::Mismatch;
 }
 
+std::vector<Gc::ConditionalDeleteChunk> Gc::prepareConditionalDeleteChunks(
+    const std::vector<RedeleteBlobState> & redelete_blob_states, size_t chunk_keys)
+{
+    std::vector<ConditionalDeleteChunk> chunks;
+    for (size_t i = 0; i < redelete_blob_states.size(); ++i)
+    {
+        const RedeleteBlobState & redelete_blob_state = redelete_blob_states[i];
+        if (redelete_blob_state.error || !redelete_blob_state.live_token)
+            continue;
+        if (chunks.empty() || chunks.back().indices.size() == chunk_keys)
+            chunks.emplace_back();
+        chunks.back().indices.push_back(i);
+        chunks.back().removals.push_back({redelete_blob_state.blob_key, *redelete_blob_state.live_token});
+    }
+    return chunks;
+}
+
 void Gc::recordRedeleteSuccess(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteBlobState & redelete_blob_state)
 {
     if (const auto & hook = store->poolConfig().gc_redelete_record_hook_for_test)
@@ -728,60 +745,46 @@ void Gc::redeleteBlobs(
         }
     }
 
-    std::vector<size_t> matched;
-    for (size_t i = 0; i < scheduled; ++i)
-        if (!redelete_blob_states[i].error && redelete_blob_states[i].live_token)
-            matched.push_back(i);
     const size_t chunk_keys = std::clamp<size_t>(
         std::min<uint64_t>(store->poolConfig().gc_bulk_delete_chunk_keys, store->poolBackendPtr()->conditionalBatchDeleteKeyLimit()),
         1,
         kBulkDeleteMaxKeys);
+    const std::vector<ConditionalDeleteChunk> delete_chunks = prepareConditionalDeleteChunks(redelete_blob_states, chunk_keys);
     ThreadPoolCallbackRunnerLocal<void> delete_runner(pool, ThreadName::CAS_GC_REDELETE);
     std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> delete_handles;
-    delete_handles.reserve((matched.size() + chunk_keys - 1) / chunk_keys);
+    delete_handles.reserve(delete_chunks.size());
     SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(delete_handles); });
-    std::vector<std::vector<size_t>> delete_indices;
-    delete_indices.reserve(delete_handles.capacity());
     std::optional<IndexedException> delete_schedule_error;
-    size_t delete_begin = 0;
+    size_t delete_scheduled = 0;
     try
     {
-        for (; delete_begin < matched.size(); delete_begin += chunk_keys)
+        for (; delete_scheduled < delete_chunks.size(); ++delete_scheduled)
         {
-            const size_t end = std::min(matched.size(), delete_begin + chunk_keys);
-            std::vector<size_t> indices(matched.begin() + delete_begin, matched.begin() + end);
-            std::vector<ConditionalRemove> removals;
-            removals.reserve(indices.size());
-            for (const size_t index : indices)
-                removals.push_back({redelete_blob_states[index].blob_key, *redelete_blob_states[index].live_token});
-            if (io_pool_refuse_at_for_test == entries.size() + delete_handles.size())
+            if (io_pool_refuse_at_for_test == entries.size() + delete_scheduled)
             {
                 io_pool_refuse_at_for_test.reset();
                 throw Exception(
                     ErrorCodes::CANNOT_SCHEDULE_TASK,
                     "Injected CAS GC re-delete batch enqueue refusal at index {}",
-                    delete_handles.size());
+                    delete_scheduled);
             }
-            auto handle = delete_runner.enqueueAndGiveOwnership(
-                [indices,
-                 chunk_removals = std::move(removals),
+            delete_handles.emplace_back(delete_runner.enqueueAndGiveOwnership(
+                [chunk = &delete_chunks[delete_scheduled],
                  states = &redelete_blob_states,
                  pool_store = store,
                  resumed_generation = op.generation()]
                 {
                     CasOperation job_op = pool_store->openRequests().resume(resumed_generation);
-                    const auto outcomes = job_op.removeManyByConditional(chunk_removals, Retry::standard());
-                    for (size_t pos = 0; pos < indices.size(); ++pos)
-                        (*states)[indices[pos]].del = outcomes[pos];
-                });
-            delete_handles.emplace_back(std::move(handle));
-            delete_indices.emplace_back(std::move(indices));
+                    const auto outcomes = job_op.removeManyByConditional(chunk->removals, Retry::standard());
+                    for (size_t pos = 0; pos < chunk->indices.size(); ++pos)
+                        (*states)[chunk->indices[pos]].del = outcomes[pos];
+                }));
             ++ctx.delete_batches;
         }
     }
     catch (...)
     {
-        delete_schedule_error = IndexedException{matched[delete_begin], std::current_exception()};
+        delete_schedule_error = IndexedException{delete_chunks[delete_scheduled].indices.front(), std::current_exception()};
     }
     ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(delete_handles);
     for (size_t chunk = 0; chunk < delete_handles.size(); ++chunk)
@@ -792,7 +795,7 @@ void Gc::redeleteBlobs(
         }
         catch (...)
         {
-            for (const size_t index : delete_indices[chunk])
+            for (const size_t index : delete_chunks[chunk].indices)
                 redelete_blob_states[index].error = std::current_exception();
         }
     }
@@ -816,12 +819,11 @@ void Gc::redeleteBlobs(
     }
     if (delete_schedule_error)
     {
+        size_t delete_unsent = 0;
+        for (size_t chunk = delete_scheduled; chunk < delete_chunks.size(); ++chunk)
+            delete_unsent += delete_chunks[chunk].indices.size();
         recordRedeleteFailure(
-            ctx,
-            entries[delete_schedule_error->index],
-            layout,
-            delete_schedule_error->exception,
-            matched.size() - delete_begin);
+            ctx, entries[delete_schedule_error->index], layout, delete_schedule_error->exception, delete_unsent);
         if (!first_error || delete_schedule_error->index < first_error->index)
             first_error = delete_schedule_error;
     }

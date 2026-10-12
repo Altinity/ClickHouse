@@ -1239,3 +1239,89 @@ TEST(CASGCRedeleteConcurrency, RoundsWithoutRedeletesWriteNoOutcomeLog)
         ADD_FAILURE() << "a round without redeletes or spares wrote the outcome log " << key << " with " << rows.size() << " row(s)";
     EXPECT_TRUE(logs.empty());
 }
+
+namespace
+{
+
+Gc::RedeleteBlobState liveRedeleteBlobState(CasOperation & op, const String & key)
+{
+    Gc::RedeleteBlobState redelete_blob_state;
+    redelete_blob_state.blob_key = key;
+    redelete_blob_state.live_token = std::get<Committed>(op.create(key, "v", Retry::once())).etag;
+    return redelete_blob_state;
+}
+
+Gc::RedeleteBlobState settledRedeleteBlobState(const String & key, Removal del)
+{
+    Gc::RedeleteBlobState redelete_blob_state;
+    redelete_blob_state.blob_key = key;
+    redelete_blob_state.del = del;
+    return redelete_blob_state;
+}
+
+std::vector<std::vector<size_t>> chunkIndices(const std::vector<Gc::ConditionalDeleteChunk> & chunks)
+{
+    std::vector<std::vector<size_t>> indices;
+    for (const auto & chunk : chunks)
+        indices.push_back(chunk.indices);
+    return indices;
+}
+
+}
+
+TEST(CASGCConditionalDeleteChunks, OnlyLiveTokensWithoutErrorsAreChunked)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    OperationForTest op(backend);
+    std::vector<Gc::RedeleteBlobState> redelete_blob_states;
+    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "a"));
+    redelete_blob_states.push_back(settledRedeleteBlobState("gone", Removal::Gone));
+    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "b"));
+    redelete_blob_states.push_back(settledRedeleteBlobState("replaced", Removal::Mismatch));
+    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "failed"));
+    redelete_blob_states.back().error = std::make_exception_ptr(std::runtime_error("head failed"));
+    redelete_blob_states.emplace_back();
+    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "c"));
+
+    const auto chunks = Gc::prepareConditionalDeleteChunks(redelete_blob_states, 10);
+
+    ASSERT_EQ(chunkIndices(chunks), (std::vector<std::vector<size_t>>{{0, 2, 6}}));
+    const auto & removals = chunks.front().removals;
+    ASSERT_EQ(removals.size(), 3u);
+    for (size_t pos = 0; pos < removals.size(); ++pos)
+    {
+        const auto & redelete_blob_state = redelete_blob_states[chunks.front().indices[pos]];
+        EXPECT_EQ(removals[pos].key, redelete_blob_state.blob_key);
+        EXPECT_EQ(removals[pos].expected_token, *redelete_blob_state.live_token);
+    }
+}
+
+TEST(CASGCConditionalDeleteChunks, ChunksAreBoundedByChunkKeys)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    OperationForTest op(backend);
+    std::vector<Gc::RedeleteBlobState> redelete_blob_states;
+    for (const String key : {"a", "b", "c", "d", "e"})
+        redelete_blob_states.push_back(liveRedeleteBlobState(*op, key));
+
+    EXPECT_EQ(
+        chunkIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 2)),
+        (std::vector<std::vector<size_t>>{{0, 1}, {2, 3}, {4}}));
+    EXPECT_EQ(
+        chunkIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 1)),
+        (std::vector<std::vector<size_t>>{{0}, {1}, {2}, {3}, {4}}));
+    EXPECT_EQ(
+        chunkIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 5)),
+        (std::vector<std::vector<size_t>>{{0, 1, 2, 3, 4}}));
+}
+
+TEST(CASGCConditionalDeleteChunks, NothingEligibleGivesNoChunks)
+{
+    std::vector<Gc::RedeleteBlobState> redelete_blob_states;
+    redelete_blob_states.push_back(settledRedeleteBlobState("gone", Removal::Gone));
+    redelete_blob_states.push_back(settledRedeleteBlobState("replaced", Removal::Mismatch));
+    redelete_blob_states.emplace_back();
+
+    EXPECT_TRUE(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 2).empty());
+    EXPECT_TRUE(Gc::prepareConditionalDeleteChunks({}, 2).empty());
+}
