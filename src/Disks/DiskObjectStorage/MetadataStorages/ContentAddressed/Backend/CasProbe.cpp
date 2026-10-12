@@ -44,11 +44,13 @@ Removal removeOrReportDeleteMarker(CasOperation & op, const String & key, const 
 
 }
 
-void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
+CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe_prefix)
 {
     // Sub-directory style ("probe_prefix/token") ensures that list(probe_prefix, …) works for both the
     // in-memory backend (prefix match) and the LocalObjectStorage backend (directory listing).
     const String key = probe_prefix + "/token";
+    const String first_key = probe_prefix + "/batch-first";
+    const String second_key = probe_prefix + "/batch-second";
 
     // Best-effort cleanup — runs at function exit regardless of outcome.
     auto cleanup = [&]() noexcept
@@ -59,13 +61,17 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
         // constructible here — the gate below is the only way to reach `remove` at all.
         try
         {
-            const auto h = op.head(key, Retry::standard());
-            if (h)
-                op.remove(key, h->etag, Retry::standard());
+            for (const String * cleanup_key : {&key, &first_key, &second_key})
+            {
+                const auto h = op.head(*cleanup_key, Retry::standard());
+                if (h)
+                    op.remove(*cleanup_key, h->etag, Retry::standard());
+            }
         }
         catch (...) {} /// NOLINT(bugprone-empty-catch)
     };
 
+    CapabilityProbeResult result;
     try
     {
         // ---- Step 1: create fresh -> Committed; read-after-write returns the bytes. ----
@@ -195,6 +201,25 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
                     "CasProbe: list-after-delete failed — the deleted probe key '{}' is still visible in the listing under prefix '{}'",
                     key, probe_prefix);
         }
+
+        const Etag first_token = std::get<Committed>(op.create(first_key, "probe-batch-first", Retry::standard())).etag;
+        const Etag second_token = std::get<Committed>(op.create(second_key, "probe-batch-second-v1", Retry::standard())).etag;
+        const Etag second_replacement = std::get<Committed>(op.replace(second_key, "probe-batch-second-v2", second_token, Retry::standard())).etag;
+        try
+        {
+            const std::vector<Removal> removals = op.removeManyByConditionalForProbe(
+                {{first_key, first_token}, {second_key, second_token}}, Retry::standard());
+            if (removals.size() == 2 && removals[0] == Removal::Removed && removals[1] == Removal::Mismatch)
+            {
+                const auto second = op.read(second_key, Retry::standard());
+                result.conditional_batch_delete_supported = second && second->bytes == "probe-batch-second-v2";
+            }
+        }
+        catch (const DB::Exception & e)
+        {
+            if (e.code() != DB::ErrorCodes::NOT_IMPLEMENTED)
+                throw;
+        }
     }
     catch (...)
     {
@@ -206,6 +231,7 @@ void runCapabilityProbe(CasOperation & op, const String & probe_prefix)
     // Normal-exit cleanup (the key was already deleted in step 7). Call cleanup anyway to handle any
     // partial state edge cases — it is a no-op if the key is gone.
     cleanup();
+    return result;
 }
 
 }
