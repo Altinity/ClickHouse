@@ -80,10 +80,13 @@ private:
                 std::lock_guard lock(owner.mutex);
                 owner.methods_seen.push_back(request.getMethod());
             }
-            /// `DeleteObjects` carries a request body (the XML `<Delete>` payload); leaving it unread on a
-            /// keep-alive connection makes Poco parse those leftover bytes as the start of the NEXT
-            /// request once this handler returns, corrupting the very next `DeleteObject` this test expects.
-            request.stream().ignore(std::numeric_limits<std::streamsize>::max());
+            const std::string body(
+                std::istreambuf_iterator<char>(request.stream()),
+                std::istreambuf_iterator<char>());
+            {
+                std::lock_guard lock(owner.mutex);
+                owner.bodies_seen.push_back(body);
+            }
             owner.responder(request, response);
         }
     };
@@ -108,6 +111,7 @@ private:
     Responder responder;
     mutable std::mutex mutex;
     std::vector<std::string> methods_seen;
+    std::vector<std::string> bodies_seen;
 
 public:
     explicit ScriptedS3Server(Responder responder_)
@@ -127,13 +131,19 @@ public:
         std::lock_guard lock(mutex);
         return static_cast<size_t>(std::count(methods_seen.begin(), methods_seen.end(), method));
     }
+
+    std::string lastBody() const
+    {
+        std::lock_guard lock(mutex);
+        return bodies_seen.empty() ? std::string{} : bodies_seen.back();
+    }
 };
 
 void sendXml(Poco::Net::HTTPServerResponse & response, Poco::Net::HTTPResponse::HTTPStatus status, const std::string & body)
 {
     response.setContentType("application/xml");
     response.setContentLength(body.size());
-    response.setStatus(status);
+    response.setStatusAndReason(status);
     auto & out = response.send();
     out << body;
     out.flush();
@@ -211,7 +221,10 @@ void sendConditionalDeleteObjectsResult(Poco::Net::HTTPServerResponse & response
 }
 
 std::shared_ptr<DB::S3ObjectStorage> makeStorageForTest(
-    const std::string & endpoint, const DB::S3Capabilities & capabilities, std::optional<uint64_t> objects_chunk_size_to_delete = {})
+    const std::string & endpoint,
+    const DB::S3Capabilities & capabilities,
+    std::optional<uint64_t> objects_chunk_size_to_delete = {},
+    const DB::S3ObjectStorage::S3CredentialsRefreshCallback & credentials_refresh_callback = {})
 {
     DB::RemoteHostFilter remote_host_filter;
     DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
@@ -249,7 +262,7 @@ std::shared_ptr<DB::S3ObjectStorage> makeStorageForTest(
     return std::make_shared<DB::S3ObjectStorage>(
         std::move(client), std::move(settings),
         DB::S3::URI(endpoint + "/test-bucket/"), capabilities,
-        DB::ObjectStorageKeyGeneratorPtr{}, "disk");
+        DB::ObjectStorageKeyGeneratorPtr{}, "disk", true, credentials_refresh_callback);
 }
 
 DB::ContextPtr contextForTest()
@@ -324,6 +337,100 @@ TEST(CASS3ConditionalBatchDelete, ReturnsPerKeyOutcomesInInputOrder)
     EXPECT_EQ(results[0].outcome, DB::ConditionalRemoveOutcome::Removed);
     EXPECT_EQ(results[1].outcome, DB::ConditionalRemoveOutcome::TokenMismatch);
     EXPECT_EQ(server.countMethod("POST"), 1u);
+    EXPECT_NE(server.lastBody().find("<Key>first</Key>"), std::string::npos);
+    EXPECT_NE(server.lastBody().find("<ETag>etag-first</ETag>"), std::string::npos);
+    EXPECT_NE(server.lastBody().find("<Key>second</Key>"), std::string::npos);
+    EXPECT_NE(server.lastBody().find("<ETag>etag-second</ETag>"), std::string::npos);
+}
+
+TEST(CASS3ConditionalBatchDelete, ConvertsExplicitUnsupportedToNotImplemented)
+{
+    (void)contextForTest();
+
+    ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+    {
+        sendBatchNotImplemented(response);
+    });
+    auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
+
+    expectNotImplemented([&]
+    {
+        storage->removeObjectsIfTokensMatch(
+            {{DB::StoredObject("first"), "etag-first"}, {DB::StoredObject("second"), "etag-second"}},
+            DB::ObjectStorageControlRequest{});
+    });
+    EXPECT_EQ(storage->batchDeleteKeyLimit(), 1u);
+}
+
+TEST(CASS3ConditionalBatchDelete, RefreshesExpiredCredentialsBeforeReturningFailure)
+{
+    (void)contextForTest();
+
+    std::atomic<size_t> requests{0};
+    ScriptedS3Server server([&](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+    {
+        if (requests.fetch_add(1) == 0)
+        {
+            sendSingleDeleteError(response, Poco::Net::HTTPResponse::HTTP_FORBIDDEN, "ExpiredToken", "expired");
+            return;
+        }
+        sendConditionalDeleteObjectsResult(response);
+    });
+
+    std::atomic<size_t> refreshes{0};
+    auto storage = makeStorageForTest(
+        server.getUrl(), DB::S3Capabilities{}, {},
+        [&]() -> std::unique_ptr<const DB::S3::Client>
+        {
+            ++refreshes;
+            DB::RemoteHostFilter remote_host_filter;
+            DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
+                "us-east-1", remote_host_filter, 100,
+                DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = 0},
+                false, false, false, true, {}, {});
+            cfg.endpointOverride = server.getUrl();
+            cfg.s3_use_adaptive_timeouts = false;
+            return DB::S3::ClientFactory::instance().create(
+                cfg,
+                DB::S3::ClientSettings{
+                    .use_virtual_addressing = false,
+                    .disable_checksum = false,
+                    .gcs_issue_compose_request = false,
+                    .is_s3express_bucket = false,
+                },
+                "ACCESS_KEY_ID", "SECRET_ACCESS_KEY", "", {}, {}, DB::S3::CredentialsConfiguration{});
+        });
+
+    const auto results = storage->removeObjectsIfTokensMatch(
+        {{DB::StoredObject("first"), "etag-first"}, {DB::StoredObject("second"), "etag-second"}},
+        DB::ObjectStorageControlRequest{});
+
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_EQ(refreshes.load(), 1u);
+    EXPECT_EQ(requests.load(), 2u);
+}
+
+TEST(CASS3ConditionalBatchDelete, DoesNotTreatMissingBucketAsMissingObject)
+{
+    (void)contextForTest();
+
+    ScriptedS3Server server([](const Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response)
+    {
+        sendDeleteObjectsResult(response, {{"first", "NoSuchBucket"}, {"second", "PreconditionFailed"}});
+    });
+    auto storage = makeStorageForTest(server.getUrl(), DB::S3Capabilities{});
+
+    try
+    {
+        storage->removeObjectsIfTokensMatch(
+            {{DB::StoredObject("first"), "etag-first"}, {DB::StoredObject("second"), "etag-second"}},
+            DB::ObjectStorageControlRequest{});
+        FAIL() << "expected NoSuchBucket to remain a hard error";
+    }
+    catch (const DB::S3Exception & e)
+    {
+        EXPECT_EQ(e.getExceptionName(), "NoSuchBucket");
+    }
 }
 
 TEST(CASS3ConditionalBatchDelete, RejectsDuplicateResponseKey)
