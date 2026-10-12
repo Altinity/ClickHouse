@@ -35,8 +35,8 @@ public:
     void scheduleCondemnMarkerWrite(const BlobRef & ref, uint64_t condemn_round, uint64_t size);
 
     /// Drop the marker of a blob whose body is confirmed deleted or absent, but only while it is `Condemned`
-    /// at `condemn_round` or older: a newer marker, or `Clean`, belongs to a later incarnation.
-    void scheduleConfirmedMetaDelete(const BlobRef & ref, uint64_t condemn_round);
+    /// at `newest_round` or older: a newer marker, or `Clean`, belongs to a later incarnation.
+    void scheduleConfirmedMetaDelete(const BlobRef & ref, uint64_t newest_round);
 
     /// Successful-path protocol barrier. Wait for every job scheduled so far, propagating any
     /// pool/framework exception recorded by `ThreadPool`; per-hash operation exceptions are caught

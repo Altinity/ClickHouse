@@ -1466,17 +1466,13 @@ TEST(CASGCCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
                   - carries_before, 4u)
         << "every refused graduation must count one unconfirmed carry";
 
-    /// Heal the backend: the carry-time retry publishes the marker, the entry confirms + graduates, and
-    /// the pipeline reclaims the blob. The retry stamped a round above the entry's, so the entry's marker
-    /// delete leaves it: an orphan over the absent body.
-    const uint64_t entry_round = e->condemn_round;
+    /// Heal the backend: the carry-time retry publishes the marker at a round above the entry's, the entry
+    /// confirms and graduates, and the pipeline reclaims the blob together with that re-stamped marker.
     backend->fail_meta_writes.store(false);
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), blob));
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
-    const auto orphan = loadMetaForTest(*backend, store->layout(), blob);
-    ASSERT_TRUE(orphan.has_value());
-    EXPECT_EQ(orphan->meta.state, MetaState::Condemned);
-    EXPECT_GT(orphan->meta.condemn_round, entry_round);
+    EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), blob).has_value())
+        << "the re-stamped marker outlived its body";
 }
 
 /// The healthy-path counterpart: with the condemn-time marker write landing normally, the gate must not

@@ -739,9 +739,7 @@ TEST(CASGcMetaWriter, GraduationRefusesAnOlderRoundMarker)
     EXPECT_EQ(runGateRound(store, gc).graduated, 1u);
     EXPECT_EQ(runGateRound(store, gc).redeleted, 1u);
     EXPECT_FALSE(blobPresent(*backend, layout, x));
-    const auto orphan = markerOf(*backend, layout, x);
-    ASSERT_TRUE(orphan.has_value()) << "the job for round " << c << " removed a newer marker";
-    EXPECT_EQ(orphan->meta.condemn_round, c + 1);
+    EXPECT_FALSE(markerOf(*backend, layout, x).has_value()) << "the re-stamped marker outlived its body";
 }
 
 TEST(CASGcMetaWriter, SparedThenRecondemnedBlobGraduates)
@@ -774,4 +772,29 @@ TEST(CASGcMetaWriter, SparedThenRecondemnedBlobGraduates)
         const auto entry = retiredEntryFor(*backend, layout, x);
         return entry && entry->delete_pending;
     }, /*max_rounds*/ 2)) << "a spared, re-condemned blob never graduates";
+}
+
+/// The condemn-marker write is lost, so the gate refuses and re-stamps the marker at the refusing round.
+/// The redelete must remove that marker with the body; nothing else ever would.
+TEST(CASGcMarker, RedeleteRemovesMarkerRestampedByGate)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openGatePool(backend);
+    const Layout & layout = store->layout();
+    const UInt128 hash = DB::UInt128(0x3604);
+    const BlobRef x = gateRef(hash);
+    Gc gc(store, kGateLeaderA);
+    uint64_t c = 0;
+    ASSERT_NO_FATAL_FAILURE(condemnBlobs(store, gc, *backend, "tbl", 1, {hash}, c));
+    ASSERT_NO_FATAL_FAILURE(removeMarker(*backend, layout, x));
+
+    ASSERT_EQ(runGateRound(store, gc).graduated, 0u);
+    const auto restamped = markerOf(*backend, layout, x);
+    ASSERT_TRUE(restamped.has_value());
+    ASSERT_EQ(restamped->meta.condemn_round, c + 1);
+    ASSERT_EQ(runGateRound(store, gc).graduated, 1u);
+
+    ASSERT_EQ(runGateRound(store, gc).redeleted, 1u);
+    EXPECT_FALSE(blobPresent(*backend, layout, x));
+    EXPECT_FALSE(markerOf(*backend, layout, x).has_value()) << "a Condemned marker outlived its body";
 }
