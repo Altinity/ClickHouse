@@ -156,7 +156,7 @@ DataFileMetaInfo::DataFileMetaInfo(
                 {
                     auto left = Iceberg::deserializeFieldFromBinaryRepr(left_str, type, true);
                     auto right = Iceberg::deserializeFieldFromBinaryRepr(right_str, type, false);
-                    if (left && right)
+                    if (left && right && !DB::Range::less(*right, *left))
                         hyperrectangle = DB::Range(*left, true, *right, true);
                 }
             }
