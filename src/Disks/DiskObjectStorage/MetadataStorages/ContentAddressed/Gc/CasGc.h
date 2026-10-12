@@ -541,6 +541,23 @@ public:
     /// (throwaway keys) remove non-content objects they own. Adding a second content-delete site is a
     /// protocol defect.
 
+    struct RedeleteBlobState
+    {
+        String blob_key;
+        std::optional<Etag> live_token;
+        std::optional<Removal> del;
+        std::exception_ptr error;
+    };
+
+    struct ConditionalDeleteChunk
+    {
+        std::vector<size_t> indices;
+        std::vector<ConditionalRemove> removals;
+    };
+
+    static std::vector<ConditionalDeleteChunk> prepareConditionalDeleteChunks(
+        const std::vector<RedeleteBlobState> & redelete_blob_states, size_t chunk_keys);
+
 private:
     /// Lease acquire/renew/steal per the documented observation protocol. On success `state` holds the
     /// committed gc/state (with our lease) and `state_etag` the etag that write created.
@@ -740,14 +757,6 @@ private:
                     /// One instance for the WHOLE round, owned by `runRegularRound` and threaded through
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
                     GcRoundWorkBudget & work_budget);
-
-    struct RedeleteBlobState
-    {
-        String blob_key;
-        std::optional<Etag> live_token;
-        std::optional<Removal> del;
-        std::exception_ptr error;
-    };
 
     struct IndexedException
     {
