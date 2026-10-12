@@ -20,6 +20,7 @@
 #include <memory>
 #include <set>
 #include <limits>
+#include <unordered_set>
 
 namespace ProfileEvents
 {
@@ -723,7 +724,7 @@ ManifestSweepResult planManifestCursorPage(
     /// and the only thing a later read can observe differently is absence, which retains.
     std::vector<ListedManifestObject> candidates;
     /// Candidate namespaces that need a second ref_catalog GET after reading the floor.
-    std::set<String> catalog_recheck_namespaces;
+    std::unordered_set<String> catalog_recheck_namespaces;
 
     for (const ListedKey & listed : page.keys)
     {
