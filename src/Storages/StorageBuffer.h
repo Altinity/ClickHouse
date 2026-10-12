@@ -211,13 +211,7 @@ private:
     void backgroundFlush();
     void reschedule(size_t min_delay);
 
-<<<<<<< HEAD
-    StoragePtr getDestinationTable() const;
-
     BackgroundSchedulePoolPtr bg_pool;
-=======
-    BackgroundSchedulePool & bg_pool;
->>>>>>> 0f732b6b6975 (Merge pull request #2315 from Altinity/bugfix/antalya-26.6/distributed-global-right-join-test)
     BackgroundSchedulePoolTaskHolder flush_handle;
 
     static constexpr size_t BACKGROUND_RESCHEDULE_MIN_DELAY = 1;

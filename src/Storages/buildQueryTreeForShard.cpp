@@ -445,12 +445,8 @@ private:
     }
 
     std::vector<InFunctionOrJoin> in_function_or_join_stack;
-<<<<<<< HEAD
-    IQueryTreeNode::ReplacementMap replacement_map;
-=======
     std::vector<QueryTreeNodePtr> query_node_stack;
-    std::unordered_map<const IQueryTreeNode *, QueryTreeNodePtr> replacement_map;
->>>>>>> 0f732b6b6975 (Merge pull request #2315 from Altinity/bugfix/antalya-26.6/distributed-global-right-join-test)
+    IQueryTreeNode::ReplacementMap replacement_map;
     std::vector<InFunctionOrJoin> global_in_or_join_nodes;
     bool allow_global_join_for_right_table = false;
 
