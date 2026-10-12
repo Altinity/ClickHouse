@@ -403,6 +403,27 @@ TEST(CASGCRedeleteConcurrency, ConditionalDeleteBatchesAreRecorded)
     EXPECT_EQ(rows->total("delete_batches"), 3u);
 }
 
+TEST(CASGCRedeleteConcurrency, DeleteWaveEnqueueRefusalWaitsForSubmittedChunks)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, kBlobs + 1, 2);
+    Gc gc(store, kGc);
+    publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kReplacedBlob));
+
+    RoundReport progress;
+    EXPECT_THROW(
+        gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress),
+        DB::Exception);
+    store->renewWatermarkOnce();
+
+    EXPECT_EQ(progress.redeleted, 2u);
+    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(runRegularRoundReclaiming(gc).redeleted, kBlobs);
+    EXPECT_TRUE(allBlobsAbsent(*backend, *store));
+}
+
 TEST(CASGCRedeleteConcurrency, BlobDeletesActuallyOverlap)
 {
     auto backend = std::make_shared<BlobRemoveWitnessBackend>();
