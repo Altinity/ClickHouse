@@ -564,6 +564,8 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
         if (configuration->isDataLakeConfiguration()
             && (!storage_metadata || !storage_metadata->datalake_table_state.has_value()))
         {
+            configuration->lazyInitializeIfNeeded(object_storage, local_context);
+
             if (auto state = configuration->getTableStateSnapshot(local_context))
             {
                 auto fixed_metadata = storage_metadata

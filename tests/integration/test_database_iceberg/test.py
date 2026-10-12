@@ -3724,3 +3724,65 @@ def test_catalog_commit_conflict_reaches_caller_at_once(started_cluster):
     assert int(node.query(f"SELECT count() FROM {table_ref}")) == 4000000
 
     node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
+
+
+def test_alias_to_datalake_catalog_object_storage_cluster(started_cluster):
+    """
+    A DataLakeCatalog lookup builds a fresh storage. Query analysis initializes one
+    copy, then an Alias read looks the table up again. Cluster planning lists files
+    from that second copy in StorageObjectStorageCluster::getTaskIteratorExtension.
+
+    Direct catalog reads and count() through the alias succeed. A distributed scan
+    through the alias must return the same rows.
+    """
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_alias_osc_{uuid.uuid4().hex[:8]}"
+    namespace = f"{test_ref}_ns"
+    table_name = f"{test_ref}_t"
+    catalog_table = f"{CATALOG_NAME}.`{namespace}.{table_name}`"
+    alias_name = f"{test_ref}_alias"
+    table_settings = {
+        "allow_database_iceberg": 1,
+        "allow_insert_into_iceberg": 1,
+        "write_full_path_in_iceberg_metadata": 1,
+    }
+    cluster_settings = {
+        **table_settings,
+        "object_storage_cluster": "cluster_simple",
+    }
+    expected = "1\n2\n3\n"
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    create_clickhouse_iceberg_table(
+        started_cluster, node, namespace, table_name, "(id Int64)"
+    )
+    node.query(f"INSERT INTO {catalog_table} VALUES (1), (2), (3);", settings=table_settings)
+
+    node.query(f"DROP TABLE IF EXISTS {alias_name}")
+    node.query(
+        f"CREATE TABLE {alias_name} ENGINE = Alias('{CATALOG_NAME}', '{namespace}.{table_name}')"
+    )
+
+    try:
+        assert node.query(
+            f"SELECT id FROM {catalog_table} ORDER BY id",
+            settings=cluster_settings,
+        ) == expected
+
+        assert node.query(
+            f"SELECT id FROM {alias_name} ORDER BY id",
+            settings=table_settings,
+        ) == expected
+
+        assert node.query(
+            f"SELECT count() FROM {alias_name}",
+            settings=cluster_settings,
+        ) == "3\n"
+
+        assert node.query(
+            f"SELECT id FROM {alias_name} WHERE id > 0 ORDER BY id",
+            settings=cluster_settings,
+        ) == expected
+    finally:
+        node.query(f"DROP TABLE IF EXISTS {alias_name}")
