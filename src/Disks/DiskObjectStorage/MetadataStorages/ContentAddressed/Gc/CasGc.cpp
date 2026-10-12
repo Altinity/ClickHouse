@@ -574,6 +574,13 @@ size_t Gc::bulkDeleteChunkKeys() const
     return std::clamp<size_t>(std::min(configured, storage_limit), 1, kBulkDeleteMaxKeys);
 }
 
+size_t Gc::conditionalDeleteChunkKeys() const
+{
+    const uint64_t configured = store->poolConfig().gc_bulk_delete_chunk_keys;
+    const uint64_t storage_limit = store->poolBackendPtr()->conditionalBatchDeleteKeyLimit();
+    return std::clamp<size_t>(std::min(configured, storage_limit), 1, kBulkDeleteMaxKeys);
+}
+
 void Gc::observeRetiredBlob(
     const RetiredEntry & entry, const Layout & layout, CasOperation & op, RedeleteBlobState & redelete_blob_state)
 {
@@ -745,11 +752,8 @@ void Gc::redeleteBlobs(
         }
     }
 
-    const size_t chunk_keys = std::clamp<size_t>(
-        std::min<uint64_t>(store->poolConfig().gc_bulk_delete_chunk_keys, store->poolBackendPtr()->conditionalBatchDeleteKeyLimit()),
-        1,
-        kBulkDeleteMaxKeys);
-    const std::vector<ConditionalDeleteChunk> delete_chunks = prepareConditionalDeleteChunks(redelete_blob_states, chunk_keys);
+    const std::vector<ConditionalDeleteChunk> delete_chunks
+        = prepareConditionalDeleteChunks(redelete_blob_states, conditionalDeleteChunkKeys());
     ThreadPoolCallbackRunnerLocal<void> delete_runner(pool, ThreadName::CAS_GC_REDELETE);
     std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> delete_handles;
     delete_handles.reserve(delete_chunks.size());
