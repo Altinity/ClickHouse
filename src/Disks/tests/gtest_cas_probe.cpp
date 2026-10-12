@@ -33,6 +33,41 @@ TEST(CASProbe, PassesOnEnforcingBackend)
     EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty());   // probe cleans up after itself
 }
 
+namespace
+{
+
+class IgnoresConditionalBatchTokensBackend : public InMemoryBackend
+{
+public:
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        std::vector<RawRemoval> results;
+        results.reserve(removals.size());
+        for (const RawConditionalRemove & removal : removals)
+        {
+            const auto current = InMemoryBackend::head(removal.key, access);
+            results.push_back(current ? InMemoryBackend::remove(removal.key, current->value, access) : RawRemoval::Gone);
+        }
+        return results;
+    }
+};
+
+}
+
+TEST(CASProbe, ReportsConditionalBatchCapability)
+{
+    InMemoryBackend enforcing;
+    auto enforcing_requests = makeRequests(enforcing);
+    auto enforcing_op = enforcing_requests.admit();
+    EXPECT_TRUE(runCapabilityProbe(enforcing_op, "p/.cas_probe").conditional_batch_delete_supported);
+
+    IgnoresConditionalBatchTokensBackend ignores;
+    auto ignores_requests = makeRequests(ignores);
+    auto ignores_op = ignores_requests.admit();
+    EXPECT_FALSE(runCapabilityProbe(ignores_op, "p/.cas_probe").conditional_batch_delete_supported);
+}
+
 TEST(CASProbe, FailsClosedOnNonEnforcingDelete)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -88,6 +123,20 @@ TEST(CASProbe, ConcurrentMountsDoNotCollide)
 
     /// The seeded fixed-key artifact is untouched (the probe never collided with it).
     EXPECT_TRUE(probe_op.read("p/_probe/token", Retry::once()).has_value());
+}
+
+TEST(CASProbe, PoolPinsConditionalBatchCapabilityOnlyAfterProbe)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    EXPECT_EQ(backend->conditionalBatchDeleteKeyLimit(), 1u);
+
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    EXPECT_EQ(store->poolBackendPtr()->conditionalBatchDeleteKeyLimit(), kBulkDeleteMaxKeys);
+
+    auto skipped_backend = std::make_shared<InMemoryBackend>();
+    auto skipped = Pool::open(skipped_backend, PoolConfig{
+        .pool_prefix = "skip", .server_root_id = "test", .skip_access_check = true});
+    EXPECT_EQ(skipped->poolBackendPtr()->conditionalBatchDeleteKeyLimit(), 1u);
 }
 
 /// RFC cas-s3-timeout-retry-control: a Native-mode mount over an object storage that does not support
@@ -225,7 +274,7 @@ TEST(CASProbe, ReorderedProbePassesOnAllThreeDialects)
         auto op = requests.admit();
         EXPECT_NO_THROW(runCapabilityProbe(op, "p/.cas_probe")) << "dialect " << static_cast<int>(dialect);
         EXPECT_TRUE(op.list("p/.cas_probe", "", 10, Retry::once()).keys.empty()) << "dialect " << static_cast<int>(dialect);
-        EXPECT_EQ(b.write_reached, 4) << "dialect " << static_cast<int>(dialect);
-        EXPECT_EQ(b.remove_reached, 2) << "dialect " << static_cast<int>(dialect);
+        EXPECT_EQ(b.write_reached, 7) << "dialect " << static_cast<int>(dialect);
+        EXPECT_EQ(b.remove_reached, 3) << "dialect " << static_cast<int>(dialect);
     }
 }

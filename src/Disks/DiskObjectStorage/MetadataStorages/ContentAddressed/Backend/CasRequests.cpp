@@ -619,6 +619,18 @@ std::vector<Removal> CasOperation::removeManyByConditional(
     const std::vector<ConditionalRemove> & removals, const Retry & policy)
 {
     const size_t limit = std::min(kBulkDeleteMaxKeys, owner.backend->conditionalBatchDeleteKeyLimit());
+    return removeManyByConditionalImpl(removals, policy, limit);
+}
+
+std::vector<Removal> CasOperation::removeManyByConditionalForProbe(
+    const std::vector<ConditionalRemove> & removals, const Retry & policy)
+{
+    return removeManyByConditionalImpl(removals, policy, kBulkDeleteMaxKeys);
+}
+
+std::vector<Removal> CasOperation::removeManyByConditionalImpl(
+    const std::vector<ConditionalRemove> & removals, const Retry & policy, size_t limit)
+{
     if (removals.size() > limit)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS removeManyByConditional: {} keys in one chunk, the limit is {}; the consumer chunks its input",

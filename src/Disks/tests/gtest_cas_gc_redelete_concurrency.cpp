@@ -213,6 +213,7 @@ PoolPtr openPoolWithIoConcurrency(
     config.event_sink = std::move(event_sink);
     config.gc_io_pool_refuse_at_for_test = refuse_at_for_test;
     config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
+    config.skip_access_check = true;
     return Pool::open(std::move(backend), std::move(config));
 }
 

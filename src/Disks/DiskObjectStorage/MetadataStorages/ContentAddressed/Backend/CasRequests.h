@@ -21,6 +21,10 @@
 namespace DB::Cas
 {
 
+class CasOperation;
+struct CapabilityProbeResult;
+CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe_prefix);
+
 /// TRUE when the store's own answer proves this write never applied: a malformed request, an entity
 /// too large, an access denial, or a credential failure. Whether a STALE CREDENTIAL explains it is not
 /// asked here -- the engine asks the backend for fresh credentials first, and refuses only when no
@@ -316,6 +320,13 @@ public:
     WriteResult readModifyWriteOnPresence(const String & key, const DecideOnMeta & decide, const Retry & policy);
 
 private:
+    friend CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe_prefix);
+
+    std::vector<Removal> removeManyByConditionalForProbe(
+        const std::vector<ConditionalRemove> & removals, const Retry & policy);
+    std::vector<Removal> removeManyByConditionalImpl(
+        const std::vector<ConditionalRemove> & removals, const Retry & policy, size_t limit);
+
     friend class CasRequests;
     /// The lane waits on this operation's own admission and reads and writes through its verbs; it
     /// needs the gate, the reservation, the resolve read and the give-up helpers, never the transport.
