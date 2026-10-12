@@ -3090,6 +3090,98 @@ def test_catalog_listing_error_surfaces_in_system_tables(started_cluster):
     node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
 
 
+def test_alias_iceberg_catalog_cluster(started_cluster):
+    """
+    Customer repro moved from the stateless suite. An Alias over a catalog Iceberg
+    table must apply the same filter as a direct catalog read: local, with
+    object_storage_cluster, and with parallel replicas. count() is the path that
+    already succeeded before snapshot initialization on the cluster file listing.
+    """
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_alias_repro_{uuid.uuid4().hex[:8]}"
+    namespace = f"{test_ref}_pnl"
+    table_name = "pnl_t"
+    catalog_table = f"{CATALOG_NAME}.`{namespace}.{table_name}`"
+    pnl_db = f"{test_ref}_db"
+    table_settings = {
+        "allow_database_iceberg": 1,
+        "allow_insert_into_iceberg": 1,
+        "write_full_path_in_iceberg_metadata": 1,
+    }
+    modes = {
+        "local": table_settings,
+        "osc": {**table_settings, "object_storage_cluster": "cluster_simple"},
+        "pr": {
+            **table_settings,
+            "enable_parallel_replicas": 1,
+            "cluster_for_parallel_replicas": "cluster_simple",
+            "parallel_replicas_for_cluster_engines": 1,
+            "max_parallel_replicas": 2,
+            "parallel_replicas_for_non_replicated_merge_tree": 1,
+        },
+    }
+    filtered = "WHERE TradeDate = '2026-10-06' AND Strategy = 's1'"
+    filtered_expected = "67\t2026-10-07 06:36:00.000000\n"
+    limit_expected = "2026-10-06 14:00:00.000000\ts0\n"
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(
+        f"""
+        CREATE TABLE {catalog_table}
+        (
+            TimeSlice DateTime64(6, 'UTC'),
+            TradeDate Date32,
+            Strategy String,
+            NetPL Float64
+        )
+        ENGINE = IcebergS3('http://minio1:9001/warehouse-rest/{namespace}/', '{minio_access_key}', '{minio_secret_key}')
+        PARTITION BY TradeDate
+        """,
+        settings={
+            "allow_experimental_database_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
+    )
+    node.query(
+        f"""
+        INSERT INTO {catalog_table}
+        SELECT
+            toDateTime64('2026-10-06 14:00:00', 6, 'UTC') + number * 60,
+            toDate32('2026-10-06') + (number % 3),
+            's' || toString(number % 5),
+            number / 7
+        FROM numbers(1000)
+        """,
+        settings=table_settings,
+    )
+    node.query(f"CREATE DATABASE {pnl_db}")
+    node.query(f"CREATE TABLE {pnl_db}.pnl_t ENGINE = Alias({CATALOG_NAME}.`{namespace}.{table_name}`)")
+
+    try:
+        for settings in modes.values():
+            assert node.query(
+                f"SELECT count(), toTimeZone(max(TimeSlice), 'UTC') FROM {catalog_table} {filtered}",
+                settings=settings,
+            ) == filtered_expected
+            assert node.query(
+                f"SELECT count(), toTimeZone(max(TimeSlice), 'UTC') FROM {pnl_db}.pnl_t {filtered}",
+                settings=settings,
+            ) == filtered_expected
+            assert node.query(
+                f"SELECT toTimeZone(TimeSlice, 'UTC'), Strategy FROM {pnl_db}.pnl_t ORDER BY TimeSlice LIMIT 1",
+                settings=settings,
+            ) == limit_expected
+            assert node.query(
+                f"SELECT count() FROM {pnl_db}.pnl_t",
+                settings=settings,
+            ) == "1000\n"
+    finally:
+        node.query(f"DROP TABLE IF EXISTS {pnl_db}.pnl_t")
+        node.query(f"DROP DATABASE IF EXISTS {pnl_db}")
+        drop_clickhouse_iceberg_table(node, namespace, table_name, if_exists=True)
+
+
 def _create_catalog_wrapper(node, engine, name, catalog_db, namespace, table_name, alias_name):
     catalog_table = f"{catalog_db}.`{namespace}.{table_name}`"
     qualified_name = f"{namespace}.{table_name}"
