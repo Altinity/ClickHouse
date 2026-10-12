@@ -153,7 +153,7 @@ sequenceDiagram
     alt writer republished
         S3-->>GC: TokenMismatch -- nothing deleted, blob is live at t2
     else genuinely dead
-        S3-->>GC: Deleted -- then drop the .meta only while it is still Condemned at round n or older
+        S3-->>GC: Deleted -- then drop the .meta only while it is still Condemned at round n+1 or older
     end
 ```
 
@@ -178,8 +178,9 @@ Why this closes the race in both directions:
   current round.
 - The delete job removes the `.meta` only while it is still `Condemned` at a round before the
   deleting round, and conditionally on the version it read. It also removes a marker the graduation
-  gate re-stamped, so no `Condemned` marker outlives its body. A marker rewritten `Clean` by a
-  writer, or condemned in the deleting round, stays.
+  gate re-stamped. A marker rewritten `Clean` by a writer, or condemned in the deleting round,
+  stays. The delete job runs best effort: if it fails, the `Condemned` marker outlives its body
+  until a writer of that content replaces it, which costs storage, not safety.
 
 Both directions degrade to a spurious re-upload or a no-op delete. Neither can lose data or leave
 a dangling manifest entry.
