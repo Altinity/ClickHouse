@@ -1,6 +1,7 @@
 #include <filesystem>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergPath.h>
 
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Common/Exception.h>
 
 namespace DB::ErrorCodes
@@ -67,6 +68,11 @@ IcebergPathResolver::TableRootDerivation IcebergPathResolver::deriveTableRoot(
         return {queried_path, RootRelation::Unknown};
 
     return {String(candidate), RootRelation::AdoptedDescendant};
+}
+
+IcebergPathFromMetadata IcebergPathFromMetadata::makeStorageIdentity(const ObjectStoragePtr & storage, const String & key)
+{
+    return IcebergPathFromMetadata(storage->getDescription() + '\0' + storage->getObjectsNamespace() + '\0' + key);
 }
 
 // This function is used to get the file path inside the directory which corresponds to Iceberg table from the full blob path which is written in manifest and metadata files.

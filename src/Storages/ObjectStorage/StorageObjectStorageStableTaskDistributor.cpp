@@ -1,5 +1,6 @@
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
 #include <Common/SipHash.h>
+#include <Common/maskSensitiveQueryParameters.h>
 #include <consistent_hashing.h>
 #include <optional>
 
@@ -16,6 +17,7 @@ namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int CANNOT_READ_ALL_DATA;
+    extern const int NOT_IMPLEMENTED;
 };
 
 namespace
@@ -25,6 +27,20 @@ String getSchedulingIdentifier(const ObjectInfoPtr & object_info, bool send_over
 {
     if (send_over_whole_archive && object_info->isArchive())
         return object_info->getIdentifierForPath(object_info->getPathToArchive());
+
+    if (auto metadata_path = object_info->getPathInDataLakeMetadata())
+    {
+        /// The coordinator may not be a replica, and replicas need not share its filesystem, so local files cannot be dispatched.
+        if (auto local_path = object_info->getExternalLocalPath())
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "Iceberg metadata references the file '{}' on the local filesystem, outside of the table location. "
+                "Such a file cannot be read by a cluster function, which distributes the work across replicas that "
+                "do not share this filesystem. Read the table without the `*Cluster` function instead",
+                *local_path);
+
+        return object_info->getIdentifierForPath(*metadata_path);
+    }
 
     return object_info->getIdentifier();
 }
@@ -161,7 +177,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getPreQueuedFile(size_t
         LOG_TRACE(
             log,
             "Assigning pre-queued file {} to replica {}",
-            file_identifier,
+            maskCredentialsInURI(file_identifier),
             number_of_current_replica
         );
 
@@ -202,11 +218,11 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
             file_identifier = getSchedulingIdentifier(object_info, send_over_whole_archive);
             LOG_TEST(log, "Will send over the whole archive {} to replicas. "
                      "This will be suboptimal, consider turning on "
-                     "cluster_function_process_archive_on_multiple_nodes setting", file_identifier);
+                     "cluster_function_process_archive_on_multiple_nodes setting", maskCredentialsInURI(file_identifier));
         }
         else
         {
-            file_identifier = object_info->getIdentifier();
+            file_identifier = getSchedulingIdentifier(object_info, send_over_whole_archive);
         }
 
         if (iceberg_read_optimization_enabled)
@@ -231,7 +247,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
         {
             LOG_TRACE(
                 log, "Found file {} for replica {}",
-                file_identifier, number_of_current_replica
+                maskCredentialsInURI(file_identifier), number_of_current_replica
             );
 
             ProfileEvents::increment(ProfileEvents::ObjectStorageClusterSentToMatchedReplica);
@@ -240,7 +256,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
         LOG_TEST(
             log,
             "Found file {} for replica {} (number of current replica: {})",
-            file_identifier,
+            maskCredentialsInURI(file_identifier),
             file_replica_idx,
             number_of_current_replica
         );

@@ -357,6 +357,7 @@ public:
         return false;
     }
 
+    virtual void checkCanBeDropped(ContextPtr /*query_context*/) const {}
     /// `delete_data` is what `StorageObjectStorage::drop` resolved from `data_lake_delete_data_on_drop`.
     virtual void drop(bool /* delete_data */) {}
 
