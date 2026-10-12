@@ -946,7 +946,7 @@ String readStorageObject(const DB::ObjectStoragePtr & storage, const String & ke
 
 }
 
-TEST(CASObjectStorageBackend, PublishBlobStreamingUsesOrdinaryDefaultWriteTransport)
+TEST(CASObjectStorageBackend, PublishBlobStreamingSettingsRequestSingleCreation)
 {
     auto storage = makePublicationRecordingStorage();
     auto backend = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
@@ -964,7 +964,8 @@ TEST(CASObjectStorageBackend, PublishBlobStreamingUsesOrdinaryDefaultWriteTransp
     ASSERT_TRUE(storage->last_write_settings.has_value());
     EXPECT_EQ(storage->last_write_settings->object_storage_request_mode, DB::ObjectStorageRequestMode::Default);
     EXPECT_EQ(storage->last_write_settings->object_storage_retry_profile, DB::ObjectStorageRetryProfile::Default);
-    EXPECT_EQ(storage->last_write_settings->s3_max_unexpected_write_error_retries_override, 0u);
+    EXPECT_TRUE(storage->last_write_settings->object_storage_single_attempt_object_creation);
+    EXPECT_EQ(storage->last_write_settings->s3_max_unexpected_write_error_retries_override, 1u);
     EXPECT_FALSE(storage->last_write_settings->s3_force_single_part_upload);
     EXPECT_TRUE(storage->last_write_settings->object_storage_write_if_none_match.empty());
     EXPECT_TRUE(storage->last_write_settings->object_storage_write_if_match.empty());
@@ -1155,6 +1156,8 @@ TEST(CASObjectStorageBackend, PublishBlobCopiesStagedBytesWithNativeOnlyDefaultR
     EXPECT_EQ(storage->last_copy_settings->object_storage_copy_mode, DB::ObjectStorageCopyMode::NativeOnly);
     EXPECT_EQ(storage->last_copy_settings->object_storage_request_mode, DB::ObjectStorageRequestMode::Default);
     EXPECT_EQ(storage->last_copy_settings->object_storage_retry_profile, DB::ObjectStorageRetryProfile::Default);
+    EXPECT_TRUE(storage->last_copy_settings->object_storage_single_attempt_object_creation);
+    EXPECT_EQ(storage->last_copy_settings->s3_max_unexpected_write_error_retries_override, 1u);
     EXPECT_TRUE(storage->last_copy_settings->object_storage_write_if_none_match.empty());
     EXPECT_TRUE(storage->last_copy_settings->object_storage_write_if_match.empty());
     EXPECT_EQ(readStorageObject(storage, destination), "staged-envelopepayload");
