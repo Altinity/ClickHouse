@@ -1,11 +1,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Common/Exception.h>
-<<<<<<< HEAD
-#include <Common/ProfileEvents.h>
-=======
 #include <Common/LockMemoryExceptionInThread.h>
->>>>>>> d76b59f92952 (Merge pull request #2511 from Altinity/fix/antalya-26.6/cas-renewal-memory-guard)
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
