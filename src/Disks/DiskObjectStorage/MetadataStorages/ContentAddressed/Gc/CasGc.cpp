@@ -677,6 +677,78 @@ void Gc::recordRedeleteFailure(
         unsent_count ? fmt::format("; {} re-delete entries were not submitted", *unsent_count) : String{});
 }
 
+Gc::IoJobsResult Gc::runRedeleteIoJobs(
+    ThreadPool & pool,
+    size_t concurrency,
+    size_t count,
+    size_t refuse_offset,
+    CasOperation & op,
+    const std::function<void(size_t, CasOperation &)> & job)
+{
+    IoJobsResult result;
+    result.errors.resize(count);
+    if (concurrency <= 1 || count <= 1)
+    {
+        for (; result.scheduled < count; ++result.scheduled)
+        {
+            try
+            {
+                job(result.scheduled, op);
+            }
+            catch (...)
+            {
+                result.errors[result.scheduled] = std::current_exception();
+            }
+        }
+        return result;
+    }
+
+    result.on_pool = true;
+    ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::CAS_GC_REDELETE);
+    std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;
+    handles.reserve(count);
+    SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
+    const uint64_t admitted_generation = op.generation();
+    try
+    {
+        for (; result.scheduled < count; ++result.scheduled)
+        {
+            if (io_pool_refuse_at_for_test == refuse_offset + result.scheduled)
+            {
+                io_pool_refuse_at_for_test.reset();
+                throw Exception(
+                    ErrorCodes::CANNOT_SCHEDULE_TASK,
+                    "Injected CAS GC re-delete enqueue refusal at index {}",
+                    refuse_offset + result.scheduled);
+            }
+            handles.emplace_back(runner.enqueueAndGiveOwnership(
+                [&job, index = result.scheduled, pool_store = store, admitted_generation]
+                {
+                    CasOperation job_op = pool_store->openRequests().resume(admitted_generation);
+                    job(index, job_op);
+                }));
+        }
+    }
+    catch (...)
+    {
+        result.schedule_error = IndexedException{result.scheduled, std::current_exception()};
+    }
+
+    ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
+    for (size_t i = 0; i < handles.size(); ++i)
+    {
+        try
+        {
+            handles[i]->future.get();
+        }
+        catch (...)
+        {
+            result.errors[i] = std::current_exception();
+        }
+    }
+    return result;
+}
+
 void Gc::redeleteBlobs(
     RedeleteRoundContext & ctx,
     const std::vector<RetiredEntry> & entries,
@@ -686,126 +758,44 @@ void Gc::redeleteBlobs(
     CasOperation & op)
 {
     std::vector<RedeleteBlobState> redelete_blob_states(entries.size());
-    std::optional<IndexedException> schedule_error;
-    size_t scheduled = 0;
-    if (concurrency <= 1 || entries.size() <= 1)
-    {
-        for (size_t i = 0; i < entries.size(); ++i)
-        {
-            try
-            {
-                observeRetiredBlob(entries[i], layout, op, redelete_blob_states[i]);
-            }
-            catch (...)
-            {
-                redelete_blob_states[i].error = std::current_exception();
-            }
-        }
-        scheduled = entries.size();
-    }
-    else
-    {
-        ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::CAS_GC_REDELETE);
-        std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;
-        handles.reserve(entries.size());
-        SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
-
-        const uint64_t admitted_generation = op.generation();
-        try
-        {
-            for (; scheduled < entries.size(); ++scheduled)
-            {
-                if (io_pool_refuse_at_for_test == scheduled)
-                {
-                    io_pool_refuse_at_for_test.reset();
-                    throw Exception(ErrorCodes::CANNOT_SCHEDULE_TASK, "Injected CAS GC re-delete enqueue refusal at index {}", scheduled);
-                }
-                handles.emplace_back(runner.enqueueAndGiveOwnership(
-                    [redelete_blob_state = &redelete_blob_states[scheduled],
-                     entry = entries[scheduled],
-                     layout_ptr = &layout,
-                     pool_store = store,
-                     admitted_generation]
-                    {
-                        CasOperation job_op = pool_store->openRequests().resume(admitted_generation);
-                        observeRetiredBlob(entry, *layout_ptr, job_op, *redelete_blob_state);
-                    }));
-            }
-        }
-        catch (...)
-        {
-            schedule_error = IndexedException{scheduled, std::current_exception()};
-        }
-        ctx.jobs_scheduled += handles.size();
-
-        ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
-        for (size_t i = 0; i < handles.size(); ++i)
-        {
-            try
-            {
-                handles[i]->future.get();
-            }
-            catch (...)
-            {
-                redelete_blob_states[i].error = std::current_exception();
-            }
-        }
-    }
+    const IoJobsResult observe = runRedeleteIoJobs(
+        pool,
+        concurrency,
+        entries.size(),
+        0,
+        op,
+        [&](size_t index, CasOperation & job_op) { observeRetiredBlob(entries[index], layout, job_op, redelete_blob_states[index]); });
+    if (observe.on_pool)
+        ctx.jobs_scheduled += observe.scheduled;
+    for (size_t i = 0; i < observe.scheduled; ++i)
+        redelete_blob_states[i].error = observe.errors[i];
 
     const std::vector<ConditionalDeleteChunk> delete_chunks
         = prepareConditionalDeleteChunks(redelete_blob_states, conditionalDeleteChunkKeys());
-    ThreadPoolCallbackRunnerLocal<void> delete_runner(pool, ThreadName::CAS_GC_REDELETE);
-    std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> delete_handles;
-    delete_handles.reserve(delete_chunks.size());
-    SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(delete_handles); });
-    std::optional<IndexedException> delete_schedule_error;
-    size_t delete_scheduled = 0;
-    try
-    {
-        for (; delete_scheduled < delete_chunks.size(); ++delete_scheduled)
+    const IoJobsResult del = runRedeleteIoJobs(
+        pool,
+        concurrency,
+        delete_chunks.size(),
+        entries.size(),
+        op,
+        [&](size_t chunk, CasOperation & job_op)
         {
-            if (io_pool_refuse_at_for_test == entries.size() + delete_scheduled)
-            {
-                io_pool_refuse_at_for_test.reset();
-                throw Exception(
-                    ErrorCodes::CANNOT_SCHEDULE_TASK,
-                    "Injected CAS GC re-delete batch enqueue refusal at index {}",
-                    delete_scheduled);
-            }
-            delete_handles.emplace_back(delete_runner.enqueueAndGiveOwnership(
-                [chunk = &delete_chunks[delete_scheduled],
-                 states = &redelete_blob_states,
-                 pool_store = store,
-                 resumed_generation = op.generation()]
-                {
-                    CasOperation job_op = pool_store->openRequests().resume(resumed_generation);
-                    const auto outcomes = job_op.removeManyByConditional(chunk->removals, Retry::standard());
-                    for (size_t pos = 0; pos < chunk->indices.size(); ++pos)
-                        (*states)[chunk->indices[pos]].del = outcomes[pos];
-                }));
-            ++ctx.delete_batches;
-        }
-    }
-    catch (...)
+            const ConditionalDeleteChunk & delete_chunk = delete_chunks[chunk];
+            const auto outcomes = job_op.removeManyByConditional(delete_chunk.removals, Retry::standard());
+            for (size_t pos = 0; pos < delete_chunk.indices.size(); ++pos)
+                redelete_blob_states[delete_chunk.indices[pos]].del = outcomes[pos];
+        });
+    ctx.delete_batches += del.scheduled;
+    for (size_t chunk = 0; chunk < del.scheduled; ++chunk)
     {
-        delete_schedule_error = IndexedException{delete_chunks[delete_scheduled].indices.front(), std::current_exception()};
-    }
-    ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(delete_handles);
-    for (size_t chunk = 0; chunk < delete_handles.size(); ++chunk)
-    {
-        try
-        {
-            delete_handles[chunk]->future.get();
-        }
-        catch (...)
-        {
-            for (const size_t index : delete_chunks[chunk].indices)
-                redelete_blob_states[index].error = std::current_exception();
-        }
+        if (!del.errors[chunk])
+            continue;
+        for (const size_t index : delete_chunks[chunk].indices)
+            redelete_blob_states[index].error = del.errors[chunk];
     }
 
     std::optional<IndexedException> first_error;
-    for (size_t i = 0; i < scheduled; ++i)
+    for (size_t i = 0; i < observe.scheduled; ++i)
     {
         const std::exception_ptr & error = redelete_blob_states[i].error;
         if (!error)
@@ -814,28 +804,29 @@ void Gc::redeleteBlobs(
         if (!first_error)
             first_error = IndexedException{i, error};
     }
-    if (schedule_error)
+    if (observe.schedule_error)
     {
+        const IndexedException & schedule_error = *observe.schedule_error;
         recordRedeleteFailure(
-            ctx, entries[schedule_error->index], layout, schedule_error->exception, entries.size() - schedule_error->index);
-        if (!first_error || schedule_error->index < first_error->index)
+            ctx, entries[schedule_error.index], layout, schedule_error.exception, entries.size() - schedule_error.index);
+        if (!first_error || schedule_error.index < first_error->index)
             first_error = schedule_error;
     }
-    if (delete_schedule_error)
+    if (del.schedule_error)
     {
+        const size_t index = delete_chunks[del.schedule_error->index].indices.front();
         size_t delete_unsent = 0;
-        for (size_t chunk = delete_scheduled; chunk < delete_chunks.size(); ++chunk)
+        for (size_t chunk = del.schedule_error->index; chunk < delete_chunks.size(); ++chunk)
             delete_unsent += delete_chunks[chunk].indices.size();
-        recordRedeleteFailure(
-            ctx, entries[delete_schedule_error->index], layout, delete_schedule_error->exception, delete_unsent);
-        if (!first_error || delete_schedule_error->index < first_error->index)
-            first_error = delete_schedule_error;
+        recordRedeleteFailure(ctx, entries[index], layout, del.schedule_error->exception, delete_unsent);
+        if (!first_error || index < first_error->index)
+            first_error = IndexedException{index, del.schedule_error->exception};
     }
 
     /// Every submitted delete of the batch has already run. If `recordRedeleteSuccess` throws, the batch stays deleted
     /// but unrecorded: the round fails before its outcome logs and `gc/state` commit, every entry stays
     /// `delete_pending`, and the next round records the deleted ones as `Absent`.
-    for (size_t i = 0; i < scheduled; ++i)
+    for (size_t i = 0; i < observe.scheduled; ++i)
     {
         if (!redelete_blob_states[i].error && redelete_blob_states[i].del)
             recordRedeleteSuccess(ctx, entries[i], redelete_blob_states[i]);

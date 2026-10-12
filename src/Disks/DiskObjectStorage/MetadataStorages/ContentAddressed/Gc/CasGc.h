@@ -790,6 +790,22 @@ private:
         std::exception_ptr exception,
         std::optional<size_t> unsent_count = std::nullopt);
 
+    struct IoJobsResult
+    {
+        bool on_pool = false;
+        size_t scheduled = 0;
+        std::vector<std::exception_ptr> errors;
+        std::optional<IndexedException> schedule_error;
+    };
+
+    IoJobsResult runRedeleteIoJobs(
+        ThreadPool & pool,
+        size_t concurrency,
+        size_t count,
+        size_t refuse_offset,
+        CasOperation & op,
+        const std::function<void(size_t, CasOperation &)> & job);
+
     void redeleteBlobs(
         RedeleteRoundContext & ctx,
         const std::vector<RetiredEntry> & entries,
