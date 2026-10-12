@@ -401,8 +401,11 @@ Int32 IcebergMetadata::parseTableSchema(
     if (metadata_object->has(f_last_column_id) && !metadata_object->isNull(f_last_column_id))
         schema_processor.updateLastColumnId(metadata_object->getValue<Int32>(f_last_column_id));
 
+<<<<<<< HEAD
     /// v2 and v3 (and later) store schemas in the `schemas` array. Only v1 has a top-level `schema`.
     /// Using the v1 parser first for v3 looks like a spec violation and logs a false warning.
+=======
+>>>>>>> 188290ba2c4 (Merge pull request #117198 from ClickHouse/iceberg_variant)
     if (format_version >= 2)
     {
         auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
