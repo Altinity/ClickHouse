@@ -416,6 +416,12 @@ forensic outcome logs.
   counts logical conditional-delete chunks submitted by GC. `DiskS3DeleteObjects` counts physical S3
   delete attempts, including request retries
 
+The project RustFS integration backend supports exact-token singleton deletes but does not implement
+AWS per-object `ETag` conditions in `DeleteObjects`. Its mount probe therefore keeps one-key chunks;
+integration coverage verifies this fallback and physical blob reclamation. Positive AWS batching is
+covered by deterministic GC and scripted S3 transport tests. A live AWS run is still required to
+validate the production service boundary end to end.
+
 Under `suppress_destructive` the `redelete` set is empty by construction, so nothing is deleted, and
 there is no graduation either (would-be graduates are carried unchanged); sparing and superseding
 still happen. An outcome log is written only for a shard that collected at least one budget-admitted
