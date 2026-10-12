@@ -20,6 +20,9 @@ namespace ErrorCodes
 namespace
 {
 
+/// The most bytes that `writeVarUInt` emits for a `UInt64`.
+constexpr size_t var_uint_max_size = 10;
+
 /// A string that is stored with its length in front of it, as `RowBinary` and `Native` store a `String` and as the state of
 /// some aggregate functions is stored, has the length as a `VarUInt`: an unsigned LEB128 number, 7 bits per byte, the lowest
 /// bits first, the high bit of every byte but the last one is set. The functions below convert between such a string and its
@@ -109,12 +112,12 @@ public:
             UInt64 length = 0;
             size_t prefix_size = 0;
             bool complete = false;
-            while (prefix_size < value.size() && prefix_size < VAR_UINT_MAX_SIZE)
+            while (prefix_size < value.size() && prefix_size < var_uint_max_size)
             {
                 const UInt64 byte = static_cast<unsigned char>(value[prefix_size]);
 
                 /// The tenth byte can only carry the highest bit of a `UInt64`.
-                if (prefix_size == VAR_UINT_MAX_SIZE - 1 && byte > 1)
+                if (prefix_size == var_uint_max_size - 1 && byte > 1)
                     throw Exception(ErrorCodes::INCORRECT_DATA, "The length prefix in the argument of function {} does not fit UInt64", getName());
 
                 length |= (byte & 0x7F) << (7 * prefix_size);
