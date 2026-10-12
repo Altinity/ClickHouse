@@ -4,6 +4,7 @@
 #include <Storages/ObjectStorage/DataLakes/DataLakeTableStateSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergTableStateSnapshot.h>
+#include <Core/AntalyaProtocol.h>
 #include <Core/ProtocolDefines.h>
 
 namespace DB::ErrorCodes
@@ -95,7 +96,7 @@ TEST(DatalakeStateSerde, IcebergObjectSerializableInfoRoundTrip)
     String str;
     {
         WriteBufferFromString write_buffer{str};
-        info.serializeForClusterFunctionProtocol(write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION);
+        info.serializeForClusterFunctionProtocol(write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION);
     }
     ReadBufferFromMemory read_buffer(str.data(), str.size());
     Iceberg::IcebergObjectSerializableInfo deserialized;
@@ -131,7 +132,7 @@ TEST(DatalakeStateSerde, IcebergObjectSerializableInfoWithoutFileStats)
     String str;
     {
         WriteBufferFromString write_buffer{str};
-        info.serializeForClusterFunctionProtocol(write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_EXCLUDED_ROWS);
+        info.serializeForClusterFunctionProtocol(write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_EXCLUDED_ROWS, DBMS_ANTALYA_PROTOCOL_VERSION);
     }
 
     /// Deserialize at protocol version 5 — the new fields should be absent
@@ -161,7 +162,7 @@ TEST(DatalakeStateSerde, IcebergObjectSerializableInfoNulloptFileStats)
     String str;
     {
         WriteBufferFromString write_buffer{str};
-        info.serializeForClusterFunctionProtocol(write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION);
+        info.serializeForClusterFunctionProtocol(write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION);
     }
     ReadBufferFromMemory read_buffer(str.data(), str.size());
     Iceberg::IcebergObjectSerializableInfo deserialized;
@@ -181,7 +182,8 @@ TEST(DatalakeStateSerde, IcebergObjectSerializableInfoExternalPathRejectedBefore
     WriteBufferFromString write_buffer{str};
     try
     {
-        info.serializeForClusterFunctionProtocol(write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_IDENTITY_PARTITION_COLUMNS);
+        info.serializeForClusterFunctionProtocol(
+            write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH - 1);
         FAIL() << "External storage accepted by the old protocol";
     }
     catch (const DB::Exception & e)
@@ -199,11 +201,12 @@ TEST(DatalakeStateSerde, IcebergObjectSerializableInfoDeleteFilePathsStrippedBef
     String str;
     {
         WriteBufferFromString write_buffer{str};
-        info.serializeForClusterFunctionProtocol(write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_IDENTITY_PARTITION_COLUMNS);
+        info.serializeForClusterFunctionProtocol(
+            write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH - 1);
     }
     ReadBufferFromMemory read_buffer(str.data(), str.size());
     Iceberg::IcebergObjectSerializableInfo deserialized;
-    deserialized.deserializeForClusterFunctionProtocol(read_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_IDENTITY_PARTITION_COLUMNS);
+    deserialized.deserializeForClusterFunctionProtocol(read_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION);
 
     ASSERT_TRUE(read_buffer.eof());
     ASSERT_EQ(deserialized.position_deletes_objects.size(), 1);

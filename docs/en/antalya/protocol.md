@@ -14,15 +14,21 @@ upstream ClickHouse cannot reach, defined in `src/Core/AntalyaProtocol.h`. Both 
 the name string of their `Hello`, on every connection:
 
 ```text
-client -> server   "ClickHouse client (antalya:1)"
-server -> client   "ClickHouse (antalya:1)"
+client -> server   "ClickHouse client (antalya:2)"
+server -> client   "ClickHouse (antalya:2)"
 ```
 
 Each side parses the peer's suffix, caps the value with `min(own, peer)` and keeps the result. `0`
 means the peer is not an Antalya build. Negotiation is per hop and not transitive: initiator to
 worker and worker to worker negotiate independently.
 
-Version 1 is the advertisement itself. Nothing is gated on it yet.
+Version 1 is the advertisement itself.
+
+Version 2 lets the `*Cluster` read-task payload (the `ReadTaskResponse` body) carry the Iceberg
+delete-file paths as absolute URIs, as the manifest spells them, so that a worker can read files
+outside the table location, including files on another object storage. For a worker below version 2
+the initiator strips the scheme and authority as before, and refuses to dispatch a data file that
+needs another storage.
 
 ## Adding an Antalya-only wire change {#adding-a-wire-change}
 

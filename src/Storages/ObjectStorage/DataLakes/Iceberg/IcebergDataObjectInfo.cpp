@@ -18,6 +18,7 @@
 
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
+#include <Core/AntalyaProtocol.h>
 #include <Core/ProtocolDefines.h>
 
 namespace DB::ErrorCodes
@@ -186,24 +187,24 @@ std::optional<String> IcebergDataObjectInfo::getExternalLocalPath() const
 
 #endif
 
-void IcebergObjectSerializableInfo::serializeForClusterFunctionProtocol(WriteBuffer & out, size_t protocol_version) const
+void IcebergObjectSerializableInfo::serializeForClusterFunctionProtocol(WriteBuffer & out, size_t protocol_version, UInt64 antalya_protocol_version) const
 {
     checkVersion(protocol_version);
 
-    if (requires_external_storage && protocol_version < DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH)
+    if (requires_external_storage && antalya_protocol_version < DBMS_ANTALYA_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH)
     {
         throw Exception(
             ErrorCodes::PROTOCOL_VERSION_MISMATCH,
             "Iceberg data file '{}' is outside of the table location, "
-            "worker needs to have protocol version >= {}, but has {}. ",
+            "worker needs to have Antalya protocol version >= {}, but has {}. ",
             data_object_file_path_key,
-            DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH,
-            protocol_version);
+            DBMS_ANTALYA_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH,
+            antalya_protocol_version);
     }
 
     auto path_for_protocol = [&](const String & path) -> String
     {
-        if (protocol_version < DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH)
+        if (antalya_protocol_version < DBMS_ANTALYA_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH)
             return SchemeAuthorityKey(path).key;
         return path;
     };

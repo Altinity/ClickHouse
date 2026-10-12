@@ -41,7 +41,8 @@ struct IcebergObjectSerializableInfo
 
     bool requires_external_storage = false;
 
-    void serializeForClusterFunctionProtocol(WriteBuffer & out, size_t protocol_version) const;
+    /// `antalya_protocol_version` is the version negotiated with the worker, see `AntalyaProtocol.h`.
+    void serializeForClusterFunctionProtocol(WriteBuffer & out, size_t protocol_version, UInt64 antalya_protocol_version) const;
     void deserializeForClusterFunctionProtocol(ReadBuffer & in, size_t protocol_version);
 
 private:
