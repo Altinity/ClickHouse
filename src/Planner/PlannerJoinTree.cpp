@@ -28,30 +28,22 @@
 #include <Storages/IStorage.h>
 #include <Storages/IStorageCluster.h>
 #include <Storages/MergeTree/MergeTreeData.h>
-<<<<<<< HEAD
 #include <Storages/MergeTree/SparsityFilter.h>
-=======
-#include <Storages/StorageAlias.h>
 #include <Storages/StorageBuffer.h>
->>>>>>> 0f732b6b6975 (Merge pull request #2315 from Altinity/bugfix/antalya-26.6/distributed-global-right-join-test)
 #include <Storages/StorageDictionary.h>
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageDummy.h>
 #include <Storages/StorageView.h>
 #include <Storages/StorageMaterializedView.h>
 #include <Storages/StorageMerge.h>
-<<<<<<< HEAD
 #include <Storages/StorageAlias.h>
-=======
 #include <Storages/StorageProxy.h>
->>>>>>> 0f732b6b6975 (Merge pull request #2315 from Altinity/bugfix/antalya-26.6/distributed-global-right-join-test)
 #include <Storages/StorageValues.h>
 #include <Storages/buildQueryTreeForShard.h>
 
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/ColumnNode.h>
 #include <Analyzer/FunctionNode.h>
-#include <Analyzer/ListNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/TableFunctionNode.h>
 #include <Analyzer/QueryNode.h>
@@ -203,7 +195,6 @@ namespace ErrorCodes
 namespace
 {
 
-<<<<<<< HEAD
 /// Recursively find the first TableNode whose storage matches `target`.
 QueryTreeNodePtr findTableNodeByStorage(const QueryTreeNodePtr & node, const StoragePtr & target)
 {
@@ -345,7 +336,8 @@ bool astContainsSubquery(const ASTPtr & ast)
             return true;
     }
     return false;
-=======
+}
+
 const StorageDistributed * getDistributedStorageFromTableExpression(const QueryTreeNodePtr & table_expression)
 {
     StoragePtr storage;
@@ -392,10 +384,10 @@ void tryRewriteGlobalRightJoinAsLeftJoin(QueryNode & query_node, const ContextPt
     /** Join trees are left deep, so the join that reads the leftmost table is the deepest one, and it is
       * the only one whose sides can be swapped without moving a join into the right table expression.
       */
-    auto * join_node = query_node.getJoinTree()->as<JoinNode>();
+    auto * join_node = query_node.getJoinTreeNode()->as<JoinNode>();
     while (join_node)
     {
-        auto * deeper_join_node = join_node->getLeftTableExpression()->as<JoinNode>();
+        auto * deeper_join_node = join_node->getLeftTableExpressionNode()->as<JoinNode>();
         if (!deeper_join_node)
             break;
         join_node = deeper_join_node;
@@ -419,7 +411,7 @@ void tryRewriteGlobalRightJoinAsLeftJoin(QueryNode & query_node, const ContextPt
 
     /// Only the left table fans the query out across shards, so only its shard count decides whether
     /// the rows of the preserved side get emitted more than once. What the right side is does not matter.
-    const auto * left_storage = getDistributedStorageFromTableExpression(join_node->getLeftTableExpression());
+    const auto * left_storage = getDistributedStorageFromTableExpression(join_node->getLeftTableExpressionNode());
     if (!left_storage || left_storage->getShardCount() < 2)
         return;
 
@@ -468,11 +460,10 @@ void tryRewriteGlobalRightJoinAsLeftJoin(QueryNode & query_node, const ContextPt
       * the only way to emit those rows once.
       * Projection nodes are already resolved and keep the user-visible column order unchanged.
       */
-    std::swap(join_node->getLeftTableExpression(), join_node->getRightTableExpression());
+    std::swap(join_node->getLeftTableExpressionNode(), join_node->getRightTableExpressionNode());
     for (auto * key_sides : using_key_sides)
         std::swap(key_sides->getNodes()[0], key_sides->getNodes()[1]);
     join_node->setKind(JoinKind::Left);
->>>>>>> 0f732b6b6975 (Merge pull request #2315 from Altinity/bugfix/antalya-26.6/distributed-global-right-join-test)
 }
 
 /// Check access rights for all tables referenced in a subquery
@@ -3535,14 +3526,10 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
     const ColumnIdentifierSet & outer_scope_columns,
     PlannerContextPtr & planner_context)
 {
-<<<<<<< HEAD
-    const QueryTreeNodePtr & join_tree_node = query_node->as<QueryNode &>().getJoinTreeNode();
-=======
     auto & query_node_typed = query_node->as<QueryNode &>();
     tryRewriteGlobalRightJoinAsLeftJoin(query_node_typed, planner_context->getQueryContext());
 
-    const QueryTreeNodePtr & join_tree_node = query_node_typed.getJoinTree();
->>>>>>> 0f732b6b6975 (Merge pull request #2315 from Altinity/bugfix/antalya-26.6/distributed-global-right-join-test)
+    const QueryTreeNodePtr & join_tree_node = query_node_typed.getJoinTreeNode();
     auto table_expressions_stack = buildTableExpressionsStack(join_tree_node);
     size_t table_expressions_stack_size = table_expressions_stack.size();
     bool is_single_table_expression = table_expressions_stack_size == 1;

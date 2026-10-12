@@ -249,11 +249,7 @@ When querying a `Distributed` table, `SELECT` queries are sent to all shards and
 
 When the `max_parallel_replicas` option is enabled, query processing is parallelized across all replicas within a single shard. For more information, see the section [max_parallel_replicas](/reference/settings/session-settings/max#max_parallel_replicas).
 
-<<<<<<< HEAD:docs/reference/engines/table-engines/special/distributed.mdx
 To learn more about how distributed `in` and `global in` queries are processed, refer to [this](/reference/statements/in#distributed-subqueries) documentation.
-=======
-To learn more about how distributed `IN` and `GLOBAL IN` queries are processed, refer to [Distributed subqueries](/sql-reference/operators/in#distributed-subqueries). For where a `JOIN` runs and which table is sent to the shards, see [Distributed JOIN](/sql-reference/statements/select/join.md#distributed-join).
->>>>>>> 0f732b6b6975 (Merge pull request #2315 from Altinity/bugfix/antalya-26.6/distributed-global-right-join-test):docs/en/engines/table-engines/special/distributed.md
 
 ## Virtual columns {#virtual-columns}
 

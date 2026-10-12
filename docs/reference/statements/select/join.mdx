@@ -399,9 +399,6 @@ A query whose left table is [`Distributed`](/engines/table-engines/special/distr
 
 The join then runs in one of two places:
 
-<<<<<<< HEAD:docs/reference/statements/select/join.mdx
-Be careful when using `GLOBAL`. For more information, see the [Distributed subqueries](/reference/statements/in#distributed-subqueries) section.
-=======
 - **On the shards.** Each node reads its part of the table that stays on the cluster and runs the join. The initiator is the server that received the query. For a `GLOBAL` join it reads the other side once, stores it in a temporary table, and sends that table to every node. For a join without `GLOBAL` it sends nothing: each node builds the right side from the query it receives.
 - **On the initiator.** The nodes read the left table and return its rows. The initiator reads the right table and runs the join. No join side is sent to the nodes.
 
@@ -483,8 +480,7 @@ The setting applies when the left table is a `*Cluster` table function or a tabl
 
 `PREWHERE` is applied on the table it belongs to. When that table is the one sent to the nodes, the filter runs while the initiator builds the temporary table. When that table stays on the nodes, the filter runs there. A `PREWHERE` that names no column is attached to the leftmost table and keeps a `GLOBAL` `RIGHT` join on the initiator.
 
-`GLOBAL` copies one side of the join to every node. For a large side that is expensive, and the copy has to fit in memory on each node. See also [Distributed subqueries](/sql-reference/operators/in#distributed-subqueries).
->>>>>>> 0f732b6b6975 (Merge pull request #2315 from Altinity/bugfix/antalya-26.6/distributed-global-right-join-test):docs/en/sql-reference/statements/select/join.md
+`GLOBAL` copies one side of the join to every node. For a large side that is expensive, and the copy has to fit in memory on each node. See also [Distributed subqueries](/reference/statements/in#distributed-subqueries).
 
 ## Implicit type conversion {#implicit-type-conversion}
 
