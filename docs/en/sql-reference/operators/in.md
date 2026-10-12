@@ -172,7 +172,7 @@ When using the regular `IN`, the query is sent to remote servers, and each of th
 
 When using `GLOBAL IN` / `GLOBAL JOIN`, first all the subqueries are run for `GLOBAL IN` / `GLOBAL JOIN`, and the results are collected in temporary tables. Then the temporary tables are sent to each remote server, where the queries are run using this temporary data.
 
-For `GLOBAL ... JOIN`, which side of the join is calculated as the subquery depends on the join kind: for `LEFT` and `INNER` joins, the right table is calculated; for `RIGHT` joins, the left table is calculated instead, since the right table is the preserved side and should be read from shards.
+Which side of a `GLOBAL ... JOIN` is calculated on the initiator and sent to the nodes depends on the join kind, the number of shards, and whether the join runs on the shards or on the initiator. See [Distributed JOIN](../statements/select/join.md#distributed-join).
 
 For a non-distributed query, use the regular `IN` / `JOIN`.
 
