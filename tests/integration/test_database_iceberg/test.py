@@ -3090,63 +3090,124 @@ def test_catalog_listing_error_surfaces_in_system_tables(started_cluster):
     node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
 
 
-def test_alias_to_datalake_catalog_object_storage_cluster(started_cluster):
-    """
-    A DataLakeCatalog lookup builds a fresh storage. Query analysis initializes one
-    copy, then an Alias read looks the table up again. Cluster planning lists files
-    from that second copy in StorageObjectStorageCluster::getTaskIteratorExtension.
+def _create_catalog_wrapper(node, engine, name, catalog_db, namespace, table_name, alias_name):
+    catalog_table = f"{catalog_db}.`{namespace}.{table_name}`"
+    qualified_name = f"{namespace}.{table_name}"
+    if engine == "Alias":
+        node.query(f"CREATE TABLE {name} ENGINE = Alias('{catalog_db}', '{qualified_name}')")
+    elif engine == "Buffer":
+        node.query(
+            f"CREATE TABLE {name} (id Int64) ENGINE = Buffer('{catalog_db}', '{qualified_name}', "
+            "1, 86400, 86400, 1000000, 1000000, 1000000000, 1000000000)"
+        )
+    elif engine == "Merge":
+        node.query(
+            f"CREATE TABLE {name} (id Int64) ENGINE = Merge('{catalog_db}', '^{namespace}[.]{table_name}$')"
+        )
+    elif engine == "MergeAlias":
+        node.query(f"CREATE TABLE {name} (id Int64) ENGINE = Merge(currentDatabase(), '^{alias_name}$')")
+    elif engine == "MaterializedView":
+        node.query(f"CREATE MATERIALIZED VIEW {name} TO {catalog_table} AS SELECT id FROM {alias_name}")
+    elif engine == "Distributed":
+        node.query(
+            f"CREATE TABLE {name} (id Int64) "
+            f"ENGINE = Distributed('cluster_simple', currentDatabase(), '{alias_name}')"
+        )
+    else:
+        raise AssertionError(f"Unexpected engine {engine}")
 
-    Direct catalog reads and count() through the alias succeed. A distributed scan
-    through the alias must return the same rows.
+
+@pytest.mark.parametrize(
+    "engine",
+    ["Alias", "Buffer", "Merge", "MergeAlias", "MaterializedView", "Loop", "Distributed"],
+)
+@pytest.mark.parametrize("cluster_mode", ["local", "query", "database"])
+def test_datalake_catalog_wrapper_object_storage_cluster(started_cluster, engine, cluster_mode):
     """
+    A DataLakeCatalog lookup builds a fresh storage and leaves its configuration
+    uninitialized. Each engine below resolves that table again, then lists files.
+
+    cluster_mode chooses where object_storage_cluster comes from:
+    local keeps it unset, query sets it on the scan, database sets it on the catalog.
+    """
+    if engine == "Loop" and cluster_mode != "local":
+        pytest.skip("loop has no cluster table function")
+
     node = started_cluster.instances["node1"]
+    node2 = started_cluster.instances["node2"]
 
-    test_ref = f"test_alias_osc_{uuid.uuid4().hex[:8]}"
+    test_ref = f"test_wrapper_osc_{uuid.uuid4().hex[:8]}"
     namespace = f"{test_ref}_ns"
     table_name = f"{test_ref}_t"
     catalog_table = f"{CATALOG_NAME}.`{namespace}.{table_name}`"
+    cluster_catalog_name = f"{test_ref}_catalog_cluster"
+    catalog_db = cluster_catalog_name if cluster_mode == "database" else CATALOG_NAME
     alias_name = f"{test_ref}_alias"
+    wrapper_name = alias_name if engine == "Alias" else f"{test_ref}_wrapper"
     table_settings = {
         "allow_database_iceberg": 1,
         "allow_insert_into_iceberg": 1,
         "write_full_path_in_iceberg_metadata": 1,
     }
-    cluster_settings = {
+    settings = table_settings if cluster_mode != "query" else {
         **table_settings,
         "object_storage_cluster": "cluster_simple",
     }
-    expected = "1\n2\n3\n"
+    # A clustered Buffer destination reports WithMergeableState, so Buffer plans
+    # the in-memory branch as a second read of the same query.
+    distinct = "DISTINCT " if engine == "Buffer" and cluster_mode != "local" else ""
+    nodes = [node, node2] if engine == "Distributed" else [node]
+    created = {replica: [] for replica in nodes}
 
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
     create_clickhouse_iceberg_table(
         started_cluster, node, namespace, table_name, "(id Int64)"
     )
     node.query(f"INSERT INTO {catalog_table} VALUES (1), (2), (3);", settings=table_settings)
-
-    node.query(f"DROP TABLE IF EXISTS {alias_name}")
-    node.query(
-        f"CREATE TABLE {alias_name} ENGINE = Alias('{CATALOG_NAME}', '{namespace}.{table_name}')"
-    )
+    if cluster_mode == "database":
+        create_clickhouse_iceberg_database(
+            started_cluster,
+            node,
+            cluster_catalog_name,
+            {"object_storage_cluster": "cluster_simple"},
+        )
 
     try:
-        assert node.query(
-            f"SELECT id FROM {catalog_table} ORDER BY id",
-            settings=cluster_settings,
-        ) == expected
+        for replica in nodes:
+            if replica is node2:
+                catalog_settings = (
+                    {"object_storage_cluster": "cluster_simple"} if cluster_mode == "database" else {}
+                )
+                create_clickhouse_iceberg_database(
+                    started_cluster, replica, catalog_db, catalog_settings
+                )
+            if engine in ("Alias", "MergeAlias", "MaterializedView", "Distributed"):
+                replica.query(
+                    f"CREATE TABLE {alias_name} ENGINE = Alias('{catalog_db}', '{namespace}.{table_name}')"
+                )
+                created[replica].append(alias_name)
+            if engine != "Alias" and engine != "Loop" and replica is node:
+                _create_catalog_wrapper(
+                    replica, engine, wrapper_name, catalog_db, namespace, table_name, alias_name
+                )
+                created[replica].append(wrapper_name)
 
+        if engine == "Loop":
+            source = (
+                f"(SELECT id FROM loop('{catalog_db}', '{namespace}.{table_name}') "
+                "WHERE id > 0 LIMIT 3)"
+            )
+        else:
+            source = wrapper_name
         assert node.query(
-            f"SELECT id FROM {alias_name} ORDER BY id",
-            settings=table_settings,
-        ) == expected
-
-        assert node.query(
-            f"SELECT count() FROM {alias_name}",
-            settings=cluster_settings,
-        ) == "3\n"
-
-        assert node.query(
-            f"SELECT id FROM {alias_name} WHERE id > 0 ORDER BY id",
-            settings=cluster_settings,
-        ) == expected
+            f"SELECT {distinct}id FROM {source} WHERE id > 0 ORDER BY id",
+            settings=settings,
+        ) == "1\n2\n3\n"
     finally:
-        node.query(f"DROP TABLE IF EXISTS {alias_name}")
+        for replica, names in created.items():
+            for name in reversed(names):
+                replica.query(f"DROP TABLE IF EXISTS {name}")
+        if engine == "Distributed":
+            node2.query(f"DROP DATABASE IF EXISTS {catalog_db}")
+        if cluster_mode == "database":
+            node.query(f"DROP DATABASE IF EXISTS {cluster_catalog_name}")
