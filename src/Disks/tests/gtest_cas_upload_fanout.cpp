@@ -320,8 +320,8 @@ TEST(CASUploadFanout, CopiedAndMovedRequestsSharePublicationAttemptedState)
 /// Test 1 (spec §1 "serial-vs-parallel equivalence for successful runs"): a multi-blob part that
 /// exercises every branch of `uploadBlobDetached` produces IDENTICAL recorded deps and IDENTICAL backend
 /// end state whether the fan-out runs serially (pool size 1) or in parallel (pool size 4). It covers
-/// present-clean observation, metadata backfill, fresh local publication, staging copy, and local and
-/// staged condemned-body republication.
+/// present-clean observation, republication of a body without metadata, fresh local publication,
+/// staging copy, and local and staged condemned-body republication.
 namespace
 {
 
@@ -355,7 +355,7 @@ WorldA arrangeWorldA()
     seedPresentBody(*w.b, w.s->layout(), w.s->poolMeta(), kObserved);
     writeMetaClean(*w.b, w.s->layout(), u128Of(kObserved), std::string(kObserved).size());
 
-    /// HEAD-miss then 412-path live adopt with meta backfill: present body, NO meta, not cached.
+    /// Present body, NO meta: republished like an absent body.
     seedPresentBody(*w.b, w.s->layout(), w.s->poolMeta(), kAdopt);
 
     /// fresh local streaming: nothing present.

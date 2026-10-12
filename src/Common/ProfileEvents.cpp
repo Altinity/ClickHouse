@@ -918,8 +918,8 @@ The server successfully detected this situation and will download merged part fr
     M(CASMetaPut,          "Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates metadata reconciliation or write contention.", ValueType::Number) \
     M(CASMetaCompareSwap,          "Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention.", ValueType::Number) \
     M(CASMetaDelete,       "Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity.", ValueType::Number) \
-    M(CASMetaCreateClean,  "Number of absent-body publication paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation.", ValueType::Number) \
-    M(CASMetaAdoptBackfill, "Number of blob-adoption paths that attempted a missing-metadata Clean backfill. Counts the attempt, not a guaranteed metadata creation.", ValueType::Number) \
+    M(CASMetaCreateClean,  "Number of publications after an absent body or an absent marker that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation.", ValueType::Number) \
+    M(CASMetaAbsentRepublish, "Number of blob uploads made because the body was present but its freshness marker was absent; such a body is republished, never adopted.", ValueType::Number) \
     M(CASMetaResurrectClean, "Number of condemned-body replacement paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata reset.", ValueType::Number) \
     M(CASGCMetaOps, "Number of per-hash metadata operations executed by CAS GC. Growing values indicate more GC candidates or metadata work.", ValueType::Number) \
     M(CASGCEnumerationPages, "Number of CAS GC LIST pages fetched while enumerating the object universe. Growing values indicate a larger universe or more frequent scans.", ValueType::Number) \

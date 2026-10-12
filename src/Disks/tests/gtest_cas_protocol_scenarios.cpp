@@ -50,6 +50,7 @@ using DB::Cas::tests::loadMetaForTest;
 using DB::Cas::tests::streamingHexOf;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::writeBlobRaw;
+using DB::Cas::tests::writeMetaClean;
 
 namespace
 {
@@ -190,8 +191,9 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    /// X pre-exists out-of-band; the build dedup-adopts it via putBlob (records the current token t0).
+    /// X and its `Clean` marker pre-exist out-of-band; the build dedup-adopts X via putBlob (token t0).
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
+    writeMetaClean(*b, s->layout(), u128Of("payload-X"), 9);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
 
@@ -269,6 +271,7 @@ TEST(CASProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     {
         auto s0 = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
         writeBlobRaw(*b, s0->layout(), "payload-X", s0->poolMeta().blob_header_len, s0->poolMeta().pool_id);
+        writeMetaClean(*b, s0->layout(), u128Of("payload-X"), 9);
     }
     const String blob_key = layout.blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);

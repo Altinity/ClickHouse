@@ -268,9 +268,9 @@ These counters cover per-blob metadata creates, rewrites, and deletes.
 
 | Event | Type | Description |
 | --- | --- | --- |
-| `CASMetaAdoptBackfill` | `Number` | Number of blob-adoption paths that attempted a missing-metadata Clean backfill. Counts the attempt, not a guaranteed metadata creation. |
+| `CASMetaAbsentRepublish` | `Number` | Number of blob uploads made because the body was present but its freshness marker was absent; such a body is republished, never adopted. |
 | `CASMetaCompareSwap` | `Number` | Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention. |
-| `CASMetaCreateClean` | `Number` | Number of absent-body publication paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation. |
+| `CASMetaCreateClean` | `Number` | Number of publications after an absent body or an absent marker that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation. |
 | `CASMetaDelete` | `Number` | Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity. |
 | `CASMetaPut` | `Number` | Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates metadata reconciliation or write contention. |
 | `CASMetaResurrectClean` | `Number` | Number of condemned-body replacement paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata reset. |
