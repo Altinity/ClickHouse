@@ -510,6 +510,8 @@ public:
     /// limit, clamped to [1, `kBulkDeleteMaxKeys`] because an empty request would never advance.
     size_t bulkDeleteChunkKeys() const;
 
+    size_t conditionalDeleteChunkKeys() const;
+
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
     /// TEST SEAM: disable the round's journal trim so a folded event stays in the journal
