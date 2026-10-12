@@ -28,11 +28,14 @@ void deleteFileFromS3(
     BlobStorageLogWriterPtr blob_storage_log,
     const String & local_path_for_blob_storage_log,
     size_t file_size_for_blob_storage_log,
-    std::optional<ProfileEvents::Event> profile_event)
+    std::optional<ProfileEvents::Event> profile_event,
+    size_t attempt_seed)
 {
     S3::DeleteObjectRequest request;
     request.SetBucket(bucket);
     request.SetKey(key);
+    if (attempt_seed != 0)
+        S3::setClickHouseAttemptNumber(request, attempt_seed);
 
     ProfileEvents::increment(ProfileEvents::S3DeleteObjects);
     if (profile_event && *profile_event != ProfileEvents::S3DeleteObjects)
@@ -71,8 +74,10 @@ void deleteFileFromS3(
     else
     {
         const auto & err = outcome.GetError();
-        throw S3Exception(err.GetErrorType(), "{} (Code: {}) while removing object with path {} from S3",
-                          err.GetMessage(), static_cast<size_t>(err.GetErrorType()), key);
+        throw S3Exception(
+            PreformattedMessage::create("{} (Code: {}) while removing object with path {} from S3",
+                err.GetMessage(), static_cast<size_t>(err.GetErrorType()), key),
+            err.GetErrorType(), err.GetExceptionName());
     }
 }
 
