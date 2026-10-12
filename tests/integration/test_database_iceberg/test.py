@@ -3092,10 +3092,10 @@ def test_catalog_listing_error_surfaces_in_system_tables(started_cluster):
 
 def test_alias_iceberg_catalog_cluster(started_cluster):
     """
-    Customer repro moved from the stateless suite. An Alias over a catalog Iceberg
-    table must apply the same filter as a direct catalog read: local, with
-    object_storage_cluster, and with parallel replicas. count() is the path that
-    already succeeded before snapshot initialization on the cluster file listing.
+    An `Alias` over a catalog `Iceberg` table must apply the same filter as a direct
+    catalog read: local, with `object_storage_cluster`, and with parallel replicas.
+    `count` is the path that already succeeded before snapshot initialization on the
+    cluster file listing.
     """
     node = started_cluster.instances["node1"]
 
@@ -3216,10 +3216,10 @@ def _create_catalog_wrapper(node, engine, name, catalog_db, namespace, table_nam
 @pytest.mark.parametrize("cluster_mode", ["local", "query", "database"])
 def test_datalake_catalog_wrapper_object_storage_cluster(started_cluster, engine, cluster_mode):
     """
-    A DataLakeCatalog lookup builds a fresh storage and leaves its configuration
+    A `DataLakeCatalog` lookup builds a fresh storage and leaves its configuration
     uninitialized. Each engine below resolves that table again, then lists files.
 
-    cluster_mode chooses where object_storage_cluster comes from:
+    `cluster_mode` chooses where `object_storage_cluster` comes from:
     local keeps it unset, query sets it on the scan, database sets it on the catalog.
     """
     if engine == "Loop" and cluster_mode != "local":
