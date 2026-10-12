@@ -165,14 +165,18 @@ a `MountClaimResult::Kind` together with a `MountPriorState` describing which ce
 
 | `Kind` | Meaning |
 |---|---|
-| `Claimed` | fresh claim (absent slot), same-`(uuid, epoch)` refresh, or a certified reclaim |
-| `LiveDoubleStart` | same `server_uuid`, different `writer_epoch`, and no certificate of death yet — a live twin, wait it out |
+| `Claimed` | fresh claim (absent slot), or a certified reclaim of an older `writer_epoch` |
+| `LiveDoubleStart` | same `server_uuid` with an older `writer_epoch` and no certificate of death yet — a live twin, wait it out; or the same `(uuid, epoch)` already in the slot — two starts got one epoch, refused at once |
 | `ForeignOwner` | different `server_uuid` — refused unconditionally |
 | `FencedSelf` | same `(uuid, epoch)`, but `gc_fenced` — terminal for *this* epoch; the caller must mint a fresh one |
 
+A claim never installs a `writer_epoch` at or below the one in the slot. When the slot holds a newer
+`writer_epoch` of the same `server_uuid`, the claim fails with `ABORTED` and writes nothing: another
+start or a decommission of this `server_root_id` allocated after this one.
+
 | `MountPriorState` | Certificate that justified the reclaim |
 |---|---|
-| `None` | no reclaim needed (fresh claim or same-epoch refresh) |
+| `None` | no reclaim needed (fresh claim) |
 | `Clean` | the predecessor's own graceful farewell (`min_active_build_sequence == UINT64_MAX`) |
 | `Fenced` | GC's own threshold-gated fence-out (`gc_fenced`) |
 | `UncleanObserved` | this claimant's own token-stability observation held for the full `TTL + drift` window |
@@ -190,8 +194,8 @@ stateDiagram-v2
     Live --> Live: renewer beat, putOverwrite seq+1
     Live --> Fenced: GC observes a stable token past threshold, gc_fenced=1, body preserved
     Live --> Terminated: certified drain, terminal farewell (expires_at=now, min_active_build_sequence=MAX)
-    Fenced --> Live: same-uuid claim with a fresh writer_epoch, instant reclaim
-    Terminated --> Live: same-uuid claim with a fresh writer_epoch, instant reclaim
+    Fenced --> Live: same-uuid claim with a higher writer_epoch, instant reclaim
+    Terminated --> Live: same-uuid claim with a higher writer_epoch, instant reclaim
     Live --> Live: same-uuid claim, proven-dead token via UncleanObserved
     Live --> Live: same-uuid claim under cas_unsafe_remount_no_delay, no observation
     Fenced --> Fenced: same uuid and epoch claim, FencedSelf, no write

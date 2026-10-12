@@ -702,10 +702,10 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             const bool unsafe = store->config.unsafe_remount_no_delay;
             if (unsafe)
             {
-                /// One bare attempt first: a slot held by OUR uuid under another epoch is reclaimed at
+                /// One bare attempt first: a slot held by OUR uuid under an older epoch is reclaimed at
                 /// once under the operator's authorization, carrying the exact token this read saw so a
                 /// slot that moves in between is refused. Every outcome but a claim (an absent slot
-                /// freshly minted, or a same-epoch refresh) falls through to the ordinary observed path
+                /// freshly minted) falls through to the ordinary observed path
                 /// below.
                 claim = claimMount(claim_op, store->pool_layout, srid, our_uuid, writer_epoch, now_ms(), ttl_ms,
                                    /*proven_dead_incarnation=*/{}, emit_mount_event);
@@ -804,7 +804,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// the three `MountPriorState`s with no such proof (`UncleanUnsafe` has no proof at all, not merely
     /// no proof of a CLEAN death: it is the operator's explicit `cas_unsafe_remount_no_delay`
     /// acceptance of that risk, with no observation behind it). `Clean`, drained farewell, and `None`, a
-    /// fresh mount / same-epoch refresh with nothing to hand over, are the proven ones.
+    /// fresh mount with nothing to hand over, are the proven ones.
     /// An EXHAUSTIVE switch, not a positive allowlist -- a future `MountPriorState`
     /// enumerator with no proof of clean death must fail the BUILD (a missing `-Wswitch` case), never
     /// silently fall through to "clean".

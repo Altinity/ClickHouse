@@ -185,9 +185,8 @@ uint64_t allocateWriterEpoch(CasOperation & op, const Layout & l, const String &
                              const ObserveRefCatalog & observe_catalog);
 
 /// Which certificate of death, or the operator's explicit unsafe authorization, justified a
-/// same-uuid, different-epoch mount reclaim. `None` when no
-/// reclaim of that kind happened (a fresh claim, a
-/// same-epoch refresh, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
+/// same-uuid, older-epoch mount reclaim. `None` when no reclaim of that kind happened (a fresh
+/// claim, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
 enum class MountPriorState
 {
     None,
@@ -202,12 +201,13 @@ enum class MountPriorState
 /// already settled who may write; the lease settles whether a live incarnation currently holds the
 /// slot. Decision over `get(mountKey)`:
 ///   - absent → write our body via `create` → `Claimed`;
-///   - same `server_uuid` AND same `writer_epoch` as (our_uuid, our_epoch) → it is OUR OWN claim
-///     (a replay / the renewer adopting it):
-///       - `gc_fenced` → terminal for THIS (uuid, epoch) — a fence costs an epoch, so refreshing it
-///         in place would reactivate a fenced incarnation → `FencedSelf` (no write);
-///       - otherwise → refresh (`replace` to bump seq + fresh `expires_at_ms`) → `Claimed`;
-///   - same `server_uuid`, DIFFERENT `writer_epoch` → reclaimed ONLY on a certificate of death, or the
+///   - same `server_uuid` and a NEWER `writer_epoch` than `our_epoch` → throw `ABORTED`, no write: an
+///     older allocation never replaces a newer incarnation, whatever certifies its end;
+///   - same `server_uuid` AND same `writer_epoch` → another process was allocated our epoch; never
+///     refreshed:
+///       - `gc_fenced` → terminal for THIS (uuid, epoch) → `FencedSelf` (no write);
+///       - otherwise → `LiveDoubleStart` (no write);
+///   - same `server_uuid`, OLDER `writer_epoch` → reclaimed ONLY on a certificate of death, or the
 ///     operator's explicit unsafe authorization, that
 ///     needs no fresh wall-clock trust (see
 ///     `claimMountAwaitingExpiry` below for how a plain "looks expired" reading is turned into one):
@@ -248,8 +248,8 @@ struct MountClaimResult
     /// rather than the proposal, because a caller cannot check a convention it cannot see.
     std::optional<MountLease> body;
     /// Which certificate of death, or the operator's explicit unsafe authorization, justified a
-    /// same-uuid, different-epoch `Claimed` reclaim (`None` for
-    /// every other `Kind`, and for the absent-slot / same-epoch-refresh `Claimed` cases).
+    /// same-uuid, older-epoch `Claimed` reclaim (`None` for
+    /// every other `Kind`, and for the absent-slot `Claimed` case).
     MountPriorState prior = MountPriorState::None;
     /// The incarnation of the body this result observed, for
     /// `LiveDoubleStart` only (a fresh `Claimed`/`FencedSelf`/`ForeignOwner` write/observe has no
@@ -273,6 +273,8 @@ public:
         : DB::Exception(msg, DB::ErrorCodes::ABORTED) {}
 };
 
+/// A caller never claims twice with one `writer_epoch`; a retry allocates a new one. That is why a
+/// body of our own `(uuid, epoch)` found in the slot belongs to another process.
 /// `proven_dead_incarnation`: the incarnation of a same-uuid, different-epoch lease that the CALLER
 /// already proved dead by observation (see `claimMountAwaitingExpiry`) — matching it against the
 /// CURRENTLY observed incarnation is the ONLY way (besides `gc_fenced` / the clean marker) a
@@ -298,9 +300,9 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
 
 /// Observation-based mount claim for restart recovery.
 /// Wraps `claimMount` in a loop:
-///   - first attempt decided immediately for `Claimed` (fresh / refreshed / reclaimed via `Fenced` or
-///     `Clean`), `ForeignOwner`, or `FencedSelf`;
-///   - a `LiveDoubleStart` from OUR OWN uuid (a stale lease from a prior incarnation of this server,
+///   - first attempt decided immediately for `Claimed` (fresh / reclaimed via `Fenced` or `Clean`),
+///     `ForeignOwner`, `FencedSelf`, or a `LiveDoubleStart` on our own (uuid, epoch);
+///   - a `LiveDoubleStart` from OUR OWN uuid with an older epoch (a stale lease from a prior incarnation of this server,
 ///     OR a genuinely live twin — the two are indistinguishable from a bare read) is resolved by
 ///     WATCHING the lease's incarnation on OUR OWN clock (`mono_ms_fn`), NEVER by comparing the
 ///     lease's stamped `expires_at_ms` against any clock: once the observed incarnation has held stable for

@@ -78,7 +78,7 @@ OwnerObject decodeOwner(std::string_view data);
 String encodeServerEpoch(const ServerEpoch & e);
 
 /// Decode the epoch counter, requiring its `next_writer_epoch` field and rejecting bytes after the body line.
-/// Unknown JSON fields are skipped for forward-compatible reads; malformed input, a missing `next_writer_epoch`,
+/// Unknown JSON fields are skipped for forward-compatible reads; malformed input, a missing or zero `next_writer_epoch`,
 /// and trailing data throw `CORRUPTED_DATA`.
 ServerEpoch decodeServerEpoch(std::string_view data);
 

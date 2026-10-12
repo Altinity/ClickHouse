@@ -116,8 +116,14 @@ TEST(CASMountClaimConflicts, SlotChangedInsideAdoptionWindow)
     /// Rewrite the slot under a NEW incarnation after our read, so our adoption write is refused.
     backend->before_put_overwrite = [&]
     {
-        CasOperation racer = requests.admit();
-        claimMount(racer, layout, "r", DB::UInt128(1), 7, now + 1, /*ttl_ms=*/100);
+        OperationForTest racer(*backend);
+        const String key = layout.mountKey("r");
+        const auto got = (*racer).read(key, Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease rewritten = decodeMountLease(got->bytes);
+        ++rewritten.seq;
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*racer).replace(key, encodeMountLease(rewritten), got->etag, Retry::standard())));
     };
     auto renewer = makeRenewer(requests, now);
     expectThrowsCodeWithMessage(
@@ -216,9 +222,8 @@ TEST(CASMountClaimConflicts, ALostCreateReportsTheOccupantNotTheProposer)
         << "the operator message must name the foreign holder";
 }
 
-/// The same for the refresh branch: a body that changed under our own adoption is the one the message
-/// must name. The reclaim branch reaches the identical helper, so it is not repeated here.
-TEST(CASMountClaimConflicts, ALostRefreshReportsTheObservedBodyNotTheProposer)
+/// The same for the reclaim branch: a body that changed under our own reclaim is the one the message must name.
+TEST(CASMountClaimConflicts, ALostReclaimReportsTheObservedBodyNotTheProposer)
 {
     auto backend = std::make_shared<MountSlotRaceBackend>();
     Layout layout("p");
@@ -227,7 +232,8 @@ TEST(CASMountClaimConflicts, ALostRefreshReportsTheObservedBodyNotTheProposer)
     CasOperation seed = requests.admit();
     ASSERT_EQ(claimMount(seed, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100).kind,
               MountClaimResult::Claimed);
-    /// A distinguishable body lands under our own refresh, so a result carrying the proposal cannot
+    markMountGcFenced(seed, layout, "r");
+    /// A distinguishable body lands under our own reclaim, so a result carrying the proposal cannot
     /// pass by accident: our proposal would carry `seq` 2 and this process's pid.
     backend->before_put_overwrite = [&]
     {
@@ -242,7 +248,7 @@ TEST(CASMountClaimConflicts, ALostRefreshReportsTheObservedBodyNotTheProposer)
             (*racer).replace(key, encodeMountLease(raced), got->etag, Retry::standard())));
     };
     CasOperation op = requests.admit();
-    const MountClaimResult claim = claimMount(op, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100);
+    const MountClaimResult claim = claimMount(op, layout, "r", DB::UInt128(1), 8, now, /*ttl_ms=*/100);
 
     EXPECT_EQ(claim.kind, MountClaimResult::LiveDoubleStart);
     ASSERT_TRUE(claim.body.has_value());
@@ -256,7 +262,7 @@ TEST(CASMountClaimConflicts, ALostRefreshReportsTheObservedBodyNotTheProposer)
 /// process in the "Existing mount" line of an operator message -- the same defect as naming it after a
 /// conflict that did observe someone. `ProvenAbsent` is the reachable half; `NotObserved` (the resolve
 /// read itself failed) leaves through the same branch.
-TEST(CASMountClaimConflicts, ARacedRefreshThatObservedNothingNamesNoHolder)
+TEST(CASMountClaimConflicts, ARacedReclaimThatObservedNothingNamesNoHolder)
 {
     auto backend = std::make_shared<MountSlotRaceBackend>();
     Layout layout("p");
@@ -265,7 +271,8 @@ TEST(CASMountClaimConflicts, ARacedRefreshThatObservedNothingNamesNoHolder)
     CasOperation seed = requests.admit();
     ASSERT_EQ(claimMount(seed, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100).kind,
               MountClaimResult::Claimed);
-    /// The slot is removed under our own refresh, so the refused precondition resolves to a proven
+    markMountGcFenced(seed, layout, "r");
+    /// The slot is removed under our own reclaim, so the refused precondition resolves to a proven
     /// absence rather than to an occupant.
     backend->before_put_overwrite = [&]
     {
@@ -276,7 +283,7 @@ TEST(CASMountClaimConflicts, ARacedRefreshThatObservedNothingNamesNoHolder)
         ASSERT_EQ((*racer).remove(key, got->etag, Retry::standard()), Removal::Removed);
     };
     CasOperation op = requests.admit();
-    const MountClaimResult claim = claimMount(op, layout, "r", DB::UInt128(1), 7, now, /*ttl_ms=*/100);
+    const MountClaimResult claim = claimMount(op, layout, "r", DB::UInt128(1), 8, now, /*ttl_ms=*/100);
 
     EXPECT_EQ(claim.kind, MountClaimResult::LiveDoubleStart);
     EXPECT_FALSE(claim.etag.has_value());
