@@ -547,7 +547,7 @@ public:
     {
         String blob_key;
         std::optional<Etag> live_token;
-        std::optional<Removal> del;
+        std::optional<Removal> removal;
         std::exception_ptr error;
     };
 
@@ -766,6 +766,12 @@ private:
         std::exception_ptr exception;
     };
 
+    struct RedeleteScheduleFailure
+    {
+        IndexedException error;
+        size_t unsent;
+    };
+
     struct RedeleteRoundContext
     {
         uint64_t new_round;
@@ -789,6 +795,17 @@ private:
         const Layout & layout,
         std::exception_ptr exception,
         std::optional<size_t> unsent_count = std::nullopt);
+
+    std::optional<IndexedException> recordRedeleteResults(
+        RedeleteRoundContext & ctx,
+        const std::vector<RetiredEntry> & entries,
+        const Layout & layout,
+        const std::vector<RedeleteBlobState> & redelete_blob_states,
+        size_t observed,
+        const std::vector<RedeleteScheduleFailure> & schedule_failures);
+
+    void scheduleBlobMetaDeletes(
+        const std::vector<RetiredEntry> & entries, const std::vector<RedeleteBlobState> & redelete_blob_states);
 
     struct IoJobsResult
     {
