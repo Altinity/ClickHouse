@@ -1251,11 +1251,11 @@ Gc::RedeleteBlobState liveRedeleteBlobState(CasOperation & op, const String & ke
     return redelete_blob_state;
 }
 
-Gc::RedeleteBlobState settledRedeleteBlobState(const String & key, Removal del)
+Gc::RedeleteBlobState settledRedeleteBlobState(const String & key, Removal removal)
 {
     Gc::RedeleteBlobState redelete_blob_state;
     redelete_blob_state.blob_key = key;
-    redelete_blob_state.del = del;
+    redelete_blob_state.removal = removal;
     return redelete_blob_state;
 }
 
