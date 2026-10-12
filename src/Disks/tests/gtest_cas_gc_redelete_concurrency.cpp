@@ -782,11 +782,11 @@ void expectBodiesPresentOnlyFor(Backend & backend, const Pool & store, const std
         EXPECT_EQ(blobAbsent(backend, store.layout(), blobHash(b)), !present.contains(b)) << "blob " << b;
 }
 
-struct ApplyHookState
+struct RecordHookState
 {
     std::atomic<bool> armed{false};
     BlobRef target{};
-    size_t applied = 0;
+    size_t recorded = 0;
 };
 
 }
@@ -1065,22 +1065,22 @@ TEST(CASGCRedeleteConcurrency, ShardedPoolDeletesEveryShard)
     EXPECT_EQ(shards_with_rows, expected_shards);
 }
 
-TEST(CASGCRedeleteConcurrency, ApplyPhaseFaultLeavesEveryEntryForTheNextRound)
+TEST(CASGCRedeleteConcurrency, RecordPhaseFaultLeavesEveryEntryForTheNextRound)
 {
-    auto state = std::make_shared<ApplyHookState>();
+    auto state = std::make_shared<RecordHookState>();
     auto backend = std::make_shared<InMemoryBackend>();
     PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.gc_io_concurrency = 4;
-    config.gc_redelete_apply_hook_for_test = [state](const BlobRef & ref)
+    config.gc_redelete_record_hook_for_test = [state](const BlobRef & ref)
     {
         if (!state->armed.load())
             return;
         if (ref == state->target)
         {
             state->armed.store(false);
-            throw std::runtime_error("injected apply fault");
+            throw std::runtime_error("injected record fault");
         }
-        ++state->applied;
+        ++state->recorded;
     };
     auto store = Pool::open(backend, std::move(config));
     Gc gc(store, kGc);
@@ -1102,10 +1102,10 @@ TEST(CASGCRedeleteConcurrency, ApplyPhaseFaultLeavesEveryEntryForTheNextRound)
     }
     store->renewWatermarkOnce();
 
-    EXPECT_NE(message.find("injected apply fault"), String::npos) << message;
-    EXPECT_EQ(progress.redeleted, state->applied);
-    EXPECT_EQ(failedCounter() - failed_before, 0u) << "a failed apply is not a failed delete";
-    EXPECT_TRUE(allBlobsAbsent(*backend, *store)) << "every delete finished before the apply walk started";
+    EXPECT_NE(message.find("injected record fault"), String::npos) << message;
+    EXPECT_EQ(progress.redeleted, state->recorded);
+    EXPECT_EQ(failedCounter() - failed_before, 0u) << "a failed record is not a failed delete";
+    EXPECT_TRUE(allBlobsAbsent(*backend, *store)) << "every delete finished before the record walk started";
 
     const RoundReport next = runRegularRoundReclaiming(gc);
     EXPECT_EQ(next.redeleted, kBlobs);

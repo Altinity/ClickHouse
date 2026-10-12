@@ -46,13 +46,13 @@ inline BlobRef gateRef(const UInt128 & hash)
 /// A pool that folds every round, so a round's number is the number of rounds run.
 template <typename BackendT>
 PoolPtr openGatePool(std::shared_ptr<BackendT> backend, uint64_t io_concurrency = 1, uint64_t graduation_budget = 0,
-                     std::function<void(const BlobRef &)> apply_hook = {}, uint64_t gc_shards = 1)
+                     std::function<void(const BlobRef &)> record_hook = {}, uint64_t gc_shards = 1)
 {
     PoolConfig config{.pool_prefix = "p", .server_root_id = "test",
                       .gc_fold_max_defer_rounds = 0, .gc_io_concurrency = io_concurrency};
     config.gc_shards = gc_shards;
     config.gc_round_graduation_budget = graduation_budget;
-    config.gc_redelete_apply_hook_for_test = std::move(apply_hook);
+    config.gc_redelete_record_hook_for_test = std::move(record_hook);
     return Pool::open(std::move(backend), std::move(config));
 }
 

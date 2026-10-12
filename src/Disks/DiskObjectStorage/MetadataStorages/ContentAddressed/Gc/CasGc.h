@@ -741,11 +741,12 @@ private:
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
                     GcRoundWorkBudget & work_budget);
 
-    struct RedeleteIo
+    struct RedeleteBlobState
     {
         String blob_key;
-        std::optional<Etag> expected_token;
-        Removal del = Removal::Gone;
+        std::optional<Etag> live_token;
+        std::optional<Removal> del;
+        std::exception_ptr error;
     };
 
     struct IndexedException
@@ -766,11 +767,12 @@ private:
         uint64_t & delete_batches;
     };
 
-    static RedeleteIo performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op);
+    static void observeRetiredBlob(
+        const RetiredEntry & entry, const Layout & layout, CasOperation & op, RedeleteBlobState & redelete_blob_state);
 
-    void applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteIo & io);
+    void recordRedeleteSuccess(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteBlobState & redelete_blob_state);
 
-    void reportRedeleteFailure(
+    void recordRedeleteFailure(
         RedeleteRoundContext & ctx,
         const RetiredEntry & entry,
         const Layout & layout,
