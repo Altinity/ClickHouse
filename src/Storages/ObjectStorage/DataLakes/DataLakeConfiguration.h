@@ -352,10 +352,10 @@ public:
         return getMetadata()->getColumnMapperForCurrentSchema(storage_metadata_snapshot, context);
     }
 
-    void drop(ContextPtr local_context) override
+    void drop(bool delete_data) override
     {
         if (auto metadata = tryGetMetadata())
-            metadata->drop(local_context);
+            metadata->drop(delete_data);
     }
 
     SinkToStoragePtr write(
@@ -894,7 +894,7 @@ public:
 
     bool supportsPrewhere() const override { return getImpl().supportsPrewhere(); }
 
-    void drop(ContextPtr context) override { getImpl().drop(context); }
+    void drop(bool delete_data) override { getImpl().drop(delete_data); }
 
 protected:
     void createDynamicConfiguration(ASTs & args, ContextPtr context)
