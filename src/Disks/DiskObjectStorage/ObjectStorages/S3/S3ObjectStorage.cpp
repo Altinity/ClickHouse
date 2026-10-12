@@ -1079,6 +1079,11 @@ void S3ObjectStorage::copyObject( // NOLINT
     auto current_client = client.get();
     auto settings_ptr = s3_settings.get();
     auto size = S3::getObjectSize(*current_client, uri.bucket, object_from.remote_path, {});
+
+    S3::S3RequestSettings request_settings = settings_ptr->request_settings;
+    if (write_settings.s3_max_unexpected_write_error_retries_override)
+        request_settings[S3RequestSetting::max_unexpected_write_error_retries]
+            = write_settings.s3_max_unexpected_write_error_retries_override;
     auto scheduler = threadPoolCallbackRunnerUnsafe<void>(getThreadPoolWriter(), ThreadName::S3_COPY_POOL);
     const auto read_settings_to_use = patchSettings(read_settings);
 
@@ -1091,7 +1096,7 @@ void S3ObjectStorage::copyObject( // NOLINT
         /*dest_s3_client=*/current_client,
         /*dest_bucket=*/uri.bucket,
         /*dest_key=*/object_to.remote_path,
-        settings_ptr->request_settings,
+        request_settings,
         read_settings_to_use,
         BlobStorageLogWriter::create(disk_name),
         scheduler,
