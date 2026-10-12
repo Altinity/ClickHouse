@@ -281,7 +281,7 @@ StorageMergeTree::StorageMergeTree(
     {
         partition_export_scheduler = std::make_shared<MergeTreePartitionExportScheduler>(*this);
 
-        partition_export_task = getContext()->getSchedulePool().createTask(
+        partition_export_task = getContext()->getSchedulePool()->createTask(
             getStorageID(),
             getStorageID().getFullTableName() + " (StorageMergeTree::partition_export_task)",
             [this] { partitionExportTask(); });
