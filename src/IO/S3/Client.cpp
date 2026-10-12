@@ -580,8 +580,13 @@ Model::CompleteMultipartUploadOutcome Client::CompleteMultipartUpload(CompleteMu
     const auto & key = request.GetKey();
     const auto & bucket = request.GetBucket();
 
+    /// A single-attempt client sent this request once, so `NoSuchUpload` cannot mean that its own earlier
+    /// attempt completed; an object at the key may come from another writer.
+    const bool single_attempt = usesSingleAttemptRetryStrategy();
+
     if (!outcome.IsSuccess()
-        && outcome.GetError().GetErrorType() == Aws::S3::S3Errors::NO_SUCH_UPLOAD)
+        && outcome.GetError().GetErrorType() == Aws::S3::S3Errors::NO_SUCH_UPLOAD
+        && !single_attempt)
     {
         auto check_request = HeadObjectRequest()
                                  .WithBucket(bucket)
@@ -594,7 +599,8 @@ Model::CompleteMultipartUploadOutcome Client::CompleteMultipartUpload(CompleteMu
             outcome = Aws::S3::Model::CompleteMultipartUploadOutcome(Aws::S3::Model::CompleteMultipartUploadResult());
     }
 
-    if (outcome.IsSuccess() && provider_type == ProviderType::GCS && client_settings.gcs_issue_compose_request)
+    /// The compose rewrites the object as a new generation: a second creating request.
+    if (outcome.IsSuccess() && provider_type == ProviderType::GCS && client_settings.gcs_issue_compose_request && !single_attempt)
     {
         /// For GCS we will try to compose object at the end, otherwise we cannot do a native copy
         /// for the object (e.g. for backups)
