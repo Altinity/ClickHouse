@@ -11,6 +11,7 @@
 #include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -158,6 +159,35 @@ private:
     bool armed = false;
     bool listed_page = false;
     bool replaced_manifest = false;
+};
+
+class CatalogChangesOnFloorReadBackend : public InMemoryBackend
+{
+public:
+    void arm(const String & mount_key_, std::function<void()> callback_)
+    {
+        mount_key = mount_key_;
+        callback = std::move(callback_);
+        fired = false;
+    }
+
+    bool didFire() const { return fired; }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (!fired && callback && key == mount_key)
+        {
+            fired = true;
+            auto current_callback = std::move(callback);
+            current_callback();
+        }
+        return InMemoryBackend::read(key, access);
+    }
+
+private:
+    String mount_key;
+    std::function<void()> callback;
+    bool fired = false;
 };
 }
 
@@ -370,23 +400,73 @@ TEST(CASOrphanManifestSweep, CursorPageRespectsDeleteBudget)
     EXPECT_NE(first_exists, second_exists);
 }
 
-/// A physical manifest captured before a catalog cut which omits its name is dead-life debris: a live
-/// creation cannot publish a life-owned object before its catalog row. It therefore has an eventual
-/// page-sweep owner without trying to reconstruct a deleted incarnation from the key.
-TEST(CASOrphanManifestSweep, CursorPageDeletesObservedBodyWhenCatalogOmitsNamespace)
+TEST(CASOrphanManifestSweep, CursorPageRetainsRowlessBodyWithoutMountLease)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/catalog-absent-debris@cas@"};
     const ManifestRef r = ref(5, 0xA9);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("debris", DB::UInt128(9))});
-    /// No mount lease/watermark exists: after legal catalog-row deletion there may be no server-root
-    /// state left to supply one. The post-observation absent row is the complete dead-life proof.
 
     const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
+    EXPECT_EQ(result.floor_lookups, 1u);
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
+}
+
+TEST(CASOrphanManifestSweep, CursorPageRetainsRowlessBodyOfActiveBuild)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/catalog-absent-active@cas@"};
+    const ManifestRef r = ref(5, 0xA9);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("active", DB::UInt128(9))});
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 5);
+
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
+
+    EXPECT_EQ(result.floor_lookups, 1u);
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
+}
+
+TEST(CASOrphanManifestSweep, CursorPageDeletesRowlessBodyBelowFloor)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/catalog-absent-retired@cas@"};
+    const ManifestRef r = ref(5, 0xA9);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("retired", DB::UInt128(9))});
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
+
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
+
+    EXPECT_EQ(result.floor_lookups, 1u);
     EXPECT_EQ(result.deleted, 1u);
     EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
+}
+
+TEST(CASOrphanManifestSweep, CursorPageRetainsRowlessBodyWhenNamespaceAppearsAfterCatalogCut)
+{
+    auto backend = std::make_shared<CatalogChangesOnFloorReadBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/catalog-appears-after-cut@cas@"};
+    const ManifestRef r = ref(5, 0xA9);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("committed", DB::UInt128(9))});
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 5);
+    backend->arm(store->layout().mountKey(kServerRoot), [&]
+    {
+        publishCommittedTransition(*backend, store->layout(), ns, "part", std::nullopt, r);
+        setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
+    });
+
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
+
+    EXPECT_TRUE(backend->didFire());
+    EXPECT_EQ(result.floor_lookups, 1u);
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
 /// Manifest keys are write-once, so a same-key rewrite after the observation below never happens in

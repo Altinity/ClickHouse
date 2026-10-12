@@ -722,6 +722,8 @@ ManifestSweepResult planManifestCursorPage(
     /// catalog cut: a manifest key is write-once, so its bytes do not depend on when they are read,
     /// and the only thing a later read can observe differently is absence, which retains.
     std::vector<ListedManifestObject> candidates;
+    /// Candidate namespaces that need a second ref_catalog GET after reading the floor.
+    std::set<String> catalog_recheck_namespaces;
 
     for (const ListedKey & listed : page.keys)
     {
@@ -758,22 +760,20 @@ ManifestSweepResult planManifestCursorPage(
             continue;
         }
 
-        const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
-        if (catalog_entry)
+        auto [floor_it, floor_inserted] = floor_by_ns.emplace(parsed->ns.string(), std::nullopt);
+        if (floor_inserted)
         {
-            auto [floor_it, floor_inserted] = floor_by_ns.emplace(parsed->ns.string(), std::nullopt);
-            if (floor_inserted)
-            {
-                ++result.floor_lookups;
-                floor_it->second = floorForNamespace(op, layout, parsed->ns, &result.floor_reads);
-            }
-            if (!prefixEligibleUnder(floor_it->second, parsed->prefix))
-            {
-                ++result.skipped;
-                decided_through = listed.key;
-                continue;
-            }
+            ++result.floor_lookups;
+            floor_it->second = floorForNamespace(op, layout, parsed->ns, &result.floor_reads);
         }
+        if (!prefixEligibleUnder(floor_it->second, parsed->prefix))
+        {
+            ++result.skipped;
+            decided_through = listed.key;
+            continue;
+        }
+
+        const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
 
         auto [view_it, view_inserted] = view_by_ns.emplace(parsed->ns.string(), NamespaceFoldView{});
         auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
@@ -882,10 +882,6 @@ ManifestSweepResult planManifestCursorPage(
             continue;
         }
 
-        /// If the post-observation catalog cut has no row, this candidate was necessarily created by a
-        /// now-dead life: creation publishes its row before any life-owned object. No current life can
-        /// name it, and a concurrent later creation can only replace its token after this observation.
-        /// A catalog-named row instead needs the ordinary coverage/owner proof below.
         if (catalog_entry)
         {
             /// THE §6 SAFETY FLOOR, the same predicate `sweepNamespace` calls, under the same watermark
@@ -915,8 +911,28 @@ ManifestSweepResult planManifestCursorPage(
             }
         }
 
+        if (!catalog_entry)
+            catalog_recheck_namespaces.insert(parsed->ns.string());
         candidates.push_back(*parsed);
         decided_through = listed.key;
+    }
+
+    /// Between a successful stageManifest body PUT and a successful precommitAdd owner transition, the
+    /// body already exists without a durable owner edge; the initial catalog cut may still miss its namespace.
+    /// Recheck it after the floor read before deleting the body as orphaned.
+    if (!catalog_recheck_namespaces.empty())
+    {
+        const CasRefCatalog::Snapshot post_floor_catalog = CasRefCatalog::read(op, layout);
+        post_floor_catalog.life_index.throwIfAmbiguous("CAS orphan manifest sweep");
+        std::erase_if(candidates, [&](const ListedManifestObject & candidate)
+        {
+            if (!catalog_recheck_namespaces.contains(candidate.ns.string()))
+                return false;
+            if (!catalogEntryOf(post_floor_catalog, candidate.ns))
+                return false;
+            ++result.skipped;
+            return true;
+        });
     }
 
     size_t next_body_hint = 0;
