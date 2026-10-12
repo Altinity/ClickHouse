@@ -178,7 +178,7 @@ TEST(CASGcMetaWriter, ThrowingRoundDrainsBeforeReturning)
 namespace
 {
 
-/// The delete job, scheduled the way `Gc::applyRedeleteOutcome` schedules it, and drained.
+/// The delete job, scheduled the way `Gc::recordRedeleteSuccess` schedules it, and drained.
 void runConfirmedMetaDelete(Gc & gc, const BlobRef & ref, uint64_t condemn_round)
 {
     gc.metaWriterForTest().scheduleConfirmedMetaDelete(ref, condemn_round);
