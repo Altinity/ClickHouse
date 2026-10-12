@@ -3245,7 +3245,7 @@ def test_datalake_catalog_wrapper_object_storage_cluster(started_cluster, engine
         **table_settings,
         "object_storage_cluster": "cluster_simple",
     }
-    # A clustered Buffer destination reports WithMergeableState, so Buffer plans
+    # A clustered `Buffer` destination reports `WithMergeableState`, so `Buffer` plans
     # the in-memory branch as a second read of the same query.
     distinct = "DISTINCT " if engine == "Buffer" and cluster_mode != "local" else ""
     nodes = [node, node2] if engine == "Distributed" else [node]
