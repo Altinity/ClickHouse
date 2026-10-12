@@ -4,14 +4,17 @@
 
 #if USE_DATASKETCHES
 
+#include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/Helpers.h>
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <Columns/ColumnDecimal.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/Exception.h>
 #include <Common/assert_cast.h>
+#include <Common/transformEndianness.h>
 #include <Core/Field.h>
 #include <Core/UUID.h>
+#include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDate32.h>
 #include <DataTypes/DataTypeDateTime.h>
@@ -72,7 +75,7 @@ private:
         if (sk_union && sk_update)
         {
             sk_union->update(*sk_update);
-            sk_update.reset();
+            sk_update = nullptr;
         }
     }
 
@@ -88,38 +91,45 @@ public:
         getSkUpdate(lg_config_k, tgt_type)->update(static_cast<const void *>(data), size);
     }
 
-    UInt64 size() const
+    /// With `use_composite_estimate` the estimate is computed from the registers of the sketch only, so it does not depend on the order
+    /// of the inserts and of the merges. The estimate of the library is the HIP estimate while the sketch is in order, which is more
+    /// accurate for a small sketch, but it depends on that order.
+    UInt64 size(bool use_composite_estimate) const
     {
         foldUpdateIntoUnionIfNeeded();
 
         /// Rounding preserves exact cardinalities despite floating-point error.
         if (sk_union)
-            return static_cast<UInt64>(std::llround(sk_union->get_estimate()));
+            return static_cast<UInt64>(std::llround(use_composite_estimate ? sk_union->get_composite_estimate() : sk_union->get_estimate()));
         if (sk_update)
-            return static_cast<UInt64>(std::llround(sk_update->get_estimate()));
+            return static_cast<UInt64>(std::llround(use_composite_estimate ? sk_update->get_composite_estimate() : sk_update->get_estimate()));
         return 0;
     }
 
     void merge(const HllSketchData & rhs, uint8_t lg_config_k)
     {
-        if (!rhs.sk_update && !rhs.sk_union)
+        const bool rhs_has_update = rhs.sk_update && !rhs.sk_update->is_empty();
+        if (!rhs_has_update && !rhs.sk_union)
             return;
 
         datasketches::hll_union * u = getSkUnion(lg_config_k);
 
-        /// `rhs` may hold both sketches; take both without modifying it.
-        if (rhs.sk_update)
-            u->update(*rhs.sk_update);
-
+        /// `rhs` may hold both sketches; take both without modifying it, in the order of `foldUpdateIntoUnionIfNeeded`: the union, then the
+        /// updates. The registers of the result do not depend on the order, but the HIP estimate and the bytes of the sketch do.
         /// The union accepts a sketch of any type, and `HLL_8` is its own type, so there is no re-encoding.
         if (rhs.sk_union)
             u->update(rhs.sk_union->get_result(datasketches::HLL_8));
 
+        if (rhs_has_update)
+            u->update(*rhs.sk_update);
+
         foldUpdateIntoUnionIfNeeded();
     }
 
-    /// You can only call this for an empty object.
-    void read(ReadBuffer & in, uint8_t lg_config_k)
+    /// You can only call this for an empty object. The sketch is kept as it was written, with its own resolution and
+    /// storage type: reading a state must not lose what writing it back would then persist. It is folded into a union,
+    /// at the declared resolution, only when it is merged.
+    void read(ReadBuffer & in)
     {
         datasketches::hll_sketch::vector_bytes bytes;
         readVectorBinary(bytes, in);
@@ -129,7 +139,7 @@ public:
         try
         {
             auto sk = datasketches::hll_sketch::deserialize(bytes.data(), bytes.size());
-            getSkUnion(lg_config_k)->update(std::move(sk));
+            sk_update = std::make_unique<datasketches::hll_sketch>(std::move(sk));
         }
         catch (const DB::Exception &)
         {
@@ -169,16 +179,19 @@ class AggregateFunctionUniqApacheHLL final : public IAggregateFunctionDataHelper
 
     uint8_t lg_config_k;
     datasketches::target_hll_type target_type;
+    bool use_composite_estimate;
 
 public:
     AggregateFunctionUniqApacheHLL(
         uint8_t lg_config_k_,
         datasketches::target_hll_type target_type_,
+        bool use_composite_estimate_,
         const DataTypes & argument_types_,
         const Array & params_)
         : Base(argument_types_, params_, std::make_shared<DataTypeUInt64>())
         , lg_config_k(lg_config_k_)
         , target_type(target_type_)
+        , use_composite_estimate(use_composite_estimate_)
     {
     }
 
@@ -199,7 +212,7 @@ public:
 
             /// Other DataSketches implementations ignore empty strings, and the sketch of a mixed
             /// input must be the same as theirs.
-            if (value.size() == 0)
+            if (value.empty())
                 return;
 
             data.insertData(value.data(), value.size(), lg_config_k, target_type);
@@ -210,11 +223,11 @@ public:
 
             if constexpr (std::is_same_v<T, UUID>)
             {
-                /// Convert the two host-order halves of a `UUID` to canonical bytes.
-                const UInt64 halves[2] = {
-                    std::byteswap(UUIDHelpers::getHighBytes(value)),
-                    std::byteswap(UUIDHelpers::getLowBytes(value)),
-                };
+                /// The two halves of a `UUID` are numbers in host order; the canonical bytes are their big-endian
+                /// representation on every platform.
+                UInt64 halves[2] = {UUIDHelpers::getHighBytes(value), UUIDHelpers::getLowBytes(value)};
+                transformEndianness<std::endian::big>(halves[0]);
+                transformEndianness<std::endian::big>(halves[1]);
                 data.insertData(reinterpret_cast<const char *>(halves), sizeof(halves), lg_config_k, target_type);
             }
             else if constexpr (std::is_same_v<T, IPv6>)
@@ -249,6 +262,21 @@ public:
                 [](const auto & lhs, const auto & rhs_type) { return removeNullable(lhs)->equals(*removeNullable(rhs_type)); });
     }
 
+    /// The parameters do not change what a state means, so every spelling of them is the same type wherever a common type is
+    /// needed (`UNION ALL`, arrays, `if`) and wherever a state is accepted by the name of its type. The default parameters
+    /// stand for all of them.
+    DataTypePtr getNormalizedStateType() const override
+    {
+        DataTypes normalized_argument_types;
+        normalized_argument_types.reserve(this->argument_types.size());
+        for (const auto & type : this->argument_types)
+            normalized_argument_types.emplace_back(type->getNormalizedType());
+
+        AggregateFunctionProperties properties;
+        auto function = AggregateFunctionFactory::instance().get("uniqApacheHLL", NullsAction::EMPTY, normalized_argument_types, {}, properties);
+        return std::make_shared<DataTypeAggregateFunction>(function, normalized_argument_types, Array{});
+    }
+
     void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override
     {
         this->data(place).merge(this->data(rhs), lg_config_k);
@@ -261,12 +289,12 @@ public:
 
     void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /* version */, Arena *) const override
     {
-        this->data(place).read(buf, lg_config_k);
+        this->data(place).read(buf);
     }
 
     void insertResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena *) const override
     {
-        assert_cast<ColumnUInt64 &>(to).getData().push_back(this->data(place).size());
+        assert_cast<ColumnUInt64 &>(to).getData().push_back(this->data(place).size(use_composite_estimate));
     }
 };
 

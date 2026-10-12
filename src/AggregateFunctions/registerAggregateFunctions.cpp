@@ -63,7 +63,9 @@ void registerAggregateFunctionSumMap(AggregateFunctionFactory &);
 void registerAggregateFunctionsUniq(AggregateFunctionFactory &);
 void registerAggregateFunctionUniqCombined(AggregateFunctionFactory &);
 void registerAggregateFunctionUniqUpTo(AggregateFunctionFactory &);
-#if USE_DATASKETCHES
+/// Apache DataSketches hashes values and serializes sketches in the byte order of the host, so `uniqApacheHLL` is registered only on
+/// little-endian platforms, as if DataSketches were not built.
+#if USE_DATASKETCHES && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 void registerAggregateFunctionUniqApacheHLL(AggregateFunctionFactory &);
 #endif
 void registerAggregateFunctionTopK(AggregateFunctionFactory &);
@@ -179,7 +181,7 @@ void registerAggregateFunctions()
         registerAggregateFunctionsUniq(factory);
         registerAggregateFunctionUniqCombined(factory);
         registerAggregateFunctionUniqUpTo(factory);
-#if USE_DATASKETCHES
+#if USE_DATASKETCHES && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         registerAggregateFunctionUniqApacheHLL(factory);
 #endif
         registerAggregateFunctionTopK(factory);
