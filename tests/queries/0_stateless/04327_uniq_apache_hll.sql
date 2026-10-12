@@ -1,4 +1,4 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-cpu-s390x
 -- ^ DataSketches is not built in fast-test builds.
 
 SELECT 'accuracy';
@@ -37,7 +37,7 @@ SELECT uniqApacheHLL(3)(number) FROM numbers(1); -- { serverError ARGUMENT_OUT_O
 SELECT uniqApacheHLL(22)(number) FROM numbers(1); -- { serverError ARGUMENT_OUT_OF_BOUND }
 SELECT uniqApacheHLL(-1)(number) FROM numbers(1); -- { serverError ARGUMENT_OUT_OF_BOUND }
 SELECT uniqApacheHLL(12, 'HLL_9')(number) FROM numbers(1); -- { serverError BAD_ARGUMENTS }
-SELECT uniqApacheHLL(12, 'HLL_4', 1)(number) FROM numbers(1); -- { serverError NUMBER_OF_ARGUMENTS_DOESNT_MATCH }
+SELECT uniqApacheHLL(12, 'HLL_4', 'DEFAULT', 1)(number) FROM numbers(1); -- { serverError NUMBER_OF_ARGUMENTS_DOESNT_MATCH }
 
 SELECT 'argument types';
 -- Small counts stay in coupon mode, where the estimate is exact.
