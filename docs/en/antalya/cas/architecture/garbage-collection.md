@@ -52,7 +52,7 @@ follower or a deferred round execution returns before that commit.
 | 8 | `fold_ref_intake` | fold | `GET` every new ref-log record and every referenced manifest, extracting blob source edges |
 | 9 | `fold_reduce` | fold | Merge prior edges, new deltas and the parent's condemned rows: spare, condemn, graduate or redelete each candidate; compute `suppress_destructive` |
 | 10 | `fold_seal_write` | fold | Write the new fold seal once, write-once deterministic, adopting a byte-identical replay instead of rewriting it |
-| 11 | `pending_deletes` | fold | The single blob-body delete site: exact-token delete of entries a *previous* round marked `delete_pending`, up to the redelete budget, plus the outcome-log writes |
+| 11 | `pending_deletes` | fold | The single blob-body delete site: `HEAD` each entry a *previous* round marked `delete_pending`, then exact-token conditional delete chunks where the mounted backend proved that capability, plus the outcome-log writes |
 | 12 | `meta_pool_wait` | fold | Drain the bounded pool of async `.meta` condemn-marker writes queued during the fold |
 | 13 | `round_commit` | fold | Retention-prune old generations, then publish the single `gc/state` `CAS` that adopts the whole round |
 | 14 | `handoff_reclaim` | post-`CAS` | Reclaim a generation a ref moved off during this round, which the ordinary retention prune already skipped and will not revisit |
@@ -400,8 +400,11 @@ forensic outcome logs.
 - **Reads:** one `HEAD` per `redelete` entry — the persisted condemned token cannot itself be a
   precondition, so the round observes the blob first, which also settles the absent case without
   spending a conditional delete
-- **Writes / deletes:** a `DELETE` conditional on the observed etag for each `redelete` entry whose
-  live etag matches the condemned token; one write-once outcome log per shard with settled entries
+- **Writes / deletes:** conditional delete chunks for entries whose live etag matches the condemned
+  token. A chunk is bounded by `cas_gc_bulk_delete_chunk_keys`, the backend conditional-batch limit,
+  and 1000 keys. An unprobed, unsupported, or `skip_access_check` mount uses one-key chunks. `.meta`
+  cleanup remains one per settled blob; it is not part of the conditional delete request. One
+  write-once outcome log is written per shard with settled entries
 - **Safety:** an entry is deletable only because a previously committed fold seal published it
   `delete_pending` — durable state from an earlier commit, safe at any leader staleness. Exact token
   means a stale leader cannot delete a fresh incarnation; `NotFound` and `TokenMismatch` are
@@ -409,7 +412,9 @@ forensic outcome logs.
 - **Fails the round if:** a backend delete marker appears in a response — object versioning on a
   mis-provisioned pool (`LOGICAL_ERROR`)
 - **Observability:** phase row `pending_deletes`; metrics `deleted`, `absent`, `redeleted`,
-  `graduated`, `replaced`, `spared`, `outcome_logs_written`
+  `graduated`, `replaced`, `spared`, `outcome_logs_written`, `delete_batches`. `delete_batches`
+  counts logical conditional-delete chunks submitted by GC. `DiskS3DeleteObjects` counts physical S3
+  delete attempts, including request retries
 
 Under `suppress_destructive` the `redelete` set is empty by construction, so nothing is deleted, and
 there is no graduation either (would-be graduates are carried unchanged); sparing and superseding
@@ -802,7 +807,7 @@ the chunk size reject `0`:
 | `cas_manifest_sweep_delete_budget_keys` | 100 | orphan-manifest sweep `DELETE` budget per round (phases 9, 18) |
 | `cas_gc_round_sweep_namespace_budget` | 20 | namespaces whose protection view the sweep may build per page (phase 9) |
 | `cas_gc_round_sweep_recovery_op_budget` | 5000 | committed-tail ref-log reads the sweep's recovery walk may spend (phase 9) |
-| `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for write-once families (phases 15, 17); `1` to `1000` |
+| `cas_gc_bulk_delete_chunk_keys` | 1000 | keys per batch `DELETE` request for blob redelete and write-once families (phases 11, 15, 17); `1` to `1000` |
 | `cas_gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes (phase 12) |
 | `cas_gc_io_concurrency` | 16 | bounded pool for the fold's read-ahead of checkpoints, ref logs, manifest bodies and zero-candidate `HEAD`s (phases 8, 9), the graduation `.meta` reads (phase 9), the orphan-sweep planning reads (phase 9), the rebuild read-ahead and the `pending_deletes` `HEAD` + conditional `DELETE` fan-out (phase 11); other GC requests run on the round thread; `1` runs the covered requests sequentially. `cas_gc_read_concurrency` is rejected without an alias; use `cas_gc_io_concurrency` instead |
 
