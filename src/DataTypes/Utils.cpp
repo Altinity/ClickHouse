@@ -33,6 +33,12 @@ bool canBeSafelyCast(const DataTypePtr & from_type, const DataTypePtr & to_type)
                 to_type_unwrapped->getSizeOfValueInMemory() >= from_type->getSizeOfValueInMemory())
                 return true;
 
+            /// An unsigned value fits into a signed integer only if the latter is strictly wider:
+            /// `UInt8 -> Int16` is lossless, `UInt8 -> Int8` is not.
+            if (to_which_type.isInt() &&
+                to_type_unwrapped->getSizeOfValueInMemory() > from_type->getSizeOfValueInMemory())
+                return true;
+
             if (to_which_type.isString())
                 return true;
 
