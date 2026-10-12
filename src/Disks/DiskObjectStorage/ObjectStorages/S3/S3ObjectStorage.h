@@ -6,6 +6,7 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -212,11 +213,14 @@ public:
     /// disk client rotates (applyNewSettings/credentials refresh) — the cached clone is keyed by the
     /// base client's identity, so a stale clone can never outlive a rotation.
     /// `request_timeout_ms` overrides the clone's send/receive inactivity bound; 0 keeps the disk's.
-    /// `connect_timeout_cap_ms` caps the clone's connect timeout (0 = no cap); the cache key is the
-    /// pair, so two callers asking for the same request timeout but different caps get distinct clones.
-    std::shared_ptr<const S3::Client> getSingleAttemptClient(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms = 0) const;
+    /// `connect_timeout_cap_ms` caps the clone's connect timeout (0 = no cap). `configured_timeouts` turns
+    /// off the adaptive first-attempt timeouts, which assume a second attempt with the configured ones.
+    /// The cache key is all three, so callers asking for different bounds get distinct clones.
+    std::shared_ptr<const S3::Client> getSingleAttemptClient(
+        uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms = 0, bool configured_timeouts = false) const;
 
-    /// True iff a clone for exactly this (request timeout, connect cap) pair is already cached --
+    /// True iff a clone for exactly this (request timeout, connect cap) pair, with adaptive timeouts
+    /// left as configured, is already cached --
     /// never builds one. Lets a test prove dispatch used a SPECIFIC key (and no other) without ever
     /// creating a clone itself and without measuring anything.
     bool hasSingleAttemptClientForTest(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms) const;
@@ -242,6 +246,9 @@ private:
         const StoredObjects & objects, const std::shared_ptr<const S3::Client> & used_client, size_t attempt_seed);
 
     std::shared_ptr<const S3::Client> clientForRetryProfile(const ObjectStorageControlRequest & request) const;
+
+    /// The single-attempt client for the object-creating requests of a write that asks for it, else null.
+    std::shared_ptr<const S3::Client> objectCreationClient(const WriteSettings & write_settings) const;
 
     /// Runs `fn` and, if it failed because the vended credentials expired, refreshes this disk's
     /// client and runs it once more. `fn` must re-read the client itself, so the second run signs
@@ -279,10 +286,10 @@ private:
     std::atomic<int8_t> pinned_generation_dialect{-1};   /// -1 unpinned, 0 pinned ETag, 1 pinned generation
 
     mutable std::mutex single_attempt_client_mutex;
-    /// One clone per (requested timeout, connect cap) pair: the verbs of one operation ask for
-    /// different bounds, and a single slot would rebuild a whole S3 client (and lose its connection
-    /// pool) on every alternation between them.
-    mutable std::map<std::pair<uint64_t, uint64_t>, std::shared_ptr<const S3::Client>> single_attempt_clients;
+    /// One clone per (requested timeout, connect cap, configured timeouts) key: the verbs of one
+    /// operation ask for different bounds, and a single slot would rebuild a whole S3 client (and lose
+    /// its connection pool) on every alternation between them.
+    mutable std::map<std::tuple<uint64_t, uint64_t, bool>, std::shared_ptr<const S3::Client>> single_attempt_clients;
     /// The base client the cached clones above were built from. Deliberately held as a shared_ptr (not
     /// a raw pointer): a raw pointer would be compared for identity AFTER the object it once pointed
     /// to could have been freed and a new client reallocated at the same address by an unrelated

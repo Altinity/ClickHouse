@@ -108,13 +108,15 @@ WriteBufferFromS3::WriteBufferFromS3(
     BlobStorageLogWriterPtr blob_log_,
     std::optional<ObjectAttributes> object_metadata_,
     ThreadPoolCallbackRunnerUnsafe<void> schedule_,
-    const WriteSettings & write_settings_)
+    const WriteSettings & write_settings_,
+    std::shared_ptr<const S3::Client> object_creation_client_)
     : WriteBufferFromFileBase(std::min(buf_size_, static_cast<size_t>(DBMS_DEFAULT_BUFFER_SIZE)), nullptr, 0)
     , bucket(bucket_)
     , key(key_)
     , request_settings(request_settings_)
     , write_settings(write_settings_)
     , client_ptr(std::move(client_ptr_))
+    , object_creation_client(object_creation_client_ ? std::move(object_creation_client_) : client_ptr)
     , object_metadata(std::move(object_metadata_))
     , buffer_allocation_policy(createBufferAllocationPolicy(request_settings))
     , task_tracker(
@@ -682,7 +684,7 @@ bool WriteBufferFromS3::completeMultipartUpload()
             ProfileEvents::increment(ProfileEvents::DiskS3CompleteMultipartUpload);
 
         Stopwatch watch;
-        auto outcome = client_ptr->CompleteMultipartUpload(req);
+        auto outcome = object_creation_client->CompleteMultipartUpload(req);
         auto elapsed = watch.elapsedMicroseconds();
 
         ProfileEvents::increment(ProfileEvents::WriteBufferFromS3Microseconds, elapsed);
@@ -786,7 +788,7 @@ void WriteBufferFromS3::makeSinglepartUpload(WriteBufferFromS3::PartData && data
             CurrentThread::WriteThrottlingScope write_throttling_scope(write_settings.remote_throttler);
 
             Stopwatch watch;
-            auto outcome = client_ptr->PutObject(request);
+            auto outcome = object_creation_client->PutObject(request);
             auto elapsed = watch.elapsedMicroseconds();
 
             ProfileEvents::increment(ProfileEvents::WriteBufferFromS3Microseconds, elapsed);

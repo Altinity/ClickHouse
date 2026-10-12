@@ -67,6 +67,15 @@ struct WriteSettings
     /// exactly one attempt. 0 = no override.
     size_t s3_max_unexpected_write_error_retries_override = 0;
 
+    /// The request that creates the object (`PutObject`, `CopyObject`, `CompleteMultipartUpload`) is
+    /// never resent after an ambiguous outcome: it goes through the storage's single-attempt client with
+    /// the configured timeouts. Part uploads keep their retries. A copy must use
+    /// `ObjectStorageCopyMode::NativeOnly`. The `NO_SUCH_KEY` loops above the client are bounded
+    /// separately by `s3_max_unexpected_write_error_retries_override`. A resent request the store already
+    /// applied can add a version on a versioned bucket, emit a second `ObjectCreated` event, or land after
+    /// a newer write of the key and overwrite it. Supported by S3 only.
+    bool object_storage_single_attempt_object_creation = false;
+
     /// Selects the retry profile the object storage should execute this write under; see
     /// ObjectStorageRetryProfile.
     ObjectStorageRetryProfile object_storage_retry_profile = ObjectStorageRetryProfile::Default;

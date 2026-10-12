@@ -82,8 +82,10 @@ namespace
             const std::optional<ObjectAttributes> & object_metadata_,
             ThreadPoolCallbackRunnerUnsafe<void> schedule_,
             BlobStorageLogWriterPtr blob_storage_log_,
-            const LoggerPtr log_)
+            const LoggerPtr log_,
+            const std::shared_ptr<const S3::Client> & object_creation_client_ = nullptr)
             : client_ptr(client_ptr_)
+            , object_creation_client(object_creation_client_ ? object_creation_client_ : client_ptr_)
             , dest_bucket(dest_bucket_)
             , dest_key(dest_key_)
             , request_settings(request_settings_)
@@ -100,6 +102,8 @@ namespace
 
     protected:
         std::shared_ptr<const S3::Client> client_ptr;
+        /// Sends the requests that create the destination object.
+        std::shared_ptr<const S3::Client> object_creation_client;
         const String & dest_bucket;
         const String & dest_key;
         const S3::S3RequestSettings & request_settings;
@@ -206,7 +210,7 @@ namespace
                     ProfileEvents::increment(ProfileEvents::DiskS3CompleteMultipartUpload);
 
                 Stopwatch watch;
-                auto outcome = client_ptr->CompleteMultipartUpload(request);
+                auto outcome = object_creation_client->CompleteMultipartUpload(request);
                 auto elapsed = watch.elapsedMicroseconds();
 
                 if (blob_storage_log)
@@ -616,7 +620,8 @@ namespace
             ThreadPoolCallbackRunnerUnsafe<void> schedule_,
             BlobStorageLogWriterPtr blob_storage_log_,
             std::function<void()> fallback_method_,
-            bool allow_fallback_ = true)
+            bool allow_fallback_,
+            const std::shared_ptr<const S3::Client> & object_creation_client_)
             : UploadHelper(
                 client_ptr_,
                 dest_bucket_,
@@ -625,7 +630,8 @@ namespace
                 object_metadata_,
                 schedule_,
                 blob_storage_log_,
-                getLogger("copyS3File"))
+                getLogger("copyS3File"),
+                object_creation_client_)
             , src_bucket(src_bucket_)
             , src_key(src_key_)
             , offset(src_offset_)
@@ -725,7 +731,7 @@ namespace
                 if (client_ptr->isClientForDisk())
                     ProfileEvents::increment(ProfileEvents::DiskS3CopyObject);
 
-                auto outcome = client_ptr->CopyObject(request);
+                auto outcome = object_creation_client->CopyObject(request);
                 if (outcome.IsSuccess())
                 {
                     LOG_TRACE(
@@ -896,8 +902,15 @@ void copyS3File(
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
     const CreateReadBuffer& fallback_file_reader,
     const std::optional<ObjectAttributes> & object_metadata,
-    ObjectStorageCopyMode copy_mode)
+    ObjectStorageCopyMode copy_mode,
+    std::shared_ptr<const S3::Client> object_creation_client)
 {
+    if (object_creation_client && copy_mode != ObjectStorageCopyMode::NativeOnly)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "copyS3File: an object creation client requires NativeOnly copy mode, "
+            "because the read-write fallback would write through the retrying client");
+
     if (!dest_s3_client)
         dest_s3_client = src_s3_client;
 
@@ -942,7 +955,8 @@ void copyS3File(
         schedule,
         blob_storage_log,
         std::move(fallback_method),
-        /*allow_fallback=*/copy_mode == ObjectStorageCopyMode::Default};
+        /*allow_fallback=*/copy_mode == ObjectStorageCopyMode::Default,
+        object_creation_client};
     helper.performCopy();
 }
 

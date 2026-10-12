@@ -473,7 +473,8 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         std::move(blob_storage_log),
         attributes,
         std::move(scheduler),
-        disk_write_settings);
+        disk_write_settings,
+        objectCreationClient(write_settings));
 }
 
 
@@ -1102,7 +1103,8 @@ void S3ObjectStorage::copyObject( // NOLINT
         scheduler,
         [&, this]{ return readObject(object_from, read_settings_to_use);},
         object_to_attributes,
-        write_settings.object_storage_copy_mode);
+        write_settings.object_storage_copy_mode,
+        objectCreationClient(write_settings));
 }
 
 void S3ObjectStorage::shutdown()
@@ -1240,7 +1242,8 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::tryGetS3StorageClient()
     return client.get();
 }
 
-std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms) const
+std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(
+    uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms, bool configured_timeouts) const
 {
     auto base = client.get();
     std::lock_guard lock(single_attempt_client_mutex);
@@ -1250,7 +1253,7 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(uint64
         single_attempt_client_base = base;
     }
 
-    const auto cache_key = std::make_pair(request_timeout_ms, connect_timeout_cap_ms);
+    const auto cache_key = std::make_tuple(request_timeout_ms, connect_timeout_cap_ms, configured_timeouts);
     if (auto it = single_attempt_clients.find(cache_key); it != single_attempt_clients.end())
         return it->second;
 
@@ -1267,6 +1270,8 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(uint64
 
     if (request_timeout_ms != 0)
         cfg.requestTimeoutMs = static_cast<long>(request_timeout_ms);
+    if (configured_timeouts)
+        cfg.s3_use_adaptive_timeouts = false;
 
     /// One TCP/TLS connect may not cost more than the cap the mount froze at open: the engine reserves
     /// attempt + 2 × cap per envelope, and a reloaded base client with a wider connect timeout must not
@@ -1289,7 +1294,7 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(uint64
 bool S3ObjectStorage::hasSingleAttemptClientForTest(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms) const
 {
     std::lock_guard lock(single_attempt_client_mutex);
-    return single_attempt_clients.contains(std::make_pair(request_timeout_ms, connect_timeout_cap_ms));
+    return single_attempt_clients.contains(std::make_tuple(request_timeout_ms, connect_timeout_cap_ms, false));
 }
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::clientForRetryProfile(const ObjectStorageControlRequest & request) const
@@ -1299,6 +1304,16 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::clientForRetryProfile(const O
     if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
         return getSingleAttemptClient(request.attempt_timeout_ms, request.connect_timeout_cap_ms);
     return client.get();
+}
+
+std::shared_ptr<const S3::Client> S3ObjectStorage::objectCreationClient(const WriteSettings & write_settings) const
+{
+    if (!write_settings.object_storage_single_attempt_object_creation)
+        return nullptr;
+    /// The creating request has no second attempt, so it must not run under the first-attempt timeouts.
+    return getSingleAttemptClient(
+        write_settings.object_storage_attempt_timeout_ms, write_settings.object_storage_connect_timeout_cap_ms,
+        /*configured_timeouts=*/true);
 }
 
 bool S3ObjectStorage::tryRefreshCredentialsViaCallback()
