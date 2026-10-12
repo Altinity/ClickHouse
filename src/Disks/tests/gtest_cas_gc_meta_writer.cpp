@@ -78,7 +78,7 @@ TEST(CASGcMetaWriter, RealConfirmedMetaDeleteCompletesAcrossOwnerDestruction)
 
     auto gc = std::make_unique<Gc>(store, DB::Cas::tests::u128Of(kGcId));
     backend->arm();
-    gc->metaWriterForTest().scheduleConfirmedMetaDelete(ref, /*condemn_round=*/1);
+    gc->metaWriterForTest().scheduleConfirmedMetaDelete(ref, /*newest_round=*/1);
 
     awaitLatchEntered(*backend);
 
@@ -179,9 +179,9 @@ namespace
 {
 
 /// The delete job, scheduled the way `Gc::applyRedeleteOutcome` schedules it, and drained.
-void runConfirmedMetaDelete(Gc & gc, const BlobRef & ref, uint64_t condemn_round)
+void runConfirmedMetaDelete(Gc & gc, const BlobRef & ref, uint64_t newest_round)
 {
-    gc.metaWriterForTest().scheduleConfirmedMetaDelete(ref, condemn_round);
+    gc.metaWriterForTest().scheduleConfirmedMetaDelete(ref, newest_round);
     gc.metaWriterForTest().drain();
 }
 

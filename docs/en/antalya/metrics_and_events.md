@@ -268,7 +268,7 @@ These counters cover per-blob metadata creates, rewrites, and deletes.
 
 | Event | Type | Description |
 | --- | --- | --- |
-| `CASMetaAbsentRepublish` | `Number` | Number of blob uploads made because the body was present but its freshness marker was absent; such a body is republished, never adopted. |
+| `CASMetaAbsentRepublish` | `Number` | Number of blob publication attempts started because the body was present but its freshness marker was absent; such a body is republished, never adopted. Counts attempts, including ones that fail. |
 | `CASMetaCompareSwap` | `Number` | Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention. |
 | `CASMetaCreateClean` | `Number` | Number of publications after an absent body or an absent marker that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation. |
 | `CASMetaDelete` | `Number` | Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity. |

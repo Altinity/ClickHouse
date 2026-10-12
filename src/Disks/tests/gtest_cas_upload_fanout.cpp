@@ -337,7 +337,7 @@ struct WorldA
 };
 
 const char * const kObserved = "fanoutA-observed-clean";
-const char * const kAdopt = "fanoutA-head-miss-adopt";
+const char * const kAbsentMarker = "fanoutA-absent-marker";
 const char * const kFresh = "fanoutA-fresh-local";
 const char * const kStaging = "fanoutA-s3-staging";
 const char * const kResLocal = "fanoutA-condemned-local";
@@ -356,7 +356,7 @@ WorldA arrangeWorldA()
     writeMetaClean(*w.b, w.s->layout(), u128Of(kObserved), std::string(kObserved).size());
 
     /// Present body, NO meta: republished like an absent body.
-    seedPresentBody(*w.b, w.s->layout(), w.s->poolMeta(), kAdopt);
+    seedPresentBody(*w.b, w.s->layout(), w.s->poolMeta(), kAbsentMarker);
 
     /// fresh local streaming: nothing present.
 
@@ -389,13 +389,13 @@ WorldA arrangeWorldA()
 
     w.requests = {
         localRequest(kObserved),
-        localRequest(kAdopt),
+        localRequest(kAbsentMarker),
         localRequest(kFresh),
         s3Request(kStaging, "p/staging/mount1/A-staging.tmp"),
         localRequest(kResLocal),
         s3Request(kResS3, "p/staging/mount1/A-republish.tmp"),
     };
-    w.payloads = {kObserved, kAdopt, kFresh, kStaging, kResLocal, kResS3};
+    w.payloads = {kObserved, kAbsentMarker, kFresh, kStaging, kResLocal, kResS3};
     return w;
 }
 

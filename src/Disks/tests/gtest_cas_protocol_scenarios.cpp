@@ -201,7 +201,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// adopts t0 on its `Clean` marker
 
     /// GC advanced the round to 1 with an EMPTY retired set; fence to 1. X is NOT condemned and its
     /// token is unchanged.
@@ -226,6 +226,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     const RootNamespace ns{"srv1/tbl"};
 
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
+    writeMetaClean(*b, s->layout(), u128Of("payload-X"), 9);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
 
@@ -233,7 +234,7 @@ TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob.
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// adopts t0 on its `Clean` marker
 
     /// Another writer displaces X out-of-band ⇒ a new current token t1 (same payload, fresh tag).
     const Etag t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
@@ -288,7 +289,7 @@ TEST(CASProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// adopts t0 on its `Clean` marker
 
     /// promote: the materialized leaf is edge-protected (not re-observed) ⇒ commit. Lands. t0 untouched.
     build->promote(ns, "part_1", build->buildId(), id);
@@ -483,6 +484,7 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     const RootNamespace ns{"srv1/tbl"};
 
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
+    writeMetaClean(*b, s->layout(), u128Of("payload-X"), 9);
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
     const Etag t0 = currentIncarnation(*b, blob_key);
 
@@ -490,7 +492,7 @@ TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob.
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// adopts t0 on its `Clean` marker
 
     /// Another writer displaces X to t1 (uncondemned) before our gate runs.
     const Etag t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));

@@ -53,9 +53,9 @@ Everything persisted is a text format with a versioned header line; see
 
 - **Write**: `ContentAddressedTransaction` buffers or spills file writes
   (`scratch_path`, or opt-in S3 staging), hashes the payload, and hands it to
-  `Pool/CasPartWriteTxn`: start every materialization with blob `HEAD`, adopt a present
-  non-condemned body or publish the writer's source unconditionally, reconcile `.meta` to
-  `Clean`, and record explicit `Materialized` proof; then stage the manifest, `precommitAdd` the ref,
+  `Pool/CasPartWriteTxn`: start every materialization with blob `HEAD`, adopt only on a `Clean`
+  marker read after the `HEAD`, otherwise publish the writer's source unconditionally and reconcile
+  `.meta` to `Clean`, and record explicit `Materialized` proof; then stage the manifest, `precommitAdd` the ref,
   then promote it to committed in the ref log.
 - **Read**: disk path → `Parts/PartPathParser` (namespace + part + file) →
   ref table resolves the manifest → `Pool/CasManifestReader` locates the

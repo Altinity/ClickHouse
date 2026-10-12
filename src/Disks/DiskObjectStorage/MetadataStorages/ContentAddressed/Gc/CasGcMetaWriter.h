@@ -35,7 +35,8 @@ public:
     void scheduleCondemnMarkerWrite(const BlobRef & ref, uint64_t condemn_round, uint64_t size);
 
     /// Drop the marker of a blob whose body is confirmed deleted or absent, but only while it is `Condemned`
-    /// at `newest_round` or older: a newer marker, or `Clean`, belongs to a later incarnation.
+    /// at `newest_round` or older; a newer marker and `Clean` stay. The marker removed may be a later
+    /// incarnation's, which is safe because a writer adopts only on `Clean`.
     void scheduleConfirmedMetaDelete(const BlobRef & ref, uint64_t newest_round);
 
     /// Successful-path protocol barrier. Wait for every job scheduled so far, propagating any
