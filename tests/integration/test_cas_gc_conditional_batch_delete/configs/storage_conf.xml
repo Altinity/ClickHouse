@@ -1,0 +1,29 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <disk_cas_gc_conditional_batch>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <http_keep_alive_timeout>30</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>10000</http_keep_alive_max_requests>
+                <cas_server_root_id>itest-cas-gc-conditional-batch</cas_server_root_id>
+                <endpoint>http://rustfs1:11121/test/cas_gc_conditional_batch/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>3600</cas_gc_interval_sec>
+                <cas_gc_bulk_delete_chunk_keys>2</cas_gc_bulk_delete_chunk_keys>
+            </disk_cas_gc_conditional_batch>
+        </disks>
+        <policies>
+            <cas_gc_conditional_batch>
+                <volumes>
+                    <main>
+                        <disk>disk_cas_gc_conditional_batch</disk>
+                    </main>
+                </volumes>
+            </cas_gc_conditional_batch>
+        </policies>
+    </storage_configuration>
+</clickhouse>
