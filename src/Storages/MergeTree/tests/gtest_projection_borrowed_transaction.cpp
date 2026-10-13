@@ -1,12 +1,23 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskLocal.h>
+#include <Disks/DiskObjectStorage/DiskObjectStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/Replication/ClusterConfiguration.h>
+#include <Disks/DiskObjectStorage/Replication/ObjectStorageRouter.h>
 #include <Disks/SingleDiskVolume.h>
+#include <Disks/tests/cas_test_helpers.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
 #include <Storages/MergeTree/DataPartStorageOnDiskFull.h>
+#include <Storages/MergeTree/DataPartStorageOnDiskPacked.h>
+
+#include <Poco/Util/XMLConfiguration.h>
 
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <unistd.h>
 
 using namespace DB;
@@ -38,6 +49,39 @@ namespace
         {
             std::error_code ec;
             std::filesystem::remove_all(base_path, ec);
+        }
+    };
+
+    struct CASPackedStorageFixture
+    {
+        std::filesystem::path scratch_path;
+        ObjectStoragePtr object_storage;
+        std::shared_ptr<ContentAddressedMetadataStorage> metadata_storage;
+        std::shared_ptr<DiskObjectStorage> disk;
+        VolumePtr volume;
+        const String root_path = "a11/a11a11a1-1111-4111-8111-111111111111";
+        const String part_dir = "all_1_1_0";
+
+        CASPackedStorageFixture()
+        {
+            Cas::tests::ensureBlobUploadPoolForTest();
+            const auto unique = std::to_string(::getpid()) + "_"
+                + std::to_string(reinterpret_cast<uintptr_t>(this));
+            scratch_path = std::filesystem::temp_directory_path() / ("packed_cas_gtest_" + unique);
+            object_storage = Cas::tests::makeLocalObjectStorageForTest();
+            auto settings = Cas::tests::makeSettingsForTest("packed", scratch_path);
+            metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
+                object_storage, "pool", "srv1", "", nullptr, settings);
+            metadata_storage->startup();
+
+            std::unordered_map<Location, LocationInfo> cluster_registry = {{"main", {true, true, ""}}};
+            std::unordered_map<Location, ObjectStoragePtr> object_storage_registry = {{"main", object_storage}};
+            auto cluster = std::make_shared<ClusterConfiguration>("packed_cas", std::move(cluster_registry));
+            auto object_storages = std::make_shared<ObjectStorageRouter>(std::move(object_storage_registry));
+            Poco::AutoPtr<Poco::Util::XMLConfiguration> config(new Poco::Util::XMLConfiguration());
+            disk = std::make_shared<DiskObjectStorage>(
+                "packed_cas", std::move(cluster), metadata_storage, std::move(object_storages), nullptr, *config, "");
+            volume = std::make_shared<SingleDiskVolume>("packed_cas", disk);
         }
     };
 }
@@ -83,4 +127,153 @@ TEST(ProjectionBorrowedTransaction, OwnedProjectionStorageStillBeginsAndCommits)
     EXPECT_TRUE(proj->hasActiveTransaction());
     EXPECT_NO_THROW(proj->commitTransaction());
     EXPECT_FALSE(proj->hasActiveTransaction());
+}
+
+TEST(ProjectionBorrowedTransaction, BorrowedPackedStorageFinalizesWithoutCommittingParent)
+{
+    ParentStorageFixture fx;
+    auto parent = std::make_shared<DataPartStorageOnDiskPacked>(fx.volume, "", "all_1_1_0", ReadSettings{}, false);
+
+    parent->beginTransaction();
+    ASSERT_TRUE(parent->hasActiveTransaction());
+
+    auto parent_out = parent->writeFile("parent.bin", 4096, WriteMode::Rewrite, WriteSettings{});
+    writeString("parent payload", *parent_out);
+    parent_out->finalize();
+
+    auto proj = parent->getProjectionNoInitialize("p.proj", true);
+    ASSERT_TRUE(proj->hasActiveTransaction());
+    EXPECT_NO_THROW(proj->beginTransaction());
+    proj->createDirectories();
+
+    auto out = proj->writeFile("value.bin", 4096, WriteMode::Rewrite, WriteSettings{});
+    writeString("packed payload", *out);
+    out->finalize();
+
+    EXPECT_NO_THROW(proj->precommitTransaction());
+    EXPECT_NO_THROW(proj->commitTransaction());
+    EXPECT_TRUE(parent->hasActiveTransaction());
+
+    auto in = proj->readFile("value.bin", ReadSettings{}, std::nullopt);
+    String value;
+    readStringUntilEOF(value, *in);
+    EXPECT_EQ(value, "packed payload");
+
+    EXPECT_NO_THROW(parent->commitTransaction());
+    EXPECT_FALSE(parent->hasActiveTransaction());
+}
+
+TEST(ProjectionBorrowedTransaction, BorrowedPackedStorageCommitFinalizesWriter)
+{
+    ParentStorageFixture fx;
+    auto parent = std::make_shared<DataPartStorageOnDiskPacked>(fx.volume, "", "all_1_1_0", ReadSettings{}, false);
+
+    parent->beginTransaction();
+    auto parent_out = parent->writeFile("parent.bin", 4096, WriteMode::Rewrite, WriteSettings{});
+    writeString("parent payload", *parent_out);
+    parent_out->finalize();
+
+    auto proj = parent->getProjectionNoInitialize("p.proj", true);
+    proj->beginTransaction();
+    proj->createDirectories();
+
+    auto out = proj->writeFile("value.bin", 4096, WriteMode::Rewrite, WriteSettings{});
+    writeString("packed payload", *out);
+    out->finalize();
+
+    EXPECT_NO_THROW(proj->commitTransaction());
+    EXPECT_TRUE(parent->hasActiveTransaction());
+
+    auto in = proj->readFile("value.bin", ReadSettings{}, std::nullopt);
+    String value;
+    readStringUntilEOF(value, *in);
+    EXPECT_EQ(value, "packed payload");
+
+    EXPECT_NO_THROW(parent->commitTransaction());
+    EXPECT_FALSE(parent->hasActiveTransaction());
+}
+
+TEST(ProjectionBorrowedTransaction, OwnedPackedStorageStillCommitsAndResets)
+{
+    ParentStorageFixture fx;
+    auto storage = std::make_shared<DataPartStorageOnDiskPacked>(fx.volume, "", "all_1_1_0", ReadSettings{}, false);
+
+    storage->beginTransaction();
+    auto out = storage->writeFile("value.bin", 4096, WriteMode::Rewrite, WriteSettings{});
+    writeString("packed payload", *out);
+    out->finalize();
+
+    EXPECT_NO_THROW(storage->commitTransaction());
+    EXPECT_FALSE(storage->hasActiveTransaction());
+
+    auto in = storage->readFile("value.bin", ReadSettings{}, std::nullopt);
+    String value;
+    readStringUntilEOF(value, *in);
+    EXPECT_EQ(value, "packed payload");
+}
+
+TEST(ProjectionBorrowedTransaction, CASPackedStorageReadsStagedReplacement)
+{
+    CASPackedStorageFixture fx;
+
+    {
+        auto parent = std::make_shared<DataPartStorageOnDiskPacked>(
+            fx.volume, fx.root_path, fx.part_dir, ReadSettings{}, false);
+        parent->beginTransaction();
+        parent->createDirectories();
+
+        auto parent_out = parent->writeFile("parent.bin", 4096, WriteMode::Rewrite, WriteSettings{});
+        writeString("parent payload", *parent_out);
+        parent_out->finalize();
+
+        auto proj = parent->getProjectionNoInitialize("p.proj", true);
+        proj->beginTransaction();
+        proj->createDirectories();
+        auto out = proj->writeFile("value.bin", 4096, WriteMode::Rewrite, WriteSettings{});
+        writeString("old payload", *out);
+        out->finalize();
+        proj->commitTransaction();
+        parent->commitTransaction();
+    }
+
+    auto parent = std::make_shared<DataPartStorageOnDiskPacked>(
+        fx.volume, fx.root_path, fx.part_dir, ReadSettings{}, true);
+    parent->beginTransaction();
+    auto proj = parent->getProjection("p.proj", true);
+    ASSERT_FALSE(proj->getRemotePaths("value.bin").empty());
+
+    auto out = proj->writeFile("value.bin", 4096, WriteMode::Rewrite, WriteSettings{});
+    writeString("new payload", *out);
+    out->finalize();
+    proj->commitTransaction();
+
+    EXPECT_TRUE(parent->hasActiveTransaction());
+    EXPECT_TRUE(proj->getRemotePaths("value.bin").empty());
+
+    auto in = proj->readFile("value.bin", ReadSettings{}, std::nullopt);
+    String value;
+    readStringUntilEOF(value, *in);
+    EXPECT_EQ(value, "new payload");
+
+    parent->checkpointTransaction();
+    EXPECT_TRUE(parent->hasActiveTransaction());
+
+    auto before_commit_parent = std::make_shared<DataPartStorageOnDiskPacked>(
+        fx.volume, fx.root_path, fx.part_dir, ReadSettings{}, true);
+    auto before_commit_proj = before_commit_parent->getProjection("p.proj");
+    auto before_commit_in = before_commit_proj->readFile("value.bin", ReadSettings{}, std::nullopt);
+    value.clear();
+    readStringUntilEOF(value, *before_commit_in);
+    EXPECT_EQ(value, "old payload");
+
+    parent->commitTransaction();
+    EXPECT_FALSE(parent->hasActiveTransaction());
+
+    auto committed_parent = std::make_shared<DataPartStorageOnDiskPacked>(
+        fx.volume, fx.root_path, fx.part_dir, ReadSettings{}, true);
+    auto committed_proj = committed_parent->getProjection("p.proj");
+    auto committed_in = committed_proj->readFile("value.bin", ReadSettings{}, std::nullopt);
+    value.clear();
+    readStringUntilEOF(value, *committed_in);
+    EXPECT_EQ(value, "new payload");
 }
