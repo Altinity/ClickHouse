@@ -595,8 +595,10 @@ confirmed permanently dead, since it fences the member out even if it later come
 it deletes namespace and drain state that cannot be recovered.
 
 The claim accepts only a terminal mount slot (`state` `terminated` or `fenced` in
-`system.cas_mounts`). A hard-killed member shows `expired` until the next GC round fences it; until
-then the command refuses with `alive or contended`.
+`system.cas_mounts`). A hard-killed member shows `expired` until the disk's GC leader fences it, once it has
+seen the lease unchanged for about one lease TTL plus one renew period. Until then the command
+refuses with `alive or contended`. `SYSTEM CAS GC RUN` on the leader (`is_leader = 1` in
+`system.cas_mounts`) speeds this up and may take two runs.
 
 It is a writer operation, not GC: it emits ordinary ref-edge deltas rather than inventing GC
 transitions, and it does not synchronously reclaim shared blob content — removing the ref edges only

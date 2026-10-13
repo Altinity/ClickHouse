@@ -768,9 +768,10 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                     "variant. A member can be removed only once its mount slot is terminal in system.cas_mounts "
                     "(server_root_id = '{}'): state = 'terminated' (the server stopped cleanly) or state = 'fenced' "
                     "(GC fenced its lease). A hard-killed member shows state = 'expired' first and is not removable "
-                    "yet: GC fences a lease whose token has stayed unchanged for about one cas_mount_lease_ttl_ms "
-                    "plus one cas_mount_renew_period_ms, in its next round on any live member (SYSTEM CAS GC RUN "
-                    "starts one). Then rerun this command.",
+                    "yet. The disk's GC leader fences it once it has seen the lease unchanged for about one "
+                    "cas_mount_lease_ttl_ms plus one cas_mount_renew_period_ms. SYSTEM CAS GC RUN on the leader "
+                    "(is_leader = 1 in system.cas_mounts) speeds this up, and it may take two runs. "
+                    "Then rerun this command.",
                     srid, holder, srid);
             }
             /// LiveDoubleStart (waited out the bound → a live twin) or ForeignOwner → fail closed

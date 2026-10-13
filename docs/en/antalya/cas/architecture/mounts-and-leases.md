@@ -263,7 +263,8 @@ which any reclaim is instant.
 
 **Permanent removal** of a dead replica (`Cas::decommissionPoolMember`, driven by
 `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'`) claims the victim's mount slot
-as an administrative writer with a no-wait policy (refuses unless the slot is terminal: `terminated` or `fenced`; an `expired` slot is refused until GC fences it),
+as an administrative writer with a no-wait policy (refuses unless the slot is terminal:
+`terminated` or `fenced`; an `expired` slot is refused until the disk's GC leader fences it),
 drops every ref-bearing namespace, sweeps manifest debris before the slot (deleting the mount
 removes the watermark authority), drains staging and roots, then — only with zero warnings —
 retires in order: mount, epoch, a final liveness re-check, owner tombstone.

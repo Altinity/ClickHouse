@@ -513,10 +513,18 @@ TEST(CASDecommission, NoWaitRefusalNamesTheTerminalStates)
     auto backend = std::make_shared<InMemoryBackend>();
     auto victim = openVictim(backend);
 
-    DB::Cas::tests::expectThrowsCodeWithMessage(ErrorCodes::ABORTED, "state = 'fenced'", [&]
+    try
     {
         Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
-    });
+        FAIL() << "expected the live member to be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::ABORTED);
+        EXPECT_NE(e.message().find("alive or contended"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("state = 'terminated'"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("state = 'fenced'"), String::npos) << e.message();
+    }
 }
 
 TEST(CASDecommission, ClaimsDeadMemberAndBumpsEpoch)

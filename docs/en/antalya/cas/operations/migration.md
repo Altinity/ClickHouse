@@ -205,8 +205,9 @@ operation fences that `server_root_id` out even if the server comes back online,
 namespace and drain state that cannot be recovered. The command claims the slot without waiting and trusts no wall clock, so it accepts only a terminal
 slot in `system.cas_mounts`: `state = 'terminated'` (clean stop) or `state = 'fenced'` (GC fenced the
 lease). A `live` or `expired` row is refused with `alive or contended`; a hard-killed member stays
-`expired` until the next GC round on any live member fences it, about one `cas_mount_lease_ttl_ms`
-plus one `cas_mount_renew_period_ms` after its last renewal (`SYSTEM CAS GC RUN` starts a round).
+`expired` until the disk's GC leader fences it, once it has seen the lease unchanged for about one
+`cas_mount_lease_ttl_ms` plus one `cas_mount_renew_period_ms`. `SYSTEM CAS GC RUN` on the leader
+(`is_leader = 1` in `system.cas_mounts`) speeds it up and may take two runs.
 
 **Verification.** After the command reports `slot_removed = true` with no warnings, the member's
 `server_root_id` no longer appears as a row in `system.cas_mounts` on any peer, and a subsequent
