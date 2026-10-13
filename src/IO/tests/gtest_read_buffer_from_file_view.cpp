@@ -2,6 +2,7 @@
 
 #include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromFileBase.h>
+#include <IO/ReadBufferFromMemory.h>
 
 #include <cstring>
 
@@ -121,6 +122,37 @@ class ReadBufferFromFileViewTest : public ::testing::TestWithParam<Case>
 {
 };
 
+}
+
+TEST(ReadBufferFromFileViewCount, MemoryBacked)
+{
+    const auto data = makePayload(1057);
+    auto inner = std::make_unique<ReadBufferFromOutsideMemoryFile>("memory", data);
+    ReadBufferFromFileView view(std::move(inner), "viewed", 1053, 1057);
+
+    EXPECT_EQ(view.count(), 0);
+    EXPECT_EQ(readExact(view, 4), data.substr(1053, 4));
+    EXPECT_EQ(view.count(), 4);
+    EXPECT_EQ(view.seek(1, SEEK_SET), 1);
+    EXPECT_EQ(view.getPosition(), 1);
+    EXPECT_EQ(readExact(view, 3), data.substr(1054, 3));
+    EXPECT_EQ(view.count(), 4);
+}
+
+TEST(ReadBufferFromFileViewCount, Nested)
+{
+    const auto data = makePayload(1088);
+    auto memory = std::make_unique<ReadBufferFromOutsideMemoryFile>("memory", data);
+    auto inner = std::make_unique<ReadBufferFromFileView>(std::move(memory), "inner", 1024, 1088);
+    ReadBufferFromFileView view(std::move(inner), "outer", 29, 33);
+
+    EXPECT_EQ(view.count(), 0);
+    EXPECT_EQ(readExact(view, 4), data.substr(1053, 4));
+    EXPECT_EQ(view.count(), 4);
+    EXPECT_EQ(view.seek(1, SEEK_SET), 1);
+    EXPECT_EQ(view.getPosition(), 1);
+    EXPECT_EQ(readExact(view, 3), data.substr(1054, 3));
+    EXPECT_EQ(view.count(), 4);
 }
 
 TEST_P(ReadBufferFromFileViewTest, SequentialReadWholeView)
