@@ -24,11 +24,13 @@ from helpers.iceberg_timestamp_ns import (
     DATETIME64_MAX_US,
     FILTER_LITERAL_IDS,
     FILTER_LITERALS,
+    NEAR_EPOCH_NS_ROWS,
     PRUNE_OFF,
     PRUNE_ON,
     ROWS,
     SPARK_TIMESTAMP_SENTINEL_US,
     check_minmax_far_future_us_upper_bound,
+    check_minmax_near_epoch_ns_bounds_on_timestamp_schema,
     check_minmax_ns_bounds_on_timestamp_schema,
     check_ns_pruning,
     check_ns_pruning_datetime64_microseconds,
@@ -76,7 +78,7 @@ def _arrow_timestamp_row(ts_ns, row_id):
     )
 
 
-def _create_timestamp_table(started_cluster, table_name, patch):
+def _create_timestamp_table(started_cluster, table_name, patch, rows=ROWS):
     """Iceberg v2 `timestamp` (microseconds parquet) with a custom manifest-bound patch."""
     work = Path(tempfile.mkdtemp(prefix="iceberg_ns_bounds_"))
     try:
@@ -96,7 +98,7 @@ def _create_timestamp_table(started_cluster, table_name, patch):
         )
         table.append(
             pa.concat_tables(
-                [_arrow_timestamp_row(ts_ns, row_id) for ts_ns, row_id, _utc in ROWS]
+                [_arrow_timestamp_row(ts_ns, row_id) for ts_ns, row_id, _utc in rows]
             )
         )
         table = catalog.load_table(identifier)
@@ -119,10 +121,10 @@ def _create_timestamp_table(started_cluster, table_name, patch):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _create_timestamp_table_with_ns_bounds(started_cluster, table_name):
+def _create_timestamp_table_with_ns_bounds(started_cluster, table_name, rows=ROWS):
     """Iceberg v2 `timestamp` (microseconds) whose manifest min/max bytes are nanoseconds."""
     return _create_timestamp_table(
-        started_cluster, table_name, patch_iceberg_timestamp_bounds_us_to_ns
+        started_cluster, table_name, patch_iceberg_timestamp_bounds_us_to_ns, rows=rows
     )
 
 
@@ -263,6 +265,27 @@ def test_minmax_pruning_ns_bounds_on_timestamp_schema(started_cluster_iceberg_no
         )
 
     check_minmax_ns_bounds_on_timestamp_schema(node, table, "value", pruned_files)
+
+
+def test_minmax_pruning_near_epoch_ns_bounds_on_timestamp_schema(started_cluster_iceberg_no_spark):
+    """Near-epoch ns min/max on Iceberg `timestamp` must not be decoded as microseconds."""
+    node = started_cluster_iceberg_no_spark.instances["node1"]
+    s3_filename = _create_timestamp_table_with_ns_bounds(
+        started_cluster_iceberg_no_spark, "minmax_near_epoch_ns", rows=NEAR_EPOCH_NS_ROWS
+    )
+    table = _iceberg_table(s3_filename)
+
+    def pruned_files(select_expression):
+        return check_validity_and_get_prunned_files_general(
+            node,
+            "minmax_near_epoch_ns",
+            PRUNE_OFF,
+            PRUNE_ON,
+            "IcebergMinMaxIndexPrunedFiles",
+            select_expression,
+        )
+
+    check_minmax_near_epoch_ns_bounds_on_timestamp_schema(node, table, "value", pruned_files)
 
 
 @pytest.mark.parametrize(

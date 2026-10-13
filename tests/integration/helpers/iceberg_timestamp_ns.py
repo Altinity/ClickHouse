@@ -223,6 +223,40 @@ DATETIME64_MAX_US = _utc_datetime_to_micros(
 )
 
 
+# One day after the Unix epoch as nanoseconds. Kept as microseconds this is ~1972,
+# so a predicate on 1970-01-02 over-prunes unless the decoder fails open.
+NEAR_EPOCH_NS_ROWS = [
+    (86_400_000_000_000, 1, "1970-01-02 00:00:00.000000000"),
+]
+
+
+def check_minmax_near_epoch_ns_bounds_on_timestamp_schema(node, table, column, pruned_files):
+    """Iceberg `timestamp` whose min/max bytes are near-epoch nanoseconds must not over-prune.
+
+    One day after the epoch is `8.64e13` ns (`|ticks| <= 1e16`). The inverted-range
+    check does not fire when both bounds stay in that band.
+    """
+    type_name = node.query(
+        f"SELECT toTypeName({column}) FROM {table} LIMIT 1",
+        settings=PRUNE_OFF,
+    )
+    assert "DateTime64(6" in type_name, type_name
+    assert "DateTime64(9" not in type_name, type_name
+
+    ids = node.query(f"SELECT id FROM {table} ORDER BY id", settings=PRUNE_OFF)
+    assert ids == "1\n"
+    micros = node.query(
+        f"SELECT toUnixTimestamp64Micro({column}) FROM {table} WHERE id = 1",
+        settings=PRUNE_OFF,
+    ).strip()
+    assert micros == "86400000000", micros
+
+    eq_epoch_day = datetime64_literal("1970-01-02 00:00:00.000000000", scale=6, timezone=None)
+    query = f"SELECT id FROM {table} WHERE {column} = {eq_epoch_day} ORDER BY id"
+    assert pruned_files(query) == 0
+    assert node.query(query, settings=PRUNE_ON) == "1\n"
+
+
 def check_minmax_far_future_us_upper_bound(node, table, column, pruned_files):
     """Iceberg `timestamp` with a far-future microsecond *upper* bound must not over-prune.
 
