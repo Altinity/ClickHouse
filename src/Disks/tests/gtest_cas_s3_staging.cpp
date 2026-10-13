@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 #include <IO/WriteSettings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
@@ -842,6 +843,29 @@ void writeThroughS3Transaction(DB::ContentAddressedTransaction & tx, const std::
     buf->finalize();
 }
 
+/// Stages one blob through a real transaction, lets the transaction abort, and re-creates the exact key
+/// the writer minted: the abort delete is best-effort, so a lost delete leaves the object at precisely
+/// this key. Returns the key as the object storage sees it.
+std::string leakWriterStagedObject(DB::IObjectStorage & object_storage, DB::ContentAddressedMetadataStorage & metadata_storage)
+{
+    std::string key;
+    {
+        auto tx = metadata_storage.createTransaction();
+        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+        writeThroughS3Transaction(
+            ca_tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", std::string(300, 'x'));
+        DB::RelativePathsWithMetadata staged;
+        object_storage.listObjects(metadata_storage.stagingKeyPrefix(), staged, /*max_keys=*/0);
+        if (staged.size() != 1)
+            throw std::runtime_error("expected exactly one staged object, got " + std::to_string(staged.size()));
+        key = staged.front()->relative_path;
+    }
+    auto buf = object_storage.writeObject(DB::StoredObject(key), DB::WriteMode::Rewrite);
+    buf->write("x", 1);
+    buf->finalize();
+    return key;
+}
+
 }
 
 TEST(CASS3Staging, WritableS3StagingRequiresNativeOnlyCopy)
@@ -1034,6 +1058,46 @@ TEST(CASS3Staging, GcBlobDiscoveryPrefixExcludesStagingObjects)
     EXPECT_FALSE(staging_prefix.starts_with(blobs_prefix));
     EXPECT_FALSE(blobs_prefix.starts_with(staging_prefix));
     EXPECT_FALSE(staging_key.starts_with(blobs_prefix));
+}
+
+/// Guard: the drain lists `<pool_prefix>/staging/<srid>/` as a LOGICAL key and the backend applies the
+/// local root itself, while the writer mints its keys through `physicalKey`. Local prefix:
+/// `EmulatedSingleProcess` over a `LocalObjectStorage`, whose physical keys carry its root.
+TEST(CASDecommission, StagingDrainRemovesWhatTheWriterStagedUnderTheLocalPrefix)
+{
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "victimLocal");
+    metadata_storage->startup();
+    const std::string leaked = leakWriterStagedObject(*object_storage, *metadata_storage);
+    metadata_storage->shutdown();   /// clean farewell: the member is dead and claimable without a wait
+    ASSERT_TRUE(object_storage->exists(DB::StoredObject(leaked)));
+
+    auto backend = std::make_shared<DB::Cas::ObjectStorageBackend>(
+        object_storage, DB::Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    const DB::Cas::DecommissionReport report = DB::Cas::decommissionPoolMember(
+        backend, DB::Cas::PoolConfig{.pool_prefix = "pool", .server_root_id = "admin"}, "victimLocal");
+
+    EXPECT_EQ(report.staging_objects_removed, 1u) << "the drain did not see the writer's key space";
+    EXPECT_FALSE(object_storage->exists(DB::StoredObject(leaked)));
+}
+
+/// Guard: a staging object whose abort delete was lost is reclaimed by the next mount of the same
+/// `server_root_id`, through the same prefix the writer minted it under.
+TEST(CASS3Staging, MountStartSweepsALostAbortDelete)
+{
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
+    std::string leaked;
+    {
+        auto first_mount = makeS3StagingMetadataStorageForTest(object_storage, "mountSweep");
+        first_mount->startup();
+        leaked = leakWriterStagedObject(*object_storage, *first_mount);
+        first_mount->shutdown();
+    }
+    ASSERT_TRUE(object_storage->exists(DB::StoredObject(leaked)));
+
+    auto second_mount = makeS3StagingMetadataStorageForTest(object_storage, "mountSweep");
+    second_mount->startup();
+    EXPECT_FALSE(object_storage->exists(DB::StoredObject(leaked)));
 }
 
 #if USE_AWS_S3
@@ -1373,6 +1437,26 @@ TEST(CASS3Staging, GenerationBackendMayUseNativeOnlyCopy)
     DB::RelativePathsWithMetadata staged;
     object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
     EXPECT_EQ(staged.size(), 1u);
+}
+
+/// Native prefix: keys pass through unchanged on both sides, so a `physicalKey` that started adding a
+/// root for Native, or a drain that started adding one, would miss the writer's objects.
+TEST(CASDecommission, StagingDrainRemovesWhatTheWriterStagedUnderTheNativePrefix)
+{
+    auto object_storage = makeFakeGenerationObjectStorageForTest();
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "victimNative");
+    metadata_storage->startup();
+    const std::string leaked = leakWriterStagedObject(*object_storage, *metadata_storage);
+    metadata_storage->shutdown();
+    ASSERT_TRUE(object_storage->exists(DB::StoredObject(leaked)));
+
+    auto backend = std::make_shared<DB::Cas::ObjectStorageBackend>(
+        object_storage, DB::Cas::ObjectStorageBackend::Mode::Native);
+    const DB::Cas::DecommissionReport report = DB::Cas::decommissionPoolMember(
+        backend, DB::Cas::PoolConfig{.pool_prefix = "pool", .server_root_id = "admin"}, "victimNative");
+
+    EXPECT_EQ(report.staging_objects_removed, 1u) << "the drain did not see the writer's key space";
+    EXPECT_FALSE(object_storage->exists(DB::StoredObject(leaked)));
 }
 
 #endif
