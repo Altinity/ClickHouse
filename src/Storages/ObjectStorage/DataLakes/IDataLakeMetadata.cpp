@@ -170,7 +170,7 @@ DataFileMetaInfo::DataFileMetaInfo(
     /// file schema so the read optimization substitutes NULL only for columns added after the file
     /// was written. `emplace` keeps the statistics already stored above.
     size_t columns_without_metrics = 0;
-    if (schema_processor.hasClickhouseTableSchemaById(file_schema_id))
+    if (schema_processor.hasClickHouseTableSchemaById(file_schema_id))
     {
         const auto fields = schema_processor.getIcebergTableSchemaById(file_schema_id)->getArray(Iceberg::f_fields);
         for (size_t i = 0; i < fields->size(); ++i)

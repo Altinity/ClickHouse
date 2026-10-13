@@ -615,13 +615,8 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                                     table_schema_id, /// current schema id to use current column names
                                     manifest_file_entry->resolved_schema_id, /// file's schema id to interpret value_bounds bytes
                                     manifest_file_entry->parsed_entry->columns_infos,
-<<<<<<< HEAD
-                                    manifest_file_entry->parsed_entry->value_bounds));
-=======
                                     manifest_file_entry->parsed_entry->value_bounds,
                                     data_file_path.serialize()));
-
->>>>>>> 8204033cfc6e (Merge pull request #2527 from Altinity/bugfix/antalya-26.6/iceberg-partial-column-stats)
         ProfileEvents::increment(ProfileEvents::IcebergMetadataReturnedObjectInfos);
 
         if (callback)
