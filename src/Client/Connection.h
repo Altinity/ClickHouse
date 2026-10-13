@@ -187,6 +187,8 @@ public:
 
     UInt64 getParallelReplicasProtocolVersion() const { return server_parallel_replicas_protocol_version; }
 
+    UInt64 getServerAntalyaProtocolVersion() const { return server_antalya_protocol_version; }
+
 private:
     String host;
     UInt16 port;
