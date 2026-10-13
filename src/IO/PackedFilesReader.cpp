@@ -101,7 +101,7 @@ Names PackedFilesReader::getFileNames() const
     return res;
 }
 
-static ReadSettings patchSettings(ReadSettings settings)
+ReadSettings PackedFilesReader::patchSettings(ReadSettings settings)
 {
     settings.local_fs_settings.direct_io_threshold = 0;
     if (settings.local_fs_settings.method == LocalFSReadMethod::mmap)

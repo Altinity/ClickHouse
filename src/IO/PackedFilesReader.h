@@ -57,6 +57,7 @@ public:
     const PackedFilesIO::Index & getIndex() const { return index; }
 
     static PackedFilesIO::Index readIndex(ReadBuffer & in);
+    static ReadSettings patchSettings(ReadSettings settings);
 
 private:
     /// Index of archive: immutable and path-independent.

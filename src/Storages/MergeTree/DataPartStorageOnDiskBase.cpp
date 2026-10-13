@@ -1418,13 +1418,14 @@ size_t DataPartStorageOnDiskBase::getFileSizeInTransactionOrDisk(const std::stri
 
 StoredObjects DataPartStorageOnDiskBase::getStorageObjectsInTransactionOrDisk(const std::string & path) const
 {
-    StoredObjects objects;
     if (transaction)
+    {
         if (auto inflight = transaction->tryGetInFlightStorageObjects(path))
-            objects = std::move(*inflight);
-    if (objects.empty())
-        objects = volume->getDisk()->getStorageObjects(path);
-    return objects;
+            return std::move(*inflight);
+        if (transaction->tryGetInFlightFileSize(path))
+            return {};
+    }
+    return volume->getDisk()->getStorageObjects(path);
 }
 
 void DataPartStorageOnDiskBase::prepareReadInTransactionOrDisk(
@@ -1443,11 +1444,14 @@ void DataPartStorageOnDiskBase::prepareReadInTransactionOrDisk(
 
         if (!inflight_objects.empty())
         {
-            auto * current_transaction = transaction.get();
+            auto current_transaction = transaction;
             pipeline.setSource(
                 [current_transaction, path](const StoredObject &, const ReadSettings & read_settings, bool, bool)
                 {
-                    return current_transaction->tryReadFileInFlight(path, read_settings, std::nullopt);
+                    auto buffer = current_transaction->tryReadFileInFlight(path, read_settings, std::nullopt);
+                    if (!buffer)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "In-flight file {} cannot be read", path);
+                    return buffer;
                 },
                 std::move(inflight_objects),
                 settings);
@@ -1464,8 +1468,13 @@ std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskBase::readFileIfExi
     std::optional<size_t> read_hint) const
 {
     if (transaction)
+    {
+        auto in_flight_size = transaction->tryGetInFlightFileSize(path);
         if (auto buffer = transaction->tryReadFileInFlight(path, settings, read_hint))
             return buffer;
+        if (in_flight_size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "In-flight file {} cannot be read", path);
+    }
     return volume->getDisk()->readFileIfExists(path, settings, read_hint);
 }
 
