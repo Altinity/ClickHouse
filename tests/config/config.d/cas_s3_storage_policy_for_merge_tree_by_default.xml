@@ -24,6 +24,7 @@
                 <secret_access_key>clickhouse</secret_access_key>
                 <!-- Real server-local scratch dir for the write-buffer spill. -->
                 <cas_scratch_path>cas_s3_scratch/</cas_scratch_path>
+                <cas_allow_packed_parts>1</cas_allow_packed_parts>
                 <!-- Background GC pacing: the incarnation protocol's fence/recheck handshake
                      replaces the old grace window (M-W D-W5); a short interval so reclamation
                      happens during the run. -->

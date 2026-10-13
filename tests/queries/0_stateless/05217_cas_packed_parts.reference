@@ -1,2 +1,26 @@
 cas_packed_disabled	Full
 cas_packed_local	Packed
+initial_parts	4	Packed
+aggregate	40000	799980000	19980000
+minmax_query	80
+merged_parts	1	Packed
+projection_active	1
+projection_query	0	40	780000
+projection_query	1	40	780040
+projection_query	2	40	780080
+1
+unfreeze_parts	1
+partition_reload	40000	799980000
+table_reload	40000	799980000
+copy_rows	40000	799980000
+copy_storage	Packed
+copy_projection_active	1
+copy_after_source_drop	40000	799980000
+copy_after_reload	40000	799980000
+has_blob_put	1
+default_gc_drained 1
+default_fsck_unreachable 0
+default_fsck_dangling 0
+disabled_gc_drained 1
+disabled_fsck_unreachable 0
+disabled_fsck_dangling 0
