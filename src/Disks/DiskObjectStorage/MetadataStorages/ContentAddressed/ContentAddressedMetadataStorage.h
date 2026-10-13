@@ -241,6 +241,7 @@ public:
     bool supportsStat() const override { return false; }
     bool isReadOnly() const override { return read_only; }
     bool isContentAddressed() const override { return true; }
+    bool allowsPackedParts() const override { return allow_packed_parts; }
 
 
     /// Fail-close gate shared by every mutating entry point (transactions, GC round, GC rebuild,
@@ -639,6 +640,7 @@ private:
     const uint64_t cas_part_folder_cache_bytes;
     const uint64_t cas_part_folder_cache_max_entries;
     const uint64_t cas_part_folder_cache_max_entry_bytes;
+    const bool allow_packed_parts;
     /// Byte bound for the manifest decode cache in `Cas::Pool`. Zero disables decode caching.
     const uint64_t manifest_decode_cache_bytes;
     /// Bounded pool size for GC's per-hash freshness-metadata writes.

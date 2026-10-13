@@ -227,6 +227,8 @@ public:
 
     bool isContentAddressed() const override;
 
+    bool allowsPackedParts() const override;
+
     bool supportsAtomicFileWrites() const override;
 
     /// Get structure of object storage this disk works with. Examples:

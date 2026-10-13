@@ -479,6 +479,8 @@ public:
     /// True when a file write on this disk publishes atomically (see `IDataPartStorage::supportsAtomicFileWrites`).
     virtual bool supportsAtomicFileWrites() const { return false; }
 
+    virtual bool allowsPackedParts() const { return true; }
+
     virtual bool isWriteOnce() const { return false; }
 
     virtual bool supportsHardLinks() const { return true; }

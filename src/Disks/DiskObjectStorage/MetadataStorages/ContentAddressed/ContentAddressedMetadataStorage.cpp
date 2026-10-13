@@ -83,6 +83,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 part_folder_cache_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entries;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
+    extern const ContentAddressedSettingsBool allow_packed_parts;
     extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
     extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
     extern const ContentAddressedSettingsUInt64 gc_io_concurrency;
@@ -307,6 +308,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_bytes(settings_[ContentAddressedSetting::part_folder_cache_bytes].value)
     , cas_part_folder_cache_max_entries(settings_[ContentAddressedSetting::part_folder_cache_max_entries].value)
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
+    , allow_packed_parts(settings_[ContentAddressedSetting::allow_packed_parts].value)
     , manifest_decode_cache_bytes(settings_[ContentAddressedSetting::manifest_decode_cache_bytes].value)
     , gc_meta_pool_size(settings_[ContentAddressedSetting::gc_meta_pool_size].value)
     , gc_io_concurrency(settings_[ContentAddressedSetting::gc_io_concurrency].value)
