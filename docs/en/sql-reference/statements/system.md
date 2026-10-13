@@ -603,7 +603,7 @@ SYSTEM CAS DROP POOL MEMBER 'server_root_id' FROM DISK 'disk_name' [ON CLUSTER c
 ```
 
 Both `server_root_id` and `disk_name` are required string literals (a `server_root_id` is an opaque string, not a
-plain identifier, so it cannot be written unquoted; ids created before nesting was closed may contain `/`).
+plain identifier, so it cannot be written unquoted; an existing id may contain `/`).
 
 The operation is resumable: a rerun skips namespaces already marked `Removed` and reports them
 separately from namespaces newly removed by this invocation. Per-object drain failures are recorded

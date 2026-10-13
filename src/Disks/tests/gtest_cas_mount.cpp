@@ -515,8 +515,8 @@ TEST(CASServerRootId, NewIdWithSlashIsRefused)
 }
 
 /// Guard: a member that already owns a nested id (its owner object exists, written by an older build)
-/// still mounts under it. Besides the pool meta only the owner is seeded: the epoch counter is minted by this very open, so
-/// the nesting rule must not run once the owner is present.
+/// still mounts under it. Besides the pool meta only the owner is seeded: the epoch counter is minted
+/// by this very open, so the nesting rule must not run once the owner is present.
 TEST(CASServerRootId, ExistingIdWithSlashStillMounts)
 {
     auto b = std::make_shared<InMemoryBackend>();

@@ -37,7 +37,8 @@ dedup work. Ref/namespace keys are also deliberately opaque and do not embed the
 
 Each replica sharing a backend endpoint must use a distinct `cas_server_root_id`; omitting the setting
 is a startup error.
-A new `cas_server_root_id` may not contain `/`; ids that already own their owner object keep working.
+
+A new `cas_server_root_id` may not contain `/`; ids that already own their owner object keep working. The rule does not cover two cases: decommissioning `a` still selects the namespaces and staging of an existing `a/b`, and a new `a` can be claimed while an empty `a/b` exists.
 
 ## The owner claim {#owner-claim}
 

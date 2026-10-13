@@ -89,7 +89,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 
 | Setting | Default | Description |
 |---|---|---|
-| `cas_server_root_id` | — (required) | Explicit layout subtree identity; macros expand as in the `s3` `endpoint`. Anchored in the pool by a write-once owner claim — a colliding identity is refused at mount. A new id may not contain `/`: the first mount refuses to create a nested id, because `SYSTEM CAS DROP POOL MEMBER` selects objects by key prefix and would drain every member whose id starts with the victim's. An id that already owns its owner object keeps working |
+| `cas_server_root_id` | — (required) | Explicit layout subtree identity; macros expand as in the `s3` `endpoint`. Anchored in the pool by a write-once owner claim — a colliding identity is refused at mount. A new id may not contain `/`: the first mount refuses to create a nested id, because `SYSTEM CAS DROP POOL MEMBER` selects objects by key prefix and would drain every member whose id starts with the victim's. An id that already owns its owner object keeps working, and keeps the prefix hazard: decommissioning `a` selects the namespaces and staging of an existing `a/b`. A new `a` can also be claimed while an empty `a/b` exists |
 | `cas_scratch_path` | `<clickhouse-path>/disks/<disk_name>/cas_scratch/` | Server-local scratch dir for the write-buffer spill; a relative value is anchored to the server data path |
 | `cas_gc_enabled` | `true` | Run the background GC scheduler on this disk. `false` is a debugging aid, not an operating mode: garbage then accumulates indefinitely and silently — watch `system.cas_gc_log` for round activity if you ever toggle it |
 | `cas_gc_interval_sec` | `60` | Seconds between background GC rounds (≥ 1) |
