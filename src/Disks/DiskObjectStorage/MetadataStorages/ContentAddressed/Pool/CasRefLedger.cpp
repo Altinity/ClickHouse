@@ -565,20 +565,31 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::lookupRefTableRunti
     return it == ref_name_slots.end() ? nullptr : it->second.current;
 }
 
+uint64_t CasRefLedger::refNameRetirements(const RootNamespace & ns) const
+{
+    std::lock_guard lock(ref_queue_mutex);
+    const auto it = ref_name_slots.find(ns.string());
+    return it == ref_name_slots.end() ? 0 : it->second.retirements;
+}
+
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRuntime(
-    const NamespaceLifeId & life, uint64_t admitted_generation)
+    const NamespaceLifeId & life, uint64_t admitted_generation, uint64_t retirements_seen)
 {
     refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref-table runtime install");
 
     std::shared_ptr<RefTableRuntime> result;
     bool generation_moved = false;
+    bool retired_since_observation = false;
     bool identity_conflict = false;
     {
         std::lock_guard lock(ref_queue_mutex);
         generation_moved = fence_generation_fn() != admitted_generation;
-        if (!generation_moved)
+        const auto it = ref_name_slots.find(life.ns.string());
+        /// The catalog row this life came from may have been removed and drained after the caller read
+        /// it; inserting then would publish a runtime for a life the janitor sweeps.
+        retired_since_observation = (it == ref_name_slots.end() ? 0 : it->second.retirements) != retirements_seen;
+        if (!generation_moved && !retired_since_observation)
         {
-            const auto it = ref_name_slots.find(life.ns.string());
             if (it != ref_name_slots.end() && it->second.current)
             {
                 const auto & current = it->second.current;
@@ -596,13 +607,18 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRunt
                     next_ref_runtime_id.fetch_add(1, std::memory_order_relaxed) + 1,
                     life,
                     admitted_generation);
-                ref_name_slots.emplace(life.ns.string(), RefNameSlot{.current = result});
+                ref_name_slots[life.ns.string()].current = result;
             }
         }
     }
 
     if (generation_moved)
         refuseUnlessAdmitted(mount_requests.resume(admitted_generation), "ref-table runtime install");
+    if (retired_since_observation)
+        throwCasWriteRetryLater(fmt::format(
+            "CAS namespace '{}': a life of this name was retired while life {} was being admitted; "
+            "retry from a fresh catalog observation",
+            life.ns.string(), renderIncarnation(life.incarnation)));
     if (identity_conflict)
         throwCasWriteRetryLater(fmt::format(
             "CAS namespace '{}': the cached runtime identity changed while publishing catalog life {}; "
@@ -636,6 +652,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
     }
 
     const uint64_t admitted_generation = fence_generation_fn();
+    const uint64_t retirements_seen = refNameRetirements(ns);
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(op, layout);
     refuseUnlessAdmitted(op, "cold readable runtime admission");
@@ -672,20 +689,22 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
             "retry from a fresh catalog observation",
             ns.string(), renderIncarnation(life.incarnation)));
 
-    return acquireRefTableRuntime(life, admitted_generation);
+    return acquireRefTableRuntime(life, admitted_generation, retirements_seen);
 }
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireMutableRefTableRuntime(
     const RootNamespace & ns)
 {
+    /// Captured before `namespaceLife`, whose answer may come from a runtime retired right after.
+    const uint64_t admitted_generation = fence_generation_fn();
+    const uint64_t retirements_seen = refNameRetirements(ns);
     const NamespaceLifeId life = namespaceLife(ns);
     if (const auto current = lookupRefTableRuntime(ns))
     {
         if (current->life == life)
             return current;
     }
-    const uint64_t admitted_generation = fence_generation_fn();
-    return acquireRefTableRuntime(life, admitted_generation);
+    return acquireRefTableRuntime(life, admitted_generation, retirements_seen);
 }
 
 void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
@@ -693,12 +712,15 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
     std::shared_ptr<RefTableRuntime> rt;
     {
         std::lock_guard lock(ref_queue_mutex);
-        const auto it = ref_name_slots.find(life.ns.string());
-        if (it == ref_name_slots.end())
-            return;
-        rt = it->second.current;
+        /// Recorded even with no resident runtime: a cold admission may be between its catalog read
+        /// and its insertion.
+        RefNameSlot & slot = ref_name_slots[life.ns.string()];
+        rt = slot.current;
         if (!rt)
+        {
+            ++slot.retirements;
             return;
+        }
     }
 
     /// Invalidation must neither materialize a cache entry nor perform catalog I/O on GC's thread.
@@ -718,7 +740,10 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
         std::lock_guard queue_lock(ref_queue_mutex);
         const auto it = ref_name_slots.find(life.ns.string());
         if (it != ref_name_slots.end() && it->second.current == rt)
-            ref_name_slots.erase(it);
+        {
+            it->second.current.reset();
+            ++it->second.retirements;
+        }
     }
     rt->cv.notify_all();
     rt->recovery_cv.notify_all();
@@ -1806,7 +1831,8 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
                 continue;   /// re-check under the still-held ref_queue_mutex
             total -= c.weight;
             evicted.push_back(std::move(rt));   /// keep alive past the erase and lock release
-            ref_name_slots.erase(it);
+            if (it->second.retirements == 0)
+                ref_name_slots.erase(it);
             ProfileEvents::increment(ProfileEvents::CASRefTableEvictions);
         }
     }
@@ -4943,12 +4969,14 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
         if (rt)
         {
             ensureRefTableRecovered(ns, *rt);
+            refuseTerminalLife(ns, *rt);
             return rt->life;
         }
     }
 
     /// A cold mutation observes or births the durable identity before allocating any local state.
     const uint64_t admitted_generation = fence_generation_fn();
+    const uint64_t retirements_seen = refNameRetirements(ns);
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(op, layout);
     refuseUnlessAdmitted(op, "cold mutable namespace admission");
@@ -4964,9 +4992,21 @@ NamespaceLifeId CasRefLedger::namespaceLife(const RootNamespace & ns)
         ? NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation)
         : resolveNamespaceLife(ns, admitted_generation, live_epoch_fn());
     refuseUnlessAdmitted(op, "cold mutable namespace admission, after life resolution");
-    rt = acquireRefTableRuntime(life, admitted_generation);
+    rt = acquireRefTableRuntime(life, admitted_generation, retirements_seen);
     ensureRefTableRecovered(ns, *rt);
+    refuseTerminalLife(ns, *rt);
     return rt->life;
+}
+
+void CasRefLedger::refuseTerminalLife(const RootNamespace & ns, RefTableRuntime & rt)
+{
+    /// Bytes written under a removed life are swept by the dead-life janitor, so the caller must not be
+    /// handed one to write into. A never-born stream is also `Removed` but has no `remove_txn_id`.
+    std::lock_guard lock(rt.state_mutex);
+    if (rt.state.getLifecycle() != RefLifecycle::Live && rt.state.getRemoveTxnId().has_value())
+        throwCasWriteRetryLater(fmt::format(
+            "CAS namespace '{}': its resident life {} is already removed; retry after the removal completes",
+            ns.string(), renderIncarnation(rt.life.incarnation)));
 }
 
 std::optional<NamespaceLifeId> CasRefLedger::namespaceFilesLifeIfReadable(const RootNamespace & ns)
@@ -5016,6 +5056,7 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// the one answer that must never be manufactured by a race, so it alone is re-confirmed by a
     /// second read of this namespace's row before being trusted.
     const uint64_t admitted_generation = fence_generation_fn();
+    const uint64_t retirements_seen = refNameRetirements(ns);
     CasOperation op = mount_requests.resume(admitted_generation);
     const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(op, layout);
     refuseUnlessAdmitted(op, "namespace presence probe");
@@ -5060,7 +5101,7 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// therefore not proof that the CURRENT logical namespace `ns` is absent; a fresh catalog read is
     /// required before answering `false` for the name.
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
-    const auto rt = acquireRefTableRuntime(life, admitted_generation);
+    const auto rt = acquireRefTableRuntime(life, admitted_generation, retirements_seen);
     ensureRefTableRecovered(ns, *rt);
     bool this_incarnation_terminal = false;
     {
@@ -5099,6 +5140,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     /// class shares the bigger complete-table byte budget (encodeRefLogTxn's own `checkBudget`, keyed
     /// off the presence of a `RemoveNamespace` op) and is exempt from the ordinary per-op admission
     /// check (it only ever shrinks state; see `flushRefBatch`'s `state_growing` filter).
+    const uint64_t retirements_seen = refNameRetirements(ns);
     CasOperation initial_op = mount_requests.admit();
     const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(initial_op, layout);
     const auto initial_it = std::find_if(initial_catalog.catalog.entries.begin(), initial_catalog.catalog.entries.end(),
@@ -5143,7 +5185,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     const NamespaceLifeId observed_life
         = NamespaceLifeId::fromCatalogEntry(initial_it->ns, initial_it->incarnation);
     const uint64_t runtime_generation = fence_generation_fn();
-    const auto rt = acquireRefTableRuntime(observed_life, runtime_generation);
+    const auto rt = acquireRefTableRuntime(observed_life, runtime_generation, retirements_seen);
     ensureRefTableRecovered(ns, *rt);
     {
         /// A real terminal transaction is idempotent. The representation also calls an empty, never-born

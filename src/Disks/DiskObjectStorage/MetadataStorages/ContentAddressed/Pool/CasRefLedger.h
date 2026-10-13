@@ -189,7 +189,8 @@ public:
     /// resolution, and the ONLY one that CREATES: recovery's step 0 (`resolveNamespaceLife`) mints a
     /// life when the catalog names none, so the first namespace file a table ever writes births the
     /// namespace exactly as its first ref op would. A read or a removal must not use this -- see the
-    /// sibling below for why that is a correctness matter and not a preference.
+    /// sibling below for why that is a correctness matter and not a preference. Throws retry-later for
+    /// a life whose terminal removal is already applied, since the janitor sweeps whatever is written there.
     NamespaceLifeId namespaceLife(const RootNamespace & ns);
 
     /// The life a READER (or a REMOVER) of this namespace's files must use, or `nullopt` when there are
@@ -474,7 +475,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        return it == ref_name_slots.end() ? 0 : it->second.current->pending.size();
+        return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->pending.size();
     }
 
     /// Reports whether `ns` currently has an active append-lane leader (the baton). Under the queue mutex.
@@ -482,7 +483,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        return it != ref_name_slots.end() && it->second.current->leader_active;
+        return it != ref_name_slots.end() && it->second.current && it->second.current->leader_active;
     }
 
     /// Returns the number of items carved by the current tenure and not yet released by its exit guard.
@@ -491,7 +492,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        return it == ref_name_slots.end() ? 0 : it->second.current->carved.size();
+        return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->carved.size();
     }
 
     /// Returns whether the `carved` entry for `ref_name` (if any) is already completed. Lets a test
@@ -501,7 +502,7 @@ public:
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_name_slots.find(ns.string());
-        if (it == ref_name_slots.end())
+        if (it == ref_name_slots.end() || !it->second.current)
             return false;
         for (const auto & item : it->second.current->carved)
             if (item->scope.kind == MutationScope::Kind::Ref && item->scope.ref_name == ref_name)
@@ -936,6 +937,10 @@ private:
     struct RefNameSlot
     {
         std::shared_ptr<RefTableRuntime> current;
+        /// Bumped by `invalidateRemovedCatalogLife`. A slot with a non-zero count is never erased (only
+        /// remount clears it, and remount also moves the fence generation), so a cold admission compares
+        /// the count it captured before its catalog read with the one at insertion.
+        uint64_t retirements = 0;
     };
     static constexpr size_t kMaxRefBatch = 1000;
     /// Recovery retries at most this many times when an object selected by LIST vanishes before GET.
@@ -1037,9 +1042,17 @@ private:
 
     /// Publishes or returns one runtime for an exact catalog-observed life and admitted mount-fence
     /// generation. A conflicting attached identity is a stale observation and fails closed rather than
-    /// retargeting either runtime.
+    /// retargeting either runtime. `retirements_seen` is `refNameRetirements` captured before the
+    /// catalog read that produced `life`; if a retirement of this name landed since, the observation is
+    /// stale and the call throws retry-later instead of republishing a possibly retired life.
     std::shared_ptr<RefTableRuntime> acquireRefTableRuntime(
-        const NamespaceLifeId & life, uint64_t admitted_generation);
+        const NamespaceLifeId & life, uint64_t admitted_generation, uint64_t retirements_seen);
+
+    /// The name's retirement count, under `ref_queue_mutex`. Zero for a name with no slot.
+    uint64_t refNameRetirements(const RootNamespace & ns) const;
+
+    /// Throws retry-later when `rt` (already recovered) has applied its namespace's terminal removal.
+    void refuseTerminalLife(const RootNamespace & ns, RefTableRuntime & rt);
 
     /// Lookup-first non-minting read acquisition. A cold name consults the catalog and materializes only
     /// an exact `Live` life; absence/`Creating`/`Removing` returns no runtime.
