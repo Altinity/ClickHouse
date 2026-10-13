@@ -6,6 +6,10 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergTableStateSnapshot.h>
 #include <Core/AntalyaProtocol.h>
 #include <Core/ProtocolDefines.h>
+#if USE_AVRO && USE_AWS_S3
+#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
+#endif
 
 namespace DB::ErrorCodes
 {
@@ -178,38 +182,70 @@ TEST(DatalakeStateSerde, IcebergObjectSerializableInfoExternalPathRejectedBefore
 {
     auto info = makeObjectInfo();
     info.requires_external_storage = true;
-    String str;
-    WriteBufferFromString write_buffer{str};
-    try
+    for (UInt64 antalya_version : {0, 1})
     {
-        info.serializeForClusterFunctionProtocol(
-            write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH - 1);
-        FAIL() << "External storage accepted by the old protocol";
-    }
-    catch (const DB::Exception & e)
-    {
-        ASSERT_EQ(e.code(), ErrorCodes::PROTOCOL_VERSION_MISMATCH);
+        SCOPED_TRACE(antalya_version);
+        String str;
+        WriteBufferFromString write_buffer{str};
+        try
+        {
+            info.serializeForClusterFunctionProtocol(write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, antalya_version);
+            FAIL() << "External storage accepted by the old protocol";
+        }
+        catch (const DB::Exception & e)
+        {
+            ASSERT_EQ(e.code(), ErrorCodes::PROTOCOL_VERSION_MISMATCH);
+        }
     }
 }
 
 
-TEST(DatalakeStateSerde, IcebergObjectSerializableInfoDeleteFilePathsStrippedBeforeAbsolutePathProtocol)
+TEST(DatalakeStateSerde, IcebergObjectSerializableInfoDeleteFilePathsByAntalyaVersion)
 {
     auto info = makeObjectInfo();
     info.position_deletes_objects = {{"s3://bucket/deletes/pos1.parquet", "PARQUET", "s3://bucket/path/to/file.parquet", 0}};
+    info.equality_deletes_objects = {{"s3://bucket/deletes/eq1.parquet", "PARQUET", std::vector<Int32>{1}, 1}};
 
-    String str;
+    for (UInt64 antalya_version : {0, 1, 2})
     {
-        WriteBufferFromString write_buffer{str};
-        info.serializeForClusterFunctionProtocol(
-            write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH - 1);
-    }
-    ReadBufferFromMemory read_buffer(str.data(), str.size());
-    Iceberg::IcebergObjectSerializableInfo deserialized;
-    deserialized.deserializeForClusterFunctionProtocol(read_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION);
+        SCOPED_TRACE(antalya_version);
+        info.requires_external_storage = (antalya_version == 2);
+        String str;
+        {
+            WriteBufferFromString write_buffer{str};
+            info.serializeForClusterFunctionProtocol(write_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, antalya_version);
+        }
+        ReadBufferFromMemory read_buffer(str.data(), str.size());
+        Iceberg::IcebergObjectSerializableInfo deserialized;
+        deserialized.deserializeForClusterFunctionProtocol(read_buffer, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION);
 
-    ASSERT_TRUE(read_buffer.eof());
-    ASSERT_EQ(deserialized.position_deletes_objects.size(), 1);
-    ASSERT_EQ(deserialized.position_deletes_objects[0].file_path, "deletes/pos1.parquet");
-    ASSERT_EQ(deserialized.position_deletes_objects[0].reference_data_file_path, "path/to/file.parquet");
+        ASSERT_TRUE(read_buffer.eof());
+        ASSERT_EQ(deserialized.data_object_file_path_key, info.data_object_file_path_key);
+        ASSERT_EQ(deserialized.position_deletes_objects.size(), 1);
+        ASSERT_EQ(deserialized.equality_deletes_objects.size(), 1);
+        const String prefix = antalya_version == 2 ? "s3://bucket/" : "";
+        EXPECT_EQ(deserialized.position_deletes_objects[0].file_path, prefix + "deletes/pos1.parquet");
+        EXPECT_EQ(deserialized.position_deletes_objects[0].reference_data_file_path, prefix + "path/to/file.parquet");
+        EXPECT_EQ(deserialized.equality_deletes_objects[0].file_path, prefix + "deletes/eq1.parquet");
+    }
 }
+
+#if USE_AVRO && USE_AWS_S3
+TEST(DatalakeStateSerde, CopiedTableDeletePathsRequireAbsolutePathProtocol)
+{
+    const auto storage = std::make_shared<LocalObjectStorage>(LocalObjectStorageSettings("test", "./", true));
+    ExternalStorageCache external_storages;
+    const String location = "s3://old-bucket/prefix/table";
+    const String path = location + "/data/delete.parquet";
+    const Iceberg::IcebergPathResolver resolver(location, "table");
+
+    const auto [resolved_storage, key] = resolveObjectStorageForPath(location, path, storage, external_storages, {}, resolver);
+    ASSERT_EQ(resolved_storage, storage);
+    ASSERT_EQ(key, "table/data/delete.parquet");
+    EXPECT_TRUE(requiresAbsolutePathForCluster(location, path, storage, external_storages, {}, resolver));
+    EXPECT_FALSE(requiresAbsolutePathForCluster(location, key, storage, external_storages, {}, resolver));
+
+    const Iceberg::IcebergPathResolver original_resolver(location, "prefix/table");
+    EXPECT_FALSE(requiresAbsolutePathForCluster(location, path, storage, external_storages, {}, original_resolver));
+}
+#endif

@@ -923,6 +923,18 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     return {base_storage, path_resolver.resolve(Iceberg::IcebergPathFromMetadata::deserialize(path))};
 }
 
+bool requiresAbsolutePathForCluster(
+    const std::string & table_location,
+    const std::string & path,
+    const ObjectStoragePtr & base_storage,
+    ExternalStorageCache & external_storages,
+    const ContextPtr & context,
+    const Iceberg::IcebergPathResolver & path_resolver)
+{
+    auto [storage, key] = resolveObjectStorageForPath(table_location, path, base_storage, external_storages, context, path_resolver);
+    return storage != base_storage || key != SchemeAuthorityKey(path).key;
+}
+
 bool isObjectInTableDirectory(
     const ObjectStoragePtr & storage,
     const std::string & key,

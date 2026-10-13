@@ -65,6 +65,15 @@ std::pair<ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     const ContextPtr & context,
     const Iceberg::IcebergPathResolver & path_resolver);
 
+/// Legacy workers open the transmitted object key directly, without resolving it against the table location.
+bool requiresAbsolutePathForCluster(
+    const std::string & table_location,
+    const std::string & path,
+    const ObjectStoragePtr & base_storage,
+    ExternalStorageCache & external_storages,
+    const ContextPtr & context,
+    const Iceberg::IcebergPathResolver & path_resolver);
+
 bool isObjectInTableDirectory(
     const ObjectStoragePtr & storage,
     const std::string & key,

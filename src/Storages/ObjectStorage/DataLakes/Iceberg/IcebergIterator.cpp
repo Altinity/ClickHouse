@@ -637,38 +637,11 @@ ObjectInfoPtr IcebergIterator::next(size_t)
         /// Only distributed tasks need compatibility checks, which parse every delete-file URI.
         if (tasks_go_to_other_replicas && !object_info->info.requires_external_storage)
         {
-            /// Old workers strip scheme and authority from delete paths. Require the new protocol when that changes
-            /// the resolved object. Scheme-less paths need a check only on local storage.
-            const bool base_storage_is_local = object_storage->getType() == ObjectStorageType::Local;
-            auto resolves_to_itself_on_base_storage = [&](const String & file_path)
-            {
-                SchemeAuthorityKey decomposed{file_path};
-                if (!decomposed.scheme.empty())
-                    return false;
-                return !decomposed.key.starts_with('/') || !base_storage_is_local;
-            };
-
             auto needs_absolute_path_protocol = [&](const String & file_path)
             {
-                if (resolves_to_itself_on_base_storage(file_path))
-                    return false;
-
-                auto [del_storage, del_key] = resolveObjectStorageForPath(
+                return requiresAbsolutePathForCluster(
                     persistent_components.table_location, file_path, object_storage, *external_storages, local_context,
                     persistent_components.path_resolver);
-                if (del_storage != object_storage)
-                    return true;
-                try
-                {
-                    auto [stripped_storage, stripped_key] = resolveObjectStorageForPath(
-                        persistent_components.table_location, SchemeAuthorityKey(file_path).key, object_storage,
-                        *external_storages, local_context, persistent_components.path_resolver);
-                    return stripped_storage != object_storage || stripped_key != del_key;
-                }
-                catch (const Exception &)
-                {
-                    return true;
-                }
             };
             auto any_needs_protocol = [&](const auto & delete_objects)
             {

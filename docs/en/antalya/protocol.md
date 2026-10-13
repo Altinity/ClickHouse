@@ -28,7 +28,7 @@ Version 2 lets the `*Cluster` read-task payload (the `ReadTaskResponse` body) ca
 delete-file paths as absolute URIs, as the manifest spells them, so that a worker can read files
 outside the table location, including files on another object storage. For a worker below version 2
 the initiator strips the scheme and authority as before, and refuses to dispatch a data file that
-needs another storage.
+needs another storage or whose delete-file keys differ from the resolved keys.
 
 ## Adding an Antalya-only wire change {#adding-a-wire-change}
 
