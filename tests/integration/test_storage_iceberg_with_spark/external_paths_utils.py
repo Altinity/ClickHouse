@@ -37,6 +37,14 @@ def modify_avro_file(avro_path: str, field_path: list, modifier_func) -> None:
         writer.close()
 
 
+def read_avro_records(avro_path: str) -> list:
+    with open(avro_path, 'rb') as f:
+        reader = avro.datafile.DataFileReader(f, avro.io.DatumReader())
+        records = list(reader)
+        reader.close()
+    return records
+
+
 def get_absolute_path(storage_type: str, cluster, relative_path: str) -> str:
     relative_path = relative_path.lstrip("/")
 
