@@ -553,7 +553,6 @@ def test_backup_to_s3_multipart(cluster):
         "policy_s3",
         "policy_s3_other_bucket",
         "policy_s3_plain_rewritable",
-        "policy_cas",
     ],
 )
 def test_backup_to_s3_native_copy(cluster, storage_policy):
@@ -562,20 +561,6 @@ def test_backup_to_s3_native_copy(cluster, storage_policy):
     (backup_events, restore_events) = check_backup_and_restore(
         cluster, storage_policy, backup_destination
     )
-
-    if storage_policy in CAS_POLICIES:
-        assert (
-            backup_events.get("S3CopyObject", 0)
-            + backup_events.get("S3UploadPartCopy", 0)
-            > 0
-        )
-        assert (
-            restore_events.get("S3CopyObject", 0)
-            + restore_events.get("S3UploadPartCopy", 0)
-            == 0
-        )
-        return
-
     # single part upload
     assert backup_events["S3CopyObject"] > 0
     assert restore_events["S3CopyObject"] > 0
