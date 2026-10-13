@@ -33,6 +33,13 @@ namespace
 constexpr Int64 microseconds_ambiguous_threshold = 10'000'000'000'000'000LL;
 constexpr Int64 nanoseconds_lower_threshold = 1'000'000'000'000'000'000LL;
 constexpr Int64 nanoseconds_per_microsecond = 1000;
+/// 2024-01-01 00:00:00 UTC as microseconds. Below this, `|ticks|` is also a
+/// plausible near-epoch nanosecond count (1.704e15 ns is ~19.7 days). Fail-open
+/// that overlap so a 1-day-after-epoch ns min/max is not read as year ~1972.
+/// Ticks from this instant through 1e16 stay microseconds so 2024+ Iceberg
+/// `timestamp` pruning is unchanged. Residual: 19.7..115 days as ns still collide
+/// with 2024..2286 as µs.
+constexpr Int64 min_kept_microseconds = 1'704'067'200'000'000LL;
 
 bool magnitudeExceeds(Int64 value, Int64 threshold)
 {
@@ -63,7 +70,9 @@ Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
 /// Some writers store nanosecond stats on Iceberg `timestamp` (`DateTime64(6)`).
 /// Convert only in a true nanosecond band (`|ticks| > 1e18`). Between 1e16 and
 /// 1e18 the value may be far-future microseconds (do not convert; fail open so
-/// min/max pruning is skipped). `|ticks| <= 1e16` is kept as microseconds.
+/// min/max pruning is skipped). Below `min_kept_microseconds`, ticks may be
+/// near-epoch nanoseconds (also fail open). `(min_kept_microseconds, 1e16]` is
+/// kept as microseconds.
 std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str, const IDataType & type, bool lower_bound)
 {
     if (str.size() != sizeof(Int64))
@@ -72,12 +81,18 @@ std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str
     Int64 unscaled = unalignedLoadLittleEndian<Int64>(str.data());
     const UInt32 scale = getDecimalScale(type);
 
-    if (scale == 6 && magnitudeExceeds(unscaled, microseconds_ambiguous_threshold))
+    if (scale == 6)
     {
-        if (!magnitudeExceeds(unscaled, nanoseconds_lower_threshold))
+        if (!magnitudeExceeds(unscaled, min_kept_microseconds))
             return std::nullopt;
 
-        unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
+        if (magnitudeExceeds(unscaled, microseconds_ambiguous_threshold))
+        {
+            if (!magnitudeExceeds(unscaled, nanoseconds_lower_threshold))
+                return std::nullopt;
+
+            unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
+        }
     }
 
     return DecimalField<DateTime64>(DateTime64(unscaled), scale);
