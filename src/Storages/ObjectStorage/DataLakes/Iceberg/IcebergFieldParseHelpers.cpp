@@ -46,6 +46,11 @@ bool magnitudeExceeds(Int64 value, Int64 threshold)
     return value > threshold || value < -threshold;
 }
 
+bool magnitudeBelow(Int64 value, Int64 threshold)
+{
+    return value < threshold && value > -threshold;
+}
+
 /// Convert ns ticks to us ticks without shrinking a [lower, upper] range.
 Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
 {
@@ -71,7 +76,7 @@ Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
 /// Convert only in a true nanosecond band (`|ticks| > 1e18`). Between 1e16 and
 /// 1e18 the value may be far-future microseconds (do not convert; fail open so
 /// min/max pruning is skipped). Below `min_kept_microseconds`, ticks may be
-/// near-epoch nanoseconds (also fail open). `(min_kept_microseconds, 1e16]` is
+/// near-epoch nanoseconds (also fail open). `[min_kept_microseconds, 1e16]` is
 /// kept as microseconds.
 std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str, const IDataType & type, bool lower_bound)
 {
@@ -83,7 +88,7 @@ std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str
 
     if (scale == 6)
     {
-        if (!magnitudeExceeds(unscaled, min_kept_microseconds))
+        if (magnitudeBelow(unscaled, min_kept_microseconds))
             return std::nullopt;
 
         if (magnitudeExceeds(unscaled, microseconds_ambiguous_threshold))
