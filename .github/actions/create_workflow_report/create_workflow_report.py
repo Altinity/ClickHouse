@@ -468,33 +468,15 @@ def _ensure_release_history(
     releases: list[dict],
     cwd: str,
 ) -> None:
-    """Fetch version-line tags; on shallow clones also deepen history to tip_sha.
+    """Fetch the full commit graph (no trees or blobs), then the version-line tags.
 
-    --filter and --shallow-since convert a full clone into a partial/shallow
-    repo, so those options are used only when the checkout is already shallow.
+    --filter converts a full clone into a partial one, so history is only
+    fetched when the checkout is shallow. Tags come second: once the history is
+    local they cost almost nothing.
     """
+    if _git_is_shallow(cwd):
+        _git_fetch(["--filter=tree:0", "--unshallow"], [fetch_ref, tip_sha], cwd)
     _fetch_release_tags(releases, cwd)
-    if not _git_is_shallow(cwd):
-        return
-    since = _history_since_date(tip_sha, cwd)
-    _git_fetch(
-        ["--filter=tree:0", f"--shallow-since={since}"],
-        [fetch_ref, tip_sha],
-        cwd,
-    )
-
-
-def _history_since_date(sha: str, cwd: str | None) -> str:
-    """Earliest date an Altinity baseline on sha's version line can have.
-
-    ClickHouse major.minor is the year.month of the upstream X.Y release, and Altinity
-    commits on an X.Y line are newer than that. One month of margin is added.
-    """
-    year_minor = _read_version_major_minor(sha, cwd)
-    year, month = 2000 + year_minor[0], year_minor[1] - 1
-    if month == 0:
-        year, month = year - 1, 12
-    return f"{year}-{month:02d}-01"
 
 
 def get_prs_in_release_dataframe(
