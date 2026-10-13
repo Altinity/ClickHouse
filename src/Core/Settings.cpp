@@ -12,12 +12,17 @@
 #include <Core/SettingsEnums.h>
 #include <Core/SettingsFields.h>
 #include <Core/SettingsObsoleteMacros.h>
+#include <Core/SettingsSecrets.h>
 #include <Core/SettingsTierType.h>
+#include <IO/Operators.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/S3Defines.h>
+#include <IO/WriteBufferFromString.h>
+#include <Access/resolveSetting.h>
 #include <Storages/System/MutableColumnsAndConstraints.h>
 #include <base/types.h>
 #include <Common/NamePrompter.h>
+#include <Common/FieldVisitorToString.h>
 #include <Common/typeid_cast.h>
 
 #include <boost/program_options.hpp>
@@ -2124,9 +2129,7 @@ Possible values:
 - `allow` — Allows the use of these types of subqueries.
 )", IMPORTANT) \
     DECLARE(ObjectStorageClusterJoinMode, object_storage_cluster_join_mode, ObjectStorageClusterJoinMode::ALLOW, R"(
-Changes the behaviour of object storage cluster function or table.
-
-ClickHouse applies this setting when the query contains the product of object storage cluster function or table, i.e. when the query for a object storage cluster function or table contains a non-GLOBAL subquery for the object storage cluster function or table.
+Where a [JOIN](../../sql-reference/statements/select/join.md#distributed-join) runs when its left table is a cluster table function (`s3Cluster`, `icebergCluster`, and the other `*Cluster` functions) or a table engine with [`object_storage_cluster`](#object_storage_cluster) set.
 
 Restrictions:
 
@@ -2138,6 +2141,8 @@ Possible values:
 - `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN`. Right table executes first and is added to the secondary query as a temporary table.
 - `allow` — Default value. Reads the left object-storage table on cluster nodes and executes `JOIN` / local `IN` on the initiator, so the right table does not need to exist on remote nodes.
 - `local` — Deprecated legacy alias of `allow`.
+
+See [Distributed JOIN](../../sql-reference/statements/select/join.md#object-storage-cluster-join-mode).
 )", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
@@ -5554,9 +5559,9 @@ Possible values:
 - manifest_file_entry - Everything above + traversed avro manifest files entries.
 )", 0) \
     \
-    DECLARE(Bool, iceberg_delete_data_on_drop, false, R"(
-Whether to delete all iceberg files on drop or not.
-)", 0) \
+    DECLARE_WITH_ALIAS(Bool, data_lake_delete_data_on_drop, false, R"(
+Whether to delete the underlying data files when dropping a data lake table. For catalog databases the catalog is asked to purge the data (`purgeRequested=true`); for self-managed tables ClickHouse removes the files directly.
+)", 0, iceberg_delete_data_on_drop) \
     DECLARE(Int64, iceberg_expire_default_min_snapshots_to_keep, 1, R"(
 Default value for Iceberg table property `history.expire.min-snapshots-to-keep` used by `expire_snapshots` when that property is absent.
 )", 0) \
@@ -6840,6 +6845,8 @@ SETTINGS additional_table_filters = {'table_1': 'x != 2'}
 │ 4 │ dddd │
 └───┴──────┘
 ```
+
+Filters keyed on a table read through a view with `SQL SECURITY DEFINER` or `NONE` are not applied inside the view.
 )", 0) \
     DECLARE(String, additional_result_filter, "", R"(
 An additional filter expression to apply to the result of `SELECT` query.
@@ -6886,6 +6893,8 @@ Maximum time to read from a pipe for receiving information from the threads when
 - **Default value:** Empty string
 
 This setting allows to specify renaming pattern for files processed by `file` table function. When option is set, all files read by `file` table function will be renamed according to specified pattern with placeholders, only if files processing was successful.
+
+Renaming is a write to the source, so a query that reads the files with this option set requires the `WRITE ON FILE` grant in addition to `READ ON FILE`. `DESCRIBE` does not build the data-reading pipeline that renames, and so requires only `READ ON FILE`.
 
 ### Placeholders
 
@@ -7556,6 +7565,8 @@ Simple expressions using primary keys are preferred.
 
 If the setting is used on a cluster that consists of a single shard with multiple replicas, those replicas will be converted into virtual shards.
 Otherwise, it will behave same as for `SAMPLE` key, it will use multiple replicas of each shard.
+
+The expression is checked against the column-level `SELECT` grants of the user. For a view with `SQL SECURITY DEFINER` or `NONE` it is applied to the columns of the view; the body of the view is read without it.
 )", BETA) \
     DECLARE(UInt64, parallel_replicas_custom_key_range_lower, 0, R"(
 Allows the filter type `range` to split the work evenly between replicas based on the custom range `[parallel_replicas_custom_key_range_lower, INT_MAX]`.
@@ -7651,6 +7662,10 @@ Allow experimental database engine DataLakeCatalog with catalog_type = 'iceberg'
 
 Cloud default value: `1`.
 )", BETA, allow_database_iceberg) \
+    DECLARE(Bool, datalake_ignore_unsupported_table_properties, false, R"(
+Allow `CREATE TABLE`, `CREATE TABLE ... AS`, and `SHOW CREATE TABLE` in a `DataLakeCatalog` database to omit unsupported table properties, including explicitly specified and inherited properties. Supported properties are preserved. By default, properties that cannot be represented cause an exception.
+This setting does not suppress invalid expressions, unknown columns, invalid transform arguments, or incompatible storage engines, endpoints, and credentials.
+)", BETA) \
     DECLARE_WITH_ALIAS(Bool, allow_experimental_database_unity_catalog, true, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'unity'
 
@@ -8348,6 +8363,12 @@ Trigger processor to spill data into external storage adpatively. grace join is 
     DECLARE(String, object_storage_cluster, "", R"(
 Cluster to make distributed requests to object storages with alternative syntax.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, object_storage_cluster_fallback_to_local_if_empty, false, R"(
+Execute the read locally if 'object_storage_cluster' is set but the cluster is empty or unknown.
+Does not apply to explicit *Cluster table functions, to 'object_storage_remote_initiator_cluster', or to writes.
+With remote initiator + remote_initiator_cluster, the initiator sends plain s3()/iceberg() and passes
+object_storage_cluster as a query setting so the remote can resolve or fall back (OSC may be unknown locally).
+)", EXPERIMENTAL) \
     DECLARE(UInt64, object_storage_max_nodes, 0, R"(
 Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
 Possible values:
@@ -8727,6 +8748,15 @@ Name of the named collection used by `aiEmbed` when the call does not pass `cred
 
 DECLARE_SETTINGS_TRAITS_ALLOW_CUSTOM_SETTINGS(SettingsTraits, LIST_OF_SETTINGS, COMMON_SETTINGS_SUPPORTED_TYPES)
 
+/// A `merge_tree_`-prefixed name is a `MergeTreeSettings` setting kept here as a custom setting, and it can
+/// have two names. Store it under the canonical one, so that a value written under either name is the value
+/// read under either name, instead of the two names holding two values of one setting.
+template <>
+std::string_view resolveCustomSettingName<SettingsTraits>(std::string_view name)
+{
+    return canonicalSettingName(name);
+}
+
 /** Settings of query execution.
   * These settings go to users.xml.
   */
@@ -8743,7 +8773,7 @@ struct SettingsImpl : public BaseSettings<SettingsTraits>, public IHints<2>
     void loadSettingsFromConfig(const String & path, const Poco::Util::AbstractConfiguration & config);
 
     /// Dumps profile events to column of type Map(String, String)
-    void dumpToMapColumn(IColumn * column, bool changed_only = true);
+    void dumpToMapColumn(IColumn * column, bool changed_only, bool show_secrets);
 
     /// Check that there is no user-level settings at the top level in config.
     /// This is a common source of mistake (user don't know where to write user-level setting).
@@ -8797,7 +8827,7 @@ void SettingsImpl::loadSettingsFromConfig(const String & path, const Poco::Util:
     }
 }
 
-void SettingsImpl::dumpToMapColumn(IColumn * column, bool changed_only)
+void SettingsImpl::dumpToMapColumn(IColumn * column, bool changed_only, bool show_secrets)
 {
     if (!column)
         return;
@@ -8820,6 +8850,8 @@ void SettingsImpl::dumpToMapColumn(IColumn * column, bool changed_only)
 
         const auto & name = accessor.getName(i);
         auto value = accessor.getValueString(*this, i);
+        if (!show_secrets)
+            CoreSettings::maskSettingValue(String(name), value);
         key_column.insertData(name.data(), name.size());
         value_column.insertData(value.data(), value.size());
         ++size;
@@ -8833,7 +8865,9 @@ void SettingsImpl::dumpToMapColumn(IColumn * column, bool changed_only)
             continue;
 
         const auto & name = custom.first;
-        auto value = setting_field.toString();
+        auto value = setting_field.toString(show_secrets);
+        if (!show_secrets)
+            CoreSettings::maskSettingValue(name, value);
         key_column.insertData(name.data(), name.size());
         value_column.insertData(value.data(), value.size());
         ++size;
@@ -9008,9 +9042,24 @@ std::vector<String> Settings::getHints(const String & name) const
     return impl->getHints(name);
 }
 
-String Settings::toString() const
+String Settings::toString(bool show_secrets) const
 {
-    return impl->toString();
+    if (show_secrets)
+        return impl->toString();
+
+    /// Same rendering as `BaseSettings::toString`, with the secrets masked.
+    WriteBufferFromOwnString out;
+    bool first = true;
+    for (const auto & setting : impl->allChanged())
+    {
+        if (!first)
+            out << ", ";
+        auto masked = CoreSettings::renderSecretSettingValue(String(setting.getName()), setting.getValue());
+        out << setting.getName() << " = "
+            << (masked ? *masked : applyVisitor(FieldVisitorToString(), setting.getValue()));
+        first = false;
+    }
+    return out.str();
 }
 
 SettingsChanges Settings::changes() const
@@ -9065,13 +9114,30 @@ std::vector<std::string_view> Settings::getUnchangedNames() const
     return setting_names;
 }
 
-void Settings::dumpToSystemSettingsColumns(MutableColumnsAndConstraints & params) const
+void Settings::dumpToSystemSettingsColumns(MutableColumnsAndConstraints & params, bool show_secrets) const
 {
     MutableColumns & res_columns = params.res_columns;
 
+    /// `setting_name` may be an alias, so the masking always keys off the canonical name.
+    const auto mask = [&](const auto & setting, String & value)
+    {
+        if (!show_secrets)
+            CoreSettings::maskSettingValue(String(setting.getName()), value);
+    };
+
+    /// For a constraint, whose raw `Field` is at hand: the value of a custom setting can be an AST
+    /// that no plain `Field` formatter hides.
+    const auto mask_field = [&](const auto & setting, const Field & field, String & value)
+    {
+        if (!show_secrets)
+            CoreSettings::maskSettingValue(String(setting.getName()), field, value);
+    };
+
     const auto fill_data_for_setting = [&](std::string_view setting_name, const auto & setting)
     {
-        res_columns[1]->insert(setting.getValueString());
+        String value = setting.getValueString(show_secrets);
+        mask(setting, value);
+        res_columns[1]->insert(value);
         res_columns[2]->insert(setting.isValueChanged());
 
         /// Trim starting/ending newline.
@@ -9091,20 +9157,34 @@ void Settings::dumpToSystemSettingsColumns(MutableColumnsAndConstraints & params
 
         /// These two columns can accept strings only.
         if (!min.isNull())
-            min = Settings::valueToStringUtil(setting_name, min);
+        {
+            String min_string = Settings::valueToStringUtil(setting_name, min);
+            mask_field(setting, min, min_string);
+            min = min_string;
+        }
         if (!max.isNull())
-            max = Settings::valueToStringUtil(setting_name, max);
+        {
+            String max_string = Settings::valueToStringUtil(setting_name, max);
+            mask_field(setting, max, max_string);
+            max = max_string;
+        }
 
         Array disallowed_array;
-        for (const auto & value : disallowed_values)
-            disallowed_array.emplace_back(Settings::valueToStringUtil(setting_name, value));
+        for (const auto & disallowed_value : disallowed_values)
+        {
+            String disallowed_string = Settings::valueToStringUtil(setting_name, disallowed_value);
+            mask_field(setting, disallowed_value, disallowed_string);
+            disallowed_array.emplace_back(disallowed_string);
+        }
 
         res_columns[4]->insert(min);
         res_columns[5]->insert(max);
         res_columns[6]->insert(disallowed_array);
         res_columns[7]->insert(writability == SettingConstraintWritability::CONST);
         res_columns[8]->insert(setting.getTypeName());
-        res_columns[9]->insert(setting.getDefaultValueString());
+        String default_value = setting.getDefaultValueString(show_secrets);
+        mask(setting, default_value);
+        res_columns[9]->insert(default_value);
         res_columns[11]->insert(setting.getTier() == SettingsTierType::OBSOLETE);
         res_columns[12]->insert(setting.getTier());
     };
@@ -9130,9 +9210,9 @@ void Settings::dumpToSystemSettingsColumns(MutableColumnsAndConstraints & params
     }
 }
 
-void Settings::dumpToMapColumn(IColumn * column, bool changed_only) const
+void Settings::dumpToMapColumn(IColumn * column, bool changed_only, bool show_secrets) const
 {
-    impl->dumpToMapColumn(column, changed_only);
+    impl->dumpToMapColumn(column, changed_only, show_secrets);
 }
 
 NameToNameMap Settings::toNameToNameMap() const
@@ -9141,7 +9221,7 @@ NameToNameMap Settings::toNameToNameMap() const
     for (const auto & param : *impl)
     {
         std::string value;
-        ReadBufferFromOwnString buf(param.getValueString());
+        ReadBufferFromOwnString buf(param.getValueString(/* show_secrets */ true));
         readQuoted(value, buf);
         query_parameters.emplace(param.getName(), value);
     }
@@ -9220,6 +9300,11 @@ Field Settings::stringToValueUtil(std::string_view name, const String & str)
 bool Settings::hasBuiltin(std::string_view name)
 {
     return SettingsImpl::hasBuiltin(name);
+}
+
+std::optional<SettingsTierType> Settings::tryGetTierOfBuiltin(std::string_view name)
+{
+    return SettingsImpl::tryGetTierOfBuiltin(name);
 }
 
 std::string_view Settings::resolveName(std::string_view name)

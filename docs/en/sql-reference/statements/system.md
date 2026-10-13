@@ -479,7 +479,7 @@ When `disk_name` is given, the round runs on that content-addressed disk only; t
 
 Each round is recorded in [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) as a `Start` and a `Finish` row (with `trigger = 'Manual'`).
 
-The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`, `entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, `anomalies`, `pending_candidates`, `pending_condemned`, and `pending_retired`, describing the outcome of that round. The `pending_*` columns are the retire pipeline's remaining backlog sizes read from the `gc/state` this round's own commit just published (not this round's own delta, unlike the columns before them) — `0` on a non-authoritative row (`acquired_lease = 0` or `deferred = 1`), same as every other counter.
+The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`, `entries_condemned`, `entries_graduated`, `entries_redeleted`, `entries_redelete_failed`, `fence_outs`, `anomalies`, `pending_candidates`, `pending_condemned`, and `pending_retired`, describing the outcome of that round. The `pending_*` columns are the retire pipeline's remaining backlog sizes read from the `gc/state` this round's own commit just published (not this round's own delta, unlike the columns before them) — `0` on a non-authoritative row (`acquired_lease = 0` or `deferred = 1`), same as every other counter.
 
 A manual run always executes, regardless of [`SYSTEM CAS GC STOP`](#system-cas-gc-stop-start): `STOP` pauses only the background scheduler on that disk.
 
@@ -516,6 +516,9 @@ carried no durable hold forward, concluding from enumeration alone that the pool
 baseline — on a pool that has ever completed a GC round this means the object listing lied.
 `adopted_seal_generation` names which generation's fold seal the rebuild carried holds from; `0`
 when it carried none.
+
+Before rebuilding a lost `gc/state`, stop or restart every server of the pool. A request a server sent before it
+stopped can still reach the object store afterwards; this rule does not cover it.
 
 ### SYSTEM CAS GC STOP / SYSTEM CAS GC START {#system-cas-gc-stop-start}
 

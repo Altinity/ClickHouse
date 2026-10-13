@@ -10,18 +10,25 @@ doc_type: 'reference'
 # Antalya protocol version {#antalya-protocol-version}
 
 Antalya versions its own wire-protocol changes with `DBMS_ANTALYA_PROTOCOL_VERSION`, a counter that
-upstream ClickHouse cannot reach, defined in `src/Core/AntalyaProtocol.h`. A server advertises it in
-the `ServerHello` name string, on every connection:
+upstream ClickHouse cannot reach, defined in `src/Core/AntalyaProtocol.h`. Both sides advertise it in
+the name string of their `Hello`, on every connection:
 
 ```text
-server -> client   "ClickHouse (antalya:1)"
+client -> server   "ClickHouse client (antalya:2)"
+server -> client   "ClickHouse (antalya:2)"
 ```
 
-The client parses the suffix, caps the value with `min(own, server)` and keeps the result. `0` means
-the peer is not an Antalya build. Negotiation is per hop and not transitive: initiator to worker and
-worker to worker negotiate independently.
+Each side parses the peer's suffix, caps the value with `min(own, peer)` and keeps the result. `0`
+means the peer is not an Antalya build. Negotiation is per hop and not transitive: initiator to
+worker and worker to worker negotiate independently.
 
-Version 1 is the advertisement itself. Nothing is gated on it yet.
+Version 1 is the advertisement itself.
+
+Version 2 appends two optional fields to `ReadTaskResponse`, after the upstream cluster-processing
+payload. The first is Iceberg column statistics (`DataFileMetaInfo`). The second is `retry_after_us`,
+sent when `lock_object_storage_task_distribution_ms` asks a worker to wait before taking another
+node's file. If any worker negotiated a lower version, the initiator ignores that setting for the
+query and assigns files immediately, so every task path stays an object key.
 
 ## Adding an Antalya-only wire change {#adding-a-wire-change}
 
@@ -30,8 +37,6 @@ Version 1 is the advertisement itself. Nothing is gated on it yet.
   `DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION` for a feature upstream does not have.
 - Keep the counter cumulative. A backport takes the whole contiguous range up to the value it needs,
   or does not bump at all - the `min(own, server)` cap is only sound for a cumulative feature set.
-- Gate only what the *client* decides to do. The server never learns the client's version, because
-  only the server advertises.
 - Update this page, and update `docs/en/interfaces/specs/NativeProtocol.md` when the change alters
   a packet layout described there.
 
@@ -40,11 +45,9 @@ Version 1 is the advertisement itself. Nothing is gated on it yet.
 An upstream rebase can reuse the next value of an upstream protocol counter for a different feature.
 Keeping the Antalya counter separate prevents the same version from describing two wire layouts.
 
-## Why the marker rides in `ServerHello` {#why-the-marker-rides-in-serverhello}
+## Why the marker rides in the `Hello` name {#why-the-marker-rides-in-the-hello-name}
 
-The client `Hello` cannot advertise the version because it is sent before the peer is known. Its
-`client_name` is also stored and validated against the Query packet, so changing it can raise
-`CLIENT_INFO_DOES_NOT_MATCH` on an upstream peer.
-
-The server advertises through `server_name`, which is display text. The marker stays inside that
-existing string because adding a field would make older peers read it as the next packet.
+The marker stays inside the existing name string because adding a field would make older peers read
+it as the next packet. The client writes its `Hello` before it knows the peer, so it always marks
+`client_name`. With `validate_tcp_client_information` enabled, an upstream server rejects an initial
+query from an Antalya client with `CLIENT_INFO_DOES_NOT_MATCH`; an Antalya server ignores the marker.
