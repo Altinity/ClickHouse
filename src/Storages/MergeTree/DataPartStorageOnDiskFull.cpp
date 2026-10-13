@@ -62,101 +62,22 @@ DataPartStoragePtr DataPartStorageOnDiskFull::getProjection(const std::string & 
 
 bool DataPartStorageOnDiskFull::exists() const
 {
-    auto path = fs::path(root_path) / part_dir;
-    /// CA read-your-writes: a part dir being assembled by this transaction (e.g. a carried-forward
-    /// projection dir staged into the open whole-part txn) is not on committed metadata yet. Mirrors
-    /// existsDirectory at directory granularity for the part's OWN directory.
-    if (transaction && transaction->hasInFlightDirectory(path))
-        return true;
-    return volume->getDisk()->existsDirectory(path);
+    return existsDirectoryInTransactionOrDisk(fs::path(root_path) / part_dir);
 }
 
 bool DataPartStorageOnDiskFull::existsFileImpl(const std::string & name) const
 {
-    auto path = fs::path(root_path) / part_dir / name;
-    /// B59: a part still being assembled by this transaction can have staged-but-uncommitted files
-    /// (e.g. projection temp blocks on a content-addressed disk). Consult the held transaction first.
-    if (transaction && transaction->tryGetInFlightFileSize(path).has_value())
-        return true;
-    return volume->getDisk()->existsFile(path);
+    return existsFileInTransactionOrDisk(fs::path(root_path) / part_dir / name);
 }
 
 bool DataPartStorageOnDiskFull::existsDirectory(const std::string & name) const
 {
-    auto path = fs::path(root_path) / part_dir / name;
-    /// CA read-your-writes: a part still being assembled by this transaction can have a staged-but-uncommitted
-    /// directory (e.g. a carried-forward projection hardlinked into the open whole-part txn) that committed
-    /// metadata cannot see yet. Mirrors existsFile (B59) at directory granularity.
-    if (transaction && transaction->hasInFlightDirectory(path))
-        return true;
-    return volume->getDisk()->existsDirectory(path);
+    return existsDirectoryInTransactionOrDisk(fs::path(root_path) / part_dir / name);
 }
-
-class DataPartStorageIteratorOnDisk final : public IDataPartStorageIterator
-{
-public:
-    DataPartStorageIteratorOnDisk(DiskPtr disk_, DirectoryIteratorPtr it_)
-        : disk(std::move(disk_)), it(std::move(it_))
-    {
-    }
-
-    void next() override { it->next(); }
-    bool isValid() const override { return it->isValid(); }
-    bool isFile() const override { return isValid() && disk->existsFile(it->path()); }
-    std::string name() const override { return it->name(); }
-    std::string path() const override { return it->path(); }
-
-private:
-    DiskPtr disk;
-    DirectoryIteratorPtr it;
-};
-
-/// CA read-your-writes directory enumeration: a merged view of the committed disk entries PLUS the
-/// immediate children this transaction has STAGED under the part dir (deduplicated). Used so
-/// loadProjections' withPartFormatFromDisk can iterate a staged-but-uncommitted projection directory and
-/// find its mark file. Mirrors existsFile/existsDirectory (B59) at the enumeration level; the committed
-/// entries dominate (a name present both on disk and staged appears once).
-class DataPartStorageMergedIterator final : public IDataPartStorageIterator
-{
-public:
-    DataPartStorageMergedIterator(DiskPtr disk_, std::string dir_path_, std::vector<std::string> names_)
-        : disk(std::move(disk_)), dir_path(std::move(dir_path_)), names(std::move(names_))
-    {
-    }
-
-    void next() override { ++pos; }
-    bool isValid() const override { return pos < names.size(); }
-    std::string name() const override { return names[pos]; }
-    std::string path() const override { return fs::path(dir_path) / names[pos]; }
-    bool isFile() const override { return isValid() && disk->existsFile(path()); }
-
-private:
-    DiskPtr disk;
-    std::string dir_path;
-    std::vector<std::string> names;
-    size_t pos = 0;
-};
 
 DataPartStorageIteratorPtr DataPartStorageOnDiskFull::iterate() const
 {
-    auto dir_path = fs::path(root_path) / part_dir;
-    if (transaction)
-    {
-        if (auto staged = transaction->listInFlightDirectory(dir_path); !staged.empty())
-        {
-            /// Union the committed entries with the staged children (set semantics, committed dominates).
-            std::set<std::string> names(staged.begin(), staged.end());
-            if (volume->getDisk()->existsDirectory(dir_path))
-                for (auto it = volume->getDisk()->iterateDirectory(dir_path); it->isValid(); it->next())
-                    names.insert(it->name());
-            return std::make_unique<DataPartStorageMergedIterator>(
-                volume->getDisk(), dir_path, std::vector<std::string>(names.begin(), names.end()));
-        }
-    }
-
-    return std::make_unique<DataPartStorageIteratorOnDisk>(
-        volume->getDisk(),
-        volume->getDisk()->iterateDirectory(dir_path));
+    return iterateDirectoryInTransactionOrDisk(fs::path(root_path) / part_dir);
 }
 
 Poco::Timestamp DataPartStorageOnDiskFull::getFileLastModified(const String & file_name) const
@@ -166,12 +87,7 @@ Poco::Timestamp DataPartStorageOnDiskFull::getFileLastModified(const String & fi
 
 size_t DataPartStorageOnDiskFull::getFileSizeImpl(const String & file_name) const
 {
-    auto path = fs::path(root_path) / part_dir / file_name;
-    /// B59: see existsFile — the merge stats the staged temp files before reading them back.
-    if (transaction)
-        if (auto size = transaction->tryGetInFlightFileSize(path))
-            return *size;
-    return volume->getDisk()->getFileSize(path);
+    return getFileSizeInTransactionOrDisk(fs::path(root_path) / part_dir / file_name);
 }
 
 std::optional<UInt64> DataPartStorageOnDiskFull::getPackedFileUncompressedSize(const std::string & file_name) const
@@ -191,16 +107,7 @@ std::vector<std::string> DataPartStorageOnDiskFull::getRemotePaths(const std::st
 {
     const std::string path = fs::path(root_path) / part_dir / file_name;
 
-    /// B59: a file staged by this transaction resolves to its already-uploaded blob object(s) before commit.
-    /// A mutable per-part file intentionally does NOT resolve here (tryGetInFlightStorageObjects returns
-    /// nullopt → falls through): it has no blob object and must be read via tryReadFileInFlight. The merge
-    /// reads projection column blocks (blob-backed) through this path, not mutable files.
-    StoredObjects objects;
-    if (transaction)
-        if (auto inflight = transaction->tryGetInFlightStorageObjects(path))
-            objects = std::move(*inflight);
-    if (objects.empty())
-        objects = volume->getDisk()->getStorageObjects(path);
+    auto objects = getStorageObjectsInTransactionOrDisk(path);
 
     std::vector<std::string> remote_paths;
     remote_paths.reserve(objects.size());
@@ -226,43 +133,7 @@ void DataPartStorageOnDiskFull::prepareReadImpl(
     std::optional<size_t> read_hint,
     ReadPipeline & pipeline) const
 {
-    auto path = fs::path(root_path) / part_dir / name;
-
-    /// B59: read-your-writes for a part still being assembled by this transaction. A projection
-    /// spill-and-merge reads its own temp blocks back before the parent part's single commit; on a
-    /// content-addressed disk those files are staged in the transaction (blob uploaded, no ref yet),
-    /// so the committed metadata path can't see them. If the held transaction resolves the file
-    /// in-flight, serve it via a custom pipeline source that reads through the transaction. Gated on
-    /// `transaction != nullptr` so committed-part reads (no open transaction) are unchanged.
-    if (transaction)
-    {
-        StoredObjects inflight_objects;
-        if (auto objs = transaction->tryGetInFlightStorageObjects(path))
-            inflight_objects = std::move(*objs);
-        else if (auto size = transaction->tryGetInFlightFileSize(path))
-            /// Mutable per-part file staged inline (no blob object); synthesize a placeholder so the
-            /// single-object pipeline is satisfied — the custom creator below ignores it and reads the
-            /// inline bytes through the transaction.
-            inflight_objects = StoredObjects{StoredObject(path, path, *size)};
-
-        if (!inflight_objects.empty())
-        {
-            /// Safe to capture the raw transaction pointer: no cache/gather/async stage is added on this
-            /// branch, so the custom source is consumed synchronously inside build() during this read and
-            /// the pointer is never retained past it.
-            auto * tx = transaction.get();
-            pipeline.setSource(
-                [tx, path](const StoredObject &, const ReadSettings & read_settings, bool /*use_external_buffer*/, bool /*restrict_seek*/)
-                {
-                    return tx->tryReadFileInFlight(path, read_settings, std::nullopt);
-                },
-                std::move(inflight_objects),
-                settings);
-            return;
-        }
-    }
-
-    volume->getDisk()->prepareRead(path, settings, read_hint, pipeline);
+    prepareReadInTransactionOrDisk(fs::path(root_path) / part_dir / name, settings, read_hint, pipeline);
 }
 
 std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskFull::readFileIfExistsImpl(
@@ -270,14 +141,7 @@ std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskFull::readFileIfExi
     const ReadSettings & settings,
     std::optional<size_t> read_hint) const
 {
-    auto path = fs::path(root_path) / part_dir / name;
-    /// B59: serve a file staged by this transaction (uploaded blob or inline mutable bytes) before commit.
-    /// This direct delegate bypasses prepareRead, so the in-flight guard must be repeated here; it is the
-    /// only path that reaches the inline-mutable case via a returned buffer.
-    if (transaction)
-        if (auto rb = transaction->tryReadFileInFlight(path, settings, read_hint))
-            return rb;
-    return volume->getDisk()->readFileIfExists(path, settings, read_hint);
+    return readFileIfExistsInTransactionOrDisk(fs::path(root_path) / part_dir / name, settings, read_hint);
 }
 
 std::unique_ptr<WriteBufferFromFileBase> DataPartStorageOnDiskFull::writeFile(
