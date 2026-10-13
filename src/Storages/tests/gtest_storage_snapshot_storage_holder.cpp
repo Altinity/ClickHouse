@@ -7,6 +7,7 @@
 #include <Interpreters/DatabaseCatalog.h>
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MutationCommands.h>
 #include <Storages/StorageAlias.h>
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageInMemoryMetadata.h>
@@ -184,6 +185,60 @@ void assertStorageAliasPinsItsTarget(
     EXPECT_TRUE(weak_target.expired());
 }
 
+/// `clone` only copies the `shared_ptr`. These virtuals are never called; the object exists so the
+/// fixture can hold a non-null `mutations_snapshot`.
+struct MutationsSnapshotForCloneTest final : MergeTreeData::IMutationsSnapshot
+{
+    void addPatches(MergeTreeData::DataPartsVector) override
+    {
+    }
+
+    MutationCommands getOnFlyMutationCommandsForPart(const MergeTreeData::DataPartPtr &) const override
+    {
+        return {};
+    }
+
+    PatchParts getPatchesForPart(const MergeTreeData::DataPartPtr &) const override
+    {
+        return {};
+    }
+
+    std::shared_ptr<MergeTreeData::IMutationsSnapshot> cloneEmpty() const override
+    {
+        return std::make_shared<MutationsSnapshotForCloneTest>();
+    }
+
+    NameSet getAllUpdatedColumns() const override
+    {
+        return {};
+    }
+
+    bool hasPatchParts() const override
+    {
+        return false;
+    }
+
+    bool hasDataMutations() const override
+    {
+        return false;
+    }
+
+    bool hasAlterMutations() const override
+    {
+        return false;
+    }
+
+    bool hasMetadataMutations() const override
+    {
+        return false;
+    }
+
+    bool hasLightweightDeletedMask() const override
+    {
+        return false;
+    }
+};
+
 /// `withStorageHolder` must clone `data` rather than steal it: the source snapshot can already be
 /// shared through the query metadata cache.
 template <typename SnapshotData>
@@ -201,10 +256,13 @@ TEST(StorageSnapshotStorageHolder, WithStorageHolderClonesPopulatedData)
     auto storage = makeStorage("populated");
 
     auto parts = std::make_shared<const RangesInDataParts>();
+    /// A default-null `mutations_snapshot` would make the pointer comparison pass even if `clone` dropped the field.
+    MergeTreeData::MutationsSnapshotPtr mutations = std::make_shared<MutationsSnapshotForCloneTest>();
     {
         auto data = std::make_unique<MergeTreeData::SnapshotData>();
         data->storage = storage;
         data->parts = parts;
+        data->mutations_snapshot = mutations;
         auto [source, pinned] = pinPopulatedSnapshot(storage, std::move(data));
 
         const auto * source_data = assert_cast<const MergeTreeData::SnapshotData *>(source->data.get());
@@ -213,7 +271,8 @@ TEST(StorageSnapshotStorageHolder, WithStorageHolderClonesPopulatedData)
         EXPECT_EQ(source_data->storage.get(), storage.get());
         EXPECT_EQ(pinned_data->storage.get(), source_data->storage.get());
         EXPECT_EQ(pinned_data->parts.get(), parts.get());
-        EXPECT_EQ(pinned_data->mutations_snapshot.get(), source_data->mutations_snapshot.get());
+        EXPECT_EQ(source_data->mutations_snapshot.get(), mutations.get());
+        EXPECT_EQ(pinned_data->mutations_snapshot.get(), mutations.get());
     }
 
     auto blocks = std::make_shared<const Blocks>(Blocks{Block{}});
