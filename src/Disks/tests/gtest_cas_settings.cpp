@@ -28,6 +28,7 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
     extern const ContentAddressedSettingsString scratch_path;
     extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
+    extern const ContentAddressedSettingsBool allow_packed_parts;
 }
 
 namespace
@@ -109,6 +110,21 @@ TEST(CASContentAddressedSettings, DefaultsAndOverridesLand)
     EXPECT_EQ(s[ContentAddressedSetting::gc_interval_sec].value, 60u);          /// table default
     /// Absent key -> the verbatim default (never touches the anchor).
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/default_scratch");
+}
+
+TEST(CASContentAddressedSettings, PackedPartsDefaultOffAndOptIn)
+{
+    auto default_cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
+    ContentAddressedSettings defaults;
+    defaults.loadFromConfig(*default_cfg, "disk", "/data", "/data/default_scratch", identity_macros);
+    EXPECT_FALSE(defaults[ContentAddressedSetting::allow_packed_parts].value);
+
+    auto enabled_cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_allow_packed_parts>true</cas_allow_packed_parts>");
+    ContentAddressedSettings enabled;
+    enabled.loadFromConfig(*enabled_cfg, "disk", "/data", "/data/default_scratch", identity_macros);
+    EXPECT_TRUE(enabled[ContentAddressedSetting::allow_packed_parts].value);
 }
 
 TEST(CASContentAddressedSettings, RemovedCacheSettingsAreRejected)
