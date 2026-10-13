@@ -3927,7 +3927,7 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
                 SingleProjectionIndexReader(
                     std::make_shared<MergeTreeReadPoolProjectionIndex>(
                         empty_mutations_snapshot,
-                        storage_snapshot->cloneWithMetadata(read_info.projection->metadata),
+                        std::make_shared<StorageSnapshot>(storage_snapshot->storage, read_info.projection->metadata),
                         read_info.prewhere_info,
                         actions_settings,
                         reader_settings,
@@ -4654,7 +4654,7 @@ void ReadFromMergeTree::createReadTasksForTextIndex(const UsefulSkipIndexes & sk
         }
     }
 
-    storage_snapshot = storage_snapshot->cloneWithMetadata(std::move(new_metadata));
+    storage_snapshot = std::make_shared<StorageSnapshot>(storage_snapshot->storage, std::move(new_metadata));
 
     if (output_header != nullptr)
     {

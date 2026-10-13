@@ -399,7 +399,7 @@ std::optional<String> optimizeUseNormalProjections(
     }
 
     auto storage_snapshot = reading->getStorageSnapshot();
-    auto proj_snapshot = storage_snapshot->cloneWithMetadata(best_candidate->projection->metadata);
+    auto proj_snapshot = std::make_shared<StorageSnapshot>(storage_snapshot->storage, best_candidate->projection->metadata);
 
     /// Enables PREWHERE on projections to improve read efficiency and leverage query condition cache.
     if (query.dag && query.filter_node)

@@ -1,8 +1,5 @@
 #pragma once
-#include <Storages/IStorage_fwd.h>
 #include <Storages/VirtualColumnsDescription.h>
-
-#include <memory>
 
 namespace DB
 {
@@ -21,11 +18,6 @@ struct StorageSnapshot
 {
     const IStorage & storage;
     const StorageMetadataPtr metadata;
-
-    /// Owns `storage` when nothing else does. Empty for catalog-resident tables.
-    /// `Alias` over `DataLakeCatalog` fills it: each lookup returns a new storage,
-    /// and this snapshot is the only object that outlives that lookup.
-    StoragePtr storage_holder;
 
     /// Additional data, on which set of columns may depend.
     /// E.g. data parts in MergeTree, list of blocks in Memory, etc.
@@ -47,9 +39,6 @@ struct StorageSnapshot
         DataPtr data_);
 
     std::shared_ptr<StorageSnapshot> clone(DataPtr data_) const;
-
-    /// Same `storage` and `storage_holder`, replaced metadata. Drops `data`.
-    std::shared_ptr<StorageSnapshot> cloneWithMetadata(StorageMetadataPtr metadata_) const;
 
     /// Get columns description
     ColumnsDescription getAllColumnsDescription() const;

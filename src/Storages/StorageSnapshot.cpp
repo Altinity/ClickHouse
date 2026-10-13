@@ -39,16 +39,7 @@ StorageSnapshot::StorageSnapshot(
 
 std::shared_ptr<StorageSnapshot> StorageSnapshot::clone(DataPtr data_) const
 {
-    auto result = std::make_shared<StorageSnapshot>(storage, metadata, std::move(data_));
-    result->storage_holder = storage_holder;
-    return result;
-}
-
-std::shared_ptr<StorageSnapshot> StorageSnapshot::cloneWithMetadata(StorageMetadataPtr metadata_) const
-{
-    auto result = std::make_shared<StorageSnapshot>(storage, std::move(metadata_));
-    result->storage_holder = storage_holder;
-    return result;
+    return std::make_shared<StorageSnapshot>(storage, metadata, std::move(data_));
 }
 
 ColumnsDescription StorageSnapshot::getAllColumnsDescription() const

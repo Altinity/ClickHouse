@@ -350,20 +350,12 @@ std::optional<QueryPipeline> StorageAlias::distributedWrite(const ASTInsertQuery
 
 StorageSnapshotPtr StorageAlias::getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const
 {
-    auto target = getTargetTable();
-    auto snapshot = target->getStorageSnapshot(metadata_snapshot, query_context);
-    /// `DataLakeCatalog` builds a new storage on every lookup. The snapshot keeps only a reference,
-    /// so it must own that `shared_ptr` or the analyzer reads freed memory.
-    snapshot->storage_holder = std::move(target);
-    return snapshot;
+    return getTargetTable()->getStorageSnapshot(metadata_snapshot, query_context);
 }
 
 StorageSnapshotPtr StorageAlias::getStorageSnapshotWithoutData(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const
 {
-    auto target = getTargetTable();
-    auto snapshot = target->getStorageSnapshotWithoutData(metadata_snapshot, query_context);
-    snapshot->storage_holder = std::move(target);
-    return snapshot;
+    return getTargetTable()->getStorageSnapshotWithoutData(metadata_snapshot, query_context);
 }
 
 void StorageAlias::rename(const String & /* new_path_to_table_data */, const StorageID & new_table_id)

@@ -873,7 +873,7 @@ std::optional<String> optimizeUseAggregateProjections(
     {
         chassert(parent_reading_select_result);
         auto storage_snapshot = reading->getStorageSnapshot();
-        auto proj_snapshot = storage_snapshot->cloneWithMetadata(best_candidate->projection->metadata);
+        auto proj_snapshot = std::make_shared<StorageSnapshot>(storage_snapshot->storage, best_candidate->projection->metadata);
         auto projection_query_info = query_info;
         projection_query_info.prewhere_info = nullptr;
         projection_query_info.row_level_filter = nullptr;
