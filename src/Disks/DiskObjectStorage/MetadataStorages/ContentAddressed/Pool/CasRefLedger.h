@@ -553,6 +553,8 @@ public:
         const auto it = ref_name_slots.find(ns.string());
         return it == ref_name_slots.end() || !it->second.current ? 0 : it->second.current->admitted_fence_generation;
     }
+    /// How many lives of `ns` catalog retirement has recorded since the last remount.
+    uint64_t refNameRetirementsForTest(const RootNamespace & ns) const { return refNameRetirements(ns); }
     /// The physical life currently pinned in the cached runtime, without resolving or recovering it.
     std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
     {

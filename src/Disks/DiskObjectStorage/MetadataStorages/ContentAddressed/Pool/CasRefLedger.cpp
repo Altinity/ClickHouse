@@ -712,15 +712,13 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
     std::shared_ptr<RefTableRuntime> rt;
     {
         std::lock_guard lock(ref_queue_mutex);
-        /// Recorded even with no resident runtime: a cold admission may be between its catalog read
-        /// and its insertion.
+        /// Recorded whatever is resident, a successor included: a cold admission of `life` may be
+        /// between its catalog read and its insertion, and the successor may be evicted before it.
         RefNameSlot & slot = ref_name_slots[life.ns.string()];
+        ++slot.retirements;
         rt = slot.current;
         if (!rt)
-        {
-            ++slot.retirements;
             return;
-        }
     }
 
     /// Invalidation must neither materialize a cache entry nor perform catalog I/O on GC's thread.
@@ -740,10 +738,7 @@ void CasRefLedger::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
         std::lock_guard queue_lock(ref_queue_mutex);
         const auto it = ref_name_slots.find(life.ns.string());
         if (it != ref_name_slots.end() && it->second.current == rt)
-        {
             it->second.current.reset();
-            ++it->second.retirements;
-        }
     }
     rt->cv.notify_all();
     rt->recovery_cv.notify_all();
