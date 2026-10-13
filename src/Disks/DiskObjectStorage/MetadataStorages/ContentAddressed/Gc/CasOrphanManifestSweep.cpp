@@ -20,7 +20,6 @@
 #include <memory>
 #include <set>
 #include <limits>
-#include <unordered_set>
 
 namespace ProfileEvents
 {
@@ -723,9 +722,6 @@ ManifestSweepResult planManifestCursorPage(
     /// catalog cut: a manifest key is write-once, so its bytes do not depend on when they are read,
     /// and the only thing a later read can observe differently is absence, which retains.
     std::vector<ListedManifestObject> candidates;
-    /// Candidate namespaces that need a second ref_catalog GET after reading the floor.
-    std::unordered_set<String> catalog_recheck_namespaces;
-
     for (const ListedKey & listed : page.keys)
     {
         ++result.listed;
@@ -912,24 +908,19 @@ ManifestSweepResult planManifestCursorPage(
             }
         }
 
-        if (!catalog_entry)
-            catalog_recheck_namespaces.insert(parsed->ns.string());
         candidates.push_back(*parsed);
         decided_through = listed.key;
     }
 
-    /// Between a successful stageManifest body PUT and a successful precommitAdd owner transition, the
-    /// body already exists without a durable owner edge; the initial catalog cut may still miss its namespace.
-    /// Recheck it after the floor read before deleting the body as orphaned.
-    if (!catalog_recheck_namespaces.empty())
+    if (!candidates.empty())
     {
         const CasRefCatalog::Snapshot post_floor_catalog = CasRefCatalog::read(op, layout);
         post_floor_catalog.life_index.throwIfAmbiguous("CAS orphan manifest sweep");
         std::erase_if(candidates, [&](const ListedManifestObject & candidate)
         {
-            if (!catalog_recheck_namespaces.contains(candidate.ns.string()))
-                return false;
-            if (!catalogEntryOf(post_floor_catalog, candidate.ns))
+            const CatalogEntry * before = catalogEntryOf(catalog_cut, candidate.ns);
+            const CatalogEntry * after = catalogEntryOf(post_floor_catalog, candidate.ns);
+            if ((!before && !after) || (before && after && *before == *after))
                 return false;
             ++result.skipped;
             return true;
