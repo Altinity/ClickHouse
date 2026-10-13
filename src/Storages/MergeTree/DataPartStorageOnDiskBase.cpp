@@ -4,6 +4,7 @@
 #include <Backups/BackupSettings.h>
 #include <Core/Defines.h>
 #include <Disks/IDiskTransaction.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Common/Jemalloc.h>
 #include <Common/JemallocMergeTreeArena.h>
@@ -31,6 +32,9 @@
 #include <Common/logger_useful.h>
 
 #include <fmt/ranges.h>
+
+#include <set>
+#include <vector>
 
 namespace DB
 {
@@ -1323,6 +1327,146 @@ bool DataPartStorageOnDiskBase::hasActiveTransaction() const
 bool DataPartStorageOnDiskBase::isCaseInsensitive() const
 {
     return getDisk()->isCaseInsensitive();
+}
+
+bool DataPartStorageOnDiskBase::existsFileInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction && transaction->tryGetInFlightFileSize(path).has_value())
+        return true;
+    return volume->getDisk()->existsFile(path);
+}
+
+bool DataPartStorageOnDiskBase::existsDirectoryInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction && transaction->hasInFlightDirectory(path))
+        return true;
+    return volume->getDisk()->existsDirectory(path);
+}
+
+namespace
+{
+
+class DataPartStorageIteratorOnDisk final : public IDataPartStorageIterator
+{
+public:
+    DataPartStorageIteratorOnDisk(DiskPtr disk_, DirectoryIteratorPtr it_)
+        : disk(std::move(disk_)), it(std::move(it_))
+    {
+    }
+
+    void next() override { it->next(); }
+    bool isValid() const override { return it->isValid(); }
+    bool isFile() const override { return isValid() && disk->existsFile(it->path()); }
+    std::string name() const override { return it->name(); }
+    std::string path() const override { return it->path(); }
+
+private:
+    DiskPtr disk;
+    DirectoryIteratorPtr it;
+};
+
+class DataPartStorageMergedIterator final : public IDataPartStorageIterator
+{
+public:
+    DataPartStorageMergedIterator(DiskPtr disk_, std::string dir_path_, std::vector<std::string> names_)
+        : disk(std::move(disk_)), dir_path(std::move(dir_path_)), names(std::move(names_))
+    {
+    }
+
+    void next() override { ++pos; }
+    bool isValid() const override { return pos < names.size(); }
+    std::string name() const override { return names[pos]; }
+    std::string path() const override { return fs::path(dir_path) / names[pos]; }
+    bool isFile() const override { return isValid() && disk->existsFile(path()); }
+
+private:
+    DiskPtr disk;
+    std::string dir_path;
+    std::vector<std::string> names;
+    size_t pos = 0;
+};
+
+}
+
+DataPartStorageIteratorPtr DataPartStorageOnDiskBase::iterateDirectoryInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction)
+    {
+        if (auto staged = transaction->listInFlightDirectory(path); !staged.empty())
+        {
+            std::set<std::string> names(staged.begin(), staged.end());
+            if (volume->getDisk()->existsDirectory(path))
+                for (auto it = volume->getDisk()->iterateDirectory(path); it->isValid(); it->next())
+                    names.insert(it->name());
+            return std::make_unique<DataPartStorageMergedIterator>(
+                volume->getDisk(), path, std::vector<std::string>(names.begin(), names.end()));
+        }
+    }
+
+    return std::make_unique<DataPartStorageIteratorOnDisk>(
+        volume->getDisk(),
+        volume->getDisk()->iterateDirectory(path));
+}
+
+size_t DataPartStorageOnDiskBase::getFileSizeInTransactionOrDisk(const std::string & path) const
+{
+    if (transaction)
+        if (auto size = transaction->tryGetInFlightFileSize(path))
+            return *size;
+    return volume->getDisk()->getFileSize(path);
+}
+
+StoredObjects DataPartStorageOnDiskBase::getStorageObjectsInTransactionOrDisk(const std::string & path) const
+{
+    StoredObjects objects;
+    if (transaction)
+        if (auto inflight = transaction->tryGetInFlightStorageObjects(path))
+            objects = std::move(*inflight);
+    if (objects.empty())
+        objects = volume->getDisk()->getStorageObjects(path);
+    return objects;
+}
+
+void DataPartStorageOnDiskBase::prepareReadInTransactionOrDisk(
+    const std::string & path,
+    const ReadSettings & settings,
+    std::optional<size_t> read_hint,
+    ReadPipeline & pipeline) const
+{
+    if (transaction)
+    {
+        StoredObjects inflight_objects;
+        if (auto objects = transaction->tryGetInFlightStorageObjects(path))
+            inflight_objects = std::move(*objects);
+        else if (auto size = transaction->tryGetInFlightFileSize(path))
+            inflight_objects = StoredObjects{StoredObject(path, path, *size)};
+
+        if (!inflight_objects.empty())
+        {
+            auto * current_transaction = transaction.get();
+            pipeline.setSource(
+                [current_transaction, path](const StoredObject &, const ReadSettings & read_settings, bool, bool)
+                {
+                    return current_transaction->tryReadFileInFlight(path, read_settings, std::nullopt);
+                },
+                std::move(inflight_objects),
+                settings);
+            return;
+        }
+    }
+
+    volume->getDisk()->prepareRead(path, settings, read_hint, pipeline);
+}
+
+std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskBase::readFileIfExistsInTransactionOrDisk(
+    const std::string & path,
+    const ReadSettings & settings,
+    std::optional<size_t> read_hint) const
+{
+    if (transaction)
+        if (auto buffer = transaction->tryReadFileInFlight(path, settings, read_hint))
+            return buffer;
+    return volume->getDisk()->readFileIfExists(path, settings, read_hint);
 }
 
 std::shared_ptr<const PackedFilesReader> DataPartStorageOnDiskBase::getArchiveReaderForFile(const std::string & name) const

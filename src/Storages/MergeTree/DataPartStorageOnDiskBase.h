@@ -183,6 +183,21 @@ protected:
     DataPartStorageOnDiskBase(VolumePtr volume_, std::string root_path_, std::string part_dir_, DiskTransactionPtr transaction_);
     virtual MutableDataPartStoragePtr create(VolumePtr volume_, std::string root_path_, std::string part_dir_, bool initialize_) const = 0;
 
+    bool existsFileInTransactionOrDisk(const std::string & path) const;
+    bool existsDirectoryInTransactionOrDisk(const std::string & path) const;
+    DataPartStorageIteratorPtr iterateDirectoryInTransactionOrDisk(const std::string & path) const;
+    size_t getFileSizeInTransactionOrDisk(const std::string & path) const;
+    StoredObjects getStorageObjectsInTransactionOrDisk(const std::string & path) const;
+    void prepareReadInTransactionOrDisk(
+        const std::string & path,
+        const ReadSettings & settings,
+        std::optional<size_t> read_hint,
+        ReadPipeline & pipeline) const;
+    std::unique_ptr<ReadBufferFromFileBase> readFileIfExistsInTransactionOrDisk(
+        const std::string & path,
+        const ReadSettings & settings,
+        std::optional<size_t> read_hint) const;
+
     /// Lazily load the per-part skp_idx.packed archive (if any), reading it as a standalone disk
     /// file. Subsequent calls return the cached reader, or nullptr when there is no such file --
     /// including on storages that don't keep skp_idx.packed standalone (e.g. packed part storage,

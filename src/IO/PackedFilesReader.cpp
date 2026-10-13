@@ -19,6 +19,11 @@ PackedFilesReader::PackedFilesReader(
 {
 }
 
+PackedFilesReader::PackedFilesReader(ReadBufferFromFileBase & data_file)
+    : index(readIndex(data_file))
+{
+}
+
 PackedFilesReader::PackedFilesReader(PackedFilesIO::Index index_)
     : index(std::move(index_))
 {
@@ -115,14 +120,24 @@ std::unique_ptr<ReadBufferFromFileBase> PackedFilesReader::readFile(
     if (it == index.end())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "File {} does not exist", file_name);
 
-    const auto offset = it->second.offset;
-    const auto size = it->second.size;
-
     /// ReadBufferFromFileView doesn't support reading with mmap and direct io methods, because
     /// they require special alignment which cannot be achieved while reading archive file.
     /// So just disable them.
     auto in = disk->readFile(data_file_name, patchSettings(settings), read_hint);
-    return std::make_unique<ReadBufferFromFileView>(std::move(in), file_name, offset, offset + size);
+    return readFile(std::move(in), file_name);
+}
+
+std::unique_ptr<ReadBufferFromFileBase> PackedFilesReader::readFile(
+    std::unique_ptr<ReadBufferFromFileBase> data_file,
+    const String & file_name) const
+{
+    auto it = index.find(file_name);
+    if (it == index.end())
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "File {} does not exist", file_name);
+
+    const auto offset = it->second.offset;
+    const auto size = it->second.size;
+    return std::make_unique<ReadBufferFromFileView>(std::move(data_file), file_name, offset, offset + size);
 }
 
 }
