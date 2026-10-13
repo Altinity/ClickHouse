@@ -48,8 +48,8 @@ and never reassigned — decommission only tombstones it in place.
 | Observed at `gc/server-roots/<server_root_id>/owner` | Action |
 |---|---|
 | present, same `server_uuid`, not tombstoned | proceed |
-| present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned, refuses to resume |
-| present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause |
+| present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned; the refusal says to configure a new `cas_server_root_id` |
+| present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause and, for a dead owner, `SYSTEM CAS DROP POOL MEMBER` |
 | absent, id contains `/` | `BAD_ARGUMENTS` — a new id may not be nested; an existing nested owner proceeds by the first row |
 | absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
@@ -263,7 +263,7 @@ which any reclaim is instant.
 
 **Permanent removal** of a dead replica (`Cas::decommissionPoolMember`, driven by
 `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'`) claims the victim's mount slot
-as an administrative writer with a no-wait policy (refuses immediately if the member is alive),
+as an administrative writer with a no-wait policy (refuses unless the slot is terminal: `terminated` or `fenced`; an `expired` slot is refused until GC fences it),
 drops every ref-bearing namespace, sweeps manifest debris before the slot (deleting the mount
 removes the watermark authority), drains staging and roots, then — only with zero warnings —
 retires in order: mount, epoch, a final liveness re-check, owner tombstone.

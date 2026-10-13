@@ -594,6 +594,10 @@ are confirmed. This is a **destructive, irreversible** operation: only run it on
 confirmed permanently dead, since it fences the member out even if it later comes back online, and
 it deletes namespace and drain state that cannot be recovered.
 
+The claim accepts only a terminal mount slot (`state` `terminated` or `fenced` in
+`system.cas_mounts`). A hard-killed member shows `expired` until the next GC round fences it; until
+then the command refuses with `alive or contended`.
+
 It is a writer operation, not GC: it emits ordinary ref-edge deltas rather than inventing GC
 transitions, and it does not synchronously reclaim shared blob content — removing the ref edges only
 makes the now-unreferenced blobs eligible for an ordinary GC round to reclaim later.

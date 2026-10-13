@@ -444,10 +444,10 @@ void throwIfOwnerRetired(const OwnerObject & owner, const String & srid)
         return;
 
     throw Exception(ErrorCodes::CORRUPTED_DATA,
-        "CAS server-root '{}' was explicitly decommissioned by an operator (tombstoned at {} ms) "
-        "and is refusing to silently resume — if you genuinely intend to bring this server-root "
-        "back, manually clear the owner object's tombstone field and restart "
-        "(same manual-recovery pattern as an owner anchor lost over existing data)",
+        "CAS server-root '{}' was explicitly decommissioned (owner tombstoned at {} ms by "
+        "SYSTEM CAS DROP POOL MEMBER) and refuses to start again: writer epochs of a retired id must never "
+        "repeat. To run a server on this pool again, configure a new <cas_server_root_id> for this disk and "
+        "keep the local uuid file. Do not clear the tombstone by hand.",
         srid, *owner.retired_at_ms);
 }
 }
@@ -539,17 +539,20 @@ void claimOwnerOrThrow(
             throwIfOwnerRetired(*owner, srid);
             return;
         }
-        /// Mirror mountDoubleStartMessage's operator guidance: the by-far most common cause is a
-        /// REGENERATED local ClickHouse uuid file (wiped /var/lib/clickhouse, a pod rescheduled
-        /// without a persistent volume) while the pool kept the old identity — name it and the
-        /// recovery options instead of a bare refusal.
+        /// The common cause is a regenerated local uuid file (wiped /var/lib/clickhouse, a pod recreated
+        /// without a persistent volume) while the pool kept the old identity; name it and the supported
+        /// ways out, with the hand delete last: it is refused anyway while the subtree holds data.
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS server-root '{}' is owned by a different server (owner server_uuid={}, ours={}) — refusing to claim. "
-            "This usually means THIS server's local uuid file was regenerated (e.g. /var/lib/clickhouse was wiped, "
-            "or the container/pod was recreated without a persistent volume) while the pool kept the old identity. "
-            "Recover by restoring the old local uuid file; or configure a fresh <cas_server_root_id> for this disk; "
-            "or — only after verifying that NO server uses this root — manually delete the owner object '{}' and restart.",
-            srid, u128ToHex(owner->server_uuid), u128ToHex(our_uuid), key);
+            "Either this server's local uuid file was regenerated (/var/lib/clickhouse wiped, or a pod recreated "
+            "without a persistent volume) while the pool kept the old identity, or two servers are configured with "
+            "the same <cas_server_root_id>. Recover by restoring the old uuid file; or configure a fresh "
+            "<cas_server_root_id> for this disk; or, if the owning server is permanently gone, decommission it "
+            "first — SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '<disk>' on a surviving member (offline: "
+            "clickhouse-disks cas-drop-member) — and then start this server under a new <cas_server_root_id>. "
+            "Deleting the owner object '{}' by hand is a last resort, only after verifying that NO server uses this "
+            "root; it is refused while the subtree still holds data.",
+            srid, u128ToHex(owner->server_uuid), u128ToHex(our_uuid), srid, key);
     }
 
     /// Owner absent. Claiming is allowed ONLY over a provably-empty subtree; an absent owner over

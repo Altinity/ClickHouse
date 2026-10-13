@@ -631,6 +631,37 @@ TEST(CASServerRootClaim, TombstonedSameOwnerFailsClosed)
     }
 }
 
+/// Each identity refusal names the supported recovery: the decommission verb for a dead foreign owner,
+/// a new id for a retired one. Neither advises a hand edit of the owner object as the first option.
+TEST(CASServerRootClaim, RefusalsNameTheSupportedRecovery)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    const Layout l("p");
+    Ops ops(b);
+    claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation());
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "SYSTEM CAS DROP POOL MEMBER 'r'", [&]
+    {
+        claimOwnerOrThrow(ops.op, l, "r", UInt128(2), emptyCatalogObservation());
+    });
+
+    mustCommit(ops.op.create(l.ownerKey("t"), encodeOwner(OwnerObject{
+        .server_uuid = UInt128(1),
+        .retired_at_ms = 1752537600000ULL,
+    }), Retry::standard()), "tombstoned owner");
+    try
+    {
+        claimOwnerOrThrow(ops.op, l, "t", UInt128(1), emptyCatalogObservation());
+        FAIL() << "expected a tombstoned owner claim to fail closed";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(e.message().find("explicitly decommissioned"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("new <cas_server_root_id>"), String::npos) << e.message();
+        EXPECT_EQ(e.message().find("clear the owner object"), String::npos) << e.message();
+    }
+}
+
 TEST(CASServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
 {
     auto b = std::make_shared<InMemoryBackend>();
