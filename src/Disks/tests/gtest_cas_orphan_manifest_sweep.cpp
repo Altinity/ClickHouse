@@ -469,6 +469,51 @@ TEST(CASOrphanManifestSweep, CursorPageRetainsRowlessBodyWhenNamespaceAppearsAft
     EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
 }
 
+TEST(CASOrphanManifestSweep, CursorPageRetainsBodyWhenNamespaceIsRebornAfterCatalogCut)
+{
+    auto backend = std::make_shared<CatalogChangesOnFloorReadBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/catalog-life-changes-after-cut@cas@"};
+    fixture::admitLive(*backend, store->layout(), ns);
+    seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
+
+    CasOperation op = store->openRequests().admit();
+    const CasRefCatalog::Snapshot initial_catalog = CasRefCatalog::read(op, store->layout());
+    ASSERT_EQ(initial_catalog.catalog.entries.size(), 1u);
+    const CatalogEntry predecessor = initial_catalog.catalog.entries.front();
+    CatalogEntry successor = predecessor;
+    successor.incarnation = DB::UInt128(0xBEEF);
+
+    const ManifestRef r = ref(5, 0xAA);
+    const String key = store->layout().manifestKey(ManifestId{ns, r});
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("committed", DB::UInt128(9))});
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
+    seedConsumedSealCursor(*backend, store->layout(), ns);
+    backend->arm(store->layout().mountKey(kServerRoot), [&]
+    {
+        OperationForTest replace_op(*backend);
+        const CasRefCatalog::Snapshot current = CasRefCatalog::read(*replace_op, store->layout());
+        if (!current.etag)
+            throw std::runtime_error("test catalog has no token");
+        RefCatalog reborn = current.catalog;
+        const auto it = std::find(reborn.entries.begin(), reborn.entries.end(), predecessor);
+        if (it == reborn.entries.end())
+            throw std::runtime_error("test predecessor catalog row disappeared");
+        *it = successor;
+        if (!std::holds_alternative<Committed>((*replace_op).replace(
+                store->layout().refCatalogKey(), encodeRefCatalog(reborn), *current.etag, Retry::standard())))
+            throw std::runtime_error("test catalog replacement conflicted");
+        publishCommittedTransition(*backend, store->layout(), ns, "part", std::nullopt, r);
+    });
+
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", 100, 10);
+
+    EXPECT_TRUE(backend->didFire());
+    EXPECT_TRUE(result.nominations.empty());
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_TRUE(headExists(*backend, key));
+}
+
 /// Manifest keys are write-once, so a same-key rewrite after the observation below never happens in
 /// production; this backend forces one anyway to prove the page does not need the old freeze-before-cut
 /// discipline to stay correct. The body is read only after the catalog cut, so it sees whatever
