@@ -249,6 +249,13 @@ private:
     struct HybridSnapshotData : public StorageSnapshot::Data
     {
         MultiVersion<WatermarkParams>::Version watermark_snapshot;
+
+        std::unique_ptr<StorageSnapshot::Data> clone() const override
+        {
+            auto copy = std::make_unique<HybridSnapshotData>();
+            copy->watermark_snapshot = watermark_snapshot;
+            return copy;
+        }
     };
 
     /// Per-query Hybrid pruning verdict. Recomputed in both `getQueryProcessingStage()`

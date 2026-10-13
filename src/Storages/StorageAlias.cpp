@@ -350,12 +350,19 @@ std::optional<QueryPipeline> StorageAlias::distributedWrite(const ASTInsertQuery
 
 StorageSnapshotPtr StorageAlias::getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const
 {
-    return getTargetTable()->getStorageSnapshot(metadata_snapshot, query_context);
+    /// Bind the target to a named local so that one owning pointer spans both calls, and hand it to the
+    /// snapshot: `getTargetTable` resolves through `DatabaseCatalog` and returns a temporary, while our
+    /// caller owns and share-locks this alias rather than the target the snapshot refers to.
+    StoragePtr target = getTargetTable();
+    auto snapshot = target->getStorageSnapshot(metadata_snapshot, query_context);
+    return snapshot->withStorageHolder(std::move(target));
 }
 
 StorageSnapshotPtr StorageAlias::getStorageSnapshotWithoutData(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const
 {
-    return getTargetTable()->getStorageSnapshotWithoutData(metadata_snapshot, query_context);
+    StoragePtr target = getTargetTable();
+    auto snapshot = target->getStorageSnapshotWithoutData(metadata_snapshot, query_context);
+    return snapshot->withStorageHolder(std::move(target));
 }
 
 void StorageAlias::rename(const String & /* new_path_to_table_data */, const StorageID & new_table_id)
