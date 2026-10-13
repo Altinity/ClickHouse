@@ -607,7 +607,7 @@ void StorageObjectStorage::read(
         {
             auto stripped = std::make_shared<StorageInMemoryMetadata>(*storage_snapshot->metadata);
             stripped->datalake_table_state.reset();
-            storage_snapshot = std::make_shared<StorageSnapshot>(*this, std::move(stripped));
+            storage_snapshot = storage_snapshot->cloneWithMetadata(std::move(stripped));
         }
     });
 
@@ -643,8 +643,8 @@ void StorageObjectStorage::read(
                         rebuilt->columns, local_context, format_settings, configuration->partition_strategy_type));
             }
 
-            storage_snapshot = std::make_shared<StorageSnapshot>(
-                *this, std::make_shared<StorageInMemoryMetadata>(std::move(pinned)));
+            storage_snapshot = storage_snapshot->cloneWithMetadata(
+                std::make_shared<StorageInMemoryMetadata>(std::move(pinned)));
         }
     }
 
