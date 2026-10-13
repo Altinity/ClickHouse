@@ -933,6 +933,46 @@ TEST(CASS3Staging, ReadYourWritesReturnsStagedBytesFromS3StagingObject)
     EXPECT_EQ(got, payload);
 }
 
+/// An aborted transaction deletes its own S3 staging object instead of leaving it for the next mount.
+TEST(CASS3Staging, AbortDeletesS3Staging)
+{
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountAbort");
+    metadata_storage->startup();
+
+    auto tx = metadata_storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    writeThroughS3Transaction(
+        ca_tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", std::string(300, 'x'));
+
+    DB::RelativePathsWithMetadata staged;
+    object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
+    ASSERT_EQ(staged.size(), 1u);
+
+    tx.reset();   /// never committed
+
+    DB::RelativePathsWithMetadata after;
+    object_storage->listObjects(metadata_storage->stagingKeyPrefix(), after, /*max_keys=*/0);
+    EXPECT_TRUE(after.empty()) << "an aborted transaction must not leave its S3 staging object behind";
+}
+
+/// Guard: the abort delete runs in a `noexcept` destructor, also after the storage was shut down with
+/// the transaction still open (server shutdown). Whatever the delete does then, nothing may escape.
+TEST(CASS3Staging, AbortAfterStorageShutdownDoesNotThrow)
+{
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountAbortLate");
+    metadata_storage->startup();
+
+    auto tx = metadata_storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    writeThroughS3Transaction(
+        ca_tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", std::string(300, 'x'));
+
+    metadata_storage->shutdown();
+    EXPECT_NO_THROW(tx.reset());
+}
+
 /// (c) `sweepOwnMountStaging` removes only objects under the given mount prefix and leaves a DIFFERENT
 /// mount's staging objects untouched (the lease-fence — `CASStagingSweeper.h`).
 TEST(CASStagingSweeper, RemovesOnlyObjectsUnderGivenMountPrefix)

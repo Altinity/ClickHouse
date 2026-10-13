@@ -175,37 +175,20 @@ void ContentAddressedTransaction::cleanupPendingTempFiles() noexcept
                 std::error_code ec;
                 std::filesystem::remove(pb.staging_key, ec);
             }
-            else if (committed)
+            else
             {
-                /// A successful commit deletes the S3 staging object
-                /// HERE — `committed` is only ever true when EVERY part's `publishStaging` ran to
-                /// completion (commit() sets it right before this call), which means every referenced
-                /// pending blob was already materialized (`PartWriteTxn::putBlob` → `publishBlob`)
-                /// or, for an orphaned pending blob (its entry removed by `unlinkFile`/`replaceFile`
-                /// before commit), was never going to be promoted at all — either way the staging object
-                /// is no longer needed as a re-readable publication source, so it is safe to reclaim now.
-                ///
-                /// An ABORTED/exception-unwound transaction (`committed == false`, including a partial
-                /// multi-part commit failure where an EARLIER part's blobs were already promoted) leaves
-                /// its S3 staging objects in place — `staging_key` is a remote object-storage key, never a
-                /// bare `fs::remove` target, and is reclaimed by the mount-lease-scoped sweeper
-                /// (`Cas::sweepOwnMountStaging`), never here. This mirrors the local path's own asymmetry:
-                /// `Local` staging is a private per-transaction scratch file removed unconditionally on
-                /// both commit and abort (nobody else can ever read it), whereas an `S3` staging object
-                /// is the sanctioned re-readable source for publication and must outlive an aborted
-                /// transaction so a later attempt (or the sweeper) can still account for it.
+                /// The S3 staging object is private to this transaction and nothing reads
+                /// `pending_blobs` after this call, so commit and abort delete it alike. An object that
+                /// outlived an abort would stay until the next mount of this `server_root_id`.
                 try
                 {
                     metadata_storage.objectStorage()->removeObjectIfExists(StoredObject(pb.staging_key));
                 }
                 catch (...) // NOLINT(bugprone-empty-catch)
                 {
-                    /// Best-effort (noexcept context): a stubborn delete just leaves debris for the
-                    /// mount-lease sweeper to reclaim on a later mount.
+                    /// Best-effort (noexcept context): a stubborn delete leaves debris for the mount-start sweep.
                 }
             }
-            /// else: an S3-mode pending blob of an ABORTED transaction — intentionally left in place
-            /// (see above); the mount-lease sweeper (`Cas::sweepOwnMountStaging`) is its reclaimer.
         }
         st.pending_blobs.clear();
     }

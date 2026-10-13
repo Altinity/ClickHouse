@@ -45,6 +45,12 @@ Because that check is part of the mount battery, `skip_access_check = true` is r
 generation-token disk. Mount the disk read-only if you need to start before the access check can
 pass.
 
+**Incomplete multipart uploads.** With `cas_staging_backend = s3`, a process killed during a
+multipart upload leaves an incomplete upload under `staging/<server_root_id>/`. Object `LIST` does
+not show it, so neither the transaction's own delete nor the mount-start sweep can remove it, and its
+parts stay billed. Add an `AbortIncompleteMultipartUpload` lifecycle rule on the bucket (one day is
+enough: a staging upload completes within its own transaction or never).
+
 ## Soft delete is an operator precondition {#soft-delete}
 
 Object **soft delete must be disabled** on a `CAS` bucket, and unlike versioning this one is *not*

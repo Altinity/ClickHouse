@@ -33,7 +33,7 @@ namespace DB
 ///
 /// Content blobs are first represented by local or S3 staging objects and are uploaded only during
 /// publication. Inline entries remain in the manifest tree when they fit `INLINE_CAP`. The
-/// destructor removes private local staging, leaves aborted S3 staging for the mount-lease sweeper,
+/// destructor removes the transaction's local and S3 staging,
 /// and abandons any open part builds; it never publishes an uncommitted ref.
 class ContentAddressedTransaction : public IMetadataTransaction
 {
@@ -145,9 +145,8 @@ private:
                                                    /// loop is idempotent (never re-publishes a staging).
 
         /// `staging_key` is either a private local temp path or an S3 staging object key returned by
-        /// `CaContentWriteBuffer` at finalize. The backend selects cleanup and read-your-writes:
-        /// local files are removed by this transaction, whereas aborted S3 objects must remain
-        /// available to the mount-lease sweeper and to recovery of the promote source.
+        /// `CaContentWriteBuffer` at finalize. The backend selects the read-your-writes source; both
+        /// kinds are removed by this transaction on commit and on abort.
         struct PendingBlob { Cas::BlobRef ref; std::string staging_key; uint64_t size = 0; Cas::StagingBackend backend = Cas::StagingBackend::Local; };
         std::vector<PendingBlob> pending_blobs;    /// Staged blobs uploaded after the manifest edge is precommitted.
     };
@@ -192,8 +191,8 @@ private:
     /// Parses a disk path and maps a part-file path to its namespace/ref/file route.
     std::optional<ContentAddressedMetadataStorage::Route> routeOf(const std::string & path) const;
 
-    /// Removes local staging files after commit or abort. On a successful commit it also removes
-    /// S3 staging objects; aborted S3 objects are intentionally retained for lease-scoped cleanup.
+    /// Removes the transaction's staging after commit or abort: local files and S3 staging objects
+    /// alike. S3 deletes are best-effort; a lost delete leaves debris for the mount-start sweep.
     void cleanupPendingTempFiles() noexcept;
 
     /// Uploads through `st.build` only the pending blobs still referenced by `st.entries`. An entry

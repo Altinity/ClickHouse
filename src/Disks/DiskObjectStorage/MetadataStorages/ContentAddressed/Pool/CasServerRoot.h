@@ -607,11 +607,9 @@ private:
 
 /// Mount-lease-scoped staging sweeper for objects left behind by S3-native staging.
 ///
-/// A leaked S3 staging object happens two ways: (1) an exception between blob publication succeeding and
-/// `cleanupPendingTempFiles` deleting the staging key (`ContentAddressedTransaction.cpp`), or (2) an
-/// aborted/cancelled transaction whose pending blobs were staged but never promoted — by design,
-/// `cleanupPendingTempFiles` deliberately leaves an S3 staging object in place on the abort path (never a
-/// bare `fs::remove` on a remote key), so this sweeper is its ONLY reclaimer. Debris from either case is
+/// A leaked S3 staging object is one whose transaction never ran `cleanupPendingTempFiles` (the process
+/// died, or an exception hit between the upload and the cleanup) or whose best-effort delete on commit or
+/// abort was lost; this sweeper is its only reclaimer. Debris from either case is
 /// bounded to `staging/<mount_id>/` — the ONE mount that could ever have written under that prefix, since
 /// every staging key this mount ever mints comes from `ContentAddressedMetadataStorage::stagingKeyPrefix()`
 /// (`physicalKey(pool_prefix + "/staging/" + server_root_id)`), keyed by THIS mount's own `server_root_id`.
