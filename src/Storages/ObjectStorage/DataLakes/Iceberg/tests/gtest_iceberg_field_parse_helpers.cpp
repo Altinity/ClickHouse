@@ -42,6 +42,16 @@ TEST(IcebergFieldParseHelpers, NearEpochNanosecondDateTime64BoundsFailOpen)
 TEST(IcebergFieldParseHelpers, ModernMicrosecondDateTime64BoundsAreKept)
 {
     auto type = std::make_shared<DataTypeDateTime64>(6);
+    /// 2024-01-01 00:00:00 UTC is the first kept microsecond bound (`min_kept_microseconds`).
+    constexpr Int64 us_2024_01_01 = 1'704'067'200'000'000LL;
+    auto at_threshold = deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_01_01), type, true);
+    ASSERT_TRUE(at_threshold.has_value());
+    EXPECT_EQ(decimal64Ticks(*at_threshold), us_2024_01_01);
+    auto negative_threshold = deserializeFieldFromBinaryRepr(littleEndianInt64(-us_2024_01_01), type, true);
+    ASSERT_TRUE(negative_threshold.has_value());
+    EXPECT_EQ(decimal64Ticks(*negative_threshold), -us_2024_01_01);
+    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_01_01 - 1), type, true).has_value());
+
     /// 2024-02-20 10:00:00 UTC as microseconds — spec-correct Iceberg `timestamp`.
     constexpr Int64 us_2024_02_20 = 1'708'423'200'000'000LL;
     auto lower = deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_02_20), type, true);
