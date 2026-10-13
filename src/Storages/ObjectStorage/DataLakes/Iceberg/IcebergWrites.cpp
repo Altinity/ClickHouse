@@ -219,6 +219,12 @@ Int64 getDateTime64ValueForIcebergBounds(const Field & field, DataTypePtr type)
     if (!WhichDataType(type).isDateTime64())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected DateTime64, got {}", type->getName());
 
+    /// Manifest rewrite reads the Avro `long` back as Int64 (contrib Avro has no `timestamp-nanos`).
+    if (field.getType() == Field::Types::Int64)
+        return field.safeGet<Int64>();
+    if (field.getType() == Field::Types::UInt64)
+        return static_cast<Int64>(field.safeGet<UInt64>());
+
     const auto scale = getDecimalScale(*type);
     const auto value = field.safeGet<Decimal64>().getValue().value;
     if (scale == 9)
