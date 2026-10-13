@@ -463,7 +463,6 @@ def _fetch_release_tags(releases: list[dict], cwd: str) -> None:
 
 
 def _ensure_release_history(
-    fetch_ref: str,
     tip_sha: str,
     releases: list[dict],
     cwd: str,
@@ -475,7 +474,7 @@ def _ensure_release_history(
     local they cost almost nothing.
     """
     if _git_is_shallow(cwd):
-        _git_fetch(["--filter=tree:0", "--unshallow"], [fetch_ref, tip_sha], cwd)
+        _git_fetch(["--filter=tree:0", "--unshallow"], [tip_sha], cwd)
     _fetch_release_tags(releases, cwd)
 
 
@@ -484,7 +483,7 @@ def get_prs_in_release_dataframe(
     *,
     repo: str = GITHUB_REPO,
     cwd: str,
-    tip: str | None = None,
+    tip: str,
 ) -> tuple[pd.DataFrame, str | None]:
     f"""
     PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
@@ -492,32 +491,19 @@ def get_prs_in_release_dataframe(
     Merge commits whose subject is from the upstream repository (ClickHouse/) are omitted.
     Columns: pr_number, pr_name, labels.
 
+    tip is the workflow commit SHA (not the local head_branch ref — that branch can sit on
+    the latest release tag while the run is elsewhere, which collapses the range to empty).
+
     Returns (dataframe, baseline_date YYYY-MM-DD or None).
     """
-    # Use the run commit (or HEAD), not the local branch named head_branch.
-    # That branch can sit on the latest release tag while the run is elsewhere,
-    # which collapses the range to empty.
-    if tip is not None:
-        tip_sha = _git_rev_parse(tip, cwd)
-        if not tip_sha:
-            raise Exception(f"Cannot resolve commit: {tip!r}")
-    else:
-        tip_sha = _git_rev_parse("HEAD", cwd) or _git_rev_parse(branch_ref, cwd)
-        if not tip_sha:
-            raise Exception(f"Cannot resolve commit: {branch_ref!r}")
+    tip_sha = _git_rev_parse(tip, cwd)
+    if not tip_sha:
+        raise Exception(f"Cannot resolve commit: {tip!r}")
 
     releases = _releases_for_version_line(
         _get_github_releases(repo), branch_ref, tip_sha, cwd
     )
-
-    parsed = _parse_release_ref(branch_ref)
-    fetch_ref = (
-        f"refs/tags/{branch_ref}"
-        if parsed is not None and parsed[2] is not None
-        else branch_ref
-    )
-
-    _ensure_release_history(fetch_ref, tip_sha, releases, cwd)
+    _ensure_release_history(tip_sha, releases, cwd)
 
     _, baseline_sha, baseline_date = _find_release_baseline(
         branch_ref, releases, cwd, tip=tip_sha
