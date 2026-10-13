@@ -204,6 +204,24 @@ public:
 
     bool initializeDiskOnConfigChange(const std::set<String> & new_added_disks) override;
 
+    /// Hybrid-specific snapshot-time state attached to `StorageSnapshot::data`. Populated
+    /// once in `StorageDistributed::getStorageSnapshot` so the watermark values seen by
+    /// `getQueryProcessingStage` and `read` cannot diverge mid-query under a concurrent
+    /// `ALTER MODIFY SETTING hybrid_watermark_*`. Without this, two independent
+    /// `MultiVersion::get` calls could observe different versions and produce inconsistent
+    /// pruning verdicts (e.g. a `Complete`-stage plan unioned without final merge).
+    struct HybridSnapshotData : public StorageSnapshot::Data
+    {
+        MultiVersion<WatermarkParams>::Version watermark_snapshot;
+
+        std::unique_ptr<StorageSnapshot::Data> clone() const override
+        {
+            auto copy = std::make_unique<HybridSnapshotData>();
+            copy->watermark_snapshot = watermark_snapshot;
+            return copy;
+        }
+    };
+
 private:
     void renameOnDisk(const String & new_path_to_table_data);
 
@@ -239,24 +257,6 @@ private:
     static ASTPtr substituteHybridWatermarks(
         ASTPtr predicate_ast,
         const MultiVersion<WatermarkParams>::Version & watermarks);
-
-    /// Hybrid-specific snapshot-time state attached to `StorageSnapshot::data`. Populated
-    /// once in `StorageDistributed::getStorageSnapshot()` so the watermark values seen by
-    /// `getQueryProcessingStage()` and `read()` cannot diverge mid-query under a concurrent
-    /// `ALTER MODIFY SETTING hybrid_watermark_*`. Without this, two independent
-    /// `MultiVersion::get()` calls could observe different versions and produce inconsistent
-    /// pruning verdicts (e.g. a `Complete`-stage plan unioned without final merge).
-    struct HybridSnapshotData : public StorageSnapshot::Data
-    {
-        MultiVersion<WatermarkParams>::Version watermark_snapshot;
-
-        std::unique_ptr<StorageSnapshot::Data> clone() const override
-        {
-            auto copy = std::make_unique<HybridSnapshotData>();
-            copy->watermark_snapshot = watermark_snapshot;
-            return copy;
-        }
-    };
 
     /// Per-query Hybrid pruning verdict. Recomputed in both `getQueryProcessingStage()`
     /// (to drive the stage decision and empty `optimized_cluster` when the base is pruned)

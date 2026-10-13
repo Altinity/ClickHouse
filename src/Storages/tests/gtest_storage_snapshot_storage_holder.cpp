@@ -1,14 +1,21 @@
 #include <gtest/gtest.h>
 
+#include <Core/Block.h>
 #include <Databases/DatabaseMemory.h>
 #include <Interpreters/Context.h>
+#include <Common/assert_cast.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Storages/IStorage.h>
+#include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/StorageAlias.h>
+#include <Storages/StorageDistributed.h>
 #include <Storages/StorageInMemoryMetadata.h>
+#include <Storages/StorageMemory.h>
 #include <Storages/StorageSnapshot.h>
 #include <Common/tests/gtest_global_context.h>
 #include <base/scope_guard.h>
+
+#include <functional>
 
 /// StorageSnapshot refers to its storage without owning it, which is sound only while the caller that
 /// took the snapshot keeps a StoragePtr. StorageAlias breaks that: it hands out a snapshot of the table
@@ -139,10 +146,17 @@ TEST(StorageSnapshotStorageHolder, AliasChainKeepsTheInnermostReferentPinned)
     EXPECT_TRUE(weak_intermediate.expired());
 }
 
-TEST(StorageSnapshotStorageHolder, StorageAliasPinsTheTargetItHandsOut)
+namespace
+{
+
+/// Both `StorageAlias` accessors have to pin, so the two arms below differ only in which one they call.
+/// `take_snapshot` receives the alias rather than capturing it, because the alias must be constructed
+/// after the target is attached.
+void assertStorageAliasPinsItsTarget(
+    const String & database_name,
+    const std::function<StorageSnapshotPtr(const StorageAlias &, ContextPtr)> & take_snapshot)
 {
     auto context = getContext().context;
-    const String database_name = "test_storage_alias_holder_db";
 
     auto database = std::make_shared<DatabaseMemory>(database_name, context);
     DatabaseCatalog::instance().attachDatabase(database_name, database);
@@ -156,10 +170,10 @@ TEST(StorageSnapshotStorageHolder, StorageAliasPinsTheTargetItHandsOut)
     /// An alias owns nothing and resolves its target through DatabaseCatalog on every access, so this
     /// is the whole ownership state a query has when it reads through one.
     auto alias = std::make_shared<StorageAlias>(StorageID{database_name, "alias"}, context, database_name, "target");
-    auto snapshot = alias->getStorageSnapshot(std::make_shared<StorageInMemoryMetadata>(), context);
+    auto snapshot = take_snapshot(*alias, context);
 
     /// Detaching releases the catalog's own StoragePtr, which is what DROP does before the background
-    /// worker destroys the table: DatabaseCatalog::getTablesToDrop() frees it as soon as no one else
+    /// worker destroys the table: DatabaseCatalog::getTablesToDrop frees it as soon as no one else
     /// owns it. So from here the snapshot's token is the only thing that can keep the target alive.
     database->detachTable(context, "target");
 
@@ -168,4 +182,81 @@ TEST(StorageSnapshotStorageHolder, StorageAliasPinsTheTargetItHandsOut)
 
     snapshot.reset();
     EXPECT_TRUE(weak_target.expired());
+}
+
+/// `withStorageHolder` must clone `data` rather than steal it: the source snapshot can already be
+/// shared through the query metadata cache.
+template <typename SnapshotData>
+std::pair<StorageSnapshotPtr, StorageSnapshotPtr> pinPopulatedSnapshot(const StoragePtr & storage, std::unique_ptr<SnapshotData> data)
+{
+    auto source = std::make_shared<StorageSnapshot>(*storage, std::make_shared<StorageInMemoryMetadata>(), std::move(data));
+    auto pinned = source->withStorageHolder(storage);
+    return {std::move(source), std::move(pinned)};
+}
+
+}
+
+TEST(StorageSnapshotStorageHolder, WithStorageHolderClonesPopulatedData)
+{
+    auto storage = makeStorage("populated");
+
+    auto parts = std::make_shared<const RangesInDataParts>();
+    {
+        auto data = std::make_unique<MergeTreeData::SnapshotData>();
+        data->storage = storage;
+        data->parts = parts;
+        auto [source, pinned] = pinPopulatedSnapshot(storage, std::move(data));
+
+        const auto * source_data = assert_cast<const MergeTreeData::SnapshotData *>(source->data.get());
+        const auto * pinned_data = assert_cast<const MergeTreeData::SnapshotData *>(pinned->data.get());
+        EXPECT_NE(source->data.get(), pinned->data.get());
+        EXPECT_EQ(source_data->storage.get(), storage.get());
+        EXPECT_EQ(pinned_data->storage.get(), source_data->storage.get());
+        EXPECT_EQ(pinned_data->parts.get(), parts.get());
+        EXPECT_EQ(pinned_data->mutations_snapshot.get(), source_data->mutations_snapshot.get());
+    }
+
+    auto blocks = std::make_shared<const Blocks>(Blocks{Block{}});
+    {
+        auto data = std::make_unique<StorageMemory::SnapshotData>();
+        data->blocks = blocks;
+        data->rows_approx = 3;
+        auto [source, pinned] = pinPopulatedSnapshot(storage, std::move(data));
+
+        const auto * source_data = assert_cast<const StorageMemory::SnapshotData *>(source->data.get());
+        const auto * pinned_data = assert_cast<const StorageMemory::SnapshotData *>(pinned->data.get());
+        EXPECT_NE(source->data.get(), pinned->data.get());
+        EXPECT_EQ(source_data->blocks.get(), blocks.get());
+        EXPECT_EQ(pinned_data->blocks.get(), source_data->blocks.get());
+        EXPECT_EQ(pinned_data->rows_approx, source_data->rows_approx);
+    }
+
+    auto watermarks = std::make_shared<const StorageDistributed::WatermarkParams>(StorageDistributed::WatermarkParams{{"ts", "1"}});
+    {
+        auto data = std::make_unique<StorageDistributed::HybridSnapshotData>();
+        data->watermark_snapshot = watermarks;
+        auto [source, pinned] = pinPopulatedSnapshot(storage, std::move(data));
+
+        const auto * source_data = assert_cast<const StorageDistributed::HybridSnapshotData *>(source->data.get());
+        const auto * pinned_data = assert_cast<const StorageDistributed::HybridSnapshotData *>(pinned->data.get());
+        EXPECT_NE(source->data.get(), pinned->data.get());
+        EXPECT_EQ(source_data->watermark_snapshot.get(), watermarks.get());
+        EXPECT_EQ(pinned_data->watermark_snapshot.get(), source_data->watermark_snapshot.get());
+    }
+}
+
+TEST(StorageSnapshotStorageHolder, StorageAliasPinsTheTargetItHandsOut)
+{
+    assertStorageAliasPinsItsTarget(
+        "test_storage_alias_holder_db",
+        [](const StorageAlias & alias, ContextPtr context)
+        { return alias.getStorageSnapshot(std::make_shared<StorageInMemoryMetadata>(), context); });
+}
+
+TEST(StorageSnapshotStorageHolder, StorageAliasPinsTheTargetForASnapshotWithoutData)
+{
+    assertStorageAliasPinsItsTarget(
+        "test_storage_alias_holder_without_data_db",
+        [](const StorageAlias & alias, ContextPtr context)
+        { return alias.getStorageSnapshotWithoutData(std::make_shared<StorageInMemoryMetadata>(), context); });
 }
