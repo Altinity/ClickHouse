@@ -37,6 +37,7 @@ dedup work. Ref/namespace keys are also deliberately opaque and do not embed the
 
 Each replica sharing a backend endpoint must use a distinct `cas_server_root_id`; omitting the setting
 is a startup error.
+A new `cas_server_root_id` may not contain `/`; ids that already own their owner object keep working.
 
 ## The owner claim {#owner-claim}
 
@@ -48,6 +49,7 @@ and never reassigned — decommission only tombstones it in place.
 | present, same `server_uuid`, not tombstoned | proceed |
 | present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned, refuses to resume |
 | present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause |
+| absent, id contains `/` | `BAD_ARGUMENTS` — a new id may not be nested; an existing nested owner proceeds by the first row |
 | absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
 | lost the `putIfAbsent` race | re-read; equal uuid proceeds, else `CORRUPTED_DATA` |

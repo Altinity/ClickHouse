@@ -547,6 +547,42 @@ TEST(CASDecommission, RefusesUnknownMember)
     });
 }
 
+/// The adopt-from-lease fallback (owner deleted by hand, mount present, subtree empty) re-creates the
+/// owner through the same claim as a first mount, so a nested id is refused there too, before any
+/// object of the member is touched.
+TEST(CASDecommission, LeaseAdoptFallbackRefusesANestedIdWithoutOwner)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    OperationForTest raw_op(*backend);
+    /// A member that already owned the nested id (its owner written by an older build), then one
+    /// clean life of it, then the owner deleted by hand: the state the fallback exists for.
+    ASSERT_TRUE(std::holds_alternative<Committed>((*raw_op).create(layout.ownerKey("shard-01/replica-a"),
+        encodeOwner(OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = std::nullopt}), Retry::once())));
+    { auto member = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "shard-01/replica-a"}); }
+    const auto owner = (*raw_op).read(layout.ownerKey("shard-01/replica-a"), Retry::once());
+    ASSERT_TRUE(owner.has_value());
+    ASSERT_EQ((*raw_op).remove(layout.ownerKey("shard-01/replica-a"), owner->etag, Retry::once()), Removal::Removed);
+    const auto mount_before = (*raw_op).read(layout.mountKey("shard-01/replica-a"), Retry::once());
+    const auto epoch_before = (*raw_op).read(layout.epochKey("shard-01/replica-a"), Retry::once());
+    ASSERT_TRUE(mount_before.has_value());
+    ASSERT_TRUE(epoch_before.has_value());
+
+    DB::Cas::tests::expectThrowsCodeWithMessage(ErrorCodes::BAD_ARGUMENTS, "contains '/'", [&]
+    {
+        decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "shard-01/replica-a");
+    });
+
+    EXPECT_FALSE((*raw_op).head(layout.ownerKey("shard-01/replica-a"), Retry::once()).has_value());
+    const auto mount_after = (*raw_op).read(layout.mountKey("shard-01/replica-a"), Retry::once());
+    const auto epoch_after = (*raw_op).read(layout.epochKey("shard-01/replica-a"), Retry::once());
+    ASSERT_TRUE(mount_after.has_value());
+    ASSERT_TRUE(epoch_after.has_value());
+    EXPECT_EQ(mount_after->etag, mount_before->etag);
+    EXPECT_EQ(epoch_after->etag, epoch_before->etag);
+}
+
 TEST(CASDecommission, SecondConcurrentDecommissionRefused)
 {
     auto backend = std::make_shared<InMemoryBackend>();

@@ -602,8 +602,8 @@ makes the now-unreferenced blobs eligible for an ordinary GC round to reclaim la
 SYSTEM CAS DROP POOL MEMBER 'server_root_id' FROM DISK 'disk_name' [ON CLUSTER cluster_name]
 ```
 
-Both `server_root_id` and `disk_name` are required string literals (a `server_root_id` is an opaque server-root path
-that may contain `/`, not a plain identifier, so it cannot be written unquoted).
+Both `server_root_id` and `disk_name` are required string literals (a `server_root_id` is an opaque string, not a
+plain identifier, so it cannot be written unquoted; ids created before nesting was closed may contain `/`).
 
 The operation is resumable: a rerun skips namespaces already marked `Removed` and reports them
 separately from namespaces newly removed by this invocation. Per-object drain failures are recorded

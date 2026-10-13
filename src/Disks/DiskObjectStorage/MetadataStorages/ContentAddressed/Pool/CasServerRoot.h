@@ -83,6 +83,8 @@ struct MountRenewOperationEnvironment
 ///   - total length <= 255;
 ///   - no segment equal to the reserved "_files" / "_manifests".
 /// Throws `ErrorCodes::BAD_ARGUMENTS` on any violation. Fail closed — there is no sanitizing fallback.
+/// A `/` is still accepted here for members that already own a nested id; `claimOwnerOrThrow` refuses to
+/// create a new one.
 inline void validateServerRootId(const String & id)
 {
     if (id.empty())
@@ -146,6 +148,8 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
 ///   - owner present, equal `our_uuid`, and not tombstoned → ok (return);
 ///   - owner present and tombstoned → throw `CORRUPTED_DATA` (explicitly retired — fail closed);
 ///   - owner present, different → throw `CORRUPTED_DATA` (foreign owner — fail closed);
+///   - owner absent AND `srid` contains '/' → throw `BAD_ARGUMENTS` (nested ids are not created; an
+///     existing nested owner is honoured by the first bullet);
 ///   - owner absent AND the subtree is provably empty → `create` the owner (claim);
 ///   - owner absent BUT the subtree is non-empty → throw `CORRUPTED_DATA` (identity lost over
 ///     existing data — never silently re-claim).

@@ -560,6 +560,18 @@ void claimOwnerOrThrow(
             "(identity lost over existing data) — refusing to re-claim",
             srid);
 
+    /// First claim of `srid`. A nested id is refused here rather than in `validateServerRootId`, so
+    /// members that already own one keep mounting; after the emptiness check, so an id that lost its
+    /// owner over data still gets the identity-lost refusal. Decommission and the staging sweep select
+    /// objects by key prefix, so `a` would otherwise drain a live `a/b`.
+    if (srid.find('/') != String::npos)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "CAS server-root '{}' has no owner and its id contains '/': a new server_root_id may not be nested, "
+            "because a decommission selects objects by key prefix and would drain every member whose id starts "
+            "with it. Configure a <cas_server_root_id> without '/'. A member that already owns a nested id keeps "
+            "working while its owner object '{}' exists.",
+            srid, key);
+
     const std::optional<Observation> occupant = conflictOrThrow(
         op.create(key, encodeOwner(OwnerObject{.server_uuid = our_uuid, .retired_at_ms = std::nullopt}),
                   Retry::standard()),

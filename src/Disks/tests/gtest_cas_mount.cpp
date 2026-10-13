@@ -120,10 +120,10 @@ public:
         const String & key, const String & bytes,
         const std::optional<String> & expected_value, TransportAccess & access) override
     {
-        if (!fired && !expected_value && key == "p/gc/server-roots/root/x/owner")
+        if (!fired && !expected_value && key == "p/gc/server-roots/rootx/owner")
         {
             fired = true;
-            InMemoryBackend::write("p/cas/manifests/root/x/table/debris", "x", std::nullopt, access);
+            InMemoryBackend::write("p/cas/manifests/rootx/table/debris", "x", std::nullopt, access);
             return std::unexpected(RawConflict{});
         }
         return InMemoryBackend::write(key, bytes, expected_value, access);
@@ -498,6 +498,44 @@ TEST(CASServerRootId, ValidationAcceptsCleanPathsRejectsBad)
     EXPECT_THROW(validateServerRootId("a/_files/b"), DB::Exception);
 }
 
+/// Decommission and the staging sweep select objects by key prefix, so a member `a/b` could be drained
+/// by a decommission of `a`. The first claim of an id refuses a nested one; `validateServerRootId`
+/// still accepts it so that members created before this rule keep mounting (the guard below).
+TEST(CASServerRootId, NewIdWithSlashIsRefused)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    const Layout l("p");
+    Ops ops(b);
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::BAD_ARGUMENTS, "contains '/'", [&]
+    {
+        claimOwnerOrThrow(ops.op, l, "shard-01/replica-a", UInt128(1), emptyCatalogObservation());
+    });
+    EXPECT_FALSE(ops.op.head(l.ownerKey("shard-01/replica-a"), Retry::standard()).has_value())
+        << "a refused claim must not create the owner";
+}
+
+/// Guard: a member that already owns a nested id (its owner object exists, written by an older build)
+/// still mounts under it. Besides the pool meta only the owner is seeded: the epoch counter is minted by this very open, so
+/// the nesting rule must not run once the owner is present.
+TEST(CASServerRootId, ExistingIdWithSlashStillMounts)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    const Layout l("p");
+    DB::Cas::tests::seedPoolMetaForRestart(*b);
+    {
+        Ops seed(b);
+        mustCommit(seed.op.create(l.ownerKey("shard-01/replica-a"),
+            encodeOwner(OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = std::nullopt}),
+            Retry::standard()), "owner of an existing nested member");
+    }
+    auto store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "shard-01/replica-a"});
+    ASSERT_TRUE(store != nullptr);
+    Ops check(b);
+    const auto mount = check.op.read(l.mountKey("shard-01/replica-a"), Retry::standard());
+    ASSERT_TRUE(mount.has_value());
+    EXPECT_EQ(decodeMountLease(mount->bytes).server_uuid, UInt128(1));
+}
+
 TEST(CASServerRoot, KeysAndCodecsRoundTrip)
 {
     Layout layout("p");
@@ -772,9 +810,9 @@ TEST(CASServerRootSafety, OpaqueStreamAndStateDebrisAloneDoesNotBlockRecreation)
     mustCommit(ops.op.create(layout.refCkptKey(dead), "debris", Retry::standard()), "ckpt debris");
     mustCommit(ops.op.create(layout.namespaceFileKey(dead, "f"), "debris", Retry::standard()), "ns-file debris");
 
-    EXPECT_NO_THROW(claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation()));
+    EXPECT_NO_THROW(claimOwnerOrThrow(ops.op, layout, "rootx", UInt128{1}, emptyCatalogObservation()));
     EXPECT_EQ(allocateWriterEpoch(
-        ops.op, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+        ops.op, layout, "rootx", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
 }
 
 TEST(CASServerRootSafety, ManifestAndLooseRootDebrisStillBlockRecreation)
@@ -819,9 +857,9 @@ TEST(CASServerRootSafety, OwnerConflictRecomputesTheWholeEmptinessBundle)
     DB::Cas::tests::expectThrowsCodeWithMessage(
         DB::ErrorCodes::CORRUPTED_DATA,
         "newly visible owned work blocks recreation",
-        [&] { claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation()); });
+        [&] { claimOwnerOrThrow(ops.op, layout, "rootx", UInt128{1}, emptyCatalogObservation()); });
     EXPECT_TRUE(backend->fired);
-    EXPECT_FALSE(ops.op.head(layout.ownerKey("root/x"), Retry::standard()).has_value());
+    EXPECT_FALSE(ops.op.head(layout.ownerKey("rootx"), Retry::standard()).has_value());
 }
 
 TEST(CASServerRootSafety, EpochConflictRecomputesTheWholeEmptinessBundle)
