@@ -66,9 +66,9 @@ jobs:
       GITHUB_JOB_OVERRIDDEN: ${{inputs.test_name}}
     steps:
       - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f
+        uses: actions/checkout@v6
         with:
-          clear-repository: true
+          clean: true
           ref: ${{ inputs.git_ref }}
           submodules: ${{inputs.submodules}}
           fetch-depth: ${{inputs.checkout_depth}}
