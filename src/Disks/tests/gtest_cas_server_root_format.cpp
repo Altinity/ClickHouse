@@ -52,6 +52,20 @@ TEST(CASFormatBattery, ServerEpoch)
         currentFormatHeader("cas_epoch") + "{\"next_writer_epoch\":\"7\"}\n"});
 }
 
+TEST(CASServerEpochFormat, ZeroNextWriterEpochIsRejected)
+{
+    const String data = currentFormatHeader("cas_epoch") + "{\"next_writer_epoch\":\"0\"}\n";
+    try
+    {
+        decodeServerEpoch(data);
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
+}
+
 CAS_BATTERY_COVERS(MountLease);
 
 TEST(CASFormatBattery, MountLease)

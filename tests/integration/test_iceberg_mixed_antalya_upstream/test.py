@@ -51,30 +51,20 @@ def started_cluster():
 
 
 @pytest.mark.parametrize(
-    ("initiator_name", "cluster_name", "settings"),
+    ("initiator_name", "cluster_name"),
     [
-        pytest.param(
-            "antalya",
-            "upstream_only",
-            # Default 500 makes the Antalya initiator send a JSON retry command in the task
-            # path. An upstream worker would open that text as an object key.
-            {"lock_object_storage_task_distribution_ms": 0},
-            id="antalya_initiator_upstream_worker",
-        ),
-        pytest.param(
-            "upstream",
-            "antalya_only",
-            None,
-            id="upstream_initiator_antalya_worker",
-        ),
+        pytest.param("antalya", "upstream_only", id="antalya_initiator_upstream_worker"),
+        pytest.param("upstream", "antalya_only", id="upstream_initiator_antalya_worker"),
+        # Both workers, default `lock_object_storage_task_distribution_ms`. The Antalya initiator
+        # must not put a retry command into the object path: the upstream worker would open that text as a key.
+        pytest.param("antalya", "mixed", id="antalya_initiator_mixed_workers"),
     ],
 )
-def test_mixed_iceberg_cluster_read(started_cluster, initiator_name, cluster_name, settings):
+def test_mixed_iceberg_cluster_read(started_cluster, initiator_name, cluster_name):
     expected = antalya.query(f"SELECT id, tag FROM icebergS3('{TABLE_URL}', '{minio_access_key}', '{minio_secret_key}') ORDER BY id")
     initiator = started_cluster.instances[initiator_name]
     got = initiator.query(
         f"SELECT id, tag FROM icebergS3Cluster('{cluster_name}', '{TABLE_URL}', '{minio_access_key}', '{minio_secret_key}') ORDER BY id",
-        settings=settings,
     )
     assert got == expected
     assert got == "1\talpha\n2\tbeta\n"

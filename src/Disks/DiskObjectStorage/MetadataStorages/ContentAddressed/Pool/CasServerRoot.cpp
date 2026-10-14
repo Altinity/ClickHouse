@@ -817,10 +817,23 @@ MountClaimResult claimMount(
         return {.kind = MountClaimResult::ForeignOwner, .body = existing, .etag = std::nullopt};
     }
 
-    /// Same uuid + same epoch: it is OUR OWN claim — but a FENCED body is terminal for this
-    /// (uuid, epoch): the GC dropped its ack from the floor when it fenced. Refreshing it in place
-    /// would reactivate a fenced incarnation — a fence permanently consumes this `(server_uuid,
-    /// writer_epoch)` pair, so the caller must re-open with a fresh `writer_epoch`.
+    /// An older allocation that reached the slot late must not replace a newer incarnation of this
+    /// server: recovery seals only epochs below the live one, so a late write of the newer epoch would
+    /// never be sealed out.
+    if (existing.writer_epoch > our_epoch)
+    {
+        emitMountEvent(sink, CasEventType::MountConflict, srid, "newer_epoch", &existing,
+            "same server_uuid, newer writer_epoch in the mount slot — refusing to replace it");
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS mount slot '{}' holds writer_epoch {} of this server_uuid, newer than the writer_epoch {} "
+            "this claim allocated: another start or a decommission of server_root_id '{}' allocated after "
+            "this one. Refusing to replace the newer incarnation ({})",
+            key, existing.writer_epoch, our_epoch, srid, describeMountHolder(existing));
+    }
+
+    /// Our own `(uuid, epoch)` is in the slot, but this call has written nothing: the engine settles a
+    /// sent attempt inside the write itself. Another process was allocated the same epoch, and its body
+    /// is never replaced. A fenced one is terminal for the pair; the caller takes a fresh epoch.
     if (existing.writer_epoch == our_epoch)
     {
         if (existing.gc_fenced)
@@ -830,20 +843,12 @@ MountClaimResult claimMount(
                 "recover with a fresh writer_epoch");
             return {.kind = MountClaimResult::FencedSelf, .body = existing, .etag = std::nullopt};
         }
-        const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
-        if (const std::optional<Observation> raced
-                = conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
-                                  fmt::format("CAS mount slot refresh of '{}'", key)))
-            /// The mount changed under us between the read and the write, so `got->etag` is KNOWN
-            /// STALE -- that mismatch is exactly why the write was refused. What the write's resolve
-            /// read observed is current, and it is that pair that is reported.
-            return racedDoubleStart(*raced);
-        emitMountEvent(sink, CasEventType::MountClaim, srid, "refresh", &existing,
-            "own claim replayed — refreshed seq + expiry");
-        return {.kind = MountClaimResult::Claimed, .body = body, .etag = std::nullopt};
+        emitMountEvent(sink, CasEventType::MountConflict, srid, "same_epoch_occupied", &existing,
+            "own (uuid, epoch) is already in the mount slot, written by another process — refusing to write");
+        return {.kind = MountClaimResult::LiveDoubleStart, .body = existing, .etag = got->etag};
     }
 
-    /// Same uuid, DIFFERENT epoch: reclaim ONLY on a certificate of death that needs no fresh
+    /// Same uuid, OLDER epoch: reclaim ONLY on a certificate of death that needs no fresh
     /// wall-clock trust — never by comparing `expires_at_ms` against `now_ms`:
     ///   - `gc_fenced` → the fence-out is terminal for that incarnation by construction (its renewer's
     ///     every renewal fails the token guard forever, so it can never write again) — there is no
@@ -968,6 +973,13 @@ MountClaimResult claimMountAwaitingExpiry(
             threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{});
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
+        /// Observation certifies only an older epoch dead; a body of our own pair is never replaced,
+        /// so waiting on it could not end.
+        if (r.body && r.body->server_uuid == our_uuid && r.body->writer_epoch == our_epoch)
+            return r;
+        /// A raced write observed a newer epoch of ours; the re-read refuses it with the newer-epoch error.
+        if (r.body && r.body->server_uuid == our_uuid && r.body->writer_epoch > our_epoch)
+            return claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, std::nullopt, sink, {});
 
         /// `claimMount` already read the current body, and a raced write reports whatever its own
         /// resolve read observed. Reuse `r.etag` whenever it is set instead of re-reading the SAME key
@@ -1017,11 +1029,18 @@ MountClaimResult claimMountAwaitingExpiry(
     }
 }
 
+bool MountIncarnationObservation::heldFor(uint64_t threshold_ms, uint64_t sample_ms) const
+{
+    return sample_ms >= first_seen_mono_ms && sample_ms - first_seen_mono_ms >= threshold_ms;
+}
+
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
-                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
-                                     MountObservationMap & obs)
+                                     const std::function<uint64_t()> & mono_ms_fn,
+                                     uint64_t stable_threshold_ms, MountObservationMap & obs)
 {
     HeartbeatFloor floor;
+    /// Taken before any read: it can confirm that a token held, never date a sighting.
+    const uint64_t round_start_ms = mono_ms_fn();
 
     /// `obs` is keyed by every srid this leader has EVER observed, but a
     /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CAS
@@ -1083,12 +1102,13 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
                 const bool stable = it != obs.end() && it->second.etag == observed->etag
-                    && mono_now_ms - it->second.first_seen_mono_ms >= stable_threshold_ms;
+                    && it->second.heldFor(stable_threshold_ms, round_start_ms);
 
                 if (!stable)
                 {
+                    /// A sample from before this read would count the walk to the slot as time watched.
                     if (it == obs.end() || it->second.etag != observed->etag)
-                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_now_ms});
+                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_ms_fn()});
                     ++floor.live;
                     return std::nullopt;
                 }

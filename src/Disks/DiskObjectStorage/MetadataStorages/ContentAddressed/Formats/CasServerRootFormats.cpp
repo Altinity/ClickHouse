@@ -129,8 +129,8 @@ ServerEpoch decodeServerEpoch(std::string_view data)
         else
             r.skipUnknown(key);
     }
-    if (!saw)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: missing next_writer_epoch");
+    if (!saw || e.next_writer_epoch == 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: missing or zero next_writer_epoch");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: trailing bytes");
     return e;

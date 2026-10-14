@@ -20,6 +20,7 @@
 
 namespace DB::ErrorCodes
 {
+    extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
@@ -200,6 +201,112 @@ public:
 
 private:
     bool reveal_owned_work;
+};
+
+/// Between this start's epoch allocation and its claim read, a second start of the same server
+/// allocates the next epoch and installs its live body. Armed by the test after the bootstrap open.
+class NewerStartBackend : public InMemoryBackend
+{
+public:
+    String epoch_key;
+    String mount_key;
+    bool arm_on_next_epoch_write = false;
+    std::optional<uint64_t> newer_epoch;
+
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes,
+        const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        auto result = InMemoryBackend::write(key, bytes, expected_value, access);
+        if (arm_on_next_epoch_write && key == epoch_key && result)
+        {
+            arm_on_next_epoch_write = false;
+            install_on_next_mount_read = true;
+        }
+        return result;
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (install_on_next_mount_read && key == mount_key)
+        {
+            install_on_next_mount_read = false;
+            installNewerStart(access);
+        }
+        return InMemoryBackend::read(key, access);
+    }
+
+private:
+    bool install_on_next_mount_read = false;
+
+    void installNewerStart(TransportAccess & access)
+    {
+        const auto epoch = InMemoryBackend::read(epoch_key, access);
+        const auto mount = InMemoryBackend::read(mount_key, access);
+        if (!epoch || !mount)
+            throw std::runtime_error("NewerStartBackend: a control object is missing");
+        ServerEpoch counter = decodeServerEpoch(epoch->bytes);
+        newer_epoch = counter.next_writer_epoch;
+        ++counter.next_writer_epoch;
+        if (!InMemoryBackend::write(epoch_key, encodeServerEpoch(counter), epoch->value, access))
+            throw std::runtime_error("NewerStartBackend: the epoch bump conflicted");
+        const MountLease newer{
+            .server_uuid = UInt128(1),
+            .writer_epoch = *newer_epoch,
+            .hostname = "newer-start",
+            .pid = 2,
+            .started_at_ms = 1,
+            .seq = 1,
+            .expires_at_ms = 4'000'000'000'000,
+            .write_attempt_id = UInt128{0xB}};
+        if (!InMemoryBackend::write(mount_key, encodeMountLease(newer), mount->value, access))
+            throw std::runtime_error("NewerStartBackend: the mount install conflicted");
+    }
+};
+
+/// A competitor's conditional bump of the epoch counter lands with the very bytes ours sends, and ours
+/// is lost unapplied. Our resolve read then finds our bytes under a moved precondition and reports the
+/// allocation committed, so two allocators hold one writer_epoch.
+class EpochCollisionBackend : public InMemoryBackend
+{
+public:
+    String epoch_key;
+    bool armed = false;
+
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes,
+        const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (armed && expected_value && key == epoch_key)
+        {
+            armed = false;
+            if (!InMemoryBackend::write(key, bytes, expected_value, access))
+                throw std::runtime_error("EpochCollisionBackend: the competitor's bump conflicted");
+            throw Poco::TimeoutException("EpochCollisionBackend: response lost, our attempt did not apply");
+        }
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+};
+
+/// Applies the first conditional write of `key` after arming, then loses its response.
+class LandedReplaceAckLostOnceBackend : public InMemoryBackend
+{
+public:
+    String key;
+    bool armed = false;
+
+    std::expected<String, RawConflict> write(
+        const String & k, const String & bytes,
+        const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (armed && expected_value && k == key)
+        {
+            armed = false;
+            (void)InMemoryBackend::write(k, bytes, expected_value, access);
+            throw Poco::TimeoutException("LandedReplaceAckLostOnceBackend: simulated lost PUT response");
+        }
+        return InMemoryBackend::write(k, bytes, expected_value, access);
+    }
 };
 
 /// Counts every request that reaches the store, per primitive, so a test can pin how many a protocol
@@ -502,6 +609,24 @@ TEST(CASServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
     ASSERT_FALSE(ops.op.head(l.mountKey("r"), Retry::standard()).has_value());
     EXPECT_EQ(ops.op.removeCurrent(l.mountKey("r"), Retry::standard()), Removal::Gone);
     EXPECT_GT(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), e2);
+}
+
+/// No writer emits a zero counter; an allocation over one would hand out writer_epoch 0.
+TEST(CASServerRootEpoch, ZeroCounterFailsAllocationWithoutWriting)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    mustCommit(ops.op.create(l.epochKey("r"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 0}), Retry::standard()),
+               "zero counter");
+    const auto before = ops.op.read(l.epochKey("r"), Retry::standard());
+    ASSERT_TRUE(before.has_value());
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        (void)allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+    });
+    EXPECT_EQ(ops.op.read(l.epochKey("r"), Retry::standard())->bytes, before->bytes);
 }
 
 /// Phase C (spec rev.4): an ABSENT epoch object over a PRESENT mount object means durable epoch
@@ -976,7 +1101,13 @@ TEST(CASMountAwaitExpiry, LiveRenewingTwinTimesOutAsDoubleStart)
     {
         wall += ms;
         mono += ms;
-        ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, wall, 100).kind, MountClaimResult::Claimed);
+        const auto got = ops.op.read(l.mountKey("r"), Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease renewed = decodeMountLease(got->bytes);
+        ++renewed.seq;
+        renewed.expires_at_ms = wall + 100;
+        mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(renewed), got->etag, Retry::standard()),
+                   "twin renewal");
     };
 
     const auto r = claimMountAwaitingExpiry(
@@ -1116,10 +1247,16 @@ TEST(CASMountClaim, UnsafeAuthorizationIsTokenExact)
     const Etag stale = ops.op.read(l.mountKey("r"), Retry::standard())->etag;
 
     /// `Etag` equality compares (key, value), and it is minted only through the request planes -- there
-    /// is no cross-key comparison to exercise here. Build the stale token by refreshing the SAME slot a
-    /// second time (same uuid, same epoch): `stale`, read before this refresh, is then a genuinely stale
-    /// token for the slot's CURRENT value, without touching an unrelated key.
-    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 30000).kind, MountClaimResult::Claimed);
+    /// is no cross-key comparison to exercise here. Build the stale token by renewing the SAME slot once:
+    /// `stale`, read before this renewal, is then a genuinely stale token for the slot's CURRENT value.
+    {
+        const auto got = ops.op.read(l.mountKey("r"), Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease renewed = decodeMountLease(got->bytes);
+        ++renewed.seq;
+        mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(renewed), got->etag, Retry::standard()),
+                   "holder renewal");
+    }
     const Etag current = ops.op.read(l.mountKey("r"), Retry::standard())->etag;
 
     /// A stale token is refused: nothing authorizes a reclaim over a slot that moved.
@@ -1209,6 +1346,40 @@ TEST(CASMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     const uint64_t e2 = s2->writerEpoch();
     EXPECT_GT(e2, e1);
+}
+
+TEST(CASMountStartup, DelayedStartOverANewerIncarnationFailsWithoutWaiting)
+{
+    auto b = std::make_shared<NewerStartBackend>();
+    const Layout l("p");
+    b->epoch_key = l.epochKey("r");
+    b->mount_key = l.mountKey("r");
+    {
+        /// Bootstrap: owner, counter and a clean farewell of epoch 1.
+        auto first = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
+    }
+    b->arm_on_next_epoch_write = true;
+
+    /// Shared, heap-owned: the Pool may outlive this frame through a background publish.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
+    auto waits = std::make_shared<std::atomic<uint64_t>>(0);
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "newer than the writer_epoch", [&]
+    {
+        (void)Pool::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
+            .boot_ms_fn = [fake_boot] { return fake_boot->load(); },
+            .wait_sleep_fn = [fake_boot, waits](uint64_t ms)
+            {
+                *fake_boot += ms;
+                ++(*waits);
+            }});
+    });
+    ASSERT_TRUE(b->newer_epoch.has_value()) << "the newer start was never installed";
+    EXPECT_EQ(waits->load(), 0u) << "a newer incarnation is refused, not observed";
+    Ops ops(b);
+    const MountLease slot = decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes);
+    EXPECT_EQ(slot.writer_epoch, *b->newer_epoch);
+    EXPECT_EQ(slot.write_attempt_id, UInt128{0xB});
 }
 
 TEST(CASMountStartup, FreshWritablePoolBootstrapsAnExplicitEmptyCatalog)
@@ -1502,7 +1673,7 @@ namespace
 /// Rev.6 §token-stability observation removed the wall clock from the fence DECISION; `kNowMs` below
 /// is threaded through only as `computeHeartbeatFloor`'s audit-only `now_ms`.
 constexpr uint64_t kNowMs = 1'000'000;
-/// The fence-out threshold measured on the LEADER's OWN monotonic clock (`mono_now_ms`), independent
+/// The fence-out threshold measured on the LEADER's OWN monotonic clock (`mono_ms_fn`), independent
 /// of any lease's stamped `expires_at_ms`.
 constexpr uint64_t kStableThresholdMs = 10'000;
 
@@ -1540,6 +1711,13 @@ void renewMount(CasOperation & op, const Layout & l, const String & srid)
     mustCommit(op.replace(l.mountKey(srid), encodeMountLease(m), got->etag, Retry::standard()),
                "renewed mount " + srid);
 }
+
+/// An observer clock that does not move during a call: the entry sample and every sighting read the
+/// same value.
+std::function<uint64_t()> frozenClock(uint64_t ms)
+{
+    return [ms] { return ms; };
+}
 }
 
 TEST(CASHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
@@ -1553,7 +1731,7 @@ TEST(CASHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, /*now_ms*/ kNowMs, /*mono_now_ms*/ 0,
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, /*now_ms*/ kNowMs, frozenClock(0),
                                                          kStableThresholdMs, obs);
 
     EXPECT_EQ(floor.fenced_now, 0u);
@@ -1570,14 +1748,14 @@ TEST(CASHeartbeatFloor, StableIncarnationPastThresholdIsFenced)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     EXPECT_EQ(floor_before.fenced_now, 0u);
 
     const MountLease before = decodeMountLease(ops.op.read(l.mountKey("s1"), Retry::standard())->bytes);
 
     /// No renewal in between: the SAME incarnation, observed since mono 0, is now stable for the full
     /// threshold on the leader's own clock.
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.fenced_now, 1u);
@@ -1595,7 +1773,7 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     ASSERT_TRUE(obs.contains("s1"));
     const Etag first_etag = obs.at("s1").etag;
 
@@ -1603,7 +1781,7 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     const Etag renewed_etag = currentEtag(ops.op, l.mountKey("s1"));
     EXPECT_NE(renewed_etag, first_etag);
 
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.fenced_now, 0u);
@@ -1626,7 +1804,7 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     seedMount(ops.op, l, "s2", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
 
     MountObservationMap obs;
-    computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     ASSERT_TRUE(obs.contains("s1"));
     ASSERT_TRUE(obs.contains("s2"));
 
@@ -1638,7 +1816,7 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     renewMount(ops.op, l, "s1");
     ASSERT_EQ(ops.op.removeCurrent(l.mountKey("s2"), Retry::standard()), Removal::Removed);
 
-    computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs, kStableThresholdMs, obs);
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs), kStableThresholdMs, obs);
     EXPECT_TRUE(obs.contains("s1"));
     EXPECT_FALSE(obs.contains("s2"))
         << "a srid removed from the LIST entirely must be pruned from obs, not linger forever";
@@ -1665,7 +1843,7 @@ TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
     MountObservationMap obs;
 
     /// Round 1 (mono 0): first sight of every non-terminal mount — nothing is fence-eligible yet.
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     EXPECT_EQ(floor_before.live, 3u);            // s1, s2, s3: observation just started
     EXPECT_EQ(floor_before.terminated, 1u);      // s5
     EXPECT_EQ(floor_before.fenced_now, 0u);
@@ -1682,7 +1860,7 @@ TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
 
     /// Round 2 (mono == threshold): s1/s2's renewed incarnations restart their observation (still
     /// live); s3's original incarnation has now held stable for the full threshold -> fenced.
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.live, 2u);            // s1, s2: renewed, observation restarted
@@ -1760,14 +1938,14 @@ TEST(CASHeartbeatFloor, FenceOutLosesTheIncarnationRaceAndReclassifiesLive)
     MountObservationMap obs;
     /// Round 1: first sight, observation starts — never reaches the fence-out path (the race
     /// decorator stays armed for round 2).
-    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
     EXPECT_EQ(floor_before.fenced_now, 0u);
 
     /// Round 2: the incarnation has been stable past threshold, so the function attempts the
     /// fence-out. The decorator renews concurrently under the real incarnation, the write is refused,
     /// and the re-decision reclassifies the slot as live (observation restarted on the new
     /// incarnation) — never fenced.
-    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ kStableThresholdMs,
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs),
                                                           kStableThresholdMs, obs);
 
     EXPECT_EQ(floor2.fenced_now, 0u);
@@ -1778,6 +1956,192 @@ TEST(CASHeartbeatFloor, FenceOutLosesTheIncarnationRaceAndReclassifiesLive)
     EXPECT_FALSE(decodeMountLease(after->bytes).gc_fenced);
 }
 
+namespace
+{
+/// Moves the observer clock by `read_cost_ms` on every read of a mount slot, so a call spends that
+/// long between its entry sample and the read it decides on. `renew_before_next_fence` makes the
+/// holder renew just before the next guarded write of a slot lands, so the fence-out is refused and
+/// decided again on the new token. `fail_slot_reads` makes every slot read time out.
+class SlotClockBackend : public InMemoryBackend
+{
+public:
+    explicit SlotClockBackend(uint64_t & mono_) : mono(mono_) {}
+
+    uint64_t read_cost_ms = 0;
+    bool renew_before_next_fence = false;
+    bool fail_slot_reads = false;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (key.ends_with("/mount"))
+        {
+            if (fail_slot_reads)
+                throw Poco::TimeoutException("injected: mount slot read timed out");
+            mono += read_cost_ms;
+        }
+        return InMemoryBackend::read(key, access);
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value,
+                                             TransportAccess & access) override
+    {
+        if (renew_before_next_fence && expected_value && key.ends_with("/mount"))
+        {
+            renew_before_next_fence = false;
+            const auto got = InMemoryBackend::read(key, access);
+            MountLease m = decodeMountLease(got->bytes);
+            m.seq += 1;
+            EXPECT_TRUE(InMemoryBackend::write(key, encodeMountLease(m), got->value, access).has_value());
+        }
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+
+private:
+    uint64_t & mono;
+};
+}
+
+TEST(CASHeartbeatFloor, ConfirmingCallDecidesOnItsEntrySample)
+{
+    uint64_t mono = 0;
+    auto b = std::make_shared<SlotClockBackend>(mono);
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const auto clock = [&mono] { return mono; };
+    MountObservationMap obs;
+
+    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_EQ(obs.at("s1").first_seen_mono_ms, 0u);
+
+    /// The call starts one millisecond short of the threshold; its walk passes the threshold many times.
+    mono = kStableThresholdMs - 1;
+    b->read_cost_ms = 10 * kStableThresholdMs;
+    const HeartbeatFloor slow = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    EXPECT_EQ(slow.fenced_now, 0u);
+    EXPECT_EQ(slow.live, 1u);
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, 0u) << "an unchanged token keeps its first sighting";
+
+    b->read_cost_ms = 0;
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u);
+}
+
+TEST(CASHeartbeatFloor, FailedSlotReadKeepsTheWatch)
+{
+    uint64_t mono = 0;
+    auto b = std::make_shared<SlotClockBackend>(mono);
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const auto clock = [&mono] { return mono; };
+    MountObservationMap obs;
+
+    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_EQ(obs.at("s1").first_seen_mono_ms, 0u);
+
+    mono = kStableThresholdMs / 2;
+    b->fail_slot_reads = true;
+    EXPECT_ANY_THROW(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs));
+    ASSERT_TRUE(obs.contains("s1"));
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, 0u);
+
+    b->fail_slot_reads = false;
+    mono = kStableThresholdMs;
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u)
+        << "a failed read restarted the observation";
+}
+
+TEST(CASHeartbeatFloor, SampleOlderThanTheSightingNeverFences)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    MountObservationMap obs;
+
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs), kStableThresholdMs, obs);
+    ASSERT_EQ(obs.at("s1").first_seen_mono_ms, kStableThresholdMs);
+
+    /// A clock that went back: the unsigned difference would wrap past any threshold.
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs - 1),
+                                                       kStableThresholdMs, obs);
+    EXPECT_EQ(floor.fenced_now, 0u);
+    EXPECT_EQ(floor.live, 1u);
+}
+
+namespace
+{
+constexpr uint64_t kWalkMs = 4'000;
+}
+
+TEST(CASHeartbeatFloor, FirstSightingCountsFromAfterItsRead)
+{
+    uint64_t mono = 0;
+    auto b = std::make_shared<SlotClockBackend>(mono);
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const auto clock = [&mono] { return mono; };
+    MountObservationMap obs;
+
+    /// The call starts at 0 and reaches the slot at `kWalkMs`.
+    b->read_cost_ms = kWalkMs;
+    ASSERT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 0u);
+    ASSERT_TRUE(obs.contains("s1"));
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kWalkMs);
+
+    /// One threshold after the first call started, less than one after its read.
+    b->read_cost_ms = 0;
+    mono = kStableThresholdMs;
+    const HeartbeatFloor early = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    EXPECT_EQ(early.fenced_now, 0u) << "fenced a token watched for less than the threshold";
+    EXPECT_EQ(early.live, 1u);
+
+    mono = kWalkMs + kStableThresholdMs;
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u);
+}
+
+TEST(CASHeartbeatFloor, RedecisionAfterARefusedFenceCountsFromItsRead)
+{
+    uint64_t mono = 0;
+    auto b = std::make_shared<SlotClockBackend>(mono);
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    const auto clock = [&mono] { return mono; };
+    MountObservationMap obs;
+
+    computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_TRUE(obs.contains("s1"));
+    const Etag first = obs.at("s1").etag;
+
+    /// Stable at this call's start, so it tries the fence-out. The holder renews first, the write is
+    /// refused, and the call decides again on the new token after reading it.
+    mono = kStableThresholdMs;
+    b->read_cost_ms = kWalkMs;
+    b->renew_before_next_fence = true;
+    const HeartbeatFloor refused = computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs);
+    ASSERT_FALSE(b->renew_before_next_fence) << "the call never attempted the fence-out";
+    ASSERT_EQ(refused.fenced_now, 0u);
+    ASSERT_EQ(refused.live, 1u);
+    ASSERT_NE(obs.at("s1").etag, first);
+
+    /// Nothing reads after the re-decision, so the clock holds the value of the last read.
+    const uint64_t reread_at = mono;
+    ASSERT_GT(reread_at, kStableThresholdMs);
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, reread_at);
+
+    /// One threshold after that call started, less than one after its re-read.
+    b->read_cost_ms = 0;
+    mono = 2 * kStableThresholdMs;
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 0u)
+        << "fenced the renewed token before it was watched for the threshold";
+
+    mono = reread_at + kStableThresholdMs;
+    EXPECT_EQ(computeHeartbeatFloor(ops.op, l, kNowMs, clock, kStableThresholdMs, obs).fenced_now, 1u);
+}
+
 TEST(CASHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -1785,7 +2149,7 @@ TEST(CASHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
 
     Ops ops(b);
     MountObservationMap obs;
-    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kStableThresholdMs, obs);
 
     EXPECT_EQ(floor.live, 0u);
     EXPECT_EQ(floor.terminated, 0u);
@@ -1880,6 +2244,159 @@ TEST(CASClaimMount, SameEpochFencedIsNotRefreshable)
     /// A DIFFERENT epoch reclaims immediately (existing branch, unchanged):
     EXPECT_EQ(claimMount(ops.op, layout, "a", DB::UInt128{1}, 2, 2000, 10'000).kind,
               MountClaimResult::Claimed);
+}
+
+/// An older allocation that reaches the slot late must not replace a newer incarnation of this server,
+/// whatever certifies that incarnation's end: recovery seals only epochs below the live one.
+TEST(CASClaimMountMonotonicity, LowerEpochOverANewerBodyFailsWithoutWriting)
+{
+    enum class Shape { Live, GcFenced, CleanFarewell, ProvenDead, UnsafeAuthorized };
+    for (const Shape shape : {Shape::Live, Shape::GcFenced, Shape::CleanFarewell, Shape::ProvenDead,
+                              Shape::UnsafeAuthorized})
+    {
+        SCOPED_TRACE(static_cast<int>(shape));
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        const String key = l.mountKey("r");
+        ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/8, 1000, 30000).kind, MountClaimResult::Claimed);
+        if (shape == Shape::GcFenced || shape == Shape::CleanFarewell)
+        {
+            const auto got = ops.op.read(key, Retry::standard());
+            ASSERT_TRUE(got.has_value());
+            MountLease body = decodeMountLease(got->bytes);
+            ++body.seq;
+            if (shape == Shape::GcFenced)
+                body.gc_fenced = true;
+            else
+                body.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+            mustCommit(ops.op.replace(key, encodeMountLease(body), got->etag, Retry::standard()), "terminal newer body");
+        }
+        const auto before = ops.op.read(key, Retry::standard());
+        ASSERT_TRUE(before.has_value());
+        const std::optional<Etag> token = before->etag;
+
+        DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "newer than the writer_epoch", [&]
+        {
+            (void)claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/7, 2000, 30000,
+                             shape == Shape::ProvenDead ? token : std::nullopt, /*sink=*/{},
+                             shape == Shape::UnsafeAuthorized ? token : std::nullopt);
+        });
+        EXPECT_EQ(ops.op.read(key, Retry::standard())->bytes, before->bytes) << "the newer body was replaced";
+    }
+}
+
+TEST(CASClaimMountMonotonicity, TwoAllocatorsSharingAnEpochDoNotShareTheSlot)
+{
+    auto b = std::make_shared<EpochCollisionBackend>();
+    Layout l("p");
+    Ops ops(b);
+    b->epoch_key = l.epochKey("r");
+    ASSERT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+
+    b->armed = true;
+    const uint64_t shared_epoch
+        = allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+    ASSERT_FALSE(b->armed) << "the collision was never injected";
+    ASSERT_EQ(shared_epoch, 2u);
+    /// One bump past the shared epoch: the competitor's, which our resolve read took for ours.
+    ASSERT_EQ(decodeServerEpoch(ops.op.read(l.epochKey("r"), Retry::standard())->bytes).next_writer_epoch, 3u);
+
+    /// The competitor claims first.
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), shared_epoch, 1000, 30000).kind, MountClaimResult::Claimed);
+    const auto competitor = ops.op.read(l.mountKey("r"), Retry::standard());
+    ASSERT_TRUE(competitor.has_value());
+
+    const MountClaimResult ours = claimMount(ops.op, l, "r", UInt128(1), shared_epoch, 2000, 30000);
+    EXPECT_EQ(ours.kind, MountClaimResult::LiveDoubleStart);
+    ASSERT_TRUE(ours.body.has_value());
+    EXPECT_EQ(ours.body->write_attempt_id, decodeMountLease(competitor->bytes).write_attempt_id);
+    ASSERT_TRUE(ours.etag.has_value());
+    EXPECT_TRUE(*ours.etag == competitor->etag);
+    EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->bytes, competitor->bytes) << "the slot was written";
+}
+
+TEST(CASClaimMountMonotonicity, AwaitingExpiryReturnsAtOnceOnABodyOfOurOwnPair)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    /// Another process allocated epoch 7 as well; its body is in the slot.
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, 1000, 100).kind, MountClaimResult::Claimed);
+    const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
+    ASSERT_TRUE(before.has_value());
+
+    uint64_t mono = 0;
+    int sleeps = 0;
+    const auto r = claimMountAwaitingExpiry(ops.op, l, "r", UInt128(1), /*our_epoch=*/7,
+        [] { return uint64_t{1000}; }, [&] { return mono; }, /*ttl_ms=*/100, /*poll_interval_ms=*/20,
+        [&](uint64_t ms)
+        {
+            mono += ms;
+            if (++sleeps > 100)
+                throw std::runtime_error("the observation of our own (uuid, epoch) never ended");
+        });
+    EXPECT_EQ(r.kind, MountClaimResult::LiveDoubleStart);
+    EXPECT_EQ(sleeps, 0) << "no observation can authorize replacing our own pair";
+    EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->bytes, before->bytes);
+}
+
+TEST(CASClaimMountMonotonicity, AwaitingExpiryFailsAtOnceWhenARacedWriteMeetsANewerEpoch)
+{
+    auto b = std::make_shared<DB::Cas::tests::MountSlotRaceBackend>();
+    Layout l("p");
+    Ops ops(b);
+    /// Absent at our read; a newer start of this server mints the slot before our create lands.
+    b->before_put_if_absent = [&]
+    {
+        DB::Cas::tests::OperationForTest racer(*b);
+        ASSERT_EQ(claimMount(*racer, l, "r", UInt128(1), /*our_epoch=*/8, 1000, 100).kind, MountClaimResult::Claimed);
+    };
+
+    uint64_t mono = 0;
+    int sleeps = 0;
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "newer than the writer_epoch", [&]
+    {
+        (void)claimMountAwaitingExpiry(ops.op, l, "r", UInt128(1), /*our_epoch=*/7,
+            [] { return uint64_t{1000}; }, [&] { return mono; }, /*ttl_ms=*/100, /*poll_interval_ms=*/20,
+            [&](uint64_t ms)
+            {
+                mono += ms;
+                ++sleeps;
+            });
+    });
+    EXPECT_FALSE(b->before_put_if_absent) << "the newer start was never installed";
+    EXPECT_EQ(sleeps, 0) << "a newer incarnation is refused, not observed";
+    EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 8u);
+}
+
+/// The engine settles our own landed attempt inside the write call, so a claim never meets its own body
+/// on a later call.
+TEST(CASClaimMountMonotonicity, AConfirmedLandedReclaimIsStillClaimed)
+{
+    auto b = std::make_shared<LandedReplaceAckLostOnceBackend>();
+    Layout l("p");
+    Ops ops(b);
+    b->key = l.mountKey("r");
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, 1000, 30000).kind, MountClaimResult::Claimed);
+    {
+        const auto got = ops.op.read(b->key, Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease fenced = decodeMountLease(got->bytes);
+        fenced.gc_fenced = true;
+        ++fenced.seq;
+        mustCommit(ops.op.replace(b->key, encodeMountLease(fenced), got->etag, Retry::standard()), "fence-out");
+    }
+
+    b->armed = true;
+    const MountClaimResult r = claimMount(ops.op, l, "r", UInt128(1), 8, 2000, 30000);
+    ASSERT_FALSE(b->armed) << "the lost response was never injected";
+    EXPECT_EQ(r.kind, MountClaimResult::Claimed);
+    EXPECT_EQ(r.prior, MountPriorState::Fenced);
+    ASSERT_TRUE(r.body.has_value());
+    const MountLease slot = decodeMountLease(ops.op.read(b->key, Retry::standard())->bytes);
+    EXPECT_EQ(slot.writer_epoch, 8u);
+    EXPECT_EQ(slot.write_attempt_id, r.body->write_attempt_id);
 }
 
 /// ---- rev.6 Task 4: observation-based lease reclaim (no cross-node wall-clock trust) ----

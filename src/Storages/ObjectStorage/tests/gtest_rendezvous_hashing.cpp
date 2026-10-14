@@ -53,7 +53,7 @@ namespace
     {
         for (size_t i = 0; i < n; ++i)
         {
-            ObjectInfoPtr object = distributor.getNextTask(replica_id);
+            ObjectInfoPtr object = distributor.getNextTask(replica_id).object;
             if (!object)
                 return false;
             auto path = object->getPath();

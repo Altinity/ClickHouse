@@ -310,8 +310,10 @@ static detail::ConditionalWriteOutcome finalizeConditionalWriteInstrumented(Writ
 std::expected<String, Backend::RawConflict> ObjectStorageBackend::nativeConditionalPut(
     const String & key, const String & bytes, const WriteSettings & ws)
 {
+    /// Sized to the body, so a small control-plane write does not allocate a full default buffer. At
+    /// least one byte, because `WriteBuffer::write` asserts a non-empty buffer.
     auto buf = object_storage->writeObject(
-        StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, ws);
+        StoredObject(key), WriteMode::Rewrite, /*attributes=*/std::nullopt, std::max<size_t>(1, bytes.size()), ws);
     buf->write(bytes.data(), bytes.size());
     if (finalizeConditionalWriteInstrumented(*buf) == detail::ConditionalWriteOutcome::PreconditionLost)
         return std::unexpected(RawConflict{});
@@ -810,6 +812,10 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings(size_t attempt_no) 
     if (native_token_type == Dialect::Generation)
         ws.s3_force_single_part_upload = true;
     ws.s3_check_objects_after_upload_override = false;
+    /// Upload on the calling thread, so a memory guard the caller holds covers the upload. The caller
+    /// waits for the write anyway; only a multipart body on an ETag store pays, its parts now uploading
+    /// one after another.
+    ws.s3_allow_parallel_part_upload = false;
     /// Exactly one attempt at the WriteBufferFromS3 layer too: makeSinglepartUpload/
     /// completeMultipartUpload run their OWN retry loop above the S3 client, reissuing the identical
     /// (conditional!) request on NO_SUCH_KEY — a client-level override alone does not bound it. Plain

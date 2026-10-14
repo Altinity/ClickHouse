@@ -14,9 +14,19 @@
 #include <vector>
 #include <mutex>
 #include <memory>
+#include <optional>
+#include <atomic>
 
 namespace DB
 {
+
+struct DistributedReadTask
+{
+    ObjectInfoPtr object;
+    /// Microseconds the worker should wait before asking again.
+    /// Set only when `object` is empty and the worker understands Antalya protocol version 2.
+    std::optional<UInt64> retry_after_us;
+};
 
 class StorageObjectStorageStableTaskDistributor
 {
@@ -27,7 +37,10 @@ public:
         bool send_over_whole_archive_,
         uint64_t lock_object_storage_task_distribution_ms_);
 
-    ObjectInfoPtr getNextTask(size_t number_of_current_replica);
+    /// `worker_supports_task_retry` is false for a peer that did not negotiate Antalya protocol version 2.
+    /// The first such peer disables `lock_object_storage_task_distribution_ms` for the rest of the query:
+    /// every replica is then given a file immediately, with no `retry_after_us`.
+    DistributedReadTask getNextTask(size_t number_of_current_replica, bool worker_supports_task_retry = true);
 
     /// Insert objects back to unprocessed files
     void rescheduleTasksFromReplica(size_t number_of_current_replica);
@@ -36,7 +49,7 @@ private:
     size_t getReplicaForFile(const String & file_path);
     ObjectInfoPtr getPreQueuedFile(size_t number_of_current_replica);
     ObjectInfoPtr getMatchingFileFromIterator(size_t number_of_current_replica);
-    ObjectInfoPtr getAnyUnprocessedFile(size_t number_of_current_replica);
+    DistributedReadTask getAnyUnprocessedFile(size_t number_of_current_replica, bool allow_task_retry);
 
     void saveLastNodeActivity(size_t number_of_current_replica);
 
@@ -56,6 +69,8 @@ private:
 
     std::mutex mutex;
     bool iterator_exhausted = false;
+    /// Set when any worker in this query cannot carry `retry_after_us`. Further tasks skip the lock.
+    std::atomic<bool> task_retry_disabled{false};
 
     LoggerPtr log = getLogger("StorageClusterTaskDistributor");
 };

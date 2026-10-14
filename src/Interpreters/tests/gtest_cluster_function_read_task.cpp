@@ -363,12 +363,12 @@ TEST(ClusterFunctionReadTaskResponse, RoundTripsFileMetaInfoOnAntalyaProtocol)
 
     String serialized;
     WriteBufferFromString out(serialized);
-    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS);
     out.finalize();
 
     ReadBufferFromString in(serialized);
     ClusterFunctionReadTaskResponse deserialized;
-    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO);
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS);
 
     ASSERT_TRUE(deserialized.file_meta_info && *deserialized.file_meta_info);
     const auto & column = (*deserialized.file_meta_info)->columns_info.at("id");
@@ -389,12 +389,82 @@ TEST(ClusterFunctionReadTaskResponse, AntalyaProtocolWithoutFileMetaInfoConsumes
 
     String serialized;
     WriteBufferFromString out(serialized);
-    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS);
     out.finalize();
 
     ReadBufferFromString in(serialized);
     ClusterFunctionReadTaskResponse deserialized;
-    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_DATA_FILE_META_INFO);
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS);
     EXPECT_FALSE(deserialized.file_meta_info.has_value());
+    EXPECT_TRUE(in.eof());
+}
+
+TEST(ClusterFunctionReadTaskResponse, OmitsRetryAfterUsForUpstreamPeer)
+{
+    ClusterFunctionReadTaskResponse with_retry;
+    with_retry.path = "data/file.parquet";
+    with_retry.retry_after_us = 1000;
+
+    ClusterFunctionReadTaskResponse without_retry;
+    without_retry.path = with_retry.path;
+
+    String with_retry_bytes;
+    String without_retry_bytes;
+    {
+        WriteBufferFromString out(with_retry_bytes);
+        with_retry.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, /*antalya_protocol_version*/ 0);
+        out.finalize();
+    }
+    {
+        WriteBufferFromString out(without_retry_bytes);
+        without_retry.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, /*antalya_protocol_version*/ 0);
+        out.finalize();
+    }
+    EXPECT_EQ(with_retry_bytes, without_retry_bytes);
+
+    ReadBufferFromString in(with_retry_bytes);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, /*antalya_protocol_version*/ 0);
+    EXPECT_FALSE(deserialized.retry_after_us.has_value());
+    EXPECT_EQ(deserialized.path, "data/file.parquet");
+    EXPECT_TRUE(in.eof());
+}
+
+TEST(ClusterFunctionReadTaskResponse, RoundTripsRetryAfterUsOnAntalyaProtocol)
+{
+    ClusterFunctionReadTaskResponse response;
+    response.retry_after_us = 2500;
+    EXPECT_FALSE(response.isEmpty());
+
+    String serialized;
+    WriteBufferFromString out(serialized);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS);
+    out.finalize();
+
+    ReadBufferFromString in(serialized);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS);
+    ASSERT_TRUE(deserialized.retry_after_us.has_value());
+    EXPECT_EQ(*deserialized.retry_after_us, 2500);
+    EXPECT_TRUE(deserialized.path.empty());
+    EXPECT_FALSE(deserialized.isEmpty());
+    EXPECT_TRUE(in.eof());
+}
+
+TEST(ClusterFunctionReadTaskResponse, AntalyaProtocolWithoutRetryConsumesPresenceFlag)
+{
+    ClusterFunctionReadTaskResponse response;
+    response.path = "data/file.parquet";
+
+    String serialized;
+    WriteBufferFromString out(serialized);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS);
+    out.finalize();
+
+    ReadBufferFromString in(serialized);
+    ClusterFunctionReadTaskResponse deserialized;
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS);
+    EXPECT_FALSE(deserialized.retry_after_us.has_value());
+    EXPECT_EQ(deserialized.path, "data/file.parquet");
     EXPECT_TRUE(in.eof());
 }

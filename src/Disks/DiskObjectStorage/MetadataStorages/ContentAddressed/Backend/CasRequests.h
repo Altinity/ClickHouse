@@ -304,8 +304,8 @@ public:
     void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, const Retry & policy);
     /// The one primitive that reports failure as a value, so the policy reissues on the OUTCOME:
     /// `Indeterminate` is retried, the four authoritative outcomes return at once, and an
-    /// `Indeterminate` that outlives the bound is returned rather than thrown. Admission refused before
-    /// the first attempt still throws -- nothing was probed.
+    /// `Indeterminate` that outlives the bound is returned rather than thrown. A lost fence or a spent
+    /// lease budget throws at any point, and so does a deadline reached before the first probe.
     SentinelProbeResult probeSentinel(const String & key, const Retry & policy);
     /// The OPEN is under the policy; the body is the SDK's.
     std::unique_ptr<ReadBuffer> stream(const String & key, const Retry & policy);

@@ -88,7 +88,7 @@ calling thread only submits and joins, never occupies a pool slot, so a pool of 
 to a correct serial run and can never deadlock. The contract is merge-nothing: if any task threw,
 nothing is merged and the first error in dispatch order is rethrown. Results are folded into the
 dependency set on the owning thread, into a copy, committed by one no-throw swap. Every physical
-task starts with blob `HEAD`; a present non-condemned body or a completed publication yields an
+task starts with blob `HEAD`; a present body with a `Clean` marker or a completed publication yields an
 explicit `Materialized` proof. A trusted source manifest instead yields `TrustedManifest` without
 blob I/O. Pool size is the
 server setting `cas_blob_upload_pool_size` (default 16).

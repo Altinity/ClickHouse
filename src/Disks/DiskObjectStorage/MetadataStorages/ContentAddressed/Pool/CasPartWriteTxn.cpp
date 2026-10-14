@@ -25,7 +25,7 @@ namespace ProfileEvents
     extern const Event CASMetaPut;
     extern const Event CASMetaCompareSwap;
     extern const Event CASMetaCreateClean;
-    extern const Event CASMetaAdoptBackfill;
+    extern const Event CASMetaAbsentRepublish;
     extern const Event CASMetaResurrectClean;
 }
 
@@ -425,22 +425,10 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             if (loaded)
                 validateMetaSize(loaded->meta);
 
-            if (!loaded || loaded->meta.state == MetaState::Clean)
+            /// Only a `Clean` marker read after the `HEAD` permits adoption. GC deletes the marker right
+            /// after the body, so an absent marker may mean the body this `HEAD` saw is already gone.
+            if (loaded && loaded->meta.state == MetaState::Clean)
             {
-                /// Observation can produce durable metadata and dependency readiness too.
-                requireAdmitted("after the mandatory `HEAD`");
-                if (!loaded)
-                {
-                    /// A backfilled marker is a point-read hint for the next observer, so a competing
-                    /// writer that got there first settles the same question: its outcome is not read.
-                    ProfileEvents::increment(ProfileEvents::CASMetaAdoptBackfill);
-                    putMetaIfAbsent(
-                        op,
-                        store->layout(),
-                        ref,
-                        BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size},
-                        policy);
-                }
                 requireAdmitted("before the body-put-avoided observation is recorded");
                 ProfileEvents::increment(ProfileEvents::CASBlobBodyPutAvoided);
                 EventEmitter{*store}.emit([&](CasEvent & event)
@@ -450,7 +438,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     event.object_hash = blobIdOf(ref);
                     event.token = present->etag.render();
                     event.outcome = "observed";
-                    event.reason = "a present non-condemned blob was observed after mandatory `HEAD`";
+                    event.reason = "a present blob with a `Clean` marker was observed after mandatory `HEAD`";
                     event.detail = {{"action", "observed"}, {"size", std::to_string(source.size)}};
                 });
                 requireAdmitted("before the observed dependency proof is returned");
@@ -459,7 +447,10 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::Materialized, source.size},
                     BlobUploadDiagnostics{BlobMaterializationAction::Observed, std::nullopt, std::nullopt}};
             }
-            reason = BlobPublicationReason::Condemned;
+            if (loaded)
+                reason = BlobPublicationReason::Condemned;
+            else
+                ProfileEvents::increment(ProfileEvents::CASMetaAbsentRepublish);
         }
 
         const bool first_publication = source.beginPublication();
@@ -531,7 +522,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             event.object_hash = blobIdOf(ref);
             event.outcome = "published";
             event.reason = reason == BlobPublicationReason::Absent
-                ? "blob was absent after mandatory `HEAD`"
+                ? "blob or its marker was absent after mandatory `HEAD`"
                 : "blob was present but `Condemned` after mandatory `HEAD`";
             event.detail = {
                 {"action", "published"},

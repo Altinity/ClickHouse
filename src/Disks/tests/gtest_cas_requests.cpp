@@ -71,6 +71,7 @@ using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::FakeClock;
 using DB::Cas::tests::expectBytes;
 using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::expectThrowsCodeWithMessage;
 
 namespace
 {
@@ -496,6 +497,36 @@ struct IndeterminateProbeBackend : InMemoryBackend
     }
 };
 
+/// With a zero attempt reservation only a reissue gate asks the fence for a non-zero budget, and what
+/// it asks for is the pause the loop is about to sleep. The first such gate moves the clock so the
+/// window left equals that pause, which lands the sleep exactly on the deadline whatever the jitter
+/// drew. Every later `admit` answers `after_landing`.
+struct PauseLandsOnDeadline
+{
+    FakeClock & clock;
+    uint64_t deadline_ms;
+    Fence::Admit after_landing = Fence::Admit::Ok;
+    std::optional<uint64_t> landed_pause_ms = std::nullopt;
+
+    Fence fence()
+    {
+        return Fence{
+            []() -> uint64_t { return 0; },
+            [this](uint64_t, uint64_t needed_ms)
+            {
+                if (landed_pause_ms)
+                    return after_landing;
+                if (needed_ms > 0)
+                {
+                    clock.now.store(deadline_ms - needed_ms);
+                    landed_pause_ms = needed_ms;
+                }
+                return Fence::Admit::Ok;
+            },
+            [](uint64_t) {}};
+    }
+};
+
 /// Refuses the FIRST `list` naming each distinct cursor -- one refusal per page -- and charges every
 /// list a fixed slice of the caller's clock, so what a page costs is a fact rather than a jitter draw.
 /// `always_refuse_cursor` keeps one page refused for good.
@@ -902,6 +933,59 @@ TEST(CASRequests, ProbeSentinelRetriesOnlyTheIndeterminateOutcome)
         EXPECT_EQ(backend->probes, 1u);
         EXPECT_TRUE(clock.sleeps.empty());
     }
+}
+
+TEST(CASRequests, ProbeSentinelReturnsTheLastIndeterminateWhenAPauseEndsOnTheDeadline)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<IndeterminateProbeBackend>();
+    backend->indeterminate_answers = std::numeric_limits<size_t>::max();
+    PauseLandsOnDeadline landing{.clock = clock, .deadline_ms = clock.now.load() + 10'000};
+    auto requests = makeRequests(backend, clock, landing.fence());
+    requests.setAttemptReservationForTest(0);
+    auto op = requests.admit();
+
+    const SentinelProbeResult result = op.probeSentinel("k", Retry::within(10'000));
+    EXPECT_EQ(result.outcome, ProbeOutcome::Indeterminate);
+    ASSERT_TRUE(landing.landed_pause_ms.has_value());
+    EXPECT_EQ(clock.now.load(), landing.deadline_ms);
+    ASSERT_FALSE(clock.sleeps.empty());
+    EXPECT_EQ(clock.sleeps.back(), *landing.landed_pause_ms);
+    /// The last pause ended on the boundary, so no probe followed it.
+    EXPECT_EQ(backend->probes, clock.sleeps.size());
+}
+
+TEST(CASRequests, ProbeSentinelStillThrowsARefusalAfterAPauseEndsOnTheDeadline)
+{
+    const auto expect_refusal = [](Fence::Admit refusal, const String & expected_message)
+    {
+        FakeClock clock;
+        auto backend = std::make_shared<IndeterminateProbeBackend>();
+        backend->indeterminate_answers = std::numeric_limits<size_t>::max();
+        PauseLandsOnDeadline landing{.clock = clock, .deadline_ms = clock.now.load() + 10'000, .after_landing = refusal};
+        auto requests = makeRequests(backend, clock, landing.fence());
+        requests.setAttemptReservationForTest(0);
+        auto op = requests.admit();
+
+        expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, expected_message,
+                                    [&] { (void)op.probeSentinel("k", Retry::within(10'000)); });
+        EXPECT_TRUE(landing.landed_pause_ms.has_value());
+    };
+    expect_refusal(Fence::Admit::LostOrRearmed, "mount fence tripped before the request");
+    expect_refusal(Fence::Admit::NoBudget, "no lease budget for one more request");
+}
+
+TEST(CASRequests, ProbeSentinelWithNoWindowThrowsBeforeAnyProbe)
+{
+    FakeClock clock;
+    auto backend = std::make_shared<IndeterminateProbeBackend>();
+    auto requests = makeRequests(backend, clock);
+    requests.setAttemptReservationForTest(0);
+    auto op = requests.admit();
+
+    expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "gave up at the policy deadline after 0 attempt(s)",
+                                [&] { (void)op.probeSentinel("k", Retry::within(0)); });
+    EXPECT_EQ(backend->probes, 0u);
 }
 
 TEST(CASRequests, AdmissionIsCheckedAtThreePoints)

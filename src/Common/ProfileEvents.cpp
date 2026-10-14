@@ -918,8 +918,8 @@ The server successfully detected this situation and will download merged part fr
     M(CASMetaPut,          "Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates metadata reconciliation or write contention.", ValueType::Number) \
     M(CASMetaCompareSwap,          "Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention.", ValueType::Number) \
     M(CASMetaDelete,       "Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity.", ValueType::Number) \
-    M(CASMetaCreateClean,  "Number of absent-body publication paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation.", ValueType::Number) \
-    M(CASMetaAdoptBackfill, "Number of blob-adoption paths that attempted a missing-metadata Clean backfill. Counts the attempt, not a guaranteed metadata creation.", ValueType::Number) \
+    M(CASMetaCreateClean,  "Number of publications after an absent body or an absent marker that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation.", ValueType::Number) \
+    M(CASMetaAbsentRepublish, "Number of blob publication attempts started because the body was present but its freshness marker was absent; such a body is republished, never adopted. Counts attempts, including ones that fail.", ValueType::Number) \
     M(CASMetaResurrectClean, "Number of condemned-body replacement paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata reset.", ValueType::Number) \
     M(CASGCMetaOps, "Number of per-hash metadata operations executed by CAS GC. Growing values indicate more GC candidates or metadata work.", ValueType::Number) \
     M(CASGCEnumerationPages, "Number of CAS GC LIST pages fetched while enumerating the object universe. Growing values indicate a larger universe or more frequent scans.", ValueType::Number) \
@@ -1377,6 +1377,7 @@ The server successfully detected this situation and will download merged part fr
     \
     M(ConnectionPoolIsFullMicroseconds, "Total time spent waiting for a slot in connection pool.", ValueType::Microseconds) \
     M(AsyncLoaderWaitMicroseconds, "Total time a query was waiting for async loader jobs.", ValueType::Microseconds) \
+    M(AsyncLoaderSpawnFailures, "Number of times the async loader could not spawn a worker because the global thread pool could not provide a thread. Queued jobs are then run by a worker the pool already has: one that is running, or one resuming from a wait on a job of another pool.", ValueType::Number) \
     \
     M(DistrCacheServerSwitches, "Distributed Cache read buffer event. Number of server switches between distributed cache servers in read/write-through cache", ValueType::Number) \
     M(DistrCacheReadMicroseconds, "Distributed Cache read buffer event. Time spent reading from distributed cache", ValueType::Microseconds) \
