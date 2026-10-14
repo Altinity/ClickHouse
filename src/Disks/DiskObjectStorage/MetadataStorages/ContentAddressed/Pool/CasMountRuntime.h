@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Common/ThreadPool.h>
+#include <base/defines.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -520,7 +521,7 @@ private:
     ThreadFromGlobalPool remount_worker;
     /// A leaf lock, never held across I/O.
     mutable std::mutex renewal_progress_mutex;
-    RenewalProgress renewal_progress;
+    RenewalProgress renewal_progress TSA_GUARDED_BY(renewal_progress_mutex);
     /// Counted entries into `scheduleRemount`; retained as a test-only observability seam.
     std::atomic<uint64_t> schedule_remount_calls_for_test{0};
 
