@@ -76,6 +76,7 @@ jobs:
             ./.github/grype/run_grype_scan.sh $DOCKER_IMAGE
 
         - name: Parse grype results
+          timeout-minutes: 60
           id: parse_grype
           run: |
             python3 -u ./.github/grype/parse_vulnerabilities_grype.py -o nice --no-colors --log raw.log --test-to-end
