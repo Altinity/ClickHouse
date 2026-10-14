@@ -130,7 +130,7 @@ anchor plus the TTL, and wall-clock `now` stays audit-only.
 
 `cas_mount_lease_ttl_ms` is local to each server. It is how long this server may write after its last
 confirmed renewal, and every other server waits at least this long before fencing or reclaiming its
-slot. Mixed values are safe, and so is changing the value one server at a time in any order. A longer
+slot. A configured value above 10 minutes (600000 ms) is clamped to 10 minutes with a warning at startup, so no holder declares a longer lease. Mixed values are safe, and so is changing the value one server at a time in any order. A longer
 lease on one server delays recovery after that server's crash, and the GC leader logs one `WARNING` per
 slot whose declared lease differs from its own. A server built without this rule waits only its own
 lease: keep the values equal until every server of the pool runs a build with the rule.

@@ -28,6 +28,10 @@ namespace ErrorCodes
 
 namespace
 {
+/// Observers wait for the lease a holder declares, so a long lease would block reclaim of a silently
+/// dead member for that long. The configured TTL is clamped here, before anything derives from it.
+constexpr UInt64 max_mount_lease_ttl_ms = 600'000;
+
 /// Poco renders repeated XML elements as `name`, `name[1]`, `name[2]` -- the convention
 /// `StorageURL` and `HTTPDictionarySource` both handle when reading repeated `<header>` elements.
 /// A key of ours that appears twice must be recognised by its base name rather than passed over as
@@ -251,6 +255,14 @@ void ContentAddressedSettings::validate()
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "content_addressed disk: cas_mount_lease_ttl_ms must be >= 1 (got {})",
             settings[ContentAddressedSetting::mount_lease_ttl_ms].value);
+
+    if (settings[ContentAddressedSetting::mount_lease_ttl_ms] > max_mount_lease_ttl_ms)
+    {
+        LOG_WARNING(getLogger("ContentAddressedSettings"),
+            "content_addressed disk: cas_mount_lease_ttl_ms={} exceeds the maximum of {} ms; using {} ms",
+            settings[ContentAddressedSetting::mount_lease_ttl_ms].value, max_mount_lease_ttl_ms, max_mount_lease_ttl_ms);
+        settings[ContentAddressedSetting::mount_lease_ttl_ms] = max_mount_lease_ttl_ms;
+    }
 
     if (settings[ContentAddressedSetting::mount_renew_period_ms] == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,

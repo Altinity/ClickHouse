@@ -26,6 +26,7 @@ namespace DB::ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsUInt64 gc_bulk_delete_chunk_keys;
+    extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
     extern const ContentAddressedSettingsString scratch_path;
     extern const ContentAddressedSettingsBool unsafe_remount_no_delay;
 }
@@ -610,4 +611,25 @@ TEST(CASContentAddressedSettings, UnsafeRemountNoDelayIsOffByDefault)
         s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
         EXPECT_TRUE(s[ContentAddressedSetting::unsafe_remount_no_delay].value);
     }
+}
+
+TEST(CASContentAddressedSettings, MountLeaseTtlAboveTheMaximumIsClampedWithOneWarning)
+{
+    ScopedCasSettingsLogCapture capture;
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_mount_lease_ttl_ms>3600000</cas_mount_lease_ttl_ms>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::mount_lease_ttl_ms].value, 600'000u);
+    const auto log = capture.captured();
+    EXPECT_EQ(countOccurrences(log, "cas_mount_lease_ttl_ms=3600000 exceeds the maximum of 600000 ms; using 600000 ms"), 1u) << log;
+}
+
+TEST(CASContentAddressedSettings, MountLeaseTtlAtTheMaximumIsKeptSilently)
+{
+    ScopedCasSettingsLogCapture capture;
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_mount_lease_ttl_ms>600000</cas_mount_lease_ttl_ms>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::mount_lease_ttl_ms].value, 600'000u);
+    EXPECT_EQ(countOccurrences(capture.captured(), "exceeds the maximum"), 0u) << capture.captured();
 }

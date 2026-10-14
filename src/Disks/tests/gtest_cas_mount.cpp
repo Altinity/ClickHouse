@@ -2067,6 +2067,19 @@ TEST(CASHeartbeatFloor, HolderDeclaringALongerLeaseIsWatchedForThatLease)
     EXPECT_EQ(floorAt(ops, l, 64'000, obs, warned).fenced_now, 1u);
 }
 
+/// A 10 minute declared lease (the longest a new holder declares) against the observer's 30 s: 600 s + 30 s + the 1 s step.
+TEST(CASHeartbeatFloor, HolderDeclaringTheMaximumLeaseIsFencedAtItsThresholdNotLater)
+{
+    Ops ops(std::make_shared<InMemoryBackend>());
+    Layout l("p");
+    seedMount(ops.op, l, "s1", /*expires*/ kNowMs + 600'000, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    MountObservationMap obs;
+    std::set<String> warned;
+    floorAt(ops, l, 0, obs, warned);
+    EXPECT_EQ(floorAt(ops, l, 630'999, obs, warned).fenced_now, 0u);
+    EXPECT_EQ(floorAt(ops, l, 631'000, obs, warned).fenced_now, 1u);
+}
+
 /// A shorter declared lease, a missing start stamp, equal stamps, an expiry before the start.
 TEST(CASHeartbeatFloor, ShorterOrUnusableDeclaredLeaseIsWatchedForTheObserversOwn)
 {

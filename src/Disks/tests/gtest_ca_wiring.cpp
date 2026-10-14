@@ -347,6 +347,7 @@ namespace DB::ErrorCodes
 namespace DB::ContentAddressedSetting
 {
     extern const ContentAddressedSettingsString staging_backend;
+    extern const ContentAddressedSettingsUInt64 mount_lease_ttl_ms;
 }
 
 namespace
@@ -3080,4 +3081,24 @@ TEST(CASWiring, TryFromDiskOnLocalDiskIsExceptionFreeAndCountsNoError)
         << "tryFromDisk on a non-content-addressed disk must not construct (and thereby count) "
            "a NOT_IMPLEMENTED exception — it runs per disk on every asynchronous-metrics tick";
     std::filesystem::remove_all(tmp);
+}
+
+/// A pool mounted from a 1-hour `cas_mount_lease_ttl_ms` declares the clamped 10 minutes in its slot.
+TEST(CASWiringMount, OverlongConfiguredLeaseIsDeclaredClamped)
+{
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_wiring_clamp_scratch");
+    settings[DB::ContentAddressedSetting::mount_lease_ttl_ms] = 3'600'000;
+    settings.validate();
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+
+    const auto pool = storage->store();
+    EXPECT_EQ(pool->poolConfig().mount_lease_ttl_ms.count(), 600'000);
+    DB::Cas::tests::OperationForTest op(*pool->poolBackendPtr());
+    const auto mounts = DB::Cas::listMounts(*op, pool->layout(), /*now_ms=*/0, /*skew_margin_ms=*/0);
+    ASSERT_EQ(mounts.size(), 1u);
+    EXPECT_GT(mounts[0].lease.started_at_ms, 0u);
+    EXPECT_EQ(mounts[0].lease.expires_at_ms - mounts[0].lease.started_at_ms, 600'000u);
 }
