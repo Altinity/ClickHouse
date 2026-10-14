@@ -991,13 +991,16 @@ std::unique_ptr<ExpressionStep> createComputeAliasColumnsStep(
 bool parallelReplicasEnabledForStorage(const StoragePtr & current_storage, const ContextPtr & context, const Settings & query_settings)
 {
     const auto * table_ptr = current_storage.get();
+    /// `getTargetTable` and `getUnderlyingMergeTreeStorageForParallelReplicas` return a `StoragePtr` by value.
+    /// A catalog lookup can be the only owner of that storage, so it has to stay alive for the checks below.
+    StoragePtr underlying_storage;
 
     if (query_settings[Setting::parallel_replicas_allow_view_over_mergetree])
     {
         const auto * view = typeid_cast<const StorageView *>(current_storage.get());
         if (view)
         {
-            auto underlying_storage = view->getUnderlyingMergeTreeStorageForParallelReplicas(context);
+            underlying_storage = view->getUnderlyingMergeTreeStorageForParallelReplicas(context);
             if (!underlying_storage)
                 return false;
 
@@ -1015,7 +1018,8 @@ bool parallelReplicasEnabledForStorage(const StoragePtr & current_storage, const
         if (mv->isRefreshable())
             return false;
 
-        table_ptr = mv->getTargetTable().get();
+        underlying_storage = mv->getTargetTable();
+        table_ptr = underlying_storage.get();
     }
 
     if (!table_ptr->isMergeTree())
