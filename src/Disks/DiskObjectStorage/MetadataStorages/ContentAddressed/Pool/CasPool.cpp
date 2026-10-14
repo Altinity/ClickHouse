@@ -770,7 +770,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                     "(GC fenced its lease). A hard-killed member shows state = 'expired' first and is not removable "
                     "yet. The disk's GC leader fences it once it has seen the lease unchanged for about one "
                     "cas_mount_lease_ttl_ms plus one cas_mount_renew_period_ms. SYSTEM CAS GC RUN on the leader "
-                    "(is_leader = 1 in system.cas_mounts) speeds this up, and it may take two runs. "
+                    "(is_leader = 1 in system.cas_mounts) can trigger the fence, but the run that fences must come at "
+                    "least that long after the first run that saw the lease. "
                     "Then rerun this command.",
                     srid, holder, srid);
             }

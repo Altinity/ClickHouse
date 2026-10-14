@@ -598,7 +598,8 @@ The claim accepts only a terminal mount slot (`state` `terminated` or `fenced` i
 `system.cas_mounts`). A hard-killed member shows `expired` until the disk's GC leader fences it, once it has
 seen the lease unchanged for about one lease TTL plus one renew period. Until then the command
 refuses with `alive or contended`. `SYSTEM CAS GC RUN` on the leader (`is_leader = 1` in
-`system.cas_mounts`) speeds this up and may take two runs.
+`system.cas_mounts`) can trigger the fence, but the run that fences must come at least that long after
+the first run that saw the lease; two back-to-back runs do not fence.
 
 It is a writer operation, not GC: it emits ordinary ref-edge deltas rather than inventing GC
 transitions, and it does not synchronously reclaim shared blob content — removing the ref edges only

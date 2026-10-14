@@ -50,9 +50,9 @@ and never reassigned — decommission only tombstones it in place.
 | present, same `server_uuid`, not tombstoned | proceed |
 | present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned; the refusal says to configure a new `cas_server_root_id` |
 | present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause and, for a dead owner, `SYSTEM CAS DROP POOL MEMBER` |
-| absent, id contains `/` | `BAD_ARGUMENTS` — a new id may not be nested; an existing nested owner proceeds by the first row |
-| absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
+| absent, subtree provably empty, id contains `/` | `BAD_ARGUMENTS` — a new id may not be nested; an existing nested owner proceeds by the first row |
+| absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | lost the `putIfAbsent` race | re-read; equal uuid proceeds, else `CORRUPTED_DATA` |
 
 "Provably empty" requires both an authoritative decoded catalog naming no life owned by `server_root_id` and

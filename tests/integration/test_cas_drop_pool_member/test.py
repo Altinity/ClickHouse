@@ -178,7 +178,7 @@ def test_drop_dead_pool_member_heals_the_pool():
     #     be live under its conservative safety margin. The destructive side being stricter is the
     #     fail-close direction, so the table saying "not live" does not guarantee the command is
     #     ready yet -- under sanitizer slowdowns the gap is wide enough to hit. Retry the command
-    #     itself through the documented "wait for its lease to lapse" refusal, bounded.
+    #     itself through its `alive or contended` refusal until the slot turns `fenced`, bounded.
     report_tsv = None
     for _ in range(90):
         try:
@@ -190,7 +190,7 @@ def test_drop_dead_pool_member_heals_the_pool():
             if "alive or contended" not in str(e):
                 raise
             time.sleep(1.0)
-    assert report_tsv is not None, "decommission kept refusing: lease never lapsed within the bound"
+    assert report_tsv is not None, "decommission kept refusing as alive or contended: the slot never turned fenced within the bound"
     fields = report_tsv.split("\t")
     assert len(fields) == 10, report_tsv
     assert fields[0] == SRID2, report_tsv

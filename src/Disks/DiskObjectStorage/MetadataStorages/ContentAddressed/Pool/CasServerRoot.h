@@ -148,11 +148,11 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
 ///   - owner present, equal `our_uuid`, and not tombstoned → ok (return);
 ///   - owner present and tombstoned → throw `CORRUPTED_DATA` (explicitly retired — fail closed);
 ///   - owner present, different → throw `CORRUPTED_DATA` (foreign owner — fail closed);
-///   - owner absent AND `srid` contains '/' → throw `BAD_ARGUMENTS` (nested ids are not created; an
-///     existing nested owner is honoured by the first bullet);
-///   - owner absent AND the subtree is provably empty → `create` the owner (claim);
 ///   - owner absent BUT the subtree is non-empty → throw `CORRUPTED_DATA` (identity lost over
-///     existing data — never silently re-claim).
+///     existing data — never silently re-claim);
+///   - owner absent, subtree provably empty AND `srid` contains '/' → throw `BAD_ARGUMENTS` (nested ids
+///     are not created; an existing nested owner is honoured by the first bullet);
+///   - owner absent, subtree provably empty → `create` the owner (claim).
 /// The owner object is never deleted and never reassigned to a different UUID.
 void claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
@@ -608,8 +608,9 @@ private:
 /// Mount-lease-scoped staging sweeper for objects left behind by S3-native staging.
 ///
 /// A leaked S3 staging object is one whose transaction never ran `cleanupPendingTempFiles` (the process
-/// died, or an exception hit between the upload and the cleanup) or whose best-effort delete on commit or
-/// abort was lost; this sweeper is its only reclaimer. Debris from either case is
+/// died, or an exception hit between `sink->finalize()` and `on_finalized` registering the key in
+/// `CaContentWriteBuffer::finalizeImpl`) or whose best-effort delete on commit or abort was lost. While
+/// the member lives, this sweeper is its only reclaimer. Debris from either case is
 /// bounded to `staging/<mount_id>/` — the ONE mount that could ever have written under that prefix, since
 /// every staging key this mount ever mints comes from `ContentAddressedMetadataStorage::stagingKeyPrefix()`
 /// (`physicalKey(pool_prefix + "/staging/" + server_root_id)`), keyed by THIS mount's own `server_root_id`.

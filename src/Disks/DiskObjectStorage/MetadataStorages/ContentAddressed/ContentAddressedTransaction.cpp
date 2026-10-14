@@ -108,9 +108,8 @@ ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadat
 
 ContentAddressedTransaction::~ContentAddressedTransaction()
 {
-    /// Always clean up pending staging (whether committed or not). On the success path
-    /// cleanupPendingTempFiles was already called at the end of commit(); this call is the defensive
-    /// backstop for aborted/exception-unwound transactions whose publishStaging never ran.
+    /// On abort this is the cleanup of local and S3 staging. After a commit it finds nothing left,
+    /// except when the commit published some parts and then threw.
     cleanupPendingTempFiles();
 
     /// An uncommitted transaction's uploads become min_active_build_sequence-spared debris: abandon every

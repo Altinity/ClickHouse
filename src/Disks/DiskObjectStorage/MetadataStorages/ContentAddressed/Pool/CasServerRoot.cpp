@@ -546,10 +546,11 @@ void claimOwnerOrThrow(
             "CAS server-root '{}' is owned by a different server (owner server_uuid={}, ours={}) — refusing to claim. "
             "Either this server's local uuid file was regenerated (/var/lib/clickhouse wiped, or a pod recreated "
             "without a persistent volume) while the pool kept the old identity, or two servers are configured with "
-            "the same <cas_server_root_id>. Recover by restoring the old uuid file; or configure a fresh "
-            "<cas_server_root_id> for this disk; or, if the owning server is permanently gone, decommission it "
-            "first — SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '<disk>' on a surviving member (offline: "
-            "clickhouse-disks cas-drop-member) — and then start this server under a new <cas_server_root_id>. "
+            "the same <cas_server_root_id>. Recover by restoring the old uuid file, or by starting this "
+            "server under a new <cas_server_root_id>. To reclaim the old id's data once its owning server is "
+            "permanently gone, decommission it — SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '<disk>' on a "
+            "surviving member (offline: clickhouse-disks cas-drop-member) — once its slot in system.cas_mounts is "
+            "'terminated' or 'fenced'. "
             "Deleting the owner object '{}' by hand is a last resort, only after verifying that NO server uses this "
             "root; it is refused while the subtree still holds data.",
             srid, u128ToHex(owner->server_uuid), u128ToHex(our_uuid), srid, key);
@@ -572,7 +573,8 @@ void claimOwnerOrThrow(
             "CAS server-root '{}' has no owner and its id contains '/': a new server_root_id may not be nested, "
             "because a decommission selects objects by key prefix and would drain every member whose id starts "
             "with it. Configure a <cas_server_root_id> without '/'. A member that already owns a nested id keeps "
-            "working while its owner object '{}' exists.",
+            "working while its owner object '{}' exists (to decommission such a member, its owner object must "
+            "exist).",
             srid, key);
 
     const std::optional<Observation> occupant = conflictOrThrow(

@@ -33,8 +33,8 @@ namespace DB
 ///
 /// Content blobs are first represented by local or S3 staging objects and are uploaded only during
 /// publication. Inline entries remain in the manifest tree when they fit `INLINE_CAP`. The
-/// destructor removes the transaction's local and S3 staging,
-/// and abandons any open part builds; it never publishes an uncommitted ref.
+/// destructor removes the transaction's local and S3 staging and abandons any open part builds;
+/// it never publishes an uncommitted ref.
 class ContentAddressedTransaction : public IMetadataTransaction
 {
 public:

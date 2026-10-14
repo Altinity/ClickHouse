@@ -202,12 +202,13 @@ mount slot stays in place as a resume anchor rather than being fully retired.
 
 **Preconditions.** Confirm the member is actually and permanently dead before running this: the
 operation fences that `server_root_id` out even if the server comes back online, and it deletes
-namespace and drain state that cannot be recovered. The command claims the slot without waiting and trusts no wall clock, so it accepts only a terminal
-slot in `system.cas_mounts`: `state = 'terminated'` (clean stop) or `state = 'fenced'` (GC fenced the
-lease). A `live` or `expired` row is refused with `alive or contended`; a hard-killed member stays
-`expired` until the disk's GC leader fences it, once it has seen the lease unchanged for about one
+namespace and drain state that cannot be recovered. The command claims the slot without waiting
+and trusts no wall clock, so it accepts only a terminal slot in `system.cas_mounts`:
+`state = 'terminated'` (clean stop) or `state = 'fenced'` (GC fenced the lease). A `live` or `expired`
+row is refused with `alive or contended`; a hard-killed member stays `expired` until the disk's GC leader fences it, once it has seen the lease unchanged for about one
 `cas_mount_lease_ttl_ms` plus one `cas_mount_renew_period_ms`. `SYSTEM CAS GC RUN` on the leader
-(`is_leader = 1` in `system.cas_mounts`) speeds it up and may take two runs.
+(`is_leader = 1` in `system.cas_mounts`) can trigger the fence, but the run that fences must come at
+least that long after the first run that saw the lease; two back-to-back runs do not fence.
 
 **Verification.** After the command reports `slot_removed = true` with no warnings, the member's
 `server_root_id` no longer appears as a row in `system.cas_mounts` on any peer, and a subsequent
