@@ -2452,6 +2452,27 @@ TEST(CASPartWriteTxn, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
         << "stageManifest must fail closed before writing the manifest body, leaving no new objects";
 }
 
+TEST(CASPartWriteTxn, StageManifestRejectsTraversalPathBeforeBodyWrite)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/traversal-path"};
+    auto build = startBuildFor(store, ns, "part");
+
+    ManifestEntry entry;
+    entry.path = "../evil";
+    entry.placement = EntryPlacement::Inline;
+    entry.inline_bytes = "payload";
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        build->stageManifest({entry});
+    });
+
+    OperationForTest op(*backend);
+    EXPECT_TRUE((*op).list(store->layout().manifestNamespacePrefix(ns), "", 10, Retry::once()).keys.empty());
+}
+
 /// spec §9.9 (mixed-algo pools, Phase 3 T2) — the W-DEP-SET cross-satisfaction crux: a manifest with
 /// two entries carrying the SAME digest VALUE under TWO DIFFERENT algos (`ch128:X` / `xxh3:X`). Only
 /// `ch128:X`'s body is ever putBlob'd; `xxh3:X`'s body never lands anywhere. Promote MUST fail closed —
