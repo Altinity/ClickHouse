@@ -678,7 +678,7 @@ flowchart LR
     D -->|"still zero, .meta absent, Clean, older or unreadable"| C2["carried, .meta rewritten at this round, never throw"]
     D -->|"current token not equal to t"| SUP["SUPERSEDED -- a writer resurrected, re-condemn the CURRENT token"]
     G --> E["round n+2, pre-CAS: exact-token DELETE of blob at t"]
-    E -->|"Deleted or Absent"| F["then drop the .meta if it is still Condemned at round n or older"]
+    E -->|"Deleted or Absent"| F["then drop the .meta if it is still Condemned from a round before this one"]
     E -->|TokenMismatch| H["nothing deleted -- live at a newer token, leave the .meta alone"]
 ```
 
@@ -690,9 +690,11 @@ round that issues it and replaces an absent marker, `Clean`, or an older-round `
 
 Graduation reads the marker in the round that graduates and accepts only `Condemned` at the entry's round or
 newer: an older round may belong to another incarnation of the same content. The marker delete after a redelete
-removes only `Condemned` at the entry's round or older, conditional on the version it read, so a delayed delete
-never removes the marker of a later incarnation. It can leave an orphan `Condemned` marker over an absent body;
-the next writer of that hash republishes and clears it, and `cas-fsck` counts it in `meta_without_body`.
+removes only `Condemned` from a round before the deleting round, conditional on the version it read. This covers
+a marker the graduation gate re-stamped at a round later than the entry's. It can also remove the marker of a
+later incarnation; that is safe because a writer adopts only on `Clean` and republishes over an absent marker.
+A failed delete job can leave an orphan `Condemned` marker over an absent body; the next writer of that hash
+republishes and clears it, and `cas-fsck` counts it in `meta_without_body`.
 
 A blob whose in-degree reaches zero in round `n` is retired with `condemn_round = n`; it can graduate to
 `delete_pending` in round `n+1` at the earliest and be deleted in round `n+2`, so a minimum of two full rounds
@@ -751,7 +753,7 @@ logs:
 | `PUT` run segments | 1 per non-pure-carry shard, plus 1 fold seal |
 | `HEAD` blobs | 1 per newly condemned |
 | `GET` blob `.meta` at graduation | 1 per entry the graduation budget admits, plus 1 `GET` and 1 `PUT` per refusal (the rewrite job re-reads the marker before its conditional `PUT`) |
-| `GET` + conditional `DELETE` blob `.meta` after a redelete | 1 `GET` per `Deleted` or `Absent` outcome; the `DELETE` only while the marker is `Condemned` at the entry's round or older |
+| `GET` + conditional `DELETE` blob `.meta` after a redelete | 1 `GET` per `Deleted` or `Absent` outcome; the `DELETE` only while the marker is `Condemned` from a round before the deleting round |
 | Blob `HEAD` + conditional `DELETE` | 1 `HEAD` per `redelete` entry — an entry that graduated in an *earlier* round, not the current one — up to `cas_gc_round_redelete_budget`; a `DELETE` only when the body is present at the condemned token |
 | Successful lease `CAS gc/state` | 1 |
 | Commit `CAS gc/state` | 1 |

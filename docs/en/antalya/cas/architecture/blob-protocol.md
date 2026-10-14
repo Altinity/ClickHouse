@@ -36,11 +36,11 @@ sequenceDiagram
     alt body present
         S3-->>Writer: present, size, backend token t1
         Writer->>S3: GET .meta (point read, body never streamed)
-        alt meta Clean or absent
+        alt meta Clean
             Writer->>Writer: record token-free BlobDependencyProof::Materialized (never adopt t1)
-        else meta Condemned
+        else meta Condemned or absent
             Writer->>S3: unconditional publish with fresh envelope
-            Writer->>S3: reconcile .meta to Clean
+            Writer->>S3: create or reconcile .meta to Clean
         end
     else body absent
         S3-->>Writer: absent
@@ -56,9 +56,10 @@ Ordered steps in `PartWriteTxn::ensureBlobPresent`:
    still live.
 2. **Mandatory observation.** Every physical materialization begins with one blob `HEAD`, regardless
    of size, provider, staging backend, or whether another writer probably uploaded the same hash.
-3. On a hit, the writer reads `.meta`. `Clean` or absent metadata permits adoption; the writer
-   records a `Materialized` dependency proof without retaining the observed token. `Condemned`
-   requires a new publication.
+3. On a hit, the writer reads `.meta`. Only `Clean` permits adoption; the writer records a
+   `Materialized` dependency proof without retaining the observed token. `Condemned` or absent
+   metadata requires a new publication. `GC` deletes `.meta` right after the body, so an absent
+   marker can follow a delete that landed between the `HEAD` and the read.
 4. On a miss, the writer does not read `.meta` before publication. It publishes its own payload
    unconditionally, then creates or reconciles `.meta` to `Clean`.
 5. Streaming publication mints a fresh `incarnation_tag` and can use ordinary multipart. The first
@@ -67,7 +68,8 @@ Ordered steps in `PartWriteTxn::ensureBlobPresent`:
 6. `BlobSource::beginPublication` consumes the shared, monotonic `publication_attempted` state
    before backend I/O. A lost response cannot re-enable verbatim copy on a later attempt.
 7. Retryable or ambiguous failures restart at `HEAD`. No dependency proof is recorded until a
-   present non-condemned body was observed, or publication and metadata reconciliation completed.
+   present body with a `Clean` marker was observed, or publication and metadata reconciliation
+   completed.
 
 **Two writers uploading identical content** may both observe absence and both publish. The last
 physical incarnation wins, but the key proves that both payloads have the same logical identity and
@@ -151,7 +153,7 @@ sequenceDiagram
     alt writer republished
         S3-->>GC: TokenMismatch -- nothing deleted, blob is live at t2
     else genuinely dead
-        S3-->>GC: Deleted -- then drop the .meta only while it is still Condemned at round n or older
+        S3-->>GC: Deleted -- then drop the .meta only while it is still Condemned at round n+1 or older
     end
 ```
 
@@ -163,7 +165,7 @@ and a writer never trusts a body it did not itself just write.
 
 Why this closes the race in both directions:
 
-- A writer that **adopts** a present body must have read a non-`Condemned` marker, and its precommit
+- A writer that **adopts** a present body must have read a `Clean` marker, and its precommit
   edge was durable *before* that read. The next fold therefore sees in-degree ≥ 1 and spares the
   blob.
 - A writer that **replaces a condemned incarnation** changes the token. A stale `deleteExact(t1)` then returns
@@ -174,9 +176,11 @@ Why this closes the race in both directions:
   at the entry's round or newer. A `Clean`, absent, older-round or unreadable marker never
   graduates the entry: `GC` does not throw, it carries the entry and rewrites the marker at the
   current round.
-- The delete job removes the `.meta` only while it is still `Condemned` at the entry's round or
-  older, and conditionally on the version it read. A marker rewritten `Clean` by a writer, or
-  condemned again at a later round, stays.
+- The delete job removes the `.meta` only while it is still `Condemned` at a round before the
+  deleting round, and conditionally on the version it read. It also removes a marker the graduation
+  gate re-stamped. A marker rewritten `Clean` by a writer, or condemned in the deleting round,
+  stays. The delete job runs best effort: if it fails, the `Condemned` marker outlives its body
+  until a writer of that content replaces it, which costs storage, not safety.
 
 Both directions degrade to a spurious re-upload or a no-op delete. Neither can lose data or leave
 a dangling manifest entry.
@@ -189,8 +193,9 @@ in RAM at a time. Native object storage streams and can use multipart.
 
 `.meta` has exactly two states: `Clean` (body present, may be referenced) and `Condemned`
 (`GC` observed zero in-degree; the body is still present and a writer may replace it). An
-*absent* `.meta` reads exactly like `Clean` — there is no third "unaccounted" state in the
-stored format; `unaccounted` is a `cas-fsck` classification, not something `GC` ever writes.
+*absent* `.meta` never permits adoption: the writer republishes as for an absent body. There is
+no third "unaccounted" state in the stored format; `unaccounted` is a `cas-fsck` classification,
+not something `GC` ever writes.
 
 The record carries `state`, `condemn_round`, and `size`, and deliberately carries **no token**:
 it is a per-hash hint, not a per-incarnation fact. All safety comes from the body's in-envelope
