@@ -13,7 +13,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage 1: Install ClickHouse and assemble the output directory tree.
 # ──────────────────────────────────────────────────────────────────────────────
-FROM ubuntu:22.04 AS ch-builder
+FROM ubuntu:26.04 AS ch-builder
 
 # see https://github.com/moby/moby/issues/4032#issuecomment-192327844
 ARG DEBIAN_FRONTEND=noninteractive
