@@ -198,6 +198,7 @@ std::optional<ProcessedManifestFileEntryPtr> SingleThreadIcebergKeysIterator::ne
                 *persistent_components.schema_processor,
                 manifest_list_entry.added_sequence_number,
                 manifest_list_entry.added_snapshot_id,
+                manifest_list_entry.first_row_id,
                 local_context,
                 filter_dag,
                 table_snapshot->schema_id);
@@ -530,7 +531,8 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                                     table_schema_id, /// current schema id to use current column names
                                     manifest_file_entry->resolved_schema_id, /// file's schema id to interpret value_bounds bytes
                                     manifest_file_entry->parsed_entry->columns_infos,
-                                    manifest_file_entry->parsed_entry->value_bounds));
+                                    manifest_file_entry->parsed_entry->value_bounds,
+                                    data_file_path.serialize()));
 
         ProfileEvents::increment(ProfileEvents::IcebergMetadataReturnedObjectInfos);
 

@@ -17,6 +17,7 @@ namespace ProfileEvents
 #include <city.h>
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <optional>
 
@@ -38,9 +39,10 @@ namespace
 
 const UInt128 kZeroSourceId{0};
 
-/// Streams a shard's prior source-edge run at O(one block) resident memory: chains the run SEGMENTS the
-/// caller resolved from the parent seal (`blob_target_runs` filtered to one shard) and exposes a one-row
-/// lookahead for the fold merge. The prior run carries
+/// Streams a shard's prior source-edge run with one block resident, plus up to `kGraduationLookaheadRows`
+/// decoded rows while a graduation scan is buffering: chains the run SEGMENTS the caller resolved from the
+/// parent seal (`blob_target_runs` filtered to one shard) and exposes the next row to the fold merge. The
+/// prior run carries
 /// BOTH surviving edges (`RunMarker::Edge`) AND the retired `RunMarker::Condemned` sentinel rows at the zero source id,
 /// so the cursor stops at edges AND at condemned rows (exposing the type via `rowType`), while zero-marker
 /// sentinels are dropped on carry (per-generation, never carried forward). Row/key invariants are enforced
@@ -61,64 +63,35 @@ public:
     }
 
     bool valid() const { return has_current; }
-    const String & key() const { return current_key; }
+    const String & key() const { return current.key; }
     /// The value byte of the current row: `RunMarker::Edge` (a surviving edge) or `RunMarker::Condemned` (a retired
     /// sentinel row). Zero markers are never surfaced (dropped on carry).
-    RunMarker rowType() const { return current_type; }
+    RunMarker rowType() const { return current.type; }
     /// The decoded retired sentinel for the current row (only valid when `rowType() == RunMarker::Condemned`).
-    const CondemnedRow & condemnedRow() const { return current_condemned; }
+    const CondemnedRow & condemnedRow() const { return current.condemned; }
 
     /// Advance to the next surviving edge OR retired sentinel, dropping zero markers, enforcing the
     /// row/key invariants, and crossing segment boundaries.
     void advance()
     {
+        if (!lookahead.empty())
+        {
+            current = std::move(lookahead.front());
+            lookahead.pop_front();
+            current_offered = offered_ahead > 0;
+            if (offered_ahead > 0)
+                --offered_ahead;
+            has_current = true;
+            return;
+        }
+        current_offered = false;
         while (true)
         {
-            /// Pull rows from the open segment until a surviving edge, retired sentinel, or the segment ends.
             if (reader)
             {
-                String k;
-                String p;
-                while (reader->next(k, p))
+                if (auto row = pullRow())
                 {
-                    BlobRef bh;
-                    UInt128 sid;
-                    /// `parse` throws CORRUPTED_DATA on a malformed size / NOT_IMPLEMENTED on an
-                    /// unknown algo byte (fail-closed).
-                    SourceEdgeKeyCodec::parse(k, bh, sid);
-                    if (p.empty())
-                        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: empty row payload");
-                    const RunMarker v = runMarkerFromByte(p[0], "CAS source-edge run");
-                    const bool sentinel_key = (sid == kZeroSourceId);
-
-                    if (sentinel_key)
-                    {
-                        /// A sentinel key carries exactly one row per blob and never an edge.
-                        if (v == RunMarker::Edge)
-                            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                                "CAS source-edge run: active edge at the reserved sentinel source_id 0");
-                        if (have_sentinel_blob && sentinel_blob == bh)
-                            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                                "CAS source-edge run: duplicate sentinel row for one blob");
-                        have_sentinel_blob = true;
-                        sentinel_blob = bh;
-                        if (v == RunMarker::Zero)
-                            continue;   // A zero marker is per-generation and is dropped on carry.
-                        /// A retired sentinel: decode and surface it (settled at close-out, not an edge).
-                        current_condemned = decodeCondemnedRow(p);
-                        current_key = k;
-                        current_type = RunMarker::Condemned;
-                        has_current = true;
-                        return;
-                    }
-
-                    /// A non-sentinel key must carry a surviving edge and nothing else.
-                    if (v != RunMarker::Edge)
-                        throw Exception(ErrorCodes::CORRUPTED_DATA,
-                            "CAS source-edge run: sentinel row type 0x{:02x} at a non-sentinel key",
-                            static_cast<uint8_t>(v));
-                    current_key = k;
-                    current_type = RunMarker::Edge;
+                    current = std::move(*row);
                     has_current = true;
                     return;
                 }
@@ -139,19 +112,119 @@ public:
             /// Typed open validates the NDJSON header before any row is consumed. Each row carries its
             /// own algorithm byte, so no separate width gate is needed.
             reader = openSourceEdgeRun(op, segments[seg_idx].key);
+            reader_drained = false;
+        }
+    }
+
+    /// Offers the condemned rows from the current row onward, in order, each until `offer` accepts it: rows
+    /// of the OPEN segment are decoded into a buffer of at most `max_rows`. Stops when `offer` returns false
+    /// (that row is offered again next time), the buffer is full, or the open segment ends: opening the next segment,
+    /// and verifying the checksum of the one that ends, stay with `advance`. Rows are validated as `advance`
+    /// validates them, so a corrupt row throws here a few rows early.
+    void scanAhead(size_t max_rows, const std::function<bool(const BlobRef &, const CondemnedRow &)> & offer)
+    {
+        if (has_current && !current_offered)
+        {
+            if (!offerRow(current, offer))
+                return;
+            current_offered = true;
+        }
+        while (offered_ahead < lookahead.size())
+        {
+            if (!offerRow(lookahead[offered_ahead], offer))
+                return;
+            ++offered_ahead;
+        }
+        while (reader && lookahead.size() < max_rows)
+        {
+            auto row = pullRow();
+            if (!row)
+                return;
+            lookahead.push_back(std::move(*row));
+            if (!offerRow(lookahead.back(), offer))
+                return;
+            ++offered_ahead;
         }
     }
 
 private:
+    struct Row
+    {
+        String key;
+        RunMarker type = RunMarker::Edge;
+        CondemnedRow condemned;
+    };
+
+    static bool offerRow(const Row & row, const std::function<bool(const BlobRef &, const CondemnedRow &)> & offer)
+    {
+        if (row.type != RunMarker::Condemned)
+            return true;
+        BlobRef ref;
+        UInt128 source_id;
+        SourceEdgeKeyCodec::parse(row.key, ref, source_id);
+        return offer(ref, row.condemned);
+    }
+
+    /// The next surviving edge or retired sentinel of the open segment, validated; nullopt once it is drained.
+    std::optional<Row> pullRow()
+    {
+        if (reader_drained)
+            return std::nullopt;
+        String k;
+        String p;
+        while (reader->next(k, p))
+        {
+            BlobRef bh;
+            UInt128 sid;
+            /// `parse` throws CORRUPTED_DATA on a malformed size / NOT_IMPLEMENTED on an
+            /// unknown algo byte (fail-closed).
+            SourceEdgeKeyCodec::parse(k, bh, sid);
+            if (p.empty())
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: empty row payload");
+            const RunMarker v = runMarkerFromByte(p[0], "CAS source-edge run");
+            const bool sentinel_key = (sid == kZeroSourceId);
+
+            if (sentinel_key)
+            {
+                /// A sentinel key carries exactly one row per blob and never an edge.
+                if (v == RunMarker::Edge)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS source-edge run: active edge at the reserved sentinel source_id 0");
+                if (have_sentinel_blob && sentinel_blob == bh)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS source-edge run: duplicate sentinel row for one blob");
+                have_sentinel_blob = true;
+                sentinel_blob = bh;
+                if (v == RunMarker::Zero)
+                    continue;   // A zero marker is per-generation and is dropped on carry.
+                /// A retired sentinel: decode and surface it (settled at close-out, not an edge).
+                return Row{.key = k, .type = RunMarker::Condemned, .condemned = decodeCondemnedRow(p)};
+            }
+
+            /// A non-sentinel key must carry a surviving edge and nothing else.
+            if (v != RunMarker::Edge)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS source-edge run: sentinel row type 0x{:02x} at a non-sentinel key",
+                    static_cast<uint8_t>(v));
+            return Row{.key = k, .type = RunMarker::Edge, .condemned = {}};
+        }
+        reader_drained = true;
+        return std::nullopt;
+    }
+
     CasOperation & op;
     const std::vector<RunRef> & segments;
 
     size_t seg_idx = 0;
     std::optional<SourceEdgeRunView> reader;
-    String current_key;
-    RunMarker current_type = RunMarker::Edge;
-    CondemnedRow current_condemned;
+    /// The open segment returned its last row; `advance` verifies it and opens the next.
+    bool reader_drained = false;
+    Row current;
     bool has_current = false;
+    bool current_offered = false;
+    /// Rows decoded ahead of `current`; the first `offered_ahead` of them were offered.
+    std::deque<Row> lookahead;
+    size_t offered_ahead = 0;
 
     /// Duplicate-sentinel guard: the last blob for which a sentinel row was seen (across skipped zero
     /// markers too). Rows are globally sorted, so two sentinels for one blob are adjacent.
@@ -368,7 +441,8 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                               bool suppress_destructive,
                               std::vector<uint8_t> * out_applied_by_txn_ordinal,
                               std::vector<BlobSourceRetirement> source_retirements,
-                              GcRoundWorkBudget * work_budget)
+                              GcRoundWorkBudget * work_budget,
+                              const GraduationReadHints * graduation_reads)
 {
     RetiredMergeResult sink;
     RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
@@ -484,20 +558,18 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
         }
         else if (!suppress_destructive && e.condemn_round < current_round)
         {
-            /// Graduation gate (triage 2026-07-17 §3.4): publishing delete_pending is the one edge that
-            /// authorizes an irreversible delete, and it requires CONFIRMED durable Condemned evidence
-            /// for this exact (hash, token) — the marker is the writer's adopt gate, so an entry whose
-            /// marker write was swallowed could be same-token adopted invisibly to this fold's cut.
-            /// Unconfirmed => carry unchanged (fail-safe delay; the gate callback retries the marker so a
-            /// later pass can confirm). This gates a DELETE on missing evidence; it never throws.
-            if (e.marker_confirmed || !confirm_condemned_marker || confirm_condemned_marker(e))
+            /// Budget before the gate: a carried entry must not cost a marker read every round. A refusal
+            /// consumes no slot, so refusals cannot crowd out graduations.
+            const bool admitted = graduation_reads ? graduation_reads->admit(e.ref)
+                                                   : (!work_budget || work_budget->graduationAvailable());
+            if (!admitted)
+                rmr.still_retired.push_back(e);
+            else
             {
-                /// Excess past the round's graduation budget carries the floor-passed entry unchanged
-                /// (still condemned, not yet delete_pending) — it re-evaluates the floor next round and
-                /// graduates then; nothing is lost, only delayed.
-                if (work_budget && !work_budget->graduationAvailable())
-                    rmr.still_retired.push_back(e);
-                else
+                /// After the admission: a look-ahead hint must never take the settling entry's slot.
+                if (graduation_reads)
+                    cursor.scanAhead(kGraduationLookaheadRows, graduation_reads->offer);
+                if (!confirm_condemned_marker || confirm_condemned_marker(e))
                 {
                     if (work_budget)
                         ++work_budget->graduations_used;
@@ -507,9 +579,9 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                     rmr.graduated.push_back(pending);
                     rmr.still_retired.push_back(std::move(pending));
                 }
+                else
+                    rmr.still_retired.push_back(e); /// the gate refused: carried; it has rewritten the marker
             }
-            else
-                rmr.still_retired.push_back(e); /// no durable condemn-marker evidence yet — carried
         }
         else
             rmr.still_retired.push_back(e);     /// carried unchanged until the floor passes it

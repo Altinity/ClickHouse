@@ -15,10 +15,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Logger.h>
 #include <atomic>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <utility>
 #include <vector>
@@ -164,6 +166,9 @@ struct RoundReport
     size_t condemned = 0;         /// entries newly condemned into the retired list this round
     size_t graduated = 0;         /// entries newly floor-passed (published delete_pending) this round
     size_t redeleted = 0;         /// pending deletes executed this round (exact-token blob deletes)
+    /// Counts one failed `HEAD`, conditional `DELETE`, or refused re-delete enqueue
+    /// per affected `delete_pending` entry.
+    size_t redelete_failed = 0;
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
 
@@ -244,6 +249,7 @@ struct RefScanSummary
 
 class RefPlan;
 class RoundInput;
+struct NamespaceJanitorResult;
 RefPlan buildRefWalkPlan(RoundInput && round_input);
 
 namespace tests
@@ -500,6 +506,10 @@ public:
     /// instance, and the scheduler holds `gc_round_mutex` across both the install and the round.
     void setPhaseSink(GcPhaseSink sink) { phase_sink = std::move(sink); }
 
+    /// Keys per GC write-once delete request: `gc_bulk_delete_chunk_keys` capped by the storage's batch
+    /// limit, clamped to [1, `kBulkDeleteMaxKeys`] because an empty request would never advance.
+    size_t bulkDeleteChunkKeys() const;
+
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
     /// TEST SEAM: disable the round's journal trim so a folded event stays in the journal
@@ -543,12 +553,17 @@ private:
     /// It performs no physical LIST or delete.
     CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state);
 
-    /// Run exactly one independently paced physical namespace-maintenance page. The caller supplies
+    /// Run the independently paced physical namespace maintenance: pages from the persisted cursor while
+    /// each one deleted dead-life objects, under a soft time budget. The caller supplies
     /// the one round-wide destructive verdict when it exists; DEFER passes suppression because it has
-    /// no folded frontier verdict. This helper owns only janitor I/O and phase metrics, never lifecycle
-    /// transitions or the hot stream walk plan.
-    void runNamespaceJanitorPage(
+    /// no folded frontier verdict, which takes one page. This helper owns only janitor I/O and phase
+    /// metrics, never lifecycle transitions or the hot stream walk plan.
+    void runNamespaceJanitor(
         const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows);
+
+    /// The janitor's `RemoveWriteOnce`: one job per `bulkDeleteChunkKeys` keys on the GC I/O pool, waited for
+    /// before it returns. A failed job leaks the keys it did not delete, and so does a job the pool refused.
+    void removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out);
 
     void reportStuckRemovals(const RefPlan & plan, uint64_t current_round);
 
@@ -725,6 +740,48 @@ private:
                     /// One instance for the WHOLE round, owned by `runRegularRound` and threaded through
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
                     GcRoundWorkBudget & work_budget);
+
+    struct RedeleteIo
+    {
+        String blob_key;
+        Removal del = Removal::Gone;
+    };
+
+    struct IndexedException
+    {
+        size_t index;
+        std::exception_ptr exception;
+    };
+
+    struct RedeleteRoundContext
+    {
+        uint64_t new_round;
+        uint64_t snap_generation;
+        uint64_t shard;
+        GcRoundWorkBudget & round_work_budget;
+        RoundReport & report;
+        std::map<uint64_t, OutcomeLog> & outcomes;
+        uint64_t & jobs_scheduled;
+    };
+
+    static RedeleteIo performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op);
+
+    void applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteIo & io);
+
+    void reportRedeleteFailure(
+        RedeleteRoundContext & ctx,
+        const RetiredEntry & entry,
+        const Layout & layout,
+        std::exception_ptr exception,
+        std::optional<size_t> unsent_count = std::nullopt);
+
+    void redeleteBlobs(
+        RedeleteRoundContext & ctx,
+        const std::vector<RetiredEntry> & entries,
+        ThreadPool & pool,
+        size_t concurrency,
+        const Layout & layout,
+        CasOperation & op);
 
     /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
     /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
@@ -976,10 +1033,11 @@ private:
     /// initialized before that check.
     std::unique_ptr<GcMetaWriter> meta_writer;
 
-    /// The fold's read-ahead pool, sized by `gc_read_concurrency`. A `unique_ptr` for the same reason
-    /// as `meta_writer`: the size comes from `store->poolConfig()`, which may only be read after the
-    /// constructor body has validated `store`.
-    std::unique_ptr<ThreadPool> read_pool;
+    /// The GC I/O pool: the fold's and rebuild's read-ahead, the orphan-manifest sweep planning reads,
+    /// the `pending_deletes` fan-out and the namespace janitor's batch deletes, sized by `gc_io_concurrency`. A `unique_ptr` for the same reason as `meta_writer`: the size comes from
+    /// `store->poolConfig()`, which may only be read after the constructor body has validated `store`.
+    std::unique_ptr<ThreadPool> io_pool;
+    std::optional<size_t> io_pool_refuse_at_for_test;
 
     /// Probe B1's two numbers for the round: the ref-log POSITIONS the sealed coverage declares covered
     /// (counted arithmetically over each namespace's cut -- not by listed ids, which under arithmetic

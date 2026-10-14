@@ -36,12 +36,8 @@ struct RetiredEntry
                                   /// delete (pre-CAS, safe at any leader staleness) and drops the entry.
                                   /// Terminal: a pending entry is never un-pended (writers keep seeing
                                   /// it condemned and recreate).
-    bool marker_confirmed = false;   /// Durable `Condemned` meta CONFIRMED for this entry — the
-                                     /// graduation gate (triage 2026-07-17 §3.4): the per-hash condemn
-                                     /// marker is the writer's adopt gate, so graduation to
-                                     /// delete_pending requires confirmed durable evidence; an
-                                     /// unconfirmed entry is CARRIED, never fail-open deleted. Set at
-                                     /// graduation (delete_pending rows always carry it).
+    bool marker_confirmed = false;   /// Written with `delete_pending`, as released builds write it. The
+                                     /// graduation gate never reads it: it reads the marker itself.
 };
 
 /// The fold's HEAD hooks (`head_blob`, `peek_head`): the caller issues the request on its own admitted
@@ -82,7 +78,7 @@ struct CondemnedRow
     PersistedEtag token;   // the incarnation the exact-token delete must re-observe
     uint64_t size = 0;
     uint64_t condemn_round = 0;
-    bool marker_confirmed = false;   // durable Condemned meta confirmed (graduation gate)
+    bool marker_confirmed = false;   // written with `delete_pending`; the graduation gate reads the marker, not this bit
     /// Spelled out rather than defaulted because `PersistedEtag` carries no equality of its
     /// own. A field added above belongs here too.
     bool operator==(const CondemnedRow & o) const
@@ -101,6 +97,22 @@ String encodeCondemnedRow(const CondemnedRow & row);
 /// Decode and validate a condemned-row payload. Unknown flags, dialect bytes, or inconsistent lengths
 /// throw `CORRUPTED_DATA`.
 CondemnedRow decodeCondemnedRow(std::string_view payload);
+
+/// Look-ahead for the graduation gate's marker read, supplied by the GC round. The gate still decides on the
+/// value it takes; only the moment of the fetch moves.
+struct GraduationReadHints
+{
+    /// Reserves a budget slot for the entry at the gate and hints its read if the window has room. False: no
+    /// budget left; the entry is carried unread. Idempotent for an entry that already holds a slot.
+    std::function<bool(const BlobRef &)> admit;
+    /// Reserves and hints a later condemned row, or skips a row that will not reach the gate. False: the window
+    /// or the budget is full, or the row's blob was touched this round and must be decided inline; the scan
+    /// stops and offers the row again later.
+    std::function<bool(const BlobRef &, const CondemnedRow &)> offer;
+};
+
+/// Rows the merge decodes ahead of its position to find graduation candidates. Bounds memory, not requests.
+inline constexpr size_t kGraduationLookaheadRows = 16384;
 
 /// Bridges the backend-free `Formats/CasRecordStreamFormat` NDJSON reader to the
 /// `(key, payload)` BYTE interface the fold / `zeroInDegree` / `previewDeletes` / `fsck` consumers use:
@@ -353,10 +365,9 @@ struct GcRoundWorkBudget
 ///                                                 fail-closed abort;
 ///   d > 0                                       -> spared (recovery wins even past the floor);
 ///   d = 0 and condemn_round < current_round     -> graduated: REPUBLISHED as delete_pending (two-phase
-///                                                 graduation) — deleted the NEXT pass. GATED on a
-///                                                 confirmed durable condemn marker (see
-///                                                 `confirm_condemned_marker` below): an unconfirmed
-///                                                 entry is carried unchanged instead;
+///                                                 graduation) — deleted the NEXT pass. Only while the
+///                                                 round's graduation budget has a slot, and only if
+///                                                 `confirm_condemned_marker` accepts; otherwise carried;
 ///   d = 0 otherwise                             -> still_retired, carried byte-unchanged.
 /// A carried `RunMarker::Condemned` row is SETTLEMENT-ONLY: it never sets the blob's `cur_touched` bit, so a
 /// generation that only carries the row emits no zero-marker and pays no `peek_head` HEAD. The surviving
@@ -386,15 +397,16 @@ struct GcRoundWorkBudget
 /// `peek_head` is a plain HEAD with no events and no counters. No supersede detection happens if
 /// `peek_head` is unset (default `{}`), independent of whether `head_blob` is set.
 ///
-/// `confirm_condemned_marker` is the GRADUATION GATE (triage 2026-07-17 §3.4): graduation to
-/// `delete_pending` is the one edge that authorizes an irreversible delete, and the per-hash condemn
-/// marker (`writeCondemnedMeta`) is the writer's adopt gate — an entry whose marker write was silently
-/// swallowed can be same-token adopted by a writer invisible to this fold's cut, so it must NOT
-/// graduate. The callback returns whether durable `Condemned` evidence is confirmed for the entry's
-/// exact (hash, token); on false the entry is carried unchanged (fail-safe delay — the caller is
-/// expected to retry the marker so a later pass can confirm). An entry whose `marker_confirmed` bit is
-/// already set skips the callback. Unset (default `{}`) means UNGATED — the pre-gate merge semantics,
-/// for merge-mechanics unit tests only; the real GC round always passes the gate.
+/// `confirm_condemned_marker` is the GRADUATION GATE: graduation to `delete_pending` is the one edge that
+/// authorizes an irreversible delete, and the per-hash marker is the writer's adopt gate. It is called only
+/// for an entry the graduation budget admits, and returns whether the entry may graduate; on false the entry
+/// is carried unchanged. Unset (default `{}`) means UNGATED — merge-mechanics unit tests only; the real GC
+/// round always passes the gate.
+///
+/// `graduation_reads`, when set, admits each graduation candidate against the round's budget before the gate and
+/// offers later condemned rows of the open run segment so their marker reads can start early. Null reads every
+/// admitted marker at the gate.
+///
 /// The merge comparator is exactly `(ref.algo, ref.digest, source_id)` (that is, `BlobRef::operator<`
 /// followed by `source_id`), which is also the raw key order produced by `SourceEdgeKeyCodec`.
 void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
@@ -418,7 +430,8 @@ void foldDeltasIntoGeneration(CasOperation & op, const Layout & layout,
                               std::vector<BlobSourceRetirement> source_retirements = {},
                               /// Shared by reference across every shard's call within one round;
                               /// `nullptr` (default) is unbounded, matching every existing caller.
-                              GcRoundWorkBudget * work_budget = nullptr);
+                              GcRoundWorkBudget * work_budget = nullptr,
+                              const GraduationReadHints * graduation_reads = nullptr);
 
 /// Stream the sealed in-degree runs named by `runs` (the current seal's `blob_target_runs` filtered to one
 /// shard) and return every blob written at in-degree 0 (the candidates that transitioned to zero). An

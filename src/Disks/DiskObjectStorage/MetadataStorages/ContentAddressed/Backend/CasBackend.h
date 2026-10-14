@@ -201,6 +201,10 @@ public:
     /// absence is success.
     virtual void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess &) = 0;
 
+    /// The most keys one `removeManyWriteOnce` sends to the storage as one request; at least 1. A decorator
+    /// must forward it: the default of 1 would turn every batch below it into one-key requests.
+    virtual size_t bulkDeleteKeyLimit() const { return 1; }
+
     /// Authoritative, cache-bypassing probe of one key -- see `ProbeOutcome`. DEFAULT (used by every
     /// backend without sharper raw-error evidence, e.g. `InMemoryBackend`): derived from `head`/`read`
     /// alone, so it can only distinguish `Present` from `KeyAbsent`, and ANY exception from either

@@ -474,6 +474,13 @@ public:
     /// always considered present.
     bool liveTreeDirHasChildren(const std::string & path) const;
 
+    /// The table-level-subdirectory answers (a LIST of the life's `_files/` prefix filtered by
+    /// `tf.tail + "/"`), shared by the `TableSubdir` shape and by a `PartFile` whose ref does not
+    /// resolve: an unresolved ref answers as the table subdirectory or generic directory that the
+    /// same path denotes.
+    bool tableSubdirExists(const Cas::TableFilePath & tf) const;
+    std::vector<std::string> tableSubdirChildren(const Cas::TableFilePath & tf) const;
+
     /// Resolves one parsed path to its namespace, reference, and in-tree file. Detached paths are
     /// re-split here so their references remain in the table namespace with a `detached/` prefix;
     /// shadow paths map to a namespace derived from the literal shadow directory.
@@ -516,6 +523,7 @@ public:
         MovingContainer,
         PartDir,
         ProjectionDir,
+        PartFile,
         TableSubdir,
         GenericIntermediate,
     };
@@ -635,8 +643,8 @@ private:
     const uint64_t manifest_decode_cache_bytes;
     /// Bounded pool size for GC's per-hash freshness-metadata writes.
     const uint64_t gc_meta_pool_size;
-    /// Bounded pool size for the GC fold's read-ahead; 1 disables it.
-    const uint64_t gc_read_concurrency;
+    /// Maximum number of threads in the GC I/O pool; 1 disables parallel GC I/O.
+    const uint64_t gc_io_concurrency;
     /// Keys per batch delete request for the write-once families.
     const uint64_t gc_bulk_delete_chunk_keys;
     /// The budget for one HTTP attempt of a writable Native mount's control-plane requests; feeds

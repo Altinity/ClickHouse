@@ -11,6 +11,7 @@
 #include <utility>
 #include <IO/S3/S3Capabilities.h>
 #include <IO/S3Settings.h>
+#include <Common/logger_useful.h>
 #include <Common/MultiVersion.h>
 #include <Common/ObjectStorageKeyGenerator.h>
 #include <IO/ReadBufferFromS3.h>
@@ -136,6 +137,9 @@ public:
     /// that can admit each physical delete as its own request.
     void removeObjectsIfExistUnderProfile(
         const StoredObjects & objects, const ObjectStorageControlRequest & request) override;
+
+    /// `objects_chunk_size_to_delete`, at least 1, while `DeleteObjects` is not known unsupported; 1 after.
+    size_t batchDeleteKeyLimit() const override;
 
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 

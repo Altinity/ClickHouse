@@ -34,6 +34,7 @@
 #include <Columns/validateColumnType.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExternalDictionariesLoader.h>
+#include <Interpreters/formatWithPossiblyHidingSecrets.h>
 #include <Interpreters/misc.h>
 #include <Functions/IFunctionAdaptors.h>
 #include <Functions/FunctionFactory.h>
@@ -73,7 +74,6 @@ namespace ErrorCodes
 namespace Setting
 {
     extern const SettingsBool execute_exists_as_scalar_subquery;
-    extern const SettingsBool format_display_secrets_in_show_and_select;
     extern const SettingsBool transform_null_in;
     extern const SettingsBool force_grouping_standard_compatibility;
     extern const SettingsBool validate_enum_literals_in_operators;
@@ -1087,7 +1087,7 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         allow_niladic_functions);
 
     /// Mask arguments if needed
-    if (!scope.context->getSettingsRef()[Setting::format_display_secrets_in_show_and_select])
+    if (!canDisplaySecrets(scope.context))
     {
         if (FunctionSecretArgumentsFinder::Result secret_arguments = FunctionSecretArgumentsFinderTreeNode(*function_node_ptr).getResult(); secret_arguments.hasSecrets())
         {
@@ -1629,7 +1629,11 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         ///
         /// `getSetting` and `rowNumberInAllBlocks` are non-deterministic but must NOT be shared: the cache
         /// is global across scopes, and e.g. `SETTINGS` can change `getSetting`'s result for every scope.
+        ///
+        /// Server constants (`hostName`, `serverUUID`, ...) capture `Context::isDistributed` when built.
+        /// A local `UNION` branch and a later cluster branch must not share that instance.
         if (function && !function->isDeterministic()
+            && !function->isServerConstant()
             && function_name != "getSetting" && function_name != "rowNumberInAllBlocks")
         {
             auto hash = function_node_ptr->getTreeHash();

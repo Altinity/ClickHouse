@@ -187,7 +187,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
     {
         readLineInto(in, row_line, line_cap, "ref catalog");
         ReadBufferFromMemory l(row_line.data(), row_line.size());
-        row_reader.reset(l, KeyStrictness::Strict, "ref catalog");
+        row_reader.reset(l, "ref catalog");
         JsonObjectReader & r = row_reader;
         String key;
         if (!r.nextKey(key))
@@ -196,8 +196,8 @@ RefCatalog decodeRefCatalog(std::string_view data)
         if (key == "n")
         {
             const uint64_t n = r.readU64Number();
-            if (r.nextKey(key))
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: trailer has extra keys");
+            while (r.nextKey(key))
+                r.skipUnknown(key);
             if (!l.eof() || !in.eof())
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: bytes after trailer");
             if (n != seen)
@@ -227,7 +227,7 @@ RefCatalog decodeRefCatalog(std::string_view data)
             else if (key == RefCatalogWire::creator_epoch) cwe = r.readU64String();
             else if (key == RefCatalogWire::creator_fence) cfg = r.readU64String();
             else if (key == RefCatalogWire::remove_round) removal_started_round = r.readU64String();
-            else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: unknown entry key '{}'", key);
+            else r.skipUnknown(key);
         }
         if (!l.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref catalog: junk after record");

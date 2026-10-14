@@ -235,7 +235,7 @@ The happy path runs straight down — `HANDSHAKE → READY → READING_RESPONSE 
 | State              | Description |
 |--------------------|-------------|
 | `HANDSHAKE`        | Initial state after the TCP connection opens. Only [handshake](#handshake-phase) messages are valid. Transitions to `READY` on success or terminates on failure. |
-| `READY`            | Idle. The client may send [Ping](#ping-phase), [Query](#query-phase), or close. The connection may stay in `READY` indefinitely (subject to `idle_connection_timeout`, see [connection limits](#connection-limits)). |
+| `READY`            | Idle. The client may send [Ping](#ping-phase), [Query](#query-phase), or close. The connection may stay in `READY` indefinitely (subject to `idle_connection_timeout`, see [connection limits](#connection-limits)). A `Data` (2) or `Scalar` (7) packet here is a protocol violation: the server terminates the connection without decoding the packet body, and without sending an `Exception` packet first. Because the body is left unread, the client may observe a TCP reset rather than an orderly close. |
 | `READING_RESPONSE` | Entered when the client sends a Query. The client must fully drain the server's response stream before returning to `READY`. The only allowed client→server packet here is Cancel (not specified on this page). |
 | Terminated         | No longer usable. The client must open a new TCP connection and restart the handshake. |
 
@@ -335,7 +335,7 @@ sequenceDiagram
 On error at any point the server sends an `Exception` instead of `EndOfStream`, which terminates the query.
 
 1. The client sends [`Query`](#query) with a unique `query_id` (typically a UUID).
-2. The client sends any external tables, then the empty Data marker. The empty Data packet has `table_name = ""`, `num_columns = 0`, `num_rows = 0`. The server does not begin executing the query until it receives this marker.
+2. The client sends any external tables, then the empty Data marker. The empty Data packet has `table_name = ""`, `num_columns = 0`, `num_rows = 0`. The server does not begin executing the query until it receives this marker. An external table may be split over several `Data` packets with the same `table_name`; the first of them binds the table's schema, and every later packet for that name must carry the same column names and types, in the same order, or the server rejects the query with `INCORRECT_DATA` (see [Data](#data)).
 3. The client moves to `READING_RESPONSE` and flushes its write buffer.
 4. The client reads response packets in a loop, dispatching by type:
 
@@ -426,7 +426,7 @@ Client → Server. The first message after the TCP connection opens.
 
 | # | Field            | Type    | Role      | Description |
 |---|------------------|---------|-----------|-------------|
-| 1 | client_name      | String  | universal | Client identifier (e.g., `"clickhouse-client"`) |
+| 1 | client_name      | String  | universal | Client identifier (e.g., `"clickhouse-client"`). An Altinity Antalya build appends `" (antalya:N)"`, where `N` is its Antalya protocol version. See [Antalya protocol version](/antalya/protocol). |
 | 2 | version_major    | VarUInt | universal | Client major version |
 | 3 | version_minor    | VarUInt | universal | Client minor version |
 | 4 | protocol_version | VarUInt | universal | Client's max supported protocol version |
@@ -440,7 +440,7 @@ Server → Client. The reply to ClientHello on successful authentication.
 
 | # | Field            | Type    | Role      | Condition              | Description |
 |---|------------------|---------|-----------|------------------------|-------------|
-| 1 | server_name      | String  | universal | always                 | Server identifier |
+| 1 | server_name      | String  | universal | always                 | Server identifier. An Altinity Antalya build appends `" (antalya:N)"`, where `N` is its Antalya protocol version; a client may ignore or strip the suffix. See [Antalya protocol version](/antalya/protocol). |
 | 2 | version_major    | VarUInt | universal | always                 | Server major version |
 | 3 | version_minor    | VarUInt | universal | always                 | Server minor version |
 | 4 | protocol_version | VarUInt | universal | always                 | Server's protocol version |
@@ -633,7 +633,7 @@ The wire format is symmetric — both directions include a `table_name` prefix b
 
 | Field      | Type   | Role      | Description |
 |------------|--------|-----------|-------------|
-| table_name | String | universal | External table name. Empty (`""`) is the common case — for the main table, query results, and the INSERT row stream. Empty `table_name` alone is **not** the end-of-data marker (normal INSERT row packets also carry `""`). |
+| table_name | String | universal | External table name. Empty (`""`) is the common case — for the main table, query results, and the INSERT row stream. Empty `table_name` alone is **not** the end-of-data marker (normal INSERT row packets also carry `""`). A non-empty name may repeat across client `Data` packets of one query: the first packet with a given name creates the external table and binds its schema (a packet with columns but `num_rows = 0` counts), and each later packet with that name must declare the same column names and types in the same order — the server compares the block header with the bound schema and answers with an `Exception` (`INCORRECT_DATA`) on a mismatch. |
 | Block body | —      | —         | See [Block & column structure](/interfaces/specs/NativeFormat#block-and-column-structure). |
 
 The **end-of-data marker** is a packet whose Block is empty — `0` columns and `0` rows — regardless of `table_name`. The server treats a client `Data` packet as the terminator only when the decoded block is empty (`block.empty()`); a packet with `table_name = ""` and a non-empty block is an ordinary row packet, not a terminator. So an INSERT row stream is a sequence of non-empty `Data` blocks followed by one empty `Data` block that ends it.
@@ -833,7 +833,7 @@ External clients that don't use SSH auth never see packets 11, 12, or 18 — the
 | 6    | KeepAlive                 | not specified       | Connection keepalive |
 | 7    | Scalar                    | not specified       | Scalar data block |
 | 8    | IgnoredPartUUIDs          | not specified       | Parts to exclude from query |
-| 9    | ReadTaskResponse          | not specified       | S3 cluster read response |
+| 9    | ReadTaskResponse          | not specified       | S3 cluster read response. When both peers negotiated [Antalya protocol](/antalya/protocol) version 2 or newer, the initiator appends optional Iceberg column statistics and then optional `retry_after_us` for `lock_object_storage_task_distribution_ms` after the upstream payload. If any worker negotiated a lower Antalya version, `retry_after_us` is omitted and that setting is ignored for the query. |
 | 10   | MergeTreeReadTaskResponse | not specified       | Parallel read task response |
 | 11   | SSHChallengeRequest       | [SSH auth](#ssh-authentication) | SSH auth challenge request |
 | 12   | SSHChallengeResponse      | [SSH auth](#ssh-authentication) | SSH auth challenge response |
