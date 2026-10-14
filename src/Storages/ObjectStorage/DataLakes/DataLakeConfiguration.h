@@ -352,6 +352,12 @@ public:
         return getMetadata()->getColumnMapperForCurrentSchema(storage_metadata_snapshot, context);
     }
 
+    void checkCanBeDropped(ContextPtr query_context) const override
+    {
+        if (auto metadata = tryGetMetadata())
+            metadata->checkCanBeDropped(query_context);
+    }
+
     void drop(bool delete_data) override
     {
         if (auto metadata = tryGetMetadata())
@@ -894,6 +900,7 @@ public:
 
     bool supportsPrewhere() const override { return getImpl().supportsPrewhere(); }
 
+    void checkCanBeDropped(ContextPtr query_context) const override { getImpl().checkCanBeDropped(query_context); }
     void drop(bool delete_data) override { getImpl().drop(delete_data); }
 
 protected:

@@ -127,6 +127,8 @@ public:
 
     virtual bool operator==(const IDataLakeMetadata & other) const = 0;
 
+    virtual std::string getTableLocation() const { return {}; }
+
     /// Return iterator to `data files`.
     using FileProgressCallback = std::function<void(FileProgress)>;
     virtual ObjectIterator iterate(
@@ -290,6 +292,8 @@ public:
         throwNotImplemented("truncate");
     }
 
+    /// Checks with the `DROP` query context what `drop` will do in the background.
+    virtual void checkCanBeDropped(ContextPtr /*query_context*/) const { }
     /// `delete_data` is what `StorageObjectStorage::drop` resolved from `data_lake_delete_data_on_drop`.
     virtual void drop(bool /* delete_data */) { }
 

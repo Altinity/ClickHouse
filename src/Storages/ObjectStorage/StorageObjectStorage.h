@@ -132,6 +132,7 @@ public:
         ContextPtr local_context,
         TableExclusiveLockHolder &) override;
 
+    void checkTableCanBeDropped(ContextPtr query_context) const override { configuration->checkCanBeDropped(query_context); }
     void drop() override;
 
     void prepareForDrop(ContextPtr query_context) override;

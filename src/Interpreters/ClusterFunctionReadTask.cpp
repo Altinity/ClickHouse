@@ -35,10 +35,8 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
         data_lake_metadata = object->data_lake_metadata.value();
 
 #if USE_AVRO
-    if (std::dynamic_pointer_cast<IcebergDataObjectInfo>(object))
-    {
-        iceberg_info = dynamic_cast<IcebergDataObjectInfo &>(*object).info;
-    }
+    if (auto iceberg_object = std::dynamic_pointer_cast<IcebergDataObjectInfo>(object))
+        iceberg_info = iceberg_object->info;
 #endif
 
     file_meta_info = object->relative_path_with_metadata.file_meta_info;
@@ -91,7 +89,7 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
     return object;
 }
 
-void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker_protocol_version) const
+void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker_protocol_version, UInt64 worker_antalya_protocol_version) const
 {
     auto protocol_version
         = std::min(static_cast<UInt64>(worker_protocol_version), static_cast<UInt64>(DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION));
@@ -188,7 +186,7 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
         if (iceberg_info.has_value())
         {
             writeVarUInt(1, out);
-            iceberg_info->serializeForClusterFunctionProtocol(out, protocol_version);
+            iceberg_info->serializeForClusterFunctionProtocol(out, protocol_version, worker_antalya_protocol_version);
         }
         else
         {

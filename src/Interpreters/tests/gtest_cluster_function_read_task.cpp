@@ -3,6 +3,7 @@
 #include <AggregateFunctions/AggregateFunctionGroupBitmapData.h>
 #include <Common/Exception.h>
 #include <Core/NamesAndTypes.h>
+#include <Core/AntalyaProtocol.h>
 #include <Core/ProtocolDefines.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <IO/ReadBufferFromString.h>
@@ -38,7 +39,7 @@ TEST(ClusterFunctionReadTaskResponse, RejectsSchemaTransformOnProtocolBeforeData
     WriteBufferFromString out(serialized);
     try
     {
-        response.serialize(out, DBMS_CLUSTER_INITIAL_PROCESSING_PROTOCOL_VERSION);
+        response.serialize(out, DBMS_CLUSTER_INITIAL_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION);
         FAIL() << "Expected exception";
     }
     catch (const Exception & e)
@@ -56,7 +57,7 @@ TEST(ClusterFunctionReadTaskResponse, AllowsEmptySchemaTransformOnProtocolBefore
 
     String serialized;
     WriteBufferFromString out(serialized);
-    response.serialize(out, DBMS_CLUSTER_INITIAL_PROCESSING_PROTOCOL_VERSION);
+    response.serialize(out, DBMS_CLUSTER_INITIAL_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION);
     out.finalize();
     EXPECT_FALSE(serialized.empty());
 }
@@ -70,7 +71,7 @@ TEST(ClusterFunctionReadTaskResponse, RoundTripsSchemaTransformOnSupportedProtoc
 
     String serialized;
     WriteBufferFromString out(serialized);
-    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA, DBMS_ANTALYA_PROTOCOL_VERSION);
     out.finalize();
 
     ReadBufferFromString in(serialized);
@@ -92,7 +93,7 @@ TEST(ClusterFunctionReadTaskResponse, RejectsNonEmptyExcludedRowsOnOldProtocol)
     WriteBufferFromString out(serialized);
     try
     {
-        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_FILE_BUCKETS_INFO);
+        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_FILE_BUCKETS_INFO, DBMS_ANTALYA_PROTOCOL_VERSION);
         FAIL() << "Expected exception";
     }
     catch (const Exception & e)
@@ -110,7 +111,7 @@ TEST(ClusterFunctionReadTaskResponse, AllowsEmptyExcludedRowsOnOldProtocol)
 
     String serialized;
     WriteBufferFromString out(serialized);
-    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_FILE_BUCKETS_INFO);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_FILE_BUCKETS_INFO, DBMS_ANTALYA_PROTOCOL_VERSION);
     out.finalize();
     EXPECT_FALSE(serialized.empty());
 }
@@ -125,7 +126,7 @@ TEST(ClusterFunctionReadTaskResponse, RoundTripsExcludedRowsOnSupportedProtocol)
 
     String serialized;
     WriteBufferFromString out(serialized);
-    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_EXCLUDED_ROWS);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_EXCLUDED_ROWS, DBMS_ANTALYA_PROTOCOL_VERSION);
     out.finalize();
 
     ReadBufferFromString in(serialized);
@@ -155,7 +156,7 @@ TEST(ClusterFunctionReadTaskResponse, RejectsEqualityDeletesOnProtocolBeforeIceb
     WriteBufferFromString out(serialized);
     try
     {
-        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA);
+        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA, DBMS_ANTALYA_PROTOCOL_VERSION);
         FAIL() << "Expected exception";
     }
     catch (const Exception & e)
@@ -182,7 +183,7 @@ TEST(ClusterFunctionReadTaskResponse, RejectsPositionDeletesOnProtocolBeforeIceb
     WriteBufferFromString out(serialized);
     try
     {
-        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA);
+        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA, DBMS_ANTALYA_PROTOCOL_VERSION);
         FAIL() << "Expected exception";
     }
     catch (const Exception & e)
@@ -205,7 +206,7 @@ TEST(ClusterFunctionReadTaskResponse, RejectsIcebergInfoWithoutDeletesOnProtocol
     WriteBufferFromString out(serialized);
     try
     {
-        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA);
+        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA, DBMS_ANTALYA_PROTOCOL_VERSION);
         FAIL() << "Expected exception";
     }
     catch (const Exception & e)
@@ -240,7 +241,7 @@ TEST(ClusterFunctionReadTaskResponse, RoundTripsIcebergDeletesOnSupportedProtoco
 
     String serialized;
     WriteBufferFromString out(serialized);
-    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_METADATA);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_METADATA, DBMS_ANTALYA_PROTOCOL_VERSION);
     out.finalize();
 
     ReadBufferFromString in(serialized);
@@ -266,7 +267,7 @@ TEST(ClusterFunctionReadTaskResponse, RejectsFileBucketInfoOnProtocolBeforeFileB
     WriteBufferFromString out(serialized);
     try
     {
-        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_METADATA);
+        response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_METADATA, DBMS_ANTALYA_PROTOCOL_VERSION);
         FAIL() << "Expected exception";
     }
     catch (const Exception & e)
@@ -283,7 +284,7 @@ TEST(ClusterFunctionReadTaskResponse, AllowsMissingFileBucketInfoOnProtocolBefor
 
     String serialized;
     WriteBufferFromString out(serialized);
-    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_METADATA);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_METADATA, DBMS_ANTALYA_PROTOCOL_VERSION);
     out.finalize();
     EXPECT_FALSE(serialized.empty());
 }
@@ -298,7 +299,7 @@ TEST(ClusterFunctionReadTaskResponse, RoundTripsFileBucketInfoOnSupportedProtoco
 
     String serialized;
     WriteBufferFromString out(serialized);
-    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_FILE_BUCKETS_INFO);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_FILE_BUCKETS_INFO, DBMS_ANTALYA_PROTOCOL_VERSION);
     out.finalize();
 
     ReadBufferFromString in(serialized);
