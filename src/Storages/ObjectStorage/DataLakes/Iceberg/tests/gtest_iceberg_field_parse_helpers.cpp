@@ -39,27 +39,22 @@ TEST(IcebergFieldParseHelpers, NearEpochNanosecondDateTime64BoundsFailOpen)
     EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(-one_day_ns), type, true).has_value());
 }
 
-TEST(IcebergFieldParseHelpers, ModernMicrosecondDateTime64BoundsAreKept)
+TEST(IcebergFieldParseHelpers, AmbiguousScaleDateTime64BoundsFailOpen)
 {
     auto type = std::make_shared<DataTypeDateTime64>(6);
-    /// 2024-01-01 00:00:00 UTC is the first kept microsecond bound (`min_kept_microseconds`).
+    /// 2024-01-01 UTC µs is also ~19.7 days as ns. No integer test splits those scales.
     constexpr Int64 us_2024_01_01 = 1'704'067'200'000'000LL;
-    auto at_threshold = deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_01_01), type, true);
-    ASSERT_TRUE(at_threshold.has_value());
-    EXPECT_EQ(decimal64Ticks(*at_threshold), us_2024_01_01);
-    auto negative_threshold = deserializeFieldFromBinaryRepr(littleEndianInt64(-us_2024_01_01), type, true);
-    ASSERT_TRUE(negative_threshold.has_value());
-    EXPECT_EQ(decimal64Ticks(*negative_threshold), -us_2024_01_01);
-    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_01_01 - 1), type, true).has_value());
+    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_01_01), type, true).has_value());
+    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(-us_2024_01_01), type, true).has_value());
 
-    /// 2024-02-20 10:00:00 UTC as microseconds — spec-correct Iceberg `timestamp`.
-    constexpr Int64 us_2024_02_20 = 1'708'423'200'000'000LL;
-    auto lower = deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_02_20), type, true);
-    auto upper = deserializeFieldFromBinaryRepr(littleEndianInt64(us_2024_02_20), type, false);
-    ASSERT_TRUE(lower.has_value());
-    ASSERT_TRUE(upper.has_value());
-    EXPECT_EQ(decimal64Ticks(*lower), us_2024_02_20);
-    EXPECT_EQ(decimal64Ticks(*upper), us_2024_02_20);
+    /// 50 days after the epoch as ns (`4.32e15`) sits in the same band as 2024–2286 µs.
+    constexpr Int64 fifty_days_ns = 4'320'000'000'000'000LL;
+    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(fifty_days_ns), type, true).has_value());
+    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(fifty_days_ns), type, false).has_value());
+
+    /// Band upper edge: 1e16 ns is ~1970-04-26, 1e16 µs is ~year 2286.
+    constexpr Int64 one_e16 = 10'000'000'000'000'000LL;
+    EXPECT_FALSE(deserializeFieldFromBinaryRepr(littleEndianInt64(one_e16), type, true).has_value());
 }
 
 TEST(IcebergFieldParseHelpers, ProvenNanosecondDateTime64BoundsAreConverted)

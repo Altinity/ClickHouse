@@ -229,6 +229,12 @@ NEAR_EPOCH_NS_ROWS = [
     (86_400_000_000_000, 1, "1970-01-02 00:00:00.000000000"),
 ]
 
+# 50 days after the epoch as nanoseconds (`4.32e15`). Same integer as ~2106 µs,
+# so a predicate on 1970-02-20 over-prunes unless the decoder fails open.
+OVERLAP_BAND_NS_ROWS = [
+    (4_320_000_000_000_000, 1, "1970-02-20 00:00:00.000000000"),
+]
+
 
 def check_minmax_near_epoch_ns_bounds_on_timestamp_schema(node, table, column, pruned_files):
     """Iceberg `timestamp` whose min/max bytes are near-epoch nanoseconds must not over-prune.
@@ -253,6 +259,33 @@ def check_minmax_near_epoch_ns_bounds_on_timestamp_schema(node, table, column, p
 
     eq_epoch_day = datetime64_literal("1970-01-02 00:00:00.000000000", scale=6, timezone=None)
     query = f"SELECT id FROM {table} WHERE {column} = {eq_epoch_day} ORDER BY id"
+    assert pruned_files(query) == 0
+    assert node.query(query, settings=PRUNE_ON) == "1\n"
+
+
+def check_minmax_overlap_band_ns_bounds_on_timestamp_schema(node, table, column, pruned_files):
+    """Iceberg `timestamp` whose min/max bytes are leftover-band nanoseconds must not over-prune.
+
+    50 days after the epoch is `4.32e15` ns, which is also a 2024–2286 microsecond
+    timestamp. The decoder cannot tell the scales apart and must fail open.
+    """
+    type_name = node.query(
+        f"SELECT toTypeName({column}) FROM {table} LIMIT 1",
+        settings=PRUNE_OFF,
+    )
+    assert "DateTime64(6" in type_name, type_name
+    assert "DateTime64(9" not in type_name, type_name
+
+    ids = node.query(f"SELECT id FROM {table} ORDER BY id", settings=PRUNE_OFF)
+    assert ids == "1\n"
+    micros = node.query(
+        f"SELECT toUnixTimestamp64Micro({column}) FROM {table} WHERE id = 1",
+        settings=PRUNE_OFF,
+    ).strip()
+    assert micros == "4320000000000", micros
+
+    eq_day = datetime64_literal("1970-02-20 00:00:00.000000000", scale=6, timezone=None)
+    query = f"SELECT id FROM {table} WHERE {column} = {eq_day} ORDER BY id"
     assert pruned_files(query) == 0
     assert node.query(query, settings=PRUNE_ON) == "1\n"
 
