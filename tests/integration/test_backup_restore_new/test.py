@@ -1765,6 +1765,8 @@ def test_backup_all(exclude_system_log_tables):
             "query_metric_log",
             "query_thread_log",
             "part_log",
+            "cas_gc_log",
+            "cas_log",
             "trace_log",
             "crash_log",
             "text_log",
