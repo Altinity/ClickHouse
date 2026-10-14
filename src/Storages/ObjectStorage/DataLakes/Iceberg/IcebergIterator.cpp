@@ -632,7 +632,8 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                                     table_schema_id, /// current schema id to use current column names
                                     manifest_file_entry->resolved_schema_id, /// file's schema id to interpret value_bounds bytes
                                     manifest_file_entry->parsed_entry->columns_infos,
-                                    manifest_file_entry->parsed_entry->value_bounds));
+                                    manifest_file_entry->parsed_entry->value_bounds,
+                                    data_file_path.serialize()));
 
         /// Only distributed tasks need compatibility checks, which parse every delete-file URI.
         if (tasks_go_to_other_replicas && !object_info->info.requires_external_storage)
