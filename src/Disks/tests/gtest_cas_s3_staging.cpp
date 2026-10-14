@@ -45,6 +45,7 @@ namespace DB::ErrorCodes
 {
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
+    extern const int NETWORK_ERROR;
 }
 
 namespace
@@ -100,6 +101,15 @@ public:
         return mode == DB::ObjectStorageCopyMode::Default
             || (mode == DB::ObjectStorageCopyMode::NativeOnly && native_only_copy_supported);
     }
+
+    void removeObjectIfExists(const DB::StoredObject & object) override
+    {
+        if (throw_on_remove.load())
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected delete failure for {}", object.remote_path);
+        DB::LocalObjectStorage::removeObjectIfExists(object);
+    }
+
+    std::atomic<bool> throw_on_remove{false};
 
 private:
     const bool native_only_copy_supported;
@@ -981,7 +991,7 @@ TEST(CASS3Staging, AbortDeletesS3Staging)
 }
 
 /// Guard: the abort delete runs in a `noexcept` destructor, also after the storage was shut down with
-/// the transaction still open (server shutdown). Whatever the delete does then, nothing may escape.
+/// the transaction still open (server shutdown). A failing delete must not escape it.
 TEST(CASS3Staging, AbortAfterStorageShutdownDoesNotThrow)
 {
     auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
@@ -994,6 +1004,7 @@ TEST(CASS3Staging, AbortAfterStorageShutdownDoesNotThrow)
         ca_tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", std::string(300, 'x'));
 
     metadata_storage->shutdown();
+    object_storage->throw_on_remove = true;
     EXPECT_NO_THROW(tx.reset());
 }
 

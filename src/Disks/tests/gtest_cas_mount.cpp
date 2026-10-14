@@ -812,7 +812,11 @@ TEST(CASServerRootSafety, EveryCatalogLifecycleStateBlocksOwnerAndEpochRecreatio
         const ObserveRefCatalog observe = [catalog] { return catalog; };
 
         Ops owner_ops(std::make_shared<InMemoryBackend>());
-        EXPECT_THROW(claimOwnerOrThrow(owner_ops.op, layout, "root/x", UInt128{1}, observe), DB::Exception);
+        DB::Cas::tests::expectThrowsCodeWithMessage(
+            DB::ErrorCodes::CORRUPTED_DATA, "identity lost over existing data", [&]
+        {
+            claimOwnerOrThrow(owner_ops.op, layout, "root/x", UInt128{1}, observe);
+        });
         EXPECT_FALSE(owner_ops.op.head(layout.ownerKey("root/x"), Retry::standard()).has_value());
 
         Ops epoch_ops(std::make_shared<InMemoryBackend>());
@@ -855,8 +859,11 @@ TEST(CASServerRootSafety, ManifestAndLooseRootDebrisStillBlockRecreation)
     {
         Ops ops(std::make_shared<InMemoryBackend>());
         mustCommit(ops.op.create(key, "x", Retry::standard()), "blocking debris");
-        EXPECT_THROW(claimOwnerOrThrow(
-            ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation()), DB::Exception);
+        DB::Cas::tests::expectThrowsCodeWithMessage(
+            DB::ErrorCodes::CORRUPTED_DATA, "identity lost over existing data", [&]
+        {
+            claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation());
+        });
         EXPECT_THROW(allocateWriterEpoch(
             ops.op, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);
     }
@@ -870,7 +877,11 @@ TEST(CASServerRootSafety, UnreadableCatalogNeverFallsBackToPhysicalGuesses)
     {
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "injected unreadable catalog");
     };
-    EXPECT_THROW(claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, unreadable), DB::Exception);
+    DB::Cas::tests::expectThrowsCodeWithMessage(
+        DB::ErrorCodes::CORRUPTED_DATA, "injected unreadable catalog", [&]
+    {
+        claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, unreadable);
+    });
     EXPECT_THROW(allocateWriterEpoch(
         ops.op, layout, "root/x", EpochMintPolicy::NormalMount, 0, unreadable), DB::Exception);
     EXPECT_FALSE(ops.op.head(layout.ownerKey("root/x"), Retry::standard()).has_value());
