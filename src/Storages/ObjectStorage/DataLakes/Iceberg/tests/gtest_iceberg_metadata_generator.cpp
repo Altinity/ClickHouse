@@ -637,6 +637,32 @@ static Poco::JSON::Object::Ptr makeMetadataWithTwoColumns()
     metadata->set(f_last_column_id, 2);
 
     auto schemas = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+    auto schema = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    schema->set(f_schema_id, 0);
+    schema->set(f_type, "struct");
+    auto fields = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+
+    auto field_x = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    field_x->set(f_id, 1);
+    field_x->set(f_name, "x");
+    field_x->set(f_required, true);
+    field_x->set(f_type, "int");
+    fields->add(field_x);
+
+    auto field_y = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    field_y->set(f_id, 2);
+    field_y->set(f_name, "y");
+    field_y->set(f_required, true);
+    field_y->set(f_type, "string");
+    fields->add(field_y);
+
+    schema->set(f_fields, fields);
+    schemas->add(schema);
+    metadata->set(f_schemas, schemas);
+
+    return metadata;
+}
+
 TEST(IcebergMetadataGenerator, GetIcebergTypeNothingProducesUnknown)
 {
     Int32 iter = 0;
@@ -703,26 +729,31 @@ TEST(IcebergMetadataGenerator, ModifyColumnAfterMovesFieldAfterNamedColumn)
     schema->set(f_schema_id, 0);
     schema->set(f_type, "struct");
     auto fields = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
-
-    auto field_x = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
-    field_x->set(f_id, 1);
-    field_x->set(f_name, "x");
-    field_x->set(f_required, true);
-    field_x->set(f_type, "int");
-    fields->add(field_x);
-
-    auto field_y = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
-    field_y->set(f_id, 2);
-    field_y->set(f_name, "y");
-    field_y->set(f_required, true);
-    field_y->set(f_type, "string");
-    fields->add(field_y);
-
+    for (Int32 i = 0; i < 3; ++i)
+    {
+        auto field = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+        field->set(f_id, i + 1);
+        field->set(f_name, String(1, static_cast<char>('a' + i)));
+        field->set(f_required, false);
+        field->set(f_type, "long");
+        fields->add(field);
+    }
     schema->set(f_fields, fields);
+    auto schemas = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
     schemas->add(schema);
     metadata->set(f_schemas, schemas);
 
-    return metadata;
+    MetadataGenerator gen(metadata);
+
+    EXPECT_TRUE(gen.generateModifyColumnMetadata(
+        "a", makeNullable(std::make_shared<DataTypeInt64>()), getContext().context,
+        /* first */ false, /* after_column */ "b"));
+
+    auto names = getCurrentFieldNames(metadata);
+    ASSERT_EQ(names.size(), 3u);
+    EXPECT_EQ(names[0], "b");
+    EXPECT_EQ(names[1], "a");
+    EXPECT_EQ(names[2], "c");
 }
 
 
@@ -780,31 +811,6 @@ TEST(IcebergMetadataGenerator, DropColumnRejectsIfInMultiArgSortOrder)
 
     expectDropRejected(metadata, "x");
     expectDropRejected(metadata, "y");
-    for (Int32 i = 0; i < 3; ++i)
-    {
-        auto field = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
-        field->set(f_id, i + 1);
-        field->set(f_name, String(1, static_cast<char>('a' + i)));
-        field->set(f_required, false);
-        field->set(f_type, "long");
-        fields->add(field);
-    }
-    schema->set(f_fields, fields);
-    auto schemas = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
-    schemas->add(schema);
-    metadata->set(f_schemas, schemas);
-
-    MetadataGenerator gen(metadata);
-
-    EXPECT_TRUE(gen.generateModifyColumnMetadata(
-        "a", makeNullable(std::make_shared<DataTypeInt64>()), getContext().context,
-        /* first */ false, /* after_column */ "b"));
-
-    auto names = getCurrentFieldNames(metadata);
-    ASSERT_EQ(names.size(), 3u);
-    EXPECT_EQ(names[0], "b");
-    EXPECT_EQ(names[1], "a");
-    EXPECT_EQ(names[2], "c");
 }
 
 
