@@ -25,6 +25,7 @@ from helpers.iceberg_timestamp_ns import (
     FILTER_LITERAL_IDS,
     FILTER_LITERALS,
     NEAR_EPOCH_NS_ROWS,
+    OVERLAP_BAND_NS_ROWS,
     PRUNE_OFF,
     PRUNE_ON,
     ROWS,
@@ -32,6 +33,7 @@ from helpers.iceberg_timestamp_ns import (
     check_minmax_far_future_us_upper_bound,
     check_minmax_near_epoch_ns_bounds_on_timestamp_schema,
     check_minmax_ns_bounds_on_timestamp_schema,
+    check_minmax_overlap_band_ns_bounds_on_timestamp_schema,
     check_ns_pruning,
     check_ns_pruning_datetime64_microseconds,
     patch_iceberg_table_long_to_timestamp_ns,
@@ -286,6 +288,27 @@ def test_minmax_pruning_near_epoch_ns_bounds_on_timestamp_schema(started_cluster
         )
 
     check_minmax_near_epoch_ns_bounds_on_timestamp_schema(node, table, "value", pruned_files)
+
+
+def test_minmax_pruning_overlap_band_ns_bounds_on_timestamp_schema(started_cluster_iceberg_no_spark):
+    """Ns min/max in `[1.704e15, 1e16]` on Iceberg `timestamp` must not be decoded as microseconds."""
+    node = started_cluster_iceberg_no_spark.instances["node1"]
+    s3_filename = _create_timestamp_table_with_ns_bounds(
+        started_cluster_iceberg_no_spark, "minmax_overlap_band_ns", rows=OVERLAP_BAND_NS_ROWS
+    )
+    table = _iceberg_table(s3_filename)
+
+    def pruned_files(select_expression):
+        return check_validity_and_get_prunned_files_general(
+            node,
+            "minmax_overlap_band_ns",
+            PRUNE_OFF,
+            PRUNE_ON,
+            "IcebergMinMaxIndexPrunedFiles",
+            select_expression,
+        )
+
+    check_minmax_overlap_band_ns_bounds_on_timestamp_schema(node, table, "value", pruned_files)
 
 
 @pytest.mark.parametrize(

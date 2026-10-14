@@ -26,29 +26,13 @@ namespace Iceberg
 namespace
 {
 
-/// 1e16 µs is ~year 2286. That is not an Iceberg `timestamp` max: Spark sentinels
-/// such as `9999-12-31` (`~2.53e17` µs) and ClickHouse `DateTime64` max
-/// `2299-12-31` (`~1.04e16` µs) are spec-correct microseconds above this.
 /// 1e18 ns is ~year 2001; customer 2026 ns bounds are `~1.76e18`.
-constexpr Int64 microseconds_ambiguous_threshold = 10'000'000'000'000'000LL;
 constexpr Int64 nanoseconds_lower_threshold = 1'000'000'000'000'000'000LL;
 constexpr Int64 nanoseconds_per_microsecond = 1000;
-/// 2024-01-01 00:00:00 UTC as microseconds. Below this, `|ticks|` is also a
-/// plausible near-epoch nanosecond count (1.704e15 ns is ~19.7 days). Fail-open
-/// that overlap so a 1-day-after-epoch ns min/max is not read as year ~1972.
-/// Ticks from this instant through 1e16 stay microseconds so 2024+ Iceberg
-/// `timestamp` pruning is unchanged. Residual: 19.7..115 days as ns still collide
-/// with 2024..2286 as µs.
-constexpr Int64 min_kept_microseconds = 1'704'067'200'000'000LL;
 
 bool magnitudeExceeds(Int64 value, Int64 threshold)
 {
     return value > threshold || value < -threshold;
-}
-
-bool magnitudeBelow(Int64 value, Int64 threshold)
-{
-    return value < threshold && value > -threshold;
 }
 
 /// Convert ns ticks to us ticks without shrinking a [lower, upper] range.
@@ -73,11 +57,9 @@ Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
 
 /// Iceberg timestamps are 8-byte little-endian (spec Appendix D).
 /// Some writers store nanosecond stats on Iceberg `timestamp` (`DateTime64(6)`).
-/// Convert only in a true nanosecond band (`|ticks| > 1e18`). Between 1e16 and
-/// 1e18 the value may be far-future microseconds (do not convert; fail open so
-/// min/max pruning is skipped). Below `min_kept_microseconds`, ticks may be
-/// near-epoch nanoseconds (also fail open). `[min_kept_microseconds, 1e16]` is
-/// kept as microseconds.
+/// Convert only when `|ticks| > 1e18`. Otherwise fail open: `|ticks| <= 1e16`
+/// collides near-epoch nanoseconds (~115 days) with 1970–2286 microseconds, and
+/// `(1e16, 1e18]` collides Spark `9999-12-31` sentinels with 1970–2001 nanoseconds.
 std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str, const IDataType & type, bool lower_bound)
 {
     if (str.size() != sizeof(Int64))
@@ -88,16 +70,10 @@ std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str
 
     if (scale == 6)
     {
-        if (magnitudeBelow(unscaled, min_kept_microseconds))
+        if (!magnitudeExceeds(unscaled, nanoseconds_lower_threshold))
             return std::nullopt;
 
-        if (magnitudeExceeds(unscaled, microseconds_ambiguous_threshold))
-        {
-            if (!magnitudeExceeds(unscaled, nanoseconds_lower_threshold))
-                return std::nullopt;
-
-            unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
-        }
+        unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
     }
 
     return DecimalField<DateTime64>(DateTime64(unscaled), scale);
