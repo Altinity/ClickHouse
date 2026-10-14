@@ -203,7 +203,12 @@ static Plan getPlan(
     Poco::JSON::Object::Ptr initial_metadata_object
         = getMetadataJSONObject(metadata_file_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
 
-    if (initial_metadata_object->getValue<Int32>(Iceberg::f_format_version) < 2)
+    /// Exactly version 2: v1 lacks the sequence-number machinery the rewrite relies on, and
+    /// a v3 table must not be accepted either -- writeMetadataFiles rebuilds the metadata
+    /// from createEmptyMetadataFile, which produces format_version 2, so a v3 table would be
+    /// silently downgraded and lose v3-only state such as row lineage (first_row_id /
+    /// next_row_id).
+    if (initial_metadata_object->getValue<Int32>(Iceberg::f_format_version) != 2)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Compaction is supported only for format_version 2.");
 
     auto current_schema_id = initial_metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);

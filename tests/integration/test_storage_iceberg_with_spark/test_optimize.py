@@ -1,3 +1,4 @@
+import json
 import pytest
 from datetime import datetime, timezone
 import time
@@ -186,3 +187,82 @@ def test_optimize_manifest_per_file_stats(started_cluster_iceberg_with_spark):
             data_entries_checked += 1
 
     assert data_entries_checked > 0
+
+
+def test_optimize_v3_rejected(started_cluster_iceberg_with_spark):
+    """
+    Data-file compaction rebuilds the table metadata from a fresh format-version 2 template,
+    so running it on a format-version 3 table would silently downgrade the table and drop
+    its row lineage (next-row-id / first-row-id). OPTIMIZE must reject v3 and leave the
+    table untouched.
+    """
+    instance = started_cluster_iceberg_with_spark.instances["node1"]
+    spark = started_cluster_iceberg_with_spark.spark_session
+    storage_type = "local"
+    TABLE_NAME = "test_optimize_v3_rejected_" + storage_type + "_" + get_uuid_str()
+
+    spark.sql(
+        f"""
+        CREATE TABLE {TABLE_NAME} (id long, data string) USING iceberg TBLPROPERTIES (
+            'format-version' = '3',
+            'write.update.mode' = 'merge-on-read',
+            'write.delete.mode' = 'merge-on-read',
+            'write.merge.mode' = 'merge-on-read'
+        )
+        """
+    )
+    spark.sql(
+        f"INSERT INTO {TABLE_NAME} SELECT id, char(id + ascii('a')) FROM range(10, 100)"
+    )
+    spark.sql(f"DELETE FROM {TABLE_NAME} WHERE id < 20")
+
+    default_upload_directory(
+        started_cluster_iceberg_with_spark,
+        storage_type,
+        f"/iceberg_data/default/{TABLE_NAME}/",
+        f"/iceberg_data/default/{TABLE_NAME}/",
+    )
+    create_iceberg_table(
+        storage_type, instance, TABLE_NAME, started_cluster_iceberg_with_spark
+    )
+
+    assert int(instance.query(f"SELECT count() FROM {TABLE_NAME}")) == 80
+
+    metadata_dir = (
+        f"/var/lib/clickhouse/user_files/iceberg_data/default/{TABLE_NAME}/metadata"
+    )
+
+    def list_metadata_files():
+        return sorted(
+            instance.exec_in_container(
+                [
+                    "bash",
+                    "-c",
+                    f"find '{metadata_dir}' -maxdepth 1 -name '*.metadata.json' -type f",
+                ]
+            )
+            .strip()
+            .splitlines()
+        )
+
+    metadata_files_before = list_metadata_files()
+    assert metadata_files_before
+
+    error_message = instance.query_and_get_error(
+        f"OPTIMIZE TABLE {TABLE_NAME};",
+        settings={"allow_experimental_iceberg_compaction": 1},
+    )
+    assert "Compaction is supported only for format_version 2" in error_message
+
+    # No new metadata was committed, and every metadata file is still format-version 3.
+    assert list_metadata_files() == metadata_files_before
+    for metadata_file in metadata_files_before:
+        metadata = json.loads(
+            instance.exec_in_container(["bash", "-c", f"cat '{metadata_file}'"])
+        )
+        assert metadata["format-version"] == 3
+
+    assert int(instance.query(f"SELECT count() FROM {TABLE_NAME}")) == 80
+    assert instance.query(f"SELECT id FROM {TABLE_NAME} ORDER BY id") == instance.query(
+        "SELECT number FROM numbers(20, 80)"
+    )
