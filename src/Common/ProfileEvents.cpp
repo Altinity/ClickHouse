@@ -795,6 +795,8 @@ The server successfully detected this situation and will download merged part fr
     M(CASBlobCompareSwapConflict,"Number of CAS blob compare-and-swap conflicts. A non-zero value indicates concurrent update contention.", ValueType::Number) \
     M(CASBlobHead,       "Number of successful backend HEAD requests under CAS blob paths that found an object, aggregated across all callers.", ValueType::Number) \
     M(CASBlobHeadMiss,   "Number of successful backend HEAD requests under CAS blob paths that found no object, aggregated across all callers.", ValueType::Number) \
+    M(CASBlobPublishAttemptFailed, "Number of CAS blob publication attempts that failed with an ambiguous or retryable error. The writer observes the blob again and publishes a fresh envelope, up to the attempt limit.", ValueType::Number) \
+    M(CASBlobPublishGaveUp, "Number of CAS blob publications abandoned because the last allowed attempt failed. The write fails with a retryable error.", ValueType::Number) \
     M(CASBlobBodyPutAvoided, "Number of physical CAS blob body publications avoided after a safe presence observation found the object present. Growing values indicate saved upload traffic.", ValueType::Number) \
     M(CASBlobUploadFanoutBatches, "Number of CAS intra-part blob-upload fan-out invocations (one per part publish that had at least one unique blob to upload). Compare with CASBlobUploadFanoutTasks for the average number of unique blobs uploaded per part.", ValueType::Number) \
     M(CASBlobUploadFanoutTasks, "Number of CAS blob-upload tasks dispatched to the fan-out pool (one per unique blob ref across all part publishes). Duplicate references within a part collapse to one task.", ValueType::Number) \
