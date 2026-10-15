@@ -1,6 +1,7 @@
 #include "config.h"
 
 #include <Storages/IStorage.h>
+#include <Storages/StorageProxy.h>
 #include <Parsers/ASTOptimizeQuery.h>
 #include <Parsers/ASTLiteral.h>
 #include <Interpreters/Context.h>
@@ -48,7 +49,9 @@ BlockIO InterpreterOptimizeQuery::execute()
     getContext()->checkAccess(getRequiredAccess());
 
     auto table_id = getContext()->resolveStorageID(ast);
-    StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
+    /// Resolve before reading the metadata, so the checks below and `optimizeDryRun` see the real
+    /// structure rather than the columns-only one a lazily loaded table reports.
+    StoragePtr table = resolveStorageProxyLoading(DatabaseCatalog::instance().getTable(table_id, getContext()));
     checkStorageSupportsTransactionsIfNeeded(table, getContext());
     auto metadata_snapshot = table->getInMemoryMetadataPtr(getContext(), false);
     auto storage_snapshot = table->getStorageSnapshotWithoutData(metadata_snapshot, getContext());
@@ -62,8 +65,8 @@ BlockIO InterpreterOptimizeQuery::execute()
 #if USE_AVRO
         /// Object storage engines are created as StorageObjectStorageCluster, which wraps a plain
         /// StorageObjectStorage, so both have to be accepted here.
-        auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(table.get());
-        auto * object_storage_cluster_table = dynamic_cast<StorageObjectStorageCluster *>(table.get());
+        auto object_storage_table = castStorage<StorageObjectStorage>(table, DeferredTable::Skip);
+        auto object_storage_cluster_table = castStorage<StorageObjectStorageCluster>(table, DeferredTable::Skip);
         if (!object_storage_table && !object_storage_cluster_table)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "OPTIMIZE MANIFEST is only supported for Iceberg tables");
 
@@ -124,7 +127,7 @@ BlockIO InterpreterOptimizeQuery::execute()
 
     if (ast.dry_run)
     {
-        auto * merge_tree_data = dynamic_cast<MergeTreeData *>(table.get());
+        auto * merge_tree_data = castStorage<MergeTreeData>(table, DeferredTable::Load).get();
         if (!merge_tree_data)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "OPTIMIZE DRY RUN is only supported for MergeTree family tables");
 

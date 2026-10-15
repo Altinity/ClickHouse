@@ -521,6 +521,9 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
     if (!context->getSettingsRef()[Setting::use_index_for_in_with_subqueries])
         return nullptr;
 
+    /// Concurrent index analyses may share this set through cloned filter DAGs, and the build mutates
+    /// `set_and_key->set` and `source`. A mutex and not `callOnce` because this build may stop without
+    /// creating the set (e.g. a subquery timeout with `overflow_mode = 'break'`) and then be retried.
     std::lock_guard lock(mutex);
 
     if (auto set = get_unsafe())
@@ -681,14 +684,10 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
     }
 
     /// Runs the speculative pipeline in its own scope so that `executor`, `pipeline`, and the pipeline
-    /// builder are destroyed before `source` is reset below. On the non-destructive path the cloned plan
-    /// carries an *empty* `QueryPlanResourceHolder` (`QueryPlan::clone` copies the plan nodes only, not the
-    /// resources), so the speculative pipeline relies on the original `source` plan to keep the interpreter
-    /// contexts, storage holders, and table locks alive: processors may use them implicitly, including in
-    /// their destructors — this is exactly what the resource holder normally guarantees for the lifetime of
-    /// the pipeline. Resetting `source` while the pipeline is still alive would release them too early. On
-    /// the destructive fallback `build` moved the resources into the plan, which outlives this call, so the
-    /// ordering is safe there too.
+    /// builder are destroyed before `source` is reset below. `QueryPlan::clone` copies the shared resource
+    /// handles onto the cloned plan, so the speculative pipeline holds the interpreter contexts, storage
+    /// holders, and table locks itself rather than depending on `source` outliving it. On the destructive
+    /// fallback `build` moved the resources into the plan, which outlives this call.
     ///
     /// Returns false when the pipeline stopped without creating the set.
     auto run_plan = [&](QueryPlan & plan_to_run)
@@ -737,8 +736,7 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
     /// In-place build succeeded. On the non-destructive path, publish the fully-created temporary set into
     /// the canonical `set_and_key`; the deferred build is then skipped (it checks `isCreated()` / `get()`),
     /// so the original `source` plan is no longer needed. On the destructive fallback `source` was already
-    /// consumed by `build`, so `reset` is a no-op there. Reset only now, after the pipeline and executor have
-    /// been destroyed, so the resources held by `source` outlive every processor.
+    /// consumed by `build`, so `reset` is a no-op there.
     if (tmp_set_and_key)
         set_and_key->set = tmp_set_and_key->set;
     source.reset();

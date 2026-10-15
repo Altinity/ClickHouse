@@ -48,6 +48,7 @@
 #include <Storages/AlterCommands.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/StorageProxy.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Common/typeid_cast.h>
 #include <Common/quoteString.h>
@@ -1194,17 +1195,18 @@ void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context,
         }
 
         MergeTreeSettings effective_settings;
-        bool any_mt_setting = false;
+        SettingsChanges builtin_changes;
         for (const auto & change : settings_from_storage)
         {
             if (MergeTreeSettings::hasBuiltin(change.name))
-            {
-                effective_settings.applyChange(change, context, /*is_loading_from_existing_metadata=*/true);
-                any_mt_setting = true;
-            }
+                builtin_changes.push_back(change);
         }
-        if (any_mt_setting)
+        if (!builtin_changes.empty())
         {
+            /// Only the implicit-index settings below are read here, and this runs before the statement is
+            /// known to be allowed, so the `disk` setting is left unresolved rather than creating the disk.
+            effective_settings.applyChangesLeavingDiskUnresolved(builtin_changes);
+
             metadata.add_minmax_index_for_numeric_columns = effective_settings[MergeTreeSetting::add_minmax_index_for_numeric_columns];
             metadata.add_minmax_index_for_string_columns = effective_settings[MergeTreeSetting::add_minmax_index_for_string_columns];
             metadata.add_minmax_index_for_temporal_columns = effective_settings[MergeTreeSetting::add_minmax_index_for_temporal_columns];
@@ -2026,7 +2028,7 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
     const auto virtuals = metadata->virtuals;
 
     bool share_nested = true;
-    if (auto * merge_tree = dynamic_cast<MergeTreeData *>(table.get()))
+    if (auto * merge_tree = castStorage<MergeTreeData>(table, DeferredTable::Load).get())
         share_nested = (*merge_tree->getSettings())[MergeTreeSetting::share_nested_offsets];
 
     auto all_columns = metadata->columns;
@@ -2323,7 +2325,7 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
             if (all_columns.hasNested(command.column_name))
             {
                 bool skip = false;
-                if (auto * merge_tree = dynamic_cast<MergeTreeData *>(table.get()))
+                if (auto * merge_tree = castStorage<MergeTreeData>(table, DeferredTable::Load).get())
                     skip = !(*merge_tree->getSettings())[MergeTreeSetting::share_nested_offsets];
                 if (!skip)
                     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Cannot rename whole Nested struct");
@@ -2366,7 +2368,7 @@ void AlterCommands::validate(const StoragePtr & table, ContextPtr context) const
 
             /// When share_nested_offsets is disabled, dotted-name columns are independent
             /// and not part of a Nested group, so they can be freely renamed.
-            if (auto * merge_tree = dynamic_cast<MergeTreeData *>(table.get()))
+            if (auto * merge_tree = castStorage<MergeTreeData>(table, DeferredTable::Load).get())
             {
                 if (!(*merge_tree->getSettings())[MergeTreeSetting::share_nested_offsets])
                 {
