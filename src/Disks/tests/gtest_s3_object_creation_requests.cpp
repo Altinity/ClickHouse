@@ -231,6 +231,10 @@ TEST_P(S3SingleAttemptObjectCreationPath, LostResponseLogsNothingAtError)
     ScopedLogCapture capture;
     EXPECT_EQ(thrownCode([&] { path.create(*storage, path.singleAttemptSettings()); }), DB::ErrorCodes::S3_ERROR);
     EXPECT_EQ(capture.captured(), "");
+
+    /// Positive control: an `Error` message does reach the capture, so the emptiness above means something.
+    Poco::Logger::get("ScopedLogCaptureControl").error("control");
+    EXPECT_NE(capture.captured().find("control"), std::string::npos);
 }
 
 /// The flag alone bounds the `NO_SUCH_KEY` reissue loops above the client.

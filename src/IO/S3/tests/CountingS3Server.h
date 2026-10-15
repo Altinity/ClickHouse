@@ -72,8 +72,8 @@ inline Verb classify(const Poco::Net::HTTPServerRequest & request)
     return Verb::Other;
 }
 
-/// Thrown by a responder to close the connection without an answer: the server has applied the
-/// request, the client sees a network error.
+/// Thrown by a responder to close the connection without an answer: the client sees a network error.
+/// Whether the request was applied depends on the thrower; `ObjectStore` faults fire before the put.
 struct DropResponse : std::runtime_error
 {
     DropResponse() : std::runtime_error("test server drops the response") {}
