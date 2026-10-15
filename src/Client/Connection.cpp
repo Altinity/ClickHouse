@@ -73,8 +73,11 @@ namespace DB
 {
 namespace Setting
 {
+    extern const SettingsUInt64 input_format_binary_max_type_complexity;
+    extern const SettingsBool input_format_native_decode_types_in_binary_format;
     extern const SettingsString network_compression_method;
     extern const SettingsInt64 network_zstd_compression_level;
+    extern const SettingsBool output_format_native_encode_types_in_binary_format;
 }
 
 namespace FailPoints
@@ -1080,6 +1083,22 @@ void Connection::sendQuery(
 
     query_id = query_id_;
 
+    /// The server applies the binary type encoding settings to the `Native` blocks of every query except a secondary one
+    /// (see `getNativeWireFormatSettings`), and a server sends initial queries to other servers too.
+    query_wire_format_settings.reset();
+    if (settings && !(client_info && client_info->query_kind == ClientInfo::QueryKind::SECONDARY_QUERY))
+    {
+        const bool server_encodes = (*settings)[Setting::output_format_native_encode_types_in_binary_format];
+        const bool server_decodes = (*settings)[Setting::input_format_native_decode_types_in_binary_format];
+        if (server_encodes || server_decodes)
+        {
+            query_wire_format_settings.emplace();
+            query_wire_format_settings->native.decode_types_in_binary_format = server_encodes;
+            query_wire_format_settings->native.encode_types_in_binary_format = server_decodes;
+            query_wire_format_settings->binary.max_binary_type_complexity = (*settings)[Setting::input_format_binary_max_type_complexity];
+        }
+    }
+
     /// Avoid reusing connections that had been left in the intermediate state
     /// (i.e. not all packets had been sent).
     bool completed = false;
@@ -1260,7 +1279,7 @@ void Connection::sendData(const Block & block, const String & name, bool scalar)
         else
             maybe_compressed_out = out;
 
-        block_out = std::make_unique<NativeWriter>(*maybe_compressed_out, server_revision, std::make_shared<const Block>(block.cloneEmpty()), format_settings);
+        block_out = std::make_unique<NativeWriter>(*maybe_compressed_out, server_revision, std::make_shared<const Block>(block.cloneEmpty()), getNativeFormatSettings());
     }
 
     if (scalar)
@@ -1729,7 +1748,7 @@ void Connection::initBlockInput()
         initMaybeCompressedInput();
         /// The server may send marshalled result blocks; their consumers convert them back.
         block_in = std::make_unique<NativeReader>(
-            *maybe_compressed_in, server_revision, format_settings, ISerialization::KindSet::all());
+            *maybe_compressed_in, server_revision, getNativeFormatSettings(), ISerialization::KindSet::all());
     }
 }
 
@@ -1746,7 +1765,7 @@ void Connection::initBlockLogsInput()
         }
 
         /// Have to return superset of SystemLogsQueue::getSampleBlock() columns
-        block_logs_in = std::make_unique<NativeReader>(*logs_buf, server_revision, format_settings);
+        block_logs_in = std::make_unique<NativeReader>(*logs_buf, server_revision, getNativeFormatSettings());
     }
 }
 
@@ -1762,7 +1781,7 @@ void Connection::initBlockProfileEventsInput()
             profile_events_buf = maybe_compressed_in.get();
         }
 
-        block_profile_events_in = std::make_unique<NativeReader>(*profile_events_buf, server_revision, format_settings);
+        block_profile_events_in = std::make_unique<NativeReader>(*profile_events_buf, server_revision, getNativeFormatSettings());
     }
 }
 
