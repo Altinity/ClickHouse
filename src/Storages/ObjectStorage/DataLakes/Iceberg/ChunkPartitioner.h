@@ -24,6 +24,10 @@ public:
         ContextPtr context,
         SharedHeader sample_block_);
 
+    /// Throws if the partition spec cannot be evaluated on write (e.g. multi-argument `source-ids` transforms).
+    /// Callers that write objects before constructing a `ChunkPartitioner` must call this first.
+    static void checkPartitionSpecSupportedForWrites(const Poco::JSON::Array::Ptr & partition_specification);
+
     using PartitionKey = Row;
     struct PartitionKeyHasher
     {

@@ -27,11 +27,30 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
+void ChunkPartitioner::checkPartitionSpecSupportedForWrites(const Poco::JSON::Array::Ptr & partition_specification)
+{
+    if (!partition_specification)
+        return;
+
+    for (size_t i = 0; i != partition_specification->size(); ++i)
+    {
+        /// Iceberg V3: multi-argument transforms use `source-ids` instead of `source-id`.
+        /// Writing with multi-arg transforms is not supported yet (hash semantics not finalized upstream).
+        if (partition_specification->getObject(static_cast<UInt32>(i))->has(Iceberg::f_source_ids))
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Multi-argument partition transforms (source-ids) are not supported for writes. "
+                "Multi-argument transform evaluation is not yet implemented");
+    }
+}
+
 ChunkPartitioner::ChunkPartitioner(
     Poco::JSON::Array::Ptr partition_specification, Poco::JSON::Array::Ptr schema_fields, ContextPtr context, SharedHeader sample_block_)
     : sample_block(sample_block_)
     , max_partitions_count(context->getSettingsRef()[Setting::iceberg_insert_max_partitions])
 {
+    checkPartitionSpecSupportedForWrites(partition_specification);
+
     std::unordered_map<Int32, String> id_to_column;
     {
         for (size_t i = 0; i < schema_fields->size(); ++i)
@@ -48,14 +67,6 @@ ChunkPartitioner::ChunkPartitioner(
         transform_name = Poco::toLower(transform_name);
 
         FunctionOverloadResolverPtr transform;
-
-        /// Iceberg V3: multi-argument transforms use `source-ids` instead of `source-id`.
-        /// Writing with multi-arg transforms is not supported yet (hash semantics not finalized upstream).
-        if (partition_specification_field->has(Iceberg::f_source_ids))
-            throw Exception(
-                ErrorCodes::BAD_ARGUMENTS,
-                "Multi-argument partition transforms (source-ids) are not supported for writes. "
-                "Multi-argument transform evaluation is not yet implemented");
 
         auto source_id = partition_specification_field->getValue<Int32>(Iceberg::f_source_id);
         auto column_name = id_to_column[source_id];
