@@ -16,6 +16,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 
+#include <atomic>
 #include <optional>
 #include <base/defines.h>
 
@@ -32,6 +33,9 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/SnapshotFilesTraversal.h>
 
 
 namespace DB
@@ -178,6 +182,8 @@ public:
 
     CompressionMethod getCompressionMethod() const { return persistent_components.metadata_compression_method; }
 
+    std::string getTableLocation() const override { return persistent_components.table_location; }
+
     bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override;
     bool optimizeManifestFiles(
         const StorageMetadataPtr & metadata_snapshot,
@@ -221,7 +227,8 @@ public:
         StorageMetadataPtr storage_metadata,
         ContextPtr local_context) const override;
 
-    void drop(ContextPtr context) override;
+    void checkCanBeDropped(ContextPtr query_context) const override;
+    void drop(bool delete_data) override;
 
     static DataLakeMetadataPtr createWithDeserialization(
         const ObjectStoragePtr & object_storage,
@@ -295,9 +302,15 @@ private:
     std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
     KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
 
+    /// Files outside the table directory that `iceberg_delete_data_on_drop` deletes.
+    std::vector<Iceberg::ExternalFile> collectExternalFilesToDeleteOnDrop(ContextPtr context) const;
+
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
-    const DB::Iceberg::PersistentTableComponents persistent_components;
+    mutable std::shared_ptr<ExternalStorageCache> external_storages;
+    /// Set by `checkCanBeDropped` once the dropping user is allowed to delete the external files.
+    mutable std::atomic<bool> external_files_drop_authorized = false;
+    DB::Iceberg::PersistentTableComponents persistent_components;
     const DataLakeStorageSettings & data_lake_settings;
     const String write_format;
     BackgroundSchedulePoolTaskHolder background_metadata_prefetch_task;

@@ -25,6 +25,7 @@
 #include <Functions/FunctionDateOrDateTimeToSomething.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/identity.h>
+#include <IO/CompressionMethod.h>
 #include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/sortBlock.h>
@@ -41,6 +42,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MetadataGenerator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
 #include <base/Decimal.h>
 #include <base/defines.h>
 #include <base/types.h>
@@ -1046,6 +1048,7 @@ void generateManifestList(
     const Iceberg::IcebergPathResolver & path_resolver,
     Poco::JSON::Object::Ptr metadata,
     ObjectStoragePtr object_storage,
+    ExternalStorageCache & external_storages,
     ContextPtr context,
     const std::vector<Iceberg::IcebergPathFromMetadata> & manifest_entry_names,
     Poco::JSON::Object::Ptr new_snapshot,
@@ -1267,7 +1270,7 @@ void generateManifestList(
     }
 
     /// Copy entries from the parent snapshot's manifest list: `use_previous_snapshots` copies all, `carry_forward_manifest_paths` copies only the listed manifests.
-    if (use_previous_snapshots || !carry_forward_manifest_paths.empty())
+    if ((use_previous_snapshots || !carry_forward_manifest_paths.empty()) && new_snapshot->has(Iceberg::f_parent_snapshot_id))
     {
         auto parent_snapshot_id = new_snapshot->getValue<Int64>(Iceberg::f_parent_snapshot_id);
         auto snapshots = metadata->getArray(Iceberg::f_snapshots);
@@ -1278,8 +1281,9 @@ void generateManifestList(
                 auto manifest_list = Iceberg::IcebergPathFromMetadata::deserialize(
                     snapshots->getObject(static_cast<UInt32>(i))->getValue<String>(Iceberg::f_manifest_list));
 
-                auto resolved_manifest_list_path = path_resolver.resolve(manifest_list);
-                forEachAvroEntry(resolved_manifest_list_path, object_storage, context, "IcebergWrites",
+                auto [manifest_list_storage, resolved_manifest_list_path] = resolveObjectStorageForPath(
+                    path_resolver.getTableLocation(), manifest_list.serialize(), object_storage, external_storages, context, path_resolver);
+                forEachAvroEntry(resolved_manifest_list_path, manifest_list_storage, context, "IcebergWrites",
                     [&](const avro::GenericDatum & datum)
                     {
                         const avro::GenericRecord & old_entry = datum.value<avro::GenericRecord>();
@@ -1355,7 +1359,8 @@ IcebergStorageSink::IcebergStorageSink(
     ContextPtr context_,
     std::shared_ptr<DataLake::ICatalog> catalog_,
     const Iceberg::PersistentTableComponents & persistent_table_components_,
-    const StorageID & table_id_)
+    const StorageID & table_id_,
+    std::shared_ptr<ExternalStorageCache> external_storages_)
     : SinkToStorage(sample_block_)
     , sample_block(sample_block_)
     , object_storage(object_storage_)
@@ -1366,6 +1371,7 @@ IcebergStorageSink::IcebergStorageSink(
     , persistent_table_components(persistent_table_components_)
     , data_lake_settings(configuration_->getDataLakeSettings())
     , write_format(configuration_->getFormat())
+    , external_storages(std::move(external_storages_))
 {
     auto [last_version, metadata_path, compression_method] = getLatestMetadataFileAndVersionWithCatalog(
         object_storage,
@@ -1389,6 +1395,7 @@ IcebergStorageSink::IcebergStorageSink(
         compression_method,
         persistent_table_components.table_uuid);
     metadata_compression_method = compression_method;
+    previous_metadata_file_path = metadata_path;
     filename_generator = FileNamesGenerator(
         persistent_table_components.path_resolver.getTableLocation(),
         (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
@@ -1615,7 +1622,7 @@ bool IcebergStorageSink::initializeMetadata()
         total_data_files += static_cast<Int64>(writer.getDataFiles().size());
     auto [new_snapshot, manifest_list_path] = MetadataGenerator(metadata).generateNextMetadata(
         filename_generator,
-        metadata_info.path,
+        previous_metadata_file_path.empty() ? Iceberg::IcebergPathFromMetadata{} : resolver.reverseResolve(previous_metadata_file_path),
         parent_snapshot,
         total_data_files,
         total_rows,
@@ -1688,6 +1695,7 @@ bool IcebergStorageSink::initializeMetadata()
             LOG_DEBUG(log, "Rereading metadata file {} with version {}", metadata_path, last_version);
 
             metadata_compression_method = compression_method;
+            previous_metadata_file_path = metadata_path;
             filename_generator.setVersion(last_version + 1);
 
             metadata = getMetadataJSONObject(
@@ -1804,7 +1812,7 @@ bool IcebergStorageSink::initializeMetadata()
             {
                 generateManifestList(
                     persistent_table_components.path_resolver,
-                    metadata, object_storage, context,
+                    metadata, object_storage, *external_storages, context,
                     manifest_entries,
                     new_snapshot,
                     manifest_entry_sizes,

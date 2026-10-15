@@ -13,7 +13,6 @@
 
 #include <string_view>
 
-
 namespace DB::Iceberg
 {
 
@@ -26,6 +25,7 @@ void requireParquetDataFileForRowDeletes(const String & file_format, std::string
 
 struct IcebergObjectSerializableInfo
 {
+    /// Preserve the manifest spelling for `_path` and task identity; it may differ from the resolved storage key.
     IcebergPathFromMetadata data_object_file_path_key;
     Int32 underlying_format_read_schema_id{};
     Int32 schema_id_relevant_to_iterator{};
@@ -39,7 +39,10 @@ struct IcebergObjectSerializableInfo
     std::optional<Int64> file_size_in_bytes;
     std::vector<std::pair<String, Field>> identity_partition_columns;
 
-    void serializeForClusterFunctionProtocol(WriteBuffer & out, size_t protocol_version) const;
+    bool requires_external_storage = false;
+
+    /// `antalya_protocol_version` is the version negotiated with the worker, see `AntalyaProtocol.h`.
+    void serializeForClusterFunctionProtocol(WriteBuffer & out, size_t protocol_version, UInt64 antalya_protocol_version) const;
     void deserializeForClusterFunctionProtocol(ReadBuffer & in, size_t protocol_version);
 
 private:
@@ -51,8 +54,9 @@ private:
 #if USE_AVRO
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
+#include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
 #include <base/defines.h>
-
 
 namespace DB
 {
@@ -66,14 +70,14 @@ struct IcebergDataObjectInfo : public ObjectInfo, std::enable_shared_from_this<I
 {
     using IcebergDataObjectInfoPtr = std::shared_ptr<IcebergDataObjectInfo>;
 
-    /// Full path to the data object file
-    /// It is used to filter position deletes objects by data file path.
-    /// It is also used to create a filter for the data object in the position delete transform.
+    /// Position deletes match the data path exactly as written in the manifest.
     explicit IcebergDataObjectInfo(
         Iceberg::ProcessedManifestFileEntryPtr data_manifest_file_entry_,
-        const String & resolved_storage_path_,
+        const String & metadata_path_,
         Int32 schema_id_relevant_to_iterator_,
-        std::vector<std::pair<String, Field>> identity_partition_columns_);
+        std::vector<std::pair<String, Field>> identity_partition_columns_,
+        ObjectStoragePtr resolved_storage_ = nullptr,
+        const String & resolved_key_ = "");
 
     explicit IcebergDataObjectInfo(const RelativePathWithMetadata & path_);
     explicit IcebergDataObjectInfo(const RelativePathWithMetadata & path_, const Iceberg::IcebergObjectSerializableInfo & info_);
@@ -83,7 +87,9 @@ struct IcebergDataObjectInfo : public ObjectInfo, std::enable_shared_from_this<I
         const SharedHeader & header,
         const std::optional<FormatSettings> & format_settings,
         FormatParserSharedResourcesPtr parser_shared_resources,
-        ContextPtr context_);
+        ContextPtr context_,
+        const Iceberg::IcebergPathResolver & path_resolver,
+        std::shared_ptr<ExternalStorageCache> external_storages);
 
     std::optional<String> getFileFormat() const override { return info.file_format; }
 
@@ -96,11 +102,32 @@ struct IcebergDataObjectInfo : public ObjectInfo, std::enable_shared_from_this<I
 
     void addPositionDeleteObject(Iceberg::ProcessedManifestFileEntryPtr position_delete_object, const String & resolved_storage_path);
 
+    std::optional<String> getPathInDataLakeMetadata() const override
+    {
+        if (info.data_object_file_path_key.empty())
+            return std::nullopt;
+        return info.data_object_file_path_key.serialize();
+    }
+
+    std::optional<String> getExternalLocalPath() const override;
+
+    ObjectStoragePtr getResolvedStorage(const ObjectStoragePtr & default_storage) const override
+    {
+        return resolved_storage ? resolved_storage : default_storage;
+    }
+
+    ObjectStoragePtr tryGetResolvedStorage() const { return resolved_storage; }
+
+    void setResolvedStorage(ObjectStoragePtr storage) { resolved_storage = std::move(storage); }
+
     void addEqualityDeleteObject(const Iceberg::ProcessedManifestFileEntryPtr & equality_delete_object, const String & resolved_storage_path);
 
     std::shared_ptr<ObjectInfo> clone() const override { return std::make_shared<IcebergDataObjectInfo>(*this); }
 
     Iceberg::IcebergObjectSerializableInfo info;
+
+private:
+    ObjectStoragePtr resolved_storage;
 };
 
 using IcebergDataObjectInfoPtr = std::shared_ptr<IcebergDataObjectInfo>;

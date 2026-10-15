@@ -36,7 +36,8 @@ struct ClusterFunctionReadTaskResponse
     bool isEmpty() const { return path.empty(); }
 
     /// Serialize according to the protocol version.
-    void serialize(WriteBuffer & out, size_t worker_protocol_version) const;
+    /// `worker_antalya_protocol_version` is the Antalya protocol version negotiated with the worker.
+    void serialize(WriteBuffer & out, size_t worker_protocol_version, UInt64 worker_antalya_protocol_version) const;
     /// Deserialize. Protocol version will be received from `in`
     /// and the result will be deserialized accordingly.
     void deserialize(ReadBuffer & in);

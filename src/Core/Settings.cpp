@@ -692,6 +692,10 @@ Use multiple threads for azure multipart upload.
     DECLARE(Bool, s3_throw_on_zero_files_match, false, R"(
 Throw an error, when ListObjects request cannot match any files
 )", 0) \
+    DECLARE(Bool, object_storage_propagate_credentials_to_other_storages, false, R"(
+Reuse the base storage's `S3` credentials when accessing Iceberg table files located in a different endpoint.
+Ignored if `s3_allow_server_credentials_in_user_queries` is disabled.
+)", 0) \
     DECLARE(Bool, hdfs_throw_on_zero_files_match, false, R"(
 Throw an error if matched zero files according to glob expansion rules.
 
@@ -2286,20 +2290,15 @@ Possible values:
 - `allow` — Allows the use of these types of subqueries.
 )", IMPORTANT) \
     DECLARE(ObjectStorageClusterJoinMode, object_storage_cluster_join_mode, ObjectStorageClusterJoinMode::ALLOW, R"(
-Changes the behaviour of object storage cluster function or table.
-
-ClickHouse applies this setting when the query contains the product of object storage cluster function or table, i.e. when the query for a object storage cluster function or table contains a non-GLOBAL subquery for the object storage cluster function or table.
-
-Restrictions:
-
-- Only applied for JOIN subqueries.
-- Only if the FROM section uses a object storage cluster function or table.
+Where a [JOIN](../../sql-reference/statements/select/join.md#distributed-join) runs when its left table is a cluster table function (`s3Cluster`, `icebergCluster`, and the other `*Cluster` functions) or a table engine with [`object_storage_cluster`](#object_storage_cluster) set.
 
 Possible values:
 
-- `local` — Replaces the database and table in the subquery with local ones for the destination server (shard), leaving the normal `IN`/`JOIN.`
-- `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.` Right table executes first and is added to the secondary query as temporay table.
-- `allow` — Default value. Allows the use of these types of subqueries.
+- `allow` — Default. Nodes read the left table and return its rows. The join runs on the initiator. The right table is read there and is not sent to the nodes.
+- `local` — The join runs on the initiator. Nodes read the left table and return its rows. The right table is read on the initiator and is not sent to the nodes.
+- `global` — `INNER`, `LEFT`, and `CROSS` run on the nodes. The initiator reads the right table once and sends it to each node. For `CROSS JOIN`, every table after the first is sent. `RIGHT` and `FULL` stay on the initiator, so unmatched rows of the preserved side are returned once.
+
+See [Distributed JOIN](../../sql-reference/statements/select/join.md#object-storage-cluster-join-mode).
 )", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
@@ -5991,9 +5990,9 @@ Possible values:
 - manifest_file_entry - Everything above + traversed avro manifest files entries.
 )", 0) \
     \
-    DECLARE(Bool, iceberg_delete_data_on_drop, false, R"(
-Whether to delete all iceberg files on drop or not.
-)", 0) \
+    DECLARE_WITH_ALIAS(Bool, data_lake_delete_data_on_drop, false, R"(
+Whether to delete the underlying data files when dropping a data lake table. For catalog databases the catalog is asked to purge the data (`purgeRequested=true`); for self-managed tables ClickHouse removes the files directly.
+)", 0, iceberg_delete_data_on_drop) \
     DECLARE(Int64, iceberg_expire_default_min_snapshots_to_keep, 1, R"(
 Default value for Iceberg table property `history.expire.min-snapshots-to-keep` used by `expire_snapshots` when that property is absent.
 )", 0) \
@@ -8289,6 +8288,10 @@ Allow experimental database engine DataLakeCatalog with catalog_type = 'iceberg'
 
 Cloud default value: `1`.
 )", BETA, allow_database_iceberg) \
+    DECLARE(Bool, datalake_ignore_unsupported_table_properties, false, R"(
+Allow `CREATE TABLE`, `CREATE TABLE ... AS`, and `SHOW CREATE TABLE` in a `DataLakeCatalog` database to omit unsupported table properties, including explicitly specified and inherited properties. Supported properties are preserved. By default, properties that cannot be represented cause an exception.
+This setting does not suppress invalid expressions, unknown columns, invalid transform arguments, or incompatible storage engines, endpoints, and credentials.
+)", BETA) \
     DECLARE_WITH_ALIAS(Bool, allow_experimental_database_unity_catalog, true, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'unity'
 

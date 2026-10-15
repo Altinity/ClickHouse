@@ -74,7 +74,8 @@ public:
         Int32 table_schema_id,
         Int32 file_schema_id,
         const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_,
-        const std::unordered_map<Int32, std::pair<Field, Field>> & value_bounds_);
+        const std::unordered_map<Int32, std::pair<Field, Field>> & value_bounds_,
+        const String & file_path);
 
     void serialize(WriteBuffer & out) const;
     static DataFileMetaInfo deserialize(ReadBuffer & in);
@@ -125,6 +126,8 @@ public:
     virtual ~IDataLakeMetadata() = default;
 
     virtual bool operator==(const IDataLakeMetadata & other) const = 0;
+
+    virtual std::string getTableLocation() const { return {}; }
 
     /// Return iterator to `data files`.
     using FileProgressCallback = std::function<void(FileProgress)>;
@@ -289,7 +292,10 @@ public:
         throwNotImplemented("truncate");
     }
 
-    virtual void drop(ContextPtr) { }
+    /// Checks with the `DROP` query context what `drop` will do in the background.
+    virtual void checkCanBeDropped(ContextPtr /*query_context*/) const { }
+    /// `delete_data` is what `StorageObjectStorage::drop` resolved from `data_lake_delete_data_on_drop`.
+    virtual void drop(bool /* delete_data */) { }
 
     virtual ObjectStorageType getObjectStorageType() const { return ObjectStorageType::None; }
 

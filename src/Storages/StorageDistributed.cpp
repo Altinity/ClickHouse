@@ -3200,7 +3200,7 @@ When querying a `Distributed` table, `SELECT` queries are sent to all shards and
 
 When the `max_parallel_replicas` option is enabled, query processing is parallelized across all replicas within a single shard. For more information, see the section [max_parallel_replicas](/reference/settings/session-settings/max#max_parallel_replicas).
 
-To learn more about how distributed `in` and `global in` queries are processed, refer to [this](/reference/statements/in#distributed-subqueries) documentation.
+To learn more about how distributed `IN` and `GLOBAL IN` queries are processed, refer to [Distributed subqueries](/reference/statements/in#distributed-subqueries). For where a `JOIN` runs and which table is sent to the shards, see [Distributed JOIN](/reference/statements/select/join#distributed-join).
 
 ## Virtual columns {#virtual-columns}
 

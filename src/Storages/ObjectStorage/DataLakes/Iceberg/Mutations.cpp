@@ -1,4 +1,5 @@
 #include <Columns/ColumnLowCardinality.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Core/ColumnsWithTypeAndName.h>
@@ -114,13 +115,13 @@ static bool alterAlreadyApplied(const MetadataGenerator & generator, const Alter
     switch (command.type)
     {
         case AlterCommand::Type::ADD_COLUMN:
-            return generator.isAddColumnApplied(command.column_name, command.data_type);
+            return generator.isAddColumnApplied(command.column_name, command.data_type, command.first, command.after_column);
         case AlterCommand::Type::DROP_COLUMN:
             return generator.isDropColumnApplied(command.column_name);
         case AlterCommand::Type::RENAME_COLUMN:
             return generator.isRenameColumnApplied(command.column_name, command.rename_to);
         case AlterCommand::Type::MODIFY_COLUMN:
-            return generator.isModifyColumnApplied(command.column_name, command.data_type);
+            return generator.isModifyColumnApplied(command.column_name, command.data_type, command.first, command.after_column);
         default:
             return false;
     }
@@ -433,6 +434,7 @@ static bool writeMetadataFiles(
     const DataFileWriteResultWithStats & delete_files,
     const DataFileWriteResultWithStats & data_files,
     ObjectStoragePtr object_storage,
+    ExternalStorageCache & external_storages,
     ContextPtr context,
     FileNamesGenerator & filename_generator,
     const Iceberg::IcebergPathResolver & path_resolver,
@@ -444,13 +446,14 @@ static bool writeMetadataFiles(
     Poco::JSON::Object::Ptr partititon_spec,
     Int32 partition_spec_id,
     std::optional<ChunkPartitioner> & chunk_partitioner,
-    SharedHeader data_sample_block)
+    SharedHeader data_sample_block,
+    const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path)
 {
     auto delete_sample_block = std::make_shared<const Block>(getPositionDeleteFileSampleBlock());
 
     auto metadata_info = filename_generator.generateMetadataPathWithInfo();
     Int64 parent_snapshot = -1;
-    if (metadata->has(Iceberg::f_current_snapshot_id))
+    if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
         parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
 
     auto sum_files = [](const DataFileWriteResultWithStats & set) -> std::tuple<Int64, Int64, Int64>
@@ -478,7 +481,7 @@ static bool writeMetadataFiles(
 
     auto result = MetadataGenerator(metadata).generateNextMetadata(
         filename_generator,
-        metadata_info.path,
+        previous_metadata_file_path,
         parent_snapshot,
         /* added_files */ data_files_count,
         /* added_records */ data_rows,
@@ -597,6 +600,7 @@ static bool writeMetadataFiles(
                 path_resolver,
                 metadata,
                 object_storage,
+                external_storages,
                 context,
                 manifest_entries,
                 new_snapshot,
@@ -684,7 +688,8 @@ void validateSnapshotDataFileFormatsForMutation(
     const PersistentTableComponents & persistent_table_components,
     ContextPtr context,
     LoggerPtr log,
-    Int32 current_schema_id)
+    Int32 current_schema_id,
+    ExternalStorageCache & external_storages)
 {
     if (!metadata->has(f_current_snapshot_id) || metadata->isNull(f_current_snapshot_id))
         return;
@@ -710,11 +715,11 @@ void validateSnapshotDataFileFormatsForMutation(
         return;
 
     auto manifest_list_path = IcebergPathFromMetadata::deserialize(current_snapshot->getValue<String>(f_manifest_list));
-    auto manifest_list_entries = getManifestList(object_storage, persistent_table_components, context, manifest_list_path, log);
+    auto manifest_list_entries = getManifestList(object_storage, persistent_table_components, context, manifest_list_path, log, external_storages);
     for (const auto & manifest_list_entry : manifest_list_entries)
     {
         auto files_handle = getManifestFileEntriesHandle(
-            object_storage, persistent_table_components, context, log, manifest_list_entry, current_schema_id);
+            object_storage, persistent_table_components, context, log, manifest_list_entry, current_schema_id, external_storages);
 
         for (const auto & file_entry : files_handle.getFilesWithoutDeleted(FileContentType::DATA))
         {
@@ -724,7 +729,7 @@ void validateSnapshotDataFileFormatsForMutation(
                     ErrorCodes::NOT_IMPLEMENTED,
                     "Iceberg DELETE and UPDATE require all data files in the current snapshot to be Parquet, "
                     "but data file `{}` has format `{}`",
-                    file_entry->parsed_entry->file_path_key.serialize(),
+                    file_entry->parsed_entry->file_path_key,
                     file_format);
         }
     }
@@ -738,6 +743,7 @@ void mutate(
     StorageMetadataPtr storage_metadata,
     StorageID storage_id,
     ObjectStoragePtr object_storage,
+    ExternalStorageCache & external_storages,
     const DataLakeStorageSettings & data_lake_settings,
     const PersistentTableComponents & persistent_table_components,
     const String & write_format,
@@ -772,6 +778,7 @@ void mutate(
         filename_generator.setCompressionMethod(compression_method);
 
         auto metadata = getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
+        auto previous_metadata_path = persistent_table_components.path_resolver.reverseResolve(metadata_path);
 
         /// Iceberg v3 writers must not add new position-delete files; row-level deletes require
         /// deletion vectors. Fail closed before any object writes until ClickHouse can write DVs.
@@ -815,13 +822,13 @@ void mutate(
         /// metadata version, so a concurrent writer that commits non-Parquet
         /// data files between iterations is caught by the next retry.
         validateSnapshotDataFileFormatsForMutation(
-            metadata, object_storage, persistent_table_components, context, log, static_cast<Int32>(current_schema_id));
+            metadata, object_storage, persistent_table_components, context, log, static_cast<Int32>(current_schema_id), external_storages);
 
         TableStateSnapshot current_iceberg_snapshot;
         current_iceberg_snapshot.metadata_file_path = metadata_path;
         current_iceberg_snapshot.metadata_version = last_version;
         current_iceberg_snapshot.schema_id = static_cast<Int32>(current_schema_id);
-        if (metadata->has(Iceberg::f_current_snapshot_id))
+        if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
         {
             Int64 snapshot_id_val = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
             if (snapshot_id_val >= 0)
@@ -854,6 +861,7 @@ void mutate(
                     mutation_files->delete_file,
                     mutation_files->data_file,
                     object_storage,
+                    external_storages,
                     context,
                     filename_generator,
                     persistent_table_components.path_resolver,
@@ -865,7 +873,8 @@ void mutate(
                     partititon_spec,
                     static_cast<Int32>(partition_spec_id),
                     chunk_partitioner,
-                    sample_block))
+                    sample_block,
+                    previous_metadata_path))
                 continue;
         }
         break;
@@ -934,7 +943,7 @@ void alter(
         switch (params[0].type)
         {
             case AlterCommand::Type::ADD_COLUMN:
-                metadata_json_generator.generateAddColumnMetadata(params[0].column_name, params[0].data_type);
+                metadata_json_generator.generateAddColumnMetadata(params[0].column_name, params[0].data_type, params[0].first, params[0].after_column);
                 break;
             case AlterCommand::Type::DROP_COLUMN:
                 if (params[0].clear)
@@ -943,7 +952,7 @@ void alter(
                 break;
             case AlterCommand::Type::MODIFY_COLUMN:
             {
-                if (!metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type, context))
+                if (!metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type, context, params[0].first, params[0].after_column))
                 {
                     succeeded = true;
                 }

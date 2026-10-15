@@ -18,6 +18,8 @@
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Storages/checkAndGetLiteralArgument.h>
 #include <Poco/UUIDGenerator.h>
+#include <filesystem>
+
 
 namespace DB
 {
@@ -365,4 +367,5 @@ extern const SettingsBool use_cache_for_count_from_files;
 extern const SettingsString filesystem_cache_name;
 extern const SettingsUInt64 filesystem_cache_boundary_alignment;
 }
+
 }

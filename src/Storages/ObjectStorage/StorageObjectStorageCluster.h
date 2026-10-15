@@ -51,6 +51,9 @@ public:
         const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
 
+    void checkTableCanBeDropped(ContextPtr query_context) const override { configuration->checkCanBeDropped(query_context); }
+    void prepareForDrop(ContextPtr query_context) override;
+
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node * predicate,
         const ActionsDAG * filter,
