@@ -104,8 +104,9 @@ manifest never loses an owner, so it is net zero.
 
 ## Crash points and their cleaners {#crash-points}
 
-This table is the single best summary of the design's crash-safety story: every row leaks
-something recoverable; no row loses data or leaves a dangling reference.
+This table is the single best summary of the design's crash-safety story: no row loses committed
+data or leaves a dangling reference. A write reported as failed is known durable in C10 and C11,
+and may be durable in C3 and C6.
 
 | # | Crash window | Left behind | Who cleans it |
 |---|---|---|---|
@@ -114,10 +115,15 @@ something recoverable; no row loses data or leaves a dangling reference.
 | C3 | `precommitAdd` returned Unresolved | A possibly-live precommit binding | Intent recorded pre-append; `abandon` appends the exact removal, tolerating absence. The body is never writer-deleted |
 | C4 | Between `precommitAdd` and `promote` | A live precommit plus uploaded blobs | No resume path exists. Removed by `abandon`, else by a fenced successor's stale-precommit sweep |
 | C5 | Mid blob fan-out | Already-uploaded blobs | Nothing merged; blobs become `GC`-reclaimable debris; the part is not published |
-| C6 | `promote` append Unresolved | The ref may or may not be committed | Commit state Uncertain — the relink layer maps this to "retry the whole fetch", never to a byte fetch |
+| C6 | `promote` append Unresolved | The ref may or may not be committed | Commit state Uncertain — the relink layer maps this to "retry the whole fetch", never to a byte fetch. The client sees `outcome is unknown` |
 | C7 | A later part throws after earlier parts published | A partial multi-part commit | Precise rollback: drop only the refs this call created, matching the exact manifest — never clobbers a concurrent writer's repoint |
 | C8 | Transaction destroyed uncommitted | Open builds | Destructor abandons every build |
 | C9 | Namespace dropped mid-build | — | One atomic flag; every further op fails closed at the alive check |
+| C10 | `promote` ref-log `PUT` committed, then the `_ckpt` frontier publish failed | A durable promotion this server has not installed; the ref lane needs recovery | The next ref-log recovery installs it. The in-memory part was already rolled back, and part cleanup later drops the ref; a restart before that drop brings the part back. The client sees `is durable, but publishing its checkpoint frontier was not confirmed` |
+| C11 | `precommitAdd` ref-log `PUT` committed, then the `_ckpt` frontier publish failed | A durable precommit binding this server has not installed | The next ref-log recovery installs the binding; the part is never published. `abandon`, else the stale-precommit sweep, removes it. The client sees the same message as in C10, although the part never appears |
+
+What each client-visible message means, and when a retry is safe, is in
+[CAS commit errors](/antalya/cas/operations/troubleshooting#cas-commit-errors).
 
 ## The repoint {#repoint}
 
