@@ -83,6 +83,8 @@ validation, and other callers.
 | `CASBlobHeadMiss` | `Number` | Number of successful backend HEAD requests under CAS blob paths that found no object, aggregated across all callers. |
 | `CASBlobList` | `Number` | Number of CAS blob LIST requests. Growing values indicate more object enumeration. |
 | `CASBlobOverwrite` | `Number` | Number of CAS blob overwrite requests. Growing values indicate repeated replacement writes. |
+| `CASBlobPublishAttemptFailed` | `Number` | Number of CAS blob publication attempts that failed with an ambiguous or retryable error. The writer observes the blob again and publishes a fresh envelope, up to the attempt limit. |
+| `CASBlobPublishGaveUp` | `Number` | Number of CAS blob publications abandoned because the last allowed attempt failed. The write fails with a retryable error. |
 | `CASBlobPut` | `Number` | Number of CAS blob PUT requests. Grows with blob uploads and indicates storage write traffic. |
 | `CASBlobPutDeduplicated` | `Number` | Number of CAS blob deduplicating PUT requests. Grows when uploads reuse existing content. |
 
@@ -523,7 +525,7 @@ These counters cover client-side time of individual S3 and Azure list and head c
 | `AzureListObjectsMicroseconds` | `Microseconds` | Time of Azure blob storage API ListObjects execution. |
 | `S3HeadObjectMicroseconds` | `Microseconds` | Time of S3 API HeadObject execution. |
 | `S3ListObjectsMicroseconds` | `Microseconds` | Time of S3 API ListObjects execution. |
-| `S3SingleAttemptRetryConsultations` | `Number` | Number of AWS SDK retry consultations refused by the single-attempt S3 retry profile. Non-zero means the SDK attempted a transparent retry on a write that must make exactly one HTTP attempt. |
+| `S3SingleAttemptRetryConsultations` | `Number` | Number of AWS SDK retry consultations refused by a single-attempt S3 client: the clone used by the single-attempt retry profile, or the clone that sends the object-creating requests of a write that forbids a resend. Non-zero means a request on such a client failed and was not resent. |
 
 ### Other profile events {#other-profile-events}
 
