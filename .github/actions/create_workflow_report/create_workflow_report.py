@@ -61,13 +61,28 @@ def query_dataframe_with_retry(
             wait = backoff_seconds * attempt
             time.sleep(wait)
 
-def get_commit_statuses(sha: str) -> pd.DataFrame:
+def _results_link_has_ref(target_url: str | None, ref: str) -> bool:
+    """
+    Whether a CI status results link has `ref` in it:`json.html?REF=<ref>&...` for
+    praktika jobs, `/REFs/<ref>/...` for regression jobs.
+    """
+    target_url = target_url or ""
+    return f"REF={ref}&" in target_url or f"/REFs/{ref}/" in target_url
+
+
+def get_commit_statuses(sha: str, pr_number: int, ref: str) -> pd.DataFrame:
     """
     Fetch commit statuses for a given SHA and return as a pandas DataFrame.
     Handles pagination to get all statuses.
 
+    Statuses belong to the commit, not the ref, so a release tag and its branch
+    can write to the same job names. For release runs (`pr_number` 0), only
+    statuses of `ref` are kept.
+
     Args:
         sha (str): Commit SHA to fetch statuses for.
+        pr_number (int): Pull request number, 0 for release runs.
+        ref (str): Ref of the run being reported.
 
     Returns:
         pd.DataFrame: DataFrame containing all statuses.
@@ -116,6 +131,7 @@ def get_commit_statuses(sha: str) -> pd.DataFrame:
             "results_link": item["target_url"],
         }
         for item in all_data
+        if pr_number != 0 or _results_link_has_ref(item["target_url"], ref)
     ]
 
     # Create DataFrame
@@ -1283,7 +1299,7 @@ def create_workflow_report(
 
     results_dfs = {
         "prs_in_release": [],
-        "job_statuses": get_commit_statuses(commit_sha),
+        "job_statuses": get_commit_statuses(commit_sha, pr_number, branch_name),
         "checks_fails": add_labels_to_checks_fails(
             get_checks_fails(db_client, commit_sha, branch_name),
             workflow_result,
