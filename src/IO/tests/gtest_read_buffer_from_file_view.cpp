@@ -225,9 +225,27 @@ TEST_P(ReadBufferFromFileViewTest, SetReadUntilTruncateThenExtend)
     EXPECT_EQ(view->getPosition(), 30);
     EXPECT_EQ(readExact(*view, 100), payload.substr(30, 100));
 
+    EXPECT_EQ(view->count(), 130);
     view->setReadUntilEnd();
+    EXPECT_EQ(view->count(), 130);
     EXPECT_EQ(readExact(*view, payload.size() - 130), payload.substr(130));
     EXPECT_TRUE(view->eof());
+    EXPECT_EQ(view->count(), payload.size());
+}
+
+TEST_P(ReadBufferFromFileViewTest, PrefetchKeepsCount)
+{
+    const auto [chunk, mode] = GetParam();
+    const auto payload = makePayload(1000);
+    auto view = makeView(payload, chunk, mode);
+
+    EXPECT_EQ(readExact(*view, 37), payload.substr(0, 37));
+    const auto count = view->count();
+    EXPECT_EQ(count, 37);
+    view->prefetch(Priority{0});
+    EXPECT_EQ(view->count(), count);
+    EXPECT_EQ(readExact(*view, 23), payload.substr(37, 23));
+    EXPECT_EQ(view->count(), 60);
 }
 
 /// The exact shape of the failing compact-part in-order read: per granule, adjust the right
