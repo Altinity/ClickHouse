@@ -75,8 +75,15 @@ struct DropResponse : std::runtime_error
 
 using VerbCounts = std::array<std::atomic<size_t>, static_cast<size_t>(Verb::Count)>;
 
-/// Answers one request. `nth` is the 1-based count of requests of this verb, this one included.
-using Responder = std::function<void(Verb verb, size_t nth, Poco::Net::HTTPServerResponse & response)>;
+/// One request as the server received it.
+struct Request
+{
+    Verb verb;
+    /// The 1-based count of requests of this verb, this one included.
+    size_t nth;
+};
+
+using Responder = std::function<void(const Request & request, Poco::Net::HTTPServerResponse & response)>;
 
 class CountingHandler : public Poco::Net::HTTPRequestHandler
 {
@@ -96,7 +103,7 @@ public:
             Poco::StreamCopier::copyStream64(request.stream(), discard);
         }
         const size_t nth = ++counts[static_cast<size_t>(verb)];
-        respond(verb, nth, response);
+        respond(Request{.verb = verb, .nth = nth}, response);
     }
 };
 
@@ -213,6 +220,34 @@ inline void answerOk(Verb verb, Poco::Net::HTTPServerResponse & response)
             break;
     }
     sendError(response, Poco::Net::HTTPResponse::HTTP_NOT_IMPLEMENTED, "NotImplemented");
+}
+
+using Fault = std::function<void(Poco::Net::HTTPServerResponse & response)>;
+
+/// Answers requests of `faulted_verb` with `fault` (only the `only_nth`-th one, or every one when it is 0)
+/// and everything else with `answerOk`.
+inline Responder faulting(Verb faulted_verb, Fault fault, size_t only_nth = 0)
+{
+    return [faulted_verb, respond_with = std::move(fault), only_nth](const Request & request, Poco::Net::HTTPServerResponse & response)
+    {
+        if (request.verb == faulted_verb && (only_nth == 0 || request.nth == only_nth))
+            return respond_with(response);
+        answerOk(request.verb, response);
+    };
+}
+
+/// Reads the whole request and closes the connection without an answer.
+inline Responder dropping(Verb faulted_verb, size_t only_nth = 0)
+{
+    return faulting(faulted_verb, [](Poco::Net::HTTPServerResponse &) { throw DropResponse(); }, only_nth);
+}
+
+inline Responder failing(Verb faulted_verb, Poco::Net::HTTPResponse::HTTPStatus status, std::string code, size_t only_nth = 0)
+{
+    return faulting(
+        faulted_verb,
+        [status, error_code = std::move(code)](Poco::Net::HTTPServerResponse & response) { sendError(response, status, error_code); },
+        only_nth);
 }
 
 }

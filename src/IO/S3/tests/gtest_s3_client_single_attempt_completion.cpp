@@ -32,7 +32,8 @@ namespace
 /// name in its path, which is all the provider detection looks at.
 std::shared_ptr<DB::S3::Client> makeRetryingClient(const std::string & endpoint, bool gcs)
 {
-    DB::RemoteHostFilter remote_host_filter;
+    /// The client configuration keeps a reference to the filter.
+    static const DB::RemoteHostFilter remote_host_filter;
     DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
         "us-east-1",
         remote_host_filter,
@@ -79,18 +80,16 @@ DB::S3::Model::CompleteMultipartUploadOutcome complete(const DB::S3::Client & cl
     return client.CompleteMultipartUpload(request);
 }
 
-void answerNoSuchUpload(Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
+CountingS3::Responder answerNoSuchUpload()
 {
-    if (verb == Verb::CompleteMultipartUpload)
-        return CountingS3::sendError(response, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchUpload");
-    CountingS3::answerOk(verb, response);
+    return CountingS3::failing(Verb::CompleteMultipartUpload, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchUpload");
 }
 
 }
 
 TEST(S3ClientSingleAttemptCompletion, NoSuchUploadWithObjectAtKeyIsAnError)
 {
-    CountingS3Server server(answerNoSuchUpload);
+    CountingS3Server server(answerNoSuchUpload());
     auto client = singleAttemptClone(*makeRetryingClient(server.getUrl(), /*gcs=*/false));
 
     const auto outcome = complete(*client);
@@ -103,7 +102,7 @@ TEST(S3ClientSingleAttemptCompletion, NoSuchUploadWithObjectAtKeyIsAnError)
 /// A retrying client may have completed the upload on an attempt whose response it lost.
 TEST(S3ClientSingleAttemptCompletion, OrdinaryClientReadsNoSuchUploadWithObjectAtKeyAsSuccess)
 {
-    CountingS3Server server(answerNoSuchUpload);
+    CountingS3Server server(answerNoSuchUpload());
     auto client = makeRetryingClient(server.getUrl(), /*gcs=*/false);
 
     EXPECT_TRUE(complete(*client).IsSuccess());
@@ -113,9 +112,9 @@ TEST(S3ClientSingleAttemptCompletion, OrdinaryClientReadsNoSuchUploadWithObjectA
 /// The compose rewrites the object as a new generation, a second creating request.
 TEST(S3ClientSingleAttemptCompletion, GcsComposeIsSkipped)
 {
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
+    CountingS3Server server([](const CountingS3::Request & request, Poco::Net::HTTPServerResponse & response)
     {
-        CountingS3::answerOk(verb, response);
+        CountingS3::answerOk(request.verb, response);
     });
     auto client = makeRetryingClient(server.getUrl(), /*gcs=*/true);
 

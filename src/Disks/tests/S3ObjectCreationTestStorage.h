@@ -9,6 +9,7 @@
 #include <IO/S3/PocoHTTPClient.h>
 #include <IO/S3/URI.h>
 #include <IO/S3Settings.h>
+#include <Common/Exception.h>
 #include <Common/RemoteHostFilter.h>
 
 #include <functional>
@@ -33,7 +34,8 @@ inline std::shared_ptr<DB::S3ObjectStorage> makeRetryingStorage(
     const std::string & endpoint, const std::function<void(DB::S3Settings &)> & adjust_settings = {},
     bool adaptive_timeouts = false, long request_timeout_ms = 10000)
 {
-    DB::RemoteHostFilter remote_host_filter;
+    /// The client configuration keeps a reference to the filter.
+    static const DB::RemoteHostFilter remote_host_filter;
     DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
         "us-east-1",
         remote_host_filter,
@@ -67,6 +69,24 @@ inline std::shared_ptr<DB::S3ObjectStorage> makeRetryingStorage(
     return std::make_shared<DB::S3ObjectStorage>(
         std::move(client), std::move(settings), DB::S3::URI(endpoint + "/test-bucket/"), DB::S3Capabilities{},
         DB::ObjectStorageKeyGeneratorPtr{}, "disk");
+}
+
+/// The `DB::Exception` code `fn` throws: 0 when it returns, -1 for any other exception.
+inline int thrownCode(const std::function<void()> & fn)
+{
+    try
+    {
+        fn();
+    }
+    catch (const DB::Exception & e)
+    {
+        return e.code();
+    }
+    catch (...)
+    {
+        return -1;
+    }
+    return 0;
 }
 
 /// A body above the single-part ceiling that fits one part, so a write is exactly one `UploadPart`.

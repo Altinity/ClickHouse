@@ -12,19 +12,27 @@
 #include <IO/S3/tests/CountingS3Server.h>
 #include <Common/tests/gtest_global_context.h>
 
+#include <functional>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <vector>
 
 /// Blob publication must put every object-creating request (`PutObject`, `CopyObject`,
-/// `CompleteMultipartUpload`) on the wire at most once: on a content-ETag store a resent envelope that
-/// lands after GC deleted it restores the condemned incarnation. These tests drive the backend's
-/// `publish` against a counting S3 server whose client retries, as a disk's client does.
+/// `CompleteMultipartUpload`) on the wire at most once. These tests drive the backend's `publish`
+/// against a counting S3 server whose client retries, as a disk's client does.
+
+namespace DB::ErrorCodes
+{
+extern const int S3_ERROR;
+}
 
 using CountingS3::CountingS3Server;
 using CountingS3::Verb;
 using S3ObjectCreationTestStorage::forceOnePartMultipart;
 using S3ObjectCreationTestStorage::forceOnePartMultipartCopy;
 using S3ObjectCreationTestStorage::makeRetryingStorage;
+using S3ObjectCreationTestStorage::thrownCode;
 
 namespace
 {
@@ -64,109 +72,77 @@ void publishOnce(const DB::ObjectStoragePtr & storage, const DB::Cas::BlobPublis
     op.publish(request, DB::Cas::Retry::once());
 }
 
-CountingS3::Responder failing(Verb failing_verb, Poco::Net::HTTPResponse::HTTPStatus status, std::string code)
+/// A failed creating request, and the verb that fails.
+struct Fault
 {
-    return [failing_verb, status, code](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == failing_verb)
-            return CountingS3::sendError(response, status, code);
-        CountingS3::answerOk(verb, response);
-    };
-}
+    std::string name;
+    CountingS3::Responder (*responder)(Verb verb);
+    /// Only `CompleteMultipartUpload` can answer it.
+    bool completion_only;
+};
 
-CountingS3::Responder dropping(Verb dropped_verb)
+/// One blob publication path: the verb that creates the object, and how to reach it.
+struct PublicationPath
 {
-    return [dropped_verb](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == dropped_verb)
-            throw CountingS3::DropResponse();
-        CountingS3::answerOk(verb, response);
-    };
-}
+    std::string name;
+    Verb creating_verb;
+    void (*adjust_settings)(DB::S3Settings &);
+    bool staged_copy;
+};
 
-}
+const PublicationPath publication_paths[] = {
+    {"Put", Verb::PutObject, nullptr, false},
+    {"Copy", Verb::CopyObject, nullptr, true},
+    {"Complete", Verb::CompleteMultipartUpload, forceOnePartMultipart, false},
+    {"MultipartCopyComplete", Verb::CompleteMultipartUpload, forceOnePartMultipartCopy, true},
+};
 
-TEST(CASBlobPublishTransport, PutIsOneWireRequestOnLostResponse)
+const Fault faults[] = {
+    {"LostResponse", [](Verb verb) { return CountingS3::dropping(verb); }, false},
+    /// The `NO_SUCH_KEY` loops above the client would reissue the identical envelope.
+    {"NoSuchKey", [](Verb verb) { return CountingS3::failing(verb, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey"); }, false},
+    /// An object at the key does not prove that this upload created it: it may be a condemned incarnation.
+    {"NoSuchUpload",
+     [](Verb verb) { return CountingS3::failing(verb, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchUpload"); },
+     true},
+};
+
+using FaultedPublication = std::tuple<PublicationPath, Fault>;
+
+class CASBlobPublishTransportFault : public ::testing::TestWithParam<FaultedPublication>
 {
-    (void)getContext();
-    CountingS3Server server(dropping(Verb::PutObject));
+};
 
-    EXPECT_ANY_THROW(publishOnce(makeRetryingStorage(server.getUrl()), streamingPublication()));
-    EXPECT_EQ(server.count(Verb::PutObject), 1u);
-}
-
-TEST(CASBlobPublishTransport, CopyIsOneWireRequestOnLostResponse)
+std::vector<FaultedPublication> faultedPublications()
 {
-    (void)getContext();
-    CountingS3Server server(dropping(Verb::CopyObject));
-
-    EXPECT_ANY_THROW(publishOnce(makeRetryingStorage(server.getUrl()), stagedCopyPublication()));
-    EXPECT_EQ(server.count(Verb::CopyObject), 1u);
+    std::vector<FaultedPublication> cases;
+    for (const auto & path : publication_paths)
+        for (const auto & fault : faults)
+            if (!fault.completion_only || path.creating_verb == Verb::CompleteMultipartUpload)
+                cases.emplace_back(path, fault);
+    return cases;
 }
 
-TEST(CASBlobPublishTransport, CompleteIsOneWireRequestOnLostResponse)
-{
-    (void)getContext();
-    CountingS3Server server(dropping(Verb::CompleteMultipartUpload));
-
-    EXPECT_ANY_THROW(publishOnce(makeRetryingStorage(server.getUrl(), forceOnePartMultipart), streamingPublication()));
-    EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
 }
 
-TEST(CASBlobPublishTransport, MultipartCopyCompleteIsOneWireRequestOnLostResponse)
-{
-    (void)getContext();
-    CountingS3Server server(dropping(Verb::CompleteMultipartUpload));
-
-    EXPECT_ANY_THROW(publishOnce(makeRetryingStorage(server.getUrl(), forceOnePartMultipartCopy), stagedCopyPublication()));
-    EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
-}
-
-/// An object at the key does not prove that this upload created it: it may be a condemned incarnation.
-TEST(CASBlobPublishTransport, CompleteNoSuchUploadIsAmbiguous)
+TEST_P(CASBlobPublishTransportFault, OneWireRequest)
 {
     (void)getContext();
-    CountingS3Server server(failing(Verb::CompleteMultipartUpload, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchUpload"));
+    const auto & [path, fault] = GetParam();
+    CountingS3Server server(fault.responder(path.creating_verb));
+    auto storage = makeRetryingStorage(server.getUrl(), path.adjust_settings ? path.adjust_settings : std::function<void(DB::S3Settings &)>{});
 
-    EXPECT_ANY_THROW(publishOnce(makeRetryingStorage(server.getUrl(), forceOnePartMultipart), streamingPublication()));
-    EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
+    EXPECT_EQ(
+        thrownCode([&] { publishOnce(storage, path.staged_copy ? stagedCopyPublication() : streamingPublication()); }),
+        DB::ErrorCodes::S3_ERROR);
+    EXPECT_EQ(server.count(path.creating_verb), 1u);
 }
 
-/// The `NO_SUCH_KEY` loops above the client reissue the identical envelope.
-TEST(CASBlobPublishTransport, NoSuchKeyLoopDoesNotResend)
-{
-    (void)getContext();
-    CountingS3Server server(failing(Verb::PutObject, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey"));
-
-    EXPECT_ANY_THROW(publishOnce(makeRetryingStorage(server.getUrl()), streamingPublication()));
-    EXPECT_EQ(server.count(Verb::PutObject), 1u);
-}
-
-TEST(CASBlobPublishTransport, CopyNoSuchKeyLoopDoesNotResend)
-{
-    (void)getContext();
-    CountingS3Server server(failing(Verb::CopyObject, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey"));
-
-    EXPECT_ANY_THROW(publishOnce(makeRetryingStorage(server.getUrl()), stagedCopyPublication()));
-    EXPECT_EQ(server.count(Verb::CopyObject), 1u);
-}
-
-TEST(CASBlobPublishTransport, CompleteNoSuchKeyLoopDoesNotResend)
-{
-    (void)getContext();
-    CountingS3Server server(failing(Verb::CompleteMultipartUpload, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey"));
-
-    EXPECT_ANY_THROW(publishOnce(makeRetryingStorage(server.getUrl(), forceOnePartMultipart), streamingPublication()));
-    EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
-}
-
-TEST(CASBlobPublishTransport, MultipartCopyCompleteNoSuchKeyLoopDoesNotResend)
-{
-    (void)getContext();
-    CountingS3Server server(failing(Verb::CompleteMultipartUpload, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey"));
-
-    EXPECT_ANY_THROW(publishOnce(makeRetryingStorage(server.getUrl(), forceOnePartMultipartCopy), stagedCopyPublication()));
-    EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
-}
+INSTANTIATE_TEST_SUITE_P(
+    CASBlobPublishTransport,
+    CASBlobPublishTransportFault,
+    ::testing::ValuesIn(faultedPublications()),
+    [](const ::testing::TestParamInfo<FaultedPublication> & param_info)
+    { return std::get<0>(param_info.param).name + "_" + std::get<1>(param_info.param).name; });
 
 #endif

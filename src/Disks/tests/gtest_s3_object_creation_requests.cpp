@@ -23,6 +23,7 @@
 namespace DB::ErrorCodes
 {
 extern const int LOGICAL_ERROR;
+extern const int S3_ERROR;
 }
 
 using CountingS3::CountingS3Server;
@@ -30,6 +31,7 @@ using CountingS3::Verb;
 using S3ObjectCreationTestStorage::forceOnePartMultipart;
 using S3ObjectCreationTestStorage::forceOnePartMultipartCopy;
 using S3ObjectCreationTestStorage::makeRetryingStorage;
+using S3ObjectCreationTestStorage::thrownCode;
 
 namespace
 {
@@ -73,112 +75,101 @@ DB::WriteSettings singleAttemptNativeCopy()
     return write_settings;
 }
 
+/// One way `S3ObjectStorage` creates an object, and the verb that creates it.
+struct CreationPath
+{
+    std::string name;
+    Verb creating_verb;
+    void (*adjust_settings)(DB::S3Settings &);
+    bool is_copy;
+
+    std::shared_ptr<DB::S3ObjectStorage> storage(const std::string & endpoint) const
+    {
+        return makeRetryingStorage(endpoint, adjust_settings ? adjust_settings : std::function<void(DB::S3Settings &)>{});
+    }
+
+    DB::WriteSettings singleAttemptSettings() const { return is_copy ? singleAttemptNativeCopy() : singleAttemptCreation(); }
+
+    void create(DB::S3ObjectStorage & target, const DB::WriteSettings & write_settings) const
+    {
+        if (is_copy)
+            copyObject(target, write_settings);
+        else
+            writeObject(target, write_settings);
+    }
+};
+
+const CreationPath creation_paths[] = {
+    {"Put", Verb::PutObject, nullptr, false},
+    {"Copy", Verb::CopyObject, nullptr, true},
+    {"Complete", Verb::CompleteMultipartUpload, forceOnePartMultipart, false},
+    {"MultipartCopyComplete", Verb::CompleteMultipartUpload, forceOnePartMultipartCopy, true},
+};
+
+class S3SingleAttemptObjectCreationPath : public ::testing::TestWithParam<CreationPath>
+{
+};
+
 }
 
 /// `writeObject` already applies the override; a copy reissues `CopyObject` in the same loop.
 TEST(S3ObjectStorageCopyObject, HonoursUnexpectedWriteErrorRetryOverride)
 {
     (void)getContext();
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::CopyObject)
-            return CountingS3::sendError(response, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey");
-        CountingS3::answerOk(verb, response);
-    });
+    CountingS3Server server(CountingS3::failing(Verb::CopyObject, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey"));
     auto storage = makeRetryingStorage(server.getUrl());
 
-    EXPECT_ANY_THROW(copyObject(*storage, DB::WriteSettings{}));
+    EXPECT_EQ(thrownCode([&] { copyObject(*storage, DB::WriteSettings{}); }), DB::ErrorCodes::S3_ERROR);
     EXPECT_EQ(server.count(Verb::CopyObject), 4u) << "the default `max_unexpected_write_error_retries`";
 
     DB::WriteSettings write_settings;
     write_settings.s3_max_unexpected_write_error_retries_override = 1;
-    EXPECT_ANY_THROW(copyObject(*storage, write_settings));
+    EXPECT_EQ(thrownCode([&] { copyObject(*storage, write_settings); }), DB::ErrorCodes::S3_ERROR);
     EXPECT_EQ(server.count(Verb::CopyObject), 5u);
 }
 
-TEST(S3SingleAttemptObjectCreation, PutIsOneWireRequestOnLostResponse)
+TEST_P(S3SingleAttemptObjectCreationPath, OneWireRequestOnLostResponse)
 {
     (void)getContext();
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::PutObject)
-            throw CountingS3::DropResponse();
-        CountingS3::answerOk(verb, response);
-    });
+    const CreationPath & path = GetParam();
+    CountingS3Server server(CountingS3::dropping(path.creating_verb));
 
-    EXPECT_ANY_THROW(writeObject(*makeRetryingStorage(server.getUrl()), singleAttemptCreation()));
-    EXPECT_EQ(server.count(Verb::PutObject), 1u);
+    EXPECT_EQ(thrownCode([&] { path.create(*path.storage(server.getUrl()), path.singleAttemptSettings()); }), DB::ErrorCodes::S3_ERROR);
+    EXPECT_EQ(server.count(path.creating_verb), 1u);
 }
 
-TEST(S3SingleAttemptObjectCreation, CopyIsOneWireRequestOnLostResponse)
+/// A writer that does not ask for single-attempt creation keeps the client's retries.
+TEST_P(S3SingleAttemptObjectCreationPath, DefaultWriteStillResendsLostResponse)
 {
     (void)getContext();
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::CopyObject)
-            throw CountingS3::DropResponse();
-        CountingS3::answerOk(verb, response);
-    });
+    const CreationPath & path = GetParam();
+    CountingS3Server server(CountingS3::dropping(path.creating_verb, /*only_nth=*/1));
 
-    EXPECT_ANY_THROW(copyObject(*makeRetryingStorage(server.getUrl()), singleAttemptNativeCopy()));
-    EXPECT_EQ(server.count(Verb::CopyObject), 1u);
+    EXPECT_EQ(thrownCode([&] { path.create(*path.storage(server.getUrl()), DB::WriteSettings{}); }), 0);
+    EXPECT_EQ(server.count(path.creating_verb), 2u);
 }
 
-TEST(S3SingleAttemptObjectCreation, CompleteIsOneWireRequestOnLostResponse)
-{
-    (void)getContext();
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::CompleteMultipartUpload)
-            throw CountingS3::DropResponse();
-        CountingS3::answerOk(verb, response);
-    });
-
-    EXPECT_ANY_THROW(writeObject(*makeRetryingStorage(server.getUrl(), forceOnePartMultipart), singleAttemptCreation()));
-    EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
-}
-
-TEST(S3SingleAttemptObjectCreation, MultipartCopyCompleteIsOneWireRequestOnLostResponse)
-{
-    (void)getContext();
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::CompleteMultipartUpload)
-            throw CountingS3::DropResponse();
-        CountingS3::answerOk(verb, response);
-    });
-
-    EXPECT_ANY_THROW(copyObject(*makeRetryingStorage(server.getUrl(), forceOnePartMultipartCopy), singleAttemptNativeCopy()));
-    EXPECT_EQ(server.count(Verb::UploadPartCopy), 1u);
-    EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
-}
+INSTANTIATE_TEST_SUITE_P(
+    S3SingleAttemptObjectCreation,
+    S3SingleAttemptObjectCreationPath,
+    ::testing::ValuesIn(creation_paths),
+    [](const ::testing::TestParamInfo<CreationPath> & param_info) { return param_info.param.name; });
 
 /// The client resends a request whose response body fails mid-read; the `PUT` was applied by then.
 TEST(S3SingleAttemptObjectCreation, PutIsOneWireRequestOnBrokenResponseBody)
 {
     (void)getContext();
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
+    CountingS3Server server(CountingS3::faulting(Verb::PutObject, [](Poco::Net::HTTPServerResponse & response)
     {
-        if (verb == Verb::PutObject)
-        {
-            response.set("ETag", "\"put-etag\"");
-            response.setContentType("application/xml");
-            response.setContentLength(4096);
-            response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
-            response.send() << "<?xml version=\"1.0\" encoding=\"UTF-8\"?><PutObjectResult>" << std::flush;
-            throw CountingS3::DropResponse();
-        }
-        CountingS3::answerOk(verb, response);
-    });
+        response.set("ETag", "\"put-etag\"");
+        response.setContentType("application/xml");
+        response.setContentLength(4096);
+        response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+        response.send() << "<?xml version=\"1.0\" encoding=\"UTF-8\"?><PutObjectResult>" << std::flush;
+        throw CountingS3::DropResponse();
+    }));
 
-    try
-    {
-        writeObject(*makeRetryingStorage(server.getUrl()), singleAttemptCreation());
-    }
-    catch (...) // NOLINT(bugprone-empty-catch)
-    {
-        /// Whether a truncated body fails the request is the SDK's business; the resend count is ours.
-    }
+    EXPECT_EQ(thrownCode([&] { writeObject(*makeRetryingStorage(server.getUrl()), singleAttemptCreation()); }), DB::ErrorCodes::S3_ERROR);
     EXPECT_EQ(server.count(Verb::PutObject), 1u);
 }
 
@@ -186,14 +177,10 @@ TEST(S3SingleAttemptObjectCreation, PutIsOneWireRequestOnBrokenResponseBody)
 TEST(S3SingleAttemptObjectCreation, UploadPartStillRetried)
 {
     (void)getContext();
-    CountingS3Server server([](Verb verb, size_t nth, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::UploadPart && nth == 1)
-            return CountingS3::sendError(response, Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR, "InternalError");
-        CountingS3::answerOk(verb, response);
-    });
+    CountingS3Server server(CountingS3::failing(
+        Verb::UploadPart, Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR, "InternalError", /*only_nth=*/1));
 
-    EXPECT_NO_THROW(writeObject(*makeRetryingStorage(server.getUrl(), forceOnePartMultipart), singleAttemptCreation()));
+    EXPECT_EQ(thrownCode([&] { writeObject(*makeRetryingStorage(server.getUrl(), forceOnePartMultipart), singleAttemptCreation()); }), 0);
     EXPECT_EQ(server.count(Verb::UploadPart), 2u);
     EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
 }
@@ -201,14 +188,10 @@ TEST(S3SingleAttemptObjectCreation, UploadPartStillRetried)
 TEST(S3SingleAttemptObjectCreation, CreateMultipartUploadStillRetried)
 {
     (void)getContext();
-    CountingS3Server server([](Verb verb, size_t nth, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::CreateMultipartUpload && nth == 1)
-            return CountingS3::sendError(response, Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR, "InternalError");
-        CountingS3::answerOk(verb, response);
-    });
+    CountingS3Server server(CountingS3::failing(
+        Verb::CreateMultipartUpload, Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR, "InternalError", /*only_nth=*/1));
 
-    EXPECT_NO_THROW(writeObject(*makeRetryingStorage(server.getUrl(), forceOnePartMultipart), singleAttemptCreation()));
+    EXPECT_EQ(thrownCode([&] { writeObject(*makeRetryingStorage(server.getUrl(), forceOnePartMultipart), singleAttemptCreation()); }), 0);
     EXPECT_EQ(server.count(Verb::CreateMultipartUpload), 2u);
     EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
 }
@@ -216,14 +199,10 @@ TEST(S3SingleAttemptObjectCreation, CreateMultipartUploadStillRetried)
 TEST(S3SingleAttemptObjectCreation, UploadPartCopyStillRetried)
 {
     (void)getContext();
-    CountingS3Server server([](Verb verb, size_t nth, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::UploadPartCopy && nth == 1)
-            return CountingS3::sendError(response, Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR, "InternalError");
-        CountingS3::answerOk(verb, response);
-    });
+    CountingS3Server server(CountingS3::failing(
+        Verb::UploadPartCopy, Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR, "InternalError", /*only_nth=*/1));
 
-    EXPECT_NO_THROW(copyObject(*makeRetryingStorage(server.getUrl(), forceOnePartMultipartCopy), singleAttemptNativeCopy()));
+    EXPECT_EQ(thrownCode([&] { copyObject(*makeRetryingStorage(server.getUrl(), forceOnePartMultipartCopy), singleAttemptNativeCopy()); }), 0);
     EXPECT_EQ(server.count(Verb::UploadPartCopy), 2u);
     EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
 }
@@ -232,95 +211,41 @@ TEST(S3SingleAttemptObjectCreation, UploadPartCopyStillRetried)
 TEST(S3SingleAttemptObjectCreation, CopyRefusedAsTooLargeBecomesOneMultipartCopy)
 {
     (void)getContext();
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::CopyObject)
-            return CountingS3::sendError(response, Poco::Net::HTTPResponse::HTTP_BAD_REQUEST, "EntityTooLarge");
-        CountingS3::answerOk(verb, response);
-    });
+    CountingS3Server server(CountingS3::failing(Verb::CopyObject, Poco::Net::HTTPResponse::HTTP_BAD_REQUEST, "EntityTooLarge"));
 
-    EXPECT_NO_THROW(copyObject(*makeRetryingStorage(server.getUrl()), singleAttemptNativeCopy()));
+    EXPECT_EQ(thrownCode([&] { copyObject(*makeRetryingStorage(server.getUrl()), singleAttemptNativeCopy()); }), 0);
     EXPECT_EQ(server.count(Verb::CopyObject), 1u);
     EXPECT_EQ(server.count(Verb::CreateMultipartUpload), 1u);
     EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
 }
 
-/// The creating request has no second attempt, so it must not run under the short first-attempt
-/// timeouts: a store that answers within the configured timeout must not fail it.
+/// The creating request has no second attempt, so its client must not use the short first-attempt timeouts.
+TEST(S3SingleAttemptObjectCreation, CreationClientDisablesAdaptiveTimeouts)
+{
+    auto storage = makeRetryingStorage("http://127.0.0.1:1", {}, /*adaptive_timeouts=*/true);
+    ASSERT_TRUE(storage->getS3StorageClient()->getClientConfiguration().s3_use_adaptive_timeouts);
+
+    EXPECT_FALSE(storage->getSingleAttemptClient(0, 0, /*configured_timeouts=*/true)
+                     ->getClientConfiguration().s3_use_adaptive_timeouts);
+    EXPECT_TRUE(storage->getSingleAttemptClient(0, 0)->getClientConfiguration().s3_use_adaptive_timeouts)
+        << "the control-plane clone keeps the disk's adaptive timeouts";
+}
+
+/// End to end: `writeObject` sends the `PUT` through that client. The delay is above the adaptive
+/// first-attempt receive timeout of a `PUT` and below the configured one.
 TEST(S3SingleAttemptObjectCreation, PutSlowerThanTheFirstAttemptTimeoutSucceedsOnce)
 {
     (void)getContext();
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
+    CountingS3Server server(CountingS3::faulting(Verb::PutObject, [](Poco::Net::HTTPServerResponse & response)
     {
-        /// Above the 3 s adaptive receive timeout of a first `PUT` attempt, below the configured 10 s.
-        if (verb == Verb::PutObject)
-            std::this_thread::sleep_for(std::chrono::milliseconds(3500));
-        CountingS3::answerOk(verb, response);
-    });
+        std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+        CountingS3::answerOk(Verb::PutObject, response);
+    }));
 
-    EXPECT_NO_THROW(writeObject(*makeRetryingStorage(server.getUrl(), {}, /*adaptive_timeouts=*/true), singleAttemptCreation()));
+    EXPECT_EQ(
+        thrownCode([&] { writeObject(*makeRetryingStorage(server.getUrl(), {}, /*adaptive_timeouts=*/true), singleAttemptCreation()); }),
+        0);
     EXPECT_EQ(server.count(Verb::PutObject), 1u);
-}
-
-TEST(S3SingleAttemptObjectCreation, CopySlowerThanTheFirstAttemptTimeoutSucceedsOnce)
-{
-    (void)getContext();
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
-    {
-        /// Above the 3 s adaptive receive timeout of a first `PUT` attempt, below the configured 10 s.
-        if (verb == Verb::CopyObject)
-            std::this_thread::sleep_for(std::chrono::milliseconds(3500));
-        CountingS3::answerOk(verb, response);
-    });
-
-    EXPECT_NO_THROW(copyObject(*makeRetryingStorage(server.getUrl(), {}, /*adaptive_timeouts=*/true), singleAttemptNativeCopy()));
-    EXPECT_EQ(server.count(Verb::CopyObject), 1u);
-}
-
-/// The adaptive first-attempt receive timeout of a `POST` is 30 s.
-TEST(S3SingleAttemptObjectCreation, CompleteSlowerThanTheFirstAttemptTimeoutSucceedsOnce)
-{
-    (void)getContext();
-    CountingS3Server server([](Verb verb, size_t, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::CompleteMultipartUpload)
-            std::this_thread::sleep_for(std::chrono::milliseconds(31000));
-        CountingS3::answerOk(verb, response);
-    });
-
-    EXPECT_NO_THROW(writeObject(
-        *makeRetryingStorage(server.getUrl(), forceOnePartMultipart, /*adaptive_timeouts=*/true, /*request_timeout_ms=*/60000),
-        singleAttemptCreation()));
-    EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
-}
-
-/// A writer that does not ask for single-attempt creation keeps the client's retries.
-TEST(S3SingleAttemptObjectCreation, DefaultWriteStillResendsDroppedPut)
-{
-    (void)getContext();
-    CountingS3Server server([](Verb verb, size_t nth, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::PutObject && nth == 1)
-            throw CountingS3::DropResponse();
-        CountingS3::answerOk(verb, response);
-    });
-
-    EXPECT_NO_THROW(writeObject(*makeRetryingStorage(server.getUrl()), DB::WriteSettings{}));
-    EXPECT_EQ(server.count(Verb::PutObject), 2u);
-}
-
-TEST(S3SingleAttemptObjectCreation, DefaultCopyStillResendsDroppedCopy)
-{
-    (void)getContext();
-    CountingS3Server server([](Verb verb, size_t nth, Poco::Net::HTTPServerResponse & response)
-    {
-        if (verb == Verb::CopyObject && nth == 1)
-            throw CountingS3::DropResponse();
-        CountingS3::answerOk(verb, response);
-    });
-
-    EXPECT_NO_THROW(copyObject(*makeRetryingStorage(server.getUrl()), DB::WriteSettings{}));
-    EXPECT_EQ(server.count(Verb::CopyObject), 2u);
 }
 
 /// The read-write fallback would write through the retrying client, so a creation client without
@@ -329,15 +254,7 @@ TEST(S3SingleAttemptObjectCreation, DefaultCopyStillResendsDroppedCopy)
 TEST(S3SingleAttemptObjectCreation, CreationClientRequiresNativeOnlyCopy)
 {
     (void)getContext();
-    try
-    {
-        copyWithCreationClientAllowingFallback();
-        FAIL() << "a creation client with the read-write fallback allowed was accepted";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR) << e.message();
-    }
+    EXPECT_EQ(thrownCode(copyWithCreationClientAllowingFallback), DB::ErrorCodes::LOGICAL_ERROR);
 }
 #else
 TEST(S3SingleAttemptObjectCreationDeathTest, CreationClientRequiresNativeOnlyCopy)
