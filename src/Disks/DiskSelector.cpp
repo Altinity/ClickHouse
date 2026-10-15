@@ -168,7 +168,10 @@ DiskSelectorPtr DiskSelector::updateFromConfig(
         {
             if (disks_to_skip.contains(disk_name))
             {
-                LOG_WARNING(getLogger("DiskSelector"), "Disk {} is not created from the configuration: a custom disk with this name is being created", backQuote(disk_name));
+                LOG_WARNING(
+                    getLogger("DiskSelector"),
+                    "Disk {} is not created from the configuration: a custom disk with this name is being created",
+                    backQuote(disk_name));
                 continue;
             }
             auto created_disk = factory.create(

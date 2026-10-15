@@ -431,8 +431,9 @@ TEST_F(CASStartupStaleMounts, ConcurrentRequestsShareOneFailure)
         std::unique_lock lock(mutex);
         first_started = true;
         cv.notify_all();
-        /// Gives the second request time to join this creation. It returns early only if it did not join.
-        cv.wait_for(lock, std::chrono::seconds(2), [&] { return second_returned; });
+        /// Gives the second request time to join this creation; it returns early only if it did not join.
+        /// A late scheduler can only cause a false failure, never a false pass.
+        cv.wait_for(lock, std::chrono::seconds(5), [&] { return second_returned; });
         DB::ErrnoException::throwWithErrno(DB::ErrorCodes::BAD_ARGUMENTS, ENOSPC, "creation failed");
     };
 
@@ -466,9 +467,10 @@ TEST_F(CASStartupStaleMounts, ConcurrentRequestsShareOneFailure)
     Outcome first_outcome;
     Outcome second_outcome;
     std::thread first([&] { request("first", first_outcome); });
+    bool first_is_creating = false;
     {
         std::unique_lock lock(mutex);
-        cv.wait(lock, [&] { return first_started; });
+        first_is_creating = cv.wait_for(lock, std::chrono::seconds(30), [&] { return first_started; });
     }
     std::thread second([&]
     {
@@ -480,6 +482,7 @@ TEST_F(CASStartupStaleMounts, ConcurrentRequestsShareOneFailure)
     first.join();
     second.join();
 
+    ASSERT_TRUE(first_is_creating) << "the first creator never started";
     EXPECT_EQ(creator_calls.load(), 1u);
     for (const Outcome * outcome : {&first_outcome, &second_outcome})
     {

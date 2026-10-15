@@ -6789,14 +6789,9 @@ DiskPtr getDiskCreationResult(const std::shared_future<DiskPtr> & creation)
     {
         return creation.get();
     }
-    catch (const Poco::Exception & e)
-    {
-        /// Virtual, so the copy keeps the dynamic type (e.g. `ErrnoException`).
-        e.rethrow();
-    }
     catch (...)
     {
-        throw Exception::createRuntime(getCurrentExceptionCode(), getCurrentExceptionMessage(/* with_stacktrace */ false));
+        std::rethrow_exception(copyMutableException(std::current_exception()));
     }
 }
 
