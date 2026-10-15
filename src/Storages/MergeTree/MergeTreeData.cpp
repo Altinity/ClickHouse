@@ -6320,6 +6320,12 @@ MergeTreeDataPartFormat MergeTreeData::choosePartFormat(
 MergeTreeDataPartFormat MergeTreeData::choosePartFormatForMutation(const DataPartPtr & source_part) const
 {
     auto format = source_part->getFormat();
+    if (auto metadata_snapshot = getInMemoryMetadataPtr(getContext(), false); metadata_snapshot->hasUniqueKey())
+    {
+        format.storage_type = MergeTreeDataPartStorageType::Full;
+        return format;
+    }
+
     format.storage_type = choosePartFormat(
         source_part->getTotalColumnsSize().data_uncompressed,
         source_part->rows_count,
