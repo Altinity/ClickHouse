@@ -95,6 +95,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_gc_interval_sec` | `60` | Seconds between background GC rounds (≥ 1) |
 | `cas_blob_hash` | `cityhash128` | Pool blob content-hash function (`cityhash128` \| `xxh3-128` \| `sha256`). Recorded in the pool at creation; a mismatching config is refused at mount |
 | `cas_blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool. One-way: once admitted, the pool carries both algorithms permanently |
+| `cas_allow_packed_parts` | `false` | Allow creation of new `Packed` MergeTree parts on this disk. The decision uses the actual destination disk, not every disk in its storage policy. Existing `Packed` parts remain readable when this setting is `false` |
 | `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Only the preflight probe is skipped — the conditional-write correctness check still runs on every writable mount. **Not available on a writable generation-token (GCS) disk**, which refuses to mount with it: there, the probe battery is the only proof that a token-exact delete carries its generation precondition. Mount such a disk read-only if you need to defer the check |
 | `cas_mount_lease_ttl_ms` | `30000` | Milliseconds for which a mount lease remains valid after a successful claim or renewal (≥ 1). Lower values shorten stale-mount recovery but reduce tolerance for object-storage and scheduling delays |
 | `cas_mount_renew_period_ms` | `10000` | Milliseconds between background mount-lease renewals (≥ 1). It must leave enough time for two attempt envelopes (a renewal write and its settlement read) and the lease safety margin before the TTL expires: `period + 2 × envelope + margin < TTL` |
@@ -111,6 +112,30 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_lease_safety_margin_ms` | `2000` | Startup-only margin validated against the mount lease TTL: the attempt envelope + `cas_lease_safety_margin_ms` must be strictly less than the mount lease TTL, and `cas_mount_renew_period_ms` + 2 × envelope + `cas_lease_safety_margin_ms` too, or the disk refuses to open writable |
 | `cas_unsafe_remount_no_delay` | `0` | Reclaim a mount slot that carries this server's own uuid at once after a hard restart, without observing the slot's token for the lease TTL. Unsafe whenever two processes can hold the same `server_uuid` (a copied uuid file, a stalled predecessor). After such a reclaim the predecessor can still start conditional writes until its own cutoff (`confirmed deadline − cas_lease_safety_margin_ms − 2 × envelope`) or until its next renewal meets the token guard, and a request it already sent may still materialize later. That is not a data hazard: ref-log keys carry `(writer_epoch, sequence)` and creates are conditional, so two writers can never commit different bodies to one key, and recovery's epoch seal settles any straggler (recovery fails closed after 64 successive seal-create attempts displaced by newly materializing old-epoch transactions). The exposure is availability, not data. Intended for test stands and deployments that guarantee one process per uuid |
 | `cas_staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount |
+
+### Enabling `Packed` parts {#enabling-packed-parts}
+
+`cas_allow_packed_parts` delegates the existing MergeTree part-storage choice to a `CAS` disk.
+When it is `true`, the usual `min_bytes_for_full_part_storage` and
+`min_rows_for_full_part_storage` thresholds, together with `min_level_for_full_part_storage`, may
+select `Packed`; when it is `false`, newly written parts on that destination use `Full`. In a
+heterogeneous storage policy, INSERT, merge, and mutation use the setting of the disk that actually
+receives the new part.
+
+The setting controls creation, not readability. Existing `Packed` parts can still be opened,
+attached, fetched, and read after the setting is changed to `false`. The setting also does not add
+support for an `encrypted` disk layered over `CAS`; use object-store encryption at rest instead.
+
+For a rolling upgrade:
+
+1. Upgrade every writer and replica while the key is absent.
+2. After every writer can read and write the new archive layout, add
+   `cas_allow_packed_parts = true` only to the destination disks where `Packed` creation is wanted.
+
+For a downgrade, first set the setting to `false` on every writer. This stops new `Packed` parts but
+does not convert existing ones. Remove or fully rewrite all existing `Packed` parts before starting
+an older binary. Finally, remove the `cas_allow_packed_parts` key from the configuration entirely:
+an older parser rejects an unknown `cas_*` key even when its value is `false`.
 
 All servers sharing a pool must run the same `cas_mount_lease_ttl_ms` and `cas_mount_renew_period_ms`.
 Startup reclaim and GC's fence-out both judge liveness by the mount slot's write token holding stable

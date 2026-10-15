@@ -22,8 +22,10 @@ binary framing, no protobuf) so any object can be read with ordinary line-orient
 
 **Write path.** Conditional writes for mutable metadata/control objects; mandatory blob `HEAD`
 followed by adoption or unconditional, multipart-capable publication; a bounded thread pool
-fanning out multi-blob part materialization in parallel; carry-forward on mutation for `Wide` parts (an
-untouched column is re-referenced, not re-hashed).
+fanning out multi-blob part materialization in parallel; carry-forward on mutation for `Wide` parts
+(an untouched column is re-referenced, not re-hashed); opt-in `Packed` parts through
+`cas_allow_packed_parts`, with each base or projection `data.packed` archive published as one CAS
+blob. The actual destination disk controls whether a newly written part may use `Packed`.
 
 **Read path.** Ref resolution to manifest to ranged blob reads, with a manifest-decode cache and
 a part-folder view cache sitting on that path.
@@ -84,7 +86,8 @@ positioning.
   disk succeeds, but the first `INSERT` fails (`Autocommit writes are not supported for content part
   files on a content-addressed disk`). Layering a `cache` disk in front of `CAS` is the supported
   wrapper shape (see [configuration](/antalya/cas/configuration)); encryption at rest currently has
-  to come from the object store side.
+  to come from the object store side. Enabling `cas_allow_packed_parts` does not change this
+  limitation.
 - **The format and settings surface can still change.** CAS is pre-release: there is no persisted
   production data to keep compatible, so a format change costs a version bump, not a migration.
   Treat every detail on these pages as subject to change until the format is declared stable.
