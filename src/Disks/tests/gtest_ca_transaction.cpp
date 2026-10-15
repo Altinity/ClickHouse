@@ -7,6 +7,7 @@
 #include <Common/ProfileEvents.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadSettings.h>
+#include <algorithm>
 #include <filesystem>
 
 namespace ProfileEvents
@@ -375,6 +376,41 @@ TEST(CASTransactionInlining, EagerFileInlinedDataBinBlobbed)
 
     /// And the inlined file is still readable through the normal read path.
     EXPECT_EQ(storage->getFileSize("a99/a99a99a9-9999-4999-8999-999999999999/all_1_1_0/checksums.txt"), 13u);
+}
+
+TEST(CASTransactionPackedManifest, ExactArchivesAreBlobs)
+{
+    auto storage = openTxStorage();
+    auto tx = storage->createTransaction();
+    const std::string tmp_part = "c01/c01c01c0-0101-4101-8101-010101010101/tmp_insert_all_1_1_0";
+    const std::string final_part = "c01/c01c01c0-0101-4101-8101-010101010101/all_1_1_0";
+
+    writeFileTx(*tx, tmp_part + "/data.packed", "base");
+    writeFileTx(*tx, tmp_part + "/p1.proj/data.packed", "projection-1");
+    writeFileTx(*tx, tmp_part + "/p2.proj/data.packed", "projection-2");
+    writeFileTx(*tx, tmp_part + "/checksums.txt", "base-checksums");
+    writeFileTx(*tx, tmp_part + "/p1.proj/checksums.txt", "projection-1-checksums");
+    writeFileTx(*tx, tmp_part + "/p2.proj/checksums.txt", "projection-2-checksums");
+    tx->moveDirectory(tmp_part, final_part);
+    tx->commit(DB::NoCommitOptions{});
+
+    const auto ns = storage->liveNamespace("c01c01c0-0101-4101-8101-010101010101");
+    const auto resolved = storage->store()->resolveRef(ns, "all_1_1_0");
+    ASSERT_TRUE(resolved.has_value());
+    const auto manifest = storage->store()->readManifest(resolved->manifest_id);
+
+    std::vector<std::string> blob_paths;
+    for (const auto & entry : manifest.entries)
+        if (entry.placement == DB::Cas::EntryPlacement::Blob)
+            blob_paths.push_back(entry.path);
+    std::sort(blob_paths.begin(), blob_paths.end());
+
+    const std::vector<std::string> expected{
+        "data.packed",
+        "p1.proj/data.packed",
+        "p2.proj/data.packed",
+    };
+    EXPECT_EQ(blob_paths, expected);
 }
 
 /// all-tree-part-files Task 4: a standalone
