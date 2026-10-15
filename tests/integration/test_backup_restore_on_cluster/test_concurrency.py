@@ -25,7 +25,9 @@ main_configs = [
 # No [Zoo]Keeper retries for tests with concurrency
 user_configs = ["configs/allow_database_types.xml"]
 
-nodes = add_nodes_to_cluster(cluster, num_nodes, main_configs, user_configs, cpu_limit=12)
+nodes = add_nodes_to_cluster(
+    cluster, num_nodes, main_configs, user_configs, cas_file=__file__, cpu_limit=12
+)
 
 node0 = nodes[0]
 
@@ -51,8 +53,8 @@ def drop_after_test():
 backup_id_counter = 0
 
 
-def create_and_fill_table() -> None:
-    create_test_table(node0)
+def create_and_fill_table(storage_policy=None) -> None:
+    create_test_table(node0, storage_policy)
     for i, node in enumerate(nodes):
         node.query(f"INSERT INTO tbl VALUES ({i})")
 
@@ -66,8 +68,23 @@ def new_backup_name():
 expected_sum = num_nodes * (num_nodes - 1) // 2
 
 
-def test_replicated_table():
-    create_and_fill_table()
+def check_restored_table(storage_policy):
+    for node in nodes:
+        assert node.query("SELECT sum(x) FROM tbl") == TSV([expected_sum])
+        if storage_policy is not None:
+            assert (
+                node.query("SELECT storage_policy FROM system.tables WHERE name = 'tbl'")
+                == f"{storage_policy}\n"
+            )
+            assert (
+                node.query("CHECK TABLE tbl SETTINGS check_query_single_value_result = 1")
+                == "1\n"
+            )
+
+
+@pytest.mark.parametrize("storage_policy", [None, "cas_policy"])
+def test_replicated_table(storage_policy):
+    create_and_fill_table(storage_policy)
 
     backup_name = new_backup_name()
     node0.query(f"BACKUP TABLE tbl ON CLUSTER 'cluster' TO {backup_name}")
@@ -76,15 +93,15 @@ def test_replicated_table():
     node0.query(f"RESTORE TABLE tbl ON CLUSTER 'cluster' FROM {backup_name}")
     node0.query("SYSTEM SYNC REPLICA ON CLUSTER 'cluster' tbl")
 
-    for i in range(num_nodes):
-        assert nodes[i].query("SELECT sum(x) FROM tbl") == TSV([expected_sum])
+    check_restored_table(storage_policy)
 
 
 num_concurrent_backups = 4
 
 
-def test_concurrent_backups_on_same_node():
-    create_and_fill_table()
+@pytest.mark.parametrize("storage_policy", [None, "cas_policy"])
+def test_concurrent_backups_on_same_node(storage_policy):
+    create_and_fill_table(storage_policy)
 
     backup_names = [new_backup_name() for _ in range(num_concurrent_backups)]
 
@@ -113,12 +130,12 @@ def test_concurrent_backups_on_same_node():
         node0.query("DROP TABLE tbl ON CLUSTER 'cluster' SYNC")
         node0.query(f"RESTORE TABLE tbl ON CLUSTER 'cluster' FROM {backup_name}")
         node0.query("SYSTEM SYNC REPLICA ON CLUSTER 'cluster' tbl")
-        for i in range(num_nodes):
-            assert nodes[i].query("SELECT sum(x) FROM tbl") == TSV([expected_sum])
+        check_restored_table(storage_policy)
 
 
-def test_concurrent_backups_on_different_nodes():
-    create_and_fill_table()
+@pytest.mark.parametrize("storage_policy", [None, "cas_policy"])
+def test_concurrent_backups_on_different_nodes(storage_policy):
+    create_and_fill_table(storage_policy)
 
     assert num_concurrent_backups <= num_nodes
     backup_names = [new_backup_name() for _ in range(num_concurrent_backups)]
@@ -150,8 +167,7 @@ def test_concurrent_backups_on_different_nodes():
         nodes[i].query("DROP TABLE tbl ON CLUSTER 'cluster' SYNC")
         nodes[i].query(f"RESTORE TABLE tbl ON CLUSTER 'cluster' FROM {backup_names[i]}")
         nodes[i].query("SYSTEM SYNC REPLICA ON CLUSTER 'cluster' tbl")
-        for j in range(num_nodes):
-            assert nodes[j].query("SELECT sum(x) FROM tbl") == TSV([expected_sum])
+        check_restored_table(storage_policy)
 
 
 @pytest.mark.parametrize(
