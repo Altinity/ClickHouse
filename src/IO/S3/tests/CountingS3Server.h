@@ -3,12 +3,15 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <Poco/AutoPtr.h>
-#include <Poco/NullStream.h>
 #include <Poco/SharedPtr.h>
 #include <Poco/StreamCopier.h>
 #include <Poco/ThreadPool.h>
@@ -36,6 +39,7 @@ enum class Verb : size_t
     CompleteMultipartUpload,
     AbortMultipartUpload,
     HeadObject,
+    GetObject,
     ComposeObject,
     Other,
     Count,
@@ -51,6 +55,8 @@ inline Verb classify(const Poco::Net::HTTPServerRequest & request)
 
     if (method == Poco::Net::HTTPRequest::HTTP_HEAD)
         return Verb::HeadObject;
+    if (method == Poco::Net::HTTPRequest::HTTP_GET && !query.contains("list-type"))
+        return Verb::GetObject;
     if (method == Poco::Net::HTTPRequest::HTTP_PUT && query.contains("compose"))
         return Verb::ComposeObject;
     if (method == Poco::Net::HTTPRequest::HTTP_PUT && has_part_number)
@@ -81,6 +87,11 @@ struct Request
     Verb verb;
     /// The 1-based count of requests of this verb, this one included.
     size_t nth;
+    /// `/bucket/key`.
+    std::string path;
+    std::string body;
+    /// `CopyObject` and `UploadPartCopy`: the source as `/bucket/key`.
+    std::string copy_source;
 };
 
 using Responder = std::function<void(const Request & request, Poco::Net::HTTPServerResponse & response)>;
@@ -97,13 +108,25 @@ public:
     {
         const Verb verb = classify(request);
         /// Read the whole body first, so a dropped response follows a fully received request.
+        std::string body;
         if (request.hasContentLength())
+            Poco::StreamCopier::copyToString64(request.stream(), body);
+        std::string copy_source;
+        if (request.has("x-amz-copy-source"))
         {
-            Poco::NullOutputStream discard;
-            Poco::StreamCopier::copyStream64(request.stream(), discard);
+            Poco::URI::decode(request.get("x-amz-copy-source"), copy_source);
+            if (!copy_source.starts_with('/'))
+                copy_source.insert(0, "/");
         }
         const size_t nth = ++counts[static_cast<size_t>(verb)];
-        respond(Request{.verb = verb, .nth = nth}, response);
+        respond(
+            Request{
+                .verb = verb,
+                .nth = nth,
+                .path = Poco::URI(request.getURI()).getPath(),
+                .body = std::move(body),
+                .copy_source = std::move(copy_source)},
+            response);
     }
 };
 
@@ -215,6 +238,7 @@ inline void answerOk(Verb verb, Poco::Net::HTTPServerResponse & response)
             response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
             response.send();
             return;
+        case Verb::GetObject:
         case Verb::Other:
         case Verb::Count:
             break;
@@ -249,5 +273,100 @@ inline Responder failing(Verb faulted_verb, Poco::Net::HTTPResponse::HTTPStatus 
         [status, error_code = std::move(code)](Poco::Net::HTTPServerResponse & response) { sendError(response, status, error_code); },
         only_nth);
 }
+
+/// An in-memory bucket behind a `CountingS3Server`: `PutObject` and `CopyObject` store a body, `HeadObject`
+/// and `GetObject` read it, every other verb gets `answerOk`. `fault` sees each request first and, by
+/// returning true or throwing `DropResponse`, answers it instead; such a request is not applied.
+class ObjectStore
+{
+public:
+    using FaultFn = std::function<bool(const Request & request, Poco::Net::HTTPServerResponse & response)>;
+
+    explicit ObjectStore(FaultFn fault_ = {}) : fault(std::move(fault_)) {}
+
+    /// Must not outlive this store.
+    Responder responder()
+    {
+        return [this](const Request & request, Poco::Net::HTTPServerResponse & response) { respond(request, response); };
+    }
+
+    void put(const std::string & path, std::string body)
+    {
+        std::lock_guard lock(mutex);
+        objects[path] = std::move(body);
+    }
+
+    std::optional<std::string> get(const std::string & path) const
+    {
+        std::lock_guard lock(mutex);
+        if (auto it = objects.find(path); it != objects.end())
+            return it->second;
+        return std::nullopt;
+    }
+
+    /// Every request in arrival order, unapplied ones included.
+    std::vector<Request> journal() const
+    {
+        std::lock_guard lock(mutex);
+        return requests;
+    }
+
+private:
+    void respond(const Request & request, Poco::Net::HTTPServerResponse & response)
+    {
+        {
+            std::lock_guard lock(mutex);
+            requests.push_back(request);
+        }
+        if (fault && fault(request, response))
+            return;
+
+        switch (request.verb)
+        {
+            case Verb::PutObject:
+                put(request.path, request.body);
+                break;
+            case Verb::CopyObject:
+            {
+                auto source = get(request.copy_source);
+                if (!source)
+                    return sendError(response, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey");
+                put(request.path, std::move(*source));
+                break;
+            }
+            case Verb::HeadObject:
+            case Verb::GetObject:
+            {
+                auto body = get(request.path);
+                if (!body && request.verb == Verb::HeadObject)
+                {
+                    response.setStatus(Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+                    response.setContentLength(0);
+                    response.send();
+                    return;
+                }
+                if (!body)
+                    return sendError(response, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey");
+                response.set("ETag", "\"stored-etag\"");
+                response.set("Last-Modified", "Thu, 01 Jan 2026 00:00:00 GMT");
+                response.setContentLength(static_cast<std::streamsize>(body->size()));
+                response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+                if (request.verb == Verb::HeadObject)
+                    response.send();
+                else
+                    response.send() << *body;
+                return;
+            }
+            default:
+                break;
+        }
+        answerOk(request.verb, response);
+    }
+
+    FaultFn fault;
+    mutable std::mutex mutex;
+    std::map<std::string, std::string> objects;
+    std::vector<Request> requests;
+};
 
 }

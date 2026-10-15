@@ -13,16 +13,24 @@
 #include <Common/tests/gtest_global_context.h>
 #include <base/defines.h>
 
+#include <Poco/AutoPtr.h>
+#include <Poco/Logger.h>
+#include <Poco/StreamChannel.h>
+
 #include <chrono>
 #include <cstdlib>
+#include <sstream>
+#include <ostream>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 /// Per-verb wire counts of the requests `S3ObjectStorage` sends to create an object.
 
 namespace DB::ErrorCodes
 {
-extern const int LOGICAL_ERROR;
+extern const int BAD_ARGUMENTS;
 extern const int S3_ERROR;
 }
 
@@ -49,6 +57,7 @@ void writeObject(DB::S3ObjectStorage & storage, const DB::WriteSettings & write_
     buffer->finalize();
 }
 
+#ifdef DEBUG_OR_SANITIZER_BUILD
 /// A copy that asks for a creation client but allows the read-write fallback; sends no request.
 void copyWithCreationClientAllowingFallback()
 {
@@ -60,6 +69,57 @@ void copyWithCreationClientAllowingFallback()
         /*fallback_file_reader=*/{}, /*object_metadata=*/std::nullopt, DB::ObjectStorageCopyMode::Default,
         /*object_creation_client=*/client);
 }
+#endif
+
+/// Captures what any logger writes at `priority` and above while in scope.
+class ScopedLogCapture
+{
+public:
+    explicit ScopedLogCapture(int priority = Poco::Message::PRIO_ERROR)
+        : channel(new Poco::StreamChannel(stream))
+        , root_channel(Poco::Logger::root().getChannel(), /*shared=*/true)
+        , root_level(Poco::Logger::root().getLevel())
+    {
+        std::vector<std::string> names;
+        Poco::Logger::names(names);
+        for (const auto & name : names)
+            if (auto * logger = Poco::Logger::has(name))
+                saved.push_back({name, Poco::AutoPtr<Poco::Channel>(logger->getChannel(), /*shared=*/true), logger->getLevel()});
+        Poco::Logger::setChannel(Poco::Logger::ROOT, channel.get());
+        Poco::Logger::setLevel(Poco::Logger::ROOT, priority);
+    }
+
+    ~ScopedLogCapture()
+    {
+        /// A logger created in scope took the capture's channel and gets the root's.
+        Poco::Logger::setChannel(Poco::Logger::ROOT, root_channel.get());
+        Poco::Logger::setLevel(Poco::Logger::ROOT, root_level);
+        for (auto & [name, old_channel, old_level] : saved)
+        {
+            if (auto * logger = Poco::Logger::has(name))
+            {
+                logger->setChannel(old_channel.get());
+                logger->setLevel(old_level);
+            }
+        }
+    }
+
+    std::string captured() const { return stream.str(); }
+
+private:
+    struct SavedLogger
+    {
+        std::string name;
+        Poco::AutoPtr<Poco::Channel> channel;
+        int level;
+    };
+
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    Poco::AutoPtr<Poco::Channel> root_channel;
+    int root_level;
+    std::vector<SavedLogger> saved;
+};
 
 DB::WriteSettings singleAttemptCreation()
 {
@@ -106,6 +166,11 @@ const CreationPath creation_paths[] = {
     {"MultipartCopyComplete", Verb::CompleteMultipartUpload, forceOnePartMultipartCopy, true},
 };
 
+void PrintTo(const CreationPath & path, std::ostream * os)
+{
+    *os << path.name;
+}
+
 class S3SingleAttemptObjectCreationPath : public ::testing::TestWithParam<CreationPath>
 {
 };
@@ -149,11 +214,72 @@ TEST_P(S3SingleAttemptObjectCreationPath, DefaultWriteStillResendsLostResponse)
     EXPECT_EQ(server.count(path.creating_verb), 2u);
 }
 
+/// The caller of a single-attempt creating request resolves the outcome and retries, so one failed
+/// attempt is not an error for the operator.
+TEST_P(S3SingleAttemptObjectCreationPath, LostResponseLogsNothingAtError)
+{
+    (void)getContext();
+    const CreationPath & path = GetParam();
+    CountingS3Server server(CountingS3::dropping(path.creating_verb));
+    auto storage = path.storage(server.getUrl());
+
+    ScopedLogCapture capture;
+    EXPECT_EQ(thrownCode([&] { path.create(*storage, path.singleAttemptSettings()); }), DB::ErrorCodes::S3_ERROR);
+    EXPECT_EQ(capture.captured(), "");
+}
+
+/// The flag alone bounds the `NO_SUCH_KEY` reissue loops above the client.
+TEST_P(S3SingleAttemptObjectCreationPath, NoSuchKeyIsOneWireRequest)
+{
+    (void)getContext();
+    const CreationPath & path = GetParam();
+    CountingS3Server server(CountingS3::failing(path.creating_verb, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey"));
+
+    EXPECT_EQ(thrownCode([&] { path.create(*path.storage(server.getUrl()), path.singleAttemptSettings()); }), DB::ErrorCodes::S3_ERROR);
+    EXPECT_EQ(server.count(path.creating_verb), 1u);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     S3SingleAttemptObjectCreation,
     S3SingleAttemptObjectCreationPath,
     ::testing::ValuesIn(creation_paths),
     [](const ::testing::TestParamInfo<CreationPath> & param_info) { return param_info.param.name; });
+
+/// After a lost single-attempt `CompleteMultipartUpload` the abort finds no upload: the completion may
+/// have applied, and the caller resolves that.
+TEST(S3SingleAttemptObjectCreation, AbortAfterLostCompleteLogsNothingAtError)
+{
+    (void)getContext();
+    CountingS3Server server([](const CountingS3::Request & request, Poco::Net::HTTPServerResponse & response)
+    {
+        if (request.verb == Verb::CompleteMultipartUpload)
+            throw CountingS3::DropResponse();
+        if (request.verb == Verb::AbortMultipartUpload)
+            return CountingS3::sendError(response, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchUpload");
+        CountingS3::answerOk(request.verb, response);
+    });
+    auto storage = makeRetryingStorage(server.getUrl(), forceOnePartMultipart);
+
+    ScopedLogCapture capture;
+    EXPECT_EQ(thrownCode([&] { writeObject(*storage, singleAttemptCreation()); }), DB::ErrorCodes::S3_ERROR);
+    EXPECT_EQ(server.count(Verb::AbortMultipartUpload), 1u);
+    EXPECT_EQ(capture.captured(), "");
+}
+
+/// A `NO_SUCH_KEY` loop bounded to one request must not announce a retry.
+TEST(S3SingleAttemptObjectCreation, LastNoSuchKeyAttemptDoesNotAnnounceARetry)
+{
+    (void)getContext();
+    CountingS3Server server(CountingS3::failing(Verb::PutObject, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey"));
+    auto storage = makeRetryingStorage(server.getUrl());
+    DB::WriteSettings write_settings;
+    write_settings.s3_max_unexpected_write_error_retries_override = 1;
+
+    ScopedLogCapture capture(Poco::Message::PRIO_INFORMATION);
+    EXPECT_EQ(thrownCode([&] { writeObject(*storage, write_settings); }), DB::ErrorCodes::S3_ERROR);
+    EXPECT_NE(capture.captured().find("NO_SUCH_KEY"), std::string::npos) << capture.captured();
+    EXPECT_EQ(capture.captured().find("will retry"), std::string::npos) << capture.captured();
+}
 
 /// The client resends a request whose response body fails mid-read; the `PUT` was applied by then.
 TEST(S3SingleAttemptObjectCreation, PutIsOneWireRequestOnBrokenResponseBody)
@@ -225,7 +351,7 @@ TEST(S3SingleAttemptObjectCreation, CreationClientDisablesAdaptiveTimeouts)
     auto storage = makeRetryingStorage("http://127.0.0.1:1", {}, /*adaptive_timeouts=*/true);
     ASSERT_TRUE(storage->getS3StorageClient()->getClientConfiguration().s3_use_adaptive_timeouts);
 
-    EXPECT_FALSE(storage->getSingleAttemptClient(0, 0, /*configured_timeouts=*/true)
+    EXPECT_FALSE(storage->getSingleAttemptClient(0, 0, /*disable_adaptive_timeouts=*/true)
                      ->getClientConfiguration().s3_use_adaptive_timeouts);
     EXPECT_TRUE(storage->getSingleAttemptClient(0, 0)->getClientConfiguration().s3_use_adaptive_timeouts)
         << "the control-plane clone keeps the disk's adaptive timeouts";
@@ -248,15 +374,25 @@ TEST(S3SingleAttemptObjectCreation, PutSlowerThanTheFirstAttemptTimeoutSucceedsO
     EXPECT_EQ(server.count(Verb::PutObject), 1u);
 }
 
-/// The read-write fallback would write through the retrying client, so a creation client without
-/// `NativeOnly` is a caller bug. `LOGICAL_ERROR` aborts under debug and sanitizer builds.
-#ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(S3SingleAttemptObjectCreation, CreationClientRequiresNativeOnlyCopy)
+/// The read-write fallback would write through the retrying client, so the storage refuses the request
+/// before sending anything.
+TEST(S3ObjectStorageCopyObject, SingleAttemptCreationRequiresNativeOnly)
 {
     (void)getContext();
-    EXPECT_EQ(thrownCode(copyWithCreationClientAllowingFallback), DB::ErrorCodes::LOGICAL_ERROR);
+    CountingS3Server server([](const CountingS3::Request & request, Poco::Net::HTTPServerResponse & response)
+    {
+        CountingS3::answerOk(request.verb, response);
+    });
+
+    EXPECT_EQ(
+        thrownCode([&] { copyObject(*makeRetryingStorage(server.getUrl()), singleAttemptCreation()); }),
+        DB::ErrorCodes::BAD_ARGUMENTS);
+    EXPECT_EQ(server.count(Verb::HeadObject), 0u);
+    EXPECT_EQ(server.count(Verb::CopyObject), 0u);
 }
-#else
+
+/// `copyS3File` itself only asserts it; a failed assertion aborts debug and sanitizer builds.
+#ifdef DEBUG_OR_SANITIZER_BUILD
 TEST(S3SingleAttemptObjectCreationDeathTest, CreationClientRequiresNativeOnlyCopy)
 {
     (void)getContext();
@@ -265,7 +401,7 @@ TEST(S3SingleAttemptObjectCreationDeathTest, CreationClientRequiresNativeOnlyCop
             copyWithCreationClientAllowingFallback();
             std::_Exit(0);
         },
-        "requires NativeOnly");
+        "NativeOnly");
 }
 #endif
 

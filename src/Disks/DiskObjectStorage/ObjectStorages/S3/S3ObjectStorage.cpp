@@ -105,6 +105,17 @@ namespace ErrorCodes
 namespace
 {
 
+/// `WriteBufferFromS3` and `copyS3File` reissue the identical request on `NO_SUCH_KEY` in their own
+/// loops above the client, so neither a client retry profile nor single-attempt creation bounds them.
+void applyWriteErrorRetryOverride(S3::S3RequestSettings & request_settings, const WriteSettings & write_settings)
+{
+    if (write_settings.object_storage_single_attempt_object_creation)
+        request_settings[S3RequestSetting::max_unexpected_write_error_retries] = 1;
+    else if (write_settings.s3_max_unexpected_write_error_retries_override)
+        request_settings[S3RequestSetting::max_unexpected_write_error_retries]
+            = write_settings.s3_max_unexpected_write_error_retries_override;
+}
+
 template <typename Result, typename Error>
 void throwIfError(const Aws::Utils::Outcome<Result, Error> & response)
 {
@@ -438,15 +449,7 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         request_settings[S3RequestSetting::min_upload_part_size] = cap;
     }
 
-    if (write_settings.s3_max_unexpected_write_error_retries_override)
-    {
-        /// WriteBufferFromS3's OWN retry loop (makeSinglepartUpload/completeMultipartUpload) reissues
-        /// the identical request — WITH its If-None-Match/If-Match condition — on a NO_SUCH_KEY
-        /// response; this sits ABOVE the S3 client, so a client-level profile override does not bound
-        /// it. See WriteSettings.
-        request_settings[S3RequestSetting::max_unexpected_write_error_retries]
-            = write_settings.s3_max_unexpected_write_error_retries_override;
-    }
+    applyWriteErrorRetryOverride(request_settings, write_settings);
 
     ThreadPoolCallbackRunnerUnsafe<void> scheduler;
     if (write_settings.s3_allow_parallel_part_upload)
@@ -1077,14 +1080,19 @@ void S3ObjectStorage::copyObject( // NOLINT
             "(allow_native_copy=false) for object storage {}",
             getName());
 
+    if (write_settings.object_storage_single_attempt_object_creation
+        && write_settings.object_storage_copy_mode != ObjectStorageCopyMode::NativeOnly)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "A copy with single-attempt object creation requires NativeOnly copy mode: the read-write "
+            "fallback would write through the retrying client");
+
     auto current_client = client.get();
     auto settings_ptr = s3_settings.get();
     auto size = S3::getObjectSize(*current_client, uri.bucket, object_from.remote_path, {});
 
     S3::S3RequestSettings request_settings = settings_ptr->request_settings;
-    if (write_settings.s3_max_unexpected_write_error_retries_override)
-        request_settings[S3RequestSetting::max_unexpected_write_error_retries]
-            = write_settings.s3_max_unexpected_write_error_retries_override;
+    applyWriteErrorRetryOverride(request_settings, write_settings);
     auto scheduler = threadPoolCallbackRunnerUnsafe<void>(getThreadPoolWriter(), ThreadName::S3_COPY_POOL);
     const auto read_settings_to_use = patchSettings(read_settings);
 
@@ -1243,7 +1251,7 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::tryGetS3StorageClient()
 }
 
 std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(
-    uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms, bool configured_timeouts) const
+    uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms, bool disable_adaptive_timeouts) const
 {
     auto base = client.get();
     std::lock_guard lock(single_attempt_client_mutex);
@@ -1253,7 +1261,7 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(
         single_attempt_client_base = base;
     }
 
-    const auto cache_key = std::make_tuple(request_timeout_ms, connect_timeout_cap_ms, configured_timeouts);
+    const auto cache_key = std::make_tuple(request_timeout_ms, connect_timeout_cap_ms, disable_adaptive_timeouts);
     if (auto it = single_attempt_clients.find(cache_key); it != single_attempt_clients.end())
         return it->second;
 
@@ -1270,7 +1278,7 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient(
 
     if (request_timeout_ms != 0)
         cfg.requestTimeoutMs = static_cast<long>(request_timeout_ms);
-    if (configured_timeouts)
+    if (disable_adaptive_timeouts)
         cfg.s3_use_adaptive_timeouts = false;
 
     /// One TCP/TLS connect may not cost more than the cap the mount froze at open: the engine reserves
@@ -1301,6 +1309,8 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::clientForRetryProfile(const O
 {
     /// getSingleAttemptClient is only invoked when actually selected, so an ordinary request never
     /// pays for building or locking the clone.
+    /// The clone keeps the disk's adaptive timeouts: the caller reissues these requests itself and numbers
+    /// its reissues, and the HTTP client gives attempt 2 onwards the configured timeouts.
     if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
         return getSingleAttemptClient(request.attempt_timeout_ms, request.connect_timeout_cap_ms);
     return client.get();
@@ -1313,7 +1323,7 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::objectCreationClient(const Wr
     /// The creating request has no second attempt, so it must not run under the first-attempt timeouts.
     return getSingleAttemptClient(
         write_settings.object_storage_attempt_timeout_ms, write_settings.object_storage_connect_timeout_cap_ms,
-        /*configured_timeouts=*/true);
+        /*disable_adaptive_timeouts=*/true);
 }
 
 bool S3ObjectStorage::tryRefreshCredentialsViaCallback()

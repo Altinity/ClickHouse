@@ -599,7 +599,7 @@ Model::CompleteMultipartUploadOutcome Client::CompleteMultipartUpload(CompleteMu
             outcome = Aws::S3::Model::CompleteMultipartUploadOutcome(Aws::S3::Model::CompleteMultipartUploadResult());
     }
 
-    /// The compose rewrites the object as a new generation: a second creating request.
+    /// The compose rewrites the object as a new generation, a second creating request; off by default.
     if (outcome.IsSuccess() && provider_type == ProviderType::GCS && client_settings.gcs_issue_compose_request && !single_attempt)
     {
         /// For GCS we will try to compose object at the end, otherwise we cannot do a native copy

@@ -309,7 +309,11 @@ namespace
             }
             catch (...)
             {
-                tryLogCurrentException(log, fmt::format("While performing multipart upload of object {} in bucket {}", dest_key, dest_bucket));
+                /// A caller that sends the completion once resolves a failure and retries itself.
+                tryLogCurrentException(
+                    log,
+                    fmt::format("While performing multipart upload of object {} in bucket {}", dest_key, dest_bucket),
+                    object_creation_client->usesSingleAttemptRetryStrategy() ? LogsLevel::debug : LogsLevel::error);
 
                 task_tracker.safeWaitAll();
 
@@ -905,11 +909,8 @@ void copyS3File(
     ObjectStorageCopyMode copy_mode,
     std::shared_ptr<const S3::Client> object_creation_client)
 {
-    if (object_creation_client && copy_mode != ObjectStorageCopyMode::NativeOnly)
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "copyS3File: an object creation client requires NativeOnly copy mode, "
-            "because the read-write fallback would write through the retrying client");
+    /// The read-write fallback would write through the retrying client.
+    chassert(!object_creation_client || copy_mode == ObjectStorageCopyMode::NativeOnly);
 
     if (!dest_s3_client)
         dest_s3_client = src_s3_client;

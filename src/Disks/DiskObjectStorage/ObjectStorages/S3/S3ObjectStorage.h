@@ -213,15 +213,14 @@ public:
     /// disk client rotates (applyNewSettings/credentials refresh) — the cached clone is keyed by the
     /// base client's identity, so a stale clone can never outlive a rotation.
     /// `request_timeout_ms` overrides the clone's send/receive inactivity bound; 0 keeps the disk's.
-    /// `connect_timeout_cap_ms` caps the clone's connect timeout (0 = no cap). `configured_timeouts` turns
-    /// off the adaptive first-attempt timeouts, which assume a second attempt with the configured ones.
-    /// The cache key is all three, so callers asking for different bounds get distinct clones.
+    /// `connect_timeout_cap_ms` caps the clone's connect timeout (0 = no cap). `disable_adaptive_timeouts`
+    /// turns off the adaptive first-attempt timeouts, which assume a second attempt with the configured
+    /// ones. The cache key is all three, so callers asking for different bounds get distinct clones.
     std::shared_ptr<const S3::Client> getSingleAttemptClient(
-        uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms = 0, bool configured_timeouts = false) const;
+        uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms = 0, bool disable_adaptive_timeouts = false) const;
 
-    /// True iff a clone for exactly this (request timeout, connect cap) pair, with adaptive timeouts
-    /// left as configured, is already cached --
-    /// never builds one. Lets a test prove dispatch used a SPECIFIC key (and no other) without ever
+    /// True iff a clone for exactly this (request timeout, connect cap) pair, with the disk's adaptive
+    /// timeouts setting, is already cached -- never builds one. Lets a test prove dispatch used a SPECIFIC key (and no other) without ever
     /// creating a clone itself and without measuring anything.
     bool hasSingleAttemptClientForTest(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms) const;
 
@@ -286,7 +285,7 @@ private:
     std::atomic<int8_t> pinned_generation_dialect{-1};   /// -1 unpinned, 0 pinned ETag, 1 pinned generation
 
     mutable std::mutex single_attempt_client_mutex;
-    /// One clone per (requested timeout, connect cap, configured timeouts) key: the verbs of one
+    /// One clone per (requested timeout, connect cap, adaptive timeouts disabled) key: the verbs of one
     /// operation ask for different bounds, and a single slot would rebuild a whole S3 client (and lose
     /// its connection pool) on every alternation between them.
     mutable std::map<std::tuple<uint64_t, uint64_t, bool>, std::shared_ptr<const S3::Client>> single_attempt_clients;
