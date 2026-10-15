@@ -30,6 +30,7 @@ namespace DB
 
 class FileNamesGenerator;
 class IcebergMetadata;
+struct ExternalStorageCache;
 
 namespace Iceberg
 {
@@ -42,6 +43,7 @@ public:
         const IcebergMetadata & metadata_,
         ContextPtr context_,
         ObjectStoragePtr object_storage_,
+        ExternalStorageCache & external_storages_,
         const PersistentTableComponents & components_,
         const DataLakeStorageSettings & data_lake_settings_,
         String write_format_,
@@ -106,6 +108,7 @@ private:
     const IcebergMetadata & metadata;
     ContextPtr context;
     ObjectStoragePtr object_storage;
+    ExternalStorageCache & external_storages;
     const PersistentTableComponents & components;
     const DataLakeStorageSettings & data_lake_settings;
     String write_format;

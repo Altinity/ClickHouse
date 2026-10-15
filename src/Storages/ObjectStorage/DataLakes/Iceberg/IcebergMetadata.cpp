@@ -973,6 +973,7 @@ void IcebergMetadata::alterPartitionDropImpl(const PartitionCommand & command, C
         *this,
         context,
         object_storage,
+        *external_storages,
         persistent_components,
         data_lake_settings,
         write_format,
