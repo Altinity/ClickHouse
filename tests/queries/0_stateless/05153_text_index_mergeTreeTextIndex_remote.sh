@@ -50,8 +50,8 @@ run_remote_as_user
 
 $CLICKHOUSE_CLIENT -q "GRANT SELECT ON $CLICKHOUSE_DATABASE.tab TO $user_name"
 
-# Over an ordinary connection the shard runs the query as the user of the connection, which the function refuses
-# unless that is the initiating user; with the local shortcut it runs as the user itself.
+# Over an ordinary connection `remote` with a table function on a single shard runs an initial query there as the user
+# of the connection, which checks the access of that user; with the local shortcut it runs as the user itself.
 run_remote_as_user
 
 $CLICKHOUSE_CLIENT -q "
