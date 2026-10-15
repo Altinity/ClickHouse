@@ -588,6 +588,24 @@ void Reader::initializePrefetches()
                 if (!primitive_columns[column_idx].use_bloom_filter)
                     continue;
                 const auto & meta = row_group.columns[column_idx].meta->meta_data;
+                /// Same predicate as `use_dictionary_filter` below. That flag is set only while
+                /// registering ranges, which is too late: a dictionary-filtered chunk does not read
+                /// its bloom filter and must not turn on a whole-file read.
+                if (meta.__isset.dictionary_page_offset &&
+                    primitive_columns[column_idx].used_by_key_condition &&
+                    size_t(meta.data_page_offset) - size_t(meta.dictionary_page_offset) < options.dictionary_filter_limit_bytes &&
+                    meta.__isset.encoding_stats)
+                {
+                    bool all_pages_are_dictionary_encoded = true;
+                    for (const parq::PageEncodingStats & s : meta.encoding_stats)
+                        all_pages_are_dictionary_encoded &=
+                            (s.page_type != parq::PageType::DATA_PAGE && s.page_type != parq::PageType::DATA_PAGE_V2) ||
+                            s.encoding == parq::Encoding::PLAIN_DICTIONARY ||
+                            s.encoding == parq::Encoding::RLE_DICTIONARY ||
+                            s.count == 0;
+                    if (all_pages_are_dictionary_encoded)
+                        continue;
+                }
                 /// `bloom_filter_length` is optional (Parquet 2.10). An offset without it is still a
                 /// filter; the hard-way path below derives the length and registers that range.
                 const bool length_missing_or_positive = !meta.__isset.bloom_filter_length || meta.bloom_filter_length > 0;
