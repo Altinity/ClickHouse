@@ -84,7 +84,7 @@ validation, and other callers.
 | `CASBlobList` | `Number` | Number of CAS blob LIST requests. Growing values indicate more object enumeration. |
 | `CASBlobOverwrite` | `Number` | Number of CAS blob overwrite requests. Growing values indicate repeated replacement writes. |
 | `CASBlobPublishAttemptFailed` | `Number` | Number of CAS blob publication attempts that failed with an ambiguous or retryable error. The writer observes the blob again and publishes a fresh envelope, up to the attempt limit. |
-| `CASBlobPublishGaveUp` | `Number` | Number of CAS blob publications abandoned because the last allowed attempt failed. The write fails with a retryable error. |
+| `CASBlobPublishGaveUp` | `Number` | Number of CAS blob publications that ended with an exception after at least one failed attempt, for example at the attempt limit or the deadline. |
 | `CASBlobPut` | `Number` | Number of CAS blob PUT requests. Grows with blob uploads and indicates storage write traffic. |
 | `CASBlobPutDeduplicated` | `Number` | Number of CAS blob deduplicating PUT requests. Grows when uploads reuse existing content. |
 
