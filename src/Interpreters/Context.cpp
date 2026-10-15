@@ -6781,17 +6781,22 @@ DiskPtr Context::getDisk(const String & name) const
 namespace
 {
 
-/// Every waiter of one creation rethrows the same stored exception. Copy it, so a caller that
-/// modifies its exception (e.g. `addMessage`) does not race with the other waiters.
+/// All callers of one creation get the same stored exception. Each rethrows its own copy, so a
+/// caller that modifies its exception (e.g. `addMessage`) does not race with the others.
 DiskPtr getDiskCreationResult(const std::shared_future<DiskPtr> & creation)
 {
     try
     {
         return creation.get();
     }
-    catch (const Exception & e)
+    catch (const Poco::Exception & e)
     {
-        throw Exception(e);
+        /// Virtual, so the copy keeps the dynamic type (e.g. `ErrnoException`).
+        e.rethrow();
+    }
+    catch (...)
+    {
+        throw Exception::createRuntime(getCurrentExceptionCode(), getCurrentExceptionMessage(/* with_stacktrace */ false));
     }
 }
 
@@ -6826,7 +6831,7 @@ DiskPtr Context::getOrCreateDisk(const String & name, DiskCreator creator) const
     if (!is_creator)
         return getDiskCreationResult(creation);
 
-    /// Creating a disk can take long (a CAS disk waits out a stale mount lease), so it runs without
+    /// A remote disk's startup can block on the network for a long time, so the creator runs without
     /// `storage_policies_mutex`. Concurrent requests for the same name wait for this creation rather
     /// than open the same storage a second time.
     DiskPtr disk;
@@ -6847,12 +6852,7 @@ DiskPtr Context::getOrCreateDisk(const String & name, DiskCreator creator) const
         {
             try
             {
-                auto disk_selector = getDiskSelector(lock);
-                /// A config reload may have added a disk with this name meanwhile; it wins, as if it ran first.
-                if (auto existing = disk_selector->tryGet(name))
-                    disk = existing;
-                else
-                    const_cast<DiskSelector *>(disk_selector.get())->addToDiskMap(name, disk);
+                const_cast<DiskSelector *>(getDiskSelector(lock).get())->addToDiskMap(name, disk);
             }
             catch (...)
             {
@@ -6969,8 +6969,13 @@ void Context::updateStorageConfiguration(const Poco::Util::AbstractConfiguration
         std::lock_guard lock(shared->storage_policies_mutex);
         Strings disks_to_reinit;
         if (shared->merge_tree_disk_selector)
-            shared->merge_tree_disk_selector
-                = shared->merge_tree_disk_selector->updateFromConfig(config, "storage_configuration.disks", shared_from_this());
+        {
+            NameSet disks_being_created;
+            for (const auto & [name, _] : shared->disks_being_created)
+                disks_being_created.insert(name);
+            shared->merge_tree_disk_selector = shared->merge_tree_disk_selector->updateFromConfig(
+                config, "storage_configuration.disks", shared_from_this(), disks_being_created);
+        }
 
         if (shared->merge_tree_storage_policy_selector)
         {

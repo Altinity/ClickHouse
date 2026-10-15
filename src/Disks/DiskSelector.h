@@ -29,10 +29,13 @@ public:
     using DiskValidator = std::function<bool(const Poco::Util::AbstractConfiguration & config, const String & disk_config_prefix, const String & disk_name)>;
     void initialize(const Poco::Util::AbstractConfiguration & config, const String & config_prefix, ContextPtr context, DiskValidator disk_validator = {});
 
+    /// Disks in `disks_to_skip` that are not created yet are left out: their names are being created
+    /// as custom disks, and creating them here would open the same storage twice.
     DiskSelectorPtr updateFromConfig(
         const Poco::Util::AbstractConfiguration & config,
         const String & config_prefix,
-        ContextPtr context) const;
+        ContextPtr context,
+        const NameSet & disks_to_skip = {}) const;
 
     /// Get disk by name
     DiskPtr get(const String & name) const;

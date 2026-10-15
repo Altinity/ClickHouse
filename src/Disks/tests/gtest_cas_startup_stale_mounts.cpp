@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <Common/ErrnoException.h>
 #include <Common/Exception.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Core/ServerUUID.h>
 #include <Disks/DiskFactory.h>
+#include <Disks/DiskLocal.h>
 #include <Disks/DiskFromAST.h>
 #include <Disks/registerDisks.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
@@ -22,7 +24,6 @@
 #include <Poco/Logger.h>
 #include <Poco/Message.h>
 #include <Poco/Util/XMLConfiguration.h>
-#include <base/scope_guard.h>
 
 #include <atomic>
 #include <chrono>
@@ -184,7 +185,10 @@ public:
         DB::registerDisks(/*global_skip_access_check=*/true);
     }
 
-    static void TearDownTestSuite() { DB::clearDiskRegistry(); }
+    static void TearDownTestSuite()
+    {
+        DB::clearDiskRegistry();
+    }
 
 protected:
     void SetUp() override
@@ -201,14 +205,27 @@ protected:
         for (const auto & disk : disks)
             if (auto created = getContext().context->getDisksMap(); created.contains(disk.name))
                 created.at(disk.name)->shutdown();
+        /// Restored only after the disks stop, so no CAS worker logs while the channel is swapped.
+        if (stale_mount_waits)
+        {
+            Poco::Logger & pool_logger = Poco::Logger::get("CasPool");
+            pool_logger.setChannel(previous_pool_channel);
+            pool_logger.setLevel(previous_pool_level);
+        }
         fs::remove_all(root);
+    }
+
+    /// Disks stay in the global context after a test, so every name is unique within the process.
+    static String uniqueDiskName(const String & prefix)
+    {
+        static std::atomic<size_t> counter = 0;
+        return prefix + "_" + ::testing::UnitTest::GetInstance()->current_test_info()->name() + "_" + std::to_string(++counter);
     }
 
     StaleCasDisk & addStaleDisk(const String & suffix)
     {
-        const String test_name = ::testing::UnitTest::GetInstance()->current_test_info()->name();
         StaleCasDisk disk{
-            .name = "cas_stale_" + test_name + "_" + suffix,
+            .name = uniqueDiskName("cas_stale_" + suffix),
             .server_root_id = "stale_" + suffix,
             .pool_dir = root / ("pool_" + suffix),
             .scratch_dir = root / ("scratch_" + suffix),
@@ -218,15 +235,28 @@ protected:
         return disks.emplace_back(std::move(disk));
     }
 
+    StaleMountWaitChannel & watchStaleMountWaits()
+    {
+        Poco::Logger & pool_logger = Poco::Logger::get("CasPool");
+        previous_pool_channel = Poco::AutoPtr<Poco::Channel>(pool_logger.getChannel(), /*shared=*/true);
+        previous_pool_level = pool_logger.getLevel();
+        stale_mount_waits = new StaleMountWaitChannel;
+        pool_logger.setChannel(stale_mount_waits);
+        pool_logger.setLevel(Poco::Message::PRIO_INFORMATION);
+        return *stale_mount_waits;
+    }
+
     fs::path root;
     std::vector<StaleCasDisk> disks;
+    Poco::AutoPtr<StaleMountWaitChannel> stale_mount_waits;
+    Poco::AutoPtr<Poco::Channel> previous_pool_channel;
+    int previous_pool_level = 0;
 };
 
 }
 
 /// Each stale mount must be waited out once, but the waits of different disks are independent.
-/// Waiting them one after another makes server start N × the observation window, which is what
-/// missed the start timeout with three stale mounts.
+/// Waiting them one after another makes server start N × the observation window.
 TEST_F(CASStartupStaleMounts, StaleMountsOfDifferentDisksAreWaitedOutConcurrently)
 {
     constexpr size_t disk_count = 3;
@@ -273,17 +303,7 @@ TEST_F(CASStartupStaleMounts, DiskLookupDoesNotWaitForAStaleMountObservation)
 {
     const StaleCasDisk & stale = addStaleDisk("0");
     ASSERT_FALSE(HasFatalFailure());
-
-    Poco::Logger & pool_logger = Poco::Logger::get("CasPool");
-    Poco::AutoPtr<Poco::Channel> previous_channel(pool_logger.getChannel(), /*shared=*/true);
-    const int previous_level = pool_logger.getLevel();
-    Poco::AutoPtr<StaleMountWaitChannel> channel(new StaleMountWaitChannel);
-    pool_logger.setChannel(channel);
-    pool_logger.setLevel(Poco::Message::PRIO_INFORMATION);
-    SCOPE_EXIT({
-        pool_logger.setChannel(previous_channel);
-        pool_logger.setLevel(previous_level);
-    });
+    StaleMountWaitChannel & waits = watchStaleMountWaits();
 
     std::exception_ptr error;
     std::thread loader([&]
@@ -298,13 +318,18 @@ TEST_F(CASStartupStaleMounts, DiskLookupDoesNotWaitForAStaleMountObservation)
         }
     });
 
-    ASSERT_TRUE(channel->waitForWaitStarted(1)) << "the stale mount was never observed";
-    const auto lookup_start = std::chrono::steady_clock::now();
-    (void)getContext().context->getDisksMap();
-    const uint64_t lookup_ms = elapsedMs(lookup_start);
+    const bool wait_started = waits.waitForWaitStarted(1);
+    uint64_t lookup_ms = 0;
+    if (wait_started)
+    {
+        const auto lookup_start = std::chrono::steady_clock::now();
+        (void)getContext().context->getDisksMap();
+        lookup_ms = elapsedMs(lookup_start);
+    }
     loader.join();
 
     ASSERT_FALSE(error) << DB::getExceptionMessage(error, false);
+    ASSERT_TRUE(wait_started) << "the stale mount was never observed";
     EXPECT_LT(lookup_ms, observation_ms / 3)
         << "a disk lookup took " << lookup_ms << " ms while a stale mount was being observed for up to "
         << observation_ms << " ms";
@@ -316,17 +341,7 @@ TEST_F(CASStartupStaleMounts, ConcurrentCreationsOfOneDiskShareOneOpen)
 {
     const StaleCasDisk & stale = addStaleDisk("0");
     ASSERT_FALSE(HasFatalFailure());
-
-    Poco::Logger & pool_logger = Poco::Logger::get("CasPool");
-    Poco::AutoPtr<Poco::Channel> previous_channel(pool_logger.getChannel(), /*shared=*/true);
-    const int previous_level = pool_logger.getLevel();
-    Poco::AutoPtr<StaleMountWaitChannel> channel(new StaleMountWaitChannel);
-    pool_logger.setChannel(channel);
-    pool_logger.setLevel(Poco::Message::PRIO_INFORMATION);
-    SCOPE_EXIT({
-        pool_logger.setChannel(previous_channel);
-        pool_logger.setLevel(previous_level);
-    });
+    StaleMountWaitChannel & waits = watchStaleMountWaits();
 
     const auto config = stale.xmlConfig();
     std::atomic<size_t> creator_calls = 0;
@@ -353,7 +368,7 @@ TEST_F(CASStartupStaleMounts, ConcurrentCreationsOfOneDiskShareOneOpen)
         }
     });
     /// Without this wait the second request could find the disk already created.
-    const bool first_is_waiting = channel->waitForWaitStarted(1);
+    const bool first_is_waiting = waits.waitForWaitStarted(1);
     std::thread second([&]
     {
         try
@@ -379,7 +394,7 @@ TEST_F(CASStartupStaleMounts, ConcurrentCreationsOfOneDiskShareOneOpen)
 /// A failed creation is not remembered: the next request for the name creates the disk again.
 TEST_F(CASStartupStaleMounts, FailedDiskCreationIsRetriedByTheNextRequest)
 {
-    const String name = "cas_stale_failed_creation";
+    const String name = uniqueDiskName("failed_creation");
     std::vector<String> calls;
     EXPECT_THROW(
         getContext().context->getOrCreateDisk(name, [&](const DB::DisksMap &) -> DB::DiskPtr
@@ -397,4 +412,111 @@ TEST_F(CASStartupStaleMounts, FailedDiskCreationIsRetriedByTheNextRequest)
         }),
         DB::Exception);
     EXPECT_EQ(calls, (std::vector<String>{"first", "second"}));
+}
+
+/// A request that arrives while another creation of the same name fails gets that failure without
+/// running its own creator. Each caller gets its own copy of the exception, of the original type.
+TEST_F(CASStartupStaleMounts, ConcurrentRequestsShareOneFailure)
+{
+    const String name = uniqueDiskName("shared_failure");
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool first_started = false;
+    bool second_returned = false;
+    std::atomic<size_t> creator_calls = 0;
+
+    const auto failing_creator = [&](const DB::DisksMap &) -> DB::DiskPtr
+    {
+        ++creator_calls;
+        std::unique_lock lock(mutex);
+        first_started = true;
+        cv.notify_all();
+        /// Gives the second request time to join this creation. It returns early only if it did not join.
+        cv.wait_for(lock, std::chrono::seconds(2), [&] { return second_returned; });
+        DB::ErrnoException::throwWithErrno(DB::ErrorCodes::BAD_ARGUMENTS, ENOSPC, "creation failed");
+    };
+
+    struct Outcome
+    {
+        bool got_errno_exception = false;
+        int code = 0;
+        int saved_errno = 0;
+        String message;
+    };
+    const auto request = [&](const String & caller, Outcome & outcome)
+    {
+        try
+        {
+            getContext().context->getOrCreateDisk(name, failing_creator);
+        }
+        catch (DB::ErrnoException & e)
+        {
+            outcome.got_errno_exception = true;
+            outcome.code = e.code();
+            outcome.saved_errno = e.getErrno();
+            e.addMessage("seen by " + caller);
+            outcome.message = e.message();
+        }
+        catch (...)
+        {
+            outcome.message = DB::getCurrentExceptionMessage(false);
+        }
+    };
+
+    Outcome first_outcome;
+    Outcome second_outcome;
+    std::thread first([&] { request("first", first_outcome); });
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return first_started; });
+    }
+    std::thread second([&]
+    {
+        request("second", second_outcome);
+        std::lock_guard lock(mutex);
+        second_returned = true;
+        cv.notify_all();
+    });
+    first.join();
+    second.join();
+
+    EXPECT_EQ(creator_calls.load(), 1u);
+    for (const Outcome * outcome : {&first_outcome, &second_outcome})
+    {
+        EXPECT_TRUE(outcome->got_errno_exception) << outcome->message;
+        EXPECT_EQ(outcome->code, DB::ErrorCodes::BAD_ARGUMENTS);
+        EXPECT_EQ(outcome->saved_errno, ENOSPC);
+    }
+    EXPECT_TRUE(first_outcome.message.contains("seen by first")) << first_outcome.message;
+    EXPECT_FALSE(first_outcome.message.contains("seen by second")) << first_outcome.message;
+    EXPECT_TRUE(second_outcome.message.contains("seen by second")) << second_outcome.message;
+    EXPECT_FALSE(second_outcome.message.contains("seen by first")) << second_outcome.message;
+    EXPECT_FALSE(getContext().context->getDisksMap().contains(name));
+}
+
+/// A configuration reload during a custom disk creation must not open a configured disk of the
+/// same name: both could describe the same storage.
+TEST_F(CASStartupStaleMounts, ConfigReloadSkipsADiskBeingCreated)
+{
+    const String name = uniqueDiskName("reload_race");
+    const fs::path config_disk_path = root / "config_disk";
+    const fs::path custom_disk_path = root / "custom_disk";
+    fs::create_directories(config_disk_path);
+    fs::create_directories(custom_disk_path);
+
+    std::istringstream xml(
+        "<clickhouse><storage_configuration><disks><" + name + "><type>local</type><path>" + config_disk_path.string()
+        + "/</path></" + name + "></disks></storage_configuration></clickhouse>");
+    Poco::AutoPtr<Poco::Util::XMLConfiguration> reloaded_config(new Poco::Util::XMLConfiguration(xml));
+
+    DB::DiskPtr created;
+    const auto disk = getContext().context->getOrCreateDisk(name, [&](const DB::DisksMap &) -> DB::DiskPtr
+    {
+        getContext().context->updateStorageConfiguration(*reloaded_config);
+        created = std::make_shared<DB::DiskLocal>(name, custom_disk_path.string() + "/");
+        return created;
+    });
+
+    EXPECT_EQ(disk, created);
+    EXPECT_EQ(getContext().context->getDisk(name), created);
 }

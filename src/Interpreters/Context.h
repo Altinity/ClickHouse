@@ -1685,6 +1685,10 @@ public:
     /// Provides storage disks
     DiskPtr getDisk(const String & name) const;
     using DiskCreator = std::function<DiskPtr(const DisksMap & disks_map)>;
+    /// Returns the disk `name`, creating it with `creator` if it does not exist yet. The creator runs
+    /// without the storage lock and gets a snapshot of the disks. Concurrent calls for the same name
+    /// share one creation: they all get its disk or a copy of its exception. A failed creation is not
+    /// remembered. The creator must not request a disk of its own name.
     DiskPtr getOrCreateDisk(const String & name, DiskCreator creator) const;
 
     StoragePoliciesMap getPoliciesMap() const;

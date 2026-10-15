@@ -143,7 +143,7 @@ catch (...)
 }
 
 DiskSelectorPtr DiskSelector::updateFromConfig(
-    const Poco::Util::AbstractConfiguration & config, const String & config_prefix, ContextPtr context) const
+    const Poco::Util::AbstractConfiguration & config, const String & config_prefix, ContextPtr context, const NameSet & disks_to_skip) const
 {
     assertInitialized();
 
@@ -166,6 +166,11 @@ DiskSelectorPtr DiskSelector::updateFromConfig(
         auto disk_config_prefix = config_prefix + "." + disk_name;
         if (!result->getDisksMap().contains(disk_name))
         {
+            if (disks_to_skip.contains(disk_name))
+            {
+                LOG_WARNING(getLogger("DiskSelector"), "Disk {} is not created from the configuration: a custom disk with this name is being created", backQuote(disk_name));
+                continue;
+            }
             auto created_disk = factory.create(
                 disk_name, config, disk_config_prefix, context, result->getDisksMap(), /*attach*/ false, /*custom_disk*/ false, skip_types);
             if (created_disk)
