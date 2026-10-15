@@ -349,8 +349,9 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const bool same_group = initial_req->coalesce_group != 0 && r.request->coalesce_group == initial_req->coalesce_group;
         /// Bloom-filter groups stay inside the group, so a filter is not merged with the column data next to it.
         /// `across_gaps` is the small-file path: one read covers the whole object.
+        /// The same-group span is the configured cap, even when that cap is below `bytes_per_read_task`.
         const size_t gap_limit = (same_group && coalesce_group_across_gaps) ? coalesce_group_span_limit : min_bytes_for_seek;
-        const size_t span_limit = same_group ? std::max(coalesce_group_span_limit, bytes_per_read_task) : bytes_per_read_task;
+        const size_t span_limit = same_group ? coalesce_group_span_limit : bytes_per_read_task;
         if ((initial_req->coalesce_group != 0 && !same_group) ||
             r.end + gap_limit <= start_offset || // short gap
             r.start + span_limit <= initial_offset || // task not too big
@@ -389,7 +390,7 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const RangeState & r = ranges[end_idx];
         const bool same_group = initial_req->coalesce_group != 0 && r.request->coalesce_group == initial_req->coalesce_group;
         const size_t gap_limit = (same_group && coalesce_group_across_gaps) ? coalesce_group_span_limit : min_bytes_for_seek;
-        const size_t span_limit = same_group ? std::max(coalesce_group_span_limit, bytes_per_read_task) : bytes_per_read_task;
+        const size_t span_limit = same_group ? coalesce_group_span_limit : bytes_per_read_task;
         if ((initial_req->coalesce_group != 0 && !same_group) ||
             end_offset + gap_limit <= r.start ||
             initial_offset + span_limit <= r.end ||
