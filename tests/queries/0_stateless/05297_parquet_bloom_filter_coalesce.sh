@@ -53,6 +53,8 @@ SEPARATE=$(read_count 0 1) || { echo "separate read failed"; exit 1; }
 CLUSTER=$(read_count 67108864 1) || { echo "cluster read failed"; exit 1; }
 # Enough filters that the seek budget covers the file: one read of the whole object.
 WHOLE=$(read_count 67108864 1000000000) || { echo "whole-file read failed"; exit 1; }
+# Cap of 1 byte, seek of 1 MiB: bytes_per_read_task is 4 MiB and would swallow this file if the cap were raised.
+CAPPED=$(read_count 1 1000000) || { echo "capped read failed"; exit 1; }
 
 if [ "$CLUSTER" -ge "$SEPARATE" ]; then
     echo "cluster coalesce did not reduce reads: cluster=$CLUSTER separate=$SEPARATE"
@@ -60,6 +62,10 @@ if [ "$CLUSTER" -ge "$SEPARATE" ]; then
 fi
 if [ "$WHOLE" -gt 4 ]; then
     echo "whole-file read used too many requests: whole=$WHOLE cluster=$CLUSTER separate=$SEPARATE"
+    exit 1
+fi
+if [ "$CAPPED" -le 20 ]; then
+    echo "small coalesce cap was raised: capped=$CAPPED separate=$SEPARATE cluster=$CLUSTER whole=$WHOLE"
     exit 1
 fi
 
