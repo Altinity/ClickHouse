@@ -218,7 +218,8 @@ AlterDropPartitionExecutor::AlterDropPartitionExecutor(
     const PersistentTableComponents & components_,
     const DataLakeStorageSettings & data_lake_settings_,
     String write_format_,
-    LoggerPtr log_)
+    LoggerPtr log_,
+    ExternalStorageCache & external_storages_)
     : command(command_)
     , metadata(metadata_)
     , context(context_)
@@ -227,6 +228,7 @@ AlterDropPartitionExecutor::AlterDropPartitionExecutor(
     , data_lake_settings(data_lake_settings_)
     , write_format(std::move(write_format_))
     , log(std::move(log_))
+    , external_storages(external_storages_)
 {
 }
 
@@ -365,7 +367,7 @@ AlterDropPartitionExecutor::discoverTargetFilePaths(const SnapshotState & state,
 
     for (const auto & manifest_key : state.snapshot->manifest_list_entries)
     {
-        auto handle = getManifestFileEntriesHandle(object_storage, components, context, log, manifest_key, state.schema_id);
+        auto handle = getManifestFileEntriesHandle(object_storage, components, context, log, manifest_key, state.schema_id, external_storages);
 
         collect(handle.getFilesWithoutDeleted(FileContentType::DATA));
         collect(handle.getFilesWithoutDeleted(FileContentType::POSITION_DELETE));
@@ -460,7 +462,7 @@ AlterDropPartitionExecutor::buildDropPlan(const SnapshotState & state, const Tar
 
     for (const auto & manifest_key : state.snapshot->manifest_list_entries)
     {
-        auto handle = getManifestFileEntriesHandle(object_storage, components, context, log, manifest_key, state.schema_id);
+        auto handle = getManifestFileEntriesHandle(object_storage, components, context, log, manifest_key, state.schema_id, external_storages);
 
         size_t entries_to_keep = 0;
         size_t entries_to_remove = 0;
@@ -575,6 +577,7 @@ AlterDropPartitionExecutor::ManifestListWriteResult AlterDropPartitionExecutor::
         components.path_resolver,
         state.metadata_object,
         object_storage,
+        external_storages,
         context,
         /*manifest_entry_names=*/{},
         new_snapshot,
