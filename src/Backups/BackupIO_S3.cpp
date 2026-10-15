@@ -3,6 +3,7 @@
 #if USE_AWS_S3
 #include <Core/Settings.h>
 #include <Core/ServerSettings.h>
+#include <Common/RemoteHostFilter.h>
 #include <Common/Throttler.h>
 #include <Common/threadPoolCallbackRunner.h>
 #include <Interpreters/Context.h>
@@ -131,6 +132,8 @@ private:
         const S3Settings & settings,
         const ContextPtr & context)
     {
+        s3_uri.checkRemoteHostFilter(context->getGlobalContext()->getRemoteHostFilter());
+
         Aws::Auth::AWSCredentials credentials(access_key_id, secret_access_key);
         HTTPHeaderEntries headers;
         String session_token = settings.auth_settings[S3AuthSetting::session_token];
