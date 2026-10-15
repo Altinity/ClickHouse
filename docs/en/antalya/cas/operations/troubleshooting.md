@@ -18,7 +18,7 @@ tools.
 |---|---|---|
 | A server keeps losing its mount lease and self-remounting | Check `system.cas_mounts` for the server's own `state`/`expires_at`, then correlate `watermark_renew` and `mount_remount` in `system.cas_log`; losing the lease trips a local fence and latches a remount generation | Read the failed renewal's `classification` before changing anything — it alone now says why (see [the decision flow](#mount-renewal-remount-flow)). Look for object-store latency consuming the confirmed lease or BOOTTIME advancement; see [the mount lease](/antalya/cas/architecture/mounts-and-leases#mount-lease) |
 | Writes slow down or stall under load, with no exception reaching the client | S3 `SlowDown`/`ServiceUnavailable`/`RequestTimeout`/`InternalError` (5xx) responses are not on the request engine's `isDefinitelyRefusedWrite` definite-failure list (only malformed-request, entity-too-large, and access-denied that no credential refresh can fix are), so they classify as ambiguous and are retried automatically. Confirm with `sum(ProfileEvents['CASConditionalWriteUnresolved'])` rising alongside `sum(ProfileEvents['CASConditionalWriteAttempts'])` over `system.query_log` for the affected window (or `ProfileEvent_CASConditionalWriteUnresolved` in `system.metric_log` for a cumulative view across queries), and check `system.blob_storage_log` for `disk_name = '<cas>'` rows with a nonzero `error_code` around the same window | Nothing to configure per-request: the request engine retries the same `(key, bytes)` with capped-exponential backoff (200ms initial, capped at 5s, full jitter) until the 90-second operation deadline — there is no separate attempts ceiling, only the deadline — and the mount-lease renewer keeps extending the fence across the disruption — this is the "blips, throttling, partial outages" case the write path is built to survive. Confirm the mount lease itself is still renewing (`system.cas_mounts.expires_at` moving forward, `last_success_age_seconds` not climbing) — if it is, this is expected and self-resolving. If `SlowDown` responses are sustained rather than transient, check the bucket's request-rate limits against the pool's actual PUT/GET rate (see [bucket requirements](/antalya/cas/bucket-requirements)) and consider lowering `cas_blob_upload_pool_size` to reduce concurrent upload traffic; a write only surfaces a client-visible `NETWORK_ERROR` if the 90-second deadline is exhausted before the store recovers, and that error is retried by the ordinary merge/insert backoff, not silently dropped |
-| A write fails with a message containing `CAS ref-log txn`, `is durable, but publishing its checkpoint frontier was not confirmed`, `outcome is unknown` or `nothing is durable` | The phrase says whether the write can still take effect | Read [CAS commit errors](#cas-commit-errors) before retrying: two of the three outcomes can duplicate on retry |
+| A write fails with a message containing `CAS ref-log txn`, `is durable but was not acknowledged`, `outcome is unknown` or `nothing is durable` | The phrase says whether the write can still take effect. A write blocked behind an earlier unresolved transaction (a wedged or needs-recovery lane) carries that transaction's text instead; its own write was never attempted | Read [CAS commit errors](#cas-commit-errors) before retrying: two of the three outcomes can duplicate on retry |
 | `GC` never seems to reclaim space after tables are dropped | `SELECT * FROM system.cas_gc_log WHERE event_type='Finish' ORDER BY event_time DESC LIMIT 5` — check `outcome`; also `SELECT is_leader FROM system.cas_mounts` on this node | If `outcome != 'Success'`/`'Deferred'`, see [reading GC health](/antalya/cas/operations/monitoring#gc-health); if this node is not the leader (`is_leader = 0`), it never reclaims for this disk — check the peer holding leadership. Reclamation also needs at least two full rounds past condemnation by design (the grace period is rounds, not acks) — a single manual `SYSTEM CAS GC RUN` will not finish it |
 | A dangling-access exception or `CORRUPTED_DATA` on read | Run `clickhouse-disks cas-fsck --detail` and check `dangling` specifically — it is the one class that means data loss, distinct from `unreachable`/`awaiting-gc`, which are just waiting for graduation | A nonzero `dangling` count is a real incident: collect the `--detail` output (see [what to collect before filing a bug](/antalya/cas/operations/debugging#filing-a-bug)) before taking any destructive action |
 | `SYSTEM CAS FSCK` or `clickhouse-disks cas-fsck` times out on a large pool | The scan is bounded by `--timeout` (default 600s / the `SYSTEM` form has no override); a large `roots/` prefix can make the scan slow | Retry with `--partial` to see the counts accumulated so far instead of aborting empty-handed, or `--namespace <prefix>` to scope the scan to a subset of namespaces |
@@ -31,21 +31,22 @@ tools.
 
 ## CAS commit errors and retries {#cas-commit-errors}
 
-A failed ref-log commit names one of three outcomes in its message. The error code, usually
+A failed ref-log commit of this write names one of three outcomes in its message. The error code, usually
 `NETWORK_ERROR` (210), does not tell them apart; the phrase does. The original error is kept inside
 the message, and the server log may also show the inner `CAS write could not be committed` line.
 Each phrase describes the ref-log transaction that carried this part's change; one transaction can
-batch several callers.
+batch several callers. A write blocked behind an earlier unresolved transaction (a wedged or
+needs-recovery lane) carries that transaction's text instead, and its own write was never attempted.
 
 | Message contains | What happened to this transaction | Retrying this part's write |
 |---|---|---|
 | `nothing is durable, so a retry cannot duplicate this transaction` | The store refused the write, or it was refused before any request was sent | Cannot duplicate this part. See the deduplication note below |
 | `outcome is unknown` | A request may have been sent and nothing settled its result. The append lane stays wedged until the same key resolves | May duplicate: the write may still take effect |
-| `is durable, but publishing its checkpoint frontier was not confirmed` | It landed (named as `txn <epoch>-<seq>`), then the `_ckpt` frontier publish failed. The next ref-log recovery installs it | May duplicate: the write may still take effect |
+| `is durable but was not acknowledged` | It landed (named as `txn <epoch>-<seq>`), then a later step failed: the `_ckpt` frontier publish, the mount fence, or the install admission. The next ref-log recovery installs it | May duplicate: the write may still take effect |
 
-Scope: an `INSERT` that spans several partitions commits one part at a time, so earlier parts may
-already be committed when a later one fails. Rolling back the earlier parts is best-effort (crash
-row C7). None of these phrases proves that re-running the whole query is duplicate-free.
+Scope: an `INSERT` that spans several partitions commits one part at a time. Earlier parts stay
+committed; a failed statement does not roll them back. None of these phrases proves that re-running
+the whole query is duplicate-free.
 
 For an `INSERT` in the last two rows, the part is rolled back in memory, so a `SELECT` right after
 the error does not show its rows. If the transaction landed and the server restarts before part

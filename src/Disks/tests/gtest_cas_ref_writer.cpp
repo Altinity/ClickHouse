@@ -1559,7 +1559,7 @@ TEST(CASRefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWit
     backend->ckpt_conflict_key = ckpt_key;
     backend->ckpt_conflict_latched = true;
     DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
-        "is durable, but publishing its checkpoint frontier was not confirmed", [&] { store->dropRef(ns, "x"); });
+        "is durable but was not acknowledged", [&] { store->dropRef(ns, "x"); });
     backend->disarmFaults();
 
     EXPECT_GT(clock->pauseCount(), 1u)
@@ -1596,7 +1596,7 @@ TEST(CASRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecover
     backend->ckpt_get_hook = [&] { store->tripMountLost(); };
     SCOPE_EXIT({ backend->ckpt_get_hook = nullptr; });
     DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
-        "is durable, but publishing its checkpoint frontier was not confirmed", [&] { store->dropRef(ns, "x"); });
+        "is durable but was not acknowledged", [&] { store->dropRef(ns, "x"); });
 
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)

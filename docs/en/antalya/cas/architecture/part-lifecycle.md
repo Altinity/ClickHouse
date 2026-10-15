@@ -1,5 +1,5 @@
 ---
-description: 'The part-add protocol from local build through blob upload to promote, its nine crash points and their cleaners, and how each MergeTree operation maps onto it.'
+description: 'The part-add protocol from local build through blob upload to promote, its crash points and their cleaners, and how each MergeTree operation maps onto it.'
 sidebar_label: 'Part lifecycle'
 sidebar_position: 6
 slug: /antalya/cas/architecture/part-lifecycle
@@ -105,8 +105,8 @@ manifest never loses an owner, so it is net zero.
 ## Crash points and their cleaners {#crash-points}
 
 This table is the single best summary of the design's crash-safety story: no row loses committed
-data or leaves a dangling reference. A write reported as failed is known durable in C10 and C11,
-and may be durable in C3 and C6.
+data or leaves a dangling reference. In C6 and C10 the part itself may take effect; C3 and C11
+leave only a precommit binding.
 
 | # | Crash window | Left behind | Who cleans it |
 |---|---|---|---|
@@ -119,7 +119,7 @@ and may be durable in C3 and C6.
 | C7 | A later part throws after earlier parts published | A partial multi-part commit | Precise rollback: drop only the refs this call created, matching the exact manifest — never clobbers a concurrent writer's repoint |
 | C8 | Transaction destroyed uncommitted | Open builds | Destructor abandons every build |
 | C9 | Namespace dropped mid-build | — | One atomic flag; every further op fails closed at the alive check |
-| C10 | `promote` ref-log `PUT` committed, then the `_ckpt` frontier publish failed | A durable promotion this server has not installed; the ref lane needs recovery | The next ref-log recovery installs it. The in-memory part was already rolled back, and part cleanup later drops the ref; a restart before that drop brings the part back. The client sees `is durable, but publishing its checkpoint frontier was not confirmed` |
+| C10 | `promote` ref-log `PUT` committed, then the `_ckpt` frontier publish failed | A durable promotion this server has not installed; the ref lane needs recovery | The next ref-log recovery installs it. The in-memory part was already rolled back, and part cleanup later drops the ref; a restart before that drop brings the part back. The client sees `is durable but was not acknowledged` |
 | C11 | `precommitAdd` ref-log `PUT` committed, then the `_ckpt` frontier publish failed | A durable precommit binding this server has not installed | The next ref-log recovery installs the binding; the part is never published. `abandon`, else the stale-precommit sweep, removes it. The client sees the same message as in C10, although the part never appears |
 
 What each client-visible message means, and when a retry is safe, is in
