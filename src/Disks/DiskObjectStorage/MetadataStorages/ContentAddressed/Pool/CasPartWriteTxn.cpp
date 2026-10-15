@@ -15,9 +15,11 @@
 #include <Common/thread_local_rng.h>
 #include <Common/config_version.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
+#include <exception>
 
 namespace ProfileEvents
 {
@@ -404,6 +406,14 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     };
 
     constexpr int max_publication_attempts = 8;
+    /// Every exit by exception after a failed attempt gave up on the blob, the attempt cap and the
+    /// loop's deadline alike.
+    int failed_attempts = 0;
+    const int exceptions_at_entry = std::uncaught_exceptions();
+    SCOPE_EXIT({
+        if (failed_attempts > 0 && std::uncaught_exceptions() > exceptions_at_entry)
+            ProfileEvents::increment(ProfileEvents::CASBlobPublishGaveUp);
+    });
     for (int attempt = 0; attempt < max_publication_attempts; ++attempt)
     {
         requireAlive();
@@ -514,32 +524,28 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             /// every further request of this operation refuses the same way.
             if (isDeterministicBlobPublicationFailure(error) || !op.admitted())
                 throw;
+            ++failed_attempts;
             recordFailedPublicationAttempt(key, transport, attempt, max_publication_attempts, error.what());
             if (attempt + 1 == max_publication_attempts)
-            {
-                ProfileEvents::increment(ProfileEvents::CASBlobPublishGaveUp);
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
                     "attempts: {}",
                     key,
                     max_publication_attempts,
                     error.what()));
-            }
             continue;
         }
         catch (...)
         {
+            ++failed_attempts;
             recordFailedPublicationAttempt(
                 key, transport, attempt, max_publication_attempts, getCurrentExceptionMessage(/*with_stacktrace=*/false));
             if (attempt + 1 == max_publication_attempts)
-            {
-                ProfileEvents::increment(ProfileEvents::CASBlobPublishGaveUp);
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
                     "attempts",
                     key,
                     max_publication_attempts));
-            }
             continue;
         }
 

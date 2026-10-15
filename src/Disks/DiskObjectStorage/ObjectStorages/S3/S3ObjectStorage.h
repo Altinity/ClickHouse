@@ -220,8 +220,8 @@ public:
         uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms = 0, bool disable_adaptive_timeouts = false) const;
 
     /// True iff a clone for exactly this (request timeout, connect cap) pair, with the disk's adaptive
-    /// timeouts setting, is already cached -- never builds one. Lets a test prove dispatch used a SPECIFIC key (and no other) without ever
-    /// creating a clone itself and without measuring anything.
+    /// timeouts setting, is already cached -- never builds one. Lets a test prove dispatch used a SPECIFIC
+    /// key (and no other) without ever creating a clone itself and without measuring anything.
     bool hasSingleAttemptClientForTest(uint64_t request_timeout_ms, uint64_t connect_timeout_cap_ms) const;
 
 private:

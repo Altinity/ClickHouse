@@ -16,9 +16,12 @@
 #include <IO/StdStreamFromReadBuffer.h>
 #include <IO/ReadBufferFromS3.h>
 
+#include <IO/Expect404ResponseScope.h>
 #include <IO/S3/Requests.h>
 
 #include <fmt/ranges.h>
+
+#include <optional>
 
 
 namespace ProfileEvents
@@ -249,6 +252,11 @@ namespace
             abort_request.SetKey(dest_key);
             abort_request.SetUploadId(multipart_upload_id);
 
+            /// A lost single-attempt completion may have consumed the upload.
+            std::optional<Expect404ResponseScope> no_such_upload_is_expected;
+            if (object_creation_client->usesSingleAttemptRetryStrategy())
+                no_such_upload_is_expected.emplace();
+
             Stopwatch watch;
             auto outcome = client_ptr->AbortMultipartUpload(abort_request);
             auto elapsed = watch.elapsedMicroseconds();
@@ -309,7 +317,8 @@ namespace
             }
             catch (...)
             {
-                /// A caller that sends the completion once resolves a failure and retries itself.
+                /// A caller that sends the completion once resolves a failure and retries itself, failed
+                /// `CreateMultipartUpload` and `UploadPartCopy` included; CAS logs each failed attempt.
                 tryLogCurrentException(
                     log,
                     fmt::format("While performing multipart upload of object {} in bucket {}", dest_key, dest_bucket),

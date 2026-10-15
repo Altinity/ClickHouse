@@ -175,6 +175,11 @@ class S3SingleAttemptObjectCreationPath : public ::testing::TestWithParam<Creati
 {
 };
 
+/// The paths that end in `CompleteMultipartUpload`.
+class S3SingleAttemptMultipartCreationPath : public ::testing::TestWithParam<CreationPath>
+{
+};
+
 }
 
 /// `writeObject` already applies the override; a copy reissues `CopyObject` in the same loop.
@@ -247,9 +252,10 @@ INSTANTIATE_TEST_SUITE_P(
 
 /// After a lost single-attempt `CompleteMultipartUpload` the abort finds no upload: the completion may
 /// have applied, and the caller resolves that.
-TEST(S3SingleAttemptObjectCreation, AbortAfterLostCompleteLogsNothingAtError)
+TEST_P(S3SingleAttemptMultipartCreationPath, AbortAfterLostCompleteLogsNothingAtError)
 {
     (void)getContext();
+    const CreationPath & path = GetParam();
     CountingS3Server server([](const CountingS3::Request & request, Poco::Net::HTTPServerResponse & response)
     {
         if (request.verb == Verb::CompleteMultipartUpload)
@@ -258,13 +264,19 @@ TEST(S3SingleAttemptObjectCreation, AbortAfterLostCompleteLogsNothingAtError)
             return CountingS3::sendError(response, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchUpload");
         CountingS3::answerOk(request.verb, response);
     });
-    auto storage = makeRetryingStorage(server.getUrl(), forceOnePartMultipart);
+    auto storage = path.storage(server.getUrl());
 
     ScopedLogCapture capture;
-    EXPECT_EQ(thrownCode([&] { writeObject(*storage, singleAttemptCreation()); }), DB::ErrorCodes::S3_ERROR);
+    EXPECT_EQ(thrownCode([&] { path.create(*storage, path.singleAttemptSettings()); }), DB::ErrorCodes::S3_ERROR);
     EXPECT_EQ(server.count(Verb::AbortMultipartUpload), 1u);
     EXPECT_EQ(capture.captured(), "");
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    S3SingleAttemptObjectCreation,
+    S3SingleAttemptMultipartCreationPath,
+    ::testing::Values(creation_paths[2], creation_paths[3]),
+    [](const ::testing::TestParamInfo<CreationPath> & param_info) { return param_info.param.name; });
 
 /// A `NO_SUCH_KEY` loop bounded to one request must not announce a retry.
 TEST(S3SingleAttemptObjectCreation, LastNoSuchKeyAttemptDoesNotAnnounceARetry)
@@ -328,7 +340,9 @@ TEST(S3SingleAttemptObjectCreation, UploadPartCopyStillRetried)
     CountingS3Server server(CountingS3::failing(
         Verb::UploadPartCopy, Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR, "InternalError", /*only_nth=*/1));
 
-    EXPECT_EQ(thrownCode([&] { copyObject(*makeRetryingStorage(server.getUrl(), forceOnePartMultipartCopy), singleAttemptNativeCopy()); }), 0);
+    EXPECT_EQ(
+        thrownCode([&] { copyObject(*makeRetryingStorage(server.getUrl(), forceOnePartMultipartCopy), singleAttemptNativeCopy()); }),
+        0);
     EXPECT_EQ(server.count(Verb::UploadPartCopy), 2u);
     EXPECT_EQ(server.count(Verb::CompleteMultipartUpload), 1u);
 }

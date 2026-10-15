@@ -90,8 +90,6 @@ struct Request
     /// `/bucket/key`.
     std::string path;
     std::string body;
-    /// `CopyObject` and `UploadPartCopy`: the source as `/bucket/key`.
-    std::string copy_source;
 };
 
 using Responder = std::function<void(const Request & request, Poco::Net::HTTPServerResponse & response)>;
@@ -111,21 +109,13 @@ public:
         std::string body;
         if (request.hasContentLength())
             Poco::StreamCopier::copyToString64(request.stream(), body);
-        std::string copy_source;
-        if (request.has("x-amz-copy-source"))
-        {
-            Poco::URI::decode(request.get("x-amz-copy-source"), copy_source);
-            if (!copy_source.starts_with('/'))
-                copy_source.insert(0, "/");
-        }
         const size_t nth = ++counts[static_cast<size_t>(verb)];
         respond(
             Request{
                 .verb = verb,
                 .nth = nth,
                 .path = Poco::URI(request.getURI()).getPath(),
-                .body = std::move(body),
-                .copy_source = std::move(copy_source)},
+                .body = std::move(body)},
             response);
     }
 };
@@ -274,8 +264,8 @@ inline Responder failing(Verb faulted_verb, Poco::Net::HTTPResponse::HTTPStatus 
         only_nth);
 }
 
-/// An in-memory bucket behind a `CountingS3Server`: `PutObject` and `CopyObject` store a body, `HeadObject`
-/// and `GetObject` read it, every other verb gets `answerOk`. `fault` sees each request first and, by
+/// An in-memory bucket behind a `CountingS3Server`: `PutObject` stores a body, `HeadObject` and
+/// `GetObject` read it, every other verb gets `answerOk`. `fault` sees each request first and, by
 /// returning true or throwing `DropResponse`, answers it instead; such a request is not applied.
 class ObjectStore
 {
@@ -326,14 +316,6 @@ private:
             case Verb::PutObject:
                 put(request.path, request.body);
                 break;
-            case Verb::CopyObject:
-            {
-                auto source = get(request.copy_source);
-                if (!source)
-                    return sendError(response, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey");
-                put(request.path, std::move(*source));
-                break;
-            }
             case Verb::HeadObject:
             case Verb::GetObject:
             {
