@@ -20,6 +20,7 @@
 
 namespace DB::ErrorCodes
 {
+    extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
@@ -200,6 +201,112 @@ public:
 
 private:
     bool reveal_owned_work;
+};
+
+/// Between this start's epoch allocation and its claim read, a second start of the same server
+/// allocates the next epoch and installs its live body. Armed by the test after the bootstrap open.
+class NewerStartBackend : public InMemoryBackend
+{
+public:
+    String epoch_key;
+    String mount_key;
+    bool arm_on_next_epoch_write = false;
+    std::optional<uint64_t> newer_epoch;
+
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes,
+        const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        auto result = InMemoryBackend::write(key, bytes, expected_value, access);
+        if (arm_on_next_epoch_write && key == epoch_key && result)
+        {
+            arm_on_next_epoch_write = false;
+            install_on_next_mount_read = true;
+        }
+        return result;
+    }
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (install_on_next_mount_read && key == mount_key)
+        {
+            install_on_next_mount_read = false;
+            installNewerStart(access);
+        }
+        return InMemoryBackend::read(key, access);
+    }
+
+private:
+    bool install_on_next_mount_read = false;
+
+    void installNewerStart(TransportAccess & access)
+    {
+        const auto epoch = InMemoryBackend::read(epoch_key, access);
+        const auto mount = InMemoryBackend::read(mount_key, access);
+        if (!epoch || !mount)
+            throw std::runtime_error("NewerStartBackend: a control object is missing");
+        ServerEpoch counter = decodeServerEpoch(epoch->bytes);
+        newer_epoch = counter.next_writer_epoch;
+        ++counter.next_writer_epoch;
+        if (!InMemoryBackend::write(epoch_key, encodeServerEpoch(counter), epoch->value, access))
+            throw std::runtime_error("NewerStartBackend: the epoch bump conflicted");
+        const MountLease newer{
+            .server_uuid = UInt128(1),
+            .writer_epoch = *newer_epoch,
+            .hostname = "newer-start",
+            .pid = 2,
+            .started_at_ms = 1,
+            .seq = 1,
+            .expires_at_ms = 4'000'000'000'000,
+            .write_attempt_id = UInt128{0xB}};
+        if (!InMemoryBackend::write(mount_key, encodeMountLease(newer), mount->value, access))
+            throw std::runtime_error("NewerStartBackend: the mount install conflicted");
+    }
+};
+
+/// A competitor's conditional bump of the epoch counter lands with the very bytes ours sends, and ours
+/// is lost unapplied. Our resolve read then finds our bytes under a moved precondition and reports the
+/// allocation committed, so two allocators hold one writer_epoch.
+class EpochCollisionBackend : public InMemoryBackend
+{
+public:
+    String epoch_key;
+    bool armed = false;
+
+    std::expected<String, RawConflict> write(
+        const String & key, const String & bytes,
+        const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (armed && expected_value && key == epoch_key)
+        {
+            armed = false;
+            if (!InMemoryBackend::write(key, bytes, expected_value, access))
+                throw std::runtime_error("EpochCollisionBackend: the competitor's bump conflicted");
+            throw Poco::TimeoutException("EpochCollisionBackend: response lost, our attempt did not apply");
+        }
+        return InMemoryBackend::write(key, bytes, expected_value, access);
+    }
+};
+
+/// Applies the first conditional write of `key` after arming, then loses its response.
+class LandedReplaceAckLostOnceBackend : public InMemoryBackend
+{
+public:
+    String key;
+    bool armed = false;
+
+    std::expected<String, RawConflict> write(
+        const String & k, const String & bytes,
+        const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (armed && expected_value && k == key)
+        {
+            armed = false;
+            (void)InMemoryBackend::write(k, bytes, expected_value, access);
+            throw Poco::TimeoutException("LandedReplaceAckLostOnceBackend: simulated lost PUT response");
+        }
+        return InMemoryBackend::write(k, bytes, expected_value, access);
+    }
 };
 
 /// Counts every request that reaches the store, per primitive, so a test can pin how many a protocol
@@ -502,6 +609,24 @@ TEST(CASServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
     ASSERT_FALSE(ops.op.head(l.mountKey("r"), Retry::standard()).has_value());
     EXPECT_EQ(ops.op.removeCurrent(l.mountKey("r"), Retry::standard()), Removal::Gone);
     EXPECT_GT(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), e2);
+}
+
+/// No writer emits a zero counter; an allocation over one would hand out writer_epoch 0.
+TEST(CASServerRootEpoch, ZeroCounterFailsAllocationWithoutWriting)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    mustCommit(ops.op.create(l.epochKey("r"), encodeServerEpoch(ServerEpoch{.next_writer_epoch = 0}), Retry::standard()),
+               "zero counter");
+    const auto before = ops.op.read(l.epochKey("r"), Retry::standard());
+    ASSERT_TRUE(before.has_value());
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        (void)allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+    });
+    EXPECT_EQ(ops.op.read(l.epochKey("r"), Retry::standard())->bytes, before->bytes);
 }
 
 /// Phase C (spec rev.4): an ABSENT epoch object over a PRESENT mount object means durable epoch
@@ -976,7 +1101,13 @@ TEST(CASMountAwaitExpiry, LiveRenewingTwinTimesOutAsDoubleStart)
     {
         wall += ms;
         mono += ms;
-        ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, wall, 100).kind, MountClaimResult::Claimed);
+        const auto got = ops.op.read(l.mountKey("r"), Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease renewed = decodeMountLease(got->bytes);
+        ++renewed.seq;
+        renewed.expires_at_ms = wall + 100;
+        mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(renewed), got->etag, Retry::standard()),
+                   "twin renewal");
     };
 
     const auto r = claimMountAwaitingExpiry(
@@ -1116,10 +1247,16 @@ TEST(CASMountClaim, UnsafeAuthorizationIsTokenExact)
     const Etag stale = ops.op.read(l.mountKey("r"), Retry::standard())->etag;
 
     /// `Etag` equality compares (key, value), and it is minted only through the request planes -- there
-    /// is no cross-key comparison to exercise here. Build the stale token by refreshing the SAME slot a
-    /// second time (same uuid, same epoch): `stale`, read before this refresh, is then a genuinely stale
-    /// token for the slot's CURRENT value, without touching an unrelated key.
-    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 30000).kind, MountClaimResult::Claimed);
+    /// is no cross-key comparison to exercise here. Build the stale token by renewing the SAME slot once:
+    /// `stale`, read before this renewal, is then a genuinely stale token for the slot's CURRENT value.
+    {
+        const auto got = ops.op.read(l.mountKey("r"), Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease renewed = decodeMountLease(got->bytes);
+        ++renewed.seq;
+        mustCommit(ops.op.replace(l.mountKey("r"), encodeMountLease(renewed), got->etag, Retry::standard()),
+                   "holder renewal");
+    }
     const Etag current = ops.op.read(l.mountKey("r"), Retry::standard())->etag;
 
     /// A stale token is refused: nothing authorizes a reclaim over a slot that moved.
@@ -1209,6 +1346,40 @@ TEST(CASMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     const uint64_t e2 = s2->writerEpoch();
     EXPECT_GT(e2, e1);
+}
+
+TEST(CASMountStartup, DelayedStartOverANewerIncarnationFailsWithoutWaiting)
+{
+    auto b = std::make_shared<NewerStartBackend>();
+    const Layout l("p");
+    b->epoch_key = l.epochKey("r");
+    b->mount_key = l.mountKey("r");
+    {
+        /// Bootstrap: owner, counter and a clean farewell of epoch 1.
+        auto first = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
+    }
+    b->arm_on_next_epoch_write = true;
+
+    /// Shared, heap-owned: the Pool may outlive this frame through a background publish.
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
+    auto waits = std::make_shared<std::atomic<uint64_t>>(0);
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "newer than the writer_epoch", [&]
+    {
+        (void)Pool::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
+            .boot_ms_fn = [fake_boot] { return fake_boot->load(); },
+            .wait_sleep_fn = [fake_boot, waits](uint64_t ms)
+            {
+                *fake_boot += ms;
+                ++(*waits);
+            }});
+    });
+    ASSERT_TRUE(b->newer_epoch.has_value()) << "the newer start was never installed";
+    EXPECT_EQ(waits->load(), 0u) << "a newer incarnation is refused, not observed";
+    Ops ops(b);
+    const MountLease slot = decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes);
+    EXPECT_EQ(slot.writer_epoch, *b->newer_epoch);
+    EXPECT_EQ(slot.write_attempt_id, UInt128{0xB});
 }
 
 TEST(CASMountStartup, FreshWritablePoolBootstrapsAnExplicitEmptyCatalog)
@@ -2073,6 +2244,159 @@ TEST(CASClaimMount, SameEpochFencedIsNotRefreshable)
     /// A DIFFERENT epoch reclaims immediately (existing branch, unchanged):
     EXPECT_EQ(claimMount(ops.op, layout, "a", DB::UInt128{1}, 2, 2000, 10'000).kind,
               MountClaimResult::Claimed);
+}
+
+/// An older allocation that reaches the slot late must not replace a newer incarnation of this server,
+/// whatever certifies that incarnation's end: recovery seals only epochs below the live one.
+TEST(CASClaimMountMonotonicity, LowerEpochOverANewerBodyFailsWithoutWriting)
+{
+    enum class Shape { Live, GcFenced, CleanFarewell, ProvenDead, UnsafeAuthorized };
+    for (const Shape shape : {Shape::Live, Shape::GcFenced, Shape::CleanFarewell, Shape::ProvenDead,
+                              Shape::UnsafeAuthorized})
+    {
+        SCOPED_TRACE(static_cast<int>(shape));
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        const String key = l.mountKey("r");
+        ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/8, 1000, 30000).kind, MountClaimResult::Claimed);
+        if (shape == Shape::GcFenced || shape == Shape::CleanFarewell)
+        {
+            const auto got = ops.op.read(key, Retry::standard());
+            ASSERT_TRUE(got.has_value());
+            MountLease body = decodeMountLease(got->bytes);
+            ++body.seq;
+            if (shape == Shape::GcFenced)
+                body.gc_fenced = true;
+            else
+                body.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+            mustCommit(ops.op.replace(key, encodeMountLease(body), got->etag, Retry::standard()), "terminal newer body");
+        }
+        const auto before = ops.op.read(key, Retry::standard());
+        ASSERT_TRUE(before.has_value());
+        const std::optional<Etag> token = before->etag;
+
+        DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "newer than the writer_epoch", [&]
+        {
+            (void)claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/7, 2000, 30000,
+                             shape == Shape::ProvenDead ? token : std::nullopt, /*sink=*/{},
+                             shape == Shape::UnsafeAuthorized ? token : std::nullopt);
+        });
+        EXPECT_EQ(ops.op.read(key, Retry::standard())->bytes, before->bytes) << "the newer body was replaced";
+    }
+}
+
+TEST(CASClaimMountMonotonicity, TwoAllocatorsSharingAnEpochDoNotShareTheSlot)
+{
+    auto b = std::make_shared<EpochCollisionBackend>();
+    Layout l("p");
+    Ops ops(b);
+    b->epoch_key = l.epochKey("r");
+    ASSERT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+
+    b->armed = true;
+    const uint64_t shared_epoch
+        = allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+    ASSERT_FALSE(b->armed) << "the collision was never injected";
+    ASSERT_EQ(shared_epoch, 2u);
+    /// One bump past the shared epoch: the competitor's, which our resolve read took for ours.
+    ASSERT_EQ(decodeServerEpoch(ops.op.read(l.epochKey("r"), Retry::standard())->bytes).next_writer_epoch, 3u);
+
+    /// The competitor claims first.
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), shared_epoch, 1000, 30000).kind, MountClaimResult::Claimed);
+    const auto competitor = ops.op.read(l.mountKey("r"), Retry::standard());
+    ASSERT_TRUE(competitor.has_value());
+
+    const MountClaimResult ours = claimMount(ops.op, l, "r", UInt128(1), shared_epoch, 2000, 30000);
+    EXPECT_EQ(ours.kind, MountClaimResult::LiveDoubleStart);
+    ASSERT_TRUE(ours.body.has_value());
+    EXPECT_EQ(ours.body->write_attempt_id, decodeMountLease(competitor->bytes).write_attempt_id);
+    ASSERT_TRUE(ours.etag.has_value());
+    EXPECT_TRUE(*ours.etag == competitor->etag);
+    EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->bytes, competitor->bytes) << "the slot was written";
+}
+
+TEST(CASClaimMountMonotonicity, AwaitingExpiryReturnsAtOnceOnABodyOfOurOwnPair)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    /// Another process allocated epoch 7 as well; its body is in the slot.
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, 1000, 100).kind, MountClaimResult::Claimed);
+    const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
+    ASSERT_TRUE(before.has_value());
+
+    uint64_t mono = 0;
+    int sleeps = 0;
+    const auto r = claimMountAwaitingExpiry(ops.op, l, "r", UInt128(1), /*our_epoch=*/7,
+        [] { return uint64_t{1000}; }, [&] { return mono; }, /*ttl_ms=*/100, /*poll_interval_ms=*/20,
+        [&](uint64_t ms)
+        {
+            mono += ms;
+            if (++sleeps > 100)
+                throw std::runtime_error("the observation of our own (uuid, epoch) never ended");
+        });
+    EXPECT_EQ(r.kind, MountClaimResult::LiveDoubleStart);
+    EXPECT_EQ(sleeps, 0) << "no observation can authorize replacing our own pair";
+    EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->bytes, before->bytes);
+}
+
+TEST(CASClaimMountMonotonicity, AwaitingExpiryFailsAtOnceWhenARacedWriteMeetsANewerEpoch)
+{
+    auto b = std::make_shared<DB::Cas::tests::MountSlotRaceBackend>();
+    Layout l("p");
+    Ops ops(b);
+    /// Absent at our read; a newer start of this server mints the slot before our create lands.
+    b->before_put_if_absent = [&]
+    {
+        DB::Cas::tests::OperationForTest racer(*b);
+        ASSERT_EQ(claimMount(*racer, l, "r", UInt128(1), /*our_epoch=*/8, 1000, 100).kind, MountClaimResult::Claimed);
+    };
+
+    uint64_t mono = 0;
+    int sleeps = 0;
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "newer than the writer_epoch", [&]
+    {
+        (void)claimMountAwaitingExpiry(ops.op, l, "r", UInt128(1), /*our_epoch=*/7,
+            [] { return uint64_t{1000}; }, [&] { return mono; }, /*ttl_ms=*/100, /*poll_interval_ms=*/20,
+            [&](uint64_t ms)
+            {
+                mono += ms;
+                ++sleeps;
+            });
+    });
+    EXPECT_FALSE(b->before_put_if_absent) << "the newer start was never installed";
+    EXPECT_EQ(sleeps, 0) << "a newer incarnation is refused, not observed";
+    EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 8u);
+}
+
+/// The engine settles our own landed attempt inside the write call, so a claim never meets its own body
+/// on a later call.
+TEST(CASClaimMountMonotonicity, AConfirmedLandedReclaimIsStillClaimed)
+{
+    auto b = std::make_shared<LandedReplaceAckLostOnceBackend>();
+    Layout l("p");
+    Ops ops(b);
+    b->key = l.mountKey("r");
+    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), 7, 1000, 30000).kind, MountClaimResult::Claimed);
+    {
+        const auto got = ops.op.read(b->key, Retry::standard());
+        ASSERT_TRUE(got.has_value());
+        MountLease fenced = decodeMountLease(got->bytes);
+        fenced.gc_fenced = true;
+        ++fenced.seq;
+        mustCommit(ops.op.replace(b->key, encodeMountLease(fenced), got->etag, Retry::standard()), "fence-out");
+    }
+
+    b->armed = true;
+    const MountClaimResult r = claimMount(ops.op, l, "r", UInt128(1), 8, 2000, 30000);
+    ASSERT_FALSE(b->armed) << "the lost response was never injected";
+    EXPECT_EQ(r.kind, MountClaimResult::Claimed);
+    EXPECT_EQ(r.prior, MountPriorState::Fenced);
+    ASSERT_TRUE(r.body.has_value());
+    const MountLease slot = decodeMountLease(ops.op.read(b->key, Retry::standard())->bytes);
+    EXPECT_EQ(slot.writer_epoch, 8u);
+    EXPECT_EQ(slot.write_attempt_id, r.body->write_attempt_id);
 }
 
 /// ---- rev.6 Task 4: observation-based lease reclaim (no cross-node wall-clock trust) ----

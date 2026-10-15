@@ -165,14 +165,18 @@ a `MountClaimResult::Kind` together with a `MountPriorState` describing which ce
 
 | `Kind` | Meaning |
 |---|---|
-| `Claimed` | fresh claim (absent slot), same-`(uuid, epoch)` refresh, or a certified reclaim |
-| `LiveDoubleStart` | same `server_uuid`, different `writer_epoch`, and no certificate of death yet — a live twin, wait it out |
+| `Claimed` | fresh claim (absent slot), or a certified reclaim of an older `writer_epoch` |
+| `LiveDoubleStart` | same `server_uuid` with an older `writer_epoch` and no certificate of death yet — a live twin, wait it out; or the same `(uuid, epoch)` already in the slot — two starts got one epoch, refused at once |
 | `ForeignOwner` | different `server_uuid` — refused unconditionally |
 | `FencedSelf` | same `(uuid, epoch)`, but `gc_fenced` — terminal for *this* epoch; the caller must mint a fresh one |
 
+A claim never installs a `writer_epoch` at or below the one in the slot. When the slot holds a newer
+`writer_epoch` of the same `server_uuid`, the claim fails with `ABORTED` and writes nothing: another
+start or a decommission of this `server_root_id` allocated after this one.
+
 | `MountPriorState` | Certificate that justified the reclaim |
 |---|---|
-| `None` | no reclaim needed (fresh claim or same-epoch refresh) |
+| `None` | no reclaim needed (fresh claim) |
 | `Clean` | the predecessor's own graceful farewell (`min_active_build_sequence == UINT64_MAX`) |
 | `Fenced` | GC's own threshold-gated fence-out (`gc_fenced`) |
 | `UncleanObserved` | this claimant's own token-stability observation held for the full `TTL + drift` window |
@@ -190,8 +194,8 @@ stateDiagram-v2
     Live --> Live: renewer beat, putOverwrite seq+1
     Live --> Fenced: GC observes a stable token past threshold, gc_fenced=1, body preserved
     Live --> Terminated: certified drain, terminal farewell (expires_at=now, min_active_build_sequence=MAX)
-    Fenced --> Live: same-uuid claim with a fresh writer_epoch, instant reclaim
-    Terminated --> Live: same-uuid claim with a fresh writer_epoch, instant reclaim
+    Fenced --> Live: same-uuid claim with a higher writer_epoch, instant reclaim
+    Terminated --> Live: same-uuid claim with a higher writer_epoch, instant reclaim
     Live --> Live: same-uuid claim, proven-dead token via UncleanObserved
     Live --> Live: same-uuid claim under cas_unsafe_remount_no_delay, no observation
     Fenced --> Fenced: same uuid and epoch claim, FencedSelf, no write
@@ -274,6 +278,7 @@ becomes `state = 'corrupt'`, never an exception). Shows every `server_root_id` i
 | `state` | one of `live`, `expired`, `terminated`, `fenced`, `corrupt` |
 | `is_leader`, `pending_reclaim`, `last_success_age_seconds`, `wedged_namespace_count` | GC health, process-local; **`NULL` on every peer row** — a process-local fact must never be stamped onto another server's row |
 | `lifecycle`, `lifecycle_reason`, `lifecycle_detail`, `lifecycle_since` | the SQL surface for the in-process `PoolLifecycle` runtime above: `lifecycle` is one of `live`, `not_live`, `identity_lost`, `vanished`, `constructing`, `shutdown`; `lifecycle_reason` distinguishes `replaced` from `forgotten` for a `vanished` disk; `lifecycle_detail` carries the full diagnosis text; `lifecycle_since` is when the current non-live state began (`NULL` while live) |
+| `renewal_in_progress`, `renewal_attempts`, `last_renewal_error` | the running (or last) lease renewal: conditional `PUT`s sent so far and the last failed request, updated per attempt; **`NULL` on every peer row** |
 
 The lifecycle snapshot is I/O-free and ungated, so a not-live, never-started, or vanished disk
 still produces a row instead of silently disappearing from the table.

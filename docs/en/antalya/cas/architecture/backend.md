@@ -34,7 +34,7 @@ different semantics: `PartWriteTxn::ensureBlobPresent` owns `HEAD`, freshness me
 `publishBlob` only moves the selected bytes.
 
 Writer readiness is represented by `BlobDependencyProof`, not by token presence. `Materialized`
-means the writer observed a present non-condemned body or completed publication and metadata
+means the writer observed a present body with a `Clean` marker or completed publication and metadata
 reconciliation. `TrustedManifest` means a durable source manifest proves the blob and requires no
 blob I/O. Pending state and writer tokens are not stored in the dependency record.
 

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <thread>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -31,7 +32,7 @@ namespace ProfileEvents
 extern const Event CASMetaPut;
 extern const Event CASMetaCompareSwap;
 extern const Event CASMetaCreateClean;
-extern const Event CASMetaAdoptBackfill;
+extern const Event CASMetaAbsentRepublish;
 extern const Event CASMetaResurrectClean;
 extern const Event CASBlobAdoptTrusted;
 }
@@ -512,44 +513,32 @@ TEST(CASPartWriteTxnMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load() - reason_before, 1);
 }
 
-/// §0 introspection: an adopt of a pre-existing body that has NO meta at all (a pre-protocol blob, or a
-/// lost race with a concurrent fresh-uploader's own meta write) backfills a Clean meta through the
-/// `putMetaIfAbsent` choke point (`CASMetaPut`), tagged with its reason (`CASMetaAdoptBackfill`). No
-/// existing test elsewhere in the suite drives this branch: every other pre-seeded raw body in this file
-/// pairs `writeRawBlobBody` with `writeMetaClean`, which skips the `!lm` backfill branch entirely.
-TEST(CASPartWriteTxnMetaCounters, AdoptBackfillCountsChokePointAndReason)
+/// A present body without a marker is republished, and the marker is created through the same choke
+/// point (`CASMetaPut`) and reason (`CASMetaCreateClean`) as for an absent body.
+TEST(CASPartWriteTxnMetaCounters, AbsentMarkerRepublishCountsChokePointAndReason)
 {
     const auto put_before = ProfileEvents::global_counters[ProfileEvents::CASMetaPut].load();
-    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaAdoptBackfill].load();
+    const auto create_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load();
+    const auto republish_before = ProfileEvents::global_counters[ProfileEvents::CASMetaAbsentRepublish].load();
 
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
 
-    const String payload = "adopt-backfill-payload-counters";
+    const String payload = "absent-marker-republish-counters";
     const UInt128 hash = u128Of(payload);
     const BlobRef id = idOf(payload);
-
-    /// Pre-seed a present body big enough that `ensureBlobPresent`'s logical-size guard does not underflow —
-    /// deliberately WITHOUT any meta (unlike PutBlobAdoptsWhenMetaCleanNoRetireView), so the adopt reaches
-    /// the `!lm` backfill branch.
-    const uint64_t header_len = s->poolMeta().blob_header_len;
-    String raw_body(header_len, '\0');
+    String raw_body(s->poolMeta().blob_header_len, '\0');
     raw_body += payload;
     writeRawBlobBody(*b, s->layout(), hash, raw_body);
 
-    /// Adopt must happen under a durable precommit edge (EDGE-BEFORE-OBSERVE).
-    const RootNamespace ns{"srv/tbl"};
-    auto build = startBuildFor(s, ns, "ref_adopt_backfill");
-    const ManifestId manifest_id = build->stageManifest({blobManifestEntry("data.bin", payload)});
-    build->precommitAdd(ns, "ref_adopt_backfill", manifest_id);
-    auto ref = build->putBlob(id, BlobSource::fromString(payload));
-    EXPECT_EQ(ref.ref, id);
+    auto build = precommittedBuildForPayload(s, RootNamespace{"srv1/absent-marker-counters"}, "part", payload);
+    EXPECT_EQ(build->putBlob(id, BlobSource::fromString(payload)).ref, id);
 
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaPut].load() - put_before, 1);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaAdoptBackfill].load() - reason_before, 1);
-
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load() - create_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaAbsentRepublish].load() - republish_before, 1);
     const auto lm = loadMetaForTest(*b, s->layout(), hash);
-    ASSERT_TRUE(lm.has_value()) << "the adopt-backfill must leave a Clean meta for future point-readers";
+    ASSERT_TRUE(lm.has_value());
     EXPECT_EQ(lm->meta.state, MetaState::Clean);
 }
 
@@ -2712,11 +2701,10 @@ TEST(CASPartWrite, AmbiguousTimeoutsThenCommitRestreamsFromSource)
     EXPECT_TRUE((*op).head(s->layout().blobKey(idOf(payload)), Retry::once()).has_value()) << "the blob body must be durable";
 }
 
-/// Ambiguous-but-landed: the FIRST attempt's response is lost AFTER the write actually landed
-/// server-side. The occupancy resolve observes the key present and the existing 412 machinery takes
-/// over — the occupant is ADOPTED (content-addressed identity: any occupant of this key IS the
-/// content), with NO reissue and NO second body upload.
-TEST(CASPartWrite, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
+/// Ambiguous-but-landed: the first publication's response is lost after the body landed, so the
+/// marker was never created. A present body without a marker is never adopted, so the landed attempt
+/// costs one more publication, after which the marker is `Clean`.
+TEST(CASPartWrite, AmbiguousLandedWriteRepublishesOnceThenClean)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
     /// Heap-owned, not a plain local: `~Pool` emits terminate events into the sink, and a background
@@ -2742,24 +2730,19 @@ TEST(CASPartWrite, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
     const PutBlobResult res = build->putBlob(idOf(payload), countingSource(payload, payload_streams));
     EXPECT_EQ(res.size, payload.size());
 
-    EXPECT_EQ(b->publish_stream_attempts, 1) << "a landed ambiguous attempt must be observed, never reissued";
-    EXPECT_EQ(b->blob_head_attempts, 2) << "the ambiguity is resolved by restarting from HEAD";
-    EXPECT_EQ(payload_streams, 1);
+    EXPECT_EQ(b->publish_stream_attempts, 2) << "the landed attempt and exactly one republication";
+    EXPECT_EQ(b->blob_head_attempts, 2);
+    EXPECT_EQ(payload_streams, 2);
 
-    const String key = s->layout().blobKey(idOf(payload));
+    const auto marker = loadMetaForTest(*b, s->layout(), u128Of(payload));
+    ASSERT_TRUE(marker.has_value());
+    EXPECT_EQ(marker->meta.state, MetaState::Clean);
     const std::vector<CasEvent> observed_events = events->snapshot();
-    const auto adopt = std::find_if(observed_events.begin(), observed_events.end(),
-                                    [](const CasEvent & e) { return e.type == CasEventType::BlobReuseAdopt; });
-    ASSERT_NE(adopt, observed_events.end()) << "the landed occupant must be ADOPTED (the standard dedup leg)";
-    CasRequests probe(b, Fence::open());
-    CasOperation probe_op = probe.admit();
-    const auto landed = probe_op.head(key, Retry::standard());
-    ASSERT_TRUE(landed.has_value());
-    EXPECT_EQ(adopt->token, landed->etag.render())
-        << "the adopted token must be the landed incarnation, rendered";
     EXPECT_EQ(std::count_if(observed_events.begin(), observed_events.end(),
-                            [](const CasEvent & e) { return e.type == CasEventType::BlobPut; }), 0)
-        << "no fresh-upload event: the body was never re-uploaded";
+                            [](const CasEvent & e) { return e.type == CasEventType::BlobReuseAdopt; }), 0)
+        << "a body without a marker was adopted";
+    EXPECT_EQ(std::count_if(observed_events.begin(), observed_events.end(),
+                            [](const CasEvent & e) { return e.type == CasEventType::BlobPut; }), 1);
 }
 
 /// Every physical publication mints its own envelope, and the request engine never reissues one. Two
@@ -2925,16 +2908,12 @@ TEST(CASPartWrite, AmbiguousNonLandingPublicationStopsAtOuterBound)
     EXPECT_EQ(payload_streams, 8);
 }
 
-/// A server-side copy publication is ambiguous-but-landed: its response is lost after the
-/// destination was created. The occupancy resolve observes the destination present and the occupant
-/// is adopted — Committed-in-effect WITHOUT a re-copy.
-TEST(CASPartWrite, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
+/// A server-side copy publication is ambiguous-but-landed: its response is lost after the destination
+/// was created, so the marker was never created. The verbatim copy is spent, so the one republication
+/// streams the payload under a fresh envelope, after which the marker is `Clean`.
+TEST(CASPartWrite, AmbiguousCopyLandedRepublishesOnceThenClean)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
-    /// Heap-owned, not a plain local: `~Pool` emits terminate events into the sink, and a background
-    /// publish can hold an extra `shared_from_this()` past this frame's return regardless of
-    /// declaration order relative to the Pool, so a by-reference capture of a local would dangle.
-    auto events = std::make_shared<DB::Cas::tests::SharedEventLog>();
     auto s = openBlobFaultPool(b);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "staged-payload-A";
@@ -2946,11 +2925,6 @@ TEST(CASPartWrite, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
         ASSERT_TRUE(std::holds_alternative<Committed>((*seed_op).create(staging_key, staging_bytes, Retry::once())));
     }
 
-    s->setEventSink([events](const CasEvent & e)
-    {
-        events->push(e);
-    });
-
     auto build = startBuildFor(s, ns, "part_copy_landed");
     const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
     build->precommitAdd(ns, "part_copy_landed", id);
@@ -2958,23 +2932,27 @@ TEST(CASPartWrite, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
     BlobSource source;
     source.size = payload.size();
     source.server_side_copy_from = staging_key;
+    source.open = [payload]() -> std::unique_ptr<DB::ReadBuffer>
+    {
+        return std::make_unique<DB::ReadBufferFromOwnString>(payload);
+    };
     b->fault_count = 1;
     b->land_despite_fault = true;
     const PutBlobResult res = build->putBlob(idOf(payload), std::move(source));
     EXPECT_EQ(res.size, payload.size());
 
-    EXPECT_EQ(b->publish_copy_attempts, 1) << "a landed ambiguous copy must be resolved, never re-copied";
-    EXPECT_EQ(b->publish_stream_attempts, 0);
+    EXPECT_EQ(b->publish_copy_attempts, 1) << "the verbatim copy is a once-only privilege";
+    EXPECT_EQ(b->publish_stream_attempts, 1) << "one republication after the landed copy";
     EXPECT_EQ(b->blob_head_attempts, 2);
     const String key = s->layout().blobKey(idOf(payload));
     OperationForTest op(*b);
     const auto got = (*op).read(key, Retry::once());
     ASSERT_TRUE(got.has_value());
-    EXPECT_EQ(got->bytes, staging_bytes) << "the destination is the staging object's verbatim copy";
-    const std::vector<CasEvent> observed_events = events->snapshot();
-    EXPECT_NE(std::find_if(observed_events.begin(), observed_events.end(),
-                           [](const CasEvent & e) { return e.type == CasEventType::BlobReuseAdopt; }),
-              observed_events.end()) << "the landed destination must be ADOPTED";
+    EXPECT_NE(got->bytes, staging_bytes) << "the landed copy was adopted";
+    EXPECT_EQ(got->bytes.substr(s->poolMeta().blob_header_len), payload);
+    const auto marker = loadMetaForTest(*b, s->layout(), u128Of(payload));
+    ASSERT_TRUE(marker.has_value());
+    EXPECT_EQ(marker->meta.state, MetaState::Clean);
 }
 
 /// A server-side copy publication is ambiguous-and-absent: the first copy attempt times out with
@@ -3017,4 +2995,118 @@ TEST(CASPartWrite, AmbiguousCopyAbsentReattemptsAndCommits)
     ASSERT_TRUE(got.has_value());
     EXPECT_NE(got->bytes, staging_bytes);
     EXPECT_EQ(got->bytes.substr(s->poolMeta().blob_header_len), payload);
+}
+
+namespace
+{
+
+/// Runs a side effect once, on the first read of the watched key, before that read is served.
+class BeforeMetaReadBackend final : public InMemoryBackend
+{
+public:
+    String watched_key;
+    std::function<void()> trigger;
+
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        if (key == watched_key && trigger)
+            std::exchange(trigger, {})();
+        return InMemoryBackend::read(key, access);
+    }
+};
+
+/// A present body and no marker, as a writer that crashed between its publication and its marker
+/// create leaves them.
+void seedBodyWithoutMarker(Backend & backend, const PoolPtr & store, const String & payload)
+{
+    String raw_body(store->poolMeta().blob_header_len, '\0');
+    raw_body += payload;
+    writeRawBlobBody(backend, store->layout(), u128Of(payload), raw_body);
+}
+
+BlobUploadResult uploadOnce(const PartWriteTxnPtr & build, const BlobRef & ref, const String & payload)
+{
+    return build->uploadBlobDetached(BlobUploadRequest{ref, BlobSource::fromString(payload), payload.size()});
+}
+
+}
+
+/// GC deletes the body and then its marker between the writer's `HEAD` and its marker read. The writer
+/// saw a present body and an absent marker; adopting would name a deleted body.
+TEST(CASPartWriteTxnMarkerRace, AbsentMarkerAfterHeadRepublishes)
+{
+    auto b = std::make_shared<BeforeMetaReadBackend>();
+    auto s = openPool(b);
+    const String payload = "absent-marker-after-head";
+    const BlobRef ref = idOf(payload);
+    const String blob_key = s->layout().blobKey(ref);
+    seedBodyWithoutMarker(*b, s, payload);
+    writeMetaClean(*b, s->layout(), u128Of(payload), payload.size());
+    condemnMeta(*b, s->layout(), u128Of(payload), /*condemn_round*/ 1);
+    const Etag condemned_token = [&]
+    {
+        OperationForTest op(*b);
+        return (*op).head(blob_key, Retry::once()).value().etag;
+    }();
+
+    auto build = precommittedBuildForPayload(s, RootNamespace{"srv1/marker-race"}, "part", payload);
+    bool fired = false;
+    b->watched_key = s->layout().blobMetaKey(ref);
+    b->trigger = [&]
+    {
+        fired = true;
+        OperationForTest op(*b);
+        ASSERT_EQ((*op).remove(blob_key, condemned_token, Retry::once()), Removal::Removed);
+        const auto marker = loadMeta(*op, s->layout(), ref);
+        ASSERT_TRUE(marker.has_value());
+        ASSERT_EQ(deleteMetaExact(*op, s->layout(), ref, marker->etag), Removal::Removed);
+    };
+
+    const BlobUploadResult result = uploadOnce(build, ref, payload);
+    ASSERT_TRUE(fired) << "the writer never read the marker after its `HEAD`";
+
+    EXPECT_EQ(result.diagnostics.action, BlobMaterializationAction::Published) << "adopted a deleted body";
+    EXPECT_EQ(result.diagnostics.reason, std::optional<BlobPublicationReason>(BlobPublicationReason::Absent));
+    OperationForTest op(*b);
+    const auto head = (*op).head(blob_key, Retry::once());
+    ASSERT_TRUE(head.has_value()) << "the writer's dependency names an absent body";
+    EXPECT_NE(head->etag, condemned_token);
+    const auto marker = loadMetaForTest(*b, s->layout(), u128Of(payload));
+    ASSERT_TRUE(marker.has_value());
+    EXPECT_EQ(marker->meta.state, MetaState::Clean);
+
+    /// GC's exact-token delete of the condemned incarnation, replayed late, misses the fresh body.
+    EXPECT_EQ((*op).remove(blob_key, condemned_token, Retry::once()), Removal::Mismatch);
+    EXPECT_TRUE((*op).head(blob_key, Retry::once()).has_value());
+}
+
+/// A crash leftover costs one upload: the first writer republishes and creates the marker, the next one
+/// adopts on that `Clean` marker.
+TEST(CASPartWriteTxnMarkerRace, PresentBodyWithoutMarkerRepublishesOnce)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const String payload = "present-body-without-marker";
+    const BlobRef ref = idOf(payload);
+    const String blob_key = s->layout().blobKey(ref);
+    seedBodyWithoutMarker(*b, s, payload);
+    OperationForTest op(*b);
+    const Etag leftover = (*op).head(blob_key, Retry::once())->etag;
+
+    const auto creates_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load();
+    auto first = precommittedBuildForPayload(s, RootNamespace{"srv1/leftover-a"}, "part", payload);
+    const BlobUploadResult first_result = uploadOnce(first, ref, payload);
+    EXPECT_EQ(first_result.diagnostics.action, BlobMaterializationAction::Published);
+    EXPECT_EQ(first_result.diagnostics.reason, std::optional<BlobPublicationReason>(BlobPublicationReason::Absent));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load() - creates_before, 1);
+    const auto republished = (*op).head(blob_key, Retry::once());
+    ASSERT_TRUE(republished.has_value());
+    EXPECT_NE(republished->etag, leftover);
+    const auto marker = loadMetaForTest(*b, s->layout(), u128Of(payload));
+    ASSERT_TRUE(marker.has_value());
+    EXPECT_EQ(marker->meta.state, MetaState::Clean);
+
+    auto second = precommittedBuildForPayload(s, RootNamespace{"srv1/leftover-b"}, "part", payload);
+    EXPECT_EQ(uploadOnce(second, ref, payload).diagnostics.action, BlobMaterializationAction::Observed);
+    EXPECT_EQ((*op).head(blob_key, Retry::once())->etag, republished->etag);
 }

@@ -230,25 +230,23 @@ TEST(CASUploadDetached, ExistingCleanHeadsAndObservesWithoutPublication)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBlobBodyPutAvoided].load(), avoided_before + 1);
 }
 
-TEST(CASUploadDetached, ExistingBodyWithoutMetadataBackfillsWithoutPublication)
+/// A body without a marker is never adopted: it is republished once and the marker is created `Clean`.
+TEST(CASUploadDetached, ExistingBodyWithoutMetadataRepublishesOnceThenClean)
 {
-    const String payload = "mandatory-head-metadata-backfill";
+    const String payload = "mandatory-head-metadata-absent";
     const BlobRef ref = idOf(payload);
     auto backend = std::make_shared<ProtocolRecordingBackend>();
     auto store = openUploadPool(backend);
     seedPresentBody(*backend, store->layout(), store->poolMeta(), ref, payload);
-    auto build = precommitBuildFor(store, RootNamespace{"srv1/protocol-backfill"}, "part", payload);
+    auto build = precommitBuildFor(store, RootNamespace{"srv1/protocol-absent-meta"}, "part", payload);
     backend->watch(store->layout().blobKey(ref), store->layout().blobMetaKey(ref));
 
     const BlobUploadResult result = build->uploadBlobDetached(
         BlobUploadRequest{ref, BlobSource::fromString(payload), payload.size()});
 
     EXPECT_EQ(result.dep.proof, BlobDependencyProof::Materialized);
-    ASSERT_FALSE(backend->operations.empty());
-    EXPECT_EQ(backend->operations.front(), "head");
-    EXPECT_EQ(backend->blob_heads, 1u);
-    EXPECT_EQ(backend->meta_gets, 1u);
-    EXPECT_EQ(backend->publish_calls, 0u);
+    EXPECT_EQ(result.diagnostics.action, BlobMaterializationAction::Published);
+    EXPECT_EQ(backend->operations, (std::vector<String>{"head", "meta-get", "publish"}));
     const auto meta = loadMetaForTest(*backend, store->layout(), u128Of(payload));
     ASSERT_TRUE(meta.has_value());
     EXPECT_EQ(meta->meta.state, MetaState::Clean);
@@ -312,8 +310,8 @@ TEST(CASUploadDetached, PresentCondemnedPublishesFreshAndQueuedOldDeleteMisses)
     }
 }
 
-/// A present body with absent metadata is observed and backfilled `Clean` without publication.
-TEST(CASUploadDetached, PresentBodyWithoutMetadataBackfills)
+/// A present body with absent metadata is republished as if absent, and the marker is created `Clean`.
+TEST(CASUploadDetached, PresentBodyWithoutMetadataRepublishesThenClean)
 {
     const RootNamespace ns{"srv1/nsAdopt"};
     const String ref_name = "part";
@@ -324,7 +322,7 @@ TEST(CASUploadDetached, PresentBodyWithoutMetadataBackfills)
     {
         b = std::make_shared<InMemoryBackend>();
         s = openUploadPool(b);
-        seedPresentBody(*b, s->layout(), s->poolMeta(), blob, payload);   /// body present, no meta: backfill
+        seedPresentBody(*b, s->layout(), s->poolMeta(), blob, payload);   /// body present, no meta
         build = precommitBuildFor(s, ns, ref_name, payload);
     };
 
@@ -340,14 +338,14 @@ TEST(CASUploadDetached, PresentBodyWithoutMetadataBackfills)
     const BlobUploadResult r = build1->uploadBlobDetached(
         BlobUploadRequest{blob, BlobSource::fromString(payload), payload.size()});
 
-    EXPECT_EQ(r.diagnostics.action, BlobMaterializationAction::Observed);
-    EXPECT_EQ(r.diagnostics.reason, std::nullopt);
-    EXPECT_EQ(r.diagnostics.transport, std::nullopt);
+    EXPECT_EQ(r.diagnostics.action, BlobMaterializationAction::Published);
+    EXPECT_EQ(r.diagnostics.reason, std::optional<BlobPublicationReason>(BlobPublicationReason::Absent));
+    EXPECT_EQ(r.diagnostics.transport, std::optional<BlobPublicationTransport>(BlobPublicationTransport::Streaming));
     EXPECT_EQ(r.dep.proof, BlobDependencyProof::Materialized);
     EXPECT_EQ(r.dep.size, payload.size());
 
     EXPECT_EQ(build1->dependencyProof(blob), std::nullopt);
-    /// The point-read backfilled a Clean meta.
+    /// The publication's reconcile created a Clean meta.
     EXPECT_EQ(metaStateAt(*b1, s1->layout(), payload), std::optional<MetaState>(MetaState::Clean));
 
     std::shared_ptr<InMemoryBackend> b2;
