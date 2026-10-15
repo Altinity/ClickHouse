@@ -382,9 +382,8 @@ public:
     /// nullptr if partition export is disabled.
     ReplicatedExportTTLIndex * getExportTTLIndex() const override { return export_ttl_index.get(); }
 
-    std::optional<ExportTaskStatus> getExportTaskStatus(const String & transaction_id) const override;
-    std::optional<ExportTaskStatus> getKnownExportTaskStatus(const String & transaction_id) const override;
-    bool isPartBeingMerged(const MergeTreePartInfo & part_info) const override;
+    std::optional<ExportTaskState> getExportTask(const String & transaction_id) const override;
+    std::optional<ExportTaskState> getKnownExportTask(const String & transaction_id) const override;
 
 private:
     std::atomic_bool are_restoring_replica {false};
@@ -540,9 +539,9 @@ private:
     /// (system table, scheduler, KILL) get() a consistent version with no lock and no ZooKeeper.
     MultiVersion<ExportTaskEntriesContainer> export_partition_manifests;
 
-    /// The export index of the `EXPORT` TTL and the merge fence built from it. Only created when
-    /// partition export is enabled; a replica without it must not assign merges of parts exported by
-    /// the TTL, which is why it does not advertise `export_features`.
+    /// The export index of the `EXPORT` TTL, which the delete gate reads. Only created when partition
+    /// export is enabled; a replica without it does not advertise `export_features`, so the TTL starts
+    /// no export while such a replica could run export tasks or assign merges that apply the `DELETE` TTL.
     ReplicatedExportTTLIndexPtr export_ttl_index;
 
     /// Runs `export_ttl_scheduler`.
@@ -809,7 +808,6 @@ private:
         bool cleanup,
         ReplicatedMergeTreeLogEntryData * out_log_entry,
         int32_t log_version,
-        int32_t export_index_version,
         MergeType merge_type);
 
     CreateMergeEntryResult createLogEntryToMutatePart(
@@ -1005,7 +1003,7 @@ private:
         const String & partition_id,
         ContextPtr query_context) const;
 
-    /// Throws unless every replica enforces the export states of parts when assigning merges.
+    /// Throws unless every replica exports only the blocks that a task claims and applies the delete gate.
     void checkAllReplicasSupportExportTTL(const zkutil::ZooKeeperPtr & zookeeper) const;
     void checkReplicasSupportExportTTL() const override;
 

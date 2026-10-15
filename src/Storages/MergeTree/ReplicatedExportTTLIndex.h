@@ -4,7 +4,6 @@
 #include <Common/MultiVersion.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Storages/MergeTree/ExportTTLIndex.h>
-#include <Storages/MergeTree/ExportFence.h>
 #include <Storages/MergeTree/IExportTTLIndex.h>
 #include <base/defines.h>
 
@@ -18,12 +17,11 @@
 namespace DB
 {
 
-/// The `TTL ... EXPORT` state of a `ReplicatedMergeTree` table in Keeper, and the merge fence built from it.
+/// The `TTL ... EXPORT` state of a `ReplicatedMergeTree` table in Keeper.
 ///
 /// Layout under `<zookeeper_path>/export_ttl`:
 ///  - `version`: bumped in every transaction that changes an index entry. Replicas cache the index
-///    for its version, and a merge is assigned with a check of the version its predicate read the
-///    index at, so no merge is assigned from a stale view of the export states;
+///    for its version;
 ///  - `scheduler_lock`: ephemeral, held by the replica that schedules TTL exports, whose name it holds;
 ///  - `destinations/<destination_key>`: holds the name of one destination;
 ///  - `destinations/<destination_key>/partitions/<partition_id>`: an `ExportTTLIndexEntry`.
@@ -87,9 +85,6 @@ public:
         Coordination::Requests & ops, const String & destination_key, const ExportTTLIndexEntry & entry, int32_t version) const;
 
     ExportTTLIndexSnapshotPtr getSnapshot(const zkutil::ZooKeeperPtr & zookeeper);
-
-    /// The export states as of the returned version of the `version` node.
-    std::pair<ExportFencePtr, int32_t> getForMergeAssignment(const zkutil::ZooKeeperPtr & zookeeper);
 
 private:
     const String zookeeper_path;

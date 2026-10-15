@@ -3589,9 +3589,9 @@ bool MutateTask::prepare()
     /// it is only recalculated here, and applied by a merge once the part is exported.
     if (ctx->execute_ttl_type == ExecuteTTLType::NORMAL)
     {
-        const auto fence = ctx->data->getLatestExportFence();
+        const auto exported_blocks = ctx->data->getLatestExportedBlocks();
         if (auto reason = ctx->data->getExportTTLDeleteGate().check(
-                ctx->source_part->name, ctx->source_part->info, ctx->source_part->ttl_infos, fence.get()))
+                ctx->source_part->name, ctx->source_part->info, ctx->source_part->ttl_infos, exported_blocks.get()))
         {
             LOG_DEBUG(ctx->log, "Not applying TTL in the mutation: {}", *reason);
             ctx->execute_ttl_type = ExecuteTTLType::RECALCULATE;

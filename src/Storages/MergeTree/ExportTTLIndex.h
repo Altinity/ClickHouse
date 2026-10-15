@@ -2,12 +2,12 @@
 
 #include <Interpreters/Context_fwd.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
-#include <Storages/MergeTree/ExportFence.h>
+#include <Storages/MergeTree/ExportBlockNumberRanges.h>
+#include <Storages/MergeTree/ExportedBlocks.h>
 #include <base/types.h>
 
 #include <map>
 #include <memory>
-#include <optional>
 #include <vector>
 
 namespace DB
@@ -15,69 +15,57 @@ namespace DB
 
 /// What a table's `TTL ... EXPORT TO TABLE` has exported to one destination from one partition.
 ///
-/// Rows are identified by block numbers: every insert gets its own block number, a part covers
-/// exactly the rows of its block range, and merges and mutations keep the range. Ranges are
-/// qualified by the partition because `ReplicatedMergeTree` allocates block numbers per partition.
+/// Rows are identified by the number of the block they were inserted in, which merges and mutations
+/// keep (`enable_block_number_column`): a part may hold rows of exported blocks and of other blocks,
+/// and an export task reads only the rows of the blocks it exports. Ranges are qualified by the
+/// partition because `ReplicatedMergeTree` allocates block numbers per partition.
 ///
 /// The entry is only updated together with a transition of a TTL export task, in the same Keeper
 /// transaction (or under the same lock for a plain `MergeTree`), so it always agrees with what was
 /// committed to the destination:
-///  - creating a task claims the ranges of its parts;
-///  - committing a task moves its claim to `exported`;
-///  - retrying a failed task moves its claim to the new task, which commits under the same id;
-///  - resolving a failed task that does not need a retry releases its claim.
+///  - creating a task makes it the current task of the partition;
+///  - committing a task adds its block ranges to `exported`;
+///  - retrying a failed task makes the retry, which exports the same block ranges under the same
+///    commit id, the current task;
+///  - resolving a failed task that does not need a retry leaves the partition without a current task.
 struct ExportTTLIndexEntry
 {
-    /// Ranges owned by a TTL export task that did not commit: in flight, or failed and waiting to be retried.
-    struct Claim
-    {
-        /// Id the ranges are committed to the destination under. The retries of a failed task commit
-        /// under the id of the first task, so the destination commits the rows once if a failed task
-        /// landed after all.
-        String commit_id;
-        /// The task that exports the ranges now.
-        String transaction_id;
-        /// Compacted.
-        std::vector<MergeTreePartInfo> ranges;
-    };
-
     String partition_id;
 
     /// Ranges committed to the destination, compacted.
     std::vector<MergeTreePartInfo> exported;
 
-    /// A partition has at most one claim: a group starts only while no task of the partition is in
-    /// flight, and takes over the claim of the failed task it retries.
-    std::optional<Claim> claim;
+    /// Transaction id of the TTL export task that exports blocks of the partition now: in flight, or
+    /// failed and waiting to be retried. Empty if there is none. The task holds its block ranges and
+    /// its commit id. A partition has at most one: a group starts only while it has none.
+    String current_task;
 
-    bool empty() const { return exported.empty() && !claim; }
+    bool empty() const { return exported.empty() && current_task.empty(); }
 
-    /// Highest block number of any exported or claimed range, 0 if there is none.
+    /// Highest block number of any exported range, 0 if there is none.
     Int64 maxBlock() const;
 
-    PartExportState classify(const MergeTreePartInfo & part) const;
+    /// State of `part`, given the block ranges of the current task.
+    PartExportState classify(const MergeTreePartInfo & part, const std::vector<MergeTreePartInfo> & current_task_ranges) const;
 
-    ExportFenceEntry toFenceEntry(const String & destination) const;
+    /// The blocks of `part` that are not exported.
+    std::vector<MergeTreePartInfo> notExported(const MergeTreePartInfo & part) const;
 
-    /// Claims the ranges of `parts` for the task `transaction_id`, which commits them under
-    /// `commit_id`. Throws if the entry has a claim already.
-    void startClaim(const String & commit_id, const String & transaction_id, const std::vector<MergeTreePartInfo> & parts);
+    /// Makes `transaction_id` the current task. Throws if the partition has one already.
+    void startClaim(const String & transaction_id);
 
-    /// Moves the claim to the task `transaction_id`, which retries the task that holds it.
+    /// Makes `transaction_id`, which retries the current task, the current task. Throws if there is none.
     void retryClaim(const String & transaction_id);
 
-    /// Moves the claim to the exported ranges if it is committed under `commit_id`, adding `parts` as
-    /// well: a task may commit parts whose claim was lost.
-    void commitClaim(const String & commit_id, const std::vector<MergeTreePartInfo> & parts);
+    /// Adds `ranges`, the block ranges of the committed task `transaction_id`, to the exported ranges,
+    /// and leaves the partition without a current task if it was that one. A task may commit after a
+    /// retry of it became the current task.
+    void commitClaim(const String & transaction_id, const std::vector<MergeTreePartInfo> & ranges);
 
-    void releaseClaim() { claim.reset(); }
+    void releaseClaim() { current_task.clear(); }
 
     String toJSONString() const;
     static ExportTTLIndexEntry fromJSONString(const String & partition_id, const String & json_string);
-
-private:
-    /// Adds the ranges of `parts` to the exported ranges.
-    void addExported(const std::vector<MergeTreePartInfo> & parts);
 };
 
 /// An index entry as read, with the version to update it with a check.
@@ -88,7 +76,7 @@ struct ExportTTLVersionedEntry
     int32_t version = -1;
 };
 
-/// The whole export index of a table as of one version, with the merge fence built from it.
+/// The whole export index of a table as of one version, with the exported blocks the delete gate reads.
 struct ExportTTLIndexSnapshot
 {
     /// Version of the `export_ttl/version` node of a `ReplicatedMergeTree` it was read at: every change of
@@ -98,7 +86,7 @@ struct ExportTTLIndexSnapshot
     /// By destination key, then by partition id.
     std::map<String, std::map<String, ExportTTLVersionedEntry>> entries;
 
-    ExportFencePtr fence;
+    ExportedBlocksPtr exported_blocks;
 
     static std::unique_ptr<const ExportTTLIndexSnapshot> build(
         int32_t version, std::map<String, std::map<String, ExportTTLVersionedEntry>> entries);
@@ -116,8 +104,9 @@ namespace ExportTTLUtils
     /// the same name is the same destination.
     String destinationKey(const String & database, const String & table);
 
-    /// Ranges of the parts named `part_names`, compacted.
-    std::vector<MergeTreePartInfo> rangesOfParts(const std::vector<String> & part_names, MergeTreeDataFormatVersion format_version);
+    /// Conversions between the block ranges of the export index and those of task descriptors.
+    std::vector<MergeTreePartInfo> toPartInfos(const String & partition_id, const ExportBlockNumberRanges & ranges);
+    ExportBlockNumberRanges toBlockNumberRanges(const std::vector<MergeTreePartInfo> & ranges);
 }
 
 }

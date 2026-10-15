@@ -4593,10 +4593,7 @@ void StorageReplicatedMergeTree::mergeSelectingTask()
             if (partitions_to_merge_in.empty())
                 can_assign_merge = false;
             else
-            {
                 merge_predicate = queue.getMergePredicate(zookeeper, partitions_to_merge_in);
-                merge_predicate->loadExportFence(zookeeper);
-            }
         }
 
         PreformattedMessage out_reason;
@@ -4645,7 +4642,6 @@ void StorageReplicatedMergeTree::mergeSelectingTask()
                     cleanup,
                     nullptr,
                     merge_predicate->getVersion(),
-                    merge_predicate->getExportIndexVersion(),
                     future_merged_part->merge_type);
 
                 if (create_result == CreateMergeEntryResult::Ok)
@@ -4891,7 +4887,6 @@ StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::c
     bool cleanup,
     ReplicatedMergeTreeLogEntryData * out_log_entry,
     int32_t log_version,
-    int32_t export_index_version,
     MergeType merge_type)
 {
     Strings exists_paths;
@@ -4947,11 +4942,6 @@ StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::c
 
     ops.emplace_back(zkutil::makeSetRequest(
         fs::path(zookeeper_path) / "log", "", log_version)); /// Check and update version.
-
-    /// The merge was checked against the export states at this version: parts exported, being
-    /// exported and not exported by the `EXPORT` TTL must not be merged together.
-    if (export_index_version >= 0 && export_ttl_index)
-        ops.emplace_back(zkutil::makeCheckRequest(export_ttl_index->getVersionPath(), export_index_version));
 
     Coordination::Error code = zookeeper->tryMulti(ops, responses);
 
@@ -6770,7 +6760,6 @@ bool StorageReplicatedMergeTree::optimize(
             }
 
             auto merge_predicate = queue.getMergePredicate(zookeeper, std::move(partition_ids_hint));
-            merge_predicate->loadExportFence(zookeeper);
             auto parts_collector = std::make_shared<ReplicatedMergeTreePartsCollector>(*this, merge_predicate);
 
             const auto select_merge = [&]() -> std::expected<MergeSelectorChoices, SelectMergeFailure>
@@ -6862,7 +6851,6 @@ bool StorageReplicatedMergeTree::optimize(
                 cleanup,
                 &merge_entry,
                 merge_predicate->getVersion(),
-                merge_predicate->getExportIndexVersion(),
                 select_merge_result.value()->merge_type);
 
             if (create_result == CreateMergeEntryResult::MissingPart)
@@ -8621,27 +8609,8 @@ bool StorageReplicatedMergeTree::exportParts(const ExportPartsRequest & request,
 
     auto zookeeper = getZooKeeperAndAssertNotReadonly();
 
-    Coordination::Requests ops;
     if (index_update)
-    {
         checkAllReplicasSupportExportTTL(zookeeper);
-
-        /// Its `/log` version is checked when the index entry is stored, so no merge can be assigned between
-        /// checking the parts below and claiming them.
-        const auto merge_predicate = queue.getMergePredicate(zookeeper, PartitionIdsHint{request.partition_id});
-        for (const auto & part : request.parts)
-        {
-            const auto covering_part = merge_predicate->getCoveringVirtualPart(part->name);
-            if (covering_part.empty())
-                return false;
-
-            const auto covering_info = MergeTreePartInfo::fromPartName(covering_part, format_version);
-            if (covering_info.min_block != part->info.min_block || covering_info.max_block != part->info.max_block)
-                return false;
-        }
-
-        ops.emplace_back(zkutil::makeCheckRequest(fs::path(zookeeper_path) / "log", merge_predicate->getVersion()));
-    }
 
     auto manifest = buildExportTaskManifest(
         destination->getStorageID(), destination, source_metadata, destination_metadata, request.parts, request.partition_id, local_context);
@@ -8649,9 +8618,13 @@ bool StorageReplicatedMergeTree::exportParts(const ExportPartsRequest & request,
     manifest.query_id = request.query_id;
     manifest.source = request.source;
     manifest.commit_id = request.commit_id.empty() ? manifest.transaction_id : request.commit_id;
+    manifest.block_ranges = request.block_ranges;
 
+    Coordination::Requests ops;
     ExportTaskUtils::appendCreateExportTaskOps(ops, fs::path(zookeeper_path) / "exports" / manifest.transaction_id, manifest);
 
+    /// The task and the entry that makes it the current task of its partition are stored together, and
+    /// the entry with a check of its version, so that two schedulers never start tasks for the same blocks.
     if (index_update)
     {
         if (index_update->entry.version < 0)
@@ -8804,7 +8777,8 @@ void StorageReplicatedMergeTree::checkAllReplicasSupportExportTTL(const zkutil::
 
     if (!unsupported.empty())
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-            "The `EXPORT` TTL is not supported by replica(s) {}, which would merge exported parts with parts that are not exported. "
+            "The `EXPORT` TTL is not supported by replica(s) {}, which could export whole parts instead of the blocks that a task claims, "
+            "or delete rows that are not exported yet. "
             "Every replica must run a version that supports it, with the server setting `allow_experimental_export_merge_tree_partition` "
             "enabled; drop the replicas that are lost",
             fmt::join(unsupported, ", "));
@@ -8899,40 +8873,48 @@ MergeTreeData::ExportTaskStatus toExportTaskStatus(ExportReplicatedMergeTreeTask
 
 }
 
-std::optional<MergeTreeData::ExportTaskStatus> StorageReplicatedMergeTree::getKnownExportTaskStatus(const String & transaction_id) const
+std::optional<MergeTreeData::ExportTaskState> StorageReplicatedMergeTree::getKnownExportTask(const String & transaction_id) const
 {
     if (const auto tasks = export_partition_manifests.get())
     {
         const auto & by_transaction_id = tasks->get<ExportTaskEntryTagByTransactionId>();
         if (const auto it = by_transaction_id.find(transaction_id); it != by_transaction_id.end())
-            return toExportTaskStatus(it->status);
+            return ExportTaskState{
+                .status = toExportTaskStatus(it->status),
+                .commit_id = it->manifest.commit_id,
+                .block_ranges = it->manifest.block_ranges,
+            };
     }
     return std::nullopt;
 }
 
-std::optional<MergeTreeData::ExportTaskStatus> StorageReplicatedMergeTree::getExportTaskStatus(const String & transaction_id) const
+std::optional<MergeTreeData::ExportTaskState> StorageReplicatedMergeTree::getExportTask(const String & transaction_id) const
 {
     /// The in-memory mirror of the tasks may lag behind Keeper, which only delays a retry. A task it
     /// does not know yet, e.g. just created, is read from Keeper, so it is never taken for missing.
-    if (const auto status = getKnownExportTaskStatus(transaction_id))
-        return status;
+    if (auto task = getKnownExportTask(transaction_id))
+        return task;
 
-    const auto status_path = fs::path(zookeeper_path) / "exports" / transaction_id / "status";
+    const auto zookeeper = getZooKeeper();
+    const fs::path task_path = fs::path(zookeeper_path) / "exports" / transaction_id;
     String status_str;
-    if (!getZooKeeper()->tryGet(status_path, status_str))
+    String manifest_str;
+    if (!zookeeper->tryGet(task_path / "status", status_str) || !zookeeper->tryGet(task_path / "metadata.json", manifest_str))
         return std::nullopt;
 
+    const auto manifest = ExportReplicatedMergeTreeTaskManifest::fromJsonString(manifest_str);
+    ExportTaskState state{.commit_id = manifest.commit_id, .block_ranges = manifest.block_ranges};
     if (const auto status = magic_enum::enum_cast<ExportReplicatedMergeTreeTaskEntry::Status>(status_str))
-        return toExportTaskStatus(*status);
-
-    /// Treated as failed: the scheduler still checks whether it committed.
-    LOG_WARNING(log, "Export task {} has an unknown status {}", transaction_id, status_str);
-    return ExportTaskStatus::FAILED;
-}
-
-bool StorageReplicatedMergeTree::isPartBeingMerged(const MergeTreePartInfo & part_info) const
-{
-    return queue.isGoingToBeMergedWithOtherParts(part_info);
+    {
+        state.status = toExportTaskStatus(*status);
+    }
+    else
+    {
+        /// Treated as failed: the scheduler still checks whether it committed.
+        LOG_WARNING(log, "Export task {} has an unknown status {}", transaction_id, status_str);
+        state.status = ExportTaskStatus::FAILED;
+    }
+    return state;
 }
 
 void StorageReplicatedMergeTree::forgetPartition(const ASTPtr & partition, ContextPtr query_context)
@@ -8957,10 +8939,10 @@ void StorageReplicatedMergeTree::forgetPartition(const ASTPtr & partition, Conte
             if (versioned.version < 0)
                 continue;
 
-            if (versioned.entry.claim)
+            if (!versioned.entry.current_task.empty())
                 throw Exception(ErrorCodes::CANNOT_FORGET_PARTITION,
                     "Partition {} is being exported by the EXPORT TTL (task {}), retry after it finishes",
-                    partition_id, versioned.entry.claim->transaction_id);
+                    partition_id, versioned.entry.current_task);
 
             ops.emplace_back(zkutil::makeRemoveRequest(export_ttl_index->getIndexEntryPath(destination_key, partition_id), versioned.version));
         }
@@ -9746,6 +9728,8 @@ std::unique_ptr<ReplicatedMergeTreeLogEntryData> StorageReplicatedMergeTree::rep
     }
 
     assertNoPatchesForParts(src_all_parts, src_patch_parts, "REPLACE PARTITION " + partition_id + " FROM");
+    for (const auto & src_part : src_all_parts)
+        checkIncomingPartForExportTTL(*src_part, *metadata_snapshot);
     LOG_DEBUG(log, "Cloning {} parts", src_all_parts.size());
 
     /// REPLACE PARTITION FROM a source that has no parts in the requested partition would
@@ -10090,6 +10074,8 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
         }
 
         assertNoPatchesForParts(src_all_parts, src_patch_parts, "MOVE PARTITION " + partition_id);
+        for (const auto & src_part : src_all_parts)
+            dest_table_storage->checkIncomingPartForExportTTL(*src_part, *dest_metadata_snapshot);
 
         if (covering_part)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Got part {} covering drop range {}, it's a bug",

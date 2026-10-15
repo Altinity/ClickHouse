@@ -321,6 +321,11 @@ void StorageMergeTree::startup()
         if (export_task_scheduler)
         {
             export_task_scheduler->load();
+
+            /// Nor may the blocks of tasks of the `EXPORT` TTL that may still commit, e.g. after their
+            /// parts were dropped, see the constructor.
+            increment.set(std::max<UInt64>(increment.value.load(), static_cast<UInt64>(export_task_scheduler->maxBlockOfTasks())));
+
             export_task_scheduling_task->activateAndSchedule();
             export_ttl_task->activateAndSchedule();
         }
@@ -3118,6 +3123,8 @@ void StorageMergeTree::replacePartitionFrom(const StoragePtr & source_table, con
                             "Cannot replace partition '{}' because part '{}' has inconsistent granularity with table",
                             partition_id, src_part->name);
 
+        checkIncomingPartForExportTTL(*src_part, *my_metadata_snapshot);
+
         /// This will generate unique name in scope of current server process.
         Int64 temp_index = insert_increment.get();
         MergeTreePartInfo dst_part_info(partition_id, temp_index, temp_index, getLevelForAdoptedPart(src_data, src_part->info.level));
@@ -3299,6 +3306,8 @@ void StorageMergeTree::movePartitionToTable(const StoragePtr & dest_table, const
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                             "Cannot move partition '{}' because part '{}' has inconsistent granularity with table",
                             partition_id, src_part->name);
+
+        dest_table_storage->checkIncomingPartForExportTTL(*src_part, *dest_metadata_snapshot);
 
         /// This will generate unique name in scope of current server process.
         Int64 temp_index = insert_increment.get();
@@ -3758,20 +3767,12 @@ bool StorageMergeTree::exportParts(const ExportPartsRequest & request, ContextPt
     descriptor.query_id = request.query_id;
     descriptor.source = request.source;
     descriptor.commit_id = request.commit_id.empty() ? descriptor.transaction_id : request.commit_id;
+    descriptor.block_ranges = request.block_ranges;
 
-    if (index_update)
-    {
-        /// Merge selection holds it while it checks the fence and tags the parts it merges.
-        std::lock_guard lock(currently_processing_in_background_mutex);
-        for (const auto & part : request.parts)
-        {
-            if (part->getState() != MergeTreeDataPartState::Active || currently_merging_mutating_parts.contains(part->info))
-                return false;
-        }
-
-        if (!export_ttl_index->updateEntry(index_update->destination_key, index_update->entry))
-            return false;
-    }
+    /// A crash before the task is saved leaves the entry pointing to a task that does not exist,
+    /// which the `EXPORT` TTL scheduler resolves as one that exported nothing.
+    if (index_update && !export_ttl_index->updateEntry(index_update->destination_key, index_update->entry))
+        return false;
 
     const auto transaction_id = descriptor.transaction_id;
     export_task_scheduler->addTask(std::move(descriptor), std::vector<DataPartPtr>(request.parts.begin(), request.parts.end()));
@@ -3936,25 +3937,21 @@ IExportTTLIndex * StorageMergeTree::getExportTTLIndex() const
     return export_ttl_index.get();
 }
 
-std::optional<MergeTreeData::ExportTaskStatus> StorageMergeTree::getExportTaskStatus(const String & transaction_id) const
+std::optional<MergeTreeData::ExportTaskState> StorageMergeTree::getExportTask(const String & transaction_id) const
 {
     const auto task = export_task_scheduler->getTask(transaction_id);
     if (!task)
         return std::nullopt;
 
+    ExportTaskState state{.commit_id = task->commit_id, .block_ranges = task->block_ranges};
     switch (task->status)
     {
-        case MergeTreeExportTask::Status::PENDING: return ExportTaskStatus::PENDING;
-        case MergeTreeExportTask::Status::COMPLETED: return ExportTaskStatus::COMPLETED;
-        case MergeTreeExportTask::Status::FAILED: return ExportTaskStatus::FAILED;
-        case MergeTreeExportTask::Status::KILLED: return ExportTaskStatus::KILLED;
+        case MergeTreeExportTask::Status::PENDING: state.status = ExportTaskStatus::PENDING; break;
+        case MergeTreeExportTask::Status::COMPLETED: state.status = ExportTaskStatus::COMPLETED; break;
+        case MergeTreeExportTask::Status::FAILED: state.status = ExportTaskStatus::FAILED; break;
+        case MergeTreeExportTask::Status::KILLED: state.status = ExportTaskStatus::KILLED; break;
     }
-}
-
-bool StorageMergeTree::isPartBeingMerged(const MergeTreePartInfo & part_info) const
-{
-    std::lock_guard lock(currently_processing_in_background_mutex);
-    return currently_merging_mutating_parts.contains(part_info);
+    return state;
 }
 
 void StorageMergeTree::triggerExportTaskScheduling()

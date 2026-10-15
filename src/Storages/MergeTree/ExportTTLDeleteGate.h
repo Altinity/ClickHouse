@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Storages/MergeTree/MergeTreeDataPartTTLInfo.h>
-#include <Storages/MergeTree/ExportFence.h>
+#include <Storages/MergeTree/ExportedBlocks.h>
 #include <base/types.h>
 
 #include <ctime>
@@ -13,7 +13,9 @@ namespace DB
 {
 
 /// Keeps TTL that deletes or rewrites rows from applying to parts that the `EXPORT` TTL of the
-/// table has not exported yet, so no row is lost before it reaches the destination.
+/// table has not exported entirely yet, so no row is lost before it reaches the destination. A view
+/// of the exported blocks older than the index only holds more parts, but for blocks that
+/// `FORGET PARTITION` forgot meanwhile.
 struct ExportTTLDeleteGate
 {
     bool enabled = false;
@@ -24,12 +26,12 @@ struct ExportTTLDeleteGate
     /// Returns the reason why the part must not be merged, or nothing if it may be.
     std::optional<String> check(
         const String & part_name, const MergeTreePartInfo & info, const MergeTreeDataPartTTLInfos & ttl_infos,
-        const ExportFence * fence) const
+        const ExportedBlocks * exported_blocks) const
     {
         if (!enabled || !ttl_infos.part_min_ttl || ttl_infos.part_min_ttl > now)
             return std::nullopt;
 
-        if (fence && !destination_key.empty() && fence->classify(info, destination_key) == PartExportState::EXPORTED)
+        if (exported_blocks && !destination_key.empty() && exported_blocks->isExported(info, destination_key))
             return std::nullopt;
 
         return fmt::format("Part {} has TTL that is due, but the EXPORT TTL has not exported it yet", part_name);

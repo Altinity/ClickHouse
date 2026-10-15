@@ -1052,8 +1052,8 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         merging_params.allow_tuple_element_aggregation = false;
     }
 
-    /// Without the setting the table has neither the export index nor the merge fence, so merges
-    /// could mix exported parts with the others, whose rows would then never be exported.
+    /// Without the setting the table has neither the export index nor the delete gate, so the TTL
+    /// could delete rows that are not exported yet.
     if (metadata.hasAnyExportTTL()
         && !args.getContext()->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,

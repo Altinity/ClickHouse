@@ -35,6 +35,9 @@ public:
 
     std::vector<ExportTaskInfo> getInfo() const;
 
+    /// Highest block number that a task exports the rows of, 0 if no task is limited to blocks.
+    Int64 maxBlockOfTasks() const;
+
     /// Scheduler tick: schedule pending parts of PENDING tasks and commit tasks whose parts are all
     /// exported. Invoked from the storage's schedule-pool task. Returns true if at least one task is
     /// still PENDING (so the caller should keep polling); false when there is no work left, letting
@@ -89,6 +92,10 @@ private:
     void scheduleOnePart(const String & transaction_id, const String & part_name);
     void handlePartCompletion(const String & transaction_id, const String & part_name, const MergeTreePartExportManifest::CompletionCallbackResult & result);
     void tryCommit(const String & transaction_id);
+
+    /// Records the blocks of a committed task of the `EXPORT` TTL as exported, before the task is
+    /// marked completed, so that the export index never misses a commit that the task records.
+    void recordExportedBlocks(const MergeTreeExportTask & descriptor);
 
 
     /// Wall-clock timeout pass. Transitions expired PENDING tasks to KILLED (unless a commit is

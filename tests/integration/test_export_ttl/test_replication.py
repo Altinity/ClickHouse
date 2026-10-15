@@ -33,13 +33,13 @@ CLUSTER_INSTANCES = ["replica1", "replica2"]
 # destination.
 
 
-def make_replicated_tables(replicas, columns=COLUMNS, partition_by="year", spec="year", settings=None):
+def make_replicated_tables(replicas, columns=COLUMNS, partition_by="year", spec="year", settings=None, extra_ttl=""):
     suffix = unique_suffix()
     mt_table, iceberg_table = f"repl_mt_{suffix}", f"repl_iceberg_{suffix}"
     create_iceberg(replicas, iceberg_table, columns=columns, partition_by=spec)
     for replica in replicas:
         create_source(
-            replica, mt_table, columns, partition_by, f"t + INTERVAL 1 DAY EXPORT TO TABLE {iceberg_table}",
+            replica, mt_table, columns, partition_by, f"t + INTERVAL 1 DAY EXPORT TO TABLE {iceberg_table}{extra_ttl}",
             engine="ReplicatedMergeTree", replica_name=replica.name, settings=settings,
         )
     return mt_table, iceberg_table
@@ -78,6 +78,41 @@ def test_replicas_export_once(cluster):
         assert ttl_tasks(replica, mt_table) == tasks
         assert_exactly_once(iceberg_ids(replica, iceberg_table), [1, 2])
     assert_one_snapshot_per_task(replicas[0], mt_table, iceberg_table)
+
+
+def test_replicas_export_then_delete(cluster):
+    """With a `DELETE` TTL due after the export, the rows are exported once, then deleted on every
+    replica by the background TTL merges, and no replica deletes a row before it is exported."""
+    replicas = [cluster.instances["replica1"], cluster.instances["replica2"]]
+    mt_table, iceberg_table = make_replicated_tables(
+        replicas, extra_ttl=", t + INTERVAL 2 DAY DELETE",
+        # A replica backs off selecting merges for up to a minute while there is nothing to merge.
+        settings={"merge_selecting_sleep_ms": 1000, "max_merge_selecting_sleep_ms": 2000},
+    )
+    holder, _ = holder_and_other(replicas, mt_table)
+
+    replicas[0].query(f"INSERT INTO {mt_table} VALUES (1, 2020, {DUE}), (2, 2020, {DUE})")
+    replicas[0].query(f"INSERT INTO {mt_table} VALUES (3, 2021, {NOT_DUE})")
+    sync(replicas, mt_table)
+
+    def deleted_after_the_export():
+        deleted_everywhere = True
+        for replica in replicas:
+            # Rows only leave the source and only enter the destination, so the source is read first.
+            source = {int(row_id) for row_id in replica.query(f"SELECT id FROM {mt_table}").split()}
+            exported = set(iceberg_ids(replica, iceberg_table))
+            lost = sorted({1, 2, 3} - source - exported)
+            assert not lost, f"Rows deleted on {replica.name} before they were exported: {lost}"
+            deleted_everywhere = deleted_everywhere and source == {3}
+        return deleted_everywhere
+
+    wait_until(deleted_after_the_export, 120, "The exported rows were not deleted on every replica")
+
+    for replica in replicas:
+        assert_exactly_once(iceberg_ids(replica, iceberg_table), [1, 2])
+        assert replica.query(f"SELECT id FROM {mt_table}") == "3\n"
+    # The replica that schedules sees the task completed before it records the parts as exported.
+    assert_one_snapshot_per_task(holder, mt_table, iceberg_table)
 
 
 def test_rows_are_the_same_on_every_replica(cluster):
@@ -215,9 +250,9 @@ def test_failover_exports_what_the_scheduler_left(cluster):
 
 def test_alter_is_refused_while_a_replica_does_not_support_it(cluster):
     """The other replicas apply an ALTER from the replication log without validating it. A replica that
-    does not keep exported parts apart from the others when it merges, e.g. because it runs an older
-    version, does not advertise `export_features`, and an ALTER that adds the `EXPORT` TTL is refused
-    while there is one."""
+    could export whole parts instead of the blocks that a task claims, or delete rows that are not
+    exported, e.g. because it runs an older version, does not advertise `export_features`, and an ALTER
+    that adds the `EXPORT` TTL is refused while there is one."""
     replicas = [cluster.instances["replica1"], cluster.instances["replica2"]]
     suffix = unique_suffix()
     mt_table, iceberg_table = f"repl_mt_{suffix}", f"repl_iceberg_{suffix}"

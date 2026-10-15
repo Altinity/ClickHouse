@@ -21,8 +21,9 @@ CLUSTER_INSTANCES = ["replica1", "replica2"]
 
 # A TTL of seconds that does not follow the partition key, on partitions that keep receiving rows:
 # rows are exported in successive groups as they become due while more keep coming, never before
-# they are due and never twice. When a row is due and when it was first read from the destination
-# are both taken from the clock of the servers.
+# they are due and never twice, and a `DELETE` TTL removes them from the source only once they are
+# exported. When a row is due and when it was first read from the destination are both taken from
+# the clock of the servers.
 
 COLUMNS = "id Int64, customer_id Int64, t DateTime"
 CUSTOMERS = [1, 2, 3]
@@ -34,15 +35,20 @@ INSERT_SECONDS = 60
 # in the first `INSERT_SECONDS - MAX_LAG_SECONDS` seconds are thus exported while rows keep coming.
 MAX_LAG_SECONDS = 40
 NO_MERGES = {"max_bytes_to_merge_at_max_space_in_pool": 1}
+# A `DELETE` TTL due after the export, so that rows are deleted while more keep coming.
+DELETE_SECONDS = 20
+# A replicated table backs off selecting merges for up to a minute when there is nothing to merge.
+FAST_MERGE_SELECTING = {"merge_selecting_sleep_ms": 1000, "max_merge_selecting_sleep_ms": 2000}
 
 
-def make_tables(nodes, engine, settings=None):
+def make_tables(nodes, engine, settings=None, extra_ttl=""):
     suffix = unique_suffix()
     mt_table, iceberg_table = f"roll_mt_{suffix}", f"roll_iceberg_{suffix}"
     create_iceberg(nodes, iceberg_table, columns=COLUMNS, partition_by="customer_id")
     for node in nodes:
         create_source(
-            node, mt_table, COLUMNS, "customer_id", f"t + INTERVAL {TTL_SECONDS} SECOND EXPORT TO TABLE {iceberg_table}",
+            node, mt_table, COLUMNS, "customer_id",
+            f"t + INTERVAL {TTL_SECONDS} SECOND EXPORT TO TABLE {iceberg_table}{extra_ttl}",
             engine=engine, replica_name=node.name, settings=settings,
         )
     return mt_table, iceberg_table
@@ -84,6 +90,17 @@ class RollingExport:
     def lags(self):
         return {row_id: self.first_read[row_id] - due for row_id, due in self.due.items()}
 
+    def read_with_source(self, mt_table):
+        """Reads the source, then the destination, and returns the ids of the rows deleted from the
+        source. Rows only leave the source and only enter the destination, so a row that is missing
+        from the source must be in the destination read after it, or it was deleted before it was exported."""
+        source = {int(row_id) for row_id in self.reader.query(f"SELECT id FROM {mt_table}").split()}
+        exported = set(self.read())
+        deleted = set(range(self.inserted)) - source
+        lost = sorted(deleted - exported)
+        assert not lost, f"Rows deleted before they were exported: {lost}"
+        return deleted
+
 
 def roll(insert_node, mt_table, reader, iceberg_table, merge=None):
     """Inserts a part into every partition at most every second for `INSERT_SECONDS`, calling *merge*
@@ -102,6 +119,28 @@ def roll(insert_node, mt_table, reader, iceberg_table, merge=None):
     lags = export.lags()
     logging.info("%d rows were exported at most %d s after they were due", len(lags), max(lags.values()))
     return export
+
+
+def roll_with_deletes(node, mt_table, iceberg_table):
+    """As `roll`, also checking on every read that no row left the source before it was exported, then
+    waits until every row is exported and deleted. Returns the rows deleted while rows kept coming."""
+    export = RollingExport(node, iceberg_table)
+    deleted_while_inserting = set()
+    start = time.time()
+    while time.time() - start < INSERT_SECONDS:
+        iteration_start = time.time()
+        export.insert(node, mt_table)
+        deleted_while_inserting = export.read_with_source(mt_table)
+        time.sleep(max(0.0, 1 - (time.time() - iteration_start)))
+
+    def exported_and_deleted():
+        # Merges are selected less and less often once nothing is inserted, so they are asked for.
+        node.query(f"OPTIMIZE TABLE {mt_table}")
+        deleted = export.read_with_source(mt_table)
+        return sorted(export.due) == list(range(export.inserted)) and len(deleted) == export.inserted
+
+    wait_until(exported_and_deleted, 120, "Not every row was exported and deleted")
+    return deleted_while_inserting
 
 
 def assert_rows_match_the_source(node, mt_table, iceberg_table):
@@ -165,6 +204,23 @@ def test_merges_never_export_rows_early(cluster, source_engine):
     assert merged_parts(node, mt_table), "No part was merged"
     wait_until_settled(node, mt_table, iceberg_table)
     assert_rows_match_the_source(node, mt_table, iceberg_table)
+
+
+def test_rows_are_deleted_only_after_they_are_exported(cluster, source_engine):
+    """With a `DELETE` TTL due after the export, rows are deleted from the source as they become due
+    while more keep coming, but never before they are exported. Without merges, a part holds the rows
+    of one insert, so it is due for deletion as a whole and dropped by a TTL merge, which the merge size
+    limit does not apply to."""
+    node = cluster.instances["replica1"]
+    mt_table, iceberg_table = make_tables(
+        [node], source_engine, {**NO_MERGES, **FAST_MERGE_SELECTING},
+        extra_ttl=f", t + INTERVAL {DELETE_SECONDS} SECOND DELETE",
+    )
+
+    deleted_while_inserting = roll_with_deletes(node, mt_table, iceberg_table)
+
+    assert deleted_while_inserting, "No row was deleted while rows kept coming"
+    wait_until_settled(node, mt_table, iceberg_table)
 
 
 def test_rows_inserted_on_another_replica_are_exported_as_they_become_due(cluster):

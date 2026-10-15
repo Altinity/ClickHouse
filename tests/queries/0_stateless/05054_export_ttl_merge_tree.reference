@@ -6,8 +6,9 @@ Tasks
 ttl	COMPLETED	2	2020
 Partition 2021 is not due
 0	0
-Parts in different export states are not merged
-refused
+Parts in different export states merge, and the merged part is not exported
+1
+0
 A part that becomes due later is exported on its own
 1	2020
 2	2020

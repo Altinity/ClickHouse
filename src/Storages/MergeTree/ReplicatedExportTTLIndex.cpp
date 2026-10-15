@@ -328,17 +328,11 @@ ExportTTLIndexSnapshotPtr ReplicatedExportTTLIndex::refresh(const zkutil::ZooKee
 
     ProfileEvents::increment(ProfileEvents::ExportTTLIndexSnapshotRefreshes);
     auto snapshot = ExportTTLIndexSnapshot::build(version, std::move(entries));
-    LOG_DEBUG(log, "Read the export index at version {}: {} partition(s) with exported or claimed parts",
-        version, snapshot->fence->entries_by_partition.size());
+    LOG_DEBUG(log, "Read the export index at version {}: {} partition(s) with exported blocks",
+        version, snapshot->exported_blocks->ranges_by_partition.size());
 
     latest.set(std::move(snapshot));
     return latest.get();
-}
-
-std::pair<ExportFencePtr, int32_t> ReplicatedExportTTLIndex::getForMergeAssignment(const zkutil::ZooKeeperPtr & zookeeper)
-{
-    const auto snapshot = getSnapshot(zookeeper);
-    return {snapshot->fence, snapshot->version};
 }
 
 }

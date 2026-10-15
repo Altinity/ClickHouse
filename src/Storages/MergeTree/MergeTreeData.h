@@ -1094,6 +1094,7 @@ public:
 
     void exportPartToTable(const PartitionCommand & command, ContextPtr query_context);
 
+    /// `block_ranges` limits the export to the rows of those blocks, see `ExportBlockNumberRanges`.
     void exportPartToTable(
         const std::string & part_name,
         const StoragePtr & destination_storage,
@@ -1101,7 +1102,8 @@ public:
         ContextPtr query_context,
         const std::optional<String> & iceberg_metadata_json = std::nullopt,
         bool allow_outdated_parts = false,
-        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {});
+        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {},
+        const ExportBlockNumberRanges & block_ranges = {});
 
     void exportPartToTable(
         const std::string & part_name,
@@ -1110,7 +1112,8 @@ public:
         ContextPtr query_context,
         const std::optional<String> & iceberg_metadata_json = std::nullopt,
         bool allow_outdated_parts = false,
-        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {});
+        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {},
+        const ExportBlockNumberRanges & block_ranges = {});
 
     void killExportPart(const String & transaction_id);
 
@@ -1121,6 +1124,8 @@ public:
         String partition_id;
         /// Parts without rows are exported as no files.
         DataPartsVector parts;
+        /// The blocks whose rows are exported from `parts`, for the `EXPORT` TTL. Empty for every row.
+        ExportBlockNumberRanges block_ranges;
         ExportTaskSource source = ExportTaskSource::query;
         /// Generated if empty.
         String transaction_id;
@@ -1137,8 +1142,8 @@ public:
         ExportTTLVersionedEntry entry;
     };
 
-    /// Checks the export and creates its task. With `index_update`, also
-    /// stores that entry in the same step and fails if a part is being merged. Returns false on a conflict.
+    /// Checks the export and creates its task. With `index_update`, also stores that entry in the same
+    /// step, and returns false if it changed meanwhile.
     virtual bool exportParts(const ExportPartsRequest & request, ContextPtr local_context, const ExportTTLIndexUpdate * index_update = nullptr) = 0;
 
     /// `ALTER TABLE ... EXPORT PARTITION`, including `EXPORT PARTITION ALL`: every call is a new task,
@@ -1792,14 +1797,21 @@ protected:
 
     void checkTTLExpressions(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata) const;
 
-    /// Validates the `TTL ... EXPORT TO TABLE` expression of an ALTER, if it changes it.
+    /// Validates the `TTL ... EXPORT TO TABLE` expression of an ALTER, if it changes it, and that the
+    /// ALTER keeps `enable_block_number_column` on while there is one.
     void checkExportTTL(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, ContextPtr local_context) const;
+
+    static void checkBlockNumberColumnForExportTTL(const MergeTreeSettings & settings);
+
+    /// Refuses a part brought in by `ATTACH`, `REPLACE`, `MOVE` or `RESTORE` whose stored `_block_number`
+    /// values would not lie in its new block range, if the table has an `EXPORT` TTL.
+    void checkIncomingPartForExportTTL(const IMergeTreeDataPart & part, const StorageInMemoryMetadata & metadata) const;
 
     /// A plain `MergeTree` keeps its export index and tasks in files on its first disk, which are
     /// written and then renamed: a content-addressed disk cannot rename a file written before.
     void checkExportTTLIsSupportedByDisk(const StorageInMemoryMetadata & metadata) const;
 
-    /// Throws unless every replica keeps exported parts apart from the others when it assigns merges.
+    /// Throws unless every replica exports only the blocks that a task claims and applies the delete gate.
     virtual void checkReplicasSupportExportTTL() const {}
 
 public:
@@ -1818,14 +1830,14 @@ public:
     /// The export index of the `EXPORT` TTL, nullptr if the table has none.
     virtual IExportTTLIndex * getExportTTLIndex() const = 0;
 
-    /// The export states of parts as last seen, without reading Keeper. May be older than the
-    /// index, which only makes the delete gate hold more parts.
-    ExportFencePtr getLatestExportFence() const;
+    /// The exported blocks as last seen, without reading Keeper. May be older than the index, which
+    /// only makes the delete gate hold more parts.
+    ExportedBlocksPtr getLatestExportedBlocks() const;
 
     /// For `system.ttl_exports`, empty if the table has no `EXPORT` TTL scheduler.
     std::vector<ExportTTLPartitionInfo> getExportTTLInfo() const;
 
-    /// The status of an export task of the table, as the `EXPORT` TTL resolves the claim of the task.
+    /// The status of an export task of the table, as the `EXPORT` TTL resolves the current task of a partition.
     enum class ExportTaskStatus : uint8_t
     {
         PENDING,
@@ -1834,15 +1846,21 @@ public:
         KILLED,
     };
 
-    /// Nullopt if there is no such task, e.g. after a crash between claiming its parts and creating it.
-    virtual std::optional<ExportTaskStatus> getExportTaskStatus(const String & transaction_id) const = 0;
+    /// What the `EXPORT` TTL needs to know about an export task of the table.
+    struct ExportTaskState
+    {
+        ExportTaskStatus status = ExportTaskStatus::PENDING;
+        String commit_id;
+        ExportBlockNumberRanges block_ranges;
+    };
 
-    /// As `getExportTaskStatus`, from what this replica knows without reading Keeper: also nullopt for
-    /// a task that it does not know yet.
-    virtual std::optional<ExportTaskStatus> getKnownExportTaskStatus(const String & transaction_id) const = 0;
+    /// Nullopt if there is no such task, e.g. after a crash between making it the current task of its
+    /// partition and creating it.
+    virtual std::optional<ExportTaskState> getExportTask(const String & transaction_id) const = 0;
 
-    /// Whether the part is a source of an assigned merge that changes its block range.
-    virtual bool isPartBeingMerged(const MergeTreePartInfo & part_info) const = 0;
+    /// As `getExportTask`, from what this replica knows without reading Keeper: also nullopt for a task
+    /// that it does not know yet.
+    virtual std::optional<ExportTaskState> getKnownExportTask(const String & transaction_id) const = 0;
 
 protected:
     /// Created by the engines that support `TTL ... EXPORT`.

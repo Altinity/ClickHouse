@@ -51,7 +51,7 @@ function run_export_ttl_test()
         CREATE TABLE $mt_table (id UInt64, year UInt16, t DateTime) ENGINE = $source_engine
         PARTITION BY year ORDER BY id
         TTL t + INTERVAL 1 DAY EXPORT TO TABLE $s3_table
-        SETTINGS ttl_export_check_period_seconds = 1"
+        SETTINGS ttl_export_check_period_seconds = 1, enable_block_number_column = 1"
 
     # Paused, so both parts of 2020 are exported in one group, and not merged before.
     ${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MOVES $mt_table"
@@ -73,11 +73,13 @@ function run_export_ttl_test()
     echo "Partition 2021 is not due"
     ${CLICKHOUSE_CLIENT} --query "SELECT eligible_parts, exported_parts FROM system.ttl_exports WHERE database = currentDatabase() AND table = '$mt_table' AND partition_id = '2021'"
 
-    echo "Parts in different export states are not merged"
+    echo "Parts in different export states merge, and the merged part is not exported"
     ${CLICKHOUSE_CLIENT} --query "INSERT INTO $mt_table VALUES (5, 2020, now())"
     ${CLICKHOUSE_CLIENT} --query "SYSTEM START MERGES $mt_table"
-    ${CLICKHOUSE_CLIENT} --query "OPTIMIZE TABLE $mt_table PARTITION ID '2020' FINAL SETTINGS optimize_throw_if_noop = 1" 2>&1 | grep -q "different export states" && echo "refused"
+    ${CLICKHOUSE_CLIENT} --query "OPTIMIZE TABLE $mt_table PARTITION ID '2020' FINAL SETTINGS optimize_throw_if_noop = 1"
     ${CLICKHOUSE_CLIENT} --query "SYSTEM STOP MERGES $mt_table"
+    ${CLICKHOUSE_CLIENT} --query "SELECT count() FROM system.parts WHERE database = currentDatabase() AND table = '$mt_table' AND partition_id = '2020' AND active"
+    ${CLICKHOUSE_CLIENT} --query "SELECT exported_parts FROM system.ttl_exports WHERE database = currentDatabase() AND table = '$mt_table' AND partition_id = '2020'"
 
     echo "A part that becomes due later is exported on its own"
     ${CLICKHOUSE_CLIENT} --query "INSERT INTO $mt_table VALUES (6, 2020, now() - INTERVAL 10 DAY)"

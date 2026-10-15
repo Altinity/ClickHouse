@@ -1,6 +1,8 @@
 #include <Storages/MergeTree/MergeTreeExportTaskScheduler.h>
 #include <Storages/StorageMergeTree.h>
 #include <Storages/MergeTree/ExportTaskUtils.h>
+#include <Storages/MergeTree/ExportTTLIndex.h>
+#include <Storages/MergeTree/IExportTTLIndex.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/CancellationCode.h>
@@ -386,7 +388,8 @@ void MergeTreeExportTaskScheduler::scheduleOnePart(const String & transaction_id
             [this, transaction_id, part_name](MergeTreePartExportManifest::CompletionCallbackResult result)
             {
                 handlePartCompletion(transaction_id, part_name, result);
-            });
+            },
+            descriptor_copy.block_ranges);
 
         /// killExportPart can only cancel a task that is already registered in `export_manifests`.
         /// A KILL that ran between the status check above and this registration therefore found
@@ -601,6 +604,9 @@ void MergeTreeExportTaskScheduler::tryCommit(const String & transaction_id)
                 context);
         }
 
+        if (descriptor_copy.source == ExportTaskSource::ttl)
+            recordExportedBlocks(descriptor_copy);
+
         success = true;
     }
     catch (const Exception & e)
@@ -665,6 +671,47 @@ void MergeTreeExportTaskScheduler::tryCommit(const String & transaction_id)
         entry.setDescriptor(std::move(updated));
         wakeUpExportTTLIfFinished(entry);
     }
+}
+
+Int64 MergeTreeExportTaskScheduler::maxBlockOfTasks() const
+{
+    std::lock_guard lock(mutex);
+    Int64 result = 0;
+    for (const auto & [_, entry] : tasks)
+        for (const auto & [min_block, max_block] : entry.getDescriptor().block_ranges)
+            result = std::max(result, max_block);
+    return result;
+}
+
+void MergeTreeExportTaskScheduler::recordExportedBlocks(const MergeTreeExportTask & descriptor)
+{
+    auto * index = storage.getExportTTLIndex();
+    if (!index)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Export task {} of the EXPORT TTL committed, but the table has no export index",
+            descriptor.transaction_id);
+
+    const auto destination_key = ExportTTLUtils::destinationKey(descriptor.destination_database, descriptor.destination_table);
+    const auto partition_id = ExportTaskUtils::getPartitionIdOfParts(descriptor.partNames(), storage.format_version);
+    const auto ranges = ExportTTLUtils::toPartInfos(partition_id, descriptor.block_ranges);
+
+    /// The scheduler of the `EXPORT` TTL changes the entry too, e.g. when it retries a task.
+    static constexpr size_t max_attempts = 10;
+    for (size_t attempt = 0; attempt < max_attempts; ++attempt)
+    {
+        const auto snapshot = index->getSnapshot();
+        ExportTTLVersionedEntry versioned;
+        versioned.entry.partition_id = partition_id;
+        if (const auto destination_it = snapshot->entries.find(destination_key); destination_it != snapshot->entries.end())
+            if (const auto it = destination_it->second.find(partition_id); it != destination_it->second.end())
+                versioned = it->second;
+
+        versioned.entry.commitClaim(descriptor.transaction_id, ranges);
+        if (index->updateEntry(destination_key, versioned))
+            return;
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "The export index of partition {} kept changing while export task {} committed",
+        partition_id, descriptor.transaction_id);
 }
 
 void MergeTreeExportTaskScheduler::persist(const String & transaction_id, const String & descriptor_json)

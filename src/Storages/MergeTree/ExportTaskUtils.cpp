@@ -591,7 +591,7 @@ namespace
         const auto destination_key = ExportTTLUtils::destinationKey(manifest.destination_database, manifest.destination_table);
 
         /// The index entry of a TTL task is stored with a check of its version, because the TTL
-        /// scheduler may change it meanwhile, e.g. when it resolves another claim of the partition.
+        /// scheduler may change it meanwhile, e.g. when it retries the task.
         static constexpr size_t max_attempts = 10;
         for (size_t attempt = 0; attempt < max_attempts; ++attempt)
         {
@@ -605,7 +605,7 @@ namespace
                 if (versioned.version < 0)
                     export_ttl_index.ensureDestination(zk, destination_key, fmt::format("{}.{}", manifest.destination_database, manifest.destination_table));
 
-                versioned.entry.commitClaim(manifest.commit_id, ExportTTLUtils::rangesOfParts(manifest.parts, source_storage.format_version));
+                versioned.entry.commitClaim(manifest.transaction_id, ExportTTLUtils::toPartInfos(partition_id, manifest.block_ranges));
                 export_ttl_index.appendUpdateEntryOps(ops, destination_key, versioned.entry, versioned.version);
             }
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Storages/MergeTree/ExportFence.h>
+#include <Storages/MergeTree/ExportedBlocks.h>
 #include <Storages/MergeTree/ExportTTLIndex.h>
 #include <base/types.h>
 

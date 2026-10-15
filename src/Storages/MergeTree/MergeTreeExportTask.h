@@ -10,6 +10,7 @@
 #include <Poco/JSON/Parser.h>
 #include <Storages/ExportCommitInfoEntry.h>
 #include <Storages/ExportTaskSource.h>
+#include <Storages/MergeTree/ExportBlockNumberRanges.h>
 #include <Storages/MergeTree/MergeTreePartExportManifest.h>
 
 namespace DB
@@ -66,6 +67,9 @@ struct MergeTreeExportTask
 
     /// Work + progress
     std::vector<PartProgress> parts;
+    /// The blocks whose rows the task exports from its parts, for a task of the `EXPORT` TTL. Empty
+    /// for `EXPORT PARTITION`, which exports every row of its parts.
+    ExportBlockNumberRanges block_ranges;
     Status status = Status::PENDING;
     LastException last_exception;
 
@@ -172,6 +176,8 @@ struct MergeTreeExportTask
             parts_array->add(part_object);
         }
         json.set("parts", parts_array);
+        if (!block_ranges.empty())
+            json.set("block_ranges", exportBlockNumberRangesToJSON(block_ranges));
 
         Poco::JSON::Object::Ptr exception_object = new Poco::JSON::Object();
         exception_object->set("message", last_exception.message);
@@ -262,6 +268,9 @@ struct MergeTreeExportTask
                 part.paths_in_destination.push_back(paths_array->getElement<String>(static_cast<unsigned int>(j)));
             task.parts.push_back(std::move(part));
         }
+
+        if (json->has("block_ranges"))
+            task.block_ranges = exportBlockNumberRangesFromJSON(json->getArray("block_ranges"));
 
         if (json->has("last_exception"))
         {

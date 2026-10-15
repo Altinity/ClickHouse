@@ -33,80 +33,103 @@ TEST(ExportTTLIndex, ClaimThenCommit)
     ExportTTLIndexEntry entry;
     entry.partition_id = "p";
 
-    entry.startClaim("t1", "t1", {part(1, 1), part(2, 2), part(4, 4)});
-    ASSERT_TRUE(entry.claim);
-    EXPECT_EQ(entry.claim->commit_id, "t1");
-    EXPECT_EQ(entry.claim->transaction_id, "t1");
-    EXPECT_EQ(blocks(entry.claim->ranges), (Blocks{{1, 2}, {4, 4}}));
-    EXPECT_EQ(blocks(entry.toFenceEntry("db.t").claimed), (Blocks{{1, 2}, {4, 4}}));
-    EXPECT_EQ(entry.classify(part(1, 2, 1)), PartExportState::CLAIMED);
-    EXPECT_EQ(entry.classify(part(3, 3)), PartExportState::NONE);
+    entry.startClaim("t1");
+    EXPECT_EQ(entry.current_task, "t1");
+    EXPECT_FALSE(entry.empty());
 
-    entry.commitClaim("t1", {});
-    EXPECT_FALSE(entry.claim);
+    /// The ranges of the current task live in the task.
+    const std::vector<MergeTreePartInfo> task_ranges{part(1, 2), part(4, 4)};
+    EXPECT_EQ(entry.classify(part(1, 2, 1), task_ranges), PartExportState::CLAIMED);
+    /// A part merged with a claimed part is in flight too: the task exports its claimed rows.
+    EXPECT_EQ(entry.classify(part(1, 3, 1), task_ranges), PartExportState::CLAIMED);
+    EXPECT_EQ(entry.classify(part(3, 3), task_ranges), PartExportState::NONE);
+
+    /// The commit adds only the task's ranges, not those of the parts that hold them.
+    entry.commitClaim("t1", task_ranges);
+    EXPECT_TRUE(entry.current_task.empty());
     EXPECT_EQ(blocks(entry.exported), (Blocks{{1, 2}, {4, 4}}));
     /// A mutated exported part keeps its block range.
-    EXPECT_EQ(entry.classify(part(4, 4, 0, 7)), PartExportState::EXPORTED);
-    EXPECT_EQ(entry.classify(part(3, 3)), PartExportState::NONE);
+    EXPECT_EQ(entry.classify(part(4, 4, 0, 7), {}), PartExportState::EXPORTED);
+    EXPECT_EQ(entry.classify(part(3, 3), {}), PartExportState::NONE);
+    /// A part merged from exported and other blocks is not exported.
+    EXPECT_EQ(entry.classify(part(1, 4, 2), {}), PartExportState::NONE);
+    EXPECT_EQ(blocks(entry.notExported(part(1, 6, 2))), (Blocks{{3, 3}, {5, 6}}));
     EXPECT_EQ(entry.maxBlock(), 4);
 }
 
-TEST(ExportTTLIndex, RetryKeepsTheCommitIdAndRanges)
+TEST(ExportTTLIndex, RetryMovesThePointer)
 {
     ExportTTLIndexEntry entry;
     entry.partition_id = "p";
-    entry.startClaim("t1", "t1", {part(1, 1), part(2, 2)});
+    entry.startClaim("t1");
 
     entry.retryClaim("t2");
-    ASSERT_TRUE(entry.claim);
-    EXPECT_EQ(entry.claim->commit_id, "t1");
-    EXPECT_EQ(entry.claim->transaction_id, "t2");
-    EXPECT_EQ(blocks(entry.claim->ranges), (Blocks{{1, 2}}));
+    EXPECT_EQ(entry.current_task, "t2");
 
-    /// The claim is committed under its commit id, whichever task commits it.
-    entry.commitClaim("t2", {});
-    ASSERT_TRUE(entry.claim);
-    entry.commitClaim("t1", {});
-    EXPECT_FALSE(entry.claim);
+    /// The failed task commits after all, e.g. its commit to the destination was only discovered
+    /// later: its ranges are exported, and the retry stays the current task until it settles.
+    entry.commitClaim("t1", {part(1, 2)});
+    EXPECT_EQ(entry.current_task, "t2");
+    EXPECT_EQ(blocks(entry.exported), (Blocks{{1, 2}}));
+
+    entry.commitClaim("t2", {part(1, 2)});
+    EXPECT_TRUE(entry.current_task.empty());
     EXPECT_EQ(blocks(entry.exported), (Blocks{{1, 2}}));
 }
 
-/// A second claim is a `LOGICAL_ERROR`, which aborts debug and sanitizer builds instead of throwing.
-#ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(ExportTTLIndex, OneClaimAtATime)
+TEST(ExportTTLIndex, ReleaseExportsNothing)
 {
     ExportTTLIndexEntry entry;
     entry.partition_id = "p";
-    entry.startClaim("t1", "t1", {part(1, 1)});
+    entry.exported = {part(1, 2)};
+    entry.startClaim("t1");
 
-    EXPECT_THROW(entry.startClaim("t2", "t2", {part(2, 2)}), Exception);
-    EXPECT_EQ(entry.claim->transaction_id, "t1");
-    EXPECT_EQ(blocks(entry.claim->ranges), (Blocks{{1, 1}}));
+    entry.releaseClaim();
+    EXPECT_TRUE(entry.current_task.empty());
+    EXPECT_EQ(blocks(entry.exported), (Blocks{{1, 2}}));
+
+    /// A new task can start once the partition has none.
+    entry.startClaim("t2");
+    EXPECT_EQ(entry.current_task, "t2");
+}
+
+/// Starting a second task or retrying without one is a `LOGICAL_ERROR`, which aborts debug and
+/// sanitizer builds instead of throwing.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(ExportTTLIndex, OneTaskAtATime)
+{
+    ExportTTLIndexEntry entry;
+    entry.partition_id = "p";
+    EXPECT_THROW(entry.retryClaim("t1"), Exception);
+
+    entry.startClaim("t1");
+    EXPECT_THROW(entry.startClaim("t2"), Exception);
+    EXPECT_EQ(entry.current_task, "t1");
 }
 #else
-TEST(ExportTTLIndexDeathTest, OneClaimAtATime)
+TEST(ExportTTLIndexDeathTest, OneTaskAtATime)
 {
     ExportTTLIndexEntry entry;
     entry.partition_id = "p";
-    entry.startClaim("t1", "t1", {part(1, 1)});
+    EXPECT_DEATH(entry.retryClaim("t1"), "cannot retry the task of partition p");
 
-    EXPECT_DEATH(entry.startClaim("t2", "t2", {part(2, 2)}), "cannot claim parts of partition p");
+    entry.startClaim("t1");
+    EXPECT_DEATH(entry.startClaim("t2"), "cannot start for partition p");
 }
 #endif
 
-TEST(ExportTTLIndex, CommitAddsPartsWhoseClaimWasLost)
+TEST(ExportTTLIndex, CommitOfAnotherTaskKeepsThePointer)
 {
     ExportTTLIndexEntry entry;
     entry.partition_id = "p";
     entry.commitClaim("t1", {part(3, 5)});
     EXPECT_EQ(blocks(entry.exported), (Blocks{{3, 5}}));
+    EXPECT_TRUE(entry.current_task.empty());
 
-    /// The claim of another task is kept.
-    entry.startClaim("t2", "t2", {part(7, 7)});
+    entry.startClaim("t2");
     entry.commitClaim("t1", {part(6, 6)});
     EXPECT_EQ(blocks(entry.exported), (Blocks{{3, 6}}));
-    ASSERT_TRUE(entry.claim);
-    EXPECT_EQ(entry.claim->transaction_id, "t2");
+    EXPECT_EQ(entry.current_task, "t2");
 }
 
 TEST(ExportTTLIndex, JsonRoundTrip)
@@ -117,21 +140,13 @@ TEST(ExportTTLIndex, JsonRoundTrip)
 
     auto parsed = ExportTTLIndexEntry::fromJSONString("p", entry.toJSONString());
     EXPECT_EQ(blocks(parsed.exported), (Blocks{{0, 10}, {20, 30}}));
-    EXPECT_FALSE(parsed.claim);
+    EXPECT_TRUE(parsed.current_task.empty());
 
-    entry.startClaim("c1", "t1", {part(31, 31)});
+    entry.startClaim("t1");
     parsed = ExportTTLIndexEntry::fromJSONString("p", entry.toJSONString());
     EXPECT_EQ(parsed.partition_id, "p");
     EXPECT_EQ(blocks(parsed.exported), (Blocks{{0, 10}, {20, 30}}));
-    ASSERT_TRUE(parsed.claim);
-    EXPECT_EQ(parsed.claim->commit_id, "c1");
-    EXPECT_EQ(parsed.claim->transaction_id, "t1");
-    EXPECT_EQ(blocks(parsed.claim->ranges), (Blocks{{31, 31}}));
-
-    /// A claim stored before commit ids existed is committed under its transaction id.
-    parsed = ExportTTLIndexEntry::fromJSONString("p", R"({"exported":[],"claim":{"transaction_id":"t1","ranges":[[31,31]]}})");
-    ASSERT_TRUE(parsed.claim);
-    EXPECT_EQ(parsed.claim->commit_id, "t1");
+    EXPECT_EQ(parsed.current_task, "t1");
 
     EXPECT_TRUE(ExportTTLIndexEntry::fromJSONString("p", "").empty());
     EXPECT_ANY_THROW(ExportTTLIndexEntry::fromJSONString("p", R"({"exported":[[1]]})"));
@@ -142,10 +157,14 @@ TEST(ExportTTLIndex, DestinationKeysOfDottedNamesDiffer)
     EXPECT_NE(ExportTTLUtils::destinationKey("db.x", "y"), ExportTTLUtils::destinationKey("db", "x.y"));
 }
 
-TEST(ExportTTLIndex, RangesOfParts)
+TEST(ExportTTLIndex, BlockRangesOfTasks)
 {
-    const auto ranges = ExportTTLUtils::rangesOfParts({"p_3_3_0", "p_1_2_1", "p_5_5_0_9"}, MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING);
+    const auto ranges = ExportTTLUtils::toPartInfos("p", {{5, 5}, {1, 2}, {3, 3}});
     EXPECT_EQ(blocks(ranges), (Blocks{{1, 3}, {5, 5}}));
+    EXPECT_EQ(ranges.front().getPartitionId(), "p");
+    EXPECT_EQ(ExportTTLUtils::toBlockNumberRanges(ranges), (ExportBlockNumberRanges{{1, 3}, {5, 5}}));
+
+    EXPECT_EQ(exportBlockNumberRangesFromJSON(exportBlockNumberRangesToJSON({{1, 3}, {5, 5}})), (ExportBlockNumberRanges{{1, 3}, {5, 5}}));
 }
 
 TEST(ExportTTLIndex, EligibleOnceTheMaximumIsDue)

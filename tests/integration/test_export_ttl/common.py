@@ -15,9 +15,11 @@ COLUMNS = "id Int64, year Int32, t DateTime"
 DUE = "now() - INTERVAL 10 DAY"
 NOT_DUE = "now()"
 
-# A group is shipped on the first check after its parts are due.
+# A group is shipped on the first check after its parts are due. The `EXPORT` TTL requires
+# `enable_block_number_column`.
 FAST_TTL_SETTINGS = {
     "ttl_export_check_period_seconds": 1,
+    "enable_block_number_column": 1,
 }
 
 PAUSE_EXPORT_FAILPOINT = "export_part_pause_before_schema_validation"
@@ -315,24 +317,9 @@ def merged_parts(node, table):
     ).split())
 
 
-def assert_never_merged(node, table, part_names, seconds=5):
-    """Give merges *seconds* to happen, asking for them every second, and check that none of
-    *part_names* was merged."""
-    start = time.time()
-    while time.time() - start < seconds:
-        node.query(f"OPTIMIZE TABLE {table}")
-        time.sleep(1)
-    active = active_parts(node, table)
-    missing = [name for name in part_names if name not in active]
-    assert not missing, f"Parts {missing} are no longer active on {node.name}; active parts: {active}"
-    merged = set(part_names) & merged_parts(node, table)
-    assert not merged, f"Parts {sorted(merged)} were merged on {node.name}"
-
-
-def optimize_final_error(node, table, partition_id):
-    return node.query_and_get_error(
-        f"OPTIMIZE TABLE {table} PARTITION ID '{partition_id}' FINAL", settings={"optimize_throw_if_noop": 1}
-    )
+def optimize_partition(node, table, partition_id):
+    """Merges every part of the partition into one."""
+    node.query(f"OPTIMIZE TABLE {table} PARTITION ID '{partition_id}' FINAL", settings={"optimize_throw_if_noop": 1})
 
 
 @contextlib.contextmanager

@@ -48,54 +48,54 @@ ENGINE = S3(s3_conn, filename = 'export_ttl_pkey_check_hundreds/{_partition_id}/
 SELECT 'structural';
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_year;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_year SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY toYYYYMM(t) ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_month;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_month SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY (region, toYYYYMM(t)) ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_region;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_region SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY (a, b) ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_ba;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_ba SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_year_mod;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_year_mod SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_hash;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_hash SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY toString(year) ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_year;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_year SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
 SELECT 'dynamic';
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY toYYYYMM(t) ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_to_year;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_to_year SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY toYYYYMM(d) ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_d;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_d SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY intDiv(id, 1000) ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_hundreds;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_hundreds SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
@@ -103,32 +103,32 @@ SELECT 'refused';
 
 -- `id` is not in the source partition key.
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_id; -- { serverError BAD_ARGUMENTS }
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_id SETTINGS enable_block_number_column = 1; -- { serverError BAD_ARGUMENTS }
 
 -- `toDayOfWeek` is not monotonic.
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY toYYYYMM(t) ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_day_of_week; -- { serverError BAD_ARGUMENTS }
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_day_of_week SETTINGS enable_block_number_column = 1; -- { serverError BAD_ARGUMENTS }
 
 -- A source without a partition key into a partitioned destination.
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_year; -- { serverError BAD_ARGUMENTS }
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_year SETTINGS enable_block_number_column = 1; -- { serverError BAD_ARGUMENTS }
 
 -- A `Nullable` column that has to be checked per group: a NULL forms its own destination partition.
 CREATE TABLE dst_nullable (id UInt64, k Nullable(UInt32), t DateTime)
 ENGINE = S3(s3_conn, filename = 'export_ttl_pkey_check_nullable/{_partition_id}/{_file}.parquet', format = Parquet, partition_strategy = 'wildcard') PARTITION BY intDiv(k, 10);
 CREATE TABLE src (id UInt64, k Nullable(UInt32), t DateTime) ENGINE = MergeTree PARTITION BY intDiv(k, 100) ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_nullable SETTINGS allow_nullable_key = 1; -- { serverError BAD_ARGUMENTS }
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_nullable SETTINGS allow_nullable_key = 1, enable_block_number_column = 1; -- { serverError BAD_ARGUMENTS }
 
 -- The same destination is a function of a `Nullable` source key, which holds for every group.
 CREATE TABLE src (id UInt64, k Nullable(UInt32), t DateTime) ENGINE = MergeTree PARTITION BY k ORDER BY id
-TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_nullable SETTINGS allow_nullable_key = 1;
+TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_nullable SETTINGS allow_nullable_key = 1, enable_block_number_column = 1;
 SELECT extract(create_table_query, 'EXPORT TO TABLE (\\w+)') FROM system.tables WHERE database = currentDatabase() AND name = 'src';
 DROP TABLE src;
 
 SELECT 'alter';
 
 CREATE TABLE src (id UInt64, year UInt16, region String, a UInt8, b UInt8, t DateTime, d Date) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL t + INTERVAL 30 DAY DELETE;
+TTL t + INTERVAL 30 DAY DELETE SETTINGS enable_block_number_column = 1;
 ALTER TABLE src MODIFY TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_id; -- { serverError BAD_ARGUMENTS }
 ALTER TABLE src MODIFY TTL t + INTERVAL 1 DAY EXPORT TO TABLE dst_day_of_week; -- { serverError BAD_ARGUMENTS }
 SELECT extract(create_table_query, 'TTL .*? SETTINGS') FROM system.tables WHERE database = currentDatabase() AND name = 'src';

@@ -8,6 +8,7 @@
 #include <Poco/JSON/Parser.h>
 #include <Storages/ExportCommitInfoEntry.h>
 #include <Storages/ExportTaskSource.h>
+#include <Storages/MergeTree/ExportBlockNumberRanges.h>
 #include <Storages/MergeTree/MergeTreePartExportManifest.h>
 #include <optional>
 
@@ -173,6 +174,9 @@ struct ExportReplicatedMergeTreeTaskManifest
     String source_replica;
     size_t number_of_parts;
     std::vector<String> parts;
+    /// The blocks whose rows the task exports from its parts, for a task of the `EXPORT` TTL. Empty
+    /// for `EXPORT PARTITION`, which exports every row of its parts.
+    ExportBlockNumberRanges block_ranges;
     time_t create_time;
     size_t retry_initial_backoff_seconds = 5;
     size_t retry_max_backoff_seconds = 300;
@@ -222,6 +226,8 @@ struct ExportReplicatedMergeTreeTaskManifest
         for (const auto & part : parts)
             parts_array->add(part);
         json.set("parts", parts_array);
+        if (!block_ranges.empty())
+            json.set("block_ranges", exportBlockNumberRangesToJSON(block_ranges));
         json.set("parallel_formatting", parallel_formatting);
         json.set("max_threads", max_threads);
         json.set("parquet_parallel_encoding", parquet_parallel_encoding);
@@ -296,7 +302,10 @@ struct ExportReplicatedMergeTreeTaskManifest
         auto parts_array = json->getArray("parts");
         for (size_t i = 0; i < parts_array->size(); ++i)
             manifest.parts.push_back(parts_array->getElement<String>(static_cast<unsigned int>(i)));
-        
+
+        if (json->has("block_ranges"))
+            manifest.block_ranges = exportBlockNumberRangesFromJSON(json->getArray("block_ranges"));
+
         manifest.create_time = json->getValue<time_t>("create_time");
         manifest.task_timeout_seconds = json->getValue<size_t>("task_timeout_seconds");
         manifest.max_threads = json->getValue<size_t>("max_threads");

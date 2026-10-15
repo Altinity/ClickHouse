@@ -4,6 +4,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeQueue.h>
 #include <Storages/MergeTree/Compaction/PartProperties.h>
 #include <Storages/MergeTree/ExportTTLDeleteGate.h>
+#include <Storages/MergeTree/ExportedBlocks.h>
 
 namespace DB
 {
@@ -26,8 +27,8 @@ protected:
     /// Quorum state taken at some later time than prev_virtual_parts.
     const String * inprogress_quorum_part_ptr = nullptr;
 
-    ExportFencePtr export_fence;
-    /// Loaded with the export fence, so only merge assignment holds parts back.
+    /// This replica's copy of the exported blocks: an older one only makes the delete gate hold more parts.
+    ExportedBlocksPtr exported_blocks;
     ExportTTLDeleteGate delete_gate;
 };
 
@@ -64,15 +65,6 @@ public:
     /// The version of "log" node that is used to check that no new merges have appeared.
     int32_t getVersion() const { return merges_version; }
 
-    /// Makes `canMergeParts` refuse to merge parts in different export states, and `canUsePartInMerges`
-    /// refuse parts held by the delete gate of the `EXPORT` TTL. Required before assigning a merge;
-    /// other users of the predicate do not merge parts and skip the Keeper reads.
-    void loadExportFence(zkutil::ZooKeeperPtr & zookeeper);
-
-    /// The version of the "export_ttl/version" node the export states were read at, or -1 if they were
-    /// not loaded. A merge must be assigned with a check of it, so it is not assigned from stale export states.
-    int32_t getExportIndexVersion() const { return export_index_version; }
-
     /// Returns true if there's a drop range covering new_drop_range_info
     bool isGoingToBeDropped(const MergeTreePartInfo & new_drop_range_info, MergeTreePartInfo * out_drop_range_info = nullptr) const;
 
@@ -86,7 +78,6 @@ private:
     std::shared_ptr<String> inprogress_quorum_part;
 
     int32_t merges_version = -1;
-    int32_t export_index_version = -1;
 };
 
 using ReplicatedMergeTreeMergePredicatePtr = std::shared_ptr<const ReplicatedMergeTreeBaseMergePredicate>;

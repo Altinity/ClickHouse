@@ -14,9 +14,9 @@ from .common import (
 
 CLUSTER_INSTANCES = ["replica1"]
 
-# Without the server setting `allow_experimental_export_merge_tree_partition` a table has neither the
-# export index nor the merge fence, so merges could mix exported parts with the others, whose rows
-# would then never be exported. A table with an `EXPORT` TTL is therefore not loaded without it.
+# Without the server setting `allow_experimental_export_merge_tree_partition` a table has no export
+# index, so the delete gate could not tell which parts are exported, and the `DELETE` TTL could delete
+# rows that were never exported. A table with an `EXPORT` TTL is therefore not loaded without it.
 
 SETTING_CONFIG = "/etc/clickhouse-server/config.d/allow_experimental_export_partition.xml"
 

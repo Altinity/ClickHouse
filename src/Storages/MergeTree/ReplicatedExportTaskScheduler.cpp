@@ -237,7 +237,8 @@ std::optional<time_t> ReplicatedExportTaskScheduler::run()
                     (MergeTreePartExportManifest::CompletionCallbackResult result)
                     {
                         handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
-                    });
+                    },
+                    manifest.block_ranges);
 
                 scheduled_exports_count++;
             }

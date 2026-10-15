@@ -1,8 +1,15 @@
 #include <mutex>
 #include <Storages/MergeTree/ExportPartTask.h>
 #include <Storages/MergeTree/ExportTaskUtils.h>
+#include <Storages/MergeTree/ExportTTLIndex.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreeVirtualColumns.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Functions/FunctionFactory.h>
+#include <Processors/QueryPlan/FilterStep.h>
+#include <Common/SipHash.h>
+#include <base/hex.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/inplaceBlockConversions.h>
 #include <Core/Settings.h>
@@ -183,6 +190,52 @@ namespace
         plan_for_part.addStep(std::move(expression_step));
     }
 
+    /// Keeps the rows of the blocks in `ranges` and removes the `_block_number` column they are told by.
+    void addBlockNumberFilter(QueryPlan & plan_for_part, const ExportBlockNumberRanges & ranges, const ContextPtr & local_context)
+    {
+        const auto header = plan_for_part.getCurrentHeader();
+        ActionsDAG dag(header->getColumnsWithTypeAndName());
+        const auto & block_number = dag.findInOutputs(BlockNumberColumn::name);
+
+        const auto type = std::make_shared<DataTypeUInt64>();
+        const auto constant = [&](Int64 value) -> const ActionsDAG::Node &
+        {
+            return dag.addColumn(type->createColumnConst(1, static_cast<UInt64>(value)), type, toString(value));
+        };
+
+        auto & factory = FunctionFactory::instance();
+        ActionsDAG::NodeRawConstPtrs conditions;
+        for (const auto & [min_block, max_block] : ranges)
+        {
+            const auto & at_least = dag.addFunction(factory.get("greaterOrEquals", local_context), {&block_number, &constant(min_block)}, {});
+            const auto & at_most = dag.addFunction(factory.get("lessOrEquals", local_context), {&block_number, &constant(max_block)}, {});
+            conditions.push_back(&dag.addFunction(factory.get("and", local_context), {&at_least, &at_most}, {}));
+        }
+
+        const auto * filter = conditions.front();
+        if (conditions.size() > 1)
+            filter = &dag.addFunction(factory.get("or", local_context), std::move(conditions), {});
+
+        auto & outputs = dag.getOutputs();
+        std::erase_if(outputs, [](const ActionsDAG::Node * node) { return node->result_name == BlockNumberColumn::name; });
+        outputs.push_back(filter);
+
+        auto filter_step = std::make_unique<FilterStep>(header, std::move(dag), filter->result_name, /* remove_filter_column */ true);
+        filter_step->setStepDescription("Keep the rows of the blocks that the export task exports");
+        plan_for_part.addStep(std::move(filter_step));
+    }
+
+    String getBlockRangesHash(const ExportBlockNumberRanges & ranges)
+    {
+        SipHash hash;
+        for (const auto & [min_block, max_block] : ranges)
+        {
+            hash.update(min_block);
+            hash.update(max_block);
+        }
+        return getHexUIntLowercase(hash.get64());
+    }
+
     String buildDestinationFilename(
         const MergeTreePartExportManifest & manifest,
         const StorageID & storage_id,
@@ -232,7 +285,19 @@ bool ExportPartTask::executeStep()
     const auto & metadata_snapshot = manifest.metadata_snapshot;
 
     /// Read only physical columns from the part
-    const auto columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
+    auto columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
+
+    /// A task of the `EXPORT` TTL exports the rows of some blocks only. Unless the part holds no other
+    /// rows, e.g. because it was merged with exported parts, they are told apart by `_block_number`,
+    /// which merges keep.
+    bool filter_by_block_number = false;
+    if (!manifest.block_ranges.empty())
+    {
+        const auto ranges = ExportTTLUtils::toPartInfos(manifest.data_part->info.getPartitionId(), manifest.block_ranges);
+        filter_by_block_number = !ExportBlockRanges::isCoveredByUnion(manifest.data_part->info, ranges);
+        if (filter_by_block_number)
+            columns_to_read.push_back(BlockNumberColumn::name);
+    }
 
     MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Export;
 
@@ -309,7 +374,11 @@ bool ExportPartTask::executeStep()
                 "Failpoint: export_part_retryable_throw");
         });
 
-        const auto filename = buildDestinationFilename(manifest, storage.getStorageID(), local_context);
+        auto filename = buildDestinationFilename(manifest, storage.getStorageID(), local_context);
+        /// A filtered export of a part holds other rows than an export of all of them, so the files that
+        /// one left are never taken for the result of the other.
+        if (filter_by_block_number)
+            filename += "_" + getBlockRangesHash(manifest.block_ranges);
 
         FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
 
@@ -383,6 +452,9 @@ bool ExportPartTask::executeStep()
                 prefetch,
                 local_context,
                 getLogger("ExportPartition"));
+
+            if (filter_by_block_number)
+                addBlockNumberFilter(plan_for_part, manifest.block_ranges, local_context);
 
             /// We need to support exporting materialized and alias columns to object storage. For some reason, object storage engines don't support them.
             /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns

@@ -7,7 +7,7 @@
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeCleanupThread.h>
 #include <Storages/MergeTree/MergeTreeExportTaskScheduler.h>
-#include <Storages/MergeTree/ExportFence.h>
+#include <Storages/MergeTree/ExportedBlocks.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
@@ -143,12 +143,11 @@ public:
     /// Nullptr if partition export is disabled.
     IExportTTLIndex * getExportTTLIndex() const override;
 
-    std::optional<ExportTaskStatus> getExportTaskStatus(const String & transaction_id) const override;
-    std::optional<ExportTaskStatus> getKnownExportTaskStatus(const String & transaction_id) const override
+    std::optional<ExportTaskState> getExportTask(const String & transaction_id) const override;
+    std::optional<ExportTaskState> getKnownExportTask(const String & transaction_id) const override
     {
-        return getExportTaskStatus(transaction_id);
+        return getExportTask(transaction_id);
     }
-    bool isPartBeingMerged(const MergeTreePartInfo & part_info) const override;
 
 private:
     friend class MergeTreeExportTaskScheduler;

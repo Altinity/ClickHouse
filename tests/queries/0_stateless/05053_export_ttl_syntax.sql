@@ -29,23 +29,28 @@ TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_destination; -- { serverErro
 
 SET allow_experimental_export_ttl = 1;
 
+-- Merges keep the block number of every row only with `enable_block_number_column`.
 CREATE TABLE export_ttl_source (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_missing; -- { serverError BAD_TTL_EXPRESSION }
+TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_destination; -- { serverError SUPPORT_IS_DISABLED }
 
 CREATE TABLE export_ttl_source (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_memory; -- { serverError BAD_TTL_EXPRESSION }
+TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_missing SETTINGS enable_block_number_column = 1; -- { serverError BAD_TTL_EXPRESSION }
 
 CREATE TABLE export_ttl_source (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_narrow; -- { serverError NUMBER_OF_COLUMNS_DOESNT_MATCH }
+TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_memory SETTINGS enable_block_number_column = 1; -- { serverError BAD_TTL_EXPRESSION }
 
 CREATE TABLE export_ttl_source (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL id EXPORT TO TABLE export_ttl_destination; -- { serverError BAD_TTL_EXPRESSION }
+TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_narrow SETTINGS enable_block_number_column = 1; -- { serverError NUMBER_OF_COLUMNS_DOESNT_MATCH }
 
 CREATE TABLE export_ttl_source (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_destination, t + INTERVAL 20 YEAR EXPORT TO TABLE export_ttl_destination; -- { serverError BAD_TTL_EXPRESSION }
+TTL id EXPORT TO TABLE export_ttl_destination SETTINGS enable_block_number_column = 1; -- { serverError BAD_TTL_EXPRESSION }
 
 CREATE TABLE export_ttl_source (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree PARTITION BY year ORDER BY id
-TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_destination, t + INTERVAL 20 YEAR DELETE;
+TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_destination, t + INTERVAL 20 YEAR EXPORT TO TABLE export_ttl_destination
+SETTINGS enable_block_number_column = 1; -- { serverError BAD_TTL_EXPRESSION }
+
+CREATE TABLE export_ttl_source (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree PARTITION BY year ORDER BY id
+TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_destination, t + INTERVAL 20 YEAR DELETE SETTINGS enable_block_number_column = 1;
 
 SELECT extract(create_table_query, 'TTL .*? SETTINGS') FROM system.tables WHERE database = currentDatabase() AND name = 'export_ttl_source';
 
@@ -83,19 +88,19 @@ PARTITION BY toDayOfWeek(t);
 
 -- `id` is not in the source partition key.
 CREATE TABLE export_ttl_monthly (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree PARTITION BY toYYYYMM(t) ORDER BY id
-TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_by_id; -- { serverError BAD_ARGUMENTS }
+TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_by_id SETTINGS enable_block_number_column = 1; -- { serverError BAD_ARGUMENTS }
 
 -- `toDayOfWeek` is not monotonic.
 CREATE TABLE export_ttl_monthly (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree PARTITION BY toYYYYMM(t) ORDER BY id
-TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_by_day_of_week; -- { serverError BAD_ARGUMENTS }
+TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_by_day_of_week SETTINGS enable_block_number_column = 1; -- { serverError BAD_ARGUMENTS }
 
 -- An unpartitioned source has no partition key to prove anything from.
 CREATE TABLE export_ttl_monthly (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree ORDER BY id
-TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_destination; -- { serverError BAD_ARGUMENTS }
+TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_destination SETTINGS enable_block_number_column = 1; -- { serverError BAD_ARGUMENTS }
 
 -- A month is within a year, which is proven from the parts when they are exported.
 CREATE TABLE export_ttl_monthly (id UInt64, year UInt16, t DateTime) ENGINE = MergeTree PARTITION BY toYYYYMM(t) ORDER BY id
-TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_by_year;
+TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_by_year SETTINGS enable_block_number_column = 1;
 SELECT extract(create_table_query, 'TTL .*? SETTINGS') FROM system.tables WHERE database = currentDatabase() AND name = 'export_ttl_monthly';
 
 ALTER TABLE export_ttl_monthly MODIFY TTL t + INTERVAL 10 YEAR EXPORT TO TABLE export_ttl_by_id; -- { serverError BAD_ARGUMENTS }

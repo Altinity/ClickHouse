@@ -40,13 +40,14 @@ struct ExportTTLPartitionInfo
 
 /// The background task of a table with a `TTL <expr> EXPORT TO TABLE <destination>` expression.
 ///
-/// Every check ships the eligible parts (the maximum TTL value of their rows is due) of each partition
-/// to the destination as one export task of the table, and never exports a part twice: what was
-/// exported is recorded in the export index (see `ExportTTLIndexEntry`), and the merge fence keeps
-/// parts in different export states from merging. A partition has at most one task in flight, so the
-/// check period is the batch interval. A task that failed without committing keeps its parts claimed,
-/// and a new task retries exactly them under the same commit id, so the destination commits them once
-/// even if the failed task landed after all.
+/// Every check ships the rows of the eligible parts (the maximum TTL value of their rows is due) of each
+/// partition to the destination as one export task of the table, and never exports a block twice: the
+/// exported blocks are recorded in the export index (see `ExportTTLIndexEntry`), and every row keeps
+/// the number of its block through merges, so the task reads only the rows of the blocks it exports.
+/// A partition has at most one task in flight, so the check period is the batch interval. A task that
+/// failed without committing stays the current task of its partition, and a new task retries exactly
+/// its blocks under the same commit id, so the destination commits them once even if the failed task
+/// landed after all.
 ///
 /// Only the replica holding the scheduler lock checks. `system.ttl_exports` is computed when it is
 /// queried, from the copy of the index that the replica keeps (see `IExportTTLIndex::getLatest`) and
@@ -81,9 +82,9 @@ private:
 
     void updatePartsHeldByDeleteGate();
 
-    /// Resolves the claim of the partition unless its task is in flight. A failed task is retried with
-    /// exactly its claimed parts; otherwise every due part of the partition that is not being merged
-    /// is exported.
+    /// Resolves the current task of the partition unless it is in flight. A failed task is retried with
+    /// exactly its blocks; otherwise the blocks of every due part of the partition that are not exported
+    /// are.
     void schedulePartition(
         const String & destination_key,
         const StoragePtr & destination,
@@ -94,7 +95,7 @@ private:
         const ContextPtr & context);
 
     /// Kills the TTL tasks of a destination that is no longer the destination of the TTL, and
-    /// removes its index once none of them holds a claim.
+    /// removes its index once no partition has a current task.
     void cleanupDestination(const String & destination_key, const std::map<String, ExportTTLVersionedEntry> & entries);
 };
 
