@@ -58,10 +58,6 @@ public:
     const DB::Names & getPartitionColumns() const;
     const DB::NameToNameMap & getPhysicalNamesMap() const;
 
-    /// Get the clustering columns from the `delta.clustering` domain metadata.
-    /// Returns an empty list if the table is not liquid-clustered.
-    const DB::Names & getClusteringColumns() const;
-
     DB::ObjectStoragePtr getObjectStorage() const { return object_storage; }
 private:
     class Iterator;

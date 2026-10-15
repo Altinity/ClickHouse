@@ -1078,13 +1078,6 @@ const DB::NameToNameMap & TableSnapshot::getPhysicalNamesMap() const
     return schema->physical_names_map;
 }
 
-const DB::Names & TableSnapshot::getClusteringColumns() const
-{
-    std::lock_guard lock(mutex);
-    initOrUpdateClusteringColumns();
-    return *clustering_columns;
-}
-
 void TableSnapshot::initOrUpdateClusteringColumns() const
 {
     if (clustering_columns.has_value())
