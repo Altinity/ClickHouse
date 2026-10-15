@@ -47,6 +47,7 @@ check_fsck()
 
 ${CLICKHOUSE_CLIENT} --multiquery <<EOF
 DROP TABLE IF EXISTS cas_packed_copy SYNC;
+DROP TABLE IF EXISTS cas_packed_destination SYNC;
 DROP TABLE IF EXISTS cas_packed_local SYNC;
 DROP TABLE IF EXISTS cas_packed_disabled SYNC;
 
@@ -173,6 +174,70 @@ ATTACH TABLE cas_packed_copy;
 SELECT 'copy_after_reload', count(), sum(id) FROM cas_packed_copy;
 EOF
 
+HAS_MIXED_POLICY=$(${CLICKHOUSE_CLIENT} --query "
+    SELECT countDistinct(policy_name)
+    FROM system.storage_policies
+    WHERE policy_name = 'cas_packed_mixed'")
+
+if [ "${HAS_MIXED_POLICY}" = "1" ]; then
+    ${CLICKHOUSE_CLIENT} --multiquery <<EOF
+CREATE TABLE cas_packed_destination (id UInt64, value UInt64)
+ENGINE = MergeTree
+ORDER BY id
+SETTINGS storage_policy = 'cas_packed_mixed',
+    min_bytes_for_full_part_storage = '1G';
+
+INSERT INTO cas_packed_destination VALUES (1, 10), (2, 20);
+
+SELECT 'destination_initial', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+FROM system.parts
+WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active;
+EOF
+
+    DESTINATION_PART=$(${CLICKHOUSE_CLIENT} --query "
+        SELECT name
+        FROM system.parts
+        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active")
+    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE cas_packed_destination MOVE PART '${DESTINATION_PART}' TO VOLUME 'full'"
+    ${CLICKHOUSE_CLIENT} --query "
+        SELECT 'destination_moved_disabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+        FROM system.parts
+        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
+
+    ${CLICKHOUSE_CLIENT} --query "
+        ALTER TABLE cas_packed_destination UPDATE value = value + 1 WHERE id = 1
+        SETTINGS mutations_sync = 2"
+    ${CLICKHOUSE_CLIENT} --query "
+        SELECT 'destination_mutated_disabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+        FROM system.parts
+        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
+
+    DESTINATION_PART=$(${CLICKHOUSE_CLIENT} --query "
+        SELECT name
+        FROM system.parts
+        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active")
+    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE cas_packed_destination MOVE PART '${DESTINATION_PART}' TO VOLUME 'packed'"
+    ${CLICKHOUSE_CLIENT} --query "
+        SELECT 'destination_moved_enabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+        FROM system.parts
+        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
+
+    ${CLICKHOUSE_CLIENT} --query "
+        ALTER TABLE cas_packed_destination UPDATE value = value + 1 WHERE id = 2
+        SETTINGS mutations_sync = 2"
+    ${CLICKHOUSE_CLIENT} --query "
+        SELECT 'destination_mutated_enabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+        FROM system.parts
+        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
+    ${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_destination SYNC"
+else
+    printf 'destination_initial\tPacked\t0\n'
+    printf 'destination_moved_disabled\tPacked\t1\n'
+    printf 'destination_mutated_disabled\tFull\t1\n'
+    printf 'destination_moved_enabled\tFull\t0\n'
+    printf 'destination_mutated_enabled\tPacked\t0\n'
+fi
+
 MAIN_DISK=$(${CLICKHOUSE_CLIENT} --query "
     SELECT any(disk_name)
     FROM system.parts
@@ -201,6 +266,15 @@ else
     echo "default_gc_drained" 1
     echo "default_fsck_unreachable" 0
     echo "default_fsck_dangling" 0
+fi
+
+if [ "${HAS_MIXED_POLICY}" = "1" ]; then
+    drain_gc cas_packed_disabled destination
+    check_fsck cas_packed_disabled destination
+else
+    echo "destination_gc_drained" 1
+    echo "destination_fsck_unreachable" 0
+    echo "destination_fsck_dangling" 0
 fi
 
 drain_gc "${DISABLED_DISK_NAME}" disabled

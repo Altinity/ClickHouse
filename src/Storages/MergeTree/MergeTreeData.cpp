@@ -6287,18 +6287,6 @@ MergeTreeDataPartFormat MergeTreeData::choosePartFormat(
     if (satisfies((*settings)[MergeTreeSetting::min_bytes_for_full_part_storage], (*settings)[MergeTreeSetting::min_rows_for_full_part_storage], (*settings)[MergeTreeSetting::min_level_for_full_part_storage]))
         storage_type = PartStorageType::Packed;
 
-    if (storage_type == PartStorageType::Packed)
-    {
-        for (const auto & disk : getStoragePolicy()->getDisks())
-        {
-            if (!disk->allowsPackedParts())
-            {
-                storage_type = PartStorageType::Full;
-                break;
-            }
-        }
-    }
-
     /// The trained `pq` method of the `Quantize(...)` codec stores a per-part codebook (one artifact for the whole
     /// column, trained at serialization suffix). A compact part serializes each granule with a fresh serialization
     /// state, which would train and write a separate codebook per granule and leave the reader unable to pair each row
@@ -6327,6 +6315,24 @@ MergeTreeDataPartFormat MergeTreeData::choosePartFormat(
     }
 
     return {part_type, storage_type};
+}
+
+MergeTreeDataPartFormat MergeTreeData::choosePartFormatForMutation(const DataPartPtr & source_part) const
+{
+    auto format = source_part->getFormat();
+    format.storage_type = choosePartFormat(
+        source_part->getTotalColumnsSize().data_uncompressed,
+        source_part->rows_count,
+        source_part->info.level,
+        nullptr).storage_type;
+    return format;
+}
+
+MergeTreeDataPartFormat MergeTreeData::normalizePartFormatForDisk(MergeTreeDataPartFormat format, const DiskPtr & disk)
+{
+    if (format.storage_type == MergeTreeDataPartStorageType::Packed && !disk->allowsPackedParts())
+        format.storage_type = MergeTreeDataPartStorageType::Full;
+    return format;
 }
 
 MergeTreeDataPartBuilder MergeTreeData::getDataPartBuilder(

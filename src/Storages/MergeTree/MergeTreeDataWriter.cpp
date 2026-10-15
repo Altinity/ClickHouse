@@ -920,6 +920,7 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
     /// every subsequent load of the part.
     if (metadata_snapshot->hasUniqueKey())
         part_format.storage_type = MergeTreeDataPartStorageType::Full;
+    part_format = data.normalizePartFormatForDisk(part_format, data_part_volume->getDisk());
 
     auto new_data_part = data.getDataPartBuilder(part_name, data_part_volume, part_dir, getReadSettings(), PartDirIntent::CreateFresh)
         .withPartFormat(part_format)
