@@ -46,6 +46,7 @@ namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int DELTA_KERNEL_ERROR;
+    extern const int INCORRECT_DATA;
 }
 
 namespace DB::Setting
@@ -983,7 +984,12 @@ DB::ObjectIterator TableSnapshot::iterate(
     const auto & settings = context->getSettingsRef();
     std::lock_guard lock(mutex);
     initOrUpdateSchemaIfChanged();
-    initOrUpdateClusteringColumns();
+    /// Clustering columns are only used by the clustering-predicate fallback in `Iterator::initScanState`.
+    const bool need_clustering_columns = filter_dag
+        && settings[DB::Setting::delta_lake_enable_engine_predicate]
+        && settings[DB::Setting::delta_lake_clustering_predicate_fallback];
+    if (need_clustering_columns)
+        initOrUpdateClusteringColumns();
     auto state = getKernelSnapshotState();
     auto update_stats_func = [self = shared_from_this(), version = state->snapshot_version, this]
         (SnapshotStats && stats)
@@ -1007,7 +1013,7 @@ DB::ObjectIterator TableSnapshot::iterate(
         schema->table_schema,
         schema->physical_names_map,
         schema->partition_columns,
-        *clustering_columns,
+        need_clustering_columns ? *clustering_columns : DB::Names{},
         object_storage,
         filter_dag,
         callback,
@@ -1094,7 +1100,7 @@ void TableSnapshot::initOrUpdateClusteringColumns() const
 
     if (!result)
     {
-        LOG_TRACE(log, "No delta.clustering domain metadata found — table is not liquid-clustered");
+        LOG_TRACE(log, "No delta.clustering domain metadata found for table {} — table is not liquid-clustered", helper->getTableLocation());
         clustering_columns.emplace();
         return;
     }
@@ -1110,7 +1116,7 @@ void TableSnapshot::initOrUpdateClusteringColumns() const
 
         auto arr = obj->getArray("clusteringColumns");
         if (!arr)
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "delta.clustering: missing clusteringColumns array");
+            throw DB::Exception(DB::ErrorCodes::INCORRECT_DATA, "delta.clustering: missing clusteringColumns array");
 
         for (size_t i = 0; i < arr->size(); ++i)
         {
@@ -1131,8 +1137,10 @@ void TableSnapshot::initOrUpdateClusteringColumns() const
     catch (const Poco::Exception & e)
     {
         throw DB::Exception(
-            DB::ErrorCodes::BAD_ARGUMENTS,
-            "Failed to parse delta.clustering domain metadata: {}", e.displayText());
+            DB::ErrorCodes::INCORRECT_DATA,
+            "Failed to parse delta.clustering domain metadata of table {}: {}. "
+            "Set delta_lake_clustering_predicate_fallback = 0 to read the table without clustering-based file skipping",
+            helper->getTableLocation(), e.displayText());
     }
 
     /// Convert physical column names to logical names using the inverse of physical_names_map.
@@ -1159,7 +1167,7 @@ void TableSnapshot::initOrUpdateClusteringColumns() const
         logical_columns = std::move(physical_columns);
     }
 
-    LOG_TRACE(log, "Clustering columns: {}", fmt::join(logical_columns, ", "));
+    LOG_TRACE(log, "Clustering columns for table {}: {}", helper->getTableLocation(), fmt::join(logical_columns, ", "));
     clustering_columns.emplace(std::move(logical_columns));
 }
 
