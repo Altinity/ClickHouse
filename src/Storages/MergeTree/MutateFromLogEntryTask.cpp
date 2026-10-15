@@ -117,7 +117,7 @@ ReplicatedMergeMutateTaskBase::PrepareResult MutateFromLogEntryTask::prepare()
     }
 
     future_mutated_part->parts.push_back(source_part);
-    future_mutated_part->part_format = source_part->getFormat();
+    future_mutated_part->part_format = storage.choosePartFormatForMutation(source_part);
 
     if (source_part->name != source_part_name)
     {

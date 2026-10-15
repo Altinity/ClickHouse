@@ -17,10 +17,18 @@ copy_storage	Packed
 copy_projection_active	1
 copy_after_source_drop	40000	799980000
 copy_after_reload	40000	799980000
+destination_initial	Packed	0
+destination_moved_disabled	Packed	1
+destination_mutated_disabled	Full	1
+destination_moved_enabled	Full	0
+destination_mutated_enabled	Packed	0
 has_blob_put	1
 default_gc_drained 1
 default_fsck_unreachable 0
 default_fsck_dangling 0
+destination_gc_drained 1
+destination_fsck_unreachable 0
+destination_fsck_dangling 0
 disabled_gc_drained 1
 disabled_fsck_unreachable 0
 disabled_fsck_dangling 0

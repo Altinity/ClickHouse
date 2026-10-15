@@ -19,6 +19,16 @@
                 <cas_gc_enabled>1</cas_gc_enabled>
                 <cas_gc_interval_sec>20</cas_gc_interval_sec>
             </cas>
+            <cas_packed_disabled>
+                <type>object_storage</type>
+                <object_storage_type>local</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <cas_server_root_id>stateless-ca-local-packed-disabled</cas_server_root_id>
+                <path>cas_packed_disabled_pool/</path>
+                <cas_scratch_path>cas_packed_disabled_scratch/</cas_scratch_path>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>20</cas_gc_interval_sec>
+            </cas_packed_disabled>
         </disks>
         <policies>
             <cas>
@@ -28,6 +38,16 @@
                     </main>
                 </volumes>
             </cas>
+            <cas_packed_mixed>
+                <volumes>
+                    <packed>
+                        <disk>cas</disk>
+                    </packed>
+                    <full>
+                        <disk>cas_packed_disabled</disk>
+                    </full>
+                </volumes>
+            </cas_packed_mixed>
         </policies>
     </storage_configuration>
     <merge_tree>
