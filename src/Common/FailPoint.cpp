@@ -246,6 +246,7 @@ static struct InitFiu
     REGULAR(slowdown_skip_index_read_result_build) \
     ONCE(iceberg_writes_cleanup) \
     REGULAR(iceberg_slow_manifest_read) \
+    PAUSEABLE_ONCE(iceberg_drop_partition_pause_after_discovery) \
     ONCE(iceberg_alter_catalog_update_schema_fail) \
     ONCE(iceberg_alter_catalog_commit_reported_as_failed) \
     REGULAR(storage_cluster_read_sleep) \
