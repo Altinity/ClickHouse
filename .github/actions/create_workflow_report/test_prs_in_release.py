@@ -13,7 +13,7 @@ from create_workflow_report import (
     _checks_latest_test_status_cte,
     _enrich_prs_in_release_merge_prs,
     _fetch_release_tags,
-    _fetch_tip,
+    _fetch_commit,
     _find_release_baseline,
     _get_github_releases,
     _git_log_merge_prs,
@@ -108,7 +108,7 @@ class TestFindReleaseBaseline(unittest.TestCase):
             ),
         ):
             tag_name, tag_sha, published_date = _find_release_baseline(
-                CURRENT_TAG, RELEASES, cwd=None, tip=CURRENT_SHA
+                CURRENT_TAG, RELEASES, cwd=None, commit_sha=CURRENT_SHA
             )
         self.assertEqual(tag_name, PREV_TAG)
         self.assertEqual(tag_sha, PREV_SHA)
@@ -126,13 +126,13 @@ class TestFindReleaseBaseline(unittest.TestCase):
             ),
         ):
             tag_name, tag_sha, published_date = _find_release_baseline(
-                "antalya-26.6", RELEASES, cwd=None, tip=CURRENT_SHA
+                "antalya-26.6", RELEASES, cwd=None, commit_sha=CURRENT_SHA
             )
         self.assertEqual(tag_name, CURRENT_TAG)
         self.assertEqual(tag_sha, CURRENT_SHA)
         self.assertEqual(published_date, "2026-09-11")
 
-    def test_ancestry_uses_tip_not_branch_name(self):
+    def test_ancestry_uses_commit_not_branch_name(self):
         # Local antalya-26.6 may sit on the latest release; the run commit is older.
         with (
             patch(
@@ -145,7 +145,7 @@ class TestFindReleaseBaseline(unittest.TestCase):
             ),
         ):
             tag_name, tag_sha, published_date = _find_release_baseline(
-                "antalya-26.6", RELEASES, cwd=None, tip=PREV_SHA
+                "antalya-26.6", RELEASES, cwd=None, commit_sha=PREV_SHA
             )
         self.assertEqual(tag_name, PREV_TAG)
         self.assertEqual(tag_sha, PREV_SHA)
@@ -158,21 +158,21 @@ def _version_file(major, minor):
     )
 
 
-class TestFetchTip(unittest.TestCase):
-    def test_full_clone_fetches_tip_without_clone_shape_flags(self):
+class TestFetchCommit(unittest.TestCase):
+    def test_full_clone_fetches_commit_without_clone_shape_flags(self):
         with (
             patch("create_workflow_report._git_is_shallow", return_value=False),
             patch("create_workflow_report._git_fetch") as fetch,
         ):
-            _fetch_tip(CURRENT_SHA, ".")
+            _fetch_commit(CURRENT_SHA, ".")
         fetch.assert_called_once_with(["--no-tags"], [CURRENT_SHA], ".")
 
-    def test_shallow_clone_unshallows_tip(self):
+    def test_shallow_clone_unshallows_commit(self):
         with (
             patch("create_workflow_report._git_is_shallow", return_value=True),
             patch("create_workflow_report._git_fetch") as fetch,
         ):
-            _fetch_tip(PREV_SHA, ".")
+            _fetch_commit(PREV_SHA, ".")
         fetch.assert_called_once_with(
             ["--filter=tree:0", "--unshallow"], [PREV_SHA], "."
         )
@@ -290,15 +290,15 @@ class TestGitRevParse(unittest.TestCase):
             self.assertIsNone(_git_rev_parse("deadbeef" * 5, cwd))
 
 
-class TestGetPrsInReleaseTipResolve(unittest.TestCase):
-    def test_raises_when_tip_cannot_resolve(self):
+class TestGetPrsInReleaseCommitResolve(unittest.TestCase):
+    def test_raises_when_commit_cannot_resolve(self):
         with (
-            patch("create_workflow_report._fetch_tip"),
+            patch("create_workflow_report._fetch_commit"),
             patch("create_workflow_report._git_rev_parse", return_value=None),
         ):
             with self.assertRaises(Exception) as ctx:
                 get_prs_in_release_dataframe(
-                    "antalya-26.6", cwd=".", tip="deadbeef" * 5
+                    "antalya-26.6", cwd=".", commit_sha="deadbeef" * 5
                 )
         self.assertIn("Cannot resolve commit", str(ctx.exception))
         self.assertIn("deadbeef", str(ctx.exception))
