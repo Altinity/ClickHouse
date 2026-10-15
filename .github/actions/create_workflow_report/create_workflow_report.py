@@ -308,13 +308,12 @@ def _find_release_baseline(
     branch_ref: str,
     releases: list[dict],
     cwd: str | None,
-    tip: str | None = None,
+    tip: str,
 ) -> tuple[str | None, str | None, str | None]:
     """Return (tag_name, tag_sha, published_date YYYY-MM-DD) for the latest
-    release tag in releases that is an ancestor of tip (or branch_ref).
+    release tag in releases that is an ancestor of tip.
     Version-tag refs skip the matching release so the range is previous→this tag.
     """
-    descendant = tip or branch_ref
     parsed = _parse_release_ref(branch_ref)
     skip_current = parsed is not None and parsed[2] is not None
     for rel in releases:
@@ -324,9 +323,9 @@ def _find_release_baseline(
         tag_sha = _release_tag_sha(tag_name, cwd)
         if not tag_sha:
             continue
-        if not _git_is_ancestor(tag_sha, descendant, cwd):
+        if not _git_is_ancestor(tag_sha, tip, cwd):
             continue
-        if skip_current and _git_is_ancestor(descendant, tag_sha, cwd):
+        if skip_current and _git_is_ancestor(tip, tag_sha, cwd):
             continue
         published_at = rel.get("published_at") or rel.get("created_at") or ""
         published_date = published_at[:10] if published_at else None
@@ -427,7 +426,7 @@ def _releases_for_version_line(
     parsed = _parse_release_ref(branch_ref)
     if parsed is not None:
         flavour, minor_version, _ = parsed
-        suffix = "altinityantalya" if flavour == "antalya" else "altinitystable"
+        suffix = f"altinity{flavour}"
         prefix = f"v{minor_version}."
         return [
             rel
@@ -457,9 +456,10 @@ def _fetch_release_tags(releases: list[dict], cwd: str) -> None:
                 [f"+refs/tags/{tag_name}:{RELEASE_TAG_REF_PREFIX}{tag_name}"],
                 cwd,
             )
-        except Exception:
-            # NOTE (strtgbb): one deleted remote tag must not abort the section
-            continue
+        except Exception as e:
+            # NOTE (strtgbb): one deleted remote tag must not abort the section, but
+            # if it is the newest release the baseline moves back to an older one
+            print(f"WARNING: skipping release tag {tag_name}: {e}")
 
 
 def _ensure_release_history(
@@ -526,18 +526,18 @@ def _parse_release_ref(ref_name: str) -> tuple[str, str, str | None] | None:
     """Parse a release ref into (flavour, minor_version, full_version).
 
     Handles version tags (``v25.8.28.10001.altinitystable``) and release
-    branches (``stable-25.8``). ``full_version`` is None for branches, which
+    branches (``stable-25.8``, ``antalya-25.8``, ``fips-25.3``). ``full_version`` is None for branches, which
     carry no patch or tweak. Returns None for refs without a version.
     """
     # Match tag
     match = re.match(
-        r"^v((\d+\.\d+)\.\d+\.\d+)\.altinity(stable|antalya|test)$", ref_name
+        r"^v((\d+\.\d+)\.\d+\.\d+)\.altinity(stable|antalya|fips|test)$", ref_name
     )
     if match:
-        flavour = "antalya" if match.group(3) == "antalya" else "stable"
+        flavour = match.group(3) if match.group(3) in ("antalya", "fips") else "stable"
         return flavour, match.group(2), match.group(1)
     # Match branch
-    match = re.match(r"^(stable|antalya)-(\d+\.\d+)$", ref_name)
+    match = re.match(r"^(stable|antalya|fips)-(\d+\.\d+)$", ref_name)
     if match:
         return match.group(1), match.group(2), None
     return None
