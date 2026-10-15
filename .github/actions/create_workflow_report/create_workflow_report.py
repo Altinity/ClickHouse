@@ -299,13 +299,13 @@ def _git_log_merge_prs(
 
 def _find_release_baseline(
     branch_ref: str, repo: str, cwd: str | None
-) -> tuple[str | None, str | None, str | None]:
-    """Return (tag_name, tag_sha, published_date YYYY-MM-DD) for the latest
+) -> tuple[str | None, str | None]:
+    """Return (tag_name, tag_sha) for the latest
     non-draft release tag that is an ancestor of branch_ref.
     Version-tag refs skip the matching release so the range is previous→this tag.
     """
     if not GITHUB_TOKEN:
-        return None, None, None
+        return None, None
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
@@ -333,10 +333,8 @@ def _find_release_baseline(
             continue
         if skip_current and _git_is_ancestor(branch_ref, tag_sha, cwd):
             continue
-        published_at = rel.get("published_at") or rel.get("created_at") or ""
-        published_date = published_at[:10] if published_at else None
-        return tag_name, tag_sha, published_date
-    return None, None, None
+        return tag_name, tag_sha
+    return None, None
 
 
 def _find_rebase_baseline(branch_ref: str, cwd: str | None) -> str | None:
@@ -366,9 +364,9 @@ def _find_rebase_baseline(branch_ref: str, cwd: str | None) -> str | None:
     return lines[0]
 
 
-def _git_commit_date(sha: str, cwd: str | None) -> str | None:
+def _git_commit_time(sha: str, cwd: str | None) -> str | None:
     p = subprocess.run(
-        ["git", "show", "-s", "--format=%cs", sha],
+        ["git", "show", "-s", "--format=%ct", sha],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -376,8 +374,12 @@ def _git_commit_date(sha: str, cwd: str | None) -> str | None:
     )
     if p.returncode != 0:
         return None
-    date = p.stdout.strip()
-    return date or None
+    timestamp = p.stdout.strip()
+    if not timestamp:
+        return None
+    return datetime.fromtimestamp(int(timestamp), timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
 
 
 def get_prs_in_release_dataframe(
@@ -392,7 +394,7 @@ def get_prs_in_release_dataframe(
     Merge commits whose subject is from the upstream repository (ClickHouse/) are omitted.
     Columns: pr_number, pr_name, labels.
 
-    Returns (dataframe, baseline_date YYYY-MM-DD or None).
+    Returns (dataframe, baseline commit time as UTC YYYY-MM-DDTHH:MM:SSZ or None).
     """
     branch_sha = _git_rev_parse(branch_ref, cwd)
     if not branch_sha:
@@ -422,7 +424,6 @@ def get_prs_in_release_dataframe(
     )
 
     baseline_sha = None
-    baseline_date = None
     for _ in range(DEEPEN_CAP // DEEPEN_STEP):
         subprocess.run(
             ["git", "fetch", f"--deepen={DEEPEN_STEP}", "origin", fetch_ref],
@@ -431,13 +432,9 @@ def get_prs_in_release_dataframe(
             text=True,
             check=False,
         )
-        _, baseline_sha, baseline_date = _find_release_baseline(
-            branch_ref, repo, cwd
-        )
+        _, baseline_sha = _find_release_baseline(branch_ref, repo, cwd)
         if not baseline_sha:
             baseline_sha = _find_rebase_baseline(branch_ref, cwd)
-            if baseline_sha:
-                baseline_date = _git_commit_date(baseline_sha, cwd)
         if baseline_sha:
             break
 
@@ -448,7 +445,10 @@ def get_prs_in_release_dataframe(
         )
 
     df = _git_log_merge_prs(baseline_sha, branch_ref, cwd, repo)
-    return _enrich_prs_in_release_merge_prs(df, repo), baseline_date
+    return (
+        _enrich_prs_in_release_merge_prs(df, repo),
+        _git_commit_time(baseline_sha, cwd),
+    )
 
 
 def _parse_release_ref(ref_name: str) -> tuple[str, str, str | None] | None:
@@ -472,8 +472,8 @@ def _parse_release_ref(ref_name: str) -> tuple[str, str, str | None] | None:
     return None
 
 
-def _prs_in_release_search_url(branch_name: str, baseline_date: str | None) -> str | None:
-    if not baseline_date:
+def _prs_in_release_search_url(branch_name: str, baseline_time: str | None) -> str | None:
+    if not baseline_time:
         return None
     # Tag-triggered runs expose the tag as head_branch; search needs the PR base
     # branch (e.g. v25.8.28.10001.altinitystable → stable-25.8).
@@ -481,7 +481,7 @@ def _prs_in_release_search_url(branch_name: str, baseline_date: str | None) -> s
     if parsed:
         flavour, minor_version, _ = parsed
         branch_name = f"{flavour}-{minor_version}"
-    query = f"is:pr base:{branch_name} merged:>{baseline_date}"
+    query = f"is:pr base:{branch_name} merged:>{baseline_time}"
     return (
         f"https://github.com/{GITHUB_REPO}/pulls?"
         + urllib.parse.urlencode({"q": query})
@@ -1315,12 +1315,12 @@ def create_workflow_report(
 
     if pr_number == 0 and not mark_preview:
         try:
-            prs_df, baseline_date = get_prs_in_release_dataframe(
+            prs_df, baseline_time = get_prs_in_release_dataframe(
                 branch_name, cwd=os.getcwd()
             )
             results_dfs["prs_in_release"] = prs_df
             prs_in_release_search_url = _prs_in_release_search_url(
-                branch_name, baseline_date
+                branch_name, baseline_time
             )
         except Exception as e:
             print(f"Error in get_prs_in_release_dataframe: {e}")
