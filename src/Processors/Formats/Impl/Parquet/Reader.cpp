@@ -2136,7 +2136,8 @@ void Reader::applyPrewhere(RowSubgroup & row_subgroup, const RowGroup & row_grou
             continue;
 
         filter_column = filter_column->convertToFullIfNeeded();
-        if (filter_column->isNullable())
+        if (const auto * nullable_column = checkAndGetColumn<ColumnNullable>(filter_column.get());
+            nullable_column && checkAndGetColumn<ColumnUInt8>(&nullable_column->getNestedColumn()))
         {
             /// Calculate `filter->nested & !filter->null_map`.
             auto col = IColumn::mutate(std::move(filter_column));
@@ -2149,6 +2150,18 @@ void Reader::applyPrewhere(RowSubgroup & row_subgroup, const RowGroup & row_grou
                 nested_data[i] &= !null_map[i];
             nullable.getNullMapColumnPtr().reset();
             filter_column = std::move(nested_col);
+        }
+
+        if (!checkAndGetColumn<ColumnUInt8>(filter_column.get()))
+        {
+            /// PREWHERE can produce a wider numeric column, including a nullable one.
+            /// Use boolean conversion rather than a UInt8 cast, which would truncate values
+            /// such as 256 to zero. getBool also treats NULL as false.
+            auto boolean_column = ColumnUInt8::create(filter_column->size());
+            auto & data = boolean_column->getData();
+            for (size_t i = 0; i < data.size(); ++i)
+                data[i] = filter_column->getBool(i);
+            filter_column = std::move(boolean_column);
         }
 
         const IColumnFilter & filter = typeid_cast<const ColumnUInt8 &>(*filter_column).getData();
