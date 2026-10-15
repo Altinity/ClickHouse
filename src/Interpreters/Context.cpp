@@ -1,4 +1,5 @@
 #include <atomic>
+#include <future>
 #include <map>
 #include <set>
 #include <optional>
@@ -664,6 +665,8 @@ struct ContextSharedPart : boost::noncopyable
     mutable std::unique_ptr<CompressionCodecSelector> compression_codec_selector TSA_GUARDED_BY(mutex);
     /// Storage disk chooser for MergeTree engines
     mutable std::shared_ptr<const DiskSelector> merge_tree_disk_selector TSA_GUARDED_BY(storage_policies_mutex);
+    /// Custom disks being created by `getOrCreateDisk`, by name
+    mutable std::unordered_map<String, std::shared_future<DiskPtr>> disks_being_created TSA_GUARDED_BY(storage_policies_mutex);
     /// Storage policy chooser for MergeTree engines
     mutable std::shared_ptr<const StoragePolicySelector> merge_tree_storage_policy_selector TSA_GUARDED_BY(storage_policies_mutex);
 
@@ -6775,20 +6778,95 @@ DiskPtr Context::getDisk(const String & name) const
     return disk_selector->get(name);
 }
 
+namespace
+{
+
+/// Every waiter of one creation rethrows the same stored exception. Copy it, so a caller that
+/// modifies its exception (e.g. `addMessage`) does not race with the other waiters.
+DiskPtr getDiskCreationResult(const std::shared_future<DiskPtr> & creation)
+{
+    try
+    {
+        return creation.get();
+    }
+    catch (const Exception & e)
+    {
+        throw Exception(e);
+    }
+}
+
+}
+
 DiskPtr Context::getOrCreateDisk(const String & name, DiskCreator creator) const
 {
-    std::lock_guard lock(shared->storage_policies_mutex);
-
-    auto disk_selector = getDiskSelector(lock);
-
-    auto disk = disk_selector->tryGet(name);
-    if (!disk)
+    std::promise<DiskPtr> promise;
+    std::shared_future<DiskPtr> creation;
+    bool is_creator = false;
+    DisksMap disks_map;
     {
-        disk = creator(getDisksMap(lock));
-        const_cast<DiskSelector *>(disk_selector.get())->addToDiskMap(name, disk);
+        std::lock_guard lock(shared->storage_policies_mutex);
+
+        auto disk_selector = getDiskSelector(lock);
+        if (auto disk = disk_selector->tryGet(name))
+            return disk;
+
+        if (auto it = shared->disks_being_created.find(name); it != shared->disks_being_created.end())
+        {
+            creation = it->second;
+        }
+        else
+        {
+            disks_map = disk_selector->getDisksMap();
+            creation = promise.get_future().share();
+            shared->disks_being_created.emplace(name, creation);
+            is_creator = true;
+        }
     }
 
-    return disk;
+    if (!is_creator)
+        return getDiskCreationResult(creation);
+
+    /// Creating a disk can take long (a CAS disk waits out a stale mount lease), so it runs without
+    /// `storage_policies_mutex`. Concurrent requests for the same name wait for this creation rather
+    /// than open the same storage a second time.
+    DiskPtr disk;
+    std::exception_ptr error;
+    try
+    {
+        disk = creator(disks_map);
+    }
+    catch (...)
+    {
+        error = std::current_exception();
+    }
+
+    {
+        std::lock_guard lock(shared->storage_policies_mutex);
+        shared->disks_being_created.erase(name);
+        if (!error)
+        {
+            try
+            {
+                auto disk_selector = getDiskSelector(lock);
+                /// A config reload may have added a disk with this name meanwhile; it wins, as if it ran first.
+                if (auto existing = disk_selector->tryGet(name))
+                    disk = existing;
+                else
+                    const_cast<DiskSelector *>(disk_selector.get())->addToDiskMap(name, disk);
+            }
+            catch (...)
+            {
+                error = std::current_exception();
+            }
+        }
+    }
+
+    if (error)
+        promise.set_exception(error);
+    else
+        promise.set_value(disk);
+
+    return getDiskCreationResult(creation);
 }
 
 StoragePolicyPtr Context::getStoragePolicy(const String & name) const

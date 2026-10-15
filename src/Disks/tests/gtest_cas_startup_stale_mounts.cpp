@@ -24,6 +24,7 @@
 #include <Poco/Util/XMLConfiguration.h>
 #include <base/scope_guard.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -37,6 +38,11 @@
 /// Server start re-creates the `disk = disk(...)` custom disks of every table it loads. A CAS disk
 /// whose previous process died without a farewell waits out the stale mount lease inside that
 /// creation. These tests pin how such waits compose with the rest of startup.
+
+namespace DB::ErrorCodes
+{
+extern const int BAD_ARGUMENTS;
+}
 
 namespace
 {
@@ -302,4 +308,93 @@ TEST_F(CASStartupStaleMounts, DiskLookupDoesNotWaitForAStaleMountObservation)
     EXPECT_LT(lookup_ms, observation_ms / 3)
         << "a disk lookup took " << lookup_ms << " ms while a stale mount was being observed for up to "
         << observation_ms << " ms";
+}
+
+/// Two table loads that name the same custom disk must share one creation: a second open of the
+/// same CAS root while the first is still waiting out the stale mount would be a live twin.
+TEST_F(CASStartupStaleMounts, ConcurrentCreationsOfOneDiskShareOneOpen)
+{
+    const StaleCasDisk & stale = addStaleDisk("0");
+    ASSERT_FALSE(HasFatalFailure());
+
+    Poco::Logger & pool_logger = Poco::Logger::get("CasPool");
+    Poco::AutoPtr<Poco::Channel> previous_channel(pool_logger.getChannel(), /*shared=*/true);
+    const int previous_level = pool_logger.getLevel();
+    Poco::AutoPtr<StaleMountWaitChannel> channel(new StaleMountWaitChannel);
+    pool_logger.setChannel(channel);
+    pool_logger.setLevel(Poco::Message::PRIO_INFORMATION);
+    SCOPE_EXIT({
+        pool_logger.setChannel(previous_channel);
+        pool_logger.setLevel(previous_level);
+    });
+
+    const auto config = stale.xmlConfig();
+    std::atomic<size_t> creator_calls = 0;
+    const auto creator = [&](const DB::DisksMap & disks_map)
+    {
+        ++creator_calls;
+        return DB::DiskFactory::instance().create(
+            stale.name, *config, "disk", getContext().context, disks_map, /*attach=*/true, /*custom_disk=*/true);
+    };
+
+    DB::DiskPtr first_disk;
+    DB::DiskPtr second_disk;
+    std::exception_ptr first_error;
+    std::exception_ptr second_error;
+    std::thread first([&]
+    {
+        try
+        {
+            first_disk = getContext().context->getOrCreateDisk(stale.name, creator);
+        }
+        catch (...)
+        {
+            first_error = std::current_exception();
+        }
+    });
+    /// Without this wait the second request could find the disk already created.
+    const bool first_is_waiting = channel->waitForWaitStarted(1);
+    std::thread second([&]
+    {
+        try
+        {
+            second_disk = getContext().context->getOrCreateDisk(stale.name, creator);
+        }
+        catch (...)
+        {
+            second_error = std::current_exception();
+        }
+    });
+    first.join();
+    second.join();
+
+    ASSERT_TRUE(first_is_waiting) << "the stale mount was never observed";
+    ASSERT_FALSE(first_error) << DB::getExceptionMessage(first_error, false);
+    ASSERT_FALSE(second_error) << DB::getExceptionMessage(second_error, false);
+    EXPECT_EQ(creator_calls.load(), 1u);
+    EXPECT_EQ(first_disk, second_disk);
+    EXPECT_EQ(first_disk, getContext().context->getDisk(stale.name));
+}
+
+/// A failed creation is not remembered: the next request for the name creates the disk again.
+TEST_F(CASStartupStaleMounts, FailedDiskCreationIsRetriedByTheNextRequest)
+{
+    const String name = "cas_stale_failed_creation";
+    std::vector<String> calls;
+    EXPECT_THROW(
+        getContext().context->getOrCreateDisk(name, [&](const DB::DisksMap &) -> DB::DiskPtr
+        {
+            calls.push_back("first");
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "creation failed");
+        }),
+        DB::Exception);
+    EXPECT_FALSE(getContext().context->getDisksMap().contains(name));
+    EXPECT_THROW(
+        getContext().context->getOrCreateDisk(name, [&](const DB::DisksMap &) -> DB::DiskPtr
+        {
+            calls.push_back("second");
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "creation failed again");
+        }),
+        DB::Exception);
+    EXPECT_EQ(calls, (std::vector<String>{"first", "second"}));
 }
