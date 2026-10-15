@@ -306,8 +306,10 @@ TEST(CASRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
     /// backend's `putIfAbsent`, so the request reached it), the single-attempt budget is then spent, and
     /// the lane wedges. The message must say so -- and must NOT say "no attempt was sent", which is the
     /// only shape allowed to skip the wedge.
-    EXPECT_NE(message.find("is UNCERTAIN"), String::npos)
+    EXPECT_NE(message.find("outcome is unknown"), String::npos)
         << "the reason must reach the wedge message rather than defaulting: " << message;
+    EXPECT_NE(message.find("a retry may duplicate it"), String::npos) << message;
+    EXPECT_EQ(message.find("nothing is durable"), String::npos) << message;
     EXPECT_EQ(message.find("BEFORE any request was sent"), String::npos)
         << "an ambiguous PUT is not a pre-attempt refusal: " << message;
 }
@@ -350,6 +352,7 @@ TEST(CASRefInstallSafety, PreAttemptRefusalDoesNotWedgeTheLane)
 
     EXPECT_NE(message.find("refused BEFORE any request was sent"), String::npos)
         << "the caller must be told WHY, and this is the reason the no-wedge decision rests on: " << message;
+    EXPECT_NE(message.find("nothing is durable, so a retry cannot duplicate this transaction"), String::npos) << message;
     EXPECT_FALSE(store->refLaneWedgedForTest(ns))
         << "nothing was sent, so nothing can be durable: there is no ambiguity for a wedge to resolve";
     EXPECT_TRUE(store->wedgedKeyForTest(ns).empty());

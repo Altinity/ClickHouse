@@ -3725,6 +3725,24 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     }
     const RefAppendAttempt & active_attempt = *rt->append_attempt;
 
+    /// Callers must learn whether a retry can duplicate this transaction, so the two outcomes that
+    /// leave that open say so, and keep the original code and cause.
+    const auto durable_unconfirmed = [&](int code, const String & cause)
+    {
+        return std::make_exception_ptr(Exception(code,
+            "CAS ref-log txn {}-{} for namespace '{}' is durable, but publishing its checkpoint frontier "
+            "was not confirmed ({}); the next ref-log recovery installs it, so the write may still take "
+            "effect and a retry may duplicate it",
+            id.writer_epoch, id.ref_sequence, ns.string(), cause));
+    };
+    const auto outcome_unknown = [&](int code, const String & cause)
+    {
+        return std::make_exception_ptr(Exception(code,
+            "CAS ref-log txn {}-{} for namespace '{}' outcome is unknown ({}): it may or may not take "
+            "effect; a retry may duplicate it",
+            id.writer_epoch, id.ref_sequence, ns.string(), cause));
+    };
+
     std::optional<WriteResult> written;
     try
     {
@@ -3736,7 +3754,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         /// local failure raised at a point where an attempt may already have been sent. That is
         /// ambiguous, and it therefore transfers ownership from `Writing` to `Wedged`; the exact
         /// attempt remains installed.
-        const std::exception_ptr write_error = std::current_exception();
+        const std::exception_ptr write_error = outcome_unknown(getCurrentExceptionCode(), getCurrentExceptionMessage(false));
         {
             std::lock_guard lock(rt->state_mutex);
             if (rt->lane_state == RefLaneState::Writing && rt->append_attempt
@@ -3782,11 +3800,10 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                     rt->lane_state = RefLaneState::Wedged;
             }
             ProfileEvents::increment(ProfileEvents::CASRefAppendWedged);
-            complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                "CAS ref-log append for namespace '{}': the store refused txn {}-{}'s create and the "
-                "settling read named no occupant (observed {}) — the append lane is wedged until the "
-                "SAME key resolves durable or a conclusive rejection is observed",
-                ns.string(), id.writer_epoch, id.ref_sequence, detail::renderObservation(conflict->seen))));
+            complete_error(chunk_survivors, outcome_unknown(ErrorCodes::NETWORK_ERROR, fmt::format(
+                "the store refused the create and the settling read named no occupant (observed {}); "
+                "the append lane is wedged until the same key resolves",
+                detail::renderObservation(conflict->seen))));
             return false;
         }
 
@@ -3899,7 +3916,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         ProfileEvents::increment(ProfileEvents::CASRefAppendDefiniteFailure);
         complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS ref-log append for namespace '{}' definitively failed ({}); "
-            "cached state is unchanged and txn id {}-{} was never used (a retry re-derives it)",
+            "cached state is unchanged and txn id {}-{} was never used (a retry re-derives it); "
+            "nothing is durable, so a retry cannot duplicate this transaction",
             ns.string(), refused->message, id.writer_epoch, id.ref_sequence)));
         return false;
     }
@@ -3950,7 +3968,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}' txn {}-{} was refused BEFORE any request was "
                 "sent — the append lane is NOT wedged (nothing can be durable, so there is "
-                "nothing to resolve) and the txn id is not consumed (a retry re-derives it)",
+                "nothing to resolve) and the txn id is not consumed (a retry re-derives it); "
+                "nothing is durable, so a retry cannot duplicate this transaction",
                 ns.string(), id.writer_epoch, id.ref_sequence)));
             return false;
         }
@@ -3961,11 +3980,9 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 rt->lane_state = RefLaneState::Wedged;
         }
         ProfileEvents::increment(ProfileEvents::CASRefAppendWedged);
-        complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
-            "CAS ref-log append for namespace '{}' txn {}-{} is UNCERTAIN (last observed {}) — "
-            "the append lane is wedged until the SAME key resolves durable or a conclusive rejection "
-            "is observed; this outcome is unproven, not failure",
-            ns.string(), id.writer_epoch, id.ref_sequence, detail::renderObservation(gave_up->last_seen))));
+        complete_error(chunk_survivors, outcome_unknown(ErrorCodes::NETWORK_ERROR, fmt::format(
+            "gave up after a request was sent, last observed {}; the append lane is wedged until the "
+            "same key resolves", detail::renderObservation(gave_up->last_seen))));
         return false;
     }
 
@@ -3985,7 +4002,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         }
         catch (...)
         {
-            const std::exception_ptr frontier_error = std::current_exception();
+            const std::exception_ptr frontier_error
+                = durable_unconfirmed(getCurrentExceptionCode(), getCurrentExceptionMessage(false));
             {
                 std::lock_guard lock(rt->state_mutex);
                 requireRecovery(*rt, ns, "committed-frontier publication");
@@ -3999,10 +4017,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 std::lock_guard lock(rt->state_mutex);
                 requireRecovery(*rt, ns, "committed-frontier publication fence");
             }
-            complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
-                "CAS ref-log append for namespace '{}': txn {}-{} is durable, but the mount fence "
-                "moved before its checkpoint frontier was published; the lane needs recovery",
-                ns.string(), id.writer_epoch, id.ref_sequence)));
+            complete_error(chunk_survivors, durable_unconfirmed(ErrorCodes::NETWORK_ERROR,
+                "the mount fence moved before the frontier was published; the lane needs recovery"));
             return false;
         }
 
@@ -4022,7 +4038,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             }
             catch (...)
             {
-                install_admission_error = std::current_exception();
+                install_admission_error = durable_unconfirmed(getCurrentExceptionCode(), getCurrentExceptionMessage(false));
                 requireRecovery(*rt, ns, "post-frontier install admission");
             }
             /// Only this leader mutates `rt->state`, so the candidate's base snapshot is still the
