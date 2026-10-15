@@ -223,6 +223,13 @@ TEST(CASWriteResult, OrThrowMapsEveryAlternative)
         .sent_any = false, .last_seen = NotObserved{}};
     for (const GaveUp & gave_up : {deadline, unresolved, fence_lost})
         expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { orThrow(WriteResult{gave_up}, "t"); });
+
+    GaveUp unsent_unresolved = unresolved;
+    unsent_unresolved.sent_any = false;
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "no write was sent",
+        [&] { orThrow(WriteResult{unsent_unresolved}, "t"); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "the write is unresolved (sent",
+        [&] { orThrow(WriteResult{unresolved}, "t"); });
 }
 
 TEST(CASFence, OpenFenceAdmitsEverythingAndNeverMoves)
