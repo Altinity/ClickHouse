@@ -219,8 +219,10 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> pd.DataFram
 
 
 def _git_rev_parse(ref: str, cwd: str | None) -> str | None:
+    # Peel to a commit so a raw SHA that is not in the object store fails.
+    # git rev-parse --verify <40-hex> succeeds even when the object is missing.
     p = subprocess.run(
-        ["git", "rev-parse", "--verify", ref],
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -462,20 +464,17 @@ def _fetch_release_tags(releases: list[dict], cwd: str) -> None:
             print(f"WARNING: skipping release tag {tag_name}: {e}")
 
 
-def _ensure_release_history(
-    tip_sha: str,
-    releases: list[dict],
-    cwd: str,
-) -> None:
-    """Fetch the full commit graph (no trees or blobs), then the version-line tags.
+def _fetch_tip(tip: str, cwd: str) -> None:
+    """Fetch the workflow commit from GITHUB_GIT_URL.
 
-    --filter converts a full clone into a partial one, so history is only
-    fetched when the checkout is shallow. Tags come second: once the history is
-    local they cost almost nothing.
+    Local checkouts might be a different branch and might not have the run SHA yet.
+    --filter/--unshallow would convert a full clone into a partial one, so those
+    options are used only when the checkout is already shallow.
     """
     if _git_is_shallow(cwd):
-        _git_fetch(["--filter=tree:0", "--unshallow"], [tip_sha], cwd)
-    _fetch_release_tags(releases, cwd)
+        _git_fetch(["--filter=tree:0", "--unshallow"], [tip], cwd)
+    else:
+        _git_fetch(["--no-tags"], [tip], cwd)
 
 
 def get_prs_in_release_dataframe(
@@ -491,11 +490,11 @@ def get_prs_in_release_dataframe(
     Merge commits whose subject is from the upstream repository (ClickHouse/) are omitted.
     Columns: pr_number, pr_name, labels.
 
-    tip is the workflow commit SHA (not the local head_branch ref — that branch can sit on
-    the latest release tag while the run is elsewhere, which collapses the range to empty).
+    tip is the workflow commit SHA from the GitHub Actions API.
 
     Returns (dataframe, baseline_date YYYY-MM-DD or None).
     """
+    _fetch_tip(tip, cwd)
     tip_sha = _git_rev_parse(tip, cwd)
     if not tip_sha:
         raise Exception(f"Cannot resolve commit: {tip!r}")
@@ -503,7 +502,7 @@ def get_prs_in_release_dataframe(
     releases = _releases_for_version_line(
         _get_github_releases(repo), branch_ref, tip_sha, cwd
     )
-    _ensure_release_history(tip_sha, releases, cwd)
+    _fetch_release_tags(releases, cwd)
 
     _, baseline_sha, baseline_date = _find_release_baseline(
         branch_ref, releases, cwd, tip=tip_sha
