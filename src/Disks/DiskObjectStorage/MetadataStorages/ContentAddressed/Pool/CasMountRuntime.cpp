@@ -5,6 +5,7 @@
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
+#include <base/scope_guard.h>
 #include <algorithm>
 #include <chrono>
 #include <ctime>
@@ -420,6 +421,12 @@ uint64_t CasMountRuntime::startRenewer()
     return anchor;
 }
 
+RenewalProgress CasMountRuntime::renewalProgress() const
+{
+    std::lock_guard lock(renewal_progress_mutex);
+    return renewal_progress;
+}
+
 MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_call)
 {
     return MountRenewOperationEnvironment{
@@ -429,6 +436,29 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
             return config.renewal_live_for_test ? config.renewal_live_for_test() : renewalLive(worker_call);
         },
         .cancelled = [this] { return renewalCancelled(); },
+        .requests = RequestObserver{
+            .on_write_attempt = [this](uint32_t attempts_sent)
+            {
+                ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalAttempts);
+                if (attempts_sent > 1)
+                    ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRetries);
+                std::lock_guard lock(renewal_progress_mutex);
+                renewal_progress.attempts_sent = attempts_sent;
+            },
+            .on_failure = [this](std::string_view verb, const String & key, const std::exception & e)
+            {
+                /// Runs inside the engine's catch; a formatting failure must not change how the renewal ends.
+                try
+                {
+                    String error = describeRequestFailure(verb, key, e);
+                    std::lock_guard lock(renewal_progress_mutex);
+                    renewal_progress.last_error = std::move(error);
+                }
+                catch (...)
+                {
+                }
+            },
+        },
     };
 }
 
@@ -464,13 +494,6 @@ void CasMountRuntime::consumeRenewResult(
 {
     /// Driver ownership has already been restored by `DriverLease::finish`; this is the single logical
     /// consumption boundary and it runs without `driver_mutex` or renewer access.
-    /// The physical counters come off the result rather than off a per-attempt callback, so they count
-    /// the same on every ending: a renewal that gave up still sent what it sent.
-    if (result.attempts_sent > 0)
-    {
-        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalAttempts, result.attempts_sent);
-        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRetries, result.attempts_sent - 1);
-    }
     if (result.resolved_by_read)
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalResolved);
 
@@ -534,9 +557,17 @@ uint64_t CasMountRuntime::renewRenewerOnce(
     /// so it renews on the renewer's open plane: admitted under the mount fence it could only ever give
     /// up, and every remount would fail at this step. `RemountCall` is reached from
     /// `renewRenewerForRemountOnce` alone.
-    const MountRenewResult result = active == RenewalDriverState::RemountCall
-        ? call.renewer->renewForRemount(renewalEnvironment(worker_call))
-        : call.renewer->renew(renewalEnvironment(worker_call));
+    {
+        std::lock_guard lock(renewal_progress_mutex);
+        renewal_progress = RenewalProgress{.in_progress = true, .attempts_sent = 0, .last_error = std::nullopt};
+    }
+    MountRenewResult result;
+    {
+        SCOPE_EXIT({ std::lock_guard lock(renewal_progress_mutex); renewal_progress.in_progress = false; });
+        result = active == RenewalDriverState::RemountCall
+            ? call.renewer->renewForRemount(renewalEnvironment(worker_call))
+            : call.renewer->renew(renewalEnvironment(worker_call));
+    }
     const RenewalDriverState destination = active == RenewalDriverState::WorkerCall
         ? RenewalDriverState::WorkerIdle
         : (active == RenewalDriverState::RemountCall ? RenewalDriverState::Parked : RenewalDriverState::Dormant);

@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Common/ThreadPool.h>
+#include <base/defines.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -134,6 +135,14 @@ struct MountFence
     std::atomic<bool> lost{false};
 };
 
+/// The current logical renewal of the mount lease so far, or the last one once it ended.
+struct RenewalProgress
+{
+    bool in_progress = false;
+    uint32_t attempts_sent = 0;
+    std::optional<String> last_error;
+};
+
 /// Owns the live writer-incarnation mechanics shared by the pool's mount and recovery orchestration:
 /// the `MountLeaseRenewer`, local `MountFence`, build watermark and in-flight build registry,
 /// `live_writer_epoch`, unclean-boundary marker, and both persistent workers. `Pool` retains the higher-level
@@ -172,6 +181,8 @@ public:
     /// Renew the merged mount heartbeat once, including its build-watermark floor. A read-only runtime
     /// has no renewer and fails with a logical exception rather than fabricating a heartbeat.
     void renewWatermarkOnce();
+    /// Takes only its own lock, so a renewal stuck in a request never holds up the reader.
+    RenewalProgress renewalProgress() const;
 
     /// ---- local write fence ----
     /// Return whether a mutable operation may start under the locally observed lease state.
@@ -508,6 +519,9 @@ private:
     uint64_t remount_handled_generation = 0;
     ThreadFromGlobalPool renewal_worker;
     ThreadFromGlobalPool remount_worker;
+    /// A leaf lock, never held across I/O.
+    mutable std::mutex renewal_progress_mutex;
+    RenewalProgress renewal_progress TSA_GUARDED_BY(renewal_progress_mutex);
     /// Counted entries into `scheduleRemount`; retained as a test-only observability seam.
     std::atomic<uint64_t> schedule_remount_calls_for_test{0};
 

@@ -278,6 +278,7 @@ becomes `state = 'corrupt'`, never an exception). Shows every `server_root_id` i
 | `state` | one of `live`, `expired`, `terminated`, `fenced`, `corrupt` |
 | `is_leader`, `pending_reclaim`, `last_success_age_seconds`, `wedged_namespace_count` | GC health, process-local; **`NULL` on every peer row** — a process-local fact must never be stamped onto another server's row |
 | `lifecycle`, `lifecycle_reason`, `lifecycle_detail`, `lifecycle_since` | the SQL surface for the in-process `PoolLifecycle` runtime above: `lifecycle` is one of `live`, `not_live`, `identity_lost`, `vanished`, `constructing`, `shutdown`; `lifecycle_reason` distinguishes `replaced` from `forgotten` for a `vanished` disk; `lifecycle_detail` carries the full diagnosis text; `lifecycle_since` is when the current non-live state began (`NULL` while live) |
+| `renewal_in_progress`, `renewal_attempts`, `last_renewal_error` | the running (or last) lease renewal: conditional `PUT`s sent so far and the last failed request, updated per attempt; **`NULL` on every peer row** |
 
 The lifecycle snapshot is I/O-free and ungated, so a not-live, never-started, or vanished disk
 still produces a row instead of silently disappearing from the table.
