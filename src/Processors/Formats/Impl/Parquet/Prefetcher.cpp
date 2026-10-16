@@ -149,7 +149,11 @@ void Prefetcher::finalizeRanges()
     auto & ranges = range_sets[0].ranges;
     std::sort(ranges.begin(), ranges.end(), [](const RangeState & a, const RangeState & b)
         {
-            return a.start < b.start;
+            if (a.start != b.start)
+                return a.start < b.start;
+            /// Longer range first. A bloom-filter data range and its header share `start`, and
+            /// `std::sort` would otherwise leave that order unspecified.
+            return a.end > b.end;
         });
     for (size_t i = 0; i < ranges.size(); ++i)
     {
@@ -350,11 +354,16 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         /// Bloom-filter groups stay inside the group, so a filter is not merged with the column data next to it.
         /// `across_gaps` is the small-file path: one read covers the whole object.
         /// The same-group span is the configured cap, even when that cap is below `bytes_per_read_task`.
+        /// The cap is the whole task. A bloom body included on the left must share it with later filters.
         const size_t gap_limit = (same_group && coalesce_group_across_gaps) ? coalesce_group_span_limit : min_bytes_for_seek;
         const size_t span_limit = same_group ? coalesce_group_span_limit : bytes_per_read_task;
+        const size_t prospective_start = std::min(start_offset, r.start);
+        const size_t prospective_end = std::max(end_offset, r.end);
+        const bool end_past_cap = same_group && prospective_end - prospective_start > span_limit;
         if ((initial_req->coalesce_group != 0 && !same_group) ||
             r.end + gap_limit <= start_offset || // short gap
             r.start + span_limit <= initial_offset || // task not too big
+            end_past_cap ||
             (!same_group && !r.request->allow_incidental_read.load(std::memory_order_relaxed))) // range wants to be coalesced
             break;
 
@@ -391,9 +400,13 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const bool same_group = initial_req->coalesce_group != 0 && r.request->coalesce_group == initial_req->coalesce_group;
         const size_t gap_limit = (same_group && coalesce_group_across_gaps) ? coalesce_group_span_limit : min_bytes_for_seek;
         const size_t span_limit = same_group ? coalesce_group_span_limit : bytes_per_read_task;
+        const size_t prospective_start = std::min(start_offset, r.start);
+        const size_t prospective_end = std::max(end_offset, r.end);
+        const bool end_past_cap = same_group && prospective_end - prospective_start > span_limit;
         if ((initial_req->coalesce_group != 0 && !same_group) ||
             end_offset + gap_limit <= r.start ||
-            initial_offset + span_limit <= r.end ||
+            (!same_group && initial_offset + span_limit <= r.end) ||
+            end_past_cap ||
             (!same_group && !r.request->allow_incidental_read.load(std::memory_order_relaxed)))
             break;
 
