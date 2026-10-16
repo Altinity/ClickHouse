@@ -55,7 +55,7 @@ int64_t wallClockNowSeconds()
 CasMountRuntime::CasMountRuntime(
     BackendPtr backend_ptr_,
     CasRequests & mount_requests_,
-    CasRequests & farewell_requests_,
+    CasRequests & lease_requests_,
     const Layout & layout_,
     MountConfig config_,
     String server_root_id_,
@@ -64,7 +64,7 @@ CasMountRuntime::CasMountRuntime(
     std::function<bool()> remount_attempt_)
     : backend_ptr(std::move(backend_ptr_))
     , mount_requests(mount_requests_)
-    , farewell_requests(farewell_requests_)
+    , lease_requests(lease_requests_)
     , layout(layout_)
     , config(std::move(config_))
     , server_root_id(std::move(server_root_id_))
@@ -369,7 +369,7 @@ void CasMountRuntime::installRenewer(
     const std::function<uint64_t()> & now_ms)
 {
     auto replacement = std::make_unique<MountLeaseRenewer>(
-        mount_requests, farewell_requests, layout, server_root_id, our_uuid, writer_epoch,
+        mount_requests, lease_requests, layout, server_root_id, our_uuid, writer_epoch,
         config.mount_lease_ttl_ms, now_ms,
         [this] { return minActive(); },
         [this](CasEvent e) { emitEvent(std::move(e)); },
