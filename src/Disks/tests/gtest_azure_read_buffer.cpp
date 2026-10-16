@@ -74,8 +74,10 @@ public:
             is_download ? "Partial Content" : "OK");
         response->SetHeader("Content-Length", std::to_string(claimed_size));
         response->SetHeader("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT");
+        response->SetHeader("x-ms-creation-time", "Wed, 21 Oct 2015 07:28:00 GMT");
         response->SetHeader("ETag", "\"0x8DA000000000000\"");
         response->SetHeader("x-ms-blob-type", "BlockBlob");
+        response->SetHeader("x-ms-server-encrypted", "true");
 
         if (!is_download)
         {
