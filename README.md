@@ -94,4 +94,5 @@ ClickHouse’s thousands of core features are all well-tested and stable. To mai
 
 <hr>
 
+
 *© 2024-2026 Altinity Inc. All rights reserved. Altinity®, Altinity.Cloud®, and Altinity Stable® are registered trademarks of Altinity, Inc. ClickHouse® is a registered trademark of ClickHouse, Inc.; Altinity is not affiliated with or associated with ClickHouse, Inc.*
