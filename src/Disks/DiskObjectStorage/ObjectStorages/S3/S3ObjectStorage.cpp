@@ -116,6 +116,16 @@ void applyWriteErrorRetryOverride(S3::S3RequestSettings & request_settings, cons
             = write_settings.s3_max_unexpected_write_error_retries_override;
 }
 
+void requireNativeOnlyForSingleAttemptCreation(const WriteSettings & write_settings)
+{
+    if (write_settings.object_storage_single_attempt_object_creation
+        && write_settings.object_storage_copy_mode != ObjectStorageCopyMode::NativeOnly)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "A copy with single-attempt object creation requires NativeOnly copy mode: the read-write "
+            "fallback would write through the retrying client");
+}
+
 template <typename Result, typename Error>
 void throwIfError(const Aws::Utils::Outcome<Result, Error> & response)
 {
@@ -1001,12 +1011,17 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
     IObjectStorage & object_storage_to,
     std::optional<ObjectAttributes> object_to_attributes)
 {
+    /// A non-S3 destination is rejected here under the flag: `NativeOnly` throws `NOT_IMPLEMENTED` below.
+    requireNativeOnlyForSingleAttemptCreation(write_settings);
+
     /// Shortcut for S3
     if (auto * dest_s3 = dynamic_cast<S3ObjectStorage * >(&object_storage_to); dest_s3 != nullptr)
     {
         auto current_client = dest_s3->client.get();
         auto settings_ptr = s3_settings.get();
         auto size = S3::getObjectSize(*client.get(), uri.bucket, object_from.remote_path, {});
+        S3::S3RequestSettings request_settings = settings_ptr->request_settings;
+        applyWriteErrorRetryOverride(request_settings, write_settings);
         auto scheduler = threadPoolCallbackRunnerUnsafe<void>(getThreadPoolWriter(), ThreadName::S3_COPY_POOL);
         const auto read_settings_to_use = patchSettings(read_settings);
 
@@ -1021,13 +1036,14 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
                 /*dest_s3_client=*/current_client,
                 /*dest_bucket=*/dest_s3->uri.bucket,
                 /*dest_key=*/object_to.remote_path,
-                settings_ptr->request_settings,
+                request_settings,
                 read_settings_to_use,
                 BlobStorageLogWriter::create(disk_name),
                 scheduler,
                 [&, this]{ return readObject(object_from, read_settings_to_use);},
                 object_to_attributes,
-                write_settings.object_storage_copy_mode);
+                write_settings.object_storage_copy_mode,
+                dest_s3->objectCreationClient(write_settings));
             return;
         }
         catch (S3Exception & exc)
@@ -1080,12 +1096,7 @@ void S3ObjectStorage::copyObject( // NOLINT
             "(allow_native_copy=false) for object storage {}",
             getName());
 
-    if (write_settings.object_storage_single_attempt_object_creation
-        && write_settings.object_storage_copy_mode != ObjectStorageCopyMode::NativeOnly)
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS,
-            "A copy with single-attempt object creation requires NativeOnly copy mode: the read-write "
-            "fallback would write through the retrying client");
+    requireNativeOnlyForSingleAttemptCreation(write_settings);
 
     auto current_client = client.get();
     auto settings_ptr = s3_settings.get();

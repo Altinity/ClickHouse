@@ -409,6 +409,35 @@ TEST(S3ObjectStorageCopyObject, SingleAttemptCreationRequiresNativeOnly)
     EXPECT_EQ(server.count(Verb::CopyObject), 0u);
 }
 
+/// The S3-to-S3 shortcut creates the destination object, so it honours the flag like `copyObject`.
+TEST(S3ObjectStorageCopyObject, CopyToAnotherStorageIsOneWireRequestWhenSingleAttempt)
+{
+    (void)getContext();
+    const auto copy_to_another = [](DB::S3ObjectStorage & from, DB::S3ObjectStorage & to, const DB::WriteSettings & write_settings)
+    {
+        from.copyObjectToAnotherObjectStorage(
+            DB::StoredObject("stage"), DB::StoredObject("copy"), DB::ReadSettings{}, write_settings, to);
+    };
+
+    CountingS3Server dropping_server(CountingS3::dropping(Verb::CopyObject));
+    auto dropping_storage = makeRetryingStorage(dropping_server.getUrl());
+    EXPECT_EQ(
+        thrownCode([&] { copy_to_another(*dropping_storage, *dropping_storage, singleAttemptNativeCopy()); }),
+        DB::ErrorCodes::S3_ERROR);
+    EXPECT_EQ(dropping_server.count(Verb::CopyObject), 1u);
+
+    CountingS3Server no_such_key_server(CountingS3::failing(Verb::CopyObject, Poco::Net::HTTPResponse::HTTP_NOT_FOUND, "NoSuchKey"));
+    auto no_such_key_storage = makeRetryingStorage(no_such_key_server.getUrl());
+    EXPECT_EQ(
+        thrownCode([&] { copy_to_another(*no_such_key_storage, *no_such_key_storage, singleAttemptNativeCopy()); }),
+        DB::ErrorCodes::S3_ERROR);
+    EXPECT_EQ(no_such_key_server.count(Verb::CopyObject), 1u);
+
+    EXPECT_EQ(
+        thrownCode([&] { copy_to_another(*dropping_storage, *dropping_storage, singleAttemptCreation()); }),
+        DB::ErrorCodes::BAD_ARGUMENTS);
+}
+
 /// `copyS3File` itself only asserts it; a failed assertion aborts debug and sanitizer builds.
 #ifdef DEBUG_OR_SANITIZER_BUILD
 TEST(S3SingleAttemptObjectCreationDeathTest, CreationClientRequiresNativeOnlyCopy)

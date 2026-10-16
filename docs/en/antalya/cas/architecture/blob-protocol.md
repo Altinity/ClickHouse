@@ -72,8 +72,11 @@ Ordered steps in `PartWriteTxn::ensureBlobPresent`:
    the client's retries.
 6. `BlobSource::beginPublication` consumes the shared, monotonic `publication_attempted` state
    before backend I/O. A lost response cannot re-enable verbatim copy on a later attempt.
-7. Retryable or ambiguous failures restart at `HEAD`: up to 8 attempts inside one 90-second window,
-   each with a fresh envelope. After that the write fails with a retryable error. No dependency
+7. Retryable or ambiguous failures restart at `HEAD`: up to 8 attempts, each with a fresh envelope.
+   The engine starts no new attempt after the 90-second deadline, but an attempt already started can
+   run longer: each creating request waits up to the disk's `request_timeout_ms`, and multipart part
+   uploads keep their own retries. A write can therefore take longer than 90 seconds before it
+   fails with a retryable error. No dependency
    proof is recorded until a present body with a `Clean` marker was observed, or publication and
    metadata reconciliation completed.
 
