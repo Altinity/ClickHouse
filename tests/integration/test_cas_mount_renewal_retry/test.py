@@ -25,7 +25,7 @@ RENEWAL_EVENTS = (
     "CASMountRenewalRetries",
     "CASMountRenewalResolved",
     "CASMountRenewalRecovered",
-    "CASMountRenewalDeadlineExceeded",
+    "CASMountLeaseLost",
     "CASRemountAttempts",
     "CASRemountSucceeded",
     "CASRemountFailed",
@@ -372,7 +372,6 @@ def test_transient_mount_renewal_retries_without_remount(start_cluster):
     assert delta["CASMountRenewalAttempts"] > 1, delta
     assert delta["CASMountRenewalRetries"] > 0, delta
     assert delta["CASMountRenewalRecovered"] > 0, delta
-    assert delta["CASMountRenewalDeadlineExceeded"] == 0, delta
     assert delta["CASRemountAttempts"] == 0, delta
     assert delta["CASRemountSucceeded"] == 0, delta
     assert delta["CASRemountFailed"] == 0, delta
@@ -549,7 +548,6 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
     assert delta["CASMountRenewalRetries"] == 0, delta
     assert delta["CASMountRenewalResolved"] == 1, delta
     assert delta["CASMountRenewalRecovered"] == 1, delta
-    assert delta["CASMountRenewalDeadlineExceeded"] == 0, delta
     assert delta["CASRemountAttempts"] == 0, delta
     assert delta["CASRemountSucceeded"] == 0, delta
     assert delta["CASRemountFailed"] == 0, delta
@@ -561,6 +559,62 @@ def test_landed_response_lost_adopts_exact_mount_write(start_cluster):
     assert recovered[3] == "1", rows
     assert recovered[4] == "committed_by_read", rows
     print("targeted request count (landed response lost): {}".format(stats["faults"]), flush=True)
+
+
+PAUSE_WARNING = "has too little time left for a write"
+
+
+def _lease_state(node, timeout=None):
+    row = node.query(
+        "SELECT lifecycle, lifecycle_reason, writer_epoch FROM system.cas_mounts "
+        "WHERE disk = '{}' AND server_root_id = '{}' LIMIT 1 FORMAT TSV".format(DISK, SERVER_ROOT_ID),
+        timeout=timeout,
+    ).rstrip("\n")
+    assert row, "the local CAS mount row must be visible"
+    lifecycle, reason, epoch = row.split("\t")
+    return lifecycle, reason, int(epoch)
+
+
+def test_long_mount_put_outage_pauses_under_the_same_epoch(start_cluster):
+    # A mount PUT outage longer than the lease: the renewal keeps retrying, writes pause while the lease
+    # is expired, and the first confirmed renewal resumes them under the same writer_epoch. GC is off on
+    # this disk, so nothing fences the slot meanwhile.
+    node = start_cluster["node"]
+    control_url = start_cluster["control_url"]
+    _control(control_url, "/config", {"reset": True})
+    _wait_until(lambda deadline: _lease_state(node, timeout=deadline.remaining())[0] == "live", timeout=60)
+    epoch_before = _lease_state(node)[2]
+    counters_before = _profile_events(node)
+    warnings_before = _log_count_since_last_restart(node, PAUSE_WARNING)
+    outage_s = (MOUNT_LEASE_TTL_MS + MOUNT_RENEW_PERIOD_MS) / 1000.0
+
+    _control(
+        control_url,
+        "/config",
+        {"rate": 1.0, "modes": ["503"], "methods": ["PUT"], "path_substring": MOUNT_REQUEST_PATH, "seed": 803},
+    )
+    armed_at = time.monotonic()
+    try:
+        _wait_until(
+            lambda deadline: _lease_state(node, timeout=deadline.remaining())[:2] == ("not_live", "lease_expired"),
+            timeout=30,
+        )
+        error = node.query_and_get_error("INSERT INTO renewal_probe VALUES (301, 'during-outage')", timeout=60)
+        assert error, "a write must be refused while the lease is expired"
+        time.sleep(max(0.0, outage_s - (time.monotonic() - armed_at)))
+    finally:
+        _control(control_url, "/config", {"rate": 0.0})
+
+    _wait_until(lambda deadline: _lease_state(node, timeout=deadline.remaining())[:2] == ("live", ""), timeout=40)
+    delta = _event_delta(counters_before, _profile_events(node))
+    assert _lease_state(node)[2] == epoch_before
+    assert delta["CASRemountAttempts"] == 0, delta
+    assert delta["CASMountLeaseLost"] == 0, delta
+    assert delta["CASMountRenewalRetries"] > 0, delta
+    assert _log_count_since_last_restart(node, PAUSE_WARNING) - warnings_before == 1
+
+    node.query("INSERT INTO renewal_probe VALUES (302, 'after-outage')")
+    assert node.query("SELECT count() FROM renewal_probe WHERE id IN (301, 302)").strip() == "1"
 
 
 def test_hard_restart_observes_then_the_unsafe_knob_skips_the_observation(start_cluster):
