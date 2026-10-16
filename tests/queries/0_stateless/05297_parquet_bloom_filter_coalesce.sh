@@ -21,7 +21,7 @@ ${CLICKHOUSE_LOCAL} -q "
 "
 
 # Every row group has min 0 and max 1000000, so min/max cannot skip. Value 42 exists in one row group.
-read_count()
+read_stats()
 {
     local coalesce_max=$1
     local min_seek=$2
@@ -39,33 +39,53 @@ read_count()
             input_format_parquet_local_file_min_bytes_for_seek = ${min_seek},
             input_format_parquet_bloom_filter_coalesce_max_bytes = ${coalesce_max}
     " 2>&1 | awk '
-        $0 ~ /ParquetPrefetcherReadRandomRead:/ { sum += $(NF-1) }
+        $0 ~ /ParquetPrefetcherReadRandomRead:/ { reads += $(NF-1) }
+        $0 ~ /ReadBufferFromFileDescriptorReadBytes:/ { bytes += $(NF-1) }
         $1 == "1" { rows = 1 }
         END {
             if (rows != 1) exit 2
-            print sum
+            print reads, bytes + 0
         }
     '
 }
 
 # min_bytes_for_seek = 1 disables the old gap coalescing, so each bloom filter is its own read.
-SEPARATE=$(read_count 0 1) || { echo "separate read failed"; exit 1; }
-CLUSTER=$(read_count 67108864 1) || { echo "cluster read failed"; exit 1; }
+SEPARATE=$(read_stats 0 1) || { echo "separate read failed"; exit 1; }
+CLUSTER=$(read_stats 67108864 1) || { echo "cluster read failed"; exit 1; }
 # Enough filters that the seek budget covers the file: one read of the whole object.
-WHOLE=$(read_count 67108864 1000000000) || { echo "whole-file read failed"; exit 1; }
+WHOLE=$(read_stats 67108864 1000000000) || { echo "whole-file read failed"; exit 1; }
 # Cap of 1 byte, seek of 1 MiB: bytes_per_read_task is 4 MiB and would swallow this file if the cap were raised.
-CAPPED=$(read_count 1 1000000) || { echo "capped read failed"; exit 1; }
+CAPPED=$(read_stats 1 1000000) || { echo "capped read failed"; exit 1; }
+# Cap below one bloom filter. The header and the filter body share a start offset; the body must not be pulled in.
+NARROW=$(read_stats 512 1) || { echo "narrow read failed"; exit 1; }
 
-if [ "$CLUSTER" -ge "$SEPARATE" ]; then
+SEPARATE_READS=${SEPARATE%% *}
+SEPARATE_BYTES=${SEPARATE##* }
+CLUSTER_READS=${CLUSTER%% *}
+WHOLE_READS=${WHOLE%% *}
+CAPPED_READS=${CAPPED%% *}
+NARROW_READS=${NARROW%% *}
+NARROW_BYTES=${NARROW##* }
+
+if [ "$CLUSTER_READS" -ge "$SEPARATE_READS" ]; then
     echo "cluster coalesce did not reduce reads: cluster=$CLUSTER separate=$SEPARATE"
     exit 1
 fi
-if [ "$WHOLE" -gt 4 ]; then
+if [ "$WHOLE_READS" -gt 4 ]; then
     echo "whole-file read used too many requests: whole=$WHOLE cluster=$CLUSTER separate=$SEPARATE"
     exit 1
 fi
-if [ "$CAPPED" -le 20 ]; then
+if [ "$CAPPED_READS" -le 20 ]; then
     echo "small coalesce cap was raised: capped=$CAPPED separate=$SEPARATE cluster=$CLUSTER whole=$WHOLE"
+    exit 1
+fi
+# The header and the filter body share a start offset. A cap smaller than the body must not read the body.
+if [ "$NARROW_BYTES" -gt $((SEPARATE_BYTES * 2)) ]; then
+    echo "bloom body was read with the header: narrow=$NARROW separate=$SEPARATE"
+    exit 1
+fi
+if [ "$NARROW_READS" -le 20 ]; then
+    echo "narrow cap collapsed reads: narrow=$NARROW separate=$SEPARATE"
     exit 1
 fi
 
