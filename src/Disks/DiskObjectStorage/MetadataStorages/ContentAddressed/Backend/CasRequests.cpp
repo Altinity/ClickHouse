@@ -893,14 +893,23 @@ std::optional<WriteResult> CasOperation::gatedPause(uint64_t pause_ms, uint32_t 
     return std::nullopt;
 }
 
+uint64_t CasOperation::reissuePause(const WriteState & state, uint64_t unspaced_ms) const
+{
+    if (!state.spacing)
+        return unspaced_ms;
+    return Retry::pauseAfterAttempt(state.spacing->spacing_ms, state.spacing->attempt_started_ms, owner.now_ms());
+}
+
 std::optional<WriteResult> CasOperation::pauseAndReissue(WriteState & state, const Retry::Bound & bound)
 {
-    return gatedPause(Retry::backoff(++state.reissues), 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
+    const uint64_t pause_ms = reissuePause(state, Retry::backoff(++state.reissues));
+    return gatedPause(pause_ms, 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 
 std::optional<WriteResult> CasOperation::pauseForConflict(WriteState & state, const Retry::Bound & bound)
 {
-    return gatedPause(Retry::conflictBackoff(), 2, state, bound, detail::recordConflictPause, /*should_sleep=*/true);
+    return gatedPause(reissuePause(state, Retry::conflictBackoff()), 2, state, bound, detail::recordConflictPause,
+                      /*should_sleep=*/true);
 }
 
 /// A flat pause before reissuing an attempt whose failure text named a failed connection.
@@ -908,7 +917,7 @@ static constexpr uint64_t kConnectHintPauseMs = 50;
 
 std::optional<WriteResult> CasOperation::pauseFlat(WriteState & state, const Retry::Bound & bound)
 {
-    return gatedPause(kConnectHintPauseMs, 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
+    return gatedPause(reissuePause(state, kConnectHintPauseMs), 2, state, bound, detail::recordReissue, /*should_sleep=*/true);
 }
 
 std::optional<WriteResult> CasOperation::reissueAtOnce(WriteState & state, const Retry::Bound & bound)
@@ -943,6 +952,8 @@ WriteResult CasOperation::writeLoop(const String & key, const String & bytes, co
         if (!fits(reservation, bound))
             return gaveUp(GaveUp::Why::Deadline, sourceFor(bound), state);
 
+        if (policy.attempt_spacing_ms)
+            state.spacing = WriteState::Spacing{*policy.attempt_spacing_ms, owner.now_ms()};
         detail::recordAttempt();
         ++state.attempts_sent;
         state.sent_any = true;
