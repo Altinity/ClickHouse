@@ -67,6 +67,41 @@ ObjectStorageIteratorPtr IObjectStorage::iterate(
     return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
 }
 
+ObjectStorageIteratorPtr IObjectStorage::iterate(
+    const std::string & path_prefix,
+    size_t max_keys,
+    bool with_tags,
+    const std::optional<std::string> & start_after,
+    const ObjectStorageControlRequest & request) const
+{
+    if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt listing requests", getName());
+    return iterate(path_prefix, max_keys, with_tags, start_after);
+}
+
+std::optional<ObjectMetadata> IObjectStorage::tryGetObjectMetadataWithNativeToken(
+    const std::string & path, bool with_tags, const ObjectStorageControlRequest & request) const
+{
+    if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt metadata requests", getName());
+    return tryGetObjectMetadataWithNativeToken(path, with_tags);
+}
+
+ConditionalRemoveResult IObjectStorage::removeObjectIfTokenMatches(
+    const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request)
+{
+    if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support single-attempt removal requests", getName());
+    return removeObjectIfTokenMatches(object, etag);
+}
+
+void IObjectStorage::removeObjectsIfExistUnderProfile(const StoredObjects & objects, const ObjectStorageControlRequest & request)
+{
+    if (request.profile == ObjectStorageRetryProfile::SingleAttempt)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support batch removal under a retry profile", getName());
+    removeObjectsIfExist(objects);
+}
+
 ThreadPool & IObjectStorage::getThreadPoolWriter()
 {
     auto context = Context::getGlobalContextInstance();
@@ -127,6 +162,26 @@ RelativePathWithMetadata::RelativePathWithMetadata(const DataFileInfo & info, st
 
 RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std::string & task)
 {
+    /// TEMPORARY WORKAROUND. This constructor runs for every string passed to `RelativePathWithMetadata`,
+    /// which includes every key returned by a `listObjects` / `iterate` call of every object storage, not only
+    /// the task-distributor answers it exists for (`{"retry_after_us": N}` from
+    /// `StorageObjectStorageStableTaskDistributor`). Parsing an ordinary object key as JSON throws and catches
+    /// one `JSONException` per listed key. Besides the cost, under ASan the fake stack frame of `parseImpl`
+    /// that exits by exception is never released (it is re-entered at the same stack depth, and `FakeStack::GC`
+    /// frees only frames strictly below the next allocation), so every listed key leaks one frame per thread;
+    /// once the size class is full every `__asan_stack_malloc_1` scans all 8192 slots and every small function
+    /// on that thread becomes ~100x slower. See https://github.com/Altinity/ClickHouse/issues/2362.
+    ///
+    /// Only try to parse strings that can be a JSON object. Object keys never start with `{`; the distributor
+    /// answer always does. The proper fix is to stop multiplexing the command into the path field (a separate
+    /// `ObjectInfo` kind or the versioned cluster-function protocol, see
+    /// https://github.com/Altinity/ClickHouse/pull/1360), after which this probe goes away entirely.
+    {
+        const auto first = task.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos || task[first] != '{')
+            return;
+    }
+
     Poco::JSON::Parser parser;
     try
     {
