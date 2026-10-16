@@ -1041,7 +1041,7 @@ void FunctionSecretArgumentsFinder::findTableEngineSecretArguments()
     }
     else if (engine_name == "Iceberg")
     {
-        findIcebergTableEngineSecretArguments();
+        find_secrets = [this] { findIcebergTableEngineSecretArguments(); };
     }
     else if ((engine_name == "S3") || (engine_name == "COSN") || (engine_name == "OSS") || (engine_name == "GCS")
              || (engine_name == "DeltaLake") || (engine_name == "DeltaLakeS3") || (engine_name == "Hudi")
