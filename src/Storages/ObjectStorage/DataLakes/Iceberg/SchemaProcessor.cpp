@@ -29,6 +29,7 @@
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeFixedString.h>
 #include <DataTypes/DataTypeMap.h>
+#include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
@@ -454,6 +455,8 @@ DataTypePtr IcebergSchemaProcessor::getSimpleType(const String & type_name_arg, 
     }
     if (type_name == f_uuid)
         return std::make_shared<DataTypeUUID>();
+    if (type_name == f_unknown)
+        return std::make_shared<DataTypeNothing>();
 
     if (type_name.starts_with("fixed[") && type_name.ends_with(']'))
     {

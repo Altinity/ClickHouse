@@ -608,6 +608,8 @@ void IStorageCluster::read(
 
     storage_snapshot->check(column_names);
 
+    updateBeforeRead(context);
+
     /// Calculate the header. This is significant, because some columns could be thrown away in some cases like query with count(*)
 
     SharedHeader sample_block;

@@ -41,6 +41,7 @@ private:
         const StorageSnapshotPtr & storage_snapshot,
         const ContextPtr & context,
         bool /*make_cluster_function*/) override;
+    void updateBeforeRead(const ContextPtr & context) override;
 
     Strings paths;
     String filename;

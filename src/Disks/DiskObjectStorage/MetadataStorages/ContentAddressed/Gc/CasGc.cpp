@@ -487,7 +487,10 @@ void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & e
     /// no reason (the meta is advisory, but there is no reason to touch it on that path at all).
     if (io.del == Removal::Removed || io.del == Removal::Gone)
     {
-        meta_writer->scheduleConfirmedMetaDelete(entry.ref, entry.condemn_round);
+        /// The round before this one, not `entry.condemn_round`: the graduation gate re-stamps a marker it
+        /// refused at its own, later round. Deleting a marker is safe for writers that adopt only on `Clean`;
+        /// a 26.6.4 writer still backfills an absent marker and adopts.
+        meta_writer->scheduleConfirmedMetaDelete(entry.ref, ctx.new_round - 1);
     }
 }
 

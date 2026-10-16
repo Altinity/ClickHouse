@@ -11,10 +11,6 @@
 #include <IO/WriteBufferFromString.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/JSONException.h>
-
 
 namespace DB
 {
@@ -158,69 +154,6 @@ RelativePathWithMetadata::RelativePathWithMetadata(const DataFileInfo & info, st
 {
     relative_path = info.file_path;
     file_meta_info = info.file_meta_info;
-}
-
-RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std::string & task)
-{
-    /// TEMPORARY WORKAROUND. This constructor runs for every string passed to `RelativePathWithMetadata`,
-    /// which includes every key returned by a `listObjects` / `iterate` call of every object storage, not only
-    /// the task-distributor answers it exists for (`{"retry_after_us": N}` from
-    /// `StorageObjectStorageStableTaskDistributor`). Parsing an ordinary object key as JSON throws and catches
-    /// one `JSONException` per listed key. Besides the cost, under ASan the fake stack frame of `parseImpl`
-    /// that exits by exception is never released (it is re-entered at the same stack depth, and `FakeStack::GC`
-    /// frees only frames strictly below the next allocation), so every listed key leaks one frame per thread;
-    /// once the size class is full every `__asan_stack_malloc_1` scans all 8192 slots and every small function
-    /// on that thread becomes ~100x slower. See https://github.com/Altinity/ClickHouse/issues/2362.
-    ///
-    /// Only try to parse strings that can be a JSON object. Object keys never start with `{`; the distributor
-    /// answer always does. Column statistics no longer travel in this JSON: they are an Antalya protocol
-    /// trailer on `ReadTaskResponse`. `retry_after_us` is still encoded here until that command moves too.
-    {
-        const auto first = task.find_first_not_of(" \t\r\n");
-        if (first == std::string::npos || task[first] != '{')
-            return;
-    }
-
-    Poco::JSON::Parser parser;
-    try
-    {
-        auto json = parser.parse(task).extract<Poco::JSON::Object::Ptr>();
-        if (!json)
-            return;
-
-        is_valid = true;
-
-        if (json->has("file_path"))
-            file_path = json->getValue<std::string>("file_path");
-        if (json->has("retry_after_us"))
-            retry_after_us = json->getValue<size_t>("retry_after_us");
-        if (json->has("meta_info"))
-            file_meta_info = std::make_shared<DataFileMetaInfo>(json->getObject("meta_info"));
-    }
-    catch (const Poco::JSON::JSONException &)
-    { /// Not a JSON
-        return;
-    }
-    catch (const Poco::SyntaxException &)
-    { /// Not a JSON
-        return;
-    }
-}
-
-std::string RelativePathWithMetadata::CommandInTaskResponse::toString() const
-{
-    Poco::JSON::Object json;
-    if (file_path.has_value())
-        json.set("file_path", file_path.value());
-    if (retry_after_us.has_value())
-        json.set("retry_after_us", retry_after_us.value());
-    if (file_meta_info.has_value())
-        json.set("meta_info", file_meta_info.value()->toJson());
-
-    std::ostringstream oss;
-    oss.exceptions(std::ios::failbit);
-    Poco::JSON::Stringifier::stringify(json, oss);
-    return oss.str();
 }
 
 }

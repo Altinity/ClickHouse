@@ -128,10 +128,10 @@ S3TablesCatalog::S3TablesCatalog(
 }
 
 /// S3 Tables only supports a single level of namespaces (no nesting),
-/// so we use flat getNamespaces() instead of the base class's getNamespacesRecursive().
+/// so we use flat listChildNamespaces() instead of the base class's getNamespacesRecursive().
 DB::Names S3TablesCatalog::getTables() const
 {
-    auto namespaces = getNamespaces("");
+    auto namespaces = listChildNamespaces("");
 
     auto & pool = getContext()->getIcebergCatalogThreadpool();
     DB::ThreadPoolCallbackRunnerLocal<void> runner(pool, DB::ThreadName::DATALAKE_REST_CATALOG);
@@ -143,7 +143,7 @@ DB::Names S3TablesCatalog::getTables() const
         runner.enqueueAndKeepTrack(
             [&, ns]
             {
-                auto tables_in_ns = RestCatalog::getTables(ns);
+                auto tables_in_ns = RestCatalog::listTablesInNamespace(ns);
                 std::lock_guard lock(mutex);
                 std::move(tables_in_ns.begin(), tables_in_ns.end(), std::back_inserter(tables));
             });

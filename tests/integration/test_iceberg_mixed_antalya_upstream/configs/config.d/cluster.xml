@@ -16,5 +16,17 @@
                 </replica>
             </shard>
         </upstream_only>
+        <mixed>
+            <shard>
+                <replica>
+                    <host>antalya</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>upstream</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </mixed>
     </remote_servers>
 </clickhouse>

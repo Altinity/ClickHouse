@@ -14,18 +14,24 @@
 #include <IO/S3Defines.h>
 #include <IO/S3Settings.h>
 #include <Common/RemoteHostFilter.h>
+#include <Common/CurrentThread.h>
+#include <Common/ProfileEvents.h>
+#include <Common/ThreadPool.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Settings.h>
 #include <base/defines.h>
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -38,6 +44,8 @@
 #include <Poco/Net/HTTPServerRequest.h>
 #include <Poco/Net/HTTPServerResponse.h>
 #include <Poco/Net/ServerSocket.h>
+#include <Poco/NullStream.h>
+#include <Poco/StreamCopier.h>
 #include <Poco/Util/XMLConfiguration.h>
 
 #include <IO/S3Common.h>
@@ -48,6 +56,11 @@
 
 /// The single-attempt client clone must cap its connect timeout at the value the mount froze at open,
 /// never at the disk's (possibly wider, possibly reloaded, possibly unbounded) own connect timeout.
+
+namespace ProfileEvents
+{
+extern const Event S3PutObject;
+}
 
 namespace
 {
@@ -119,21 +132,29 @@ std::shared_ptr<DB::S3ObjectStorage> makeStorageForTest(long connect_ms)
 class DelayedResponseRequestHandler : public Poco::Net::HTTPRequestHandler
 {
     std::atomic<size_t> & requests_seen;
+    std::atomic<size_t> & body_bytes_seen;
     std::chrono::milliseconds delay;
     std::function<void(Poco::Net::HTTPServerResponse &)> respond;
 
 public:
     DelayedResponseRequestHandler(
         std::atomic<size_t> & requests_seen_,
+        std::atomic<size_t> & body_bytes_seen_,
         std::chrono::milliseconds delay_,
         std::function<void(Poco::Net::HTTPServerResponse &)> respond_)
-        : requests_seen(requests_seen_), delay(delay_), respond(std::move(respond_))
+        : requests_seen(requests_seen_), body_bytes_seen(body_bytes_seen_), delay(delay_), respond(std::move(respond_))
     {
     }
 
-    void handleRequest(Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response) override
+    void handleRequest(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response) override
     {
         ++requests_seen;
+        /// Only a body with a declared length: without one, the stream would read until the client hangs up.
+        if (request.hasContentLength())
+        {
+            Poco::NullOutputStream discard;
+            body_bytes_seen += static_cast<size_t>(Poco::StreamCopier::copyStream64(request.stream(), discard));
+        }
         std::this_thread::sleep_for(delay);
         respond(response);
     }
@@ -142,20 +163,22 @@ public:
 class DelayedResponseRequestHandlerFactory : public Poco::Net::HTTPRequestHandlerFactory
 {
     std::atomic<size_t> & requests_seen;
+    std::atomic<size_t> & body_bytes_seen;
     std::chrono::milliseconds delay;
     std::function<void(Poco::Net::HTTPServerResponse &)> respond;
 
     Poco::Net::HTTPRequestHandler * createRequestHandler(const Poco::Net::HTTPServerRequest &) override
     {
-        return new DelayedResponseRequestHandler(requests_seen, delay, respond);
+        return new DelayedResponseRequestHandler(requests_seen, body_bytes_seen, delay, respond);
     }
 
 public:
     DelayedResponseRequestHandlerFactory(
         std::atomic<size_t> & requests_seen_,
+        std::atomic<size_t> & body_bytes_seen_,
         std::chrono::milliseconds delay_,
         std::function<void(Poco::Net::HTTPServerResponse &)> respond_)
-        : requests_seen(requests_seen_), delay(delay_), respond(std::move(respond_))
+        : requests_seen(requests_seen_), body_bytes_seen(body_bytes_seen_), delay(delay_), respond(std::move(respond_))
     {
     }
 
@@ -175,11 +198,12 @@ class DelayedResponseServer
     Poco::AutoPtr<Poco::Net::HTTPServerParams> server_params;
     std::unique_ptr<Poco::Net::HTTPServer> server;
     std::atomic<size_t> requests_seen{0};
+    std::atomic<size_t> body_bytes_seen{0};
 
 public:
     DelayedResponseServer(std::chrono::milliseconds delay, std::function<void(Poco::Net::HTTPServerResponse &)> respond)
         : server_socket(std::make_unique<Poco::Net::ServerSocket>(0))
-        , handler_factory(new DelayedResponseRequestHandlerFactory(requests_seen, delay, std::move(respond)))
+        , handler_factory(new DelayedResponseRequestHandlerFactory(requests_seen, body_bytes_seen, delay, std::move(respond)))
         , server_params(new Poco::Net::HTTPServerParams())
         , server(std::make_unique<Poco::Net::HTTPServer>(handler_factory, *server_socket, server_params))
     {
@@ -188,6 +212,7 @@ public:
 
     std::string getUrl() const { return "http://" + server_socket->address().toString(); }
     size_t requestsSeen() const { return requests_seen.load(); }
+    size_t bodyBytesSeen() const { return body_bytes_seen.load(); }
     void resetRequestsSeen() { requests_seen = 0; }
 };
 
@@ -196,7 +221,8 @@ public:
 /// succeeds. No SDK-level retry (`RetryStrategy{.max_retries = 0}`,
 /// `s3_slow_all_threads_after_retryable_error = false`): a retry would blur "the single-attempt clone
 /// made exactly one request" into "the SDK also tried again".
-std::shared_ptr<DB::S3ObjectStorage> makeDispatchStorageForTest(const std::string & endpoint, long base_request_timeout_ms)
+template <typename Storage = DB::S3ObjectStorage>
+std::shared_ptr<Storage> makeDispatchStorageForTest(const std::string & endpoint, long base_request_timeout_ms)
 {
     DB::RemoteHostFilter remote_host_filter;
     DB::S3::PocoHTTPClientConfiguration cfg = DB::S3::ClientFactory::instance().createClientConfiguration(
@@ -228,7 +254,7 @@ std::shared_ptr<DB::S3ObjectStorage> makeDispatchStorageForTest(const std::strin
     cfg.http_keep_alive_timeout = 0;
     auto client = DB::S3::ClientFactory::instance().create(
         cfg, clientSettingsForTest(), "ACCESS_KEY_ID", "SECRET_ACCESS_KEY", "", {}, {}, DB::S3::CredentialsConfiguration{});
-    return std::make_shared<DB::S3ObjectStorage>(
+    return std::make_shared<Storage>(
         std::move(client), std::make_unique<DB::S3Settings>(),
         DB::S3::URI(endpoint + "/test-bucket/"), DB::S3Capabilities{},
         DB::ObjectStorageKeyGeneratorPtr{}, "disk");
@@ -237,6 +263,43 @@ std::shared_ptr<DB::S3ObjectStorage> makeDispatchStorageForTest(const std::strin
 DB::ContextPtr contextForTest()
 {
     return getContext().context;
+}
+
+/// A genuine `S3ObjectStorage` that remembers the buffer size each `writeObject` was opened with.
+class BufferSizeRecordingS3ObjectStorage final : public DB::S3ObjectStorage
+{
+public:
+    using DB::S3ObjectStorage::S3ObjectStorage;
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object,
+        DB::WriteMode mode,
+        std::optional<DB::ObjectAttributes> attributes,
+        size_t buf_size,
+        const DB::WriteSettings & write_settings) override
+    {
+        opened_buffer_sizes.push_back(buf_size);
+        return DB::S3ObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+
+    std::vector<size_t> opened_buffer_sizes;
+};
+
+/// A server that accepts every `PUT` with a fixed `ETag`.
+void acceptPut(Poco::Net::HTTPServerResponse & response)
+{
+    response.set("ETag", "\"put-etag\"");
+    response.setContentLength(0);
+    response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
+    response.send();
+}
+
+/// A writable Native backend as `openPoolView` builds one: conditional writes are single-attempt.
+std::shared_ptr<DB::Cas::ObjectStorageBackend> conditionalBackendForTest(DB::ObjectStoragePtr storage)
+{
+    return std::make_shared<DB::Cas::ObjectStorageBackend>(
+        std::move(storage), DB::Cas::ObjectStorageBackend::Mode::Native,
+        /*single_attempt_control_plane_=*/true, /*attempt_timeout_ms_=*/5000, /*connect_timeout_cap_ms_=*/5000);
 }
 
 }
@@ -726,6 +789,82 @@ TEST(CASEnvelopeWiring, FreezeConnectTimeoutCapReachesTheBackendOverProductionDi
             << "socket-level enforcement of connectTimeoutMs is PocoHTTPClient behaviour upstream of this "
                "class, not re-proved here";
     }
+}
+
+/// A conditional body larger than the first write buffer still goes out as one `PUT` carrying every byte.
+TEST(CASBackend, LargeConditionalPutIsOneRequestWithTheWholeBody)
+{
+    (void)contextForTest();
+
+    DelayedResponseServer server(std::chrono::milliseconds(0), acceptPut);
+    auto backend = conditionalBackendForTest(makeDispatchStorageForTest(server.getUrl(), 10000));
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+
+    const std::string body(3 * 1024 * 1024 + 1, 'L');
+    auto op = requests.admit();
+    EXPECT_TRUE(std::holds_alternative<DB::Cas::Committed>(op.create("large-key", body, DB::Cas::Retry::once())));
+    EXPECT_EQ(server.requestsSeen(), 1u);
+    EXPECT_EQ(server.bodyBytesSeen(), body.size());
+}
+
+/// A conditional `PUT` is sent by the thread that asked for it, so a memory guard that thread holds
+/// covers the upload. `S3PutObject` is counted on the thread that sends the request.
+TEST(CASBackend, ConditionalPutRunsOnTheCallingThread)
+{
+    (void)contextForTest();
+
+    DelayedResponseServer server(std::chrono::milliseconds(0), acceptPut);
+    auto backend = conditionalBackendForTest(makeDispatchStorageForTest(server.getUrl(), 10000));
+    EXPECT_FALSE(backend->conditionalWriteSettingsForTest().s3_allow_parallel_part_upload);
+
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+    bool committed = false;
+    uint64_t puts_on_calling_thread = 0;
+    std::exception_ptr failure;
+    ThreadFromGlobalPool caller([&]
+    {
+        try
+        {
+            const uint64_t before = DB::CurrentThread::getProfileEvents()[ProfileEvents::S3PutObject].load();
+            auto op = requests.admit();
+            committed = std::holds_alternative<DB::Cas::Committed>(op.create("put-key", "body", DB::Cas::Retry::once()));
+            puts_on_calling_thread = DB::CurrentThread::getProfileEvents()[ProfileEvents::S3PutObject].load() - before;
+        }
+        catch (...)
+        {
+            failure = std::current_exception();
+        }
+    });
+    caller.join();
+    if (failure)
+        std::rethrow_exception(failure);
+
+    EXPECT_TRUE(committed);
+    EXPECT_EQ(server.requestsSeen(), 1u);
+    EXPECT_EQ(puts_on_calling_thread, 1u) << "the conditional PUT was sent by another thread";
+}
+
+/// A conditional `PUT` opens its buffer at the body size, and an empty body at one byte, which is what
+/// `WriteBuffer::write` needs to accept zero bytes.
+TEST(CASBackend, ConditionalPutBufferStartsAtTheBodySize)
+{
+    (void)contextForTest();
+
+    DelayedResponseServer server(std::chrono::milliseconds(0), acceptPut);
+    auto storage = makeDispatchStorageForTest<BufferSizeRecordingS3ObjectStorage>(server.getUrl(), 10000);
+    auto backend = conditionalBackendForTest(storage);
+    DB::Cas::CasRequests requests(DB::Cas::BackendPtr(backend), DB::Cas::Fence::open());
+
+    const std::string body(37, 'b');
+    {
+        auto op = requests.admit();
+        EXPECT_TRUE(std::holds_alternative<DB::Cas::Committed>(op.create("small-key", body, DB::Cas::Retry::once())));
+    }
+    {
+        auto op = requests.admit();
+        EXPECT_TRUE(std::holds_alternative<DB::Cas::Committed>(op.create("empty-key", "", DB::Cas::Retry::once())));
+    }
+    EXPECT_EQ(storage->opened_buffer_sizes, (std::vector<size_t>{body.size(), 1}));
 }
 
 #endif

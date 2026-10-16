@@ -30,6 +30,8 @@ public:
     virtual void sendQueryPlan(const QueryPlan & query_plan) = 0;
 
     virtual void sendClusterFunctionReadTaskResponse(const ClusterFunctionReadTaskResponse &) = 0;
+
+    virtual UInt64 getServerAntalyaProtocolVersion() const { return 0; }
     virtual void sendMergeTreeReadTaskResponse(const ParallelReadResponse & response) = 0;
 
     /// Get packet from any replica.
