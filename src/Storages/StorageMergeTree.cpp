@@ -14,6 +14,7 @@
 #include <Databases/DatabasesCommon.h>
 #include <Databases/IDatabase.h>
 #include <Disks/supportWritingWithAppend.h>
+#include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <IO/SharedThreadPools.h>
 #include <IO/copyData.h>
 #include <Interpreters/ClusterProxy/SelectStreamFactory.h>
@@ -190,11 +191,15 @@ static bool supportTransaction(const Disks & disks, LoggerPtr log)
 {
     for (const auto & disk : disks)
     {
-        if (!supportWritingWithAppend(disk))
-        {
-            LOG_DEBUG(log, "Disk {} does not support writing with append", disk->getName());
-            return false;
-        }
+        if (supportWritingWithAppend(disk))
+            continue;
+        /// A content-addressed disk does not support append, but persists the per-part mutable
+        /// transaction file (txn_version.txt) via its per-ref sidecar, which is all MVCC needs.
+        if (auto * obj = dynamic_cast<DiskObjectStorage *>(disk.get());
+            obj && obj->getMetadataStorage()->supportsTransactionalMutableFiles())
+            continue;
+        LOG_DEBUG(log, "Disk {} does not support transactions", disk->getName());
+        return false;
     }
     return true;
 }
@@ -2088,7 +2093,7 @@ MergeMutateSelectedEntryPtr StorageMergeTree::selectPartsToMutate(
             future_part->parts.push_back(part);
             future_part->part_info = new_part_info;
             future_part->name = part->getNewName(new_part_info);
-            future_part->part_format = part->getFormat();
+            future_part->part_format = choosePartFormatForMutation(part);
 
             tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, CompactionStatistics::estimateNeededDiskSpace({part}, false), *this, metadata_snapshot, true);
             return std::make_shared<MergeMutateSelectedEntry>(future_part, std::move(tagger), commands, txn, mutation_ids);

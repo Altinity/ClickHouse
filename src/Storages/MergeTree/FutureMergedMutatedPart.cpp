@@ -105,6 +105,7 @@ void FutureMergedMutatedPart::updatePath(const MergeTreeData & storage, const IR
 {
     path = fs::path(storage.getFullPathOnDisk(reservation->getDisk())) / name;
     path += "/";
+    part_format = storage.normalizePartFormatForDisk(part_format, reservation->getDisk());
 }
 
 }

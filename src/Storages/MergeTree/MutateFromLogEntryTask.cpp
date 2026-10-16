@@ -117,7 +117,7 @@ ReplicatedMergeMutateTaskBase::PrepareResult MutateFromLogEntryTask::prepare()
     }
 
     future_mutated_part->parts.push_back(source_part);
-    future_mutated_part->part_format = source_part->getFormat();
+    future_mutated_part->part_format = storage.choosePartFormatForMutation(source_part);
 
     if (source_part->name != source_part_name)
     {
@@ -303,7 +303,9 @@ bool MutateFromLogEntryTask::finalize(ReplicatedMergeMutateTaskBase::PartLogWrit
         data_part_storage.precommitTransaction();
 
     storage.renameTempPartAndReplace(new_part, *transaction_ptr, /*rename_in_transaction=*/ true);
-    new_part->getDataPartStorage().commitTransaction();
+    /// A content-addressed part is published once, under its final name, when the transaction commits after the rename.
+    if (!new_part->getDataPartStorage().isContentAddressed())
+        new_part->getDataPartStorage().commitTransaction();
 
     FailPointInjection::pauseFailPoint(FailPoints::rmt_mutate_task_pause_before_rename_part);
 

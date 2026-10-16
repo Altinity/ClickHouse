@@ -348,7 +348,9 @@ public:
     MergeTreeDataPartFormat
     choosePartFormat(size_t bytes_uncompressed, size_t rows_count, UInt32 part_level, ProjectionDescriptionRawPtr projection) const;
 
-    MergeTreeDataPartFormat choosePartFormatOnDisk(size_t bytes_uncompressed, size_t rows_count) const;
+    MergeTreeDataPartFormat choosePartFormatForMutation(const DataPartPtr & source_part) const;
+
+    static MergeTreeDataPartFormat normalizePartFormatForDisk(MergeTreeDataPartFormat format, const DiskPtr & disk);
 
     /// return pair <exists, pointer to part>. Sometimes we may fail to load existing part (network issues, oom and so on),
     /// in this case pair of <true, nullptr> is returned.
@@ -374,9 +376,17 @@ public:
         DataPartsVector commit();
         DataPartsVector commit(DataPartsLock & lock);
 
-        /// Rename should be done explicitly, before calling commit(), to
-        /// guarantee that no lock held during rename (since rename is IO
-        /// bound, while data parts lock is the bottleneck)
+        /// Renames should be done explicitly, before calling commit, to
+        /// guarantee that no lock is held during the rename and the disk
+        /// commit (both are IO bound, while the data parts lock is the
+        /// bottleneck). Contract: after renameParts every part of this
+        /// transaction is durable on its disk at its final name; commit only
+        /// flips in-memory visibility, and rollback compensates via new disk
+        /// operations (part removal). Every caller runs this BEFORE its
+        /// external Keeper commit decision: a part must be durable before its
+        /// block_id/part-znode is registered in Keeper, otherwise a fault between the two commits
+        /// leaves a phantom part whose surviving block_id silently dedups a byte-identical client
+        /// retry (acked data loss).
         void renameParts();
 
         void addPart(MutableDataPartPtr & part, bool need_rename);

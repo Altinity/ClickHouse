@@ -135,6 +135,11 @@ DB::CommandPtr makeCommandHelp(const DisksApp & disks_app);
 DB::CommandPtr makeCommandTouch();
 DB::CommandPtr makeCommandDiskUsage();
 DB::CommandPtr makeCommandWordCount();
+DB::CommandPtr makeCommandFsck();
+DB::CommandPtr makeCommandCaGcDryRun();
+DB::CommandPtr makeCommandCaGcRebuild();
+DB::CommandPtr makeCommandCaInspect();
+DB::CommandPtr makeCommandCaDropMember();
 DB::CommandPtr makeCommandReadChecksums();
 DB::CommandPtr makeCommandPackedIO();
 }
