@@ -27,8 +27,10 @@ ${CLICKHOUSE_CLIENT} --allow_insert_into_iceberg=1 --query \
     "INSERT INTO ${TABLE} SELECT number, toString(number) FROM numbers(5)"
 
 # Merge-on-read delete: writes a position-delete file, which makes data-file compaction non-trivial.
+# Delete a single row: compaction currently accepts an overwrite snapshot only when its
+# `added-position-deletes` equals `added-delete-files`.
 ${CLICKHOUSE_CLIENT} --allow_insert_into_iceberg=1 --query \
-    "ALTER TABLE ${TABLE} DELETE WHERE x IN (1, 3)"
+    "ALTER TABLE ${TABLE} DELETE WHERE x = 1"
 
 # Make a multi-argument bucket over (x, y) the default partition spec. Existing files keep spec 0.
 python3 - "${TABLE_PATH}" << 'EOF'
@@ -66,9 +68,14 @@ count_data_files()
 
 files_before=$(count_data_files)
 
-${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache=0 --allow_experimental_iceberg_compaction=1 \
-    --query "OPTIMIZE TABLE ${TABLE}" 2>&1 \
-    | grep -o -m1 'Multi-argument partition transforms (source-ids) are not supported for writes'
+optimize_output=$(${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache=0 --allow_experimental_iceberg_compaction=1 \
+    --query "OPTIMIZE TABLE ${TABLE}" 2>&1)
+if ! echo "${optimize_output}" | grep -q -m1 'Multi-argument partition transforms (source-ids) are not supported for writes'; then
+    echo "FAIL: OPTIMIZE did not reject the multi-argument spec:"
+    echo "${optimize_output}"
+    exit 1
+fi
+echo 'Multi-argument partition transforms (source-ids) are not supported for writes'
 
 files_after=$(count_data_files)
 if [ "${files_before}" -eq "${files_after}" ]; then
