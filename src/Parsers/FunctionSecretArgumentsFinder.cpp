@@ -334,6 +334,15 @@ void FunctionSecretArgumentsFinder::findOrdinaryFunctionSecretArguments()
         findBigQuerySecretArguments();
         return;
     }
+    if ((name == "iceberg") || (name == "icebergCluster"))
+    {
+        /// `storage_type = ...` is a named argument that legitimately precedes the positional ones; the
+        /// Iceberg finder skips it and delegates to the S3/Azure finder, which classifies the remaining
+        /// positionals itself. Bypass the generic positional-after-named masking below, which would see
+        /// `storage_type` as a leading named argument and wrongly hide every positional after it.
+        findIcebergFunctionSecretArguments(/* is_cluster_function= */ name == "icebergCluster");
+        return;
+    }
 
     std::function<void()> find_secrets;
     if ((name == "mysql") || (name == "postgresql"))
@@ -345,14 +354,6 @@ void FunctionSecretArgumentsFinder::findOrdinaryFunctionSecretArguments()
     else if (name == "mongodb")
     {
         find_secrets = [this] { findMongoDBSecretArguments(); };
-    }
-    else if (name == "iceberg")
-    {
-        find_secrets = [this] { findIcebergFunctionSecretArguments(/* is_cluster_function= */ false); };
-    }
-    else if (name == "icebergCluster")
-    {
-        find_secrets = [this] { findIcebergFunctionSecretArguments(/* is_cluster_function= */ true); };
     }
     else if ((name == "s3") || (name == "cosn") || (name == "oss") || (name == "deltaLake") || (name == "deltaLakeS3")
              || (name == "hudi") || (name == "gcs") || (name == "icebergS3") || (name == "paimon")
@@ -1041,7 +1042,12 @@ void FunctionSecretArgumentsFinder::findTableEngineSecretArguments()
     }
     else if (engine_name == "Iceberg")
     {
-        find_secrets = [this] { findIcebergTableEngineSecretArguments(); };
+        /// `storage_type = ...` is a named argument that legitimately precedes the positional ones; the
+        /// Iceberg finder skips it and delegates to the S3/Azure finder, which classifies the remaining
+        /// positionals itself. Bypass the generic positional-after-named masking below, which would see
+        /// `storage_type` as a leading named argument and wrongly hide every positional after it.
+        findIcebergTableEngineSecretArguments();
+        return;
     }
     else if ((engine_name == "S3") || (engine_name == "COSN") || (engine_name == "OSS") || (engine_name == "GCS")
              || (engine_name == "DeltaLake") || (engine_name == "DeltaLakeS3") || (engine_name == "Hudi")
