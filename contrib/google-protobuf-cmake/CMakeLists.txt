@@ -475,6 +475,7 @@ else ()
                 "-Dprotobuf_BUILD_EXAMPLES=0"
                 "-Dprotobuf_BUILD_PROTOC_BINARIES=1"
                 "-DABSL_ROOT_DIR=${abseil_source_dir}"
+                "-DFETCHCONTENT_SOURCE_DIR_ABSL=${abseil_source_dir}"
                 "-DABSL_ENABLE_INSTALL=0"
                 "${protobuf_source_dir}"
             WORKING_DIRECTORY "${PROTOC_BUILD_DIR}"
