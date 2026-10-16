@@ -103,6 +103,7 @@ namespace FileCacheSetting
     extern const FileCacheSettingsBool use_split_cache;
     extern const FileCacheSettingsDouble split_cache_ratio;
     extern const FileCacheSettingsUInt64 overcommit_eviction_evict_step;
+    extern const FileCacheSettingsBool skip_cache_on_disk_failure;
 }
 
 namespace
@@ -208,6 +209,7 @@ FileCache::FileCache(const std::string & cache_name, const FileCacheSettings & s
     , keep_up_free_space_remove_batch(settings[FileCacheSetting::keep_free_space_remove_batch])
     , use_split_cache(settings[FileCacheSetting::use_split_cache])
     , split_cache_ratio(settings[FileCacheSetting::split_cache_ratio])
+    , skip_cache_on_disk_failure(settings[FileCacheSetting::skip_cache_on_disk_failure])
     , name(cache_name)
     , log(getLogger("FileCache(" + cache_name + ")"))
     , metadata(settings[FileCacheSetting::path],
@@ -344,6 +346,11 @@ void FileCache::throwInitExceptionIfNeeded()
 const String & FileCache::getBasePath() const
 {
     return metadata.getBaseDirectory();
+}
+
+bool FileCache::skipCacheOnDiskFailure() const
+{
+    return skip_cache_on_disk_failure;
 }
 
 String FileCache::getFileSegmentPath(const Key & key, size_t offset, FileSegmentKind segment_kind, const OriginInfo & origin) const
@@ -1255,18 +1262,40 @@ bool FileCache::doTryReserve(
         throw;
     }
 
+    /// Undo the reservation, so `main_priority` stays consistent with `FileSegment::reserved_size`.
+    auto rollback_main_entry = [&]
+    {
+        if (added_new_main_entry)
+            main_priority_iterator->invalidate();
+        else
+            main_priority_iterator->decrementSize(size);
+    };
+
+    /// After eviction, so a full cache disk can still admit.
+    bool created_base_directory = false;
+    try
+    {
+        created_base_directory = file_segment.getKeyMetadata()->createBaseDirectory();
+    }
+    catch (...)
+    {
+        rollback_main_entry();
+        throw;
+    }
+
+    if (!created_base_directory)
+    {
+        rollback_main_entry();
+        failure_reason = "not enough space on device";
+        return false;
+    }
+
     /// Mark that size was successfully updated.
     if (added_new_main_entry)
         file_segment.setQueueIterator(main_priority_iterator);
 
     file_segment.reserved_size += size;
     chassert(file_segment.reserved_size == main_priority_iterator->getEntry()->size);
-
-    if (!file_segment.getKeyMetadata()->createBaseDirectory())
-    {
-        failure_reason = "not enough space on device";
-        return false;
-    }
 
     return true;
 }
