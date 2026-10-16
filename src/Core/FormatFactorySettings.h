@@ -209,6 +209,9 @@ When reading Parquet files, skip whole row groups based on the WHERE expressions
     DECLARE(UInt64, input_format_parquet_dictionary_filter_push_down, 1024 * 1024, R"(
 When reading Parquet files (with reader v3), skip whole row groups based on the WHERE/PREWHERE expressions and the dictionary page contents, when all data pages of a column chunk are dictionary-encoded. The value is the maximum dictionary page size (in bytes) for which this optimization is applied; set to 0 to disable. This takes precedence over the bloom filter when both are available.
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_bloom_filter_coalesce_max_bytes, 64 * 1024 * 1024, R"(
+Max bytes of one read when loading Parquet bloom filters. Contiguous bloom filters are read together up to this size. If the file itself is not larger than this and it has enough bloom filters that separate reads would cost more than reading the file, the whole file is read once. 0 keeps a separate read per bloom filter.
+)", 0) \
     DECLARE(Bool, input_format_parquet_enable_json_parsing, true, R"(
 When reading Parquet files, parse JSON columns as ClickHouse JSON Column.
 )", 0) \

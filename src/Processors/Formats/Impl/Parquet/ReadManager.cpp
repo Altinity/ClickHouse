@@ -628,10 +628,12 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
         if (row_group_idx != i)
             return false;
         const RowGroup & row_group = reader.row_groups[row_group_idx];
-        /// Must check stage first so that read_ptr is meaningful (we start advancing it in finishRowSubgroupStage).
+        /// Before column data, read_ptr is not advanced yet. This row group still has to run: a coalesced
+        /// prefetch is charged until every handle that pins it has finished, including handles of later
+        /// row groups. Blocking this row group would leave that charge stuck.
         /// Using acquire ordering to synchronize with the release (seq_cst) store in `finishRowGroupStage`.
         if (row_group.stage.load(std::memory_order_acquire) < ReadStage::ColumnData)
-            return false;
+            return true;
         return row_group.read_ptr.load() == row_group.delivery_ptr.load();
     };
 

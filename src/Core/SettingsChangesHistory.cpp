@@ -41,6 +41,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "26.8.6.20001.altinityantalya",
+        {
+            {"input_format_parquet_bloom_filter_coalesce_max_bytes", 0, 64 * 1024 * 1024, "Read contiguous Parquet bloom filters, or a small file that has many of them, in one request."},
+        });
         addSettingsChanges(settings_changes_history, "26.8",
         {
             {"allow_experimental_ai_functions", false, false, "The setting is obsolete, AI functions are beta now and enabled by default."},

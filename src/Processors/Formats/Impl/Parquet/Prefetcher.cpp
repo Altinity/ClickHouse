@@ -129,13 +129,14 @@ void Prefetcher::readSync(char * to, size_t n, size_t offset)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Unexpected eof: offset {}, length {}, bytes read {}, expected file size {}", offset, n, nread, file_size);
 }
 
-PrefetchHandle Prefetcher::registerRange(size_t offset, size_t length, bool likely_to_be_used)
+PrefetchHandle Prefetcher::registerRange(size_t offset, size_t length, bool likely_to_be_used, uint8_t coalesce_group)
 {
     chassert(!ranges_finalized.load(std::memory_order_relaxed));
     if (offset > file_size || length > file_size - offset)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Range out of bounds: offset {}, length {}, file size {}", offset, length, file_size);
     RequestState & req = requests.emplace_back();
     req.length = length;
+    req.coalesce_group = coalesce_group_for_all_ranges ? coalesce_group_for_all_ranges : coalesce_group;
     req.allow_incidental_read.store(likely_to_be_used || length < min_bytes_for_seek, std::memory_order_relaxed);
     range_sets[0].ranges.push_back(RangeState {.request = &req, .start = offset, .end = offset + length});
     return PrefetchHandle(&req);
@@ -148,7 +149,11 @@ void Prefetcher::finalizeRanges()
     auto & ranges = range_sets[0].ranges;
     std::sort(ranges.begin(), ranges.end(), [](const RangeState & a, const RangeState & b)
         {
-            return a.start < b.start;
+            if (a.start != b.start)
+                return a.start < b.start;
+            /// Longer range first. A bloom-filter data range and its header share `start`, and
+            /// `std::sort` would otherwise leave that order unspecified.
+            return a.end > b.end;
         });
     for (size_t i = 0; i < ranges.size(); ++i)
     {
@@ -179,12 +184,29 @@ void Prefetcher::startPrefetch(const std::vector<PrefetchHandle *> & requests_to
         chassert(req);
         pickRangesAndCreateTaskIfNotExists(req, *handle, /*splitting=*/ false, 0, 0, std::unique_lock(mutex));
         chassert(req->state.load(std::memory_order_relaxed) == RequestState::State::HasTask);
-        const Task * task = req->task;
+        Task * task = req->task;
 
         if (!handle->memory)
         {
             size_t memory_usage = static_cast<size_t>(static_cast<double>(req->length) * task->memory_amplification);
-            handle->memory = MemoryUsageToken(memory_usage, diff);
+            /// A coalesced buffer outlives the handle that started it: the bloom-filter header is reset
+            /// as soon as it is parsed, while the other headers and block handles still pin `buf`.
+            /// Charge the buffer on the task until the last of those handles drops it.
+            if (req->coalesce_group != 0 || task->coalesce_memory_state.load(std::memory_order_acquire) == 1)
+            {
+                if (req->coalesce_group != 0 && task->length > 0)
+                {
+                    uint8_t expected = 0;
+                    if (task->coalesce_memory_state.compare_exchange_strong(expected, 2, std::memory_order_acq_rel))
+                    {
+                        task->coalesce_memory = MemoryUsageToken(task->length, diff);
+                        task->coalesce_memory_state.store(1, std::memory_order_release);
+                    }
+                }
+                memory_usage = 0;
+            }
+            if (memory_usage != 0)
+                handle->memory = MemoryUsageToken(memory_usage, diff);
         }
     }
 }
@@ -328,9 +350,21 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     for (size_t idx = range_idx; idx > 0; --idx)
     {
         const RangeState & r = ranges[idx - 1];
-        if (r.end + min_bytes_for_seek <= start_offset || // short gap
-            r.start + bytes_per_read_task <= initial_offset || // task not too big
-            !r.request->allow_incidental_read.load(std::memory_order_relaxed)) // range wants to be coalesced
+        const bool same_group = initial_req->coalesce_group != 0 && r.request->coalesce_group == initial_req->coalesce_group;
+        /// Bloom-filter groups stay inside the group, so a filter is not merged with the column data next to it.
+        /// `across_gaps` is the small-file path: one read covers the whole object.
+        /// The same-group span is the configured cap, even when that cap is below `bytes_per_read_task`.
+        /// The cap is the whole task. A bloom body included on the left must share it with later filters.
+        const size_t gap_limit = (same_group && coalesce_group_across_gaps) ? coalesce_group_span_limit : min_bytes_for_seek;
+        const size_t span_limit = same_group ? coalesce_group_span_limit : bytes_per_read_task;
+        const size_t prospective_start = std::min(start_offset, r.start);
+        const size_t prospective_end = std::max(end_offset, r.end);
+        const bool end_past_cap = same_group && prospective_end - prospective_start > span_limit;
+        if ((initial_req->coalesce_group != 0 && !same_group) ||
+            r.end + gap_limit <= start_offset || // short gap
+            r.start + span_limit <= initial_offset || // task not too big
+            end_past_cap ||
+            (!same_group && !r.request->allow_incidental_read.load(std::memory_order_relaxed))) // range wants to be coalesced
             break;
 
         const auto s = r.request->state.load(std::memory_order_relaxed);
@@ -363,9 +397,17 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     for (size_t idx = range_idx + 1; idx < ranges.size(); ++idx)
     {
         const RangeState & r = ranges[end_idx];
-        if (end_offset + min_bytes_for_seek <= r.start ||
-            initial_offset + bytes_per_read_task <= r.end ||
-            !r.request->allow_incidental_read.load(std::memory_order_relaxed))
+        const bool same_group = initial_req->coalesce_group != 0 && r.request->coalesce_group == initial_req->coalesce_group;
+        const size_t gap_limit = (same_group && coalesce_group_across_gaps) ? coalesce_group_span_limit : min_bytes_for_seek;
+        const size_t span_limit = same_group ? coalesce_group_span_limit : bytes_per_read_task;
+        const size_t prospective_start = std::min(start_offset, r.start);
+        const size_t prospective_end = std::max(end_offset, r.end);
+        const bool end_past_cap = same_group && prospective_end - prospective_start > span_limit;
+        if ((initial_req->coalesce_group != 0 && !same_group) ||
+            end_offset + gap_limit <= r.start ||
+            (!same_group && initial_offset + span_limit <= r.end) ||
+            end_past_cap ||
+            (!same_group && !r.request->allow_incidental_read.load(std::memory_order_relaxed)))
             break;
 
         const auto s = r.request->state.load(std::memory_order_relaxed);
@@ -408,19 +450,32 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     }
 
     chassert(actual_refcount > 0);
-    decreaseTaskRefcount(&task, initial_refcount - actual_refcount);
+    decreaseTaskRefcount(&task, initial_refcount - actual_refcount, nullptr);
 
     lock.unlock();
 
     scheduleTask(&task);
 }
 
-void Prefetcher::decreaseTaskRefcount(Task * task, size_t amount)
+void Prefetcher::decreaseTaskRefcount(Task * task, size_t amount, MemoryUsageDiff * diff)
 {
     size_t c = task->refcount.fetch_sub(amount, std::memory_order_acq_rel);
     chassert(c >= amount);
     if (c != amount)
         return;
+
+    /// Last handle. Drop the coalesced-buffer charge together with the buffer itself.
+    if (task->coalesce_memory_state.load(std::memory_order_acquire) == 1)
+    {
+        if (diff)
+            task->coalesce_memory.reset(diff);
+        else
+        {
+            /// Shutdown abandons per-stage accounting; drop the token without recording it.
+            MemoryUsageToken dropped(std::move(task->coalesce_memory));
+            (void)dropped;
+        }
+    }
 
     if (task->state.exchange(Task::State::Deallocated) != Task::State::Running)
     {
@@ -607,7 +662,7 @@ void PrefetchHandle::reset(MemoryUsageDiff * diff)
         memory.reset(diff);
 
     if (request->state.exchange(RequestState::State::Cancelled) == RequestState::State::HasTask)
-        Prefetcher::decreaseTaskRefcount(request->task, 1);
+        Prefetcher::decreaseTaskRefcount(request->task, 1, diff);
 
     request = nullptr;
 }
