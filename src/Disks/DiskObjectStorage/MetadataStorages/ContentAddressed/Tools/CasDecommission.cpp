@@ -269,7 +269,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     }
 
     /// Manifest debris must be removed before the mount slot: deleting the mount body removes the
-    /// watermark authority, after which `floorForNamespace` returns no value and the ordinary orphan
+    /// watermark authority, after which `mountLeaseForNamespace` returns no value and the ordinary orphan
     /// sweep cannot prove that old-epoch debris is eligible. The decommission claim has advanced the
     /// writer epoch, so every build prefix with `prefix.writer_epoch < w.writer_epoch` is eligible here.
     /// Group the listed keys by namespace and build prefix so each group can use the exact-token orphan

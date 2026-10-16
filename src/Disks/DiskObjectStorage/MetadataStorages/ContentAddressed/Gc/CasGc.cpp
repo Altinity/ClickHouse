@@ -2989,7 +2989,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 /// clamps every round with no terminal resolution. Fail-closed: no durable watermark (the
                 /// build cannot be proven dead) keeps the barrier.
                 if (edge.change > 0 && edge.owner_kind == RefOwnerKind::Precommit
-                    && prefixEligible(*store, ns,
+                    && isBuildPrefixCoveredByFloor(*store, ns,
                            BuildPrefix{.writer_epoch = edge.manifest_id.ref.writer_epoch,
                                        .build_sequence = edge.manifest_id.ref.build_sequence}))
                 {
@@ -4846,7 +4846,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             if (!parsed)
                 return true;   /// foreign key shape — debris
             const ManifestRef & mref = parsed->ref;
-            if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}))
+            if (isBuildPrefixCoveredByFloor(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}))
                 return true;   /// provably dead — the orphan sweep's territory, never an edge
             const ManifestId id{ns, mref};
             if (foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
