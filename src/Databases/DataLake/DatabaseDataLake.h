@@ -3,6 +3,7 @@
 
 #if USE_AVRO && USE_PARQUET
 
+#include <Access/ForwardedAuthToken.h>
 #include <Databases/DataLake/DataLakeConstants.h>
 #include <Databases/DatabasesCommon.h>
 #include <Databases/DataLake/DatabaseDataLakeSettings.h>
@@ -63,7 +64,7 @@ public:
 
     Strings getAllTableNames(ContextPtr context) const override;
 
-    void checkDatabase() const override;
+    void checkDatabase(ContextPtr context) const override;
 
     void shutdown() override {}
 
@@ -106,6 +107,10 @@ private:
     mutable std::shared_ptr<DataLake::ICatalog> catalog_impl TSA_GUARDED_BY(catalog_mutex);
 
     void validateSettings();
+
+    void validateTokenForwardingSettings() const;
+
+    static void validateGlueTokenForwardingSettings(const DatabaseDataLakeSettings & settings);
 
     void validateCreateTableEngineArguments(const ASTFunction & engine) const;
 

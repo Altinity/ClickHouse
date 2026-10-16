@@ -300,6 +300,35 @@ To reduce number of requests to IdP, tokens are cached internally for a maximum 
 If token expires sooner than `token_cache_lifetime`, then cache entry for this token will only be valid while token is valid.
 If token lifetime is longer than `token_cache_lifetime`, cache entry for this token will be valid for `token_cache_lifetime`. 
 
+## Forwarding the token to external services {#token-forwarding}
+
+By default, the authenticated token is not retained in the session for forwarding. Set
+`enable_token_forwarding` to `1` in `config.xml` to retain it for external-service authentication:
+
+```xml
+<enable_token_forwarding>1</enable_token_forwarding>
+```
+
+The setting is hot-reloadable and defaults to `false`. To use it with Iceberg REST or Glue, enable
+`oauth_forward_user_token` on the [`DataLakeCatalog`](/engines/database-engines/datalakecatalog)
+database. See [catalog token forwarding](/engines/database-engines/datalakecatalog#user-token-forwarding)
+for configuration and examples.
+
+:::danger Restrict `CREATE DATABASE`
+Database creators choose the endpoints that receive users' tokens. Grant `CREATE DATABASE` only
+to trusted users and restrict `remote_url_allow_hosts` for catalog and token-exchange endpoints.
+:::
+
+Only the session's verified token is forwarded. It is not inherited by `EXECUTE AS` or
+`DEFINER` views, forwarded to other ClickHouse nodes, or persisted to disk.
+
+HTTP requests authenticate separately, so a rotated token takes effect on the next request.
+Native TCP sessions must reconnect with the new token.
+
+With `async_insert = 1`, each queued batch retains its token until the flush completes, even with
+`wait_for_async_insert = 0`. Different tokens use separate batches; rotation does not change a
+queued batch's token.
+
 ## Enabling token authentication for a user in `users.xml` {#enabling-jwt-auth-in-users-xml}
 
 In order to enable token-based authentication for the user, specify `jwt` section instead of `password` or other similar sections in the user definition.

@@ -890,6 +890,16 @@ namespace
 
     Default value: `true` (token authentication is enabled).
     )", 0) \
+    DECLARE(Bool, enable_token_forwarding, false, R"(
+    Retain authenticated bearer tokens for forwarding through the `DataLakeCatalog`
+    setting `oauth_forward_user_token`. Supports Iceberg REST and AWS STS for Glue.
+    When disabled, tokens are not retained in sessions for forwarding.
+
+    Database creators choose the endpoints that receive users' tokens. Grant `CREATE DATABASE`
+    only to trusted users and restrict `remote_url_allow_hosts`.
+
+    Default value: `false`.
+    )", 0) \
     DECLARE(UInt64, concurrent_threads_soft_limit_num, 0, R"(
     The maximum number of query processing threads, excluding threads for retrieving data from remote servers, allowed to run all queries. This is not a hard limit. In case if the limit is reached the query will still get at least one thread to run. Query can upscale to desired number of threads during execution if more threads become available.
 
