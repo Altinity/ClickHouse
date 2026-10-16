@@ -85,6 +85,11 @@ void DataFileStatistics::addColumnSizesOnDisk(const std::unordered_map<String, s
 
     for (size_t i = 0; i < field_ids.size(); ++i)
     {
+        /// Columns not stored in the data file (e.g. a column of only the Iceberg `unknown` type) are
+        /// excluded by excludeColumns() and never reported by the output format; skip them exactly like the
+        /// getters do, otherwise finalize() throws for a column that was intentionally not written.
+        if (isExcluded(i))
+            continue;
         const auto & column_name = sample_block.getByPosition(i).name;
         auto it = sizes_by_column_name.find(column_name);
         if (it == sizes_by_column_name.end())
