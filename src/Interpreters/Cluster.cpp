@@ -875,6 +875,7 @@ Cluster::Cluster(Cluster::ReplicasAsShardsTag, const Cluster & from, const Setti
 
     secret = from.secret;
     name = from.name;
+    replicas_as_shards = true;
 
     constrainShardInfoAndAddressesToMaxHosts(max_hosts);
 
@@ -923,6 +924,7 @@ Cluster::Cluster(Cluster::SubclusterTag, const Cluster & from, const std::vector
 
     secret = from.secret;
     name = from.name;
+    replicas_as_shards = from.replicas_as_shards;
 
     initMisc();
 }
