@@ -74,7 +74,8 @@ public:
         Int32 table_schema_id,
         Int32 file_schema_id,
         const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_,
-        const std::unordered_map<Int32, std::pair<Field, Field>> & value_bounds_);
+        const std::unordered_map<Int32, std::pair<Field, Field>> & value_bounds_,
+        const String & file_path);
 
     void serialize(WriteBuffer & out) const;
     static DataFileMetaInfo deserialize(ReadBuffer & in);
@@ -115,6 +116,8 @@ struct ObjectInfo;
 using ObjectInfoPtr = std::shared_ptr<ObjectInfo>;
 using ObjectIterator = std::shared_ptr<IObjectIterator>;
 using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;
+struct PartitionCommand;
+using PartitionCommands = std::vector<PartitionCommand>;
 
 struct FormatParserSharedResources;
 using FormatParserSharedResourcesPtr = std::shared_ptr<FormatParserSharedResources>;
@@ -125,6 +128,8 @@ public:
     virtual ~IDataLakeMetadata() = default;
 
     virtual bool operator==(const IDataLakeMetadata & other) const = 0;
+
+    virtual std::string getTableLocation() const { return {}; }
 
     /// Return iterator to `data files`.
     using FileProgressCallback = std::function<void(FileProgress)>;
@@ -265,11 +270,17 @@ public:
 
     virtual void addDeleteTransformers(ObjectInfoPtr, QueryPipelineBuilder &, const std::optional<FormatSettings> &, FormatParserSharedResourcesPtr, ContextPtr) const { }
     virtual void checkAlterIsPossible(const AlterCommands & /*commands*/) { throwNotImplemented("alter"); }
+    virtual void checkAlterPartitionIsPossible(const PartitionCommands & /*commands*/) const { throwNotImplemented("alterPartition"); }
     virtual void alter(
         const AlterCommands & /*params*/,
         ContextPtr /*context*/,
         const StorageID & /*storage_id*/,
         std::shared_ptr<DataLake::ICatalog> /*catalog*/) { throwNotImplemented("alter"); }
+    virtual Pipe alterPartition(
+        const PartitionCommands & /* commands */,
+        ContextPtr /* context */,
+        std::shared_ptr<DataLake::ICatalog> /* catalog */,
+        StorageID /* storage_id */) { throwNotImplemented("alterPartition"); }
 
     virtual Pipe executeCommand(
         const String & command_name,
@@ -289,7 +300,10 @@ public:
         throwNotImplemented("truncate");
     }
 
-    virtual void drop(ContextPtr) { }
+    /// Checks with the `DROP` query context what `drop` will do in the background.
+    virtual void checkCanBeDropped(ContextPtr /*query_context*/) const { }
+    /// `delete_data` is what `StorageObjectStorage::drop` resolved from `data_lake_delete_data_on_drop`.
+    virtual void drop(bool /* delete_data */) { }
 
     virtual ObjectStorageType getObjectStorageType() const { return ObjectStorageType::None; }
 

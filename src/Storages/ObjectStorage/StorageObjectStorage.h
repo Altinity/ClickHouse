@@ -17,8 +17,10 @@
 #include <Databases/DataLake/ICatalog.h>
 #include <Storages/MutationCommands.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include <Storages/IPartitionStrategy.h>
 namespace DB
@@ -115,13 +117,25 @@ public:
         const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
 
+    /// Shared `drop` implementation: removes the table from `catalog` (if any) and drops `configuration`,
+    /// deleting the data only if `delete_data_on_drop` was captured as `true` by `prepareForDrop`.
+    static void dropImpl(
+        const std::optional<bool> & delete_data_on_drop,
+        const std::shared_ptr<DataLake::ICatalog> & catalog,
+        const StorageObjectStorageConfigurationPtr & configuration,
+        const StorageID & storage_id,
+        const LoggerPtr & log);
+
     void truncate(
         const ASTPtr & query,
         const StorageMetadataPtr & metadata_snapshot,
         ContextPtr local_context,
         TableExclusiveLockHolder &) override;
 
+    void checkTableCanBeDropped(ContextPtr query_context) const override { configuration->checkCanBeDropped(query_context); }
     void drop() override;
+
+    void prepareForDrop(ContextPtr query_context) override;
 
     bool supportsPartitionBy() const override { return true; }
 
@@ -218,7 +232,15 @@ public:
 
     void alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & alter_lock_holder) override;
 
+    Pipe alterPartition(
+        const StorageMetadataPtr & /* metadata_snapshot */, const PartitionCommands & /* commands */, ContextPtr /* context */) override;
+
     void checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const override;
+    void checkAlterPartitionIsPossible(
+        const PartitionCommands & commands,
+        const StorageMetadataPtr & metadata_snapshot,
+        const Settings & settings,
+        ContextPtr context) const override;
 
     ObjectStoragePtr getObjectStorage() const
     {
@@ -290,6 +312,8 @@ protected:
     std::shared_ptr<DataLake::ICatalog> catalog;
     StorageID storage_id;
     BackgroundJobsAssignee background_operations_assignee;
+
+    std::atomic<std::optional<bool>> delete_data_on_drop;
 };
 
 }

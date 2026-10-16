@@ -2,6 +2,7 @@
 
 #include <Common/StringUtils.h>
 #include <base/hex.h>
+#include <Common/maskURIPassword.h>
 
 #include <array>
 #include <string>
@@ -140,6 +141,13 @@ std::string maskSensitiveQueryParametersInURI(const std::string & uri)
         pos = amp + 1;
     }
 
+    return result;
+}
+
+std::string maskCredentialsInURI(const std::string & uri)
+{
+    std::string result = maskSensitiveQueryParametersInURI(uri);
+    maskURIPassword(&result);
     return result;
 }
 
