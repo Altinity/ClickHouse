@@ -28,6 +28,8 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadataFilesCache.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergTableStateSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
+#include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
 
 namespace DB
 {
@@ -45,7 +47,8 @@ public:
         const ActionsDAG * filter_dag_,
         TableStateSnapshotPtr table_snapshot_,
         IcebergDataSnapshotPtr data_snapshot_,
-        PersistentTableComponents persistent_components);
+        PersistentTableComponents persistent_components,
+        std::shared_ptr<ExternalStorageCache> external_storages_);
 
     ~SingleThreadIcebergKeysIterator();
 
@@ -60,6 +63,7 @@ private:
     Iceberg::TableStateSnapshotPtr table_snapshot;
     Iceberg::IcebergDataSnapshotPtr data_snapshot;
     PersistentTableComponents persistent_components;
+    std::shared_ptr<ExternalStorageCache> external_storages;
     LoggerPtr log;
 
     size_t manifest_file_index = 0;
@@ -88,7 +92,8 @@ public:
         IDataLakeMetadata::FileProgressCallback callback_,
         Iceberg::TableStateSnapshotPtr table_snapshot_,
         Iceberg::IcebergDataSnapshotPtr data_snapshot_,
-        Iceberg::PersistentTableComponents persistent_components_);
+        Iceberg::PersistentTableComponents persistent_components_,
+        std::shared_ptr<ExternalStorageCache> external_storages_);
 
     ObjectInfoPtr next(size_t) override;
 
@@ -121,8 +126,8 @@ private:
     std::exception_ptr exception;
     std::mutex exception_mutex;
     Int32 table_schema_id;
+    std::shared_ptr<ExternalStorageCache> external_storages;
 };
 }
-
 
 #endif

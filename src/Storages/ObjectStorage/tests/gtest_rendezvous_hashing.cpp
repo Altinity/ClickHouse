@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <Core/AntalyaProtocol.h>
 #include <Core/ProtocolDefines.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
@@ -305,7 +306,7 @@ TEST(ClusterFunctionReadTaskResponse, PreservesReadSourceIndex)
 
     String serialized;
     WriteBufferFromString out(serialized);
-    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION);
+    response.serialize(out, DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION, DBMS_ANTALYA_PROTOCOL_VERSION);
     out.finalize();
 
     ReadBufferFromString in(serialized);
