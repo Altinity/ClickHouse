@@ -322,10 +322,14 @@ public:
         return static_cast<time_t>(lifecycle_since_wall_s.load(std::memory_order_acquire));
     }
 
-    /// Extends `mayMutate` with a remaining-budget check. A ref-log attempt is refused unless the
-    /// current lease has room for its configured timeout and safety margin, so work is not started when
-    /// it cannot plausibly finish before the fence expires.
+    /// Extends `mayMutate` with a remaining-budget check: room for one write (two attempt envelopes) plus
+    /// the safety margin before the deadline.
     bool refAppendFenceOk() const;
+
+    /// When `refAppendFenceOk` stopped admitting writes under the current deadline, while the pool is
+    /// `Live` and the fence is not lost: the renewal keeps retrying and writes are paused. Empty while
+    /// writes are admitted. I/O-free.
+    std::optional<uint64_t> writesPausedSinceBootMs() const;
 
     /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
     /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
@@ -463,6 +467,10 @@ private:
         bool propagate_failure);
     /// Publish a committed renewal's deadline, its start plus the lease. Requires `driver_mutex`.
     void publishRenewedDeadline(uint64_t attempt_start_boot_ms);
+    /// One `WARNING` per pause, at the first renewal attempt after writes paused.
+    void warnOnceIfWritesPaused();
+    /// Two attempt envelopes, saturating: what one write reserves.
+    uint64_t writeReservationMs() const;
     void renewalLoop();
     void remountLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);
@@ -543,6 +551,7 @@ private:
     /// Fence-generation token (rev.7 [C2]): bumped by `tripMountLost` and `armMountFence`. See
     /// `fenceGeneration`/`checkFenceOrThrow`.
     std::atomic<uint64_t> fence_generation{0};
+    std::atomic<bool> writes_paused_warned{false};
     std::function<void()> arm_mount_fence_interposition_hook_for_test;
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions

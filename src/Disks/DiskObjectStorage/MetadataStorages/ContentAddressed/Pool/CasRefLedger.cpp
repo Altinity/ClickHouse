@@ -262,7 +262,8 @@ void CasRefLedger::refuseUnlessAdmitted(const CasOperation & op, std::string_vie
     throwCasTransientUnavailable(
         fmt::format("content-addressed pool '{}'", server_root_id),
         fmt::format("{}: the operation is no longer admitted -- the mount lease has too little time left "
-                    "for another request, or this table's runtime was detached", what));
+                    "for another request (writes are paused and resume once the lease renewal is confirmed), "
+                    "or this table's runtime was detached", what));
 }
 
 void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)

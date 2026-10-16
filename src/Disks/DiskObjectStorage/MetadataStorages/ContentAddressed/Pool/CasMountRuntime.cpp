@@ -131,9 +131,10 @@ void CasMountRuntime::checkFenceOrThrow(uint64_t admitted_generation) const
     if (!mayMutate() || fenceGeneration() != admitted_generation)
         throwCasTransientUnavailable(
             fmt::format("content-addressed pool '{}'", server_root_id),
-            "mount fence tripped: the durable write is refused because this node no longer holds the mount "
-            "incarnation it was admitted under -- either a lease loss the disk auto-recovers from, or a "
-            "FORGET decommission / lost identity that does NOT recover; consult "
+            "mount fence tripped: the durable write is refused because the mount lease has too little time "
+            "left (writes are paused and resume once the lease renewal is confirmed), or because this node "
+            "no longer holds the mount incarnation it was admitted under -- either a lease loss the disk "
+            "auto-recovers from, or a FORGET decommission / lost identity that does NOT recover; consult "
             "system.cas_mounts for the disk's lifecycle before retrying");
 }
 
@@ -153,15 +154,49 @@ Fence::Admit CasMountRuntime::admit(uint64_t admitted_generation, uint64_t neede
     return Fence::Admit::Ok;
 }
 
+uint64_t CasMountRuntime::writeReservationMs() const
+{
+    const uint64_t envelope_ms = cas_request_budget.attemptEnvelopeMs();
+    return envelope_ms > std::numeric_limits<uint64_t>::max() / 2 ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
+}
+
 bool CasMountRuntime::refAppendFenceOk() const
 {
-    /// Two envelopes' worth of room under the live generation -- a write and its settlement read, which
-    /// is what `writeLoop` reserves -- so a ref-log attempt is not started when it cannot plausibly
-    /// finish, safety margin included, before the lease expires.
-    const uint64_t envelope_ms = cas_request_budget.attemptEnvelopeMs();
-    const uint64_t needed_ms = envelope_ms > std::numeric_limits<uint64_t>::max() / 2
-        ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
-    return admit(fenceGeneration(), needed_ms) == Fence::Admit::Ok;
+    /// A write and its settlement read, which is what `writeLoop` reserves, so a ref-log attempt is not
+    /// started when it cannot plausibly finish, safety margin included, before the lease expires.
+    return admit(fenceGeneration(), writeReservationMs()) == Fence::Admit::Ok;
+}
+
+std::optional<uint64_t> CasMountRuntime::writesPausedSinceBootMs() const
+{
+    if (lifecycle() != PoolLifecycle::Live || mount_fence.lost.load(std::memory_order_acquire) || refAppendFenceOk())
+        return std::nullopt;
+    const uint64_t deadline = mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
+    const uint64_t reservation_ms = writeReservationMs();
+    const uint64_t closing_ms = reservation_ms > std::numeric_limits<uint64_t>::max() - cas_request_budget.lease_safety_margin_ms
+        ? std::numeric_limits<uint64_t>::max()
+        : reservation_ms + cas_request_budget.lease_safety_margin_ms;
+    return deadline > closing_ms ? deadline - closing_ms : 0;
+}
+
+void CasMountRuntime::warnOnceIfWritesPaused()
+{
+    const std::optional<uint64_t> paused_at = writesPausedSinceBootMs();
+    if (!paused_at || writes_paused_warned.exchange(true, std::memory_order_relaxed))
+        return;
+    std::optional<String> last_error;
+    {
+        std::lock_guard lock(renewal_progress_mutex);
+        last_error = renewal_progress.last_error;
+    }
+    const uint64_t now = bootMsNow();
+    /// Written at the first attempt after the pause began, so a renewal stuck in a request reports late;
+    /// the age says by how much.
+    LOG_WARNING(getLogger("CasPool"),
+        "CAS mount lease of '{}' under writer_epoch {} has too little time left for a write: writes are paused "
+        "since {} ms ago and resume once the renewal, which keeps retrying, is confirmed with enough lease left. "
+        "Last renewal error: {}",
+        server_root_id, liveWriterEpoch(), now > *paused_at ? now - *paused_at : 0, last_error.value_or("none"));
 }
 
 void CasMountRuntime::setMountDeadline(uint64_t deadline_boot_ms)
@@ -174,6 +209,7 @@ void CasMountRuntime::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, 
     mount_fence.server_uuid = server_uuid;
     mount_fence.writer_epoch = writer_epoch;
     mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
+    writes_paused_warned.store(false, std::memory_order_relaxed);
     /// A fresh lease incarnation is a fresh generation too: a durable-effect caller admitted under the
     /// PRIOR incarnation must re-check and abort rather than ride this re-arm through (rev.7 [C2]).
     fence_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -450,6 +486,7 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
         .requests = RequestObserver{
             .on_write_attempt = [this](uint32_t attempts_sent)
             {
+                warnOnceIfWritesPaused();
                 ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalAttempts);
                 if (attempts_sent > 1)
                     ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRetries);
@@ -555,6 +592,8 @@ void CasMountRuntime::publishRenewedDeadline(uint64_t attempt_start_boot_ms)
         ? std::numeric_limits<uint64_t>::max()
         : attempt_start_boot_ms + ttl_ms;
     setMountDeadline(deadline);
+    if (!writesPausedSinceBootMs())
+        writes_paused_warned.store(false, std::memory_order_relaxed);
 }
 
 uint64_t CasMountRuntime::renewRenewerOnce(
@@ -1180,7 +1219,14 @@ void CasMountRuntime::finishTeardown(bool drained)
 
     if (!mount_renewer)
         return;
-    if (drained && mount_renewer->state() == MountLeaseRenewerState::Active)
+    if (drained && mount_renewer->state() == MountLeaseRenewerState::Active && writesPausedSinceBootMs())
+    {
+        /// The farewell needs the lease room a pause no longer has; GC fences the slot after observing it.
+        LOG_INFO(getLogger("CasPool"),
+            "CAS mount lease of '{}' has too little time left for the farewell; the slot is left for observation",
+            server_root_id);
+    }
+    else if (drained && mount_renewer->state() == MountLeaseRenewerState::Active)
     {
         try
         {

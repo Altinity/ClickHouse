@@ -382,6 +382,16 @@ Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
     snap.lifecycle = mount_runtime.lifecycle();
     snap.detail = lifecycleReasonDetail(snap.lifecycle);
     snap.since = mount_runtime.lifecycleSinceWallS();
+    if (snap.lifecycle == PoolLifecycle::Live)
+    {
+        if (const std::optional<uint64_t> paused_at = mount_runtime.writesPausedSinceBootMs())
+        {
+            snap.writes_paused = true;
+            const uint64_t now_ms = mount_runtime.bootMsNow();
+            const uint64_t ago_s = (now_ms > *paused_at ? now_ms - *paused_at : 0) / 1000;
+            snap.since = ::time(nullptr) - static_cast<time_t>(ago_s);
+        }
+    }
     return snap;
 }
 

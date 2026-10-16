@@ -546,6 +546,8 @@ public:
         PoolLifecycle lifecycle = PoolLifecycle::Live;
         String detail;
         time_t since = 0;
+        /// `Live`, but the lease has too little time left to admit a write; `since` is then when writes paused.
+        bool writes_paused = false;
     };
     LifecycleSnapshot lifecycleSnapshot() const;
     RenewalProgress renewalProgress() const { return mount_runtime.renewalProgress(); }
