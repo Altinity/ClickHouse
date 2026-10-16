@@ -524,6 +524,7 @@ TEST(CASDecommission, NoWaitRefusalNamesTheTerminalStates)
         EXPECT_NE(e.message().find("alive or contended"), String::npos) << e.message();
         EXPECT_NE(e.message().find("state = 'terminated'"), String::npos) << e.message();
         EXPECT_NE(e.message().find("state = 'fenced'"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("GC round"), String::npos) << e.message();
     }
 }
 

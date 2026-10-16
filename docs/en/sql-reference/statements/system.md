@@ -595,8 +595,8 @@ confirmed permanently dead, since it fences the member out even if it later come
 it deletes namespace and drain state that cannot be recovered.
 
 The claim accepts only a terminal mount slot (`state` `terminated` or `fenced` in
-`system.cas_mounts`). A hard-killed member shows `expired` until the disk's GC leader fences it, once it has
-seen the lease unchanged for about one lease TTL plus one renew period. Until then the command
+`system.cas_mounts`). A hard-killed member shows `expired` until the disk's GC leader fences it at the start of a GC round, once it has
+seen the lease unchanged for about one lease TTL plus one renew period; the wait can be one GC round longer. Until then the command
 refuses with `alive or contended`. `SYSTEM CAS GC RUN` on the leader (`is_leader = 1` in
 `system.cas_mounts`) can trigger the fence, but the run that fences must come at least that long after
 the first run that saw the lease; two back-to-back runs do not fence.
