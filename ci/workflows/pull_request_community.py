@@ -62,14 +62,7 @@ def _normalize_gh_aliases(items):
 workflow = Workflow.Config(
     name="Community PR",
     event=Workflow.Event.PULL_REQUEST,
-    base_branches=[
-        BASE_BRANCH,
-        "releases/*",
-        "antalya-*",
-        # Workaround to run CI for PRs targeting `feature/antalya-26.8` branches.
-        "feature/antalya-26.8/*",
-        "stable-*",
-    ],
+    base_branches=[BASE_BRANCH, "releases/*", "antalya-*", "stable-*"],
     if_condition="github.repository != github.event.pull_request.head.repo.full_name",
     jobs=[
         JobConfigs.fast_test,

@@ -11,8 +11,7 @@ on:
         type: boolean
         default: false
   pull_request:
-    # Workaround to run CI for PRs targeting `feature/antalya-26.8` branches.
-    branches: ['antalya', 'releases/*', 'antalya-*', 'feature/antalya-26.8/*', 'stable-*']
+    branches: ['antalya', 'releases/*', 'antalya-*', 'stable-*']
 
 env:
   # Force the stdout and stderr streams to be unbuffered
