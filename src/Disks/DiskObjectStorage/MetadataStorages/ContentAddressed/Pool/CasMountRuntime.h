@@ -109,6 +109,12 @@ struct MountConfig
     /// Test-only override of the renewal's liveness predicate, for exact pre/post-send gate
     /// interleavings. FALSE ends the renewal exactly as a lost fence does.
     std::function<bool()> renewal_live_for_test = {};
+    /// The decommission tool's pool: the background renewal stays bounded by the lease, as the startup
+    /// and remount re-anchors are, instead of retrying until a definitive answer.
+    bool bounded_background_renewal = false;
+    /// Deterministic test interposition on the renewing thread right after `DriverLease::finish`
+    /// returned driver ownership, before the result is consumed. Runs without `driver_mutex`.
+    std::function<void(const MountRenewResult &)> renewal_finished_hook_for_test = {};
 };
 
 /// Local, in-memory write fence. It is deliberately not checked by reading the object store for every
@@ -334,10 +340,11 @@ public:
             || lifecycle() == PoolLifecycle::IdentityLost;
     }
 
-    /// The inter-attempt sleep the mount plane runs on. A plain sleep would hold a parked or stopping
-    /// renewal for the whole capped backoff; this one wakes on the same stop signal the workers watch.
-    /// It shortens a stop, not a fence loss: the fence cannot see a stop request, so a woken operation
-    /// still reissues unless its own liveness predicate refuses.
+    /// The inter-attempt sleep the mount and lease planes run on. A plain sleep would hold a parked or
+    /// stopping renewal for the whole pause; this one wakes while the workers are stopping or a park is
+    /// requested. It shortens a stop, not a fence loss: the fence cannot see a stop request, so a woken
+    /// operation still reissues unless its own liveness predicate refuses. Once the workers have
+    /// stopped it sleeps in full, so the farewell that follows is paced like any other write.
     void sleepInterruptibly(uint64_t ms);
 
     /// The mount fence's admission verdict, as `Fence::admit` expects it: may a request admitted under
@@ -454,6 +461,8 @@ private:
         RenewalDriverState active_state,
         RenewalDriverState returned_state,
         bool propagate_failure);
+    /// Publish a committed renewal's deadline, its start plus the lease. Requires `driver_mutex`.
+    void publishRenewedDeadline(uint64_t attempt_start_boot_ms);
     void renewalLoop();
     void remountLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);

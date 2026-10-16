@@ -67,11 +67,15 @@ struct MountRenewOperationEnvironment
     /// Facts the mount fence cannot see (park requested, pool no longer live, shutdown). FALSE ends
     /// the renewal exactly as a lost fence does; the engine does not need to know which refused.
     std::function<bool()> live;
-    /// Sampled ONCE before the write. A renewal refused before its first attempt is reported as
+    /// Sampled before each engine call. A call refused before its first attempt ends the renewal as
     /// `NotAttempted` rather than terminal only when this node had already been asked to stop --
     /// sampling it afterwards would read a flag that the refusal itself may have set.
     std::function<bool()> cancelled;
     RequestObserver requests;
+    /// The background renewal's wait after the store refused a request: the store said it cannot serve
+    /// it, and each engine call may refresh the credentials once, so a pace of one spacing would hammer
+    /// the store and refresh every second.
+    uint64_t refusal_pause_ms = 0;
 };
 
 /// Validate a `server_root_id` — the explicit, configured identity of the content-addressed layout
@@ -529,12 +533,13 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 ///   - foreign uuid → fail closed;
 ///   - absent → `create`; expired-our-uuid (any epoch) → `replace` reclaim.
 ///
-/// PLANES. Only the RENEWAL is admitted under the mount fence, because only a renewal writes under
-/// authority the fence is tracking. The claim and the farewell are admitted off it: a self-remount
-/// claims with the fence already latched lost, so a claim gated on the fence could never reclaim, and
-/// a farewell refused because the fence has run down would leave the slot looking live until GC
-/// fences it out. Neither is unguarded: a claim's safety is its own conditional write, and a caller
-/// that has shutdown facts hands them over as a `Liveness`.
+/// PLANES. The bounded renewal (`renew`: startup and direct calls) is admitted under the mount fence,
+/// because it writes under the authority the fence tracks. The background renewal, the claim, the
+/// remount re-anchor and the farewell run on the lease plane, whose fence is open: the background
+/// renewal must outlive its lease, a self-remount claims with the fence already latched lost, and a
+/// farewell refused because the fence ran down would leave the slot looking live until GC fences it
+/// out. None is unguarded: every write is conditional, and a caller with shutdown facts hands them
+/// over as a `Liveness`.
 class MountLeaseRenewer
 {
 public:
@@ -552,7 +557,7 @@ public:
     /// Adopt the already-claimed mount. Returns the exact pre-I/O BOOTTIME anchor. `liveness` carries
     /// the caller's shutdown terms; the mount fence is deliberately not consulted here.
     uint64_t start(Liveness liveness = {});
-    /// The steady-state renewal, admitted under the mount fence.
+    /// The bounded renewal, admitted under the mount fence: the startup re-anchor and direct calls.
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
     /// The remount's re-anchor, which is bootstrap control rather than steady state: a remount renews
     /// BEFORE it arms the fence for the new incarnation, so the fence is still latched lost and an
@@ -560,6 +565,10 @@ public:
     /// renewer's own open plane, the one the claim and the farewell use, so there is no plane for a
     /// caller to get wrong. Same policy and same verdicts as `renew`.
     MountRenewResult renewForRemount(const MountRenewOperationEnvironment & environment = {});
+    /// The background renewal, on the lease plane, retried until a definitive answer: a commit, a
+    /// conflict the read observed, a local failure, or `environment.live` refusing. A refusal sends the
+    /// same body again, and a refused precondition whose read failed repeats only the read.
+    MountRenewResult renewUntilDefinitive(const MountRenewOperationEnvironment & environment);
     void release();
 
     MountLeaseRenewerState state() const { return renewer_state; }
@@ -571,8 +580,14 @@ private:
     /// The incarnation every guarded write of this slot names. Engaged for exactly the states that
     /// admit such a write: `start` establishes it and each committed renewal replaces it.
     const Etag & precondition() const;
-    /// One renewal admitted on `plane`; `renew` and `renewForRemount` differ only in which they pass.
-    MountRenewResult renewOn(CasRequests & plane, const MountRenewOperationEnvironment & environment);
+    /// One renewal admitted on `plane`. `renew` and `renewForRemount` pass `until_definitive = false` (bounded by
+    /// the lease); `renewUntilDefinitive` passes `true` (the background renewal's unbounded retry).
+    MountRenewResult renewOn(CasRequests & plane, const MountRenewOperationEnvironment & environment, bool until_definitive);
+    /// Repeats the read of a slot whose precondition was refused until it observes the slot: one spacing
+    /// after the write attempt that started at `write_started_boot_ms`, then `refusal_pause_ms` after each
+    /// refused read. `NotObserved` only when `op` is no longer admitted.
+    Observation readUntilObserved(CasOperation & op, const Retry & policy,
+                                  const MountRenewOperationEnvironment & environment, uint64_t write_started_boot_ms) const;
     Etag claim(CasOperation & op, const String & body);
     [[noreturn]] void throwRenewConflict(const Observation & seen) const;
     MountRenewResult terminalResult(MountRenewResult result);
@@ -598,6 +613,8 @@ private:
     /// The incarnation our last landed write created; every renewal and the farewell name it as the
     /// precondition. Unset only before `start` has landed one.
     std::optional<Etag> last_etag;
+    /// The bytes `last_etag` names. A read that returns them under that token says the slot did not move.
+    String last_body;
     uint64_t confirmed_deadline_boot_ms = 0;
     uint64_t last_committed_attempt_start_boot_ms = 0;
 };

@@ -258,8 +258,8 @@ struct PoolConfig
 
     /// The inter-attempt sleep for the mount, lease and GC request planes (`mount_requests`,
     /// `lease_requests`, `gc_requests`), installed at their CONSTRUCTION -- before this `Pool` has
-    /// claimed or read anything. Empty = each plane's own production default (an interruptible real
-    /// sleep for the mount and GC planes, `CasRequests`'s own real sleep for the lease plane). A test
+    /// claimed or read anything. Empty = each plane's own production default, an interruptible real
+    /// sleep. A test
     /// that also freezes `boot_ms_fn` must supply a matching sleep here: a retry loop bound to a clock
     /// that only moves when this function is called would otherwise retry forever against a REAL sleep
     /// that never calls it, because the deadline it measures against never appears to elapse.
@@ -1171,9 +1171,9 @@ private:
         return std::forward<Mutation>(mutation)();
     }
 
-    /// The mount plane's inter-attempt sleep: interruptible, so a parked or stopping renewal is not
-    /// held for a whole capped backoff. Named rather than inlined because the test seam has to be able
-    /// to put it back.
+    /// The mount and lease planes' inter-attempt sleep: interruptible, so a parked or stopping renewal is
+    /// not held for a whole pause. Named rather than inlined because the test seam has to be able to put
+    /// it back.
     std::function<void(uint64_t)> mountPlaneSleepFn()
     {
         return [this](uint64_t ms) { mount_runtime.sleepInterruptibly(ms); };

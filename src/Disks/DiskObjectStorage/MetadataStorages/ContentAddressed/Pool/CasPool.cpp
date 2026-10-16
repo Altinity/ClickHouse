@@ -183,7 +183,12 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
           &hot_keys)
-    , lease_requests(pool_backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn, &hot_keys)
+    , lease_requests(
+          pool_backend,
+          Fence::open(),
+          config.boot_ms_fn,
+          config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
+          &hot_keys)
     /// The open plane's fence is the pool's teardown flag: generation 0 forever, exactly like
     /// `Fence::open`, but `admit` refuses once `beginTeardown` ran. A GC round, an FSCK or a probe in
     /// flight is then refused at its next request instead of running to completion under a disk that
@@ -1948,12 +1953,12 @@ void Pool::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {
     /// All three planes, not just the ledger's: a test that replaces the retry sleep must not be left
     /// with a real one on the plane the site under test happens to use.
-    lease_requests.setSleepFnForTest(sleep_fn);
     ref_ledger.setCasRetrySleepForTest(sleep_fn);
-    /// `CasRequests` falls back to the engine's plain sleep for an empty argument -- which is neither
-    /// the mount plane's nor the open plane's default. Re-install both, so clearing the seam cannot
-    /// leave a parked renewal held for a whole capped backoff, or the open plane deaf to a teardown.
+    /// `CasRequests` falls back to the engine's plain sleep for an empty argument -- which is none of
+    /// the planes' defaults. Re-install them, so clearing the seam cannot leave a parked renewal held
+    /// for a whole pause, or the open plane deaf to a teardown.
     gc_requests.setSleepFnForTest(sleep_fn ? sleep_fn : openPlaneSleepFn());
+    lease_requests.setSleepFnForTest(sleep_fn ? sleep_fn : mountPlaneSleepFn());
     mount_requests.setSleepFnForTest(sleep_fn ? std::move(sleep_fn) : mountPlaneSleepFn());
 }
 

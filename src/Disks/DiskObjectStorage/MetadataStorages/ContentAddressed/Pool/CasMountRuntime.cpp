@@ -305,6 +305,11 @@ RenewalDriverState CasMountRuntime::DriverLease::finish(
     const MountRenewResult * result)
 {
     std::lock_guard lock(runtime.driver_mutex);
+    /// Published before the driver leaves the call, so a remount cannot arm a new epoch between this
+    /// renewal's commit and its deadline. The renewer cannot change meanwhile: `installRenewer` requires
+    /// a dormant or parked driver.
+    if (result && result->outcome == MountRenewOutcome::Committed)
+        runtime.publishRenewedDeadline(result->attempt_start_boot_ms);
     if (runtime.workers_stop_requested)
         runtime.renewal_driver_state = RenewalDriverState::Stopping;
     else if (active == RenewalDriverState::WorkerCall
@@ -429,6 +434,12 @@ RenewalProgress CasMountRuntime::renewalProgress() const
 
 MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_call)
 {
+    uint64_t refusal_pause_ms = 0;
+    if (worker_call)
+    {
+        std::lock_guard lock(driver_mutex);
+        refusal_pause_ms = static_cast<uint64_t>(std::max<int64_t>(0, renewal_period.count()));
+    }
     return MountRenewOperationEnvironment{
         .boot_ms = [this] { return bootMsNow(); },
         .live = [this, worker_call]
@@ -459,6 +470,7 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
                 }
             },
         },
+        .refusal_pause_ms = refusal_pause_ms,
     };
 }
 
@@ -483,7 +495,10 @@ bool CasMountRuntime::renewalCancelled() const
 void CasMountRuntime::sleepInterruptibly(uint64_t ms)
 {
     std::unique_lock lock(driver_mutex);
-    driver_cv.wait_for(lock, std::chrono::milliseconds(ms), [this] { return workers_stop_requested; });
+    driver_cv.wait_for(lock, std::chrono::milliseconds(ms), [this]
+    {
+        return renewal_driver_state == RenewalDriverState::Stopping || renewal_driver_state == RenewalDriverState::ParkRequested;
+    });
 }
 
 void CasMountRuntime::consumeRenewResult(
@@ -503,17 +518,7 @@ void CasMountRuntime::consumeRenewResult(
         && result.deadline_source == GaveUp::Source::Lease)
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalDeadlineExceeded);
 
-    if (result.outcome == MountRenewOutcome::Committed)
-    {
-        const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
-        setMountDeadline(
-            result.attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
-                ? std::numeric_limits<uint64_t>::max()
-                : result.attempt_start_boot_ms + ttl_ms);
-        reportMountRenewCompletion(result);
-        return;
-    }
-    if (result.outcome == MountRenewOutcome::NotAttempted)
+    if (result.outcome != MountRenewOutcome::Terminal)
     {
         reportMountRenewCompletion(result);
         return;
@@ -543,6 +548,15 @@ void CasMountRuntime::consumeRenewResult(
         std::rethrow_exception(result.failure);
 }
 
+void CasMountRuntime::publishRenewedDeadline(uint64_t attempt_start_boot_ms)
+{
+    const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
+    const uint64_t deadline = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
+        ? std::numeric_limits<uint64_t>::max()
+        : attempt_start_boot_ms + ttl_ms;
+    setMountDeadline(deadline);
+}
+
 uint64_t CasMountRuntime::renewRenewerOnce(
     AdmittedRenewerCall call,
     RenewalDriverState active,
@@ -564,14 +578,19 @@ uint64_t CasMountRuntime::renewRenewerOnce(
     MountRenewResult result;
     {
         SCOPE_EXIT({ std::lock_guard lock(renewal_progress_mutex); renewal_progress.in_progress = false; });
-        result = active == RenewalDriverState::RemountCall
-            ? call.renewer->renewForRemount(renewalEnvironment(worker_call))
-            : call.renewer->renew(renewalEnvironment(worker_call));
+        if (active == RenewalDriverState::RemountCall)
+            result = call.renewer->renewForRemount(renewalEnvironment(worker_call));
+        else if (worker_call && !config.bounded_background_renewal)
+            result = call.renewer->renewUntilDefinitive(renewalEnvironment(worker_call));
+        else
+            result = call.renewer->renew(renewalEnvironment(worker_call));
     }
     const RenewalDriverState destination = active == RenewalDriverState::WorkerCall
         ? RenewalDriverState::WorkerIdle
         : (active == RenewalDriverState::RemountCall ? RenewalDriverState::Parked : RenewalDriverState::Dormant);
     const RenewalDriverState returned_state = call.lease->finish(destination, &result);
+    if (config.renewal_finished_hook_for_test)
+        config.renewal_finished_hook_for_test(result);
     if (result.outcome == MountRenewOutcome::Terminal && config.renewal_terminal_deposited_hook_for_test)
         config.renewal_terminal_deposited_hook_for_test();
     consumeRenewResult(result, active, returned_state, propagate_failure);
