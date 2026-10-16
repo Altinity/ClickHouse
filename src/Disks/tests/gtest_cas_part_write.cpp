@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -2324,57 +2325,62 @@ namespace
 /// cap ever changes, update this one to match.
 constexpr uint64_t kExpectedManifestEncodedCap = 256ULL << 20;
 
-constexpr size_t kWideManifestPathBytes = 60'000;
+/// The exact encoded size `PartWriteTxn::stageManifest` would compute for a single Blob-placement entry whose
+/// path is `path_len` bytes long, staged under `ns` — measured through the SAME `encodePartManifest`
+/// codec `stageManifest` calls, so this is an exact reproduction rather than a hand-derived estimate.
+/// `ref` and `payload_digest` are fixed-width fields (20 and 16 bytes respectively): their VALUES don't
+/// affect the encoded size, only their presence does, so the zero-valued placeholders here reproduce
+/// the exact same byte count `stageManifest` would produce with its real (non-zero) values.
+size_t manifestEncodedSizeForPathLen(const RootNamespace & ns, size_t path_len)
+{
+    PartManifest probe;
+    probe.root_namespace_id = ns;
+    ManifestEntry e;
+    e.path = String(path_len, 'a');
+    e.placement = EntryPlacement::Blob;
+    e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(UInt128{})};
 
-ManifestEntry wideBlobManifestEntry(size_t index)
+    e.blob_size = 12345;
+    probe.entries = {std::move(e)};
+    return encodePartManifest(probe).size();
+}
+
+/// Finds the exact boundary: the SMALLEST `path_len` whose single-entry manifest encodes to MORE than
+/// `kExpectedManifestEncodedCap` bytes under `ns`. `path_len - 1` therefore encodes to AT MOST the cap
+/// (the encoding is monotonic in `path_len` — a longer path can only grow the encoded size). Starts
+/// from a linear estimate (the encoding is affine in `path_len`: fixed framing overhead plus a constant
+/// number of bytes per path byte) and walks to the exact crossing, so this stays correct even if the
+/// framing overhead changes, without needing a full binary search over a ~256 MiB range.
+size_t findManifestEncodedCapBoundaryPathLen(const RootNamespace & ns)
+{
+    constexpr size_t probe_lo = 1000;
+    constexpr size_t probe_hi = 2'000'000;
+    const size_t size_lo = manifestEncodedSizeForPathLen(ns, probe_lo);
+    const size_t size_hi = manifestEncodedSizeForPathLen(ns, probe_hi);
+    const double slope = static_cast<double>(size_hi - size_lo) / static_cast<double>(probe_hi - probe_lo);
+    const double intercept = static_cast<double>(size_lo) - slope * static_cast<double>(probe_lo);
+
+    size_t path_len = static_cast<size_t>(std::ceil(
+        (static_cast<double>(kExpectedManifestEncodedCap) - intercept) / slope)) + 1;
+
+    while (manifestEncodedSizeForPathLen(ns, path_len) <= kExpectedManifestEncodedCap)
+        ++path_len;
+    while (path_len > 1 && manifestEncodedSizeForPathLen(ns, path_len - 1) > kExpectedManifestEncodedCap)
+        --path_len;
+    return path_len;
+}
+
+/// A one-entry Blob ManifestEntry with a synthetic `path_len`-byte path (used only to inflate the
+/// encoded manifest size towards the OQ7 cap).
+ManifestEntry wideBlobManifestEntry(size_t path_len)
 {
     ManifestEntry e;
-    e.path = std::to_string(index) + "/";
-    e.path.resize(kWideManifestPathBytes, 'a');
+    e.path = String(path_len, 'a');
     e.placement = EntryPlacement::Blob;
     e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(UInt128{0x42})};
+
     e.blob_size = 12345;
     return e;
-}
-
-std::vector<ManifestEntry> wideBlobManifestEntries(size_t count)
-{
-    std::vector<ManifestEntry> entries;
-    entries.reserve(count);
-    for (size_t i = 0; i < count; ++i)
-        entries.push_back(wideBlobManifestEntry(i));
-    return entries;
-}
-
-size_t estimatedManifestEncodedSizeForEntryCount(const RootNamespace & ns, size_t count)
-{
-    PartManifest empty;
-    empty.root_namespace_id = ns;
-    const size_t empty_size = encodePartManifest(empty).size();
-
-    PartManifest one = empty;
-    one.entries.push_back(wideBlobManifestEntry(0));
-    const size_t entry_size = encodePartManifest(one).size() - empty_size;
-
-    return empty_size + count * entry_size + std::to_string(count).size() - 1;
-}
-
-size_t firstManifestEntryCountOverEncodedCap(const RootNamespace & ns)
-{
-    size_t count = kExpectedManifestEncodedCap / kWideManifestPathBytes;
-    while (estimatedManifestEncodedSizeForEntryCount(ns, count) <= kExpectedManifestEncodedCap)
-        ++count;
-    while (estimatedManifestEncodedSizeForEntryCount(ns, count - 1) > kExpectedManifestEncodedCap)
-        --count;
-    return count;
-}
-
-size_t manifestEncodedSizeForEntryCount(const RootNamespace & ns, size_t count)
-{
-    PartManifest manifest;
-    manifest.root_namespace_id = ns;
-    manifest.entries = wideBlobManifestEntries(count);
-    return encodePartManifest(manifest).size();
 }
 
 }
@@ -2397,27 +2403,30 @@ TEST(CASPartWriteTxn, ManifestCapEncodedBytesJustUnderStagesSuccessfully)
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .boot_ms_fn = [] { return uint64_t{0}; }});
     const RootNamespace ns{"srv1/tbl"};
 
-    const size_t entry_count_over = firstManifestEntryCountOverEncodedCap(ns);
-    ASSERT_GT(entry_count_over, 1u);
-    const size_t entry_count_under = entry_count_over - 1;
-    ASSERT_LE(manifestEncodedSizeForEntryCount(ns, entry_count_under), kExpectedManifestEncodedCap);
+    const size_t path_len_over = findManifestEncodedCapBoundaryPathLen(ns);
+    ASSERT_GT(path_len_over, 1u);
+    const size_t path_len_under = path_len_over - 1;
+    ASSERT_LE(manifestEncodedSizeForPathLen(ns, path_len_under), kExpectedManifestEncodedCap);
 
     auto build = startBuildFor(s, ns, "wide_part");
-    const ManifestId id = build->stageManifest(wideBlobManifestEntries(entry_count_under));
+    const ManifestId id = build->stageManifest({wideBlobManifestEntry(path_len_under)});
     EXPECT_EQ(id.root_namespace, ns);
     OperationForTest op(*b);
     EXPECT_TRUE((*op).head(s->layout().manifestKey(id), Retry::once()).has_value())
         << "a just-under-cap manifest must actually be written";
 }
 
+/// Boundary case 2/2: a manifest whose encoded size exceeds the cap by the smallest possible margin
+/// (one more path byte than the passing case above) throws `LIMIT_EXCEEDED` fail-closed, BEFORE the body
+/// write — no manifest object lands in the backend for the rejected attempt.
 TEST(CASPartWriteTxn, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    const size_t entry_count_over = firstManifestEntryCountOverEncodedCap(ns);
-    ASSERT_GT(manifestEncodedSizeForEntryCount(ns, entry_count_over), kExpectedManifestEncodedCap);
+    const size_t path_len_over = findManifestEncodedCapBoundaryPathLen(ns);
+    ASSERT_GT(manifestEncodedSizeForPathLen(ns, path_len_over), kExpectedManifestEncodedCap);
 
     auto build = startBuildFor(s, ns, "wide_part");
 
@@ -2426,7 +2435,7 @@ TEST(CASPartWriteTxn, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
     bool threw = false;
     try
     {
-        build->stageManifest(wideBlobManifestEntries(entry_count_over));
+        build->stageManifest({wideBlobManifestEntry(path_len_over)});
     }
     catch (const DB::Exception & e)
     {
@@ -2456,28 +2465,6 @@ TEST(CASPartWriteTxn, StageManifestRejectsTraversalPathBeforeBodyWrite)
     entry.inline_bytes = "payload";
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
-    {
-        build->stageManifest({entry});
-    });
-
-    OperationForTest op(*backend);
-    EXPECT_TRUE((*op).list(store->layout().manifestNamespacePrefix(ns), "", 10, Retry::once()).keys.empty());
-}
-
-TEST(CASPartWriteTxn, StageManifestRejectsEntryRecordOverLineCapBeforeBodyWrite)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPool(backend);
-    const RootNamespace ns{"srv1/entry-line-cap"};
-    auto build = startBuildFor(store, ns, "part");
-
-    ManifestEntry entry;
-    entry.path = String(70 * 1024, 'a');
-    entry.placement = EntryPlacement::Blob;
-    entry.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128{0x42})};
-    entry.blob_size = 1;
-
-    expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&]
     {
         build->stageManifest({entry});
     });

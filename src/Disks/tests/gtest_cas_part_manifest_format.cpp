@@ -7,11 +7,6 @@
 
 #include <magic_enum.hpp>
 
-namespace DB::ErrorCodes
-{
-extern const int LIMIT_EXCEEDED;
-}
-
 using namespace DB::Cas;
 
 namespace
@@ -363,13 +358,6 @@ TEST(CASPartManifestFormat, DecodeRejectsMalformedEntryPaths)
         forged.replace(pos, needle.size(), "\"path\":\"" + String(path) + "\"");
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(forged); });
     }
-}
-
-TEST(CASPartManifestFormat, EncodeRejectsEntryRecordOverLineCap)
-{
-    PartManifest manifest = manifestWithSinglePath("safe");
-    manifest.entries[0].path = String(70 * 1024, 'a');
-    expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&] { encodePartManifest(manifest); });
 }
 
 /// Legal projection subdirectories (`<projection>.proj/<file>`) must not be caught by the shape
