@@ -184,6 +184,8 @@ struct PoolConfig
     uint64_t gc_io_concurrency = 16;
     /// Tests drive `renewWatermarkOnce` explicitly; gates both persistent runtime workers.
     bool background_watermark = false;
+    /// See `MountConfig::bounded_background_renewal`.
+    bool bounded_background_renewal = false;
     /// Installed on the pool before a writable mount can start its runtime-owned workers.
     CasEventSink event_sink = {};
 
@@ -355,6 +357,7 @@ struct PoolConfig
             .boot_ms_fn = boot_ms_fn,
             .wait_sleep_fn = wait_sleep_fn,
             .worker_factory = worker_factory,
+            .bounded_background_renewal = bounded_background_renewal,
         };
     }
 };
