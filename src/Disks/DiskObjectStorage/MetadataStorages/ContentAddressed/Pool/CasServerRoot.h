@@ -68,9 +68,8 @@ struct MountRenewOperationEnvironment
     /// Facts the mount fence cannot see (park requested, pool no longer live, shutdown). FALSE ends
     /// the renewal exactly as a lost fence does; the engine does not need to know which refused.
     std::function<bool()> live;
-    /// Sampled ONCE before the write. A renewal refused before its first attempt is reported as
-    /// `NotAttempted` rather than terminal only when this node had already been asked to stop --
-    /// sampling it afterwards would read a flag that the refusal itself may have set.
+    /// Read once the write has given up. A renewal refused before its first attempt is reported as
+    /// `NotAttempted` rather than terminal when this node has been asked to stop by then.
     std::function<bool()> cancelled;
     RequestObserver requests;
 };

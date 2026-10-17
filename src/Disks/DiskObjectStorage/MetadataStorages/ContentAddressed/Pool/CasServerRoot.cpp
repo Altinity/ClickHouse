@@ -1656,11 +1656,6 @@ MountRenewResult MountLeaseRenewer::renewOn(
             static_cast<uint32_t>(renewer_state));
 
     const auto boot_clock = environment.boot_ms ? environment.boot_ms : boot_ms_fn;
-    /// Sampled BEFORE the write. A refused admission is reported as "never attempted" only when this
-    /// node had already been asked to stop, and reading the flag afterwards could not tell that apart
-    /// from a flag the refusal itself set.
-    const bool cancelled = environment.cancelled && environment.cancelled();
-
     const uint64_t wall_ms = now_ms_fn();
     const uint64_t attempt_start_boot_ms = boot_clock();
     const uint64_t next_seq = seq + 1;
@@ -1747,8 +1742,11 @@ MountRenewResult MountLeaseRenewer::renewOn(
         if (gave_up->why == GaveUp::Why::Deadline)
             result.deadline_source = gave_up->deadline_source;
 
-        /// Nothing was sent and the node was already stopping: the lease is exactly as it was, so this
-        /// is a renewal that never ran, not one that lost its authority.
+        /// Read after the refusal, because a stop that lands mid-renewal is what refused it.
+        const bool cancelled = environment.cancelled && environment.cancelled();
+
+        /// Nothing was sent and the node is stopping: the lease is exactly as it was, so this is a
+        /// renewal that never ran, not one that lost its authority.
         if (gave_up->why == GaveUp::Why::FenceLost && !gave_up->sent_any && cancelled)
         {
             markMountRenewTermination(MountRenewTerminalClassification::Cancelled);

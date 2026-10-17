@@ -460,8 +460,8 @@ private:
     /// The renewal's liveness: facts the mount fence cannot see -- a shutdown request, a parked or
     /// park-requested driver, a pool that left `Live`. FALSE ends the renewal.
     bool renewalLive(bool worker_call) const;
-    /// Whether this node has already been asked to stop. Sampled ONCE, before the write, so a refusal
-    /// caused by the stop cannot be mistaken for one that preceded it.
+    /// Whether this node has been asked to stop; read after a refused renewal, so a stop that lands
+    /// mid-renewal is not mistaken for a lost lease.
     bool renewalCancelled() const;
     void tripFenceWithoutOperationalLoss();
     std::unique_lock<std::mutex> lockTerminalPublication();
