@@ -20,8 +20,8 @@ otherwise regenerate the same `ServerUUID` from a wiped local state directory, w
 silently steal an existing identity.
 
 Validation (`validateServerRootId`, `Pool/CasServerRoot.h`) is fail-closed `BAD_ARGUMENTS`, no
-sanitizing fallback: non-empty, at most 255 bytes, no empty/`.`/`..` path segment, no `_files` or
-`_manifests` segment.
+sanitizing fallback: non-empty, at most 255 bytes, no `/`, not `.` or `..`, not `_files` or
+`_manifests`.
 
 It roots four subtrees and owns catalog names at or below `<server_root_id>`:
 
@@ -38,6 +38,11 @@ dedup work. Ref/namespace keys are also deliberately opaque and do not embed the
 Each replica sharing a backend endpoint must use a distinct `cas_server_root_id`; omitting the setting
 is a startup error.
 
+The id may not contain `/`, and this holds for an id that already owns its owner object too: decommission
+and the staging sweep select a member's objects by key prefix, so a member `a/b` would be drained by a
+decommission of `a`. A server whose id contains `/` refuses to open the disk; see
+[recreating a member whose id contains `/`](/antalya/cas/operations/migration#recreate-id-with-slash).
+
 ## The owner claim {#owner-claim}
 
 `claimOwnerOrThrow` binds `server_root_id` ↔ `server_uuid` **permanently**. The owner object is never deleted
@@ -46,10 +51,10 @@ and never reassigned — decommission only tombstones it in place.
 | Observed at `gc/server-roots/<server_root_id>/owner` | Action |
 |---|---|
 | present, same `server_uuid`, not tombstoned | proceed |
-| present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned, refuses to resume |
-| present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause |
-| absent, subtree provably empty | `putIfAbsent` the owner (claim) |
+| present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned; the refusal says to configure a new `cas_server_root_id` |
+| present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause and, for a dead owner, `SYSTEM CAS DROP POOL MEMBER` |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
+| absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | lost the `putIfAbsent` race | re-read; equal uuid proceeds, else `CORRUPTED_DATA` |
 
 "Provably empty" requires both an authoritative decoded catalog naming no life owned by `server_root_id` and
@@ -261,7 +266,8 @@ which any reclaim is instant.
 
 **Permanent removal** of a dead replica (`Cas::decommissionPoolMember`, driven by
 `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'`) claims the victim's mount slot
-as an administrative writer with a no-wait policy (refuses immediately if the member is alive),
+as an administrative writer with a no-wait policy (refuses unless the slot is terminal:
+`terminated` or `fenced`; an `expired` slot is refused until the disk's GC leader fences it),
 drops every ref-bearing namespace, sweeps manifest debris before the slot (deleting the mount
 removes the watermark authority), drains staging and roots, then — only with zero warnings —
 retires in order: mount, epoch, a final liveness re-check, owner tombstone.
