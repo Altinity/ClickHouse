@@ -371,8 +371,12 @@ static void writeDataFiles(
 
         FormatFilterInfoPtr output_format_filter_info
             = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr);
+        auto write_format_settings = format_settings;
+        if (!write_format_settings)
+            write_format_settings = getFormatSettings(context);
+        write_format_settings->parquet.output_timestamp_adjusted_to_utc_from_timezone = true;
         auto output_format = FormatFactory::instance().getOutputFormat(
-            write_format, *write_buffer, *sample_block, context, format_settings, output_format_filter_info);
+            write_format, *write_buffer, *sample_block, context, write_format_settings, output_format_filter_info);
 
         while (true)
         {
@@ -987,7 +991,9 @@ static void writeMetadataFiles(
     auto log = getLogger("IcebergCompaction");
 
     ColumnsDescription columns_description = ColumnsDescription::fromNamesAndTypes(sample_block_->getNamesAndTypes());
-    auto [metadata_object, metadata_object_str] = createEmptyMetadataFile(table_path, columns_description, nullptr, nullptr, context);
+    const auto format_version = plan.initial_metadata_object->getValue<UInt64>(Iceberg::f_format_version);
+    auto [metadata_object, metadata_object_str] = createEmptyMetadataFile(
+        table_path, columns_description, nullptr, nullptr, context, format_version);
 
     auto current_schema_id = metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
     Poco::JSON::Object::Ptr current_schema;

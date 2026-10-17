@@ -352,7 +352,8 @@ bool MetadataGenerator::isAddColumnApplied(const String & column_name, DataTypeP
         return false;
 
     Int32 unused_field_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
-    auto expected_type = Iceberg::getIcebergType(type, unused_field_id);
+    auto format_version = metadata_object->getValue<UInt64>(Iceberg::f_format_version);
+    auto expected_type = Iceberg::getIcebergType(type, unused_field_id, format_version);
 
     auto fields = current_schema->getArray(Iceberg::f_fields);
     for (UInt32 i = 0; i < fields->size(); ++i)
@@ -420,7 +421,8 @@ bool MetadataGenerator::isModifyColumnApplied(const String & column_name, DataTy
         if (type)
         {
             Int32 unused_field_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
-            auto expected_type = Iceberg::getIcebergType(type, unused_field_id);
+            auto format_version = metadata_object->getValue<UInt64>(Iceberg::f_format_version);
+            auto expected_type = Iceberg::getIcebergType(type, unused_field_id, format_version);
             if (field->getValue<bool>(Iceberg::f_required) != expected_type.second
                 || !icebergTypesEqualIgnoringIds(field->get(Iceberg::f_type), expected_type.first))
                 return false;
@@ -795,7 +797,8 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
 
     auto last_column_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
 
-    auto new_type = Iceberg::getIcebergType(type, last_column_id);
+    auto format_version = metadata_object->getValue<UInt64>(Iceberg::f_format_version);
+    auto new_type = Iceberg::getIcebergType(type, last_column_id, format_version);
     Poco::JSON::Object::Ptr new_field = new Poco::JSON::Object;
     new_field->set(Iceberg::f_id, last_column_id + 1);
     new_field->set(Iceberg::f_name, column_name);
@@ -847,6 +850,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
     auto current_schema = getCurrentSchema();
 
     auto last_column_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);
+    auto format_version = metadata_object->getValue<UInt64>(Iceberg::f_format_version);
     auto schema_fields = current_schema->getArray(Iceberg::f_fields);
 
     /// `AFTER` the column itself keeps its position, as in `ColumnsDescription::modifyColumnOrder`.
@@ -855,7 +859,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
 
     if (type)
     {
-        auto new_type = Iceberg::getIcebergType(type, last_column_id);
+        auto new_type = Iceberg::getIcebergType(type, last_column_id, format_version);
 
         for (UInt32 i = 0; i < schema_fields->size(); ++i)
         {
@@ -919,7 +923,7 @@ bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name,
 
     if (type_changed)
     {
-        auto new_type = Iceberg::getIcebergType(type, last_column_id);
+        auto new_type = Iceberg::getIcebergType(type, last_column_id, format_version);
         target_field->set(Iceberg::f_type, new_type.first);
         target_field->set(Iceberg::f_required, new_type.second);
     }

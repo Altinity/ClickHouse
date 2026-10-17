@@ -629,7 +629,7 @@ TEST(IcebergMetadataGenerator, ModifyColumnWideningRecordsTheNewTypeInANewSchema
 TEST(IcebergMetadataGenerator, GetIcebergTypeNothingProducesUnknown)
 {
     Int32 iter = 0;
-    auto [iceberg_type, required] = Iceberg::getIcebergType(std::make_shared<DataTypeNothing>(), iter);
+    auto [iceberg_type, required] = Iceberg::getIcebergType(std::make_shared<DataTypeNothing>(), iter, /* format_version */ 3);
     ASSERT_TRUE(iceberg_type.isString());
     EXPECT_EQ(iceberg_type.extract<String>(), "unknown");
     EXPECT_FALSE(required);
@@ -639,7 +639,7 @@ TEST(IcebergMetadataGenerator, GetIcebergTypeNothingProducesUnknown)
 TEST(IcebergMetadataGenerator, GetIcebergTypeNullableNothingProducesUnknown)
 {
     Int32 iter = 0;
-    auto [iceberg_type, required] = Iceberg::getIcebergType(makeNullable(std::make_shared<DataTypeNothing>()), iter);
+    auto [iceberg_type, required] = Iceberg::getIcebergType(makeNullable(std::make_shared<DataTypeNothing>()), iter, /* format_version */ 3);
     ASSERT_TRUE(iceberg_type.isString());
     EXPECT_EQ(iceberg_type.extract<String>(), "unknown");
     EXPECT_FALSE(required);
