@@ -154,4 +154,13 @@ void InstrumentedBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & 
         incrementCasEvent(classifyCasNs(key.str()), CasOp::Delete);
 }
 
+std::vector<Backend::RawRemoval> InstrumentedBackend::removeManyByConditional(
+    const std::vector<RawConditionalRemove> & removals, TransportAccess & access)
+{
+    std::vector<RawRemoval> results = inner->removeManyByConditional(removals, access);
+    for (const RawConditionalRemove & removal : removals)
+        incrementCasEvent(classifyCasNs(removal.key), CasOp::Delete);
+    return results;
+}
+
 }

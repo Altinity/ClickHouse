@@ -184,6 +184,12 @@ struct ConditionalRemoveResult
     bool created_delete_marker = false;   /// backend reported a versioning delete marker
 };
 
+struct ConditionalRemoveObject
+{
+    StoredObject object;
+    std::string expected_token;
+};
+
 /// Base class for all object storages which implement some subset of ordinary filesystem operations.
 ///
 /// Examples of object storages are S3, Azure Blob Storage, HDFS.
@@ -325,6 +331,9 @@ public:
     /// Same, under a chosen control-request context; see the note on `iterate`.
     virtual ConditionalRemoveResult removeObjectIfTokenMatches(
         const StoredObject & object, const std::string & etag, const ObjectStorageControlRequest & request);
+
+    virtual std::vector<ConditionalRemoveResult> removeObjectsIfTokensMatch(
+        const std::vector<ConditionalRemoveObject> & objects, const ObjectStorageControlRequest & request);
 
     /// Removes every object in ONE request with no per-key precondition; an absent object is success.
     /// Content-addressed callers use it for write-once keys only, at most 1000 per call. Throws on a

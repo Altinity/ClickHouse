@@ -510,6 +510,8 @@ public:
     /// limit, clamped to [1, `kBulkDeleteMaxKeys`] because an empty request would never advance.
     size_t bulkDeleteChunkKeys() const;
 
+    size_t conditionalDeleteChunkKeys() const;
+
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
     /// TEST SEAM: disable the round's journal trim so a folded event stays in the journal
@@ -540,6 +542,23 @@ public:
     /// drop, the resume path (GC metadata), dropNamespace (verbatim files), and the capability probe
     /// (throwaway keys) remove non-content objects they own. Adding a second content-delete site is a
     /// protocol defect.
+
+    struct RedeleteBlobState
+    {
+        String blob_key;
+        std::optional<Etag> live_token;
+        std::optional<Removal> removal;
+        std::exception_ptr error;
+    };
+
+    struct ConditionalDeleteChunk
+    {
+        std::vector<size_t> indices;
+        std::vector<ConditionalRemove> removals;
+    };
+
+    static std::vector<ConditionalDeleteChunk> prepareConditionalDeleteChunks(
+        const std::vector<RedeleteBlobState> & redelete_blob_states, size_t chunk_keys);
 
 private:
     /// Lease acquire/renew/steal per the documented observation protocol. On success `state` holds the
@@ -741,16 +760,16 @@ private:
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
                     GcRoundWorkBudget & work_budget);
 
-    struct RedeleteIo
-    {
-        String blob_key;
-        Removal del = Removal::Gone;
-    };
-
     struct IndexedException
     {
         size_t index;
         std::exception_ptr exception;
+    };
+
+    struct RedeleteScheduleFailure
+    {
+        IndexedException error;
+        size_t unsent;
     };
 
     struct RedeleteRoundContext
@@ -762,18 +781,47 @@ private:
         RoundReport & report;
         std::map<uint64_t, OutcomeLog> & outcomes;
         uint64_t & jobs_scheduled;
+        uint64_t & delete_batches;
     };
 
-    static RedeleteIo performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op);
+    static void observeRetiredBlob(
+        const RetiredEntry & entry, const Layout & layout, CasOperation & op, RedeleteBlobState & redelete_blob_state);
 
-    void applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteIo & io);
+    void recordRedeleteSuccess(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteBlobState & redelete_blob_state);
 
-    void reportRedeleteFailure(
+    void recordRedeleteFailure(
         RedeleteRoundContext & ctx,
         const RetiredEntry & entry,
         const Layout & layout,
         std::exception_ptr exception,
         std::optional<size_t> unsent_count = std::nullopt);
+
+    std::optional<IndexedException> recordRedeleteResults(
+        RedeleteRoundContext & ctx,
+        const std::vector<RetiredEntry> & entries,
+        const Layout & layout,
+        const std::vector<RedeleteBlobState> & redelete_blob_states,
+        size_t observed,
+        const std::vector<RedeleteScheduleFailure> & schedule_failures);
+
+    void scheduleBlobMetaDeletes(
+        const std::vector<RetiredEntry> & entries, const std::vector<RedeleteBlobState> & redelete_blob_states);
+
+    struct IoJobsResult
+    {
+        bool on_pool = false;
+        size_t scheduled = 0;
+        std::vector<std::exception_ptr> errors;
+        std::optional<IndexedException> schedule_error;
+    };
+
+    IoJobsResult runRedeleteIoJobs(
+        ThreadPool & pool,
+        size_t concurrency,
+        size_t count,
+        size_t refuse_offset,
+        CasOperation & op,
+        const std::function<void(size_t, CasOperation &)> & job);
 
     void redeleteBlobs(
         RedeleteRoundContext & ctx,
