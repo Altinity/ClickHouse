@@ -2,18 +2,23 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteHelpers.h>
 #include <Common/ProfileEvents.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <limits>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <unistd.h>
 #include <fmt/ranges.h>
 
 namespace ProfileEvents
@@ -2215,3 +2220,676 @@ TEST_F(CASDecommission, AdminDoesNotReclaimAForeignTerminalBody)
     EXPECT_EQ(slot().seq, slot_before.seq);
 }
 
+namespace
+{
+/// A rejoin needs a real server uuid: a start without one (uuid 0) never rejoins.
+const UInt128 victim_uuid = UInt128(7);
+
+PoolConfig victimConfig(UInt128 uuid = victim_uuid)
+{
+    return PoolConfig{.pool_prefix = "p", .server_id = uuid, .server_root_id = "victim"};
+}
+
+/// One completed decommission of the victim with nothing left for GC: the state a rejoin starts from.
+void retireVictim(const std::shared_ptr<InMemoryBackend> & backend, const String & admin_srid)
+{
+    const auto report = decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = admin_srid}, "victim");
+    if (!report.member_retired || report.namespaces_pending_gc != 0)
+        throw std::runtime_error("fixture: the decommission did not retire the victim cleanly");
+}
+
+bool victimSubtreeEmpty(Backend & backend)
+{
+    const Layout layout("p");
+    CasRequests requests = openRequestsForTest(backend);
+    CasOperation op = requests.admit();
+    return serverRootSubtreeEmpty(op, layout, "victim", CasRefCatalog::read(op, layout).catalog);
+}
+
+/// GC removes the dropped namespaces' catalog rows and manifests over a few rounds; a rejoin waits for all of them.
+void gcUntilVictimSubtreeEmpty(const std::shared_ptr<InMemoryBackend> & backend)
+{
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "gc", .gc_fold_threshold = 1, .gc_fold_max_defer_rounds = 0});
+    Gc gc(store, UInt128{991});
+    for (int round = 0; round < 8 && !victimSubtreeEmpty(*backend); ++round)
+        runRegularRoundReclaiming(gc);
+    if (!victimSubtreeEmpty(*backend))
+        throw std::runtime_error("fixture: GC left data of the victim's previous life");
+}
+
+/// The rejoined member writes a part under the old life's namespace name; GC rounds run from another member
+/// keep it, and the member's slot stays its own.
+void expectWriteSurvivesGc(const std::shared_ptr<InMemoryBackend> & backend, const PoolPtr & member, UInt128 member_uuid)
+{
+    const RootNamespace ns{"victim/db/t1"};
+    const String payload = "written after the rejoin";
+    PartWriteInfo info;
+    info.intended_ref = ns.string() + "/r";
+    auto build = member->beginPartWrite(info);
+    ManifestEntry entry;
+    entry.path = "data.bin";
+    entry.placement = EntryPlacement::Blob;
+    entry.ref = idOf(payload);
+    entry.blob_size = payload.size();
+    const ManifestId manifest = build->stageManifest({entry});
+    build->precommitAdd(ns, "r", manifest);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
+    build->promote(ns, "r", build->buildId(), manifest);
+
+    {
+        auto gc_store = Pool::open(backend, PoolConfig{
+            .pool_prefix = "p", .server_root_id = "gc", .gc_fold_threshold = 1, .gc_fold_max_defer_rounds = 0});
+        Gc gc(gc_store, UInt128{992});
+        for (int round = 0; round < 3; ++round)
+        {
+            runRegularRoundReclaiming(gc);
+            member->renewWatermarkOnce();
+        }
+    }
+
+    const Layout layout("p");
+    EXPECT_EQ(member->listRefs(ns).size(), 1u);
+    OperationForTest op(*backend);
+    EXPECT_TRUE((*op).head(layout.manifestKey(manifest), Retry::once()).has_value());
+    EXPECT_TRUE((*op).head(layout.blobKey(idOf(payload)), Retry::once()).has_value());
+    const MountLease slot = readSlot(*backend, layout, "victim");
+    EXPECT_TRUE(slot.isHeldBy(member_uuid, member->writerEpoch()));
+    EXPECT_FALSE(slot.gc_fenced);
+}
+
+/// The slot body rewritten by hand; `edit` changes the decoded body before it is written back.
+void rewriteSlot(Backend & backend, const Layout & layout, const std::function<void(MountLease &)> & edit)
+{
+    OperationForTest op(backend);
+    const auto got = (*op).read(layout.mountKey("victim"), Retry::once());
+    ASSERT_TRUE(got.has_value());
+    MountLease body = decodeMountLease(got->bytes);
+    edit(body);
+    body.seq += 1;
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace(layout.mountKey("victim"), encodeMountLease(body), got->etag, Retry::once())));
+}
+}
+
+TEST(CASRejoin, SameUuidStartsEmptyAndContinuesTheCounter)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    {
+        auto victim = Pool::open(backend, victimConfig());
+        makeTableWithRefs(*victim, "victim/db/t1", 2, 0);
+    }
+    ASSERT_TRUE(decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim").member_retired);
+    gcUntilVictimSubtreeEmpty(backend);
+    const Layout layout("p");
+    const OwnerObject retired = readOwner(*backend, layout, "victim");
+    ASSERT_TRUE(retired.retirement_verified);
+    const uint64_t admin_epoch = readSlot(*backend, layout, "victim").writer_epoch;
+
+    auto rejoined = Pool::open(backend, victimConfig());
+
+    EXPECT_GT(rejoined->writerEpoch(), admin_epoch) << "the kept counter continues past every earlier life";
+    const OwnerObject owner = readOwner(*backend, layout, "victim");
+    EXPECT_EQ(owner.owner_life, retired.owner_life + 1);
+    EXPECT_FALSE(owner.retired_at_ms.has_value());
+    EXPECT_FALSE(owner.retirement_verified);
+    EXPECT_TRUE(victimSubtreeEmpty(*backend)) << "the member comes back empty";
+    EXPECT_EQ(readSlot(*backend, layout, "victim").writer_epoch, rejoined->writerEpoch());
+    expectWriteSurvivesGc(backend, rejoined, victim_uuid);
+}
+
+TEST(CASRejoin, NewUuidReclaimsTheOldLifesFarewell)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    retireVictim(backend, "admin");
+    const Layout layout("p");
+    const MountLease farewell = readSlot(*backend, layout, "victim");
+
+    auto rejoined = Pool::open(backend, victimConfig(UInt128(77)));
+
+    const OwnerObject owner = readOwner(*backend, layout, "victim");
+    EXPECT_EQ(owner.server_uuid, UInt128(77));
+    EXPECT_FALSE(owner.retired_at_ms.has_value());
+    const MountLease slot = readSlot(*backend, layout, "victim");
+    EXPECT_EQ(slot.server_uuid, UInt128(77));
+    EXPECT_GT(slot.writer_epoch, farewell.writer_epoch);
+    EXPECT_EQ(slot.writer_epoch, rejoined->writerEpoch());
+    expectWriteSurvivesGc(backend, rejoined, UInt128(77));
+}
+
+/// The old victim reclaimed the admin's farewell under a fresh epoch, saw the tombstone and fenced itself.
+TEST(CASRejoin, NewUuidReclaimsASelfFencedOldVictimBody)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    retireVictim(backend, "admin");
+    const Layout layout("p");
+    uint64_t victim_epoch = 0;
+    {
+        OperationForTest op(*backend);
+        victim_epoch = allocateWriterEpoch(*op, layout, "victim", [] { return RefCatalog{}; });
+    }
+    rewriteSlot(*backend, layout, [&](MountLease & body)
+    {
+        body.writer_epoch = victim_epoch;
+        body.min_active_build_sequence = 0;
+        body.gc_fenced = true;
+    });
+
+    auto rejoined = Pool::open(backend, victimConfig(UInt128(77)));
+
+    const MountLease slot = readSlot(*backend, layout, "victim");
+    EXPECT_EQ(slot.server_uuid, UInt128(77));
+    EXPECT_EQ(slot.writer_epoch, rejoined->writerEpoch());
+    EXPECT_FALSE(slot.gc_fenced);
+}
+
+TEST(CASRejoin, RefusesWhileTheDecommissionRuns)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    retireVictim(backend, "admin");
+    const Layout layout("p");
+    auto rerun_admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
+    const OwnerObject before = readOwner(*backend, layout, "victim");
+
+    for (const UInt128 uuid : {victim_uuid, UInt128(77)})
+    {
+        SCOPED_TRACE(u128ToHex(uuid));
+        expectThrowsCodeWithMessage(ErrorCodes::ABORTED, "still running", [&] { Pool::open(backend, victimConfig(uuid)); });
+    }
+
+    const OwnerObject after = readOwner(*backend, layout, "victim");
+    EXPECT_EQ(after.owner_life, before.owner_life);
+    EXPECT_TRUE(after.retirement_verified);
+    EXPECT_EQ(readSlot(*backend, layout, "victim").writer_epoch, rerun_admin->writerEpoch()) << "the admin's live body is untouched";
+}
+
+/// Each part of the old life that can remain refuses the rejoin, names the part and writes nothing; once the
+/// part is gone the start rejoins. The verified mark does not wait for GC; the rejoin does.
+TEST(CASRejoin, RefusesWhileDataOfTheOldLifeRemains)
+{
+    const Layout layout("p");
+    const auto control_objects = [&](Backend & backend)
+    {
+        OperationForTest op(backend);
+        std::vector<Etag> etags;
+        for (const String & key : {layout.ownerKey("victim"), layout.epochKey("victim"), layout.mountKey("victim")})
+            etags.push_back((*op).read(key, Retry::once())->etag);
+        return etags;
+    };
+    for (const ServerRootLeftover leftover :
+         {ServerRootLeftover::CatalogRows, ServerRootLeftover::Manifests, ServerRootLeftover::RootsObjects})
+    {
+        SCOPED_TRACE(static_cast<int>(leftover));
+        auto backend = std::make_shared<InMemoryBackend>();
+        OperationForTest op(*backend);
+        /// The server uuid as `IDisk::checkAccess` formats it for the probe key and the server passes as its id.
+        const String old_uuid = toString(parseFromString<UUID>("01234567-89ab-cdef-fedc-ba9876543210"));
+        String old_uuid_hex = old_uuid;
+        std::erase(old_uuid_hex, '-');
+        const String probe = "p/roots/victim/clickhouse_access_check_" + old_uuid;
+        {
+            auto victim = Pool::open(backend, victimConfig(hexToU128(old_uuid_hex)));
+            if (leftover == ServerRootLeftover::CatalogRows)
+                makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
+        }
+        const auto report = decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+        ASSERT_TRUE(report.member_retired);
+        ASSERT_EQ(report.namespaces_pending_gc, leftover == ServerRootLeftover::CatalogRows ? 1u : 0u);
+
+        String part;
+        std::function<void()> clear;
+        switch (leftover)
+        {
+            case ServerRootLeftover::CatalogRows:
+                part = "catalog rows of the old life";
+                clear = [&] { gcUntilVictimSubtreeEmpty(backend); };
+                break;
+            case ServerRootLeftover::Manifests:
+                ASSERT_TRUE(std::holds_alternative<Committed>((*op).create("p/cas/manifests/victim/m", "m", Retry::once())));
+                part = "manifests under cas/manifests/victim/";
+                clear = [&] { ASSERT_EQ((*op).removeCurrent("p/cas/manifests/victim/m", Retry::once()), Removal::Removed); };
+                break;
+            case ServerRootLeftover::RootsObjects:
+                ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(probe, "test", Retry::once())));
+                ASSERT_TRUE(std::holds_alternative<Committed>((*op).create("p/roots/victim/backup.zip", "zip", Retry::once())));
+                part = "an object under roots/victim/";
+                clear = [&] { ASSERT_EQ((*op).removeCurrent("p/roots/victim/backup.zip", Retry::once()), Removal::Removed); };
+                break;
+            case ServerRootLeftover::None:
+                FAIL();
+        }
+        const std::vector<Etag> before = control_objects(*backend);
+
+        try
+        {
+            Pool::open(backend, victimConfig(UInt128(77)));
+            ADD_FAILURE() << "the rejoin was not refused";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::ABORTED) << e.message();
+            EXPECT_NE(e.message().find(part), String::npos) << e.message();
+            if (leftover != ServerRootLeftover::RootsObjects)
+                EXPECT_NE(e.message().find("on the GC leader"), String::npos) << e.message();
+        }
+
+        EXPECT_EQ(control_objects(*backend), before);
+        if (leftover == ServerRootLeftover::RootsObjects)
+            EXPECT_FALSE((*op).head(probe, Retry::once()).has_value()) << "the old life's access probe is deleted first";
+        clear();
+        EXPECT_NO_THROW(Pool::open(backend, victimConfig(UInt128(77))));
+    }
+}
+
+/// A rerun over a verified retirement died holding the slot. The rejoin waits until GC fences the lapsed lease.
+TEST(CASRejoin, RejoinsOnceGcFencesAKilledRerunsLease)
+{
+    for (const UInt128 uuid : {victim_uuid, UInt128(77)})
+    {
+        SCOPED_TRACE(u128ToHex(uuid));
+        auto backend = std::make_shared<InMemoryBackend>();
+        { auto victim = Pool::open(backend, victimConfig()); }
+        retireVictim(backend, "admin");
+        const Layout layout("p");
+        OperationForTest op(*backend);
+        const uint64_t rerun_epoch = allocateWriterEpoch(*op, layout, "victim", [] { return RefCatalog{}; });
+        rewriteSlot(*backend, layout, [&](MountLease & body)
+        {
+            body.writer_epoch = rerun_epoch;
+            body.min_active_build_sequence = 0;
+        });
+        tombstoneOwnerForTest(*backend, layout.ownerKey("victim"));
+        ASSERT_TRUE(readOwner(*backend, layout, "victim").retirement_verified);
+
+        expectThrowsCodeWithMessage(ErrorCodes::ABORTED, "still running", [&] { Pool::open(backend, victimConfig(uuid)); });
+
+        MountObservationMap observations;
+        std::set<String> warned;
+        for (const uint64_t mono_ms : {uint64_t{0}, uint64_t{1'000'000'000}})
+            computeHeartbeatFloor(*op, layout, /*now_ms=*/0, [mono_ms] { return mono_ms; }, /*observer_lease_ms=*/30'000,
+                                  /*cadence_ms=*/1'000, observations, warned);
+        ASSERT_TRUE(readSlot(*backend, layout, "victim").gc_fenced);
+
+        auto rejoined = Pool::open(backend, victimConfig(uuid));
+        EXPECT_EQ(readOwner(*backend, layout, "victim").server_uuid, uuid);
+        EXPECT_TRUE(readSlot(*backend, layout, "victim").isHeldBy(uuid, rejoined->writerEpoch()));
+    }
+}
+
+TEST(CASRejoin, RefusesSlotRetiredBy2664)
+{
+    const Layout layout("p");
+    {
+        SCOPED_TRACE("26.6.4 end state: tombstone without life or mark, no epoch, no mount");
+        auto backend = std::make_shared<InMemoryBackend>();
+        { auto other = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "other"}); }
+        OperationForTest op(*backend);
+        const String tombstone = encodeOwner(OwnerObject{.server_uuid = UInt128{}, .retired_at_ms = 1});
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(layout.ownerKey("victim"), tombstone, Retry::once())));
+        try
+        {
+            Pool::open(backend, victimConfig());
+            ADD_FAILURE() << "the start was not refused";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::CORRUPTED_DATA) << e.message();
+            EXPECT_NE(e.message().find("retired by an older version"), String::npos) << e.message();
+            EXPECT_EQ(e.message().find("not finished"), String::npos) << "a rerun refuses the absent counter: " << e.message();
+        }
+        EXPECT_EQ((*op).read(layout.ownerKey("victim"), Retry::once())->bytes, tombstone);
+        EXPECT_FALSE((*op).head(layout.epochKey("victim"), Retry::once()).has_value());
+        EXPECT_FALSE((*op).head(layout.mountKey("victim"), Retry::once()).has_value());
+    }
+    {
+        SCOPED_TRACE("verified retirement whose epoch counter was deleted by hand");
+        auto backend = std::make_shared<InMemoryBackend>();
+        { auto victim = Pool::open(backend, victimConfig()); }
+        retireVictim(backend, "admin");
+        OperationForTest op(*backend);
+        ASSERT_EQ((*op).removeCurrent(layout.epochKey("victim"), Retry::once()), Removal::Removed);
+        expectThrowsCodeWithMessage(ErrorCodes::CORRUPTED_DATA, "cannot rejoin", [&] { Pool::open(backend, victimConfig()); });
+        EXPECT_FALSE((*op).head(layout.epochKey("victim"), Retry::once()).has_value());
+        EXPECT_TRUE(readOwner(*backend, layout, "victim").retired_at_ms.has_value());
+    }
+    {
+        SCOPED_TRACE("verified retirement whose mount slot was deleted by hand");
+        auto backend = std::make_shared<InMemoryBackend>();
+        { auto victim = Pool::open(backend, victimConfig()); }
+        retireVictim(backend, "admin");
+        OperationForTest op(*backend);
+        ASSERT_EQ((*op).removeCurrent(layout.mountKey("victim"), Retry::once()), Removal::Removed);
+        expectThrowsCodeWithMessage(ErrorCodes::CORRUPTED_DATA, "cannot rejoin", [&] { Pool::open(backend, victimConfig()); });
+        EXPECT_FALSE((*op).head(layout.mountKey("victim"), Retry::once()).has_value());
+        EXPECT_TRUE(readOwner(*backend, layout, "victim").retired_at_ms.has_value());
+    }
+}
+
+/// Starter 88 rewrote the slot and stalled before its owner write; starter 77 then writes its owner and
+/// takes the loser's terminal body. A later start of 88 is refused and writes nothing.
+TEST(CASRejoin, ConcurrentStartersWithDifferentUuidsOneWins)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    retireVictim(backend, "admin");
+    const Layout layout("p");
+    bool loser_wrote_mount = false;
+    backend->onBeforeWrite(layout.ownerKey("victim"), [&]
+    {
+        if (std::exchange(loser_wrote_mount, true))
+            return;
+        rewriteSlot(*backend, layout, [](MountLease & body) { body.server_uuid = UInt128(88); });
+    });
+
+    auto winner = Pool::open(backend, victimConfig(UInt128(77)));
+
+    ASSERT_TRUE(loser_wrote_mount);
+    EXPECT_EQ(readOwner(*backend, layout, "victim").server_uuid, UInt128(77));
+    EXPECT_EQ(readSlot(*backend, layout, "victim").server_uuid, UInt128(77));
+    expectThrowsCodeWithMessage(ErrorCodes::CORRUPTED_DATA, "different server", [&] { Pool::open(backend, victimConfig(UInt128(88))); });
+    EXPECT_EQ(readSlot(*backend, layout, "victim").writer_epoch, winner->writerEpoch());
+}
+
+/// Starter 88's owner write loses its `If-Match` to starter 77's owner write: it decides again from a fresh
+/// owner read, sees the foreign owner and refuses. It has already rewritten the slot, as every new uuid does
+/// before its owner write, and leaves the owner alone.
+TEST(CASRejoin, LostOwnerWriteDecidesAgainAndRefuses)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    retireVictim(backend, "admin");
+    const Layout layout("p");
+    const OwnerObject retired = readOwner(*backend, layout, "victim");
+    const MountLease slot_before = readSlot(*backend, layout, "victim");
+    const uint64_t slot_seq = slot_before.seq;
+    bool winner_wrote = false;
+    String winner_body;
+    backend->onBeforeWrite(layout.ownerKey("victim"), [&]
+    {
+        if (std::exchange(winner_wrote, true))
+            return;
+        OperationForTest op(*backend);
+        const auto current = (*op).read(layout.ownerKey("victim"), Retry::once());
+        winner_body = encodeOwner(OwnerObject{.server_uuid = UInt128(77), .retired_at_ms = std::nullopt, .owner_life = retired.owner_life + 1});
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(layout.ownerKey("victim"), winner_body, current->etag, Retry::once())));
+    });
+
+    expectThrowsCodeWithMessage(ErrorCodes::CORRUPTED_DATA, "different server", [&] { Pool::open(backend, victimConfig(UInt128(88))); });
+
+    ASSERT_TRUE(winner_wrote);
+    OperationForTest op(*backend);
+    EXPECT_EQ((*op).read(layout.ownerKey("victim"), Retry::once())->bytes, winner_body) << "the loser left the owner alone";
+    const MountLease slot = readSlot(*backend, layout, "victim");
+    EXPECT_EQ(slot.seq, slot_seq + 1);
+    EXPECT_EQ(slot.server_uuid, UInt128(88));
+    EXPECT_NE(slot.write_attempt_id, slot_before.write_attempt_id);
+    EXPECT_EQ(slot.pid, static_cast<uint64_t>(::getpid()));
+}
+
+/// The old uuid rejoins after a new uuid replaced the mount body, and the new uuid writes the owner first. The old
+/// uuid writes no body of its own: under the new owner it would be a farewell a 26.6.4 starter of the old uuid,
+/// prechecked before the decommission, could still reclaim.
+TEST(CASRejoin, SameUuidLeavesTheMountBodyAlone)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    retireVictim(backend, "admin");
+    const Layout layout("p");
+    const OwnerObject retired = readOwner(*backend, layout, "victim");
+    rewriteSlot(*backend, layout, [](MountLease & body) { body.server_uuid = UInt128(77); });
+    const MountLease replaced = readSlot(*backend, layout, "victim");
+    std::atomic<bool> fired = false;
+    backend->onBeforeWrite(layout.ownerKey("victim"), [&]
+    {
+        if (fired.exchange(true))
+            return;
+        OperationForTest op(*backend);
+        const auto current = (*op).read(layout.ownerKey("victim"), Retry::once());
+        const String body = encodeOwner(
+            OwnerObject{.server_uuid = UInt128(77), .retired_at_ms = std::nullopt, .owner_life = retired.owner_life + 1});
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.ownerKey("victim"), body, current->etag, Retry::once())));
+    });
+
+    expectThrowsCodeWithMessage(ErrorCodes::CORRUPTED_DATA, "different server", [&] { Pool::open(backend, victimConfig()); });
+
+    backend->onBeforeWrite(layout.ownerKey("victim"), {});
+    ASSERT_TRUE(fired);
+    const MountLease slot = readSlot(*backend, layout, "victim");
+    EXPECT_EQ(slot.server_uuid, UInt128(77)) << "the old uuid wrote no body under the new owner";
+    EXPECT_EQ(slot.seq, replaced.seq);
+}
+
+/// Every rejoin write loses its `If-Match`: the start gives up after a bounded number of decisions.
+TEST(CASRejoin, OwnerChangingOnEveryDecisionIsBounded)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    retireVictim(backend, "admin");
+    const Layout layout("p");
+    bool in_hook = false;
+    size_t fires = 0;
+    backend->onBeforeWrite(layout.ownerKey("victim"), [&]
+    {
+        if (std::exchange(in_hook, true))
+            return;
+        ++fires;
+        OperationForTest op(*backend);
+        const auto current = (*op).read(layout.ownerKey("victim"), Retry::once());
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(layout.ownerKey("victim"), current->bytes, current->etag, Retry::once())));
+        in_hook = false;
+    });
+
+    expectThrowsCodeWithMessage(ErrorCodes::ABORTED, "kept changing", [&] { Pool::open(backend, victimConfig(UInt128(77))); });
+
+    EXPECT_EQ(fires, 4u);
+    EXPECT_TRUE(readOwner(*backend, layout, "victim").retired_at_ms.has_value());
+}
+
+/// A start of the old life allocated its epoch before the decommission and claims only after a rejoin.
+TEST(CASRejoin, DelayedLowerEpochClaimAfterRejoinIsRefused)
+{
+    for (const UInt128 rejoiner : {victim_uuid, UInt128(77)})
+    {
+        SCOPED_TRACE(rejoiner == victim_uuid ? "same uuid" : "new uuid: a foreign farewell");
+        auto backend = std::make_shared<InMemoryBackend>();
+        { auto victim = Pool::open(backend, victimConfig()); }
+        const Layout layout("p");
+        uint64_t delayed_epoch = 0;
+        {
+            OperationForTest op(*backend);
+            delayed_epoch = allocateWriterEpoch(*op, layout, "victim", [] { return RefCatalog{}; });
+        }
+        retireVictim(backend, "admin");
+        { auto rejoined = Pool::open(backend, victimConfig(rejoiner)); }
+        OperationForTest op(*backend);
+        const auto before = (*op).read(layout.mountKey("victim"), Retry::once());
+        const OwnerExpectation old_life{.server_uuid = victim_uuid, .owner_life = 1, .retired = RetiredOwnerPolicy::Refuse};
+        if (rejoiner == victim_uuid)
+            expectThrowsCode(ErrorCodes::ABORTED, [&] { claimMount(*op, layout, "victim", victim_uuid, delayed_epoch, 1, 100, {}, {}, {}, old_life); });
+        else
+            EXPECT_EQ(claimMount(*op, layout, "victim", victim_uuid, delayed_epoch, 1, 100, {}, {}, {}, old_life).kind, MountClaimResult::ForeignOwner);
+        EXPECT_EQ((*op).read(layout.mountKey("victim"), Retry::once())->etag, before->etag);
+    }
+}
+
+/// The victim restarts while the admin holds the slot; it reclaims the farewell, sees the tombstone and
+/// fences itself. A completed rerun later, the same victim rejoins on its next start.
+TEST(CASRejoin, VictimRefusedAfterFarewellRejoinsOnItsNextStart)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    const Layout layout("p");
+    auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
+    bool decommissioned = false;
+    PoolConfig waiting = victimConfig();
+    waiting.boot_ms_fn = [fake_boot] { return fake_boot->load(); };
+    waiting.wait_sleep_fn = [&, fake_boot](uint64_t ms)
+    {
+        *fake_boot += ms;
+        if (std::exchange(decommissioned, true))
+            return;
+        tombstoneOwnerForTest(*backend, layout.ownerKey("victim"));
+        admin.reset();
+    };
+    expectThrowsCodeWithMessage(ErrorCodes::CORRUPTED_DATA, "decommissioned", [&] { Pool::open(backend, waiting); });
+    ASSERT_TRUE(readSlot(*backend, layout, "victim").gc_fenced);
+
+    retireVictim(backend, "admin2");
+    auto rejoined = Pool::open(backend, victimConfig());
+    EXPECT_FALSE(readOwner(*backend, layout, "victim").retired_at_ms.has_value());
+    EXPECT_EQ(readSlot(*backend, layout, "victim").writer_epoch, rejoined->writerEpoch());
+}
+
+TEST(CASRejoin, RefusesWhileAnUnfinishedDecommissionLeftData)
+{
+    auto backend = std::make_shared<FailingDeleteBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    {
+        OperationForTest op(*backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create("p/roots/victim/kept", "x", Retry::once())));
+    }
+    backend->failWithTokenMismatch("p/roots/victim/kept");
+    ASSERT_FALSE(decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim").member_retired);
+    const Layout layout("p");
+    const OwnerObject tombstone = readOwner(*backend, layout, "victim");
+    ASSERT_TRUE(tombstone.retired_at_ms.has_value());
+    ASSERT_FALSE(tombstone.retirement_verified);
+
+    for (const UInt128 uuid : {victim_uuid, UInt128(77)})
+    {
+        SCOPED_TRACE(u128ToHex(uuid));
+        expectThrowsCodeWithMessage(ErrorCodes::CORRUPTED_DATA, "decommission is not finished", [&] { Pool::open(backend, victimConfig(uuid)); });
+    }
+    EXPECT_EQ(readOwner(*backend, layout, "victim").owner_life, tombstone.owner_life);
+
+    backend->disarm();
+    retireVictim(backend, "admin2");
+    EXPECT_NO_THROW(Pool::open(backend, victimConfig()));
+}
+
+/// A losing racing rejoiner of uuid 88 left its terminal body; the old uuid's own restart still rejoins.
+TEST(CASRejoin, SameUuidRejoinsOverAForeignTerminalBody)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    retireVictim(backend, "admin");
+    const Layout layout("p");
+    rewriteSlot(*backend, layout, [](MountLease & body) { body.server_uuid = UInt128(88); });
+
+    auto rejoined = Pool::open(backend, victimConfig());
+
+    const MountLease slot = readSlot(*backend, layout, "victim");
+    EXPECT_EQ(slot.server_uuid, victim_uuid);
+    EXPECT_EQ(slot.writer_epoch, rejoined->writerEpoch());
+}
+
+/// Only a start rejoins. A process that was fenced and finds its id retired keeps refusing to remount.
+TEST(CASRejoin, RemountDoesNotRejoin)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, victimConfig());
+    const Layout layout("p");
+    tombstoneOwnerForTest(*backend, layout.ownerKey("victim"), /*verified=*/true);
+    fenceOutMountForTest(*backend, layout.mountKey("victim"));
+    expectThrowsCode(ErrorCodes::ABORTED, [&] { store->renewWatermarkOnce(); });
+    const OwnerObject before = readOwner(*backend, layout, "victim");
+
+    EXPECT_FALSE(store->tryRemountOnce());
+
+    const OwnerObject after = readOwner(*backend, layout, "victim");
+    EXPECT_EQ(after.owner_life, before.owner_life);
+    EXPECT_TRUE(after.retired_at_ms.has_value());
+}
+
+
+/// A 26.6.4 starter of the old uuid read the farewell before the rejoin and reclaims it by `If-Match` with
+/// no owner recheck; it fires just before the rejoin's owner write.
+TEST(CASRejoin, NewUuidReplacesTheMountBeforeTheOwner)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    retireVictim(backend, "admin");
+    const Layout layout("p");
+    OperationForTest raw_op(*backend);
+    const auto old_farewell = (*raw_op).read(layout.mountKey("victim"), Retry::once());
+    ASSERT_TRUE(old_farewell.has_value());
+    std::optional<WriteResult> old_claim;
+    backend->onBeforeWrite(layout.ownerKey("victim"), [&]
+    {
+        if (old_claim)
+            return;
+        MountLease body = decodeMountLease(old_farewell->bytes);
+        body.writer_epoch += 1;
+        body.min_active_build_sequence = 0;
+        body.seq += 1;
+        OperationForTest op(*backend);
+        old_claim = (*op).replace(layout.mountKey("victim"), encodeMountLease(body), old_farewell->etag, Retry::once());
+    });
+
+    auto rejoined = Pool::open(backend, victimConfig(UInt128(77)));
+
+    ASSERT_TRUE(old_claim.has_value());
+    EXPECT_TRUE(std::holds_alternative<Conflict>(*old_claim)) << "the rejoin rewrote the mount body first";
+    EXPECT_EQ(readSlot(*backend, layout, "victim").server_uuid, UInt128(77));
+}
+
+/// A decommission rerun claims the slot between the rejoin's reads and its first write: the rejoin's
+/// `If-Match` fails, the next decision sees the admin's live body and refuses; the owner stays retired.
+TEST(CASRejoin, DecommissionRerunDuringARejoinWins)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = Pool::open(backend, victimConfig()); }
+    retireVictim(backend, "admin");
+    const Layout layout("p");
+    const OwnerObject before = readOwner(*backend, layout, "victim");
+    std::atomic<bool> fired = false;
+    PoolPtr rerun_admin;
+    const auto admin_claims = [&]
+    {
+        if (fired.exchange(true))
+            return;
+        rerun_admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
+    };
+    backend->onBeforeWrite(layout.mountKey("victim"), admin_claims);
+    backend->onBeforeWrite(layout.ownerKey("victim"), admin_claims);
+
+    expectThrowsCodeWithMessage(ErrorCodes::ABORTED, "still running", [&] { Pool::open(backend, victimConfig(UInt128(77))); });
+
+    backend->onBeforeWrite(layout.mountKey("victim"), {});
+    backend->onBeforeWrite(layout.ownerKey("victim"), {});
+    ASSERT_TRUE(rerun_admin != nullptr);
+    const OwnerObject after = readOwner(*backend, layout, "victim");
+    EXPECT_EQ(after.server_uuid, before.server_uuid);
+    EXPECT_EQ(after.owner_life, before.owner_life);
+    EXPECT_TRUE(after.retirement_verified);
+    EXPECT_EQ(readSlot(*backend, layout, "victim").writer_epoch, rerun_admin->writerEpoch());
+}
+
+/// A writable open without a server uuid (uuid 0) stays refused over a retired owner, whoever owned it.
+TEST(CASRejoin, ZeroUuidDoesNotRejoin)
+{
+    for (const UInt128 old_uuid : {UInt128(77), UInt128{}})
+    {
+        SCOPED_TRACE(u128ToHex(old_uuid));
+        auto backend = std::make_shared<InMemoryBackend>();
+        { auto victim = Pool::open(backend, victimConfig(old_uuid)); }
+        retireVictim(backend, "admin");
+        const Layout layout("p");
+        const OwnerObject before = readOwner(*backend, layout, "victim");
+        const MountLease slot_before = readSlot(*backend, layout, "victim");
+
+        expectThrowsCodeWithMessage(
+            ErrorCodes::CORRUPTED_DATA, "no server uuid",
+            [&] { Pool::open(backend, victimConfig(UInt128{})); });
+
+        const OwnerObject after = readOwner(*backend, layout, "victim");
+        EXPECT_EQ(after.owner_life, before.owner_life);
+        EXPECT_TRUE(after.retired_at_ms.has_value());
+        EXPECT_EQ(readSlot(*backend, layout, "victim").seq, slot_before.seq);
+    }
+}

@@ -619,16 +619,20 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// can reach a slot mutation; the callback remains available for fresh conflict rechecks below.
     (void)observe_catalog();
 
-    /// 2. Owner anchor — IDENTITY (clock-free). A foreign uuid fails closed; an absent owner over a
-    ///    non-empty subtree is CORRUPTED_DATA; a fresh empty root is claimed.
+    /// 2. Owner anchor — IDENTITY (clock-free). A foreign uuid fails closed unless it is a verified, drained
+    ///    retirement (rejoin); an absent owner over a non-empty subtree is CORRUPTED_DATA; a fresh empty root
+    ///    is claimed.
     /// Every step of this protocol runs on the OPEN plane. These are bootstrap-control writes: they
     /// establish the very right to write, and the mount fence they would otherwise be gated on is
     /// either unarmed (a first open) or latched lost (a self-remount, which could then never reclaim).
-    const RetiredOwnerPolicy retired_policy = policy == MountClaimPolicy::NoWait
-        ? RetiredOwnerPolicy::AcceptForDecommission
-        : RetiredOwnerPolicy::Refuse;
+    const bool is_decommission = policy == MountClaimPolicy::NoWait;
+    const RetiredOwnerPolicy claim_retired_policy
+        = is_decommission ? RetiredOwnerPolicy::AcceptForDecommission : RetiredOwnerPolicy::RejoinIfVerified;
+    const RetiredOwnerPolicy recheck_retired_policy
+        = is_decommission ? RetiredOwnerPolicy::AcceptForDecommission : RetiredOwnerPolicy::Refuse;
     CasOperation owner_op = store->gc_requests.admit();
-    const uint64_t owner_life = claimOwnerOrThrow(owner_op, store->pool_layout, srid, our_uuid, observe_catalog, retired_policy);
+    const uint64_t owner_life = claimOwnerOrThrow(
+        owner_op, store->pool_layout, srid, our_uuid, observe_catalog, claim_retired_policy);
     store->recorded_owner_life = owner_life;
 
     const auto now_ms = []() -> uint64_t
@@ -800,7 +804,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         /// below runs under an owner this process did not start under.
         CasOperation recheck_op = store->gc_requests.admit();
         recheckOwnerAfterClaim(recheck_op, store->pool_layout, srid,
-            OwnerExpectation{.server_uuid = our_uuid, .owner_life = owner_life, .retired = retired_policy},
+            OwnerExpectation{.server_uuid = our_uuid, .owner_life = owner_life, .retired = recheck_retired_policy},
             writer_epoch, emit_mount_event);
 
         /// The mount object now holds OUR live (uuid, epoch) body. `installRenewer` constructs the renewer

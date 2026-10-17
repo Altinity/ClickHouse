@@ -124,6 +124,21 @@ def _assert_retired_or_racing_stop(report, report_tsv):
         assert report["warnings"].replace("\\'", "'") == FAREWELL_SKIPPED_BY_A_RACING_STOP, report_tsv
 
 
+MANIFESTS_PREFIX = POOL + "/cas/manifests/" + SRID2 + "/"
+ROOTS_PREFIX = POOL + "/roots/" + SRID2 + "/"
+
+
+def _srid2_mount(node1):
+    return tuple(
+        node1.query(
+            "SELECT state, server_uuid FROM system.cas_mounts "
+            "WHERE server_root_id = '{}' AND disk = '{}'".format(SRID2, CA_DISK)
+        )
+        .strip()
+        .split("\t")
+    )
+
+
 def _srid2_retirement(node1):
     return tuple(
         node1.query(
@@ -133,6 +148,32 @@ def _srid2_retirement(node1):
         .strip()
         .split("\t")
     )
+
+
+def _retire_srid2(node1):
+    # A rejoin needs a verified retirement, no catalog row left for GC and no object left under the id.
+    # The test polls namespaces_pending_gc through the report of a rerun, which is safe only because node2 is
+    # stopped; an operator runs SYSTEM CAS GC RUN after a verified run and does not rerun the decommission.
+    report_tsv = ""
+    for _ in range(60):
+        report_tsv, report = _drop_member(node1)
+        if (
+            int(report["member_retired"]) == 1
+            and int(report["namespaces_pending_gc"]) == 0
+            and _count(MANIFESTS_PREFIX) == 0
+            and _count(ROOTS_PREFIX) == 0
+        ):
+            return
+        node1.query("SYSTEM CAS GC RUN '{}'".format(CA_DISK))
+        time.sleep(1.0)
+    pytest.fail("node2 never reached a drained, verified retirement: {}".format(report_tsv))
+
+
+def _gc_rounds(nodes, rounds=3):
+    # GC RUN acts only on the GC leader and does nothing elsewhere; running it on every node reaches the leader.
+    for _ in range(rounds):
+        for node in nodes:
+            node.query("SYSTEM CAS GC RUN '{}'".format(CA_DISK))
 
 
 def test_drop_dead_pool_member_heals_the_pool():
@@ -360,3 +401,56 @@ def test_drop_pool_member_rejected_on_readonly_disk():
         "SYSTEM CAS DROP POOL MEMBER 'whatever' FROM DISK '{}'".format(RO_DISK)
     )
     assert "read-only" in err, err
+
+
+def test_retired_member_rejoins_empty():
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    # Start from a retired node2 whatever ran before: a stop of a stopped server only warns.
+    node2.stop_clickhouse(kill=True)
+    _retire_srid2(node1)
+    assert _srid2_retirement(node1) == ("retired", "1")
+
+    # Same uuid: the restart rejoins, then the member writes a table of its own.
+    node2.start_clickhouse()
+    state, old_uuid = _srid2_mount(node1)
+    assert state == "live"
+    node2.query("DROP TABLE IF EXISTS t3 SYNC")
+    node2.query(
+        "CREATE TABLE t3 (id Int64, s String) ENGINE = MergeTree() ORDER BY id "
+        "SETTINGS storage_policy = '{}'".format(STORAGE_POLICY)
+    )
+    node2.query("INSERT INTO t3 SELECT number, toString(number) FROM numbers(1000)")
+    _gc_rounds([node1, node2])
+    assert int(node2.query("SELECT count() FROM t3")) == 1000
+    assert _srid2_mount(node1) == ("live", old_uuid)
+
+    node2.stop_clickhouse()
+    _retire_srid2(node1)
+    assert _srid2_retirement(node1) == ("retired", "1")
+
+    # The same uuid comes back empty: the local table definition attaches with no rows and takes writes.
+    node2.start_clickhouse()
+    assert _srid2_mount(node1) == ("live", old_uuid)
+    assert int(node2.query("SELECT count() FROM t3")) == 0
+    node2.query("INSERT INTO t3 SELECT number, toString(number) FROM numbers(10)")
+    _gc_rounds([node1, node2])
+    assert int(node2.query("SELECT count() FROM t3")) == 10
+    assert _srid2_mount(node1) == ("live", old_uuid)
+
+    # A new uuid (the local uuid file regenerated) rejoins the same id, also empty.
+    node2.stop_clickhouse()
+    _retire_srid2(node1)
+    node2.exec_in_container(["rm", "-f", "/var/lib/clickhouse/uuid"], user="root")
+    node2.start_clickhouse()
+    state, new_uuid = _srid2_mount(node1)
+    assert state == "live"
+    assert new_uuid != old_uuid
+    assert int(node2.query("SELECT count() FROM t3")) == 0
+    node2.query("INSERT INTO t3 SELECT number, toString(number) FROM numbers(10)")
+    _gc_rounds([node1, node2])
+    assert int(node2.query("SELECT count() FROM t3")) == 10
+    assert _srid2_mount(node1) == ("live", new_uuid)
+
+    node2.query("DROP TABLE t3 SYNC")

@@ -668,8 +668,8 @@ TEST(CASServerRootClaim, DecommissionPolicyAcceptsARetiredOwnerOfTheSameUuid)
     });
     EXPECT_EQ(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation(),
                                 RetiredOwnerPolicy::AcceptForDecommission), 2u);
-    /// A retired owner of ANOTHER uuid is still foreign under either policy.
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "owned by a different server", [&]
+    /// A retired owner of ANOTHER uuid is still foreign under either policy; the refusal also names a duplicate id.
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "same <cas_server_root_id>", [&]
     {
         claimOwnerOrThrow(ops.op, l, "r", UInt128(2), emptyCatalogObservation(), RetiredOwnerPolicy::AcceptForDecommission);
     });
@@ -679,9 +679,10 @@ TEST(CASServerRootClaim, DecommissionPolicyAcceptsARetiredOwnerOfTheSameUuid)
 /// policy as the first read.
 TEST(CASServerRootClaim, ConflictRereadAppliesTheRetiredPolicy)
 {
-    for (const RetiredOwnerPolicy policy : {RetiredOwnerPolicy::Refuse, RetiredOwnerPolicy::AcceptForDecommission})
+    for (const RetiredOwnerPolicy policy :
+         {RetiredOwnerPolicy::Refuse, RetiredOwnerPolicy::AcceptForDecommission, RetiredOwnerPolicy::RejoinIfVerified})
     {
-        SCOPED_TRACE(policy == RetiredOwnerPolicy::Refuse ? "Refuse" : "AcceptForDecommission");
+        SCOPED_TRACE(static_cast<int>(policy));
         auto b = std::make_shared<InMemoryBackend>();
         Layout l("p");
         Ops ops(b);
@@ -695,9 +696,9 @@ TEST(CASServerRootClaim, ConflictRereadAppliesTheRetiredPolicy)
                 .server_uuid = UInt128(1), .retired_at_ms = 1752537600000ULL, .owner_life = 2}), Retry::standard()),
                 "racing tombstone");
         });
-        if (policy == RetiredOwnerPolicy::Refuse)
+        if (policy != RetiredOwnerPolicy::AcceptForDecommission)
         {
-            DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommissioned", [&]
+            DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommission is not finished", [&]
             {
                 claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation(), policy);
             });
@@ -710,33 +711,27 @@ TEST(CASServerRootClaim, ConflictRereadAppliesTheRetiredPolicy)
     }
 }
 
-/// GUARD: a server start over a tombstoned owner is refused in this PR whether or not the retirement is
-/// verified, and writes neither the counter nor the slot. (A later PR lets a verified, drained retirement
-/// rejoin; the unverified arm stays.)
-TEST(CASMount, PoolOpenNeverAcceptsARetiredOwner)
+/// A start over an unverified tombstone is refused and writes neither the counter nor the slot.
+TEST(CASMount, PoolOpenRefusesAnUnverifiedRetirement)
 {
-    for (const bool verified : {false, true})
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    { auto first = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"}); }
+    Ops ops(b);
+    const auto owner = ops.op.read(l.ownerKey("r"), Retry::standard());
+    OwnerObject tombstone = decodeOwner(owner->bytes);
+    tombstone.retired_at_ms = 1;
+    tombstone.owner_life += 1;
+    tombstone.retirement_verified = false;
+    mustCommit(ops.op.replace(l.ownerKey("r"), encodeOwner(tombstone), owner->etag, Retry::standard()), "tombstone");
+    const Etag epoch_before = currentEtag(ops.op, l.epochKey("r"));
+    const Etag mount_before = currentEtag(ops.op, l.mountKey("r"));
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommission is not finished", [&]
     {
-        SCOPED_TRACE(verified ? "verified" : "unverified");
-        auto b = std::make_shared<InMemoryBackend>();
-        Layout l("p");
-        { auto first = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"}); }
-        Ops ops(b);
-        const auto owner = ops.op.read(l.ownerKey("r"), Retry::standard());
-        OwnerObject tombstone = decodeOwner(owner->bytes);
-        tombstone.retired_at_ms = 1;
-        tombstone.owner_life += 1;
-        tombstone.retirement_verified = verified;
-        mustCommit(ops.op.replace(l.ownerKey("r"), encodeOwner(tombstone), owner->etag, Retry::standard()), "tombstone");
-        const Etag epoch_before = currentEtag(ops.op, l.epochKey("r"));
-        const Etag mount_before = currentEtag(ops.op, l.mountKey("r"));
-        DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommissioned", [&]
-        {
-            Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
-        });
-        EXPECT_EQ(currentEtag(ops.op, l.epochKey("r")), epoch_before);
-        EXPECT_EQ(currentEtag(ops.op, l.mountKey("r")), mount_before);
-    }
+        Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
+    });
+    EXPECT_EQ(currentEtag(ops.op, l.epochKey("r")), epoch_before);
+    EXPECT_EQ(currentEtag(ops.op, l.mountKey("r")), mount_before);
 }
 
 TEST(CASServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
@@ -944,7 +939,17 @@ TEST(CASServerRootClaim, MissingOwnerOverNonEmptyRootIsCorrupted)
     Ops ops(b);
     /// Simulate existing data without an owner (identity lost): plant a key under roots/<srid>/.
     mustCommit(ops.op.create(l.serverRootDataPrefix("r") + "some-data", "x", Retry::standard()), "root debris");
-    EXPECT_THROW(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation()), DB::Exception);
+    try
+    {
+        claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation());
+        FAIL() << "the claim over an ownerless non-empty subtree must be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA) << e.message();
+        EXPECT_NE(e.message().find("refusing to re-claim"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("Configure a new <cas_server_root_id> for this disk"), String::npos) << e.message();
+    }
 }
 
 TEST(CASServerRootSafety, EveryCatalogLifecycleStateBlocksOwnerAndEpochRecreation)

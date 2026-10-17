@@ -133,6 +133,18 @@ class Layout;
 bool serverRootSubtreeEmpty(
     CasOperation & op, const Layout & l, const String & srid, const RefCatalog & catalog_observation);
 
+/// The first part of a server root's subtree that is not empty, checked in this order.
+enum class ServerRootLeftover
+{
+    None,
+    CatalogRows,
+    Manifests,
+    RootsObjects,
+};
+
+ServerRootLeftover serverRootLeftover(
+    CasOperation & op, const Layout & l, const String & srid, const RefCatalog & catalog_observation);
+
 /// Supplied by the pool layer so the low-level server-root protocol always observes the mandatory
 /// catalog. Every absent-control retry obtains a fresh, successfully decoded observation.
 using ObserveRefCatalog = std::function<RefCatalog()>;
@@ -145,20 +157,24 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
 
 enum class RetiredOwnerPolicy : uint8_t
 {
-    Refuse,                  /// a server start or remount never resumes a tombstoned owner
+    Refuse,                  /// a remount, and every check after the owner claim, never accept a tombstoned owner
     AcceptForDecommission,   /// the decommission admin impersonates a retired victim to drain or rerun
+    RejoinIfVerified,        /// a server start takes over a verified, drained retirement as an empty member
 };
 
 /// Claim or validate the owner anchor that binds `srid` to a server uuid, and return the owner life.
 ///   - present, equal `our_uuid`, not tombstoned → the stored life;
+///   - present and tombstoned, under `RejoinIfVerified` (a server start), any non-zero uuid → rejoin as an
+///     empty member: the owner becomes `{our_uuid, owner_life + 1}` and that life is returned. Refused with
+///     `CORRUPTED_DATA` (zero uuid, `epoch` or `mount` missing, retirement not verified) or `ABORTED` (slot held,
+///     data of the old life left, owner or slot changing on every decision);
 ///   - present, equal `our_uuid`, tombstoned → `CORRUPTED_DATA` under `Refuse`; the stored life under
-///     `AcceptForDecommission` (the admin runs or reruns a decommission over its retired victim);
-///   - present, different uuid → `CORRUPTED_DATA` (foreign owner), tombstoned or not;
+///     `AcceptForDecommission`;
+///   - present, different uuid, outside a rejoin → `CORRUPTED_DATA` (foreign owner), tombstoned or not;
 ///   - absent, subtree provably empty → create `{our_uuid, owner_life = 1}` and return 1;
 ///   - absent, subtree non-empty → `CORRUPTED_DATA` (identity lost over data).
 /// The returned life is 0 for a body written before the field existed.
-/// The owner object is never deleted. A rejoin after a verified retirement is the one supported reassignment
-/// (not in this file yet); every other uuid change is a refusal.
+/// The owner object is never deleted; a rejoin is the one supported change of its uuid.
 uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
     const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse);
@@ -202,8 +218,8 @@ uint64_t allocateWriterEpoch(CasOperation & op, const Layout & l, const String &
                              const ObserveRefCatalog & observe_catalog);
 
 /// Which certificate of death, or the operator's explicit unsafe authorization, justified a
-/// same-uuid, older-epoch mount reclaim. `None` when no reclaim of that kind happened (a fresh
-/// claim, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
+/// older-epoch mount reclaim (`Fenced` and `Clean` also cover another uuid's terminal body). `None` when no
+/// reclaim of that kind happened (a fresh claim, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
 enum class MountPriorState
 {
     None,

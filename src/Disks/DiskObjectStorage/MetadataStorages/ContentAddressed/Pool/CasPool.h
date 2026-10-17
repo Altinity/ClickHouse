@@ -427,6 +427,8 @@ public:
     /// Construct a pool after backend capabilities and durable pool metadata have been validated.
     /// For a writable configuration, `open` also claims the configured mount before returning; a
     /// read-only configuration returns an instance that performs no mutating startup operations.
+    /// A start over a verified, drained retirement of its `server_root_id` rejoins it as an empty member
+    /// (`claimOwnerOrThrow`).
     static PoolPtr open(BackendPtr backend, PoolConfig config);
     /// Admin writer mount of the VICTIM `server_root_id`, for `SYSTEM CAS DROP POOL MEMBER`.
     /// Impersonates the victim's owner uuid (`readOwnerUuid`, or, when the owner was deleted by hand, the uuid
