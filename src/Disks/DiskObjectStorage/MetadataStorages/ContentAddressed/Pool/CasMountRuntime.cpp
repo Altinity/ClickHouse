@@ -1175,7 +1175,7 @@ void CasMountRuntime::finishTeardown(bool drained)
     {
         LOG_WARNING(
             getLogger("CasPool"),
-            "CAS store shutdown with an unresolved ref-log PUT: skipping the clean-release marker; "
+            "CAS store shutdown with an unresolved write: skipping the clean-release marker; "
             "the next mount will treat this end as unclean");
     }
 }

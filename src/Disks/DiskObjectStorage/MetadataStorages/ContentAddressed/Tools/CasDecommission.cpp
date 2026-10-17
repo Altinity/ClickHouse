@@ -10,9 +10,9 @@
 #include <Common/logger_useful.h>
 #include <base/defines.h>
 #include <base/scope_guard.h>
+#include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
-#include <limits>
 #include <set>
 #include <tuple>
 
@@ -20,7 +20,9 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int ABORTED;
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -52,11 +54,13 @@ std::string_view removalName(Removal r)
 /// fenced by the decommission claim (`Pool::openForDecommission`), so nothing should be racing these
 /// deletes, and a plain exact-incarnation delete of every listed object is race-free.
 ///
+/// Runs on the admin's mount plane, so a fenced admin's deletes are refused locally; only attempts already
+/// sent can land late.
+///
 /// A per-object failure — a backend exception, a `Mismatch` or `Gone` outcome, or an object
 /// disappearing between `LIST` and `HEAD` — is recorded as a warning and does not prevent the remaining
-/// objects from being attempted. The caller keeps the pool slot whenever warnings are present, so the
-/// terminated slot remains available as a resume anchor instead of being deleted after an unconfirmed
-/// drain. Returns only the objects whose exact-incarnation delete was reported as `Removed`.
+/// objects from being attempted while `op` is still admitted. Returns only the objects whose
+/// exact-incarnation delete was reported as `Removed`.
 uint64_t deleteListedPrefix(CasOperation & op, const String & prefix, std::vector<String> & warnings)
 {
     uint64_t deleted = 0;
@@ -87,116 +91,254 @@ uint64_t deleteListedPrefix(CasOperation & op, const String & prefix, std::vecto
         {
             warnings.push_back("decommission drain: " + listed.key + " delete failed: "
                                 + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+            return op.admitted();
         }
         return true;
     }, Retry::standard());
     return deleted;
 }
 
-/// Delete one slot control object by an incarnation captured at the protocol-defined fence point. Slot
-/// retirement is fail-closed: unlike the debris drains above, any non-`Removed` outcome or exception
-/// stops the tail before it can touch the next control object.
-bool deleteSlotObject(CasOperation & op, const String & key, const Etag & etag, std::vector<String> & warnings)
+String whyNotWritten(const WriteResult & result)
+{
+    return std::visit(detail::Overload{
+        [](const Committed &) -> String { return "committed"; },
+        [](const Declined &) -> String { return "declined"; },
+        [](const Conflict &) -> String { return "the object changed since it was read"; },
+        [](const Refused & refused) -> String { return "the store refused it: " + refused.message; },
+        [](const GaveUp & gave_up) -> String
+        {
+            return gave_up.sent_any ? "gave up after sending, it may have landed" : "gave up before sending";
+        }}, result);
+}
+
+/// A mark counts only on a retired owner: clearing `retired_at_ms` by hand to restart a member leaves the mark
+/// of the earlier life behind.
+bool holdsVerifiedRetirement(const OwnerObject & owner)
+{
+    return owner.retirement_verified && owner.retired_at_ms.has_value();
+}
+
+/// This run's tombstone: what a later exit needs to decide whether to keep it or roll it back.
+struct Tombstone
+{
+    OwnerObject owner;                /// the tombstone's body
+    bool previously_retired = false;  /// the owner was already retired; a rollback never undoes that
+    Etag etag;                        /// the tombstone's incarnation, the rollback's precondition
+};
+
+void logWarnings(const String & srid, const std::vector<String> & warnings)
+{
+    for (const String & warning : warnings)
+        LOG_WARNING(getLogger("CasDecommission"), "CAS decommission '{}': {}", srid, warning);
+}
+
+/// Undo this run's tombstone after a lost claim: the next life, not retired, no mark. An earlier retirement
+/// stays: its tombstone landed while its run held the claim, so no member runs under it. A rollback whose
+/// precondition moved was overtaken by a later owner write, which then owns the outcome.
+void rollBackTombstone(CasOperation & op, const Layout & layout, const String & srid, const Tombstone & tombstone,
+                       std::vector<String> & warnings)
+{
+    if (tombstone.previously_retired)
+    {
+        warnings.push_back("the admin claim was lost after the tombstone; the owner keeps its earlier retirement");
+        return;
+    }
+    const OwnerObject restored = nextOwnerLife(tombstone.owner, std::nullopt, false);
+    const WriteResult written = op.replace(layout.ownerKey(srid), encodeOwner(restored), tombstone.etag, Retry::standard());
+    if (std::holds_alternative<Committed>(written))
+        warnings.push_back("the admin claim was lost after the tombstone; the tombstone was rolled back (owner life "
+                           + std::to_string(restored.owner_life) + "); rerun to decommission");
+    else if (std::holds_alternative<Conflict>(written))
+        warnings.push_back("the admin claim was lost after the tombstone and the rollback did not land: the owner "
+                           "changed after this run's tombstone; read the owner object '" + layout.ownerKey(srid)
+                           + "' before rerunning");
+    else
+        warnings.push_back("the admin claim was lost after the tombstone and the rollback did not complete ("
+                           + whyNotWritten(written) + "); read the owner object '" + layout.ownerKey(srid)
+                           + "' before rerunning");
+}
+
+/// Every exit after the tombstone and before the farewell: the tombstone stays while the claim holds. A failed
+/// confirm is a warning, so an exit that already carries an error still propagates its own.
+void confirmClaimOrRollBack(CasOperation & op, const Layout & layout, const String & srid, UInt128 victim_uuid,
+                            uint64_t admin_epoch, const Tombstone & tombstone, std::vector<String> & warnings)
 {
     try
     {
-        const Removal outcome = op.remove(key, etag, Retry::standard());
-        if (outcome == Removal::Removed)
-            return true;
-
-        warnings.push_back("slot delete failed: " + key + ": delete outcome "
-                           + String(removalName(outcome)));
+        if (!adminClaimStillHeld(op, layout, srid, victim_uuid, admin_epoch))
+            rollBackTombstone(op, layout, srid, tombstone, warnings);
     }
     catch (...)
     {
-        warnings.push_back("slot delete failed: " + key + ": "
+        warnings.push_back("could not confirm the admin claim: " + getCurrentExceptionMessage(/*with_stacktrace=*/false)
+                           + "; read the owner object '" + layout.ownerKey(srid) + "' before rerunning");
+    }
+}
+
+/// Reads the owner on `control`, requires the victim's uuid, and replaces it on the admin's mount plane by the
+/// next life, retired, keeping an earlier verified mark. The mount plane sends no attempt after the admin's
+/// lease deadline, but the store may apply one later. A paused earlier run cannot roll this tombstone back:
+/// its precondition is older. A write with an unknown outcome is still an exit after the tombstone when it
+/// landed: if the owner reads back as exactly these bytes, the claim is confirmed (or the tombstone rolled
+/// back) before the error propagates. Otherwise the admin withholds its clean farewell: the victim then runs
+/// only after its slot is fenced or observed dead.
+Tombstone writeTombstone(CasOperation & control, Pool & admin, const Layout & layout, const String & srid,
+                         UInt128 victim_uuid, uint64_t admin_epoch, std::vector<String> & warnings)
+{
+    CasOperation fenced = admin.mountRequests().admit();
+    const String key = layout.ownerKey(srid);
+    const std::optional<Object> current = control.read(key, Retry::standard());
+    if (!current)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS decommission '{}': the owner anchor vanished after the admin claim", srid);
+    const OwnerObject read = decodeOwner(current->bytes);
+    if (read.server_uuid != victim_uuid)
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS decommission '{}': the owner is now server_uuid={}, the claim was made for {}; another server "
+            "took this server_root_id since the claim, nothing was removed",
+            srid, u128ToHex(read.server_uuid), u128ToHex(victim_uuid));
+
+    const bool previously_retired = read.retired_at_ms.has_value();
+    const OwnerObject owner = nextOwnerLife(read, nowMs(), holdsVerifiedRetirement(read));
+    const String bytes = encodeOwner(owner);
+    const String what = fmt::format("CAS decommission '{}' owner tombstone", srid);
+
+    std::optional<WriteResult> written;
+    std::exception_ptr unknown_outcome;
+    try
+    {
+        written = fenced.replace(key, bytes, current->etag, Retry::standard());
+    }
+    catch (...)
+    {
+        /// The engine rethrows a local failure even after an attempt was sent.
+        unknown_outcome = std::current_exception();
+    }
+    if (written)
+    {
+        if (const Committed * committed = std::get_if<Committed>(&*written))
+            return Tombstone{.owner = owner, .previously_retired = previously_retired, .etag = committed->etag};
+        if (std::holds_alternative<Conflict>(*written))
+            throw Exception(ErrorCodes::ABORTED,
+                "CAS decommission '{}': the owner was rewritten between the claim and the tombstone (a rerun or a "
+                "rejoin); nothing was removed, rerun to decide against the current owner", srid);
+        const GaveUp * gave_up = std::get_if<GaveUp>(&*written);
+        if (!gave_up || !gave_up->sent_any)
+        {
+            orThrow(std::move(*written), what);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "{}: a conditional replace was declined", what);
+        }
+        try
+        {
+            orThrow(std::move(*written), what);
+        }
+        catch (...)
+        {
+            unknown_outcome = std::current_exception();
+        }
+    }
+
+    std::optional<Object> landed;
+    try
+    {
+        landed = control.read(key, Retry::standard());
+    }
+    catch (...)
+    {
+        warnings.push_back("could not read the owner back after the tombstone write: "
                            + getCurrentExceptionMessage(/*with_stacktrace=*/false));
     }
+    if (landed && landed->bytes == bytes)
+    {
+        const Tombstone tombstone{.owner = owner, .previously_retired = previously_retired, .etag = landed->etag};
+        confirmClaimOrRollBack(control, layout, srid, victim_uuid, admin_epoch, tombstone, warnings);
+    }
+    else
+        admin.withholdFarewell();
+    logWarnings(srid, warnings);
+    std::rethrow_exception(unknown_outcome);
+}
+
+/// Whether the owner carries a verified retirement once this run can no longer act. Otherwise says why not:
+/// an unretired owner past this run's tombstone moved on (a rejoin, or another run's rollback), and a rerun
+/// there could drain a rejoined member; anything else, a later run's unverified tombstone included, means
+/// rerun.
+bool ownerHoldsVerifiedRetirement(CasOperation & op, const Layout & layout, const String & srid, const Tombstone & tombstone,
+                                  std::vector<String> & warnings)
+{
+    try
+    {
+        if (const std::optional<Object> current = op.read(layout.ownerKey(srid), Retry::standard()))
+        {
+            const OwnerObject owner = decodeOwner(current->bytes);
+            if (holdsVerifiedRetirement(owner))
+                return true;
+            if (!owner.retired_at_ms && owner.owner_life > tombstone.owner.owner_life)
+            {
+                warnings.push_back(fmt::format(
+                    "the owner moved on to life {} after this run's tombstone (a rejoin or another run's rollback); "
+                    "read system.cas_mounts and the owner object '{}' before rerunning",
+                    owner.owner_life, layout.ownerKey(srid)));
+                return false;
+            }
+        }
+    }
+    catch (...)
+    {
+        warnings.push_back("could not re-read the owner: " + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+    }
+    warnings.push_back("the retirement is not verified; rerun SYSTEM CAS DROP POOL MEMBER");
     return false;
 }
 
+/// The mark records that this run's claim, tombstone and farewell all held; it does not wait for GC.
+bool verifyAndMark(CasOperation & op, const Layout & layout, const String & srid, UInt128 victim_uuid,
+                   uint64_t admin_epoch, const Tombstone & tombstone, std::vector<String> & warnings)
+{
+    const size_t warnings_before = warnings.size();
+    const String owner_key = layout.ownerKey(srid);
+    try
+    {
+        const std::optional<Object> slot = op.read(layout.mountKey(srid), Retry::standard());
+        const std::optional<Object> current = op.read(owner_key, Retry::standard());
+        if (slot && current)
+        {
+            const MountLease body = decodeMountLease(slot->bytes);
+            const OwnerObject owner = decodeOwner(current->bytes);
+            const bool farewell_held = body.isHeldBy(victim_uuid, admin_epoch) && !body.gc_fenced && body.isFarewell();
+            const bool tombstone_held = owner.server_uuid == victim_uuid && owner.retired_at_ms
+                && owner.owner_life == tombstone.owner.owner_life;
+            if (farewell_held && tombstone_held)
+            {
+                const OwnerObject marked_owner = nextOwnerLife(owner, owner.retired_at_ms, true);
+                const WriteResult marked = op.replace(owner_key, encodeOwner(marked_owner), current->etag, Retry::standard());
+                if (std::holds_alternative<Committed>(marked))
+                    return true;
+                warnings.push_back("the verified mark was not written (" + whyNotWritten(marked) + ")");
+            }
+            else
+                warnings.push_back(farewell_held ? "the owner is not this run's tombstone" : "the slot does not hold this run's farewell");
+        }
+    }
+    catch (...)
+    {
+        warnings.push_back("verification failed: " + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+    }
+    if (!ownerHoldsVerifiedRetirement(op, layout, srid, tombstone, warnings))
+        return false;
+    /// The owner re-read found the mark: the failure above, e.g. an unclear mark write, needs no rerun.
+    for (size_t i = warnings_before; i < warnings.size(); ++i)
+        LOG_INFO(getLogger("CasDecommission"), "CAS decommission '{}': settled by the owner re-read: {}", srid, warnings[i]);
+    warnings.resize(warnings_before);
+    return true;
 }
 
-DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
-                                          const String & victim_srid, const CasEventSink & sink,
-                                          const std::function<void()> & request_gc_round,
-                                          const std::function<uint64_t()> & drain_now_fn,
-                                          const std::function<void(uint64_t)> & drain_sleep_fn)
+/// The drain on the admin's fenced mount plane: victim namespaces, manifest debris, staging, roots. Per-object
+/// failures land in `report.warnings`; a namespace that changed or lost its checkpoint throws.
+void drainVictim(Pool & admin, const CasRefCatalog::Snapshot & catalog_cut, const String & victim_srid,
+                 DecommissionReport & report, bool & gc_round_needed)
 {
-    DecommissionReport report;
-    report.srid = victim_srid;
-    bool gc_round_needed = false;
-    /// A namespace may have reached `Removing` before a later namespace fails closed. Preserve the
-    /// already-earned liveness signal on every exit: the callback only wakes the existing serialized
-    /// GC worker and cannot perform catalog work itself.
-    SCOPE_EXIT({
-        if (gc_round_needed && request_gc_round)
-            request_gc_round();
-    });
-
-    /// Decommission is administrative and non-hot-path: it has no mount-lease fence of its own -- the
-    /// exact-incarnation compare on every write is the safety mechanism -- so it opens its own
-    /// always-admitted request engine rather than one of `Pool`'s fenced planes. The pre-impersonation
-    /// cut below runs against the raw backend passed in, because `Pool::openForDecommission` has not
-    /// yet wrapped it for instrumentation and no `Pool` exists yet to route through.
-    CasRequests preflight_requests(backend, Fence::open());
-    CasOperation preflight_op = preflight_requests.admit();
-
-    /// Validate one required immutable ownership cut before impersonating the victim. The admin open
-    /// performs its own fresh catalog observation for mount safety, but namespace selection below
-    /// must reuse this exact pre-mutation decision rather than read a later authority set.
-    const Layout catalog_layout(config.pool_prefix);
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(preflight_op, catalog_layout);
-    catalog_cut.life_index.throwIfAmbiguous("CAS decommission");
-
-    /// `drain_now_fn`/`drain_sleep_fn` below replace the clock and sleep the STANDALONE `requests`
-    /// engine (opened further down) paces its own retries on, but `config.boot_ms_fn`/
-    /// `config.retry_sleep_fn` -- the seams `Pool::openForDecommission` itself constructs its
-    /// mount/farewell/GC planes with -- are distinct. Left unset, those planes retry on the real boot
-    /// clock and a real sleep, and a caller that fakes only the standalone engine's clock ends up
-    /// comparing it against an unrelated one at the mount lease's farewell bound (or, worse, against a
-    /// clock that only the standalone engine's sleep advances: a retry loop on `mount_requests`/
-    /// `gc_requests` bound to that frozen clock while actually sleeping for real would never see its
-    /// own deadline elapse). Fold BOTH into `config` here, together, unless the caller already asked
-    /// for a specific clock or sleep of its own -- installing only one of the two is exactly the
-    /// half-fix that leaves the other seam retrying forever.
-    if (drain_now_fn && drain_sleep_fn)
-    {
-        if (!config.boot_ms_fn)
-            config.boot_ms_fn = drain_now_fn;
-        if (!config.retry_sleep_fn)
-            config.retry_sleep_fn = drain_sleep_fn;
-    }
-
-    config.event_sink = sink;
-    PoolPtr admin = Pool::openForDecommission(std::move(backend), std::move(config), victim_srid);
-    if (drain_now_fn && drain_sleep_fn)
-    {
-        /// Re-affirms the same values `config` above already installed on `mount_requests`/
-        /// `farewell_requests`/`gc_requests` at construction, and additionally wires `ref_ledger`'s own
-        /// retry sleep, which has no construction-time seam of its own. `sweepNamespace` below issues
-        /// its deletes on `admin`'s own GC plane.
-        admin->setCasRequestNowFnForTest(drain_now_fn);
-        admin->setCasRetrySleepForTest(drain_sleep_fn);
-    }
-
-    /// A second engine over the pool's own (now instrumented) backend: `CasRequests` keeps its own
-    /// shared_ptr to it, so `op` stays usable after `admin.reset()` retires the `Pool` below.
-    CasRequests requests(admin->poolBackendPtr(), Fence::open());
-    if (drain_now_fn && drain_sleep_fn)
-    {
-        requests.setNowFnForTest(drain_now_fn);
-        requests.setSleepFnForTest(drain_sleep_fn);
-    }
-    CasOperation op = requests.admit();
-
-    EventEmitter{*admin}.emit([&](CasEvent & e)
-    {
-        e.type = CasEventType::MemberDecommission;
-        e.outcome = "begin";
-        e.reason = "operator decommission of pool member";
-        e.detail = {{"server_root_id", victim_srid}};
-    });
+    CasOperation op = admin.mountRequests().admit();
 
     /// The pre-impersonation catalog cut is the complete ownership universe. Physical life keys carry
     /// no logical path, and raw string prefixes such as `victim` must not select the distinct owner
@@ -222,7 +364,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         /// Refuse a same-name lifecycle move that landed after the immutable selection cut. The
         /// exact-life overloads below also pin recovery to `life`, closing the race after this check:
         /// a later replacement can never redirect a removal to its new incarnation.
-        const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(op, admin->layout());
+        const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(op, admin.layout());
         const auto current_entry = std::find_if(
             current_catalog.catalog.entries.begin(), current_catalog.catalog.entries.end(),
             [&](const CatalogEntry & entry) { return entry.ns.string() == ns_str; });
@@ -234,7 +376,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
 
         if (selected_entry.state == NsState::Removing)
         {
-            if (!op.head(admin->layout().refCkptKey(life), Retry::standard()).has_value())
+            if (!op.head(admin.layout().refCkptKey(life), Retry::standard()).has_value())
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "ca-decommission: namespace '{}' is Removing but its exact checkpoint is absent; "
                     "the catalog row remains owned and the victim slot cannot be retired",
@@ -243,13 +385,13 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
             /// `dropNamespace` is the sole terminal writer. On an already-complete removal this is an
             /// idempotent observation; on a pre-terminal `Removing` life it resumes the exact terminal
             /// append under the administrative writer fence. Catalog deletion remains GC's job.
-            (void)admin->dropNamespace(life);
+            (void)admin.dropNamespace(life);
             ++report.namespaces_already_removed;
             gc_round_needed = true;
             continue;
         }
 
-        const auto stats = admin->dropNamespace(life);
+        const auto stats = admin.dropNamespace(life);
         ++report.namespaces_removed;
         report.committed_refs_removed += stats.committed_refs;
         report.precommits_removed += stats.precommits;
@@ -257,7 +399,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         if (selected_entry.state != NsState::Creating)
             gc_round_needed = true;
 
-        EventEmitter{*admin}.emit([&](CasEvent & e)
+        EventEmitter{admin}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::MemberDecommission;
             e.outcome = "namespace_removed";
@@ -268,255 +410,168 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         });
     }
 
-    /// Manifest debris must be removed before the mount slot: deleting the mount body removes the
-    /// watermark authority, after which `floorForNamespace` returns no value and the ordinary orphan
-    /// sweep cannot prove that old-epoch debris is eligible. The decommission claim has advanced the
-    /// writer epoch, so every build prefix with `prefix.writer_epoch < w.writer_epoch` is eligible here.
-    /// Group the listed keys by namespace and build prefix so each group can use the exact-token orphan
-    /// sweep while the mount body still supplies its authority.
+    /// The decommission claim has advanced the writer epoch, so every build prefix with
+    /// `prefix.writer_epoch < w.writer_epoch` is eligible here. Group the listed keys by namespace and
+    /// build prefix so each group can use the exact-token orphan sweep.
     {
-        const String debris_prefix = admin->layout().casManifestsServerPrefix(victim_srid);
+        const String debris_prefix = admin.layout().casManifestsServerPrefix(victim_srid);
         std::set<std::tuple<String, uint64_t, uint64_t>> groups;   /// (namespace, writer epoch, build sequence)
         op.forEachListedKey(debris_prefix, [&](const ListedKey & listed)
         {
-            if (const auto parsed = admin->layout().parseManifestKey(listed.key))
+            if (const auto parsed = admin.layout().parseManifestKey(listed.key))
                 groups.emplace(parsed->root_namespace.string(), parsed->ref.writer_epoch, parsed->ref.build_sequence);
             return true;
         }, Retry::standard());
         for (const auto & [ns_str, writer_epoch, build_sequence] : groups)
             report.manifest_debris_removed += sweepNamespace(
-                *admin, RootNamespace(ns_str), BuildPrefix{writer_epoch, build_sequence}, &report.warnings);
+                admin, RootNamespace(ns_str), BuildPrefix{writer_epoch, build_sequence}, &report.warnings);
     }
 
     /// Drain the victim's own `<pool_prefix>/staging/<srid>/` area. The live-mount staging helper uses
     /// an `IObjectStorage`, while this command intentionally works at the `Backend` layer, so the same
     /// prefix is listed and deleted directly. The claim fences the victim's writers during this sweep.
     report.staging_objects_removed += deleteListedPrefix(
-        op, admin->poolConfig().pool_prefix + "/staging/" + victim_srid + "/", report.warnings);
+        op, admin.poolConfig().pool_prefix + "/staging/" + victim_srid + "/", report.warnings);
 
     /// Drain the victim's mountpoint objects. These are loose, non-content-addressed files under
     /// `Layout::serverRootDataPrefix`; they have no writer epoch of their own, so the claim is what
     /// prevents a returning victim from racing this deletion.
     report.mountpoint_objects_removed += deleteListedPrefix(
-        op, admin->layout().serverRootDataPrefix(victim_srid), report.warnings);
+        op, admin.layout().serverRootDataPrefix(victim_srid), report.warnings);
 
-    /// The catalog, not physical debris, owns the slot-retirement decision. A terminal append only
-    /// moves a row to `Removing`; GC must fold/prune/delete it before the member's ownership anchor can
-    /// disappear. Capture one exact whole-catalog cut after every drain, then revalidate its incarnation
-    /// and canonical value immediately before entering the retirement tail. The administrative claim
-    /// fences the victim writer between those observations.
-    std::optional<CasRefCatalog::Snapshot> retirement_catalog_cut;
-    if (report.warnings.empty())
+    if (!op.admitted())
     {
-        retirement_catalog_cut = CasRefCatalog::read(op, admin->layout());
-        const uint64_t victim_owned_count = std::count_if(
-            retirement_catalog_cut->catalog.entries.begin(), retirement_catalog_cut->catalog.entries.end(),
-            [&](const CatalogEntry & entry)
-            {
-                return entry.ns.string() == victim_srid
-                    || entry.ns.string().starts_with(victim_namespace_prefix);
-            });
-        if (victim_owned_count > 0)
-            report.warnings.push_back(
-                "pool member decommission underway: " + std::to_string(victim_owned_count)
-                + " namespace(s) are still owned by this member; upcoming GC rounds perform the final "
-                  "cleanup — re-run this command afterwards to retire the slot");
+        report.warnings.push_back("the admin lost its mount lease during the drain; rerun");
+        return;
     }
 
-    /// Retire the slot strictly last and only after a clean drain. Copy the layout before
-    /// `admin.reset()`: graceful close destroys the `Pool`, while `op` (holding its own shared_ptr to
-    /// the backend) remains usable to retire the slot objects afterwards.
+    /// Rows still owned by the victim after the drain. `Removing` rows are GC's: they count as pending, not
+    /// as a failure. Anything else appeared after the ownership cut and was not drained: rerun.
+    const CasRefCatalog::Snapshot after_drain = CasRefCatalog::read(op, admin.layout());
+    for (const CatalogEntry & entry : after_drain.catalog.entries)
+    {
+        if (entry.ns.string() != victim_srid && !entry.ns.string().starts_with(victim_namespace_prefix))
+            continue;
+        if (entry.state == NsState::Removing)
+            ++report.namespaces_pending_gc;
+        else
+            report.warnings.push_back("namespace '" + entry.ns.string() + "' appeared after the ownership cut and was not drained; rerun");
+    }
+}
+
+}
+
+bool adminClaimStillHeld(CasOperation & op, const Layout & layout, const String & srid, UInt128 victim_uuid, uint64_t admin_epoch)
+{
+    const std::optional<Object> slot = op.read(layout.mountKey(srid), Retry::standard());
+    if (!slot)
+        return false;
+    const MountLease body = decodeMountLease(slot->bytes);
+    return body.isHeldBy(victim_uuid, admin_epoch) && !body.gc_fenced && !body.isFarewell();
+}
+
+DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
+                                          const String & victim_srid, const CasEventSink & sink,
+                                          const std::function<void()> & request_gc_round,
+                                          const std::function<uint64_t()> & drain_now_fn,
+                                          const std::function<void(uint64_t)> & drain_sleep_fn)
+{
+    DecommissionReport report;
+    report.srid = victim_srid;
+    bool gc_round_needed = false;
+    /// A namespace may have reached `Removing` before a later namespace fails closed: wake GC on every exit.
+    SCOPE_EXIT({
+        if (gc_round_needed && request_gc_round)
+            request_gc_round();
+    });
+
+    /// Validate one immutable ownership cut before impersonating the victim, on the raw backend: no `Pool`
+    /// exists yet. Namespace selection reuses this exact pre-mutation decision rather than a later read.
+    CasRequests preflight_requests(backend, Fence::open());
+    CasOperation preflight_op = preflight_requests.admit();
+    const Layout catalog_layout(config.pool_prefix);
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(preflight_op, catalog_layout);
+    catalog_cut.life_index.throwIfAmbiguous("CAS decommission");
+
+    /// One fake clock and sleep for every plane: the farewell deadline is bound to the boot clock, and a
+    /// plane on a frozen clock that sleeps for real would never see its retry deadline elapse.
+    if (drain_now_fn && drain_sleep_fn)
+    {
+        if (!config.boot_ms_fn)
+            config.boot_ms_fn = drain_now_fn;
+        if (!config.retry_sleep_fn)
+            config.retry_sleep_fn = drain_sleep_fn;
+    }
+    config.event_sink = sink;
+
+    /// The admin claim. `NoWait` refuses a live victim and accepts a tombstoned owner.
+    PoolPtr admin = Pool::openForDecommission(std::move(backend), std::move(config), victim_srid);
+    if (drain_now_fn && drain_sleep_fn)
+    {
+        admin->setCasRequestNowFnForTest(drain_now_fn);
+        admin->setCasRetrySleepForTest(drain_sleep_fn);
+    }
+    const UInt128 victim_uuid = admin->poolConfig().server_id;
+    const uint64_t admin_epoch = admin->writerEpoch();
     const Layout layout = admin->layout();
+
+    /// The control plane: always admitted, so a fenced admin can still confirm, roll back and verify. It keeps
+    /// its own shared_ptr to the backend and outlives `admin.reset()`.
+    CasRequests control_requests(admin->poolBackendPtr(), Fence::open());
+    if (drain_now_fn && drain_sleep_fn)
+    {
+        control_requests.setNowFnForTest(drain_now_fn);
+        control_requests.setSleepFnForTest(drain_sleep_fn);
+    }
+    CasOperation control = control_requests.admit();
+
+    EventEmitter{*admin}.emit([&](CasEvent & e)
+    {
+        e.type = CasEventType::MemberDecommission;
+        e.outcome = "begin";
+        e.reason = "operator decommission of pool member";
+        e.detail = {{"server_root_id", victim_srid}, {"server_uuid", u128ToHex(victim_uuid)}};
+    });
+
+    /// From here on every exit decides the tombstone's fate (`confirmClaimOrRollBack`).
+    const Tombstone tombstone = writeTombstone(control, *admin, layout, victim_srid, victim_uuid, admin_epoch, report.warnings);
+
+    try
+    {
+        /// The claim must have held through the tombstone write.
+        if (!adminClaimStillHeld(control, layout, victim_srid, victim_uuid, admin_epoch))
+        {
+            rollBackTombstone(control, layout, victim_srid, tombstone, report.warnings);
+        }
+        else
+        {
+            drainVictim(*admin, catalog_cut, victim_srid, report, gc_round_needed);
+            if (!report.warnings.empty())
+                confirmClaimOrRollBack(control, layout, victim_srid, victim_uuid, admin_epoch, tombstone, report.warnings);
+        }
+    }
+    catch (...)
+    {
+        /// The farewell `admin`'s destructor writes on unwind is a clean body, which the confirm would read as
+        /// a lost claim, so the decision is made here, while the admin is alive.
+        confirmClaimOrRollBack(control, layout, victim_srid, victim_uuid, admin_epoch, tombstone, report.warnings);
+        logWarnings(victim_srid, report.warnings);
+        throw;
+    }
+
+    /// The farewell: it lands while the claim holds and loses to the fence after a lost claim.
+    /// `MountLeaseRenewer::terminate` reports no outcome, so `verifyAndMark` reads it back.
+    admin.reset();
     if (report.warnings.empty())
     {
-        const CasRefCatalog::Snapshot fresh_retirement_catalog = CasRefCatalog::read(op, admin->layout());
-        if (!retirement_catalog_cut
-            || fresh_retirement_catalog.etag != retirement_catalog_cut->etag
-            || fresh_retirement_catalog.catalog != retirement_catalog_cut->catalog)
-        {
-            report.warnings.push_back(
-                "catalog changed after the victim ownership check; refusing slot retirement against a stale cut");
-        }
+        report.member_retired = verifyAndMark(control, layout, victim_srid, victim_uuid, admin_epoch, tombstone, report.warnings);
+        if (report.member_retired)
+            LOG_INFO(getLogger("CasDecommission"), "CAS decommission '{}': retired server_uuid={} at owner life {}",
+                     victim_srid, u128ToHex(victim_uuid), tombstone.owner.owner_life);
     }
-    if (report.warnings.empty())
-    {
-        const String mount_key = layout.mountKey(victim_srid);
-        const String epoch_key = layout.epochKey(victim_srid);
-        const String owner_key = layout.ownerKey(victim_srid);
+    logWarnings(victim_srid, report.warnings);
 
-        /// Capture both the epoch value and its exact incarnation while the decommission claim still
-        /// fences the victim. A successor can only bump this object after the farewell below releases
-        /// the claim, so this incarnation is the epoch-side successor fence for the retirement tail.
-        std::optional<Object> claimed_epoch;
-        try
-        {
-            claimed_epoch = op.read(epoch_key, Retry::standard());
-            if (!claimed_epoch)
-                report.warnings.push_back("slot capture failed: " + epoch_key + " is absent under the admin claim");
-        }
-        catch (...)
-        {
-            report.warnings.push_back("slot capture failed: " + epoch_key + ": "
-                                      + getCurrentExceptionMessage(/*with_stacktrace=*/false));
-        }
-
-        /// Graceful close stamps an already-expired lease and the watermark farewell
-        /// (`min_active_build_sequence = UINT64_MAX`), making the slot `terminated` before its mutable control objects
-        /// are removed and its owner anchor is tombstoned.
-        admin.reset();
-
-        /// Read the farewell immediately after `finishTeardown` wrote it. Its exact incarnation is the
-        /// mount-side fence: deleting by this incarnation can remove only THIS decommission's farewell,
-        /// not a successor reclaim. Validate the body against the epoch value captured under the claim
-        /// so a successor that completed before this read is also recognized and left untouched.
-        std::optional<Object> farewell_mount;
-        try
-        {
-            farewell_mount = op.read(mount_key, Retry::standard());
-            if (!farewell_mount)
-                report.warnings.push_back("slot capture failed: " + mount_key + " farewell is absent");
-        }
-        catch (...)
-        {
-            report.warnings.push_back("slot capture failed: " + mount_key + ": "
-                                      + getCurrentExceptionMessage(/*with_stacktrace=*/false));
-        }
-
-        bool captures_match = claimed_epoch && farewell_mount;
-        if (captures_match)
-        {
-            try
-            {
-                const ServerEpoch epoch_value = decodeServerEpoch(claimed_epoch->bytes);
-                const MountLease mount_value = decodeMountLease(farewell_mount->bytes);
-                captures_match = epoch_value.next_writer_epoch != 0
-                    && mount_value.writer_epoch == epoch_value.next_writer_epoch - 1
-                    && mount_value.min_active_build_sequence == std::numeric_limits<uint64_t>::max()
-                    && !mount_value.gc_fenced;
-                if (!captures_match)
-                {
-                    report.warnings.push_back(
-                        "slot capture failed: " + mount_key
-                        + " is not this decommission's farewell for the epoch captured under the admin claim");
-                }
-            }
-            catch (...)
-            {
-                report.warnings.push_back("slot capture failed while validating " + mount_key + " and " + epoch_key + ": "
-                                          + getCurrentExceptionMessage(/*with_stacktrace=*/false));
-                captures_match = false;
-            }
-        }
-
-        /// Mount first: if a successor reclaimed it after the farewell capture, the stale farewell
-        /// incarnation yields `Mismatch` and the tail stops before touching epoch or owner. Epoch
-        /// second: its under-claim incarnation similarly detects a successor allocation. Before
-        /// touching owner, re-read both mutable objects: a same-UUID successor can recreate them after
-        /// both deletes without rewriting the owner identity anchor. Mere presence proves that the slot
-        /// is live again. Every delete must be explicitly confirmed as `Removed`, and the final owner
-        /// tombstone rewrite must succeed against the exact incarnation read immediately before it.
-        ///
-        /// ACCEPTED RESIDUAL WINDOW (final review, not closed by this recheck): a same-UUID successor
-        /// can still recreate epoch/mount in the narrow gap strictly AFTER this liveness recheck but
-        /// BEFORE the owner CAS below reads its own incarnation -- the successor's owner anchor (same
-        /// server_uuid, not yet retired) then gets tombstoned by this decommission run. The successor's
-        /// live process is not deleted (only its owner anchor is marked retired), but a LATER restart of
-        /// that same identity would refuse to reclaim it (claimOwnerOrThrow's tombstone guard). This is
-        /// a narrow, low-probability window, deliberately not closed here: T5's owner-tombstone design
-        /// (finding #9) intentionally stopped short of making concurrent decommission-vs-recreate
-        /// airtight to the microsecond, since that was explicitly not the priority for this fix.
-        report.slot_removed = false;
-        if (captures_match && deleteSlotObject(op, mount_key, farewell_mount->etag, report.warnings)
-            && deleteSlotObject(op, epoch_key, claimed_epoch->etag, report.warnings))
-        {
-            std::optional<Object> current_mount;
-            std::optional<Object> current_epoch;
-            bool liveness_recheck_succeeded = true;
-            try
-            {
-                current_mount = op.read(mount_key, Retry::standard());
-            }
-            catch (...)
-            {
-                report.warnings.push_back("slot liveness recheck failed: " + mount_key + ": "
-                                          + getCurrentExceptionMessage(/*with_stacktrace=*/false));
-                liveness_recheck_succeeded = false;
-            }
-            try
-            {
-                current_epoch = op.read(epoch_key, Retry::standard());
-            }
-            catch (...)
-            {
-                report.warnings.push_back("slot liveness recheck failed: " + epoch_key + ": "
-                                          + getCurrentExceptionMessage(/*with_stacktrace=*/false));
-                liveness_recheck_succeeded = false;
-            }
-
-            if (liveness_recheck_succeeded && (current_mount || current_epoch))
-            {
-                report.warnings.push_back(
-                    "slot delete aborted: successor reappeared after mutable control-object deletion; owner kept");
-            }
-            else if (liveness_recheck_succeeded)
-            {
-                try
-                {
-                    if (const auto owner = op.read(owner_key, Retry::standard()))
-                    {
-                        OwnerObject tombstoned = decodeOwner(owner->bytes);
-                        tombstoned.retired_at_ms = nowMs();
-                        /// `op.replace` resolves an ambiguous attempt with a resolve read on its own:
-                        /// a transient transport error here (or one whose response was simply lost)
-                        /// must not be reported as a hard failure when the write actually landed.
-                        /// Unchanged incarnation means the write never applied (legitimately retryable
-                        /// within budget); matching bytes means this exact tombstone already landed
-                        /// (`Committed`, not a failure); a genuine successor reclaim is `Conflict`;
-                        /// `Refused` is the store's own definite answer (a denial, a malformed
-                        /// request, an expired credential) and carries its own code and message,
-                        /// which is worth more here than the generic retry advice below.
-                        WriteResult result = op.replace(owner_key, encodeOwner(tombstoned), owner->etag, Retry::standard());
-                        if (std::holds_alternative<Committed>(result))
-                            report.slot_removed = true;
-                        else if (std::holds_alternative<Conflict>(result))
-                            report.warnings.push_back(
-                                "slot tombstone failed: " + owner_key
-                                + ": successor reclaimed the owner anchor before this decommission's tombstone write");
-                        else if (const Refused * refused = std::get_if<Refused>(&result))
-                            report.warnings.push_back(
-                                "slot tombstone failed: " + owner_key + ": the store refused the write ("
-                                + std::to_string(refused->store_error) + "): " + refused->message);
-                        else
-                            report.warnings.push_back(
-                                "slot tombstone failed: " + owner_key
-                                + ": tombstone write outcome could not be resolved (retry budget exhausted "
-                                  "or the resolve read itself failed) -- rerun the command to retry");
-                    }
-                    else
-                        report.warnings.push_back(
-                            "slot tombstone failed: " + owner_key + ": object absent before tombstone write");
-                }
-                catch (...)
-                {
-                    report.warnings.push_back("slot tombstone failed: " + owner_key + ": "
-                                              + getCurrentExceptionMessage(/*with_stacktrace=*/false));
-                }
-            }
-        }
-    }
-    else
-    {
-        report.slot_removed = false;
-        LOG_WARNING(getLogger("CasDecommission"),
-            "CAS decommission '{}': drain incomplete ({} warnings) — mount slot kept (terminated); "
-            "re-run the command to finish", victim_srid, report.warnings.size());
-        admin.reset();   /// Graceful close still stamps the farewell, leaving the slot `terminated`.
-    }
-
-    /// The `end` event is emitted via `sink` directly, not `EventEmitter{*admin}`: `admin` is gone by
-    /// now. This also means its `warnings` count reflects the FINAL total, including a slot-retirement
-    /// failure appended just above -- `EventEmitter`'s own zero-cost-when-absent guard is reproduced by
-    /// the `if (sink)` below.
+    /// Emitted through `sink` directly: `admin` is gone by now.
     if (sink)
     {
         CasEvent e;
@@ -524,9 +579,12 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         e.outcome = "end";
         e.reason = "decommission finished";
         e.detail = {{"server_root_id", victim_srid},
+                    {"server_uuid", u128ToHex(victim_uuid)},
+                    {"owner_life", std::to_string(tombstone.owner.owner_life)},
                     {"namespaces_removed", std::to_string(report.namespaces_removed)},
+                    {"namespaces_pending_gc", std::to_string(report.namespaces_pending_gc)},
                     {"warnings", std::to_string(report.warnings.size())},
-                    {"slot_removed", report.slot_removed ? "1" : "0"}};
+                    {"member_retired", report.member_retired ? "1" : "0"}};
         sink(std::move(e));
     }
     return report;

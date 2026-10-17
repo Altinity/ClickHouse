@@ -27,8 +27,8 @@ namespace DB::Cas
 struct OwnerObject
 {
     UInt128 server_uuid{};
-    /// Set when this identity was explicitly decommissioned by an operator (`CasDecommission`'s
-    /// final step tombstones the owner object in place rather than deleting it, since its content
+    /// Set when this identity was explicitly decommissioned by an operator (`CasDecommission`
+    /// tombstones the owner object in place rather than deleting it, since its content
     /// alone cannot distinguish decommissioned debris from a legitimate successor's live anchor).
     /// A normal claim (`claimOwnerOrThrow`) must refuse to silently resume a tombstoned identity.
     std::optional<uint64_t> retired_at_ms;

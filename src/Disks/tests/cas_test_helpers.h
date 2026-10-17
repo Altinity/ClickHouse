@@ -29,13 +29,17 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Common/Exception.h>
 #include <Common/Logger.h>
+#include <Common/logger_useful.h>
 #include <Common/SipHash.h>
 #include <Common/thread_local_rng.h>
 
 #include <base/hex.h>
 #include <city.h>
 
+#include <Poco/StreamChannel.h>
+
 #include <gtest/gtest.h>
+#include <sstream>
 #include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
@@ -85,6 +89,37 @@ namespace DB::ErrorCodes
 
 namespace DB::Cas::tests
 {
+
+/// Redirects the named logger into a string for the scope, at the given level.
+class ScopedLoggerCapture
+{
+public:
+    ScopedLoggerCapture(const String & logger_name, const String & level)
+        : logger(getLogger(logger_name))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel(), /*shared=*/true)
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel(level);
+    }
+
+    ~ScopedLoggerCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    /// A real reference (shared=true), so the parked previous channel cannot die while ours is installed.
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
 
 /// A `CasRequests` over an always-open fence, for a fixture that has a backend but no mounted pool.
 /// Every operation admitted from it holds a reference to it, so it must be named and outlive them.

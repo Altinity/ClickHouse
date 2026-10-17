@@ -426,36 +426,6 @@ public:
     }
 };
 
-class ScopedRenewalLogCapture
-{
-public:
-    explicit ScopedRenewalLogCapture(const String & level)
-        : logger(getLogger("CasMountLeaseRenewer"))
-        , channel(new Poco::StreamChannel(stream))
-        , old_channel(logger->getChannel(), /*shared=*/true)
-        , old_level(logger->getLevel())
-    {
-        logger->setChannel(channel.get());
-        logger->setLevel(level);
-    }
-
-    ~ScopedRenewalLogCapture()
-    {
-        logger->setChannel(old_channel);
-        logger->setLevel(old_level);
-    }
-
-    String captured() const { return stream.str(); }
-
-private:
-    LoggerPtr logger;
-    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    Poco::AutoPtr<Poco::StreamChannel> channel;
-    /// A real reference (shared=true), so the parked previous channel cannot die while ours is installed.
-    Poco::AutoPtr<Poco::Channel> old_channel;
-    int old_level;
-};
-
 size_t countRenewalLogText(const String & haystack, std::string_view needle)
 {
     size_t count = 0;
@@ -510,7 +480,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         auto backend = std::make_shared<RenewalLogBackend>();
         auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-silent");
-        ScopedRenewalLogCapture capture("information");
+        DB::Cas::tests::ScopedLoggerCapture capture("CasMountLeaseRenewer", "information");
         EXPECT_NO_THROW(store->renewWatermarkOnce());
         EXPECT_EQ(countRenewalLogText(capture.captured(), "CAS mount renewal"), 0u);
     }
@@ -519,7 +489,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         auto backend = std::make_shared<RenewalLogBackend>();
         auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-recovered");
-        ScopedRenewalLogCapture capture("information");
+        DB::Cas::tests::ScopedLoggerCapture capture("CasMountLeaseRenewer", "information");
         backend->throw_before_next_overwrite = true;
         EXPECT_NO_THROW(store->renewWatermarkOnce());
         const String output = capture.captured();
@@ -532,7 +502,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         auto backend = std::make_shared<RenewalLogBackend>();
         auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-debug");
-        ScopedRenewalLogCapture capture("debug");
+        DB::Cas::tests::ScopedLoggerCapture capture("CasMountLeaseRenewer", "debug");
         backend->throw_before_next_overwrite = true;
         EXPECT_NO_THROW(store->renewWatermarkOnce());
         EXPECT_EQ(countRenewalLogText(capture.captured(), "physical retry attempt 2"), 1u);
@@ -542,7 +512,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         auto backend = std::make_shared<RenewalLogBackend>();
         auto boot_ms = std::make_shared<std::atomic<uint64_t>>(100);
         auto store = open_store(backend, boot_ms, "renewal-log-fenced");
-        ScopedRenewalLogCapture capture("information");
+        DB::Cas::tests::ScopedLoggerCapture capture("CasMountLeaseRenewer", "information");
         /// The lease was claimed at boot 100 with the 1000 ms TTL above, so it expires at 1100. The
         /// fence admits only while the remaining time strictly clears the safety margin plus whatever
         /// the attempt reserves, so exactly `margin` remaining (with the reservation on top) refuses.

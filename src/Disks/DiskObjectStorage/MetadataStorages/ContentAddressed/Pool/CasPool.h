@@ -422,18 +422,18 @@ public:
     /// For a writable configuration, `open` also claims the configured mount before returning; a
     /// read-only configuration returns an instance that performs no mutating startup operations.
     static PoolPtr open(BackendPtr backend, PoolConfig config);
-    /// Admin writer mount of the VICTIM `server_root_id`, for `SYSTEM CAS DROP POOL
-    /// MEMBER`. Impersonates the victim's
-    /// owner uuid (`readOwnerUuid`, or -- when the owner anchor itself is missing -- recovered from a
-    /// lingering mount lease) and mounts writable under `MountClaimPolicy::NoWait`: a live victim
-    /// lease is an immediate `ABORTED` refusal (no wait-and-observe, no FORCE variant), unlike the
-    /// bounded reclaim wait a normal `open` pays. Throws `BAD_ARGUMENTS` when there is nothing to
-    /// decommission (no owner anchor and no mount lease for `victim_srid`).
+    /// Admin writer mount of the VICTIM `server_root_id`, for `SYSTEM CAS DROP POOL MEMBER`.
+    /// Impersonates the victim's owner uuid (`readOwnerUuid`, or, when the owner was deleted by hand, the uuid
+    /// of the surviving lease) and mounts writable under `MountClaimPolicy::NoWait`: a live victim lease is an
+    /// immediate `ABORTED` refusal; a tombstoned owner of the victim is accepted; a member without an epoch
+    /// counter is refused (`CORRUPTED_DATA`). Throws `BAD_ARGUMENTS` when neither owner nor lease exists.
     static PoolPtr openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid);
     /// Stop the mount-renewal and remount activity, drain ref-log work, and release the owned
     /// backend-facing components in their dependency order. Destruction is also the clean-farewell
     /// path for a writable mount, so it must complete before the owning backend is released.
     ~Pool();
+    /// The teardown writes no clean farewell: a successor then waits for this lease to be fenced or observed dead.
+    void withholdFarewell() noexcept { farewell_withheld = true; }
 
     bool tryDispatchDetached(std::function<void(DetachedStopToken)> task);
     /// Marks this pool as being torn down. The open request plane refuses every further admission and
@@ -770,10 +770,10 @@ public:
     /// on the fence would make a self-remount, which runs with the fence latched lost, unable ever to
     /// reclaim.
     CasRequests & openRequests() { return gc_requests; }
-    /// The owning `BackendPtr` itself (not just a reference into it): the decommission slot-retirement
-    /// decommission step (`CasDecommission.cpp`) must keep the backend alive across `admin.reset()` -- the graceful
-    /// close that stamps the mount's farewell -- to physically delete the control objects afterward. A
-    /// bare `Backend &` from `backend()` would dangle the instant the owning `Pool` is destroyed.
+    /// The owning `BackendPtr` itself (not just a reference into it): decommission (`CasDecommission.cpp`)
+    /// keeps the backend alive across `admin.reset()` -- the graceful close that stamps the mount's farewell --
+    /// to read the farewell back and mark the retirement verified. A bare `Backend &` from `backend()` would
+    /// dangle the instant the owning `Pool` is destroyed.
     BackendPtr poolBackendPtr() const { return pool_backend; }
 
     /// Staging write surface for `PartWriteTxn`: thin delegate onto the ref ledger, so a staging write
@@ -1219,6 +1219,7 @@ private:
     /// Sticky fail-close bit for the destructor's allocation-failure path. If a duty could not enter
     /// the queue, no mount teardown may claim a clean farewell even though the guarded map is empty.
     std::atomic<bool> writer_cleanup_queue_failed{false};
+    std::atomic<bool> farewell_withheld{false};
 
     /// CAS mixed-algo pools: monotone in-memory cache of `algos_used`, seeded from
     /// `meta.algos_used` at open. Guards `isAlgoAdmitted`/`refreshAdmittedAlgos` -- ITS OWN mutex,

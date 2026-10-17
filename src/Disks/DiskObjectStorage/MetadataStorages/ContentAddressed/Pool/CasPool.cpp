@@ -77,6 +77,16 @@ namespace
 
 std::atomic<uint64_t> remount_attempt_sequence{0};
 
+/// What a mount that skipped the capability battery did not prove about its store. Said once per open at
+/// the default level, because nothing else tells an operator the checks did not run.
+void logSkippedCapabilityProbe(const String & srid, const String & pool_prefix, std::string_view reason)
+{
+    LOG_INFO(getLogger("CasPool"),
+        "CAS pool '{}' (prefix '{}'): the capability probe was skipped ({}); unverified on this mount: bucket "
+        "versioning, conditional-write support, list-after-write visibility",
+        srid, pool_prefix, reason);
+}
+
 /// Validate every writable factory's lease/request/cadence relationship before it can publish
 /// owner, epoch, mount, or probe authority. Decommission forces background renewal before calling
 /// this helper, so it is held to the same cadence window as an ordinary production mount.
@@ -516,6 +526,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
             /// working single-attempt client still fails closed at open instead of silently
             /// corrupting CAS state under blind retries later.
             backend->checkConditionalWriteSingleAttemptSupport();
+            logSkippedCapabilityProbe(config.server_root_id, config.pool_prefix, "skip_access_check");
         }
     }
     /// The catalog is mandatory for every minted pool. Make it durable before `_pool_meta`: otherwise
@@ -601,8 +612,10 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// Every step of this protocol runs on the OPEN plane. These are bootstrap-control writes: they
     /// establish the very right to write, and the mount fence they would otherwise be gated on is
     /// either unarmed (a first open) or latched lost (a self-remount, which could then never reclaim).
+    const RetiredOwnerPolicy retired_policy = policy == MountClaimPolicy::NoWait
+        ? RetiredOwnerPolicy::AcceptForDecommission
+        : RetiredOwnerPolicy::Refuse;
     CasOperation owner_op = store->gc_requests.admit();
-    const RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse;
     const uint64_t owner_life = claimOwnerOrThrow(owner_op, store->pool_layout, srid, our_uuid, observe_catalog, retired_policy);
     store->recorded_owner_life = owner_life;
 
@@ -925,6 +938,8 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// refusing an ordinary mount costs availability and protects data, whereas refusing a
     /// decommission strands a pool with a dead replica in it and leaves the operator no way forward.
     config.skip_access_check = true;
+    logSkippedCapabilityProbe(
+        victim_srid, config.pool_prefix, fmt::format("decommission of pool member '{}'", victim_srid));
     /// The admin claim must be RENEWED like any writable mount: the host disk may be observe-only
     /// (background_watermark=false), but an unrenewed claim (TTL ~30s) aborts any long drain midway.
     config.background_watermark = true;
@@ -936,7 +951,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// below is then EXACTLY the crash-recovery reclaim semantics (`MountClaimPolicy::NoWait`): a
     /// fenced/terminated/clean-farewell lease reclaims; a live lease refuses immediately (no bounded
     /// observation wait -- see `mountWritable`). Owner anchor absent + mount absent = nothing to
-    /// decommission.
+    /// decommission. A tombstoned owner of the victim is accepted: a rerun resumes over its own tombstone.
     /// The open plane: this factory impersonates the victim to take its mount, so there is no lease of
     /// ours to be gated on until the claim below establishes one. `config.retry_sleep_fn` must travel
     /// with `config.boot_ms_fn`: a retry loop bound to a frozen test clock that only a fake sleep
@@ -956,6 +971,15 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
                 victim_srid);
     }
     config.server_id = *victim_uuid;
+
+    /// A member of this build always has a counter next to its owner. An absent counter is a state left by
+    /// 26.6.4 or by a process that died between the owner create and the counter create; minting one here
+    /// would hand out epoch 1 again over whatever that member wrote.
+    if (!owner_op.read(layout.epochKey(victim_srid), Retry::standard()))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS decommission '{}': no epoch counter '{}'; a decommission never creates one. Start the server with a new "
+            "server_root_id; see decommission compatibility in the CAS migration docs",
+            victim_srid, layout.epochKey(victim_srid));
 
     backend->checkConditionalWriteSingleAttemptSupport();
     /// Decommission operates on an EXISTING pool member (an owner anchor / mount lease was just found), so
@@ -1035,7 +1059,7 @@ Pool::~Pool()
             config.teardown_phase2_throw_for_test();
         const bool ref_lanes_drained = ref_ledger.drainRefLanesForShutdown(
             config.cas_request_budget.attemptEnvelopeMs() + config.cas_request_budget.lease_safety_margin_ms);
-        drained = ref_lanes_drained && !writerCleanupDutiesPending();
+        drained = ref_lanes_drained && !writerCleanupDutiesPending() && !farewell_withheld;
     }, "CAS pool teardown: draining ref lanes");
 
     /// 3. Retire the merged heartbeat. This always runs after phase 2, even when that phase failed, and
