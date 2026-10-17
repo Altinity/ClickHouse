@@ -41,6 +41,9 @@ rows.
 - `lifecycle_reason` ([String](/sql-reference/data-types/string)) — The enum-clean sub-state word for a `vanished` disk: `replaced` or `forgotten`. Empty for every other lifecycle, so `lifecycle || '(' || lifecycle_reason || ')'` reads e.g. `vanished(forgotten)`.
 - `lifecycle_detail` ([String](/sql-reference/data-types/string)) — The full typed reason text naming the actual cause when not live: the vanish diagnosis (a data root replaced by a foreign pool, or decommissioned by `SYSTEM CAS FORGET` at a given time) or the identity-loss message. Empty when live.
 - `lifecycle_since` ([Nullable(DateTime)](/sql-reference/data-types/nullable)) — When this server entered the current non-live lifecycle state. `NULL` when live, or when the state has no backing pool to date from.
+- `renewal_in_progress` ([Nullable(UInt8)](/sql-reference/data-types/nullable)) — `1` while this server renews its mount lease.
+- `renewal_attempts` ([Nullable(UInt64)](/sql-reference/data-types/nullable)) — Conditional `PUT`s sent by the current renewal, or by the last one once it ended. Updated per attempt, so a renewal stuck in retries is visible before it ends.
+- `last_renewal_error` ([Nullable(String)](/sql-reference/data-types/nullable)) — The last failed request of that renewal, as `<VERB> <key>: <class> <code> <message>`. `class` is `refused` when the store definitely refused the request (access denied, malformed request, entity too large), `transport` otherwise; `code` is the store's error name, such as `SlowDown`. `NULL` when no request failed.
 
 `lifecycle`/`lifecycle_reason`/`lifecycle_detail`/`lifecycle_since` are the SQL surface for
 diagnosing an identity-lost or forgotten disk without reading server logs — see the
@@ -49,9 +52,10 @@ diagnosing an identity-lost or forgotten disk without reading server logs — se
 what each lifecycle value means, and [`SYSTEM CAS FORGET`](/antalya/cas/operations/debugging#sql-forget)
 for the command that produces `vanished(forgotten)`.
 
-:::note Local-only GC-health columns
-`is_leader`, `pending_reclaim`, `last_success_age_seconds`, and `wedged_namespace_count` are process-local
-facts about *this* server's own GC scheduler. They are populated **only** on the row whose `server_root_id` matches
+:::note Local-only columns
+`is_leader`, `pending_reclaim`, `last_success_age_seconds`, `wedged_namespace_count`,
+`renewal_in_progress`, `renewal_attempts` and `last_renewal_error` are process-local facts about
+*this* server. They are populated **only** on the row whose `server_root_id` matches
 this server's own mount, and are `NULL` on every row describing another server's mount — stamping a local
 health fact onto a peer's row would misread as "the peer is the GC leader" during an incident. To see the
 peer's own view of these columns, query `system.cas_mounts` on that server.

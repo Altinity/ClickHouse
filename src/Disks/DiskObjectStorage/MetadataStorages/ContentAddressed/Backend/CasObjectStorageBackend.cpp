@@ -801,10 +801,9 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelUnder(const String & key,
 
 /// Settings for a genuine Native conditional write. Mark the request for the typed conditional
 /// dialect and, on a generation-token store, force a single PUT: GCS does not enforce the condition
-/// on multipart completion. Blob publication never uses these settings; it remains an ordinary
-/// unconditional multipart-capable write. CAS-mutable keys (shard manifests, gc/state, the registry)
-/// also skip the racy post-upload existence/size check; a publish's manifest CAS was observed racing
-/// the GC fence there.
+/// on multipart completion. Blob publication uses `blobPublicationWriteSettings` instead. CAS-mutable
+/// keys (shard manifests, gc/state, the registry) also skip the racy post-upload existence/size check;
+/// a publish's manifest CAS was observed racing the GC fence there.
 WriteSettings ObjectStorageBackend::conditionalWriteSettings(size_t attempt_no) const
 {
     WriteSettings ws;
@@ -874,6 +873,18 @@ std::expected<String, Backend::RawConflict> ObjectStorageBackend::write(
     return emuWrite(key, bytes);
 }
 
+/// On a content-ETag store a resent envelope that lands after GC deleted it restores the condemned
+/// incarnation, and the exact-token delete of that incarnation then removes a live body. Retries belong
+/// to the caller, which re-observes and publishes a fresh envelope. Requests keep the storage's own
+/// request timeout, which a body upload needs.
+WriteSettings ObjectStorageBackend::blobPublicationWriteSettings() const
+{
+    WriteSettings ws;
+    ws.object_storage_single_attempt_object_creation = true;
+    ws.object_storage_connect_timeout_cap_ms = connect_timeout_cap_ms;
+    return ws;
+}
+
 void ObjectStorageBackend::publish(const BlobPublishRequest & request, TransportAccess &)
 {
     if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
@@ -893,14 +904,14 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
             return;
         }
 
-        /// Ordinary unconditional rewrite: default request mode, retry profile, and multipart policy.
-        /// In particular, generation stores are not restricted by the conditional single-PUT cap.
+        /// Unconditional rewrite: default request mode and multipart policy, so generation stores are
+        /// not restricted by the conditional single-PUT cap.
         auto out = object_storage->writeObject(
             StoredObject(request.destination_key),
             WriteMode::Rewrite,
             /*attributes=*/std::nullopt,
             DBMS_DEFAULT_BUFFER_SIZE,
-            WriteSettings{});
+            blobPublicationWriteSettings());
         out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
         blob_publication_detail::BlobPayloadCopyResult copy_result;
         try
@@ -933,7 +944,7 @@ void ObjectStorageBackend::publish(const BlobPublishRequest & request, Transport
             ErrorCodes::NOT_IMPLEMENTED,
             "ObjectStorageBackend::publish: verbatim staged publication requires Native mode");
 
-    WriteSettings write_settings;
+    WriteSettings write_settings = blobPublicationWriteSettings();
     write_settings.object_storage_copy_mode = ObjectStorageCopyMode::NativeOnly;
     if (!object_storage->supportsCopyMode(write_settings.object_storage_copy_mode))
         throw Exception(
