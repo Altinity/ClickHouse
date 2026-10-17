@@ -50,8 +50,9 @@ run_remote_as_user
 
 $CLICKHOUSE_CLIENT -q "GRANT SELECT ON $CLICKHOUSE_DATABASE.tab TO $user_name"
 
-# Over an ordinary connection the shard runs the query as the user of the connection, which the function refuses;
-# with the local shortcut it runs as the user itself.
+# Antalya sends single-shard `remote` requests as initial queries, so the shard checks the connection user;
+# the local shortcut checks the initiating user. Schema inference above checks the initiating user's access
+# in both cases, so after the `SELECT` grant all four variants are allowed.
 run_remote_as_user
 
 $CLICKHOUSE_CLIENT -q "
