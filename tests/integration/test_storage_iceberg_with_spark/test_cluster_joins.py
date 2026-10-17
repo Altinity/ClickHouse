@@ -6,7 +6,7 @@ from helpers.iceberg_utils import (
     execute_spark_query_general,
 )
 
-@pytest.mark.parametrize("join_mode", ["local", "global"])
+@pytest.mark.parametrize("join_mode", ["allow", "local", "global"])
 @pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mode):
     instance = started_cluster_iceberg_with_spark.instances["node1"]
