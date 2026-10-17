@@ -40,30 +40,72 @@ is a startup error.
 
 ## The owner claim {#owner-claim}
 
-`claimOwnerOrThrow` binds `server_root_id` ↔ `server_uuid` **permanently**. The owner object is never deleted
-and never reassigned — decommission only tombstones it in place.
+`claimOwnerOrThrow` binds `server_root_id` to one `server_uuid` per owner life. The owner object is never
+deleted. Decommission tombstones it in place; a server start over a verified, drained retirement takes it over
+at the next life ([rejoin](#rejoin)).
 
 | Observed at `gc/server-roots/<server_root_id>/owner` | Action |
 |---|---|
 | present, same `server_uuid`, not tombstoned | proceed |
-| present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned, refuses to resume |
-| present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause |
+| present, `retired_at_ms` set, `retirement_verified` | a server start rejoins when its preconditions hold ([below](#rejoin)); a remount fails with `CORRUPTED_DATA`; the decommission admin accepts its victim's tombstone |
+| present, `retired_at_ms` set, not verified | `CORRUPTED_DATA` for a server start or remount: the decommission is not finished; the decommission admin accepts it |
+| present, different `server_uuid`, not tombstoned | `CORRUPTED_DATA` — names the regenerated-uuid-file cause |
 | absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
 | lost the `putIfAbsent` race | re-read; equal uuid proceeds, else `CORRUPTED_DATA` |
+
+The owner carries `owner_life`, a counter every owner write sets to the read value + 1 by `If-Match`, so
+two owner writes never repeat their bytes and a delayed `If-Match` against an older incarnation cannot
+land. A process records the life it started under; after every mount claim (start, self-remount,
+decommission) it reads the owner once more and requires its own `server_uuid` and that life
+(`recheckOwnerAfterClaim`); otherwise it fences its own mount body and fails, so a successor does not wait
+the refused lease out. A self-remount also compares the life before it allocates an epoch: an owner at
+another life, not retired, moves the pool to `IdentityLost` instead of retrying. `retirement_verified`
+marks a decommission whose claim, tombstone and farewell all held.
 
 "Provably empty" requires both an authoritative decoded catalog naming no life owned by `server_root_id` and
 a 1-key `LIST` probe finding nothing under `cas/manifests/<server_root_id>/` or `roots/<server_root_id>/`.
 
 Two failure modes this closes:
 
-- A **second server with a different `server_uuid`** is refused at this gate and can never take
-  over, regardless of lease expiry.
+- A **second server with a different `server_uuid`** is refused at this gate, regardless of lease expiry,
+  and takes over only by a rejoin after the id's decommission is verified and drained.
 - A **same-uuid live twin** (two processes sharing one uuid file and `server_root_id`) is caught separately, by
   the mount claim's token-stability observation, and aborts with an operator-facing message rather
   than corrupting the pool — this is the default behavior, with `cas_unsafe_remount_no_delay` off.
   With it on, a same-uuid claim over such a slot reclaims at once instead of observing (see
   `cas_unsafe_remount_no_delay` in the configuration reference).
+
+### Rejoin at start {#rejoin}
+
+A server whose `server_root_id` was decommissioned rejoins on its next start, with the same or a new
+`server_uuid`. There is no command. It comes back empty: the decommission deleted the data of the
+previous life.
+
+`claimOwnerOrThrow` rejoins only from `Pool::open`, never from a self-remount, and only when:
+
+- the process has a non-zero `server_uuid` (`clickhouse disks` without a uuid file never rejoins and is refused);
+- `epoch` and `mount` exist (checked first: an id retired by 26.6.4 has neither);
+- the owner carries `retirement_verified`;
+- the slot body is terminal (clean farewell or `gc_fenced`);
+- the subtree is empty, after deleting the old life's access-probe key `roots/<server_root_id>/clickhouse_access_check_<uuid>`.
+
+Then a new `server_uuid` first rewrites the terminal `mount` body under its own uuid, and the owner becomes
+`{server_uuid, owner_life + 1}` by `If-Match`. A lost `If-Match` re-reads the owner and decides again. The
+kept counter gives the new life an epoch above every earlier one.
+
+| Refusal | Code | Cause |
+|---|---|---|
+| `no server uuid` | `CORRUPTED_DATA` | the process has no server uuid |
+| `cannot rejoin` | `CORRUPTED_DATA` | `epoch` or `mount` is missing: the id was retired by 26.6.4, or the object was deleted by hand |
+| `decommission is not finished` | `CORRUPTED_DATA` | the tombstone is not verified; `system.cas_mounts` shows the id as `retired` with `retirement_verified = 0` once its slot is terminal |
+| `still running` | `ABORTED` | a decommission run holds the slot, or the lease of a killed run or an interrupted restart has not lapsed and been fenced by GC (up to one GC round after the lease threshold) |
+| `previous life remains` | `ABORTED` | the message names the first part left: catalog rows, `cas/manifests/<server_root_id>/` or `roots/<server_root_id>/` |
+| `kept changing` | `ABORTED` | the owner or the slot changed under every rejoin attempt of this start; restart |
+
+For `previous life remains`, catalog rows and manifests are removed by GC over several rounds: run `SYSTEM CAS GC RUN '<disk>'` on the GC leader
+(`is_leader = 1` in `system.cas_mounts`) and restart. A late object under `roots/<server_root_id>/` is not reclaimed by GC and blocks the rejoin until it is deleted by hand.
+The operator rule for rerunning a decommission is in [bringing a member back](/antalya/cas/operations/migration#rejoin-rerun-rule).
 
 ## The mount lease {#mount-lease}
 
@@ -124,8 +166,7 @@ lease the slot's body declares (`expires_at_ms − started_at_ms`). A body witho
 non-positive interval (a farewell), declares nothing. A re-mounting server waits out a predecessor the
 same way with the step `max(1, floor(period/2))`. `period` is always the observer's own. The two stamps
 are compared only with each other, never with the observer's clock. `expires_at_ms` alone is a
-writer-stamped diagnostic used by `system.cas_mounts` and the non-authoritative decommission
-epoch-recovery precheck. Local fencing is derived from the confirmed request's pre-I/O `BOOTTIME`
+writer-stamped diagnostic used by `system.cas_mounts`. Local fencing is derived from the confirmed request's pre-I/O `BOOTTIME`
 anchor plus the TTL, and wall-clock `now` stays audit-only.
 
 `cas_mount_lease_ttl_ms` is local to each server. It is how long this server may write after its last
@@ -140,12 +181,32 @@ the first renewal attempt of a period can begin, where `envelope = attempt_timeo
 `cap` is `attempt_timeout` when the disk's `connect_timeout_ms` is `0`, else
 `min(connect_timeout_ms, attempt_timeout)` (7 s with defaults).
 
+### Cloning a running server is unsupported {#clone-unsupported}
+
+Do not start a second server from a copy of a running server's data directory or volume, or restore one
+snapshot of a running VM twice. The copy carries the `uuid` file, so both processes claim one mount slot
+under one `server_uuid`.
+
+- A second start that finds the first one's slot is refused as `LiveDoubleStart` (same `server_uuid`, no
+  certificate of death).
+- A clone of a process that is already running is worse. It inherits the same `server_uuid`, `writer_epoch`
+  and lease state, so both processes renew one slot as one incarnation. The lease is not designed to tell them
+  apart and cannot be relied on to fence the clone.
+
+To add a server, give it its own `cas_server_root_id` and a fresh `uuid` file.
+
 ## The two monotone counters {#counters}
 
 | Counter | Storage | Scope | Protects against |
 |---|---|---|---|
-| `writer_epoch` | durable, `gc/server-roots/<server_root_id>/epoch` (`ServerEpoch::next_writer_epoch`, CAS-bumped by `allocateWriterEpoch`) | across crashes and restarts | a same-`(uuid, epoch)` twin: a present mount under a normal claim attempt is `CORRUPTED_DATA` |
+| `writer_epoch` | durable, `gc/server-roots/<server_root_id>/epoch` (`ServerEpoch::next_writer_epoch`, CAS-bumped by `allocateWriterEpoch`); never deleted: a retired `server_root_id` keeps its counter | across crashes and restarts | a same-`(uuid, epoch)` twin: a present mount under a normal claim attempt is `CORRUPTED_DATA` |
 | `build_seq` | in-memory only, `CasMountRuntime::next_build_seq`, reset to 1 on every process start | one process incarnation | orders builds *within* an epoch; combined with `writer_epoch` it gives GC a total order |
+
+Each bump of the `epoch` counter also writes a fresh random 128-bit `allocation_nonce`. When a
+counter write's outcome is unclear and the counter has since moved, the allocator counts the write
+as landed only if the stored bytes match its own exactly. Two starts of the same `server_uuid` running this allocator that bump
+to the same value write different nonces, so they never both adopt one `writer_epoch`. Allocators
+of 26.6.4 write no nonce, so two of them can still collide. 26.6.4 readers skip the field.
 
 The absent-epoch branch of `allocateWriterEpoch` is deliberately paranoid: absent with a
 non-empty subtree is `CORRUPTED_DATA` (reset hazard); absent with an empty subtree decides by an
@@ -168,7 +229,7 @@ a `MountClaimResult::Kind` together with a `MountPriorState` describing which ce
 |---|---|
 | `Claimed` | fresh claim (absent slot), or a certified reclaim of an older `writer_epoch` |
 | `LiveDoubleStart` | same `server_uuid` with an older `writer_epoch` and no certificate of death yet — a live twin, wait it out; or the same `(uuid, epoch)` already in the slot — two starts got one epoch, refused at once |
-| `ForeignOwner` | different `server_uuid` — refused unconditionally |
+| `ForeignOwner` | different `server_uuid` — refused, except a terminal body below the claimer's epoch when a fresh owner read shows the claimer's uuid and life (a server start or self-remount after a rejoin) |
 | `FencedSelf` | same `(uuid, epoch)`, but `gc_fenced` — terminal for *this* epoch; the caller must mint a fresh one |
 
 A claim never installs a `writer_epoch` at or below the one in the slot. When the slot holds a newer
@@ -200,7 +261,9 @@ stateDiagram-v2
     Live --> Live: same-uuid claim, proven-dead token via UncleanObserved
     Live --> Live: same-uuid claim under cas_unsafe_remount_no_delay, no observation
     Fenced --> Fenced: same uuid and epoch claim, FencedSelf, no write
-    Live --> Absent: decommission tail, mount then epoch then owner tombstone
+    Terminated --> Terminated: decommission farewell, owner tombstoned and verified
+    Terminated --> Live: rejoin of a verified, drained retirement, any server_uuid
+    Fenced --> Live: rejoin of a verified, drained retirement, any server_uuid
     Terminated --> [*]
 ```
 
@@ -213,7 +276,7 @@ stateDiagram-v2
     Live --> TransientNotLive: renewal failure, tripMountLost, lost=true
     TransientNotLive --> Live: self-remount succeeds with a fresh epoch
     TransientNotLive --> TransientNotLive: probe inconclusive, retry with backoff
-    TransientNotLive --> IdentityLost: pool meta and owner both authoritatively absent
+    TransientNotLive --> IdentityLost: pool meta and owner both absent, or the owner at another life
     TransientNotLive --> VanishedReplaced: foreign pool_id observed
     Live --> VanishedForgotten: SYSTEM CAS FORGET
     IdentityLost --> [*]
@@ -259,27 +322,48 @@ while a stale conditional request from the predecessor is still in flight.
 and waiting out the token-stability observation, or the GC leader fencing the slot first, after
 which any reclaim is instant.
 
-**Permanent removal** of a dead replica (`Cas::decommissionPoolMember`, driven by
-`SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'`) claims the victim's mount slot
-as an administrative writer with a no-wait policy (refuses immediately if the member is alive),
-drops every ref-bearing namespace, sweeps manifest debris before the slot (deleting the mount
-removes the watermark authority), drains staging and roots, then — only with zero warnings —
-retires in order: mount, epoch, a final liveness re-check, owner tombstone.
+**Removal** of a dead replica (`Cas::decommissionPoolMember`, `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'`)
+keeps `owner`, `epoch` and `mount` and removes only data, in six steps:
+
+1. Claim the victim's slot as an administrative writer with a no-wait policy. A live member is refused; a
+   member without an epoch counter is refused.
+2. Tombstone the owner at the next `owner_life`, on the admin's fenced mount plane: no attempt is sent
+   after the admin's lease deadline, but the store may apply a sent one later. When the outcome is unknown and
+   the owner does not read back as the tombstone, the run fails without a farewell: the victim restarts only
+   after GC fences the admin's slot or its own start sees the lease hold still for the observation threshold.
+   A tombstone applied later than that is the case the
+   [rerun rule](/antalya/cas/operations/migration#rejoin-rerun-rule) repairs by hand.
+3. Confirm the slot still holds the admin's claim; otherwise roll the tombstone back, unless the owner was
+   already retired before this run. Every exit between (2) and (5) runs this confirm.
+4. Drop every namespace, sweep manifest debris, drain `staging/` and `roots/`, all on the admin's fenced
+   mount plane.
+5. Write the admin's clean farewell.
+6. Read the farewell and the tombstone back and set `retirement_verified`.
+
+`member_retired = 1` only when the owner carries a verified retirement. An owner that moved on to a later,
+unretired life after the tombstone (a rejoin, or another run's rollback) reports `member_retired = 0` with
+the warning `the owner moved on to life N`. Catalog rows GC still has to delete are reported as
+`namespaces_pending_gc`, not as a failure. The operator reruns only after `member_retired = 0`, under the
+[rerun rule](/antalya/cas/operations/migration#rejoin-rerun-rule); a rerun refused as alive or contended
+waits until GC fences the previous run's slot: about one mount lease TTL plus one GC round, with a GC leader
+running. A later start under that `server_root_id` rejoins it as an empty member once the retirement is
+verified and drained ([rejoin](#rejoin)).
 
 ## `system.cas_mounts` {#mounts-table}
 
 A read-only view of the same heartbeat-floor computation GC uses: one `LIST` of
-`gc/server-roots/` plus one `GET` per slot, zero writes, per-row fail-open (an undecodable body
+`gc/server-roots/` plus one `GET` per slot, plus one owner `GET` per terminated or fenced slot, zero writes, per-row fail-open (an undecodable body, or an undecodable owner of a terminated or fenced slot,
 becomes `state = 'corrupt'`, never an exception). Shows every `server_root_id` in the pool, including peers.
 
 | Column | Notes |
 |---|---|
 | `disk`, `server_root_id`, `server_uuid`, `hostname`, `process_id` | identity |
 | `writer_epoch`, `renewal_sequence`, `started_at`, `expires_at`, `min_active_build_sequence`, `gc_fenced` | lease state (`DateTime64(3)` columns; the millisecond-integer field names live only in the internal `MountLease` struct and the on-disk body) |
-| `state` | one of `live`, `expired`, `terminated`, `fenced`, `corrupt` |
+| `state` | one of `live`, `expired`, `terminated`, `fenced`, `retired`, `corrupt`; `retired` = terminated or fenced with a tombstoned owner (one more `GET` per terminated or fenced row) |
 | `is_leader`, `pending_reclaim`, `last_success_age_seconds`, `wedged_namespace_count` | GC health, process-local; **`NULL` on every peer row** — a process-local fact must never be stamped onto another server's row |
 | `lifecycle`, `lifecycle_reason`, `lifecycle_detail`, `lifecycle_since` | the SQL surface for the in-process `PoolLifecycle` runtime above: `lifecycle` is one of `live`, `not_live`, `identity_lost`, `vanished`, `constructing`, `shutdown`; `lifecycle_reason` distinguishes `replaced` from `forgotten` for a `vanished` disk; `lifecycle_detail` carries the full diagnosis text; `lifecycle_since` is when the current non-live state began (`NULL` while live) |
 | `renewal_in_progress`, `renewal_attempts`, `last_renewal_error` | the running (or last) lease renewal: conditional `PUT`s sent so far and the last failed request, updated per attempt; **`NULL` on every peer row** |
+| `retirement_verified` | `1` on a `retired` row whose decommission verified the retirement, else `0`; a rejoin needs `1`, a rerun is for `0` only |
 
 The lifecycle snapshot is I/O-free and ungated, so a not-live, never-started, or vanished disk
 still produces a row instead of silently disappearing from the table.

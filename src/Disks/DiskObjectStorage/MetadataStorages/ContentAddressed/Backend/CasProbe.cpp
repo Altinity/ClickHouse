@@ -36,8 +36,8 @@ Removal removeOrReportDeleteMarker(CasOperation & op, const String & key, const 
             "object VERSIONING enabled, and a content-addressed pool cannot run on a versioned bucket: "
             "every GC delete would archive a noncurrent version instead of reclaiming storage (the bucket "
             "grows forever), and the constantly-rewritten ref objects would pile up versions on every "
-            "commit. This is NOT ignorable and has no override. Use a bucket where versioning was NEVER "
-            "enabled — note that merely SUSPENDING versioning is not enough (deletes on a "
+            "commit. Use a bucket where versioning was NEVER enabled; skip_access_check skips this probe "
+            "but does not make a versioned bucket usable — note that merely SUSPENDING versioning is not enough (deletes on a "
             "versioning-suspended bucket still mint delete markers, so this probe will refuse again)");
     }
 }

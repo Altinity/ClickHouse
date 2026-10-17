@@ -117,7 +117,8 @@ token holding stable on the observer's own `CLOCK_BOOTTIME` for `L + floor(L / 2
 longer of the observer's `cas_mount_lease_ttl_ms` and the lease the holder's body declares
 (`expires_at_ms − started_at_ms`; a body without stamps or with a non-positive interval declares
 nothing). Startup's step is `max(1, floor(cas_mount_renew_period_ms / 2))` and GC's is
-`cas_mount_renew_period_ms`, both the observer's own. Mixed values are therefore safe in any order;
+`cas_mount_renew_period_ms`, both the observer's own. GC checks only at the start of a round, so a
+fence-out can land up to one GC round after that. Mixed values are therefore safe in any order;
 a longer lease on one server delays recovery after that server's crash. A server built without this
 rule waits only its own lease, so keep the values equal until every server of the pool runs a build
 with it.
@@ -132,7 +133,7 @@ where `envelope = cas_attempt_timeout_ms + 2 × cap` (7000 ms with defaults) and
 retrying until `confirmed deadline − cas_lease_safety_margin_ms`.
 
 The `expires_at_ms` stamped into the mount object is a writer-stamped diagnostic used by
-`system.cas_mounts` and by the non-authoritative decommission epoch-recovery precheck; it never
+`system.cas_mounts`; it never
 authorizes a reclaim or a GC fence-out. Local fencing is derived instead from the confirmed
 request's pre-I/O `CLOCK_BOOTTIME` anchor plus the TTL.
 

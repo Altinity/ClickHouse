@@ -580,19 +580,17 @@ SYSTEM CAS FORGET [ON CLUSTER cluster_name] disk_name
 `disk_name` is **required**. It is an assertion, not a proof of erasure: the disk stays registered
 and answers further store-class access with a typed error, and a server restart re-registers the
 name. Returns no result set. This is different from
-[`SYSTEM CAS DROP POOL MEMBER`](#system-cas-drop-pool-member), which permanently retires one pool
-*member's* identity across the whole shared pool — `FORGET` only affects this node's own local view
+[`SYSTEM CAS DROP POOL MEMBER`](#system-cas-drop-pool-member), which decommissions one pool
+*member* across the whole shared pool — `FORGET` only affects this node's own local view
 of one disk.
 
 ### SYSTEM CAS DROP POOL MEMBER {#system-cas-drop-pool-member}
 
-Permanently decommissions a dead member (`server_root_id`) of a content-addressed disk
-pool. It claims the member's mount slot as an administrative writer — fencing that `server_root_id` from ever
-writing again — then drops every table namespace the member owned, drains eligible manifest debris,
-staging objects, and mountpoint objects belonging to it, and retires the mount slot once all drains
-are confirmed. This is a **destructive, irreversible** operation: only run it once the `server_root_id` is
-confirmed permanently dead, since it fences the member out even if it later comes back online, and
-it deletes namespace and drain state that cannot be recovered.
+Decommissions a dead member (`server_root_id`) of a content-addressed disk
+pool. It claims the member's mount slot as an administrative writer — fencing the member's current life — tombstones the member's owner, drops every table namespace the member owned, drains
+eligible manifest debris, staging objects, and mountpoint objects belonging to it, writes the member's
+farewell and marks the retirement verified. The control objects (`owner`, `epoch`, `mount`) stay. This is a **destructive** operation: run it only once the member is confirmed dead, since the
+namespace and drain state it deletes cannot be recovered.
 
 It is a writer operation, not GC: it emits ordinary ref-edge deltas rather than inventing GC
 transitions, and it does not synchronously reclaim shared blob content — removing the ref edges only
@@ -607,13 +605,19 @@ that may contain `/`, not a plain identifier, so it cannot be written unquoted).
 
 The operation is resumable: a rerun skips namespaces already marked `Removed` and reports them
 separately from namespaces newly removed by this invocation. Per-object drain failures are recorded
-as warnings and leave the slot in a terminated-but-not-fully-drained state that a later invocation
-can resume from, rather than raising an exception.
+as warnings; the owner keeps an unverified tombstone that a later invocation resumes over, rather than
+raising an exception.
 
 The command returns one row with columns `server_root_id`, `namespaces_removed`, `namespaces_already_removed`,
 `committed_refs_removed`, `precommits_removed`, `manifest_debris_removed`, `staging_objects_removed`,
-`mountpoint_objects_removed`, `slot_removed`, and `warnings`. A non-empty `warnings` means some
-drain was not confirmed and the mount slot was left in place as a resume anchor.
+`mountpoint_objects_removed`, `member_retired`, `warnings`, and `namespaces_pending_gc`.
+`member_retired = 1` means the member's retirement is verified. `member_retired = 0` means the run stopped
+before its verified mark: rerun it only under the
+[rerun rule](/antalya/cas/operations/migration#rejoin-rerun-rule). Rows under `namespaces_pending_gc`
+are deleted by GC and need no rerun.
+
+A server started later under the same `server_root_id` rejoins as an empty member once the retirement is
+verified and drained ([details](/antalya/cas/operations/migration#rejoin)).
 
 ## Managing ReplicatedMergeTree Tables {#managing-replicatedmergetree-tables}
 

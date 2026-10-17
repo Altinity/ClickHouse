@@ -1651,6 +1651,19 @@ TEST(CASPoolRemount, FenceOutThenSelfRemountRestoresWrites)
     EXPECT_NO_THROW(store->renewWatermarkOnce());
 }
 
+TEST(CASPool, RestartKeepsTheOwnerLife)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    String owner_key;
+    { auto store = DB::Cas::tests::openPoolForTest(backend); owner_key = store->layout().ownerKey(store->poolConfig().server_root_id); }
+    DB::Cas::tests::OperationForTest op(*backend);
+    const auto before = (*op).read(owner_key, DB::Cas::Retry::once());
+    ASSERT_TRUE(before.has_value());
+    EXPECT_EQ(DB::Cas::decodeOwner(before->bytes).owner_life, 1u);
+    auto again = DB::Cas::tests::openPoolForTest(backend);
+    EXPECT_EQ((*op).read(owner_key, DB::Cas::Retry::once())->etag, before->etag) << "a plain restart writes no owner";
+}
+
 TEST(CASPoolRemount, OldEpochBuildFailsClosedAfterRemount)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -3822,7 +3835,7 @@ TEST(CASPoolRemount, NaturalTerminalTransitionMakesBothPersistentWorkersSelfExit
             "test", sink, runtimeRenewBudget(), [&]
             {
                 if (terminal == PoolLifecycle::IdentityLost)
-                    runtime_ptr->enterIdentityLost();
+                    runtime_ptr->enterIdentityLost("forced by the test");
                 else
                     runtime_ptr->enterVanished(PoolLifecycle::VanishedReplaced, "injected natural replacement");
                 transitioned.arriveAndWait();
@@ -3928,7 +3941,7 @@ TEST(CASPoolRemount, ParkedRenewalCannotMissNaturalTerminalPublication)
             {
                 parked_predicate_sampled_false.wait();
                 if (terminal == PoolLifecycle::IdentityLost)
-                    runtime_ptr->enterIdentityLost();
+                    runtime_ptr->enterIdentityLost("forced by the test");
                 else
                     runtime_ptr->enterVanished(PoolLifecycle::VanishedReplaced, "injected parked-wait replacement");
                 /// Before the fix, terminal publication does not wait for `driver_mutex`, so it reaches

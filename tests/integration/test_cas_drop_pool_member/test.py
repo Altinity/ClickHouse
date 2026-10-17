@@ -72,6 +72,110 @@ def _disks(node, query):
     )
 
 
+# A stop that lands after the admin's renewal write was sent ends its renewer terminally: the farewell is
+# skipped (fail-safe), the run reports rerun with exactly these warnings, and the admin's live body holds the
+# slot until GC fences it: about one lease TTL plus a GC round. Tolerated until the stop waits for an in-flight renewal
+# before the farewell, a tracked follow-up.
+FAREWELL_SKIPPED_BY_A_RACING_STOP = (
+    "the slot does not hold this run's farewell; "
+    "the retirement is not verified; rerun SYSTEM CAS DROP POOL MEMBER"
+)
+
+# The result row of SYSTEM CAS DROP POOL MEMBER, in column order.
+REPORT_COLUMNS = [
+    "server_root_id",
+    "namespaces_removed",
+    "namespaces_already_removed",
+    "committed_refs_removed",
+    "precommits_removed",
+    "manifest_debris_removed",
+    "staging_objects_removed",
+    "mountpoint_objects_removed",
+    "member_retired",
+    "warnings",
+    "namespaces_pending_gc",
+]
+
+
+def _drop_member(node):
+    # Retried through the "wait for its lease to lapse" refusal, bounded: the slot may hold the live body
+    # FAREWELL_SKIPPED_BY_A_RACING_STOP describes.
+    for _ in range(90):
+        try:
+            report_tsv = node.query(
+                "SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
+            ).rstrip("\n")
+        except Exception as e:
+            if "alive or contended" not in str(e):
+                raise
+            time.sleep(1.0)
+            continue
+        fields = report_tsv.split("\t")
+        assert len(fields) == len(REPORT_COLUMNS), report_tsv
+        return report_tsv, dict(zip(REPORT_COLUMNS, fields))
+    pytest.fail("decommission kept refusing: lease never lapsed within the bound")
+
+
+def _assert_retired_or_racing_stop(report, report_tsv):
+    if int(report["member_retired"]) == 1:
+        assert report["warnings"] == "", report_tsv
+    else:
+        # TSV escapes the apostrophe.
+        assert report["warnings"].replace("\\'", "'") == FAREWELL_SKIPPED_BY_A_RACING_STOP, report_tsv
+
+
+MANIFESTS_PREFIX = POOL + "/cas/manifests/" + SRID2 + "/"
+ROOTS_PREFIX = POOL + "/roots/" + SRID2 + "/"
+
+
+def _srid2_mount(node1):
+    return tuple(
+        node1.query(
+            "SELECT state, server_uuid FROM system.cas_mounts "
+            "WHERE server_root_id = '{}' AND disk = '{}'".format(SRID2, CA_DISK)
+        )
+        .strip()
+        .split("\t")
+    )
+
+
+def _srid2_retirement(node1):
+    return tuple(
+        node1.query(
+            "SELECT state, retirement_verified FROM system.cas_mounts "
+            "WHERE server_root_id = '{}' AND disk = '{}'".format(SRID2, CA_DISK)
+        )
+        .strip()
+        .split("\t")
+    )
+
+
+def _retire_srid2(node1):
+    # A rejoin needs a verified retirement, no catalog row left for GC and no object left under the id.
+    # The test polls namespaces_pending_gc through the report of a rerun, which is safe only because node2 is
+    # stopped; an operator runs SYSTEM CAS GC RUN after a verified run and does not rerun the decommission.
+    report_tsv = ""
+    for _ in range(60):
+        report_tsv, report = _drop_member(node1)
+        if (
+            int(report["member_retired"]) == 1
+            and int(report["namespaces_pending_gc"]) == 0
+            and _count(MANIFESTS_PREFIX) == 0
+            and _count(ROOTS_PREFIX) == 0
+        ):
+            return
+        node1.query("SYSTEM CAS GC RUN '{}'".format(CA_DISK))
+        time.sleep(1.0)
+    pytest.fail("node2 never reached a drained, verified retirement: {}".format(report_tsv))
+
+
+def _gc_rounds(nodes, rounds=3):
+    # GC RUN acts only on the GC leader and does nothing elsewhere; running it on every node reaches the leader.
+    for _ in range(rounds):
+        for node in nodes:
+            node.query("SYSTEM CAS GC RUN '{}'".format(CA_DISK))
+
+
 def test_drop_dead_pool_member_heals_the_pool():
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
@@ -162,16 +266,13 @@ def test_drop_dead_pool_member_heals_the_pool():
 
     # (6) Decommission the dead member from node1 -- PHASE 1 of a two-phase heal. SYSTEM queries do
     #     not accept a FORMAT clause (ParserSystemQuery is not part of ParserQueryWithOutput), so parse
-    #     the default TSV row. Column order matches the interpreter's ColumnsDescription:
-    #     server_root_id, namespaces_removed, namespaces_already_removed, committed_refs_removed,
-    #     precommits_removed, manifest_debris_removed, staging_objects_removed,
-    #     mountpoint_objects_removed, slot_removed, warnings.
+    #     the default TSV row (REPORT_COLUMNS).
     #
     #     t2 is still `Live` at this point, so THIS call's normal drop path is what appends its
     #     removal terminal and moves its catalog row to `Removing` -- catalog deletion stays GC's job
     #     (`224aacd8eb9`), never the decommission command's, so a row this same call just legitimately
-    #     transitioned still counts as "owned" and the retirement fence correctly refuses the slot.
-    #     This is a success with GC completion pending, not a failure.
+    #     transitioned is reported under `namespaces_pending_gc`.
+    #     This is a verified retirement with GC completion pending, not a failure.
     #     The mounts-table poll above and the decommission command judge liveness by DIFFERENT
     #     predicates on purpose: the table renders TTL arithmetic over the last observed mount row,
     #     while the command re-reads the mountpoint object and refuses while the lease could still
@@ -179,26 +280,13 @@ def test_drop_dead_pool_member_heals_the_pool():
     #     fail-close direction, so the table saying "not live" does not guarantee the command is
     #     ready yet -- under sanitizer slowdowns the gap is wide enough to hit. Retry the command
     #     itself through the documented "wait for its lease to lapse" refusal, bounded.
-    report_tsv = None
-    for _ in range(90):
-        try:
-            report_tsv = node1.query(
-                "SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
-            ).rstrip("\n")
-            break
-        except Exception as e:
-            if "alive or contended" not in str(e):
-                raise
-            time.sleep(1.0)
-    assert report_tsv is not None, "decommission kept refusing: lease never lapsed within the bound"
-    fields = report_tsv.split("\t")
-    assert len(fields) == 10, report_tsv
-    assert fields[0] == SRID2, report_tsv
-    assert int(fields[1]) >= 1, report_tsv  # namespaces_removed: the drop half did its work
-    assert int(fields[8]) == 0, report_tsv  # slot_removed: not yet -- GC owns the row now
-    assert "pool member decommission underway" in fields[9], report_tsv
+    report_tsv, report = _drop_member(node1)
+    assert report["server_root_id"] == SRID2, report_tsv
+    assert int(report["namespaces_removed"]) >= 1, report_tsv  # the drop half did its work
+    assert int(report["namespaces_pending_gc"]) >= 1, report_tsv  # GC owns the row now
+    _assert_retired_or_racing_stop(report, report_tsv)
 
-    # (6b) PHASE 2: drive GC and re-run the decommission until the slot retires. Folding a fresh
+    # (6b) PHASE 2: drive GC and re-run the decommission until no row is pending. Folding a fresh
     #      terminal and pruning its catalog row are two separate GC rounds by design (a fold-then-prune
     #      handoff -- see `CasDecommissionCatalogDuties.FoldedTerminalRemainsGcOwnedAndOnlyRequestsAnotherRound`),
     #      so poll rather than assume one round suffices. The explicit `GC RUN` is the same idiom
@@ -207,30 +295,26 @@ def test_drop_dead_pool_member_heals_the_pool():
     #      Stage A's destructive-reclaim suppression, so this heals under the current Stage-A posture.
     for _ in range(30):
         node1.query("SYSTEM CAS GC RUN '{}'".format(CA_DISK))
-        report_tsv = node1.query(
-            "SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
-        ).rstrip("\n")
-        fields = report_tsv.split("\t")
-        assert len(fields) == 10, report_tsv
-        if int(fields[8]) == 1:
+        report_tsv, report = _drop_member(node1)
+        _assert_retired_or_racing_stop(report, report_tsv)  # on every rerun
+        if int(report["namespaces_pending_gc"]) == 0 and int(report["member_retired"]) == 1:
             break
-        assert "pool member decommission underway" in fields[9], report_tsv
     else:
         pytest.fail("pool never healed after driving GC: {}".format(report_tsv))
-
-    assert fields[9] == "", report_tsv  # warnings: the pool healed cleanly
 
     # (7) node1's own data survives the whole flow untouched.
     assert int(node1.query("SELECT count() FROM t1")) == n1_count
     assert int(node1.query("SELECT sum(id) FROM t1")) == n1_sum
 
-    # (8) node2's server_root_id is gone from the mounts table (only true once the slot above actually
-    #     retired -- checked after PHASE 2, not right after the first, still-pending call).
+    # (8) node2's mount slot stays and reads as `retired`: the decommission keeps
+    # the control objects and tombstones the owner.
     assert (
         node1.query(
-            "SELECT count() FROM system.cas_mounts WHERE server_root_id = '{}'".format(SRID2)
+            "SELECT state FROM system.cas_mounts WHERE server_root_id = '{}' AND disk = '{}'".format(
+                SRID2, CA_DISK
+            )
         ).strip()
-        == "0"
+        == "retired"
     )
 
     # (9) Drive GC (node1's background GC is already running against the shared pool) to reclaim
@@ -280,7 +364,7 @@ def test_drop_dead_pool_member_heals_the_pool():
     assert deleted > 0, "the pool drained but GC's own bookkeeping reports no deletion"
 
     # node2's decommissioned-and-healed namespace (t2) left canonical dead-life residue behind: its
-    # catalog row is gone (that is what let the slot retire above), but its `_ckpt`/`_files`/`_log`
+    # catalog row is gone (pruned by GC after the drop), but its `_ckpt`/`_files`/`_log`
     # objects are the perpetual namespace janitor's job, not decommission's or GC's own destructive
     # round. t1's row is pruned the same way once dropped. That residue must DRAIN to zero -- the
     # janitor deletes one bounded page per round, so this is polled rather than read once -- and it
@@ -301,14 +385,10 @@ def test_drop_dead_pool_member_heals_the_pool():
         "the dead-life residue from the healed decommission and the t1 drop never drained: {}".format(fsck)
     )
 
-    # (10) Re-run the same command: decommission tombstones the owner anchor in place rather than
-    # deleting it, so the slot is not "unknown" -- the tombstone is found and the re-run is refused
-    # with CORRUPTED_DATA and a message telling the operator this server-root was explicitly
-    # decommissioned and will not silently resume.
-    err = node1.query_and_get_error(
-        "SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
-    )
-    assert "explicitly decommissioned" in err, err
+    # (10) Re-run the same command: the owner carries a verified retirement, so the rerun is accepted
+    #      and reports the member retired again.
+    report_tsv, report = _drop_member(node1)
+    _assert_retired_or_racing_stop(report, report_tsv)
 
 
 def test_drop_pool_member_rejected_on_readonly_disk():
@@ -321,3 +401,56 @@ def test_drop_pool_member_rejected_on_readonly_disk():
         "SYSTEM CAS DROP POOL MEMBER 'whatever' FROM DISK '{}'".format(RO_DISK)
     )
     assert "read-only" in err, err
+
+
+def test_retired_member_rejoins_empty():
+    node1 = cluster.instances["node1"]
+    node2 = cluster.instances["node2"]
+
+    # Start from a retired node2 whatever ran before: a stop of a stopped server only warns.
+    node2.stop_clickhouse(kill=True)
+    _retire_srid2(node1)
+    assert _srid2_retirement(node1) == ("retired", "1")
+
+    # Same uuid: the restart rejoins, then the member writes a table of its own.
+    node2.start_clickhouse()
+    state, old_uuid = _srid2_mount(node1)
+    assert state == "live"
+    node2.query("DROP TABLE IF EXISTS t3 SYNC")
+    node2.query(
+        "CREATE TABLE t3 (id Int64, s String) ENGINE = MergeTree() ORDER BY id "
+        "SETTINGS storage_policy = '{}'".format(STORAGE_POLICY)
+    )
+    node2.query("INSERT INTO t3 SELECT number, toString(number) FROM numbers(1000)")
+    _gc_rounds([node1, node2])
+    assert int(node2.query("SELECT count() FROM t3")) == 1000
+    assert _srid2_mount(node1) == ("live", old_uuid)
+
+    node2.stop_clickhouse()
+    _retire_srid2(node1)
+    assert _srid2_retirement(node1) == ("retired", "1")
+
+    # The same uuid comes back empty: the local table definition attaches with no rows and takes writes.
+    node2.start_clickhouse()
+    assert _srid2_mount(node1) == ("live", old_uuid)
+    assert int(node2.query("SELECT count() FROM t3")) == 0
+    node2.query("INSERT INTO t3 SELECT number, toString(number) FROM numbers(10)")
+    _gc_rounds([node1, node2])
+    assert int(node2.query("SELECT count() FROM t3")) == 10
+    assert _srid2_mount(node1) == ("live", old_uuid)
+
+    # A new uuid (the local uuid file regenerated) rejoins the same id, also empty.
+    node2.stop_clickhouse()
+    _retire_srid2(node1)
+    node2.exec_in_container(["rm", "-f", "/var/lib/clickhouse/uuid"], user="root")
+    node2.start_clickhouse()
+    state, new_uuid = _srid2_mount(node1)
+    assert state == "live"
+    assert new_uuid != old_uuid
+    assert int(node2.query("SELECT count() FROM t3")) == 0
+    node2.query("INSERT INTO t3 SELECT number, toString(number) FROM numbers(10)")
+    _gc_rounds([node1, node2])
+    assert int(node2.query("SELECT count() FROM t3")) == 10
+    assert _srid2_mount(node1) == ("live", new_uuid)
+
+    node2.query("DROP TABLE t3 SYNC")

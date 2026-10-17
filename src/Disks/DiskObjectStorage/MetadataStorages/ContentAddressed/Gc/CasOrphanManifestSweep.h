@@ -177,8 +177,8 @@ struct ManifestSweepResult
 ///
 /// `warnings`, when non-null, opts in to the decommission drain's tolerate-and-continue contract: a
 /// per-key transient failure (a thrown backend exception on `head`/`remove`)
-/// is pushed onto `*warnings` and the sweep continues with the next key, instead of throwing out of
-/// this call; likewise a protection-view-unavailable namespace (the pre-existing corrupt-snapshot skip
+/// is pushed onto `*warnings` and the sweep continues with the next key while `store`'s mount still admits
+/// requests, instead of throwing out of this call; likewise a protection-view-unavailable namespace (the pre-existing corrupt-snapshot skip
 /// below) also pushes a "cannot confirm emptiness" warning, not just a `LOG_WARNING`. `warnings ==
 /// nullptr` (the default, every pre-existing caller) preserves the original behaviour exactly: a
 /// per-key failure propagates as an exception (fail-close default), and the protection-view skip is
@@ -186,6 +186,8 @@ struct ManifestSweepResult
 /// normal "a fresh owner reclaimed it" race the periodic sweep expects, not a failure to warn about.
 /// This direct decommission path relies on the caller's held server-root claim/fence: while that claim
 /// is held, a same-server-root rebirth cannot become live between its catalog cut and exact-token delete.
+/// Every request runs on `store`'s mount plane, so `store` must hold a writable mount; once its fence trips,
+/// the remaining requests are refused.
 /// It still rejects every catalog cut with an ambiguous current life id before making any deletion decision.
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
                         std::vector<String> * warnings = nullptr);

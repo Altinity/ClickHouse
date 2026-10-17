@@ -898,8 +898,6 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
 
         if (metadata_storage.stagingBackend() == Cas::StagingBackend::S3)
         {
-            const std::string staging_key = metadata_storage.stagingKeyPrefix() + "/" + getRandomASCIIString(32) + ".tmp";
-            auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
             /// Build the fixed-length CABL envelope header now (before
             /// the payload is streamed) so the staging object holds `[header][payload]` and the promote
             /// stays a verbatim server-side copy. The header carries a FRESH `incarnation_tag`; `build_id`
@@ -909,11 +907,12 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             std::string envelope_header = buildS3StagingBlobHeader(*r);
             /// The staged upload becomes durable in `sink->finalize()`, outside this request contract by
             /// design, so its admission is re-checked there through the callback below, against the
-            /// generation captured HERE. `admit().generation()` reads a plain value off a temporary
-            /// `CasOperation` that does not outlive this statement -- it names the fence generation at
-            /// THIS instant, not a live operation the two calls share.
+            /// generation captured HERE. The epoch in the key and the generation the finalize rechecks are
+            /// one capture, so a remount between them cannot stage new-generation bytes under an old epoch.
             const Cas::PoolPtr pool = metadata_storage.store();
-            const uint64_t admitted_generation = pool->mountRequests().admit().generation();
+            const Cas::MountIncarnation incarnation = pool->captureMountIncarnation();
+            const std::string staging_key = metadata_storage.stagingKey(incarnation.writer_epoch, getRandomASCIIString(32) + ".tmp");
+            auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
             return std::make_unique<Cas::CaContentWriteBuffer>(
                 std::move(object_sink),
                 staging_key,
@@ -927,7 +926,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                     const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
                     stageBlobPartFile(route, ref, size, key, Cas::StagingBackend::S3);
                 },
-                [pool, admitted_generation] { pool->checkFenceOrThrow(admitted_generation); });
+                [pool, generation = incarnation.fence_generation] { pool->checkFenceOrThrow(generation); });
         }
 
         return std::make_unique<Cas::CaContentWriteBuffer>(
