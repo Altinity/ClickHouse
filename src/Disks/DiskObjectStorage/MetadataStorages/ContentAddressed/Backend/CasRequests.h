@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
 #include <IO/ReadBuffer.h>
+#include <Common/Exception.h>
 #include <base/types.h>
 
 #include <cstdint>
@@ -80,6 +81,17 @@ bool isDeterministicLocalFailure(int code);
 /// SCOPE: only the ESCAPING retry-later throws route here (fence lost or a controlled write outcome
 /// remaining uncertain). Startup/decommission and generic live-lock-brake `ABORTED` values keep
 /// their meaning and are not rerouted here.
+/// Preserves NETWORK_ERROR for existing query/replication handling while allowing
+/// table construction to distinguish a transient CAS state from generic write errors.
+/// A fresh attempt must re-check the pool lifecycle; this does not override fencing.
+class TransientStateException final : public Exception
+{
+public:
+    using Exception::Exception;
+    TransientStateException * clone() const override { return new TransientStateException(*this); }
+    void rethrow() const override { throw *this; }
+};
+
 [[noreturn]] void throwCasWriteRetryLater(const String & why);
 
 /// Same classification as `throwCasWriteRetryLater`, but returns the exception as a
@@ -89,7 +101,7 @@ bool isDeterministicLocalFailure(int code);
 std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why);
 
 /// Throw the recoverable "this content-addressed disk cannot serve the request right now" condition.
-/// Sibling of `throwCasWriteRetryLater`, same class for the same reasons, differing only in what it
+/// Sibling of `throwCasWriteRetryLater`, same error code for the same reasons, differing in what it
 /// describes: that one names a WRITE whose commit did not land, this one names a DISK STATE that
 /// refused the request before it started -- on either plane.
 ///

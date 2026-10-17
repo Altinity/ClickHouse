@@ -15,6 +15,7 @@
 #include <Databases/DatabasesCommon.h>
 #include <Databases/TablesLoader.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromFile.h>
@@ -68,6 +69,7 @@ namespace ServerSetting
 
 namespace ErrorCodes
 {
+    extern const int ABORTED;
     extern const int LOGICAL_ERROR;
     extern const int UNKNOWN_DATABASE_ENGINE;
     extern const int NOT_IMPLEMENTED;
@@ -503,10 +505,33 @@ LoadTaskPtr DatabaseOrdinary::loadTableFromMetadataAsync(
         std::move(load_after),
         TablesLoaderBackgroundLoadPoolId,
         fmt::format("load table {}", name.getFullName()),
-        [this, local_context, file_path, name, ast, mode](AsyncLoader &, const LoadJobPtr &)
+        [this, local_context, file_path, name, ast, mode](AsyncLoader & loader, const LoadJobPtr &)
         {
             SCOPE_EXIT(TransactionLog::decreaseAsyncTablesLoadingJobNumber(););
-            loadTableFromMetadata(local_context, file_path, name, ast, mode);
+            bool retry_logged = false;
+            for (;;)
+            {
+                if (loading_stopped.load() || loader.isShutdownRequested())
+                    throw Exception(ErrorCodes::ABORTED, "Table loading stopped during CAS recovery");
+                try
+                {
+                    // Reconstruct after the failed attempt unwinds. Never restart
+                    // a partially initialized Storage or resume its old CAS fence.
+                    loadTableFromMetadata(local_context, file_path, name, ast, mode);
+                    return;
+                }
+                catch (const Cas::TransientStateException &)
+                {
+                    // Fresh admission still rejects terminal identity/decommission
+                    // states. Unrelated network and metadata errors are not retried.
+                    if (!retry_logged)
+                    {
+                        tryLogCurrentException(log);
+                        retry_logged = true;
+                    }
+                    sleepForSeconds(1);
+                }
+            }
         });
 
     return load_table[name.table] = makeLoadTask(async_loader, {job});
@@ -654,6 +679,7 @@ void DatabaseOrdinary::waitDatabaseStarted() const
 
 void DatabaseOrdinary::stopLoading()
 {
+    loading_stopped.store(true);
     std::unordered_map<String, LoadTaskPtr> stop_load_table;
     std::unordered_map<String, LoadTaskPtr> stop_startup_table;
     LoadTaskPtr stop_startup_database;
