@@ -490,7 +490,7 @@ void wedgeLaneOverADurableObject(VirtualRetryClock & clock, WedgeTestBackend & b
     backend.landed_ack_lost_latched = true;
     backend.fail_get_substr = logPrefix(store, ns);
     backend.fail_get_latched = true;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, ref); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "outcome is unknown", [&] { store->dropRef(ns, ref); });
     backend.landed_ack_lost_latched = false;
     backend.landed_ack_lost_substr.clear();
     backend.fail_get_latched = false;
@@ -512,7 +512,7 @@ void wedgeLaneOnUnresolvedAppend(VirtualRetryClock & clock, WedgeTestBackend & b
 
     backend.ambiguous_substr = logPrefix(store, ns);
     backend.ambiguous_latched = true;
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, drive);
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "outcome is unknown", drive);
     backend.ambiguous_latched = false;
     backend.ambiguous_substr.clear();
 
@@ -1401,7 +1401,8 @@ TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthName
     /// settling read proves absence and the conflict comes back naming no occupant at all.
     backend->refuse_precondition_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), genesis);
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishEmptyPart(store, ns, "x"); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "outcome is unknown",
+        [&] { publishEmptyPart(store, ns, "x"); });
 
     const auto ckpt_after = readObj(*backend, ckpt_key);
     ASSERT_TRUE(ckpt_after.has_value());
@@ -1467,7 +1468,8 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteWedgesWhenTheSettlingReadNamesNoOccupant
 
     const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable].load();
     const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load();
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "outcome is unknown",
+        [&] { store->dropRef(ns, "x"); });
 
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable].load(), deferred_before + 1)
         << "the deferral is the one quiet arm here -- it must be counted or a starved loud path is invisible";
@@ -1513,7 +1515,8 @@ TEST(CASRefWedgeEveryAttempt, AppendSiteWedgesWhenTheSettlingReadItselfIsRefused
     backend->refuse_read_after_precondition = true;
 
     const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable].load();
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR, "outcome is unknown",
+        [&] { store->dropRef(ns, "x"); });
 
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable].load(), deferred_before + 1);
     EXPECT_TRUE(store->mayMutate());
@@ -1661,7 +1664,8 @@ TEST(CASRefLane, RefusedReturnsTheAttemptToReadyAndDoesNotWedge)
     const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load();
     const uint64_t definite_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure].load();
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::NETWORK_ERROR,
+        "nothing is durable, so a retry cannot duplicate this transaction", [&] { store->dropRef(ns, "x"); });
 
     EXPECT_FALSE(store->refLaneWedgedForTest(ns))
         << "a proven refusal wrote nothing, so there is nothing for a wedge to resolve";
