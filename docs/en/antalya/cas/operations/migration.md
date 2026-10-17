@@ -215,3 +215,17 @@ least that long after the first run that saw the lease; two back-to-back runs do
 `SYSTEM CAS GC RUN` on the pool will no longer wait on or fence its heartbeat. See
 [mount, unmount, crash](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle) for how the
 claim, drain, and retirement steps fit into the mount-slot lifecycle.
+
+## Recreating a member whose id contains `/` {#recreate-id-with-slash}
+
+A `cas_server_root_id` that contains `/` is refused: the disk fails to open with `BAD_ARGUMENTS` and a
+message that contains `contains '/'`. Pools created by earlier builds can hold such an id. To bring the
+server back:
+
+1. Set `<cas_server_root_id>` to a new value without `/`, for example `shard-01-replica-a` instead of
+   `shard-01/replica-a`. If the id comes from macros, remove the `/` from the template.
+2. Restart the server. The disk claims the new id over an empty subtree.
+
+Data stored under the old id is not visible under the new id. The old id's objects stay in the pool
+and keep their blobs referenced. `SYSTEM CAS DROP POOL MEMBER` and `clickhouse-disks cas-drop-member`
+refuse an id with `/`, so they cannot reclaim them.

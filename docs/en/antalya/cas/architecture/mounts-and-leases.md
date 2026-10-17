@@ -20,8 +20,8 @@ otherwise regenerate the same `ServerUUID` from a wiped local state directory, w
 silently steal an existing identity.
 
 Validation (`validateServerRootId`, `Pool/CasServerRoot.h`) is fail-closed `BAD_ARGUMENTS`, no
-sanitizing fallback: non-empty, at most 255 bytes, no empty/`.`/`..` path segment, no `_files` or
-`_manifests` segment.
+sanitizing fallback: non-empty, at most 255 bytes, no `/`, not `.` or `..`, not `_files` or
+`_manifests`.
 
 It roots four subtrees and owns catalog names at or below `<server_root_id>`:
 
@@ -38,7 +38,10 @@ dedup work. Ref/namespace keys are also deliberately opaque and do not embed the
 Each replica sharing a backend endpoint must use a distinct `cas_server_root_id`; omitting the setting
 is a startup error.
 
-A new `cas_server_root_id` may not contain `/`; ids that already own their owner object keep working. The rule does not cover two cases: decommissioning `a` still selects the namespaces and staging of an existing `a/b`, and a new `a` can be claimed while an empty `a/b` exists.
+The id may not contain `/`, and this holds for an id that already owns its owner object too: decommission
+and the staging sweep select a member's objects by key prefix, so a member `a/b` would be drained by a
+decommission of `a`. A server whose id contains `/` refuses to open the disk; see
+[recreating a member whose id contains `/`](/antalya/cas/operations/migration#recreate-id-with-slash).
 
 ## The owner claim {#owner-claim}
 
@@ -51,7 +54,6 @@ and never reassigned — decommission only tombstones it in place.
 | present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned; the refusal says to configure a new `cas_server_root_id` |
 | present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause and, for a dead owner, `SYSTEM CAS DROP POOL MEMBER` |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
-| absent, subtree provably empty, id contains `/` | `BAD_ARGUMENTS` — a new id may not be nested; an existing nested owner proceeds by the first row |
 | absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | lost the `putIfAbsent` race | re-read; equal uuid proceeds, else `CORRUPTED_DATA` |
 
