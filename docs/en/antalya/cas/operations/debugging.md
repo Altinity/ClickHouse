@@ -142,8 +142,7 @@ row followed by a `recovered` one — and the older `unresolved_reason`, `deadli
   shutdown), `fence_or_lifecycle_lost` (another local fence loss or a terminal lifecycle transition
   closed admission while the operation was active), `deterministic_failure` (the store's own
   answer proved the write never applied), and `vanished` (an exact resolve read proved the mount
-  slot absent — the pool directory was removed or renamed out of band, or a decommission raced the
-  renewal). `terminal_unclassified` means the renewal terminated through a path that assigned no
+  slot absent — the pool directory was removed or renamed out of band, or a 26.6.4 decommission deleted the slot; a decommission of this version keeps it). `terminal_unclassified` means the renewal terminated through a path that assigned no
   classification; that is a defect to report together with the surrounding rows, not an operator
   condition. Do not collapse these into a generic timeout — the action
   differs by classification, and only `external_lease_deadline` and `request_deadline` are about a

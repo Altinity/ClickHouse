@@ -588,9 +588,9 @@ of one disk.
 
 Permanently decommissions a dead member (`server_root_id`) of a content-addressed disk
 pool. It claims the member's mount slot as an administrative writer — fencing that `server_root_id` from ever
-writing again — then drops every table namespace the member owned, drains eligible manifest debris,
-staging objects, and mountpoint objects belonging to it, and retires the mount slot once all drains
-are confirmed. This is a **destructive, irreversible** operation: only run it once the `server_root_id` is
+writing again — tombstones the member's owner, drops every table namespace the member owned, drains
+eligible manifest debris, staging objects, and mountpoint objects belonging to it, writes the member's
+farewell and marks the retirement verified. The control objects (`owner`, `epoch`, `mount`) stay. This is a **destructive, irreversible** operation: only run it once the `server_root_id` is
 confirmed permanently dead, since it fences the member out even if it later comes back online, and
 it deletes namespace and drain state that cannot be recovered.
 
@@ -607,13 +607,16 @@ that may contain `/`, not a plain identifier, so it cannot be written unquoted).
 
 The operation is resumable: a rerun skips namespaces already marked `Removed` and reports them
 separately from namespaces newly removed by this invocation. Per-object drain failures are recorded
-as warnings and leave the slot in a terminated-but-not-fully-drained state that a later invocation
-can resume from, rather than raising an exception.
+as warnings; the owner keeps an unverified tombstone that a later invocation resumes over, rather than
+raising an exception.
 
 The command returns one row with columns `server_root_id`, `namespaces_removed`, `namespaces_already_removed`,
 `committed_refs_removed`, `precommits_removed`, `manifest_debris_removed`, `staging_objects_removed`,
-`mountpoint_objects_removed`, `slot_removed`, and `warnings`. A non-empty `warnings` means some
-drain was not confirmed and the mount slot was left in place as a resume anchor.
+`mountpoint_objects_removed`, `member_retired`, `warnings`, and `namespaces_pending_gc`.
+`member_retired = 1` means the member's retirement is verified. `member_retired = 0` means the run stopped
+before its verified mark: rerun it, unless a warning says the owner moved on to a later life (see
+[the steps](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle)). Rows under `namespaces_pending_gc`
+are deleted by GC and need no rerun.
 
 ## Managing ReplicatedMergeTree Tables {#managing-replicatedmergetree-tables}
 

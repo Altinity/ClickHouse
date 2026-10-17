@@ -132,7 +132,7 @@ where `envelope = cas_attempt_timeout_ms + 2 × cap` (7000 ms with defaults) and
 retrying until `confirmed deadline − cas_lease_safety_margin_ms`.
 
 The `expires_at_ms` stamped into the mount object is a writer-stamped diagnostic used by
-`system.cas_mounts` and by the non-authoritative decommission epoch-recovery precheck; it never
+`system.cas_mounts`; it never
 authorizes a reclaim or a GC fence-out. Local fencing is derived instead from the confirmed
 request's pre-I/O `CLOCK_BOOTTIME` anchor plus the TTL.
 
