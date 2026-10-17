@@ -70,7 +70,6 @@ namespace DB::ErrorCodes
 extern const int FILE_DOESNT_EXIST;
 extern const int BAD_ARGUMENTS;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
-extern const int PATH_ACCESS_DENIED;
 extern const int LOGICAL_ERROR;
 }
 
@@ -1181,25 +1180,6 @@ static MetadataFileWithInfo getLatestMetadataFileAndVersion(
     return load_fn();
 }
 
-static String resolveContained(const std::filesystem::path & base, const std::filesystem::path & relative)
-{
-    auto norm_base = base.lexically_normal();
-    auto combined = (norm_base / relative).lexically_normal();
-
-    auto rel = combined.lexically_relative(norm_base);
-
-    if (rel.empty() || rel.begin()->string() == "..")
-    {
-        throw Exception(
-            ErrorCodes::PATH_ACCESS_DENIED,
-            "Explicit metadata file path `{}` should be in the table path directory : `{}`",
-            relative.string(),
-            base.string());
-    }
-
-    return combined.string();
-}
-
 MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     const ObjectStoragePtr & object_storage,
     const String & table_path,
@@ -1225,7 +1205,7 @@ MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
             if (*it == "." || *it == "..")
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Relative paths are not allowed");
         }
-        String resolved_path = resolveContained(table_path, explicit_metadata_path);
+        String resolved_path = resolvePathInsideTable(table_path, explicit_metadata_path);
         return getMetadataFileAndVersion(resolved_path);
     }
     else if (data_lake_settings[DataLakeStorageSetting::iceberg_metadata_table_uuid].changed)
@@ -1361,8 +1341,23 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
             auto column_name = source_id_to_column_name[source_id];
             int direction = field->getValue<String>(f_direction) == "asc" ? 1 : -1;
             auto iceberg_transform_name = field->getValue<String>(f_transform);
-            auto clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name,
-                local_context->getSettingsRef()[Setting::iceberg_partition_timezone]);
+            std::optional<TransformAndArgument> clickhouse_transform_name;
+            try
+            {
+                clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name,
+                    local_context->getSettingsRef()[Setting::iceberg_partition_timezone]);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::BAD_ARGUMENTS)
+                    throw;
+            }
+            if (!clickhouse_transform_name.has_value())
+            {
+                /// An unknown or malformed transform is not a reason to reject the table: an Iceberg
+                /// sort order is only an optimization hint, so drop it and read/write the table as unsorted.
+                return KeyDescription{};
+            }
             /// Quote the column name so identifiers with special characters (e.g. `@timestamp`)
             /// produce a parseable ORDER BY clause.
             auto quoted_column_name = backQuoteIfNeed(column_name);

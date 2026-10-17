@@ -811,7 +811,7 @@ The maximum allowed size for String in RowBinary format. It prevents allocating 
 The maximum allowed size for Array in RowBinary format. It prevents allocating large amount of memory in case of corrupted data. 0 means there is no limit
 )", 0) \
     DECLARE(UInt64, input_format_binary_max_type_complexity, 1000, R"(
-Max type nodes when decoding binary types (not depth, but total count). `Map(String, UInt32)` = 3 nodes. Protects against malicious inputs. 0 = unlimited.
+Max type nodes when decoding binary types (not depth, but total count). `Map(String, UInt32)` = 3 nodes. Parameters of `AggregateFunction` types count as one node per value, including nested ones. Protects against malicious inputs. 0 = unlimited.
 )", 0) \
     DECLARE(UInt64, format_binary_max_object_size, 100000, R"(
 The maximum allowed number of paths in a single Object for JSON type RowBinary format. It prevents allocating large amount of memory in case of corrupted data. 0 means there is no limit
@@ -1279,9 +1279,10 @@ When `format_schema_source` is set to 'query', the following conditions apply:
 - The result of the query is treated as the schema content.
 - This result is cached locally in the `format_schemas` directory.
 - You can clear the local cache using the command: `SYSTEM DROP FORMAT SCHEMA CACHE FOR Files`.
-- Once cached, identical queries are not executed to fetch the schema again until the cache is explicitly cleared
+- Once cached, identical queries from the same user are not executed to fetch the schema again until the cache is explicitly cleared
 - In addition to local cache files, Protobuf messages are also cached in memory. Even after clearing the local cache files, the in-memory cache must be cleared using `SYSTEM DROP FORMAT SCHEMA CACHE [FOR Protobuf]` to fully refresh the schema.
 - Run the query `SYSTEM DROP FORMAT SCHEMA CACHE` to clear the cache for both cache files and Protobuf messages schemas at once.
+- The query is executed on behalf of the user running it, so it is subject to that user's access rights, and its cached result is reused only for the same user. It cannot be executed where there is no user: in a background task, such as a streaming engine consumer, or when `INSERT` data is parsed on the client side. Use `format_schema_source` set to `file` or `string` there.
 )", 0) \
     DECLARE(String, format_schema, "", R"(
 This parameter is useful when you are using formats that require a schema definition, such as [Cap'n Proto](https://capnproto.org/) or [Protobuf](https://developers.google.com/protocol-buffers/). The value depends on the format.
@@ -1482,6 +1483,10 @@ Skip fields with unsupported types while schema inference for format BSON.
     DECLARE(Bool, format_display_secrets_in_show_and_select, false, R"(
 Enables or disables showing secrets in `SHOW` and `SELECT` queries for tables, databases,
 table functions, and dictionaries.
+
+It also controls whether secrets embedded in setting values (such as a password in
+`format_avro_schema_registry_url`) are shown in `system.settings`, `system.processes`,
+`system.settings_profile_elements` and in `SHOW CREATE USER` / `SHOW CREATE SETTINGS PROFILE`.
 
 User wishing to see secrets must also have
 [`display_secrets_in_show_and_select` server setting](../server-configuration-parameters/settings#display_secrets_in_show_and_select)

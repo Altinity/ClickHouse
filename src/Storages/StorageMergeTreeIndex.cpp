@@ -1,4 +1,5 @@
 
+#include <Storages/StorageProxy.h>
 #include <Storages/StorageMergeTreeIndex.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnsNumber.h>
@@ -14,6 +15,8 @@
 #include <Storages/MergeTree/MergeTreeMarksLoader.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Access/Common/AccessFlags.h>
+#include <Access/EnabledRowPolicies.h>
+#include <Common/CurrentThread.h>
 #include <Common/HashTable/HashSet.h>
 #include <Common/escapeForFileName.h>
 #include <Interpreters/ExpressionActions.h>
@@ -32,6 +35,7 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int NO_SUCH_COLUMN_IN_TABLE;
     extern const int NOT_IMPLEMENTED;
+    extern const int ACCESS_DENIED;
 }
 
 class MergeTreeIndexSource : public ISource, WithContext
@@ -279,7 +283,7 @@ StorageMergeTreeIndex::StorageMergeTreeIndex(
     , with_marks(with_marks_)
     , with_minmax(with_minmax_)
 {
-    const auto * merge_tree = dynamic_cast<const MergeTreeData *>(source_table.get());
+    const auto * merge_tree = castStorage<MergeTreeData>(source_table, DeferredTable::Load).get();
     if (!merge_tree)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage MergeTreeIndex expected MergeTree table, got: {}", source_table->getName());
 
@@ -389,7 +393,18 @@ void StorageMergeTreeIndex::read(
         }
     }
 
-    context->checkAccess(AccessType::SELECT, source_table->getStorageID(), columns_from_storage);
+    auto source_storage_id = source_table->getStorageID();
+    context->checkAccess(AccessType::SELECT, source_storage_id, columns_from_storage);
+
+    /// We cannot apply a row policy to granules, but the index leaks keys of the rows it hides
+    auto row_policy_filter = context->getRowPolicyFilter(
+        source_storage_id.getDatabaseName(), source_storage_id.getTableName(), RowPolicyFilterType::SELECT_FILTER);
+
+    if (row_policy_filter && !row_policy_filter->isAlwaysTrue())
+        throw Exception(ErrorCodes::ACCESS_DENIED,
+            "Cannot read from `mergeTreeIndex` because a row policy is applied on table {}. "
+            "Reading the index could violate the row policy",
+            source_storage_id.getNameForLogs());
 
     auto sample_block = std::make_shared<const Block>(storage_snapshot->getSampleBlockForColumns(column_names));
 

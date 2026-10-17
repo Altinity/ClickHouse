@@ -29,6 +29,7 @@
 #include <Storages/StorageView.h>
 #include <Storages/System/getQueriedColumnsMaskAndHeader.h>
 #include <Storages/VirtualColumnUtils.h>
+#include <Storages/StorageProxy.h>
 #include <Common/StringUtils.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/typeid_cast.h>
@@ -683,7 +684,7 @@ protected:
                         // Extract from specific DataLake metadata if suitable
                         if (auto * obj = dynamic_cast<StorageObjectStorage *>(table.get()))
                         {
-                            if (auto * dl_meta = obj->getExternalMetadata(context))
+                            if (auto dl_meta = obj->getExternalMetadata(context))
                             {
                                 if (auto p = dl_meta->partitionKey(context); p.has_value())
                                 {
@@ -694,7 +695,7 @@ protected:
                         }
                         else if (auto * clobj = dynamic_cast<StorageObjectStorageCluster *>(table.get()))
                         {
-                            if (auto * dl_meta = clobj->getExternalMetadata(context))
+                            if (auto dl_meta = clobj->getExternalMetadata(context))
                             {
                                 if (auto p = dl_meta->partitionKey(context); p.has_value())
                                 {
@@ -729,7 +730,7 @@ protected:
                         // Extract from specific DataLake metadata if suitable
                         if (auto * obj = dynamic_cast<StorageObjectStorage *>(table.get()))
                         {
-                            if (auto * dl_meta = obj->getExternalMetadata(context))
+                            if (auto dl_meta = obj->getExternalMetadata(context))
                             {
                                 if (auto p = dl_meta->sortingKey(context); p.has_value())
                                 {
@@ -740,7 +741,7 @@ protected:
                         }
                         else if (auto * clobj = dynamic_cast<StorageObjectStorageCluster *>(table.get()))
                         {
-                            if (auto * dl_meta = clobj->getExternalMetadata(context))
+                            if (auto dl_meta = clobj->getExternalMetadata(context))
                             {
                                 if (auto p = dl_meta->sortingKey(context); p.has_value())
                                 {
@@ -852,7 +853,7 @@ protected:
                     ++res_index;
                 }
 
-                auto table_merge_tree = std::dynamic_pointer_cast<MergeTreeData>(table);
+                auto table_merge_tree = castStorage<MergeTreeData>(table, DeferredTable::Skip);
                 if (columns_mask[src_index++])
                 {
                     if (table_merge_tree)

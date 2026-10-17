@@ -149,7 +149,6 @@ ManifestFileIterator::~ManifestFileIterator() = default;
 std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     std::shared_ptr<AvroForIcebergDeserializer> manifest_file_deserializer_,
     const IcebergPathFromMetadata & path_to_manifest_file_,
-    Int32 format_version_,
     const IcebergPathResolver & path_resolver_,
     IcebergSchemaProcessor & schema_processor,
     Int64 inherited_sequence_number_,
@@ -158,15 +157,19 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     std::shared_ptr<const ActionsDAG> filter_dag_,
     Int32 table_snapshot_schema_id_)
 {
-    auto dump_metadata = [&]()->String { return manifest_file_deserializer_->getMetadataContent(); };
     insertRowToLogTable(
         context_,
-        dump_metadata,
+        [&] { return manifest_file_deserializer_->getMetadataContent(); },
         DB::IcebergMetadataLogLevel::ManifestFileMetadata,
         path_resolver_.getTableRoot(),
         path_to_manifest_file_,
         std::nullopt,
         std::nullopt);
+
+    /// The manifest file's own format version governs how it is parsed. A v2 table may
+    /// still reference v1 manifests produced before an external upgrade from v1 to v2,
+    /// and those must remain readable (the Iceberg spec assigns them sequence_number = 0).
+    const Int32 manifest_format_version = static_cast<Int32>(manifest_file_deserializer_->getFormatVersionFromManifestFileMetadata());
 
     for (const auto & column_name : {f_status, f_data_file})
     {
@@ -175,7 +178,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
                 DB::ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION, "Required columns are not found in manifest file: {}", column_name);
     }
 
-    if (format_version_ > 1 && !manifest_file_deserializer_->hasPath(f_sequence_number))
+    if (manifest_format_version > 1 && !manifest_file_deserializer_->hasPath(f_sequence_number))
         throw Exception(
             ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION, "Required columns are not found in manifest file: {}", f_sequence_number);
 
@@ -223,7 +226,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
             continue;
         auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
         auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
-        partition_spec_vec.emplace_back(source_id, transform_name, partition_name);
+        partition_spec_vec.emplace_back(source_id, transform_name, partition_name, static_cast<Int32>(i));
         auto partition_ast = getASTFromTransform(transform_name, numeric_column_name, context_->getSettingsRef()[Setting::iceberg_partition_timezone]);
         /// Unsupported partition key expression
         if (partition_ast == nullptr)
@@ -243,7 +246,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     return std::shared_ptr<ManifestFileIterator>(new ManifestFileIterator(
         std::move(manifest_file_deserializer_),
         path_to_manifest_file_,
-        format_version_,
+        manifest_format_version,
         path_resolver_,
         schema_processor,
         inherited_sequence_number_,
@@ -305,10 +308,9 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
 
     if (parsed_entry->status == ManifestEntryStatus::DELETED)
     {
-        auto dump_metadata = [&]()->String { return manifest_file_deserializer->getContent(row_index); };
         insertRowToLogTable(
             context,
-            dump_metadata,
+            [&] { return manifest_file_deserializer->getContent(row_index); },
             DB::IcebergMetadataLogLevel::ManifestFileEntry,
             path_resolver.getTableRoot(),
             path_to_manifest_file,
@@ -379,20 +381,18 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
     PruningReturnStatus pruning_status = PruningReturnStatus::NOT_PRUNED;
     if (filter_dag)
     {
+        const ManifestFilesPruner * current_pruner = getOrCreatePruner(entry->resolved_schema_id);
+
         /// Compute per-column hyperrectangles for DATA files
         std::unordered_map<Int32, DB::Range> hyperrectangles;
         if (parsed_entry->content_type == FileContentType::DATA)
         {
-            for (const auto & [column_id, bounds] : parsed_entry->value_bounds)
+            for (const auto & [column_id, column_type] : current_pruner->getMinMaxColumnTypes())
             {
-                auto field_characteristics = schema_processor_ptr->tryGetFieldCharacteristics(resolved_schema_id, column_id);
-                /// If we don't have column characteristics, bounds don't have any sense.
-                /// This happens if the subfield is inside map or array, because we don't support
-                /// name generation for such subfields (we support names of nested subfields in structs only).
-                if (!field_characteristics)
+                auto bounds_it = parsed_entry->value_bounds.find(column_id);
+                if (bounds_it == parsed_entry->value_bounds.end())
                     continue;
-
-                const auto & name_and_type = *field_characteristics;
+                const auto & bounds = bounds_it->second;
 
                 String left_str;
                 String right_str;
@@ -400,12 +400,12 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
                 if (!bounds.first.tryGet(left_str) || !bounds.second.tryGet(right_str))
                     continue;
 
-                if (const auto type_id = name_and_type.type->getTypeId();
+                if (const auto type_id = column_type->getTypeId();
                     type_id == DB::TypeIndex::Tuple || type_id == DB::TypeIndex::Map || type_id == DB::TypeIndex::Array)
                     continue;
 
-                auto left = deserializeFieldFromBinaryRepr(left_str, name_and_type.type, true);
-                auto right = deserializeFieldFromBinaryRepr(right_str, name_and_type.type, false);
+                auto left = deserializeFieldFromBinaryRepr(left_str, column_type, true);
+                auto right = deserializeFieldFromBinaryRepr(right_str, column_type, false);
                 if (!left || !right)
                     continue;
 
@@ -413,13 +413,11 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
             }
         }
 
-        const ManifestFilesPruner * current_pruner = getOrCreatePruner(entry->resolved_schema_id);
         pruning_status = current_pruner->canBePruned(entry, hyperrectangles);
     }
-    auto dump_metadata = [&]()->String { return manifest_file_deserializer->getContent(row_index); };
     insertRowToLogTable(
         context,
-        dump_metadata,
+        [&] { return manifest_file_deserializer->getContent(row_index); },
         DB::IcebergMetadataLogLevel::ManifestFileEntry,
         path_resolver.getTableRoot(),
         path_to_manifest_file,

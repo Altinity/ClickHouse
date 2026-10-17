@@ -7,6 +7,7 @@
 #include <Common/FieldVisitorToString.h>
 #include <Common/SettingsChanges.h>
 
+#include <optional>
 #include <string_view>
 #include <unordered_map>
 
@@ -24,6 +25,25 @@ namespace DB
 class ReadBuffer;
 class WriteBuffer;
 
+/** A settings sequence on the wire is a list of name/value pairs, and both the number of pairs and
+  * the size of each name and value come from the peer. There are a few thousand declared settings
+  * and a handful of custom ones per query, so bound the number of pairs: otherwise a peer can keep
+  * the server allocating one pair at a time without a limit, and in interserver mode the settings of
+  * a query are read before its secret hash is checked.
+  */
+static constexpr size_t MAX_SETTINGS_IN_A_SEQUENCE = 65536;
+
+/** The name of a setting or of a query parameter is an identifier, so a name declared longer than
+  * this is rejected before any of it is read. The bound is the same as for the strings of the `Hello`
+  * packet.
+  *
+  * The value of a setting or of a parameter keeps the generic string bound: it is query-sized data
+  * (a parameter is substituted into the query), and the query text itself has to be read at that
+  * bound before the interserver hash that covers it can be checked, so a tighter bound here would
+  * only break large parameters without lowering what a peer can make the server allocate.
+  */
+static constexpr size_t MAX_SETTING_NAME_SIZE = 64 * 1024;
+
 /// Utility functions and types used by the BaseSettings template class.
 /// These are implementation details that handle serialization, error reporting,
 /// and metadata management for settings.
@@ -31,12 +51,15 @@ struct BaseSettingsHelpers
 {
     /// Error handling
     [[noreturn]] static void throwSettingNotFound(std::string_view name);
+    [[noreturn]] static void throwTooManySettings(std::string_view what);
     static void warningSettingNotFound(std::string_view name);
     static void flushWarnings();
 
     /// Serialization helpers
     static void writeString(std::string_view str, WriteBuffer & out);
     static String readString(ReadBuffer & in);
+    /// The name of a setting or a query parameter, bounded by `MAX_SETTING_NAME_SIZE`.
+    static String readName(ReadBuffer & in);
 
     /// Setting metadata flags
     enum Flags : UInt64
@@ -136,6 +159,15 @@ private:
   *
   * MY_SETTINGS_SUPPORTED_TYPES(MySettings, IMPLEMENT_SETTING_SUBSCRIPT_OPERATOR)
   */
+/// The name a custom setting is stored under. Identity, unless a settings class shares its namespace
+/// with another one: `Settings` addresses a `MergeTreeSettings` setting through a `merge_tree_`-prefixed
+/// custom setting, and such a setting can have two names, which have to reach the same value.
+template <class TTraits>
+std::string_view resolveCustomSettingName(std::string_view name)
+{
+    return name;
+}
+
 template <class TTraits>
 class BaseSettings : public TTraits::Data
 {
@@ -202,6 +234,9 @@ public:
     /// Get the tier (PRODUCTION/BETA/EXPERIMENTAL) of a setting
     SettingsTierType getTier(std::string_view name) const;
 
+    /// Tier of a built-in setting. Unlike `getTier`, ignores custom settings and returns nullopt instead of throwing when no setting exists.
+    static std::optional<SettingsTierType> tryGetTierOfBuiltin(std::string_view name);
+
     // ========================================================================
     // VALIDATION & CONVERSION (static utilities)
     // ========================================================================
@@ -238,8 +273,8 @@ public:
         std::string_view getPath() const;
         Field getValue() const;
         void setValue(const Field & value);
-        String getValueString() const;
-        String getDefaultValueString() const;
+        String getValueString(bool show_secrets) const;
+        String getDefaultValueString(bool show_secrets) const;
         bool isValueChanged() const;
         std::string_view getTypeName() const;
         std::string_view getDescription() const;
@@ -429,7 +464,7 @@ void BaseSettings<TTraits>::resetToDefault(std::string_view name)
     }
 
     if constexpr (Traits::allow_custom_settings)
-        custom_settings_map.erase(String{name});
+        custom_settings_map.erase(String{resolveCustomSettingName<TTraits>(name)});
 }
 
 template <typename TTraits>
@@ -481,6 +516,16 @@ SettingsTierType BaseSettings<TTraits>::getTier(std::string_view name) const
     if (tryGetCustomSetting(name))
         return SettingsTierType::PRODUCTION;
     BaseSettingsHelpers::throwSettingNotFound(name);
+}
+
+template <typename TTraits>
+std::optional<SettingsTierType> BaseSettings<TTraits>::tryGetTierOfBuiltin(std::string_view name)
+{
+    name = TTraits::resolveName(name);
+    const auto & accessor = Traits::Accessor::instance();
+    if (size_t index = accessor.find(name); index != static_cast<size_t>(-1))
+        return accessor.getTier(index);
+    return std::nullopt;
 }
 
 template <typename TTraits>
@@ -559,7 +604,7 @@ void BaseSettings<TTraits>::write(WriteBuffer & out, SettingsWriteFormat format)
                 flags = static_cast<Flags>(flags | Flags::IMPORTANT);
             BaseSettingsHelpers::writeFlags(flags, out);
 
-            BaseSettingsHelpers::writeString(field.getValueString(), out);
+            BaseSettingsHelpers::writeString(field.getValueString(/* show_secrets */ true), out);
         }
         else
             accessor.writeBinary(*this, field.index, out);
@@ -598,9 +643,12 @@ void BaseSettings<TTraits>::readBinary(ReadBuffer & in)
     size_t num_settings = 0;
     readVarUInt(num_settings, in);
 
+    if (num_settings > MAX_SETTINGS_IN_A_SEQUENCE)
+        BaseSettingsHelpers::throwTooManySettings("settings");
+
     for (size_t i = 0; i < num_settings; ++i)
     {
-        String read_name = BaseSettingsHelpers::readString(in);
+        String read_name = BaseSettingsHelpers::readName(in);
         std::string_view name = TTraits::resolveName(read_name);
         size_t index = accessor.find(name);
 
@@ -618,11 +666,15 @@ void BaseSettings<TTraits>::read(ReadBuffer & in, SettingsWriteFormat format)
 {
     resetToDefault();
     const auto & accessor = Traits::Accessor::instance();
+    size_t num_settings = 0;
     while (true)
     {
-        String read_name = BaseSettingsHelpers::readString(in);
+        String read_name = BaseSettingsHelpers::readName(in);
         if (read_name.empty() /* empty string is a marker of the end of settings */)
             break;
+
+        if (++num_settings > MAX_SETTINGS_IN_A_SEQUENCE)
+            BaseSettingsHelpers::throwTooManySettings("settings");
 
         std::string_view name = TTraits::resolveName(read_name);
         size_t index = accessor.find(name);
@@ -703,9 +755,9 @@ SettingFieldCustom & BaseSettings<TTraits>::getCustomSetting(std::string_view na
 {
     if constexpr (Traits::allow_custom_settings)
     {
-        auto it = custom_settings_map.find(name);
+        auto it = custom_settings_map.find(resolveCustomSettingName<TTraits>(name));
         if (it == custom_settings_map.end())
-            it = custom_settings_map.emplace(String{name}, SettingFieldCustom{}).first;
+            it = custom_settings_map.emplace(String{resolveCustomSettingName<TTraits>(name)}, SettingFieldCustom{}).first;
         return it->second;
     }
     BaseSettingsHelpers::throwSettingNotFound(name);
@@ -716,7 +768,7 @@ const SettingFieldCustom & BaseSettings<TTraits>::getCustomSetting(std::string_v
 {
     if constexpr (Traits::allow_custom_settings)
     {
-        auto it = custom_settings_map.find(name);
+        auto it = custom_settings_map.find(resolveCustomSettingName<TTraits>(name));
         if (it != custom_settings_map.end())
             return it->second;
     }
@@ -728,7 +780,7 @@ const SettingFieldCustom * BaseSettings<TTraits>::tryGetCustomSetting(std::strin
 {
     if constexpr (Traits::allow_custom_settings)
     {
-        auto it = custom_settings_map.find(name);
+        auto it = custom_settings_map.find(resolveCustomSettingName<TTraits>(name));
         if (it != custom_settings_map.end())
             return &it->second;
     }
@@ -893,23 +945,25 @@ void BaseSettings<TTraits>::SettingFieldRef::setValue(const Field & value)
 }
 
 template <typename TTraits>
-String BaseSettings<TTraits>::SettingFieldRef::getValueString() const
+String BaseSettings<TTraits>::SettingFieldRef::getValueString(bool show_secrets) const
 {
     if constexpr (Traits::allow_custom_settings)
     {
         if (custom_setting)
-            return (*custom_setting)->second.toString();
+            return (*custom_setting)->second.toString(show_secrets);
     }
     return accessor->getValueString(*settings, index);
 }
 
 template <typename TTraits>
-String BaseSettings<TTraits>::SettingFieldRef::getDefaultValueString() const
+String BaseSettings<TTraits>::SettingFieldRef::getDefaultValueString(bool show_secrets) const
 {
     if constexpr (Traits::allow_custom_settings)
     {
+        /// A custom setting has no default of its own, so this is its value, and its value can be an
+        /// AST that embeds a credential.
         if (custom_setting)
-            return (*custom_setting)->second.toString();
+            return (*custom_setting)->second.toString(show_secrets);
     }
     return accessor->getDefaultValueString(index);
 }

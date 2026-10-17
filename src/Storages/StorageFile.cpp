@@ -8,6 +8,9 @@
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/HivePartitioningUtils.h>
 
+#include <Access/ContextAccess.h>
+#include <Access/Common/AccessFlags.h>
+
 #include <Interpreters/Context.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Interpreters/evaluateConstantExpression.h>
@@ -159,7 +162,7 @@ void listFilesWithRegexpMatchingImpl(
             /// We use fs::canonical to resolve the canonical path and check if the file does exists
             /// but the result path will be fs::absolute.
             /// Otherwise it will not allow to work with symlinks in `user_files_path` directory.
-            fs::canonical(path_for_ls + for_match);
+            (void)fs::canonical(path_for_ls + for_match);
             fs::path absolute_path = fs::absolute(path_for_ls + for_match);
             absolute_path = absolute_path.lexically_normal(); /// ensure that the resulting path is normalized (e.g., removes any redundant slashes or . and .. segments)
             result.push_back(absolute_path.string());
@@ -260,6 +263,16 @@ std::string getTablePath(const std::string & table_dir_path, const std::string &
     return table_dir_path + "/data." + escapeForFileName(format_name);
 }
 
+/// Every syscall a path is passed to (`stat`, `open`, `opendir`) stops at the first NUL byte, while the
+/// containment checks see the whole value. A path with an embedded NUL therefore addresses a location the
+/// checks never look at, so it is rejected before the first filesystem probe. The path is not echoed in the
+/// message: it would put the NUL byte into the logs.
+void throwIfPathContainsEmbeddedNul(const std::string & path)
+{
+    if (path.contains('\0'))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "File path contains an embedded NUL byte");
+}
+
 /// Both db_dir_path and table_path must be converted to absolute paths (in particular, path cannot contain '..').
 void checkCreationIsAllowed(
     ContextPtr context_global,
@@ -267,6 +280,8 @@ void checkCreationIsAllowed(
     const std::string & table_path,
     bool can_be_directory)
 {
+    throwIfPathContainsEmbeddedNul(table_path);
+
     if (context_global->getApplicationType() != Context::ApplicationType::SERVER)
         return;
 
@@ -314,6 +329,10 @@ std::pair<String, String> splitToArchivePathAndPathInArchive(const String & sour
 /// Finds files matching a specified pattern with globs.
 Strings getPathsList(const String & path_with_globs, const String & user_files_path, const ContextPtr & context, size_t & total_bytes_to_read)
 {
+    /// The listing below stats the path and expands its globs on the filesystem before the matched paths
+    /// are checked for containment in `user_files_path`, so the path must be rejected here, not there.
+    throwIfPathContainsEmbeddedNul(path_with_globs);
+
     fs::path user_files_absolute_path = fs::weakly_canonical(user_files_path);
     fs::path fs_pattern(path_with_globs);
     if (fs_pattern.is_relative())
@@ -1325,6 +1344,10 @@ String StorageFileSource::FilesIterator::next()
         auto task = getContext()->getClusterFunctionReadTaskCallback()();
         if (!task || task->isEmpty())
             return {};
+
+        /// The read task may come from a client impersonating an initiator server, so validate the path.
+        checkCreationIsAllowed(getContext(), getContext()->getUserFilesPath(), task->path, /*can_be_directory=*/ true);
+
         return task->path;
     }
 
@@ -1801,6 +1824,13 @@ void StorageFile::read(
     size_t max_block_size,
     size_t num_streams)
 {
+    /// A storage carrying a renaming rule renames the files it read once its readers are destroyed
+    /// (`StorageFileSource::beforeDestroy`), so reading it needs `WRITE` on the source besides `READ`.
+    /// This context is the reading query's, not that of the query which built the storage.
+    if (!file_renamer.isEmpty())
+        context->getAccess()->checkAccessWithFilter(
+            AccessType::WRITE, toStringSource(AccessTypeObjects::Source::FILE), /* filter */ "");
+
     if (distributed_processing && context->getSettingsRef()[Setting::max_streams_for_files_processing_in_cluster_functions])
         num_streams = context->getSettingsRef()[Setting::max_streams_for_files_processing_in_cluster_functions];
 
@@ -2076,6 +2106,15 @@ public:
         /// In case of formats with prefixes if file is not empty we have already written prefix.
         bool do_not_write_prefix = naked_buffer->size();
         const auto & settings = getContext()->getSettingsRef();
+
+        /// The size is re-checked here, per sink: `StorageFile::write` checks it once at query
+        /// start, and not at all when writing through a file descriptor or a partitioned path.
+        if (do_not_write_prefix
+            && !FormatFactory::instance().checkIfFormatSupportAppend(format_name, getContext(), format_settings))
+            throw Exception(
+                ErrorCodes::CANNOT_APPEND_TO_FILE,
+                "Data cannot be appended to {} because the {} format doesn't support appends",
+                use_table_fd ? "the given file descriptor" : ("file " + path), format_name);
         write_buf = wrapWriteBufferWithCompressionMethod(
             std::move(naked_buffer),
             compression_method,

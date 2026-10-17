@@ -1,4 +1,5 @@
 import glob
+import io
 import json
 import logging
 import os
@@ -4985,6 +4986,12 @@ def test_insert_select_from_cluster_with_partition_pruning(started_cluster, allo
         settings={"allow_experimental_delta_kernel_rs": 1, "delta_lake_enable_engine_predicate": 0, "allow_experimental_analyzer" : allow_experimental_analyzer},
     )
 
+    # The cluster INSERT path runs the SELECT on a remote replica, which writes
+    # the part there and replicates via ZooKeeper. Wait for the local replica
+    # to fetch the part before reading; otherwise the count below races against
+    # background fetch and returns 0.
+    node.query(f"SYSTEM SYNC REPLICA {table_name}_dst")
+
     node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster'")
 
     result = int(
@@ -5043,6 +5050,11 @@ def test_insert_select_from_cluster_with_partition_pruning(started_cluster, allo
             "allow_experimental_analyzer": allow_experimental_analyzer,
         },
     )
+
+    # Same race as above: the matching file is processed by a remote replica,
+    # and the local replica fetches the resulting part asynchronously. Without
+    # SYSTEM SYNC REPLICA, the SELECT below can run before the part is active.
+    node.query(f"SYSTEM SYNC REPLICA {table_name2}_dst")
 
     result = int(
         node.query(
@@ -5175,3 +5187,105 @@ def test_delta_kernel_retry_on_stale_token_via_catalog_callback(started_cluster)
         f"Expected the catalog-callback retry log line to fire for query {retry_query_id}, "
         f"found {retry_hits} hits — the stale-token retry path was not exercised."
     )
+
+
+@pytest.mark.parametrize(
+    "use_delta_kernel",
+    ["0", "1"],
+)
+def test_azure_url_encoded_partition_path(started_cluster, use_delta_kernel):
+    instance = get_node(started_cluster, use_delta_kernel)
+    TABLE_NAME = randomize_table_name("test_azure_url_encoded")
+
+    container_client = started_cluster.blob_service_client.get_container_client(
+        started_cluster.azure_container_name
+    )
+
+    # Upload the parquet file at the on-disk (decoded-once) blob path.
+    # Partition value "@INTERNAL@" → directory "org=%40INTERNAL%40" (@ → %40).
+    partition_dir = "org=%40INTERNAL%40"
+    parquet_blob = f"{TABLE_NAME}/{partition_dir}/part-0.parquet"
+
+    schema = pa.schema([
+        pa.field("id", pa.int32()),
+        pa.field("org", pa.string()),
+    ])
+    table_data = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int32()),
+            "org": pa.array(["@INTERNAL@"] * 3, type=pa.string()),
+        },
+        schema=schema,
+    )
+    buf = io.BytesIO()
+    pq.write_table(table_data, buf, compression=None)
+    parquet_bytes = buf.getvalue()
+    container_client.upload_blob(parquet_blob, parquet_bytes, overwrite=True)
+
+    # Build the Delta log manually. add.path is URI-encoded per the Delta protocol:
+    # '%' in the on-disk name (%40) is encoded to '%25', producing %2540.
+    add_path = "org=%2540INTERNAL%2540/part-0.parquet"
+
+    protocol = '{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}'
+    metadata = json.dumps(
+        {
+            "metaData": {
+                "id": str(uuid.uuid4()),
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": json.dumps(
+                    {
+                        "type": "struct",
+                        "fields": [
+                            {
+                                "name": "id",
+                                "type": "integer",
+                                "nullable": True,
+                                "metadata": {},
+                            },
+                            {
+                                "name": "org",
+                                "type": "string",
+                                "nullable": True,
+                                "metadata": {},
+                            },
+                        ],
+                    }
+                ),
+                "partitionColumns": ["org"],
+                "configuration": {},
+                "createdTime": 1600000000000,
+            }
+        }
+    )
+    add = json.dumps(
+        {
+            "add": {
+                "path": add_path,
+                "partitionValues": {"org": "@INTERNAL@"},
+                "size": len(parquet_bytes),
+                "modificationTime": 1600000000000,
+                "dataChange": True,
+                "stats": json.dumps({"numRecords": 3}),
+            }
+        }
+    )
+
+    log_content = "\n".join([protocol, metadata, add])
+    container_client.upload_blob(
+        f"{TABLE_NAME}/_delta_log/00000000000000000000.json",
+        log_content.encode(),
+        overwrite=True,
+    )
+
+    connection_string = started_cluster.env_variables["AZURITE_CONNECTION_STRING"]
+    instance.query(
+        f"""
+        DROP TABLE IF EXISTS {TABLE_NAME};
+        CREATE TABLE {TABLE_NAME}
+        ENGINE = DeltaLakeAzure('{connection_string}', '{started_cluster.azure_container_name}', '{TABLE_NAME}', Parquet)
+        """
+    )
+
+    assert int(instance.query(f"SELECT count() FROM {TABLE_NAME}")) == 3
+
+    instance.query(f"DROP TABLE IF EXISTS {TABLE_NAME}")

@@ -3,6 +3,7 @@
 #include <Columns/ColumnObject.h>
 #include <Core/MergeTreeSerializationEnums.h>
 #include <DataTypes/Serializations/SerializationObjectSharedData.h>
+#include <Common/VectorWithMemoryTracking.h>
 #include <Common/re2.h>
 
 #include <list>
@@ -59,6 +60,8 @@ public:
         Value value;
 
         static void checkVersion(UInt64 version);
+        /// Each version is written into one channel only, so reading data of the other channel means the data is corrupted.
+        static void checkVersion(UInt64 version, bool native_format);
 
         explicit SerializationVersion(UInt64 version);
         explicit SerializationVersion(MergeTreeObjectSerializationVersion version);
@@ -121,6 +124,8 @@ public:
     const SerializationPtr & getDynamicPathSerialization() const { return dynamic_serialization; }
     const std::unordered_map<String, SerializationPtr> & getTypedPathsSerializations() const { return typed_paths_serializations; }
 
+    static void updateMaxDynamicPathsLimitIfNeeded(IColumn & column, const FormatSettings & format_settings);
+
 private:
     friend SerializationObjectDynamicPath;
     friend SerializationSubObject;
@@ -138,7 +143,7 @@ private:
         ColumnObject::StatisticsPtr statistics;
 
         /// For flattened serialization only.
-        std::vector<String> flattened_paths;
+        VectorWithMemoryTracking<String> flattened_paths;
 
         explicit DeserializeBinaryBulkStateObjectStructure(UInt64 serialization_version_)
             : serialization_version(serialization_version_)
@@ -170,8 +175,6 @@ private:
 protected:
     bool shouldSkipPath(const String & path) const;
 
-    void updateMaxDynamicPathsLimitIfNeeded(IColumn & column, const FormatSettings & format_settings) const;
-
     std::unordered_map<String, DataTypePtr> typed_paths_types;
     std::unordered_map<String, SerializationPtr> typed_paths_serializations;
     std::unordered_set<String> paths_to_skip;
@@ -181,6 +184,8 @@ protected:
     SerializationPtr dynamic_serialization;
 
 private:
+    void checkPathIsNotTyped(const String & path, bool native_format) const;
+
     std::vector<String> sorted_typed_paths;
 };
 
