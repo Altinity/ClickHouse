@@ -134,6 +134,14 @@ battery, skipping the battery used to skip it too, which is exactly why the thir
   committed, so retries on the conditional path must be explicit CAS state-machine transitions, not
   transparent client behavior.
 
+Blob publication is unconditional and does not use that profile, but its object-creating request
+(`PutObject`, `CopyObject`, `CompleteMultipartUpload`) is also sent once. On a store with
+content-derived ETags, a resent body that lands after GC deleted its incarnation brings that ETag
+back, and the pending exact-ETag delete then removes a live body. The request runs on a clone of the
+disk client with the disk's `request_timeout_ms`, no adaptive first-attempt timeouts, and the connect
+timeout capped as for the control plane. `CreateMultipartUpload`, `UploadPart` and `UploadPartCopy`
+keep the disk client's retries.
+
 A third staging check requires `supportsCopyMode(ObjectStorageCopyMode::NativeOnly)` when
 `cas_staging_backend = s3`. Writable mount fails closed when native same-store copy is unavailable; it
 does not silently fall back to local staging. Ordinary non-CAS `copyObject` fallback behavior is
