@@ -476,16 +476,20 @@ std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(CasOperation & op, 
 /// A read-only snapshot of one server's mount slot, for introspection (`system.cas_mounts`).
 /// state: `live` (lease within TTL+skew), `expired` (lease ran out; the next GC round's heartbeat floor
 /// will fence it), `terminated` (clean farewell: `min_active_build_sequence == UINT64_MAX`), `fenced` (`gc_fenced`),
+/// `retired` (terminated or fenced, owner tombstoned; one more `GET` per terminated or fenced row),
 /// `corrupt` (body failed to decode — surfaced as a row, never an exception).
 struct MountInfo
 {
     String srid;
     MountLease lease;
     String state;
+    /// For a `retired` row: whether a decommission verified the retirement. A rerun is for an unverified one only.
+    bool retirement_verified = false;
 };
 
 /// Enumerate every mount slot under `gc/server-roots/`, decoded and classified — the read-only sibling
-/// of `computeHeartbeatFloor`: ZERO writes (no fence-out), per-row fail-open. One LIST + one GET per slot.
+/// of `computeHeartbeatFloor`: ZERO writes (no fence-out); an undecodable mount body, or an undecodable owner of a
+/// terminal row, is a `corrupt` row. One LIST, one GET per slot, and one more per terminated or fenced slot.
 std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint64_t now_ms, uint64_t skew_margin_ms);
 
 /// Whether the mounted writer identified by `(server_root_id, writer_epoch)` (the two fields of a

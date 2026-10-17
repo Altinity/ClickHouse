@@ -1303,6 +1303,27 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
             info.state = "live";
         else
             info.state = "expired";
+        /// A decommission keeps the slot; the owner says whether the member behind a terminal row is retired, and
+        /// whether that retirement is verified: a rerun is for an unverified one only.
+        if (info.state == "terminated" || info.state == "fenced")
+        {
+            if (const auto owner_got = op.read(layout.ownerKey(info.srid), Retry::standard()))
+            {
+                try
+                {
+                    const OwnerObject owner = decodeOwner(owner_got->bytes);
+                    if (owner.retired_at_ms)
+                    {
+                        info.state = "retired";
+                        info.retirement_verified = owner.retirement_verified;
+                    }
+                }
+                catch (...)
+                {
+                    info.state = "corrupt";
+                }
+            }
+        }
         out.push_back(std::move(info));
         return true;
     }, Retry::standard());

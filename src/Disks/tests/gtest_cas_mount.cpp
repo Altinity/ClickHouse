@@ -3711,3 +3711,49 @@ TEST(CASMount, ClaimPathsReclaimAForeignTerminalBodyOfTheirOwnOwner)
 
 /// A terminal row reads its owner: a tombstone makes it `retired`, and the row carries whether the retirement is
 /// verified. A live row never reads its owner (its owner here is undecodable).
+TEST(CASListMounts, TerminalSlotOfATombstonedOwnerIsRetired)
+{
+    const auto state_of = [](Ops & ops, const Layout & l, const String & srid) -> String
+    {
+        for (const MountInfo & m : listMounts(ops.op, l, /*now_ms=*/0, /*skew_margin_ms=*/0))
+            if (m.srid == srid)
+                return m.state + (m.retirement_verified ? "+verified" : "");
+        return "absent";
+    };
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    { auto first = Pool::open(b, rootConfig()); }
+    EXPECT_EQ(state_of(ops, l, "r"), "terminated");
+    DB::Cas::tests::tombstoneOwnerForTest(*b, l.ownerKey("r"));
+    EXPECT_EQ(state_of(ops, l, "r"), "retired") << "an unverified tombstone";
+    DB::Cas::tests::tombstoneOwnerForTest(*b, l.ownerKey("r"), /*verified=*/true);
+    EXPECT_EQ(state_of(ops, l, "r"), "retired+verified");
+    DB::Cas::tests::fenceOutMountForTest(*b, l.mountKey("r"));
+    EXPECT_EQ(state_of(ops, l, "r"), "retired+verified") << "a fenced slot of a retired owner";
+    rewriteOwnerAt(*b, l, "r", UInt128(2));
+    EXPECT_EQ(state_of(ops, l, "r"), "fenced") << "a rejoined owner";
+
+    mustCommit(ops.op.create(l.ownerKey("x"), "garbage-not-a-proto", Retry::standard()), "undecodable owner of x");
+    mustCommit(ops.op.create(l.mountKey("x"), encodeMountLease(liveBody(UInt128(1), 4)), Retry::standard()), "live slot of x");
+    EXPECT_EQ(state_of(ops, l, "x"), "live") << "a non-terminal row keeps its lease state and never reads its owner";
+}
+
+TEST(CASListMounts, TerminalSlotWithAnUndecodableOwnerIsCorrupt)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    { auto first = Pool::open(b, rootConfig()); }
+    DB::Cas::tests::OperationForTest op(*b);
+    const auto current = (*op).read(l.ownerKey("r"), Retry::once());
+    ASSERT_TRUE(current.has_value());
+    ASSERT_TRUE(std::holds_alternative<Committed>((*op).replace(l.ownerKey("r"), "garbage-not-a-proto", current->etag, Retry::once())));
+    mustCommit(ops.op.create(l.mountKey("other"), encodeMountLease(liveBody(UInt128(1), 4)), Retry::standard()), "live slot of other");
+    std::map<String, String> by_srid;
+    for (const MountInfo & m : listMounts(ops.op, l, /*now_ms=*/0, /*skew_margin_ms=*/0))
+        by_srid[m.srid] = m.state;
+    EXPECT_EQ(by_srid.size(), 2u);
+    EXPECT_EQ(by_srid["r"], "corrupt");
+    EXPECT_EQ(by_srid["other"], "live");
+}

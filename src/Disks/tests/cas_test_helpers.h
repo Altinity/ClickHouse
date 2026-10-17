@@ -2375,14 +2375,16 @@ inline void fenceOutMountForTest(DB::Cas::Backend & backend, const String & moun
     ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
 }
 
-/// A decommission tombstone by hand: the next owner life, retired, keeping a verified mark of a retired owner.
-inline void tombstoneOwnerForTest(DB::Cas::Backend & backend, const String & owner_key)
+/// A decommission tombstone by hand: the next owner life, retired, keeping a verified mark of a retired owner;
+/// `verified` also marks it, as a completed run does.
+inline void tombstoneOwnerForTest(DB::Cas::Backend & backend, const String & owner_key, bool verified = false)
 {
     OperationForTest op(backend);
     const auto current = (*op).read(owner_key, DB::Cas::Retry::once());
     ASSERT_TRUE(current.has_value());
     const DB::Cas::OwnerObject owner = DB::Cas::decodeOwner(current->bytes);
-    const DB::Cas::OwnerObject tombstone = DB::Cas::nextOwnerLife(owner, 1, owner.retirement_verified && owner.retired_at_ms.has_value());
+    const DB::Cas::OwnerObject tombstone = DB::Cas::nextOwnerLife(
+        owner, 1, verified || (owner.retirement_verified && owner.retired_at_ms.has_value()));
     const auto put = (*op).replace(owner_key, DB::Cas::encodeOwner(tombstone), current->etag, DB::Cas::Retry::once());
     ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
 }

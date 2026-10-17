@@ -124,6 +124,17 @@ def _assert_retired_or_racing_stop(report, report_tsv):
         assert report["warnings"].replace("\\'", "'") == FAREWELL_SKIPPED_BY_A_RACING_STOP, report_tsv
 
 
+def _srid2_retirement(node1):
+    return tuple(
+        node1.query(
+            "SELECT state, retirement_verified FROM system.cas_mounts "
+            "WHERE server_root_id = '{}' AND disk = '{}'".format(SRID2, CA_DISK)
+        )
+        .strip()
+        .split("\t")
+    )
+
+
 def test_drop_dead_pool_member_heals_the_pool():
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
@@ -254,14 +265,15 @@ def test_drop_dead_pool_member_heals_the_pool():
     assert int(node1.query("SELECT count() FROM t1")) == n1_count
     assert int(node1.query("SELECT sum(id) FROM t1")) == n1_sum
 
-    # (8) node2's mount slot stays, as `terminated`: the decommission keeps the control objects.
+    # (8) node2's mount slot stays and reads as `retired`: the decommission keeps
+    # the control objects and tombstones the owner.
     assert (
         node1.query(
             "SELECT state FROM system.cas_mounts WHERE server_root_id = '{}' AND disk = '{}'".format(
                 SRID2, CA_DISK
             )
         ).strip()
-        == "terminated"
+        == "retired"
     )
 
     # (9) Drive GC (node1's background GC is already running against the shared pool) to reclaim
