@@ -133,6 +133,7 @@ StorageObjectStorage::StorageObjectStorage(
     , storage_id(table_id_)
 {
     configuration->initPartitionStrategy(partition_by_, columns_in_table_or_function_definition, context);
+    configuration->check(context);
     const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->format == "auto");
     const bool need_resolve_sample_path = context->getSettingsRef()[Setting::use_hive_partitioning]
         && !configuration->partition_strategy
@@ -205,8 +206,6 @@ StorageObjectStorage::StorageObjectStorage(
         resolveSchemaAndFormat(columns, configuration->format, object_storage, configuration, format_settings, sample_path, context);
     else
         validateSupportedColumns(columns, *configuration);
-
-    configuration->check(context);
 
     /// Resolving the sample path requires listing the object storage. Defer it to the first use
     /// of the table, so that CREATE, ATTACH and server startup do not depend on the endpoint.
@@ -360,7 +359,7 @@ IStorage::ColumnSizeByName StorageObjectStorage::getColumnSizes() const
     return getInMemoryMetadataPtr()->getFakeColumnSizes();
 }
 
-IDataLakeMetadata * StorageObjectStorage::getExternalMetadata(ContextPtr query_context)
+std::shared_ptr<IDataLakeMetadata> StorageObjectStorage::getExternalMetadata(ContextPtr query_context)
 {
     if (!configuration->isDataLakeConfiguration())
     return nullptr;
@@ -602,7 +601,7 @@ void StorageObjectStorage::read(
         if (auto start_version = settings[Setting::delta_lake_snapshot_start_version].value;
             start_version != DeltaLake::TableSnapshot::LATEST_SNAPSHOT_VERSION)
         {
-            if (const auto * delta_kernel_metadata = dynamic_cast<const DeltaLakeMetadataDeltaKernel *>(configuration->getExternalMetadata());
+            if (const auto delta_kernel_metadata = std::dynamic_pointer_cast<const DeltaLakeMetadataDeltaKernel>(configuration->getExternalMetadata());
                 delta_kernel_metadata != nullptr)
             {
                 auto source_header = storage_snapshot->getSampleBlockForColumns(column_names);
@@ -928,7 +927,7 @@ void StorageObjectStorage::checkMutationIsPossible(const MutationCommands & comm
 
 Pipe StorageObjectStorage::executeCommand(const String & command_name, const ASTPtr & args, ContextPtr context)
 {
-    auto * metadata = getExternalMetadata(context);
+    auto metadata = getExternalMetadata(context);
     if (!metadata)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXECUTE command '{}' is not supported by this storage", command_name);
     return metadata->executeCommand(command_name, args, object_storage, configuration, catalog, context, storage_id);

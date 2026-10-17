@@ -10,6 +10,7 @@
 #include <Compression/CompressedReadBuffer.h>
 #include <Compression/CompressedWriteBuffer.h>
 #include <Compression/CompressionFactory.h>
+#include <Core/Block.h>
 #include <Core/ProtocolDefines.h>
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
@@ -24,6 +25,7 @@
 #include <IO/WriteHelpers.h>
 #include <Interpreters/AsynchronousInsertQueue.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Storages/StorageProxy.h>
 #include <Interpreters/InternalTextLogsQueue.h>
 #include <Interpreters/Session.h>
 #include <Interpreters/Squashing.h>
@@ -48,6 +50,7 @@
 #include <Common/Exception.h>
 #include <Common/NetException.h>
 #include <Common/OpenSSLHelpers.h>
+#include <Common/quoteString.h>
 #include <Common/Stopwatch.h>
 #include <Common/VersionNumber.h>
 #include <Common/logger_useful.h>
@@ -127,6 +130,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 tcp_close_connection_after_queries_num;
     extern const ServerSettingsUInt64 tcp_close_connection_after_queries_seconds;
     extern const ServerSettingsUInt64 handshake_timeout_milliseconds;
+    extern const ServerSettingsBool interserver_tables_status_allow_unauthenticated;
 }
 
 namespace FailPoints
@@ -1104,7 +1108,15 @@ bool TCPHandler::receivePacketsExpectQuery(std::shared_ptr<QueryState> & state)
 
         case Protocol::Client::Data:
         case Protocol::Client::Scalar:
-            processUnexpectedData();
+            /// The payload is deliberately left unread: nothing consumes it here (the connection
+            /// closes with no reply), and in interserver mode the connection is not authenticated
+            /// until the Query packet, so reading it would deserialize a peer-chosen type.
+            ///
+            /// Name that case for what it is: an unauthenticated peer, so that `runImpl` answers it
+            /// the way it answers every other interserver authentication failure.
+            if (is_interserver_mode && !is_interserver_authenticated)
+                throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
+                    "Unexpected data packet received before interserver authentication");
             throw Exception(ErrorCodes::UNEXPECTED_PACKET_FROM_CLIENT, "Unexpected packet Data received from client");
 
         case Protocol::Client::Ping:
@@ -1521,8 +1533,22 @@ void TCPHandler::processTablesStatusRequest()
     request.read(*in, client_tcp_protocol_version);
 
     ContextPtr context_to_resolve_table_names;
+    /// An interserver connection is not authenticated until its first `Query`, but this request arrives
+    /// before it. Until then, report every table as present, not replicated and writable, so that nothing
+    /// is disclosed and the initiator still proceeds to the `Query`.
+    bool hide_table_status = false;
     if (is_interserver_mode)
     {
+        if (!is_interserver_authenticated
+            && !server.context()->getServerSettings()[ServerSetting::interserver_tables_status_allow_unauthenticated])
+        {
+            LOG_DEBUG(LogFrequencyLimiter(log, 10),
+                "Answering an unauthenticated interserver TablesStatusRequest without the table status. "
+                "Replica staleness, readonly state and table existence are not taken into account until "
+                "a query on this connection has authenticated with the cluster secret.");
+            hide_table_status = true;
+        }
+
         /// In the interserver mode session context does not exist, because authentication is done for each query.
         /// We also cannot create query context earlier, because it cannot be created before authentication,
         /// but query is not received yet. So we have to do this trick.
@@ -1540,13 +1566,20 @@ void TCPHandler::processTablesStatusRequest()
     TablesStatusResponse response;
     for (const QualifiedTableName & table_name: request.tables)
     {
+        if (hide_table_status)
+        {
+            response.table_states_by_id.emplace(table_name, TableStatus{});
+            continue;
+        }
+
         auto resolved_id = context_to_resolve_table_names->tryResolveStorageID({table_name.database, table_name.table});
         StoragePtr table = DatabaseCatalog::instance().tryGetTable(resolved_id, context_to_resolve_table_names);
         if (!table)
             continue;
 
         TableStatus status;
-        if (auto * replicated_table = dynamic_cast<StorageReplicatedMergeTree *>(table.get()))
+        /// The initiator asks about this table by name, so a lazily loaded replica is loaded to report its delay.
+        if (auto * replicated_table = castStorage<StorageReplicatedMergeTree>(table, DeferredTable::Load).get())
         {
             status.is_replicated = true;
             status.absolute_delay = static_cast<UInt32>(replicated_table->getAbsoluteDelay());
@@ -1747,7 +1780,10 @@ bool TCPHandler::receiveProxyHeader()
     /// Only PROXYv1 is supported.
     /// Validation of protocol is not fully performed.
 
-    LimitReadBuffer limit_in(*in, {.read_no_more=107, .expect_eof=true}); /// Maximum length from the specs.
+    /// No `expect_eof`: except for the `UNKNOWN` health check below, the client sends its handshake
+    /// right after the header, so the connection does not end at the limit. An over-long header is
+    /// rejected anyway, by carrying no `\r\n` within these 107 bytes.
+    LimitReadBuffer limit_in(*in, {.read_no_more=107}); /// Maximum length from the specs.
 
     assertString("PROXY ", limit_in);
 
@@ -1871,6 +1907,16 @@ std::unique_ptr<Session> TCPHandler::makeSession()
 /// Applied before authentication to prevent unauthenticated clients
 /// from consuming excessive memory. See #52501.
 static constexpr size_t MAX_HELLO_STRING_SIZE = 64 * 1024;
+
+/** The externally granted roles are a serialized list of role names. Both the size of the list and
+  * the number of names in it come from the peer, and in interserver mode they are read before the
+  * secret hash of the query is checked, so bound them.
+  */
+static constexpr size_t MAX_EXTRA_ROLES_SIZE = 1024 * 1024;
+/// Only read on the interserver path, which is compiled out without SSL.
+[[maybe_unused]] static constexpr size_t MAX_EXTRA_ROLES = 65536;
+/// A role name is an identifier, and it is resized to its declared size before its value arrives.
+[[maybe_unused]] static constexpr size_t MAX_EXTRA_ROLE_NAME_SIZE = 64 * 1024;
 
 void TCPHandler::receiveHello()
 {
@@ -2246,7 +2292,7 @@ void TCPHandler::processQuery(std::shared_ptr<QueryState> & state)
     // TODO: check if having `is_interserver_mode` doesn't break interoperability with the CH-client.
     if (client_tcp_protocol_version >= DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES)
     {
-        readStringBinary(received_extra_roles, *in);
+        readStringBinary(received_extra_roles, *in, MAX_EXTRA_ROLES_SIZE);
     }
 
     /// Interserver secret.
@@ -2342,7 +2388,7 @@ void TCPHandler::processQuery(std::shared_ptr<QueryState> & state)
             {
                 ReadBufferFromString buffer(received_extra_roles);
 
-                readVectorBinary(external_roles, buffer);
+                readVectorBinary(external_roles, buffer, MAX_EXTRA_ROLES, MAX_EXTRA_ROLE_NAME_SIZE);
                 LOG_DEBUG(log, "Parsed extra roles [{}]", fmt::join(external_roles, ", "));
             }
 
@@ -2469,7 +2515,7 @@ void TCPHandler::processUnexpectedQuery()
     UInt64 skip_uint_64;
     String skip_string;
 
-    readStringBinary(skip_string, *in);
+    readStringBinary(skip_string, *in, MAX_HELLO_STRING_SIZE);
 
     ClientInfo skip_client_info;
     if (client_tcp_protocol_version >= DBMS_MIN_REVISION_WITH_CLIENT_INFO)
@@ -2479,6 +2525,10 @@ void TCPHandler::processUnexpectedQuery()
     auto settings_format = (client_tcp_protocol_version >= DBMS_MIN_REVISION_WITH_SETTINGS_SERIALIZED_AS_STRINGS) ? SettingsWriteFormat::STRINGS_WITH_FLAGS
                                                                                                       : SettingsWriteFormat::BINARY;
     skip_settings.read(*in, settings_format);
+
+    /// The same layout as in `processQuery`: the externally granted roles precede the interserver hash.
+    if (client_tcp_protocol_version >= DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES)
+        readStringBinary(skip_string, *in, MAX_EXTRA_ROLES_SIZE);
 
     std::string skip_hash;
     bool interserver_secret = client_tcp_protocol_version >= DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET;
@@ -2551,6 +2601,22 @@ bool TCPHandler::processData(QueryState & state, bool scalar)
             state.query_context->addExternalTable(temporary_id.table_name, std::move(temporary_table));
         }
         auto metadata_snapshot = storage->getInMemoryMetadataPtr();
+
+        /// The block is self-describing and comes from the client, while the schema of an external table
+        /// is bound once, by its first block (see the branch above). Every block after that one must match
+        /// that schema: the columns are written to the table as a `Chunk`, which carries no types at all,
+        /// and `MemorySink::consume` labels them with the table header again. A block declaring other
+        /// types would therefore not be rejected anywhere, and its data would later be read as the type
+        /// the header names - a type confusion on data the client controls, not a data error.
+        if (resolved && !isCompatibleHeader(block, metadata_snapshot->getSampleBlock()))
+            throw Exception(
+                ErrorCodes::INCORRECT_DATA,
+                "Structure of the block for external table {} does not match the structure of the table. "
+                "Received:\n{}\nExpected:\n{}",
+                backQuoteIfNeed(temporary_id.table_name),
+                block.dumpStructure(),
+                metadata_snapshot->getSampleBlock().dumpStructure());
+
         /// The data will be written directly to the table.
         QueryPipeline temporary_table_out(storage->write(ASTPtr(), metadata_snapshot, state.query_context, /*async_insert=*/false));
         PushingPipelineExecutor executor(temporary_table_out);
