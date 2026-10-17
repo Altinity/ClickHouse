@@ -631,9 +631,6 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     const uint64_t owner_life = claimOwnerOrThrow(owner_op, store->pool_layout, srid, our_uuid, observe_catalog, retired_policy);
     store->recorded_owner_life = owner_life;
 
-    /// Wall-clock `now_ms`, hoisted above the writer_epoch allocation below: the absent-epoch
-    /// branch's `DecommissionRecovery` policy needs it to judge a surviving mount's liveness before
-    /// the mount-lease claim (step 4) gets its own use of the same clock.
     const auto now_ms = []() -> uint64_t
     {
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -647,16 +644,9 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// Mutable: a GC fence of our fresh lease during open (expiry mid-open racing a GC round) is
     /// recoverable — a fence costs an epoch, so the fence-recovery loop below re-allocates a fresh
     /// writer_epoch and re-claims (the TLA+-checked `NoPermanentWedge` invariant).
-    /// `epoch_policy`: `openForDecommission`'s `NoWait` gates the absent-epoch branch's mount-probe
-    /// on a TERMINAL (not live) surviving mount instead of authoritative absence (Phase C) — passed
-    /// uniformly to every call below, including the fence-recovery re-allocations, where it is inert
-    /// because those run with the epoch object already present.
-    const EpochMintPolicy epoch_policy = (policy == MountClaimPolicy::NoWait)
-        ? EpochMintPolicy::DecommissionRecovery
-        : EpochMintPolicy::NormalMount;
     CasOperation epoch_op = store->gc_requests.admit();
     uint64_t writer_epoch = allocateWriterEpoch(
-        epoch_op, store->pool_layout, srid, epoch_policy, now_ms(), observe_catalog);
+        epoch_op, store->pool_layout, srid, observe_catalog);
     store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
 
     /// 4. Mount lease — LIVENESS. Decide over the current mount object using the wall-clock `now_ms`
@@ -773,7 +763,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                     srid, max_fence_recoveries);
             CasOperation reallocate_op = store->gc_requests.admit();
             writer_epoch = allocateWriterEpoch(
-                reallocate_op, store->pool_layout, srid, epoch_policy, now_ms(), observe_catalog);
+                reallocate_op, store->pool_layout, srid, observe_catalog);
             store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
             continue;
         }
@@ -827,7 +817,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             store->mount_runtime.renewerReset();
             CasOperation refenced_epoch_op = store->gc_requests.admit();
             writer_epoch = allocateWriterEpoch(
-                refenced_epoch_op, store->pool_layout, srid, epoch_policy, now_ms(), observe_catalog);
+                refenced_epoch_op, store->pool_layout, srid, observe_catalog);
             store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
             continue;
         }
@@ -1492,7 +1482,7 @@ bool Pool::tryRemountOnce()
         step = "writer_epoch_allocate";
         CasOperation epoch_op = gc_requests.admit();
         const uint64_t writer_epoch = allocateWriterEpoch(
-            epoch_op, pool_layout, srid, EpochMintPolicy::NormalMount, 0, observe_catalog);
+            epoch_op, pool_layout, srid, observe_catalog);
         result_writer_epoch = writer_epoch;
 
         /// Mount-slot writer audit: `this` is already fully open (setEventSink ran long ago), so

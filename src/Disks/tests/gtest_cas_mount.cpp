@@ -745,8 +745,8 @@ TEST(CASServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
     Layout l("r");
     Ops ops(b);
     claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation());
-    const uint64_t e1 = allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
-    const uint64_t e2 = allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+    const uint64_t e1 = allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation());
+    const uint64_t e2 = allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation());
     EXPECT_GE(e1, 1u);                                             // 0 is a reserved sentinel
     EXPECT_GT(e2, e1);                                             // strictly increasing
 
@@ -754,7 +754,7 @@ TEST(CASServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
     /// so the removal is a no-op that touches nothing.
     ASSERT_FALSE(ops.op.head(l.mountKey("r"), Retry::standard()).has_value());
     EXPECT_EQ(ops.op.removeCurrent(l.mountKey("r"), Retry::standard()), Removal::Gone);
-    EXPECT_GT(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), e2);
+    EXPECT_GT(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()), e2);
 }
 
 /// Our counter write is lost while a twin of the same uuid allocates the same next epoch. Its counter
@@ -770,15 +770,15 @@ TEST(CASServerRootEpoch, TwinAllocatorsNeverShareAnEpochAfterALostWrite)
         Ops twin(b);
         b->key = l.epochKey("r");
         if (counter_exists)
-            ASSERT_EQ(allocateWriterEpoch(ours.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+            ASSERT_EQ(allocateWriterEpoch(ours.op, l, "r", emptyCatalogObservation()), 1u);
 
         uint64_t twin_epoch = 0;
         b->competitor = [&]
         {
-            twin_epoch = allocateWriterEpoch(twin.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+            twin_epoch = allocateWriterEpoch(twin.op, l, "r", emptyCatalogObservation());
         };
         const uint64_t our_epoch
-            = allocateWriterEpoch(ours.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+            = allocateWriterEpoch(ours.op, l, "r", emptyCatalogObservation());
         ASSERT_FALSE(b->competitor) << "the twin never ran";
         ASSERT_NE(twin_epoch, 0u);
         EXPECT_NE(our_epoch, twin_epoch);
@@ -795,10 +795,10 @@ TEST(CASServerRootEpoch, LandedCounterWriteWithLostResponseIsOurs)
     Layout l("p");
     Ops ops(b);
     b->key = l.epochKey("r");
-    ASSERT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+    ASSERT_EQ(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()), 1u);
 
     b->armed = true;
-    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 2u);
+    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()), 2u);
     ASSERT_FALSE(b->armed) << "the lost response was never injected";
     EXPECT_EQ(decodeServerEpoch(ops.op.read(l.epochKey("r"), Retry::standard())->bytes).next_writer_epoch, 3u);
 }
@@ -815,12 +815,12 @@ TEST(CASServerRootEpoch, ReissuedCounterWriteKeepsItsNonce)
         Ops ops(b);
         b->key = l.epochKey("r");
         if (counter_exists)
-            ASSERT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+            ASSERT_EQ(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()), 1u);
 
         b->writes.clear();
         b->lose_first = true;
         const uint64_t expected_epoch = counter_exists ? 2 : 1;
-        EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()),
+        EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()),
                   expected_epoch);
         ASSERT_FALSE(b->lose_first) << "the lost write was never injected";
         ASSERT_GE(b->writes.size(), 2u) << "the unclear write was never reissued";
@@ -843,7 +843,7 @@ TEST(CASServerRootEpoch, EveryAllocationWritesAFreshNonce)
     std::vector<UInt128> nonces;
     for (int i = 0; i < 2; ++i)
     {
-        (void)allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+        (void)allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation());
         const std::optional<UInt128> nonce
             = decodeServerEpoch(ops.op.read(l.epochKey("r"), Retry::standard())->bytes).allocation_nonce;
         ASSERT_TRUE(nonce.has_value());
@@ -865,7 +865,7 @@ TEST(CASServerRootEpoch, ZeroCounterFailsAllocationWithoutWriting)
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        (void)allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+        (void)allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation());
     });
     EXPECT_EQ(ops.op.read(l.epochKey("r"), Retry::standard())->bytes, before->bytes);
 }
@@ -882,7 +882,7 @@ TEST(CASMount, EpochRemintOverExistingMountRefuses)
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/1, /*now_ms=*/1000, /*ttl_ms=*/30000).kind,
               MountClaimResult::Claimed);
     /// The epoch object is ABSENT (never created in this sequence) while the mount exists:
-    EXPECT_THROW(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);   /// CORRUPTED_DATA
+    EXPECT_THROW(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()), DB::Exception);   /// CORRUPTED_DATA
 }
 
 TEST(CASMount, EpochRemintAuthoritativeAbsenceMints)
@@ -891,8 +891,8 @@ TEST(CASMount, EpochRemintAuthoritativeAbsenceMints)
     Layout l("p");
     Ops ops(b);
     claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation());
-    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);   /// fresh root: both control objects absent
-    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 2u);   /// epoch present now: normal conditional bump, no probe
+    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()), 1u);   /// fresh root: both control objects absent
+    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()), 2u);   /// epoch present now: normal conditional bump, no probe
 }
 
 /// The probe outcome gates the mint: anything short of authoritative KeyAbsent fails closed.
@@ -910,35 +910,7 @@ TEST(CASMount, EpochRemintIndeterminateProbeFailsClosed)
     Layout l("p");
     Ops ops(b);
     claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation());
-    EXPECT_THROW(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);
-}
-
-/// Decommission over a TERMINAL (expired/fenced) mount with a lost epoch object proceeds and mints
-/// an epoch DISTINCT from the surviving mount's — the same-pair state is unrepresentable.
-TEST(CASMount, DecommissionRemintOverTerminalMountMintsDistinctEpoch)
-{
-    auto b = std::make_shared<InMemoryBackend>();
-    Layout l("p");
-    Ops ops(b);
-    claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation());
-    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/3, /*now_ms=*/1000, /*ttl_ms=*/100).kind,
-              MountClaimResult::Claimed);
-    /// now_ms=5000: the ttl_ms=100 lease above is long expired -> terminal.
-    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::DecommissionRecovery, /*now_ms=*/5000, emptyCatalogObservation()), 4u);
-}
-
-/// Decommission over a LIVE mount with a lost epoch refuses — the blind bypass would recreate the
-/// forbidden pair (codex round-3 finding 1) and defeat CASDecommission.RefusesLiveMember.
-TEST(CASMount, DecommissionRemintOverLiveMountRefuses)
-{
-    auto b = std::make_shared<InMemoryBackend>();
-    Layout l("p");
-    Ops ops(b);
-    claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation());
-    ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), /*our_epoch=*/1, /*now_ms=*/1000, /*ttl_ms=*/30000).kind,
-              MountClaimResult::Claimed);
-    EXPECT_THROW(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::DecommissionRecovery, /*now_ms=*/2000, emptyCatalogObservation()),
-                 DB::Exception);   /// ABORTED: live member
+    EXPECT_THROW(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()), DB::Exception);
 }
 
 /// The steady-state path (epoch object PRESENT) must never pay the probe — pins the zero
@@ -959,9 +931,9 @@ TEST(CASMount, EpochBumpWithPresentEpochIssuesNoProbe)
     Layout l("p");
     Ops ops(b);
     claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation());
-    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);   /// bootstrap: ONE probe (absent-epoch branch)
+    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()), 1u);   /// bootstrap: ONE probe (absent-epoch branch)
     const int probes_after_bootstrap = b->probes;
-    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 2u);   /// epoch present: normal conditional bump...
+    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", emptyCatalogObservation()), 2u);   /// epoch present: normal conditional bump...
     EXPECT_EQ(b->probes, probes_after_bootstrap) << "...must not probe the mount key";
 }
 
@@ -989,7 +961,7 @@ TEST(CASServerRootSafety, EveryCatalogLifecycleStateBlocksOwnerAndEpochRecreatio
 
         Ops epoch_ops(std::make_shared<InMemoryBackend>());
         EXPECT_THROW(allocateWriterEpoch(
-            epoch_ops.op, layout, "root/x", EpochMintPolicy::NormalMount, 0, observe), DB::Exception);
+            epoch_ops.op, layout, "root/x", observe), DB::Exception);
         EXPECT_FALSE(epoch_ops.op.head(layout.epochKey("root/x"), Retry::standard()).has_value());
     }
 }
@@ -1015,7 +987,7 @@ TEST(CASServerRootSafety, OpaqueStreamAndStateDebrisAloneDoesNotBlockRecreation)
 
     EXPECT_NO_THROW(claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation()));
     EXPECT_EQ(allocateWriterEpoch(
-        ops.op, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+        ops.op, layout, "root/x", emptyCatalogObservation()), 1u);
 }
 
 TEST(CASServerRootSafety, ManifestAndLooseRootDebrisStillBlockRecreation)
@@ -1030,7 +1002,7 @@ TEST(CASServerRootSafety, ManifestAndLooseRootDebrisStillBlockRecreation)
         EXPECT_THROW(claimOwnerOrThrow(
             ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation()), DB::Exception);
         EXPECT_THROW(allocateWriterEpoch(
-            ops.op, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);
+            ops.op, layout, "root/x", emptyCatalogObservation()), DB::Exception);
     }
 }
 
@@ -1044,7 +1016,7 @@ TEST(CASServerRootSafety, UnreadableCatalogNeverFallsBackToPhysicalGuesses)
     };
     EXPECT_THROW(claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, unreadable), DB::Exception);
     EXPECT_THROW(allocateWriterEpoch(
-        ops.op, layout, "root/x", EpochMintPolicy::NormalMount, 0, unreadable), DB::Exception);
+        ops.op, layout, "root/x", unreadable), DB::Exception);
     EXPECT_FALSE(ops.op.head(layout.ownerKey("root/x"), Retry::standard()).has_value());
     EXPECT_FALSE(ops.op.head(layout.epochKey("root/x"), Retry::standard()).has_value());
 }
@@ -1071,7 +1043,7 @@ TEST(CASServerRootSafety, EpochConflictRecomputesTheWholeEmptinessBundle)
     Ops ops(backend);
     const Layout layout("p");
     EXPECT_THROW(allocateWriterEpoch(
-        ops.op, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);
+        ops.op, layout, "root/x", emptyCatalogObservation()), DB::Exception);
     EXPECT_TRUE(backend->fired);
     ASSERT_TRUE(backend->winner_installed);
     const auto epoch = ops.op.read(layout.epochKey("root/x"), Retry::standard());
@@ -1359,62 +1331,32 @@ TEST(CASMountAwaitExpiry, LiveRenewingTwinTimesOutAsDoubleStart)
 
 namespace
 {
-/// fix-round F5 harness: makes the mount key vanish to EVERY read, unconditionally, while the real
-/// underlying object stays put -- forcing `claimMount`'s own read to take the absent-slot race
-/// branch every call (its create then conflicts against the real, still-present object, returning
-/// `LiveDoubleStart` with no incarnation -- that branch deliberately leaves `.etag` unset,
-/// since no re-read was done). That in turn forces `claimMountAwaitingExpiry`'s fallback re-read,
-/// which ALSO sees the slot as vanished -- deterministically reproducing "the slot vanished between
-/// claimMount's own read and ours" on EVERY loop iteration, not just a lucky one-shot race.
-class AlwaysVanishesBackend final : public DB::Cas::Backend
+/// Hides the watched key from every read while the object stays underneath, so `claimMount`'s create
+/// conflicts with nothing observed and the observation loop's re-read finds the slot absent every time.
+class AlwaysVanishesBackend final : public InMemoryBackend
 {
 public:
-    explicit AlwaysVanishesBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
     String watched_key;
 
-    bool supportsListTokens() const override { return inner->supportsListTokens(); }
-
-    /// The fault is on the read primitive, which is the only way anything now reaches the store.
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         if (key == watched_key)
             return std::nullopt;
-        return inner->read(key, access);
+        return InMemoryBackend::read(key, access);
     }
-    std::optional<RawMeta> head(const String & key, TransportAccess & access) override { return inner->head(key, access); }
-    RawListPage list(const String & prefix, const String & cursor, size_t limit, TransportAccess & access) override { return inner->list(prefix, cursor, limit, access); }
-    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override { return inner->remove(key, expected_value, access); }
-    void removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access) override { inner->removeManyWriteOnce(keys, access); }
-    size_t bulkDeleteKeyLimit() const override { return inner->bulkDeleteKeyLimit(); }
-    std::expected<String, RawConflict> write(const String & key, const String & bytes,
-                                             const std::optional<String> & expected_value, TransportAccess & access) override
-    {
-        return inner->write(key, bytes, expected_value, access);
-    }
-    std::unique_ptr<DB::ReadBuffer> stream(const String & key, TransportAccess & access) override { return inner->stream(key, access); }
-    void publish(const BlobPublishRequest & request, TransportAccess & access) override { inner->publish(request, access); }
-    Dialect dialect() const override { return inner->dialect(); }
-
-private:
-    std::shared_ptr<DB::Cas::Backend> inner;
 };
 }
 
-/// fix-round F5 (author-review: `!got -> continue` in the observation loop, with no sleep and outside
-/// the restart limit, spins `get`/`claimMount`/`put` at backend RTT under persistent slot churn). A
-/// backend that makes the mount slot look vanished to every GET must still terminate (bounded restarts,
-/// not an infinite loop) AND must pace itself (the injected `sleep_fn` must actually fire) rather than
-/// busy-spin.
+/// A slot deleted under the observation loop (a 26.6.4 decommission still deletes it) is re-claimed on the
+/// same paced, bounded restart budget as a renewing holder, not spun at backend RTT.
 TEST(CASMountAwaitExpiry, PersistentSlotVanishPacesAndBoundsRestartsInsteadOfSpinning)
 {
-    auto inner = std::make_shared<InMemoryBackend>();
+    auto vanishing = std::make_shared<AlwaysVanishesBackend>();
     Layout l("p");
-    Ops inner_ops(inner);
-    /// A real slot exists underneath (uuid 1, epoch 7) so `claimMount`'s absent-slot create
-    /// genuinely conflicts every time (never accidentally re-mints).
-    ASSERT_EQ(claimMount(inner_ops.op, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100).kind, MountClaimResult::Claimed);
-
-    auto vanishing = std::make_shared<AlwaysVanishesBackend>(inner);
+    {
+        Ops seed(vanishing);
+        ASSERT_EQ(claimMount(seed.op, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    }
     vanishing->watched_key = l.mountKey("r");
     Ops ops(vanishing);
 
@@ -1427,11 +1369,10 @@ TEST(CASMountAwaitExpiry, PersistentSlotVanishPacesAndBoundsRestartsInsteadOfSpi
 
     const auto r = claimMountAwaitingExpiry(
         ops.op, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, mono_fn, /*ttl*/ 100, /*poll*/ 20, sleep_fn);
-    EXPECT_EQ(r.kind, MountClaimResult::LiveDoubleStart) << "must terminate (bounded), not loop forever";
-    EXPECT_GT(sleeps, 0) << "a persistently vanishing slot must still pace via sleep_fn, not busy-spin";
-    /// The real epoch-7 lease is untouched -- every create attempt against it genuinely conflicts
-    /// (the object is still there), so it is never accidentally re-minted over.
-    EXPECT_EQ(decodeMountLease(inner_ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 7u);
+    EXPECT_EQ(r.kind, MountClaimResult::LiveDoubleStart);
+    EXPECT_GT(sleeps, 0);
+    vanishing->watched_key.clear();
+    EXPECT_EQ(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).writer_epoch, 7u);
 }
 
 TEST(CASMountAwaitExpiry, ForeignUuidFailsClosedImmediately)
@@ -2079,11 +2020,33 @@ TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kStableThresholdMs);
 }
 
-/// fix-round F7 (author-review: `Gc::mount_obs` not pruned for srids gone from LIST -> slow unbounded
-/// growth on a long-lived leader, worsened by pool-member decommission). A srid whose `/mount` key is
-/// removed ENTIRELY (not merely fenced/terminated -- those already `obs.erase` themselves mid-loop) is
-/// never visited by a later LIST pass again, so its observation entry must be pruned at end-of-round,
-/// not linger in `obs` forever.
+/// A slot that turns terminal leaves the observation map in the walk that sees it.
+TEST(CASHeartbeatFloor, TerminalSlotLeavesTheObservationMap)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    seedMount(ops.op, l, "s2", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
+    MountObservationMap obs;
+    std::set<String> warned;
+    computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
+    ASSERT_TRUE(obs.contains("s1"));
+    ASSERT_TRUE(obs.contains("s2"));
+
+    renewMount(ops.op, l, "s1");
+    const auto got = ops.op.read(l.mountKey("s2"), Retry::standard());
+    MountLease farewell = decodeMountLease(got->bytes);
+    farewell.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+    mustCommit(ops.op.replace(l.mountKey("s2"), encodeMountLease(farewell), got->etag, Retry::standard()), "s2 farewell");
+
+    const HeartbeatFloor floor = computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs), kObserverLeaseMs, kCadenceMs, obs, warned);
+    EXPECT_EQ(floor.terminated, 1u);
+    EXPECT_TRUE(obs.contains("s1"));
+    EXPECT_FALSE(obs.contains("s2"));
+}
+
+/// A slot deleted by a 26.6.4 decommission or by hand is never listed again; its observation is dropped.
 TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -2091,25 +2054,17 @@ TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     Ops ops(b);
     seedMount(ops.op, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
     seedMount(ops.op, l, "s2", /*expires*/ 10, /*fenced*/ false, /*min_active_build_sequence*/ 0);
-
     MountObservationMap obs;
     std::set<String> warned;
     computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(0), kObserverLeaseMs, kCadenceMs, obs, warned);
-    ASSERT_TRUE(obs.contains("s1"));
     ASSERT_TRUE(obs.contains("s2"));
 
-    /// s2's `/mount` key is removed entirely -- e.g. `SYSTEM CAS DROP POOL MEMBER` -- so
-    /// no future LIST pass will ever visit it again. s1 renews (a live renewer would), so its OWN
-    /// observation restarts and it stays `live` -- isolating this test to the pruning behavior alone,
-    /// not confounding it with s1 also becoming fence-eligible (which would erase its `obs` entry too,
-    /// for an unrelated reason).
+    /// s1 renews so it stays observed for its own reason; only s2's absence from the listing is under test.
     renewMount(ops.op, l, "s1");
     ASSERT_EQ(ops.op.removeCurrent(l.mountKey("s2"), Retry::standard()), Removal::Removed);
-
     computeHeartbeatFloor(ops.op, l, kNowMs, frozenClock(kStableThresholdMs), kObserverLeaseMs, kCadenceMs, obs, warned);
     EXPECT_TRUE(obs.contains("s1"));
-    EXPECT_FALSE(obs.contains("s2"))
-        << "a srid removed from the LIST entirely must be pruned from obs, not linger forever";
+    EXPECT_FALSE(obs.contains("s2"));
 }
 
 TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
@@ -3138,7 +3093,7 @@ TEST(CASServerRoot, AllocateWriterEpochKeepsThePostConflictCorruptionCheck)
         auto backend = std::make_shared<EpochConflictBackend>(/*reveal_owned_work=*/true);
         Ops ops(backend);
         EXPECT_THROW(allocateWriterEpoch(
-            ops.op, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);
+            ops.op, layout, "root/x", emptyCatalogObservation()), DB::Exception);
         EXPECT_TRUE(backend->fired);
         ASSERT_TRUE(backend->winner_installed);
     }
@@ -3146,7 +3101,7 @@ TEST(CASServerRoot, AllocateWriterEpochKeepsThePostConflictCorruptionCheck)
         auto backend = std::make_shared<EpochConflictBackend>(/*reveal_owned_work=*/false);
         Ops ops(backend);
         EXPECT_EQ(allocateWriterEpoch(
-            ops.op, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 2u)
+            ops.op, layout, "root/x", emptyCatalogObservation()), 2u)
             << "the second decision must allocate from the conflict winner's epoch, not refuse outright";
         EXPECT_TRUE(backend->fired);
         ASSERT_TRUE(backend->winner_installed);

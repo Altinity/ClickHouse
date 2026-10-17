@@ -164,13 +164,6 @@ uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
     const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse);
 
-/// Which mint policy governs `allocateWriterEpoch`'s absent-epoch branch (see below).
-enum class EpochMintPolicy : uint8_t
-{
-    NormalMount,            /// absent-epoch re-mint requires authoritative mount absence
-    DecommissionRecovery,   /// absent-epoch re-mint requires a TERMINAL mount; mints a distinct epoch
-};
-
 /// What a claimer requires of the owner once its body is in the slot and before it installs the renewer.
 struct OwnerExpectation
 {
@@ -196,12 +189,9 @@ void recheckOwnerAfterClaim(
 ///     flattens transport faults into "not found"), to decide whether the mount object is really
 ///     gone:
 ///       - `KeyAbsent` → authoritative absence, mint epoch 1 (fresh-root bootstrap);
-///       - `Present`, `policy == NormalMount` → throw `CORRUPTED_DATA` (durable epoch state was
-///         lost while a mount is live or recently live — refusing to re-mint epoch 1 there is how a
-///         same-(uuid, epoch) twin is avoided);
-///       - `Present`, `policy == DecommissionRecovery` → the surviving mount must be TERMINAL (not
-///         live); a live member throws `ABORTED`, otherwise mint `surviving.writer_epoch + 1` —
-///         distinct from the survivor's by construction (`now_ms` is required, nonzero, here);
+///       - `Present` → throw `CORRUPTED_DATA` (durable epoch state was lost while a mount is live or
+///         recently live; refusing to re-mint epoch 1 is how a same-(uuid, epoch) twin is avoided. If no
+///         server uses this root, start with a new server_root_id; a decommission never recreates a counter);
 ///       - anything else (`ContainerAbsent`/`AccessDenied`/`Indeterminate`) → throw
 ///         `CORRUPTED_DATA` (absence was never proven; fail closed);
 ///   - otherwise read `next = current.next_writer_epoch`, write `{next + 1}` against the observed
@@ -209,7 +199,6 @@ void recheckOwnerAfterClaim(
 /// Every decision writes a fresh `allocation_nonce`, so an unclear write counts as ours only when the
 /// stored bytes are exactly ours; a same-uuid twin bumping to the same value is a conflict.
 uint64_t allocateWriterEpoch(CasOperation & op, const Layout & l, const String & srid,
-                             EpochMintPolicy policy, uint64_t now_ms,
                              const ObserveRefCatalog & observe_catalog);
 
 /// Which certificate of death, or the operator's explicit unsafe authorization, justified a
@@ -428,8 +417,8 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 /// leader instance, `Cas::Gc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
 /// fencing one round, never fences early).
 /// A body whose declared lease is non-zero and differs from `observer_lease_ms` is named in one `WARNING`
-/// per srid; `lease_mismatch_warned` holds the srids already named and is pruned like `obs`. The check
-/// never changes a classification or a write.
+/// per srid; `lease_mismatch_warned` holds the srids already named. The check never changes a classification
+/// or a write. `obs` and `lease_mismatch_warned` drop every srid this pass did not list.
 ///
 /// The fence-out is BOTH safety and liveness. Safety: a sleeper's later renewal permanently fails
 /// (its `replace` now mismatches the fenced incarnation → `tripMountLost`), so it can never re-arm

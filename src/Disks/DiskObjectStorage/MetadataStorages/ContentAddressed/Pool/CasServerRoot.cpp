@@ -427,10 +427,6 @@ void deliverMountRenewObservability(
     }
 }
 
-/// Forward declaration: defined below (same TU-unique anonymous namespace) — `allocateWriterEpoch`
-/// names the current mount holder in its DecommissionRecovery live-refusal message.
-String describeMountHolder(const MountLease & m);
-
 std::optional<OwnerObject> readOwnerObject(CasOperation & op, const Layout & l, const String & server_root_id)
 {
     const auto got = op.read(l.ownerKey(server_root_id), Retry::standard());
@@ -596,7 +592,7 @@ uint64_t claimOwnerOrThrow(
 }
 
 uint64_t allocateWriterEpoch(
-    CasOperation & op, const Layout & l, const String & srid, EpochMintPolicy policy, uint64_t now_ms,
+    CasOperation & op, const Layout & l, const String & srid,
     const ObserveRefCatalog & observe_catalog)
 {
     if (!observe_catalog)
@@ -646,40 +642,12 @@ uint64_t allocateWriterEpoch(
                         break;   /// authoritative absence — fresh-root bootstrap proceeds below
                     case ProbeOutcome::Present:
                     {
-                        if (policy == EpochMintPolicy::DecommissionRecovery)
-                        {
-                            chassert(now_ms != 0);   /// the decommission caller must pass its clock
-                            const MountLease surviving = decodeMountLease(*mount_probe.body);
-                            /// Deliberately weaker than claimMount's reclaim gate, which never trusts a
-                            /// bare wall-clock comparison alone (only gc_fenced / the clean-farewell
-                            /// min_active_build_sequence==UINT64_MAX marker / a caller-proven-dead
-                            /// incarnation justify a reclaim there, because clock skew can misjudge
-                            /// liveness). This is still safe: (a) the mint below is DISTINCT from the
-                            /// survivor's epoch by construction, so no same-(uuid, epoch) pair is ever
-                            /// representable even if this liveness read is wrong; (b) claimMount right
-                            /// after this still applies its own STRONG liveness gate and refuses a
-                            /// genuinely live member regardless of what happens here. So a clock-skewed
-                            /// "terminal" misread can only burn one epoch number on a doomed
-                            /// decommission attempt that aborts at claimMount — it can never admit a
-                            /// claim over a live member.
-                            const bool live = !surviving.gc_fenced && surviving.expires_at_ms > now_ms;
-                            if (live)
-                                throw Exception(ErrorCodes::ABORTED,
-                                    "CAS decommission '{}': epoch object missing but a LIVE mount lease "
-                                    "exists ({}) — refusing to re-mint an epoch under a live member "
-                                    "(stop the server or wait for its lease to lapse)",
-                                    srid, describeMountHolder(surviving));
-                            /// Terminal mount: proceed, but mint an epoch DISTINCT from the survivor's
-                            /// by construction — the same-pair state is unrepresentable on this path.
-                            current.next_writer_epoch = std::max<uint64_t>(1, surviving.writer_epoch + 1);
-                            break;
-                        }
                         throw Exception(ErrorCodes::CORRUPTED_DATA,
                             "CAS server-root '{}' has no durable epoch object but a mount lease exists — "
                             "durable epoch state was lost while a mount is live or recently live; "
-                            "refusing to re-mint epoch 1. If no server is live on this root, "
-                            "decommission it or manually remove the stale mount object '{}'.",
-                            srid, l.mountKey(srid));
+                            "refusing to re-mint epoch 1. If no server uses this root, start with a new "
+                            "server_root_id; a decommission never recreates a counter",
+                            srid);
                     }
                     case ProbeOutcome::ContainerAbsent:
                     case ProbeOutcome::AccessDenied:
@@ -1067,14 +1035,9 @@ MountClaimResult claimMountAwaitingExpiry(
             const auto got = op.read(l.mountKey(srid), Retry::standard());
             if (!got)
             {
-                /// The slot vanished between claimMount's own GET and ours — normally self-resolving
-                /// within one more `claimMount` call (which re-mints fresh on an absent slot), but under
-                /// slot churn (something else concurrently removing/re-minting it) that resolution could
-                /// keep losing the same race. Pace this like every other iteration and
-                /// count it toward the SAME bounded restart budget the incarnation-churn case below
-                /// uses, instead of spinning read/claim/write at backend RTT with no sleep and no bound
-                /// — a persistently vanishing slot is exactly as "alive and contended" as a persistently
-                /// renewing holder.
+                /// The slot vanished between `claimMount`'s read and ours (a 26.6.4 decommission or a hand delete):
+                /// the next `claimMount` re-mints it. Paced and counted like a renewing holder, so a slot that
+                /// keeps vanishing cannot spin read, claim and write at backend RTT.
                 if (++restarts > kMaxObservationRestarts)
                     return r;
                 sleep_ms_fn(poll);
@@ -1139,15 +1102,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
     /// Taken before any read: it can confirm that a token held, never date a sighting.
     const uint64_t round_start_ms = mono_ms_fn();
 
-    /// `obs` is keyed by every srid this leader has EVER observed, but a
-    /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CAS
-    /// DROP POOL MEMBER`) is never visited by the walk below again, so its entry would otherwise linger
-    /// forever (~150-250 B/srid, worse on a long-lived leader across many decommissions). Track every
-    /// srid actually seen THIS pass and prune anything else out of `obs` at the end -- disjoint from the
-    /// mid-walk `obs.erase(srid)` calls below (those fire for a srid seen but now terminal/fenced/gone
-    /// this pass; this is for a srid not seen AT ALL).
     std::set<String> seen_srids;
-
     const String prefix = l.serverRootsPrefix();
     op.forEachListedKey(prefix, [&](const ListedKey & listed)
     {
@@ -1240,9 +1195,9 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
         return true;
     }, Retry::standard());
 
-    /// Prune every `obs` and `lease_mismatch_warned` entry for a srid this pass's walk never saw at all.
-    for (auto it = obs.begin(); it != obs.end(); )
-        it = seen_srids.contains(it->first) ? std::next(it) : obs.erase(it);
+    /// A slot deleted by a 26.6.4 decommission or by hand is never listed again; without this its srid would
+    /// stay in both maps forever on a long-lived leader.
+    std::erase_if(obs, [&](const auto & entry) { return !seen_srids.contains(entry.first); });
     std::erase_if(lease_mismatch_warned, [&](const String & s) { return !seen_srids.contains(s); });
 
     return floor;
