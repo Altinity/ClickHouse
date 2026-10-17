@@ -107,7 +107,7 @@ TEST(CASSweepDeletionPremise, AnUnconsumedEpochSealRetainsTheBuildsManifests)
     seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
 
     std::vector<String> warnings;
-    const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings);
+    const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), listServerRoots(*f.store), &warnings);
 
     EXPECT_EQ(deleted, 0u);
     EXPECT_TRUE(f.orphanExists())
@@ -127,7 +127,7 @@ TEST(CASSweepDeletionPremise, AConsumedEpochSealWithACleanTailDeletes)
     seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
 
     std::vector<String> warnings;
-    const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings);
+    const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), listServerRoots(*f.store), &warnings);
 
     EXPECT_EQ(deleted, 1u);
     EXPECT_FALSE(f.orphanExists());
@@ -146,7 +146,7 @@ TEST(CASSweepDeletionPremise, AHeldNamespaceRetainsEvenAboveAConsumedSeal)
     seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 3}, hold);
 
     std::vector<String> warnings;
-    const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings);
+    const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), listServerRoots(*f.store), &warnings);
 
     EXPECT_EQ(deleted, 0u);
     EXPECT_TRUE(f.orphanExists());
@@ -167,7 +167,7 @@ TEST(CASSweepDeletionPremise, ANamespaceWithNoSealedCursorRetains)
                           RefTxnId{kBuildEpoch + 1, 1});
 
     std::vector<String> warnings;
-    const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings);
+    const uint64_t deleted = sweepNamespace(*f.store, f.ns, buildPrefix(5), listServerRoots(*f.store), &warnings);
 
     EXPECT_EQ(deleted, 0u);
     EXPECT_TRUE(f.orphanExists());
@@ -289,7 +289,8 @@ TEST(CASSweepDeletionPremise, DebrisUnderANamespaceTheFoldNeverWalksIsRetainedIn
     /// No ref stream, no coverage row -- repeated passes change nothing.
     std::vector<String> warnings;
     for (int pass = 0; pass < 3; ++pass)
-        EXPECT_EQ(sweepNamespace(*f.store, f.ns, buildPrefix(5), &warnings), 0u) << "pass " << pass;
+        EXPECT_EQ(sweepNamespace(*f.store, f.ns, buildPrefix(5), listServerRoots(*f.store), &warnings), 0u)
+            << "pass " << pass;
 
     EXPECT_TRUE(f.orphanExists());
     EXPECT_EQ(warnings.size(), 3u) << "every pass reports the retention rather than going quiet";

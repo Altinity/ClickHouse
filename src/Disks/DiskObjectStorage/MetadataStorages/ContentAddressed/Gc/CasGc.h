@@ -736,7 +736,9 @@ private:
     /// its catalog cut; the fold regroups those keys strictly rather than listing the prefix again.
     FoldResult fold(GcState & state, std::optional<Etag> & state_etag,
                     RoundReport & report, uint64_t current_round,
-                    const RefPlan & walk_plan, UniversePolicy policy,
+                    const RefPlan & walk_plan,
+                    /// The srids phase 3's LIST of `gc/server-roots/` returned (`HeartbeatFloor::listed_srids`).
+                    const std::set<String> & listed_server_roots, UniversePolicy policy,
                     /// One instance for the WHOLE round, owned by `runRegularRound` and threaded through
                     /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
                     GcRoundWorkBudget & work_budget);

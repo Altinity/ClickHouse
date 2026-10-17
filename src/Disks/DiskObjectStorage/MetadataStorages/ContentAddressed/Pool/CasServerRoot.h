@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -404,6 +405,9 @@ struct HeartbeatFloor
     size_t already_fenced = 0;
     /// The srids of every mount fenced-out THIS call (one GcFenceOut audit event each).
     std::vector<String> fenced_srids;
+    /// The srids whose `/mount` key this call's LIST returned, whatever their classification. The round
+    /// resolves a namespace's mount from these instead of probing every prefix of the namespace.
+    std::set<String> listed_srids;
 };
 
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,

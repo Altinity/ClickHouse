@@ -1,10 +1,12 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasNamespaceLifeId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ThreadPool.h>
 #include <base/types.h>
+#include <map>
 #include <optional>
 #include <set>
 #include <utility>
@@ -134,8 +136,9 @@ struct ManifestSweepResult
 
     /// The floor a namespace's builds are judged against is one mount body per server root. A page
     /// resolves it once per namespace (`floor_lookups`); each lookup reads the mount key of every
-    /// `/`-prefix of the namespace until one answers (`floor_reads`), so an absent mount costs the
-    /// whole chain once.
+    /// `/`-prefix of the namespace that the round's LIST of `gc/server-roots/` names, longest first,
+    /// until one answers (`floor_reads`) -- one read for a namespace whose root is listed, none for one
+    /// whose root is not.
     uint64_t floor_lookups = 0;
     uint64_t floor_reads = 0;
 
@@ -187,13 +190,22 @@ struct ManifestSweepResult
 /// This direct decommission path relies on the caller's held server-root claim/fence: while that claim
 /// is held, a same-server-root rebirth cannot become live between its catalog cut and exact-token delete.
 /// It still rejects every catalog cut with an ambiguous current life id before making any deletion decision.
+/// `listed_server_roots` is as for `prefixEligible`.
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
-                        std::vector<String> * warnings = nullptr);
+                        const std::set<String> & listed_server_roots, std::vector<String> * warnings = nullptr);
+
+/// The server-root ids with a `/mount` key under `gc/server-roots/` (one `listMounts` pass): the
+/// `listed_server_roots` of a caller outside a GC round, which takes it once and passes it to every
+/// `prefixEligible`/`sweepNamespace` call it makes. A GC round passes phase 3's own LIST instead.
+std::set<String> listServerRoots(Pool & store);
 
 /// Whether `prefix` is sweep-eligible by the durable watermark fact alone. The floor is read from the
 /// mount lease identified by the namespace's server-root prefix, not inferred from the manifest key or a
 /// judged-dead heuristic. A missing lease provides no deletion authority, so the prefix is not eligible.
-bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix);
+/// Only the server roots in `listed_server_roots` (the caller's LIST of `gc/server-roots/`) are tried: a
+/// mount younger than that LIST is not found, and so retains, until the caller lists again.
+bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
+                    const std::set<String> & listed_server_roots);
 
 /// The pure half of `prefixEligible`: whether `prefix` is retired under one observation of the mount
 /// floor. `nullopt` (no mount body under any prefix of the namespace) admits nothing. Retirement is
@@ -217,6 +229,12 @@ bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPre
 /// the affected namespace on THIS page rather than deciding it without a complete protection view;
 /// `nullptr` (the default) reproduces the pre-budget unbounded behavior.
 ///
+/// `listed_server_roots` and `listed_ref_logs` are what the round's own LISTs already returned: the
+/// server-root ids under `gc/server-roots/` that have a `/mount` key (phase 3), and the log ids under
+/// `cas/ns/stream/` per physical life (phase 4). The page asks neither listing for completeness. The
+/// first chooses which mount keys a floor lookup reads; the second chooses which ref-log ids a walk may
+/// hint, so a walk never prefetches the positions past an epoch's seal that do not exist.
+///
 /// `read_pool` and `read_concurrency` (default `nullptr`/1, i.e. every read inline on the caller's
 /// operation) drive the page's read-ahead: with a pool and a concurrency above one, the candidates'
 /// bodies and the catalog-recovery/committed-tail ref-log walks overlap their round trips on `read_pool`
@@ -228,6 +246,8 @@ ManifestSweepResult planManifestCursorPage(
     uint64_t list_budget,
     uint64_t nomination_budget,
     bool catalog_recovery_authoritative,
+    const std::set<String> & listed_server_roots,
+    const std::map<NamespaceLifePhysicalId, std::set<RefTxnId>> & listed_ref_logs,
     GcRoundWorkBudget * work_budget = nullptr,
     ThreadPool * read_pool = nullptr,
     size_t read_concurrency = 1);

@@ -1027,10 +1027,10 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
     /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CAS
     /// DROP POOL MEMBER`) is never visited by the walk below again, so its entry would otherwise linger
     /// forever (~150-250 B/srid, worse on a long-lived leader across many decommissions). Track every
-    /// srid actually seen THIS pass and prune anything else out of `obs` at the end -- disjoint from the
-    /// mid-walk `obs.erase(srid)` calls below (those fire for a srid seen but now terminal/fenced/gone
-    /// this pass; this is for a srid not seen AT ALL).
-    std::set<String> seen_srids;
+    /// srid actually seen THIS pass (`floor.listed_srids`, which the round also uses to resolve namespace
+    /// mounts) and prune anything else out of `obs` at the end -- disjoint from the mid-walk
+    /// `obs.erase(srid)` calls below (those fire for a srid seen but now terminal/fenced/gone this pass;
+    /// this is for a srid not seen AT ALL).
 
     const String prefix = l.serverRootsPrefix();
     op.forEachListedKey(prefix, [&](const ListedKey & listed)
@@ -1046,7 +1046,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
         /// (`<prefix>/gc/server-roots/<srid>/mount`). Used both for observability (fenced) and as
         /// the key into `obs`.
         const String srid = key.substr(prefix.size(), key.size() - prefix.size() - mount_suffix.size());
-        seen_srids.insert(srid);
+        floor.listed_srids.insert(srid);
 
         /// One decision per re-read: a refused fence-out re-enters this lambda with the body the
         /// holder's own renewal installed, and the observation check below then sees the new
@@ -1124,7 +1124,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
 
     /// Prune every `obs` entry for a srid this pass's walk never saw at all.
     for (auto it = obs.begin(); it != obs.end(); )
-        it = seen_srids.contains(it->first) ? std::next(it) : obs.erase(it);
+        it = floor.listed_srids.contains(it->first) ? std::next(it) : obs.erase(it);
 
     return floor;
 }
