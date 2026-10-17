@@ -682,8 +682,7 @@ void readEscapedStringIntoImpl(Vector & s, ReadBuffer & buf)
                 }
             }
         }
-
-        if constexpr (support_crlf)
+        else if constexpr (support_crlf)
         {
             if (*buf.position() == '\r')
             {
@@ -1955,6 +1954,26 @@ bool trySkipJSONField(ReadBuffer & buf, std::string_view name_of_field, const Fo
 }
 
 
+void readStringBinaryGrowing(String & s, ReadBuffer & buf, size_t max_string_size)
+{
+    size_t size = 0;
+    readVarUInt(size, buf);
+
+    if (size > max_string_size)
+        throw Exception(ErrorCodes::TOO_LARGE_STRING_SIZE, "Too large string size.");
+
+    s.clear();
+    while (s.size() < size)
+    {
+        if (buf.eof())
+            throwReadAfterEOF();
+
+        const size_t bytes_to_copy = std::min(size - s.size(), buf.available());
+        s.append(buf.position(), bytes_to_copy);
+        buf.position() += bytes_to_copy;
+    }
+}
+
 Exception readException(ReadBuffer & buf, const String & additional_message, bool remote_exception)
 {
     int code = 0;
@@ -1964,9 +1983,11 @@ Exception readException(ReadBuffer & buf, const String & additional_message, boo
     bool has_nested = false;    /// Obsolete
 
     readBinaryLittleEndian(code, buf);
-    readBinary(name, buf);
-    readBinary(message, buf);
-    readBinary(stack_trace, buf);
+    /// This is the first thing read from a server during the handshake, and the sizes of these
+    /// strings come from the other side, so read them without preallocating the declared size.
+    readStringBinaryGrowing(name, buf);
+    readStringBinaryGrowing(message, buf);
+    readStringBinaryGrowing(stack_trace, buf);
     readBinary(has_nested, buf);
 
     WriteBufferFromOwnString out;

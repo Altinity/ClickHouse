@@ -142,7 +142,7 @@ namespace
     )", 0) \
     DECLARE(UInt64, max_fetch_partition_thread_pool_size, 64, R"(The number of threads for ALTER TABLE FETCH PARTITION.)", 0) \
     DECLARE(UInt64, max_active_parts_loading_thread_pool_size, 64, R"(The number of threads to load active set of data parts (Active ones) at startup.)", 0) \
-    DECLARE(UInt64, max_snapshot_commit_thread_pool_size, 64, R"(The number of threads to commit snapshot.)", 0) \
+    DECLARE(UInt64, max_snapshot_commit_thread_pool_size, 16, R"(The number of threads to commit snapshot.)", 0) \
     DECLARE(UInt64, max_snapshot_commit_thread_pool_free_size, 0, R"(If the number of idle threads in the snapshot commit thread pool exceeds `max_snapshot_commit_thread_pool_free_size`, ClickHouse will release resources occupied by idling threads and decrease the pool size. Threads can be created again if necessary.)", 0) \
     DECLARE(UInt64, max_outdated_parts_loading_thread_pool_size, 32, R"(The number of threads to load inactive set of data parts (Outdated ones) at startup.)", 0) \
     DECLARE(UInt64, max_unexpected_parts_loading_thread_pool_size, 8, R"(The number of threads to load inactive set of data parts (Unexpected ones) at startup.)", 0) \
@@ -1365,6 +1365,22 @@ The policy on how to perform a scheduling of CPU slots specified by `concurrent_
     <top_level_domains_path>/var/lib/clickhouse/top_level_domains/</top_level_domains_path>
     ```
     )", 0) \
+    DECLARE(Bool, interserver_tables_status_allow_unauthenticated, false, R"(
+    Answer an interserver `TablesStatusRequest` with the actual table status even when the
+    connection has not yet authenticated a query with the cluster `<secret>`.
+
+    By default such a request, which a node sends while establishing a connection to a replica,
+    gets a response that reports every requested table as present, not replicated and writable,
+    independently of the actual state of the tables, so a peer that does not know the secret
+    cannot learn which tables exist, whether they are replicated, their replication delay or
+    whether they are read-only. The cost is that until a connection has run its first query,
+    `max_replica_delay_for_distributed_queries`, `distributed_insert_skip_read_only_replicas` and
+    skipping a replica that does not have the table do not apply to it. Connections that have
+    already authenticated a query get the actual status.
+
+    Enabling this restores the previous behavior, and with it the disclosure of the table status
+    to any peer that can connect to the native port.
+    )", 0) \
     DECLARE(String, interserver_http_host, "", R"(
     The hostname that can be used by other servers to access this server.
 
@@ -1539,6 +1555,11 @@ The policy on how to perform a scheduling of CPU slots specified by `concurrent_
 
 /// Settings with a path are server settings with at least one layer of nesting that have a fixed structure (no lists, lists, enumerations, repetitions, ...).
 #define LIST_OF_SERVER_SETTINGS_WITH_PATH(DECLARE, ALIAS) \
+    DECLARE(String, named_collections_storage_type, "local", R"(
+The storage type for named collections. Possible values are `local`, `local_encrypted`, `keeper`,
+`keeper_encrypted`, `zookeeper`, and `zookeeper_encrypted`.
+Configured as `named_collections_storage.type` (`<named_collections_storage><type>` in XML).
+)", 0, "named_collections_storage.type") \
     DECLARE(UInt64, query_cache_max_size_in_bytes, 1073741824, R"(The maximum cache size in bytes. 0 means the query cache is disabled.)", 0, "query_cache.max_size_in_bytes") \
     DECLARE(UInt64, query_cache_max_entries, 1024, R"(The maximum number of SELECT query results stored in the cache.)", 0, "query_cache.max_entries") \
     DECLARE(UInt64, query_cache_max_entry_size_in_bytes, 1048576, R"(The maximum size in bytes SELECT query results may have to be saved in the cache.)", 0, "query_cache.max_entry_size_in_bytes") \
@@ -1587,7 +1608,7 @@ The policy on how to perform a scheduling of CPU slots specified by `concurrent_
     DECLARE(Bool, openssl_client_load_default_ca_file, true, R"(Determines whether built-in CA certificates for OpenSSL will be used. ClickHouse assumes that builtin CA certificates are in the file `</etc/ssl/cert.pem>` (resp. the directory `</etc/ssl/certs>`) or in file (resp. directory) specified by the environment variable `<SSL_CERT_FILE>` (resp. `<SSL_CERT_DIR>`).)", 0, "openSSL.client.loadDefaultCAFile") \
     DECLARE(String, openssl_client_chipher_list, "ALL:!ADH:!LOW:!EXP:!MD5:!3DES:@STRENGTH", R"(Supported OpenSSL encryptions.)", 0, "openSSL.client.cipherList") \
     DECLARE(Bool, openssl_client_cache_sessions, false, R"(Enables or disables caching sessions. Must be used in combination with `<sessionIdContext>`. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.cacheSessions") \
-    DECLARE(Bool, openssl_client_extended_verification, false, R"(If enabled, verify that the certificate CN or SAN matches the peer hostname.)", 0, "openSSL.client.extendedVerification") \
+    DECLARE(Bool, openssl_client_extended_verification, true, R"(If enabled, verify that the certificate CN or SAN matches the peer hostname.)", 0, "openSSL.client.extendedVerification") \
     DECLARE(Bool, openssl_client_required_tls_v1, false, R"(Require a TLSv1 connection. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.requireTLSv1") \
     DECLARE(Bool, openssl_client_required_tls_v1_1, false, R"(Require a TLSv1.1 connection. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.requireTLSv1_1") \
     DECLARE(Bool, openssl_client_required_tls_v1_2, false, R"(Require a TLSv1.2 connection. Acceptable values: `<true>`, `<false>`.)", 0, "openSSL.client.requireTLSv1_2") \
@@ -1716,6 +1737,10 @@ void ServerSettings::dumpToSystemServerSettingsColumns(ServerSettingColumnsParam
     std::unordered_map<String, std::pair<String, ChangeableWithoutRestart>> changeable_settings
         = {
             {"max_server_memory_usage", {std::to_string(total_memory_tracker.getHardLimit()), ChangeableWithoutRestart::Yes}},
+
+            /// Named collections metadata storage is initialized once, so use its effective startup type.
+            {"named_collections_storage_type",
+             {context->getServerSettings()[ServerSetting::named_collections_storage_type].toString(), ChangeableWithoutRestart::No}},
 
             {"max_table_size_to_drop", {std::to_string(context->getMaxTableSizeToDrop()), ChangeableWithoutRestart::Yes}},
             {"max_named_collection_num_to_warn", {std::to_string(context->getMaxNamedCollectionNumToWarn()), ChangeableWithoutRestart::Yes}},
@@ -1852,8 +1877,8 @@ void ServerSettings::dumpToSystemServerSettingsColumns(ServerSettingColumnsParam
         const bool is_changeable = (changeable_settings_it != changeable_settings.end());
 
         res_columns[0]->insert(setting_path.empty() ? setting_name : setting_path);
-        res_columns[1]->insert(is_changeable ? changeable_settings_it->second.first : setting.getValueString());
-        res_columns[2]->insert(setting.getDefaultValueString());
+        res_columns[1]->insert(is_changeable ? changeable_settings_it->second.first : setting.getValueString(/* show_secrets */ true));
+        res_columns[2]->insert(setting.getDefaultValueString(/* show_secrets */ true));
         res_columns[3]->insert(setting.isValueChanged());
         res_columns[4]->insert(setting.getDescription());
         res_columns[5]->insert(setting.getTypeName());

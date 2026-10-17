@@ -30,11 +30,13 @@
 #include <Functions/exists.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExternalDictionariesLoader.h>
+#include <Interpreters/formatWithPossiblyHidingSecrets.h>
 #include <Interpreters/misc.h>
 #include <Functions/IFunctionAdaptors.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/grouping.h>
 #include <Storages/StorageJoin.h>
+#include <Storages/StorageProxy.h>
 
 #include <Functions/UserDefined/UserDefinedExecutableFunctionFactory.h>
 #include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
@@ -68,7 +70,6 @@ namespace ErrorCodes
 namespace Setting
 {
     extern const SettingsBool execute_exists_as_scalar_subquery;
-    extern const SettingsBool format_display_secrets_in_show_and_select;
     extern const SettingsBool transform_null_in;
     extern const SettingsBool force_grouping_standard_compatibility;
     extern const SettingsBool validate_enum_literals_in_operators;
@@ -446,7 +447,7 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
                         scope.scope_node->formatASTForErrorMessage());
 
                 auto & table_node_typed = table_node->as<TableNode &>();
-                if (!std::dynamic_pointer_cast<StorageJoin>(table_node_typed.getStorage()))
+                if (!castStorage<StorageJoin>(table_node_typed.getStorage(), DeferredTable::Load))
                     throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
                         "Function {} table '{}' should have engine StorageJoin. In scope {}",
                         function_name,
@@ -747,21 +748,53 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         allow_niladic_functions);
 
     /// Mask arguments if needed
-    if (!scope.context->getSettingsRef()[Setting::format_display_secrets_in_show_and_select])
+    if (!canDisplaySecrets(scope.context))
     {
-        if (FunctionSecretArgumentsFinder::Result secret_arguments = FunctionSecretArgumentsFinderTreeNode(*function_node_ptr).getResult(); secret_arguments.count)
+        if (FunctionSecretArgumentsFinder::Result secret_arguments = FunctionSecretArgumentsFinderTreeNode(*function_node_ptr).getResult(); secret_arguments.hasSecrets())
         {
             auto & argument_nodes = function_node_ptr->getArgumentsNode()->as<ListNode &>().getNodes();
 
-            for (size_t n = secret_arguments.start; n < secret_arguments.start + secret_arguments.count; ++n)
+            /// This tree is used for execution, so the value itself cannot be rewritten; only the
+            /// display mask of its constants can be set. `setMaskId` is a display flag, so it hides
+            /// the literal in projection names, `EXPLAIN QUERY TREE` and the `EXPLAIN actions = 1`
+            /// ActionsDAG (see PlannerActionsVisitor) without changing what is executed.
+            auto assign_mask = [&](ConstantNode & constant)
             {
-                if (auto * constant = argument_nodes[n]->as<ConstantNode>())
+                auto mask = scope.projection_mask_map->insert({constant.getTreeHash(), scope.projection_mask_map->size() + 1}).first->second;
+                constant.setMaskId(mask);
+                return mask;
+            };
+            /// A secret value can be an expression, not a bare literal (e.g. an `encrypt` key built as
+            /// `leftPad('...', 16, '*')`, including one inlined from a SQL UDF body). Hide every
+            /// constant inside it so no fragment of the secret leaks; returns whether any literal was
+            /// hidden. A slot that carries no literal (a plaintext like `toString(number)` or a key
+            /// held in a column) exposes nothing in the query text, so it is left as is.
+            std::function<bool(const QueryTreeNodePtr &)> mask_secret_constants = [&](const QueryTreeNodePtr & subtree)
+            {
+                if (auto * constant = subtree->as<ConstantNode>())
                 {
-                    auto mask = scope.projection_mask_map->insert({constant->getTreeHash(), scope.projection_mask_map->size() + 1}).first->second;
-                    constant->setMaskId(mask);
-                    arguments_projection_names[n] = "[HIDDEN id: " + std::to_string(mask) + "]";
+                    assign_mask(*constant);
+                    return true;
                 }
-            }
+                bool masked_any = false;
+                for (const auto & child : subtree->getChildren())
+                    if (child)
+                        masked_any |= mask_secret_constants(child);
+                return masked_any;
+            };
+
+            forEachSecretArgumentNode(
+                argument_nodes,
+                secret_arguments,
+                [&](size_t n, QueryTreeNodePtr & secret_node)
+                {
+                    if (auto * constant = secret_node->as<ConstantNode>())
+                        arguments_projection_names[n] = "[HIDDEN id: " + std::to_string(assign_mask(*constant)) + "]";
+                    /// Masking constants feeding `arrayJoin` would give it a second name in the
+                    /// `ActionsDAG`, duplicating the operation and multiplying the rows.
+                    else if (!hasFunctionNode(secret_node, "arrayJoin") && mask_secret_constants(secret_node))
+                        arguments_projection_names[n] = "[HIDDEN]";
+                });
         }
     }
 
@@ -838,8 +871,9 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         }
         else
         {
-            /// Replace storage with values storage of insertion block
-            if (StoragePtr storage = scope.context->getViewSource())
+            /// Replace storage with values storage of insertion block.
+            /// The inner query of an ordinary view referenced by the view query reads the table itself.
+            if (StoragePtr storage = scope.context->getViewSource(); storage && !scope.context->isViewInnerQuery())
             {
                 QueryTreeNodePtr table_expression = in_second_argument;
 

@@ -92,7 +92,7 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
-    IDataLakeMetadata * getExternalMetadata(ContextPtr query_context);
+    std::shared_ptr<IDataLakeMetadata> getExternalMetadata(ContextPtr query_context);
 
     StorageMetadataPtr getInMemoryMetadataPtr(bool bypass_metadata_cache = false) const override;
 

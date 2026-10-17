@@ -112,6 +112,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     , cluster_name_in_settings(false)
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
+    configuration->check(context_);
 
     const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto");
     const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && catalog;
@@ -177,7 +178,6 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
     else
         validateSupportedColumns(columns, *configuration);
-    configuration->check(context_);
 
     if (updated_configuration && sample_path.empty()
             && context_->getSettingsRef()[Setting::use_hive_partitioning]
@@ -830,7 +830,7 @@ StorageMetadataPtr StorageObjectStorageCluster::getInMemoryMetadataPtr(bool bypa
     return IStorageCluster::getInMemoryMetadataPtr(bypass_metadata_cache);
 }
 
-IDataLakeMetadata * StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
+std::shared_ptr<IDataLakeMetadata> StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
 {
     if (getClusterName(query_context).empty())
         return pure_storage->getExternalMetadata(query_context);

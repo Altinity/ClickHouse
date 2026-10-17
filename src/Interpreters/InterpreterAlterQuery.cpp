@@ -26,11 +26,13 @@
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTIdentifier_fwd.h>
 #include <Parsers/ASTColumnDeclaration.h>
+#include <QueryPipeline/QueryPlanResourceHolder.h>
 #include <Storages/AlterCommands.h>
 #include <Storages/IStorage.h>
 #include <Storages/MutationCommands.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/StorageKeeperMap.h>
+#include <Storages/StorageProxy.h>
 
 #include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
 #include <Functions/UserDefined/UserDefinedSQLFunctionVisitor.h>
@@ -117,12 +119,13 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
     if (table_id)
     {
         query_ptr->as<ASTAlterQuery &>().setDatabase(table_id.database_name);
+        /// Not resolved: `StorageProxy::alter` is what refreshes the metadata a lazily loaded table reports.
         table = DatabaseCatalog::instance().tryGetTable(table_id, getContext());
     }
 
     if (!alter.cluster.empty() && !maybeRemoveOnCluster(query_ptr, getContext()))
     {
-        if (table && table->as<StorageKeeperMap>())
+        if (table && castStorage<StorageKeeperMap>(table, DeferredTable::Load))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Mutations with ON CLUSTER are not allowed for KeeperMap tables");
 
         DDLQueryOnClusterParams params;
@@ -172,7 +175,7 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
     if (modify_query)
     {
         // Expand CTE before filling default database
-        ApplyWithSubqueryVisitor(getContext()).visit(*modify_query);
+        ApplyWithSubqueryVisitor::visit(*modify_query);
     }
 
     /// Add default database to table identifiers that we can encounter in e.g. default expressions, mutation expression, etc.
@@ -337,6 +340,13 @@ BlockIO InterpreterAlterQuery::executeToTable(const ASTAlterQuery & alter)
             LOG_DEBUG(getLogger("InterpreterAlterQuery"), "Will execute query '{}' as a lightweight update", query_ptr->formatForErrorMessage());
             res.pipeline = table->updateLightweight(mutation_commands, getContext());
             res.pipeline.addStorageHolder(table);
+
+            /// The patch part is committed while the pipeline runs, so the share lock must outlive this
+            /// function: otherwise a concurrent DROP can clear the data parts index under the sink.
+            QueryPlanResourceHolder update_resources;
+            update_resources.table_locks.emplace_back(std::move(table_lock));
+            res.pipeline.addResources(std::move(update_resources));
+
             return res;
         }
     }
