@@ -32,7 +32,7 @@ rows.
 - `expires_at` ([DateTime64(3)](/sql-reference/data-types/datetime64)) — Time when the lease expires.
 - `min_active_build_sequence` ([UInt64](/sql-reference/data-types/int-uint)) — Oldest in-flight build sequence (`UINT64_MAX` means the mount said farewell).
 - `gc_fenced` ([UInt8](/sql-reference/data-types/int-uint)) — `1` if GC fenced this slot out (terminal).
-- `state` ([String](/sql-reference/data-types/string)) — One of `live`, `expired`, `terminated`, `fenced`, `corrupt`.
+- `state` ([String](/sql-reference/data-types/string)) — One of `live`, `expired`, `terminated`, `fenced`, `retired`, `corrupt`. `retired` is a terminated or fenced slot of a decommissioned member; `retirement_verified` says whether the decommission finished. `corrupt` covers an undecodable mount body, and a terminated or fenced slot whose owner object cannot be decoded. Each terminated or fenced slot costs one more `GET` for its owner; a `corrupt` row from an undecodable mount body costs none.
 - `is_leader` ([Nullable(UInt8)](/sql-reference/data-types/nullable)) — `1` if this server's GC scheduler currently holds this disk's leadership lease.
 - `pending_reclaim` ([Nullable(Int64)](/sql-reference/data-types/nullable)) — Cumulative two-phase deletion backlog observed by this process's GC on this disk (condemned entries minus executed exact-token deletes).
 - `last_success_age_seconds` ([Nullable(UInt64)](/sql-reference/data-types/nullable)) — Seconds since this disk's GC last led a round (`0` if it has never led or GC is not running here).
@@ -44,6 +44,7 @@ rows.
 - `renewal_in_progress` ([Nullable(UInt8)](/sql-reference/data-types/nullable)) — `1` while this server renews its mount lease.
 - `renewal_attempts` ([Nullable(UInt64)](/sql-reference/data-types/nullable)) — Conditional `PUT`s sent by the current renewal, or by the last one once it ended. Updated per attempt, so a renewal stuck in retries is visible before it ends.
 - `last_renewal_error` ([Nullable(String)](/sql-reference/data-types/nullable)) — The last failed request of that renewal, as `<VERB> <key>: <class> <code> <message>`. `class` is `refused` when the store definitely refused the request (access denied, malformed request, entity too large), `transport` otherwise; `code` is the store's error name, such as `SlowDown`. `NULL` when no request failed.
+- `retirement_verified` ([UInt8](/sql-reference/data-types/int-uint)) — `1` on a `retired` row whose decommission verified the retirement, `0` otherwise. A server started under that `server_root_id` rejoins only from `retired` with `retirement_verified = 1`. Rerun `SYSTEM CAS DROP POOL MEMBER` only on `retired` with `retirement_verified = 0`; see the [rerun rule](/antalya/cas/operations/migration#rejoin-rerun-rule).
 
 `lifecycle`/`lifecycle_reason`/`lifecycle_detail`/`lifecycle_since` are the SQL surface for
 diagnosing an identity-lost or forgotten disk without reading server logs — see the
@@ -82,4 +83,4 @@ FORMAT Vertical;
 - [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) — per-round GC event log.
 - [`system.cas_log`](/operations/system-tables/cas_log) — per-decision event log for the CAS garbage collector and writer.
 - [`SYSTEM CAS GC RUN`](/sql-reference/statements/system#system-cas-gc-run) — run one GC round synchronously.
-- [`SYSTEM CAS DROP POOL MEMBER`](/sql-reference/statements/system#system-cas-drop-pool-member) — permanently decommission a dead pool member's `server_root_id`.
+- [`SYSTEM CAS DROP POOL MEMBER`](/sql-reference/statements/system#system-cas-drop-pool-member) — decommission a dead pool member's `server_root_id`.

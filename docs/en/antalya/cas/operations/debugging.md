@@ -190,6 +190,9 @@ available:
 SYSTEM CAS GC RUN cas;
 ```
 
+Run it on the GC leader (`is_leader = 1` in `system.cas_mounts`). On any other node it does nothing and
+returns no error.
+
 One row per disk it ran on: `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`,
 `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`,
 `entries_condemned`, `entries_graduated`, `entries_redeleted`, `entries_redelete_failed`, `fence_outs`,
@@ -224,8 +227,8 @@ SYSTEM CAS FORGET cas;
 
 It is an assertion, not a proof of erasure: the disk stays registered and answers further store-class
 access with a typed error, and a server restart re-registers the name. This is different from
-[`SYSTEM CAS DROP POOL MEMBER`](/antalya/cas/operations/migration#decommission), which permanently
-retires one pool *member*'s identity across the whole shared pool — `FORGET` only affects this node's
+[`SYSTEM CAS DROP POOL MEMBER`](/antalya/cas/operations/migration#decommission), which decommissions
+one pool *member* across the whole shared pool — `FORGET` only affects this node's
 own local view of one disk.
 
 ## Offline tools {#offline-tools}
