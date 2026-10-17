@@ -163,7 +163,8 @@ uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
     const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse);
 
-/// What a claimer requires of the owner once its body is in the slot and before it installs the renewer.
+/// What a claimer requires of the owner: after its body is in the slot and before it installs the renewer,
+/// and, for a foreign terminal body, before the reclaim write.
 struct OwnerExpectation
 {
     UInt128 server_uuid;
@@ -241,7 +242,10 @@ enum class MountPriorState
 ///         now_ms` ALONE is never sufficient — comparing a predecessor's stamp against OUR wall clock
 ///         is unsafe because a clock-skewed or merely late-observing
 ///         caller must never conclude death from a bare timestamp read);
-///   - different `server_uuid` → `ForeignOwner` (do NOT write, regardless of expiry or prior state).
+///   - different `server_uuid` → `ForeignOwner`, no write, unless the body is terminal (`gc_fenced` or the
+///     clean marker), its `writer_epoch` is below `our_epoch`, and a fresh owner read matches
+///     `foreign_reclaim_owner`: then it is reclaimed like an older epoch of our own (`prior = Fenced` or
+///     `Clean`). A rejoin under a new uuid leaves such a body.
 struct MountClaimResult
 {
     /// Plain (unscoped) enum: callers compare with `MountClaimResult::Claimed` directly.
@@ -303,7 +307,8 @@ public:
 MountClaimResult claimMount(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     uint64_t now_ms, uint64_t ttl_ms, const std::optional<Etag> & proven_dead_incarnation = {},
-    const CasEventSink & sink = {}, const std::optional<Etag> & unsafe_reclaim_authorization = {});
+    const CasEventSink & sink = {}, const std::optional<Etag> & unsafe_reclaim_authorization = {},
+    const std::optional<OwnerExpectation> & foreign_reclaim_owner = {});
 
 /// Format the operator-actionable startup error shown when the mount lease is held by a genuinely
 /// live second server (the same `server_root_id` is mounted twice). Produced only AFTER this server
@@ -316,6 +321,8 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
 
 /// Observation-based mount claim for restart recovery.
 /// Wraps `claimMount` in a loop:
+///   - `foreign_reclaim_owner` is forwarded to `claimMount`, so `Claimed` can also come from another
+///     uuid's terminal body; any other foreign body is `ForeignOwner` at once, never observed;
 ///   - first attempt decided immediately for `Claimed` (fresh / reclaimed via `Fenced` or `Clean`),
 ///     `ForeignOwner`, `FencedSelf`, or a `LiveDoubleStart` on our own (uuid, epoch);
 ///   - a `LiveDoubleStart` from OUR OWN uuid with an older epoch (a stale lease from a prior incarnation of this server,
@@ -362,7 +369,8 @@ MountClaimResult claimMountAwaitingExpiry(
     uint64_t ttl_ms, uint64_t poll_interval_ms,
     const std::function<void(uint64_t)> & sleep_ms_fn,
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {},
-    const CasEventSink & sink = {});
+    const CasEventSink & sink = {},
+    const std::optional<OwnerExpectation> & foreign_reclaim_owner = {});
 
 /// One `server_root_id`'s cross-round incarnation-stability observation,
 /// owned by the GC leader instance (`Cas::Gc::mount_obs`) and threaded through consecutive

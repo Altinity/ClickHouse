@@ -2191,3 +2191,27 @@ TEST_F(CASDecommission, OpenLogsTheSkippedProbe)
     auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim");
     EXPECT_NE(capture.captured().find("capability probe was skipped"), String::npos) << capture.captured();
 }
+
+/// The admin impersonates the owner it retires, so whose life is "ours" is ambiguous: it never takes another
+/// uuid's terminal body and refuses before writing anything.
+TEST_F(CASDecommission, AdminDoesNotReclaimAForeignTerminalBody)
+{
+    startVictim();
+    {
+        OperationForTest op(*victim_backend);
+        const auto got = (*op).read(layout.mountKey("victim"), Retry::once());
+        MountLease body = decodeMountLease(got->bytes);
+        body.server_uuid = UInt128(5);
+        body.seq += 1;
+        ASSERT_TRUE(std::holds_alternative<Committed>(
+            (*op).replace(layout.mountKey("victim"), encodeMountLease(body), got->etag, Retry::once())));
+    }
+    const OwnerObject owner_before = owner();
+    const MountLease slot_before = slot();
+
+    expectThrowsCodeWithMessage(ErrorCodes::ABORTED, "alive or contended", [&] { run("admin"); });
+
+    expectOwner(owner_before.owner_life, /*retired=*/false, /*verified=*/false);
+    EXPECT_EQ(slot().seq, slot_before.seq);
+}
+

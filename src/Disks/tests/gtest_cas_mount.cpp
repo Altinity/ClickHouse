@@ -3562,3 +3562,152 @@ TEST(CASMount, RecheckForDecommissionStillRefusesForeignOwnerAndMovedLife)
         }
     }
 }
+
+namespace
+{
+MountLease terminalBody(UInt128 uuid, uint64_t epoch, bool fenced)
+{
+    MountLease body = liveBody(uuid, epoch);
+    if (fenced)
+        body.gc_fenced = true;
+    else
+        body.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+    return body;
+}
+
+const OwnerExpectation uuid_one_at_life_two{.server_uuid = UInt128(1), .owner_life = 2, .retired = RetiredOwnerPolicy::Refuse};
+
+OwnerObject liveOwner(UInt128 uuid, uint64_t life)
+{
+    return OwnerObject{.server_uuid = uuid, .retired_at_ms = std::nullopt, .owner_life = life, .retirement_verified = false};
+}
+
+/// The slot's body with another `server_uuid`, everything else kept: what a rejoin under a new uuid leaves.
+void rewriteSlotUuid(Backend & backend, const Layout & l, const String & srid, UInt128 uuid)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto got = (*op).read(l.mountKey(srid), Retry::standard());
+    ASSERT_TRUE(got.has_value());
+    MountLease m = decodeMountLease(got->bytes);
+    m.server_uuid = uuid;
+    m.seq += 1;
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace(l.mountKey(srid), encodeMountLease(m), got->etag, Retry::standard())));
+}
+}
+
+/// After a rejoin under a new uuid the slot can hold another uuid's farewell or self-fence; the server
+/// whose owner life it is takes it over.
+TEST(CASMount, ForeignTerminalBodyIsReclaimable)
+{
+    for (const bool fenced : {false, true})
+    {
+        SCOPED_TRACE(fenced ? "gc_fenced" : "clean farewell");
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        seedOwner(ops, l, liveOwner(UInt128(1), 2));
+        mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(terminalBody(UInt128(2), 7, fenced)), Retry::standard()), "slot");
+        const MountClaimResult claim = claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, uuid_one_at_life_two);
+        ASSERT_EQ(claim.kind, MountClaimResult::Claimed);
+        EXPECT_EQ(claim.prior, fenced ? MountPriorState::Fenced : MountPriorState::Clean);
+        const MountLease slot = slotBody(*b, l, "r");
+        EXPECT_EQ(slot.server_uuid, UInt128(1));
+        EXPECT_EQ(slot.writer_epoch, 8u);
+    }
+}
+
+/// The owner is read before the reclaim: a reclaim that a later recheck refuses would leave an old-uuid
+/// body that a 26.6.4 starter (no recheck) could take.
+TEST(CASMount, ForeignReclaimReadsTheOwnerFirst)
+{
+    struct Case
+    {
+        String name;
+        std::optional<OwnerObject> owner;
+        std::optional<OwnerExpectation> expected;
+    };
+    OwnerObject retired = liveOwner(UInt128(1), 2);
+    retired.retired_at_ms = 5;
+    const std::vector<Case> cases{
+        {"owner of another uuid", liveOwner(UInt128(3), 2), uuid_one_at_life_two},
+        {"owner retired", retired, uuid_one_at_life_two},
+        {"owner at another life", liveOwner(UInt128(1), 3), uuid_one_at_life_two},
+        {"owner absent", std::nullopt, uuid_one_at_life_two},
+        {"no expectation passed", liveOwner(UInt128(1), 2), std::nullopt}};
+    for (const Case & c : cases)
+    {
+        SCOPED_TRACE(c.name);
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        if (c.owner)
+            seedOwner(ops, l, *c.owner);
+        mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(terminalBody(UInt128(2), 7, false)), Retry::standard()), "slot");
+        const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
+        EXPECT_EQ(claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, c.expected).kind, MountClaimResult::ForeignOwner);
+        EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->etag, before->etag);
+    }
+}
+
+/// A foreign body at or above our epoch is never replaced: a delayed claimer with a lower epoch stays out.
+TEST(CASMount, ForeignTerminalBodyAtOrAboveOurEpochStaysForeign)
+{
+    for (const uint64_t body_epoch : {8, 9})
+    {
+        SCOPED_TRACE(body_epoch);
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        seedOwner(ops, l, liveOwner(UInt128(1), 2));
+        mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(terminalBody(UInt128(2), body_epoch, false)), Retry::standard()), "slot");
+        const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
+        EXPECT_EQ(claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, uuid_one_at_life_two).kind, MountClaimResult::ForeignOwner);
+        EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->etag, before->etag);
+    }
+}
+
+/// A live body of another uuid is never taken, whatever the owner says.
+TEST(CASMount, ForeignLiveBodyStaysForeignOwner)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    seedOwner(ops, l, liveOwner(UInt128(1), 2));
+    mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(liveBody(UInt128(2), 7)), Retry::standard()), "slot");
+    const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
+    EXPECT_EQ(claimMount(ops.op, l, "r", UInt128(1), 8, 1000, 100, {}, {}, {}, uuid_one_at_life_two).kind, MountClaimResult::ForeignOwner);
+    EXPECT_EQ(ops.op.read(l.mountKey("r"), Retry::standard())->etag, before->etag);
+}
+
+/// A start and a self-remount pass their owner expectation, so both take over a terminal body of another uuid.
+TEST(CASMount, ClaimPathsReclaimAForeignTerminalBodyOfTheirOwnOwner)
+{
+    {
+        SCOPED_TRACE("start");
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        { auto first = Pool::open(b, rootConfig()); }
+        rewriteSlotUuid(*b, l, "r", UInt128(2));
+        auto store = Pool::open(b, rootConfig());
+        const MountLease slot = slotBody(*b, l, "r");
+        EXPECT_EQ(slot.server_uuid, UInt128(1));
+        EXPECT_EQ(slot.writer_epoch, store->writerEpoch());
+    }
+    {
+        SCOPED_TRACE("self-remount");
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        auto store = Pool::open(b, rootConfig());
+        DB::Cas::tests::fenceOutMountForTest(*b, l.mountKey("r"));
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->renewWatermarkOnce(); });
+        rewriteSlotUuid(*b, l, "r", UInt128(2));
+        EXPECT_TRUE(store->tryRemountOnce());
+        const MountLease slot = slotBody(*b, l, "r");
+        EXPECT_EQ(slot.server_uuid, UInt128(1));
+        EXPECT_FALSE(slot.gc_fenced);
+    }
+}
+
+/// A terminal row reads its owner: a tombstone makes it `retired`, and the row carries whether the retirement is
+/// verified. A live row never reads its owner (its owner here is undecodable).

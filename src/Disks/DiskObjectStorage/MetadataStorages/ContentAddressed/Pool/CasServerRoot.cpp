@@ -751,12 +751,35 @@ void emitMountEvent(const CasEventSink & sink, CasEventType type, const String &
         /// allocate or recurse through the same diagnostic machinery at a protocol-critical site.
     }
 }
+
+/// Why `owner` is not the one `expected` names; nullopt when it is.
+std::optional<String> ownerRefusal(const std::optional<OwnerObject> & owner, const String & srid, const OwnerExpectation & expected)
+{
+    if (!owner)
+        return fmt::format("CAS server-root '{}': the owner anchor vanished after the mount claim", srid);
+    if (owner->server_uuid != expected.server_uuid)
+        return fmt::format(
+            "CAS server-root '{}' is owned by a different server since this claim began (owner server_uuid={}, "
+            "ours={}); the mount slot was handed to another server and this claim is withdrawn",
+            srid, u128ToHex(owner->server_uuid), u128ToHex(expected.server_uuid));
+    if (owner->retired_at_ms && expected.retired != RetiredOwnerPolicy::AcceptForDecommission)
+        return fmt::format(
+            "CAS server-root '{}' was decommissioned (tombstoned at {} ms) while this claim was in progress; "
+            "refusing to run under a retired owner", srid, *owner->retired_at_ms);
+    if (owner->owner_life != expected.owner_life)
+        return fmt::format(
+            "CAS server-root '{}': the owner moved from life {} to life {} since this process started (a "
+            "retirement, a rollback or a rejoin happened in between); restart to continue under the current life",
+            srid, expected.owner_life, owner->owner_life);
+    return std::nullopt;
+}
 }
 
 MountClaimResult claimMount(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     uint64_t now_ms, uint64_t ttl_ms, const std::optional<Etag> & proven_dead_incarnation,
-    const CasEventSink & sink, const std::optional<Etag> & unsafe_reclaim_authorization)
+    const CasEventSink & sink, const std::optional<Etag> & unsafe_reclaim_authorization,
+    const std::optional<OwnerExpectation> & foreign_reclaim_owner)
 {
     const String key = l.mountKey(srid);
     const auto got = op.read(key, Retry::standard());
@@ -777,13 +800,21 @@ MountClaimResult claimMount(
 
     const MountLease existing = decodeMountLease(got->bytes);
 
-    /// Foreign owner → fail closed regardless of expiry. (This runs after the owner gate, so a foreign
-    /// mount should not normally exist, but the lease must never be taken across UUIDs.)
+    const bool clean_marker = existing.isFarewell();
+
+    /// A live body of another uuid is never taken. A terminal one below our epoch is what a rejoin under a new
+    /// uuid finds; it is reclaimed only once the owner reads as this claimer's own life. The owner is read before
+    /// the write, not only rechecked after it, so a reclaim never lands under somebody else's owner.
     if (existing.server_uuid != our_uuid)
     {
-        emitMountEvent(sink, CasEventType::MountConflict, srid, "foreign_owner", &existing,
-            "mount slot is held by a foreign server_uuid — refusing to take over across identities");
-        return {.kind = MountClaimResult::ForeignOwner, .body = existing, .etag = std::nullopt};
+        const bool reclaimable = (existing.gc_fenced || clean_marker) && existing.writer_epoch < our_epoch
+            && foreign_reclaim_owner && !ownerRefusal(readOwnerObject(op, l, srid), srid, *foreign_reclaim_owner);
+        if (!reclaimable)
+        {
+            emitMountEvent(sink, CasEventType::MountConflict, srid, "foreign_owner", &existing,
+                "mount slot is held by a foreign server_uuid — refusing to take over across identities");
+            return {.kind = MountClaimResult::ForeignOwner, .body = existing, .etag = std::nullopt};
+        }
     }
 
     /// An older allocation that reached the slot late must not replace a newer incarnation of this
@@ -837,7 +868,6 @@ MountClaimResult claimMount(
     /// clean-marked, not (yet) proven-dead, not unsafe-authorized lease may simply be a live twin, and
     /// `expires_at_ms` alone can never distinguish that from a dead predecessor across two different
     /// clocks.
-    const bool clean_marker = existing.isFarewell();
     const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
     const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
     if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
@@ -855,7 +885,8 @@ MountClaimResult claimMount(
                                      : proven_dead        ? MountPriorState::UncleanObserved
                                                            : MountPriorState::UncleanUnsafe;
         emitMountEvent(sink, CasEventType::MountClaim, srid, "reclaim", &existing,
-            existing.gc_fenced ? "same server_uuid, different writer_epoch, GC-fenced — reclaimed"
+            existing.server_uuid != our_uuid ? "terminal body of another server_uuid, the owner is ours — reclaimed"
+            : existing.gc_fenced ? "same server_uuid, different writer_epoch, GC-fenced — reclaimed"
             : clean_marker     ? "same server_uuid, different writer_epoch, clean farewell — reclaimed"
             : proven_dead      ? "same server_uuid, different writer_epoch, observed dead by "
                                  "token-stability observation — reclaimed"
@@ -906,25 +937,8 @@ void recheckOwnerAfterClaim(
     CasOperation & op, const Layout & l, const String & srid, const OwnerExpectation & expected,
     uint64_t our_epoch, const CasEventSink & sink)
 {
-    const std::optional<OwnerObject> owner = readOwnerObject(op, l, srid);
-    String refusal;
-    if (!owner)
-        refusal = fmt::format("CAS server-root '{}': the owner anchor vanished after the mount claim", srid);
-    else if (owner->server_uuid != expected.server_uuid)
-        refusal = fmt::format(
-            "CAS server-root '{}' is owned by a different server since this claim began (owner server_uuid={}, "
-            "ours={}); the mount slot was handed to another server and this claim is withdrawn",
-            srid, u128ToHex(owner->server_uuid), u128ToHex(expected.server_uuid));
-    else if (owner->retired_at_ms && expected.retired == RetiredOwnerPolicy::Refuse)
-        refusal = fmt::format(
-            "CAS server-root '{}' was decommissioned (tombstoned at {} ms) while this claim was in progress; "
-            "refusing to run under a retired owner", srid, *owner->retired_at_ms);
-    else if (owner->owner_life != expected.owner_life)
-        refusal = fmt::format(
-            "CAS server-root '{}': the owner moved from life {} to life {} since this process started (a "
-            "retirement, a rollback or a rejoin happened in between); restart to continue under the current life",
-            srid, expected.owner_life, owner->owner_life);
-    if (refusal.empty())
+    const std::optional<String> refusal = ownerRefusal(readOwnerObject(op, l, srid), srid, expected);
+    if (!refusal)
         return;
 
     /// The fence only spares a successor the lease wait; its failure must not replace the owner's reason.
@@ -937,7 +951,7 @@ void recheckOwnerAfterClaim(
         tryLogCurrentException(getLogger("CasMountLease"),
             fmt::format("CAS server-root '{}': the refused claim's mount body could not be fenced", srid));
     }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", refusal);
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", *refusal);
 }
 
 String mountDoubleStartMessage(const String & srid, const std::optional<MountLease> & existing)
@@ -996,7 +1010,8 @@ MountClaimResult claimMountAwaitingExpiry(
     uint64_t ttl_ms, uint64_t poll_interval_ms,
     const std::function<void(uint64_t)> & sleep_ms_fn,
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start,
-    const CasEventSink & sink)
+    const CasEventSink & sink,
+    const std::optional<OwnerExpectation> & foreign_reclaim_owner)
 {
     /// A zero poll interval would spin; a single-ms floor keeps the loop a real (bounded) wait.
     const uint64_t poll = poll_interval_ms == 0 ? 1 : poll_interval_ms;
@@ -1013,7 +1028,7 @@ MountClaimResult claimMountAwaitingExpiry(
     {
         const bool threshold_met = observed && mono_ms_fn() - observed_since >= threshold_ms;
         MountClaimResult r = claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms,
-            threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{});
+            threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{}, foreign_reclaim_owner);
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
         /// Observation certifies only an older epoch dead; a body of our own pair is never replaced,
@@ -1022,7 +1037,7 @@ MountClaimResult claimMountAwaitingExpiry(
             return r;
         /// A raced write observed a newer epoch of ours; the re-read refuses it with the newer-epoch error.
         if (r.body && r.body->server_uuid == our_uuid && r.body->writer_epoch > our_epoch)
-            return claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, std::nullopt, sink, {});
+            return claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, std::nullopt, sink, {}, foreign_reclaim_owner);
 
         /// `claimMount` already read the current body, and a raced write reports whatever its own
         /// resolve read observed. Reuse `r.etag` whenever it is set instead of re-reading the SAME key
