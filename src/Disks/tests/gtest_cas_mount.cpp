@@ -17,6 +17,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -172,6 +173,51 @@ public:
 
 private:
     UInt128 winner;
+};
+
+/// Owner ETags derived from the bytes, as S3 derives them: equal bytes bring back an equal ETag.
+class ContentEtagOwnerBackend : public InMemoryBackend
+{
+public:
+    std::optional<Raw> read(const String & key, TransportAccess & access) override
+    {
+        auto raw = InMemoryBackend::read(key, access);
+        if (raw && isOwner(key))
+            raw->value = contentValue(raw->bytes);
+        return raw;
+    }
+
+    std::optional<RawMeta> head(const String & key, TransportAccess & access) override
+    {
+        auto meta = InMemoryBackend::head(key, access);
+        if (meta && isOwner(key))
+            if (const auto raw = InMemoryBackend::read(key, access))
+                meta->value = contentValue(raw->bytes);
+        return meta;
+    }
+
+    std::expected<String, RawConflict> write(const String & key, const String & bytes,
+                                             const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (!isOwner(key))
+            return InMemoryBackend::write(key, bytes, expected_value, access);
+        std::optional<String> minted_expected;
+        if (expected_value)
+        {
+            const auto current = InMemoryBackend::read(key, access);
+            if (!current || contentValue(current->bytes) != *expected_value)
+                return std::unexpected(RawConflict{});
+            minted_expected = current->value;
+        }
+        const auto written = InMemoryBackend::write(key, bytes, minted_expected, access);
+        if (!written)
+            return written;
+        return contentValue(bytes);
+    }
+
+private:
+    static bool isOwner(const String & key) { return key.ends_with("/owner"); }
+    static String contentValue(const String & bytes) { return "content-" + DB::Cas::tests::hexOf(bytes); }
 };
 
 /// Refuses the FIRST write of the epoch key after installing a competing allocator's own epoch, so the
@@ -611,7 +657,115 @@ TEST(CASServerRootClaim, TombstonedSameOwnerFailsClosed)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
         EXPECT_NE(e.message().find("decommissioned"), String::npos) << e.message();
-        EXPECT_EQ(e.message().find("owned by a different server"), String::npos) << e.message();
+    }
+}
+
+TEST(CASServerRootClaim, FirstClaimWritesLifeOne)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    EXPECT_EQ(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation()), 1u);
+    const OwnerObject stored = decodeOwner(ops.op.read(l.ownerKey("r"), Retry::standard())->bytes);
+    EXPECT_EQ(stored.owner_life, 1u);
+    EXPECT_FALSE(stored.retirement_verified);
+    /// A restart under the same owner writes nothing and reads the same life.
+    const Etag before = currentEtag(ops.op, l.ownerKey("r"));
+    EXPECT_EQ(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation()), 1u);
+    EXPECT_EQ(currentEtag(ops.op, l.ownerKey("r")), before);
+}
+
+TEST(CASServerRootClaim, ClaimOverA2664OwnerReadsLifeZero)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    mustCommit(ops.op.create(l.ownerKey("r"), encodeOwner(OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = std::nullopt}), Retry::standard()),
+               "owner without a life");
+    EXPECT_EQ(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation()), 0u);
+}
+
+TEST(CASServerRootClaim, DecommissionPolicyAcceptsARetiredOwnerOfTheSameUuid)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    mustCommit(ops.op.create(l.ownerKey("r"), encodeOwner(OwnerObject{
+        .server_uuid = UInt128(1), .retired_at_ms = 1752537600000ULL, .owner_life = 2}), Retry::standard()), "tombstone");
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation(), RetiredOwnerPolicy::Refuse);
+    });
+    EXPECT_EQ(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation(),
+                                RetiredOwnerPolicy::AcceptForDecommission), 2u);
+    /// A retired owner of ANOTHER uuid is still foreign under either policy.
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "owned by a different server", [&]
+    {
+        claimOwnerOrThrow(ops.op, l, "r", UInt128(2), emptyCatalogObservation(), RetiredOwnerPolicy::AcceptForDecommission);
+    });
+}
+
+/// The owner appears between the claim's read and its create: the conflict re-read applies the same retired
+/// policy as the first read.
+TEST(CASServerRootClaim, ConflictRereadAppliesTheRetiredPolicy)
+{
+    for (const RetiredOwnerPolicy policy : {RetiredOwnerPolicy::Refuse, RetiredOwnerPolicy::AcceptForDecommission})
+    {
+        SCOPED_TRACE(policy == RetiredOwnerPolicy::Refuse ? "Refuse" : "AcceptForDecommission");
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        bool raced = false;
+        b->onBeforeWrite(l.ownerKey("r"), [&]
+        {
+            if (std::exchange(raced, true))
+                return;
+            Ops racer(b);
+            mustCommit(racer.op.create(l.ownerKey("r"), encodeOwner(OwnerObject{
+                .server_uuid = UInt128(1), .retired_at_ms = 1752537600000ULL, .owner_life = 2}), Retry::standard()),
+                "racing tombstone");
+        });
+        if (policy == RetiredOwnerPolicy::Refuse)
+        {
+            DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommissioned", [&]
+            {
+                claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation(), policy);
+            });
+        }
+        else
+        {
+            EXPECT_EQ(claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation(), policy), 2u);
+        }
+        EXPECT_TRUE(raced);
+    }
+}
+
+/// GUARD: a server start over a tombstoned owner is refused in this PR whether or not the retirement is
+/// verified, and writes neither the counter nor the slot. (A later PR lets a verified, drained retirement
+/// rejoin; the unverified arm stays.)
+TEST(CASMount, PoolOpenNeverAcceptsARetiredOwner)
+{
+    for (const bool verified : {false, true})
+    {
+        SCOPED_TRACE(verified ? "verified" : "unverified");
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        { auto first = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"}); }
+        Ops ops(b);
+        const auto owner = ops.op.read(l.ownerKey("r"), Retry::standard());
+        OwnerObject tombstone = decodeOwner(owner->bytes);
+        tombstone.retired_at_ms = 1;
+        tombstone.owner_life += 1;
+        tombstone.retirement_verified = verified;
+        mustCommit(ops.op.replace(l.ownerKey("r"), encodeOwner(tombstone), owner->etag, Retry::standard()), "tombstone");
+        const Etag epoch_before = currentEtag(ops.op, l.epochKey("r"));
+        const Etag mount_before = currentEtag(ops.op, l.mountKey("r"));
+        DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommissioned", [&]
+        {
+            Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
+        });
+        EXPECT_EQ(currentEtag(ops.op, l.epochKey("r")), epoch_before);
+        EXPECT_EQ(currentEtag(ops.op, l.mountKey("r")), mount_before);
     }
 }
 
@@ -3174,6 +3328,35 @@ TEST(CASServerRootClaim, OwnerLostToARacerIsDecidedFromTheConflictObservation)
     }
 }
 
+/// A tombstone sent against the owner's first ETag, delivered after a tombstone and a rejoin. Without a
+/// life the rejoined owner's bytes equal the first owner's, so a content-derived ETag would admit it.
+TEST(CASOwner, DelayedTombstoneAfterRejoinFailsOnLife)
+{
+    auto b = std::make_shared<ContentEtagOwnerBackend>();
+    Layout l("p");
+    Ops ops(b);
+    const String key = l.ownerKey("r");
+    const OwnerObject first{.server_uuid = UInt128(1), .retired_at_ms = std::nullopt, .owner_life = 1};
+    mustCommit(ops.op.create(key, encodeOwner(first), Retry::standard()), "first owner");
+    const Etag stale = currentEtag(ops.op, key);
+
+    OwnerObject tombstone = first;
+    tombstone.retired_at_ms = 1000;
+    tombstone.owner_life = 2;
+    mustCommit(ops.op.replace(key, encodeOwner(tombstone), currentEtag(ops.op, key), Retry::standard()), "tombstone");
+    OwnerObject rejoined = first;
+    rejoined.owner_life = 3;
+    mustCommit(ops.op.replace(key, encodeOwner(rejoined), currentEtag(ops.op, key), Retry::standard()), "rejoin");
+    ASSERT_NE(currentEtag(ops.op, key), stale) << "the life makes the rejoined bytes differ from the first";
+
+    OwnerObject late = first;
+    late.retired_at_ms = 2000;
+    late.owner_life = 2;
+    const WriteResult landed = ops.op.replace(key, encodeOwner(late), stale, Retry::standard());
+    EXPECT_TRUE(std::holds_alternative<Conflict>(landed));
+    EXPECT_EQ(decodeOwner(ops.op.read(key, Retry::standard())->bytes).owner_life, 3u);
+}
+
 /// A remount re-anchors its lease BEFORE it arms the fence for the new incarnation, so the fence is
 /// still latched lost at that moment. The steady-state renewal is refused there — the sibling test
 /// above pins that — and the remount's own renewal has to be admitted off the fence, or the pool could
@@ -3205,4 +3388,252 @@ TEST(CASMountLease, RemountRenewalIsAdmittedOffTheMountFence)
 
     CasOperation reader = open_requests.admit();
     EXPECT_EQ(decodeMountLease(reader.read(l.mountKey("r"), Retry::standard())->bytes).seq, 2u);
+}
+
+namespace
+{
+/// A rejoin by hand: the next life under `uuid`, not retired.
+void rewriteOwnerAt(Backend & backend, const Layout & l, const String & srid, UInt128 uuid)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto current = (*op).read(l.ownerKey(srid), Retry::once());
+    ASSERT_TRUE(current.has_value());
+    const OwnerObject next{
+        .server_uuid = uuid, .retired_at_ms = std::nullopt, .owner_life = decodeOwner(current->bytes).owner_life + 1,
+        .retirement_verified = false};
+    ASSERT_TRUE(std::holds_alternative<Committed>(
+        (*op).replace(l.ownerKey(srid), encodeOwner(next), current->etag, Retry::once())));
+}
+
+MountLease slotBody(Backend & backend, const Layout & l, const String & srid)
+{
+    DB::Cas::tests::OperationForTest op(backend);
+    const auto current = (*op).read(l.mountKey(srid), Retry::once());
+    if (!current)
+        throw std::runtime_error("mount absent: " + l.mountKey(srid));
+    return decodeMountLease(current->bytes);
+}
+
+PoolConfig rootConfig()
+{
+    return PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"};
+}
+}
+
+/// The tombstone lands between the owner claim and the mount write; the only write of the mount key in
+/// this open is the reclaim of the first open's farewell.
+TEST(CASMount, NormalMountRefusesARetiredOwnerAfterClaim)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    { auto first = Pool::open(b, rootConfig()); }
+    bool fired = false;
+    b->onBeforeWrite(l.mountKey("r"), [&]
+    {
+        if (std::exchange(fired, true))
+            return;
+        DB::Cas::tests::tombstoneOwnerForTest(*b, l.ownerKey("r"));
+    });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommissioned", [&] { Pool::open(b, rootConfig()); });
+    ASSERT_TRUE(fired);
+    const MountLease slot = slotBody(*b, l, "r");
+    EXPECT_EQ(slot.server_uuid, UInt128(1));
+    EXPECT_EQ(slot.writer_epoch, 2u) << "the refused claim's own body, not the first open's farewell";
+    EXPECT_TRUE(slot.gc_fenced) << "the refused claimer fences itself so nobody waits its lease out";
+}
+
+/// A victim prechecked before a decommission wakes after a new-uuid rejoin and reclaims its own farewell.
+TEST(CASMount, ClaimRecheckRefusesAForeignOwner)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    { auto first = Pool::open(b, rootConfig()); }
+    bool fired = false;
+    b->onBeforeWrite(l.mountKey("r"), [&]
+    {
+        if (std::exchange(fired, true))
+            return;
+        rewriteOwnerAt(*b, l, "r", UInt128(2));
+    });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "different server", [&] { Pool::open(b, rootConfig()); });
+    ASSERT_TRUE(fired);
+    const MountLease slot = slotBody(*b, l, "r");
+    EXPECT_EQ(slot.server_uuid, UInt128(1));
+    EXPECT_EQ(slot.writer_epoch, 2u);
+    EXPECT_TRUE(slot.gc_fenced);
+}
+
+TEST(CASMount, ClaimRecheckRefusesAnAbsentOwner)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    { auto first = Pool::open(b, rootConfig()); }
+    bool fired = false;
+    b->onBeforeWrite(l.mountKey("r"), [&]
+    {
+        if (std::exchange(fired, true))
+            return;
+        DB::Cas::tests::OperationForTest op(*b);
+        ASSERT_EQ((*op).removeCurrent(l.ownerKey("r"), Retry::once()), Removal::Removed);
+    });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "vanished", [&] { Pool::open(b, rootConfig()); });
+    ASSERT_TRUE(fired);
+    EXPECT_TRUE(slotBody(*b, l, "r").gc_fenced);
+}
+
+/// The owner read refuses, and the self-fence write cannot reach the store: the refusal is still the
+/// owner's reason and the slot keeps the claimer's live body for GC to fence.
+TEST(CASMount, RecheckRefusalSurvivesAFailedSelfFence)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    { auto first = Pool::open(b, rootConfig()); }
+    bool fired = false;
+    b->onBeforeWrite(l.mountKey("r"), [&]
+    {
+        if (std::exchange(fired, true))
+            return;
+        DB::Cas::tests::tombstoneOwnerForTest(*b, l.ownerKey("r"));
+        /// The claim write has already passed its armed-failure check, so this arming fails the next
+        /// mount write: the self-fence.
+        b->failNextWriteWith(l.mountKey("r"), std::make_exception_ptr(
+            DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "store refused the fence write")));
+    });
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "decommissioned", [&] { Pool::open(b, rootConfig()); });
+    ASSERT_TRUE(fired);
+    const MountLease slot = slotBody(*b, l, "r");
+    EXPECT_EQ(slot.writer_epoch, 2u) << "the claim itself landed";
+    EXPECT_FALSE(slot.gc_fenced) << "the fence write was refused; the body is untouched";
+}
+
+/// The GC fenced our lease; the remount reclaims it, and the owner was tombstoned in between.
+TEST(CASMount, FenceRecoveryReclaimRechecksTheOwner)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    auto store = Pool::open(b, rootConfig());
+    DB::Cas::tests::fenceOutMountForTest(*b, l.mountKey("r"));
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->renewWatermarkOnce(); });
+    bool fired = false;
+    b->onBeforeWrite(l.mountKey("r"), [&]
+    {
+        if (std::exchange(fired, true))
+            return;
+        DB::Cas::tests::tombstoneOwnerForTest(*b, l.ownerKey("r"));
+    });
+    EXPECT_FALSE(store->tryRemountOnce());
+    ASSERT_TRUE(fired);
+    const MountLease slot = slotBody(*b, l, "r");
+    EXPECT_EQ(slot.writer_epoch, 2u) << "the remount's fresh epoch reached the slot";
+    EXPECT_TRUE(slot.gc_fenced) << "and was fenced by the refused recheck";
+    EXPECT_FALSE(store->mayMutate());
+}
+
+/// Another process of the same uuid rejoined (the life moved) while this one was fenced. The remount sees the
+/// moved life before it allocates an epoch and stops for good instead of retrying.
+TEST(CASMount, RemountRefusesAfterASameUuidRejoin)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    auto store = Pool::open(b, rootConfig());
+    rewriteOwnerAt(*b, l, "r", UInt128(1));   /// life 2, same uuid, not retired
+    DB::Cas::tests::fenceOutMountForTest(*b, l.mountKey("r"));
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->renewWatermarkOnce(); });
+    Ops ops(b);
+    const String counter_before = ops.op.read(l.epochKey("r"), Retry::standard())->bytes;
+
+    EXPECT_FALSE(store->tryRemountOnce());
+    EXPECT_EQ(store->lifecycle(), PoolLifecycle::IdentityLost);
+    EXPECT_FALSE(store->tryRemountOnce());
+
+    EXPECT_EQ(ops.op.read(l.epochKey("r"), Retry::standard())->bytes, counter_before) << "no epoch was allocated";
+    const MountLease slot = slotBody(*b, l, "r");
+    EXPECT_EQ(slot.writer_epoch, 1u);
+    EXPECT_TRUE(slot.gc_fenced);
+}
+
+namespace
+{
+void seedOwner(Ops & ops, const Layout & l, const OwnerObject & owner)
+{
+    mustCommit(ops.op.create(l.ownerKey("r"), encodeOwner(owner), Retry::standard()), "owner");
+}
+
+MountLease liveBody(UInt128 uuid, uint64_t epoch)
+{
+    return MountLease{
+        .server_uuid = uuid, .writer_epoch = epoch, .hostname = "h", .pid = 1, .started_at_ms = 1, .seq = 1,
+        .expires_at_ms = 100, .min_active_build_sequence = 0, .gc_fenced = false, .write_attempt_id = UInt128(9)};
+}
+}
+
+/// A refusing recheck rewrites only its own live `(uuid, epoch)` body; every other slot body keeps its bytes.
+TEST(CASMount, RecheckSelfFenceLeavesAnyOtherBodyAlone)
+{
+    MountLease other_epoch = liveBody(UInt128(1), 6);
+    MountLease foreign = liveBody(UInt128(2), 7);
+    MountLease farewell = liveBody(UInt128(1), 7);
+    farewell.min_active_build_sequence = std::numeric_limits<uint64_t>::max();
+    MountLease fenced = liveBody(UInt128(1), 7);
+    fenced.gc_fenced = true;
+    const std::vector<std::pair<String, MountLease>> cases{
+        {"same uuid, another epoch", other_epoch}, {"foreign uuid", foreign}, {"clean farewell", farewell},
+        {"already fenced", fenced}};
+    for (const auto & [name, body] : cases)
+    {
+        SCOPED_TRACE(name);
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        seedOwner(ops, l, OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = std::nullopt, .owner_life = 2,
+                                      .retirement_verified = false});
+        mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(body), Retry::standard()), "slot");
+        const auto before = ops.op.read(l.mountKey("r"), Retry::standard());
+        ASSERT_TRUE(before.has_value());
+        DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "owner moved from life 1 to life 2", [&]
+        {
+            recheckOwnerAfterClaim(ops.op, l, "r",
+                OwnerExpectation{.server_uuid = UInt128(1), .owner_life = 1, .retired = RetiredOwnerPolicy::Refuse}, 7);
+        });
+        const auto after = ops.op.read(l.mountKey("r"), Retry::standard());
+        ASSERT_TRUE(after.has_value());
+        EXPECT_EQ(after->bytes, before->bytes);
+        EXPECT_EQ(after->etag, before->etag);
+    }
+}
+
+/// The decommission admin accepts a retired owner, but not a foreign one or one at another life.
+TEST(CASMount, RecheckForDecommissionStillRefusesForeignOwnerAndMovedLife)
+{
+    const OwnerExpectation admin{.server_uuid = UInt128(1), .owner_life = 2, .retired = RetiredOwnerPolicy::AcceptForDecommission};
+    struct Case
+    {
+        String name;
+        OwnerObject owner;
+        String refusal;
+    };
+    const std::vector<Case> cases{
+        {"retired at the expected life", {.server_uuid = UInt128(1), .retired_at_ms = 5, .owner_life = 2, .retirement_verified = false}, ""},
+        {"foreign uuid", {.server_uuid = UInt128(2), .retired_at_ms = 5, .owner_life = 2, .retirement_verified = false}, "different server"},
+        {"moved life", {.server_uuid = UInt128(1), .retired_at_ms = 5, .owner_life = 3, .retirement_verified = false}, "owner moved from life 2 to life 3"}};
+    for (const Case & c : cases)
+    {
+        SCOPED_TRACE(c.name);
+        auto b = std::make_shared<InMemoryBackend>();
+        Layout l("p");
+        Ops ops(b);
+        seedOwner(ops, l, c.owner);
+        mustCommit(ops.op.create(l.mountKey("r"), encodeMountLease(liveBody(UInt128(1), 7)), Retry::standard()), "slot");
+        const auto run = [&] { recheckOwnerAfterClaim(ops.op, l, "r", admin, 7); };
+        if (c.refusal.empty())
+        {
+            EXPECT_NO_THROW(run());
+            EXPECT_FALSE(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).gc_fenced);
+        }
+        else
+        {
+            DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, c.refusal, run);
+            EXPECT_TRUE(decodeMountLease(ops.op.read(l.mountKey("r"), Retry::standard())->bytes).gc_fenced);
+        }
+    }
 }

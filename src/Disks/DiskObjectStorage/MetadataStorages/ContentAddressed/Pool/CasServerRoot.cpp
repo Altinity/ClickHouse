@@ -439,17 +439,14 @@ std::optional<OwnerObject> readOwnerObject(CasOperation & op, const Layout & l, 
     return decodeOwner(got->bytes);
 }
 
-void throwIfOwnerRetired(const OwnerObject & owner, const String & srid)
+void throwIfOwnerRetired(const OwnerObject & owner, const String & srid, const String & owner_key)
 {
     if (!owner.retired_at_ms)
         return;
-
     throw Exception(ErrorCodes::CORRUPTED_DATA,
-        "CAS server-root '{}' was explicitly decommissioned by an operator (tombstoned at {} ms) "
-        "and is refusing to silently resume — if you genuinely intend to bring this server-root "
-        "back, manually clear the owner object's tombstone field and restart "
-        "(same manual-recovery pattern as an owner anchor lost over existing data)",
-        srid, *owner.retired_at_ms);
+        "CAS server-root '{}' was decommissioned (owner object '{}' retired at {} ms, owner life {}); refusing to "
+        "resume. To bring it back, see the CAS troubleshooting docs: a decommissioned member refuses to start",
+        srid, owner_key, *owner.retired_at_ms, owner.owner_life);
 }
 }
 
@@ -523,9 +520,9 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
     return owner->server_uuid;
 }
 
-void claimOwnerOrThrow(
+uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
-    const ObserveRefCatalog & observe_catalog)
+    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy)
 {
     if (!observe_catalog)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS server-root '{}': catalog observer is required", srid);
@@ -537,8 +534,9 @@ void claimOwnerOrThrow(
     {
         if (owner->server_uuid == our_uuid)
         {
-            throwIfOwnerRetired(*owner, srid);
-            return;
+            if (retired_policy == RetiredOwnerPolicy::Refuse)
+                throwIfOwnerRetired(*owner, srid, key);
+            return owner->owner_life;
         }
         /// Mirror mountDoubleStartMessage's operator guidance: the by-far most common cause is a
         /// REGENERATED local ClickHouse uuid file (wiped /var/lib/clickhouse, a pod rescheduled
@@ -562,11 +560,11 @@ void claimOwnerOrThrow(
             srid);
 
     const std::optional<Observation> occupant = conflictOrThrow(
-        op.create(key, encodeOwner(OwnerObject{.server_uuid = our_uuid, .retired_at_ms = std::nullopt}),
+        op.create(key, encodeOwner(OwnerObject{.server_uuid = our_uuid, .retired_at_ms = std::nullopt, .owner_life = 1}),
                   Retry::standard()),
         fmt::format("CAS server-root '{}' owner claim", srid));
     if (!occupant)
-        return;
+        return 1;
 
     /// The conditional create conflicted. Recompute the whole catalog + manifest + roots bundle;
     /// no stale emptiness result is carried across the conflict.
@@ -587,8 +585,9 @@ void claimOwnerOrThrow(
             "CAS server-root '{}' owner anchor vanished during claim", srid);
     if (reread->server_uuid == our_uuid)
     {
-        throwIfOwnerRetired(*reread, srid);
-        return;
+        if (retired_policy == RetiredOwnerPolicy::Refuse)
+            throwIfOwnerRetired(*reread, srid, key);
+        return reread->owner_life;
     }
     throw Exception(ErrorCodes::CORRUPTED_DATA,
         "CAS server-root '{}' was claimed by a different server during our claim (foreign owner) "
@@ -870,7 +869,7 @@ MountClaimResult claimMount(
     /// clean-marked, not (yet) proven-dead, not unsafe-authorized lease may simply be a live twin, and
     /// `expires_at_ms` alone can never distinguish that from a dead predecessor across two different
     /// clocks.
-    const bool clean_marker = existing.min_active_build_sequence == std::numeric_limits<uint64_t>::max();
+    const bool clean_marker = existing.isFarewell();
     const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
     const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
     if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
@@ -905,6 +904,72 @@ MountClaimResult claimMount(
     /// etag (what we just read is what's still there), so it is safe to hand back for the
     /// caller's observation loop to compare across polls without a redundant re-read.
     return {.kind = MountClaimResult::LiveDoubleStart, .body = existing, .etag = got->etag};
+}
+
+namespace
+{
+/// Rewrite the claimer's own live body `gc_fenced`, preserving everything else as the GC fence does. Only
+/// `(our_uuid, our_epoch)`, not yet fenced or farewelled, is touched; anything else in the slot is left alone.
+void fenceOwnClaim(CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
+                   const CasEventSink & sink)
+{
+    const String key = l.mountKey(srid);
+    WriteResult fenced = op.readModifyWrite(key,
+        [&](const std::optional<Object> & observed) -> std::optional<String>
+        {
+            if (!observed)
+                return std::nullopt;
+            const MountLease body = decodeMountLease(observed->bytes);
+            if (!body.isHeldBy(our_uuid, our_epoch) || body.gc_fenced || body.isFarewell())
+                return std::nullopt;
+            return encodeMountLease(body.fencedCopy());
+        },
+        Retry::standard());
+    if (std::holds_alternative<Committed>(fenced))
+        emitMountEvent(sink, CasEventType::MountRelease, srid, "self_fenced", nullptr,
+            "the owner recheck refused this claim; the slot is fenced so a successor need not wait");
+    else if (!std::holds_alternative<Declined>(fenced))
+        LOG_WARNING(getLogger("CasMountLease"),
+            "CAS server-root '{}': the refused claim's mount body could not be fenced; its lease expires on its own", srid);
+}
+}
+
+void recheckOwnerAfterClaim(
+    CasOperation & op, const Layout & l, const String & srid, const OwnerExpectation & expected,
+    uint64_t our_epoch, const CasEventSink & sink)
+{
+    const std::optional<OwnerObject> owner = readOwnerObject(op, l, srid);
+    String refusal;
+    if (!owner)
+        refusal = fmt::format("CAS server-root '{}': the owner anchor vanished after the mount claim", srid);
+    else if (owner->server_uuid != expected.server_uuid)
+        refusal = fmt::format(
+            "CAS server-root '{}' is owned by a different server since this claim began (owner server_uuid={}, "
+            "ours={}); the mount slot was handed to another server and this claim is withdrawn",
+            srid, u128ToHex(owner->server_uuid), u128ToHex(expected.server_uuid));
+    else if (owner->retired_at_ms && expected.retired == RetiredOwnerPolicy::Refuse)
+        refusal = fmt::format(
+            "CAS server-root '{}' was decommissioned (tombstoned at {} ms) while this claim was in progress; "
+            "refusing to run under a retired owner", srid, *owner->retired_at_ms);
+    else if (owner->owner_life != expected.owner_life)
+        refusal = fmt::format(
+            "CAS server-root '{}': the owner moved from life {} to life {} since this process started (a "
+            "retirement, a rollback or a rejoin happened in between); restart to continue under the current life",
+            srid, expected.owner_life, owner->owner_life);
+    if (refusal.empty())
+        return;
+
+    /// The fence only spares a successor the lease wait; its failure must not replace the owner's reason.
+    try
+    {
+        fenceOwnClaim(op, l, srid, expected.server_uuid, our_epoch, sink);
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger("CasMountLease"),
+            fmt::format("CAS server-root '{}': the refused claim's mount body could not be fenced", srid));
+    }
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "{}", refusal);
 }
 
 String mountDoubleStartMessage(const String & srid, const std::optional<MountLease> & existing)
@@ -985,7 +1050,7 @@ MountClaimResult claimMountAwaitingExpiry(
             return r;
         /// Observation certifies only an older epoch dead; a body of our own pair is never replaced,
         /// so waiting on it could not end.
-        if (r.body && r.body->server_uuid == our_uuid && r.body->writer_epoch == our_epoch)
+        if (r.body && r.body->isHeldBy(our_uuid, our_epoch))
             return r;
         /// A raced write observed a newer epoch of ours; the re-read refuses it with the newer-epoch error.
         if (r.body && r.body->server_uuid == our_uuid && r.body->writer_epoch > our_epoch)
@@ -1121,7 +1186,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                     obs.erase(srid);   /// terminal — no further observation needed
                     return std::nullopt;
                 }
-                if (m.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
+                if (m.isFarewell())
                 {
                     ++floor.terminated;
                     obs.erase(srid);   /// terminal — no further observation needed
@@ -1151,10 +1216,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
 
                 /// Stable past the threshold, not yet fenced → fence-out preserving the whole body
                 /// (gc_fenced = true, seq + 1) against the incarnation this decision observed.
-                MountLease fenced = m;
-                fenced.gc_fenced = true;
-                fenced.seq = m.seq + 1;
-                return encodeMountLease(fenced);
+                return encodeMountLease(m.fencedCopy());
             },
             Retry::standard());
 
@@ -1223,7 +1285,7 @@ std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(CasOperation & op, 
             return true;
         }
 
-        if (m.gc_fenced || m.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
+        if (m.gc_fenced || m.isFarewell())
             return true;   /// terminal: fenced out by GC, or the holder's own graceful farewell.
 
         slots.push_back(NonTerminalMountSlot{srid, fmt::format(
@@ -1265,7 +1327,7 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
         }
         if (info.lease.gc_fenced)
             info.state = "fenced";
-        else if (info.lease.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
+        else if (info.lease.isFarewell())
             info.state = "terminated";
         else if (now_ms <= info.lease.expires_at_ms + skew_margin_ms)
             info.state = "live";
@@ -1295,7 +1357,7 @@ FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fen
 {
     if (lease.gc_fenced)
         return FenceCertificate::GcFenced;
-    if (lease.min_active_build_sequence == std::numeric_limits<uint64_t>::max())
+    if (lease.isFarewell())
         return FenceCertificate::CleanFarewell;
     if (lease.writer_epoch != fence_writer_epoch)
         return FenceCertificate::SupersededEpoch;

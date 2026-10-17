@@ -18,6 +18,8 @@ namespace OwnerWire
 {
     constexpr WireKey server_uuid{"server_uuid"};
     constexpr WireKey retired_at_ms{"retired_at_ms"};
+    constexpr WireKey owner_life{"owner_life"};
+    constexpr WireKey retirement_verified{"retirement_verified"};
 }
 
 namespace ServerEpochWire
@@ -61,6 +63,10 @@ String encodeOwner(const OwnerObject & o)
     writeHex128Field(out, OwnerWire::server_uuid, o.server_uuid, first);
     if (o.retired_at_ms)
         writeNumberField(out, OwnerWire::retired_at_ms, *o.retired_at_ms, first);
+    if (o.owner_life != 0)
+        writeU64StringField(out, OwnerWire::owner_life, o.owner_life, first);
+    if (o.retirement_verified)
+        writeBoolField(out, OwnerWire::retirement_verified, true, first);
     closeObject(out, first);
     writeChar('\n', out);
     return std::move(out).take();
@@ -87,6 +93,10 @@ OwnerObject decodeOwner(std::string_view data)
         }
         else if (key == OwnerWire::retired_at_ms)
             rt = r.readU64Number();
+        else if (key == OwnerWire::owner_life)
+            o.owner_life = r.readU64String();
+        else if (key == OwnerWire::retirement_verified)
+            o.retirement_verified = r.readBool();
         else
             r.skipUnknown(key);
     }

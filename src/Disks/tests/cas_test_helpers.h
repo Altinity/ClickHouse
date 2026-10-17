@@ -12,6 +12,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
@@ -2326,6 +2327,30 @@ private:
 
 /// The plain form, over a bare `InMemoryBackend`.
 using HintHoleBackend = HintHoleBackendOn<DB::Cas::InMemoryBackend>;
+
+/// GC's fence-out applied directly to the mount lease: preserve the body, set `gc_fenced`, bump `seq`.
+/// A following `tryRemountOnce` reclaims a fresh incarnation.
+inline void fenceOutMountForTest(DB::Cas::Backend & backend, const String & mount_key)
+{
+    OperationForTest op(backend);
+    const auto got = (*op).read(mount_key, DB::Cas::Retry::once());
+    ASSERT_TRUE(got.has_value());
+    const DB::Cas::MountLease fenced = DB::Cas::decodeMountLease(got->bytes).fencedCopy();
+    const auto put = (*op).replace(mount_key, DB::Cas::encodeMountLease(fenced), got->etag, DB::Cas::Retry::once());
+    ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
+}
+
+/// A decommission tombstone by hand: the next owner life, retired, keeping a verified mark of a retired owner.
+inline void tombstoneOwnerForTest(DB::Cas::Backend & backend, const String & owner_key)
+{
+    OperationForTest op(backend);
+    const auto current = (*op).read(owner_key, DB::Cas::Retry::once());
+    ASSERT_TRUE(current.has_value());
+    const DB::Cas::OwnerObject owner = DB::Cas::decodeOwner(current->bytes);
+    const DB::Cas::OwnerObject tombstone = DB::Cas::nextOwnerLife(owner, 1, owner.retirement_verified && owner.retired_at_ms.has_value());
+    const auto put = (*op).replace(owner_key, DB::Cas::encodeOwner(tombstone), current->etag, DB::Cas::Retry::once());
+    ASSERT_TRUE(std::holds_alternative<DB::Cas::Committed>(put));
+}
 
 /// Stand in for the self-remount that `Pool::reportImpossibleInterference` schedules. That reaction
 /// trips the local write fence closed AND schedules a remount; a unit-test Pool runs no background

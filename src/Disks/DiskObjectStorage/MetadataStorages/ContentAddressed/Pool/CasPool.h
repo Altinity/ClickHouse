@@ -1276,6 +1276,9 @@ private:
     /// the Pool-side orchestration, so it stays on Pool.
     std::mutex remount_mutex;
 
+    /// Set once by the owner claim in `mountWritable`; a remount checks against it and never updates it.
+    uint64_t recorded_owner_life = 0;
+
     /// The single home of the [D5] per-lifecycle reason detail (spec §1) — the human-readable text that
     /// names the ACTUAL sub-state, WITHOUT the `content-addressed pool '<id>' ` prefix. Both
     /// `throwIfLifecycleTerminal` (which prefixes it and throws) and the non-gated `lifecycleSnapshot`

@@ -144,17 +144,25 @@ using ObserveRefCatalog = std::function<RefCatalog()>;
 /// counterpart used by normal opens and reuses this GET+decode path.
 std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const String & server_root_id);
 
-/// Claim (or validate) the sticky owner anchor that binds `srid` to a server UUID (identity).
-///   - owner present, equal `our_uuid`, and not tombstoned → ok (return);
-///   - owner present and tombstoned → throw `CORRUPTED_DATA` (explicitly retired — fail closed);
-///   - owner present, different → throw `CORRUPTED_DATA` (foreign owner — fail closed);
-///   - owner absent AND the subtree is provably empty → `create` the owner (claim);
-///   - owner absent BUT the subtree is non-empty → throw `CORRUPTED_DATA` (identity lost over
-///     existing data — never silently re-claim).
-/// The owner object is never deleted and never reassigned to a different UUID.
-void claimOwnerOrThrow(
+enum class RetiredOwnerPolicy : uint8_t
+{
+    Refuse,                  /// a server start or remount never resumes a tombstoned owner
+    AcceptForDecommission,   /// the decommission admin impersonates a retired victim to drain or rerun
+};
+
+/// Claim or validate the owner anchor that binds `srid` to a server uuid, and return the owner life.
+///   - present, equal `our_uuid`, not tombstoned → the stored life;
+///   - present, equal `our_uuid`, tombstoned → `CORRUPTED_DATA` under `Refuse`; the stored life under
+///     `AcceptForDecommission` (the admin runs or reruns a decommission over its retired victim);
+///   - present, different uuid → `CORRUPTED_DATA` (foreign owner), tombstoned or not;
+///   - absent, subtree provably empty → create `{our_uuid, owner_life = 1}` and return 1;
+///   - absent, subtree non-empty → `CORRUPTED_DATA` (identity lost over data).
+/// The returned life is 0 for a body written before the field existed.
+/// The owner object is never deleted. A rejoin after a verified retirement is the one supported reassignment
+/// (not in this file yet); every other uuid change is a refusal.
+uint64_t claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
-    const ObserveRefCatalog & observe_catalog);
+    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse);
 
 /// Which mint policy governs `allocateWriterEpoch`'s absent-epoch branch (see below).
 enum class EpochMintPolicy : uint8_t
@@ -162,6 +170,22 @@ enum class EpochMintPolicy : uint8_t
     NormalMount,            /// absent-epoch re-mint requires authoritative mount absence
     DecommissionRecovery,   /// absent-epoch re-mint requires a TERMINAL mount; mints a distinct epoch
 };
+
+/// What a claimer requires of the owner once its body is in the slot and before it installs the renewer.
+struct OwnerExpectation
+{
+    UInt128 server_uuid;
+    uint64_t owner_life;
+    RetiredOwnerPolicy retired;
+};
+
+/// One `GET owner` after `claimMount` returned `Claimed`. Throws `CORRUPTED_DATA` unless the owner is exactly
+/// `(expected.server_uuid, expected.owner_life)` and, under `Refuse`, not retired. Before throwing it rewrites
+/// the claimer's own `(uuid, our_epoch)` body `gc_fenced`, so a successor need not wait the lease out; a
+/// failed fence write is logged and the refusal is still thrown.
+void recheckOwnerAfterClaim(
+    CasOperation & op, const Layout & l, const String & srid, const OwnerExpectation & expected,
+    uint64_t our_epoch, const CasEventSink & sink = {});
 
 /// Allocate the next durable-monotone `writer_epoch` by CAS-bumping the sticky `epoch` object
 /// (`ServerEpoch{next_writer_epoch, allocation_nonce}`), returning the value the caller adopts as its writer_epoch.

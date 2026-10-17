@@ -32,8 +32,8 @@ using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 ///   - `Live`             — the steady state; the mount lease is (or was last) held.
 ///   - `TransientNotLive` — the lease was lost; access is uncertain and a self-remount retries. The §2
 ///                          `Present`+identity-match recovery rule fires only from here (or `Live`).
-///   - `IdentityLost`     — the pool sentinels are authoritatively absent (both KeyAbsent):
-///                          fail-loud and TERMINAL (rev.8). The remount/GC workers self-exit;
+///   - `IdentityLost`     — the pool sentinels are authoritatively absent (both KeyAbsent), or a
+///                          remount found the owner at another life: fail-loud and TERMINAL (rev.8). The remount/GC workers self-exit;
 ///                          matching-sentinel reappearance does NOT auto-revive it ([D3]); recovery is a
 ///                          restart or `SYSTEM CAS FORGET`.
 ///   - `Vanished*`        — fully terminal truth: the data root was replaced by a foreign pool, or the
@@ -256,8 +256,9 @@ public:
     /// (and the GC scheduler self-exits, through `Pool`) at its next boundary; there is no demoted observer.
     /// It deliberately does NOT publish the `vanished_intent` latch (which is reserved for the `Vanished*`
     /// idempotency/FORGET protocol); `remountTerminal` widens the worker-exit boundary to include it.
+    /// `reason` names the cause in that WARN: the pool sentinels are gone, or the owner moved to another life.
     /// Must be called under the caller's remount serialization (Pool::remount_mutex).
-    void enterIdentityLost();
+    void enterIdentityLost(const String & reason);
     /// Test seam: force the lifecycle condition directly to `lc`, bypassing the natural transition
     /// preconditions (used by the operation-gate tests to pin each class × state cell without driving a
     /// full remount/erase sequence). For a `Vanished*` value it also latches `vanished_intent`, so the

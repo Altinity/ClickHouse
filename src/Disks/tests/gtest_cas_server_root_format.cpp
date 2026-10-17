@@ -222,3 +222,61 @@ TEST(CASMountLeaseFormat, RejectsMissingIdentityFields)
     expectMessage(header + "{" + uuid + attempt + rest + "\n", "CAS mount-lease: missing writer_epoch");
     expectMessage(header + "{" + uuid + epoch + rest + "\n", "CAS mount-lease: missing or zero write_attempt_id");
 }
+
+TEST(CASOwnerFormat, LifeAndVerifiedRoundTrip)
+{
+    OwnerObject o;
+    o.server_uuid = hexToU128("0123456789abcdeffedcba9876543210");
+    o.retired_at_ms = 1752537600000ULL;
+    o.owner_life = 7;
+    o.retirement_verified = true;
+    EXPECT_EQ(encodeOwner(o), currentFormatHeader("cas_owner")
+        + "{\"server_uuid\":\"0123456789abcdeffedcba9876543210\",\"retired_at_ms\":1752537600000,"
+          "\"owner_life\":\"7\",\"retirement_verified\":true}\n");
+    const OwnerObject back = decodeOwner(encodeOwner(o));
+    EXPECT_EQ(back.owner_life, 7u);
+    EXPECT_TRUE(back.retirement_verified);
+    EXPECT_EQ(back.retired_at_ms, o.retired_at_ms);
+}
+
+/// The owner body written by 26.6.4 and by a never-retired owner: no life, no mark.
+TEST(CASOwnerFormat, BodyWithoutLifeReadsAsZeroAndUnverified)
+{
+    const OwnerObject o = decodeOwner(currentFormatHeader("cas_owner")
+        + "{\"server_uuid\":\"0123456789abcdeffedcba9876543210\"}\n");
+    EXPECT_EQ(o.owner_life, 0u);
+    EXPECT_FALSE(o.retirement_verified);
+    OwnerObject zero;
+    zero.server_uuid = o.server_uuid;
+    EXPECT_EQ(encodeOwner(zero), currentFormatHeader("cas_owner")
+        + "{\"server_uuid\":\"0123456789abcdeffedcba9876543210\"}\n")
+        << "a zero life and a false mark are not written, so the 26.6.4 bytes stay reachable";
+}
+
+/// The 26.6.4 decoder's loop knows `server_uuid` and `retired_at_ms` and hands every other key to `skipUnknown`.
+TEST(CASOwnerFormat, NewFieldsDecodeWithThe2664KeySet)
+{
+    const String body = encodeOwner(OwnerObject{
+        .server_uuid = hexToU128("0123456789abcdeffedcba9876543210"),
+        .retired_at_ms = 5, .owner_life = 3, .retirement_verified = true});
+    DB::ReadBufferFromMemory in(body.data(), body.size());
+    expectHeaderLine(in, FormatId::Owner);
+    const String line = readLine(in, traitsFor(FormatId::Owner).line_cap, "owner");
+    DB::ReadBufferFromMemory line_in(line.data(), line.size());
+    JsonObjectReader r(line_in, "owner");
+    String key;
+    std::optional<UInt128> uuid;
+    std::optional<uint64_t> retired;
+    while (r.nextKey(key))
+    {
+        if (key == "server_uuid")
+            uuid = r.readHex128();
+        else if (key == "retired_at_ms")
+            retired = r.readU64Number();
+        else
+            r.skipUnknown(key);
+    }
+    EXPECT_EQ(uuid, hexToU128("0123456789abcdeffedcba9876543210"));
+    EXPECT_EQ(retired, 5u);
+    EXPECT_TRUE(line_in.eof());
+}
