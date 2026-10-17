@@ -1,0 +1,318 @@
+: "305 lines displayed"
+Total bytes processed: "48.3  kB"
+Common labels: {"app":"chi-otel-otel-0-0","apps_kubernetes_io_pod_index":"0","clickhouse_altinity_com_app":"chop","clickhouse_altinity_com_chi":"otel","clickhouse_altinity_com_cluster":"otel","clickhouse_altinity_com_namespace":"demo","clickhouse_altinity_com_replica":"0","clickhouse_altinity_com_shard":"0","container":"clickhouse-pod","controller_revision_hash":"chi-otel-otel-0-0-689fc5b965","job":"demo/chi-otel-otel-0-0","namespace":"demo","node_name":"ip-10-129-57-226.ec2.internal","pod":"chi-otel-otel-0-0-0","statefulset_kubernetes_io_pod_name":"chi-otel-otel-0-0-0","stream":"stderr","topology_kubernetes_io_region":"us-east-1","topology_kubernetes_io_zone":"us-east-1a"}
+
+
+1790350690756	2026-09-25T15:38:10.756Z	2026.09.25 15:38:10.755819 [ 730 ] {} <Information> Application: Changed setting 'max_server_memory_usage' to 5.36 GiB (6.30 GiB available memory * 0.85 max_server_memory_usage_to_ram_ratio)
+1790350690756	2026-09-25T15:38:10.756Z	2026.09.25 15:38:10.755819 [ 730 ] {} <Information> Application: Changed setting 'max_server_memory_usage' to 5.36 GiB (6.30 GiB available memory * 0.85 max_server_memory_usage_to_ram_ratio)
+1790350690756	2026-09-25T15:38:10.756Z	2026.09.25 15:38:10.755862 [ 730 ] {} <Information> Application: Setting merges_mutations_memory_usage_soft_limit was set to 3.15 GiB (6.30 GiB available * 0.50 merges_mutations_memory_usage_to_ram_ratio)
+1790350690756	2026-09-25T15:38:10.756Z	2026.09.25 15:38:10.755862 [ 730 ] {} <Information> Application: Setting merges_mutations_memory_usage_soft_limit was set to 3.15 GiB (6.30 GiB available * 0.50 merges_mutations_memory_usage_to_ram_ratio)
+1790350690756	2026-09-25T15:38:10.756Z	2026.09.25 15:38:10.755866 [ 730 ] {} <Information> Application: Merges and mutations memory limit is set to 3.15 GiB
+1790350690756	2026-09-25T15:38:10.756Z	2026.09.25 15:38:10.755866 [ 730 ] {} <Information> Application: Merges and mutations memory limit is set to 3.15 GiB
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.757979 [ 730 ] {} <Information> Application: Setting max_remote_read_network_bandwidth_for_server was set to 0
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.757979 [ 730 ] {} <Information> Application: Setting max_remote_read_network_bandwidth_for_server was set to 0
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758031 [ 730 ] {} <Information> Application: Setting max_remote_write_network_bandwidth_for_server was set to 0
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758031 [ 730 ] {} <Information> Application: Setting max_remote_write_network_bandwidth_for_server was set to 0
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758033 [ 730 ] {} <Information> Application: Setting max_local_read_bandwidth_for_server was set to 0
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758033 [ 730 ] {} <Information> Application: Setting max_local_read_bandwidth_for_server was set to 0
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758035 [ 730 ] {} <Information> Application: Setting max_local_write_bandwidth_for_server was set to 0
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758035 [ 730 ] {} <Information> Application: Setting max_local_write_bandwidth_for_server was set to 0
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758040 [ 730 ] {} <Information> Application: ConcurrencyControl limit is set to 4 CPU slots with 'max_min_fair' scheduler
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758040 [ 730 ] {} <Information> Application: ConcurrencyControl limit is set to 4 CPU slots with 'max_min_fair' scheduler
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758054 [ 730 ] {} <Information> MergeTreeBackgroundExecutor: Loaded new threads count (16) and max tasks count (32) for MergeMutateExecutor
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758054 [ 730 ] {} <Information> MergeTreeBackgroundExecutor: Loaded new threads count (16) and max tasks count (32) for MergeMutateExecutor
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758076 [ 730 ] {} <Information> MergeTreeBackgroundExecutor: Loaded new threads count (8) and max tasks count (8) for MoveExecutor
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758076 [ 730 ] {} <Information> MergeTreeBackgroundExecutor: Loaded new threads count (8) and max tasks count (8) for MoveExecutor
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758085 [ 730 ] {} <Information> MergeTreeBackgroundExecutor: Loaded new threads count (16) and max tasks count (16) for FetchExecutor
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758085 [ 730 ] {} <Information> MergeTreeBackgroundExecutor: Loaded new threads count (16) and max tasks count (16) for FetchExecutor
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758088 [ 730 ] {} <Information> MergeTreeBackgroundExecutor: Loaded new threads count (8) and max tasks count (8) for CommonExecutor
+1790350690758	2026-09-25T15:38:10.758Z	2026.09.25 15:38:10.758088 [ 730 ] {} <Information> MergeTreeBackgroundExecutor: Loaded new threads count (8) and max tasks count (8) for CommonExecutor
+1790350690767	2026-09-25T15:38:10.767Z	2026.09.25 15:38:10.767270 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:8123 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:8123 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690767	2026-09-25T15:38:10.767Z	2026.09.25 15:38:10.767270 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:8123 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:8123 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690767	2026-09-25T15:38:10.767Z	2026.09.25 15:38:10.767422 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:8443 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:8443 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690767	2026-09-25T15:38:10.767Z	2026.09.25 15:38:10.767422 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:8443 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:8443 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690767	2026-09-25T15:38:10.767Z	2026.09.25 15:38:10.767753 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:9000 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9000 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690767	2026-09-25T15:38:10.767Z	2026.09.25 15:38:10.767753 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:9000 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9000 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690768	2026-09-25T15:38:10.768Z	2026.09.25 15:38:10.768043 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:9440 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9440 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690768	2026-09-25T15:38:10.768Z	2026.09.25 15:38:10.768043 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:9440 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9440 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690768	2026-09-25T15:38:10.768Z	2026.09.25 15:38:10.768230 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:9004 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9004 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690768	2026-09-25T15:38:10.768Z	2026.09.25 15:38:10.768230 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:9004 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9004 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690768	2026-09-25T15:38:10.768Z	2026.09.25 15:38:10.768381 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:9005 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9005 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690768	2026-09-25T15:38:10.768Z	2026.09.25 15:38:10.768381 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:9005 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9005 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690768	2026-09-25T15:38:10.768Z	2026.09.25 15:38:10.768563 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:9009 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9009 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690768	2026-09-25T15:38:10.768Z	2026.09.25 15:38:10.768563 [ 730 ] {} <Warning> Application: Listen [0.0.0.0]:9009 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9009 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350690768	2026-09-25T15:38:10.768Z	2026.09.25 15:38:10.768704 [ 730 ] {} <Information> cas::ClusterConfiguration: Applying new settings
+1790350690768	2026-09-25T15:38:10.768Z	2026.09.25 15:38:10.768704 [ 730 ] {} <Information> cas::ClusterConfiguration: Applying new settings
+1790350690774	2026-09-25T15:38:10.774Z	2026.09.25 15:38:10.773938 [ 730 ] {} <Information> cas::BlobKillerThread: Applying new settings: Enabled: true, Started: true
+1790350690774	2026-09-25T15:38:10.774Z	2026.09.25 15:38:10.773938 [ 730 ] {} <Information> cas::BlobKillerThread: Applying new settings: Enabled: true, Started: true
+1790350690774	2026-09-25T15:38:10.774Z	2026.09.25 15:38:10.774020 [ 730 ] {} <Information> cas::BlobCopierThread: Applying new settings: Enabled: false, Started: true
+1790350690774	2026-09-25T15:38:10.774Z	2026.09.25 15:38:10.774020 [ 730 ] {} <Information> cas::BlobCopierThread: Applying new settings: Enabled: false, Started: true
+1790350690774	2026-09-25T15:38:10.774Z	2026.09.25 15:38:10.774050 [ 730 ] {} <Information> cas_cache::ClusterConfiguration: Applying new settings
+1790350690774	2026-09-25T15:38:10.774Z	2026.09.25 15:38:10.774050 [ 730 ] {} <Information> cas_cache::ClusterConfiguration: Applying new settings
+1790350690777	2026-09-25T15:38:10.777Z	2026.09.25 15:38:10.776687 [ 730 ] {} <Information> cas_cache::BlobKillerThread: Applying new settings: Enabled: true, Started: true
+1790350690777	2026-09-25T15:38:10.777Z	2026.09.25 15:38:10.776687 [ 730 ] {} <Information> cas_cache::BlobKillerThread: Applying new settings: Enabled: true, Started: true
+1790350690777	2026-09-25T15:38:10.777Z	2026.09.25 15:38:10.776764 [ 730 ] {} <Information> cas_cache::BlobCopierThread: Applying new settings: Enabled: false, Started: true
+1790350690777	2026-09-25T15:38:10.777Z	2026.09.25 15:38:10.776764 [ 730 ] {} <Information> cas_cache::BlobCopierThread: Applying new settings: Enabled: false, Started: true
+1790350690777	2026-09-25T15:38:10.777Z	2026.09.25 15:38:10.776785 [ 730 ] {} <Information> s3_compare::ClusterConfiguration: Applying new settings
+1790350690777	2026-09-25T15:38:10.777Z	2026.09.25 15:38:10.776785 [ 730 ] {} <Information> s3_compare::ClusterConfiguration: Applying new settings
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779233 [ 730 ] {} <Information> s3_compare::BlobKillerThread: Applying new settings: Enabled: true, Started: true
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779233 [ 730 ] {} <Information> s3_compare::BlobKillerThread: Applying new settings: Enabled: true, Started: true
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779317 [ 730 ] {} <Information> s3_compare::BlobCopierThread: Applying new settings: Enabled: false, Started: true
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779317 [ 730 ] {} <Information> s3_compare::BlobCopierThread: Applying new settings: Enabled: false, Started: true
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779469 [ 730 ] {} <Information> StoragePolicySelector: Storage policy `default` loaded
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779469 [ 730 ] {} <Information> StoragePolicySelector: Storage policy `default` loaded
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779521 [ 730 ] {} <Information> StoragePolicySelector: Storage policy `cas` loaded
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779521 [ 730 ] {} <Information> StoragePolicySelector: Storage policy `cas` loaded
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779638 [ 730 ] {} <Information> StoragePolicySelector: Storage policy `cas_tiered` loaded
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779638 [ 730 ] {} <Information> StoragePolicySelector: Storage policy `cas_tiered` loaded
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779706 [ 730 ] {} <Information> StoragePolicySelector: Storage policy `s3_compare` loaded
+1790350690779	2026-09-25T15:38:10.779Z	2026.09.25 15:38:10.779706 [ 730 ] {} <Information> StoragePolicySelector: Storage policy `s3_compare` loaded
+1790350690785	2026-09-25T15:38:10.785Z	2026.09.25 15:38:10.785117 [ 730 ] {} <Information> CertificateReloader: Reloaded certificate (/etc/clickhouse-server/config.d/node.crt) and key (/etc/clickhouse-server/config.d/node.key).
+1790350690785	2026-09-25T15:38:10.785Z	2026.09.25 15:38:10.785117 [ 730 ] {} <Information> CertificateReloader: Reloaded certificate (/etc/clickhouse-server/config.d/node.crt) and key (/etc/clickhouse-server/config.d/node.key).
+1790350693679	2026-09-25T15:38:13.679Z	2026.09.25 15:38:13.679611 [ 1054 ] {} <Information> AWSClient: Response status: 412, Precondition Failed
+1790350693680	2026-09-25T15:38:13.680Z	2026.09.25 15:38:13.679995 [ 1492 ] {} <Information> WriteBufferFromS3: Nothing to abort. Details: bucket bvt-cas-test, key otel-cas-2664-gen1/cas/ns/state/ec1a636b88e865ec0fffda23d5ea7239/_ckpt, total size 178, count 178, hidden_size 0, offset 0, with pool: true, prefinalized: true, finalized: false
+1790350693680	2026-09-25T15:38:13.680Z	2026.09.25 15:38:13.680048 [ 1492 ] {} <Information> WriteBufferFromS3: WriteBufferFromS3 was canceled.The file might not be written to S3. Details: bucket bvt-cas-test, key otel-cas-2664-gen1/cas/ns/state/ec1a636b88e865ec0fffda23d5ea7239/_ckpt, total size 178, count 178, hidden_size 0, offset 0, with pool: true, prefinalized: true, finalized: false.
+1790350707596	2026-09-25T15:38:27.596Z	2026.09.25 15:38:27.595834 [ 24 ] {} <Information> BaseDaemon: Received termination signal (Terminated)
+1790350707597	2026-09-25T15:38:27.597Z	2026.09.25 15:38:27.596210 [ 24 ] {} <Information> BaseDaemon: Received second termination signal (Terminated). Immediately terminate.
+1790350708611	2026-09-25T15:38:28.611Z	Processing configuration file '/etc/clickhouse-server/config.xml'.
+1790350708612	2026-09-25T15:38:28.612Z	Merging configuration file '/etc/clickhouse-server/conf.d/chop-generated-hostname-ports.xml'.
+1790350708612	2026-09-25T15:38:28.612Z	Merging configuration file '/etc/clickhouse-server/conf.d/chop-generated-macros.xml'.
+1790350708613	2026-09-25T15:38:28.613Z	Merging configuration file '/etc/clickhouse-server/conf.d/chop-generated-settings.xml'.
+1790350708613	2026-09-25T15:38:28.613Z	Merging configuration file '/etc/clickhouse-server/conf.d/chop-generated-zookeeper.xml'.
+1790350708613	2026-09-25T15:38:28.613Z	Merging configuration file '/etc/clickhouse-server/config.d/01-clickhouse-01-listen.xml'.
+1790350708613	2026-09-25T15:38:28.613Z	Merging configuration file '/etc/clickhouse-server/config.d/01-clickhouse-02-logger.xml'.
+1790350708613	2026-09-25T15:38:28.613Z	Merging configuration file '/etc/clickhouse-server/config.d/01-clickhouse-03-query_log.xml'.
+1790350708613	2026-09-25T15:38:28.613Z	Merging configuration file '/etc/clickhouse-server/config.d/01-clickhouse-04-part_log.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/01-clickhouse-05-trace_log.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/a1-default-policy-cas.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/asynchronous_metric_log.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/cas.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/cas_gc_tuning.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/cas_tiered.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/ch-jwt-verify.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/ch-oauth-ldap.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/chop-generated-remote_servers.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/chop-generated-settings.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/http-sql-browser.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/keeper_map.xml'.
+1790350708615	2026-09-25T15:38:28.615Z	Merging configuration file '/etc/clickhouse-server/config.d/otel_spa_handlers.xml'.
+1790350708616	2026-09-25T15:38:28.616Z	Merging configuration file '/etc/clickhouse-server/config.d/s3_compare.xml'.
+1790350708616	2026-09-25T15:38:28.616Z	Merging configuration file '/etc/clickhouse-server/config.d/session_log.xml'.
+1790350708616	2026-09-25T15:38:28.616Z	Merging configuration file '/etc/clickhouse-server/config.d/url.xml'.
+1790350708616	2026-09-25T15:38:28.616Z	Merging configuration file '/etc/clickhouse-server/config.d/user_directories.xml'.
+1790350708626	2026-09-25T15:38:28.626Z	Logging information to /var/log/clickhouse-server/clickhouse-server.log
+1790350708635	2026-09-25T15:38:28.635Z	Logging errors to /var/log/clickhouse-server/clickhouse-server.err.log
+1790350708638	2026-09-25T15:38:28.638Z	2026.09.25 15:38:28.637505 [ 1 ] {} <Information> Application: Will watch for the process with pid 13
+1790350708638	2026-09-25T15:38:28.638Z	2026.09.25 15:38:28.637718 [ 13 ] {} <Information> Application: Forked a child process to watch
+1790350708956	2026-09-25T15:38:28.956Z	2026.09.25 15:38:28.956620 [ 13 ] {} <Information> Application: Starting ClickHouse 26.6.4.20001.altinityantalya (revision: 54514, git hash: 2073b1f88dec885444fac97edb8179ad1753c1ad, build id: 64F6443C056574409B852AEEF0007F2AEB4DFF81), PID 13
+1790350708957	2026-09-25T15:38:28.957Z	2026.09.25 15:38:28.956888 [ 13 ] {} <Information> Application: starting up
+1790350708957	2026-09-25T15:38:28.957Z	2026.09.25 15:38:28.957087 [ 13 ] {} <Information> Application: OS name: Linux, version: 6.18.33-63.124.amzn2023.aarch64, architecture: aarch64
+1790350708957	2026-09-25T15:38:28.957Z	2026.09.25 15:38:28.957455 [ 13 ] {} <Information> Application: Available RAM: 6.30 GiB; logical cores: 2; used cores: 2.
+1790350708959	2026-09-25T15:38:28.959Z	2026.09.25 15:38:28.959832 [ 13 ] {} <Information> Application: It looks like the process has no CAP_IPC_LOCK capability, binary mlock will be disabled. It could happen due to incorrect ClickHouse package installation. You could resolve the problem manually with 'sudo setcap cap_ipc_lock=+ep /usr/bin/clickhouse'. Note that it will not work on 'nosuid' mounted filesystems.
+1790350709019	2026-09-25T15:38:29.019Z	2026.09.25 15:38:29.018859 [ 13 ] {} <Information> CgroupsReader: Will create cgroup reader from '/sys/fs/cgroup/' (cgroups version: v2)
+1790350709020	2026-09-25T15:38:29.020Z	2026.09.25 15:38:29.019978 [ 13 ] {} <Information> AsynchronousMetrics: Will use cgroup reader from '/sys/fs/cgroup/' (cgroups version: v2)
+1790350709020	2026-09-25T15:38:29.020Z	2026.09.25 15:38:29.020326 [ 13 ] {} <Warning> Context: Effective user of the process (clickhouse) does not match the owner of the data (root).
+1790350709020	2026-09-25T15:38:29.020Z	2026.09.25 15:38:29.020880 [ 13 ] {} <Information> StatusFile: Status file /var/lib/clickhouse/status already exists - unclean restart. Contents:
+PID: 13
+Started at: 2026-09-24 16:41:32
+Revision: 54514
+
+1790350709021	2026-09-25T15:38:29.021Z	2026.09.25 15:38:29.021406 [ 13 ] {} <Information> StatusFile: Writing pid 13 to /var/lib/clickhouse/status
+1790350710697	2026-09-25T15:38:30.697Z	2026.09.25 15:38:30.697153 [ 13 ] {} <Information> Application: Integrity check of the executable successfully passed (checksum: 5C2E512ABD7B2525E190AAD7F4195F2D)
+1790350710697	2026-09-25T15:38:30.697Z	2026.09.25 15:38:30.697249 [ 13 ] {} <Information> MemoryWorker: Starting background memory thread with period of 50ms, using Cgroups as source, purging dirty pages enabled (total memory threshold ratio: 0.9, dirty pages threshold ratio: 0.2, page size: 65536)
+1790350710698	2026-09-25T15:38:30.698Z	2026.09.25 15:38:30.697553 [ 13 ] {} <Information> Application: OOM canary is disabled
+1790350710698	2026-09-25T15:38:30.698Z	2026.09.25 15:38:30.697631 [ 13 ] {} <Information> BackgroundSchedulePool/BgSchPool: Create BackgroundSchedulePool with 512 threads
+1790350710698	2026-09-25T15:38:30.698Z	2026.09.25 15:38:30.697696 [ 31 ] {} <Information> MemoryWorker: Default dirty pages decay period: 5000ms
+1790350710721	2026-09-25T15:38:30.721Z	2026.09.25 15:38:30.721194 [ 13 ] {} <Information> Application: Lowered uncompressed cache size to 3.15 GiB because the system has limited RAM
+1790350710721	2026-09-25T15:38:30.721Z	2026.09.25 15:38:30.721363 [ 13 ] {} <Information> Application: Lowered mark cache size to 3.15 GiB because the system has limited RAM
+1790350710721	2026-09-25T15:38:30.721Z	2026.09.25 15:38:30.721539 [ 13 ] {} <Information> Application: Lowered primary index cache size to 3.15 GiB because the system has limited RAM
+1790350710721	2026-09-25T15:38:30.721Z	2026.09.25 15:38:30.721631 [ 13 ] {} <Information> Application: Lowered index mark cache size to 3.15 GiB because the system has limited RAM
+1790350710721	2026-09-25T15:38:30.721Z	2026.09.25 15:38:30.721787 [ 13 ] {} <Information> Application: Lowered vector similarity index cache size to 3.15 GiB because the system has limited RAM
+1790350710725	2026-09-25T15:38:30.725Z	2026.09.25 15:38:30.725326 [ 13 ] {} <Information> DNSCacheUpdater: Update period 15 seconds
+1790350710743	2026-09-25T15:38:30.743Z	2026.09.25 15:38:30.743249 [ 13 ] {} <Information> Application: Changed setting 'max_server_memory_usage' to 5.36 GiB (6.30 GiB available memory * 0.85 max_server_memory_usage_to_ram_ratio)
+1790350710743	2026-09-25T15:38:30.743Z	2026.09.25 15:38:30.743426 [ 13 ] {} <Information> Application: Setting merges_mutations_memory_usage_soft_limit was set to 3.15 GiB (6.30 GiB available * 0.50 merges_mutations_memory_usage_to_ram_ratio)
+1790350710743	2026-09-25T15:38:30.743Z	2026.09.25 15:38:30.743515 [ 13 ] {} <Information> Application: Merges and mutations memory limit is set to 3.15 GiB
+1790350710746	2026-09-25T15:38:30.746Z	2026.09.25 15:38:30.746139 [ 13 ] {} <Information> Application: Setting max_remote_read_network_bandwidth_for_server was set to 0
+1790350710746	2026-09-25T15:38:30.746Z	2026.09.25 15:38:30.746326 [ 13 ] {} <Information> Application: Setting max_remote_write_network_bandwidth_for_server was set to 0
+1790350710746	2026-09-25T15:38:30.746Z	2026.09.25 15:38:30.746508 [ 13 ] {} <Information> Application: Setting max_local_read_bandwidth_for_server was set to 0
+1790350710746	2026-09-25T15:38:30.746Z	2026.09.25 15:38:30.746644 [ 13 ] {} <Information> Application: Setting max_local_write_bandwidth_for_server was set to 0
+1790350710746	2026-09-25T15:38:30.746Z	2026.09.25 15:38:30.746825 [ 13 ] {} <Information> Application: ConcurrencyControl limit is set to 4 CPU slots with 'max_min_fair' scheduler
+1790350710747	2026-09-25T15:38:30.747Z	2026.09.25 15:38:30.746993 [ 13 ] {} <Information> BackgroundSchedulePool/BgBufSchPool: Create BackgroundSchedulePool with 16 threads
+1790350710748	2026-09-25T15:38:30.748Z	2026.09.25 15:38:30.747838 [ 13 ] {} <Information> BackgroundSchedulePool/BgMBSchPool: Create BackgroundSchedulePool with 16 threads
+1790350710748	2026-09-25T15:38:30.748Z	2026.09.25 15:38:30.748712 [ 30 ] {} <Information> MemoryTracker: Correcting the value of global memory tracker from 81.36 MiB to 172.21 MiB
+1790350710750	2026-09-25T15:38:30.750Z	2026.09.25 15:38:30.749668 [ 13 ] {} <Information> BackgroundSchedulePool/BgDistSchPool: Create BackgroundSchedulePool with 16 threads
+1790350710751	2026-09-25T15:38:30.751Z	2026.09.25 15:38:30.750348 [ 13 ] {} <Information> WorkloadEntityDiskStorage: Loading workload entities from /var/lib/clickhouse/workload/
+1790350710751	2026-09-25T15:38:30.751Z	2026.09.25 15:38:30.751110 [ 13 ] {} <Warning> Application: Listen [0.0.0.0]:9009 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9009 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350710753	2026-09-25T15:38:30.753Z	2026.09.25 15:38:30.753462 [ 13 ] {} <Information> CertificateReloader: Reloaded certificate (/etc/clickhouse-server/config.d/node.crt) and key (/etc/clickhouse-server/config.d/node.key).
+1790350710753	2026-09-25T15:38:30.753Z	2026.09.25 15:38:30.753528 [ 13 ] {} <Information> CertificateReloader: One of paths is empty. Cannot apply new configuration for certificates. Fill all paths and try again.
+1790350710753	2026-09-25T15:38:30.753Z	2026.09.25 15:38:30.753627 [ 13 ] {} <Information> Application: Listening for replica communication (interserver): http://[::]:9009
+1790350710791	2026-09-25T15:38:30.791Z	2026.09.25 15:38:30.791792 [ 13 ] {} <Information> ZooKeeperClient: Connected to ZooKeeper at 172.20.45.72:2181 with session_id 72412356296704037
+1790350710838	2026-09-25T15:38:30.838Z	2026.09.25 15:38:30.837768 [ 13 ] {} <Information> CgroupsMemoryUsageObserver: Started cgroup current memory usage observer thread
+1790350710838	2026-09-25T15:38:30.838Z	2026.09.25 15:38:30.837947 [ 599 ] {} <Information> CgroupsMemoryUsageObserver: Memory amount initially available to the process is 6.30 GiB
+1790350710838	2026-09-25T15:38:30.838Z	2026.09.25 15:38:30.838723 [ 13 ] {} <Information> Context: Initialized background executor for merges and mutations with num_threads=16, num_tasks=32, scheduling_policy=round_robin
+1790350710839	2026-09-25T15:38:30.839Z	2026.09.25 15:38:30.839391 [ 13 ] {} <Information> Context: Initialized background executor for move operations with num_threads=8, num_tasks=8
+1790350710840	2026-09-25T15:38:30.840Z	2026.09.25 15:38:30.840161 [ 13 ] {} <Information> Context: Initialized background executor for fetches with num_threads=16, num_tasks=16
+1790350710840	2026-09-25T15:38:30.840Z	2026.09.25 15:38:30.840833 [ 13 ] {} <Information> Context: Initialized background executor for common operations (e.g. clearing old parts) with num_threads=8, num_tasks=8
+1790350710843	2026-09-25T15:38:30.843Z	2026.09.25 15:38:30.842877 [ 13 ] {} <Warning> Context: Delay accounting is not enabled, OSIOWaitMicroseconds will not be gathered. You can enable it using `sudo sh -c 'echo 1 > /proc/sys/kernel/task_delayacct'` or by using sysctl.
+1790350710843	2026-09-25T15:38:30.843Z	2026.09.25 15:38:30.843365 [ 13 ] {} <Information> Application: Loading metadata from /var/lib/clickhouse/
+1790350710846	2026-09-25T15:38:30.846Z	2026.09.25 15:38:30.846709 [ 13 ] {} <Information> cas::ClusterConfiguration: Applying new settings
+1790350710846	2026-09-25T15:38:30.846Z	2026.09.25 15:38:30.846757 [ 13 ] {} <Information> cas::BlobKillerThread: Applying new settings: Enabled: true, Started: false
+1790350710847	2026-09-25T15:38:30.847Z	2026.09.25 15:38:30.846892 [ 13 ] {} <Information> cas::BlobCopierThread: Applying new settings: Enabled: false, Started: false
+1790350710847	2026-09-25T15:38:30.847Z	2026.09.25 15:38:30.847043 [ 13 ] {} <Information> DiskObjectStorage(cas): Starting up disk cas
+1790350710847	2026-09-25T15:38:30.847Z	2026.09.25 15:38:30.847131 [ 13 ] {} <Information> CasRequestBudget: CAS request budget in effect: attempt_timeout_ms=5000 connect_timeout_cap_ms=1000 envelope_ms=7000 lease_safety_margin_ms=2000 (mount_lease_ttl_ms=30000 mount_renew_period_ms=10000)
+1790350711118	2026-09-25T15:38:31.118Z	2026.09.25 15:38:31.118066 [ 13 ] {} <Information> CasPool: CAS mount 'chi-otel-otel-0-0': a stale-looking mount lease is held by uuid=5659fc44f78d45bd8723a1cc760ba48c epoch=22 pid=13 hostname=chi-otel-otel-0-0-0.chi-otel-otel-0-0.demo.svc.cluster.local (expires_at_ms=1790350735241); observing its write-token for up to ~36500 ms before reclaiming. If a second server is genuinely live, its renewals will keep restarting the observation and startup will eventually abort as a live double-start.
+1790350711118	2026-09-25T15:38:31.118Z	2026.09.25 15:38:31.118101 [ 13 ] {} <Information> CasMountLease: Attempting to mount content-addressed server root chi-otel-otel-0-0 after node change or hard restart; waiting ~36500 ms (token-stability observation) to confirm the previous incarnation's operations are all finalized
+1790350751486	2026-09-25T15:39:11.486Z	2026.09.25 15:39:11.486392 [ 13 ] {} <Information> CasPool: Content-addressed mount chi-otel-otel-0-0 follows a predecessor whose death was not proven clean (writer_epoch 23). Opening without a grace period: a still-in-flight conditional PUT from that predecessor is fenced by the recovery seal, whenever it arrives.
+1790350751487	2026-09-25T15:39:11.487Z	2026.09.25 15:39:11.487070 [ 13 ] {} <Information> cas::BlobKillerThread: Execution started
+1790350751487	2026-09-25T15:39:11.487Z	2026.09.25 15:39:11.487126 [ 13 ] {} <Information> DiskObjectStorage(cas): Waiting until all expected blobs are replicated to local location
+1790350751487	2026-09-25T15:39:11.487Z	2026.09.25 15:39:11.487131 [ 13 ] {} <Information> DiskObjectStorage(cas): Disk cas started up
+1790350751487	2026-09-25T15:39:11.487Z	2026.09.25 15:39:11.487318 [ 13 ] {} <Information> SLRUFileCachePriority(cas_cache): Probationary queue 20615843021 in size and 4000000 in elements. Protected queue 30923764531 in size and 6000000 in elements
+1790350751488	2026-09-25T15:39:11.488Z	2026.09.25 15:39:11.487935 [ 13 ] {} <Information> StatusFile: Status file /var/lib/clickhouse/disks/cas_cache/status already exists - unclean restart. Contents:
+PID: 13
+Started at: 2026-09-24 16:42:14
+Revision: 54514
+
+1790350751488	2026-09-25T15:39:11.488Z	2026.09.25 15:39:11.488087 [ 13 ] {} <Information> StatusFile: Writing pid 13 to /var/lib/clickhouse/disks/cas_cache/status
+1790350751488	2026-09-25T15:39:11.488Z	2026.09.25 15:39:11.488163 [ 13 ] {} <Information> FileCache(cas_cache): Loading filesystem cache from /var/lib/clickhouse/disks/cas_cache/ using 8 listing thread(s) and 8 loading thread(s)
+1790350796967	2026-09-25T15:39:56.967Z	2026.09.25 15:39:56.967078 [ 13 ] {} <Information> cas_cache::ClusterConfiguration: Applying new settings
+1790350796967	2026-09-25T15:39:56.967Z	2026.09.25 15:39:56.967240 [ 13 ] {} <Information> cas_cache::BlobKillerThread: Applying new settings: Enabled: true, Started: false
+1790350796967	2026-09-25T15:39:56.967Z	2026.09.25 15:39:56.967341 [ 13 ] {} <Information> cas_cache::BlobCopierThread: Applying new settings: Enabled: false, Started: false
+1790350796967	2026-09-25T15:39:56.967Z	2026.09.25 15:39:56.967392 [ 13 ] {} <Information> DiskObjectStorage(cas_cache): Starting up disk cas_cache
+1790350796967	2026-09-25T15:39:56.967Z	2026.09.25 15:39:56.967471 [ 13 ] {} <Information> cas_cache::BlobKillerThread: Execution started
+1790350796967	2026-09-25T15:39:56.967Z	2026.09.25 15:39:56.967664 [ 13 ] {} <Information> DiskObjectStorage(cas_cache): Waiting until all expected blobs are replicated to local location
+1790350796967	2026-09-25T15:39:56.967Z	2026.09.25 15:39:56.967710 [ 13 ] {} <Information> DiskObjectStorage(cas_cache): Disk cas_cache started up
+1790350797322	2026-09-25T15:39:57.322Z	2026.09.25 15:39:57.322213 [ 13 ] {} <Information> DiskCache: Registered cached disk (`cas_cache`) with structure: DiskObjectStorage-cas_cache(CachedObjectStorage-cas_cache(S3))
+1790350797324	2026-09-25T15:39:57.324Z	2026.09.25 15:39:57.324227 [ 13 ] {} <Information> s3_compare::ClusterConfiguration: Applying new settings
+1790350797324	2026-09-25T15:39:57.324Z	2026.09.25 15:39:57.324288 [ 13 ] {} <Information> s3_compare::BlobKillerThread: Applying new settings: Enabled: true, Started: false
+1790350797324	2026-09-25T15:39:57.324Z	2026.09.25 15:39:57.324315 [ 13 ] {} <Information> s3_compare::BlobCopierThread: Applying new settings: Enabled: false, Started: false
+1790350797324	2026-09-25T15:39:57.324Z	2026.09.25 15:39:57.324338 [ 13 ] {} <Information> DiskObjectStorage(s3_compare): Starting up disk s3_compare
+1790350797324	2026-09-25T15:39:57.324Z	2026.09.25 15:39:57.324354 [ 13 ] {} <Information> s3_compare::BlobKillerThread: Execution started
+1790350797324	2026-09-25T15:39:57.324Z	2026.09.25 15:39:57.324378 [ 13 ] {} <Information> DiskObjectStorage(s3_compare): Waiting until all expected blobs are replicated to local location
+1790350797324	2026-09-25T15:39:57.324Z	2026.09.25 15:39:57.324389 [ 13 ] {} <Information> DiskObjectStorage(s3_compare): Disk s3_compare started up
+1790350797324	2026-09-25T15:39:57.324Z	2026.09.25 15:39:57.324426 [ 13 ] {} <Information> Context: Database disk name: default
+1790350797324	2026-09-25T15:39:57.324Z	2026.09.25 15:39:57.324452 [ 13 ] {} <Information> Context: Database disk name: default, path: /var/lib/clickhouse/
+1790350797325	2026-09-25T15:39:57.325Z	2026.09.25 15:39:57.325147 [ 13 ] {} <Information> DatabaseAtomic (system): Metadata disk default, path /var/lib/clickhouse/
+1790350797340	2026-09-25T15:39:57.340Z	2026.09.25 15:39:57.340020 [ 680 ] {} <Information> StoragePolicySelector: Storage policy `default` loaded
+1790350797340	2026-09-25T15:39:57.340Z	2026.09.25 15:39:57.340104 [ 680 ] {} <Information> StoragePolicySelector: Storage policy `cas` loaded
+1790350797340	2026-09-25T15:39:57.340Z	2026.09.25 15:39:57.340268 [ 680 ] {} <Information> StoragePolicySelector: Storage policy `cas_tiered` loaded
+1790350797340	2026-09-25T15:39:57.340Z	2026.09.25 15:39:57.340362 [ 680 ] {} <Information> StoragePolicySelector: Storage policy `s3_compare` loaded
+1790350835869	2026-09-25T15:40:35.869Z	2026.09.25 15:40:35.869503 [ 13 ] {} <Information> DatabaseAtomic (system): Metadata processed, database system has 29 tables, 0 dictionaries and 0 materialized views in total.
+1790350835869	2026-09-25T15:40:35.869Z	2026.09.25 15:40:35.869622 [ 13 ] {} <Information> TablesLoader: Parsed metadata of 29 tables in 1 databases in 38.543883078 sec
+1790350835934	2026-09-25T15:40:35.934Z	2026.09.25 15:40:35.934676 [ 13 ] {} <Information> DatabaseAtomic (bentoclick): Metadata disk default, path /var/lib/clickhouse/
+1790350835935	2026-09-25T15:40:35.935Z	2026.09.25 15:40:35.935363 [ 13 ] {} <Information> DatabaseAtomic (bentosecrets): Metadata disk default, path /var/lib/clickhouse/
+1790350835936	2026-09-25T15:40:35.936Z	2026.09.25 15:40:35.935951 [ 13 ] {} <Information> DatabaseAtomic (claude_otel): Metadata disk default, path /var/lib/clickhouse/
+1790350835936	2026-09-25T15:40:35.936Z	2026.09.25 15:40:35.936450 [ 13 ] {} <Information> DatabaseAtomic (claude_otel_anon): Metadata disk default, path /var/lib/clickhouse/
+1790350835937	2026-09-25T15:40:35.937Z	2026.09.25 15:40:35.936999 [ 13 ] {} <Information> DatabaseAtomic (default): Metadata disk default, path /var/lib/clickhouse/
+1790350835937	2026-09-25T15:40:35.937Z	2026.09.25 15:40:35.937704 [ 13 ] {} <Information> DatabaseAtomic (system_anon): Metadata disk default, path /var/lib/clickhouse/
+1790350836166	2026-09-25T15:40:36.166Z	2026.09.25 15:40:36.166201 [ 13 ] {} <Information> DatabaseAtomic (bentoclick): Metadata processed, database bentoclick has 36 tables, 0 dictionaries and 1 materialized views in total.
+1790350836195	2026-09-25T15:40:36.195Z	2026.09.25 15:40:36.193447 [ 13 ] {} <Information> DatabaseAtomic (bentosecrets): Metadata processed, database bentosecrets has 4 tables, 1 dictionaries and 0 materialized views in total.
+1790350836197	2026-09-25T15:40:36.197Z	2026.09.25 15:40:36.196923 [ 13 ] {} <Information> DatabaseAtomic (claude_otel): Metadata processed, database claude_otel has 20 tables, 0 dictionaries and 5 materialized views in total.
+1790350836379	2026-09-25T15:40:36.379Z	2026.09.25 15:40:36.378888 [ 13 ] {} <Information> DatabaseAtomic (claude_otel_anon): Metadata processed, database claude_otel_anon has 28 tables, 0 dictionaries and 0 materialized views in total.
+1790350838285	2026-09-25T15:40:38.285Z	2026.09.25 15:40:38.285262 [ 778 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838286	2026-09-25T15:40:38.286Z	2026.09.25 15:40:38.286185 [ 745 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838287	2026-09-25T15:40:38.287Z	2026.09.25 15:40:38.286671 [ 849 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838301	2026-09-25T15:40:38.301Z	2026.09.25 15:40:38.300862 [ 815 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838301	2026-09-25T15:40:38.301Z	2026.09.25 15:40:38.301415 [ 790 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838309	2026-09-25T15:40:38.309Z	2026.09.25 15:40:38.309152 [ 778 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838310	2026-09-25T15:40:38.310Z	2026.09.25 15:40:38.310448 [ 729 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838332	2026-09-25T15:40:38.332Z	2026.09.25 15:40:38.332505 [ 789 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838357	2026-09-25T15:40:38.357Z	2026.09.25 15:40:38.357306 [ 713 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838357	2026-09-25T15:40:38.357Z	2026.09.25 15:40:38.357758 [ 789 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838358	2026-09-25T15:40:38.358Z	2026.09.25 15:40:38.358388 [ 840 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838366	2026-09-25T15:40:38.366Z	2026.09.25 15:40:38.366070 [ 845 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838377	2026-09-25T15:40:38.377Z	2026.09.25 15:40:38.377711 [ 830 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838378	2026-09-25T15:40:38.378Z	2026.09.25 15:40:38.378122 [ 722 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838379	2026-09-25T15:40:38.379Z	2026.09.25 15:40:38.378958 [ 790 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838391	2026-09-25T15:40:38.391Z	2026.09.25 15:40:38.390855 [ 825 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838400	2026-09-25T15:40:38.400Z	2026.09.25 15:40:38.400545 [ 729 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838403	2026-09-25T15:40:38.403Z	2026.09.25 15:40:38.402827 [ 845 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838425	2026-09-25T15:40:38.425Z	2026.09.25 15:40:38.425537 [ 806 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838432	2026-09-25T15:40:38.432Z	2026.09.25 15:40:38.432802 [ 830 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838441	2026-09-25T15:40:38.441Z	2026.09.25 15:40:38.441123 [ 712 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838449	2026-09-25T15:40:38.449Z	2026.09.25 15:40:38.449131 [ 724 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838453	2026-09-25T15:40:38.453Z	2026.09.25 15:40:38.453657 [ 813 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838454	2026-09-25T15:40:38.454Z	2026.09.25 15:40:38.454216 [ 806 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838455	2026-09-25T15:40:38.455Z	2026.09.25 15:40:38.454515 [ 840 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838455	2026-09-25T15:40:38.455Z	2026.09.25 15:40:38.454877 [ 778 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838460	2026-09-25T15:40:38.460Z	2026.09.25 15:40:38.460037 [ 815 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838473	2026-09-25T15:40:38.473Z	2026.09.25 15:40:38.473499 [ 776 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350838741	2026-09-25T15:40:38.741Z	2026.09.25 15:40:38.741498 [ 13 ] {} <Information> DatabaseAtomic (default): Metadata processed, database default has 10 tables, 0 dictionaries and 0 materialized views in total.
+1790350839007	2026-09-25T15:40:39.007Z	2026.09.25 15:40:39.007623 [ 13 ] {} <Information> DatabaseAtomic (system_anon): Metadata processed, database system_anon has 37 tables, 0 dictionaries and 0 materialized views in total.
+1790350839007	2026-09-25T15:40:39.007Z	2026.09.25 15:40:39.007697 [ 13 ] {} <Information> TablesLoader: Parsed metadata of 136 tables in 6 databases in 3.069994016 sec
+1790350839010	2026-09-25T15:40:39.010Z	2026.09.25 15:40:39.010426 [ 13 ] {} <Information> loadMetadata: Start asynchronous loading of databases
+1790350839024	2026-09-25T15:40:39.024Z	2026.09.25 15:40:39.023244 [ 13 ] {} <Information> Application: Tasks stats provider: procfs
+1790350839024	2026-09-25T15:40:39.024Z	2026.09.25 15:40:39.023270 [ 13 ] {} <Information> Application: It looks like the process has no CAP_SYS_NICE capability, the setting 'os_thread_priority' will have no effect. It could happen due to incorrect ClickHouse package installation. You could resolve the problem manually with 'sudo setcap cap_sys_nice=+ep /usr/bin/clickhouse'. Note that it will not work on 'nosuid' mounted filesystems.
+1790350839133	2026-09-25T15:40:39.133Z	2026.09.25 15:40:39.132900 [ 13 ] {} <Warning> Application: Listen [0.0.0.0]:8123 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:8123 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350839133	2026-09-25T15:40:39.133Z	2026.09.25 15:40:39.133106 [ 13 ] {} <Warning> Application: Listen [0.0.0.0]:8443 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:8443 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350839133	2026-09-25T15:40:39.133Z	2026.09.25 15:40:39.133313 [ 13 ] {} <Warning> Application: Listen [0.0.0.0]:9000 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9000 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350839133	2026-09-25T15:40:39.133Z	2026.09.25 15:40:39.133680 [ 13 ] {} <Warning> Application: Listen [0.0.0.0]:9440 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9440 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350839134	2026-09-25T15:40:39.134Z	2026.09.25 15:40:39.133929 [ 13 ] {} <Warning> Application: Listen [0.0.0.0]:9004 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9004 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350839134	2026-09-25T15:40:39.134Z	2026.09.25 15:40:39.134202 [ 13 ] {} <Warning> Application: Listen [0.0.0.0]:9005 failed: Poco::Exception. Code: 1000, e.code() = 98, Net Exception: Address already in use: 0.0.0.0:9005 (version 26.6.4.20001.altinityantalya (altinity build)). If it is an IPv6 or IPv4 address and your host has disabled IPv6 or IPv4, then consider to specify not disabled IPv4 or IPv6 address to listen in <listen_host> element of configuration file. Example for disabled IPv6: <listen_host>0.0.0.0</listen_host> . Example for disabled IPv4: <listen_host>::</listen_host>
+1790350839134	2026-09-25T15:40:39.134Z	2026.09.25 15:40:39.134308 [ 13 ] {} <Information> CertificateReloader: One of paths is empty. Cannot apply new configuration for certificates. Fill all paths and try again.
+1790350839139	2026-09-25T15:40:39.139Z	2026.09.25 15:40:39.138878 [ 13 ] {} <Information> Application: Listening for http://[::]:8123
+1790350839139	2026-09-25T15:40:39.139Z	2026.09.25 15:40:39.138956 [ 13 ] {} <Information> Application: Listening for https://[::]:8443
+1790350839139	2026-09-25T15:40:39.139Z	2026.09.25 15:40:39.139005 [ 13 ] {} <Information> Application: Listening for native protocol (tcp): [::]:9000
+1790350839139	2026-09-25T15:40:39.139Z	2026.09.25 15:40:39.139233 [ 13 ] {} <Information> Application: Listening for secure native protocol (tcp_secure): [::]:9440
+1790350839139	2026-09-25T15:40:39.139Z	2026.09.25 15:40:39.139333 [ 13 ] {} <Information> Application: Listening for MySQL compatibility protocol: [::]:9004
+1790350839139	2026-09-25T15:40:39.139Z	2026.09.25 15:40:39.139389 [ 13 ] {} <Information> Application: Listening for PostgreSQL compatibility protocol: [::]:9005
+1790350839139	2026-09-25T15:40:39.139Z	2026.09.25 15:40:39.139400 [ 13 ] {} <Information> Application: Ready for connections.
+1790350841837	2026-09-25T15:40:41.837Z	2026.09.25 15:40:41.837661 [ 680 ] {} <Information> AsyncLoader: Processed: 4.6%
+1790350842360	2026-09-25T15:40:42.360Z	2026.09.25 15:40:42.359781 [ 744 ] {} <Information> claude_otel.otel_logs (05e0a06a-110a-4186-92ca-29f878a37dd7): Table will be in readonly mode until initialization is finished
+1790350844921	2026-09-25T15:40:44.921Z	2026.09.25 15:40:44.918812 [ 744 ] {} <Information> claude_otel.mv_daily_usage_by_user_data (8e7786a3-7b2a-4770-b070-2d0f5ee39516): Table will be in readonly mode until initialization is finished
+1790350845185	2026-09-25T15:40:45.185Z	2026.09.25 15:40:45.184484 [ 761 ] {} <Information> claude_otel.mv_api_latency_by_model_data (8ff2f597-3b47-409f-89d9-c22bbd3061b2): Table will be in readonly mode until initialization is finished
+1790350847882	2026-09-25T15:40:47.882Z	2026.09.25 15:40:47.882197 [ 761 ] {} <Information> AsyncLoader: Processed: 6.1%
+1790350848298	2026-09-25T15:40:48.298Z	2026.09.25 15:40:48.298439 [ 761 ] {} <Information> system.zookeeper_connection_log (a6369cad-2670-4564-a6b9-15ae553d9ec9): Start to refresh statistics
+1790350848314	2026-09-25T15:40:48.314Z	2026.09.25 15:40:48.313624 [ 761 ] {} <Information> system.aggregated_zookeeper_log (295351d1-1572-40b5-8ef8-ba6f791a39af): Start to refresh statistics
+1790350848328	2026-09-25T15:40:48.328Z	2026.09.25 15:40:48.328220 [ 761 ] {} <Information> system.processors_profile_log (db76b326-d1a8-4fcc-a062-ef84150cb412): Start to refresh statistics
+1790350848341	2026-09-25T15:40:48.341Z	2026.09.25 15:40:48.341209 [ 761 ] {} <Information> system.trace_log (b1791d31-5a2d-46ba-ad5b-6d15bdb1627a): Start to refresh statistics
+1790350850397	2026-09-25T15:40:50.397Z	2026.09.25 15:40:50.397122 [ 813 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850433	2026-09-25T15:40:50.433Z	2026.09.25 15:40:50.433461 [ 743 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850450	2026-09-25T15:40:50.450Z	2026.09.25 15:40:50.449830 [ 771 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850484	2026-09-25T15:40:50.484Z	2026.09.25 15:40:50.483815 [ 807 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850496	2026-09-25T15:40:50.496Z	2026.09.25 15:40:50.496304 [ 833 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850496	2026-09-25T15:40:50.496Z	2026.09.25 15:40:50.496783 [ 872 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850510	2026-09-25T15:40:50.510Z	2026.09.25 15:40:50.510220 [ 765 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850511	2026-09-25T15:40:50.511Z	2026.09.25 15:40:50.510902 [ 769 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850540	2026-09-25T15:40:50.540Z	2026.09.25 15:40:50.540602 [ 771 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850563	2026-09-25T15:40:50.563Z	2026.09.25 15:40:50.563353 [ 761 ] {} <Error> AWSClient: Response status: 503, Service Unavailable
+1790350850575	2026-09-25T15:40:50.575Z	2026.09.25 15:40:50.574598 [ 730 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850575	2026-09-25T15:40:50.575Z	2026.09.25 15:40:50.575622 [ 862 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850579	2026-09-25T15:40:50.579Z	2026.09.25 15:40:50.577768 [ 860 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850579	2026-09-25T15:40:50.579Z	2026.09.25 15:40:50.578053 [ 822 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850579	2026-09-25T15:40:50.579Z	2026.09.25 15:40:50.579146 [ 859 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850580	2026-09-25T15:40:50.580Z	2026.09.25 15:40:50.579767 [ 722 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850584	2026-09-25T15:40:50.584Z	2026.09.25 15:40:50.583962 [ 758 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850591	2026-09-25T15:40:50.591Z	2026.09.25 15:40:50.591599 [ 836 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850623	2026-09-25T15:40:50.623Z	2026.09.25 15:40:50.623316 [ 840 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850632	2026-09-25T15:40:50.632Z	2026.09.25 15:40:50.632777 [ 774 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850637	2026-09-25T15:40:50.637Z	2026.09.25 15:40:50.637259 [ 840 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850638	2026-09-25T15:40:50.638Z	2026.09.25 15:40:50.638582 [ 862 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850723	2026-09-25T15:40:50.723Z	2026.09.25 15:40:50.723757 [ 843 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850734	2026-09-25T15:40:50.734Z	2026.09.25 15:40:50.734062 [ 885 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850735	2026-09-25T15:40:50.735Z	2026.09.25 15:40:50.735350 [ 872 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350850759	2026-09-25T15:40:50.759Z	2026.09.25 15:40:50.759069 [ 798 ] {} <Error> AWSClient: Response status: 503, Slow Down
+1790350854170	2026-09-25T15:40:54.170Z	2026.09.25 15:40:54.170353 [ 761 ] {} <Information> claude_otel.otel_metrics_sum (a2cdfc33-2709-43e3-b231-a4303efec232): Table will be in readonly mode until initialization is finished
+1790350854170	2026-09-25T15:40:54.170Z	2026.09.25 15:40:54.170353 [ 761 ] {} <Information> claude_otel.otel_metrics_sum (a2cdfc33-2709-43e3-b231-a4303efec232): Table will be in readonly mode until initialization is finished
+1790350854170	2026-09-25T15:40:54.170Z	2026.09.25 15:40:54.170823 [ 761 ] {} <Information> AsyncLoader: Processed: 7.8%
+1790350854170	2026-09-25T15:40:54.170Z	2026.09.25 15:40:54.170823 [ 761 ] {} <Information> AsyncLoader: Processed: 7.8%
+1790350854665	2026-09-25T15:40:54.665Z	2026.09.25 15:40:54.662418 [ 761 ] {} <Information> system.asynchronous_metric_log (d79d998f-9f4f-44f7-85ee-6651b08244aa): Start to refresh statistics
+1790350854665	2026-09-25T15:40:54.665Z	2026.09.25 15:40:54.662418 [ 761 ] {} <Information> system.asynchronous_metric_log (d79d998f-9f4f-44f7-85ee-6651b08244aa): Start to refresh statistics
+1790350859978	2026-09-25T15:40:59.978Z	2026.09.25 15:40:59.978705 [ 761 ] {} <Information> claude_otel.mv_daily_activity_by_user_data (f8d1800a-e4b6-40e5-a38b-0f0804cd0aeb): Table will be in readonly mode until initialization is finished
+1790350859979	2026-09-25T15:40:59.979Z	2026.09.25 15:40:59.978909 [ 761 ] {} <Information> AsyncLoader: Processed: 9.3%
+1790350865298	2026-09-25T15:41:05.298Z	2026.09.25 15:41:05.297679 [ 761 ] {} <Information> AsyncLoader: Processed: 9.6%
+1790350865713	2026-09-25T15:41:05.713Z	2026.09.25 15:41:05.713516 [ 761 ] {} <Information> bentoclick.schema_guide_data (2431d343-0575-4837-91cc-edf11d4e978d): Table will be in readonly mode until initialization is finished
+1790350866361	2026-09-25T15:41:06.361Z	2026.09.25 15:41:06.361380 [ 761 ] {} <Information> bentoclick.generated_objects (d5b0f4f1-dd82-4a30-baa8-ed7f72c6c4f1): Table will be in readonly mode until initialization is finished
+1790350866960	2026-09-25T15:41:06.960Z	2026.09.25 15:41:06.959910 [ 761 ] {} <Information> bentoclick.profile_shape (451d0c31-22ed-4b73-8433-78e890d5e8af): Table will be in readonly mode until initialization is finished
+1790350867830	2026-09-25T15:41:07.830Z	2026.09.25 15:41:07.829347 [ 761 ] {} <Information> bentoclick.profile_queries (9e6cebce-aa84-4bce-998a-189ee8645190): Table will be in readonly mode until initialization is finished
+1790350868216	2026-09-25T15:41:08.216Z	2026.09.25 15:41:08.216131 [ 761 ] {} <Information> bentoclick.profile_hot_columns (72545af2-4c62-4e61-8a6e-54440c81dc5d): Table will be in readonly mode until initialization is finished
+1790350868608	2026-09-25T15:41:08.608Z	2026.09.25 15:41:08.608385 [ 761 ] {} <Information> bentoclick.profile_attr_keys (0dfac7fc-c814-43c5-9c6a-1d1aca69b40c): Table will be in readonly mode until initialization is finished
+1790350868986	2026-09-25T15:41:08.986Z	2026.09.25 15:41:08.986153 [ 761 ] {} <Information> bentoclick.manifest (36063232-9018-47f1-9d6f-7f8e727697d3): Table will be in readonly mode until initialization is finished
+1790350869835	2026-09-25T15:41:09.835Z	2026.09.25 15:41:09.834926 [ 761 ] {} <Information> bentoclick.attr_guide_data (0ee0d6c3-60fd-4b0a-85eb-7a4a98882b95): Table will be in readonly mode until initialization is finished
+1790350870310	2026-09-25T15:41:10.310Z	2026.09.25 15:41:10.309917 [ 761 ] {} <Information> AsyncLoader: Processed: 15.4%
+1790350870685	2026-09-25T15:41:10.685Z	2026.09.25 15:41:10.685178 [ 761 ] {} <Information> bentoclick.profile_workload (dfb1593b-4441-462f-9b8a-89e038a6c726): Table will be in readonly mode until initialization is finished
+1790350871106	2026-09-25T15:41:11.106Z	2026.09.25 15:41:11.106480 [ 761 ] {} <Information> bentoclick.profile_verification (f8106360-98ce-4302-8c6b-2533922b48aa): Table will be in readonly mode until initialization is finished
+1790350871490	2026-09-25T15:41:11.490Z	2026.09.25 15:41:11.489759 [ 761 ] {} <Information> bentoclick.profile_relations (39710c05-ae93-46d4-80aa-ee970c8c53c2): Table will be in readonly mode until initialization is finished
+1790350871889	2026-09-25T15:41:11.889Z	2026.09.25 15:41:11.889788 [ 761 ] {} <Information> bentoclick.profile_catalog (ade09c34-d27f-4235-aec5-dd33d532e2ea): Table will be in readonly mode until initialization is finished
+1790350872297	2026-09-25T15:41:12.297Z	2026.09.25 15:41:12.296707 [ 761 ] {} <Information> bentoclick.profile_conventions (738000b9-d88c-46a2-88c7-399c184667f9): Table will be in readonly mode until initialization is finished
+1790350878512	2026-09-25T15:41:18.512Z	2026.09.25 15:41:18.512195 [ 761 ] {} <Information> claude_otel.mv_daily_cost_summary_data (3b7f9bc3-0058-4e41-b566-66aa49d9bf75): Table will be in readonly mode until initialization is finished
+1790350878512	2026-09-25T15:41:18.512Z	2026.09.25 15:41:18.512496 [ 761 ] {} <Information> AsyncLoader: Processed: 18.6%

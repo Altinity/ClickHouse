@@ -1,0 +1,42 @@
+=== Diff Mode ===
+Match method: mangled_symbol
+
+--- Before ---
+Binary: ~/workspace/ClickHouse/cas-p2-before/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
+Function: DB::Cas::SourceEdgeRunReader::next(DB::Cas::SourceEdgeRecord&)
+Build ID: cccbca33e4c37d55...
+Instructions: 995  Bytes: 5058
+Spill: 26.7%  Branch: 14.8%  Call: 8.6%
+Blocks: 190  Loops: 3
+
++++ After +++
+Binary: build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
+Function: DB::Cas::SourceEdgeRunReader::next(DB::Cas::SourceEdgeRecord&)
+Build ID: 469d1aa112b7e3f0...
+Instructions: 987  Bytes: 4901
+Spill: 25.9%  Branch: 13.9%  Call: 8.4%
+Blocks: 175  Loops: 3
+
+=== Deltas ===
+  instruction_count: -8
+  byte_size: -157
+  branch_count: -10
+  call_count: -3
+  spill_store_count: -6
+  spill_load_count: -4
+  spill_density: -0.79%
+  branch_density: -0.89%
+  call_density: -0.23%
+  block_count: -15
+  loop_count: 0
+
+=== Timing ===
+  probe: 22ms
+  inspect_before: 9ms
+  resolve_before: 702ms
+  disassemble_before: 82ms
+  inspect_after: 8ms
+  resolve_after: 704ms
+  disassemble_after: 81ms
+  diff_total: 1587ms
+

@@ -1,0 +1,85 @@
+# S41 write-path baseline: an ISOLATED single-node stack, deliberately in its own docker-compose
+# project (`name: ca-s41`) so bringing it up/down never touches the long-lived `ca-soak` soak stack
+# that shares this directory. One ClickHouse replica (ch1) + one Keeper + one RustFS, all on the
+# project's own docker network. Host port 18123 only (8123/8124 are taken by the soak). The same
+# host-built RelWithDebInfo binary is mounted as in docker-compose.yml.
+#
+# Single node is the correct shape for a WRITE-PATH baseline: there is no interserver fetch /
+# replication confound, so the INSERT-query ProfileEvents + trace_log on ch1 are the pure write path.
+# ReplicatedMergeTree (not plain MergeTree) is still used so the suite's standard end-checkpoint
+# (SYSTEM SYNC REPLICA, a no-op with one replica) works unchanged.
+name: ca-s41
+
+services:
+  rustfs1:
+    image: rustfs/rustfs:1.0.0-rc.3
+    command: server --address 0.0.0.0:11121
+    env_file: configs/rustfs.env
+    expose:
+      - "11121"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  createbucket:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      - rustfs1
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set carustfs http://rustfs1:11121 clickhouse clickhouse; do
+        echo 'waiting for rustfs...'; sleep 1;
+      done;
+      /usr/bin/mc mb --ignore-existing carustfs/test;
+      until /usr/bin/mc ls carustfs/test >/dev/null 2>&1; do
+        echo 'waiting for bucket to become visible...'; sleep 1;
+      done;
+      echo 'bucket ready';
+      "
+
+  keeper1:
+    image: clickhouse/clickhouse-server:25.8
+    entrypoint: ["/usr/bin/clickhouse", "keeper", "--config-file", "/etc/clickhouse-keeper/keeper.xml"]
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/keeper.xml:/etc/clickhouse-keeper/keeper.xml:ro
+    expose:
+      - "9181"
+
+  ch1:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+    # RelWithDebInfo footprint is small; cap well under the host budget. Fail-closed on memory
+    # (memory.xml caps ClickHouse at 0.9x this) instead of a kernel OOM-kill.
+    mem_limit: 16g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_s41.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/fsck_only_s41.xml:/etc/clickhouse-server/fsck-only.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./configs/ca_server_settings.xml:/etc/clickhouse-server/config.d/ca_server_settings.xml:ro
+      # NOTE: NO profiling.xml here. The card sets query_profiler_{real,cpu}_time_period_ns explicitly
+      # per measured INSERT so the profiler samples ONLY the measured window (a server-wide 10ms
+      # profiler would also sample idle/background threads and dilute the write-path attribution).
+      - ./logs_s41/ch1:/var/log/clickhouse-server
+    ports:
+      - "18123:8123"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s

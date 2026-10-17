@@ -1,0 +1,55 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- Writable content-addressed disk over the shared RustFS pool. Both ch1 and ch2 load
+                 this same config, so they mount the SAME pool (one bucket path = single source of
+                 truth). RustFS is required (not MinIO) because the CA capability probe demands a
+                 store that ENFORCES conditional ops (wrong-token DELETE must fail with 412). -->
+            <ca>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <!-- Background reachability GC enabled on both servers, running aggressively. -->
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>2</cas_gc_interval_sec>
+                <!-- #4: widen shard fanout (default 8) so manifest CAS writes spread across more
+                     keys — drops per-key 64-permit congestion (503) and per-key overwrite-orphan
+                     pileup. Creation-time; the fresh per-run pool picks it up. -->
+                <!-- B187: rustfs honors Expect: 100-continue, so negotiate it for ALL conditional
+                     blob PUTs >= 64 KiB (not just the default >= 1 MiB). A dedup-hit conditional PUT
+                     (If-None-Match:* on an existing blob) then gets a clean early 412 instead of
+                     rustfs closing mid-body -> a transport Broken pipe -> the 500x5s retry storm that
+                     wedges the merge finalize. 64 KiB still spares the high-volume tiny manifest casPuts. -->
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+            </ca>
+
+            <!-- Read-only fsck view over the SAME endpoint. <readonly>true</readonly> is parsed by
+                 S3Settings into S3RequestSetting::read_only, which makes S3ObjectStorage::isReadOnly
+                 return true (sub-project A's read-only-mode trigger). GC must stay disabled here so
+                 the read-only mount never attempts a reclaim. -->
+            <ca_ro>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_gc_enabled>0</cas_gc_enabled>
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+                <readonly>true</readonly>
+            </ca_ro>
+        </disks>
+        <policies>
+            <ca>
+                <volumes>
+                    <main>
+                        <disk>ca</disk>
+                    </main>
+                </volumes>
+            </ca>
+        </policies>
+    </storage_configuration>
+</clickhouse>

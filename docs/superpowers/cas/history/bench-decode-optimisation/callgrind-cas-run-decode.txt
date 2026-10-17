@@ -1,0 +1,3130 @@
+--------------------------------------------------------------------------------
+Profile data file 'tmp/cg.run.only.out' (creator: callgrind-3.24.0)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 17607169
+Trigger: Program termination
+Profiled target:  build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol --benchmark_filter=BM_CasRunDecode/1000$ --benchmark_min_time=0.05 (PID 3644535, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       60
+Include dirs:     
+User annotated:   
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir                  
+--------------------------------------------------------------------------------
+51,324,724 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                  file:function
+--------------------------------------------------------------------------------
+3,008,916 ( 5.86%)  ./src/Common/MemoryTracker.cpp:MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+2,138,514 ( 4.17%)  ./src/Common/MemoryTracker.cpp:MemoryTracker::free(long, double) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+2,136,348 ( 4.16%)  contrib/llvm-project/libcxx/include/string:std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >::append(char const*, unsigned long) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+2,030,112 ( 3.96%)  ./src/Common/ProfileEvents.cpp:ProfileEvents::increment(StrongTypedef<unsigned long, ProfileEvents::EventTag>, unsigned long) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+1,632,000 ( 3.18%)  src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h:DB::Cas::DigestCodec::fromHex(std::__1::basic_string_view<char, std::__1::char_traits<char> >) const [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+1,574,598 ( 3.07%)  ./src/IO/ReadHelpers.cpp:void DB::readJSONStringInto<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, void>(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&, DB::ReadBuffer&, DB::FormatSettings::JSON const&) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+1,536,000 ( 2.99%)  src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h:DB::Cas::SourceEdgeRunReader::next(DB::Cas::SourceEdgeRecord&)
+1,450,080 ( 2.83%)  ./src/Common/CurrentMemoryTracker.cpp:CurrentMemoryTracker::allocImpl(long, bool) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+1,414,170 ( 2.76%)  ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.cpp:DB::Cas::SourceEdgeRunReader::next(DB::Cas::SourceEdgeRecord&) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+1,413,594 ( 2.75%)  contrib/jemalloc/include/jemalloc/internal/rtree.h:rtree_read [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+1,341,102 ( 2.61%)  ./src/Common/CurrentMemoryTracker.cpp:CurrentMemoryTracker::free(long) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+1,270,554 ( 2.48%)  base/base/../base/find_symbols.h:void DB::readJSONStringInto<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, void>(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&, DB::ReadBuffer&, DB::FormatSettings::JSON const&)
+1,212,000 ( 2.36%)  src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h:DB::Cas::JsonObjectReader::readHex128()
+  942,000 ( 1.84%)  contrib/llvm-project/libcxx/include/__algorithm/any_of.h:DB::Cas::JsonObjectReader::readHex128()
+  888,174 ( 1.73%)  contrib/llvm-project/libcxx/include/__vector/vector.h:std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >* std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > > >::__emplace_back_slow_path<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&>(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+  870,312 ( 1.70%)  contrib/jemalloc/include/jemalloc/internal/tsd_tls.h:jemalloc_tls_addr_tsd_tls [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+  870,048 ( 1.70%)  ./src/Common/MemoryTracker.cpp:incrementAllocationWithoutCheck(long) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+  797,544 ( 1.55%)  ./src/Common/MemoryTracker.cpp:MemoryTracker::updatePeak(long, bool) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+  780,000 ( 1.52%)  base/base/../base/hex.h:impl::HexConversionUInt<wide::integer<128ul, unsigned int>, void>::unhex(char const*) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+  779,772 ( 1.52%)  ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::nextKey(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&) [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+  725,040 ( 1.41%)  ./src/Common/CurrentThread.cpp:DB::CurrentThread::getProfileEvents() [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+  724,980 ( 1.41%)  ./src/Common/CurrentThread.cpp:DB::CurrentThread::getMemoryTracker() [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+  688,698 ( 1.34%)  contrib/jemalloc/include/jemalloc/internal/jemalloc_internal_inlines_c.h:je_sdallocx
+  652,536 ( 1.27%)  ./contrib/jemalloc/src/jemalloc.c:je_nallocx [/home/mfilimonov/workspace/ClickHouse/master/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol]
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: ./src/Common/ProfileEvents.cpp
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 1970 ----------------------------------------
+      .                   }
+      .               }
+      .           
+      .               return false;
+      .           }
+      .           
+      .           void increment(Event event, Count amount)
+      .           {
+ 72,504 ( 0.14%)      DB::CurrentThread::getProfileEvents().increment(event, amount);
+725,040 ( 1.41%)  => ./src/Common/CurrentThread.cpp:DB::CurrentThread::getProfileEvents() (97,030x)
+507,528 ( 0.99%)  }
+      .           
+      .           void incrementNoTrace(Event event, Count amount)
+      .           {
+      .               DB::CurrentThread::getProfileEvents().incrementNoTrace(event, amount);
+      .           }
+      .           
+      .           double Counters::getCPUOverload(Int64 os_cpu_busy_time_threshold, bool reset)
+      .           {
+-- line 1987 ----------------------------------------
+-- line 2009 ----------------------------------------
+      .           
+      .           void Counters::increment(Event event, Count amount)
+      .           {
+      .               Counters * current = this;
+      .               bool send_to_trace_log = false;
+      .           
+      .               do
+      .               {
+ 72,504 ( 0.14%)          current->counters[event].fetch_add(amount, std::memory_order_relaxed);
+145,008 ( 0.28%)          if (auto * trace_arr = current->should_trace_array.load(std::memory_order_relaxed))
+      .                       send_to_trace_log |= trace_arr[event].load(std::memory_order_relaxed);
+145,008 ( 0.28%)          send_to_trace_log |= current->trace_all_profile_events.load(std::memory_order_relaxed);
+      .           
+      .                   current = current->parent;
+145,008 ( 0.28%)      } while (current != nullptr);
+      .           
+ 72,504 ( 0.14%)      if (unlikely(send_to_trace_log))
+      .                   DB::TraceSender::send(DB::TraceType::ProfileEvent, StackTrace(), {.event = event, .increment = amount});
+      .           }
+      .           
+      .           void Counters::incrementNoTrace(Event event, Count amount)
+      .           {
+      .               Counters * current = this;
+      .               do
+      .               {
+-- line 2033 ----------------------------------------
+
+870,048 ( 1.70%)  <counts for unidentified lines in ./src/Common/ProfileEvents.cpp>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: contrib/jemalloc/include/jemalloc/internal/rtree.h
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 144 ----------------------------------------
+      .           	unsigned cumbits = (rtree_levels[RTREE_HEIGHT - 1].cumbits
+      .           	    - rtree_levels[RTREE_HEIGHT - 1].bits);
+      .           	return ptrbits - cumbits;
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE uintptr_t
+      .           rtree_leafkey(uintptr_t key) {
+      .           	uintptr_t mask = ~((ZU(1) << rtree_leaf_maskbits()) - 1);
+ 73,281 ( 0.14%)  	return (key & mask);
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE size_t
+      .           rtree_cache_direct_map(uintptr_t key) {
+      .           	return (
+109,950 ( 0.21%)  	    size_t)((key >> rtree_leaf_maskbits()) & (RTREE_CTX_NCACHE - 1));
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE uintptr_t
+      .           rtree_subkey(uintptr_t key, unsigned level) {
+      .           	unsigned  ptrbits = ZU(1) << (LG_SIZEOF_PTR + 3);
+      .           	unsigned  cumbits = rtree_levels[level].cumbits;
+      .           	unsigned  shiftbits = ptrbits - cumbits;
+      .           	unsigned  maskbits = rtree_levels[level].bits;
+-- line 166 ----------------------------------------
+-- line 186 ----------------------------------------
+      .           	return (uintptr_t)atomic_load_p(
+      .           	    &elm->le_bits, dependent ? ATOMIC_RELAXED : ATOMIC_ACQUIRE);
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE uintptr_t
+      .           rtree_leaf_elm_bits_encode(rtree_contents_t contents) {
+      .           	assert((uintptr_t)contents.edata % (uintptr_t)EDATA_ALIGNMENT == 0);
+      .           	uintptr_t edata_bits = (uintptr_t)contents.edata
+      3 ( 0.00%)  	    & (((uintptr_t)1 << LG_VADDR) - 1);
+      .           
+      .           	uintptr_t szind_bits = (uintptr_t)contents.metadata.szind << LG_VADDR;
+      .           	uintptr_t slab_bits = (uintptr_t)contents.metadata.slab;
+      9 ( 0.00%)  	uintptr_t is_head_bits = (uintptr_t)contents.metadata.is_head << 1;
+      .           	uintptr_t state_bits = (uintptr_t)contents.metadata.state
+      6 ( 0.00%)  	    << RTREE_LEAF_STATE_SHIFT;
+      .           	uintptr_t metadata_bits = szind_bits | state_bits | is_head_bits
+      .           	    | slab_bits;
+      .           	assert((edata_bits & metadata_bits) == 0);
+      .           
+      3 ( 0.00%)  	return edata_bits | metadata_bits;
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE rtree_contents_t
+      .           rtree_leaf_elm_bits_decode(uintptr_t bits) {
+      .           	rtree_contents_t contents;
+      .           	/* Do the easy things first. */
+108,738 ( 0.21%)  	contents.metadata.szind = bits >> LG_VADDR;
+108,738 ( 0.21%)  	contents.metadata.slab = (bool)(bits & 1);
+144,984 ( 0.28%)  	contents.metadata.is_head = (bool)(bits & (1 << 1));
+      .           
+      .           	uintptr_t state_bits = (bits & RTREE_LEAF_STATE_MASK)
+      .           	    >> RTREE_LEAF_STATE_SHIFT;
+      .           	assert(state_bits <= extent_state_max);
+144,984 ( 0.28%)  	contents.metadata.state = (extent_state_t)state_bits;
+      .           
+      .           	uintptr_t low_bit_mask = ~((uintptr_t)EDATA_ALIGNMENT - 1);
+      .           #	ifdef __aarch64__
+      .           	/*
+      .           	 * aarch64 doesn't sign extend the highest virtual address bit to set
+      .           	 * the higher ones.  Instead, the high bits get zeroed.
+      .           	 */
+      .           	uintptr_t high_bit_mask = ((uintptr_t)1 << LG_VADDR) - 1;
+      .           	/* Mask off metadata. */
+      .           	uintptr_t mask = high_bit_mask & low_bit_mask;
+      .           	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
+      .           	contents.edata = (edata_t *)(bits & mask);
+      .           #	else
+      .           	/* Restore sign-extended high bits, mask metadata bits. */
+      .           	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
+ 36,246 ( 0.07%)  	contents.edata = (edata_t *)((uintptr_t)((intptr_t)(bits << RTREE_NHIB)
+ 73,244 ( 0.14%)  	                                 >> RTREE_NHIB)
+ 36,604 ( 0.07%)  	    & low_bit_mask);
+      .           #	endif
+      .           	assert((uintptr_t)contents.edata % (uintptr_t)EDATA_ALIGNMENT == 0);
+      .           	return contents;
+      .           }
+      .           
+      .           #endif /* RTREE_LEAF_COMPACT */
+      .           
+      .           JEMALLOC_ALWAYS_INLINE rtree_contents_t
+-- line 245 ----------------------------------------
+-- line 318 ----------------------------------------
+      .           /* The state field can be updated independently (and more frequently). */
+      .           JEMALLOC_ALWAYS_INLINE void
+      .           rtree_leaf_elm_state_update(tsdn_t *tsdn, rtree_t *rtree,
+      .               rtree_leaf_elm_t *elm1, rtree_leaf_elm_t *elm2, extent_state_t state) {
+      .           	assert(elm1 != NULL);
+      .           #ifdef RTREE_LEAF_COMPACT
+      .           	uintptr_t bits = rtree_leaf_elm_bits_read(tsdn, rtree, elm1,
+      .           	    /* dependent */ true);
+     13 ( 0.00%)  	bits &= ~RTREE_LEAF_STATE_MASK;
+     26 ( 0.00%)  	bits |= state << RTREE_LEAF_STATE_SHIFT;
+      .           	/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
+      .           	atomic_store_p(&elm1->le_bits, (void *)bits, ATOMIC_RELEASE);
+     22 ( 0.00%)  	if (elm2 != NULL) {
+      .           		/* NOLINTNEXTLINE(performance-no-int-to-ptr) */
+      .           		atomic_store_p(&elm2->le_bits, (void *)bits, ATOMIC_RELEASE);
+      .           	}
+      .           #else
+      .           	unsigned bits = atomic_load_u(&elm1->le_metadata, ATOMIC_RELAXED);
+      .           	bits &= ~RTREE_LEAF_STATE_MASK;
+      .           	bits |= state << RTREE_LEAF_STATE_SHIFT;
+      .           	atomic_store_u(&elm1->le_metadata, bits, ATOMIC_RELEASE);
+-- line 338 ----------------------------------------
+-- line 372 ----------------------------------------
+      .           	assert(key != 0);
+      .           	assert(!dependent || !init_missing);
+      .           
+      .           	size_t    slot = rtree_cache_direct_map(key);
+      .           	uintptr_t leafkey = rtree_leafkey(key);
+      .           	assert(leafkey != RTREE_LEAFKEY_INVALID);
+      .           
+      .           	/* Fast path: L1 direct mapped cache. */
+183,614 ( 0.36%)  	if (likely(rtree_ctx->cache[slot].leafkey == leafkey)) {
+      .           		rtree_leaf_elm_t *leaf = rtree_ctx->cache[slot].leaf;
+      .           		assert(leaf != NULL);
+      .           		uintptr_t subkey = rtree_subkey(key, RTREE_HEIGHT - 1);
+109,962 ( 0.21%)  		return &leaf[subkey];
+      .           	}
+      .           	/*
+      .           	 * Search the L2 LRU cache.  On hit, swap the matching element into the
+      .           	 * slot in L1 cache, and move the position in L2 up by 1.
+      .           	 */
+      .           #define RTREE_CACHE_CHECK_L2(i)                                                \
+      .           	do {                                                                   \
+      .           		if (likely(rtree_ctx->l2_cache[i].leafkey == leafkey)) {       \
+-- line 392 ----------------------------------------
+-- line 440 ----------------------------------------
+      .           	}
+      .           	*r_contents = rtree_leaf_elm_read(tsdn, rtree, elm,
+      .           	    /* dependent */ false);
+      .           	return false;
+      .           }
+      .           
+      .           static inline rtree_contents_t
+      .           rtree_read(
+144,984 ( 0.28%)      tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx, uintptr_t key) {
+      .           	rtree_leaf_elm_t *elm = rtree_leaf_elm_lookup(tsdn, rtree, rtree_ctx,
+      .           	    key, /* dependent */ true, /* init_missing */ false);
+      .           	assert(elm != NULL);
+      .           	return rtree_leaf_elm_read(tsdn, rtree, elm, /* dependent */ true);
+144,984 ( 0.28%)  }
+      .           
+      .           static inline rtree_metadata_t
+      .           rtree_metadata_read(
+      .               tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx, uintptr_t key) {
+      .           	rtree_leaf_elm_t *elm = rtree_leaf_elm_lookup(tsdn, rtree, rtree_ctx,
+      .           	    key, /* dependent */ true, /* init_missing */ false);
+      .           	assert(elm != NULL);
+      .           	return rtree_leaf_elm_read(tsdn, rtree, elm,
+-- line 461 ----------------------------------------
+-- line 496 ----------------------------------------
+      .           	 * are dependent w/o init_missing, assuming the range spans across at
+      .           	 * most 2 rtree leaf nodes (each covers 1 GiB of vaddr).
+      .           	 */
+      .           	void    *bits;
+      .           	unsigned additional;
+      .           	rtree_contents_encode(contents, &bits, &additional);
+      .           
+      .           	rtree_leaf_elm_t *elm = NULL; /* Dead store. */
+     21 ( 0.00%)  	for (uintptr_t addr = base; addr <= end; addr += PAGE) {
+      9 ( 0.00%)  		if (addr == base
+      3 ( 0.00%)  		    || (addr & ((ZU(1) << rtree_leaf_maskbits()) - 1)) == 0) {
+      .           			elm = rtree_leaf_elm_lookup(tsdn, rtree, rtree_ctx,
+      .           			    addr,
+      .           			    /* dependent */ true, /* init_missing */ false);
+      .           			assert(elm != NULL);
+      .           		}
+      .           		assert(elm
+      .           		    == rtree_leaf_elm_lookup(tsdn, rtree, rtree_ctx, addr,
+      .           		        /* dependent */ true, /* init_missing */ false));
+      .           		assert(!clearing
+      .           		    || rtree_leaf_elm_read(tsdn, rtree, elm,
+      .           		           /* dependent */ true)
+      .           		            .edata
+      .           		        != NULL);
+      .           		rtree_leaf_elm_write_commit(tsdn, rtree, elm, bits, additional);
+      3 ( 0.00%)  		elm++;
+      .           	}
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE void
+      .           rtree_write_range(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+      .               uintptr_t base, uintptr_t end, rtree_contents_t contents) {
+      .           	rtree_write_range_impl(tsdn, rtree, rtree_ctx, base, end, contents,
+      .           	    /* clearing */ false);
+-- line 529 ----------------------------------------
+
+     26 ( 0.00%)  <counts for unidentified lines in contrib/jemalloc/include/jemalloc/internal/rtree.h>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: ./src/Common/CurrentMemoryTracker.cpp
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 26 ----------------------------------------
+      .           }
+      .           }
+      .           
+      .           namespace
+      .           {
+      .           
+      .           MemoryTracker * getMemoryTracker()
+      .           {
+326,244 ( 0.64%)      if (auto * thread_memory_tracker = DB::CurrentThread::getMemoryTracker())
+362,460 ( 0.71%)  => ./src/Common/CurrentThread.cpp:DB::CurrentThread::getMemoryTracker() (59,535x)
+      .                   return thread_memory_tracker;
+      .           
+      .               /// total_memory_tracker can be used before MainThreadStatus is initialized,
+      .               /// but only after its own initialization and before teardown.
+362,490 ( 0.71%)      if (DB::MainThreadStatus::initialized() || isTotalMemoryTrackerInitialized())
+181,230 ( 0.35%)  => ./src/Common/MemoryTracker.cpp:isTotalMemoryTrackerInitialized() (59,535x)
+      .                   return &total_memory_tracker;
+      .           
+      .               return nullptr;
+      .           }
+      .           
+      .           }
+      .           
+      .           using DB::current_thread;
+      .           
+      .           AllocationTrace CurrentMemoryTracker::allocImpl(Int64 size, bool enforce_memory_limit)
+362,520 ( 0.71%)  {
+      .           #ifdef MEMORY_TRACKER_DEBUG_CHECKS
+      .               if (unlikely(memory_tracker_always_throw_logical_error_on_allocation))
+      .               {
+      .                   memory_tracker_always_throw_logical_error_on_allocation = false;
+      .                   throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Memory tracker: allocations not allowed.");
+      .               }
+      .           #endif
+      .           
+      .               if (auto * memory_tracker = getMemoryTracker())
+      .               {
+217,512 ( 0.42%)          if (!current_thread)
+      .                   {
+      .                       /// total_memory_tracker only, ignore untracked_memory
+471,276 ( 0.92%)              return memory_tracker->allocImpl(size, enforce_memory_limit);
+8,917,992 (17.38%)  => ./src/Common/MemoryTracker.cpp:MemoryTracker::allocImpl(long, bool, MemoryTracker*, double) (48,515x)
+      .                   }
+      .           
+      .                   /// Make sure we do memory tracker calls with the correct level in MemoryTrackerBlockerInThread.
+      .                   /// E.g. suppose allocImpl is called twice: first for 2 MB with blocker set to
+      .                   /// VariableContext::User, then for 3 MB with no blocker. This should increase the
+      .                   /// Global memory tracker by 5 MB and the User memory tracker by 3 MB. So we can't group
+      .                   /// these two calls into one memory_tracker->allocImpl call.
+      .                   VariableContext blocker_level = MemoryTrackerBlockerInThread::getLevel();
+-- line 72 ----------------------------------------
+-- line 112 ----------------------------------------
+      .           }
+      .           
+      .           AllocationTrace CurrentMemoryTracker::allocNoThrow(Int64 size)
+      .           {
+      .               return allocImpl(size, /*enforce_memory_limit=*/ false);
+      .           }
+      .           
+      .           AllocationTrace CurrentMemoryTracker::allocThrow(Int64 size)
+ 72,504 ( 0.14%)  {
+108,756 ( 0.21%)      const bool enforce_memory_limit = static_cast<UInt64>(size) >= min_allocation_size_to_throw_on_memory_limit.load(std::memory_order_relaxed);
+ 72,504 ( 0.14%)      return allocImpl(size, enforce_memory_limit);
+11,020,608 (21.47%)  => ./src/Common/CurrentMemoryTracker.cpp:CurrentMemoryTracker::allocImpl(long, bool) (55,179x)
+      .           }
+      .           
+      .           void CurrentMemoryTracker::setMinAllocationSizeBytesToThrow(UInt64 value)
+      .           {
+      .               min_allocation_size_to_throw_on_memory_limit.store(
+      .                   value == 0 ? std::numeric_limits<UInt64>::max() : value,
+      .                   std::memory_order_relaxed);
+      .           }
+-- line 130 ----------------------------------------
+-- line 131 ----------------------------------------
+      .           
+      .           UInt64 CurrentMemoryTracker::getMinAllocationSizeBytesToThrow()
+      .           {
+      .               const auto value = min_allocation_size_to_throw_on_memory_limit.load(std::memory_order_relaxed);
+      .               return value == std::numeric_limits<UInt64>::max() ? 0 : value;
+      .           }
+      .           
+      .           AllocationTrace CurrentMemoryTracker::free(Int64 size)
+326,214 ( 0.64%)  {
+      .               if (auto * memory_tracker = getMemoryTracker())
+      .               {
+217,476 ( 0.42%)          if (!current_thread)
+      .                   {
+ 72,492 ( 0.14%)              return memory_tracker->free(size);
+      .                   }
+      .           
+      .                   VariableContext blocker_level = MemoryTrackerBlockerInThread::getLevel();
+      .                   if (blocker_level != current_thread->untracked_memory_blocker_level)
+      .                   {
+      .                       current_thread->flushUntrackedMemory();
+      .                   }
+      .                   current_thread->untracked_memory_blocker_level = blocker_level;
+-- line 152 ----------------------------------------
+
+434,958 ( 0.85%)  <counts for unidentified lines in ./src/Common/CurrentMemoryTracker.cpp>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: contrib/jemalloc/include/jemalloc/internal/tsd_tls.h
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 10 ----------------------------------------
+      .           #define JEMALLOC_TSD_TYPE_ATTR(type) __thread type JEMALLOC_TLS_MODEL
+      .           
+      .           extern JEMALLOC_TSD_TYPE_ATTR(tsd_t) tsd_tls;
+      .           extern pthread_key_t tsd_tsd;
+      .           extern bool          tsd_booted;
+      .           
+      .           JEMALLOC_TLS_ADDR_DECLARE(tsd_tls)
+      .           #ifdef JEMALLOC_TSD_C_
+870,312 ( 1.70%)  JEMALLOC_TLS_ADDR_DEFINE(tsd_tls)
+      .           #endif
+      .           
+      .           /* Initialization/cleanup. */
+      .           JEMALLOC_ALWAYS_INLINE bool
+      .           tsd_boot0(void) {
+      .           	if (pthread_key_create(&tsd_tsd, &tsd_cleanup) != 0) {
+      .           		return true;
+      .           	}
+-- line 26 ----------------------------------------
+-- line 35 ----------------------------------------
+      .           
+      .           JEMALLOC_ALWAYS_INLINE bool
+      .           tsd_boot(void) {
+      .           	return tsd_boot0();
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE bool
+      .           tsd_booted_get(void) {
+ 72,498 ( 0.14%)  	return tsd_booted;
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE bool
+      .           tsd_get_allocates(void) {
+      .           	return false;
+      .           }
+      .           
+      .           /* Get/set. */
+      .           JEMALLOC_ALWAYS_INLINE tsd_t *
+      .           tsd_get(bool init) {
+181,330 ( 0.35%)  	return JEMALLOC_TLS_ADDR(tsd_tls);
+217,512 ( 0.42%)  => contrib/jemalloc/include/jemalloc/internal/tsd_tls.h:jemalloc_tls_addr_tsd_tls (58,799x)
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE void
+      .           tsd_set(tsd_t *val) {
+      .           	tsd_t *tsd = JEMALLOC_TLS_ADDR(tsd_tls);
+      .           
+      .           	assert(tsd_booted);
+      .           	if (likely(tsd != val)) {
+-- line 62 ----------------------------------------
+
+ 72,516 ( 0.14%)  <counts for unidentified lines in contrib/jemalloc/include/jemalloc/internal/tsd_tls.h>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: ./src/Common/MemoryTracker.cpp
+--------------------------------------------------------------------------------
+Ir                 
+
+-- line 143 ----------------------------------------
+        .           
+        .           static constexpr size_t log_peak_memory_usage_every = 1ULL << 30;
+        .           static std::atomic_bool total_memory_tracker_initialized{false};
+        .           
+        .           MemoryTracker total_memory_tracker(nullptr, VariableContext::Global);
+        .           MemoryTracker background_memory_tracker(&total_memory_tracker, VariableContext::User, false);
+        .           
+        .           bool isTotalMemoryTrackerInitialized()
+  144,996 ( 0.28%)  {
+  144,996 ( 0.28%)      return total_memory_tracker_initialized.load(std::memory_order_acquire);
+        .           }
+        .           
+        .           MemoryTracker::MemoryTracker(VariableContext level_) : parent(&total_memory_tracker), level(level_)
+        .           {
+        .               if (this == &total_memory_tracker)
+        .                   total_memory_tracker_initialized.store(true, std::memory_order_release);
+        .           }
+        .           
+-- line 160 ----------------------------------------
+-- line 239 ----------------------------------------
+        .               throw DB::Exception(
+        .                   DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED,
+        .                   "{}{}: fault injected (at specific point)",
+        .                   description ? description : "",
+        .                   description ? " memory tracker" : "Memory tracker");
+        .           }
+        .           
+        .           static void incrementAllocationWithoutCheck(Int64 size)
+  181,260 ( 0.35%)  {
+  145,008 ( 0.28%)      ProfileEvents::increment(ProfileEvents::MemoryAllocatedWithoutCheck);
+1,558,836 ( 3.04%)  => ./src/Common/ProfileEvents.cpp:ProfileEvents::increment(StrongTypedef<unsigned long, ProfileEvents::EventTag>, unsigned long) (48,509x)
+   72,504 ( 0.14%)      if (size < 0)
+        .                   return;
+        .           
+  145,008 ( 0.28%)      ProfileEvents::increment(ProfileEvents::MemoryAllocatedWithoutCheckBytes, size);
+1,558,836 ( 3.04%)  => ./src/Common/ProfileEvents.cpp:ProfileEvents::increment(StrongTypedef<unsigned long, ProfileEvents::EventTag>, unsigned long) (48,509x)
+        .           
+  108,756 ( 0.21%)      if (MemoryTrackerUntrackedAllocationsBlockerInThread::isBlocked())
+  253,764 ( 0.49%)  => ./src/Common/MemoryTrackerUntrackedAllocationsBlockerInThread.cpp:MemoryTrackerUntrackedAllocationsBlockerInThread::isBlocked() (48,509x)
+        .                   return;
+        .           
+        .               /// The choice is arbitrary (maybe we should decrease it)
+        .               constexpr Int64 threshold = 16 * 1024 * 1024;
+        .           
+        .               if (size > threshold)
+        .               {
+        .                   try
+-- line 262 ----------------------------------------
+-- line 266 ----------------------------------------
+        .                           .memory_blocked_context = MemoryTrackerBlockerInThread::getLevel(),
+        .                       });
+        .                   }
+        .                   catch (const std::exception &) // NOLINT(bugprone-empty-catch)
+        .                   {
+        .                       /// Ignore failures, we have ProfileEvents anyway
+        .                   }
+        .               }
+  145,008 ( 0.28%)  }
+        .           
+        .           AllocationTrace MemoryTracker::allocImpl(Int64 size, bool enforce_memory_limit, MemoryTracker * query_tracker, double _sample_probability)
+        .           {
+   72,504 ( 0.14%)      if (size < 0)
+        .                   throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Negative size ({}) is passed to MemoryTracker. It is a bug.", size);
+        .           
+   72,504 ( 0.14%)      if (_sample_probability < 0)
+        .                   _sample_probability = sample_probability.load(std::memory_order_relaxed);
+        .           
+  108,756 ( 0.21%)      if (!isSizeOkForSampling(size))
+        .                   _sample_probability = 0;
+        .           
+  108,756 ( 0.21%)      if (MemoryTrackerBlockerInThread::isBlocked(level))
+        .               {
+        .                   if (level == VariableContext::Global)
+        .                   {
+        .                       /// For global memory tracker always update memory usage.
+        .                       Int64 will_be = amount.fetch_add(size, std::memory_order_relaxed) + size;
+        .                       rss.fetch_add(size, std::memory_order_relaxed);
+        .                       updatePeak(will_be, /*log_memory_usage=*/ false);
+        .           
+-- line 295 ----------------------------------------
+-- line 307 ----------------------------------------
+        .           
+        .                   return AllocationTrace(_sample_probability);
+        .               }
+        .           
+        .               /** Using memory_order_relaxed means that if allocations are done simultaneously,
+        .                 *  we allow exception about memory limit exceeded to be thrown only on next allocation.
+        .                 * So, we allow over-allocations.
+        .                 */
+  108,756 ( 0.21%)      Int64 will_be = size ? size + amount.fetch_add(size, std::memory_order_relaxed) : amount.load(std::memory_order_relaxed);
+        .               Int64 will_be_rss = 0;
+   72,504 ( 0.14%)      if (level == VariableContext::Global)
+   72,504 ( 0.14%)          will_be_rss = size ? size + rss.fetch_add(size, std::memory_order_relaxed) : rss.load(std::memory_order_relaxed);
+        .           
+        .               Int64 current_hard_limit = hard_limit.load(std::memory_order_relaxed);
+        .               Int64 current_profiler_limit = profiler_limit.load(std::memory_order_relaxed);
+        .           
+        .               bool memory_limit_exceeded_ignored = false;
+        .           
+        .               bool allocation_traced = false;
+  326,268 ( 0.64%)      if (unlikely(current_profiler_limit && will_be > current_profiler_limit))
+        .               {
+        .                   auto memory_blocked_context = MemoryTrackerBlockerInThread::getLevel();
+        .                   MemoryTrackerBlockerInThread untrack_lock(VariableContext::Global);
+        .                   DB::TraceSender::send(DB::TraceType::Memory, StackTrace(), {
+        .                       .size = size,
+        .                       .memory_context = level,
+        .                       .memory_blocked_context = memory_blocked_context,
+        .                   });
+        .                   const auto step = profiler_step.load(std::memory_order_relaxed);
+        .                   setOrRaiseProfilerLimit((will_be + step - 1) / step * step);
+        .                   allocation_traced = true;
+        .               }
+        .           
+        .               double current_fault_probability = fault_probability.load(std::memory_order_relaxed);
+        .               std::bernoulli_distribution fault(current_fault_probability);
+   72,504 ( 0.14%)      if (unlikely(current_fault_probability > 0.0 && fault(thread_local_rng)))
+        .               {
+        .                   if (memoryTrackerCanThrow(level, true) && enforce_memory_limit)
+        .                   {
+        .                       /// Revert
+        .                       amount.fetch_sub(size, std::memory_order_relaxed);
+        .                       rss.fetch_sub(size, std::memory_order_relaxed);
+        .           
+        .                       /// Prevent recursion. Exception::ctor -> std::string -> new[] -> MemoryTracker::alloc
+-- line 350 ----------------------------------------
+-- line 363 ----------------------------------------
+        .                           formatReadableSizeWithBinarySuffix(size),
+        .                           formatReadableSizeWithBinarySuffix(current_hard_limit));
+        .                   }
+        .           
+        .                   memory_limit_exceeded_ignored = true;
+        .                   incrementAllocationWithoutCheck(size);
+        .               }
+        .           
+   72,504 ( 0.14%)      if (unlikely(
+        .                       current_hard_limit && (will_be > current_hard_limit || (level == VariableContext::Global && will_be_rss > current_hard_limit))))
+        .               {
+        .           #if USE_JEMALLOC
+        .                   if (level == VariableContext::Global && (jemalloc_flush_profile_on_memory_exceeded_interval_s || jemalloc_flush_profile_on_memory_exceeded))
+        .                   {
+        .                       MemoryTrackerBlockerInThread untrack_lock(VariableContext::Global);
+        .                       bool prof_active = false;
+        .                       if (DB::Jemalloc::tryGetValue("prof.active", prof_active) && prof_active)
+-- line 379 ----------------------------------------
+-- line 475 ----------------------------------------
+        .                       incrementAllocationWithoutCheck(size);
+        .                   }
+        .               }
+        .           
+        .               bool peak_updated = false;
+        .               /// In case of MEMORY_LIMIT_EXCEEDED was ignored, will_be may include
+        .               /// memory of other allocations, that may fail but not reverted yet, and so
+        .               /// updating peak will be inaccurate.
+  108,756 ( 0.21%)      if (!memory_limit_exceeded_ignored)
+        .               {
+  108,756 ( 0.21%)          if (enforce_memory_limit)
+        .                   {
+        .                       /// Prevent recursion. Exception::ctor -> std::string -> new[] -> MemoryTracker::alloc
+        .                       MemoryTrackerBlockerInThread untrack_lock(VariableContext::Global);
+        .                       bool log_memory_usage = true;
+        .                       peak_updated = updatePeak(will_be, log_memory_usage);
+        .                   }
+        .                   else
+        .                   {
+        .                       bool log_memory_usage = false;
+  145,008 ( 0.28%)              peak_updated = updatePeak(will_be, log_memory_usage);
+  833,796 ( 1.62%)  => ./src/Common/MemoryTracker.cpp:MemoryTracker::updatePeak(long, bool) (48,509x)
+   72,504 ( 0.14%)              incrementAllocationWithoutCheck(size);
+4,241,484 ( 8.26%)  => ./src/Common/MemoryTracker.cpp:incrementAllocationWithoutCheck(long) (48,509x)
+        .                   }
+        .               }
+        .           
+        .               auto metric_loaded = metric.load(std::memory_order_relaxed);
+   72,504 ( 0.14%)      if (metric_loaded != CurrentMetrics::end() && size)
+  181,260 ( 0.35%)  => ./src/Common/CurrentMetrics.cpp:CurrentMetrics::end() (48,509x)
+        .                   CurrentMetrics::add(metric_loaded, size);
+        .           
+  108,756 ( 0.21%)      if (peak_updated && allocation_traced)
+        .               {
+        .                   auto memory_blocked_context = MemoryTrackerBlockerInThread::getLevel();
+        .                   MemoryTrackerBlockerInThread untrack_lock(VariableContext::Global);
+        .                   DB::TraceSender::send(DB::TraceType::MemoryPeak, StackTrace(), {
+        .                       .size = will_be,
+        .                       .memory_context = level,
+        .                       .memory_blocked_context = memory_blocked_context,
+        .                   });
+        .               }
+        .           
+  108,756 ( 0.21%)      if (auto * loaded_next = parent.load(std::memory_order_relaxed))
+        .               {
+        .                   MemoryTracker * tracker = level == VariableContext::Process ? this : query_tracker;
+        .                   return loaded_next->allocImpl(size, enforce_memory_limit, tracker, _sample_probability);
+        .               }
+        .           
+        .               return AllocationTrace(_sample_probability);
+  290,016 ( 0.57%)  }
+        .           
+        .           void MemoryTracker::adjustWithUntrackedMemory(Int64 untracked_memory)
+        .           {
+        .               if (untracked_memory > 0)
+        .                   std::ignore = allocImpl(untracked_memory, /*enforce_memory_limit*/ false);
+        .               else
+        .                   std::ignore = free(-untracked_memory);
+        .           }
+-- line 530 ----------------------------------------
+-- line 539 ----------------------------------------
+        .               if (metric_loaded != CurrentMetrics::end())
+        .                   CurrentMetrics::sub(metric_loaded, background_memory_consumption);
+        .           }
+        .           
+        .           
+        .           bool MemoryTracker::updatePeak(Int64 will_be, bool log_memory_usage)
+        .           {
+        .               auto peak_old = peak.load(std::memory_order_relaxed);
+  145,008 ( 0.28%)      if (will_be > peak_old)        /// Races doesn't matter. Could rewrite with CAS, but not worth.
+        .               {
+        .                   peak.store(will_be, std::memory_order_relaxed);
+        .           
+        .                   if (log_memory_usage && (level == VariableContext::Process || level == VariableContext::Global)
+        .                       && will_be / log_peak_memory_usage_every > peak_old / log_peak_memory_usage_every)
+        .                       logMemoryUsage(will_be);
+        .           
+        .           #if USE_JEMALLOC
+-- line 555 ----------------------------------------
+-- line 594 ----------------------------------------
+        .                           }
+        .                       }
+        .                   }
+        .           #endif
+        .           
+        .                   return true;
+        .               }
+        .               return false;
+  290,016 ( 0.57%)  }
+        .           
+        .           AllocationTrace MemoryTracker::free(Int64 size, double _sample_probability)
+  724,920 ( 1.41%)  {
+  144,984 ( 0.28%)      if (_sample_probability < 0)
+        .                   _sample_probability = sample_probability.load(std::memory_order_relaxed);
+        .           
+  108,738 ( 0.21%)      if (!isSizeOkForSampling(size))
+        .                   _sample_probability = 0;
+        .           
+  108,738 ( 0.21%)      if (MemoryTrackerBlockerInThread::isBlocked(level))
+        .               {
+        .                   if (level == VariableContext::Global)
+        .                   {
+        .                       /// For global memory tracker always update memory usage.
+        .                       amount.fetch_sub(size, std::memory_order_relaxed);
+        .                       rss.fetch_sub(size, std::memory_order_relaxed);
+        .                       auto metric_loaded = metric.load(std::memory_order_relaxed);
+        .                       if (metric_loaded != CurrentMetrics::end())
+-- line 620 ----------------------------------------
+-- line 624 ----------------------------------------
+        .                   /// Since the MemoryTrackerBlockerInThread should respect the level, we should go to the next parent.
+        .                   if (auto * loaded_next = parent.load(std::memory_order_relaxed))
+        .                       return loaded_next->free(size, _sample_probability);
+        .           
+        .                   return AllocationTrace(_sample_probability);
+        .               }
+        .           
+        .               Int64 accounted_size = size;
+  181,230 ( 0.35%)      if (level == VariableContext::Global)
+        .               {
+        .                   amount.fetch_sub(accounted_size, std::memory_order_relaxed);
+        .                   rss.fetch_sub(accounted_size, std::memory_order_relaxed);
+        .               }
+        .               else if (level == VariableContext::Thread)
+        .               {
+        .                   /// Could become negative if memory allocated in this thread is freed in another one
+        .                   amount.fetch_sub(accounted_size, std::memory_order_relaxed);
+-- line 640 ----------------------------------------
+-- line 650 ----------------------------------------
+        .                     * NOTE: The code is not atomic. Not worth to fix.
+        .                     */
+        .                   if (unlikely(new_amount < 0))
+        .                   {
+        .                       amount.fetch_sub(new_amount);
+        .                       accounted_size += new_amount;
+        .                   }
+        .               }
+  108,738 ( 0.21%)      if (auto * overcommit_tracker_ptr = overcommit_tracker.load(std::memory_order_relaxed))
+        .                   overcommit_tracker_ptr->tryContinueQueryExecutionAfterFree(accounted_size);
+        .           
+        .               /// free should never throw, we can update metric early.
+        .               auto metric_loaded = metric.load(std::memory_order_relaxed);
+  108,738 ( 0.21%)      if (metric_loaded != CurrentMetrics::end())
+  181,230 ( 0.35%)  => ./src/Common/CurrentMetrics.cpp:CurrentMetrics::end() (49,425x)
+        .                   CurrentMetrics::sub(metric_loaded, accounted_size);
+        .           
+  108,738 ( 0.21%)      if (auto * loaded_next = parent.load(std::memory_order_relaxed))
+        .                   return loaded_next->free(size, _sample_probability);
+        .           
+        .               return AllocationTrace(_sample_probability);
+  326,214 ( 0.64%)  }
+        .           
+        .           
+        .           OvercommitRatio MemoryTracker::getOvercommitRatio()
+        .           {
+        .               return { amount.load(std::memory_order_relaxed), soft_limit.load(std::memory_order_relaxed) };
+        .           }
+        .           
+        .           
+-- line 678 ----------------------------------------
+-- line 764 ----------------------------------------
+        .                   ;
+        .           }
+        .           
+        .           bool MemoryTracker::isSizeOkForSampling(UInt64 size) const
+        .           {
+        .               /// We can avoid comparison min_allocation_size_bytes with zero, because we cannot have 0 bytes allocation/deallocation
+        .               const auto max_size = max_allocation_size_bytes.load(std::memory_order_relaxed);
+        .               const auto min_size = min_allocation_size_bytes.load(std::memory_order_relaxed);
+   72,498 ( 0.14%)      return ((max_size == 0 || size <= max_size) && size >= min_size);
+        .           }
+        .           
+        .           void MemoryTracker::setParent(MemoryTracker * elem)
+        .           {
+        .               /// Untracked memory shouldn't be accounted to a query or a user if it was allocated before the thread was attached
+        .               /// to a query thread group or a user group, because this memory will be (🤞) freed outside of these scopes.
+        .               if (level == VariableContext::Thread && DB::current_thread)
+        .                   DB::current_thread->flushUntrackedMemory();
+-- line 780 ----------------------------------------
+
+1,486,302 ( 2.90%)  <counts for unidentified lines in ./src/Common/MemoryTracker.cpp>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 73 ----------------------------------------
+      .           /// would require for 32-byte digests.
+      .           ///
+      .           /// This type is reserved for content hashes. Protocol identifiers such as `payload_digest`,
+      .           /// `RunRef::checksum`, source-edge identifiers, lease owners, and cleanup shards remain
+      .           /// `UInt128`, because widening the content digest does not change their separate wire or ordering
+      .           /// contracts. A blob's complete identity is `BlobRef`, which pairs this digest with its algorithm.
+      .           struct BlobDigest
+      .           {
+ 36,000 ( 0.07%)      std::array<uint8_t, 32> bytes{};
+      .           
+      .               auto operator<=>(const BlobDigest &) const = default;
+      .               bool operator==(const BlobDigest &) const = default;
+      .           
+      .               /// Converts a 128-bit content hash to the common representation: big-endian in `bytes[0:16]`
+      .               /// and zero in the tail. This is the bridge for the 128-bit hash algorithms.
+      .               static BlobDigest fromU128(const UInt128 & v)
+      .               {
+-- line 89 ----------------------------------------
+-- line 142 ----------------------------------------
+      .                   checkZeroTail(d, "toHex");
+      .                   return hexString(d.bytes.data(), len);
+      .               }
+      .           
+      .               /// Requires exactly `2 * len` hex chars; throws `BAD_ARGUMENTS` otherwise (wrong
+      .               /// width or a non-hex character). Zero-fills the tail beyond `len`.
+      .               BlobDigest fromHex(std::string_view hex) const
+      .               {
+ 30,000 ( 0.06%)          if (hex.size() != 2 * len)
+      .                       throw Exception(ErrorCodes::BAD_ARGUMENTS,
+      .                           "DigestCodec::fromHex: expected {} hex chars for a {}-byte digest, got {}",
+      .                           2 * len, len, hex.size());
+      .           
+582,000 ( 1.13%)          for (char c : hex)
+      .                   {
+384,000 ( 0.75%)              if (unhex(c) == 0xff)
+      .                           throw Exception(ErrorCodes::BAD_ARGUMENTS, "DigestCodec::fromHex: invalid hex character '{}'", c);
+      .                   }
+      .           
+      .                   BlobDigest d;
+396,000 ( 0.77%)          for (uint64_t i = 0; i < len; ++i)
+ 96,000 ( 0.19%)              d.bytes[i] = unhex2(hex.data() + i * 2);
+ 42,000 ( 0.08%)          return d;
+      .               }
+      .           
+      .               /// Serializes exactly `len` raw bytes, big-endian (i.e. `bytes[0:len]`).
+      .               String toBytesBE(const BlobDigest & d) const
+      .               {
+      .                   checkZeroTail(d, "toBytesBE");
+      .                   return String(reinterpret_cast<const char *>(d.bytes.data()), len);
+      .               }
+-- line 172 ----------------------------------------
+-- line 232 ----------------------------------------
+      .                   h ^= static_cast<size_t>(r.algo) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+      .                   return h;
+      .               }
+      .           };
+      .           
+      .           /// Returns the codec whose width belongs to `algo`; callers must not substitute a pool-wide width.
+      .           inline DigestCodec codecFor(BlobHashAlgo algo)
+      .           {
+ 12,000 ( 0.02%)      return DigestCodec(blobHashLenFor(algo));
+102,000 ( 0.20%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.cpp:DB::Cas::blobHashLenFor(DB::Cas::BlobHashAlgo) (6,000x)
+      .           }
+      .           
+      .           /// Bare lowercase hex of the digest at the algo's width -- for OBJECT KEY construction only
+      .           /// (the algo lives in the key's path segment `blobs/<algo>/...`).
+      .           inline String blobHexOf(const BlobRef & r)
+      .           {
+      .               return codecFor(r.algo).toHex(r.digest);
+      .           }
+-- line 248 ----------------------------------------
+
+ 84,000 ( 0.16%)  <counts for unidentified lines in src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: contrib/llvm-project/libcxx/include/__vector/vector.h
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 240 ----------------------------------------
+      .           #endif
+      .           
+      .           private:
+      .             class __destroy_vector {
+      .             public:
+      .               _LIBCPP_CONSTEXPR _LIBCPP_HIDE_FROM_ABI __destroy_vector(vector& __vec) : __vec_(__vec) {}
+      .           
+      .               _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI void operator()() {
+ 18,018 ( 0.04%)        if (__vec_.__begin_ != nullptr) {
+      .                   __vec_.clear();
+      .                   __vec_.__annotate_delete();
+  6,006 ( 0.01%)          __alloc_traits::deallocate(__vec_.__alloc_, __vec_.__begin_, __vec_.capacity());
+      .                 }
+      .               }
+      .           
+      .             private:
+      .               vector& __vec_;
+      .             };
+      .           
+      .           public:
+-- line 259 ----------------------------------------
+-- line 342 ----------------------------------------
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI allocator_type get_allocator() const _NOEXCEPT {
+      .               return this->__alloc_;
+      .             }
+      .           
+      .             //
+      .             // Iterators
+      .             //
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI iterator begin() _NOEXCEPT {
+ 18,366 ( 0.04%)      return __make_iter(__add_alignment_assumption(this->__begin_));
+      .             }
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI const_iterator begin() const _NOEXCEPT {
+      .               return __make_iter(__add_alignment_assumption(this->__begin_));
+      .             }
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI iterator end() _NOEXCEPT {
+ 18,366 ( 0.04%)      return __make_iter(__add_alignment_assumption(this->__end_));
+      .             }
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI const_iterator end() const _NOEXCEPT {
+      .               return __make_iter(__add_alignment_assumption(this->__end_));
+      .             }
+      .           
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI reverse_iterator rbegin() _NOEXCEPT {
+      .               return reverse_iterator(end());
+      .             }
+-- line 364 ----------------------------------------
+-- line 386 ----------------------------------------
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI const_reverse_iterator crend() const _NOEXCEPT {
+      .               return rend();
+      .             }
+      .           
+      .             //
+      .             // [vector.capacity], capacity
+      .             //
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI size_type size() const _NOEXCEPT {
+132,888 ( 0.26%)      return static_cast<size_type>(this->__end_ - this->__begin_);
+      .             }
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI size_type capacity() const _NOEXCEPT {
+102,642 ( 0.20%)      return static_cast<size_type>(this->__cap_ - this->__begin_);
+      .             }
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI bool empty() const _NOEXCEPT {
+      .               return this->__begin_ == this->__end_;
+      .             }
+      .             [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI size_type max_size() const _NOEXCEPT {
+      .               return std::min<size_type>(__alloc_traits::max_size(this->__alloc_), numeric_limits<difference_type>::max());
+      .             }
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI void reserve(size_type __n);
+-- line 405 ----------------------------------------
+-- line 474 ----------------------------------------
+      .           #endif
+      .           
+      .             template <class... _Args>
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI void __emplace_back_assume_capacity(_Args&&... __args) {
+      .               _LIBCPP_ASSERT_INTERNAL(
+      .                   size() < capacity(), "We assume that we have enough space to insert an element at the end of the vector");
+      .               _ConstructTransaction __tx(*this, 1);
+      .               __alloc_traits::construct(this->__alloc_, std::__to_address(__tx.__pos_), std::forward<_Args>(__args)...);
+    240 ( 0.00%)      ++__tx.__pos_;
+      .             }
+      .           
+      .           #if _LIBCPP_STD_VER >= 23
+      .             template <_ContainerCompatibleRange<_Tp> _Range>
+      .             _LIBCPP_HIDE_FROM_ABI constexpr void append_range(_Range&& __range) {
+      .               if constexpr (ranges::forward_range<_Range> || ranges::sized_range<_Range>) {
+      .                 auto __len = ranges::distance(__range);
+      .                 if (__len <= __cap_ - __end_) {
+-- line 490 ----------------------------------------
+-- line 574 ----------------------------------------
+      .           #else
+      .                 _NOEXCEPT_(!__alloc_traits::propagate_on_container_swap::value || __is_nothrow_swappable_v<allocator_type>);
+      .           #endif
+      .           
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI bool __invariants() const;
+      .           
+      .           private:
+      .             pointer __begin_ = nullptr;
+ 18,018 ( 0.04%)    pointer __end_   = nullptr;
+      .             _LIBCPP_COMPRESSED_PAIR(pointer, __cap_ = nullptr, allocator_type, __alloc_);
+      .           
+      .             //  Allocate space for __n objects
+      .             //  throws length_error if __n > max_size()
+      .             //  throws (probably bad_alloc) if memory run out
+      .             //  Precondition:  __begin_ == __end_ == __cap_ == nullptr
+      .             //  Precondition:  __n > 0
+      .             //  Postcondition:  capacity() >= __n
+-- line 590 ----------------------------------------
+-- line 751 ----------------------------------------
+      .           
+      .             struct _ConstructTransaction {
+      .               _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI explicit _ConstructTransaction(vector& __v, size_type __n)
+      .                   : __v_(__v), __pos_(__v.__end_), __new_end_(__v.__end_ + __n) {
+      .                 __v_.__annotate_increase(__n);
+      .               }
+      .           
+      .               _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI ~_ConstructTransaction() {
+    240 ( 0.00%)        __v_.__end_ = __pos_;
+      .                 if (__pos_ != __new_end_) {
+      .                   __v_.__annotate_shrink(__new_end_ - __v_.__begin_);
+      .                 }
+      .               }
+      .           
+      .               vector& __v_;
+      .               pointer __pos_;
+      .               const_pointer const __new_end_;
+      .           
+      .               _ConstructTransaction(_ConstructTransaction const&)            = delete;
+      .               _ConstructTransaction& operator=(_ConstructTransaction const&) = delete;
+      .             };
+      .           
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI void __base_destruct_at_end(pointer __new_last) _NOEXCEPT {
+      .               pointer __soon_to_be_end = this->__end_;
+ 48,744 ( 0.09%)      while (__new_last != __soon_to_be_end)
+      .                 __alloc_traits::destroy(this->__alloc_, std::__to_address(--__soon_to_be_end));
+  6,006 ( 0.01%)      this->__end_ = __new_last;
+      .             }
+      .           
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI void __copy_assign_alloc(const vector& __c) {
+      .               __copy_assign_alloc(__c, integral_constant<bool, __alloc_traits::propagate_on_container_copy_assignment::value>());
+      .             }
+      .           
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI void __move_assign_alloc(vector& __c)
+      .                 _NOEXCEPT_(!__alloc_traits::propagate_on_container_move_assignment::value ||
+-- line 785 ----------------------------------------
+-- line 830 ----------------------------------------
+      .               auto __vector_sentinel = __end_;
+      .               auto __vector_cap      = __cap_;
+      .           
+      .               auto __sb_begin    = __sb.begin();
+      .               auto __sb_sentinel = __sb.__raw_sentinel();
+      .               auto __sb_cap      = __sb.__raw_capacity();
+      .           
+      .               // TODO: replace with __set_valid_range and __set_capacity when vector supports it.
+ 18,126 ( 0.04%)      __begin_ = __sb_begin;
+ 36,252 ( 0.07%)      __end_   = __sb_sentinel;
+ 18,126 ( 0.04%)      __cap_   = __sb_cap;
+      .           
+      .               __sb.__set_valid_range(__vector_begin, __vector_sentinel);
+      .               __sb.__set_capacity(__vector_cap);
+      .             }
+      .           };
+      .           
+      .           #if _LIBCPP_STD_VER >= 17
+      .           template <class _InputIterator,
+-- line 848 ----------------------------------------
+-- line 867 ----------------------------------------
+      .           
+      .           // __swap_out_circular_buffer relocates the objects in [__begin_, __end_) into the front of __v and swaps the buffers of
+      .           // *this and __v. It is assumed that __v provides space for exactly (__end_ - __begin_) objects in the front. This
+      .           // function has a strong exception guarantee.
+      .           template <class _Tp, class _Allocator>
+      .           _LIBCPP_CONSTEXPR_SINCE_CXX20 void
+      .           vector<_Tp, _Allocator>::__swap_out_circular_buffer(__split_buffer<value_type, allocator_type>& __v) {
+      .             __annotate_delete();
+ 18,126 ( 0.04%)    auto __new_begin = __v.begin() - size();
+      .             std::__uninitialized_allocator_relocate(
+      .                 this->__alloc_, std::__to_address(__begin_), std::__to_address(__end_), std::__to_address(__new_begin));
+      .             __v.__set_valid_range(__new_begin, __v.end());
+      .             __end_       = __begin_; // All the objects have been destroyed by relocating them.
+      .           
+      .             __swap_layouts(__v);
+      .             __v.__set_data(__v.begin());
+      .             __annotate_new(size());
+-- line 883 ----------------------------------------
+-- line 922 ----------------------------------------
+      .             }
+      .           }
+      .           
+      .           //  Precondition:  __new_size > capacity()
+      .           template <class _Tp, class _Allocator>
+      .           _LIBCPP_CONSTEXPR_SINCE_CXX20 inline _LIBCPP_HIDE_FROM_ABI typename vector<_Tp, _Allocator>::size_type
+      .           vector<_Tp, _Allocator>::__recommend(size_type __new_size) const {
+      .             const size_type __ms = max_size();
+ 36,252 ( 0.07%)    if (__new_size > __ms)
+      .               this->__throw_length_error();
+      .             const size_type __cap = capacity();
+ 90,630 ( 0.18%)    if (__cap >= __ms / 2)
+      .               return __ms;
+      .             return std::max<size_type>(2 * __cap, __new_size);
+      .           }
+      .           
+      .           //  Default constructs __n objects starting at __end_
+      .           //  throws if construction throws
+      .           //  Precondition:  __n > 0
+      .           //  Precondition:  size() + __n <= capacity()
+-- line 941 ----------------------------------------
+-- line 1112 ----------------------------------------
+      .           #endif // _LIBCPP_HAS_EXCEPTIONS
+      .             }
+      .           }
+      .           
+      .           template <class _Tp, class _Allocator>
+      .           template <class... _Args>
+      .           _LIBCPP_CONSTEXPR_SINCE_CXX20 typename vector<_Tp, _Allocator>::pointer
+      .           vector<_Tp, _Allocator>::__emplace_back_slow_path(_Args&&... __args) {
+ 18,126 ( 0.04%)    __split_buffer<value_type, allocator_type> __v(__recommend(size() + 1), size(), this->__alloc_);
+      .             //    __v.emplace_back(std::forward<_Args>(__args)...);
+      .             pointer __end = __v.end();
+      .             __alloc_traits::construct(this->__alloc_, std::__to_address(__end), std::forward<_Args>(__args)...);
+ 18,126 ( 0.04%)    __v.__set_sentinel(++__end);
+      .             __swap_out_circular_buffer(__v);
+      .             return this->__end_;
+181,260 ( 0.35%)  }
+      .           
+      .           // This makes the compiler inline `__else()` if `__cond` is known to be false. Currently LLVM doesn't do that without
+      .           // the `__builtin_constant_p`, since it considers `__else` unlikely even through it's known to be run.
+      .           // See https://llvm.org/PR154292
+      .           template <class _If, class _Else>
+      .           _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX14 void __if_likely_else(bool __cond, _If __if, _Else __else) {
+      .             if (__builtin_constant_p(__cond)) {
+      .               if (__cond)
+      .                 __if();
+      .               else
+      .                 __else();
+      .             } else {
+ 18,366 ( 0.04%)      if (__cond) [[__likely__]]
+      .                 __if();
+      .               else
+      .                 __else();
+      .             }
+      .           }
+      .           
+      .           template <class _Tp, class _Allocator>
+      .           template <class... _Args>
+-- line 1148 ----------------------------------------
+-- line 1150 ----------------------------------------
+      .           #if _LIBCPP_STD_VER >= 17
+      .               typename vector<_Tp, _Allocator>::reference
+      .           #else
+      .               void
+      .           #endif
+      .               vector<_Tp, _Allocator>::emplace_back(_Args&&... __args) {
+      .             pointer __end = this->__end_;
+      .             std::__if_likely_else(
+ 18,366 ( 0.04%)        __end < this->__cap_,
+      .                 [&] {
+      .                   __emplace_back_assume_capacity(std::forward<_Args>(__args)...);
+      .                   ++__end;
+      .                 },
+ 18,126 ( 0.04%)        [&] { __end = __emplace_back_slow_path(std::forward<_Args>(__args)...); });
+13,443,478 (26.19%)  => contrib/llvm-project/libcxx/include/__vector/vector.h:std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >* std::__1::vector<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, std::__1::allocator<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > > >::__emplace_back_slow_path<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&>(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> > const&) (18,144x)
+      .           
+ 36,732 ( 0.07%)    this->__end_ = __end;
+      .           #if _LIBCPP_STD_VER >= 17
+      .             return *(__end - 1);
+      .           #endif
+      .           }
+      .           
+      .           template <class _Tp, class _Allocator>
+      .           _LIBCPP_CONSTEXPR_SINCE_CXX20 inline _LIBCPP_HIDE_FROM_ABI typename vector<_Tp, _Allocator>::iterator
+      .           vector<_Tp, _Allocator>::erase(const_iterator __position) {
+-- line 1173 ----------------------------------------
+
+296,502 ( 0.58%)  <counts for unidentified lines in contrib/llvm-project/libcxx/include/__vector/vector.h>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: base/base/../base/find_symbols.h
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 69 ----------------------------------------
+      .           #if defined(__SSE4_2__)
+      .               __m128i simd_vector{};
+      .           #endif
+      .               std::string str;
+      .           };
+      .           
+      .           namespace detail
+      .           {
+     90 ( 0.00%)  template <char ...chars> constexpr bool is_in(char x) { return ((x == chars) || ...); } // NOLINT(misc-redundant-expression)
+      .           
+      .           static bool is_in(char c, const char * symbols, size_t num_chars)
+      .           {
+      .               for (size_t i = 0u; i < num_chars; ++i)
+      .               {
+      .                   if (c == symbols[i])
+      .                   {
+      .                       return true;
+-- line 85 ----------------------------------------
+-- line 88 ----------------------------------------
+      .           
+      .               return false;
+      .           }
+      .           
+      .           #if defined(__SSE2__)
+      .           template <char s0>
+      .           inline __m128i mm_is_in(__m128i bytes)
+      .           {
+ 48,900 ( 0.10%)      __m128i eq0 = _mm_cmpeq_epi8(bytes, _mm_set1_epi8(s0));
+      .               return eq0;
+      .           }
+      .           
+      .           template <char s0, char s1, char... tail>
+      .           inline __m128i mm_is_in(__m128i bytes)
+      .           {
+ 97,800 ( 0.19%)      __m128i eq0 = _mm_cmpeq_epi8(bytes, _mm_set1_epi8(s0));
+      .               __m128i eq = mm_is_in<s1, tail...>(bytes);
+ 48,900 ( 0.10%)      return _mm_or_si128(eq0, eq);
+      .           }
+      .           
+      .           inline __m128i mm_is_in(__m128i bytes, const char * symbols, size_t num_chars)
+      .           {
+      .               __m128i accumulator = _mm_setzero_si128();
+      .               for (size_t i = 0; i < num_chars; ++i)
+      .               {
+      .                   __m128i eq = _mm_cmpeq_epi8(bytes, _mm_set1_epi8(symbols[i]));
+-- line 113 ----------------------------------------
+-- line 267 ----------------------------------------
+      .           
+      .           
+      .           template <bool positive, ReturnMode return_mode, char... symbols>
+      .           inline const char * find_first_symbols_sse2(const char * const begin, const char * const end)
+      .           {
+      .               const char * pos = begin;
+      .           
+      .           #if defined(__SSE2__)
+552,840 ( 1.08%)      for (; pos + 15 < end; pos += 16)
+      .               {
+ 91,374 ( 0.18%)          __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pos));
+      .           
+      .                   __m128i eq = mm_is_in<symbols...>(bytes);
+      .           
+133,848 ( 0.26%)          uint16_t bit_mask = maybe_negate<positive>(uint16_t(_mm_movemask_epi8(eq)));
+182,748 ( 0.36%)          if (bit_mask)
+      .                       return pos + __builtin_ctz(bit_mask);
+      .               }
+      .           #elif defined(__aarch64__)
+      .               /// Short haystacks (< 16 bytes) dominate many callers (e.g. `trim` on
+      .               /// `toString(number)`). Tail-call the out-of-line NEON helper so the
+      .               /// inline body collapses to the original scalar loop on master.
+      .               if (end - begin >= 16) [[unlikely]]
+      .                   return find_first_symbols_neon_long<positive, return_mode, symbols...>(begin, end);
+      .           #endif
+      .           
+166,608 ( 0.32%)      for (; pos < end; ++pos)
+273,378 ( 0.53%)          if (maybe_negate<positive>(is_in<symbols...>(*pos)))
+      .                       return pos;
+      .           
+      .               return return_mode == ReturnMode::End ? end : nullptr;
+      .           }
+      .           
+      .           #if defined(__aarch64__)
+      .           /// Runtime-needle NEON body for long haystacks. Always returns either a
+      .           /// matching pointer or `end` (treated by the caller as "no match"). Kept
+-- line 302 ----------------------------------------
+
+159,792 ( 0.31%)  <counts for unidentified lines in base/base/../base/find_symbols.h>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: base/base/../base/hex.h
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 108 ----------------------------------------
+      .                   "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+      .                   "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+      .                   "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+      .                   256};
+      .           
+      .               /// Converts a hex digit '0'..'f' or '0'..'F' to its value 0..15.
+      .               constexpr UInt8 unhexDigit(char c)
+      .               {
+288,000 ( 0.56%)          return hex_char_to_digit_table[static_cast<UInt8>(c)];
+      .               }
+      .           
+      .               /// Converts an unsigned integer in the native endian to hexadecimal representation and back. Used as a base class for HexConversion<T>.
+      .               template <typename TUInt, typename = void>
+      .               struct HexConversionUInt
+      .               {
+      .                   static const constexpr size_t num_hex_digits = sizeof(TUInt) * 2;
+      .           
+-- line 124 ----------------------------------------
+-- line 141 ----------------------------------------
+      .                       }
+      .                   }
+      .           
+      .                   static TUInt unhex(const char * data)
+      .                   {
+      .                       TUInt res{};
+      .                       if constexpr (sizeof(TUInt) == 1)
+      .                       {
+384,000 ( 0.75%)                  res = unhexDigit(data[0]) * 0x10 + unhexDigit(data[1]);
+      .                       }
+      .                       else if constexpr (sizeof(TUInt) == 2)
+      .                       {
+      .                           res = static_cast<UInt16>(unhexDigit(data[0])) * 0x1000 + static_cast<UInt16>(unhexDigit(data[1])) * 0x100
+      .                               + static_cast<UInt16>(unhexDigit(data[2])) * 0x10 + static_cast<UInt16>(unhexDigit(data[3]));
+      .                       }
+      .                       else if constexpr ((sizeof(TUInt) <= 8) || ((sizeof(TUInt) % 8) != 0))
+      .                       {
+      .                           res = 0;
+      .                           for (size_t i = 0; i < sizeof(TUInt) * 2; ++i, ++data)
+      .                           {
+264,000 ( 0.51%)                      res <<= 4;
+288,000 ( 0.56%)                      res += unhexDigit(*data);
+      .                           }
+      .                       }
+      .                       else
+      .                       {
+      .                           res = 0;
+      .                           for (size_t i = 0; i < sizeof(TUInt) / 8; ++i, data += 16)
+      .                           {
+      .                               res <<= 64;
+      .                               res += HexConversionUInt<UInt64>::unhex(data);
+      .                           }
+      .                       }
+ 18,000 ( 0.04%)              return res;
+      .                   }
+      .               };
+      .           
+      .               /// Helper template class to convert a value of any supported type to hexadecimal representation and back.
+      .               template <typename T>
+      .               struct HexConversion;
+      .           
+      .               template <typename TUInt>
+-- line 182 ----------------------------------------
+-- line 260 ----------------------------------------
+      .               memcpy(out, &impl::hex_byte_to_char_lowercase_table[static_cast<size_t>(byte) * 2], 2);
+      .           }
+      .           
+      .           /// Converts a hex representation with leading zeros back to an integer value.
+      .           /// The function supports native integer types, wide::integer, CityHash_v1_0_2::uint128.
+      .           template <typename T>
+      .           constexpr T unhexUInt(const char * data)
+      .           {
+  6,000 ( 0.01%)      return impl::HexConversion<T>::unhex(data);
+786,000 ( 1.53%)  => base/base/../base/hex.h:impl::HexConversionUInt<wide::integer<128ul, unsigned int>, void>::unhex(char const*) (6,000x)
+      .           }
+      .           
+      .           /// Converts a hexadecimal digit '0'..'f' or '0'..'F' to UInt8.
+      .           constexpr UInt8 unhex(char c)
+      .           {
+      .               return impl::unhexDigit(c);
+      .           }
+      .           
+-- line 276 ----------------------------------------
+
+ 18,000 ( 0.04%)  <counts for unidentified lines in base/base/../base/hex.h>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: ./src/IO/ReadHelpers.cpp
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 148 ----------------------------------------
+      .                   out << " before: " << quote << std::string_view(buf.position(), std::min(SHOW_CHARS_ON_SYNTAX_ERROR, buf.buffer().end() - buf.position()));
+      .           
+      .               throw Exception(ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED, "Cannot parse input: expected {}", out.str());
+      .           }
+      .           
+      .           
+      .           bool checkString(const char * s, ReadBuffer & buf)
+      .           {
+  3,270 ( 0.01%)      for (; *s; ++s)
+      .               {
+  1,320 ( 0.00%)          if (buf.eof() || *buf.position() != *s)
+      .                       return false;
+  1,140 ( 0.00%)          ++buf.position();
+      .               }
+      .               return true;
+    960 ( 0.00%)  }
+      .           
+      .           
+      .           bool checkStringCaseInsensitive(const char * s, ReadBuffer & buf)
+      .           {
+      .               for (; *s; ++s)
+      .               {
+      .                   if (buf.eof())
+      .                       return false;
+-- line 171 ----------------------------------------
+-- line 179 ----------------------------------------
+      .               return true;
+      .           }
+      .           
+      .           
+      .           void assertString(const char * s, ReadBuffer & buf)
+      .           {
+      .               if (!checkString(s, buf))
+      .                   throwAtAssertionFailed(s, buf);
+    630 ( 0.00%)  }
+      .           
+      .           
+      .           void assertEOF(ReadBuffer & buf)
+      .           {
+      .               if (!buf.eof())
+      .                   throwAtAssertionFailed("eof", buf);
+      .           }
+      .           
+-- line 195 ----------------------------------------
+-- line 258 ----------------------------------------
+      .               /// Diagnostic asserts for the bounds-corruption class of bug tracked in
+      .               /// `https://github.com/ClickHouse/ClickHouse/issues/104692`. If
+      .               /// `working_buffer` becomes inverted or extends past the underlying owned
+      .               /// `Memory<>`, the `s.append` below memcpys an arbitrary span and corrupts
+      .               /// the destination `String`'s heap arena. The exception then surfaces
+      .               /// either at the memcpy itself (unmapped source) or much later when the
+      .               /// oversized `String` is freed.
+      .               assertReadBufferRangeForAppend(rb, end);
+146,664 ( 0.29%)      s.append(rb.position(), end - rb.position());
+7,908,679 (15.41%)  => contrib/llvm-project/libcxx/include/string:std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >::append(char const*, unsigned long) (36,696x)
+      .           }
+      .           
+      .           template <>
+      .           inline void appendToStringOrVector(PaddedPODArray<UInt8> & s, ReadBuffer & rb, const char * end)
+      .           {
+      .               assertReadBufferRangeForAppend(rb, end);
+      .               if (rb.isPadded())
+      .                   s.insertSmallAllowReadWriteOverflow15(rb.position(), end);
+-- line 274 ----------------------------------------
+-- line 518 ----------------------------------------
+      .           
+      .               auto error = [](const char * message [[maybe_unused]], int code [[maybe_unused]])
+      .               {
+      .                   if constexpr (throw_exception)
+      .                       throw Exception::createDeprecated(message, code);
+      .                   return ReturnType(false);
+      .               };
+      .           
+    240 ( 0.00%)      ++buf.position();
+      .           
+      .               if (buf.eof())
+      .               {
+      .                   if (keep_bad_sequences)
+      .                       return ReturnType(true);
+      .                   return error("Cannot parse escape sequence: unexpected eof", ErrorCodes::CANNOT_PARSE_ESCAPE_SEQUENCE);
+      .               }
+      .           
+      .               chassert(buf.hasPendingData());
+      .           
+    600 ( 0.00%)      switch (*buf.position())
+      .               {
+      .                   case '"':
+      .                       s.push_back('"');
+      .                       break;
+      .                   case '\\':
+      .                       s.push_back('\\');
+      .                       break;
+      .                   case '/':
+-- line 545 ----------------------------------------
+-- line 718 ----------------------------------------
+      .           
+      .                       return ReturnType(true);
+      .                   }
+      .                   default:
+      .                       s.push_back(*buf.position());
+      .                       break;
+      .               }
+      .           
+    360 ( 0.00%)      ++buf.position();
+      .               return ReturnType(true);
+      .           }
+      .           
+      .           
+      .           template <typename Vector, bool parse_complex_escape_sequence, bool support_crlf>
+      .           void readEscapedStringIntoImpl(Vector & s, ReadBuffer & buf)
+      .           {
+      .               while (!buf.eof())
+-- line 734 ----------------------------------------
+-- line 1271 ----------------------------------------
+      .           
+      .               auto error = [](FormatStringHelper<> message [[maybe_unused]], int code [[maybe_unused]])
+      .               {
+      .                   if constexpr (throw_exception)
+      .                       throw Exception(code, std::move(message));
+      .                   return ReturnType(false);
+      .               };
+      .           
+ 73,092 ( 0.14%)      if (buf.eof() || *buf.position() != '"')
+      .                   return error("Cannot parse JSON string: expected opening quote", ErrorCodes::CANNOT_PARSE_QUOTED_STRING);
+219,276 ( 0.43%)      ++buf.position();
+      .           
+      .               while (!buf.eof())
+      .               {
+      .                   char * next_pos = find_first_symbols<'\\', '"'>(buf.position(), buf.buffer().end());
+      .           
+      .                   appendToStringOrVector(s, buf, next_pos);
+ 36,666 ( 0.07%)          buf.position() = next_pos;
+      .           
+ 36,666 ( 0.07%)          if (!buf.hasPendingData())
+      .                       continue;
+      .           
+219,756 ( 0.43%)          if (*buf.position() == '"')
+      .                   {
+ 73,092 ( 0.14%)              ++buf.position();
+      .                       return ReturnType(true);
+      .                   }
+      .           
+      .                   if (*buf.position() == '\\')
+    120 ( 0.00%)              parseJSONEscapeSequence<Vector, ReturnType>(s, buf, !settings.throw_on_bad_escape_sequence);
+      .               }
+      .           
+      .               return error("Cannot parse JSON string: expected closing quote", ErrorCodes::CANNOT_PARSE_QUOTED_STRING);
+292,368 ( 0.57%)  }
+      .           
+      .           void readJSONString(String & s, ReadBuffer & buf, const FormatSettings::JSON & settings)
+      .           {
+      .               s.clear();
+ 36,546 ( 0.07%)      readJSONStringInto(s, buf, settings);
+11,124,331 (21.67%)  => ./src/IO/ReadHelpers.cpp:void DB::readJSONStringInto<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >, void>(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&, DB::ReadBuffer&, DB::FormatSettings::JSON const&) (36,576x)
+      .           }
+      .           
+      .           template void readJSONStringInto<PaddedPODArray<UInt8>, void>(PaddedPODArray<UInt8> & s, ReadBuffer & buf, const FormatSettings::JSON & settings);
+      .           template bool readJSONStringInto<PaddedPODArray<UInt8>, bool>(PaddedPODArray<UInt8> & s, ReadBuffer & buf, const FormatSettings::JSON & settings);
+      .           template void readJSONStringInto<NullOutput>(NullOutput & s, ReadBuffer & buf, const FormatSettings::JSON & settings);
+      .           template void readJSONStringInto<String>(String & s, ReadBuffer & buf, const FormatSettings::JSON & settings);
+      .           template bool readJSONStringInto<String, bool>(String & s, ReadBuffer & buf, const FormatSettings::JSON & settings);
+      .           
+-- line 1317 ----------------------------------------
+
+478,098 ( 0.93%)  <counts for unidentified lines in ./src/IO/ReadHelpers.cpp>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.cpp
+--------------------------------------------------------------------------------
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ Source file './src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.cpp' is more recent than input file 'tmp/cg.run.only.out'.
+@ Annotations may not be correct.
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+Ir               
+
+-- line 44 ----------------------------------------
+      .               /// Keep the high and low halves in the same order for the write-side helper and the streaming
+      .               /// reader. The value is compared internally rather than exposed as a separately interpreted wire
+      .               /// field, but both paths must use the same packing for a stored run to verify successfully.
+      .               return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
+      .           }
+      .           
+      .           int hexNibble(char c)
+      .           {
+ 66,000 ( 0.13%)      if (c >= '0' && c <= '9') return c - '0';
+      .               if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      .               return -1;
+      .           }
+      .           
+      .           /// The run `ref` carries the algorithm as a raw leading byte, so this is the byte-side counterpart of
+      .           /// the word table -- and it walks that same table rather than listing the enumerators again. A second
+      .           /// list is how the writer and the reader come to disagree about which algorithms exist: `renderB`
+      .           /// writes whatever the enum holds, and a hand-written switch here would reject exactly what a new
+-- line 60 ----------------------------------------
+-- line 77 ----------------------------------------
+      .               b.push_back(H[(a >> 4) & 0xF]);
+      .               b.push_back(H[a & 0xF]);
+      .               b += codecFor(ref.algo).toHex(ref.digest);
+      .               return b;
+      .           }
+      .           
+      .           BlobRef parseB(std::string_view b)
+      .           {
+ 12,000 ( 0.02%)      if (b.size() < 2)
+      .                   throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: record key too short");
+  6,000 ( 0.01%)      const int hi = hexNibble(b[0]);
+  6,000 ( 0.01%)      const int lo = hexNibble(b[1]);
+ 18,000 ( 0.04%)      if (hi < 0 || lo < 0)
+      .                   throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: non-hex algo byte in record key");
+ 12,000 ( 0.02%)      const BlobHashAlgo algo = algoFromByte(static_cast<uint8_t>((hi << 4) | lo), "cas_run");
+      .               const std::string_view digest_hex = b.substr(2);
+ 36,000 ( 0.07%)      if (digest_hex.size() != static_cast<size_t>(blobHashLenFor(algo)) * 2)
+102,000 ( 0.20%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.cpp:DB::Cas::blobHashLenFor(DB::Cas::BlobHashAlgo) (6,000x)
+      .                   throw Exception(ErrorCodes::CORRUPTED_DATA,
+      .                       "CAS cas_run: digest hex width {} does not match algo width {}", digest_hex.size(), blobHashLenFor(algo) * 2);
+396,000 ( 0.77%)      for (const char c : digest_hex)
+      .                   if (!isLowercaseHexChar(c))
+      .                       throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: non-lowercase-hex digest in record key");
+      .               BlobRef ref;
+      .               ref.algo = algo;
+ 36,000 ( 0.07%)      ref.digest = codecFor(algo).fromHex(String(digest_hex));
+2,598,000 ( 5.06%)  => src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h:DB::Cas::DigestCodec::fromHex(std::__1::basic_string_view<char, std::__1::char_traits<char> >) const (6,000x)
+      .               return ref;
+      .           }
+      .           
+      .           }
+      .           
+      .           std::string_view runMarkerToWireWord(RunMarker marker)
+      .           {
+      .               return kRunMarkerWords.toWord(marker, "CAS cas_run: RunMarker");
+      .           }
+      .           
+      .           RunMarker runMarkerFromWireWord(std::string_view w)
+      .           {
+ 30,000 ( 0.06%)      return kRunMarkerWords.fromWord(w, "CAS cas_run: RunMarker");
+535,320 ( 1.04%)  => src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEnumWireTable.h:DB::Cas::EnumWireTable<DB::Cas::RunMarker, 3ul>::fromWord(std::__1::basic_string_view<char, std::__1::char_traits<char> >, std::__1::basic_string_view<char, std::__1::char_traits<char> >) const (6,000x)
+      .           }
+      .           
+      .           void writeRunHeaderLine(WriteBuffer & out, std::string_view kind)
+      .           {
+      .               const FormatTraits & t = traitsFor(FormatId::RunFile);
+      .               CasJsonWriter line(64);
+      .               bool first = true;
+      .               writeKey(line, "type", first);
+-- line 122 ----------------------------------------
+-- line 234 ----------------------------------------
+      .               : hashing(in_)
+      .           {
+      .               /// Typed open: gate type/v/kind (and hash the header bytes) before any record is interpreted.
+      .               expectRunHeaderLine(hashing, kSourceEdgeKindWord);
+      .           }
+      .           
+      .           bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
+      .           {
+ 12,012 ( 0.02%)      if (done)
+      .                   return false;
+      .           
+ 60,060 ( 0.12%)      readLineInto(hashing, scratch, traitsFor(FormatId::RunFile).line_cap, "cas_run");
+1,240,520 ( 2.42%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::readLineInto(DB::ReadBuffer&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&, unsigned long, std::__1::basic_string_view<char, std::__1::char_traits<char> >) (6,006x)
+120,120 ( 0.23%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.cpp:DB::Cas::traitsFor(DB::Cas::FormatId) (6,006x)
+      .               ReadBufferFromMemory line_in(scratch.data(), scratch.size());
+ 30,030 ( 0.06%)      /// Re-point the reader rather than building one per row: a fresh reader re-allocates its
+402,402 ( 0.78%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::JsonObjectReader(DB::ReadBuffer&, DB::Cas::KeyStrictness, std::__1::basic_string_view<char, std::__1::char_traits<char> >) (6,006x)
+      .               /// seen-key store and value scratch every row, and this loop runs once per record.
+      .               reader.reset(line_in, KeyStrictness::Strict, "cas_run");
+ 30,030 ( 0.06%)      JsonObjectReader & r = reader;
+4,378,392 ( 8.53%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::nextKey(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&) (6,006x)
+      .           
+      .               String key;
+      6 ( 0.00%)      if (!r.nextKey(key))
+      .                   throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: empty line");
+     30 ( 0.00%)  
+    714 ( 0.00%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::readU64Number() (6x)
+     18 ( 0.00%)      if (key == "n")
+    222 ( 0.00%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::nextKey(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&) (6x)
+      .               {
+     12 ( 0.00%)          const uint64_t n = r.readU64Number();
+      .                   if (r.nextKey(key))
+      .                       throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: trailer has extra keys");
+      .                   if (!line_in.eof())
+     12 ( 0.00%)              throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: junk after trailer object");
+      .                   /// The trailer must be the last line of the object; hashing must be at EOF (this also drains and
+     12 ( 0.00%)          /// hashes the final bytes so accumulatedChecksum covers the whole object).
+      .                   if (!hashing.eof())
+      .                       throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: bytes after trailer");
+     12 ( 0.00%)          if (n != seen)
+      .                       throw Exception(ErrorCodes::CORRUPTED_DATA,
+      .                           "CAS cas_run: trailer count {} != {} records (line truncation?)", n, seen);
+      .                   done = true;
+      .                   return false;
+      .               }
+      .           
+      .               SourceEdgeRecord out;
+      .               String b;
+      .               TokenFields token_fields;
+      .               bool have_ref = false;
+      .               bool have_src = false;
+      .               bool have_mark = false;
+      .               bool have_pending = false;
+      .               bool have_size = false;
+      .               bool have_condemn_round = false;
+ 36,000 ( 0.07%)      bool have_confirmed = false;
+3,912,699 ( 7.62%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::readString() (6,000x)
+ 24,000 ( 0.05%)      do
+9,125,116 (17.78%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::readHex128() (6,000x)
+ 30,060 ( 0.06%)      {
+1,120,380 ( 2.18%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::readString() (6,000x)
+    240 ( 0.00%)          if (key == RunWire::ref) { b = r.readString(); have_ref = true; }
+  6,420 ( 0.01%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::readBool() (60x)
+      .                   else if (key == RunWire::src) { out.source_id = r.readHex128(); have_src = true; }
+    180 ( 0.00%)          else if (key == RunWire::mark) { out.marker = runMarkerFromWireWord(r.readString()); have_mark = true; }
+  7,980 ( 0.02%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::readU64Number() (60x)
+    180 ( 0.00%)          else if (key == RunWire::pending) { out.delete_pending = r.readBool(); have_pending = true; }
+ 20,160 ( 0.04%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::readU64String() (60x)
+    240 ( 0.00%)          else if (matchTokenFields(key, r, token_fields)) {}
+  7,680 ( 0.01%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::readBool() (60x)
+      .                   else if (key == RunWire::size) { out.size = r.readU64Number(); have_size = true; }
+103,800 ( 0.20%)          else if (key == RunWire::condemn_round) { out.condemn_round = r.readU64String(); have_condemn_round = true; }
+13,642,924 (26.58%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::nextKey(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&) (18,360x)
+      .                   else if (key == RunWire::confirmed) { out.marker_confirmed = r.readBool(); have_confirmed = true; }
+ 30,000 ( 0.06%)          else r.skipUnknown(key);   /// Strict => any unknown key is CORRUPTED_DATA
+      .               } while (r.nextKey(key));
+ 24,000 ( 0.05%)  
+ 12,000 ( 0.02%)      if (!have_ref || !have_src || !have_mark)
+      .                   throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: record missing ref/src/mark");
+    540 ( 0.00%)      out.ref = parseB(b);
+      .               if (out.marker == RunMarker::Condemned)
+    300 ( 0.00%)      {
+ 34,500 ( 0.07%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.cpp:DB::Cas::TokenFields::build(std::__1::basic_string_view<char, std::__1::char_traits<char> >) const (60x)
+      .                   if (!have_pending || !have_size || !have_condemn_round || !have_confirmed)
+ 77,220 ( 0.15%)              throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pending/size/condemn_round/confirmed");
+      .                   out.token = token_fields.build("cas_run");
+      .               }
+ 24,000 ( 0.05%)      else if (have_pending || token_fields.type_word || token_fields.value || have_size || have_condemn_round || have_confirmed)
+      .                   throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: non-condemned record carries condemned fields");
+      .           
+      .               if (!line_in.eof())
+  6,000 ( 0.01%)          throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: junk after record object");
+      .           
+ 60,060 ( 0.12%)      rec = std::move(out);
+      .               ++seen;
+      .               return true;
+      .           }
+      .           
+      .           UInt128 SourceEdgeRunReader::accumulatedChecksum()
+      .           {
+      .               return toWideChecksum(hashing.getHash());
+      .           }
+-- line 320 ----------------------------------------
+
+235,116 ( 0.46%)  <counts for unidentified lines in ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.cpp>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: contrib/llvm-project/libcxx/include/__algorithm/any_of.h
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 19 ----------------------------------------
+      .           #endif
+      .           
+      .           _LIBCPP_BEGIN_NAMESPACE_STD
+      .           
+      .           template <class _Iter, class _Sent, class _Proj, class _Pred>
+      .           _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX14 bool
+      .           __any_of(_Iter __first, _Sent __last, _Pred& __pred, _Proj& __proj) {
+      .             for (; __first != __last; ++__first) {
+942,000 ( 1.84%)      if (std::__invoke(__pred, std::__invoke(__proj, *__first)))
+      .                 return true;
+      .             }
+      .             return false;
+      .           }
+      .           
+      .           template <class _InputIterator, class _Predicate>
+      .           [[__nodiscard__]] inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 bool
+      .           any_of(_InputIterator __first, _InputIterator __last, _Predicate __pred) {
+-- line 35 ----------------------------------------
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: ./src/Common/CurrentThread.cpp
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 42 ----------------------------------------
+      .           {
+      .               if (unlikely(!current_thread))
+      .                   throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread #{} status was not initialized", std::to_string(getThreadId()));
+      .           
+      .               return *current_thread;
+      .           }
+      .           
+      .           ProfileEvents::Counters & CurrentThread::getProfileEvents()
+145,008 ( 0.28%)  {
+507,528 ( 0.99%)      return current_thread ? *current_thread->current_performance_counters : ProfileEvents::global_counters;
+      .           }
+      .           
+      .           MemoryTracker * CurrentThread::getMemoryTracker()
+144,996 ( 0.28%)  {
+362,490 ( 0.71%)      if (!current_thread) [[unlikely]]
+      .                   return nullptr;
+      .               return &current_thread->memory_tracker;
+144,996 ( 0.28%)  }
+      .           
+      .           void CurrentThread::updateProgressIn(const Progress & value)
+      .           {
+      .               if (unlikely(!current_thread))
+      .                   return;
+      .               current_thread->progress_in.incrementPiecewiseAtomically(value);
+      .           }
+      .           
+-- line 67 ----------------------------------------
+
+145,002 ( 0.28%)  <counts for unidentified lines in ./src/Common/CurrentThread.cpp>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h
+--------------------------------------------------------------------------------
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ Source file 'src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h' is more recent than input file 'tmp/cg.run.only.out'.
+@ Annotations may not be correct.
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+Ir                 
+
+-- line 214 ----------------------------------------
+        .               writeKey(out, key, first);
+        .               writeBoolValue(out, value);
+        .           }
+        .           
+        .           /// True iff `c` is one lowercase hexadecimal digit. Persisted CAS digests deliberately reject
+        .           /// uppercase spellings so each digest has one canonical textual representation.
+        .           constexpr bool isLowercaseHexChar(char c)
+        .           {
+2,556,000 ( 4.98%)      return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        .           }
+        .           
+        .           /// Pull cursor over one canonical JSON object.
+        .           ///
+        .           /// The reader borrows the input buffer and records the object name for exception messages. It
+        .           /// enforces unique keys and translates the several low-level parser exceptions into the CAS
+        .           /// `CORRUPTED_DATA` contract. Unknown keys follow the supplied evolution policy: ordinary keys
+        .           /// may be skipped in tolerant objects, while `!`-prefixed keys always fail with
+-- line 230 ----------------------------------------
+-- line 262 ----------------------------------------
+        .               uint32_t readU32Number();
+        .               /// Reads the bare JSON literals `true` and `false`.
+        .               bool readBool();
+        .               /// Applies the evolution rule for an unrecognized key: `!`-prefixed keys produce
+        .               /// `UNKNOWN_FORMAT_VERSION`; strict objects produce `CORRUPTED_DATA`; tolerant objects skip
+        .               /// the value.
+        .               void skipUnknown(const String & key);
+        .           
+    6,006 ( 0.01%)  private:
+        .               /// Runs one parser operation under the CAS error taxonomy while preserving version exceptions.
+        .               template <typename F>
+        .               auto guarded(F && f);
+        .           
+        .               /// Reads one JSON string into `scratch` and returns a view of it, so a value that is parsed and
+        .               /// discarded -- a hex digest, a decimal counter -- costs no allocation once the scratch has
+        .               /// grown. The view is valid until the next read on this reader.
+        .               std::string_view readStringIntoScratch();
+-- line 278 ----------------------------------------
+
+  192,000 ( 0.37%)  <counts for unidentified lines in src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: contrib/jemalloc/include/jemalloc/internal/jemalloc_internal_inlines_c.h
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 271 ----------------------------------------
+      .           	    tsdn, ptr, oldsize, size, extra, zero, newsize);
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE void
+      .           fastpath_success_finish(
+      .               tsd_t *tsd, uint64_t allocated_after, cache_bin_t *bin, void *ret) {
+      .           	thread_allocated_set(tsd, allocated_after);
+      .           	if (config_stats) {
+ 36,220 ( 0.07%)  		bin->tstats.nrequests++;
+      .           	}
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE bool
+      .           malloc_initialized(void) {
+ 72,504 ( 0.14%)  	return (malloc_init_state == malloc_init_initialized);
+      .           }
+      .           
+      .           /*
+      .            * malloc() fastpath.  Included here so that we can inline it into operator new;
+      .            * function call overhead there is non-negligible as a fraction of total CPU in
+      .            * allocation-heavy C++ programs.  We take the fallback alloc to allow malloc
+      .            * (which can return NULL) to differ in its behavior from operator new (which
+      .            * can't).  It matches the signature of malloc / operator new so that we can
+-- line 293 ----------------------------------------
+-- line 304 ----------------------------------------
+      .            */
+      .           JEMALLOC_ALWAYS_INLINE void *
+      .           imalloc_fastpath(size_t size, void *(fallback_alloc)(size_t)) {
+      .           	if (tsd_get_allocates() && unlikely(!malloc_initialized())) {
+      .           		return fallback_alloc(size);
+      .           	}
+      .           
+      .           	tsd_t *tsd = tsd_get(false);
+253,764 ( 0.49%)  	if (unlikely((size > SC_LOOKUP_MAXCLASS) || tsd == NULL)) {
+      .           		return fallback_alloc(size);
+      .           	}
+      .           	/*
+      .           	 * The code below till the branch checking the next_event threshold may
+      .           	 * execute before malloc_init(), in which case the threshold is 0 to
+      .           	 * trigger slow path and initialization.
+      .           	 *
+      .           	 * Note that when uninitialized, only the fast-path variants of the sz /
+-- line 320 ----------------------------------------
+-- line 331 ----------------------------------------
+      .           	sz_size2index_usize_fastpath(size, &ind, &usize);
+      .           	/* Fast path relies on size being a bin. */
+      .           	assert(ind < SC_NBINS);
+      .           	assert((SC_LOOKUP_MAXCLASS < SC_SMALL_MAXCLASS)
+      .           	    && (size <= SC_SMALL_MAXCLASS));
+      .           
+      .           	uint64_t allocated, threshold;
+      .           	te_malloc_fastpath_ctx(tsd, &allocated, &threshold);
+ 36,252 ( 0.07%)  	uint64_t allocated_after = allocated + usize;
+      .           	/*
+      .           	 * The ind and usize might be uninitialized (or partially) before
+      .           	 * malloc_init().  The assertions check for: 1) full correctness (usize
+      .           	 * & ind) when initialized; and 2) guaranteed slow-path (threshold == 0)
+      .           	 * when !initialized.
+      .           	 */
+      .           	if (!malloc_initialized()) {
+      .           		assert(threshold == 0);
+-- line 347 ----------------------------------------
+-- line 348 ----------------------------------------
+      .           	} else {
+      .           		assert(ind == sz_size2index(size));
+      .           		assert(usize > 0 && usize == sz_index2size(ind));
+      .           	}
+      .           	/*
+      .           	 * Check for events and tsd non-nominal (fast_threshold will be set to
+      .           	 * 0) in a single branch.
+      .           	 */
+ 72,504 ( 0.14%)  	if (unlikely(allocated_after >= threshold)) {
+      .           		return fallback_alloc(size);
+      .           	}
+      .           	assert(tsd_fast(tsd));
+      .           
+      .           	tcache_t *tcache = tsd_tcachep_get(tsd);
+      .           	assert(tcache == tcache_get(tsd));
+108,666 ( 0.21%)  	cache_bin_t *bin = &tcache->bins[ind];
+      .           	/* Suppress spurious warning from static analysis */
+      .           	assert(bin != NULL);
+      .           	bool  tcache_success;
+      .           	void *ret;
+      .           
+      .           	/*
+      .           	 * We split up the code this way so that redundant low-water
+      .           	 * computation doesn't happen on the (more common) case in which we
+-- line 371 ----------------------------------------
+-- line 385 ----------------------------------------
+      .           
+      .           	return fallback_alloc(size);
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE tcache_t *
+      .           tcache_get_from_ind(tsd_t *tsd, unsigned tcache_ind, bool slow, bool is_alloc) {
+      .           	tcache_t *tcache;
+      .           	if (tcache_ind == TCACHE_IND_AUTOMATIC) {
+     48 ( 0.00%)  		if (likely(!slow)) {
+      .           			/* Getting tcache ptr unconditionally. */
+      .           			tcache = tsd_tcachep_get(tsd);
+      .           			assert(tcache == tcache_get(tsd));
+      .           		} else if (is_alloc
+      .           		    || likely(tsd_reentrancy_level_get(tsd) == 0)) {
+      .           			tcache = tcache_get(tsd);
+      .           		} else {
+      .           			tcache = NULL;
+-- line 401 ----------------------------------------
+-- line 437 ----------------------------------------
+      .           			return true;
+      .           		}
+      .           	}
+      .           	return false;
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE bool
+      .           prof_sample_aligned(const void *ptr) {
+     48 ( 0.00%)  	return ((uintptr_t)ptr & PROF_SAMPLE_ALIGNMENT_MASK) == 0;
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE bool
+      .           free_fastpath_nonfast_aligned(void *ptr, bool check_prof) {
+      .           	/*
+      .                    * free_fastpath do not handle two uncommon cases: 1) sampled profiled
+      .                    * objects and 2) sampled junk & stash for use-after-free detection.
+      .                    * Both have special alignments which are used to escape the fastpath.
+-- line 453 ----------------------------------------
+-- line 481 ----------------------------------------
+      .           }
+      .           
+      .           /* Returns whether or not the free attempt was successful. */
+      .           JEMALLOC_ALWAYS_INLINE
+      .           bool
+      .           free_fastpath(void *ptr, size_t size, bool size_hint) {
+      .           	tsd_t *tsd = tsd_get(false);
+      .           	/* The branch gets optimized away unless tsd_get_allocates(). */
+ 72,492 ( 0.14%)  	if (unlikely(tsd == NULL)) {
+      .           		return false;
+      .           	}
+      .           	/*
+      .                    *  The tsd_fast() / initialized checks are folded into the branch
+      .                    *  testing (deallocated_after >= threshold) later in this function.
+      .                    *  The threshold will be set to 0 when !tsd_fast.
+      .                    */
+      .           	assert(tsd_fast(tsd)
+-- line 497 ----------------------------------------
+-- line 512 ----------------------------------------
+      .           		assert(alloc_ctx.szind != SC_NSIZES);
+      .           		usize = sz_index2size(alloc_ctx.szind);
+      .           	} else {
+      .           		/*
+      .                            * Check for both sizes that are too large, and for sampled /
+      .                            * special aligned objects.  The alignment check will also check
+      .                            * for null ptr.
+      .                            */
+108,738 ( 0.21%)  		if (unlikely(size > SC_LOOKUP_MAXCLASS
+      .           		        || free_fastpath_nonfast_aligned(ptr,
+      .           		            /* check_prof */ true))) {
+      .           			return false;
+      .           		}
+      .           		sz_size2index_usize_fastpath(size, &alloc_ctx.szind, &usize);
+      .           		/* Max lookup class must be small. */
+      .           		assert(alloc_ctx.szind < SC_NBINS);
+      .           		/* This is a dead store, except when opt size checking is on. */
+-- line 528 ----------------------------------------
+-- line 533 ----------------------------------------
+      .                    * SC_LOOKUP_MAXCLASS makes sure of it.  This lets us avoid checking
+      .                    * tcache szind upper limit (i.e. tcache_max) as well.
+      .                    */
+      .           	assert(alloc_ctx.slab);
+      .           
+      .           	uint64_t deallocated, threshold;
+      .           	te_free_fastpath_ctx(tsd, &deallocated, &threshold);
+      .           
+ 36,246 ( 0.07%)  	uint64_t deallocated_after = deallocated + usize;
+      .           	/*
+      .                    * Check for events and tsd non-nominal (fast_threshold will be set to
+      .                    * 0) in a single branch.  Note that this handles the uninitialized case
+      .                    * as well (TSD init will be triggered on the non-fastpath).  Therefore
+      .                    * anything depends on a functional TSD (e.g. the alloc_ctx sanity check
+      .                    * below) needs to be after this branch.
+      .                    */
+ 72,492 ( 0.14%)  	if (unlikely(deallocated_after >= threshold)) {
+      .           		return false;
+      .           	}
+      .           	assert(tsd_fast(tsd));
+      .           	bool fail = maybe_check_alloc_ctx(tsd, ptr, &alloc_ctx);
+      .           	if (fail) {
+      .           		/* See the comment in isfree. */
+      .           		return true;
+      .           	}
+      .           
+      .           	tcache_t    *tcache = tcache_get_from_ind(tsd, TCACHE_IND_AUTOMATIC,
+      .           	       /* slow */ false, /* is_alloc */ false);
+ 36,222 ( 0.07%)  	cache_bin_t *bin = &tcache->bins[alloc_ctx.szind];
+      .           
+      .           	/*
+      .                    * If junking were enabled, this is where we would do it.  It's not
+      .                    * though, since we ensured above that we're on the fast path.  Assert
+      .                    * that to double-check.
+      .                    */
+      .           	assert(!opt_junk_free);
+      .           
+      .           	if (!cache_bin_dalloc_easy(bin, ptr)) {
+      .           		return false;
+      .           	}
+      .           
+ 36,222 ( 0.07%)  	*tsd_thread_deallocatedp_get(tsd) = deallocated_after;
+      .           
+      .           	return true;
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE void JEMALLOC_NOTHROW
+      .           je_sdallocx_noflags(void *ptr, size_t size) {
+      .           	if (!free_fastpath(ptr, size, true)) {
+      .           		sdallocx_default(ptr, size, 0);
+      .           	}
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE void JEMALLOC_NOTHROW
+      .           je_sdallocx_impl(void *ptr, size_t size, int flags) {
+ 72,492 ( 0.14%)  	if (flags != 0 || !free_fastpath(ptr, size, true)) {
+    120 ( 0.00%)  		sdallocx_default(ptr, size, flags);
+ 43,025 ( 0.08%)  => ./contrib/jemalloc/src/jemalloc.c:sdallocx_default (270x)
+      .           	}
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE void JEMALLOC_NOTHROW
+      .           je_free_impl(void *ptr) {
+      .           	if (!free_fastpath(ptr, 0, false)) {
+      .           		free_default(ptr);
+      .           	}
+-- line 597 ----------------------------------------
+
+253,834 ( 0.49%)  <counts for unidentified lines in contrib/jemalloc/include/jemalloc/internal/jemalloc_internal_inlines_c.h>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: ./contrib/jemalloc/src/jemalloc.c
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 313 ----------------------------------------
+      .           	if (unlikely(malloc_init_state == malloc_init_uninitialized)) {
+      .           		return malloc_init_hard_a0();
+      .           	}
+      .           	return false;
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE bool
+      .           malloc_init(void) {
+ 36,252 ( 0.07%)  	if (unlikely(!malloc_initialized()) && malloc_init_hard()) {
+      .           		return true;
+      .           	}
+      .           	return false;
+      .           }
+      .           
+      .           /*
+      .            * The a0*() functions are used instead of i{d,}alloc() in situations that
+      .            * cannot tolerate TLS variable access.
+-- line 329 ----------------------------------------
+-- line 1384 ----------------------------------------
+      .           /*
+      .            * ind parameter is optional and is only checked and filled if alignment == 0;
+      .            * return true if result is out of range.
+      .            */
+      .           JEMALLOC_ALWAYS_INLINE bool
+      .           aligned_usize_get(size_t size, size_t alignment, size_t *usize, szind_t *ind,
+      .               bool bump_empty_aligned_alloc) {
+      .           	assert(usize != NULL);
+ 72,552 ( 0.14%)  	if (alignment == 0) {
+      .           		if (ind != NULL) {
+      .           			*ind = sz_size2index(size);
+     64 ( 0.00%)  			if (unlikely(*ind >= SC_NSIZES)) {
+      .           				return true;
+      .           			}
+     96 ( 0.00%)  			*usize = sz_large_size_classes_disabled()
+      .           			    ? sz_s2u(size)
+      .           			    : sz_index2size(*ind);
+      .           			assert(*usize > 0 && *usize <= SC_LARGE_MAXCLASS);
+      .           			return false;
+      .           		}
+      .           		*usize = sz_s2u(size);
+      .           	} else {
+      .           		if (bump_empty_aligned_alloc && unlikely(size == 0)) {
+-- line 1406 ----------------------------------------
+-- line 1602 ----------------------------------------
+      .           
+      .           	/*
+      .           	 * If dopts->alignment > 0, then ind is still 0, but usize was computed
+      .           	 * in the previous if statement.  Down the positive alignment path,
+      .           	 * imalloc_no_sample and imalloc_sample will ignore ind.
+      .           	 */
+      .           
+      .           	/* If profiling is on, get our profiling context. */
+    128 ( 0.00%)  	if (config_prof && opt_prof) {
+      .           		bool prof_active = prof_active_get_unlocked();
+      .           		bool sample_event = te_prof_sample_event_lookahead(tsd, usize);
+      .           		prof_tctx_t *tctx = prof_alloc_prep(
+      .           		    tsd, prof_active, sample_event);
+      .           
+      .           		emap_alloc_ctx_t alloc_ctx;
+     64 ( 0.00%)  		if (likely(tctx == PROF_TCTX_SENTINEL)) {
+      .           			alloc_ctx.slab = sz_can_use_slab(usize);
+      .           			allocation = imalloc_no_sample(sopts, dopts, tsd, usize,
+      .           			    usize, ind, alloc_ctx.slab);
+      .           		} else if (tctx != NULL) {
+      .           			allocation = imalloc_sample(
+      .           			    sopts, dopts, tsd, usize, ind);
+      .           			alloc_ctx.slab = false;
+      .           		} else {
+      .           			allocation = NULL;
+      .           		}
+      .           
+     96 ( 0.00%)  		if (unlikely(allocation == NULL)) {
+      .           			prof_alloc_rollback(tsd, tctx);
+      .           			goto label_oom;
+      .           		}
+      .           		prof_malloc(tsd, allocation, size, usize, &alloc_ctx, tctx);
+      .           	} else {
+      .           		assert(!opt_prof);
+      .           		allocation = imalloc_no_sample(sopts, dopts, tsd, size, usize,
+      .           		    ind, sz_can_use_slab(usize));
+-- line 1637 ----------------------------------------
+-- line 1755 ----------------------------------------
+      .           
+      .           		sopts->slow = true;
+      .           		return imalloc_body(sopts, dopts, tsd);
+      .           	}
+      .           }
+      .           
+      .           JEMALLOC_NOINLINE
+      .           void *
+    288 ( 0.00%)  malloc_default(size_t size) {
+      .           	void          *ret;
+      .           	static_opts_t  sopts;
+      .           	dynamic_opts_t dopts;
+      .           
+      .           	/*
+      .           	 * This variant has logging hook on exit but not on entry.  It's callled
+      .           	 * only by je_malloc, below, which emits the entry one for us (and, if
+      .           	 * it calls us, does so only via tail call).
+-- line 1771 ----------------------------------------
+-- line 1787 ----------------------------------------
+      .           	 * Note that this branch gets optimized away -- it immediately follows
+      .           	 * the check on tsd_fast that sets sopts.slow.
+      .           	 */
+      .           	if (sopts.slow) {
+      .           		uintptr_t args[3] = {size};
+      .           		hook_invoke_alloc(hook_alloc_malloc, ret, (uintptr_t)ret, args);
+      .           	}
+      .           
+    256 ( 0.00%)  	return ret;
+      .           }
+      .           
+      .           /******************************************************************************/
+      .           /*
+      .            * Begin malloc(3)-compatible functions.
+      .            */
+      .           
+      .           JEMALLOC_EXPORT
+      .           JEMALLOC_ALLOCATOR JEMALLOC_RESTRICT_RETURN void JEMALLOC_NOTHROW *
+181,260 ( 0.35%)  JEMALLOC_ATTR(malloc) JEMALLOC_ALLOC_SIZE(1) je_malloc(size_t size) {
+      .           	LOG("core.malloc.entry", "size: %zu", size);
+      .           
+      .           	void *ret = imalloc_fastpath(size, &malloc_default);
+      .           
+      .           	LOG("core.malloc.exit", "result: %p", ret);
+181,100 ( 0.35%)  	return ret;
+      .           }
+      .           
+      .           JEMALLOC_EXPORT int JEMALLOC_NOTHROW
+      .           JEMALLOC_ATTR(nonnull(1))
+      .               je_posix_memalign(void **memptr, size_t alignment, size_t size) {
+      .           	int            ret;
+      .           	static_opts_t  sopts;
+      .           	dynamic_opts_t dopts;
+-- line 1819 ----------------------------------------
+-- line 1975 ----------------------------------------
+      .           	assert(malloc_initialized() || IS_INITIALIZER);
+      .           
+      .           	emap_alloc_ctx_t alloc_ctx;
+      .           	szind_t          szind = sz_size2index(usize);
+      .           	if (!config_prof) {
+      .           		emap_alloc_ctx_init(
+      .           		    &alloc_ctx, szind, (szind < SC_NBINS), usize);
+      .           	} else {
+     24 ( 0.00%)  		if (likely(!prof_sample_aligned(ptr))) {
+      .           			/*
+      .           			 * When the ptr is not page aligned, it was not sampled.
+      .           			 * usize can be trusted to determine szind and slab.
+      .           			 */
+      .           			emap_alloc_ctx_init(
+      .           			    &alloc_ctx, szind, (szind < SC_NBINS), usize);
+      .           		} else if (opt_prof) {
+      .           			/*
+-- line 1991 ----------------------------------------
+-- line 2018 ----------------------------------------
+      .           		 * This is a heap corruption bug.  In real life we'll crash; for
+      .           		 * the unit test we just want to avoid breaking anything too
+      .           		 * badly to get a test result out.  Let's leak instead of trying
+      .           		 * to free.
+      .           		 */
+      .           		return;
+      .           	}
+      .           
+     72 ( 0.00%)  	if (config_prof && opt_prof) {
+      .           		prof_free(tsd, ptr, usize, &alloc_ctx);
+      .           	}
+      .           	if (likely(!slow_path)) {
+      .           		isdalloct(tsd_tsdn(tsd), ptr, usize, tcache, &alloc_ctx, false);
+      .           	} else {
+      .           		if (config_fill && slow_path && opt_junk_free) {
+      .           			junk_free_callback(ptr, usize);
+      .           		}
+-- line 2034 ----------------------------------------
+-- line 2290 ----------------------------------------
+      .            */
+      .           /******************************************************************************/
+      .           /*
+      .            * Begin non-standard functions.
+      .            */
+      .           
+      .           JEMALLOC_ALWAYS_INLINE unsigned
+      .           mallocx_tcache_get(int flags) {
+     72 ( 0.00%)  	if (likely((flags & MALLOCX_TCACHE_MASK) == 0)) {
+      .           		return TCACHE_IND_AUTOMATIC;
+      .           	} else if ((flags & MALLOCX_TCACHE_MASK) == MALLOCX_TCACHE_NONE) {
+      .           		return TCACHE_IND_NONE;
+      .           	} else {
+      .           		return MALLOCX_TCACHE_GET(flags);
+      .           	}
+      .           }
+      .           
+-- line 2306 ----------------------------------------
+-- line 2832 ----------------------------------------
+      .           	UTRACE(ptr, size, ptr);
+      .           	check_entry_exit_locking(tsd_tsdn(tsd));
+      .           
+      .           	LOG("core.xallocx.exit", "result: %zu", usize);
+      .           	return usize;
+      .           }
+      .           
+      .           JEMALLOC_EXPORT size_t JEMALLOC_NOTHROW
+217,476 ( 0.42%)  JEMALLOC_ATTR(pure) je_sallocx(const void *ptr, int flags) {
+      .           	size_t  usize;
+      .           	tsdn_t *tsdn;
+      .           
+      .           	LOG("core.sallocx.entry", "ptr: %p, flags: %d", ptr, flags);
+      .           
+      .           	assert(malloc_initialized() || IS_INITIALIZER);
+      .           	assert(ptr != NULL);
+      .           
+-- line 2848 ----------------------------------------
+-- line 2854 ----------------------------------------
+      .           		assert(force_ivsalloc || usize != 0);
+      .           	} else {
+      .           		usize = isalloc(tsdn, ptr);
+      .           	}
+      .           
+      .           	check_entry_exit_locking(tsdn);
+      .           
+      .           	LOG("core.sallocx.exit", "result: %zu", usize);
+181,230 ( 0.35%)  	return usize;
+      .           }
+      .           
+      .           JEMALLOC_EXPORT void JEMALLOC_NOTHROW
+      .           je_dallocx(void *ptr, int flags) {
+      .           	LOG("core.dallocx.entry", "ptr: %p, flags: %d", ptr, flags);
+      .           
+      .           	assert(ptr != NULL);
+      .           	assert(malloc_initialized() || IS_INITIALIZER);
+-- line 2870 ----------------------------------------
+-- line 2891 ----------------------------------------
+      .           	LOG("core.dallocx.exit", "");
+      .           }
+      .           
+      .           JEMALLOC_ALWAYS_INLINE size_t
+      .           inallocx(tsdn_t *tsdn, size_t size, int flags) {
+      .           	check_entry_exit_locking(tsdn);
+      .           	size_t usize;
+      .           	/* In case of out of range, let the user see it rather than fail. */
+ 72,552 ( 0.14%)  	aligned_usize_get(size, MALLOCX_ALIGN_GET(flags), &usize, NULL, false);
+      .           	check_entry_exit_locking(tsdn);
+      .           	return usize;
+      .           }
+      .           
+      .           JEMALLOC_NOINLINE void
+    264 ( 0.00%)  sdallocx_default(void *ptr, size_t size, int flags) {
+      .           	assert(ptr != NULL);
+      .           	assert(malloc_initialized() || IS_INITIALIZER);
+      .           
+      .           	tsd_t *tsd = tsd_fetch_min();
+      .           	bool   fast = tsd_fast(tsd);
+      .           	size_t usize = inallocx(tsd_tsdn(tsd), size, flags);
+      .           	check_entry_exit_locking(tsd_tsdn(tsd));
+      .           
+-- line 2913 ----------------------------------------
+-- line 2920 ----------------------------------------
+      .           		tsd_assert_fast(tsd);
+      .           		isfree(tsd, ptr, usize, tcache, false);
+      .           	} else {
+      .           		uintptr_t args_raw[3] = {(uintptr_t)ptr, size, flags};
+      .           		hook_invoke_dalloc(hook_dalloc_sdallocx, ptr, args_raw);
+      .           		isfree(tsd, ptr, usize, tcache, true);
+      .           	}
+      .           	check_entry_exit_locking(tsd_tsdn(tsd));
+    192 ( 0.00%)  }
+      .           
+      .           JEMALLOC_EXPORT void JEMALLOC_NOTHROW
+144,984 ( 0.28%)  je_sdallocx(void *ptr, size_t size, int flags) {
+      .           	LOG("core.sdallocx.entry", "ptr: %p, size: %zu, flags: %d", ptr, size,
+      .           	    flags);
+      .           
+      .           	je_sdallocx_impl(ptr, size, flags);
+      .           
+      .           	LOG("core.sdallocx.exit", "");
+144,888 ( 0.28%)  }
+      .           
+      .           JEMALLOC_EXPORT size_t JEMALLOC_NOTHROW
+217,512 ( 0.42%)  JEMALLOC_ATTR(pure) je_nallocx(size_t size, int flags) {
+      .           	size_t  usize;
+      .           	tsdn_t *tsdn;
+      .           
+      .           	assert(size != 0);
+      .           
+      .           	if (unlikely(malloc_init())) {
+      .           		LOG("core.nallocx.exit", "result: %zu", ZU(0));
+      .           		return 0;
+      .           	}
+      .           
+      .           	tsdn = tsdn_fetch();
+      .           	check_entry_exit_locking(tsdn);
+      .           
+      .           	usize = inallocx(tsdn, size, flags);
+ 36,252 ( 0.07%)  	if (unlikely(usize > SC_LARGE_MAXCLASS)) {
+      .           		LOG("core.nallocx.exit", "result: %zu", ZU(0));
+      .           		return 0;
+      .           	}
+      .           
+      .           	check_entry_exit_locking(tsdn);
+      .           	LOG("core.nallocx.exit", "result: %zu", usize);
+      .           	return usize;
+181,260 ( 0.35%)  }
+      .           
+      .           JEMALLOC_EXPORT int JEMALLOC_NOTHROW
+      .           je_mallctl(
+      .               const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+      .           	int    ret;
+      .           	tsd_t *tsd;
+      .           
+      .           	LOG("core.mallctl.entry", "name: %s", name);
+-- line 2972 ----------------------------------------
+
+ 36,574 ( 0.07%)  <counts for unidentified lines in ./contrib/jemalloc/src/jemalloc.c>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: contrib/llvm-project/libcxx/include/string
+--------------------------------------------------------------------------------
+Ir               
+
+-- line 818 ----------------------------------------
+      .             static_assert(CHAR_BIT == 8, "This implementation assumes that one byte contains 8 bits");
+      .           
+      .           #  ifdef _LIBCPP_ABI_ALTERNATE_STRING_LAYOUT
+      .           
+      .             struct __long {
+      .               __long() = default;
+      .           
+      .               _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 __long(__alloc_result __alloc, size_type __size)
+ 42,252 ( 0.08%)          : __data_(__alloc.ptr), __size_(__size), __cap_(__alloc.count / __endian_factor), __is_long_(true) {
+      .                 _LIBCPP_ASSERT_INTERNAL(!__fits_in_sso(__alloc.count), "Long capacity should always be larger than the SSO");
+      .               }
+      .           
+      .               pointer __data_;
+      .               size_type __size_;
+      .               size_type __cap_ : sizeof(size_type) * CHAR_BIT - 1;
+      .               size_type __is_long_ : 1;
+      .             };
+-- line 834 ----------------------------------------
+-- line 904 ----------------------------------------
+      .           
+      .             static_assert(sizeof(__short) == (sizeof(value_type) * (__min_cap + 1)), "__short has an unexpected size.");
+      .           
+      .             union __rep {
+      .               __short __s;
+      .               __long __l;
+      .           
+      .               __rep() = default;
+ 90,564 ( 0.18%)      _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 __rep(__short __r) : __s(__r) {}
+      .               _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 __rep(__long __r) : __l(__r) {}
+      .               _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 __rep(__uninitialized_tag) {}
+      .             };
+      .           
+      .             _LIBCPP_COMPRESSED_PAIR(__rep, __rep_, allocator_type, __alloc_);
+      .           
+      .             // annotate the string with its size() at scope exit. The string has to be in a valid state at that point.
+      .             struct __annotate_new_size {
+-- line 920 ----------------------------------------
+-- line 996 ----------------------------------------
+      .                 : __rep_(),
+      .           #  endif
+      .                   __alloc_(__a) {
+      .               __annotate_new(0);
+      .             }
+      .           
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS basic_string(const basic_string& __str)
+      .                 : __alloc_(__alloc_traits::select_on_container_copy_construction(__str.__alloc_)) {
+ 18,426 ( 0.04%)      if (!__str.__is_long()) {
+ 73,704 ( 0.14%)        __rep_ = __str.__rep_;
+      .                 __annotate_new(__get_short_size());
+ 18,126 ( 0.04%)      } else
+    240 ( 0.00%)        __init_copy_ctor_external(std::__to_address(__str.__get_long_pointer()), __str.__get_long_size());
+ 28,980 ( 0.06%)  => contrib/llvm-project/libcxx/include/string:std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >::__init_copy_ctor_external(char const*, unsigned long) (60x)
+      .             }
+      .           
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS
+      .             basic_string(const basic_string& __str, const allocator_type& __a)
+      .                 : __alloc_(__a) {
+      .               if (!__str.__is_long()) {
+      .                 __rep_ = __str.__rep_;
+      .                 __annotate_new(__get_short_size());
+-- line 1016 ----------------------------------------
+-- line 1023 ----------------------------------------
+      .           #    if _LIBCPP_STD_VER <= 14
+      .                 _NOEXCEPT_(is_nothrow_move_constructible<allocator_type>::value)
+      .           #    else
+      .                 _NOEXCEPT
+      .           #    endif
+      .                 // Turning off ASan instrumentation for variable initialization with _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS
+      .                 // does not work consistently during initialization of __r_, so we instead unpoison __str's memory manually first.
+      .                 // __str's memory needs to be unpoisoned only in the case where it's a short string.
+    540 ( 0.00%)        : __rep_([](basic_string& __s) -> decltype(__s.__rep_)&& {
+      .                     if (!__s.__is_long())
+      .                       __s.__annotate_delete();
+      .                     return std::move(__s.__rep_);
+      .                   }(__str)),
+      .                   __alloc_(std::move(__str.__alloc_)) {
+      .               __str.__rep_ = __rep();
+      .               __str.__annotate_new(0);
+      .               if (!__is_long())
+-- line 1039 ----------------------------------------
+-- line 1282 ----------------------------------------
+      .             crbegin() const _NOEXCEPT {
+      .               return rbegin();
+      .             }
+      .             [[__nodiscard__]] _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 const_reverse_iterator crend() const _NOEXCEPT {
+      .               return rend();
+      .             }
+      .           
+      .             [[__nodiscard__]] _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 size_type size() const _NOEXCEPT {
+ 38,052 ( 0.07%)      return __is_long() ? __get_long_size() : __get_short_size();
+      .             }
+      .             [[__nodiscard__]] _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 size_type length() const _NOEXCEPT {
+      .               return size();
+      .             }
+      .           
+      .             [[__nodiscard__]] _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 size_type max_size() const _NOEXCEPT {
+      .               if (size_type __m = __alloc_traits::max_size(__alloc_); __m <= std::numeric_limits<size_type>::max() / 2) {
+      .                 size_type __res = __m - __alignment;
+-- line 1298 ----------------------------------------
+-- line 1307 ----------------------------------------
+      .                 return __res - 1;
+      .               } else {
+      .                 bool __uses_lsb = __endian_factor == 2;
+      .                 return __uses_lsb ? __m - __alignment - 1 : (__m / 2) - __alignment - 1;
+      .               }
+      .             }
+      .           
+      .             [[__nodiscard__]] _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 size_type capacity() const _NOEXCEPT {
+128,016 ( 0.25%)      return (__is_long() ? __get_long_cap() : static_cast<size_type>(__min_cap)) - 1;
+      .             }
+      .           
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 void resize(size_type __n, value_type __c);
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 void resize(size_type __n) { resize(__n, value_type()); }
+      .           
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 void reserve(size_type __requested_capacity);
+      .           
+      .           #  if _LIBCPP_STD_VER >= 23
+-- line 1323 ----------------------------------------
+-- line 1338 ----------------------------------------
+      .           
+      .           #  if _LIBCPP_STD_VER < 26 || defined(_LIBCPP_ENABLE_CXX26_REMOVED_STRING_RESERVE)
+      .             _LIBCPP_DEPRECATED_IN_CXX20 _LIBCPP_HIDE_FROM_ABI void reserve() _NOEXCEPT { shrink_to_fit(); }
+      .           #  endif
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 void shrink_to_fit() _NOEXCEPT;
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 void clear() _NOEXCEPT;
+      .           
+      .             [[__nodiscard__]] _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 bool empty() const _NOEXCEPT {
+     60 ( 0.00%)      return size() == 0;
+      .             }
+      .           
+      .             [[__nodiscard__]] _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 const_reference
+      .             operator[](size_type __pos) const _NOEXCEPT {
+      .               _LIBCPP_ASSERT_VALID_ELEMENT_ACCESS(__pos <= size(), "string index out of bounds");
+      .               if (__builtin_constant_p(__pos) && !__fits_in_sso(__pos)) {
+      .                 return *(__get_long_pointer() + __pos);
+      .               }
+-- line 1354 ----------------------------------------
+-- line 2134 ----------------------------------------
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 bool __invariants() const;
+      .           
+      .           private:
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS bool
+      .             __is_long() const _NOEXCEPT {
+      .               if (__libcpp_is_constant_evaluated() && __builtin_constant_p(__rep_.__l.__is_long_)) {
+      .                 return __rep_.__l.__is_long_;
+      .               }
+805,092 ( 1.57%)      return __rep_.__s.__is_long_;
+      .             }
+      .           
+ 18,072 ( 0.04%)    _LIBCPP_CONSTEXPR _LIBCPP_HIDE_FROM_ABI static bool __fits_in_sso(size_type __sz) { return __sz < __min_cap; }
+      .           
+      .             template <class _Iterator, class _Sentinel>
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI void
+      .             __assign_trivial(_Iterator __first, _Sentinel __last, size_type __n);
+      .           
+      .             template <class _Iterator, class _Sentinel>
+      .             _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI void __assign_with_sentinel(_Iterator __first, _Sentinel __last);
+      .           
+-- line 2153 ----------------------------------------
+-- line 2201 ----------------------------------------
+      .             __insert_with_size(const_iterator __pos, _Iterator __first, _Sentinel __last, size_type __n);
+      .           
+      .             // internal buffer accessors
+      .             // -------------------------
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS void
+      .             __set_short_size(size_type __s) _NOEXCEPT {
+      .               _LIBCPP_ASSERT_INTERNAL(__s < __min_cap, "__s should never be greater than or equal to the short string capacity");
+ 49,032 ( 0.10%)      __rep_.__s.__size_    = __s;
+ 91,590 ( 0.18%)      __rep_.__s.__is_long_ = false;
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS size_type
+      .             __get_short_size() const _NOEXCEPT {
+      .               _LIBCPP_ASSERT_INTERNAL(!__rep_.__s.__is_long_, "String has to be short when trying to get the short size");
+      .               return __rep_.__s.__size_;
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 void __set_long_size(size_type __s) _NOEXCEPT {
+ 12,120 ( 0.02%)      __rep_.__l.__size_ = __s;
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 size_type __get_long_size() const _NOEXCEPT {
+      .               _LIBCPP_ASSERT_INTERNAL(__rep_.__l.__is_long_, "String has to be long when trying to get the long size");
+    180 ( 0.00%)      return __rep_.__l.__size_;
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 void __set_size(size_type __s) _NOEXCEPT {
+ 30,486 ( 0.06%)      if (__is_long())
+      .                 __set_long_size(__s);
+      .               else
+      .                 __set_short_size(__s);
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 size_type __get_long_cap() const _NOEXCEPT {
+      .               _LIBCPP_ASSERT_INTERNAL(__rep_.__l.__is_long_, "String has to be long when trying to get the long capacity");
+ 18,240 ( 0.04%)      return __rep_.__l.__cap_ * __endian_factor;
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 pointer __get_long_pointer() _NOEXCEPT {
+      .               _LIBCPP_ASSERT_INTERNAL(__rep_.__l.__is_long_, "String has to be long when trying to get the long pointer");
+ 24,180 ( 0.05%)      return _LIBCPP_ASAN_VOLATILE_WRAPPER(__rep_.__l.__data_);
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 const_pointer __get_long_pointer() const _NOEXCEPT {
+      .               _LIBCPP_ASSERT_INTERNAL(__rep_.__l.__is_long_, "String has to be long when trying to get the long pointer");
+     60 ( 0.00%)      return _LIBCPP_ASAN_VOLATILE_WRAPPER(__rep_.__l.__data_);
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS pointer
+      .             __get_short_pointer() _NOEXCEPT {
+      .               return _LIBCPP_ASAN_VOLATILE_WRAPPER(pointer_traits<pointer>::pointer_to(__rep_.__s.__data_[0]));
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS const_pointer
+      .             __get_short_pointer() const _NOEXCEPT {
+      .               return _LIBCPP_ASAN_VOLATILE_WRAPPER(pointer_traits<const_pointer>::pointer_to(__rep_.__s.__data_[0]));
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 pointer __get_pointer() _NOEXCEPT {
+ 36,612 ( 0.07%)      return __is_long() ? __get_long_pointer() : __get_short_pointer();
+      .             }
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 const_pointer __get_pointer() const _NOEXCEPT {
+ 54,546 ( 0.11%)      return __is_long() ? __get_long_pointer() : __get_short_pointer();
+      .             }
+      .           
+      .             // Internal buffer management
+      .             // --------------------------
+      .             //
+      .             // These functions are only responsible for managing the buffer itself, not the value inside the buffer. As such,
+      .             // none of these facilities ensure that there is a null terminator at `data()[size()]`.
+      .           
+-- line 2272 ----------------------------------------
+-- line 2283 ----------------------------------------
+      .               }
+      .           
+      .               return __long(__buffer, __capacity);
+      .             }
+      .           
+      .             // Replace the current buffer with __new_rep. Deallocate the old long buffer if it exists.
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 void __reset_internal_buffer(__rep __new_rep = __short()) {
+      .               __annotate_delete();
+ 66,504 ( 0.13%)      if (__is_long())
+      .                 __alloc_traits::deallocate(__alloc_, __get_long_pointer(), __get_long_cap());
+ 36,378 ( 0.07%)      __rep_ = __new_rep;
+      .             }
+      .           
+      .             // Initialize the internal buffer to hold __size elements
+      .             // The elements and null terminator have to be set by the caller
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 pointer __init_internal_buffer(size_type __size) {
+      .               if (__libcpp_is_constant_evaluated())
+      .                 __rep_ = __rep();
+      .           
+ 42,192 ( 0.08%)      if (__size > max_size())
+      .                 __throw_length_error();
+      .           
+ 12,066 ( 0.02%)      if (__fits_in_sso(__size)) {
+      .                 __set_short_size(__size);
+      .                 __annotate_new(__size);
+  6,006 ( 0.01%)        return __get_short_pointer();
+      .               } else {
+ 18,240 ( 0.04%)        __rep_.__l = __allocate_long_buffer(__alloc_, __size);
+      .                 __annotate_new(__size);
+      .                 return __get_long_pointer();
+      .               }
+      .             }
+      .           
+      .             // ASan annotation helpers
+      .             // -----------------------
+      .           
+-- line 2318 ----------------------------------------
+-- line 2359 ----------------------------------------
+      .           
+      .               _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 ~__annotation_guard() { __str_.__annotate_new(__str_.size()); }
+      .           
+      .               basic_string& __str_;
+      .             };
+      .           
+      .             template <size_type __a>
+      .             static _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 size_type __align_it(size_type __s) _NOEXCEPT {
+ 60,378 ( 0.12%)      return (__s + (__a - 1)) & ~(__a - 1);
+      .             }
+      .             enum { __alignment = 8 };
+      .           
+      .             // This makes sure that we're using a capacity with some extra alignment, since allocators almost always over-align
+      .             // the allocations anyways, improving memory usage. More importantly, this ensures that the lowest bit is never set
+      .             // if __endian_factor == 2, allowing us to store whether we're in the long string inside the lowest bit.
+      .             _LIBCPP_HIDE_FROM_ABI static _LIBCPP_CONSTEXPR_SINCE_CXX20 size_type
+      .             __align_allocation_size(size_type __size) _NOEXCEPT {
+      .               _LIBCPP_ASSERT_INTERNAL(
+      .                   !__fits_in_sso(__size), "Trying to align allocation of a size which would fit into the SSO");
+      .               const size_type __boundary = sizeof(value_type) < __alignment ? __alignment / sizeof(value_type) : __endian_factor;
+      .               size_type __guess          = __align_it<__boundary>(__size + 1);
+ 54,378 ( 0.11%)      if (__guess == __min_cap + 1)
+      .                 __guess += __endian_factor;
+      .           
+      .               _LIBCPP_ASSERT_INTERNAL(__guess >= __size, "aligned allocation size is below the requested size");
+      .               return __guess;
+      .             }
+      .           
+      .             _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 size_type
+      .             __get_amortized_growth_capacity(size_type __required_capacity) {
+      .               size_type __max_size = max_size();
+ 36,198 ( 0.07%)      if (__required_capacity > __max_size)
+      .                 __throw_length_error();
+      .               size_type __current_cap = capacity();
+      .               _LIBCPP_ASSERT_INTERNAL(
+      .                   __current_cap < __required_capacity, "Trying to grow string even though there is enough capacity already?");
+ 72,396 ( 0.14%)      if (__current_cap > __max_size / 2 - __alignment)
+      .                 return __max_size;
+      .               return std::max(__required_capacity, 2 * __current_cap);
+      .             }
+      .           
+      .             inline _LIBCPP_CONSTEXPR_SINCE_CXX20 void __init(const value_type* __s, size_type __sz);
+      .             inline _LIBCPP_CONSTEXPR_SINCE_CXX20 void __init(size_type __n, value_type __c);
+      .           
+      .             // Slow path for the (inlined) copy constructor for 'long' strings.
+-- line 2403 ----------------------------------------
+-- line 2662 ----------------------------------------
+      .           basic_string<_CharT, _Traits, _Allocator>::__init(const value_type* __s, size_type __sz) {
+      .             pointer __p = __init_internal_buffer(__sz);
+      .             traits_type::copy(std::__to_address(__p), __s, __sz);
+      .             traits_type::assign(__p[__sz], value_type());
+      .           }
+      .           
+      .           template <class _CharT, class _Traits, class _Allocator>
+      .           _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_NOINLINE void
+    540 ( 0.00%)  basic_string<_CharT, _Traits, _Allocator>::__init_copy_ctor_external(const value_type* __s, size_type __sz) {
+      .             pointer __p = __init_internal_buffer(__sz);
+     60 ( 0.00%)    traits_type::copy(std::__to_address(__p), __s, __sz + 1);
+      .           }
+      .           
+      .           template <class _CharT, class _Traits, class _Allocator>
+      .           _LIBCPP_CONSTEXPR_SINCE_CXX20 void basic_string<_CharT, _Traits, _Allocator>::__init(size_type __n, value_type __c) {
+      .             pointer __p = __init_internal_buffer(__n);
+      .             traits_type::assign(std::__to_address(__p), __n, __c);
+      .             traits_type::assign(__p[__n], value_type());
+      .           }
+-- line 2680 ----------------------------------------
+-- line 2727 ----------------------------------------
+      .               size_type __n_copy,
+      .               size_type __n_del,
+      .               size_type __n_add,
+      .               const value_type* __p_new_stuff) {
+      .             __long __buffer = __allocate_long_buffer(__alloc_, __get_amortized_growth_capacity(__old_cap + __delta_cap));
+      .             pointer __old_p = __get_pointer();
+      .             __annotate_delete();
+      .             auto __guard = std::__make_scope_guard(__annotate_new_size(*this));
+ 36,198 ( 0.07%)    if (__n_copy != 0)
+      .               traits_type::copy(std::__to_address(__buffer.__data_), std::__to_address(__old_p), __n_copy);
+      .             if (__n_add != 0)
+ 12,066 ( 0.02%)      traits_type::copy(std::__to_address(__buffer.__data_) + __n_copy, __p_new_stuff, __n_add);
+      .             size_type __sec_cp_sz = __old_sz - __n_del - __n_copy;
+      .             if (__sec_cp_sz != 0)
+      .               traits_type::copy(std::__to_address(__buffer.__data_) + __n_copy + __n_add,
+      .                                 std::__to_address(__old_p) + __n_copy + __n_del,
+      .                                 __sec_cp_sz);
+      .             __buffer.__size_ = __n_copy + __n_add + __sec_cp_sz;
+      .             traits_type::assign(__buffer.__data_[__buffer.__size_], value_type());
+      .             __reset_internal_buffer(__buffer);
+-- line 2746 ----------------------------------------
+-- line 2920 ----------------------------------------
+      .           basic_string<_CharT, _Traits, _Allocator>::__move_assign(basic_string& __str, true_type)
+      .           #    if _LIBCPP_STD_VER >= 17
+      .               noexcept
+      .           #    else
+      .               noexcept(is_nothrow_move_assignable<allocator_type>::value)
+      .           #    endif
+      .           {
+      .             __annotate_delete();
+ 12,000 ( 0.02%)    if (__is_long()) {
+      .               __reset_internal_buffer();
+      .           #    if _LIBCPP_STD_VER <= 14
+      .               if (!is_nothrow_move_assignable<allocator_type>::value) {
+      .                 __set_short_size(0);
+      .                 traits_type::assign(__get_short_pointer()[0], value_type());
+      .                 __annotate_new(0);
+      .               }
+      .           #    endif
+      .             }
+      .             size_type __str_old_size = __str.size();
+      .             bool __str_was_short     = !__str.__is_long();
+      .           
+      .             __move_assign_alloc(__str);
+ 36,180 ( 0.07%)    __rep_ = __str.__rep_;
+      .             __str.__set_short_size(0);
+      .             traits_type::assign(__str.__get_short_pointer()[0], value_type());
+      .           
+      .             if (__str_was_short && this != std::addressof(__str))
+      .               __str.__annotate_shrink(__str_old_size);
+      .             else
+      .               // ASan annotations: was long, so object memory is unpoisoned as new.
+      .               // Or is same as *this, and __annotate_delete() was called.
+-- line 2950 ----------------------------------------
+-- line 3024 ----------------------------------------
+      .             if (auto __len = traits_type::length(__s); __builtin_constant_p(__len) && __fits_in_sso(__len))
+      .               return __assign_short(__s, __len);
+      .             return __assign_external(__s);
+      .           }
+      .           // append
+      .           
+      .           template <class _CharT, class _Traits, class _Allocator>
+      .           _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string<_CharT, _Traits, _Allocator>&
+426,720 ( 0.83%)  basic_string<_CharT, _Traits, _Allocator>::append(const value_type* __s, size_type __n) {
+      .             _LIBCPP_ASSERT_NON_NULL(__n == 0 || __s != nullptr, "string::append received nullptr");
+      .             size_type __cap = capacity();
+      .             size_type __sz  = size();
+170,688 ( 0.33%)    if (__cap - __sz < __n) {
+ 12,066 ( 0.02%)      __grow_by_and_replace(__cap, __sz + __n - __cap, __sz, __sz, 0, __n, __s);
+ 42,672 ( 0.08%)      return *this;
+      .             }
+      .           
+ 61,212 ( 0.12%)    if (__n == 0)
+      .               return *this;
+      .           
+      .             __annotate_increase(__n);
+      .             value_type* __p = std::__to_address(__get_pointer());
+ 30,486 ( 0.06%)    traits_type::copy(__p + __sz, __s, __n);
+ 30,486 ( 0.06%)    __sz += __n;
+      .             __set_size(__sz);
+      .             traits_type::assign(__p[__sz], value_type());
+      .             return *this;
+384,048 ( 0.75%)  }
+      .           
+      .           template <class _CharT, class _Traits, class _Allocator>
+      .           _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string<_CharT, _Traits, _Allocator>&
+      .           basic_string<_CharT, _Traits, _Allocator>::append(size_type __n, value_type __c) {
+      .             if (__n == 0)
+      .               return *this;
+      .           
+      .             size_type __cap = capacity();
+-- line 3059 ----------------------------------------
+-- line 3065 ----------------------------------------
+      .             traits_type::assign(std::__to_address(__p) + __sz, __n, __c);
+      .             __sz += __n;
+      .             __set_size(__sz);
+      .             traits_type::assign(__p[__sz], value_type());
+      .             return *this;
+      .           }
+      .           
+      .           template <class _CharT, class _Traits, class _Allocator>
+  1,080 ( 0.00%)  _LIBCPP_CONSTEXPR_SINCE_CXX20 void basic_string<_CharT, _Traits, _Allocator>::push_back(value_type __c) {
+      .             bool __is_short = !__is_long();
+      .             size_type __cap;
+      .             size_type __sz;
+    180 ( 0.00%)    if (__is_short) {
+      .               __cap = __min_cap - 1;
+      .               __sz  = __get_short_size();
+      .             } else {
+     60 ( 0.00%)      __cap = __get_long_cap() - 1;
+      .               __sz  = __get_long_size();
+      .             }
+    240 ( 0.00%)    if (__sz == __cap) {
+      .               __grow_by_without_replace(__cap, 1, __sz, __sz, 0);
+      .               __is_short = false; // the string is always long after __grow_by
+      .             }
+      .             __annotate_increase(1);
+      .             pointer __p;
+      .             if (__is_short) {
+      .               __p = __get_short_pointer() + __sz;
+     60 ( 0.00%)      __set_short_size(__sz + 1);
+     60 ( 0.00%)    } else {
+      .               __p = __get_long_pointer() + __sz;
+     60 ( 0.00%)      __set_long_size(__sz + 1);
+      .             }
+      .             traits_type::assign(*__p, __c);
+      .             traits_type::assign(*++__p, value_type());
+    960 ( 0.00%)  }
+      .           
+      .           template <class _CharT, class _Traits, class _Allocator>
+      .           _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string<_CharT, _Traits, _Allocator>&
+      .           basic_string<_CharT, _Traits, _Allocator>::append(const basic_string& __str, size_type __pos, size_type __n) {
+      .             size_type __sz = __str.size();
+      .             if (__pos > __sz)
+      .               this->__throw_out_of_range();
+      .             return append(__str.data() + __pos, std::min(__n, __sz - __pos));
+-- line 3107 ----------------------------------------
+-- line 3381 ----------------------------------------
+      .           inline _LIBCPP_CONSTEXPR_SINCE_CXX20 void basic_string<_CharT, _Traits, _Allocator>::pop_back() {
+      .             _LIBCPP_ASSERT_VALID_ELEMENT_ACCESS(!empty(), "string::pop_back(): string is already empty");
+      .             __erase_to_end(size() - 1);
+      .           }
+      .           
+      .           template <class _CharT, class _Traits, class _Allocator>
+      .           inline _LIBCPP_CONSTEXPR_SINCE_CXX20 void basic_string<_CharT, _Traits, _Allocator>::clear() _NOEXCEPT {
+      .             size_type __old_size;
+ 42,552 ( 0.08%)    if (__is_long()) {
+      .               __old_size = __get_long_size();
+      .               traits_type::assign(*__get_long_pointer(), value_type());
+      .               __set_long_size(0);
+      .             } else {
+      .               __old_size = __get_short_size();
+      .               traits_type::assign(*__get_short_pointer(), value_type());
+      .               __set_short_size(0);
+      .             }
+-- line 3397 ----------------------------------------
+-- line 3526 ----------------------------------------
+      .           inline _LIBCPP_CONSTEXPR_SINCE_CXX20 int basic_string<_CharT, _Traits, _Allocator>::compare(
+      .               size_type __pos1, size_type __n1, const value_type* __s, size_type __n2) const {
+      .             _LIBCPP_ASSERT_NON_NULL(__n2 == 0 || __s != nullptr, "string::compare(): received nullptr");
+      .             size_type __sz = size();
+      .             if (__pos1 > __sz || __n2 == npos)
+      .               this->__throw_out_of_range();
+      .             size_type __rlen = std::min(__n1, __sz - __pos1);
+      .             int __r          = traits_type::compare(data() + __pos1, __s, std::min(__rlen, __n2));
+      6 ( 0.00%)    if (__r == 0) {
+      .               if (__rlen < __n2)
+      .                 __r = -1;
+      .               else if (__rlen > __n2)
+      .                 __r = 1;
+      .             }
+      .             return __r;
+      .           }
+      .           
+-- line 3542 ----------------------------------------
+-- line 3557 ----------------------------------------
+      .           
+      .           // operator==
+      .           
+      .           template <class _CharT, class _Traits, class _Allocator>
+      .           inline _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI bool
+      .           operator==(const basic_string<_CharT, _Traits, _Allocator>& __lhs,
+      .                      const basic_string<_CharT, _Traits, _Allocator>& __rhs) _NOEXCEPT {
+      .             size_t __lhs_sz = __lhs.size();
+ 52,080 ( 0.10%)    return __lhs_sz == __rhs.size() && _Traits::compare(__lhs.data(), __rhs.data(), __lhs_sz) == 0;
+      .           }
+      .           
+      .           template <class _CharT, class _Traits, class _Allocator>
+      .           inline _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI bool
+      .           operator==(const basic_string<_CharT, _Traits, _Allocator>& __lhs,
+      .                      const _CharT* _LIBCPP_DIAGNOSE_NULLPTR __rhs) _NOEXCEPT {
+      .             _LIBCPP_ASSERT_NON_NULL(__rhs != nullptr, "operator==(basic_string, char*): received nullptr");
+      .           
+      .             using _String = basic_string<_CharT, _Traits, _Allocator>;
+      .           
+      .             size_t __rhs_len = _Traits::length(__rhs);
+      .             if (__builtin_constant_p(__rhs_len) && !_String::__fits_in_sso(__rhs_len)) {
+      .               if (!__lhs.__is_long())
+      .                 return false;
+      .             }
+ 12,018 ( 0.02%)    if (__rhs_len != __lhs.size())
+      .               return false;
+      .             return __lhs.compare(0, _String::npos, __rhs, __rhs_len) == 0;
+      .           }
+      .           
+      .           #  if _LIBCPP_STD_VER <= 17
+      .           template <class _CharT, class _Traits, class _Allocator>
+      .           inline _LIBCPP_HIDE_FROM_ABI bool
+      .           operator==(const _CharT* __lhs, const basic_string<_CharT, _Traits, _Allocator>& __rhs) _NOEXCEPT {
+-- line 3589 ----------------------------------------
+
+325,980 ( 0.64%)  <counts for unidentified lines in contrib/llvm-project/libcxx/include/string>
+
+--------------------------------------------------------------------------------
+-- Auto-annotated source: ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp
+--------------------------------------------------------------------------------
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@ WARNING @@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@ Source file './src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp' is more recent than input file 'tmp/cg.run.only.out'.
+@ Annotations may not be correct.
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+Ir               
+
+-- line 161 ----------------------------------------
+      .                       || e.code() == ErrorCodes::CANNOT_READ_ALL_DATA
+      .                       || e.code() == ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF
+      .                       || e.code() == ErrorCodes::INCORRECT_DATA)
+      .                       throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: {}", what, e.message());
+      .                   throw;
+      .               }
+      .           }
+      .           
+  6,006 ( 0.01%)  JsonObjectReader::JsonObjectReader(ReadBuffer & in_, KeyStrictness strictness_, std::string_view what_)
+ 18,018 ( 0.04%)      : in(&in_), strictness(strictness_), what(what_)
+      .           {
+  6,006 ( 0.01%)      guarded([&] { assertChar('{', *in); });
+ 48,048 ( 0.09%)  }
+      .           
+      .           void JsonObjectReader::reset(ReadBuffer & in_, KeyStrictness strictness_, std::string_view what_)
+      .           {
+219,348 ( 0.43%)      in = &in_;
+      .               strictness = strictness_;
+ 48,744 ( 0.09%)      what = what_;
+      .               /// `clear` on both keeps their buffers: that is the whole point of reusing the reader.
+ 48,744 ( 0.09%)      seen_keys.clear();
+      .               scratch.clear();
+  6,006 ( 0.01%)      first = true;
+  6,006 ( 0.01%)      done = false;
+      .               guarded([&] { assertChar('{', *in); });
+      .           }
+  6,006 ( 0.01%)  
+      .           std::string_view JsonObjectReader::readStringIntoScratch()
+      .           {
+      .               scratch.clear();
+      .               readJSONStringInto(scratch, *in, jsonReadSettings());
+ 18,366 ( 0.04%)      return scratch;
+      .           }
+      .           
+      .           bool JsonObjectReader::nextKey(String & key)
+      .           {
+ 12,360 ( 0.02%)      return guarded([&]() -> bool
+      .               {
+ 73,464 ( 0.14%)          if (done)
+2,737,026 ( 5.33%)  => contrib/llvm-project/libcxx/include/string:DB::readJSONString(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&, DB::ReadBuffer&, DB::FormatSettings::JSON const&) (18,384x)
+ 18,366 ( 0.04%)              return false;
+  6,006 ( 0.01%)          if (first)
+      .                   {
+      .                       first = false;
+      .                       if (checkChar('}', *in))
+      .                       {
+      .                           done = true;
+      .                           return false;
+      .                       }
+163,620 ( 0.32%)          }
+163,620 ( 0.32%)          else
+      .                   {
+      .                       if (checkChar('}', *in))
+ 36,360 ( 0.07%)              {
+8,570,035 (16.70%)  => contrib/llvm-project/libcxx/include/string:DB::readJSONString(std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >&, DB::ReadBuffer&, DB::FormatSettings::JSON const&) (18,192x)
+      .                           done = true;
+      .                           return false;
+      .                       }
+      .                       assertChar(',', *in);
+      .                   }
+      .                   readJSONString(key, *in, jsonReadSettings());
+      .                   assertChar(':', *in);
+      .                   if (std::find(seen_keys.begin(), seen_keys.end(), key) != seen_keys.end())
+-- line 221 ----------------------------------------
+-- line 233 ----------------------------------------
+      .                   readJSONString(s, *in, jsonReadSettings());
+      .                   return s;
+      .               });
+      .           }
+      .           
+      .           std::vector<String> JsonObjectReader::readStringArray()
+      .           {
+      .               return guarded([&]
+ 48,000 ( 0.09%)      {
+      .                   std::vector<String> words;
+ 18,000 ( 0.04%)          assertChar('[', *in);
+3,881,116 ( 7.56%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::readString() (6,000x)
+ 12,000 ( 0.02%)          if (checkChar(']', *in))
+      .                       return words;
+      .           
+      .                   while (true)
+      .                   {
+      .                       String word;
+      .                       readJSONString(word, *in, jsonReadSettings());
+      .                       words.push_back(std::move(word));
+    420 ( 0.00%)              if (checkChar(']', *in))
+      .                           return words;
+    180 ( 0.00%)              assertChar(',', *in);
+  9,780 ( 0.02%)  => ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:DB::Cas::JsonObjectReader::readString() (60x)
+      .                   }
+     60 ( 0.00%)      });
+      .           }
+    180 ( 0.00%)  
+      .           UInt128 JsonObjectReader::readHex128()
+     60 ( 0.00%)  {
+      .               return guarded([&]
+      .               {
+      .                   const std::string_view hex = readStringIntoScratch();
+      .                   if (hex.size() != 32 || std::any_of(hex.begin(), hex.end(), [](char c) { return !isLowercaseHexChar(c); }))
+    528 ( 0.00%)              throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: expected 32 lowercase hex chars, got '{}'", what, hex);
+    528 ( 0.00%)          return unhexUInt<UInt128>(hex.data());
+      .               });
+     66 ( 0.00%)  }
+      .           
+     66 ( 0.00%)  uint64_t JsonObjectReader::readU64String()
+      .           {
+      .               return guarded([&]
+      .               {
+      .                   const std::string_view s = readStringIntoScratch();
+      .                   ReadBufferFromMemory buf(s.data(), s.size());
+      .                   uint64_t v = 0;
+      .                   readIntText(v, buf);
+      .                   if (s.empty() || !buf.eof())
+      .                       throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: expected decimal u64 string, got '{}'", what, s);
+      .                   return v;
+      .               });
+      .           }
+    960 ( 0.00%)  
+    840 ( 0.00%)  uint64_t JsonObjectReader::readU64Number()
+      .           {
+    600 ( 0.00%)      return guarded([&]
+  4,680 ( 0.01%)  => ./src/IO/ReadHelpers.cpp:DB::checkString(char const*, DB::ReadBuffer&) (120x)
+      .               {
+    360 ( 0.00%)          uint64_t v = 0;
+  6,570 ( 0.01%)  => ./src/IO/ReadHelpers.cpp:DB::assertString(char const*, DB::ReadBuffer&) (90x)
+      .                   readIntText(v, *in);
+      .                   return v;
+      .               });
+      .           }
+      .           
+      .           uint32_t JsonObjectReader::readU32Number()
+      .           {
+      .               const uint64_t v = readU64Number();
+-- line 296 ----------------------------------------
+-- line 337 ----------------------------------------
+      .               writeChar('\n', out);
+      .           }
+      .           
+      .           void writeTrailerLine(CasJsonWriter & out, uint64_t n)
+      .           {
+      .               bool first = true;
+      .               writeKey(out, "n", first);
+      .               writeIntText(n, out);
+ 18,018 ( 0.04%)      closeObject(out, first);
+      .               writeChar('\n', out);
+ 18,018 ( 0.04%)  }
+424,460 ( 0.83%)  => contrib/llvm-project/libcxx/include/string:std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char> >::append(char const*, unsigned long) (6,012x)
+ 12,012 ( 0.02%)  
+      .           void readLineInto(ReadBuffer & in, String & line, uint64_t line_cap, std::string_view what)
+      .           {
+      .               /// `clear` keeps the capacity, so a caller that reuses one scratch across a stream's rows stops
+ 24,024 ( 0.05%)      /// allocating after the longest line it has seen -- the same bound the writer's scratch has.
+      .               line.clear();
+ 12,012 ( 0.02%)      while (true)
+      .               {
+      .                   if (in.eof())
+      .                       throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: truncated object (line without terminator)", what);
+ 54,054 ( 0.11%)  
+      .                   /// Take the whole run up to the terminator in one append rather than a byte at a time: a
+      .                   /// per-character `push_back` also re-checks the cap on every character, and a stream row is
+      .                   /// hundreds of characters long.
+      .                   const char * const from = in.position();
+      .                   const char * const found = find_first_symbols<'\n'>(from, in.buffer().end());
+      .                   const size_t taken = static_cast<size_t>(found - from);
+      .                   if (line.size() + taken > line_cap)
+      .                       throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: line exceeds the {}-byte cap", what, line_cap);
+-- line 366 ----------------------------------------
+
+527,394 ( 1.03%)  <counts for unidentified lines in ./src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp>
+
+--------------------------------------------------------------------------------
+Ir                  
+--------------------------------------------------------------------------------
+31,512,561 (61.40%)  events annotated
+

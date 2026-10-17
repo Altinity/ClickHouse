@@ -1,0 +1,94 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- Same CA disk as storage_conf_ch1.xml (identical endpoint/pool, so this variant's CA
+                 content lives in the SAME shared pool as every other run). Kept byte-for-byte
+                 identical to the default so S36/S37 exercise the real writer/GC path, not a
+                 special-cased one. -->
+            <ca>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_server_root_id>ca_soak_ch1</cas_server_root_id>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>10</cas_gc_interval_sec>
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+            </ca>
+
+            <!-- Two plain local disks (container-local filesystem, NOT shared between ch1/ch2 — each
+                 replica has its own). local2 exists only for the 3-disk S37 policy (ca_local3); the
+                 2-disk S36/S37 policy (ca_local) uses local1 only.
+
+                 Path deliberately lives OUTSIDE /var/lib/clickhouse/disks/, not under it like the
+                 upstream docker-entrypoint.sh convention would suggest. The `ca` disk above has no
+                 declared <path>/<cas_scratch_path> here, so ClickHouse itself lazily creates its scratch
+                 directory at /var/lib/clickhouse/disks/ca/cas_scratch/ at runtime, as the non-root
+                 `clickhouse` user. docker-entrypoint.sh's manage_clickhouse_directories() only
+                 chowns the LEAF directory of each declared disk `path` (mkdir -p runs as root first,
+                 then `chown -R` targets just that leaf) — it never chowns the shared `disks/` parent
+                 it implicitly creates along the way. If local1/local2 declared their path under
+                 `disks/`, that parent would end up root-owned and un-writable to the `clickhouse`
+                 user, and the server would fail at startup with `filesystem_error: Permission denied
+                 ["/var/lib/clickhouse/disks/ca"]` (reproduced and confirmed via a fresh volume: disks/
+                 was root:root 0755, disks/local1 and disks/local2 were clickhouse-owned, disks/ca
+                 didn't exist). Keeping local1/local2 under a separate top-level directory avoids
+                 pre-creating (and locking down) `disks/` before the `ca` disk gets a chance to. -->
+            <local1>
+                <type>local</type>
+                <path>/var/lib/clickhouse/local_disks/local1/</path>
+            </local1>
+            <local2>
+                <type>local</type>
+                <path>/var/lib/clickhouse/local_disks/local2/</path>
+            </local2>
+
+            <!-- ca_ro read-only fsck view intentionally omitted here too — see storage_conf_ch1.xml. -->
+        </disks>
+        <policies>
+            <!-- S36 (explicit MOVE PART/PARTITION both directions) + S37's 2-disk leg (policy-driven
+                 tiering: max_data_part_size_bytes routes big parts straight to `ca`; TTL MOVE targets
+                 the `cas` volume). One volume per disk so `ALTER TABLE ... MOVE PART|PARTITION TO
+                 DISK 'local1'|'ca'` and `TO VOLUME 'hot'|'cas'` are both exercisable. -->
+            <ca_local>
+                <volumes>
+                    <hot>
+                        <disk>local1</disk>
+                        <!-- Parts inserted/merged above this size land directly on the `cas` volume
+                             (dev/ci payloads in S36 stay well under this so they land on `local1`
+                             first; S37's routing leg inserts a part deliberately larger than this). -->
+                        <max_data_part_size_bytes>4194304</max_data_part_size_bytes>
+                    </hot>
+                    <cas>
+                        <disk>ca</disk>
+                    </cas>
+                </volumes>
+                <!-- Free-space-triggered background moves are NOT the mechanism under test here (a
+                     container filesystem has abundant free space at dev/ci scale, so a move_factor
+                     trigger would rarely fire deterministically); a small nonzero value is kept only
+                     so the setting is present/documented. S37 drives moves deterministically via
+                     max_data_part_size_bytes + TTL MOVE + explicit ALTER, not by exhausting disk space. -->
+                <move_factor>0.1</move_factor>
+            </ca_local>
+
+            <!-- S37's 3-disk leg: `hot` is a 2-disk JBOD (local1, local2) so a merge whose source
+                 parts land on BOTH disks (round-robin placement) must pick one policy-selected output
+                 disk within the volume; `cas` is the CA tier. -->
+            <ca_local3>
+                <volumes>
+                    <hot>
+                        <disk>local1</disk>
+                        <disk>local2</disk>
+                        <max_data_part_size_bytes>4194304</max_data_part_size_bytes>
+                    </hot>
+                    <cas>
+                        <disk>ca</disk>
+                    </cas>
+                </volumes>
+                <move_factor>0.1</move_factor>
+            </ca_local3>
+        </policies>
+    </storage_configuration>
+</clickhouse>

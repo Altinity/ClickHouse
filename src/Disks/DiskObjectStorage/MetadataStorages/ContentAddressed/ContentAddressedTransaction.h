@@ -227,6 +227,12 @@ private:
     /// grows a container -- it exists for the serial publish loop's rollback bookkeeping. Parts are
     /// published serially (`commit`'s loop); only the blob uploads WITHIN a part fan out. Concurrent
     /// cross-part publication is future scope and is NOT done here.
+    /// Abandons `st.build` and resets it. Never throws: a refused abandon is logged, and the reset runs
+    /// `PartWriteTxn`'s destructor, which queues the writer cleanup duty for the unsettled precommit (a
+    /// successor's recovery sweep is the backstop). Used wherever the abandon is bookkeeping after a
+    /// durable step, and in the destructor. `what` is a literal: nothing here may allocate outside a catch.
+    void abandonBuildBestEffort(const std::string & ns, const std::string & ref, PartStaging & st, const char * what) noexcept;
+
     void publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st,
                         std::optional<Cas::CommitOutcome> & out_slot);
 };

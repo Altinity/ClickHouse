@@ -122,23 +122,38 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
     /// a re-key in this overlay. An abandoned transaction therefore has no early-published ref to
     /// compensate for; it only needs to abandon still-open builds below.
     for (auto & [key, st] : parts)
+        if (st.build)
+            abandonBuildBestEffort(key.first, key.second, st,
+                "abandoning a build during transaction destruction (the precommit is left to the writer cleanup duty)");
+}
+
+void ContentAddressedTransaction::abandonBuildBestEffort(
+    const std::string & ns, const std::string & ref, PartStaging & st, const char * what) noexcept
+{
+    /// Everything that can allocate stays inside a catch boundary: this runs from the destructor.
+    try
     {
-        if (!st.build)
-            continue;
+        /// Test-only fault seam; inert in production (nothing ever arms it, and an unarmed seam allocates nothing).
+        if (metadata_storage.hasAbandonFailureForTest() && metadata_storage.takeAbandonFailureForTest({Cas::RootNamespace{ns}, ref}))
+            throw Exception(ErrorCodes::ABORTED,
+                "ContentAddressedTransaction: test-injected abandon failure for {}/{}", ns, ref);
+        st.build->abandon();
+    }
+    catch (...)
+    {
+        /// A refused abandon leaves the precommit unsettled. Resetting the build below runs
+        /// `PartWriteTxn`'s destructor, which queues the writer cleanup duty for that precommit; a
+        /// successor's recovery sweep is the backstop. It must stay diagnosable, but a logging failure
+        /// must not keep the reset from running.
         try
         {
-            st.build->abandon();
+            tryLogCurrentException(getLogger("ContentAddressedTransaction"), what);
         }
         catch (...)
         {
-            /// A destructor must not throw. But a failed abandon can leave a LIVE-epoch precommit
-            /// binding that neither GC nor the (prior-epoch-scoped) stale-precommit sweep reclaims
-            /// until this mount remounts -- that must be diagnosable, not silently swallowed.
-            tryLogCurrentException(getLogger("ContentAddressedTransaction"),
-                                   "abandoning a build during transaction destruction "
-                                   "(a live precommit binding may persist until remount)");
         }
     }
+    st.build.reset();   /// never re-abandon this build from the destructor
 }
 
 ContentAddressedTransaction::PartStaging &
@@ -410,8 +425,15 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             metadata_storage.runAfterPromoteHookForTest({ns, ref});
             if (st.build)
             {
-                st.build->abandon();   /// scratch precommit's protecting job is done; the real manifest is live
-                st.build.reset();      /// never re-abandon this build from the destructor
+                /// The scratch precommit's protecting job is done and the real manifest is live, with its
+                /// outcome already in `out_slot`; what is left is bookkeeping, so a store that refuses the
+                /// abandon's ref-log append now (fence tripped, lease not healthy, deadline exhausted)
+                /// must not fail the commit. This branch runs inside `noexcept` callers --
+                /// `MergeTreeTransaction::afterCommit` writes `txn_version.txt` into committed parts --
+                /// where a throw terminates the server. The unsettled precommit goes to the writer
+                /// cleanup duty, exactly as the destructor already tolerates.
+                abandonBuildBestEffort(ns.string(), ref, st,
+                    "abandoning the scratch build after a repoint (the precommit is left to the writer cleanup duty)");
             }
             st.published = true;
             return;
@@ -1050,8 +1072,10 @@ void ContentAddressedTransaction::removeDirectory(const std::string & path)
             st->entries.clear();
             if (st->build)
             {
-                st->build->abandon();
-                st->build.reset();
+                /// The ref drop above is already durable (or the ref was absent); the build is this
+                /// transaction's own scratch and is discarded either way. Same tolerance as after a repoint.
+                abandonBuildBestEffort(r->ns.string(), r->ref, *st,
+                    "abandoning the scratch build after a ref drop (the precommit is left to the writer cleanup duty)");
             }
         }
         return;
