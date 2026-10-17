@@ -1,0 +1,29 @@
+local source
+1	10	100	11
+2	20	200	21
+local Merge
+1	10	100	11
+2	20	200	21
+Distributed AST
+1	10	100
+2	20	200
+Distributed plan
+1	10	100
+2	20	200
+intermediate alias
+1	11
+2	21
+row policy
+2	20
+row policy all aliases
+2	20	200
+policy-only alias
+2
+flag alias policy
+2	1
+flag alias policy-only column
+2
+missing child aliases
+1	10	100	11
+2	20	200	21
+3	0	0	0
