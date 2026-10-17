@@ -951,11 +951,114 @@ TEST(CASStagingSweeper, RemovesOnlyObjectsUnderGivenMountPrefix)
     put(root + "/p/staging/mountA/two.tmp", "a2");
     put(root + "/p/staging/mountB/three.tmp", "b1");   /// a DIFFERENT mount's staging — must survive
 
-    DB::Cas::sweepOwnMountStaging(*storage, root + "/p/staging/mountA/");
+    DB::Cas::sweepOwnMountStaging(*storage, root + "/p/staging/mountA/", /*live_writer_epoch=*/1);
 
     EXPECT_FALSE(storage->exists(DB::StoredObject(root + "/p/staging/mountA/one.tmp")));
     EXPECT_FALSE(storage->exists(DB::StoredObject(root + "/p/staging/mountA/two.tmp")));
     EXPECT_TRUE(storage->exists(DB::StoredObject(root + "/p/staging/mountB/three.tmp")));
+}
+
+TEST(CASStagingSweeper, OldEpochSweepKeepsSuccessorStaging)
+{
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    const std::string root = storage->getCommonKeyPrefix();
+    auto put = [&](const std::string & key)
+    {
+        auto buf = storage->writeObject(DB::StoredObject(key), DB::WriteMode::Rewrite);
+        buf->write("x", 1);
+        buf->finalize();
+    };
+    put(root + "/p/staging/m/1/a.tmp");
+    put(root + "/p/staging/m/2/b.tmp");
+    put(root + "/p/staging/m/3/c.tmp");
+
+    DB::Cas::sweepOwnMountStaging(*storage, root + "/p/staging/m/", /*live_writer_epoch=*/3);
+
+    EXPECT_FALSE(storage->exists(DB::StoredObject(root + "/p/staging/m/1/a.tmp")));
+    EXPECT_FALSE(storage->exists(DB::StoredObject(root + "/p/staging/m/2/b.tmp")));
+    EXPECT_TRUE(storage->exists(DB::StoredObject(root + "/p/staging/m/3/c.tmp"))) << "the live epoch's own staging";
+}
+
+TEST(CASStagingSweeper, FlatLegacyKeysAreSwept)
+{
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    const std::string root = storage->getCommonKeyPrefix();
+    auto buf = storage->writeObject(DB::StoredObject(root + "/p/staging/m/legacy.tmp"), DB::WriteMode::Rewrite);
+    buf->write("x", 1);
+    buf->finalize();
+    DB::Cas::sweepOwnMountStaging(*storage, root + "/p/staging/m/", /*live_writer_epoch=*/1);
+    EXPECT_FALSE(storage->exists(DB::StoredObject(root + "/p/staging/m/legacy.tmp"))) << "a flat key counts as epoch 0";
+}
+
+TEST(CASStagingSweeper, NestedOtherMemberKeysAreKept)
+{
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    const std::string root = storage->getCommonKeyPrefix();
+    auto put = [&](const std::string & key)
+    {
+        auto buf = storage->writeObject(DB::StoredObject(key), DB::WriteMode::Rewrite);
+        buf->write("x", 1);
+        buf->finalize();
+    };
+    put(root + "/p/staging/a/b/1/x.tmp");   /// member `a/b`, nested under `a`
+    put(root + "/p/staging/a/1/own.tmp");
+    DB::Cas::sweepOwnMountStaging(*storage, root + "/p/staging/a/", /*live_writer_epoch=*/5);
+    EXPECT_TRUE(storage->exists(DB::StoredObject(root + "/p/staging/a/b/1/x.tmp"))) << "`b` is not an epoch";
+    EXPECT_FALSE(storage->exists(DB::StoredObject(root + "/p/staging/a/1/own.tmp")));
+}
+
+TEST(CASStagingSweeper, DeeperPathsUnderAnEpochDirectoryAreKept)
+{
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    const std::string root = storage->getCommonKeyPrefix();
+    auto buf = storage->writeObject(DB::StoredObject(root + "/p/staging/a/7/x/y.tmp"), DB::WriteMode::Rewrite);
+    buf->write("x", 1);
+    buf->finalize();
+    DB::Cas::sweepOwnMountStaging(*storage, root + "/p/staging/a/", /*live_writer_epoch=*/9);
+    EXPECT_TRUE(storage->exists(DB::StoredObject(root + "/p/staging/a/7/x/y.tmp"))) << "member `a/7`'s key, not `a`'s";
+}
+
+/// The staging key's epoch and the admission generation the finalize rechecks come from one capture: a
+/// self-remount between the two reads refuses the write instead of staging new-generation bytes under the
+/// old epoch. Without the hook, the key carries the live epoch.
+TEST(ContentAddressedTransaction, StagingEpochMatchesAdmissionGeneration)
+{
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountE");
+    metadata_storage->startup();
+    const DB::Cas::PoolPtr pool = metadata_storage->poolForTest();
+    const uint64_t epoch_before = pool->liveWriterEpoch();
+    const std::string path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin";
+
+    {
+        auto tx = metadata_storage->createTransaction();
+        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+        writeThroughS3Transaction(ca_tx, path, std::string(300, 'x'));
+        DB::RelativePathsWithMetadata staged;
+        object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
+        ASSERT_EQ(staged.size(), 1u);
+        EXPECT_NE(staged.front()->relative_path.find("/" + std::to_string(epoch_before) + "/"), std::string::npos)
+            << staged.front()->relative_path;
+    }
+
+    const String mount_key = pool->layout().mountKey("mountE");
+    bool remounted = false;
+    pool->setIncarnationCaptureHookForTest([&]
+    {
+        if (std::exchange(remounted, true))
+            return;
+        DB::Cas::tests::fenceOutMountForTest(*pool->poolBackendPtr(), mount_key);
+        try { pool->renewWatermarkOnce(); } catch (const DB::Exception &) {}
+        ASSERT_TRUE(pool->tryRemountOnce());
+    });
+    auto tx = metadata_storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    EXPECT_THROW(ca_tx.writeFile(path, 65536, DB::WriteMode::Rewrite, {}), DB::Exception);
+    ASSERT_TRUE(remounted);
+    EXPECT_EQ(pool->liveWriterEpoch(), epoch_before + 1);
+    DB::RelativePathsWithMetadata staged;
+    object_storage->listObjects(metadata_storage->stagingKeyPrefix() + std::to_string(epoch_before) + "/", staged, 0);
+    EXPECT_EQ(staged.size(), 1u) << "only the first write's key; the refused write staged nothing under the old epoch";
 }
 
 /// (d) GC's blob-discovery LISTs ONLY `Layout::blobsPrefix()` (`<pool>/blobs/`) — a top-level prefix
@@ -983,7 +1086,6 @@ TEST(CASS3Staging, GcBlobDiscoveryPrefixExcludesStagingObjects)
     std::string staging_prefix = full_staging_prefix.substr(physical_root.size());
     if (!staging_prefix.empty() && staging_prefix.front() == '/')
         staging_prefix.erase(0, 1);
-    staging_prefix += "/";
     const std::string staging_key = staging_prefix + "aaa.tmp";
 
     const DB::Cas::Layout layout(metadata_storage->poolForTest()->poolConfig().pool_prefix);

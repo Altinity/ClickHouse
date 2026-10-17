@@ -359,6 +359,12 @@ struct PoolConfig
     }
 };
 
+/// The live incarnation at one instant: the writer epoch and the fence generation it was admitted under.
+struct MountIncarnation
+{
+    uint64_t writer_epoch = 0;
+    uint64_t fence_generation = 0;
+};
 
 struct PartWriteInfo
 {
@@ -511,6 +517,9 @@ public:
     /// Throws the typed transient refusal (`throwCasTransientUnavailable`) unless the fence is currently
     /// held AND still at `admitted_generation`.
     void checkFenceOrThrow(uint64_t admitted_generation) const { mount_runtime.checkFenceOrThrow(admitted_generation); }
+    /// Throws the transient refusal when the fence moved between the two reads, so the pair is never mixed.
+    MountIncarnation captureMountIncarnation() const;
+    void setIncarnationCaptureHookForTest(std::function<void()> hook) { incarnation_capture_hook_for_test = std::move(hook); }
 
     /// ---- pool lifecycle condition (rev.7 §1; owned by `mount_runtime`) ----
     /// Atomic read of the current lifecycle condition. Thin forwarder; safe to call from any thread.
@@ -1208,6 +1217,7 @@ private:
     /// config they take their clock from. `mutable` because issuing a request is not a change to the
     /// pool: a `const` observer still has to read the store.
     mutable CasRequests mount_requests;
+    std::function<void()> incarnation_capture_hook_for_test;
     mutable CasRequests farewell_requests;
     mutable CasRequests gc_requests;
 

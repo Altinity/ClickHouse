@@ -430,8 +430,7 @@ void drainVictim(Pool & admin, const CasRefCatalog::Snapshot & catalog_cut, cons
     /// Drain the victim's own `<pool_prefix>/staging/<srid>/` area. The live-mount staging helper uses
     /// an `IObjectStorage`, while this command intentionally works at the `Backend` layer, so the same
     /// prefix is listed and deleted directly. The claim fences the victim's writers during this sweep.
-    report.staging_objects_removed += deleteListedPrefix(
-        op, admin.poolConfig().pool_prefix + "/staging/" + victim_srid + "/", report.warnings);
+    report.staging_objects_removed += deleteListedPrefix(op, admin.layout().stagingPrefix(victim_srid), report.warnings);
 
     /// Drain the victim's mountpoint objects. These are loose, non-content-addressed files under
     /// `Layout::serverRootDataPrefix`; they have no writer epoch of their own, so the claim is what

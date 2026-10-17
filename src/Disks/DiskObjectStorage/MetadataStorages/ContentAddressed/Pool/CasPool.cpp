@@ -576,6 +576,18 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     return store;
 }
 
+MountIncarnation Pool::captureMountIncarnation() const
+{
+    /// Admission first, then the epoch, then the admission again: a remount publishes the new epoch
+    /// before it bumps the generation, so a generation that held across the epoch read dates the epoch.
+    const uint64_t generation = mount_requests.admit().generation();
+    if (incarnation_capture_hook_for_test)
+        incarnation_capture_hook_for_test();
+    const uint64_t writer_epoch = liveWriterEpoch();
+    checkFenceOrThrow(generation);
+    return MountIncarnation{.writer_epoch = writer_epoch, .fence_generation = generation};
+}
+
 void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy policy)
 {
     /// === Mount-safety startup protocol ===

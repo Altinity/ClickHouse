@@ -1921,42 +1921,40 @@ void MountLeaseRenewer::release()
     terminate(op);
 }
 
-void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix) noexcept
+void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix, uint64_t live_writer_epoch) noexcept
 {
     try
     {
-        /// max_keys=0 asks `listObjects` for the FULL listing under the prefix (it paginates until
-        /// exhausted rather than capping at some default page size) — see `IObjectStorage::listObjects`.
-        /// A mount's own staging debris is bounded (one mount's in-flight + leaked uploads), so a single
-        /// unbounded LIST at startup is acceptable; unlike GC's per-round budgets, this runs once per
-        /// mount, not on a recurring schedule.
+        /// `max_keys=0` lists the whole prefix. One mount's staging debris is bounded and this runs once per
+        /// mount, not on GC's recurring schedule, so an unbounded LIST is acceptable here.
         RelativePathsWithMetadata children;
         object_storage.listObjects(mount_staging_prefix, children, /*max_keys=*/0);
-
         size_t removed = 0;
         for (const auto & child : children)
         {
+            const String & key = child->relative_path;
+            if (!key.starts_with(mount_staging_prefix))
+                continue;
+            const std::optional<uint64_t> epoch = Layout::stagedEpochOf(std::string_view(key).substr(mount_staging_prefix.size()));
+            if (!epoch || *epoch >= live_writer_epoch)
+                continue;   /// the live epoch's own in-flight uploads, or a nested member's keys
             try
             {
-                object_storage.removeObjectIfExists(StoredObject(child->relative_path));
+                object_storage.removeObjectIfExists(StoredObject(key));
                 ++removed;
             }
             catch (...) // NOLINT(bugprone-empty-catch)
             {
-                /// Best-effort: one stubborn key must not abort the sweep of the rest — it is retried
-                /// by a later mount's sweep.
+                /// One stubborn key must not abort the sweep; a later mount retries it.
             }
         }
-
         if (removed)
-            LOG_INFO(getLogger("CasStagingSweeper"),
-                "Reclaimed {} leaked S3 staging object(s) under '{}' at mount start",
-                removed, mount_staging_prefix);
+            LOG_INFO(getLogger("CasStagingSweeper"), "Reclaimed {} staging object(s) below writer epoch {} under '{}' at mount start",
+                     removed, live_writer_epoch, mount_staging_prefix);
     }
     catch (...) // NOLINT(bugprone-empty-catch)
     {
-        /// Best-effort: a LIST failure (a transient backend hiccup) at mount time must never fail the
-        /// mount — any leaked staging objects are bounded debris, reclaimed by a later mount's sweep.
+        /// A LIST failure at mount time must never fail the mount; the debris is bounded and retried later.
     }
 }
 
