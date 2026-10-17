@@ -183,7 +183,12 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           config.boot_ms_fn,
           config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
           &hot_keys)
-    , farewell_requests(pool_backend, Fence::open(), config.boot_ms_fn, config.retry_sleep_fn, &hot_keys)
+    , lease_requests(
+          pool_backend,
+          Fence::open(),
+          config.boot_ms_fn,
+          config.retry_sleep_fn ? config.retry_sleep_fn : mountPlaneSleepFn(),
+          &hot_keys)
     /// The open plane's fence is the pool's teardown flag: generation 0 forever, exactly like
     /// `Fence::open`, but `admit` refuses once `beginTeardown` ran. A GC round, an FSCK or a probe in
     /// flight is then refused at its next request instead of running to completion under a disk that
@@ -242,13 +247,13 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this] (const RootNamespace & ns) { cancelInflightBuildsForNamespace(ns); },
           config.recovery_pre_first_request_hook_for_test)
     /// Mount / write-fence / build-watermark / self-remount runtime. Injected with
-    /// backend/layout + the mount and farewell planes + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
+    /// backend/layout + the mount and lease planes + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
     /// `cas_request_budget` + the `remount_attempt` callback (== `Pool::tryRemountOnce`, whose claim/
     /// recovery ORCHESTRATION stays on Pool). The callback captures `this`; it is invoked only at runtime
     /// (post-construction). Declared/constructed AFTER `ref_ledger`, preserving the original member order
     /// verbatim (mount destroyed first, ledger last; both orders proven safe -- see the header note).
     , mount_runtime(
-          pool_backend, mount_requests, farewell_requests,
+          pool_backend, mount_requests, lease_requests,
           pool_layout, config.mountConfig(), config.server_root_id, event_sink_,
           config.cas_request_budget,
           [this] { return tryRemountOnce(); })
@@ -377,6 +382,16 @@ Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
     snap.lifecycle = mount_runtime.lifecycle();
     snap.detail = lifecycleReasonDetail(snap.lifecycle);
     snap.since = mount_runtime.lifecycleSinceWallS();
+    if (snap.lifecycle == PoolLifecycle::Live)
+    {
+        if (const std::optional<uint64_t> paused_at = mount_runtime.writesPausedSinceBootMs())
+        {
+            snap.writes_paused = true;
+            const uint64_t now_ms = mount_runtime.bootMsNow();
+            const uint64_t ago_s = (now_ms > *paused_at ? now_ms - *paused_at : 0) / 1000;
+            snap.since = ::time(nullptr) - static_cast<time_t>(ago_s);
+        }
+    }
     return snap;
 }
 
@@ -918,6 +933,9 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// The admin claim must be RENEWED like any writable mount: the host disk may be observe-only
     /// (background_watermark=false), but an unrenewed claim (TTL ~30s) aborts any long drain midway.
     config.background_watermark = true;
+    /// Bounded by the lease, like the startup re-anchor: an admin claim that cannot renew ends rather than
+    /// pauses.
+    config.bounded_background_renewal = true;
     validateWritableMountTiming(config);
 
     Layout layout(config.pool_prefix);
@@ -1948,19 +1966,19 @@ void Pool::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {
     /// All three planes, not just the ledger's: a test that replaces the retry sleep must not be left
     /// with a real one on the plane the site under test happens to use.
-    farewell_requests.setSleepFnForTest(sleep_fn);
     ref_ledger.setCasRetrySleepForTest(sleep_fn);
-    /// `CasRequests` falls back to the engine's plain sleep for an empty argument -- which is neither
-    /// the mount plane's nor the open plane's default. Re-install both, so clearing the seam cannot
-    /// leave a parked renewal held for a whole capped backoff, or the open plane deaf to a teardown.
+    /// `CasRequests` falls back to the engine's plain sleep for an empty argument -- which is none of
+    /// the planes' defaults. Re-install them, so clearing the seam cannot leave a parked renewal held
+    /// for a whole pause, or the open plane deaf to a teardown.
     gc_requests.setSleepFnForTest(sleep_fn ? sleep_fn : openPlaneSleepFn());
+    lease_requests.setSleepFnForTest(sleep_fn ? sleep_fn : mountPlaneSleepFn());
     mount_requests.setSleepFnForTest(sleep_fn ? std::move(sleep_fn) : mountPlaneSleepFn());
 }
 
 void Pool::setCasRequestNowFnForTest(std::function<uint64_t()> now_fn)
 {
     mount_requests.setNowFnForTest(now_fn);
-    farewell_requests.setNowFnForTest(now_fn);
+    lease_requests.setNowFnForTest(now_fn);
     gc_requests.setNowFnForTest(std::move(now_fn));
 }
 
