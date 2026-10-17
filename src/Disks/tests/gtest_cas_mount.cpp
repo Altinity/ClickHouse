@@ -490,7 +490,7 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
 TEST(CASServerRootId, ValidationAcceptsCleanPathsRejectsBad)
 {
     EXPECT_NO_THROW(validateServerRootId("replica-a"));
-    EXPECT_NO_THROW(validateServerRootId("shard-01/replica-a"));
+    EXPECT_THROW(validateServerRootId("shard-01/replica-a"), DB::Exception);
     EXPECT_THROW(validateServerRootId(""), DB::Exception);
     EXPECT_THROW(validateServerRootId("/replica"), DB::Exception);
     EXPECT_THROW(validateServerRootId("replica/"), DB::Exception);
@@ -499,26 +499,9 @@ TEST(CASServerRootId, ValidationAcceptsCleanPathsRejectsBad)
     EXPECT_THROW(validateServerRootId("a/_files/b"), DB::Exception);
 }
 
-/// Decommission and the staging sweep select objects by key prefix, so a member `a/b` could be drained
-/// by a decommission of `a`. The first claim of an id refuses a nested one; `validateServerRootId`
-/// still accepts it so that members created before this rule keep mounting (the guard below).
-TEST(CASServerRootId, NewIdWithSlashIsRefused)
-{
-    auto b = std::make_shared<InMemoryBackend>();
-    const Layout l("p");
-    Ops ops(b);
-    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::BAD_ARGUMENTS, "contains '/'", [&]
-    {
-        claimOwnerOrThrow(ops.op, l, "shard-01/replica-a", UInt128(1), emptyCatalogObservation());
-    });
-    EXPECT_FALSE(ops.op.head(l.ownerKey("shard-01/replica-a"), Retry::standard()).has_value())
-        << "a refused claim must not create the owner";
-}
-
-/// Guard: a member that already owns a nested id (its owner object exists, written by an older build)
-/// still mounts under it. Besides the pool meta only the owner is seeded: the epoch counter is minted
-/// by this very open, so the nesting rule must not run once the owner is present.
-TEST(CASServerRootId, ExistingIdWithSlashStillMounts)
+/// Decommission and the staging sweep select a member's objects by key prefix, so a member `a/b` would be
+/// drained by a decommission of `a`. An id with `/` is refused even when its owner object already exists.
+TEST(CASServerRootId, ExistingIdWithSlashRefusesToOpen)
 {
     auto b = std::make_shared<InMemoryBackend>();
     const Layout l("p");
@@ -529,12 +512,15 @@ TEST(CASServerRootId, ExistingIdWithSlashStillMounts)
             encodeOwner(OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = std::nullopt}),
             Retry::standard()), "owner of an existing nested member");
     }
-    auto store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "shard-01/replica-a"});
-    ASSERT_TRUE(store != nullptr);
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::BAD_ARGUMENTS, "new <cas_server_root_id> without '/'", [&]
+    {
+        Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "shard-01/replica-a"});
+    });
     Ops check(b);
-    const auto mount = check.op.read(l.mountKey("shard-01/replica-a"), Retry::standard());
-    ASSERT_TRUE(mount.has_value());
-    EXPECT_EQ(decodeMountLease(mount->bytes).server_uuid, UInt128(1));
+    EXPECT_FALSE(check.op.head(l.mountKey("shard-01/replica-a"), Retry::standard()).has_value())
+        << "a refused open must not claim the mount slot";
+    EXPECT_FALSE(check.op.head(l.epochKey("shard-01/replica-a"), Retry::standard()).has_value())
+        << "a refused open must not mint an epoch";
 }
 
 TEST(CASServerRoot, KeysAndCodecsRoundTrip)
@@ -2567,9 +2553,9 @@ TEST(CASListMounts, ClassifiesEveryStateReadOnly)
         }
 }
 
-/// A `srid` may itself contain `/` (e.g. `shard-01/replica-a` — legal per
-/// `CASServerRootId.ValidationAcceptsCleanPathsRejectsBad`). Slicing the key by the last `/` before
-/// the `/mount` suffix (as opposed to by `serverRootsPrefix()` length) truncates it to `replica-a`.
+/// A pool may hold a mount slot whose `srid` contains `/`, written before `validateServerRootId` refused
+/// one; `system.cas_mounts` must still name it whole. Slicing the key by the last `/` before the `/mount`
+/// suffix (as opposed to by `serverRootsPrefix()` length) truncates it to `replica-a`.
 TEST(CASListMounts, NestedSridIsNotTruncated)
 {
     auto backend = std::make_shared<InMemoryBackend>();

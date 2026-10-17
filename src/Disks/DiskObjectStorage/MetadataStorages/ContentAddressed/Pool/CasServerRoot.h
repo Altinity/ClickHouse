@@ -76,17 +76,11 @@ struct MountRenewOperationEnvironment
 };
 
 /// Validate a `server_root_id` — the explicit, configured identity of the content-addressed layout
-/// subtree a server owns. It is a clean relative path: it composes into the
-/// object-key tree (`gc/server-roots/<srid>/...`, `roots/<srid>/...`), so the same hygiene the layout
-/// applies to a namespace applies here (mirrors `CasLayout.h::checkNamespace`):
-///   - non-empty;
-///   - no leading/trailing '/', no empty segment ("//");
-///   - no '.' or '..' segment;
-///   - total length <= 255;
-///   - no segment equal to the reserved "_files" / "_manifests".
+/// subtree a server owns. It composes into object keys (`gc/server-roots/<srid>/...`, `roots/<srid>/...`)
+/// as ONE path component: non-empty, at most 255 bytes, no '/', not '.' or '..', not the reserved
+/// "_files" / "_manifests". A '/' is refused even for an id that already owns its owner object, because
+/// decommission and the staging sweep select a member's objects by key prefix.
 /// Throws `ErrorCodes::BAD_ARGUMENTS` on any violation. Fail closed — there is no sanitizing fallback.
-/// A `/` is still accepted here for members that already own a nested id; `claimOwnerOrThrow` refuses to
-/// create a new one.
 inline void validateServerRootId(const String & id)
 {
     if (id.empty())
@@ -96,27 +90,22 @@ inline void validateServerRootId(const String & id)
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
             "server_root_id '{}' is too long ({} > 255 bytes)", id, id.size());
 
-    size_t start = 0;
-    while (true)
-    {
-        size_t end = id.find('/', start);
-        const String segment = id.substr(start, end == String::npos ? String::npos : end - start);
-        if (segment.empty())
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' has an empty segment (leading/trailing or doubled '/')", id);
-        if (segment == "." || segment == "..")
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' uses a relative segment ('.' or '..')", id);
-        if (segment == "_files")
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' uses the reserved segment '_files'", id);
-        if (segment == "_manifests")
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' uses the reserved segment '_manifests'", id);
-        if (end == String::npos)
-            break;
-        start = end + 1;
-    }
+    if (id.find('/') != String::npos)
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' contains '/'. A decommission selects a member's objects by key prefix, so a "
+            "member 'a/b' would be drained by a decommission of 'a'. Recreate the server that uses this id under a new "
+            "<cas_server_root_id> without '/'; the objects of the old id stay in the pool and are not visible "
+            "under the new id",
+            id);
+    if (id == "." || id == "..")
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' uses a relative segment ('.' or '..')", id);
+    if (id == "_files")
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' uses the reserved segment '_files'", id);
+    if (id == "_manifests")
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' uses the reserved segment '_manifests'", id);
 }
 
 /// The per-server-root control objects (owner, epoch, and mount lease) and their text codecs are kept
@@ -152,8 +141,6 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
 ///   - owner present, different → throw `CORRUPTED_DATA` (foreign owner — fail closed);
 ///   - owner absent BUT the subtree is non-empty → throw `CORRUPTED_DATA` (identity lost over
 ///     existing data — never silently re-claim);
-///   - owner absent, subtree provably empty AND `srid` contains '/' → throw `BAD_ARGUMENTS` (nested ids
-///     are not created; an existing nested owner is honoured by the first bullet);
 ///   - owner absent, subtree provably empty → `create` the owner (claim).
 /// The owner object is never deleted and never reassigned to a different UUID.
 void claimOwnerOrThrow(
