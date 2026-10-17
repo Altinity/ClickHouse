@@ -1036,6 +1036,40 @@ TEST(CASHeartbeat, CancellationBeforeSendIsNotAttemptedAndAllowsRelease)
     EXPECT_EQ(renewer.state(), MountLeaseRenewerState::Released);
 }
 
+/// The stop lands after the renewal began and before its admission. Nothing was sent, so the renewer stays
+/// releasable and the teardown still writes the farewell.
+TEST(CASHeartbeat, CancellationRacingAdmissionIsNotAttemptedAndAllowsRelease)
+{
+    auto backend = std::make_shared<RenewalScriptBackend>();
+    Layout layout("pool");
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    bool cancelled = false;
+    Ops ops(backend, &boot_ms);
+    seedOwnClaim(ops.op, layout, "test", UInt128{1}, 9, wall_ms, 1000);
+    MountLeaseRenewer renewer(
+        ops.mount, ops.farewell, layout, "test", UInt128{1}, 9, std::chrono::milliseconds(1000),
+        [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
+        [&] { return boot_ms; });
+    renewer.start();
+    backend->attempts.clear();
+    backend->read_calls = 0;
+    const auto stop_then_refuse = [&]
+    {
+        cancelled = true;
+        return false;
+    };
+    const MountRenewResult result = renewer.renew(renewalEnvironment(
+        boot_ms, /*live=*/stop_then_refuse, /*cancelled=*/[&] { return cancelled; }));
+    EXPECT_EQ(result.outcome, MountRenewOutcome::NotAttempted);
+    EXPECT_EQ(result.failure, nullptr);
+    ASSERT_EQ(renewer.state(), MountLeaseRenewerState::Active);
+    EXPECT_TRUE(backend->attempts.empty());
+    EXPECT_NO_THROW(renewer.release());
+    EXPECT_EQ(decodeMountLease(ops.op.read(layout.mountKey("test"), Retry::standard())->bytes).min_active_build_sequence,
+              std::numeric_limits<uint64_t>::max());
+}
+
 TEST(CASHeartbeat, CancellationAfterSendIsTerminalAndForbidsRelease)
 {
     auto backend = std::make_shared<RenewalScriptBackend>();

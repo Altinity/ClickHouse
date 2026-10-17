@@ -11,10 +11,12 @@
 #include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <fmt/ranges.h>
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -176,6 +178,72 @@ TEST(CASOrphanManifestSweep, EligibleAndUnownedIsDeleted)
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
     EXPECT_FALSE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
+}
+
+/// The decommission drain runs this on its admin pool: once that pool lost its mount, nothing is deleted.
+TEST(CASOrphanManifestSweep, LostMountDeletesNothing)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    registerNamespaceRaw(*backend, store->layout(), ns);
+    const ManifestRef r = ref(5, 0xAB);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active_build_sequence*/6);
+    seedConsumedSealCursor(*backend, store->layout(), ns);
+    seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
+    store->tripMountLost();
+
+    std::vector<String> warnings;
+    EXPECT_THROW(sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, &warnings),
+                 DB::Exception);
+    EXPECT_TRUE(headExists(*backend, store->layout().manifestKey(ManifestId{ns, r})));
+}
+
+namespace
+{
+/// Runs `on_first_manifest_remove` once, inside the first delete of a manifest, after it applied.
+class HookOnFirstManifestRemoveBackend : public InMemoryBackend
+{
+public:
+    std::function<void()> on_first_manifest_remove;
+
+    RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
+    {
+        const RawRemoval removed = InMemoryBackend::remove(key, expected_value, access);
+        if (on_first_manifest_remove && key.starts_with("p/cas/manifests/"))
+            std::exchange(on_first_manifest_remove, {})();
+        return removed;
+    }
+};
+}
+
+/// The mount is lost after the first delete: the walk stops at the first refused key instead of adding one
+/// warning per remaining key.
+TEST(CASOrphanManifestSweep, LostMountStopsTheWalkAtTheFirstRefusal)
+{
+    auto backend = std::make_shared<HookOnFirstManifestRemoveBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    registerNamespaceRaw(*backend, store->layout(), ns);
+    std::vector<String> keys;
+    for (const uint64_t ordinal : {0xABu, 0xACu, 0xADu, 0xAEu})
+    {
+        const ManifestRef r = ref(5, ordinal);
+        writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+        keys.push_back(store->layout().manifestKey(ManifestId{ns, r}));
+    }
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active_build_sequence*/6);
+    seedConsumedSealCursor(*backend, store->layout(), ns);
+    seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
+    backend->on_first_manifest_remove = [&] { store->tripMountLost(); };
+
+    std::vector<String> warnings;
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5}, &warnings);
+
+    EXPECT_EQ(warnings.size(), 1u) << fmt::format("{}", fmt::join(warnings, "; "));
+    const auto kept = std::count_if(keys.begin(), keys.end(), [&](const String & key) { return headExists(*backend, key); });
+    EXPECT_GE(kept, 2);
 }
 
 /// The orphan sweep must not turn a forged same-id snapshot at an OLDER `EpochSeal` into an empty owner

@@ -172,9 +172,11 @@ irreversible operation from an ordinary restart or a temporary outage: it fences
 `server_root_id` and reclaims the storage attributable only to it.
 
 `SYSTEM CAS DROP POOL MEMBER` claims the victim's mount slot as an administrative writer (refusing
-immediately if the member is still alive), drops every table namespace the member owned, sweeps
-manifest debris, drains its staging and mountpoint objects, and — only once every drain is
-confirmed — retires the mount slot itself. It emits ordinary ref-edge deltas rather than a GC
+immediately if the member is still alive), tombstones its owner, drops every table namespace the member
+owned, drains its debris and marks the retirement verified; the steps are in
+[mount, unmount, crash](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle). The member's control
+objects (`owner`, `epoch`, `mount`) are kept: the epoch counter keeps epochs from being reused if the
+`server_root_id` is ever reused. It emits ordinary ref-edge deltas rather than a GC
 transition: it does not synchronously reclaim shared blob content, it only makes the now-unreferenced
 blobs eligible for an ordinary GC round to reclaim later.
 
@@ -192,13 +194,14 @@ clickhouse-disks -C config.xml --disk cas cas-drop-member 'replica-2'
 ```
 
 The command returns one row (or, offline, one line per field) with `namespaces_removed`,
-`namespaces_already_removed`, `committed_refs_removed`, `precommits_removed`,
-`manifest_debris_removed`, `staging_objects_removed`, `mountpoint_objects_removed`, and
-`slot_removed`. It is resumable: a rerun skips namespaces already marked removed and reports them
-under `namespaces_already_removed` rather than redoing the work. A per-object drain failure is
-recorded as a `warning` rather than raised as an exception, leaving the slot terminated but not
-fully drained so a later invocation can resume; a non-empty `warnings` means exactly that, and the
-mount slot stays in place as a resume anchor rather than being fully retired.
+`namespaces_already_removed`, `committed_refs_removed`, `precommits_removed`, `manifest_debris_removed`,
+`staging_objects_removed`, `mountpoint_objects_removed`, `member_retired`, `warnings` and
+`namespaces_pending_gc`; the SQL row ends with `namespaces_pending_gc`. It is resumable: a rerun skips namespaces already marked removed and reports them
+under `namespaces_already_removed` rather than redoing the work. A per-object drain failure is recorded as
+a `warning`; the owner keeps an unverified tombstone and the next run resumes over it. `member_retired = 1`
+means the owner carries a verified retirement; rows still listed under `namespaces_pending_gc` are deleted
+by GC and need no rerun. See [troubleshooting](/antalya/cas/operations/troubleshooting) for
+`member_retired = 0`.
 
 **Preconditions.** Confirm the member is actually and permanently dead before running this: the
 operation fences that `server_root_id` out even if the server comes back online, and it deletes
@@ -206,8 +209,21 @@ namespace and drain state that cannot be recovered. Check `system.cas_mounts` fo
 `state` and `last_success_age_seconds` first — a `live` row, or one with a recent lease renewal,
 means the member is not a decommission candidate yet.
 
-**Verification.** After the command reports `slot_removed = true` with no warnings, the member's
-`server_root_id` no longer appears as a row in `system.cas_mounts` on any peer, and a subsequent
-`SYSTEM CAS GC RUN` on the pool will no longer wait on or fence its heartbeat. See
+**Verification.** After `member_retired = 1`, `system.cas_mounts` shows the member's
+row as `terminated`; a `SYSTEM CAS GC RUN` no longer waits on its heartbeat. See
 [mount, unmount, crash](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle) for how the
 claim, drain, and retirement steps fit into the mount-slot lifecycle.
+
+### Upgrading and downgrading {#decommission-compatibility}
+
+| Case | Behaviour |
+|---|---|
+| A `server_root_id` retired by 26.6.4 (its `epoch` and `mount` deleted) | not repaired: a decommission rerun refuses the absent counter; use a new `server_root_id` |
+| A 26.6.4 decommission that stopped midway | the same refusal; use a new `server_root_id` |
+| Flat 26.6.4 staging keys `staging/<srid>/<name>.tmp` | swept as epoch 0 at the next mount |
+| Downgrade to 26.6.4 with a retired `server_root_id` kept by this version | 26.6.4 refuses to start it and its GC treats the farewell as terminal |
+| Downgrade: `owner_life`, `retirement_verified`, epoch staging keys | skipped by 26.6.4 readers; staging swept recursively |
+| Mixed versions: a 26.6.4 decommission tool rewrites an owner | the life drops to 0; servers of this version fail their owner check and stop (fail-closed) |
+| Mixed versions: a 26.6.4 member restarts during a decommission | its owner check refuses after the tombstone; before it there is no recheck, as in 26.6.4 |
+
+Rolling upgrades keep the old races on the old binaries; decommission from an upgraded server.

@@ -68,9 +68,8 @@ struct MountRenewOperationEnvironment
     /// Facts the mount fence cannot see (park requested, pool no longer live, shutdown). FALSE ends
     /// the renewal exactly as a lost fence does; the engine does not need to know which refused.
     std::function<bool()> live;
-    /// Sampled ONCE before the write. A renewal refused before its first attempt is reported as
-    /// `NotAttempted` rather than terminal only when this node had already been asked to stop --
-    /// sampling it afterwards would read a flag that the refusal itself may have set.
+    /// Read once the write has given up. A renewal refused before its first attempt is reported as
+    /// `NotAttempted` rather than terminal when this node has been asked to stop by then.
     std::function<bool()> cancelled;
     RequestObserver requests;
 };
@@ -144,27 +143,44 @@ using ObserveRefCatalog = std::function<RefCatalog()>;
 /// counterpart used by normal opens and reuses this GET+decode path.
 std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const String & server_root_id);
 
-/// Claim (or validate) the sticky owner anchor that binds `srid` to a server UUID (identity).
-///   - owner present, equal `our_uuid`, and not tombstoned → ok (return);
-///   - owner present and tombstoned → throw `CORRUPTED_DATA` (explicitly retired — fail closed);
-///   - owner present, different → throw `CORRUPTED_DATA` (foreign owner — fail closed);
-///   - owner absent AND the subtree is provably empty → `create` the owner (claim);
-///   - owner absent BUT the subtree is non-empty → throw `CORRUPTED_DATA` (identity lost over
-///     existing data — never silently re-claim).
-/// The owner object is never deleted and never reassigned to a different UUID.
-void claimOwnerOrThrow(
-    CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
-    const ObserveRefCatalog & observe_catalog);
-
-/// Which mint policy governs `allocateWriterEpoch`'s absent-epoch branch (see below).
-enum class EpochMintPolicy : uint8_t
+enum class RetiredOwnerPolicy : uint8_t
 {
-    NormalMount,            /// absent-epoch re-mint requires authoritative mount absence
-    DecommissionRecovery,   /// absent-epoch re-mint requires a TERMINAL mount; mints a distinct epoch
+    Refuse,                  /// a server start or remount never resumes a tombstoned owner
+    AcceptForDecommission,   /// the decommission admin impersonates a retired victim to drain or rerun
 };
 
+/// Claim or validate the owner anchor that binds `srid` to a server uuid, and return the owner life.
+///   - present, equal `our_uuid`, not tombstoned → the stored life;
+///   - present, equal `our_uuid`, tombstoned → `CORRUPTED_DATA` under `Refuse`; the stored life under
+///     `AcceptForDecommission` (the admin runs or reruns a decommission over its retired victim);
+///   - present, different uuid → `CORRUPTED_DATA` (foreign owner), tombstoned or not;
+///   - absent, subtree provably empty → create `{our_uuid, owner_life = 1}` and return 1;
+///   - absent, subtree non-empty → `CORRUPTED_DATA` (identity lost over data).
+/// The returned life is 0 for a body written before the field existed.
+/// The owner object is never deleted. A rejoin after a verified retirement is the one supported reassignment
+/// (not in this file yet); every other uuid change is a refusal.
+uint64_t claimOwnerOrThrow(
+    CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
+    const ObserveRefCatalog & observe_catalog, RetiredOwnerPolicy retired_policy = RetiredOwnerPolicy::Refuse);
+
+/// What a claimer requires of the owner once its body is in the slot and before it installs the renewer.
+struct OwnerExpectation
+{
+    UInt128 server_uuid;
+    uint64_t owner_life;
+    RetiredOwnerPolicy retired;
+};
+
+/// One `GET owner` after `claimMount` returned `Claimed`. Throws `CORRUPTED_DATA` unless the owner is exactly
+/// `(expected.server_uuid, expected.owner_life)` and, under `Refuse`, not retired. Before throwing it rewrites
+/// the claimer's own `(uuid, our_epoch)` body `gc_fenced`, so a successor need not wait the lease out; a
+/// failed fence write is logged and the refusal is still thrown.
+void recheckOwnerAfterClaim(
+    CasOperation & op, const Layout & l, const String & srid, const OwnerExpectation & expected,
+    uint64_t our_epoch, const CasEventSink & sink = {});
+
 /// Allocate the next durable-monotone `writer_epoch` by CAS-bumping the sticky `epoch` object
-/// (`ServerEpoch{next_writer_epoch}`), returning the value the caller adopts as its writer_epoch.
+/// (`ServerEpoch{next_writer_epoch, allocation_nonce}`), returning the value the caller adopts as its writer_epoch.
 ///   - `epoch` absent AND the subtree is non-empty → throw `CORRUPTED_DATA` (missing epoch over
 ///     data is a reset hazard);
 ///   - `epoch` absent AND the subtree is empty → the absent-epoch branch is a LIFECYCLE decision,
@@ -172,18 +188,16 @@ enum class EpochMintPolicy : uint8_t
 ///     flattens transport faults into "not found"), to decide whether the mount object is really
 ///     gone:
 ///       - `KeyAbsent` → authoritative absence, mint epoch 1 (fresh-root bootstrap);
-///       - `Present`, `policy == NormalMount` → throw `CORRUPTED_DATA` (durable epoch state was
-///         lost while a mount is live or recently live — refusing to re-mint epoch 1 there is how a
-///         same-(uuid, epoch) twin is avoided);
-///       - `Present`, `policy == DecommissionRecovery` → the surviving mount must be TERMINAL (not
-///         live); a live member throws `ABORTED`, otherwise mint `surviving.writer_epoch + 1` —
-///         distinct from the survivor's by construction (`now_ms` is required, nonzero, here);
+///       - `Present` → throw `CORRUPTED_DATA` (durable epoch state was lost while a mount is live or
+///         recently live; refusing to re-mint epoch 1 is how a same-(uuid, epoch) twin is avoided. If no
+///         server uses this root, start with a new server_root_id; a decommission never recreates a counter);
 ///       - anything else (`ContainerAbsent`/`AccessDenied`/`Indeterminate`) → throw
 ///         `CORRUPTED_DATA` (absence was never proven; fail closed);
 ///   - otherwise read `next = current.next_writer_epoch`, write `{next + 1}` against the observed
 ///     incarnation, re-deciding on conflict, and return `next`.
+/// Every decision writes a fresh `allocation_nonce`, so an unclear write counts as ours only when the
+/// stored bytes are exactly ours; a same-uuid twin bumping to the same value is a conflict.
 uint64_t allocateWriterEpoch(CasOperation & op, const Layout & l, const String & srid,
-                             EpochMintPolicy policy, uint64_t now_ms,
                              const ObserveRefCatalog & observe_catalog);
 
 /// Which certificate of death, or the operator's explicit unsafe authorization, justified a
@@ -402,8 +416,8 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 /// leader instance, `Cas::Gc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
 /// fencing one round, never fences early).
 /// A body whose declared lease is non-zero and differs from `observer_lease_ms` is named in one `WARNING`
-/// per srid; `lease_mismatch_warned` holds the srids already named and is pruned like `obs`. The check
-/// never changes a classification or a write.
+/// per srid; `lease_mismatch_warned` holds the srids already named. The check never changes a classification
+/// or a write. `obs` and `lease_mismatch_warned` drop every srid this pass did not list.
 ///
 /// The fence-out is BOTH safety and liveness. Safety: a sleeper's later renewal permanently fails
 /// (its `replace` now mismatches the fenced incarnation → `tripMountLost`), so it can never re-arm
@@ -612,32 +626,17 @@ private:
 
 /// Mount-lease-scoped staging sweeper for objects left behind by S3-native staging.
 ///
-/// A leaked S3 staging object happens two ways: (1) an exception between blob publication succeeding and
-/// `cleanupPendingTempFiles` deleting the staging key (`ContentAddressedTransaction.cpp`), or (2) an
-/// aborted/cancelled transaction whose pending blobs were staged but never promoted — by design,
-/// `cleanupPendingTempFiles` deliberately leaves an S3 staging object in place on the abort path (never a
-/// bare `fs::remove` on a remote key), so this sweeper is its ONLY reclaimer. Debris from either case is
-/// bounded to `staging/<mount_id>/` — the ONE mount that could ever have written under that prefix, since
-/// every staging key this mount ever mints comes from `ContentAddressedMetadataStorage::stagingKeyPrefix()`
-/// (`physicalKey(pool_prefix + "/staging/" + server_root_id)`), keyed by THIS mount's own `server_root_id`.
+/// Staging keys are `staging/<srid>/<writer_epoch>/<random>.tmp`, minted from
+/// `ContentAddressedMetadataStorage::stagingKeyPrefix()`. A key leaks when an exception hits between blob
+/// publication and `cleanupPendingTempFiles`, or when a transaction aborts after staging (the abort path
+/// leaves a remote staging object in place), so this sweep is the only reclaimer. GC never lists `staging/`.
 ///
-/// LEASE-FENCE (fail-closed, never fail-open): `sweepOwnMountStaging` removes ONLY objects whose key
-/// starts with the given `mount_staging_prefix` — pass your OWN mount's prefix, never another mount's.
-/// The caller (`ContentAddressedMetadataStorage::startup()`) invokes this exactly once, at mount start,
-/// with `stagingKeyPrefix() + "/"` — the SAME prefix construction the writer uses to mint staging keys, so
-/// this sweep can never reach a different mount's `staging/<other_mount_id>/` subtree: no other writer
-/// ever stages a key under THIS mount's own `server_root_id` prefix, and this function never lists or
-/// touches anything outside the prefix it is given.
+/// Deletes `<mount_staging_prefix><epoch>/<leaf>` with `epoch < live_writer_epoch`, and flat
+/// `<mount_staging_prefix><leaf>` keys (epoch 0). The cutoff is the live epoch fixed at the start of the
+/// sweep, so a successor's in-flight uploads (its epoch is not below the cutoff) survive. Every other path
+/// is left alone, including another member's keys nested under this prefix. Pass your OWN mount's prefix.
 ///
-/// Best-effort and NEVER THROWS: one stubborn key (or a LIST failure) must never abort the sweep of the
-/// rest, and must never fail the mount (mirrors `feedback_ca_gc_never_throw_on_404` — a throw here would
-/// only wedge startup, not GC, but the same fail-open-on-error discipline applies to any best-effort
-/// reclaim of debris).
-///
-/// GC excludes `staging/` entirely: GC blob discovery LISTs `Layout::blobsPrefix()`
-/// (`<pool_prefix>/blobs/`) — a distinct top-level prefix from `staging/`, `cas/ns/`, and
-/// `cas/manifests/` (see `CasLayout.h`) — so a `staging/` object is never listed, HEAD'd, or condemned by
-/// GC's fold. This sweeper is the ONLY reclaimer of `staging/` debris.
-void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix) noexcept;
+/// Best-effort and never throws: a LIST failure or one stubborn key must not fail the mount.
+void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix, uint64_t live_writer_epoch) noexcept;
 
 }
