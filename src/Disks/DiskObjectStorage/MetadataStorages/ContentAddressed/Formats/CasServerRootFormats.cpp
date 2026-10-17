@@ -23,6 +23,7 @@ namespace OwnerWire
 namespace ServerEpochWire
 {
     constexpr WireKey next_writer_epoch{"next_writer_epoch"};
+    constexpr WireKey allocation_nonce{"allocation_nonce"};
 }
 
 namespace MountLeaseWire
@@ -103,6 +104,8 @@ String encodeServerEpoch(const ServerEpoch & e)
     writeHeaderLine(out, FormatId::ServerEpoch);
     bool first = true;
     writeU64StringField(out, ServerEpochWire::next_writer_epoch, e.next_writer_epoch, first);
+    if (e.allocation_nonce)
+        writeHex128Field(out, ServerEpochWire::allocation_nonce, *e.allocation_nonce, first);
     closeObject(out, first);
     writeChar('\n', out);
     return std::move(out).take();
@@ -126,6 +129,8 @@ ServerEpoch decodeServerEpoch(std::string_view data)
             e.next_writer_epoch = r.readU64String();
             saw = true;
         }
+        else if (key == ServerEpochWire::allocation_nonce)
+            e.allocation_nonce = r.readHex128();
         else
             r.skipUnknown(key);
     }

@@ -9,8 +9,10 @@
 #include <Poco/Message.h>
 #include <Poco/StreamChannel.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <limits>
 #include <map>
 #include <set>
@@ -265,27 +267,25 @@ private:
     }
 };
 
-/// A competitor's conditional bump of the epoch counter lands with the very bytes ours sends, and ours
-/// is lost unapplied. Our resolve read then finds our bytes under a moved precondition and reports the
-/// allocation committed, so two allocators hold one writer_epoch.
-class EpochCollisionBackend : public InMemoryBackend
+/// Records every write of `key`; while `lose_first` is set, the first one times out without applying.
+class UnappliedFirstWriteBackend : public InMemoryBackend
 {
 public:
-    String epoch_key;
-    bool armed = false;
+    String key;
+    bool lose_first = false;
+    std::vector<std::pair<String, std::optional<String>>> writes;
 
     std::expected<String, RawConflict> write(
-        const String & key, const String & bytes,
+        const String & k, const String & bytes,
         const std::optional<String> & expected_value, TransportAccess & access) override
     {
-        if (armed && expected_value && key == epoch_key)
+        if (k == key)
         {
-            armed = false;
-            if (!InMemoryBackend::write(key, bytes, expected_value, access))
-                throw std::runtime_error("EpochCollisionBackend: the competitor's bump conflicted");
-            throw Poco::TimeoutException("EpochCollisionBackend: response lost, our attempt did not apply");
+            writes.emplace_back(bytes, expected_value);
+            if (std::exchange(lose_first, false))
+                throw Poco::TimeoutException("UnappliedFirstWriteBackend: response lost, the attempt did not apply");
         }
-        return InMemoryBackend::write(key, bytes, expected_value, access);
+        return InMemoryBackend::write(k, bytes, expected_value, access);
     }
 };
 
@@ -305,6 +305,27 @@ public:
             armed = false;
             (void)InMemoryBackend::write(k, bytes, expected_value, access);
             throw Poco::TimeoutException("LandedReplaceAckLostOnceBackend: simulated lost PUT response");
+        }
+        return InMemoryBackend::write(k, bytes, expected_value, access);
+    }
+};
+
+/// On the first write of `key` after `competitor` is set, runs `competitor` (another allocator of the
+/// same uuid) to completion, then times out our write without applying it.
+class TwinAllocatorBackend : public InMemoryBackend
+{
+public:
+    String key;
+    std::function<void()> competitor;
+
+    std::expected<String, RawConflict> write(
+        const String & k, const String & bytes,
+        const std::optional<String> & expected_value, TransportAccess & access) override
+    {
+        if (competitor && k == key)
+        {
+            std::exchange(competitor, {})();
+            throw Poco::TimeoutException("TwinAllocatorBackend: response lost, our attempt did not apply");
         }
         return InMemoryBackend::write(k, bytes, expected_value, access);
     }
@@ -610,6 +631,101 @@ TEST(CASServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
     ASSERT_FALSE(ops.op.head(l.mountKey("r"), Retry::standard()).has_value());
     EXPECT_EQ(ops.op.removeCurrent(l.mountKey("r"), Retry::standard()), Removal::Gone);
     EXPECT_GT(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), e2);
+}
+
+/// Our counter write is lost while a twin of the same uuid allocates the same next epoch. Its counter
+/// body must not read back as our landed write, on both the create and the replace path.
+TEST(CASServerRootEpoch, TwinAllocatorsNeverShareAnEpochAfterALostWrite)
+{
+    for (const bool counter_exists : {false, true})
+    {
+        SCOPED_TRACE(counter_exists ? "replace" : "create");
+        auto b = std::make_shared<TwinAllocatorBackend>();
+        Layout l("p");
+        Ops ours(b);
+        Ops twin(b);
+        b->key = l.epochKey("r");
+        if (counter_exists)
+            ASSERT_EQ(allocateWriterEpoch(ours.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+
+        uint64_t twin_epoch = 0;
+        b->competitor = [&]
+        {
+            twin_epoch = allocateWriterEpoch(twin.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+        };
+        const uint64_t our_epoch
+            = allocateWriterEpoch(ours.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+        ASSERT_FALSE(b->competitor) << "the twin never ran";
+        ASSERT_NE(twin_epoch, 0u);
+        EXPECT_NE(our_epoch, twin_epoch);
+        EXPECT_EQ(decodeServerEpoch(ours.op.read(l.epochKey("r"), Retry::standard())->bytes).next_writer_epoch,
+                  std::max(our_epoch, twin_epoch) + 1);
+    }
+}
+
+/// A resend of one allocation decision carries that decision's nonce, so our own landed write with a
+/// lost response is recognized as ours instead of costing a second epoch.
+TEST(CASServerRootEpoch, LandedCounterWriteWithLostResponseIsOurs)
+{
+    auto b = std::make_shared<LandedReplaceAckLostOnceBackend>();
+    Layout l("p");
+    Ops ops(b);
+    b->key = l.epochKey("r");
+    ASSERT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+
+    b->armed = true;
+    EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 2u);
+    ASSERT_FALSE(b->armed) << "the lost response was never injected";
+    EXPECT_EQ(decodeServerEpoch(ops.op.read(l.epochKey("r"), Retry::standard())->bytes).next_writer_epoch, 3u);
+}
+
+/// An unapplied write with an unclear outcome is reissued inside the same decision: every physical
+/// attempt must carry the same body, nonce included, under the same precondition.
+TEST(CASServerRootEpoch, ReissuedCounterWriteKeepsItsNonce)
+{
+    for (const bool counter_exists : {false, true})
+    {
+        SCOPED_TRACE(counter_exists ? "replace" : "create");
+        auto b = std::make_shared<UnappliedFirstWriteBackend>();
+        Layout l("p");
+        Ops ops(b);
+        b->key = l.epochKey("r");
+        if (counter_exists)
+            ASSERT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
+
+        b->writes.clear();
+        b->lose_first = true;
+        const uint64_t expected_epoch = counter_exists ? 2 : 1;
+        EXPECT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()),
+                  expected_epoch);
+        ASSERT_FALSE(b->lose_first) << "the lost write was never injected";
+        ASSERT_GE(b->writes.size(), 2u) << "the unclear write was never reissued";
+        for (const auto & [bytes, precondition] : b->writes)
+        {
+            EXPECT_EQ(bytes, b->writes.front().first);
+            EXPECT_EQ(precondition, b->writes.front().second);
+        }
+        const ServerEpoch stored = decodeServerEpoch(ops.op.read(l.epochKey("r"), Retry::standard())->bytes);
+        EXPECT_EQ(stored.next_writer_epoch, expected_epoch + 1);
+        EXPECT_TRUE(stored.allocation_nonce.has_value());
+    }
+}
+
+TEST(CASServerRootEpoch, EveryAllocationWritesAFreshNonce)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    Ops ops(b);
+    std::vector<UInt128> nonces;
+    for (int i = 0; i < 2; ++i)
+    {
+        (void)allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
+        const std::optional<UInt128> nonce
+            = decodeServerEpoch(ops.op.read(l.epochKey("r"), Retry::standard())->bytes).allocation_nonce;
+        ASSERT_TRUE(nonce.has_value());
+        nonces.push_back(*nonce);
+    }
+    EXPECT_NE(nonces[0], nonces[1]);
 }
 
 /// No writer emits a zero counter; an allocation over one would hand out writer_epoch 0.
@@ -2577,21 +2693,13 @@ TEST(CASClaimMountMonotonicity, LowerEpochOverANewerBodyFailsWithoutWriting)
     }
 }
 
-TEST(CASClaimMountMonotonicity, TwoAllocatorsSharingAnEpochDoNotShareTheSlot)
+/// Two processes holding one epoch, as 26.6.4 allocators without the counter nonce could produce.
+TEST(CASClaimMountMonotonicity, TwoClaimersOfOneEpochDoNotShareTheSlot)
 {
-    auto b = std::make_shared<EpochCollisionBackend>();
+    auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
     Ops ops(b);
-    b->epoch_key = l.epochKey("r");
-    ASSERT_EQ(allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
-
-    b->armed = true;
-    const uint64_t shared_epoch
-        = allocateWriterEpoch(ops.op, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation());
-    ASSERT_FALSE(b->armed) << "the collision was never injected";
-    ASSERT_EQ(shared_epoch, 2u);
-    /// One bump past the shared epoch: the competitor's, which our resolve read took for ours.
-    ASSERT_EQ(decodeServerEpoch(ops.op.read(l.epochKey("r"), Retry::standard())->bytes).next_writer_epoch, 3u);
+    const uint64_t shared_epoch = 2;
 
     /// The competitor claims first.
     ASSERT_EQ(claimMount(ops.op, l, "r", UInt128(1), shared_epoch, 1000, 30000).kind, MountClaimResult::Claimed);

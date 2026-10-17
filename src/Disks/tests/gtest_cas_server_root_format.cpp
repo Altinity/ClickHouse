@@ -1,8 +1,11 @@
 #include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <limits>
+#include <optional>
 
 using namespace DB::Cas;
 
@@ -46,10 +49,48 @@ TEST(CASFormatBattery, ServerEpoch)
 {
     ServerEpoch e;
     e.next_writer_epoch = 7;
+    e.allocation_nonce = hexToU128("0123456789abcdeffedcba9876543210");
+    const String golden = currentFormatHeader("cas_epoch")
+        + "{\"next_writer_epoch\":\"7\",\"allocation_nonce\":\"0123456789abcdeffedcba9876543210\"}\n";
+    const ServerEpoch back = decodeServerEpoch(golden);
+    EXPECT_EQ(back.next_writer_epoch, 7u);
+    EXPECT_EQ(back.allocation_nonce, e.allocation_nonce);
     runFormatBattery({FormatId::ServerEpoch,
         [&] { return sealObject(FormatId::ServerEpoch, encodeServerEpoch(e)); },
         [](std::string_view s) { decodeServerEpoch(std::string(openObject(FormatId::ServerEpoch, s))); },
-        currentFormatHeader("cas_epoch") + "{\"next_writer_epoch\":\"7\"}\n"});
+        golden});
+}
+
+/// The counter body written by 26.6.4, before the allocation nonce existed.
+TEST(CASServerEpochFormat, BodyWithoutNonceDecodes)
+{
+    const ServerEpoch e = decodeServerEpoch(currentFormatHeader("cas_epoch") + "{\"next_writer_epoch\":\"7\"}\n");
+    EXPECT_EQ(e.next_writer_epoch, 7u);
+    EXPECT_FALSE(e.allocation_nonce.has_value());
+}
+
+/// The 26.6.4 decoder's loop: it knows only `next_writer_epoch` and hands every other key to `skipUnknown`.
+TEST(CASServerEpochFormat, NonceBodyDecodesWithThe2664KeySet)
+{
+    const String body = encodeServerEpoch(ServerEpoch{
+        .next_writer_epoch = 7, .allocation_nonce = hexToU128("0123456789abcdeffedcba9876543210")});
+    DB::ReadBufferFromMemory in(body.data(), body.size());
+    expectHeaderLine(in, FormatId::ServerEpoch);
+    const String line = readLine(in, traitsFor(FormatId::ServerEpoch).line_cap, "server-epoch");
+    DB::ReadBufferFromMemory line_in(line.data(), line.size());
+    JsonObjectReader r(line_in, "server-epoch");
+    std::optional<uint64_t> next;
+    String key;
+    while (r.nextKey(key))
+    {
+        if (key == "next_writer_epoch")
+            next = r.readU64String();
+        else
+            r.skipUnknown(key);
+    }
+    EXPECT_EQ(next, 7u);
+    EXPECT_TRUE(line_in.eof());
+    EXPECT_TRUE(in.eof());
 }
 
 TEST(CASServerEpochFormat, ZeroNextWriterEpochIsRejected)

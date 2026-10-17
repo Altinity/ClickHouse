@@ -38,6 +38,10 @@ struct OwnerObject
 struct ServerEpoch
 {
     uint64_t next_writer_epoch = 0;
+    /// Random per allocation decision, so an unclear write is ours only if the stored bytes match
+    /// exactly: a twin of the same uuid bumping to the same value writes a different nonce. Absent in
+    /// bodies written by 26.6.4.
+    std::optional<UInt128> allocation_nonce = std::nullopt;
 };
 
 /// The current liveness lease for one `(server_uuid, writer_epoch)` writer incarnation. The pool
@@ -77,7 +81,8 @@ OwnerObject decodeOwner(std::string_view data);
 /// codec.
 String encodeServerEpoch(const ServerEpoch & e);
 
-/// Decode the epoch counter, requiring its `next_writer_epoch` field and rejecting bytes after the body line.
+/// Decode the epoch counter, requiring its `next_writer_epoch` field, tolerating an absent `allocation_nonce`, and
+/// rejecting bytes after the body line.
 /// Unknown JSON fields are skipped for forward-compatible reads; malformed input, a missing or zero `next_writer_epoch`,
 /// and trailing data throw `CORRUPTED_DATA`.
 ServerEpoch decodeServerEpoch(std::string_view data);

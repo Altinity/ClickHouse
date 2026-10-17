@@ -164,7 +164,7 @@ enum class EpochMintPolicy : uint8_t
 };
 
 /// Allocate the next durable-monotone `writer_epoch` by CAS-bumping the sticky `epoch` object
-/// (`ServerEpoch{next_writer_epoch}`), returning the value the caller adopts as its writer_epoch.
+/// (`ServerEpoch{next_writer_epoch, allocation_nonce}`), returning the value the caller adopts as its writer_epoch.
 ///   - `epoch` absent AND the subtree is non-empty → throw `CORRUPTED_DATA` (missing epoch over
 ///     data is a reset hazard);
 ///   - `epoch` absent AND the subtree is empty → the absent-epoch branch is a LIFECYCLE decision,
@@ -182,6 +182,8 @@ enum class EpochMintPolicy : uint8_t
 ///         `CORRUPTED_DATA` (absence was never proven; fail closed);
 ///   - otherwise read `next = current.next_writer_epoch`, write `{next + 1}` against the observed
 ///     incarnation, re-deciding on conflict, and return `next`.
+/// Every decision writes a fresh `allocation_nonce`, so an unclear write counts as ours only when the
+/// stored bytes are exactly ours; a same-uuid twin bumping to the same value is a conflict.
 uint64_t allocateWriterEpoch(CasOperation & op, const Layout & l, const String & srid,
                              EpochMintPolicy policy, uint64_t now_ms,
                              const ObserveRefCatalog & observe_catalog);

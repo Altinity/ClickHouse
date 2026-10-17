@@ -696,7 +696,8 @@ uint64_t allocateWriterEpoch(
             }
 
             allocated = current.next_writer_epoch;
-            return encodeServerEpoch(ServerEpoch{.next_writer_epoch = allocated + 1});
+            return encodeServerEpoch(
+                ServerEpoch{.next_writer_epoch = allocated + 1, .allocation_nonce = UUIDHelpers::generateV4().toUnderType()});
         },
         Retry::standard());
 
