@@ -20,6 +20,7 @@
 #include <Access/ContextAccess.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#include <Storages/StorageProxy.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Core/Settings.h>
 
@@ -67,7 +68,8 @@ void StorageSystemIcebergHistory::fillData([[maybe_unused]] MutableColumns & res
         /// to handle properly all possible errors which we can get when attempting to read metadata of iceberg table
         try
         {
-            if (IcebergMetadata * iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(context_copy)); iceberg_metadata)
+            if (auto iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(object_storage->getExternalMetadata(context_copy));
+                iceberg_metadata)
             {
                 IcebergMetadata::IcebergHistory iceberg_history_items = iceberg_metadata->getHistory(context_copy);
 
@@ -107,7 +109,7 @@ void StorageSystemIcebergHistory::fillData([[maybe_unused]] MutableColumns & res
                     // Table was dropped while acquiring the lock, skipping table
                     continue;
 
-                if (auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(storage.get()))
+                if (auto * object_storage_table = castStorage<StorageObjectStorage>(storage, DeferredTable::Skip).get())
                 {
                     add_history_record(iterator, object_storage_table);
                 }

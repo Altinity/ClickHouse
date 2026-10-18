@@ -2251,11 +2251,11 @@ jobs:
           prefix=lambda: datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
-  integration_tests_amd_asan_db_disk_old_analyzer_1_6:
+  integration_tests_amd_asan_db_disk_old_analyzer_1_8:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [build_amd_asan, build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_distributed_plan_parallel_1_4, stateless_tests_amd_asan_distributed_plan_parallel_2_4, stateless_tests_amd_asan_distributed_plan_parallel_3_4, stateless_tests_amd_asan_distributed_plan_parallel_4_4, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDEvNik=') }}
-    name: "Integration tests (amd_asan, db disk, old analyzer, 1/6)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDEvOCk=') }}
+    name: "Integration tests (amd_asan, db disk, old analyzer, 1/8)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -2270,7 +2270,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Integration tests (amd_asan, db disk, old analyzer, 1/6)"
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 1/8)"
 
       - name: Prepare env script
         run: |
@@ -2298,15 +2298,15 @@ jobs:
         run: |
           . ./ci/tmp/praktika_setup_env.sh
           set -o pipefail
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 1/6)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 1/8)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
           prefix=lambda: datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
-  integration_tests_amd_asan_db_disk_old_analyzer_2_6:
+  integration_tests_amd_asan_db_disk_old_analyzer_2_8:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [build_amd_asan, build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_distributed_plan_parallel_1_4, stateless_tests_amd_asan_distributed_plan_parallel_2_4, stateless_tests_amd_asan_distributed_plan_parallel_3_4, stateless_tests_amd_asan_distributed_plan_parallel_4_4, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDIvNik=') }}
-    name: "Integration tests (amd_asan, db disk, old analyzer, 2/6)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDIvOCk=') }}
+    name: "Integration tests (amd_asan, db disk, old analyzer, 2/8)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -2321,7 +2321,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Integration tests (amd_asan, db disk, old analyzer, 2/6)"
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 2/8)"
 
       - name: Prepare env script
         run: |
@@ -2349,15 +2349,15 @@ jobs:
         run: |
           . ./ci/tmp/praktika_setup_env.sh
           set -o pipefail
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 2/6)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 2/8)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
           prefix=lambda: datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
-  integration_tests_amd_asan_db_disk_old_analyzer_3_6:
+  integration_tests_amd_asan_db_disk_old_analyzer_3_8:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [build_amd_asan, build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_distributed_plan_parallel_1_4, stateless_tests_amd_asan_distributed_plan_parallel_2_4, stateless_tests_amd_asan_distributed_plan_parallel_3_4, stateless_tests_amd_asan_distributed_plan_parallel_4_4, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDMvNik=') }}
-    name: "Integration tests (amd_asan, db disk, old analyzer, 3/6)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDMvOCk=') }}
+    name: "Integration tests (amd_asan, db disk, old analyzer, 3/8)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -2372,7 +2372,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Integration tests (amd_asan, db disk, old analyzer, 3/6)"
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 3/8)"
 
       - name: Prepare env script
         run: |
@@ -2400,15 +2400,15 @@ jobs:
         run: |
           . ./ci/tmp/praktika_setup_env.sh
           set -o pipefail
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 3/6)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 3/8)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
           prefix=lambda: datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
-  integration_tests_amd_asan_db_disk_old_analyzer_4_6:
+  integration_tests_amd_asan_db_disk_old_analyzer_4_8:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [build_amd_asan, build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_distributed_plan_parallel_1_4, stateless_tests_amd_asan_distributed_plan_parallel_2_4, stateless_tests_amd_asan_distributed_plan_parallel_3_4, stateless_tests_amd_asan_distributed_plan_parallel_4_4, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDQvNik=') }}
-    name: "Integration tests (amd_asan, db disk, old analyzer, 4/6)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDQvOCk=') }}
+    name: "Integration tests (amd_asan, db disk, old analyzer, 4/8)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -2423,7 +2423,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Integration tests (amd_asan, db disk, old analyzer, 4/6)"
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 4/8)"
 
       - name: Prepare env script
         run: |
@@ -2451,15 +2451,15 @@ jobs:
         run: |
           . ./ci/tmp/praktika_setup_env.sh
           set -o pipefail
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 4/6)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 4/8)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
           prefix=lambda: datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
-  integration_tests_amd_asan_db_disk_old_analyzer_5_6:
+  integration_tests_amd_asan_db_disk_old_analyzer_5_8:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [build_amd_asan, build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_distributed_plan_parallel_1_4, stateless_tests_amd_asan_distributed_plan_parallel_2_4, stateless_tests_amd_asan_distributed_plan_parallel_3_4, stateless_tests_amd_asan_distributed_plan_parallel_4_4, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDUvNik=') }}
-    name: "Integration tests (amd_asan, db disk, old analyzer, 5/6)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDUvOCk=') }}
+    name: "Integration tests (amd_asan, db disk, old analyzer, 5/8)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -2474,7 +2474,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Integration tests (amd_asan, db disk, old analyzer, 5/6)"
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 5/8)"
 
       - name: Prepare env script
         run: |
@@ -2502,15 +2502,15 @@ jobs:
         run: |
           . ./ci/tmp/praktika_setup_env.sh
           set -o pipefail
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 5/6)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 5/8)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
           prefix=lambda: datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
-  integration_tests_amd_asan_db_disk_old_analyzer_6_6:
+  integration_tests_amd_asan_db_disk_old_analyzer_6_8:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [build_amd_asan, build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_distributed_plan_parallel_1_4, stateless_tests_amd_asan_distributed_plan_parallel_2_4, stateless_tests_amd_asan_distributed_plan_parallel_3_4, stateless_tests_amd_asan_distributed_plan_parallel_4_4, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDYvNik=') }}
-    name: "Integration tests (amd_asan, db disk, old analyzer, 6/6)"
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDYvOCk=') }}
+    name: "Integration tests (amd_asan, db disk, old analyzer, 6/8)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
       pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
@@ -2525,7 +2525,7 @@ jobs:
       - name: Docker setup
         uses: ./.github/actions/docker_setup
         with:
-          test_name: "Integration tests (amd_asan, db disk, old analyzer, 6/6)"
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 6/8)"
 
       - name: Prepare env script
         run: |
@@ -2553,7 +2553,109 @@ jobs:
         run: |
           . ./ci/tmp/praktika_setup_env.sh
           set -o pipefail
-          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 6/6)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 6/8)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
+          prefix=lambda: datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+          for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
+
+  integration_tests_amd_asan_db_disk_old_analyzer_7_8:
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
+    needs: [build_amd_asan, build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_distributed_plan_parallel_1_4, stateless_tests_amd_asan_distributed_plan_parallel_2_4, stateless_tests_amd_asan_distributed_plan_parallel_3_4, stateless_tests_amd_asan_distributed_plan_parallel_4_4, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDcvOCk=') }}
+    name: "Integration tests (amd_asan, db disk, old analyzer, 7/8)"
+    outputs:
+      data: ${{ steps.run.outputs.DATA }}
+      pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 7/8)"
+
+      - name: Prepare env script
+        run: |
+          rm -rf ./ci/tmp
+          mkdir -p ./ci/tmp
+          cat > ./ci/tmp/praktika_setup_env.sh << 'ENV_SETUP_SCRIPT_EOF'
+          export PYTHONPATH=./ci:.:
+
+          cat > ./ci/tmp/workflow_job.json << 'EOF'
+          ${{ toJson(job) }}
+          EOF
+          cat > ./ci/tmp/workflow_status.json << 'EOF'
+          ${{ toJson(needs) }}
+          EOF
+          ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_ASAN
+        uses: actions/download-artifact@v8
+        with:
+          name: CH_AMD_ASAN
+          path: ./ci/tmp
+
+      - name: Run
+        id: run
+        run: |
+          . ./ci/tmp/praktika_setup_env.sh
+          set -o pipefail
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 7/8)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
+          prefix=lambda: datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+          for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
+
+  integration_tests_amd_asan_db_disk_old_analyzer_8_8:
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
+    needs: [build_amd_asan, build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_asan_distributed_plan_parallel_1_4, stateless_tests_amd_asan_distributed_plan_parallel_2_4, stateless_tests_amd_asan_distributed_plan_parallel_3_4, stateless_tests_amd_asan_distributed_plan_parallel_4_4, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDgvOCk=') }}
+    name: "Integration tests (amd_asan, db disk, old analyzer, 8/8)"
+    outputs:
+      data: ${{ steps.run.outputs.DATA }}
+      pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 8/8)"
+
+      - name: Prepare env script
+        run: |
+          rm -rf ./ci/tmp
+          mkdir -p ./ci/tmp
+          cat > ./ci/tmp/praktika_setup_env.sh << 'ENV_SETUP_SCRIPT_EOF'
+          export PYTHONPATH=./ci:.:
+
+          cat > ./ci/tmp/workflow_job.json << 'EOF'
+          ${{ toJson(job) }}
+          EOF
+          cat > ./ci/tmp/workflow_status.json << 'EOF'
+          ${{ toJson(needs) }}
+          EOF
+          ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_ASAN
+        uses: actions/download-artifact@v8
+        with:
+          name: CH_AMD_ASAN
+          path: ./ci/tmp
+
+      - name: Run
+        id: run
+        run: |
+          . ./ci/tmp/praktika_setup_env.sh
+          set -o pipefail
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Integration tests (amd_asan, db disk, old analyzer, 8/8)' --workflow "Community PR" --ci 2>&1 | python3 -u -c 'import sys,datetime
           prefix=lambda: datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
