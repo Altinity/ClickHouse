@@ -47,8 +47,7 @@ public:
         const PersistentTableComponents & components_,
         const DataLakeStorageSettings & data_lake_settings_,
         String write_format_,
-        LoggerPtr log_,
-        ExternalStorageCache & external_storages_);
+        LoggerPtr log_);
 
     void run();
 
@@ -114,7 +113,6 @@ private:
     const DataLakeStorageSettings & data_lake_settings;
     String write_format;
     LoggerPtr log;
-    ExternalStorageCache & external_storages;
 };
 
 }

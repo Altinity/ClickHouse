@@ -977,8 +977,7 @@ void IcebergMetadata::alterPartitionDropImpl(const PartitionCommand & command, C
         persistent_components,
         data_lake_settings,
         write_format,
-        log,
-        *external_storages);
+        log);
     executor.run();
 }
 

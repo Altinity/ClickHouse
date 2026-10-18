@@ -219,8 +219,7 @@ AlterDropPartitionExecutor::AlterDropPartitionExecutor(
     const PersistentTableComponents & components_,
     const DataLakeStorageSettings & data_lake_settings_,
     String write_format_,
-    LoggerPtr log_,
-    ExternalStorageCache & external_storages_)
+    LoggerPtr log_)
     : command(command_)
     , metadata(metadata_)
     , context(context_)
@@ -230,7 +229,6 @@ AlterDropPartitionExecutor::AlterDropPartitionExecutor(
     , data_lake_settings(data_lake_settings_)
     , write_format(std::move(write_format_))
     , log(std::move(log_))
-    , external_storages(external_storages_)
 {
 }
 
