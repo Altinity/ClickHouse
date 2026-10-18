@@ -62,7 +62,7 @@ namespace
     {
         for (size_t i = 0; i < n; ++i)
         {
-            ObjectInfoPtr object = distributor.getNextTask(replica_id);
+            ObjectInfoPtr object = distributor.getNextTask(replica_id).object;
             if (!object)
                 return false;
             auto path = object->getPath();
@@ -79,7 +79,7 @@ namespace
     {
         for (size_t i = 0; i < n; ++i)
         {
-            ObjectInfoPtr object = distributor.getNextTask(replica_id);
+            ObjectInfoPtr object = distributor.getNextTask(replica_id).object;
             if (!object)
                 return false;
             read_source_indices.emplace_back(object->relative_path_with_metadata.read_source_index);
@@ -127,7 +127,7 @@ TEST(RendezvousHashing, SingleNode)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 0, 10));
         ASSERT_TRUE(checkHead(paths, {6}));
@@ -136,7 +136,7 @@ TEST(RendezvousHashing, SingleNode)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 1, 10));
         ASSERT_TRUE(checkHead(paths, {0, 2, 4}));
@@ -145,7 +145,7 @@ TEST(RendezvousHashing, SingleNode)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 2, 10));
         ASSERT_TRUE(checkHead(paths, {1, 5, 7, 8}));
@@ -154,7 +154,7 @@ TEST(RendezvousHashing, SingleNode)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 3, 10));
         ASSERT_TRUE(checkHead(paths, {3, 9}));
@@ -165,7 +165,7 @@ TEST(RendezvousHashing, MultipleNodes)
 {
     auto iterator = makeIterator();
     std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
+    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0);
 
     {
         std::vector<std::string> paths;
@@ -197,7 +197,7 @@ TEST(RendezvousHashing, SingleNodeReducedCluster)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica2", "replica1"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 0, 10));
         ASSERT_TRUE(checkHead(paths, {1, 5, 6, 7, 8, 9}));
@@ -206,7 +206,7 @@ TEST(RendezvousHashing, SingleNodeReducedCluster)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica2", "replica1"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 1, 10));
         ASSERT_TRUE(checkHead(paths, {0, 2, 3, 4}));
@@ -217,7 +217,7 @@ TEST(RendezvousHashing, MultipleNodesReducedCluster)
 {
     auto iterator = makeIterator();
     std::vector<std::string> replicas = {"replica2", "replica1"};
-    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
+    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0);
 
     {
         std::vector<std::string> paths;
@@ -236,7 +236,7 @@ TEST(RendezvousHashing, MultipleNodesReducedClusterOneByOne)
 {
     auto iterator = makeIterator();
     std::vector<std::string> replicas = {"replica2", "replica1"};
-    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
+    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0);
 
     std::vector<std::string> paths0;
     std::vector<std::string> paths1;
@@ -267,7 +267,7 @@ TEST(RendezvousHashing, DoesNotDeduplicateSamePathFromDifferentReadSources)
 
     auto iterator = std::make_shared<TestIterator>(paths);
     std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
+    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0);
 
     std::vector<std::optional<size_t>> read_source_indices;
     ASSERT_TRUE(extractNForReplica(distributor, read_source_indices, 0, 2));
@@ -311,7 +311,7 @@ TEST(ClusterFunctionReadTaskResponse, PreservesReadSourceIndex)
 
     ReadBufferFromString in(serialized);
     ClusterFunctionReadTaskResponse deserialized;
-    deserialized.deserialize(in);
+    deserialized.deserialize(in, DBMS_ANTALYA_PROTOCOL_VERSION);
 
     auto object_info = deserialized.getObjectInfo();
     ASSERT_TRUE(object_info->relative_path_with_metadata.read_source_index.has_value());

@@ -117,6 +117,8 @@ public:
 
     UInt64 getServerRevision(const ConnectionTimeouts & timeouts) override;
 
+    UInt64 getServerAntalyaProtocolVersion() const { return server_antalya_protocol_version; }
+
     const String & getServerTimezone(const ConnectionTimeouts & timeouts) override;
     const String & getServerDisplayName(const ConnectionTimeouts & timeouts) override;
 

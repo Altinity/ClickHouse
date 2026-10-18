@@ -44,6 +44,11 @@ public:
     bool supportsQueryPlanSerializationVersion(UInt64 version) const override;
 
     void sendClusterFunctionReadTaskResponse(const ClusterFunctionReadTaskResponse & response) override;
+
+    UInt64 getServerAntalyaProtocolVersion() const override
+    {
+        return current_connection ? current_connection->getServerAntalyaProtocolVersion() : 0;
+    }
     void sendMergeTreeReadTaskResponse(const ParallelReadResponse & response) override;
     void sendMergeTreeAllRangesAnnouncementResponse(const InitialAllRangesAnnouncementResponse & response) override;
 

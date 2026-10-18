@@ -4,6 +4,7 @@
 #include <AggregateFunctions/AggregateFunctionGroupBitmapData.h>
 #include <Core/Settings.h>
 #include <Core/ProtocolDefines.h>
+#include <Core/AntalyaProtocol.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <IO/WriteHelpers.h>
@@ -213,9 +214,28 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
             protocol_version,
             DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_READ_SOURCE_INDEX);
     }
+
+    if (worker_antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS)
+    {
+        if (file_meta_info && *file_meta_info)
+        {
+            writeVarUInt(1, out);
+            (*file_meta_info)->serialize(out);
+        }
+        else
+            writeVarUInt(0, out);
+
+        if (retry_after_us)
+        {
+            writeVarUInt(1, out);
+            writeVarUInt(*retry_after_us, out);
+        }
+        else
+            writeVarUInt(0, out);
+    }
 }
 
-void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
+void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in, UInt64 antalya_protocol_version)
 {
     size_t protocol_version = 0;
     readVarUInt(protocol_version, in);
@@ -276,6 +296,23 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
             UInt64 value = 0;
             readVarUInt(value, in);
             read_source_index = value;
+        }
+    }
+
+    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS)
+    {
+        UInt64 has_file_meta_info = 0;
+        readVarUInt(has_file_meta_info, in);
+        if (has_file_meta_info)
+            file_meta_info = std::make_shared<DataFileMetaInfo>(DataFileMetaInfo::deserialize(in));
+
+        UInt64 has_retry_after_us = 0;
+        readVarUInt(has_retry_after_us, in);
+        if (has_retry_after_us)
+        {
+            UInt64 value = 0;
+            readVarUInt(value, in);
+            retry_after_us = value;
         }
     }
 }
