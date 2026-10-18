@@ -14,6 +14,7 @@
 #include <Poco/JSON/Object.h>
 
 #include <functional>
+#include <string_view>
 #include <unordered_map>
 
 namespace DB
@@ -48,6 +49,14 @@ public:
 
 private:
     std::unordered_map<DB::DatabaseDataLakeCatalogType, Validator> validators;
+};
+
+enum class DataLakeTableFormat : uint8_t
+{
+    UNKNOWN,
+    DELTA,
+    ICEBERG,
+    PAIMON,
 };
 
 struct DataLakeSpecificProperties
@@ -101,6 +110,8 @@ public:
 
     void setTableUUID(const std::string & uuid_) { table_uuid = uuid_; }
     std::optional<std::string> getTableUUID() const { return table_uuid; }
+    void setTableFormat(DataLakeTableFormat format) { table_format = format; }
+    DataLakeTableFormat getTableFormat() const { return table_format; }
 
     bool requiresLocation() const { return with_location; }
     bool requiresSchema() const { return with_schema; }
@@ -157,6 +168,7 @@ private:
 
     std::string reason_why_table_is_not_readable;
     std::optional<std::string> table_uuid;
+    DataLakeTableFormat table_format = DataLakeTableFormat::UNKNOWN;
 
     bool is_default_readable_table = true;
 
@@ -227,6 +239,22 @@ public:
     explicit ICatalog(const std::string & warehouse_) : warehouse(warehouse_) {}
 
     virtual DB::DatabaseDataLakeCatalogType getCatalogType() const = 0;
+
+    /// Format of the data lake table served for `table_metadata`. Catalogs serving a single
+    /// format rely on the database-level table engine and never set the format per table;
+    /// mixed-format catalogs (e.g. `UnityV2Catalog`) set it in `getTableMetadata`.
+    virtual DataLakeTableFormat getTableFormat(const TableMetadata & table_metadata) const
+    {
+        return table_metadata.getTableFormat();
+    }
+
+    /// Table storage engine name for `table_metadata` ("DeltaLake", "Iceberg", "Paimon",
+    /// or the fake engine for unreadable tables). Throws LOGICAL_ERROR when a readable
+    /// table has no known format; callers handling single-format catalogs (which never set
+    /// the format) must check `getTableFormat() != UNKNOWN` first and keep their
+    /// database-level engine name otherwise.
+    std::string_view getTableEngineName(const TableMetadata & table_metadata) const;
+
     virtual ~ICatalog() = default;
 
     /// Does catalog have any tables?
@@ -323,7 +351,8 @@ public:
     /// The Glue catalog does not support such operation.
     virtual bool isTransactional() const { return false; }
 
-    virtual CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & /*storage_id*/)
+    virtual CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & /*storage_id*/, const TableMetadata & /*table_metadata*/)
     {
         return std::nullopt;
     }

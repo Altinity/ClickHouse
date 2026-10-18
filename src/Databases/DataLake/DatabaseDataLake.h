@@ -142,7 +142,8 @@ private:
 
     StorageObjectStorageConfigurationPtr getConfiguration(
         DatabaseDataLakeStorageType type,
-        DataLakeStorageSettingsPtr storage_settings) const;
+        DataLakeStorageSettingsPtr storage_settings,
+        DataLake::DataLakeTableFormat table_format) const;
 
     std::string getStorageEndpointForTable(const DataLake::TableMetadata & table_metadata) const;
 

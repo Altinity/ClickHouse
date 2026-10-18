@@ -537,7 +537,7 @@ bool UnityCatalog::isNamespaceAllowed(const std::string & namespace_) const
     return allowed_namespaces.contains("*") || allowed_namespaces.contains(namespace_);
 }
 
-ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(const DB::StorageID & table_id)
+ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(const DB::StorageID & table_id, const TableMetadata & /*table_metadata*/)
 {
     if (!table_id.hasUUID())
         throw DB::Exception(
