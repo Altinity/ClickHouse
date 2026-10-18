@@ -14,6 +14,7 @@
 #include <deque>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <utility>
 
@@ -1084,11 +1085,15 @@ TEST_F(CASHeartbeatUntilDefinitive, RetriesOneTuplePastTheLease)
 /// round that watched the previous token for its whole threshold does not fence the slot: the token changed.
 TEST_F(CASHeartbeatUntilDefinitive, ALateCommitRestartsTheGcObservation)
 {
-    const uint64_t threshold_ms = mountObservationThresholdMs(/*ttl_ms=*/1000, /*cadence_ms=*/1000);
+    const uint64_t lease_ms = 1000;
+    const uint64_t cadence_ms = 1000;
+    const uint64_t threshold_ms = mountObservationThresholdMs(lease_ms, /*declared_lease_ms=*/lease_ms, cadence_ms);
     MountObservationMap observations;
+    std::set<String> lease_mismatch_warned;
     const auto gc_round = [&]
     {
-        return computeHeartbeatFloor(ops.op, layout, wall_ms, [this] { return boot_ms; }, threshold_ms, observations);
+        return computeHeartbeatFloor(
+            ops.op, layout, wall_ms, [this] { return boot_ms; }, lease_ms, cadence_ms, observations, lease_mismatch_warned);
     };
     ASSERT_EQ(gc_round().live, 1u);
     clearRecords();
