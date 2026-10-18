@@ -1,0 +1,24 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <cas>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <cas_server_root_id>itest-backup-restore-new</cas_server_root_id>
+                <endpoint>http://rustfs1:11121/test/backup_restore_new/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+            </cas>
+        </disks>
+        <policies>
+            <cas_policy>
+                <volumes>
+                    <single>
+                        <disk>cas</disk>
+                    </single>
+                </volumes>
+            </cas_policy>
+        </policies>
+    </storage_configuration>
+</clickhouse>

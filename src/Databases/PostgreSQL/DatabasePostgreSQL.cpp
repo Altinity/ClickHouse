@@ -155,13 +155,13 @@ bool DatabasePostgreSQL::checkPostgresTable(const String & table_name) const
     {
         /// Casting table_name::regclass throws pqxx::indefined_table exception if table_name is incorrect.
         pqxx::result result = tx.exec(fmt::format(
-                    "SELECT '{}'::regclass, tablename "
+                    "SELECT {}::regclass, tablename "
                     "FROM pg_catalog.pg_tables "
                     "WHERE schemaname != 'pg_catalog' AND {} "
-                    "AND tablename = '{}'",
-                    formatTableName(table_name),
-                    (configuration.schema.empty() ? "schemaname != 'information_schema'" : "schemaname = " + quoteString(configuration.schema)),
-                    formatTableName(table_name)));
+                    "AND tablename = {}",
+                    quoteStringPostgreSQL(formatTableName(table_name)),
+                    (configuration.schema.empty() ? "schemaname != 'information_schema'" : "schemaname = " + quoteStringPostgreSQL(configuration.schema)),
+                    quoteStringPostgreSQL(formatTableName(table_name))));
     }
     catch (pqxx::undefined_table const &)
     {
@@ -296,7 +296,7 @@ void DatabasePostgreSQL::createTable(ContextPtr local_context, const String & ta
 }
 
 
-void DatabasePostgreSQL::dropTable(ContextPtr, const String & table_name, bool /* sync */)
+void DatabasePostgreSQL::dropTable(ContextPtr, const String & table_name, bool /* sync */, bool /* if_exists */)
 {
     if (!persistent)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DROP TABLE is not supported for non-persistent MySQL database");

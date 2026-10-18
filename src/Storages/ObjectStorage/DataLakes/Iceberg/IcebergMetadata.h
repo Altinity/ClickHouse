@@ -52,6 +52,7 @@ struct IcebergFileRecord
     std::map<Int32, Int64> column_sizes;
     std::map<Int32, Int64> value_counts;
     std::vector<Int32> equality_ids;
+    std::optional<UInt64> first_row_id;
 };
 
 class IcebergMetadata : public IDataLakeMetadata
@@ -223,7 +224,7 @@ public:
         StorageMetadataPtr storage_metadata,
         ContextPtr local_context) const override;
 
-    void drop(ContextPtr context) override;
+    void drop(bool delete_data) override;
 
     Poco::JSON::Object::Ptr getMetadataJSON(ContextPtr local_context) const;
 
@@ -278,6 +279,10 @@ private:
 
     std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
     KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
+
+    /// Refuse `operation` while the table root is deeper than the queried path, because anything
+    /// scoped to the queried path reaches beyond this table there.
+    void checkTableRootIsQueriedPath(std::string_view operation) const;
 
     LoggerPtr log;
     const ObjectStoragePtr object_storage;

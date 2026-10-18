@@ -417,6 +417,19 @@ public:
     /// This method returns the set of argument indexes that can be always NULL, they will be skipped in combinator Null.
     virtual UnorderedSetWithMemoryTracking<size_t> getArgumentsThatCanBeOnlyNull() const { return {}; }
 
+    /** When the function is wrapped with the Null combinator (or the If combinator over Nullable arguments), the state of the
+      * wrapper has a flag byte and a type that names the Nullable argument. So the state of a Nullable column is not the state of a
+      * plain one: another implementation cannot read it, and the two cannot be mixed.
+      *
+      * A function that only skips NULL values, and whose state of no values is the empty state (example: uniqApacheHLL),
+      * does not need that. If it returns true here, the wrapper only skips NULL rows, and its state has the same bytes and the
+      * same type as the state of this function for a non-Nullable argument.
+      *
+      * It requires returns_default_when_only_null: the result of a function that must return NULL when only NULL values
+      * were seen needs the flag to tell it from the state of no rows.
+      */
+    virtual bool stateIsIndependentOfNullability() const { return false; }
+
     /** Return the nested function if this is an Aggregate Function Combinator.
       * Otherwise return nullptr.
       */
@@ -553,6 +566,10 @@ public:
             try
             {
                 static_cast<const Derived *>(this)->deserialize(place, buf, version, arena);
+
+                /// Appending the pointer allocates, so it can throw as well, and then the state
+                /// would be neither destroyed here nor owned by the column.
+                data.push_back(place);
             }
             catch (...)
             {
@@ -560,7 +577,6 @@ public:
                 throw;
             }
 
-            data.push_back(place);
             place += total_size_of_state;
         }
     }

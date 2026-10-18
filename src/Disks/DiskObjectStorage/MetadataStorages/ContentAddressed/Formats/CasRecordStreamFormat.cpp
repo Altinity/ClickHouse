@@ -140,7 +140,7 @@ void expectRunHeaderLine(ReadBuffer & in, std::string_view expected_kind)
     const FormatTraits & t = traitsFor(FormatId::RunFile);
     const String line = readLine(in, t.line_cap, t.type);
     ReadBufferFromMemory buf(line.data(), line.size());
-    JsonObjectReader r(buf, KeyStrictness::Tolerant, t.type);
+    JsonObjectReader r(buf, t.type);
 
     String key;
     if (!r.nextKey(key) || key != "type")
@@ -250,7 +250,7 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     ReadBufferFromMemory line_in(scratch.data(), scratch.size());
     /// Re-point the reader rather than building one per row: a fresh reader re-allocates its
     /// seen-key store and value scratch every row, and this loop runs once per record.
-    reader.reset(line_in, KeyStrictness::Strict, "cas_run");
+    reader.reset(line_in, "cas_run");
     JsonObjectReader & r = reader;
 
     String key;
@@ -260,8 +260,8 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     if (key == "n")
     {
         const uint64_t n = r.readU64Number();
-        if (r.nextKey(key))
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: trailer has extra keys");
+        while (r.nextKey(key))
+            r.skipUnknown(key);
         if (!line_in.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: junk after trailer object");
         /// The trailer must be the last line of the object; hashing must be at EOF (this also drains and
@@ -295,7 +295,7 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
         else if (key == RunWire::size) { out.size = r.readU64Number(); have_size = true; }
         else if (key == RunWire::condemn_round) { out.condemn_round = r.readU64String(); have_condemn_round = true; }
         else if (key == RunWire::confirmed) { out.marker_confirmed = r.readBool(); have_confirmed = true; }
-        else r.skipUnknown(key);   /// Strict => any unknown key is CORRUPTED_DATA
+        else r.skipUnknown(key);
     } while (r.nextKey(key));
 
     if (!have_ref || !have_src || !have_mark)

@@ -76,6 +76,21 @@ std::string factoryTypeForScheme(const std::string & normalized_scheme)
     return "";
 }
 
+/// Whether `Iceberg::IcebergPathResolver::resolve` maps `path` under the table root:
+/// `path` starts with `table_location` and the remainder does not climb out of it.
+bool isPathInsideTableLocation(const std::string & table_location, const std::string & path)
+{
+    std::string_view location = table_location;
+    while (location.ends_with('/'))
+        location.remove_suffix(1);
+
+    if (location.empty() || !path.starts_with(location) || path.size() <= location.size() || path[location.size()] != '/')
+        return false;
+
+    const auto remainder = std::filesystem::path(path.substr(location.size() + 1)).lexically_normal();
+    return remainder.is_relative() && !remainder.empty() && *remainder.begin() != "..";
+}
+
 #if USE_AWS_S3
 /// For s3:// URIs (generic), bucket needs to match.
 /// For explicit http(s):// URIs, both bucket and endpoint must match.
@@ -576,7 +591,8 @@ std::optional<std::pair<DB::ObjectStoragePtr, std::string>> tryResolveObjectStor
 
     if (target_decomposed.scheme.empty() && target_decomposed.key.starts_with('/'))
     {
-        if (base_storage->getType() == ObjectStorageType::Local)
+        /// A path inside the table location is mapped under the table root by `path_resolver`.
+        if (base_storage->getType() == ObjectStorageType::Local && !isPathInsideTableLocation(table_location, path))
             ensure_local_path_inside_user_files(target_decomposed.key);
 
         return std::nullopt;

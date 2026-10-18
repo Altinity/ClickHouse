@@ -65,7 +65,7 @@ BlobMeta decodeBlobMeta(std::string_view bytes)
     expectHeaderLine(in, FormatId::BlobMeta);
     const String body = readLine(in, traitsFor(FormatId::BlobMeta).line_cap, "blob meta");
     ReadBufferFromMemory body_in(body.data(), body.size());
-    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "blob meta");
+    JsonObjectReader r(body_in, "blob meta");
 
     // Start with the documented defaults. In particular, `version` stays at 1 because the header's
     // version is authoritative and is not copied into the body struct.

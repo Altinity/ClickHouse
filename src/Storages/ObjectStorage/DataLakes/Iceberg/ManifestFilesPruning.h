@@ -1,7 +1,10 @@
 #pragma once
 #include "config.h"
 
+#include <optional>
+#include <unordered_map>
 
+#include <Core/NamesAndTypes.h>
 #include <Parsers/IAST_fwd.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
@@ -43,10 +46,14 @@ private:
     std::optional<DB::KeyCondition> partition_key_condition;
 
     std::unordered_map<Int32, DB::KeyCondition> min_max_key_conditions;
+    std::unordered_map<Int32, DB::NameAndTypePair> row_lineage_columns;
     /// NOTE: tricky part to support RENAME column.
     /// Takes ActionDAG representation of user's WHERE expression and
     /// rename columns to the their origina numeric ID's in iceberg
-    std::unique_ptr<DB::ActionsDAG> transformFilterDagForManifest(const DB::ActionsDAG * source_dag, std::vector<Int32> & used_columns_in_filter) const;
+    std::unique_ptr<DB::ActionsDAG> transformFilterDagForManifest(
+        const DB::ActionsDAG * source_dag,
+        std::vector<Int32> & used_columns_in_filter,
+        std::unordered_map<Int32, DB::NameAndTypePair> & row_lineage_columns_in_filter) const;
 
 public:
     ManifestFilesPruner(

@@ -187,6 +187,8 @@ public:
 
     UInt64 getParallelReplicasProtocolVersion() const { return server_parallel_replicas_protocol_version; }
 
+    UInt64 getServerAntalyaProtocolVersion() const { return server_antalya_protocol_version; }
+
 private:
     String host;
     UInt16 port;
@@ -238,6 +240,7 @@ private:
     UInt64 server_parallel_replicas_protocol_version = 0;
     UInt64 worker_cluster_function_protocol_version = 0;
     UInt64 server_query_plan_serialization_version = 0;
+    UInt64 server_antalya_protocol_version = 0;
     String server_timezone;
     String server_display_name;
     SettingsChanges settings_from_server;

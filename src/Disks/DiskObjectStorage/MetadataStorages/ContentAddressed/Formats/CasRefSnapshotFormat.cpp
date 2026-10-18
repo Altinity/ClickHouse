@@ -149,7 +149,7 @@ RefTableSnapshot decodeRefTableSnapshot(
     {
         const String line = readLine(in, line_cap, "cas_ref_snap");
         ReadBufferFromMemory meta_buf(line.data(), line.size());
-        JsonObjectReader r(meta_buf, KeyStrictness::Tolerant, "cas_ref_snap");
+        JsonObjectReader r(meta_buf, "cas_ref_snap");
         bool saw_ns = false;
         bool saw_snapshot_epoch = false;
         bool saw_snapshot_seq = false;
@@ -189,7 +189,7 @@ RefTableSnapshot decodeRefTableSnapshot(
     {
         readLineInto(in, row_line, line_cap, "cas_ref_snap");
         ReadBufferFromMemory l(row_line.data(), row_line.size());
-        row_reader.reset(l, KeyStrictness::Tolerant, "cas_ref_snap");
+        row_reader.reset(l, "cas_ref_snap");
         JsonObjectReader & r = row_reader;
         String key;
         if (!r.nextKey(key))

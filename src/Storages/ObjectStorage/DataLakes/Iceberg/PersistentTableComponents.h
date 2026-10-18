@@ -26,6 +26,9 @@ struct PersistentTableComponents
     const std::optional<String> table_uuid;
     const IcebergPathResolver path_resolver;
     const String common_namespace;
+    /// True when the resolver works against a table root deeper than `table_path`. Operations scoped
+    /// to `table_path` then reach outside this table, so they must refuse to run.
+    const bool table_root_was_derived;
 
     /// Invalidate cached metadata for this table under both keys we may have used to cache it
     /// (`table_path` and `table_uuid`).

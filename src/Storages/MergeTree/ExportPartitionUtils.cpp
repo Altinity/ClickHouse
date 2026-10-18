@@ -343,11 +343,11 @@ namespace ExportPartitionUtils
         if (!object_storage && !object_storage_cluster)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorage", dest_storage->getName());
 
-        IcebergMetadata * iceberg_metadata = nullptr;
+        std::shared_ptr<IcebergMetadata> iceberg_metadata;
         if (object_storage)
-            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(context));
+            iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(object_storage->getExternalMetadata(context));
         else if (object_storage_cluster)
-            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage_cluster->getExternalMetadata(context));
+            iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(object_storage_cluster->getExternalMetadata(context));
         if (!iceberg_metadata)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is a data lake but not an iceberg table", dest_storage->getName());
 

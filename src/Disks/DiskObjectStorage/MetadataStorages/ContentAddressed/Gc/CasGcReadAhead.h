@@ -30,6 +30,8 @@ namespace DB::Cas
 /// an epoch's closing seal is (it learns that only by decoding the log at that position), so it may
 /// hint ids past the seal, inside the SAME epoch, that turn out not to exist. Those are discarded
 /// rather than taken, overshooting by at most one window per epoch crossing, and counted wasted.
+/// A blob marker is not write-once: the fold hints it only after the round's cut, which is all the
+/// graduation gate needs.
 ///
 /// Memory is the CALLER's to bound: `pending` counts hinted-but-untaken slots and `window` is how
 /// many a hinting site keeps in flight. A key hinted twice is one request. Results never taken are
@@ -61,6 +63,8 @@ public:
 
     /// Hinted but not yet taken, both verbs together: what a hinting site throttles itself against.
     size_t pending() const { return reads.size() + heads.size(); }
+    /// Hinted HEADs not yet taken: the head hinting site throttles on its own count.
+    size_t pendingHeads() const { return heads.size(); }
 
     /// How many requests a hinting site should keep in flight. Zero at concurrency 1, which is what
     /// makes every `while (pending() < window())` loop hint nothing at all on the sequential setting.
