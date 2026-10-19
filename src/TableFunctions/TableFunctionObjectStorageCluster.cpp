@@ -90,6 +90,7 @@ StoragePtr TableFunctionObjectStorageCluster<Definition, Configuration, is_data_
             /* is_datalake_query*/ false,
             /* is_table_function */ true,
             /* lazy_init */ true);
+        std::static_pointer_cast<StorageObjectStorageCluster>(storage)->setClusterNameFromFunctionArgument(true);
     }
 
     storage->startup();

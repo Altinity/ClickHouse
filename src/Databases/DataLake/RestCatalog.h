@@ -67,6 +67,8 @@ public:
 
     DB::Names getTables() const override;
 
+    Namespaces getNamespaces() const override;
+
     bool existsTable(const std::string & namespace_name, const std::string & table_name) const override;
 
     void getTableMetadata(
@@ -83,12 +85,20 @@ public:
 
     std::optional<StorageType> getStorageType() const override;
 
+    String getDefaultBaseLocation() const override;
+
     DB::DatabaseDataLakeCatalogType getCatalogType() const override
     {
         return DB::DatabaseDataLakeCatalogType::ICEBERG_REST;
     }
 
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
+    bool createTable(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr metadata_content,
+        DB::CompressionMethod metadata_compression_method,
+        bool if_not_exists) const override;
 
     bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const override;
 
@@ -103,7 +113,7 @@ public:
 
     bool isTransactional() const override { return true; }
 
-    void dropTable(const String & namespace_name, const String & table_name) const override;
+    void dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const override;
 
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
 
@@ -229,11 +239,17 @@ protected:
         StopCondition stop_condition,
         ExecuteFunc func) const;
 
-    Namespaces getNamespaces(const std::string & base_namespace) const;
+    /// List the immediate child namespaces directly under `base_namespace`
+    /// (single level, not recursive). An empty base lists the root namespaces.
+    Namespaces listChildNamespaces(const std::string & base_namespace) const;
 
     Namespaces parseNamespaces(DB::ReadBuffer & buf, const std::string & base_namespace, String & next_page_token) const;
 
-    DB::Names getTables(const std::string & base_namespace, size_t limit = 0) const;
+    /// Non-recursive list of tables directly in `base_namespace` (not in sub-namespaces).
+    /// `limit` is a soft cap on the number of returned names; 0 means no limit.
+    DB::Names listTablesInNamespace(const std::string & base_namespace, size_t limit = 0) const;
+
+    DB::Names listTablesInNamespaceDirect(const std::string & namespace_name) const override;
 
     DB::Names parseTables(DB::ReadBuffer & buf, const std::string & base_namespace, size_t limit, String & next_page_token) const;
 
@@ -317,6 +333,9 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_ONELAKE;
     }
 
+    /// OneLake keeps data in Azure Data Lake Storage, whatever the catalog reports.
+    std::optional<StorageType> getStorageType() const override { return StorageType::Azure; }
+
     DB::HTTPHeaderEntries getAuthHeaders(
         const CatalogState & catalog_state,
         bool update_token,
@@ -360,6 +379,9 @@ public:
     {
         return DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE;
     }
+
+    /// BigLake keeps data in Google Cloud Storage, which is accessed through the S3 API.
+    std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
 
     DB::HTTPHeaderEntries getAuthHeaders(
         const CatalogState & catalog_state,

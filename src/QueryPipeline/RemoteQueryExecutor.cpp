@@ -773,7 +773,9 @@ void RemoteQueryExecutor::processReadTaskRequest()
 
     ProfileEvents::increment(ProfileEvents::ReadTaskRequestsReceived);
 
-    auto response = (*extension->task_iterator)(extension->replica_info->number_of_current_replica);
+    auto response = (*extension->task_iterator)(
+        extension->replica_info->number_of_current_replica,
+        connections->getServerAntalyaProtocolVersion());
     connections->sendClusterFunctionReadTaskResponse(*response);
 }
 

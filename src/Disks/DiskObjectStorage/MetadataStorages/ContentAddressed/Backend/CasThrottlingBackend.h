@@ -125,6 +125,7 @@ public:
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
     uint64_t attemptTimeoutMs() const override { return inner->attemptTimeoutMs(); }
     uint64_t attemptEnvelopeMs() const override { return inner->attemptEnvelopeMs(); }
+    size_t bulkDeleteKeyLimit() const override { return inner->bulkDeleteKeyLimit(); }
     bool refreshCredentials() override { return inner->refreshCredentials(); }
     void checkPoolPreconditions() override { inner->checkPoolPreconditions(); }
     void checkSkipAccessCheckSupport() override { inner->checkSkipAccessCheckSupport(); }

@@ -195,6 +195,8 @@ std::pair<QueryPlanPtr, bool> createLocalPlanForParallelReplicas(
     /// how constant node names are generated (using source expression instead of _CAST wrapper),
     /// leading to column name mismatches with the expected header.
     auto select_query_options = SelectQueryOptions(processed_stage);
+    /// The local replica's plan is united into the parent pipeline in this process.
+    select_query_options.is_local_plan_for_distributed_query = true;
 
     /// Positional arguments in the outer query were already resolved by the initiator.
     /// Use a context flag instead of disabling enable_positional_arguments so that

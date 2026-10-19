@@ -188,6 +188,7 @@ public:
         , with_tags(with_tags_)
         , start_after_set(start_after_.has_value() && !start_after_->empty())
         , attempt_seed(attempt_seed_)
+        , description(fmt::format("Bucket: {}, Prefix: {}", bucket_, path_prefix))
     {
         request->SetBucket(bucket_);
         request->SetPrefix(path_prefix);
@@ -207,6 +208,9 @@ public:
     }
 
 private:
+    /// Not read off `request`: the listing worker mutates and sometimes replaces it while this runs.
+    std::string describeListing() const override { return description; }
+
     bool getBatchAndCheckNext(RelativePathsWithMetadata & batch) override
     {
         ProfileEvents::increment(ProfileEvents::S3ListObjects);
@@ -272,6 +276,7 @@ private:
     const bool with_tags;
     bool start_after_set;
     const size_t attempt_seed;
+    const std::string description;
 };
 
 }
@@ -523,9 +528,10 @@ void S3ObjectStorage::listObjects(const std::string & path, RelativePathsWithMet
         auto result = outcome.GetResult();
         auto objects = result.GetContents();
 
-        if (objects.empty())
-            break;
-
+        /// A page can carry no objects while objects still remain: the scan may stop early
+        /// inside a partition and report `IsTruncated` together with a continuation token.
+        /// `IsTruncated` is the only thing that ends the listing - stopping on an empty page
+        /// would silently drop every object after it.
         for (const auto & object : objects)
             children.emplace_back(std::make_shared<RelativePathWithMetadata>(
                 object.GetKey(),
@@ -536,6 +542,12 @@ void S3ObjectStorage::listObjects(const std::string & path, RelativePathsWithMet
                     .tags = {},
                     .attributes = {},
                 }));
+
+        if (objects.empty() && outcome.GetResult().GetIsTruncated())
+            LOG_INFO(
+                LogFrequencyLimiter(log, 30),
+                "Listing returned an empty page while reporting more to come. Bucket: {}, Prefix: {}, Disk: {}",
+                uri.bucket, path, disk_name);
 
         if (max_keys)
         {
@@ -748,12 +760,15 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support DeleteObjects", getName());
         }
 
-        throw S3Exception(err.GetErrorType(), "{} (Code: {}) while removing {} objects from S3 in one request",
-                          err.GetMessage(), static_cast<size_t>(err.GetErrorType()), objects.size());
+        throw S3Exception(
+            PreformattedMessage::create("{} (Code: {}) while removing {} objects from S3 in one request",
+                err.GetMessage(), static_cast<size_t>(err.GetErrorType()), objects.size()),
+            err.GetErrorType(), err.GetExceptionName());
     }
 
     String failed_keys;
     std::optional<Aws::S3::S3Errors> first_error_type;
+    String first_error_name;
     for (const auto & err : outcome.GetResult().GetErrors())
     {
         const auto error_type = classifyDeleteObjectsErrorCode(err.GetCode());
@@ -763,10 +778,21 @@ void S3ObjectStorage::removeObjectsIfExistImpl(
             failed_keys += ", ";
         failed_keys += err.GetKey() + " (" + err.GetCode() + ": " + err.GetMessage() + ")";
         if (!first_error_type)
+        {
             first_error_type = error_type;
+            first_error_name = err.GetCode();
+        }
     }
     if (first_error_type)
-        throw S3Exception(*first_error_type, "batch removal left objects behind: [{}]", failed_keys);
+        throw S3Exception(
+            PreformattedMessage::create("batch removal left objects behind: [{}]", failed_keys), *first_error_type, first_error_name);
+}
+
+size_t S3ObjectStorage::batchDeleteKeyLimit() const
+{
+    if (const auto supported = s3_capabilities.isBatchDeleteSupported(); supported.has_value() && !*supported)
+        return 1;
+    return std::max<size_t>(1, s3_settings.get()->request_settings[S3RequestSetting::objects_chunk_size_to_delete]);
 }
 
 bool S3ObjectStorage::conditionalOpsUseGenerationTokens() const

@@ -317,21 +317,19 @@ async function getCIReportsFromPR(prUrl) {
 
   console.log(`Fetching CI reports for PR #${prNumber}...\n`);
 
-  // Fetch PR comments to find CI bot comment
+  // Report URLs are the signal — do not filter by bot login.
+  // Altinity posts via github-actions[bot] with the virtual-hosted S3 URL;
+  // older comments used clickhouse-gh[bot] and path-style S3.
   try {
-    const commentsJson = execSync(`gh api repos/Altinity/ClickHouse/issues/${prNumber}/comments --paginate --jq '.[] | select(.user.login == "clickhouse-gh[bot]") | {body, created_at}'`, {
+    const commentsJson = execSync(`gh api repos/Altinity/ClickHouse/issues/${prNumber}/comments --paginate --jq '.[] | {body, created_at}'`, {
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe']
     });
 
     const comments = commentsJson.trim().split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
     comments.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-    if (!comments || comments.length === 0) {
-      throw new Error('No CI bot comment found');
-    }
 
-    // Search through all bot comments for CI report URLs (not just the latest)
-    const reportUrlPattern = /https:\/\/s3\.amazonaws\.com\/altinity-build-artifacts\/json\.html\?[^\s)]+/g;
+    const reportUrlPattern = /https:\/\/(?:s3\.amazonaws\.com\/altinity-build-artifacts|altinity-build-artifacts\.s3\.amazonaws\.com)\/json\.html\?[^\s)]+/g;
     for (const comment of comments) {
       if (!comment.body) continue;
       const urls = comment.body.match(reportUrlPattern);
@@ -340,9 +338,9 @@ async function getCIReportsFromPR(prUrl) {
       }
     }
 
-    throw new Error('No CI report URLs found in bot comments');
+    throw new Error('No CI report URLs found in PR comments');
   } catch (error) {
-    if (error.message.includes('No CI bot comment found') || error.message.includes('No CI report URLs found')) {
+    if (error.message.includes('No CI report URLs found')) {
       throw error;
     }
     throw new Error(`Failed to fetch PR comments: ${error.message}`);
@@ -421,6 +419,7 @@ async function fetchReport(inputUrl, options = {}) {
         let totalPassed = 0;
         let totalFailed = 0;
         let totalSkipped = 0;
+        const hasJobLevelReports = allResults.some(r => !r.error && !r.isPRLevel);
 
         for (const result of allResults) {
           if (result.error) {
@@ -448,8 +447,8 @@ async function fetchReport(inputUrl, options = {}) {
             console.log(`    🔗 Report: ${result.url}`);
           }
 
-          // Skip showing individual test failures for PR-level reports to avoid duplication
-          if (failed.length > 0 && options.failedOnly && !result.isPRLevel) {
+          // Skip PR-level details only when job-level reports already list the same failures
+          if (failed.length > 0 && options.failedOnly && !(result.isPRLevel && hasJobLevelReports)) {
             for (const test of failed) {
               console.log(`      ❌ FAIL: ${test.name}`);
               if (options.showCidb && test.cidbLinks && test.cidbLinks.length > 0) {

@@ -132,6 +132,23 @@ TEST(CASContentAddressedSettings, RemovedCacheSettingsAreRejected)
     }
 }
 
+TEST(CASContentAddressedSettings, RemovedGcReadConcurrencyIsRejected)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_read_concurrency>1</cas_gc_read_concurrency>");
+    ContentAddressedSettings settings;
+    try
+    {
+        settings.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
+        FAIL() << "expected the removed setting cas_gc_read_concurrency to be rejected as unknown";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_SETTING);
+    }
+}
+
 /// `cas_part_folder_validate` paced a manifest `HEAD` that no longer exists. A config still asking
 /// for it must fail the disk open, not be quietly accepted and ignored.
 TEST(CASContentAddressedSettings, RetiredPartFolderValidateIsRejected)
@@ -176,15 +193,15 @@ TEST(CASContentAddressedSettings, InvalidBoundsDiagnosticNamesExternalConfigKeys
     expectLoadFailureWithExactMessage(
         "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shards>0</cas_gc_shards>",
         ErrorCodes::BAD_ARGUMENTS,
-        "content_addressed disk: cas_gc_interval_sec, cas_gc_shards and cas_gc_read_concurrency must be >= 1 "
+        "content_addressed disk: cas_gc_interval_sec, cas_gc_shards and cas_gc_io_concurrency must be >= 1 "
         "(got 60, 0, 16)");
-    /// The fold's read-ahead pool is refused at zero for the same reason the shard count is: a zero
-    /// would be a silently disabled subsystem rather than a configuration the pool can honour. One is
-    /// the sequential fold and is the way to turn the read-ahead off.
+    /// The GC I/O pool is refused at zero for the same reason the shard count is: a zero would be a
+    /// silently disabled subsystem rather than a configuration the pool can honour. One is the way to
+    /// run the covered GC I/O sequentially.
     expectLoadFailureWithExactMessage(
-        "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_read_concurrency>0</cas_gc_read_concurrency>",
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_io_concurrency>0</cas_gc_io_concurrency>",
         ErrorCodes::BAD_ARGUMENTS,
-        "content_addressed disk: cas_gc_interval_sec, cas_gc_shards and cas_gc_read_concurrency must be >= 1 "
+        "content_addressed disk: cas_gc_interval_sec, cas_gc_shards and cas_gc_io_concurrency must be >= 1 "
         "(got 60, 1, 0)");
 }
 

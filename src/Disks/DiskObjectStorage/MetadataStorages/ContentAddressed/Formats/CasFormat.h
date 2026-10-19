@@ -98,10 +98,6 @@ std::span<const FormatChangePoint> changePoints(FormatId id);
 /// or a descriptor followed by raw payload bytes.
 enum class TextFamily : uint8_t { Control = 1, RecordStream = 2, PayloadHybrid = 3 };
 
-/// Whether a decoder skips unknown ordinary keys or rejects them. Critical keys prefixed with `!`
-/// are rejected by all families because they signal a required extension.
-enum class KeyStrictness : uint8_t { Tolerant = 1, Strict = 2 };
-
 /// Deterministic storage policy. `Always` uses whole-object zstd and a `.zst` key suffix; `Never`
 /// remains raw; `PinnedRaw` is raw because byte adoption compares the serialized bytes.
 enum class CompressionPolicy : uint8_t { Never = 1, Always = 2, PinnedRaw = 3 };
@@ -113,7 +109,6 @@ struct FormatTraits
     FormatId id;
     std::string_view type;      /// header-line "type" value
     TextFamily family;
-    KeyStrictness strictness;
     CompressionPolicy compression;
     uint64_t object_cap;        /// max DECOMPRESSED object bytes; 0 = uncapped (streamed)
     uint64_t line_cap;          /// max bytes of one text line
