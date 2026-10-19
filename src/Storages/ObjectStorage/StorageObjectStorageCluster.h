@@ -218,6 +218,14 @@ private:
 
     /// non-clustered storage to fall back on pure realisation if needed
     std::shared_ptr<StorageObjectStorage> pure_storage;
+
+    /// Resolve the hive partitioning deferred in `pure_storage` and take its virtual columns.
+    void resolveHivePartitioningSamplePathIfDeferred(const ContextPtr & query_context);
+
+    /// Set only in the constructor when hive partitioning detection is deferred to the first use.
+    bool hive_partitioning_sample_path_deferred = false;
+    std::mutex hive_partitioning_resolution_mutex;
+    bool hive_partitioning_sample_path_resolved TSA_GUARDED_BY(hive_partitioning_resolution_mutex) = false;
 };
 
 }

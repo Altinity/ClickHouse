@@ -428,6 +428,10 @@ std::optional<std::pair<DB::ObjectStoragePtr, std::string>> tryResolveObjectStor
 
     auto ensure_local_path_inside_user_files = [&](const std::string & local_path)
     {
+        /// `clickhouse-local` has no `user_files` restriction.
+        if (context->getApplicationType() != DB::Context::ApplicationType::SERVER)
+            return;
+
         const auto target_path = std::filesystem::path(local_path).lexically_normal();
         const auto user_files_path = std::filesystem::path(context->getUserFilesPath()).lexically_normal();
 

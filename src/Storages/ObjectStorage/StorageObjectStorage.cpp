@@ -373,14 +373,14 @@ configuration->update(object_storage, query_context);
     return configuration->getExternalMetadata();
 }
 
-void StorageObjectStorage::resolveHivePartitioningSamplePathIfDeferred(const ContextPtr & query_context)
+bool StorageObjectStorage::resolveHivePartitioningSamplePathIfDeferred(const ContextPtr & query_context)
 {
     if (!hive_partitioning_sample_path_deferred)
-        return;
+        return true;
 
     std::lock_guard lock(hive_partitioning_resolution_mutex);
     if (hive_partitioning_sample_path_resolved)
-        return;
+        return true;
 
     /// Listing the storage happens on behalf of the triggering query, so it must use its context.
     /// Rebuilding the client with any other one would ignore that session's credential restriction.
@@ -410,7 +410,7 @@ void StorageObjectStorage::resolveHivePartitioningSamplePathIfDeferred(const Con
             "Failed to list object storage, cannot use hive partitioning. "
             "Error: {}",
             getCurrentExceptionMessage(true));
-        return;
+        return false;
     }
 
     auto current_metadata = getInMemoryMetadataPtr();
@@ -439,6 +439,7 @@ void StorageObjectStorage::resolveHivePartitioningSamplePathIfDeferred(const Con
     setInMemoryMetadata(new_metadata);
 
     hive_partitioning_sample_path_resolved = true;
+    return true;
 }
 
 void StorageObjectStorage::updateExternalDynamicMetadataIfExists(ContextPtr query_context)

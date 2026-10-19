@@ -1039,7 +1039,7 @@ void FunctionSecretArgumentsFinder::findTableEngineSecretArguments()
     {
         findURLSecretArguments();
     }
-    else if (engine_name == "AzureBlobStorage" || engine_name == "AzureQueue")
+    else if (engine_name == "AzureBlobStorage" || engine_name == "AzureQueue" || engine_name == "IcebergAzure")
     {
         findAzureBlobStorageTableEngineSecretArguments();
     }

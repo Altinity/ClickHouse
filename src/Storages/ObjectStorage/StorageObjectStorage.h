@@ -186,12 +186,15 @@ public:
 
     void checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const override;
 
+    /// Resolve the deferred hive partitioning sample path. Requires listing the object storage.
+    /// Returns false if the resolution is still pending after a failure.
+    bool resolveHivePartitioningSamplePathIfDeferred(const ContextPtr & query_context);
+
+    const NamesAndTypesList & getHivePartitionColumnsToReadFromFilePath() const { return hive_partition_columns_to_read_from_file_path; }
+
 protected:
     /// Get path sample for hive partitioning implementation.
     String getPathSample(ContextPtr context);
-
-    /// Resolve the deferred hive partitioning sample path. Requires listing the object storage.
-    void resolveHivePartitioningSamplePathIfDeferred(const ContextPtr & query_context);
 
     VirtualColumnsDescription createVirtualColumns(ColumnsDescription & columns, const std::string & sample_path, const ContextPtr & context) const;
 
