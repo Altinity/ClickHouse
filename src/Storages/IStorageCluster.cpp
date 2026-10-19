@@ -206,6 +206,12 @@ public:
     {
         auto node_type = node->getNodeType();
 
+        /// `SELECT 1 FROM dim` names a table and projects no column. Column collection misses it.
+        if (collect_columns_from_other_sources
+            && node != source
+            && (node_type == QueryTreeNodeType::TABLE || node_type == QueryTreeNodeType::TABLE_FUNCTION))
+            has_foreign_table = true;
+
         if (node_type != QueryTreeNodeType::COLUMN)
             return;
 
@@ -226,43 +232,14 @@ public:
     }
 
     const NamesAndTypes & getColumns() const { return columns; }
+    bool hasForeignTable() const { return has_foreign_table; }
 
 private:
     std::unordered_set<std::string> names;
     QueryTreeNodePtr source;
     NamesAndTypes columns;
     bool collect_columns_from_other_sources;
-};
-
-/// A subquery can name a table and project no column from it (`SELECT 1 FROM dim`).
-/// Column collection misses that, and the subquery is then sent to workers that cannot resolve `dim`.
-class CollectForeignTableExpressionsVisitor : public InDepthQueryTreeVisitorWithContext<CollectForeignTableExpressionsVisitor>
-{
-public:
-    using Base = InDepthQueryTreeVisitorWithContext<CollectForeignTableExpressionsVisitor>;
-    using Base::Base;
-
-    explicit CollectForeignTableExpressionsVisitor(QueryTreeNodePtr left_table_, ContextPtr context)
-        : Base(context)
-        , left_table(std::move(left_table_))
-    {
-    }
-
-    void enterImpl(QueryTreeNodePtr & node)
-    {
-        const auto node_type = node->getNodeType();
-        if (node_type != QueryTreeNodeType::TABLE && node_type != QueryTreeNodeType::TABLE_FUNCTION)
-            return;
-
-        if (node.get() != left_table.get())
-            found = true;
-    }
-
-    bool hasForeignTable() const { return found; }
-
-private:
-    QueryTreeNodePtr left_table;
-    bool found = false;
+    bool has_foreign_table = false;
 };
 
 bool astContainsSubquery(const ASTPtr & node)
@@ -359,44 +336,33 @@ void rewriteASTInFunctionsToGlobalIn(ASTPtr & node)
     }
 }
 
-bool selectHasRightOrFullJoin(const ASTSelectQuery & select_query)
-{
-    const auto tables = select_query.tables();
-    if (!tables)
-        return false;
-
-    for (const auto & child : tables->children)
-    {
-        const auto & tables_element = child->as<ASTTablesInSelectQueryElement &>();
-        if (!tables_element.table_join)
-            continue;
-
-        const auto & table_join = tables_element.table_join->as<ASTTableJoin &>();
-        if (isRightOrFull(table_join.kind))
-            return true;
-    }
-    return false;
-}
-
 bool queryHasRightOrFullJoin(const ASTPtr & query)
 {
     if (!query)
         return false;
 
     if (const auto * select_query = query->as<ASTSelectQuery>())
-        return selectHasRightOrFullJoin(*select_query);
-
-    if (const auto * union_query = query->as<ASTSelectWithUnionQuery>())
     {
-        if (!union_query->list_of_selects)
+        const auto tables = select_query->tables();
+        if (!tables)
             return false;
 
-        for (const auto & child : union_query->list_of_selects->children)
+        for (const auto & child : tables->children)
         {
-            if (queryHasRightOrFullJoin(child))
+            const auto & element = child->as<ASTTablesInSelectQueryElement &>();
+            if (element.table_join && isRightOrFull(element.table_join->as<ASTTableJoin &>().kind))
                 return true;
         }
+        return false;
     }
+
+    const auto * union_query = query->as<ASTSelectWithUnionQuery>();
+    if (!union_query || !union_query->list_of_selects)
+        return false;
+
+    for (const auto & child : union_query->list_of_selects->children)
+        if (queryHasRightOrFullJoin(child))
+            return true;
     return false;
 }
 
@@ -416,11 +382,8 @@ void rewriteASTJoinsToGlobal(ASTPtr & query)
         return;
     }
 
-    /// `RIGHT` and `FULL` preserve rows from the broadcast side. Running them on every worker
-    /// emits those rows once per worker. They stay on the initiator, as they do with the analyzer.
-    /// A preserved-side join also keeps the rest of the join tree there: an earlier `INNER`/`LEFT`
-    /// cannot be shipped on its own once a later `RIGHT`/`FULL` must see the full left stream.
-    if (selectHasRightOrFullJoin(*select_query))
+    /// `RIGHT`/`FULL` preserve broadcast rows, so the whole join stays on the initiator.
+    if (queryHasRightOrFullJoin(query))
         return;
 
     if (auto tables = select_query->tables())
@@ -490,8 +453,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     }
     case ObjectStorageClusterJoinMode::GLOBAL:
     {
-        /// Old analyzer. `RIGHT`/`FULL` were left local by `rewriteASTJoinsToGlobal`. Ship only the
-        /// left scan; the initiator runs the join. `INNER`/`LEFT`/`CROSS` stay in `query_to_send`.
+        /// Old analyzer: ship the left scan only. `INNER`/`LEFT`/`CROSS` stay in `query_to_send`.
         if (!query_info.query_tree)
         {
             if (queryHasRightOrFullJoin(query_to_send))
@@ -635,11 +597,8 @@ void IStorageCluster::readFromRemoteInitiator(
     ClusterPtr remote_initiator_cluster,
     const String & remote_initiator_cluster_name)
 {
-    /// `allow`/`local` (and initiator-local `RIGHT`/`FULL`) rewrite only `query_to_send`.
-    /// Clone that AST before `convertToRemote` wraps its table function in `remote()`.
-    /// `StorageDistributed::read` must analyze the stripped query. The original `query_info`
-    /// still contains the JOIN, and replacing only the left table there sends the right table
-    /// to a host that does not have it.
+    /// Clone the stripped query before `convertToRemote` wraps it. `StorageDistributed` must not
+    /// analyze the original `query_info`, which still contains the JOIN.
     const bool query_was_rewritten = query_to_send.get() != query_info.query.get();
     ASTPtr query_for_remote = query_was_rewritten ? query_to_send->clone() : ASTPtr{};
     if (query_for_remote)
@@ -653,7 +612,6 @@ void IStorageCluster::readFromRemoteInitiator(
     if (query_for_remote)
     {
         modified_query_info.query = query_for_remote;
-        /// The syntax result describes the original JOIN. Shard pruning must not reuse it.
         modified_query_info.syntax_analyzer_result.reset();
 
         if (storage_and_context.context->getSettingsRef()[Setting::allow_experimental_analyzer])
@@ -672,9 +630,7 @@ void IStorageCluster::readFromRemoteInitiator(
             modified_query_info.table_expression = extractLeftTableExpression(query_node->getJoinTreeNodeTyped());
         }
         else
-        {
             modified_query_info.query_tree.reset();
-        }
     }
 
     auto new_storage_snapshot = storage_and_context.storage->getStorageSnapshot(storage_snapshot->metadata, storage_and_context.context);
@@ -1038,18 +994,9 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
         if (query_node.hasWhere())
             collector_where.visit(query_node.getWhere());
 
-        // SELECT x FROM datalake.table WHERE x IN local.table.
-        // Need to modify 'WHERE' on remote node if it contains columns from other sources
-        // because remote node might not have those sources.
-        // `SELECT 1 FROM initiator_only_dim` has a table and no column from it, so also look at
-        // table expressions.
-        CollectForeignTableExpressionsVisitor foreign_tables(left_table_expression, context);
-        if (query_node.hasPrewhere())
-            foreign_tables.visit(query_node.getPrewhere());
-        if (query_node.hasWhere())
-            foreign_tables.visit(query_node.getWhere());
-
-        if (!collector_where.getColumns().empty() || foreign_tables.hasForeignTable())
+        // `WHERE` must be rewritten on the remote if it uses another table, including
+        // `WHERE x IN (SELECT 1 FROM local_table)`, which has no column from that table.
+        if (!collector_where.getColumns().empty() || collector_where.hasForeignTable())
             info.has_local_columns_in_where = true;
     }
 
@@ -1120,32 +1067,30 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         CollectUsedColumnsForSourceVisitor collector(left_table_expression, context);
         collector.visit(modified_query_tree);
 
-        /// A left-only predicate applied before a `RIGHT` or `FULL` join changes which right rows are
-        /// unmatched. The initiator still has the original predicate, so the shard scan must not.
-        const bool preserves_right_side = queryHasRightOrFullJoin(query_to_send);
-        if (!preserves_right_side)
+        /// A left-only predicate under `RIGHT`/`FULL` changes which right rows are unmatched.
+        if (queryHasRightOrFullJoin(query_to_send))
         {
-            if (query_node.getPrewhere())
-                removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getPrewhere(), left_table_expression, context);
-            if (query_node.getWhere())
-                removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getWhere(), left_table_expression, context);
-
-            /// The wrap predicate runs on remote nodes. Drop conjuncts such as `dictGet` and `hostName`
-            /// that must stay on the initiator.
-            if (query_node.getPrewhere())
-                removeExpressionsThatAreUnsafeToDuplicate(query_node.getPrewhere(), context);
-            if (query_node.getWhere())
-                removeExpressionsThatAreUnsafeToDuplicate(query_node.getWhere(), context);
+            query_node.getPrewhere() = {};
+            query_node.getWhere() = {};
         }
+
+        if (query_node.getPrewhere())
+            removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getPrewhere(), left_table_expression, context);
+        if (query_node.getWhere())
+            removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getWhere(), left_table_expression, context);
+
+        /// The wrap predicate runs on remote nodes. Drop conjuncts such as `dictGet` and `hostName`
+        /// that must stay on the initiator.
+        if (query_node.getPrewhere())
+            removeExpressionsThatAreUnsafeToDuplicate(query_node.getPrewhere(), context);
+        if (query_node.getWhere())
+            removeExpressionsThatAreUnsafeToDuplicate(query_node.getWhere(), context);
 
         auto rewritten_query_tree = buildQueryToReadColumnsFromTableExpression(
             collector.getColumns(), left_table_expression, context);
         auto & rewritten_query_node = rewritten_query_tree->as<QueryNode &>();
-        if (!preserves_right_side)
-        {
-            rewritten_query_node.getPrewhere() = query_node.getPrewhere();
-            rewritten_query_node.getWhere() = query_node.getWhere();
-        }
+        rewritten_query_node.getPrewhere() = query_node.getPrewhere();
+        rewritten_query_node.getWhere() = query_node.getWhere();
 
         query_to_send = queryNodeToDistributedSelectQuery(rewritten_query_tree);
         return;
@@ -1172,9 +1117,8 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Query is not analyzed: no syntax analyzer result");
 
         TreeRewriterResult rewriter_result = *query_info.syntax_analyzer_result;
-        /// `removeJoin` drops the join, so the kind has to be read first. A left-only `WHERE` kept
-        /// below a `RIGHT` or `FULL` join changes which right rows are unmatched.
-        const bool preserves_right_side = selectHasRightOrFullJoin(*select_query);
+        /// Read the kind before `removeJoin` drops it. Left-only `WHERE` under `RIGHT`/`FULL` changes unmatched rows.
+        const bool preserves_right_side = queryHasRightOrFullJoin(query_to_send);
         if (!removeJoin(*select_query, rewriter_result, context))
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to strip JOIN from query sent to cluster nodes");
 
@@ -1217,8 +1161,7 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         select_query->setExpression(ASTSelectQuery::Expression::WHERE, {});
         select_query->setExpression(ASTSelectQuery::Expression::GROUP_BY, {});
         select_query->group_by_all = false;
-        /// Same flags `removeJoin` clears. A leftover `WITH TOTALS`/`ROLLUP`/`CUBE`/`GROUPING SETS`
-        /// with no `GROUP BY` makes the re-analyzed shard query fail.
+        /// `removeJoin` clears these. A leftover modifier with no `GROUP BY` rejects the shard query.
         select_query->group_by_with_totals = false;
         select_query->group_by_with_rollup = false;
         select_query->group_by_with_cube = false;
@@ -1244,8 +1187,7 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
 {
     auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
     const auto join_info = getQueryJoinInfo(query_info, context);
-    /// `global` ships `INNER`/`LEFT`/`CROSS`. `RIGHT`/`FULL` preserve broadcast rows, so even in
-    /// `global` the initiator fetches left columns and joins locally.
+    /// `global` still fetches columns for `RIGHT`/`FULL`: those joins stay on the initiator.
     const bool keep_join_on_initiator = object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
         || queryHasRightOrFullJoin(query_info.query);
 
