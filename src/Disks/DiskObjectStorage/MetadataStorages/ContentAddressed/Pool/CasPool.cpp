@@ -769,9 +769,9 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             if (policy == MountClaimPolicy::NoWait)
             {
                 /// No FORCE variant, no wait-and-observe: the decommission gate treats any live-looking
-                /// or foreign-owner lease as an immediate refusal. A raced write that observed nobody
-                /// has no holder to describe, and the lease this server merely proposed is not one --
-                /// naming it would send an operator after this very process.
+                /// or foreign-owner lease as an immediate refusal, and names the terminal states it
+                /// accepts, because `expired` in system.cas_mounts is wall-clock arithmetic this claim
+                /// never trusts. A raced write that observed nobody has no holder to describe.
                 const String holder = claim.body
                     ? fmt::format("mount lease held by uuid={} epoch={} pid={} hostname={} (expires_at_ms={})",
                                   u128ToHex(claim.body->server_uuid), claim.body->writer_epoch,
@@ -779,9 +779,17 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                     : String("the conditional write that lost the mount slot observed nothing at the key, "
                              "so the holder is unknown to this server");
                 throw Exception(ErrorCodes::ABORTED,
-                    "CAS decommission '{}': pool member is alive or contended — {}. Refusing (no FORCE "
-                    "variant exists; stop the server or wait for its lease to lapse).",
-                    srid, holder);
+                    "CAS decommission '{}': pool member is alive or contended — {}. Refusing; there is no FORCE "
+                    "variant. A member can be removed only once its mount slot is terminal in system.cas_mounts "
+                    "(server_root_id = '{}'): state = 'terminated' (the server stopped cleanly) or state = 'fenced' "
+                    "(GC fenced its lease). A hard-killed member shows state = 'expired' first and is not removable "
+                    "yet. The disk's GC leader fences it at the start of a GC round, once it has seen the lease unchanged "
+                    "for about one cas_mount_lease_ttl_ms plus one cas_mount_renew_period_ms, so the wait can be one "
+                    "GC round longer. SYSTEM CAS GC RUN on the leader (is_leader = 1 in system.cas_mounts) can "
+                    "trigger the fence, but the run that fences must come at least that long after the first run "
+                    "that saw the lease. "
+                    "Then rerun this command.",
+                    srid, holder, srid);
             }
             /// LiveDoubleStart (waited out the bound → a live twin) or ForeignOwner → fail closed
             /// with the actionable, multi-line startup error.

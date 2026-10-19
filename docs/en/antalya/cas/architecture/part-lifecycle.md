@@ -109,7 +109,7 @@ something recoverable; no row loses data or leaves a dangling reference.
 
 | # | Crash window | Left behind | Who cleans it |
 |---|---|---|---|
-| C1 | During staging | Local temp files, or S3 staging objects | Local: unconditional cleanup plus buffer destructor. S3: the mount's own staging sweep at next mount — never deleted on abort |
+| C1 | During staging | Local temp files, or S3 staging objects | Local: unconditional cleanup plus buffer destructor. S3: the transaction deletes it on commit or abort (best-effort); after a crash, the next mount of the same `server_root_id` sweeps it, or `SYSTEM CAS DROP POOL MEMBER` drains it |
 | C2 | After `stageManifest`, before `precommitAdd` | An unreferenced manifest body | Writer's best-effort exact-token delete; durable backstop is the orphan-manifest sweep |
 | C3 | `precommitAdd` returned Unresolved | A possibly-live precommit binding | Intent recorded pre-append; `abandon` appends the exact removal, tolerating absence. The body is never writer-deleted |
 | C4 | Between `precommitAdd` and `promote` | A live precommit plus uploaded blobs | No resume path exists. Removed by `abandon`, else by a fenced successor's stale-precommit sweep |
