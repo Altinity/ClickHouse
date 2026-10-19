@@ -14,8 +14,8 @@ upstream ClickHouse cannot reach, defined in `src/Core/AntalyaProtocol.h`. Both 
 the name string of their `Hello`, on every connection:
 
 ```text
-client -> server   "ClickHouse client (antalya:2)"
-server -> client   "ClickHouse (antalya:2)"
+client -> server   "ClickHouse client (antalya:3)"
+server -> client   "ClickHouse (antalya:3)"
 ```
 
 Each side parses the peer's suffix, caps the value with `min(own, peer)` and keeps the result. `0`
@@ -30,6 +30,14 @@ outside the table location, including files on another object storage. For a wor
 the initiator strips the scheme and authority as before, and refuses to dispatch a data file that
 needs another storage or whose delete-file keys differ from the resolved keys.
 
+Version 3 appends two optional fields to `ReadTaskResponse`, after the upstream cluster-processing
+payload (including `read_source_index` when that cluster-protocol version writes it). The first is
+Iceberg column statistics (`DataFileMetaInfo`). The second is `retry_after_us`, sent when
+`lock_object_storage_task_distribution_ms` asks a worker to wait before taking another node's file.
+If any worker negotiated a lower version, the initiator ignores that setting for the query and
+assigns files immediately, so every task path stays an object key. On `antalya-26.6` these two
+fields used version 2; here version 2 is the absolute-path layout, so the fields are version 3.
+
 ## Adding an Antalya-only wire change {#adding-a-wire-change}
 
 - Bump `DBMS_ANTALYA_PROTOCOL_VERSION` by one and gate the change on the negotiated value.
@@ -37,7 +45,7 @@ needs another storage or whose delete-file keys differ from the resolved keys.
   `DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION` for a feature upstream does not have.
 - Keep the counter cumulative. A backport takes the whole contiguous range up to the value it needs,
   or does not bump at all - the `min(own, server)` cap is only sound for a cumulative feature set.
-- Update this page, and update `docs/en/interfaces/specs/NativeProtocol.md` when the change alters
+- Update this page, and update `docs/reference/interfaces/specs/NativeProtocol.mdx` when the change alters
   a packet layout described there.
 
 ## Why a counter of our own {#why-a-counter-of-our-own}
