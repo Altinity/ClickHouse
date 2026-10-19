@@ -309,6 +309,47 @@ void rewriteASTInFunctionsToGlobalIn(ASTPtr & node)
     }
 }
 
+bool selectHasRightOrFullJoin(const ASTSelectQuery & select_query)
+{
+    const auto tables = select_query.tables();
+    if (!tables)
+        return false;
+
+    for (const auto & child : tables->children)
+    {
+        const auto & tables_element = child->as<ASTTablesInSelectQueryElement &>();
+        if (!tables_element.table_join)
+            continue;
+
+        const auto & table_join = tables_element.table_join->as<ASTTableJoin &>();
+        if (isRightOrFull(table_join.kind))
+            return true;
+    }
+    return false;
+}
+
+bool queryHasRightOrFullJoin(const ASTPtr & query)
+{
+    if (!query)
+        return false;
+
+    if (const auto * select_query = query->as<ASTSelectQuery>())
+        return selectHasRightOrFullJoin(*select_query);
+
+    if (const auto * union_query = query->as<ASTSelectWithUnionQuery>())
+    {
+        if (!union_query->list_of_selects)
+            return false;
+
+        for (const auto & child : union_query->list_of_selects->children)
+        {
+            if (queryHasRightOrFullJoin(child))
+                return true;
+        }
+    }
+    return false;
+}
+
 void rewriteASTJoinsToGlobal(ASTPtr & query)
 {
     ASTSelectQuery * select_query = query->as<ASTSelectQuery>();
@@ -324,6 +365,13 @@ void rewriteASTJoinsToGlobal(ASTPtr & query)
         }
         return;
     }
+
+    /// `RIGHT` and `FULL` preserve rows from the broadcast side. Running them on every worker
+    /// emits those rows once per worker. They stay on the initiator, as they do with the analyzer.
+    /// A preserved-side join also keeps the rest of the join tree there: an earlier `INNER`/`LEFT`
+    /// cannot be shipped on its own once a later `RIGHT`/`FULL` must see the full left stream.
+    if (selectHasRightOrFullJoin(*select_query))
+        return;
 
     if (auto tables = select_query->tables())
     {
@@ -392,8 +440,17 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     }
     case ObjectStorageClusterJoinMode::GLOBAL:
     {
+        /// Old analyzer. `RIGHT`/`FULL` were left local by `rewriteASTJoinsToGlobal`. Ship only the
+        /// left scan; the initiator runs the join. `INNER`/`LEFT`/`CROSS` stay in `query_to_send`.
         if (!query_info.query_tree)
+        {
+            if (queryHasRightOrFullJoin(query_to_send))
+            {
+                auto info = getQueryJoinInfoFromAST(query_to_send);
+                rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context);
+            }
             return;
+        }
 
         auto info = getQueryTreeInfo(query_info.query_tree, context);
 
@@ -1080,9 +1137,13 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr &, SelectQueryInfo & query_info) const
 {
     auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
+    const auto join_info = getQueryJoinInfo(query_info, context);
+    /// `global` ships `INNER`/`LEFT`/`CROSS`. `RIGHT`/`FULL` preserve broadcast rows, so even in
+    /// `global` the initiator fetches left columns and joins locally.
+    const bool keep_join_on_initiator = object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
+        || queryHasRightOrFullJoin(query_info.query);
 
-    if (object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
-        && needsInitiatorLocalJoin(getQueryJoinInfo(query_info, context)))
+    if (keep_join_on_initiator && needsInitiatorLocalJoin(join_info))
     {
         return QueryProcessingStage::Enum::FetchColumns;
     }
