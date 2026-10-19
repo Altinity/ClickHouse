@@ -107,6 +107,7 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString google_adc_quota_project_id;
     extern const DatabaseDataLakeSettingsString google_adc_credentials_file;
     extern const DatabaseDataLakeSettingsBool force_add_bucket;
+    extern const DatabaseDataLakeSettingsBool flat_namespaces;
 }
 
 namespace Setting
@@ -295,6 +296,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 settings[DatabaseDataLakeSetting::namespaces].value,
+                settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -311,6 +313,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 settings[DatabaseDataLakeSetting::namespaces].value,
+                settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -328,6 +331,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 settings[DatabaseDataLakeSetting::namespaces].value,
+                settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -350,6 +354,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 settings[DatabaseDataLakeSetting::namespaces].value,
+                settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -985,7 +990,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     const auto is_secondary_query = context_->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
 
     /// When we applied static credentials from database settings, they are authoritative:
-    /// do not let a catalog-vended refresh callback (e.g. Unity/REST `requestReadCredentials`)
+    /// do not let a catalog-vended refresh callback (e.g. Unity/REST `requestCredentials`)
     /// silently re-fetch credentials and override them. The same holds when the user disabled
     /// `vended_credentials` and no static credentials were applied (e.g. relying on default or
     /// environment S3 auth): the object storage layer invokes the refresh callback after an

@@ -51,7 +51,7 @@ public:
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method rescheduleTasksFromReplica is not implemented");
     }
-    virtual ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica) const = 0;
+    virtual ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica, UInt64 /*antalya_protocol_version*/) const = 0;
 };
 
 /// This class allows one to launch queries on remote replicas of one shard and get results
@@ -144,6 +144,9 @@ public:
     ///                     and it should pass INITIAL_QUERY.
     void sendQuery(ClientInfo::QueryKind query_kind = ClientInfo::QueryKind::SECONDARY_QUERY, AsyncCallback async_callback = {});
     void sendQueryUnlocked(ClientInfo::QueryKind query_kind = ClientInfo::QueryKind::SECONDARY_QUERY, AsyncCallback async_callback = {}) TSA_REQUIRES(was_cancelled_mutex);
+
+    /// Stage used when a remote replica is too old to receive the query plan and the executor sends SQL instead.
+    void setQueryPlanFallbackStage(QueryProcessingStage::Enum stage_) { query_plan_fallback_stage = stage_; }
 
     int sendQueryAsync();
 
@@ -294,6 +297,7 @@ private:
     /// Temporary tables needed to be sent to remote servers
     Tables external_tables;
     QueryProcessingStage::Enum stage;
+    QueryProcessingStage::Enum query_plan_fallback_stage = QueryProcessingStage::Complete;
 
     std::optional<Extension> extension;
     /// Initiator identifier for distributed task processing
