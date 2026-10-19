@@ -1178,6 +1178,12 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         select_query->setExpression(ASTSelectQuery::Expression::WHERE, {});
         select_query->setExpression(ASTSelectQuery::Expression::GROUP_BY, {});
         select_query->group_by_all = false;
+        /// Same flags `removeJoin` clears. A leftover `WITH TOTALS`/`ROLLUP`/`CUBE`/`GROUPING SETS`
+        /// with no `GROUP BY` makes the re-analyzed shard query fail.
+        select_query->group_by_with_totals = false;
+        select_query->group_by_with_rollup = false;
+        select_query->group_by_with_cube = false;
+        select_query->group_by_with_grouping_sets = false;
         select_query->setExpression(ASTSelectQuery::Expression::HAVING, {});
         select_query->setExpression(ASTSelectQuery::Expression::ORDER_BY, {});
         select_query->order_by_all = false;
