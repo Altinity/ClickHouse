@@ -350,6 +350,8 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.arrow.output_compression_method = settings[Setting::output_format_arrow_compression_method];
     format_settings.arrow.output_date_as_uint16 = settings[Setting::output_format_arrow_date_as_uint16];
     format_settings.arrow.output_unsupported_types_as_binary = settings[Setting::output_format_arrow_unsupported_types_as_binary];
+    format_settings.arrow.output_record_batch_rows = settings[Setting::output_format_arrow_record_batch_size];
+    format_settings.arrow.output_record_batch_bytes = settings[Setting::output_format_arrow_record_batch_size_bytes];
     format_settings.orc.allow_missing_columns = settings[Setting::input_format_orc_allow_missing_columns];
     format_settings.orc.row_batch_size = settings[Setting::input_format_orc_row_batch_size];
     format_settings.orc.skip_columns_with_unsupported_types_in_schema_inference = settings[Setting::input_format_orc_skip_columns_with_unsupported_types_in_schema_inference];
@@ -476,6 +478,17 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
         format_settings.xml.valid_output_on_exception = true;
     }
 
+    return format_settings;
+}
+
+FormatSettings getNativeWireFormatSettings(const ContextPtr & context)
+{
+    auto format_settings = getFormatSettings(context);
+    if (context->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY)
+    {
+        format_settings.native.encode_types_in_binary_format = false;
+        format_settings.native.decode_types_in_binary_format = false;
+    }
     return format_settings;
 }
 

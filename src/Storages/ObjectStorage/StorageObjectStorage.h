@@ -132,6 +132,7 @@ public:
         ContextPtr local_context,
         TableExclusiveLockHolder &) override;
 
+    void checkTableCanBeDropped(ContextPtr query_context) const override { configuration->checkCanBeDropped(query_context); }
     void drop() override;
 
     void prepareForDrop(ContextPtr query_context) override;
@@ -231,7 +232,15 @@ public:
 
     void alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & alter_lock_holder) override;
 
+    Pipe alterPartition(
+        const StorageMetadataPtr & /* metadata_snapshot */, const PartitionCommands & /* commands */, ContextPtr /* context */) override;
+
     void checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const override;
+    void checkAlterPartitionIsPossible(
+        const PartitionCommands & commands,
+        const StorageMetadataPtr & metadata_snapshot,
+        const Settings & settings,
+        ContextPtr context) const override;
 
     ObjectStoragePtr getObjectStorage() const
     {

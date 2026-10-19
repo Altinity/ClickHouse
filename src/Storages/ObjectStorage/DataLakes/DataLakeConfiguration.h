@@ -207,6 +207,21 @@ public:
         getMetadata()->checkAlterIsPossible(commands);
     }
 
+    void checkAlterPartitionIsPossible(ObjectStoragePtr object_storage, ContextPtr context, const PartitionCommands & commands) override
+    {
+        lazyInitializeIfNeeded(object_storage, context);
+        getMetadata()->checkAlterPartitionIsPossible(commands);
+    }
+
+    Pipe alterPartition(
+        const PartitionCommands & commands,
+        ContextPtr context,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        StorageID storage_id) override
+    {
+        return getMetadata()->alterPartition(commands, context, std::move(catalog), std::move(storage_id));
+    }
+
     void alter(
         ObjectStoragePtr object_storage,
         const AlterCommands & params,
@@ -350,6 +365,12 @@ public:
     ColumnMapperPtr getColumnMapperForCurrentSchema(StorageMetadataPtr storage_metadata_snapshot, ContextPtr context) const override
     {
         return getMetadata()->getColumnMapperForCurrentSchema(storage_metadata_snapshot, context);
+    }
+
+    void checkCanBeDropped(ContextPtr query_context) const override
+    {
+        if (auto metadata = tryGetMetadata())
+            metadata->checkCanBeDropped(query_context);
     }
 
     void drop(bool delete_data) override
@@ -894,6 +915,7 @@ public:
 
     bool supportsPrewhere() const override { return getImpl().supportsPrewhere(); }
 
+    void checkCanBeDropped(ContextPtr query_context) const override { getImpl().checkCanBeDropped(query_context); }
     void drop(bool delete_data) override { getImpl().drop(delete_data); }
 
 protected:

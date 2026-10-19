@@ -14,15 +14,29 @@ upstream ClickHouse cannot reach, defined in `src/Core/AntalyaProtocol.h`. Both 
 the name string of their `Hello`, on every connection:
 
 ```text
-client -> server   "ClickHouse client (antalya:1)"
-server -> client   "ClickHouse (antalya:1)"
+client -> server   "ClickHouse client (antalya:3)"
+server -> client   "ClickHouse (antalya:3)"
 ```
 
 Each side parses the peer's suffix, caps the value with `min(own, peer)` and keeps the result. `0`
 means the peer is not an Antalya build. Negotiation is per hop and not transitive: initiator to
 worker and worker to worker negotiate independently.
 
-Version 1 is the advertisement itself. Nothing is gated on it yet.
+Version 1 is the advertisement itself.
+
+Version 2 lets the `*Cluster` read-task payload (the `ReadTaskResponse` body) carry the Iceberg
+delete-file paths as absolute URIs, as the manifest spells them, so that a worker can read files
+outside the table location, including files on another object storage. For a worker below version 2
+the initiator strips the scheme and authority as before, and refuses to dispatch a data file that
+needs another storage or whose delete-file keys differ from the resolved keys.
+
+Version 3 appends two optional fields to `ReadTaskResponse`, after the upstream cluster-processing
+payload (including `read_source_index` when that cluster-protocol version writes it). The first is
+Iceberg column statistics (`DataFileMetaInfo`). The second is `retry_after_us`, sent when
+`lock_object_storage_task_distribution_ms` asks a worker to wait before taking another node's file.
+If any worker negotiated a lower version, the initiator ignores that setting for the query and
+assigns files immediately, so every task path stays an object key. On `antalya-26.6` these two
+fields used version 2; here version 2 is the absolute-path layout, so the fields are version 3.
 
 ## Adding an Antalya-only wire change {#adding-a-wire-change}
 
@@ -31,7 +45,7 @@ Version 1 is the advertisement itself. Nothing is gated on it yet.
   `DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION` for a feature upstream does not have.
 - Keep the counter cumulative. A backport takes the whole contiguous range up to the value it needs,
   or does not bump at all - the `min(own, server)` cap is only sound for a cumulative feature set.
-- Update this page, and update `docs/en/interfaces/specs/NativeProtocol.md` when the change alters
+- Update this page, and update `docs/reference/interfaces/specs/NativeProtocol.mdx` when the change alters
   a packet layout described there.
 
 ## Why a counter of our own {#why-a-counter-of-our-own}
