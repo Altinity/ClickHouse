@@ -234,6 +234,37 @@ private:
     bool collect_columns_from_other_sources;
 };
 
+/// A subquery can name a table and project no column from it (`SELECT 1 FROM dim`).
+/// Column collection misses that, and the subquery is then sent to workers that cannot resolve `dim`.
+class CollectForeignTableExpressionsVisitor : public InDepthQueryTreeVisitorWithContext<CollectForeignTableExpressionsVisitor>
+{
+public:
+    using Base = InDepthQueryTreeVisitorWithContext<CollectForeignTableExpressionsVisitor>;
+    using Base::Base;
+
+    explicit CollectForeignTableExpressionsVisitor(QueryTreeNodePtr left_table_, ContextPtr context)
+        : Base(context)
+        , left_table(std::move(left_table_))
+    {
+    }
+
+    void enterImpl(QueryTreeNodePtr & node)
+    {
+        const auto node_type = node->getNodeType();
+        if (node_type != QueryTreeNodeType::TABLE && node_type != QueryTreeNodeType::TABLE_FUNCTION)
+            return;
+
+        if (node.get() != left_table.get())
+            found = true;
+    }
+
+    bool hasForeignTable() const { return found; }
+
+private:
+    QueryTreeNodePtr left_table;
+    bool found = false;
+};
+
 bool astContainsSubquery(const ASTPtr & node)
 {
     if (!node)
@@ -1010,7 +1041,15 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
         // SELECT x FROM datalake.table WHERE x IN local.table.
         // Need to modify 'WHERE' on remote node if it contains columns from other sources
         // because remote node might not have those sources.
-        if (!collector_where.getColumns().empty())
+        // `SELECT 1 FROM initiator_only_dim` has a table and no column from it, so also look at
+        // table expressions.
+        CollectForeignTableExpressionsVisitor foreign_tables(left_table_expression, context);
+        if (query_node.hasPrewhere())
+            foreign_tables.visit(query_node.getPrewhere());
+        if (query_node.hasWhere())
+            foreign_tables.visit(query_node.getWhere());
+
+        if (!collector_where.getColumns().empty() || foreign_tables.hasForeignTable())
             info.has_local_columns_in_where = true;
     }
 
