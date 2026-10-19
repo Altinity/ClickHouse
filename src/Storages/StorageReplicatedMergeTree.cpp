@@ -80,12 +80,13 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Storages/PartitionCommands.h>
+#include <Storages/StorageProxy.h>
 #include <Storages/StorageReplicatedMergeTree.h>
-#include <Storages/System/StorageSystemReplicatedPartitionExports.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeSinkPatch.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsLock.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
+#include <Storages/MergeTree/ExportPartitionKey.h>
 #include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Interpreters/ActionsDAG.h>
 
@@ -3297,7 +3298,8 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
 
     auto clone_data_parts_from_source_table = [&] () -> size_t
     {
-        source_table = DatabaseCatalog::instance().tryGetTable(source_table_id, getContext());
+        /// Leaving this proxied would make the checks below read the source as not replicated.
+        source_table = resolveStorageProxyLoading(DatabaseCatalog::instance().tryGetTable(source_table_id, getContext()));
         if (!source_table)
         {
             LOG_DEBUG(log, "Can't use {} as source table for REPLACE PARTITION command. It does not exist.", source_table_id.getNameForLogs());
@@ -3429,7 +3431,7 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
         /// However, it's quite dangerous, because part may appear in source table.
         /// So we enqueue it for check only if no replicas of source table have part either.
         bool need_check = true;
-        if (auto * replicated_src_table = typeid_cast<StorageReplicatedMergeTree *>(source_table.get()))
+        if (auto * replicated_src_table = castStorage<StorageReplicatedMergeTree>(source_table, DeferredTable::Load).get())
         {
             String src_replica = replicated_src_table->findReplicaHavingPart(part_desc->src_part_name, false);
             if (!src_replica.empty())
@@ -3493,7 +3495,7 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
                 throw Exception(ErrorCodes::UNFINISHED, "Checksums of {} is suddenly changed", part_desc->src_table_part->name);
 
             /// Don't do hardlinks in case of zero-copy at any side (defensive programming)
-            bool source_zero_copy_enabled = (*dynamic_cast<const MergeTreeData *>(source_table.get())->getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
+            bool source_zero_copy_enabled = (*castStorage<MergeTreeData>(source_table, DeferredTable::Load)->getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
             bool our_zero_copy_enabled = (*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
 
             IDataPartStorage::ClonePartParams clone_params
@@ -4871,7 +4873,7 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
     }
 }
 
-std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
+std::vector<PartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
 {
     return export_merge_tree_partition_manifest_updater->getPartitionExportsInfo();
 }
@@ -6313,7 +6315,10 @@ void StorageReplicatedMergeTree::shutdown(bool)
     if (refresh_parts_task)
         refresh_parts_task->deactivate();
     if (refresh_stats_task)
+    {
+        refresh_stats_cancelled = true;
         refresh_stats_task->deactivate();
+    }
 
     flushAndPrepareForShutdown();
 
@@ -8728,7 +8733,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     
     const auto exports_path = fs::path(zookeeper_path) / "exports";
 
-    const auto export_key = partition_id + "_" + dest_storage_id.getQualifiedName().getFullName();
+    const auto export_key = ExportPartitionUtils::compositeKey(
+        partition_id, dest_storage_id.getDatabaseName(), dest_storage_id.getTableName());
 
     const auto partition_exports_path = fs::path(exports_path) / export_key;
 
@@ -8846,50 +8852,16 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     if (dest_storage->isDataLake())
     {
 #if USE_AVRO
-        auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
-        auto * object_storage_cluster = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
-
-        /// in theory this should never happen, but just in case
-        if (!object_storage && !object_storage_cluster)
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorage", dest_storage->getName());
-        }
-
-        std::shared_ptr<IcebergMetadata> iceberg_metadata;
-        if (object_storage)
-            iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(object_storage->getExternalMetadata(query_context));
-        else if (object_storage_cluster)
-            iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(object_storage_cluster->getExternalMetadata(query_context));
-        if (!iceberg_metadata)
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is a data lake but not an iceberg table", dest_storage->getName());
-        }
-
-        if (!query_context->getSettingsRef()[Setting::allow_insert_into_iceberg])
-        {
-            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-                "Iceberg writes are experimental. "
-                "To allow its usage, enable the setting `allow_insert_into_iceberg` on the initiator (query, session or profile) - replicas inherit it from the scheduled task.");
-        }
-
-        const auto metadata_object = iceberg_metadata->getMetadataJSON(query_context);
-
-        ExportPartitionUtils::verifyIcebergPartitionCompatibility(
-            metadata_object,
+        manifest.iceberg_metadata_json = ExportPartitionUtils::verifyAndExtractDestinationIcebergMetadataJson(
             src_snapshot,
             destination_snapshot,
+            dest_storage,
             parts,
             partition_id,
             query_context);
 
-        std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-        oss.exceptions(std::ios::failbit);
-        metadata_object->stringify(oss);
-        manifest.iceberg_metadata_json = oss.str();
-
         manifest.max_bytes_per_file = query_context->getSettingsRef()[Setting::iceberg_insert_max_bytes_in_data_file];
         manifest.max_rows_per_file = query_context->getSettingsRef()[Setting::iceberg_insert_max_rows_in_data_file];
-
 #else
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif
@@ -8897,11 +8869,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     else
     {
         ExportPartitionUtils::verifyPlainPartitionCompatibility(
-            src_snapshot,
-            destination_snapshot,
-            parts,
-            partition_id,
-            query_context);
+            src_snapshot, destination_snapshot, parts, partition_id, query_context);
     }
 
     ops.emplace_back(zkutil::makeCreateRequest(
@@ -9735,7 +9703,9 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
         if (replace)
             throw DB::Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Only support DROP/DETACH/ATTACH PARTITION ALL currently");
 
+        /// Patch parts cannot be copied to another table. Partitions with unapplied patches are rejected by `replacePartitionFromImpl`.
         partitions = src_data.getAllPartitionIds();
+        std::erase_if(partitions, isPatchPartitionId);
     }
     else
     {
@@ -9752,7 +9722,7 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
     const auto zookeeper = getZooKeeper();
 
     const bool zero_copy_enabled = (*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]
-                || (*dynamic_cast<const MergeTreeData *>(source_table.get())->getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
+                || (*src_data.getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
 
     using Entry = std::unique_ptr<ReplicatedMergeTreeLogEntryData>;
     std::vector<Entry> entries(partitions.size());
@@ -10080,7 +10050,7 @@ std::unique_ptr<ReplicatedMergeTreeLogEntryData> StorageReplicatedMergeTree::rep
 void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, ContextPtr query_context)
 {
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::movePartitionToTable");
-    auto dest_table_storage = std::dynamic_pointer_cast<StorageReplicatedMergeTree>(dest_table);
+    auto dest_table_storage = castStorage<StorageReplicatedMergeTree>(dest_table, DeferredTable::Load);
     if (!dest_table_storage)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                         "Table {} supports movePartitionToTable only for ReplicatedMergeTree family of table engines. "
@@ -10205,7 +10175,7 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
 
             /// Don't do hardlinks in case of zero-copy at any side (defensive programming)
             bool zero_copy_enabled = (*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]
-                || (*dynamic_cast<const MergeTreeData *>(dest_table.get())->getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
+                || (*dest_table_storage->getSettings())[MergeTreeSetting::allow_remote_fs_zero_copy_replication];
 
             IDataPartStorage::ClonePartParams clone_params
             {

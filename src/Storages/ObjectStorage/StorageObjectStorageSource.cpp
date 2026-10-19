@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <unordered_set>
@@ -30,6 +31,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ProcessList.h>
+#include <Interpreters/castColumn.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Processors/Formats/Impl/ParquetMetadataCache.h>
@@ -99,6 +101,11 @@ namespace CurrentMetrics
 
 namespace DB
 {
+namespace FailPoints
+{
+extern const char object_storage_source_pause_before_virtual_columns[];
+}
+
 namespace ErrorCodes
 {
     extern const int CANNOT_COMPILE_REGEXP;
@@ -209,6 +216,7 @@ namespace Setting
     extern const SettingsBool s3_validate_etag_on_read;
     extern const SettingsBool use_object_storage_list_objects_cache;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
+    extern const SettingsBool azure_validate_etag_on_read;
 }
 
 static void logIcebergFileStats(const ObjectInfoPtr & object_info, const LoggerPtr & log)
@@ -728,6 +736,8 @@ Chunk StorageObjectStorageSource::generate()
             else if (object_metadata->is_size_known)
                 object_size = object_metadata->size_bytes;
 
+            FailPointInjection::pauseFailPoint(FailPoints::object_storage_source_pause_before_virtual_columns);
+
             VirtualColumnUtils::addRequestedFileLikeStorageVirtualsToChunk(
                 chunk,
                 read_from_format_info.requested_virtual_columns,
@@ -859,6 +869,11 @@ Chunk StorageObjectStorageSource::generate()
 
                                     const auto column_pos = read_from_format_info.source_header.getPositionByName(name_and_type.name);
                                     auto partition_column = name_and_type.type->createColumnConst(chunk.getNumRows(), value)->convertToFullColumnIfConst();
+                                    /// The `_delta_log` type differs from the declared one when the columns were
+                                    /// specified rather than inferred, and the block follows the declared schema.
+                                    const auto & declared_type = read_from_format_info.source_header.getByPosition(column_pos).type;
+                                    if (!name_and_type.type->equals(*declared_type))
+                                        partition_column = castColumn({partition_column, name_and_type.type, name_and_type.name}, declared_type);
                                     /// This column is filled with default value now, remove it.
                                     chunk.erase(column_pos);
                                     /// Add correct values.
@@ -1126,9 +1141,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
     ProfileEvents::increment(ProfileEvents::ObjectStorageClusterProcessedTasks);
 
+    std::unique_ptr<ReadBuffer> read_buf; /// Destroyed last: `builder` and `source` hold the input format reading it.
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
-    std::unique_ptr<ReadBuffer> read_buf;
     std::optional<Int64> rows_count_from_metadata;
 
     auto try_get_num_rows_from_cache = [&]() -> std::optional<size_t>
@@ -1860,16 +1875,24 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// 2. object etag suggests a cache key in case we use filesystem cache
     /// 3. object etag as a cache key for parquet metadata caching
     /// 4. object etag to detect a concurrent in-place overwrite during the read
+    /// Whether the read is pinned to the generation of the object seen at listing time. Each backend
+    /// that supports it has its own setting, because they are documented per backend and a user may
+    /// want to opt out of the check for one store but not the other.
+    bool validate_etag_on_read = false;
+    if (object_storage->getType() == ObjectStorageType::S3)
+        validate_etag_on_read = settings[Setting::s3_validate_etag_on_read];
+    else if (object_storage->getType() == ObjectStorageType::Azure)
+        validate_etag_on_read = settings[Setting::azure_validate_etag_on_read];
+
     if (!object_info.metadata)
     {
         object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
     }
-    else if (!object_info.metadata->is_fetched && settings[Setting::s3_validate_etag_on_read]
-             && object_storage->getType() == ObjectStorageType::S3)
+    else if (!object_info.metadata->is_fetched && validate_etag_on_read)
     {
-        /// Refresh the s3Cluster skip_object_metadata placeholder to obtain its size + ETag for read-time
-        /// validation (it carries no tags, so the with_tags=false HEAD drops nothing). A real fetch that
-        /// merely lacks an ETag (e.g. GCS) has is_fetched=true and is left as-is - no extra HEAD.
+        /// Refresh the cluster function's skip_object_metadata placeholder to obtain its size + ETag for
+        /// read-time validation (it carries no tags, so the with_tags=false HEAD drops nothing). A real fetch
+        /// that merely lacks an ETag (e.g. GCS) has is_fetched=true and is left as-is - no extra HEAD.
         object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
     }
 
@@ -1935,13 +1958,18 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// filename to `readWithDistributedCache` (it ends up in `getFileName()` and in
     /// `system.distributed_cache_log.filename`). Use the object path so the DC log
     /// shows a useful name rather than an empty string.
-    const auto stored_object_size = is_size_known ? object_size : StoredObject::UnknownSize;
+    /// The size is used by the object storage as the right bound of the read, so it must come from a
+    /// real listing or HEAD: the skip_object_metadata placeholder is default-constructed, and its
+    /// `size_bytes == 0` would otherwise read every non-empty object as empty.
+    const auto stored_object_size = is_size_known && object_info.metadata->is_fetched
+        ? object_size
+        : StoredObject::UnknownSize;
     StoredObject stored_object(object_info.getPath(), object_info.getPath(), stored_object_size, object_info.read_source_index);
 
     /// Pin the read to the object generation seen here (etag from the LIST/HEAD): a GET with a
-    /// different ETag means an in-place overwrite, reported as S3_OBJECT_CHANGED_DURING_READ
-    /// instead of torn cross-generation data.
-    if (settings[Setting::s3_validate_etag_on_read] && object_info.metadata.has_value())
+    /// different ETag means an in-place overwrite, reported as S3_OBJECT_CHANGED_DURING_READ or
+    /// AZURE_OBJECT_CHANGED_DURING_READ instead of torn cross-generation data.
+    if (validate_etag_on_read && object_info.metadata.has_value())
         stored_object.etag = object_info.metadata->etag;
     pipeline.setSource(object_storage, StoredObjects{stored_object}, modified_read_settings);
 
@@ -2379,10 +2407,7 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     for (size_t i = 0; i < max_threads_count; ++i)
         objects.push_back(pool_scheduler([this]() -> ObjectInfoPtr
         {
-            auto task = callback();
-            if (!task || task->isEmpty())
-                return nullptr;
-            return task->getObjectInfo();
+            return takeNextObject(/*wait_for_retry=*/ false);
         }, Priority{}));
 
     pool.wait();
@@ -2391,10 +2416,7 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     {
         auto object = object_future.get();
         if (object)
-        {
-            resolveObjectStorageIfNeeded(object);
             buffer.push_back(object);
-        }
     }
 }
 
@@ -2417,13 +2439,12 @@ static size_t getKnownArchiveSize(const ObjectInfoPtr & object_info)
     return object_metadata->size_bytes;
 }
 
-ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
+ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool wait_for_retry)
 {
-    size_t current_index = index.fetch_add(1, std::memory_order_relaxed);
-
-    ObjectInfoPtr object_info;
-    if (current_index >= buffer.size())
+    while (true)
     {
+        /// Recheck after each `retry_after_us` wait. `SYSTEM STOP SWARM MODE` during that wait
+        /// must not be followed by another task request.
         if (!getContext()->isSwarmModeEnabled())
         {
             LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
@@ -2438,8 +2459,35 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
         if (!task || task->isEmpty())
             return nullptr;
 
-        object_info = task->getObjectInfo();
+        if (task->retry_after_us)
+        {
+            if (!wait_for_retry)
+                return nullptr;
+
+            /// The wait stays on the worker so the initiator thread is not blocked.
+            /// TODO: wait asynchronously instead of sleeping in this thread.
+            auto wait_time = std::min<UInt64>(100000, *task->retry_after_us);
+            ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
+            sleepForMicroseconds(wait_time);
+            continue;
+        }
+
+        auto object_info = task->getObjectInfo();
         resolveObjectStorageIfNeeded(object_info);
+        return object_info;
+    }
+}
+
+ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
+{
+    size_t current_index = index.fetch_add(1, std::memory_order_relaxed);
+
+    ObjectInfoPtr object_info;
+    if (current_index >= buffer.size())
+    {
+        object_info = takeNextObject(/*wait_for_retry=*/ true);
+        if (!object_info)
+            return nullptr;
     }
     else
     {
