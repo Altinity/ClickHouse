@@ -282,6 +282,25 @@ bool astIsNestedSelect(const ASTPtr & node)
     return node && (node->as<ASTSelectQuery>() || node->as<ASTSelectWithUnionQuery>() || node->as<ASTSubquery>());
 }
 
+void stripObjectStorageRemoteInitiatorSettings(ASTPtr & query)
+{
+    auto * select_query = query ? query->as<ASTSelectQuery>() : nullptr;
+    if (!select_query)
+        return;
+
+    auto query_settings = select_query->settings();
+    if (!query_settings)
+        return;
+
+    auto & settings_ast = query_settings->as<ASTSetQuery &>();
+    bool settings_changed = false;
+    for (const auto * setting_name : {"object_storage_remote_initiator", "object_storage_remote_initiator_cluster"})
+        settings_changed |= settings_ast.changes.removeSetting(setting_name);
+
+    if (settings_changed && settings_ast.changes.empty())
+        select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
+}
+
 void rewriteASTInFunctionsToGlobalIn(ASTPtr & node)
 {
     if (!node)
@@ -585,10 +604,48 @@ void IStorageCluster::readFromRemoteInitiator(
     ClusterPtr remote_initiator_cluster,
     const String & remote_initiator_cluster_name)
 {
+    /// `allow`/`local` (and initiator-local `RIGHT`/`FULL`) rewrite only `query_to_send`.
+    /// Clone that AST before `convertToRemote` wraps its table function in `remote()`.
+    /// `StorageDistributed::read` must analyze the stripped query. The original `query_info`
+    /// still contains the JOIN, and replacing only the left table there sends the right table
+    /// to a host that does not have it.
+    const bool query_was_rewritten = query_to_send.get() != query_info.query.get();
+    ASTPtr query_for_remote = query_was_rewritten ? query_to_send->clone() : ASTPtr{};
+    if (query_for_remote)
+        stripObjectStorageRemoteInitiatorSettings(query_for_remote);
+
     auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
     auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
     auto modified_query_info = query_info;
     modified_query_info.cluster = src_distributed->getCluster();
+
+    if (query_for_remote)
+    {
+        modified_query_info.query = query_for_remote;
+        /// The syntax result describes the original JOIN. Shard pruning must not reuse it.
+        modified_query_info.syntax_analyzer_result.reset();
+
+        if (storage_and_context.context->getSettingsRef()[Setting::allow_experimental_analyzer])
+        {
+            InterpreterSelectQueryAnalyzer interpreter(
+                query_for_remote,
+                storage_and_context.context,
+                SelectQueryOptions(processed_stage).analyze());
+            modified_query_info.query_tree = interpreter.getQueryTree();
+            modified_query_info.planner_context = interpreter.getPlanner().getPlannerContext();
+
+            auto * query_node = modified_query_info.query_tree->as<QueryNode>();
+            if (!query_node || !query_node->getJoinTreeNode())
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected a table scan after stripping the initiator-local JOIN");
+
+            modified_query_info.table_expression = extractLeftTableExpression(query_node->getJoinTreeNodeTyped());
+        }
+        else
+        {
+            modified_query_info.query_tree.reset();
+        }
+    }
+
     auto new_storage_snapshot = storage_and_context.storage->getStorageSnapshot(storage_snapshot->metadata, storage_and_context.context);
     storage_and_context.storage->read(
         query_plan, column_names, new_storage_snapshot, modified_query_info, storage_and_context.context, processed_stage, max_block_size, num_streams);
@@ -798,16 +855,7 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     if (!select_query)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected SELECT query");
 
-    auto query_settings = select_query->settings();
-    if (query_settings)
-    {
-        auto & settings_ast = query_settings->as<ASTSetQuery &>();
-        bool settings_changed = false;
-        for (const auto & setting_to_remove : settings_to_remove)
-            settings_changed |= settings_ast.changes.removeSetting(setting_to_remove);
-        if (settings_changed && settings_ast.changes.empty())
-            select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
-    }
+    stripObjectStorageRemoteInitiatorSettings(query_to_send);
 
     ASTTableExpression * table_expression = extractTableExpressionASTPtrFromSelectQuery(query_to_send);
     if (!table_expression)
