@@ -1176,7 +1176,7 @@ TEST(CASS3Staging, GcBlobDiscoveryPrefixExcludesStagingObjects)
 /// Guard: the drain lists `<pool_prefix>/staging/<srid>/` as a LOGICAL key and the backend applies the
 /// local root itself, while the writer mints its keys through `physicalKey`. Local prefix:
 /// `EmulatedSingleProcess` over a `LocalObjectStorage`, whose physical keys carry its root.
-TEST(CASDecommission, StagingDrainRemovesWhatTheWriterStagedUnderTheLocalPrefix)
+TEST(CASDecommissionStaging, StagingDrainRemovesWhatTheWriterStagedUnderTheLocalPrefix)
 {
     auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
     auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "victimLocal");
@@ -1554,7 +1554,7 @@ TEST(CASS3Staging, GenerationBackendMayUseNativeOnlyCopy)
 
 /// Native prefix: keys pass through unchanged on both sides, so a `physicalKey` that started adding a
 /// root for Native, or a drain that started adding one, would miss the writer's objects.
-TEST(CASDecommission, StagingDrainRemovesWhatTheWriterStagedUnderTheNativePrefix)
+TEST(CASDecommissionStaging, StagingDrainRemovesWhatTheWriterStagedUnderTheNativePrefix)
 {
     auto object_storage = makeFakeGenerationObjectStorageForTest();
     auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "victimNative");
