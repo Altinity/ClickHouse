@@ -594,6 +594,13 @@ farewell and marks the retirement verified. The control objects (`owner`, `epoch
 confirmed permanently dead, since it fences the member out even if it later comes back online, and
 it deletes namespace and drain state that cannot be recovered.
 
+The claim accepts only a terminal mount slot (`state` `terminated` or `fenced` in
+`system.cas_mounts`). A hard-killed member shows `expired` until the disk's GC leader fences it at the start of a GC round, once it has
+seen the lease unchanged for about one lease TTL plus one renew period; the wait can be one GC round longer. Until then the command
+refuses with `alive or contended`. `SYSTEM CAS GC RUN` on the leader (`is_leader = 1` in
+`system.cas_mounts`) can trigger the fence, but the run that fences must come at least that long after
+the first run that saw the lease; two back-to-back runs do not fence.
+
 It is a writer operation, not GC: it emits ordinary ref-edge deltas rather than inventing GC
 transitions, and it does not synchronously reclaim shared blob content — removing the ref edges only
 makes the now-unreferenced blobs eligible for an ordinary GC round to reclaim later.
@@ -602,8 +609,9 @@ makes the now-unreferenced blobs eligible for an ordinary GC round to reclaim la
 SYSTEM CAS DROP POOL MEMBER 'server_root_id' FROM DISK 'disk_name' [ON CLUSTER cluster_name]
 ```
 
-Both `server_root_id` and `disk_name` are required string literals (a `server_root_id` is an opaque server-root path
-that may contain `/`, not a plain identifier, so it cannot be written unquoted).
+Both `server_root_id` and `disk_name` are required string literals (a `server_root_id` is an opaque string, not a
+plain identifier, so it cannot be written unquoted). A `server_root_id` that contains `/` is refused with
+`BAD_ARGUMENTS`.
 
 The operation is resumable: a rerun skips namespaces already marked `Removed` and reports them
 separately from namespaces newly removed by this invocation. Per-object drain failures are recorded

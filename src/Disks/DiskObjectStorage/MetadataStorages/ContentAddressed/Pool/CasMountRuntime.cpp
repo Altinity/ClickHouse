@@ -55,7 +55,7 @@ int64_t wallClockNowSeconds()
 CasMountRuntime::CasMountRuntime(
     BackendPtr backend_ptr_,
     CasRequests & mount_requests_,
-    CasRequests & farewell_requests_,
+    CasRequests & lease_requests_,
     const Layout & layout_,
     MountConfig config_,
     String server_root_id_,
@@ -64,7 +64,7 @@ CasMountRuntime::CasMountRuntime(
     std::function<bool()> remount_attempt_)
     : backend_ptr(std::move(backend_ptr_))
     , mount_requests(mount_requests_)
-    , farewell_requests(farewell_requests_)
+    , lease_requests(lease_requests_)
     , layout(layout_)
     , config(std::move(config_))
     , server_root_id(std::move(server_root_id_))
@@ -131,9 +131,10 @@ void CasMountRuntime::checkFenceOrThrow(uint64_t admitted_generation) const
     if (!mayMutate() || fenceGeneration() != admitted_generation)
         throwCasTransientUnavailable(
             fmt::format("content-addressed pool '{}'", server_root_id),
-            "mount fence tripped: the durable write is refused because this node no longer holds the mount "
-            "incarnation it was admitted under -- either a lease loss the disk auto-recovers from, or a "
-            "FORGET decommission / lost identity that does NOT recover; consult "
+            "mount fence tripped: the durable write is refused because the mount lease has too little time "
+            "left (writes are paused and resume once the lease renewal is confirmed), or because this node "
+            "no longer holds the mount incarnation it was admitted under -- either a lease loss the disk "
+            "auto-recovers from, or a FORGET decommission / lost identity that does NOT recover; consult "
             "system.cas_mounts for the disk's lifecycle before retrying");
 }
 
@@ -153,15 +154,49 @@ Fence::Admit CasMountRuntime::admit(uint64_t admitted_generation, uint64_t neede
     return Fence::Admit::Ok;
 }
 
+uint64_t CasMountRuntime::writeReservationMs() const
+{
+    const uint64_t envelope_ms = cas_request_budget.attemptEnvelopeMs();
+    return envelope_ms > std::numeric_limits<uint64_t>::max() / 2 ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
+}
+
 bool CasMountRuntime::refAppendFenceOk() const
 {
-    /// Two envelopes' worth of room under the live generation -- a write and its settlement read, which
-    /// is what `writeLoop` reserves -- so a ref-log attempt is not started when it cannot plausibly
-    /// finish, safety margin included, before the lease expires.
-    const uint64_t envelope_ms = cas_request_budget.attemptEnvelopeMs();
-    const uint64_t needed_ms = envelope_ms > std::numeric_limits<uint64_t>::max() / 2
-        ? std::numeric_limits<uint64_t>::max() : 2 * envelope_ms;
-    return admit(fenceGeneration(), needed_ms) == Fence::Admit::Ok;
+    /// A write and its settlement read, which is what `writeLoop` reserves, so a ref-log attempt is not
+    /// started when it cannot plausibly finish, safety margin included, before the lease expires.
+    return admit(fenceGeneration(), writeReservationMs()) == Fence::Admit::Ok;
+}
+
+std::optional<uint64_t> CasMountRuntime::writesPausedSinceBootMs() const
+{
+    if (lifecycle() != PoolLifecycle::Live || mount_fence.lost.load(std::memory_order_acquire) || refAppendFenceOk())
+        return std::nullopt;
+    const uint64_t deadline = mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
+    const uint64_t reservation_ms = writeReservationMs();
+    const uint64_t closing_ms = reservation_ms > std::numeric_limits<uint64_t>::max() - cas_request_budget.lease_safety_margin_ms
+        ? std::numeric_limits<uint64_t>::max()
+        : reservation_ms + cas_request_budget.lease_safety_margin_ms;
+    return deadline > closing_ms ? deadline - closing_ms : 0;
+}
+
+void CasMountRuntime::warnOnceIfWritesPaused()
+{
+    const std::optional<uint64_t> paused_at = writesPausedSinceBootMs();
+    if (!paused_at || writes_paused_warned.exchange(true, std::memory_order_relaxed))
+        return;
+    std::optional<String> last_error;
+    {
+        std::lock_guard lock(renewal_progress_mutex);
+        last_error = renewal_progress.last_error;
+    }
+    const uint64_t now = bootMsNow();
+    /// Written at the first attempt after the pause began, so a renewal stuck in a request reports late;
+    /// the age says by how much.
+    LOG_WARNING(getLogger("CasPool"),
+        "CAS mount lease of '{}' under writer_epoch {} has too little time left for a write: writes are paused "
+        "since {} ms ago and resume once the renewal, which keeps retrying, is confirmed with enough lease left. "
+        "Last renewal error: {}",
+        server_root_id, liveWriterEpoch(), now > *paused_at ? now - *paused_at : 0, last_error.value_or("none"));
 }
 
 void CasMountRuntime::setMountDeadline(uint64_t deadline_boot_ms)
@@ -174,6 +209,7 @@ void CasMountRuntime::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, 
     mount_fence.server_uuid = server_uuid;
     mount_fence.writer_epoch = writer_epoch;
     mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
+    writes_paused_warned.store(false, std::memory_order_relaxed);
     /// A fresh lease incarnation is a fresh generation too: a durable-effect caller admitted under the
     /// PRIOR incarnation must re-check and abort rather than ride this re-arm through (rev.7 [C2]).
     fence_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -305,6 +341,11 @@ RenewalDriverState CasMountRuntime::DriverLease::finish(
     const MountRenewResult * result)
 {
     std::lock_guard lock(runtime.driver_mutex);
+    /// Published before the driver leaves the call, so a remount cannot arm a new epoch between this
+    /// renewal's commit and its deadline. The renewer cannot change meanwhile: `installRenewer` requires
+    /// a dormant or parked driver.
+    if (result && result->outcome == MountRenewOutcome::Committed)
+        runtime.publishRenewedDeadline(result->attempt_start_boot_ms);
     if (runtime.workers_stop_requested)
         runtime.renewal_driver_state = RenewalDriverState::Stopping;
     else if (active == RenewalDriverState::WorkerCall
@@ -369,7 +410,7 @@ void CasMountRuntime::installRenewer(
     const std::function<uint64_t()> & now_ms)
 {
     auto replacement = std::make_unique<MountLeaseRenewer>(
-        mount_requests, farewell_requests, layout, server_root_id, our_uuid, writer_epoch,
+        mount_requests, lease_requests, layout, server_root_id, our_uuid, writer_epoch,
         config.mount_lease_ttl_ms, now_ms,
         [this] { return minActive(); },
         [this](CasEvent e) { emitEvent(std::move(e)); },
@@ -429,6 +470,12 @@ RenewalProgress CasMountRuntime::renewalProgress() const
 
 MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_call)
 {
+    uint64_t refusal_pause_ms = 0;
+    if (worker_call)
+    {
+        std::lock_guard lock(driver_mutex);
+        refusal_pause_ms = static_cast<uint64_t>(std::max<int64_t>(0, renewal_period.count()));
+    }
     return MountRenewOperationEnvironment{
         .boot_ms = [this] { return bootMsNow(); },
         .live = [this, worker_call]
@@ -439,6 +486,7 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
         .requests = RequestObserver{
             .on_write_attempt = [this](uint32_t attempts_sent)
             {
+                warnOnceIfWritesPaused();
                 ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalAttempts);
                 if (attempts_sent > 1)
                     ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRetries);
@@ -459,6 +507,7 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
                 }
             },
         },
+        .refusal_pause_ms = refusal_pause_ms,
     };
 }
 
@@ -483,7 +532,10 @@ bool CasMountRuntime::renewalCancelled() const
 void CasMountRuntime::sleepInterruptibly(uint64_t ms)
 {
     std::unique_lock lock(driver_mutex);
-    driver_cv.wait_for(lock, std::chrono::milliseconds(ms), [this] { return workers_stop_requested; });
+    driver_cv.wait_for(lock, std::chrono::milliseconds(ms), [this]
+    {
+        return renewal_driver_state == RenewalDriverState::Stopping || renewal_driver_state == RenewalDriverState::ParkRequested;
+    });
 }
 
 void CasMountRuntime::consumeRenewResult(
@@ -503,17 +555,7 @@ void CasMountRuntime::consumeRenewResult(
         && result.deadline_source == GaveUp::Source::Lease)
         ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalDeadlineExceeded);
 
-    if (result.outcome == MountRenewOutcome::Committed)
-    {
-        const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
-        setMountDeadline(
-            result.attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
-                ? std::numeric_limits<uint64_t>::max()
-                : result.attempt_start_boot_ms + ttl_ms);
-        reportMountRenewCompletion(result);
-        return;
-    }
-    if (result.outcome == MountRenewOutcome::NotAttempted)
+    if (result.outcome != MountRenewOutcome::Terminal)
     {
         reportMountRenewCompletion(result);
         return;
@@ -543,6 +585,17 @@ void CasMountRuntime::consumeRenewResult(
         std::rethrow_exception(result.failure);
 }
 
+void CasMountRuntime::publishRenewedDeadline(uint64_t attempt_start_boot_ms)
+{
+    const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
+    const uint64_t deadline = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
+        ? std::numeric_limits<uint64_t>::max()
+        : attempt_start_boot_ms + ttl_ms;
+    setMountDeadline(deadline);
+    if (!writesPausedSinceBootMs())
+        writes_paused_warned.store(false, std::memory_order_relaxed);
+}
+
 uint64_t CasMountRuntime::renewRenewerOnce(
     AdmittedRenewerCall call,
     RenewalDriverState active,
@@ -564,14 +617,19 @@ uint64_t CasMountRuntime::renewRenewerOnce(
     MountRenewResult result;
     {
         SCOPE_EXIT({ std::lock_guard lock(renewal_progress_mutex); renewal_progress.in_progress = false; });
-        result = active == RenewalDriverState::RemountCall
-            ? call.renewer->renewForRemount(renewalEnvironment(worker_call))
-            : call.renewer->renew(renewalEnvironment(worker_call));
+        if (active == RenewalDriverState::RemountCall)
+            result = call.renewer->renewForRemount(renewalEnvironment(worker_call));
+        else if (worker_call && !config.bounded_background_renewal)
+            result = call.renewer->renewUntilDefinitive(renewalEnvironment(worker_call));
+        else
+            result = call.renewer->renew(renewalEnvironment(worker_call));
     }
     const RenewalDriverState destination = active == RenewalDriverState::WorkerCall
         ? RenewalDriverState::WorkerIdle
         : (active == RenewalDriverState::RemountCall ? RenewalDriverState::Parked : RenewalDriverState::Dormant);
     const RenewalDriverState returned_state = call.lease->finish(destination, &result);
+    if (config.renewal_finished_hook_for_test)
+        config.renewal_finished_hook_for_test(result);
     if (result.outcome == MountRenewOutcome::Terminal && config.renewal_terminal_deposited_hook_for_test)
         config.renewal_terminal_deposited_hook_for_test();
     consumeRenewResult(result, active, returned_state, propagate_failure);
@@ -1160,7 +1218,14 @@ void CasMountRuntime::finishTeardown(bool drained)
 
     if (!mount_renewer)
         return;
-    if (drained && mount_renewer->state() == MountLeaseRenewerState::Active)
+    if (drained && mount_renewer->state() == MountLeaseRenewerState::Active && writesPausedSinceBootMs())
+    {
+        /// The farewell needs the lease room a pause no longer has; GC fences the slot after observing it.
+        LOG_INFO(getLogger("CasPool"),
+            "CAS mount lease of '{}' has too little time left for the farewell; the slot is left for observation",
+            server_root_id);
+    }
+    else if (drained && mount_renewer->state() == MountLeaseRenewerState::Active)
     {
         try
         {

@@ -14,6 +14,7 @@
 #include <deque>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <utility>
 
@@ -96,6 +97,9 @@ public:
         ReturnThenCancel,
         ThrowBeforeThenLandAfterResolve,
         ThrowConnectHint,
+        ThrowAccessDenied,
+        ThrowMalformed,
+        RefusePrecondition,
     };
 
     struct Attempt
@@ -103,12 +107,22 @@ public:
         String key;
         String bytes;
         std::optional<String> expected;
+        uint64_t at_ms = 0;
     };
 
     std::deque<Action> actions;
     std::vector<Attempt> attempts;
     std::function<void()> cancel_after_write;
     uint64_t read_calls = 0;
+    /// The injected boot clock, when a test asserts on when each attempt was sent.
+    const uint64_t * clock = nullptr;
+    /// While positive, a read of a mount slot fails with an access denial.
+    uint32_t refuse_reads = 0;
+    /// How many guarded mount writes had been sent when each read was made.
+    std::vector<size_t> puts_at_read;
+    std::vector<uint64_t> read_at_ms;
+    /// When set, a read of a mount slot that succeeds returns these bytes under the slot's real token.
+    std::optional<String> mount_read_bytes;
 
     /// Only a GUARDED write of a mount slot is scripted; the fixture's own seeding and every other
     /// key reach the store untouched.
@@ -119,7 +133,7 @@ public:
         if (!expected_value || !key.ends_with("/mount"))
             return InMemoryBackend::write(key, bytes, expected_value, access);
 
-        attempts.push_back({key, bytes, expected_value});
+        attempts.push_back({key, bytes, expected_value, clock ? *clock : 0});
         const Action action = actions.empty() ? Action::Delegate : actions.front();
         if (!actions.empty())
             actions.pop_front();
@@ -133,6 +147,18 @@ public:
             throw Poco::TimeoutException("connect timed out");
 #endif
         }
+        if (action == Action::ThrowAccessDenied || action == Action::ThrowMalformed)
+        {
+#if USE_AWS_S3
+            if (action == Action::ThrowAccessDenied)
+                throw DB::S3Exception("injected renewal access denial", Aws::S3::S3Errors::ACCESS_DENIED);
+            throw DB::S3Exception("injected malformed renewal request", Aws::S3::S3Errors::INVALID_REQUEST);
+#else
+            throw DB::Exception(DB::ErrorCodes::ABORTED, "store refusals need the S3 client");
+#endif
+        }
+        if (action == Action::RefusePrecondition)
+            return std::unexpected(RawConflict{});
 
         if (action == Action::ThrowBefore || action == Action::ThrowBeforeThenLandAfterResolve)
         {
@@ -156,7 +182,20 @@ public:
     std::optional<Raw> read(const String & key, TransportAccess & access) override
     {
         ++read_calls;
+        puts_at_read.push_back(attempts.size());
+        read_at_ms.push_back(clock ? *clock : 0);
+        if (refuse_reads > 0 && key.ends_with("/mount"))
+        {
+            --refuse_reads;
+#if USE_AWS_S3
+            throw DB::S3Exception("injected read access denial", Aws::S3::S3Errors::ACCESS_DENIED);
+#else
+            throw DB::Exception(DB::ErrorCodes::ABORTED, "store refusals need the S3 client");
+#endif
+        }
         std::optional<Raw> result = InMemoryBackend::read(key, access);
+        if (result && mount_read_bytes && key.ends_with("/mount"))
+            result->bytes = *mount_read_bytes;
         if (pending && pending->key == key)
         {
             const Attempt delayed = *pending;
@@ -949,6 +988,291 @@ TEST(CASHeartbeat, RenewalRetriesOneImmutableBodyAndAdoptsLostResponse)
               decodeMountLease(backend->attempts.front().bytes).write_attempt_id);
 }
 
+/// The background renewal of an adopted slot, with the script and the request records empty.
+class CASHeartbeatUntilDefinitive : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        backend->clock = &boot_ms;
+        seedOwnClaim(ops.op, layout, "test", uuid, 9, wall_ms, 1000);
+        renewer.start();
+        clearRecords();
+    }
+
+    void clearRecords()
+    {
+        backend->attempts.clear();
+        backend->read_calls = 0;
+        backend->puts_at_read.clear();
+        backend->read_at_ms.clear();
+    }
+
+    MountRenewResult renew(const std::function<bool()> & live = {}, const std::function<bool()> & cancelled = {})
+    {
+        MountRenewOperationEnvironment environment = renewalEnvironment(boot_ms, live, cancelled);
+        environment.refusal_pause_ms = kRefusalPauseMs;
+        return renewer.renewUntilDefinitive(environment);
+    }
+
+    /// Rewrites the slot behind the renewer's back.
+    void rewriteSlot(const std::function<void(MountLease &)> & change)
+    {
+        const auto got = ops.op.read(layout.mountKey("test"), Retry::standard());
+        MountLease lease = decodeMountLease(got->bytes);
+        change(lease);
+        ++lease.seq;
+        mustCommit(ops.op.replace(layout.mountKey("test"), encodeMountLease(lease), got->etag, Retry::standard()), "rewrite");
+        clearRecords();
+    }
+
+    /// A refused precondition whose first two reads are refused: the third read decides, and it must
+    /// end the series as a loss without another PUT.
+    void expectLossObservedByTheReads()
+    {
+        backend->actions = {RenewalScriptBackend::Action::RefusePrecondition};
+        backend->refuse_reads = 2;
+
+        const MountRenewResult renewed = renew();
+
+        const DB::Exception failure = terminalException(renewed);
+        EXPECT_NE(failure.code(), DB::ErrorCodes::LOGICAL_ERROR);
+        EXPECT_EQ(renewer.state(), MountLeaseRenewerState::RenewalTerminal);
+        EXPECT_EQ(backend->attempts.size(), 1u);
+        EXPECT_EQ(backend->puts_at_read, (std::vector<size_t>{1, 1, 1}));
+    }
+
+    static constexpr uint64_t kRefusalPauseMs = 10'000;
+    static constexpr uint64_t kShortestSpacingMs = Retry::kDefinitiveAttemptSpacingMs - Retry::kDefinitiveAttemptSpacingMs / 5;
+    static constexpr uint64_t kLongestSpacingMs = Retry::kDefinitiveAttemptSpacingMs + Retry::kDefinitiveAttemptSpacingMs / 5;
+
+    std::shared_ptr<RenewalScriptBackend> backend = std::make_shared<RenewalScriptBackend>();
+    Layout layout{"pool"};
+    const UInt128 uuid{0x1234};
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    Ops ops{backend, &boot_ms};
+    MountLeaseRenewer renewer{
+        ops.mount, ops.farewell, layout, "test", uuid, 9, std::chrono::milliseconds(1000),
+        [this] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(20),
+        [this] { return boot_ms; }};
+};
+
+/// The background renewal outlives its lease with one tuple, and confirms its first start.
+TEST_F(CASHeartbeatUntilDefinitive, RetriesOneTuplePastTheLease)
+{
+    for (int i = 0; i < 10; ++i)
+        backend->actions.push_back(RenewalScriptBackend::Action::ThrowBefore);
+    const uint64_t start = boot_ms;
+
+    const MountRenewResult renewed = renew();
+
+    ASSERT_EQ(renewed.outcome, MountRenewOutcome::Committed);
+    EXPECT_EQ(renewed.attempt_start_boot_ms, start);
+    EXPECT_EQ(renewed.attempts_sent, 11u);
+    ASSERT_EQ(backend->attempts.size(), 11u);
+    EXPECT_GE(backend->attempts.back().at_ms, start + 8'000) << "the renewal kept retrying past the lease";
+    for (size_t i = 1; i < backend->attempts.size(); ++i)
+    {
+        EXPECT_EQ(backend->attempts[i].bytes, backend->attempts[0].bytes);
+        EXPECT_EQ(backend->attempts[i].expected, backend->attempts[0].expected);
+        EXPECT_GE(backend->attempts[i].at_ms - backend->attempts[i - 1].at_ms, kShortestSpacingMs);
+        EXPECT_LE(backend->attempts[i].at_ms - backend->attempts[i - 1].at_ms, kLongestSpacingMs);
+    }
+}
+
+/// A renewal confirmed after an outage longer than the lease stores an `expires_at_ms` already past. A GC
+/// round that watched the previous token for its whole threshold does not fence the slot: the token changed.
+TEST_F(CASHeartbeatUntilDefinitive, ALateCommitRestartsTheGcObservation)
+{
+    const uint64_t lease_ms = 1000;
+    const uint64_t cadence_ms = 1000;
+    const uint64_t threshold_ms = mountObservationThresholdMs(lease_ms, /*declared_lease_ms=*/lease_ms, cadence_ms);
+    MountObservationMap observations;
+    std::set<String> lease_mismatch_warned;
+    const auto gc_round = [&]
+    {
+        return computeHeartbeatFloor(
+            ops.op, layout, wall_ms, [this] { return boot_ms; }, lease_ms, cadence_ms, observations, lease_mismatch_warned);
+    };
+    ASSERT_EQ(gc_round().live, 1u);
+    clearRecords();
+    for (int i = 0; i < 5; ++i)
+        backend->actions.push_back(RenewalScriptBackend::Action::ThrowBefore);
+    const uint64_t start = boot_ms;
+
+    ASSERT_EQ(renew().outcome, MountRenewOutcome::Committed);
+    wall_ms += boot_ms - start;
+
+    ASSERT_GE(boot_ms - start, threshold_ms) << "the GC watched the previous token for its whole threshold";
+    const MountLease stored = decodeMountLease(ops.op.read(layout.mountKey("test"), Retry::standard())->bytes);
+    EXPECT_LT(stored.expires_at_ms, wall_ms) << "the commit stored a lease that already expired";
+    const HeartbeatFloor floor = gc_round();
+    EXPECT_EQ(floor.fenced_now, 0u);
+    EXPECT_EQ(floor.live, 1u);
+    EXPECT_FALSE(decodeMountLease(ops.op.read(layout.mountKey("test"), Retry::standard())->bytes).gc_fenced);
+}
+
+#if USE_AWS_S3
+/// A refusal is not an answer about the slot: the next engine call sends the same tuple, one refusal
+/// pause later, whatever the store refused for.
+TEST_F(CASHeartbeatUntilDefinitive, ARefusedRenewalIsSentAgainAfterTheRefusalPause)
+{
+    backend->actions = {RenewalScriptBackend::Action::ThrowMalformed, RenewalScriptBackend::Action::ThrowAccessDenied,
+                        RenewalScriptBackend::Action::Delegate};
+    const uint64_t start = boot_ms;
+
+    const MountRenewResult renewed = renew();
+
+    ASSERT_EQ(renewed.outcome, MountRenewOutcome::Committed);
+    EXPECT_EQ(renewed.attempt_start_boot_ms, start);
+    EXPECT_EQ(renewed.attempts_sent, 3u);
+    ASSERT_EQ(backend->attempts.size(), 3u);
+    for (size_t i = 1; i < backend->attempts.size(); ++i)
+    {
+        EXPECT_EQ(backend->attempts[i].bytes, backend->attempts[0].bytes);
+        EXPECT_EQ(backend->attempts[i].expected, backend->attempts[0].expected);
+        EXPECT_EQ(backend->attempts[i].at_ms - backend->attempts[i - 1].at_ms, kRefusalPauseMs) << "attempt " << i;
+    }
+    EXPECT_EQ(backend->read_calls, 0u) << "a refusal owes no read";
+}
+
+/// A refused precondition whose read failed is not a lost slot: only the read repeats, one spacing after
+/// the write and one refusal pause after each refused read, and a read that finds the slot as the last
+/// confirmed renewal left it sends the same tuple again.
+TEST_F(CASHeartbeatUntilDefinitive, AfterACleanPreconditionRefusalOnlyTheReadRepeats)
+{
+    backend->actions = {RenewalScriptBackend::Action::RefusePrecondition, RenewalScriptBackend::Action::Delegate};
+    backend->refuse_reads = 3;
+
+    const MountRenewResult renewed = renew();
+
+    ASSERT_EQ(renewed.outcome, MountRenewOutcome::Committed);
+    ASSERT_EQ(backend->attempts.size(), 2u);
+    EXPECT_EQ(backend->attempts[1].bytes, backend->attempts[0].bytes);
+    EXPECT_EQ(backend->attempts[1].expected, backend->attempts[0].expected);
+    EXPECT_EQ(backend->puts_at_read, (std::vector<size_t>{1, 1, 1, 1})) << "no PUT between the reads";
+    ASSERT_EQ(backend->read_at_ms.size(), 4u);
+    EXPECT_GE(backend->read_at_ms[1] - backend->read_at_ms[0], kShortestSpacingMs);
+    EXPECT_LE(backend->read_at_ms[1] - backend->read_at_ms[0], kLongestSpacingMs);
+    EXPECT_EQ(backend->read_at_ms[2] - backend->read_at_ms[1], kRefusalPauseMs);
+    EXPECT_EQ(backend->read_at_ms[3] - backend->read_at_ms[2], kRefusalPauseMs);
+}
+
+/// A read that finally observes a slot that moved ends the series as a loss, with no further PUT.
+TEST_F(CASHeartbeatUntilDefinitive, AReadThatFindsAForeignHolderEndsTheSeries)
+{
+    rewriteSlot([](MountLease & lease) { lease.server_uuid = UInt128{0x9999}; });
+    expectLossObservedByTheReads();
+}
+
+TEST_F(CASHeartbeatUntilDefinitive, AReadThatFindsOurSlotFencedEndsTheSeries)
+{
+    rewriteSlot([](MountLease & lease) { lease.gc_fenced = true; });
+    expectLossObservedByTheReads();
+}
+
+TEST_F(CASHeartbeatUntilDefinitive, AReadThatFindsTheSlotDeletedEndsTheSeries)
+{
+    const auto got = ops.op.read(layout.mountKey("test"), Retry::standard());
+    ASSERT_EQ(ops.op.remove(layout.mountKey("test"), got->etag, Retry::standard()), Removal::Removed);
+    clearRecords();
+    expectLossObservedByTheReads();
+}
+
+/// Our token over bytes that are not our last confirmed body is not "the slot did not move".
+TEST_F(CASHeartbeatUntilDefinitive, OurTokenOverOtherBytesEndsTheSeries)
+{
+    MountLease other = decodeMountLease(ops.op.read(layout.mountKey("test"), Retry::standard())->bytes);
+    other.write_attempt_id = UInt128{0xABCD};
+    ++other.seq;
+    backend->mount_read_bytes = encodeMountLease(other);
+    clearRecords();
+    expectLossObservedByTheReads();
+}
+
+/// A stop between engine calls ends the series as cancelled: nothing of ours is in flight, the renewer
+/// stays active and its farewell still hands the slot back.
+TEST_F(CASHeartbeatUntilDefinitive, AStopBetweenCallsEndsTheSeriesAsCancelled)
+{
+    backend->actions = {RenewalScriptBackend::Action::ThrowMalformed};
+    const auto stopped = [&] { return !backend->attempts.empty(); };
+
+    /// No refusal pause: the farewell has to fit in the lease the last commit confirmed.
+    const MountRenewResult renewed
+        = renewer.renewUntilDefinitive(renewalEnvironment(boot_ms, [&] { return !stopped(); }, stopped));
+
+    EXPECT_EQ(renewed.outcome, MountRenewOutcome::NotAttempted);
+    EXPECT_EQ(renewer.state(), MountLeaseRenewerState::Active);
+    EXPECT_EQ(backend->attempts.size(), 1u);
+    renewer.release();
+    const MountLease left = decodeMountLease(ops.op.read(layout.mountKey("test"), Retry::standard())->bytes);
+    EXPECT_EQ(left.min_active_build_sequence, std::numeric_limits<uint64_t>::max()) << "the farewell landed";
+}
+
+/// A stop while only the read of a refused precondition repeats ends the series as cancelled with no
+/// further PUT, and without a farewell: the slot may have moved to a holder entitled to it.
+TEST_F(CASHeartbeatUntilDefinitive, AStopDuringTheReadsEndsTheSeriesWithoutAFarewell)
+{
+    backend->actions = {RenewalScriptBackend::Action::RefusePrecondition};
+    backend->refuse_reads = 5;
+    const auto stopped = [&] { return backend->read_calls >= 2; };
+
+    const MountRenewResult renewed = renew([&] { return !stopped(); }, stopped);
+
+    const DB::Exception failure = terminalException(renewed);
+    EXPECT_NE(failure.message().find("(cancelled,"), String::npos) << failure.message();
+    EXPECT_EQ(renewer.state(), MountLeaseRenewerState::RenewalTerminal);
+    EXPECT_FALSE(renewer.canRelease());
+    EXPECT_EQ(backend->attempts.size(), 1u);
+    EXPECT_EQ(backend->puts_at_read, (std::vector<size_t>{1, 1}));
+}
+
+/// A lost liveness without a stop ends the reads as a loss.
+TEST_F(CASHeartbeatUntilDefinitive, ALostLivenessDuringTheReadsEndsTheSeriesAsALoss)
+{
+    backend->actions = {RenewalScriptBackend::Action::RefusePrecondition};
+    backend->refuse_reads = 5;
+
+    const MountRenewResult renewed = renew([&] { return backend->read_calls < 2; });
+
+    const DB::Exception failure = terminalException(renewed);
+    EXPECT_NE(failure.message().find("(fence_or_lifecycle_lost,"), String::npos) << failure.message();
+    EXPECT_EQ(renewer.state(), MountLeaseRenewerState::RenewalTerminal);
+    EXPECT_EQ(backend->attempts.size(), 1u);
+    EXPECT_EQ(backend->puts_at_read, (std::vector<size_t>{1, 1}));
+}
+
+/// A renewal that ends after an earlier engine call sent an attempt reports that attempt.
+TEST_F(CASHeartbeatUntilDefinitive, AGiveUpAfterARefusedCallCountsItsAttempts)
+{
+    backend->actions = {RenewalScriptBackend::Action::ThrowMalformed};
+
+    const MountRenewResult renewed = renew([&] { return backend->attempts.empty(); });
+
+    ASSERT_EQ(renewed.outcome, MountRenewOutcome::Terminal);
+    EXPECT_EQ(renewed.attempts_sent, 1u);
+    EXPECT_TRUE(renewed.sent_any);
+    const DB::Exception e = terminalException(renewed);
+    EXPECT_NE(e.message().find("at least one attempt sent"), String::npos) << e.message();
+}
+
+/// A refusal that follows an unclear attempt does not end the engine call: the read settles the
+/// unclear attempt, and our attempt that landed meanwhile is adopted, not taken for another writer.
+TEST_F(CASHeartbeatUntilDefinitive, ARefusalAfterAnUnclearAttemptIsSettledInsideTheCall)
+{
+    backend->actions = {RenewalScriptBackend::Action::ThrowBeforeThenLandAfterResolve,
+                        RenewalScriptBackend::Action::ThrowAccessDenied};
+
+    const MountRenewResult renewed = renew();
+
+    ASSERT_EQ(renewed.outcome, MountRenewOutcome::Committed);
+    EXPECT_TRUE(renewed.resolved_by_read);
+    EXPECT_EQ(renewed.attempts_sent, 2u);
+    EXPECT_EQ(backend->attempts.size(), 2u);
+}
+#endif
+
 #if USE_AWS_S3
 TEST(CASHeartbeat, RenewalOverConnectFailuresRecoversWithoutASettleRead)
 {
@@ -1092,6 +1416,7 @@ TEST(CASHeartbeat, CancellationAfterSendIsTerminalAndForbidsRelease)
         renewalEnvironment(boot_ms, /*live=*/[&] { return !cancelled; }, /*cancelled=*/[&] { return cancelled; }));
     const DB::Exception failure = terminalException(result);
     EXPECT_EQ(failure.code(), DB::ErrorCodes::NETWORK_ERROR);
+    EXPECT_NE(failure.message().find("(cancelled,"), String::npos) << failure.message();
     EXPECT_TRUE(result.sent_any);
     EXPECT_EQ(backend->read_calls, 0u) << "post-write cancellation must not start a diagnostic read";
     EXPECT_EQ(renewer.state(), MountLeaseRenewerState::RenewalTerminal);

@@ -124,10 +124,10 @@ public:
         const String & key, const String & bytes,
         const std::optional<String> & expected_value, TransportAccess & access) override
     {
-        if (!fired && !expected_value && key == "p/gc/server-roots/root/x/owner")
+        if (!fired && !expected_value && key == "p/gc/server-roots/rootx/owner")
         {
             fired = true;
-            InMemoryBackend::write("p/cas/manifests/root/x/table/debris", "x", std::nullopt, access);
+            InMemoryBackend::write("p/cas/manifests/rootx/table/debris", "x", std::nullopt, access);
             return std::unexpected(RawConflict{});
         }
         return InMemoryBackend::write(key, bytes, expected_value, access);
@@ -527,13 +527,37 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
 TEST(CASServerRootId, ValidationAcceptsCleanPathsRejectsBad)
 {
     EXPECT_NO_THROW(validateServerRootId("replica-a"));
-    EXPECT_NO_THROW(validateServerRootId("shard-01/replica-a"));
+    EXPECT_THROW(validateServerRootId("shard-01/replica-a"), DB::Exception);
     EXPECT_THROW(validateServerRootId(""), DB::Exception);
     EXPECT_THROW(validateServerRootId("/replica"), DB::Exception);
     EXPECT_THROW(validateServerRootId("replica/"), DB::Exception);
     EXPECT_THROW(validateServerRootId("a//b"), DB::Exception);
     EXPECT_THROW(validateServerRootId("a/../b"), DB::Exception);
     EXPECT_THROW(validateServerRootId("a/_files/b"), DB::Exception);
+}
+
+/// Decommission and the staging sweep select a member's objects by key prefix, so a member `a/b` would be
+/// drained by a decommission of `a`. An id with `/` is refused even when its owner object already exists.
+TEST(CASServerRootId, ExistingIdWithSlashRefusesToOpen)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    const Layout l("p");
+    DB::Cas::tests::seedPoolMetaForRestart(*b);
+    {
+        Ops seed(b);
+        mustCommit(seed.op.create(l.ownerKey("shard-01/replica-a"),
+            encodeOwner(OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = std::nullopt}),
+            Retry::standard()), "owner of an existing nested member");
+    }
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::BAD_ARGUMENTS, "new <cas_server_root_id> without '/'", [&]
+    {
+        Pool::open(b, PoolConfig{.pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "shard-01/replica-a"});
+    });
+    Ops check(b);
+    EXPECT_FALSE(check.op.head(l.mountKey("shard-01/replica-a"), Retry::standard()).has_value())
+        << "a refused open must not claim the mount slot";
+    EXPECT_FALSE(check.op.head(l.epochKey("shard-01/replica-a"), Retry::standard()).has_value())
+        << "a refused open must not mint an epoch";
 }
 
 TEST(CASServerRoot, KeysAndCodecsRoundTrip)
@@ -736,6 +760,37 @@ TEST(CASMount, PoolOpenNeverAcceptsARetiredOwner)
         });
         EXPECT_EQ(currentEtag(ops.op, l.epochKey("r")), epoch_before);
         EXPECT_EQ(currentEtag(ops.op, l.mountKey("r")), mount_before);
+    }
+}
+
+/// Each identity refusal names the supported recovery: the decommission verb for a dead foreign owner,
+/// a new id for a retired one. Neither advises a hand edit of the owner object as the first option.
+TEST(CASServerRootClaim, RefusalsNameTheSupportedRecovery)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    const Layout l("p");
+    Ops ops(b);
+    claimOwnerOrThrow(ops.op, l, "r", UInt128(1), emptyCatalogObservation());
+    DB::Cas::tests::expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "SYSTEM CAS DROP POOL MEMBER 'r'", [&]
+    {
+        claimOwnerOrThrow(ops.op, l, "r", UInt128(2), emptyCatalogObservation());
+    });
+
+    mustCommit(ops.op.create(l.ownerKey("t"), encodeOwner(OwnerObject{
+        .server_uuid = UInt128(1),
+        .retired_at_ms = 1752537600000ULL,
+    }), Retry::standard()), "tombstoned owner");
+    try
+    {
+        claimOwnerOrThrow(ops.op, l, "t", UInt128(1), emptyCatalogObservation());
+        FAIL() << "expected a tombstoned owner claim to fail closed";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(e.message().find("was decommissioned"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("troubleshooting"), String::npos) << e.message();
+        EXPECT_EQ(e.message().find("clear the owner object"), String::npos) << e.message();
     }
 }
 
@@ -956,7 +1011,11 @@ TEST(CASServerRootSafety, EveryCatalogLifecycleStateBlocksOwnerAndEpochRecreatio
         const ObserveRefCatalog observe = [catalog] { return catalog; };
 
         Ops owner_ops(std::make_shared<InMemoryBackend>());
-        EXPECT_THROW(claimOwnerOrThrow(owner_ops.op, layout, "root/x", UInt128{1}, observe), DB::Exception);
+        DB::Cas::tests::expectThrowsCodeWithMessage(
+            DB::ErrorCodes::CORRUPTED_DATA, "identity lost over existing data", [&]
+        {
+            claimOwnerOrThrow(owner_ops.op, layout, "root/x", UInt128{1}, observe);
+        });
         EXPECT_FALSE(owner_ops.op.head(layout.ownerKey("root/x"), Retry::standard()).has_value());
 
         Ops epoch_ops(std::make_shared<InMemoryBackend>());
@@ -985,9 +1044,9 @@ TEST(CASServerRootSafety, OpaqueStreamAndStateDebrisAloneDoesNotBlockRecreation)
     mustCommit(ops.op.create(layout.refCkptKey(dead), "debris", Retry::standard()), "ckpt debris");
     mustCommit(ops.op.create(layout.namespaceFileKey(dead, "f"), "debris", Retry::standard()), "ns-file debris");
 
-    EXPECT_NO_THROW(claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation()));
+    EXPECT_NO_THROW(claimOwnerOrThrow(ops.op, layout, "rootx", UInt128{1}, emptyCatalogObservation()));
     EXPECT_EQ(allocateWriterEpoch(
-        ops.op, layout, "root/x", emptyCatalogObservation()), 1u);
+        ops.op, layout, "rootx", emptyCatalogObservation()), 1u);
 }
 
 TEST(CASServerRootSafety, ManifestAndLooseRootDebrisStillBlockRecreation)
@@ -999,8 +1058,11 @@ TEST(CASServerRootSafety, ManifestAndLooseRootDebrisStillBlockRecreation)
     {
         Ops ops(std::make_shared<InMemoryBackend>());
         mustCommit(ops.op.create(key, "x", Retry::standard()), "blocking debris");
-        EXPECT_THROW(claimOwnerOrThrow(
-            ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation()), DB::Exception);
+        DB::Cas::tests::expectThrowsCodeWithMessage(
+            DB::ErrorCodes::CORRUPTED_DATA, "identity lost over existing data", [&]
+        {
+            claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation());
+        });
         EXPECT_THROW(allocateWriterEpoch(
             ops.op, layout, "root/x", emptyCatalogObservation()), DB::Exception);
     }
@@ -1014,7 +1076,11 @@ TEST(CASServerRootSafety, UnreadableCatalogNeverFallsBackToPhysicalGuesses)
     {
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "injected unreadable catalog");
     };
-    EXPECT_THROW(claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, unreadable), DB::Exception);
+    DB::Cas::tests::expectThrowsCodeWithMessage(
+        DB::ErrorCodes::CORRUPTED_DATA, "injected unreadable catalog", [&]
+    {
+        claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, unreadable);
+    });
     EXPECT_THROW(allocateWriterEpoch(
         ops.op, layout, "root/x", unreadable), DB::Exception);
     EXPECT_FALSE(ops.op.head(layout.ownerKey("root/x"), Retry::standard()).has_value());
@@ -1032,9 +1098,9 @@ TEST(CASServerRootSafety, OwnerConflictRecomputesTheWholeEmptinessBundle)
     DB::Cas::tests::expectThrowsCodeWithMessage(
         DB::ErrorCodes::CORRUPTED_DATA,
         "newly visible owned work blocks recreation",
-        [&] { claimOwnerOrThrow(ops.op, layout, "root/x", UInt128{1}, emptyCatalogObservation()); });
+        [&] { claimOwnerOrThrow(ops.op, layout, "rootx", UInt128{1}, emptyCatalogObservation()); });
     EXPECT_TRUE(backend->fired);
-    EXPECT_FALSE(ops.op.head(layout.ownerKey("root/x"), Retry::standard()).has_value());
+    EXPECT_FALSE(ops.op.head(layout.ownerKey("rootx"), Retry::standard()).has_value());
 }
 
 TEST(CASServerRootSafety, EpochConflictRecomputesTheWholeEmptinessBundle)
@@ -2682,9 +2748,9 @@ TEST(CASListMounts, ClassifiesEveryStateReadOnly)
         }
 }
 
-/// A `srid` may itself contain `/` (e.g. `shard-01/replica-a` — legal per
-/// `CASServerRootId.ValidationAcceptsCleanPathsRejectsBad`). Slicing the key by the last `/` before
-/// the `/mount` suffix (as opposed to by `serverRootsPrefix()` length) truncates it to `replica-a`.
+/// A pool may hold a mount slot whose `srid` contains `/`, written before `validateServerRootId` refused
+/// one; `system.cas_mounts` must still name it whole. Slicing the key by the last `/` before the `/mount`
+/// suffix (as opposed to by `serverRootsPrefix()` length) truncates it to `replica-a`.
 TEST(CASListMounts, NestedSridIsNotTruncated)
 {
     auto backend = std::make_shared<InMemoryBackend>();

@@ -13,12 +13,14 @@
 #include <Common/Throttler.h>
 #include <Interpreters/FileCache/FileCache.h>
 
+#include <IO/Expect404ResponseScope.h>
 #include <IO/WriteHelpers.h>
 #include <IO/S3Common.h>
 #include <IO/S3/Requests.h>
 #include <IO/S3/getObjectInfo.h>
 #include <Common/BlobStorageLogWriter.h>
 
+#include <optional>
 #include <utility>
 
 
@@ -108,13 +110,15 @@ WriteBufferFromS3::WriteBufferFromS3(
     BlobStorageLogWriterPtr blob_log_,
     std::optional<ObjectAttributes> object_metadata_,
     ThreadPoolCallbackRunnerUnsafe<void> schedule_,
-    const WriteSettings & write_settings_)
+    const WriteSettings & write_settings_,
+    std::shared_ptr<const S3::Client> object_creation_client_)
     : WriteBufferFromFileBase(std::min(buf_size_, static_cast<size_t>(DBMS_DEFAULT_BUFFER_SIZE)), nullptr, 0)
     , bucket(bucket_)
     , key(key_)
     , request_settings(request_settings_)
     , write_settings(write_settings_)
     , client_ptr(std::move(client_ptr_))
+    , object_creation_client(object_creation_client_ ? std::move(object_creation_client_) : client_ptr)
     , object_metadata(std::move(object_metadata_))
     , buffer_allocation_policy(createBufferAllocationPolicy(request_settings))
     , task_tracker(
@@ -272,6 +276,18 @@ void WriteBufferFromS3::tryToAbortMultipartUpload() noexcept
     {
         task_tracker->safeWaitAll();
         abortMultipartUpload();
+    }
+    catch (const S3Exception & e)
+    {
+        /// A single-attempt `CompleteMultipartUpload` whose response was lost may have completed the
+        /// upload; the caller that sent it resolves the outcome.
+        if (e.getS3ErrorCode() == Aws::S3::S3Errors::NO_SUCH_UPLOAD && object_creation_client->usesSingleAttemptRetryStrategy())
+        {
+            LOG_INFO(log, "Multipart upload to abort no longer exists. {}", getVerboseLogDetails());
+            return;
+        }
+        LOG_ERROR(log, "Multipart upload hasn't been aborted. {}", getVerboseLogDetails());
+        tryLogCurrentException(__PRETTY_FUNCTION__);
     }
     catch (...)
     {
@@ -488,6 +504,11 @@ void WriteBufferFromS3::abortMultipartUpload()
     if (client_ptr->isClientForDisk())
         ProfileEvents::increment(ProfileEvents::DiskS3AbortMultipartUpload);
 
+    /// A lost single-attempt completion may have consumed the upload; `tryToAbortMultipartUpload` reports that.
+    std::optional<Expect404ResponseScope> no_such_upload_is_expected;
+    if (object_creation_client->usesSingleAttemptRetryStrategy())
+        no_such_upload_is_expected.emplace();
+
     Stopwatch watch;
     auto outcome = client_ptr->AbortMultipartUpload(req);
     auto elapsed = watch.elapsedMicroseconds();
@@ -682,7 +703,7 @@ bool WriteBufferFromS3::completeMultipartUpload()
             ProfileEvents::increment(ProfileEvents::DiskS3CompleteMultipartUpload);
 
         Stopwatch watch;
-        auto outcome = client_ptr->CompleteMultipartUpload(req);
+        auto outcome = object_creation_client->CompleteMultipartUpload(req);
         auto elapsed = watch.elapsedMicroseconds();
 
         ProfileEvents::increment(ProfileEvents::WriteBufferFromS3Microseconds, elapsed);
@@ -705,7 +726,8 @@ bool WriteBufferFromS3::completeMultipartUpload()
         {
             /// For unknown reason, at least MinIO can respond with NO_SUCH_KEY for put requests
             /// BTW, NO_SUCH_UPLOAD is expected error and we shouldn't retry it here, DB::S3::Client take care of it
-            LOG_INFO(log, "Multipart upload failed with NO_SUCH_KEY error, will retry. {}, Parts: {}", getVerboseLogDetails(), multipart_tags.size());
+            LOG_INFO(log, "Multipart upload failed with NO_SUCH_KEY error{}. {}, Parts: {}",
+                     i + 1 < max_retry ? ", will retry" : "", getVerboseLogDetails(), multipart_tags.size());
         }
         else
         {
@@ -786,7 +808,7 @@ void WriteBufferFromS3::makeSinglepartUpload(WriteBufferFromS3::PartData && data
             CurrentThread::WriteThrottlingScope write_throttling_scope(write_settings.remote_throttler);
 
             Stopwatch watch;
-            auto outcome = client_ptr->PutObject(request);
+            auto outcome = object_creation_client->PutObject(request);
             auto elapsed = watch.elapsedMicroseconds();
 
             ProfileEvents::increment(ProfileEvents::WriteBufferFromS3Microseconds, elapsed);
@@ -808,16 +830,19 @@ void WriteBufferFromS3::makeSinglepartUpload(WriteBufferFromS3::PartData && data
             {
 
                 /// For unknown reason, at least MinIO can respond with NO_SUCH_KEY for put requests
-                LOG_INFO(log, "Single part upload failed with NO_SUCH_KEY error. {}, size {}, will retry", getShortLogDetails(), content_length);
+                LOG_INFO(log, "Single part upload failed with NO_SUCH_KEY error. {}, size {}{}",
+                         getShortLogDetails(), content_length, i + 1 < max_retry ? ", will retry" : "");
             }
             else
             {
                 /// Neither says anything to the operator: PreconditionFailed is an expected response for
                 /// conditional writes (e.g. If-None-Match: *), handled by the caller (see
-                /// `S3::isPreconditionFailedError`); a SingleAttempt write is owned by an outer retry loop
-                /// that resolves the outcome and reissues, so its one failed attempt is not terminal either.
+                /// `S3::isPreconditionFailedError`); a request sent once (the SingleAttempt profile or a
+                /// single-attempt creation client) is owned by an outer retry loop that resolves the
+                /// outcome and reissues, so its one failed attempt is not terminal either.
                 if (S3::isPreconditionFailedError(outcome.GetError())
-                    || write_settings.object_storage_retry_profile == ObjectStorageRetryProfile::SingleAttempt)
+                    || write_settings.object_storage_retry_profile == ObjectStorageRetryProfile::SingleAttempt
+                    || object_creation_client->usesSingleAttemptRetryStrategy())
                     LOG_DEBUG(log, "S3Exception name {}, Message: {}, bucket {}, key {}, object size {}",
                               outcome.GetError().GetExceptionName(), outcome.GetError().GetMessage(), bucket, key, content_length);
                 else
