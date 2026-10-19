@@ -111,7 +111,8 @@ std::pair<ObjectStoragePtr, std::string> getOrCreateStorageAndKey(
     configure_fn(*cfg, config_prefix);
 
     /// Create under lock to avoid duplicate creation and wasted work
-    ObjectStoragePtr storage = ObjectStorageFactory::instance().create(cache_key, *cfg, config_prefix, context, /*skip_access_check*/ true);
+    ObjectStoragePtr storage = ObjectStorageFactory::instance().create(
+        cache_key, *cfg, config_prefix, context, /*skip_access_check*/ true, RemoteHostFilterCheck::Enforce);
 
     secondary_storages.storages.emplace(cache_key, storage);
     return {storage, key_to_use};
@@ -327,7 +328,7 @@ std::unordered_map<std::string, Field> parseKeyValueArguments(const ASTs & funct
 
         auto inserted = key_value_args.emplace(arg_name, arg_value).second;
         if (!inserted)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Duplicate key value argument: {}", arg_name);
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Duplicate key value argument: {}", arg_name);
     }
     return key_value_args;
 }
@@ -427,6 +428,10 @@ std::optional<std::pair<DB::ObjectStoragePtr, std::string>> tryResolveObjectStor
 
     auto ensure_local_path_inside_user_files = [&](const std::string & local_path)
     {
+        /// `clickhouse-local` has no `user_files` restriction.
+        if (context->getApplicationType() != DB::Context::ApplicationType::SERVER)
+            return;
+
         const auto target_path = std::filesystem::path(local_path).lexically_normal();
         const auto user_files_path = std::filesystem::path(context->getUserFilesPath()).lexically_normal();
 

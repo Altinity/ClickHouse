@@ -231,7 +231,7 @@ void SettingFieldNumber<T>::readBinary(ReadBuffer & in)
     {
         static_assert(std::is_floating_point_v<T>);
         String str;
-        readStringBinary(str, in);
+        readStringBinaryGrowing(str, in);
         *this = ::DB::parseFromString<T>(str);
     }
 }
@@ -423,7 +423,7 @@ void SettingFieldString::writeBinary(WriteBuffer & out) const
 void SettingFieldString::readBinary(ReadBuffer & in)
 {
     String str;
-    readStringBinary(str, in);
+    readStringBinaryGrowing(str, in);
     *this = std::move(str);
 }
 
@@ -506,7 +506,7 @@ void SettingFieldChar::writeBinary(WriteBuffer & out) const
 void SettingFieldChar::readBinary(ReadBuffer & in)
 {
     String str;
-    readStringBinary(str, in);
+    readStringBinaryGrowing(str, in);
     *this = stringToChar(str);
 }
 
@@ -519,7 +519,7 @@ void SettingFieldURI::writeBinary(WriteBuffer & out) const
 void SettingFieldURI::readBinary(ReadBuffer & in)
 {
     String str;
-    readStringBinary(str, in);
+    readStringBinaryGrowing(str, in);
     *this = Poco::URI{str};
 }
 
@@ -532,7 +532,7 @@ void SettingFieldEnumHelpers::writeBinary(std::string_view str, WriteBuffer & ou
 String SettingFieldEnumHelpers::readBinary(ReadBuffer & in)
 {
     String str;
-    readStringBinary(str, in);
+    readStringBinaryGrowing(str, in);
     return str;
 }
 
@@ -544,7 +544,7 @@ void SettingFieldTimezone::writeBinary(WriteBuffer & out) const
 void SettingFieldTimezone::readBinary(ReadBuffer & in)
 {
     String str;
-    readStringBinary(str, in);
+    readStringBinaryGrowing(str, in);
     *this = std::move(str);
 }
 
@@ -555,8 +555,12 @@ void SettingFieldTimezone::validateTimezone(const std::string & tz_str)
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Invalid time zone: {}", tz_str);
 }
 
-String SettingFieldCustom::toString() const
+String SettingFieldCustom::toString(bool show_secrets) const
 {
+    CustomType custom;
+    if (!show_secrets && value.tryGet<CustomType>(custom) && custom.isSecret())
+        return custom.toString(/* show_secrets */ false);
+
     return value.dump();
 }
 
@@ -573,7 +577,7 @@ void SettingFieldCustom::writeBinary(WriteBuffer & out) const
 void SettingFieldCustom::readBinary(ReadBuffer & in)
 {
     String str;
-    readStringBinary(str, in);
+    readStringBinaryGrowing(str, in);
     parseFromString(str);
 }
 

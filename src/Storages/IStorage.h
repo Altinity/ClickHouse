@@ -554,6 +554,10 @@ It is currently only implemented in StorageObjectStorage.
 
     virtual void dropInnerTableIfAny(bool /* sync */, ContextPtr /* context */) {}
 
+    /// Return true if the storage supports TRUNCATE operation.
+    /// Storages without their own data (e.g. View) return false.
+    virtual bool supportsTruncate() const { return true; }
+
     /** Clear the table data and leave it empty.
       * Must be called under exclusive lock (lockExclusively).
       */

@@ -10,6 +10,7 @@
 #include <Storages/MergeTree/MergeTreeDataPartType.h>
 
 #include <boost/noncopyable.hpp>
+#include <map>
 #include <unordered_map>
 #include <functional>
 #include <memory>
@@ -77,10 +78,35 @@ public:
     ///  - etc
     using KindStack = std::vector<Kind>;
 
+    /// The kind of a column in the Native format is chosen by the peer that sends the data, so a
+    /// reader declares with such a set which kinds the peer is allowed to select.
+    class KindSet
+    {
+    public:
+        constexpr KindSet(std::initializer_list<Kind> kinds) /// NOLINT(google-explicit-constructor)
+        {
+            for (auto kind : kinds)
+                bits |= maskOf(kind);
+        }
+
+        static constexpr KindSet all() { return KindSet(~UInt32(0)); }
+
+        constexpr bool contains(Kind kind) const { return (bits & maskOf(kind)) != 0; }
+        constexpr KindSet without(Kind kind) const { return KindSet(bits & ~maskOf(kind)); }
+
+    private:
+        explicit constexpr KindSet(UInt32 bits_) : bits(bits_) { }
+
+        static constexpr UInt32 maskOf(Kind kind) { return UInt32(1) << static_cast<UInt8>(kind); }
+
+        UInt32 bits = 0;
+    };
+
     virtual KindStack getKindStack() const { return {Kind::DEFAULT}; }
     SerializationPtr getPtr() const { return shared_from_this(); }
 
     static KindStack getKindStack(const IColumn & column);
+    static String kindToString(Kind kind);
     static String kindStackToString(const KindStack & kind);
     static KindStack stringToKindStack(const String & str);
     /// Check if provided kind stack contains specific kind.
@@ -255,6 +281,7 @@ public:
 
             Bucket,
             MapBucketsInfo,
+            MapBucketIndexes,
 
             Regular,
         };
@@ -344,6 +371,13 @@ public:
         size_t map_buckets_min_avg_size = 0;
         /// Type of MergeTree data part we serialize/deserialize data from if any.
         MergeTreeDataPartType data_part_type = MergeTreeDataPartType::Unknown;
+
+        /// Callback to check whether a specific substream exists in the current data part.
+        /// Used during enumeration to skip substreams that were introduced after the part
+        /// was written (e.g. MapBucketIndexes in old bucketed Map parts).
+        /// When not set, all substreams are enumerated unconditionally.
+        using CheckStreamExistsCallback = std::function<bool(const SubstreamPath &)>;
+        CheckStreamExistsCallback check_stream_exists_callback;
 
         /// Current level of array. Needed to differentiate stream names of nested array offsets.
         size_t array_level = 0;
@@ -443,7 +477,8 @@ public:
         bool native_format = false;
         const FormatSettings * format_settings;
 
-        bool object_and_dynamic_read_statistics = false;
+        /// Whether the stream contains statistics for `Dynamic`, `JSON`, and `Map`.
+        bool read_statistics = false;
 
         /// Callback that should be called when new dynamic subcolumns are discovered during prefix deserialization.
         StreamCallback dynamic_subcolumns_callback;
@@ -476,6 +511,13 @@ public:
 
         /// Callback used to mark a specific stream as unneeded indicating that it won't be used anymore.
         std::function<void(const SubstreamPath &)> release_stream_callback;
+
+        /// Callback to check whether a specific substream exists in the current data part.
+        /// Used during deserialization to handle backward compatibility: old parts written
+        /// before a new substream was introduced will not have it, and the getter may throw
+        /// (e.g. in compact parts) if called for a non-existent substream.
+        using CheckStreamExistsCallback = std::function<bool(const SubstreamPath &)>;
+        CheckStreamExistsCallback check_stream_exists_callback;
 
         /// Type of MergeTree data part we deserialize data from if any.
         /// Some serializations may differ from type part for more optimal deserialization.
@@ -646,8 +688,13 @@ public:
     static String getFileNameForRenamedColumnStream(const NameAndTypePair & column_from, const NameAndTypePair & column_to, const String & file_name);
     static String getFileNameForRenamedColumnStream(const String & name_from, const String & name_to, const String & file_name);
 
-    static String getSubcolumnNameForStream(const SubstreamPath & path, bool encode_sparse_stream = false, size_t initial_array_level = 0);
-    static String getSubcolumnNameForStream(const SubstreamPath & path, size_t prefix_len, bool encode_sparse_stream = false, size_t initial_array_level = 0);
+    static String getSubcolumnNameForStream(const SubstreamPath & path);
+    static String getSubcolumnNameForStream(const SubstreamPath & path, size_t prefix_len, size_t initial_array_level = 0);
+    /// Rejects a stale `(path, true)` call, which would otherwise silently bind `true` to `prefix_len`.
+    static String getSubcolumnNameForStream(const SubstreamPath & path, bool) = delete;
+
+    /// Key of a stream in SubstreamsCache and SubstreamsDeserializeStatesCache.
+    static String getSubstreamsCacheKeyForStream(const SubstreamPath & path);
 
     static void addColumnWithNumReadRowsToSubstreamsCache(SubstreamsCache * cache, const SubstreamPath & path, ColumnPtr column, size_t num_read_rows);
     static std::optional<std::pair<ColumnPtr, size_t>> getColumnWithNumReadRowsFromSubstreamsCache(SubstreamsCache * cache, const SubstreamPath & path);

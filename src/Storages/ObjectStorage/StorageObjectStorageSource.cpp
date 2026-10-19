@@ -21,6 +21,7 @@
 #include <Interpreters/Cache/FileCacheKey.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Interpreters/castColumn.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Processors/Formats/Impl/ParquetMetadataCache.h>
@@ -208,7 +209,7 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
 
         /// Use the full table location URI (e.g. `s3a://bucket/prefix/table/`) when available
         std::string table_location = configuration->getPathForRead().path;
-        if (auto * metadata = configuration->getExternalMetadata())
+        if (auto metadata = configuration->getExternalMetadata())
             table_location = metadata->getTableLocation();
 
         auto distributed_iterator = std::make_unique<ReadTaskIterator>(
@@ -331,6 +332,25 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
     }
     else if (configuration->supportsFileIterator())
     {
+        /// For datalake configurations, ensure datalake_table_state is present in the metadata
+        /// before calling iterate(). The state is normally set by
+        /// updateExternalDynamicMetadataIfExists() during query analysis, but it can be missing
+        /// due to race conditions between concurrent queries (TOCTOU between setInMemoryMetadata
+        /// and getInMemoryMetadataPtr), or when called from code paths that bypass the
+        /// analyzer/interpreter (e.g. schema inference, cluster functions with nullptr metadata).
+        if (configuration->isDataLakeConfiguration()
+            && (!storage_metadata || !storage_metadata->datalake_table_state.has_value()))
+        {
+            if (auto state = configuration->getTableStateSnapshot(local_context))
+            {
+                auto fixed_metadata = storage_metadata
+                    ? std::make_shared<StorageInMemoryMetadata>(*storage_metadata)
+                    : std::make_shared<StorageInMemoryMetadata>();
+                fixed_metadata->setDataLakeTableState(*state);
+                storage_metadata = std::move(fixed_metadata);
+            }
+        }
+
         auto iter = configuration->iterate(
             filter_actions_dag, file_progress_callback, query_settings.list_object_keys_size, storage_metadata, local_context);
 
@@ -498,7 +518,7 @@ Chunk StorageObjectStorageSource::generate()
             if (chunk_size && chunk.hasColumns())
             {
                 /// Old delta lake code which needs to be deprecated in favour of DeltaLakeMetadataDeltaKernel.
-                if (dynamic_cast<const DeltaLakeMetadata *>(configuration->getExternalMetadata()))
+                if (std::dynamic_pointer_cast<const DeltaLakeMetadata>(configuration->getExternalMetadata()))
                 {
                     /// This is an awful temporary crutch,
                     /// which will be removed once DeltaKernel is used by default for DeltaLake.
@@ -536,6 +556,11 @@ Chunk StorageObjectStorageSource::generate()
 
                                     const auto column_pos = read_from_format_info.source_header.getPositionByName(name_and_type.name);
                                     auto partition_column = name_and_type.type->createColumnConst(chunk.getNumRows(), value)->convertToFullColumnIfConst();
+                                    /// The `_delta_log` type differs from the declared one when the columns were
+                                    /// specified rather than inferred, and the block follows the declared schema.
+                                    const auto & declared_type = read_from_format_info.source_header.getByPosition(column_pos).type;
+                                    if (!name_and_type.type->equals(*declared_type))
+                                        partition_column = castColumn({partition_column, name_and_type.type, name_and_type.name}, declared_type);
                                     /// This column is filled with default value now, remove it.
                                     chunk.erase(column_pos);
                                     /// Add correct values.
@@ -791,9 +816,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
     ProfileEvents::increment(ProfileEvents::ObjectStorageClusterProcessedTasks);
 
+    std::unique_ptr<ReadBuffer> read_buf; /// Destroyed last: `builder` and `source` hold the input format reading it.
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
-    std::unique_ptr<ReadBuffer> read_buf;
     std::optional<Int64> rows_count_from_metadata;
 
     auto try_get_num_rows_from_cache = [&]() -> std::optional<size_t>
@@ -1045,14 +1070,32 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             {
                 if (auto mapper = configuration->getColumnMapperForObject(object_info))
                 {
-                    if (format_supports_prewhere)
-                        return std::make_shared<FormatFilterInfo>(
-                            format_filter_info->filter_actions_dag, format_filter_info->context.lock(),
-                            mapper, format_filter_info->row_level_filter, format_filter_info->prewhere_info);
-                    else
-                        return std::make_shared<FormatFilterInfo>(
-                            format_filter_info->filter_actions_dag, format_filter_info->context.lock(),
-                            mapper, nullptr, nullptr);
+                    /// `schema_changed` is true for real schema evolution (a schema-id
+                    /// mismatch: renamed / type-changed columns) AND for current-schema
+                    /// files that merely carry equality deletes. Strip the reader-side
+                    /// filters ONLY for the former: there the old-schema mapper resolves
+                    /// field-ids to the file's OLD names while PREWHERE / row-level filter
+                    /// reference the CURRENT names, so in-reader evaluation matches nothing
+                    /// (re-applied as fallback FilterTransforms after the schema transform
+                    /// renames the columns below). For equality-delete-only files
+                    /// (getSchemaTransformer() == null, no rename) the mapper already yields
+                    /// the current names, so keep the filters in the reader to preserve
+                    /// Parquet row-group / page pruning.
+                    const bool has_schema_transform
+                        = configuration->getSchemaTransformer(context_, object_info) != nullptr;
+                    if (format_supports_prewhere && has_schema_transform)
+                    {
+                        if (format_filter_info->row_level_filter)
+                            stripped_row_level_filter = format_filter_info->row_level_filter;
+                        if (format_filter_info->prewhere_info)
+                            stripped_prewhere_info = format_filter_info->prewhere_info;
+                    }
+                    const bool keep_in_reader = format_supports_prewhere && !has_schema_transform;
+                    return std::make_shared<FormatFilterInfo>(
+                        format_filter_info->filter_actions_dag, format_filter_info->context.lock(),
+                        mapper,
+                        keep_in_reader ? format_filter_info->row_level_filter : nullptr,
+                        keep_in_reader ? format_filter_info->prewhere_info : nullptr);
                 }
             }
 

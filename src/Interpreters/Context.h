@@ -563,11 +563,17 @@ protected:
     bool is_internal_query = false;
     /// A flag, used to detect sub-operations of background operations - in this case we won't need to build another background contexts
     bool is_background_operation = false;
+    /// True when this context belongs to the inner query of an expanded view.
+    /// Such a query reads its own tables, not the inserted block of a materialized view.
+    bool is_view_inner_query = false;
     /// Set for queries created internally by the server for DDL replication (ON CLUSTER, DatabaseReplicated)
     /// and internal backup coordination.
     /// Unlike query_kind == SECONDARY_QUERY (which comes from the client and can be spoofed),
     /// this flag can only be set server-side and is safe to use for security-sensitive checks.
     bool is_ddl_or_on_cluster_internal = false;
+    /// Set for CREATE queries a Replicated database replays from a definition it already stored.
+    /// Such a definition describes existing state, so validation that may reject a new one must not run.
+    bool is_recovery_from_stored_metadata = false;
 
     inline static ContextPtr global_context_instance;
     inline static ContextPtr background_context_instance;   /// Global holder to maintain ownership of background_context
@@ -769,6 +775,7 @@ public:
         RABBITMQ_UNSUPPORTED_COLUMNS,
         REPLICATED_DB_WITH_ALL_GROUPS_CLUSTER_PREFIX,
         ROTATIONAL_DISK_WITH_DISABLED_READHEAD,
+        CUSTOM_DISK_NOT_ALLOWED_BY_REMOTE_URL_ALLOW_HOSTS,
         SERVER_BUILT_IN_DEBUG_MODE,
         SERVER_BUILT_WITH_COVERAGE,
         SERVER_BUILT_WITH_SANITIZERS,
@@ -1047,6 +1054,7 @@ public:
 
     void addViewSource(const StoragePtr & storage);
     StoragePtr getViewSource() const;
+    void clearViewSource();
 
     String getCurrentDatabase() const;
     String getCurrentQueryId() const { return client_info.current_query_id; }
@@ -1106,6 +1114,9 @@ public:
     void checkSettingsConstraints(const SettingChange & change, SettingSource source);
     void checkSettingsConstraints(const SettingsChanges & changes, SettingSource source);
     void checkSettingsConstraints(SettingsChanges & changes, SettingSource source);
+    void checkSettingsConstraintsForSettingsReset(const std::vector<String> & names, SettingSource source);
+    /// For the resets of a statement that also changes `profile`: `changes_applied_first` decides their constraints.
+    void checkSettingsConstraintsForSettingsReset(const std::vector<String> & names, const SettingsChanges & changes_applied_first, SettingSource source);
     void clampToSettingsConstraints(SettingsChanges & changes, SettingSource source);
     void checkMergeTreeSettingsConstraints(const MergeTreeSettings & merge_tree_settings, const SettingsChanges & changes) const;
 
@@ -1619,9 +1630,14 @@ public:
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }
 
+    bool isViewInnerQuery() const { return is_view_inner_query; }
+    void setIsViewInnerQuery(bool value) { is_view_inner_query = value; }
+
     bool isDDLOrOnClusterInternal() const { return is_ddl_or_on_cluster_internal; }
     void setDDLOrOnClusterInternal(bool value) { is_ddl_or_on_cluster_internal = value; }
 
+    bool isRecoveryFromStoredMetadata() const { return is_recovery_from_stored_metadata; }
+    void setRecoveryFromStoredMetadata(bool value) { is_recovery_from_stored_metadata = value; }
 
     ActionLocksManagerPtr getActionLocksManager() const;
 

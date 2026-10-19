@@ -112,6 +112,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     , cluster_name_in_settings(false)
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
+    configuration->check(context_);
 
     const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto");
     const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && catalog;
@@ -177,12 +178,15 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
     else
         validateSupportedColumns(columns, *configuration);
-    configuration->check(context_);
 
-    if (updated_configuration && sample_path.empty()
-            && context_->getSettingsRef()[Setting::use_hive_partitioning]
-            && !configuration->isDataLakeConfiguration()
-            && !configuration->getPartitionStrategy())
+    const bool need_resolve_sample_path = context_->getSettingsRef()[Setting::use_hive_partitioning]
+        && !configuration->isDataLakeConfiguration()
+        && !configuration->getPartitionStrategy();
+
+    /// Same condition as in `StorageObjectStorage`, which resolves the sample path on the first use of the table.
+    hive_partitioning_sample_path_deferred = !is_table_function && need_resolve_sample_path && !need_resolve_columns_or_format;
+
+    if (updated_configuration && sample_path.empty() && need_resolve_sample_path && !hive_partitioning_sample_path_deferred)
     {
         sample_path = getPathSample(context_);
     }
@@ -541,10 +545,33 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
         args.insert(args.end(), object_storage_type_arg);
 }
 
+void StorageObjectStorageCluster::resolveHivePartitioningSamplePathIfDeferred(const ContextPtr & query_context)
+{
+    if (!hive_partitioning_sample_path_deferred)
+        return;
+
+    std::lock_guard lock(hive_partitioning_resolution_mutex);
+    if (hive_partitioning_sample_path_resolved)
+        return;
+
+    if (!pure_storage->resolveHivePartitioningSamplePathIfDeferred(query_context))
+        return;
+
+    hive_partition_columns_to_read_from_file_path = pure_storage->getHivePartitionColumnsToReadFromFilePath();
+    setVirtuals(*pure_storage->getVirtualsPtr());
+    setInMemoryMetadata(pure_storage->getInMemoryMetadata());
+
+    hive_partitioning_sample_path_resolved = true;
+}
+
 void StorageObjectStorageCluster::updateExternalDynamicMetadataIfExists(ContextPtr query_context)
 {
     if (!configuration->isDataLakeConfiguration())
+    {
+        /// Called before query analysis, so the hive virtual columns are visible to the triggering query.
+        resolveHivePartitioningSamplePathIfDeferred(query_context);
         return;
+    }
 
     /// Always force an update to pick up the latest snapshot version.
     /// Using if_not_updated_before=true would leave latest_snapshot_version
@@ -830,7 +857,7 @@ StorageMetadataPtr StorageObjectStorageCluster::getInMemoryMetadataPtr(bool bypa
     return IStorageCluster::getInMemoryMetadataPtr(bypass_metadata_cache);
 }
 
-IDataLakeMetadata * StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
+std::shared_ptr<IDataLakeMetadata> StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
 {
     if (getClusterName(query_context).empty())
         return pure_storage->getExternalMetadata(query_context);

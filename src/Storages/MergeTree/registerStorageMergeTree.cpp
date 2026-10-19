@@ -1,4 +1,5 @@
 #include <Databases/DatabaseReplicatedHelpers.h>
+#include <Databases/LoadingStrictnessLevel.h>
 #include <Storages/MergeTree/MergeTreeIndexMinMax.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -218,7 +219,8 @@ static TableZnodeInfo extractZooKeeperPathAndReplicaNameFromEngineArgs(
     const String & engine_name,
     ASTs & engine_args,
     LoadingStrictnessLevel mode,
-    const ContextPtr & local_context)
+    const ContextPtr & local_context,
+    bool validate_substitutions)
 {
     chassert(isReplicated(engine_name));
 
@@ -233,7 +235,7 @@ static TableZnodeInfo extractZooKeeperPathAndReplicaNameFromEngineArgs(
 
     auto expand_macro = [&] (ASTLiteral * ast_zk_path, ASTLiteral * ast_replica_name, String zookeeper_path, String replica_name) -> TableZnodeInfo
     {
-        TableZnodeInfo res = TableZnodeInfo::resolve(zookeeper_path, replica_name, table_id, query, mode, local_context);
+        TableZnodeInfo res = TableZnodeInfo::resolve(zookeeper_path, replica_name, table_id, query, mode, local_context, validate_substitutions);
         ast_zk_path->value = res.full_path_for_metadata;
         ast_replica_name->value = res.replica_name_for_metadata;
         return res;
@@ -345,8 +347,11 @@ std::optional<String> extractZooKeeperPathFromReplicatedTableDef(const ASTCreate
 
     try
     {
+        /// This only reads back the path of an already-created table, so it must never reject it:
+        /// the `catch` below turns a rejection into `nullopt`, which silently drops the table from a backup.
         auto res = extractZooKeeperPathAndReplicaNameFromEngineArgs(
-            query, table_id, engine_name, engine_args, LoadingStrictnessLevel::CREATE, local_context);
+            query, table_id, engine_name, engine_args, LoadingStrictnessLevel::CREATE, local_context,
+            /*validate_substitutions=*/ false);
         return res.full_path;
     }
     catch (Exception & e)
@@ -538,8 +543,16 @@ static StoragePtr create(const StorageFactory::Arguments & args)
 
     if (replicated)
     {
+        /// Only a freshly supplied definition is validated: a CREATE, or a full-definition ATTACH.
+        /// Every other route re-derives a table that already exists and must keep loading. Such a
+        /// replay can arrive at CREATE, so `mode` cannot tell it apart and the context carries it.
+        const bool validate_substitutions = (args.mode <= LoadingStrictnessLevel::CREATE
+                || (args.mode == LoadingStrictnessLevel::ATTACH && !args.query.attach_short_syntax))
+            && !args.is_restore_from_backup
+            && !args.getLocalContext()->isRecoveryFromStoredMetadata();
         zookeeper_info = extractZooKeeperPathAndReplicaNameFromEngineArgs(
-            args.query, args.table_id, args.engine_name, args.engine_args, args.mode, args.getLocalContext());
+            args.query, args.table_id, args.engine_name, args.engine_args, args.mode, args.getLocalContext(),
+            validate_substitutions);
 
         if (zookeeper_info.replica_name.empty())
             throw Exception(ErrorCodes::NO_REPLICA_NAME_GIVEN, "No replica name in config{}", verbose_help_message);
@@ -640,6 +653,8 @@ static StoragePtr create(const StorageFactory::Arguments & args)
     const auto & initial_storage_settings = replicated ? context->getReplicatedMergeTreeSettings() : context->getMergeTreeSettings();
     std::unique_ptr<MergeTreeSettings> storage_settings = std::make_unique<MergeTreeSettings>(initial_storage_settings);
 
+    const bool is_fresh_definition = isFreshTableDefinition(args.mode, args.query.attach_short_syntax);
+
     if (is_extended_storage_def)
     {
         ASTPtr partition_by_key;
@@ -713,15 +728,36 @@ static StoragePtr create(const StorageFactory::Arguments & args)
                 args.storage_def->ttl_table->ptr(), metadata.columns, context, metadata.primary_key, allow_suspicious_ttl);
         }
 
-        storage_settings->loadFromQuery(*args.storage_def, context, LoadingStrictnessLevel::ATTACH <= args.mode);
+        /// We use the local (query) context here so that user-level settings profiles can control
+        /// access to dynamic disk features such as `from_env`, `include`, and `from_zk`
+        /// (settings `dynamic_disk_allow_from_env`, `dynamic_disk_allow_include`, `dynamic_disk_allow_from_zk`).
+        /// When loading from existing metadata (`FORCE_ATTACH` / `FORCE_RESTORE`, e.g. server
+        /// restart or `UNDROP TABLE`), security checks inside `getDiskConfigurationFromAST` are
+        /// intentionally skipped because the disk configuration was already validated when the
+        /// table was originally created.
+        /// User-initiated `ATTACH TABLE` queries, with a definition or in the short form, use
+        /// `LoadingStrictnessLevel::ATTACH` and must still be subject to these checks.
+        storage_settings->loadFromQuery(*args.storage_def, args.getLocalContext(), isLoadingFromExistingMetadata(args.mode));
+
+        /// What this query changes from the settings the server has in effect, which already include the
+        /// `merge_tree` config section and `compatibility`: those are not changes made by the query. A
+        /// full-definition `ATTACH` states its settings itself, so it is checked like a `CREATE`.
+        if (is_fresh_definition)
+            args.getLocalContext()->checkMergeTreeSettingsConstraints(
+                initial_storage_settings, storage_settings->changesFrom(initial_storage_settings));
+
+        /// `MergeTreeData` runs `sanityCheck` on the settings it is given when the mode says `CREATE`, so a
+        /// full-definition `ATTACH` is the fresh definition left to check. Without this it can state a value
+        /// such as `index_granularity = 0` that the same `CREATE` refuses, and the table is created broken.
+        if (is_fresh_definition && args.mode > LoadingStrictnessLevel::CREATE)
+        {
+            context->getGlobalContext()->initializeBackgroundExecutorsIfNeeded();
+            storage_settings->sanityCheck(context->getMergeMutateExecutor()->getMaxTasksCount());
+        }
 
         /// Updates the default storage_settings with settings specified via SETTINGS arg in a query
         if (args.storage_def->settings)
-        {
-            if (args.mode <= LoadingStrictnessLevel::CREATE)
-                args.getLocalContext()->checkMergeTreeSettingsConstraints(initial_storage_settings, storage_settings->changes());
             metadata.settings_changes = args.storage_def->settings->ptr();
-        }
 
         metadata.add_minmax_index_for_numeric_columns = (*storage_settings)[MergeTreeSetting::add_minmax_index_for_numeric_columns];
         metadata.add_minmax_index_for_string_columns = (*storage_settings)[MergeTreeSetting::add_minmax_index_for_string_columns];
@@ -854,7 +890,8 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         if (ast && ast->value.getType() == Field::Types::UInt64)
         {
             (*storage_settings)[MergeTreeSetting::index_granularity] = ast->value.safeGet<UInt64>();
-            if (args.mode <= LoadingStrictnessLevel::CREATE)
+            /// The old syntax states `index_granularity` as an engine argument instead of a setting
+            if (is_fresh_definition)
             {
                 SettingsChanges changes;
                 changes.emplace_back("index_granularity", Field((*storage_settings)[MergeTreeSetting::index_granularity]));

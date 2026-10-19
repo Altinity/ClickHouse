@@ -86,6 +86,7 @@ def export_cluster():
             ],
             user_configs=[
                 "configs/users.d/allow_export_partition.xml",
+                "configs/users.d/users.xml",
             ],
             with_minio=True,
             stay_alive=True,
@@ -101,6 +102,7 @@ def export_cluster():
                 ],
                 user_configs=[
                     "configs/users.d/allow_export_partition.xml",
+                    "configs/users.d/users.xml",
                 ],
                 stay_alive=True,
                 with_zookeeper=True,
