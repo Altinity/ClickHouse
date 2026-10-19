@@ -1081,23 +1081,32 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         CollectUsedColumnsForSourceVisitor collector(left_table_expression, context);
         collector.visit(modified_query_tree);
 
-        if (query_node.getPrewhere())
-            removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getPrewhere(), left_table_expression, context);
-        if (query_node.getWhere())
-            removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getWhere(), left_table_expression, context);
+        /// A left-only predicate applied before a `RIGHT` or `FULL` join changes which right rows are
+        /// unmatched. The initiator still has the original predicate, so the shard scan must not.
+        const bool preserves_right_side = queryHasRightOrFullJoin(query_to_send);
+        if (!preserves_right_side)
+        {
+            if (query_node.getPrewhere())
+                removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getPrewhere(), left_table_expression, context);
+            if (query_node.getWhere())
+                removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getWhere(), left_table_expression, context);
 
-        /// The wrap predicate runs on remote nodes. Drop conjuncts such as `dictGet` and `hostName`
-        /// that must stay on the initiator.
-        if (query_node.getPrewhere())
-            removeExpressionsThatAreUnsafeToDuplicate(query_node.getPrewhere(), context);
-        if (query_node.getWhere())
-            removeExpressionsThatAreUnsafeToDuplicate(query_node.getWhere(), context);
+            /// The wrap predicate runs on remote nodes. Drop conjuncts such as `dictGet` and `hostName`
+            /// that must stay on the initiator.
+            if (query_node.getPrewhere())
+                removeExpressionsThatAreUnsafeToDuplicate(query_node.getPrewhere(), context);
+            if (query_node.getWhere())
+                removeExpressionsThatAreUnsafeToDuplicate(query_node.getWhere(), context);
+        }
 
         auto rewritten_query_tree = buildQueryToReadColumnsFromTableExpression(
             collector.getColumns(), left_table_expression, context);
         auto & rewritten_query_node = rewritten_query_tree->as<QueryNode &>();
-        rewritten_query_node.getPrewhere() = query_node.getPrewhere();
-        rewritten_query_node.getWhere() = query_node.getWhere();
+        if (!preserves_right_side)
+        {
+            rewritten_query_node.getPrewhere() = query_node.getPrewhere();
+            rewritten_query_node.getWhere() = query_node.getWhere();
+        }
 
         query_to_send = queryNodeToDistributedSelectQuery(rewritten_query_tree);
         return;
@@ -1124,6 +1133,9 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Query is not analyzed: no syntax analyzer result");
 
         TreeRewriterResult rewriter_result = *query_info.syntax_analyzer_result;
+        /// `removeJoin` drops the join, so the kind has to be read first. A left-only `WHERE` kept
+        /// below a `RIGHT` or `FULL` join changes which right rows are unmatched.
+        const bool preserves_right_side = selectHasRightOrFullJoin(*select_query);
         if (!removeJoin(*select_query, rewriter_result, context))
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to strip JOIN from query sent to cluster nodes");
 
@@ -1136,7 +1148,8 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         select_query->order_by_all = false;
 
         /// `removeJoin` keeps left-table WHERE, including `GLOBAL IN (_subqueryN)`, which remotes cannot resolve.
-        if (astContainsInTableIdentifier(select_query->where()) || astContainsInTableIdentifier(select_query->prewhere())
+        if (preserves_right_side
+            || astContainsInTableIdentifier(select_query->where()) || astContainsInTableIdentifier(select_query->prewhere())
             || astContainsSubquery(select_query->where()) || astContainsSubquery(select_query->prewhere()))
         {
             select_query->setExpression(ASTSelectQuery::Expression::PREWHERE, {});
