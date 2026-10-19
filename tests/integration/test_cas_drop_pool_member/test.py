@@ -403,6 +403,16 @@ def test_drop_pool_member_rejected_on_readonly_disk():
     assert "read-only" in err, err
 
 
+def test_drop_pool_member_refuses_id_with_slash():
+    # The drain selects a member's objects by key prefix, so it refuses an id with '/'.
+    node1 = cluster.instances["node1"]
+    err = node1.query_and_get_error(
+        "SYSTEM CAS DROP POOL MEMBER 'node2/nested' FROM DISK '{}'".format(CA_DISK)
+    )
+    assert "BAD_ARGUMENTS" in err, err
+    assert "contains '/'" in err, err
+
+
 def test_retired_member_rejoins_empty():
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]

@@ -468,6 +468,29 @@ TEST_F(CASDecommission, RefusesLiveMember)
     });
 }
 
+/// The refusal names the state a hard-killed member has to reach. `expired` in `system.cas_mounts` is
+/// wall-clock arithmetic; the claim trusts only a terminal slot (`terminated` or `fenced`), and an
+/// expired, unfenced lease takes exactly the branch an unexpired one takes here.
+TEST_F(CASDecommission, NoWaitRefusalNamesTheTerminalStates)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto victim = openVictim(backend);
+
+    try
+    {
+        Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+        FAIL() << "expected the live member to be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::ABORTED);
+        EXPECT_NE(e.message().find("alive or contended"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("state = 'terminated'"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("state = 'fenced'"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("GC round"), String::npos) << e.message();
+    }
+}
+
 TEST_F(CASDecommission, ClaimsDeadMemberAndBumpsEpoch)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -499,6 +522,7 @@ TEST_F(CASDecommission, AlwaysRenewsAdminClaimEvenWhenHostDiskIsObserveOnly)
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin", .background_watermark = false}, "victim");
     ASSERT_TRUE(admin != nullptr);
     EXPECT_TRUE(admin->poolConfig().background_watermark);
+    EXPECT_TRUE(admin->poolConfig().bounded_background_renewal);
 }
 
 TEST_F(CASDecommission, OpensOverARetiredOwner)
@@ -520,6 +544,31 @@ TEST_F(CASDecommission, RefusesUnknownMember)
     {
         Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "never_existed");
     });
+}
+
+/// `SYSTEM CAS DROP POOL MEMBER 'a/b'` is refused before it touches the member, even when `a/b` owns its
+/// owner object: the drain selects objects by key prefix, so it is defined only for ids without `/`.
+TEST_F(CASDecommission, RefusesIdWithSlash)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    OperationForTest raw_op(*backend);
+    ASSERT_TRUE(std::holds_alternative<Committed>((*raw_op).create(layout.ownerKey("shard-01/replica-a"),
+        encodeOwner(OwnerObject{.server_uuid = UInt128(1), .retired_at_ms = std::nullopt}), Retry::once())));
+    const auto owner_before = (*raw_op).read(layout.ownerKey("shard-01/replica-a"), Retry::once());
+    ASSERT_TRUE(owner_before.has_value());
+
+    DB::Cas::tests::expectThrowsCodeWithMessage(ErrorCodes::BAD_ARGUMENTS, "contains '/'", [&]
+    {
+        decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "shard-01/replica-a");
+    });
+
+    const auto owner_after = (*raw_op).read(layout.ownerKey("shard-01/replica-a"), Retry::once());
+    ASSERT_TRUE(owner_after.has_value());
+    EXPECT_EQ(owner_after->etag, owner_before->etag);
+    EXPECT_FALSE((*raw_op).head(layout.mountKey("shard-01/replica-a"), Retry::once()).has_value());
+    EXPECT_FALSE((*raw_op).head(layout.epochKey("shard-01/replica-a"), Retry::once()).has_value());
 }
 
 TEST_F(CASDecommission, SecondConcurrentDecommissionRefused)

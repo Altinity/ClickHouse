@@ -20,8 +20,8 @@ otherwise regenerate the same `ServerUUID` from a wiped local state directory, w
 silently steal an existing identity.
 
 Validation (`validateServerRootId`, `Pool/CasServerRoot.h`) is fail-closed `BAD_ARGUMENTS`, no
-sanitizing fallback: non-empty, at most 255 bytes, no empty/`.`/`..` path segment, no `_files` or
-`_manifests` segment.
+sanitizing fallback: non-empty, at most 255 bytes, no `/`, not `.` or `..`, not `_files` or
+`_manifests`.
 
 It roots four subtrees and owns catalog names at or below `<server_root_id>`:
 
@@ -38,6 +38,11 @@ dedup work. Ref/namespace keys are also deliberately opaque and do not embed the
 Each replica sharing a backend endpoint must use a distinct `cas_server_root_id`; omitting the setting
 is a startup error.
 
+The id may not contain `/`, and this holds for an id that already owns its owner object too: decommission
+and the staging sweep select a member's objects by key prefix, so a member `a/b` would be drained by a
+decommission of `a`. A server whose id contains `/` refuses to open the disk; see
+[recreating a member whose id contains `/`](/antalya/cas/operations/migration#recreate-id-with-slash).
+
 ## The owner claim {#owner-claim}
 
 `claimOwnerOrThrow` binds `server_root_id` to one `server_uuid` per owner life. The owner object is never
@@ -49,9 +54,10 @@ at the next life ([rejoin](#rejoin)).
 | present, same `server_uuid`, not tombstoned | proceed |
 | present, `retired_at_ms` set, `retirement_verified` | a server start rejoins when its preconditions hold ([below](#rejoin)); a remount fails with `CORRUPTED_DATA`; the decommission admin accepts its victim's tombstone |
 | present, `retired_at_ms` set, not verified | `CORRUPTED_DATA` for a server start or remount: the decommission is not finished; the decommission admin accepts it |
-| present, different `server_uuid`, not tombstoned | `CORRUPTED_DATA` — names the regenerated-uuid-file cause |
+| present, different `server_uuid`, not tombstoned | `CORRUPTED_DATA` — names the regenerated-uuid-file cause and, for a dead owner, `SYSTEM CAS DROP POOL MEMBER` |
 | absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
+| absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | lost the `putIfAbsent` race | re-read; equal uuid proceeds, else `CORRUPTED_DATA` |
 
 The owner carries `owner_life`, a counter every owner write sets to the read value + 1 by `If-Match`, so
@@ -123,14 +129,17 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
   after a flat pause and settled by the reissue's own answer (a 2xx) or by the exact `GET` that
   follows its `412`. The renewer adopts the result only when the complete body, including `write_attempt_id`,
   equals its immutable request. If the predecessor token is still current, another identical `PUT`
-  may follow bounded backoff. A same-pair twin, GC-fenced body, successor, foreign holder, or absent
+  follows after a pause. A same-pair twin, GC-fenced body, successor, foreign holder, or absent
   body is never treated as this renewal.
-- **Absolute deadline.** Renewal uses `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`, so a VM resumed from
-  suspend correctly observes itself expired. Its absolute deadline is the minimum of the existing
-  request-operation budget and the last confirmed lease deadline minus the safety margin. The
-  controller checks that one attempt envelope still fits before each backend `PUT` or resolving
-  `GET`, after each interruptible backoff, and before accepting success. A retry, `GET`, response
-  timestamp, or wall-clock step never extends authority.
+- **Deadline from the start.** Renewal uses `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`, so a VM resumed
+  from suspend correctly observes itself expired. A confirmed renewal sets the deadline to its own
+  start plus the lease; a retry, `GET`, response timestamp, or wall-clock step never moves it. The
+  background renewal has no deadline of its own: it retries one body every 0.8–1.2 s (measured from
+  the start of the previous attempt) until the store answers about the slot, or until a stop, a
+  remount park request, a lost fence or a pool leaving `Live` ends it. A
+  refusal (`AccessDenied`, `MalformedXML`, …) sends the same body again one renewal period later.
+  The bounded renewals — the startup re-anchor, the remount re-anchor, and the background renewal of a
+  pool opened for decommission — stay bounded by the last confirmed lease minus the safety margin.
 - **Cadence.** The runtime normally starts a logical renewal every `cas_mount_renew_period_ms` (default
   10 s), with TTL `cas_mount_lease_ttl_ms` (default 30 s, TTL/3 renewal ratio). The next beat is anchored
   at the committed body's pre-I/O BOOTTIME start. A slow recovery therefore causes an immediate
@@ -145,19 +154,32 @@ watermark — there is no separate watermark object. `MountLease` fields: `serve
 
 **Losing the lease is neither read-only mode nor a process abort.** `MountLeaseRenewer` is a
 synchronous durable-slot state machine. A committed result advances its token, sequence, confirmed
-BOOTTIME deadline, and cadence anchor. Any admitted deterministic failure, confirmed conflict, or
-ambiguity left at the deadline/attempt limit moves it to `RenewalTerminal`; it cannot mint another
-body or publish a clean farewell. Owner cancellation before any request is the only
-`NotAttempted` result and leaves clean release possible. Cancellation after a request was sent is
-terminal because that request may still land.
+BOOTTIME deadline, and cadence anchor. A deterministic failure, a confirmed conflict, or, for a
+bounded renewal, ambiguity left at its deadline moves it to `RenewalTerminal`; it cannot mint another
+body or publish a clean farewell. Owner cancellation before any request, or between two calls of the
+background renewal after a refusal or after a read that found the slot unchanged, is `NotAttempted` and
+leaves clean release possible. Cancellation after a request of the current call was sent, or while the
+reads after a refused precondition repeat, is terminal: that request may still land, or the slot may
+have moved.
+
+**An expired lease is a pause.** While the store does not answer, writes stop being admitted once the
+remaining lease cannot cover one write: `2 × envelope + safety_margin` before the deadline. From that
+moment `system.cas_mounts` shows `lifecycle = 'not_live'` and `lifecycle_reason = 'lease_expired'`,
+and the server logs one `WARNING`, at the next renewal attempt, that ends with the last renewal error:
+`CAS mount lease of '<server_root_id>' under writer_epoch <E> has too little time left for a write`.
+Nothing is remounted. A confirmed renewal resumes writes under the same `writer_epoch` only if its start
+plus the lease leaves more than `2 × envelope + safety_margin`; a renewal confirmed later than that
+leaves writes paused, and the next one starts at once. A clean shutdown during a pause skips the
+farewell, which has no lease room left, and leaves the slot for GC to observe. Such a late renewal stores an `expires_at_ms` already in the past, and GC still does
+not fence the slot for it: GC fences only a token it watched unchanged for its whole threshold.
 
 After the renewer call returns, `CasMountRuntime` consumes the result. A terminal result trips the
 local fence (latches `lost`, bumps the fence generation, moves the in-process runtime to
 `TransientNotLive`) and latches one self-remount generation. A confirmed foreign/successor or
 same-pair conflict remains a typed fail-closed error; it is never adopted. A real fence still costs
 only an epoch: recovery reclaims with a fresh one, bounded at three whole-chain attempts. This is the
-general CAS posture: doubt about the source fails closed, while transport ambiguity may retry only
-inside authority already proved by the last confirmed lease.
+general CAS posture: doubt about the source fails closed, while transport ambiguity is retried until a
+definitive answer and writes are admitted only inside the last confirmed lease.
 
 GC's own view of a dead server is symmetric and clock-skew-immune: a slot becomes fence-eligible
 only after the leader observes the *same* renewal token hold stable, on its own monotonic clock,
@@ -325,7 +347,8 @@ which any reclaim is instant.
 **Removal** of a dead replica (`Cas::decommissionPoolMember`, `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'`)
 keeps `owner`, `epoch` and `mount` and removes only data, in six steps:
 
-1. Claim the victim's slot as an administrative writer with a no-wait policy. A live member is refused; a
+1. Claim the victim's slot as an administrative writer with a no-wait policy. The claim needs a terminal
+   slot (`terminated` or `fenced`); an `expired` slot is refused until the disk's GC leader fences it. A
    member without an epoch counter is refused.
 2. Tombstone the owner at the next `owner_life`, on the admin's fenced mount plane: no attempt is sent
    after the admin's lease deadline, but the store may apply a sent one later. When the outcome is unknown and

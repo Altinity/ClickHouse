@@ -109,6 +109,12 @@ struct MountConfig
     /// Test-only override of the renewal's liveness predicate, for exact pre/post-send gate
     /// interleavings. FALSE ends the renewal exactly as a lost fence does.
     std::function<bool()> renewal_live_for_test = {};
+    /// The decommission tool's pool: the background renewal stays bounded by the lease, as the startup
+    /// and remount re-anchors are, instead of retrying until a definitive answer.
+    bool bounded_background_renewal = false;
+    /// Deterministic test interposition on the renewing thread right after `DriverLease::finish`
+    /// returned driver ownership, before the result is consumed. Runs without `driver_mutex`.
+    std::function<void(const MountRenewResult &)> renewal_finished_hook_for_test = {};
 };
 
 /// Local, in-memory write fence. It is deliberately not checked by reading the object store for every
@@ -155,10 +161,11 @@ class CasMountRuntime
 public:
     CasMountRuntime(
         BackendPtr backend_ptr_,
-        /// The two planes the `MountLeaseRenewer` runs on: renewals under the mount fence, the farewell
-        /// on an open one. Owned by `Pool` and outliving this runtime.
+        /// The two planes the `MountLeaseRenewer` runs on: bounded renewals under the mount fence; the
+        /// claim, the remount re-anchor and the farewell on the open-fence lease plane. Owned by `Pool`
+        /// and outliving this runtime.
         CasRequests & mount_requests_,
-        CasRequests & farewell_requests_,
+        CasRequests & lease_requests_,
         const Layout & layout_,
         MountConfig config_,
         String server_root_id_,
@@ -316,10 +323,14 @@ public:
         return static_cast<time_t>(lifecycle_since_wall_s.load(std::memory_order_acquire));
     }
 
-    /// Extends `mayMutate` with a remaining-budget check. A ref-log attempt is refused unless the
-    /// current lease has room for its configured timeout and safety margin, so work is not started when
-    /// it cannot plausibly finish before the fence expires.
+    /// Extends `mayMutate` with a remaining-budget check: room for one write (two attempt envelopes) plus
+    /// the safety margin before the deadline.
     bool refAppendFenceOk() const;
+
+    /// When `refAppendFenceOk` stopped admitting writes under the current deadline, while the pool is
+    /// `Live` and the fence is not lost: the renewal keeps retrying and writes are paused. Empty while
+    /// writes are admitted. I/O-free.
+    std::optional<uint64_t> writesPausedSinceBootMs() const;
 
     /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
     /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
@@ -334,10 +345,11 @@ public:
             || lifecycle() == PoolLifecycle::IdentityLost;
     }
 
-    /// The inter-attempt sleep the mount plane runs on. A plain sleep would hold a parked or stopping
-    /// renewal for the whole capped backoff; this one wakes on the same stop signal the workers watch.
-    /// It shortens a stop, not a fence loss: the fence cannot see a stop request, so a woken operation
-    /// still reissues unless its own liveness predicate refuses.
+    /// The inter-attempt sleep the mount and lease planes run on. A plain sleep would hold a parked or
+    /// stopping renewal for the whole pause; this one wakes while the workers are stopping or a park is
+    /// requested. It shortens a stop, not a fence loss: the fence cannot see a stop request, so a woken
+    /// operation still reissues unless its own liveness predicate refuses. Once the workers have
+    /// stopped it sleeps in full, so the farewell that follows is paced like any other write.
     void sleepInterruptibly(uint64_t ms);
 
     /// The mount fence's admission verdict, as `Fence::admit` expects it: may a request admitted under
@@ -454,6 +466,12 @@ private:
         RenewalDriverState active_state,
         RenewalDriverState returned_state,
         bool propagate_failure);
+    /// Publish a committed renewal's deadline, its start plus the lease. Requires `driver_mutex`.
+    void publishRenewedDeadline(uint64_t attempt_start_boot_ms);
+    /// One `WARNING` per pause, at the first renewal attempt after writes paused.
+    void warnOnceIfWritesPaused();
+    /// Two attempt envelopes, saturating: what one write reserves.
+    uint64_t writeReservationMs() const;
     void renewalLoop();
     void remountLoop();
     ThreadFromGlobalPool makeWorker(std::function<void()> body);
@@ -469,7 +487,7 @@ private:
     /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
     BackendPtr backend_ptr;
     CasRequests & mount_requests;
-    CasRequests & farewell_requests;
+    CasRequests & lease_requests;
     const Layout & layout;
     MountConfig config;
     String server_root_id;
@@ -534,6 +552,7 @@ private:
     /// Fence-generation token (rev.7 [C2]): bumped by `tripMountLost` and `armMountFence`. See
     /// `fenceGeneration`/`checkFenceOrThrow`.
     std::atomic<uint64_t> fence_generation{0};
+    std::atomic<bool> writes_paused_warned{false};
     std::function<void()> arm_mount_fence_interposition_hook_for_test;
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
