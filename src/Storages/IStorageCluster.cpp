@@ -1117,6 +1117,18 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         TreeRewriterResult rewriter_result = *query_info.syntax_analyzer_result;
         /// Read the kind before `removeJoin` drops it. Left-only `WHERE` under `RIGHT`/`FULL` changes unmatched rows.
         const bool preserves_right_side = queryHasRightOrFullJoin(query_to_send);
+        /// `removeJoin` only looks at the second table element. An `ARRAY JOIN` there hides a later join.
+        if (auto tables = select_query->tables())
+        {
+            auto & children = tables->children;
+            for (size_t i = 1; i < children.size();)
+            {
+                if (children[i]->as<ASTTablesInSelectQueryElement &>().array_join)
+                    children.erase(children.begin() + i);
+                else
+                    ++i;
+            }
+        }
         if (!removeJoin(*select_query, rewriter_result, context))
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to strip JOIN from query sent to cluster nodes");
 
