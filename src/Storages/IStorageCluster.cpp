@@ -1067,12 +1067,10 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         CollectUsedColumnsForSourceVisitor collector(left_table_expression, context);
         collector.visit(modified_query_tree);
 
-        /// A left-only predicate under `RIGHT`/`FULL` changes which right rows are unmatched.
+        /// A left-only `WHERE` under `RIGHT`/`FULL` changes which right rows are unmatched.
+        /// `PREWHERE` filters the left scan before the join, so it stays on that scan.
         if (queryHasRightOrFullJoin(query_to_send))
-        {
-            query_node.getPrewhere() = {};
             query_node.getWhere() = {};
-        }
 
         if (query_node.getPrewhere())
             removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getPrewhere(), left_table_expression, context);
@@ -1130,14 +1128,12 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         select_query->group_by_all = false;
         select_query->order_by_all = false;
 
-        /// `removeJoin` keeps left-table WHERE, including `GLOBAL IN (_subqueryN)`, which remotes cannot resolve.
-        if (preserves_right_side
-            || astContainsInTableIdentifier(select_query->where()) || astContainsInTableIdentifier(select_query->prewhere())
-            || astContainsSubquery(select_query->where()) || astContainsSubquery(select_query->prewhere()))
-        {
-            select_query->setExpression(ASTSelectQuery::Expression::PREWHERE, {});
+        /// `removeJoin` keeps left-table predicates. A left `WHERE` under `RIGHT`/`FULL` changes unmatched rows.
+        /// A subquery cannot be resolved on the shards. `PREWHERE` stays: it filters the left scan before the join.
+        if (preserves_right_side || astContainsInTableIdentifier(select_query->where()) || astContainsSubquery(select_query->where()))
             select_query->setExpression(ASTSelectQuery::Expression::WHERE, {});
-        }
+        if (astContainsInTableIdentifier(select_query->prewhere()) || astContainsSubquery(select_query->prewhere()))
+            select_query->setExpression(ASTSelectQuery::Expression::PREWHERE, {});
     }
     else if (info.has_local_columns_in_where)
     {
