@@ -28,6 +28,9 @@ namespace Iceberg
 namespace
 {
 
+/// 1e16 µs is ~year 2286. Spark sentinels such as `9999-12-31` (`~2.53e17` µs)
+/// are spec-correct microseconds above this.
+constexpr Int64 microseconds_ambiguous_threshold = 10'000'000'000'000'000LL;
 /// 1e18 ns is ~year 2001; customer 2026 ns bounds are `~1.76e18`.
 constexpr Int64 nanoseconds_lower_threshold = 1'000'000'000'000'000'000LL;
 constexpr Int64 nanoseconds_per_microsecond = 1000;
@@ -59,9 +62,9 @@ Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
 
 /// Iceberg timestamps are 8-byte little-endian (spec Appendix D).
 /// Some writers store nanosecond stats on Iceberg `timestamp` (`DateTime64(6)`).
-/// Convert only when `|ticks| > 1e18`. Otherwise fail open: `|ticks| <= 1e16`
-/// collides near-epoch nanoseconds (~115 days) with 1970–2286 microseconds, and
-/// `(1e16, 1e18]` collides Spark `9999-12-31` sentinels with 1970–2001 nanoseconds.
+/// `|ticks| <= 1e16` is kept as microseconds, as the spec requires. `|ticks| > 1e18`
+/// is converted from nanoseconds. `(1e16, 1e18]` fails open: it collides Spark
+/// `9999-12-31` sentinels with 1970–2001 nanoseconds.
 std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str, const IDataType & type, bool lower_bound)
 {
     if (str.size() != sizeof(Int64))
@@ -70,7 +73,7 @@ std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str
     Int64 unscaled = unalignedLoadLittleEndian<Int64>(str.data());
     const UInt32 scale = getDecimalScale(type);
 
-    if (scale == 6)
+    if (scale == 6 && magnitudeExceeds(unscaled, microseconds_ambiguous_threshold))
     {
         if (!magnitudeExceeds(unscaled, nanoseconds_lower_threshold))
             return std::nullopt;
