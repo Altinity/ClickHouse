@@ -2121,7 +2121,27 @@ PartitionColumnValues getIdentityPartitionColumnValues(
         if (!name_and_type.has_value())
             continue;
 
-        Field value = convertFieldToTypeOrThrow(partition_key_value[partition_field.tuple_index], *name_and_type->type);
+        const Field & raw_value = partition_key_value[partition_field.tuple_index];
+        /// Avro has no `timestamp-nanos` logical type, so `timestamp_ns` / `timestamptz_ns` (and
+        /// similarly `Time64`) identity partition values arrive as a raw Int64 of ticks at the
+        /// column's scale. `convertFieldToType` would treat that integer as whole seconds and
+        /// overflow while rescaling, so wrap the ticks directly instead (mirrors the pruning path).
+        Field value;
+        if (!raw_value.isNull() && raw_value.getType() == Field::Types::Int64)
+        {
+            auto target_type = removeNullable(name_and_type->type);
+            WhichDataType which(target_type);
+            if (which.isDateTime64())
+                value = DecimalField<DateTime64>(DateTime64(raw_value.safeGet<Int64>()), getDecimalScale(*target_type));
+            else if (which.isTime64())
+                value = DecimalField<Time64>(Time64(raw_value.safeGet<Int64>()), getDecimalScale(*target_type));
+            else
+                value = convertFieldToTypeOrThrow(raw_value, *name_and_type->type);
+        }
+        else
+        {
+            value = convertFieldToTypeOrThrow(raw_value, *name_and_type->type);
+        }
         if (value.isNull())
             continue;
 
