@@ -609,7 +609,9 @@ void IStorageCluster::readFromRemoteInitiator(
     if (query_for_remote)
         stripObjectStorageRemoteInitiatorSettings(query_for_remote);
 
-    auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
+    /// `convertToRemote` wraps the left table function in place and moves its alias inside `remote`.
+    /// `query_to_send` may be `query_info.query`, which `StorageDistributed` analyzes with its JOINs.
+    auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send->clone());
     auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
     auto modified_query_info = query_info;
     modified_query_info.cluster = src_distributed->getCluster();
