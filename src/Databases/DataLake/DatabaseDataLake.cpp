@@ -968,7 +968,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     return storage_cluster;
 }
 
-void DatabaseDataLake::validateCreateTableEngine(const ASTStorage & storage) const
+void DatabaseDataLake::validateCreateTableEngine(const ASTStorage & storage, ContextPtr context_) const
 {
     const ASTFunction & engine = *storage.engine;
     const auto catalog = getCatalog();
@@ -986,6 +986,7 @@ void DatabaseDataLake::validateCreateTableEngine(const ASTStorage & storage) con
             "This DataLakeCatalog assigns table locations itself, so an explicit table `ENGINE` with a "
             "user-provided location is not supported; omit the `ENGINE` clause");
 
+    catalog->loadConfigIfNeeded(DataLake::getForwardedAuthToken(context_));
     const auto catalog_storage_type = catalog->getStorageType();
 
     std::optional<DatabaseDataLakeStorageType> engine_backend;

@@ -153,7 +153,7 @@ public:
 
     void onTokenForwardingDisabled() const override { user_token_cache.clear(); }
 
-    void loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & auth_token) const;
+    void loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void setVendedCredentialsCacheTTL(std::chrono::seconds ttl) override { vended_credentials_cache_ttl.store(ttl, std::memory_order_relaxed); }
 
@@ -246,7 +246,6 @@ protected:
     const LoggerPtr log;
 
     mutable MultiVersion<CatalogState> state{std::make_unique<const CatalogState>()};
-    mutable std::mutex config_mutex;
 
     /// Parameters for OAuth (common for REST catalog).
     bool update_token_if_expired = false;

@@ -160,7 +160,7 @@ StorageObjectStorage::StorageObjectStorage(
     , is_table_function(is_table_function_)
     , log(getLogger(fmt::format("Storage{}({})", configuration->getEngineName(), table_id_.getFullTableName())))
     , catalog(catalog_)
-    , catalog_auth_token(context ? context->getForwardedAuthToken() : DB::ForwardedAuthTokenPtr{})
+    , catalog_auth_token(catalog_ && context ? context->getForwardedAuthToken() : DB::ForwardedAuthTokenPtr{})
     , storage_id(table_id_)
     , background_operations_assignee(*this, table_id_, BackgroundJobsAssignee::Type::DataProcessing, Context::getGlobalContextInstance())
 {

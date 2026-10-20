@@ -110,6 +110,10 @@ to trusted users and restrict `remote_url_allow_hosts`, which applies to catalog
 endpoints.
 :::
 
+The forwarded token is sent to the catalog endpoint and, with token exchange, to `oauth_token_exchange_uri`
+together with the `catalog_credential` client secret; in passthrough mode the token is also valid for
+ClickHouse itself. Use HTTPS for these endpoints in production; an HTTP endpoint is suitable only for local testing.
+
 ### Passthrough: the default {#user-token-forwarding-passthrough}
 
 For Iceberg REST catalogs, `oauth_forward_user_token = 1` forwards the user's bearer token

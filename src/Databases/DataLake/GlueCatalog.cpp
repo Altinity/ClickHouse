@@ -51,6 +51,8 @@
 #include <Parsers/ASTFunction.h>
 #include <Common/FailPoint.h>
 #include <Common/scope_guard_safe.h>
+#include <Common/SipHash.h>
+#include <base/hex.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
@@ -119,7 +121,6 @@ namespace CurrentMetrics
 {
     extern const Metric MarkCacheBytes;
     extern const Metric MarkCacheFiles;
-    extern const Metric DataLakeCatalogUserClientCacheBytes;
     extern const Metric DataLakeCatalogUserClientCacheEntries;
 }
 
@@ -210,22 +211,26 @@ namespace DataLake
 namespace
 {
 
+/// STS `RoleSessionName`: 2-64 characters matching `[\w+=,.@-]*`.
+/// If the principal does not fit as is, a hash of the full principal is appended to keep names of different principals distinct.
 std::string makeRoleSessionName(const std::string & principal)
 {
-    std::string result;
-    result.reserve(std::min<size_t>(principal.size(), 64));
+    static constexpr size_t max_length = 64;
+    static constexpr size_t hash_suffix_length = 1 + 16;
+
+    std::string sanitized;
+    sanitized.reserve(principal.size());
     for (char c : principal)
     {
-        if (result.size() == 64)
-            break;
         if (isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '+' || c == '=' || c == ',' || c == '.' || c == '@' || c == '-')
-            result += c;
+            sanitized += c;
     }
 
-    if (result.size() < 2)
-        return "ClickHouseUser";
+    if (sanitized.size() == principal.size() && sanitized.size() >= 2 && sanitized.size() <= max_length)
+        return sanitized;
 
-    return result;
+    std::string readable = sanitized.empty() ? "ClickHouseUser" : sanitized.substr(0, max_length - hash_suffix_length);
+    return readable + "-" + getHexUIntLowercase(sipHash64(principal));
 }
 
 }
@@ -238,7 +243,7 @@ GlueCatalog::GlueCatalog(
     : ICatalog("")
     , DB::WithContext(context_)
     , user_clients(
-          CurrentMetrics::DataLakeCatalogUserClientCacheBytes,
+          CurrentMetrics::end(),
           CurrentMetrics::DataLakeCatalogUserClientCacheEntries,
           user_client_cache_max_entries)
     , log(getLogger("GlueCatalog(" + settings_.region + ")"))

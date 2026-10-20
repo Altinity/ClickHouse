@@ -70,7 +70,7 @@ public:
 
     std::vector<std::pair<ASTPtr, StoragePtr>> getTablesForBackup(const FilterByNameFunction &, const ContextPtr &) const override { return {}; }
 
-    void validateCreateTableEngine(const ASTStorage & storage) const override;
+    void validateCreateTableEngine(const ASTStorage & storage, ContextPtr context_) const override;
 
     void createTable(
         ContextPtr context,

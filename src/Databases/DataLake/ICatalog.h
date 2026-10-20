@@ -260,6 +260,9 @@ public:
     /// E.g. one of S3, Azure, Local, HDFS.
     virtual std::optional<StorageType> getStorageType() const = 0;
 
+    /// Loads catalog-wide configuration with the given token if it has not been loaded yet.
+    virtual void loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const {}
+
     /// Catalog-wide base location for new tables, e.g. `s3://warehouse/data`. Empty if unknown.
     virtual String getDefaultBaseLocation() const { return ""; }
 

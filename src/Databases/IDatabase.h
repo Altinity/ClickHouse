@@ -210,7 +210,7 @@ public:
 
     virtual bool isDatalakeCatalog() const { return false; }
 
-    virtual void validateCreateTableEngine(const ASTStorage & /*storage*/) const {}
+    virtual void validateCreateTableEngine(const ASTStorage & /*storage*/, ContextPtr /*context*/) const {}
 
     /// True for databases such as `MySQL`/`PostgreSQL` whose table list lives on a remote service.
     /// This is distinct from `isExternal`, which classifies whether the engine supports ClickHouse internal table types.

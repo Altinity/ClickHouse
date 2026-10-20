@@ -319,6 +319,10 @@ Database creators choose the endpoints that receive users' tokens. Grant `CREATE
 to trusted users and restrict `remote_url_allow_hosts` for catalog and token-exchange endpoints.
 :::
 
+The forwarded token is sent to the catalog and token-exchange endpoints and, in passthrough mode, is
+also valid for ClickHouse itself. Use HTTPS for these endpoints in production; an HTTP endpoint is
+suitable only for local testing.
+
 Only the session's verified token is forwarded. It is not inherited by `EXECUTE AS` or
 `DEFINER` views, forwarded to other ClickHouse nodes, or persisted to disk.
 

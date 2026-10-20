@@ -12,6 +12,7 @@
 #include <Common/setThreadName.h>
 #include <Common/CurrentThread.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
+#include <algorithm>
 #include <mutex>
 #include <chrono>
 #include <optional>
@@ -123,7 +124,6 @@ namespace ProfileEvents
 
 namespace CurrentMetrics
 {
-    extern const Metric DataLakeCatalogUserTokenCacheBytes;
     extern const Metric DataLakeCatalogUserTokenCacheEntries;
 }
 
@@ -236,6 +236,14 @@ std::unordered_set<std::string> getAllowedBigLakeMetadataServiceHosts(
     for (const auto & key : keys)
         allowed.insert(config.getString(std::string(SECTION) + "." + key));
     return allowed;
+}
+
+/// Token is considered valid for 90% of `expires_in`, which is clamped to [0, 1 day].
+std::chrono::system_clock::time_point tokenExpiresAt(Int64 expires_in)
+{
+    static constexpr Int64 max_expires_in_seconds = 24 * 60 * 60;
+    expires_in = std::clamp<Int64>(expires_in, 0, max_expires_in_seconds);
+    return std::chrono::system_clock::now() + std::chrono::seconds(expires_in * 9 / 10);
 }
 
 }
@@ -491,7 +499,7 @@ RestCatalog::RestCatalog(
     , oauth_server_use_request_body(oauth_server_use_request_body_)
     , token_forwarding(token_forwarding_)
     , user_token_cache(
-          CurrentMetrics::DataLakeCatalogUserTokenCacheBytes,
+          CurrentMetrics::end(),
           CurrentMetrics::DataLakeCatalogUserTokenCacheEntries,
           user_token_cache_max_entries)
     , allowed_namespaces(namespaces_)
@@ -533,7 +541,7 @@ RestCatalog::RestCatalog(
     , oauth_server_uri(oauth_server_uri_)
     , oauth_server_use_request_body(oauth_server_use_request_body_)
     , user_token_cache(
-          CurrentMetrics::DataLakeCatalogUserTokenCacheBytes,
+          CurrentMetrics::end(),
           CurrentMetrics::DataLakeCatalogUserTokenCacheEntries,
           user_token_cache_max_entries)
     , allowed_namespaces(namespaces_)
@@ -543,10 +551,6 @@ RestCatalog::RestCatalog(
 
 void RestCatalog::loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-    if (state.get()->config_loaded)
-        return;
-
-    std::lock_guard lock(config_mutex);
     const auto old_state = getStateSnapshot();
     if (old_state->config_loaded)
         return;
@@ -563,6 +567,9 @@ void RestCatalog::loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & auth_toke
         LOG_DEBUG(log, "Catalog credentials changed while `/v1/config` was loading; discarding it");
         return;
     }
+    /// A concurrent first caller may have already published the config.
+    if (state.get()->config_loaded)
+        return;
     state.set(std::move(new_state));
 }
 
@@ -1128,10 +1135,7 @@ AccessToken RestCatalog::requestToken(Poco::URI url, const Poco::URI::QueryParam
 
     if (object->has("expires_in"))
     {
-        Int64 expires_in = object->getValue<Int64>("expires_in");
-        /// Use 90% of the token lifetime as the validity window so that short-lived tokens
-        /// (e.g. expires_in=300) still get a sensible buffer instead of going non-positive.
-        token.expires_at = std::chrono::system_clock::now() + std::chrono::seconds(expires_in * 9 / 10);
+        token.expires_at = tokenExpiresAt(object->getValue<Int64>("expires_in"));
     }
 
     return token;
@@ -1250,7 +1254,7 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() con
 
     AccessToken token;
     token.token = std::move(result.access_token);
-    token.expires_at = std::chrono::system_clock::now() + std::chrono::seconds(result.expires_in * 9 / 10);
+    token.expires_at = tokenExpiresAt(result.expires_in);
     return token;
 }
 
@@ -1351,8 +1355,7 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 
     if (object->has("expires_in"))
     {
-        Int64 expires_in = object->getValue<Int64>("expires_in");
-        token.expires_at = std::chrono::system_clock::now() + std::chrono::seconds(expires_in * 9 / 10);
+        token.expires_at = tokenExpiresAt(object->getValue<Int64>("expires_in"));
     }
 
     return token;
