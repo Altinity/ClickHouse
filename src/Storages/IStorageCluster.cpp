@@ -350,8 +350,13 @@ bool queryHasRightOrFullJoin(const ASTPtr & query)
         for (const auto & child : tables->children)
         {
             const auto & element = child->as<ASTTablesInSelectQueryElement &>();
-            if (element.table_join && isRightOrFull(element.table_join->as<ASTTableJoin &>().kind))
-                return true;
+            if (element.table_join)
+            {
+                const auto kind = element.table_join->as<ASTTableJoin &>().kind;
+                /// `PASTE` pairs by position, so a per-shard join would emit one pair per shard.
+                if (isRightOrFull(kind) || isPaste(kind))
+                    return true;
+            }
         }
         return false;
     }
@@ -382,7 +387,7 @@ void rewriteASTJoinsToGlobal(ASTPtr & query)
         return;
     }
 
-    /// `RIGHT`/`FULL` preserve broadcast rows, so the whole join stays on the initiator.
+    /// `RIGHT`/`FULL` preserve broadcast rows, and `PASTE` pairs by position, so the join stays on the initiator.
     if (queryHasRightOrFullJoin(query))
         return;
 
@@ -1195,7 +1200,7 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
 {
     auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
     const auto join_info = getQueryJoinInfo(query_info, context);
-    /// `global` still fetches columns for `RIGHT`/`FULL`: those joins stay on the initiator.
+    /// `global` still fetches columns for `RIGHT`/`FULL`/`PASTE`: those joins stay on the initiator.
     const bool keep_join_on_initiator = object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
         || queryHasRightOrFullJoin(query_info.query);
 
