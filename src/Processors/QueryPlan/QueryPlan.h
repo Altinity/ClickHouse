@@ -81,6 +81,9 @@ struct ExplainPlanOptions
     bool compact = false;
     /// Print query plan with pretty formatting
     bool pretty = false;
+    /// Print the values of secret function arguments (keys, passwords) in pretty expressions instead of
+    /// `[HIDDEN]`. Not a user-facing EXPLAIN option: set from `canDisplaySecrets` by the interpreter.
+    bool show_secrets = false;
     /// Show estimates
     bool estimates = false;
     /// For EXPLAIN ANALYZE: print the per-processor elapsed time distribution (min/median/max/sum).
@@ -219,6 +222,9 @@ public:
     /// standalone plan. Unlike building a plan with `addStep`, this preserves branching subtrees
     /// (multiple sources / multi-input steps).
     static QueryPlan cloneSubtree(Node * subplan_root);
+
+    /// Same as above, preserving the execution limits and resources from the plan that owns the subtree.
+    static QueryPlan cloneSubtree(Node * subplan_root, const QueryPlan & source_plan);
 
     static void cloneSubplanAndReplace(Node * node_to_replace, Node * subplan_root, Nodes & nodes);
 

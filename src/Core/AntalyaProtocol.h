@@ -9,8 +9,11 @@ namespace DB
 
 /// Bump for every Antalya-only wire protocol change. See `docs/en/antalya/protocol.md`.
 /// 2: the `*Cluster` read-task payload carries Iceberg delete-file paths as absolute URIs.
+/// 3: `ReadTaskResponse` then carries optional `DataFileMetaInfo`, then optional `retry_after_us`.
+///    Both fields ship together. Version 2 stays the absolute-path layout.
 static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH = 2;
-static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION = DBMS_ANTALYA_PROTOCOL_VERSION_WITH_ICEBERG_ABSOLUTE_PATH;
+static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS = 3;
+static constexpr auto DBMS_ANTALYA_PROTOCOL_VERSION = DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS;
 
 namespace AntalyaProtocol
 {

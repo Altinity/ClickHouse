@@ -26,6 +26,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
+#include <Storages/StorageProxy.h>
 #include <Storages/VirtualColumnUtils.h>
 
 
@@ -225,8 +226,8 @@ protected:
             /// Object storage tables created by the storage factory are `StorageObjectStorageCluster`
             /// (it falls back to plain object storage reads when no cluster is configured), while some
             /// code paths still produce a plain `StorageObjectStorage`. Handle both.
-            auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(storage.get());
-            auto * object_storage_cluster_table = dynamic_cast<StorageObjectStorageCluster *>(storage.get());
+            auto object_storage_table = castStorage<StorageObjectStorage>(storage, DeferredTable::Skip);
+            auto object_storage_cluster_table = castStorage<StorageObjectStorageCluster>(storage, DeferredTable::Skip);
 
             if (object_storage_table)
             {
