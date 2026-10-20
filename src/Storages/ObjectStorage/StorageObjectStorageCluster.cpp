@@ -683,14 +683,6 @@ private:
     ContextPtr context;
 };
 
-/// A catalog table is built with `lazy_init`, and a read resolves its configuration -- and with it the path a
-/// listing walks -- through StorageObjectStorage. A whole-query dispatch lists the driver's files without reading
-/// it, and would otherwise list none.
-void StorageObjectStorageCluster::prepareForWholeQueryDispatch(ContextPtr context)
-{
-    configuration->lazyInitializeIfNeeded(object_storage, context);
-}
-
 RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExtension(
     const ActionsDAG::Node * predicate,
     const ActionsDAG * filter,
@@ -698,6 +690,11 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
     ClusterPtr cluster,
     StorageMetadataPtr storage_metadata_snapshot) const
 {
+    /// Catalog tables may defer initialization until their first read.
+    /// Task creation must also initialize them: whole-query dispatch lists files without a table read.
+    if (configuration->isDataLakeConfiguration())
+        configuration->lazyInitializeIfNeeded(object_storage, local_context);
+
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
         configuration->getQuerySettings(local_context),

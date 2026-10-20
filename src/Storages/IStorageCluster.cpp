@@ -840,7 +840,7 @@ void IStorageCluster::read(
 ASTPtr IStorageCluster::getTableFunctionToSend(
     const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context, bool read_initiator_file_tasks)
 {
-    /// updateQueryToSendIfNeeded rewrites the table a query reads from, so give it a query of this table alone.
+    /// Reuse `updateQueryToSendIfNeeded` with a query containing only this table.
     auto select_query = make_intrusive<ASTSelectQuery>();
     select_query->replaceDatabaseAndTable(getStorageID());
     ASTPtr query = select_query;
@@ -852,8 +852,7 @@ ASTPtr IStorageCluster::getTableFunctionToSend(
     return table_function;
 }
 
-/// Smaller sibling of read(): the caller already has query_to_send and sample_block, so no join-stripping and no
-/// sample-block computation.
+/// The planner has already prepared the query and its header.
 void IStorageCluster::readPreparedClusterQuery(
     QueryPlan & query_plan,
     const StorageSnapshotPtr & storage_snapshot,
@@ -867,8 +866,6 @@ void IStorageCluster::readPreparedClusterQuery(
     auto cluster_name_from_settings = getClusterName(context);
     const auto & settings = context->getSettingsRef();
     auto cluster = getClusterImpl(context, cluster_name_from_settings, isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0);
-
-    prepareForWholeQueryDispatch(context);
 
     std::optional<Tables> external_tables = std::nullopt;
     if (query_info.planner_context && query_info.planner_context->getMutableQueryContext())
@@ -984,9 +981,8 @@ SinkToStoragePtr IStorageCluster::write(
 namespace
 {
 
-/// The cluster-function transport, shared by ReadFromCluster and ReadFromClusterQuery: every replica is taken
-/// as a shard, each gets one connection, and all of them pull work from the same task iterator. What differs
-/// between the two callers is only what the query is and where the tasks come from.
+/// Shared transport for `ReadFromCluster` and `ReadFromClusterQuery`.
+/// Each replica acts as a shard with one connection; all replicas share the file-task iterator.
 Pipe buildClusterFunctionRemotePipe(
     const ASTPtr & query_to_send,
     const SharedHeader & output_header,
@@ -1085,8 +1081,7 @@ ContextPtr ReadFromClusterQuery::updateSettings() const
     /// Cluster table functions should always skip unavailable shards.
     new_settings[Setting::skip_unavailable_shards] = true;
 
-    /// Every table in the dispatched query, driver included, must be read locally on the worker. The driver's
-    /// `*Cluster` table function takes its files from this step's task iterator instead of fanning out again.
+    /// Partners read locally. Only the driver's explicit `*Cluster` function consumes the initiator's file tasks.
     new_settings[Setting::object_storage_cluster] = "";
 
     auto new_context = Context::createCopy(context);
@@ -1098,9 +1093,7 @@ void ReadFromClusterQuery::initializePipeline(QueryPipelineBuilder & pipeline, c
 {
     auto new_context = updateSettings();
 
-    /// Not this step's own filter: its output is the whole query's result, so a predicate over that says
-    /// nothing about which of the driver's files are needed. The planner extracts the driver's own predicate
-    /// from the query tree instead and hands it over -- see buildDistributedObjectStorageQueryPlan.
+    /// The planner supplies a predicate over the driver's columns for file pruning.
     const ActionsDAG::Node * predicate = driver_filter ? driver_filter->getOutputs().front() : nullptr;
     auto extension = driver_storage->getTaskIteratorExtension(
         predicate, driver_filter.get(), new_context, cluster, driver_snapshot->metadata);
@@ -1396,8 +1389,7 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     /// break it (e.g. `format = 'Null'`). This mirrors the `Distributed` fan-out.
     ClusterProxy::stripInitiatorOnlySettings(new_settings);
 
-    /// A ReadFromCluster reached after whole-query dispatch was declined must behave exactly like `allow`. That
-    /// also lets a worker too old to know `distributed` run it.
+    /// Ordinary `ReadFromCluster` reads use `allow`, including on workers that do not recognize `distributed`.
     if (new_settings[Setting::object_storage_cluster_join_mode] == ObjectStorageClusterJoinMode::DISTRIBUTED)
         new_settings[Setting::object_storage_cluster_join_mode] = ObjectStorageClusterJoinMode::ALLOW;
 

@@ -10,18 +10,12 @@ class PlannerContext;
 using PlannerContextPtr = std::shared_ptr<PlannerContext>;
 struct SelectQueryInfo;
 
-/// Builds the whole-query dispatch plan for `candidate`: serializes the query and reads the result back through a
-/// single ReadFromClusterQuery step at WithMergeableState, so the caller's normal finalization (MergingAggregated
-/// and the rest) applies on top.
+/// Builds a `ReadFromClusterQuery` at `WithMergeableState`; the caller applies normal query finalization.
 ///
-/// Every table in the serialized query is replaced with the table function its own cluster read would send: the
-/// driver with its `*Cluster` function, which on a worker reads the files this node hands out, and every other
-/// table with its plain function, which a worker reads in full, locally.
+/// The driver uses its `*Cluster` table function to consume file tasks from the initiator.
+/// Partners use plain table functions and are read in full on every worker.
 ///
-/// Returns nullopt when the driver appears more than once in the serialized query. The caller then falls back to
-/// ordinary planning.
-///
-/// Structurally the same as buildQueryPlanForParallelReplicas in Planner/findParallelReplicasQuery.cpp.
+/// Returns `std::nullopt` when the serialized query does not contain exactly one driver reference.
 std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     const QueryTreeNodePtr & dispatch_boundary_node,
     const DistributedObjectStorageCandidate & candidate,

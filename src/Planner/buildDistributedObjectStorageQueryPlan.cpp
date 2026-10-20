@@ -46,10 +46,8 @@ void collectTableNodes(const QueryTreeNodePtr & node, TableNodesByName & table_n
             collectTableNodes(child, table_nodes);
 }
 
-/// Replaces every table named in `ast` with the table function a worker reads it through: the driver's `*Cluster`
-/// function reads the files this node hands out, any other table's plain function reads them all. Returns how
-/// many references to the driver it replaced. The text is serialized after CTE bodies are inlined, so a CTE over
-/// the driver used twice counts twice.
+/// Only the driver's `*Cluster` function consumes file tasks; partners use plain table functions.
+/// Count driver references after CTE expansion so repeated uses cannot share one task queue.
 size_t replaceTablesWithTableFunctions(
     const ASTPtr & ast, const TableNodesByName & table_nodes, const TableNode & driver, const ContextPtr & context)
 {
@@ -65,7 +63,7 @@ size_t replaceTablesWithTableFunctions(
     const auto & identifier = table_expression->database_and_table_name->as<ASTTableIdentifier &>();
     const auto storage_id = identifier.getTableId();
 
-    /// findDistributedObjectStorageCandidate admits only DataLake catalog tables, all of them `IStorageCluster`s.
+    /// `findDistributedObjectStorageCandidate` admits only catalog tables backed by `IStorageCluster`.
     auto it = table_nodes.find({storage_id.database_name, storage_id.table_name});
     auto * storage = it == table_nodes.end() ? nullptr : dynamic_cast<IStorageCluster *>(it->second->getStorage().get());
     if (!storage)
@@ -80,10 +78,24 @@ size_t replaceTablesWithTableFunctions(
     return is_driver ? 1 : 0;
 }
 
+/// Reuse the predicate collected for the driver's ordinary read to prune its file listing.
+/// Filters on the whole query's result do not describe which driver files can be skipped.
+std::shared_ptr<const ActionsDAG> buildDriverFilter(
+    const QueryTreeNodePtr & driver, const PlannerContextPtr & planner_context)
+{
+    const auto & table_filters = planner_context->getGlobalPlannerContext()->filters_for_table_expressions;
+    auto it = table_filters.find(driver);
+    if (it == table_filters.end() || !it->second.filter_actions)
+        return {};
+
+    auto filter = it->second.filter_actions->clone();
+    VirtualColumnUtils::buildSetsForDAGExcludingGlobalIn(filter, planner_context->getQueryContext());
+    return std::make_shared<const ActionsDAG>(std::move(filter));
 }
 
-/// Follows buildQueryPlanForParallelReplicas (Planner/findParallelReplicasQuery.cpp): header of the query ->
-/// serialize to SQL -> remote read.
+}
+
+/// Follows `buildQueryPlanForParallelReplicas`: compute the header, serialize the query, then build a remote read.
 std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     const QueryTreeNodePtr & dispatch_boundary_node,
     const DistributedObjectStorageCandidate & candidate,
@@ -93,16 +105,13 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     const auto context = planner_context->getQueryContext();
     constexpr auto processed_stage = QueryProcessingStage::WithMergeableState;
 
-    auto * driver_storage = candidate.driver_storage;
-    const auto & driver_storage_snapshot = candidate.driver->getStorageSnapshot();
+    auto & driver_storage = static_cast<IStorageCluster &>(*candidate.driver->getStorage());
 
-    /// The header the query produces at this stage, on the initiator and on every worker alike -- the same tree
-    /// serves both, so nothing has to be reconciled by name afterwards.
+    /// Compute the header before replacing tables in the serialized query, preserving the resolved column names.
     auto [remote_header, new_planner_context] = InterpreterSelectQueryAnalyzer::getSampleBlockAndPlannerContext(
         dispatch_boundary_node->clone(), context, SelectQueryOptions(processed_stage).analyze());
 
-    /// Strip grouping-function specializations in a clone: the workers re-resolve the generic function
-    /// themselves, but the tree the header came from must keep them.
+    /// Workers resolve grouping functions again. Keep specializations in the tree used for the header.
     auto query_tree_for_ast = dispatch_boundary_node->clone();
     removeGroupingFunctionSpecializations(query_tree_for_ast);
     ASTPtr query_to_send = queryNodeToDistributedSelectQuery(query_tree_for_ast);
@@ -111,16 +120,12 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     if (!select_query)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Whole-query dispatch: expected a plain SELECT at the dispatch boundary");
 
-    /// As `Distributed` does in rewriteSelectQuery: the query's settings are already in its context and travel
-    /// with it, so the clause is dropped rather than sent. A worker applies a query's own SETTINGS on top of
-    /// the settings it received, and would otherwise restore anything the initiator changed for the dispatch --
-    /// `object_storage_cluster`.
+    /// Settings travel in the context, as in `Distributed`. Sending the `SETTINGS` clause too would override
+    /// dispatch adjustments such as clearing `object_storage_cluster` on workers.
     select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
 
-    /// A worker resolves no catalog table: every table is sent as a table function, and an Iceberg table's
-    /// function names the metadata file the catalog resolved here. A driver referenced twice -- a self-join, or
-    /// a CTE over it used twice -- would read the initiator's file-task queue twice, which is silently wrong, so
-    /// fall back to ordinary planning instead.
+    /// Table functions carry the catalog-resolved metadata to workers.
+    /// Repeated driver references would consume one task queue independently and produce incomplete joins.
     TableNodesByName table_nodes;
     collectTableNodes(dispatch_boundary_node, table_nodes);
     if (replaceTablesWithTableFunctions(query_to_send, table_nodes, *candidate.driver, context) != 1)
@@ -134,31 +139,15 @@ std::optional<JoinTreeQueryPlan> buildDistributedObjectStorageQueryPlan(
     JoinTreeQueryPlan result;
     result.stage = processed_stage;
 
-    /// Prunes the driver's file listing. This is the filter the optimizer pushes down to the driver's own read
-    /// in the single-node plan, collected by collectFiltersForAnalysis exactly as for an ordinary cluster read,
-    /// so dropping the files it rejects cannot change the result. Without it every file of the driver is handed
-    /// out and each worker opens the ones its partitions cannot match only to discard them.
-    std::shared_ptr<const ActionsDAG> driver_filter;
-    const auto & table_filters = planner_context->getGlobalPlannerContext()->filters_for_table_expressions;
-    if (auto it = table_filters.find(candidate.driver_table_expression); it != table_filters.end() && it->second.filter_actions)
-    {
-        auto filter_dag = it->second.filter_actions->clone();
-        VirtualColumnUtils::buildSetsForDAGExcludingGlobalIn(filter_dag, context);
-        driver_filter = std::make_shared<const ActionsDAG>(std::move(filter_dag));
-    }
-
-    driver_storage->readPreparedClusterQuery(
+    driver_storage.readPreparedClusterQuery(
         result.query_plan,
-        driver_storage_snapshot,
+        candidate.driver->getStorageSnapshot(),
         query_info,
         context,
         processed_stage,
         query_to_send,
         remote_header,
-        std::move(driver_filter));
-
-    /// No converting step, unlike buildQueryPlanForParallelReplicas: tables are replaced only in the serialized
-    /// text, after the header was computed, so the header the workers produce is `remote_header` itself.
+        buildDriverFilter(candidate.driver, planner_context));
 
     return result;
 }

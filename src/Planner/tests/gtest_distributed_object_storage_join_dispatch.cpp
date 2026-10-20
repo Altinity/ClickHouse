@@ -106,15 +106,11 @@ public:
         return {};
     }
 
-    bool prepared_for_dispatch = false;
-
 protected:
     void updateQueryToSendIfNeeded(ASTPtr & query, const StorageSnapshotPtr &, const ContextPtr &, bool make_cluster_function) override
     {
         rewriteFirstTableToFunction(query, make_cluster_function ? "driverClusterFunction" : "driverTableFunction");
     }
-
-    void prepareForWholeQueryDispatch(ContextPtr) override { prepared_for_dispatch = true; }
 };
 
 /// Stand-in for a second table from the same DataLake catalog, e.g. ice.geo_location_lookup.
@@ -583,24 +579,6 @@ TEST(DistributedObjectStorageJoinDispatch, HeaderComputationHandlesQueryLevelMod
     EXPECT_NE(plan_text.find("ReadFromCluster"), String::npos) << plan_text;
     EXPECT_NE(plan_text.find("AggregateFunction(count"), String::npos)
         << "expected header computation to still see WithMergeableState types under a query-level SETTINGS override, got:\n" << plan_text;
-}
-
-/// A dispatch lists the driver's files without reading the driver, so it prepares the driver for listing itself.
-/// An ordinary cluster read does not need to: its own read prepares the storage.
-TEST(DistributedObjectStorageJoinDispatch, OnlyADispatchPreparesTheDriverForListing)
-{
-    auto & state = State::instance();
-    const String query = "SELECT driver.id, safe_lookup.lookup_id FROM driver INNER JOIN safe_lookup ON driver.id = safe_lookup.lookup_id";
-
-    state.context->setSetting("object_storage_cluster_join_mode", String("distributed"));
-    state.driver->prepared_for_dispatch = false;
-    planAndExplain(query, state.context);
-    EXPECT_TRUE(state.driver->prepared_for_dispatch);
-
-    state.context->setSetting("object_storage_cluster_join_mode", String("allow"));
-    state.driver->prepared_for_dispatch = false;
-    planAndExplain(query, state.context);
-    EXPECT_FALSE(state.driver->prepared_for_dispatch);
 }
 
 /// A driver referenced twice would read the initiator's file-task queue twice, so the query is planned ordinarily.

@@ -2706,8 +2706,7 @@ void Planner::buildPlanForQueryNode()
     }
 
     JoinTreeQueryPlan join_tree_query_plan;
-    /// Dispatch can still decline here, when the driver is referenced more than once. Whole-or-nothing for the
-    /// dispatch boundary: on rejection, ordinary planning handles everything.
+    /// Repeated driver references can still prevent dispatch after CTE expansion.
     std::optional<JoinTreeQueryPlan> dispatched_query_plan;
     const auto & distributed_object_storage_candidate = planner_context->getGlobalPlannerContext()->distributed_object_storage_candidate;
     if (distributed_object_storage_candidate && distributed_object_storage_candidate->dispatch_boundary == &query_node)

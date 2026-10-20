@@ -29,8 +29,7 @@ namespace Setting
 namespace
 {
 
-/// A worker reads every table of a dispatched query through a table function, so a row policy the initiator
-/// would have applied is lost. Reject.
+/// Replacing a table with a table function would bypass its row policy.
 bool hasEffectiveRowPolicy(const TableNode & table_node, const ContextPtr & context)
 {
     const auto & storage_id = table_node.getStorageID();
@@ -39,9 +38,8 @@ bool hasEffectiveRowPolicy(const TableNode & table_node, const ContextPtr & cont
     return filter && !filter->isAlwaysTrue();
 }
 
-/// Dispatch replaces the per-table access check that `prepareBuildQueryPlanForTableExpression` would have run on
-/// each table, so do it here instead. Table-level and non-throwing: a failure falls back to ordinary planning,
-/// which then enforces the real column-level rules with its own error.
+/// Dispatch bypasses `prepareBuildQueryPlanForTableExpression`, so check access here.
+/// If table-level access is absent, ordinary planning enforces column-level grants.
 bool hasSelectAccess(const TableNode & table_node, const ContextPtr & context)
 {
     const auto & storage_id = table_node.getStorageID();
@@ -49,9 +47,8 @@ bool hasSelectAccess(const TableNode & table_node, const ContextPtr & context)
         AccessType::SELECT, storage_id.getDatabaseName(), storage_id.getTableName());
 }
 
-/// Safe to include in the dispatch, as driver or as partner: a DataLake catalog table, which a worker reads through
-/// the table function its cluster read sends; no row policy; visible to the user.
-bool isSafeDataLakeLeaf(const TableNode & table_node, const ContextPtr & context)
+/// Both the driver and its partners must be readable through catalog-generated table functions.
+bool isSafeCatalogTable(const TableNode & table_node, const ContextPtr & context)
 {
     const auto & storage_id = table_node.getStorageID();
     if (!storage_id.hasDatabase())
@@ -66,21 +63,17 @@ bool isSafeDataLakeLeaf(const TableNode & table_node, const ContextPtr & context
     return !hasEffectiveRowPolicy(table_node, context) && hasSelectAccess(table_node, context);
 }
 
-bool isEligibleDriver(const TableNode & table_node, const ContextPtr & context, IStorageCluster *& out_storage)
+bool isEligibleDriver(const TableNode & table_node, const ContextPtr & context)
 {
-    if (!isSafeDataLakeLeaf(table_node, context))
+    if (!isSafeCatalogTable(table_node, context))
         return false;
 
-    auto * storage = dynamic_cast<IStorageCluster *>(table_node.getStorage().get());
-    if (storage->getClusterName(context).empty())
-        return false;
-
-    out_storage = storage;
-    return true;
+    const auto & storage = static_cast<const IStorageCluster &>(*table_node.getStorage());
+    return !storage.getClusterName(context).empty();
 }
 
-/// Aggregate/window function in this node's own subtree, not crossing into a nested query. Catches
-/// `SELECT count() FROM driver`, which has no GROUP BY node at all.
+/// Inspect this query's expressions without crossing into nested queries.
+/// An aggregate such as `count` needs finalization even without `GROUP BY`.
 bool containsAggregateOrWindowFunction(const QueryTreeNodePtr & node)
 {
     if (!node)
@@ -100,10 +93,8 @@ bool containsAggregateOrWindowFunction(const QueryTreeNodePtr & node)
     return false;
 }
 
-/// A subquery crossed on the way down to the driver runs independently on each worker's own partition of the
-/// driver, so anything that finalizes across rows (aggregation, DISTINCT, LIMIT, ...) would turn a partial result
-/// into a final one whenever a group spans two workers. Reject rather than prove which ones are partition-safe.
-/// Does not apply to a JOIN partner's subquery, which every worker recomputes in full.
+/// Driver subqueries run on separate partitions, so they must not finalize partial results.
+/// Partner subqueries are exempt because each worker reads them in full.
 bool isSafeIntermediateSubquery(const QueryNode & query_node)
 {
     return !query_node.isDistinct() && !query_node.hasGroupBy() && !query_node.hasHaving() && !query_node.hasWindow()
@@ -114,57 +105,30 @@ bool isSafeIntermediateSubquery(const QueryNode & query_node)
 
 struct DriverPathResult
 {
-    bool unusable = false;
-    const TableNode * driver = nullptr;
-    QueryTreeNodePtr driver_table_expression;
-    IStorageCluster * driver_storage = nullptr;
+    std::shared_ptr<TableNode> driver;
 
-    /// No JOIN on the path means there is nothing here for this mode to optimize; stock `IStorageCluster::read`
-    /// already handles a plain single-table cluster read.
+    /// Single-table reads already use `IStorageCluster::read`.
     bool has_join = false;
 };
 
-DriverPathResult unusableDriverPath()
-{
-    DriverPathResult result;
-    result.unusable = true;
-    return result;
-}
-
-/// Walks strictly down the left spine for exactly one driver. The right side of a JOIN is never inspected here --
-/// it is validated separately as worker-local content by `allWorkerLocalTableReferencesAreSafe`, which is why a
-/// DataLake table (or a whole nested JOIN/GROUP BY) on the right never competes for the driver role.
-DriverPathResult findDriverOnLeftSpine(const QueryTreeNodePtr & node, const ContextPtr & context)
+/// Follow the partitioned side of each `JOIN`. Partners are checked separately and never become drivers.
+std::optional<DriverPathResult> findDriverOnLeftSpine(const QueryTreeNodePtr & node, const ContextPtr & context)
 {
     if (const auto * table_node = node->as<TableNode>())
     {
-        IStorageCluster * storage = nullptr;
-        if (!isEligibleDriver(*table_node, context, storage))
-            return unusableDriverPath();
+        if (!isEligibleDriver(*table_node, context))
+            return {};
 
-        DriverPathResult result;
-        result.driver = table_node;
-        result.driver_table_expression = node;
-        result.driver_storage = storage;
-        return result;
+        return DriverPathResult{.driver = std::static_pointer_cast<TableNode>(node)};
     }
 
     if (const auto * query_node = node->as<QueryNode>())
     {
         const auto & join_tree = query_node->getJoinTree();
-        if (!join_tree)
-            return unusableDriverPath();
+        if (!join_tree || !isSafeIntermediateSubquery(*query_node))
+            return {};
 
-        auto result = findDriverOnLeftSpine(join_tree, context);
-        if (result.unusable)
-            return result;
-
-        /// Crossed as an intermediate subquery, not as the dispatch boundary (that is the node originally passed
-        /// to findDistributedObjectStorageCandidate).
-        if (!isSafeIntermediateSubquery(*query_node))
-            return unusableDriverPath();
-
-        return result;
+        return findDriverOnLeftSpine(join_tree, context);
     }
 
     if (const auto * join_node = node->as<JoinNode>())
@@ -172,34 +136,29 @@ DriverPathResult findDriverOnLeftSpine(const QueryTreeNodePtr & node, const Cont
         const auto join_kind = join_node->getKind();
         const auto join_strictness = join_node->getStrictness();
         if ((join_kind != JoinKind::Inner || join_strictness != JoinStrictness::All) && join_kind != JoinKind::Left)
-            return unusableDriverPath();
+            return {};
 
         auto left = findDriverOnLeftSpine(join_node->getLeftTableExpression(), context);
-        if (left.unusable)
-            return unusableDriverPath();
+        if (!left)
+            return {};
 
-        left.has_join = true;
+        left->has_join = true;
         return left;
     }
 
-    return unusableDriverPath();
+    return {};
 }
 
-/// Everything else reachable from the dispatch boundary is recomputed in full on every worker, so every table it
-/// reaches must be one a worker can read the same way. No structural restrictions apply here (unlike the driver's
-/// own path), because none of this content is partitioned.
-///
-/// Proves this for table references only. Ordinary FunctionNodes are accepted unexamined, so anything the query
-/// calls that is server-local or externally backed -- `hostName`, a dictionary via `dictGet`, a user-defined
-/// function -- moves from the initiator to the workers and must be present and consistent across the cluster.
-/// Same assumption `Distributed` makes; stated in the setting's own documentation.
+/// Workers recompute every partner in full, including nested queries.
+/// This checks tables only: dictionaries and functions such as `dictGet` or `hostName` must be consistent
+/// across workers, as documented for this setting and assumed by `Distributed`.
 bool allWorkerLocalTableReferencesAreSafe(const QueryTreeNodePtr & node, const TableNode * driver, const ContextPtr & context)
 {
     if (!node)
         return true;
 
     if (const auto * table_node = node->as<TableNode>())
-        return table_node == driver || isSafeDataLakeLeaf(*table_node, context);
+        return table_node == driver || isSafeCatalogTable(*table_node, context);
 
     if (node->as<TableFunctionNode>())
         return false;
@@ -219,14 +178,12 @@ std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCan
     if (context->getSettingsRef()[Setting::object_storage_cluster_join_mode] != ObjectStorageClusterJoinMode::DISTRIBUTED)
         return {};
 
-    /// Dispatch goes straight to the driver's cluster, bypassing the remote-initiator topology that
-    /// `IStorageCluster::read` would apply via convertToRemote.
+    /// Dispatch does not implement the remote-initiator topology from `IStorageCluster::read`.
     if (context->getSettingsRef()[Setting::object_storage_remote_initiator])
         return {};
 
-    /// additional_table_filters is keyed by the initiator's current_database and the query's own naming, both of
-    /// which shift once the query is serialized for remote execution. Planner.cpp disables parallel replicas for
-    /// the same reason.
+    /// Serialization changes the names used to match `additional_table_filters`.
+    /// Parallel replicas are disabled for the same reason.
     if (!context->getSettingsRef()[Setting::additional_table_filters].value.empty())
         return {};
 
@@ -239,31 +196,24 @@ std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCan
         return {};
 
     auto driver_path = findDriverOnLeftSpine(join_tree, context);
-    if (driver_path.unusable || !driver_path.driver || !driver_path.has_join)
+    if (!driver_path || !driver_path->has_join)
         return {};
 
-    if (!allWorkerLocalTableReferencesAreSafe(query_node, driver_path.driver, context))
+    if (!allWorkerLocalTableReferencesAreSafe(query_node, driver_path->driver.get(), context))
         return {};
 
-    DistributedObjectStorageCandidate candidate;
-    candidate.dispatch_boundary = query_node_typed;
-    candidate.driver = driver_path.driver;
-    candidate.driver_table_expression = driver_path.driver_table_expression;
-    candidate.driver_storage = driver_path.driver_storage;
-    return candidate;
+    return DistributedObjectStorageCandidate{.dispatch_boundary = query_node_typed, .driver = std::move(driver_path->driver)};
 }
 
 std::optional<DistributedObjectStorageCandidate> findDistributedObjectStorageCandidate(
     const QueryTreeNodePtr & query_tree_node, const SelectQueryOptions & select_query_options)
 {
-    /// buildDistributedObjectStorageQueryPlan takes the query's header from an analyze-only Planner over the
-    /// same tree. Dispatching from that one too would recurse until `TOO_DEEP_RECURSION`.
+    /// Header analysis in `buildDistributedObjectStorageQueryPlan` must not dispatch recursively.
     if (select_query_options.only_analyze)
         return {};
 
-    /// A subquery interpreted on its own, rather than planned through the enclosing GlobalPlannerContext, has
-    /// its `__tableN` identifiers numbered locally, so a result dispatched from it would not match the names
-    /// the enclosing query resolved against.
+    /// Independently interpreted subqueries number their `__tableN` identifiers locally.
+    /// Their dispatched headers would not match the enclosing query's names.
     if (select_query_options.is_subquery)
         return {};
 

@@ -54,11 +54,8 @@ public:
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 
-    /// Dispatches a whole query the caller has already prepared (see
-    /// Planner/buildDistributedObjectStorageQueryPlan.h) to this storage's cluster, over the same
-    /// task-iterator transport read() uses. This storage acts only as the cluster handle and the source of
-    /// file tasks; `query_to_send` is self-contained and its result is not this table's rows, so the read
-    /// goes through ReadFromClusterQuery rather than ReadFromCluster.
+    /// Dispatches a prepared query using this storage's cluster and file tasks.
+    /// `ReadFromClusterQuery` returns the query's result at `processed_stage` for the planner to finalize.
     void readPreparedClusterQuery(
         QueryPlan & query_plan,
         const StorageSnapshotPtr & storage_snapshot,
@@ -69,9 +66,8 @@ public:
         SharedHeader sample_block,
         std::shared_ptr<const ActionsDAG> driver_filter);
 
-    /// The table function that reads this table on a node of its cluster, as this storage's own cluster read
-    /// sends it. The `*Cluster` variant when `read_initiator_file_tasks`: a worker then reads only the files
-    /// the initiator hands out. Otherwise the plain one, which reads them all.
+    /// Builds the worker's table function using the ordinary cluster-read rewrite.
+    /// `read_initiator_file_tasks` selects the `*Cluster` variant; the plain variant reads all files locally.
     ASTPtr getTableFunctionToSend(const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context, bool read_initiator_file_tasks);
 
     bool isRemote() const final { return true; }
@@ -104,10 +100,6 @@ protected:
     void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);
 
     virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
-
-    /// Called before a whole-query dispatch lists this table's files. No read of this table runs on that path, so
-    /// nothing else has prepared the storage for listing.
-    virtual void prepareForWholeQueryDispatch(ContextPtr /* context */) {}
 
     struct RemoteCallVariables
     {
@@ -266,9 +258,8 @@ private:
 
 /// Dispatches one already-prepared query to a cluster, giving every node a share of one table's files.
 ///
-/// Distinct from ReadFromCluster, which reads a single table: here the output is a whole query's result, so
-/// there is no table expression to push filters into and no per-table column mapping. `driver_storage` and
-/// `driver_snapshot` describe only the table whose files are handed out, never the step's output.
+/// The output describes the query result; `driver_storage` and `driver_snapshot` describe the file-task source.
+/// Keep this separate from `ReadFromCluster`, whose table filters and column mappings do not apply to this output.
 class ReadFromClusterQuery : public ISourceStep
 {
 public:
