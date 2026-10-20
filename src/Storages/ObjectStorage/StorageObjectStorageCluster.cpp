@@ -15,6 +15,7 @@
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <TableFunctions/TableFunctionFactory.h>
 
+#include <Core/AntalyaProtocol.h>
 #include <Core/Settings.h>
 #include <Formats/FormatFactory.h>
 #include <Parsers/ASTSelectQuery.h>
@@ -52,7 +53,6 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
-    extern const SettingsBool allow_experimental_iceberg_read_optimization;
 }
 
 namespace ErrorCodes
@@ -644,14 +644,12 @@ public:
         std::vector<std::string> && ids_of_hosts,
         bool send_over_whole_archive,
         uint64_t lock_object_storage_task_distribution_ms,
-        ContextPtr context_,
-        bool iceberg_read_optimization_enabled)
+        ContextPtr context_)
         : task_distributor(
             iterator,
             std::move(ids_of_hosts),
             send_over_whole_archive,
-            lock_object_storage_task_distribution_ms,
-            iceberg_read_optimization_enabled)
+            lock_object_storage_task_distribution_ms)
         , context(context_) {}
     ~TaskDistributor() override = default;
     bool supportRerunTask() const override { return true; }
@@ -660,16 +658,23 @@ public:
         task_distributor.rescheduleTasksFromReplica(number_of_current_replica);
     }
 
-    ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica) const override
+    ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica, UInt64 antalya_protocol_version) const override
     {
         fiu_do_on(FailPoints::storage_cluster_read_sleep,
         {
             sleepForSeconds(10);
         });
 
-        auto task = task_distributor.getNextTask(number_of_current_replica);
-        if (task)
-            return std::make_shared<ClusterFunctionReadTaskResponse>(std::move(task), context);
+        const bool worker_supports_task_retry = antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS;
+        auto task = task_distributor.getNextTask(number_of_current_replica, worker_supports_task_retry);
+        if (task.retry_after_us)
+        {
+            auto response = std::make_shared<ClusterFunctionReadTaskResponse>();
+            response->retry_after_us = task.retry_after_us;
+            return response;
+        }
+        if (task.object)
+            return std::make_shared<ClusterFunctionReadTaskResponse>(std::move(task.object), context);
         return std::make_shared<ClusterFunctionReadTaskResponse>();
     }
 
@@ -711,6 +716,8 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
         );
     }
 
+    iterator->setTasksGoToOtherReplicas(true);
+
     std::vector<std::string> ids_of_hosts;
     for (const auto & shard : cluster->getShardsInfo())
     {
@@ -740,8 +747,7 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
         std::move(ids_of_hosts),
         /* send_over_whole_archive */!local_context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes],
         lock_object_storage_task_distribution_ms,
-        local_context,
-        /* iceberg_read_optimization_enabled */local_context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization]);
+        local_context);
 
     return RemoteQueryExecutor::Extension{ .task_iterator = std::move(callback) };
 }
@@ -1185,7 +1191,7 @@ bool StorageObjectStorageCluster::supportsImport(ContextPtr context) const
     return IStorageCluster::supportsImport(context);
 }
 
-SinkToStoragePtr StorageObjectStorageCluster::import(
+IStorage::ImportResult StorageObjectStorageCluster::import(
     const std::string & file_name,
     Block & block_with_partition_values,
     const std::function<void(const std::string &)> & new_file_path_callback,

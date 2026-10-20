@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
 #include <unordered_set>
 #include <Core/Range.h>
 #include <Core/SortDescription.h>
@@ -43,6 +44,8 @@
 
 namespace DB
 {
+
+struct ExternalStorageCache;
 
 String removeEscapedSlashes(const String & json_str);
 
@@ -155,10 +158,22 @@ struct ManifestListEntryCounts
     std::optional<Int64> added_sequence_number;
 };
 
+struct PreviousManifestAction
+{
+    Iceberg::IcebergPathFromMetadata new_path;
+    Int64 new_length = 0;
+    Int32 new_existing_files_count = 0;
+    Int64 new_existing_rows_count = 0;
+    Int64 new_min_sequence_number = 0;
+};
+
+using PreviousManifestActions = std::unordered_map<String, PreviousManifestAction>;
+
 void generateManifestList(
     const Iceberg::IcebergPathResolver & path_resolver,
     Poco::JSON::Object::Ptr metadata,
     ObjectStoragePtr object_storage,
+    ExternalStorageCache & external_storages,
     ContextPtr context,
     const std::vector<Iceberg::IcebergPathFromMetadata> & manifest_entry_names,
     Poco::JSON::Object::Ptr new_snapshot,
@@ -170,7 +185,8 @@ void generateManifestList(
     const std::vector<ManifestListEntryCounts> & entry_counts = {},
     const std::unordered_set<String> & carry_forward_manifest_paths = {},
     const std::vector<Int64> & entry_partition_spec_ids = {},
-    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {});
+    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {},
+    const PreviousManifestActions & previous_manifest_actions = {});
 
 std::string getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path);
 
@@ -185,7 +201,8 @@ public:
         ContextPtr context_,
         std::shared_ptr<DataLake::ICatalog> catalog_,
         const Iceberg::PersistentTableComponents & persistent_table_components_,
-        const StorageID & table_id_);
+        const StorageID & table_id_,
+        std::shared_ptr<ExternalStorageCache> external_storages_);
 
     ~IcebergStorageSink() override;
 
@@ -230,6 +247,7 @@ private:
     Iceberg::PersistentTableComponents persistent_table_components;
     const DataLakeStorageSettings & data_lake_settings;
     const String write_format;
+    std::shared_ptr<ExternalStorageCache> external_storages;
 
 };
 
@@ -273,6 +291,7 @@ private:
     const String& write_format;
     SharedHeader sample_block;
     std::unique_ptr<MultipleFileWriter> writer;
+    bool consumed_rows = false;
     const DataLakeStorageSettings & data_lake_settings;
     std::function<void(const std::string &)> new_file_path_callback;
 };

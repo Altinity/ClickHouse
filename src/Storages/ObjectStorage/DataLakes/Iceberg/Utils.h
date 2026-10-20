@@ -1,9 +1,7 @@
 #pragma once
 
+#include <Interpreters/Context_fwd.h>
 #include "config.h"
-
-#if USE_AVRO
-
 #include <optional>
 #include <string>
 #include <tuple>
@@ -18,6 +16,9 @@
 #include <Poco/JSON/Parser.h>
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+
+#if USE_AVRO
+
 #include <IO/CompressedReadBufferWrapper.h>
 #include <IO/CompressionMethod.h>
 #include <Storages/ColumnsDescription.h>
@@ -65,7 +66,8 @@ bool writeMetadataFileAndVersionHint(
     const IcebergPathFromMetadata & version_hint_path,
     DB::ObjectStoragePtr object_storage,
     DB::ContextPtr context,
-    bool try_write_version_hint);
+    bool try_write_version_hint,
+    bool * version_hint_names_metadata_file = nullptr);
 
 struct TransformAndArgument
 {

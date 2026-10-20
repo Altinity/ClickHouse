@@ -33,7 +33,7 @@ public:
 
     bool supportsImport(ContextPtr context) const override;
 
-    SinkToStoragePtr import(
+    ImportResult import(
         const std::string & file_name,
         Block & block_with_partition_values,
         const std::function<void(const std::string &)> & new_file_path_callback,
@@ -51,6 +51,7 @@ public:
         const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
 
+    void checkTableCanBeDropped(ContextPtr query_context) const override { configuration->checkCanBeDropped(query_context); }
     void prepareForDrop(ContextPtr query_context) override;
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(

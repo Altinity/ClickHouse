@@ -133,6 +133,7 @@ public:
     void checkGranteesAreAllowed(const std::vector<UUID> & grantee_ids) const;
 
     /// Checks access of grants with parameter where a filter can be applied.
+    /// The URI checked against the filter is normalized first; an invalid URI cannot match a filter.
     /// For example, for `GRANT READ ON S3('s3://foo.*') TO user` calling `checkAccess(READ, "S3")` will throw an error
     /// because we are checking for `READ` permissions for all possible URLs.
     ///
@@ -333,6 +334,7 @@ public:
     ALWAYS_INLINE void checkGranteesAreAllowed(const std::vector<UUID> & grantee_ids) const { access->checkGranteesAreAllowed(grantee_ids); }
 
     /// Checks access of grants with parameter where a filter can be applied.
+    /// The URI checked against the filter is normalized first; an invalid URI cannot match a filter.
     ALWAYS_INLINE void checkAccessWithFilter(const AccessFlags & flags, std::string_view parameter, std::string_view filter) const { access->checkAccessWithFilter(context, flags, parameter, filter); }
 
     /// Checks access of grants with parameter where a filter can be applied, without throwing.

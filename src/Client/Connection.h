@@ -117,6 +117,8 @@ public:
 
     UInt64 getServerRevision(const ConnectionTimeouts & timeouts) override;
 
+    UInt64 getServerAntalyaProtocolVersion() const { return server_antalya_protocol_version; }
+
     const String & getServerTimezone(const ConnectionTimeouts & timeouts) override;
     const String & getServerDisplayName(const ConnectionTimeouts & timeouts) override;
 
@@ -343,6 +345,11 @@ private:
     AsyncCallback async_callback = {};
 
     std::optional<FormatSettings> format_settings;
+    /// The binary type encoding of the `Native` blocks of the current query, as the server applies it.
+    /// Used when the caller does not set `format_settings`.
+    std::optional<FormatSettings> query_wire_format_settings;
+
+    std::optional<FormatSettings> getNativeFormatSettings() const { return format_settings ? format_settings : query_wire_format_settings; }
 
     void connect(const ConnectionTimeouts & timeouts);
 
