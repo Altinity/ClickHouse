@@ -389,12 +389,92 @@ SETTINGS max_block_size = 2;
 
 ## Distributed JOIN {#distributed-join}
 
-There are two ways to execute a JOIN involving distributed tables:
+A query whose left table is [`Distributed`](/engines/table-engines/special/distributed.md) is sent to the shards of its cluster. The same applies to a `*Cluster` table function (`s3Cluster`, `icebergCluster`, and the others) and to an object-storage table engine with [`object_storage_cluster`](/operations/settings/settings#object_storage_cluster) set (`S3`, `Iceberg`, and the others). An `Alias`, a `Buffer` table, or a `MaterializedView` in front of `Distributed` is treated as that `Distributed` table.
 
-- When using a normal `JOIN`, the query is sent to remote servers. Subqueries are run on each of them in order to make the right table, and the join is performed with this table. In other words, the right table is formed on each server separately.
-- When using `GLOBAL ... JOIN`, first the requestor server runs a subquery to calculate one side of the join and collects the result into a temporary table. This temporary table is then passed to each remote server, and queries are run on them using the temporary data that was transmitted. For `LEFT` and `INNER` joins, the right table is calculated as the subquery. For `RIGHT` joins, the left table is calculated instead, since the right table is the one being preserved and should be read from shards.
+The join then runs in one of two places:
 
-Be careful when using `GLOBAL`. For more information, see the [Distributed subqueries](/sql-reference/operators/in#distributed-subqueries) section.
+- **On the shards.** Each node reads its part of the table that stays on the cluster and runs the join. The initiator is the server that received the query. For a `GLOBAL` join it reads the other side once, stores it in a temporary table, and sends that table to every node. For a join without `GLOBAL` it sends nothing: each node builds the right side from the query it receives.
+- **On the initiator.** The nodes read the left table and return its rows. The initiator reads the right table and runs the join. No join side is sent to the nodes.
+
+`SELECT` column order stays the order written in the query, including when a `RIGHT` join is executed by reading the right table on the shards.
+
+### Which table is sent {#distributed-join-which-table-is-sent}
+
+| Where the join runs | Condition | Read on the nodes | Sent by the initiator |
+| --- | --- | --- | --- |
+| Shards | `JOIN` without `GLOBAL` | Left table. The right table is built on each node from the query as written | Nothing |
+| Shards | `GLOBAL` `INNER`, `LEFT`, `LEFT SEMI`, `LEFT ANTI` | Left table | Right table |
+| Shards | `GLOBAL` `RIGHT`, `RIGHT SEMI`, `RIGHT ANTI`, and the left table is `Distributed` over **two or more shards** | Right table | Left table |
+| Shards | `GLOBAL` `RIGHT`, `RIGHT SEMI`, `RIGHT ANTI`, and the left table is `Distributed` over **one shard** | Left table | Right table |
+| Shards | `CROSS JOIN` with [`object_storage_cluster_join_mode`](/operations/settings/settings#object_storage_cluster_join_mode) `global` | The first table | Every table after the first |
+| Initiator | The cases in [Join on the initiator](#distributed-join-on-the-initiator) | Rows of the left table, returned to the initiator | Nothing |
+
+A join without `GLOBAL` sends nothing. Each shard builds the right side itself. That result is correct when the rows that have to match already live on the same shard, for example when both tables are sharded by the join key. [`distributed_product_mode`](#distributed-product-mode-join) applies when the right side is distributed as well.
+
+A join without the `GLOBAL` keyword is executed as `GLOBAL` when [`distributed_product_mode`](/operations/settings/settings#distributed_product_mode) is `global`. With [`prefer_global_in_and_join`](/operations/settings/settings#prefer_global_in_and_join) enabled, the join is executed as `GLOBAL` for every `distributed_product_mode` value except `local`.
+
+For a `GLOBAL` `INNER` or `LEFT` join the preserved rows are on the left, so the right table is the one that is sent:
+
+```sql
+SELECT *
+FROM left_distributed AS l
+GLOBAL LEFT JOIN right_table AS r ON l.id = r.id
+```
+
+Each shard reads its own rows of `left_distributed` and joins them with one copy of `right_table`.
+
+For a `GLOBAL` `RIGHT` join the preserved rows are on the right. When `left_distributed` has two or more shards, the left table is the one that is sent, and each shard reads its own rows of the right table:
+
+```sql
+SELECT *
+FROM left_distributed AS l
+GLOBAL RIGHT JOIN right_distributed AS r ON l.id = r.id
+```
+
+Unmatched rows of `right_distributed` are returned from the shard that stores them, once. Sending the right table instead would return each of those rows once per shard.
+
+`ALL`, `ANY`, `SEMI`, and `ANTI` use the same side as the join kind. `USING` and `NATURAL` do too. The right table of such a `RIGHT` join may be distributed, local, a subquery, or a table function.
+
+With one shard there is no second copy of the preserved side, so a `GLOBAL` `RIGHT` join sends the right table and reads the left table on that shard.
+
+### Join on the initiator {#distributed-join-on-the-initiator}
+
+The join runs on the initiator in these cases:
+
+- The left table is local or a subquery. A distributed table on the right is read by the initiator.
+- [`object_storage_cluster_join_mode`](/operations/settings/settings#object_storage_cluster_join_mode) is `allow` (the default) or `local`. Nodes read the cluster table. The other table stays on the initiator.
+- The join is `FULL` and the left table is `Distributed` over two or more shards, or the left table is an object-storage cluster table with `object_storage_cluster_join_mode = 'global'`.
+- The join is `RIGHT`, `RIGHT SEMI`, or `RIGHT ANTI`, the left table has two or more shards, and the preserved side cannot stay on the shards. This is an `ASOF` join, `RIGHT ANY`, a `USING` key that is not a plain column on each side, a `PREWHERE` that names no column (`PREWHERE 0`), or a `RIGHT` / `FULL` join written above another join, such as `(A INNER JOIN C) RIGHT JOIN B`. A `RIGHT` or `FULL` join of an object-storage cluster table with `object_storage_cluster_join_mode = 'global'` stays on the initiator as well.
+
+In the last two cases a multi-shard left table is read to the initiator through a subquery, and the join runs there. Running it on every shard would emit each unmatched row of the preserved side once per shard.
+
+### `distributed_product_mode` {#distributed-product-mode-join}
+
+When the shard query joins two distributed tables and the join is not `GLOBAL`, [`distributed_product_mode`](/operations/settings/settings#distributed_product_mode) chooses what happens to the right table:
+
+| Value | Behavior |
+| --- | --- |
+| `deny` | The query is rejected with `DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`. |
+| `local` | On each shard the right `Distributed` table is replaced with its underlying local table. The join uses only the rows of the right table stored on that shard. |
+| `global` | The join is executed as `GLOBAL`. The side from the table above is read on the initiator and sent. |
+| `allow` | Each shard runs the right side as its own distributed query. |
+
+### `object_storage_cluster_join_mode` {#object-storage-cluster-join-mode}
+
+The setting applies when the left table is a `*Cluster` table function or a table engine with `object_storage_cluster` set.
+
+| Value | Where the join runs | What is sent |
+| --- | --- | --- |
+| `allow` | Initiator | Nothing. Nodes read the left table and return its rows. |
+| `local` | Initiator | Nothing. Same execution as `allow`. |
+| `global` | Nodes, for `INNER`, `LEFT`, and `CROSS` | The right table. For `CROSS JOIN`, every table after the first. |
+| `global` | Initiator, for `RIGHT` and `FULL` | Nothing. A `RIGHT` or `FULL` join on every node would repeat unmatched rows of the preserved side. |
+
+### `PREWHERE` {#distributed-join-prewhere}
+
+`PREWHERE` is applied on the table it belongs to. When that table is the one sent to the nodes, the filter runs while the initiator builds the temporary table. When that table stays on the nodes, the filter runs there. A `PREWHERE` that names no column is attached to the leftmost table and keeps a `GLOBAL` `RIGHT` join on the initiator.
+
+`GLOBAL` copies one side of the join to every node. For a large side that is expensive, and the copy has to fit in memory on each node. See also [Distributed subqueries](/sql-reference/operators/in#distributed-subqueries).
 
 ## Implicit type conversion {#implicit-type-conversion}
 
