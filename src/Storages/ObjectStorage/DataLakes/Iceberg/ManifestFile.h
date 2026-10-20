@@ -61,10 +61,18 @@ String FileContentTypeToString(FileContentType type);
 
 struct PartitionSpecsEntry
 {
-    Int32 source_id;
+    /// For single-argument transforms (V1/V2 and single-arg V3) this holds one element.
+    /// For multi-argument V3 transforms (e.g. bucket over multiple columns) it holds multiple.
+    std::vector<Int32> source_ids;
     String transform_name;
     String partition_name;
+<<<<<<< HEAD
     Int32 tuple_index;
+=======
+
+    /// Convenience: true when the transform references more than one source column (V3 multi-arg).
+    bool isMultiArg() const { return source_ids.size() > 1; }
+>>>>>>> 3a361c425a6b (Merge pull request #2318 from Altinity/iceberg-v3-multi-arg-transforms)
 };
 using PartitionSpecification = std::vector<PartitionSpecsEntry>;
 
