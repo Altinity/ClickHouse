@@ -8,6 +8,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasThrottlingBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
@@ -140,6 +142,14 @@ TEST(CASBulkDeleteBackend, InstrumentedCountsOneRequestAndOneDeletePerKeyClass)
 }
 
 #if USE_AWS_S3
+TEST(CASBulkDeleteBackend, ThrottlingBackendForwardsStorageLimit)
+{
+    auto inner = std::make_shared<DB::Cas::tests::BatchCapabilityBackend>();
+    inner->setStorageLimit(250);
+    ThrottlingBackend backend(inner, ThrottlingBackend::Mode::FirstPerKey, 1, 429);
+    EXPECT_EQ(backend.bulkDeleteKeyLimit(), 250u);
+}
+
 TEST(CASBulkDeleteBackend, ThrottlingRefusesTheChunkOnceAndTheEngineReissuesIt)
 {
     auto inner = std::make_shared<InMemoryBackend>();
@@ -195,3 +205,39 @@ TEST(CASBulkDeleteBackend, LocalObjectStorageRefusesTheProfileOverload)
     });
 }
 #endif
+
+TEST(CASBulkDeleteBackend, InMemoryStorageLimitDefaultsToTheCasMaximum)
+{
+    InMemoryBackend backend;
+    EXPECT_EQ(backend.bulkDeleteKeyLimit(), kBulkDeleteMaxKeys);
+}
+
+TEST(CASBulkDeleteBackend, PoolWrappedBackendForwardsStorageLimit)
+{
+    auto backend = std::make_shared<DB::Cas::tests::BatchCapabilityBackend>();
+    backend->setStorageLimit(250);
+    auto store = DB::Cas::tests::openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/ 0);
+    ASSERT_NE(dynamic_cast<InstrumentedBackend *>(store->poolBackendPtr().get()), nullptr)
+        << "the pool must wrap its backend, or this test proves nothing about the decorator";
+    EXPECT_EQ(store->poolBackendPtr()->bulkDeleteKeyLimit(), 250u);
+    Gc gc(store, DB::UInt128{1});
+    EXPECT_EQ(gc.bulkDeleteChunkKeys(), 250u);
+}
+
+TEST(CASBulkDeleteBackend, GcChunkIsTheSmallerOfSettingAndStorageLimit)
+{
+    auto backend = std::make_shared<DB::Cas::tests::BatchCapabilityBackend>();
+    backend->setStorageLimit(700);
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_bulk_delete_chunk_keys = 300});
+    EXPECT_EQ(Gc(store, DB::UInt128{1}).bulkDeleteChunkKeys(), 300u);
+    backend->setBatchDeleteSupported(false);
+    EXPECT_EQ(Gc(store, DB::UInt128{1}).bulkDeleteChunkKeys(), 1u);
+}
+
+TEST(CASBulkDeleteBackend, ZeroStorageLimitClampsGcChunkToOneKey)
+{
+    auto backend = std::make_shared<DB::Cas::tests::BatchCapabilityBackend>();
+    backend->setStorageLimit(0);
+    auto store = DB::Cas::tests::openPoolForTest(backend, 0);
+    EXPECT_EQ(Gc(store, DB::UInt128{1}).bulkDeleteChunkKeys(), 1u);
+}

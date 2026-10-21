@@ -437,12 +437,13 @@ static bool writeMetadataFiles(
     std::optional<ChunkPartitioner> & chunk_partitioner,
     Iceberg::FileContentType content_type,
     SharedHeader sample_block,
-    bool write_metadata_json_file)
+    bool write_metadata_json_file,
+    const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path)
 {
     auto metadata_info = filename_generator.generateMetadataPathWithInfo();
     auto storage_metadata_name = path_resolver.resolve(metadata_info.path);
     Int64 parent_snapshot = -1;
-    if (metadata->has(Iceberg::f_current_snapshot_id))
+    if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
         parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
 
     Int64 total_rows = 0;
@@ -461,7 +462,7 @@ static bool writeMetadataFiles(
     {
         auto result = MetadataGenerator(metadata).generateNextMetadata(
             filename_generator,
-            metadata_info.path,
+            previous_metadata_file_path,
             parent_snapshot,
             /* added_files */ 0,
             /* added_records */ 0,
@@ -476,7 +477,7 @@ static bool writeMetadataFiles(
     {
         auto result = MetadataGenerator(metadata).generateNextMetadata(
             filename_generator,
-            metadata_info.path,
+            previous_metadata_file_path,
             parent_snapshot,
             /* added_files */ total_files,
             /* added_records */ total_rows,
@@ -490,7 +491,7 @@ static bool writeMetadataFiles(
     auto manifest_entries_in_storage = std::make_shared<Strings>();
     std::vector<Iceberg::IcebergPathFromMetadata> manifest_entries;
     std::vector<Int64> manifest_entry_sizes;
-
+    std::vector<std::vector<std::pair<Field, DataTypePtr>>> entry_partition_summaries;
     auto cleanup = [object_storage, &delete_filenames, &path_resolver, manifest_entries_in_storage, storage_manifest_list_name, storage_metadata_name]()
     {
         try
@@ -516,6 +517,17 @@ static bool writeMetadataFiles(
             auto manifest_entry_path = filename_generator.generateManifestEntryName();
             manifest_entries_in_storage->push_back(path_resolver.resolve(manifest_entry_path));
             manifest_entries.push_back(manifest_entry_path);
+
+            /// The manifest holds a single partition tuple, which becomes its manifest-list field summary.
+            if (chunk_partitioner)
+            {
+                const auto & partition_types = chunk_partitioner->getResultTypes();
+                std::vector<std::pair<Field, DataTypePtr>> partition_summary;
+                partition_summary.reserve(partition_key.size());
+                for (size_t i = 0; i < partition_key.size(); ++i)
+                    partition_summary.emplace_back(partition_key[i], partition_types[i]);
+                entry_partition_summaries.push_back(std::move(partition_summary));
+            }
 
             auto buffer_manifest_entry = object_storage->writeObject(
                 StoredObject(path_resolver.resolve(manifest_entry_path)),
@@ -576,7 +588,13 @@ static bool writeMetadataFiles(
                     new_snapshot,
                     manifest_entry_sizes,
                     *buffer_manifest_list,
-                    content_type);
+                    content_type,
+                    /* use_previous_snapshots */ true,
+                    /* per_entry_content_types */ {},
+                    /* existing_entry_counts */ {},
+                    /* carry_forward_manifest_paths */ {},
+                    /* entry_partition_spec_ids */ {},
+                    entry_partition_summaries);
                 buffer_manifest_list->finalize();
             }
             catch (...)
@@ -672,6 +690,7 @@ void mutate(
         filename_generator.setCompressionMethod(compression_method);
 
         auto metadata = getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
+        auto previous_metadata_path = persistent_table_components.path_resolver.reverseResolve(metadata_path);
 
         /// Iceberg v3 writers must not add new position-delete files; row-level deletes require
         /// deletion vectors. Fail closed before any object writes until ClickHouse can write DVs.
@@ -715,7 +734,7 @@ void mutate(
         current_iceberg_snapshot.metadata_file_path = metadata_path;
         current_iceberg_snapshot.metadata_version = last_version;
         current_iceberg_snapshot.schema_id = static_cast<Int32>(current_schema_id);
-        if (metadata->has(Iceberg::f_current_snapshot_id))
+        if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
         {
             Int64 snapshot_id_val = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
             if (snapshot_id_val >= 0)
@@ -761,7 +780,8 @@ void mutate(
                 chunk_partitioner,
                 Iceberg::FileContentType::POSITION_DELETE,
                 std::make_shared<const Block>(getPositionDeleteFileSampleBlock()),
-                !mutation_files->data_file);
+                !mutation_files->data_file,
+                previous_metadata_path);
             if (!result_delete_files_metadata)
                 continue;
 
@@ -784,7 +804,8 @@ void mutate(
                     chunk_partitioner,
                     Iceberg::FileContentType::DATA,
                     sample_block,
-                    true);
+                    true,
+                    previous_metadata_path);
                 if (!result_data_files_metadata)
                 {
                     continue;

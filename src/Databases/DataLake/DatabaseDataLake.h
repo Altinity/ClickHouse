@@ -43,11 +43,23 @@ public:
         const FilterByNameFunction & filter_by_table_name,
         bool skip_not_loaded) const override;
 
+    DatabaseTablesIteratorPtr getTablesIteratorWithHint(
+        ContextPtr context,
+        const FilterByNameFunction & filter_by_table_name,
+        bool skip_not_loaded,
+        const TablesFilter & tables_filter) const override;
+
     /// skip_not_loaded flag ignores all non-iceberg tables
     std::vector<LightWeightTableDetails> getLightweightTablesIterator(
         ContextPtr context,
         const FilterByNameFunction & filter_by_table_name,
         bool skip_not_loaded) const override;
+
+    std::vector<LightWeightTableDetails> getLightweightTablesIteratorWithHint(
+        ContextPtr context,
+        const FilterByNameFunction & filter_by_table_name,
+        bool skip_not_loaded,
+        const TablesFilter & tables_filter) const override;
 
     Strings getAllTableNames(ContextPtr context) const override;
 
@@ -57,16 +69,19 @@ public:
 
     std::vector<std::pair<ASTPtr, StoragePtr>> getTablesForBackup(const FilterByNameFunction &, const ContextPtr &) const override { return {}; }
 
+    void validateCreateTableEngine(const ASTStorage & storage) const override;
+
     void createTable(
-        ContextPtr /*context*/,
-        const String & /*name*/,
+        ContextPtr context,
+        const String & name,
         const StoragePtr & /*table*/,
-        const ASTPtr & /*query*/) override {}
+        const ASTPtr & query) override;
 
     void dropTable( /// NOLINT
         ContextPtr context_,
         const String & name,
-        bool /*sync*/) override;
+        bool /*sync*/,
+        bool if_exists) override;
 
     void applySettingsChanges(const SettingsChanges & settings_changes, ContextPtr query_context) override;
 
@@ -91,6 +106,8 @@ private:
     mutable std::shared_ptr<DataLake::ICatalog> catalog_impl TSA_GUARDED_BY(catalog_mutex);
 
     void validateSettings();
+
+    void validateCreateTableEngineArguments(const ASTFunction & engine) const;
 
     /// Builds `catalog_impl` based on the configured catalog type. Constructing a catalog can
     /// validate credentials and perform network I/O (e.g. RestCatalog reads the catalog config),

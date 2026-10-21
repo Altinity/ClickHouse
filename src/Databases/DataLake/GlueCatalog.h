@@ -42,6 +42,8 @@ public:
 
     DB::Names getTables() const override;
 
+    Namespaces getNamespaces() const override;
+
     bool existsTable(const std::string & database_name, const std::string & table_name) const override;
 
     void getTableMetadata(
@@ -67,7 +69,13 @@ public:
         return DB::DatabaseDataLakeCatalogType::GLUE;
     }
 
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
+    bool createTable(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr metadata_content,
+        DB::CompressionMethod metadata_compression_method,
+        bool if_not_exists) const override;
 
     void createNamespaceIfNotExists(const String & namespace_name, const String & location) const override;
 
@@ -82,7 +90,7 @@ public:
         Int32 new_last_column_id,
         Poco::JSON::Object::Ptr metadata = nullptr) const override;
 
-    void dropTable(const String & namespace_name, const String & table_name) const override;
+    void dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const override;
 
     /// Returns a callback that re-vends fresh AWS credentials from the configured
     /// credentials provider chain. Invoked by `ReadBufferFromS3` when an S3 call
@@ -111,12 +119,15 @@ private:
 
     DataLake::ICatalog::Namespaces getDatabases(const std::string & prefix, size_t limit = 0) const;
     DB::Names getTablesForDatabase(const std::string & db_name, size_t limit = 0) const;
+    DB::Names listTablesInNamespaceDirect(const std::string & namespace_name) const override;
     void setCredentials(TableMetadata & metadata) const;
 
     /// The Glue catalog does not store detailed information about the types of timestamp columns, such as whether the column is timestamp or timestamptz.
     /// This method allows to clarify the actual type of the timestamp column.
     /// `glue_column_type` is the raw Glue type (`"timestamp"` or `"timestamp_nano"`) used as a fallback when the column is not found in Iceberg metadata.
     String getActualTimestampType(const String & column_name, const TableMetadata & table_metadata, const String & glue_column_type) const;
+
+    Poco::JSON::Object::Ptr getIcebergMetadataObject(const TableMetadata & table_metadata) const;
 
     String resolveMetadataPathFromTableLocation(const String & table_location, const TableMetadata & table_metadata) const;
 

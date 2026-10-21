@@ -226,15 +226,14 @@ constexpr bool isLowercaseHexChar(char c)
 ///
 /// The reader borrows the input buffer and records the object name for exception messages. It
 /// enforces unique keys and translates the several low-level parser exceptions into the CAS
-/// `CORRUPTED_DATA` contract. Unknown keys follow the supplied evolution policy: ordinary keys
-/// may be skipped in tolerant objects, while `!`-prefixed keys always fail with
-/// `UNKNOWN_FORMAT_VERSION`.
+/// `CORRUPTED_DATA` contract. An unknown ordinary key is skipped; an unknown `!`-prefixed key fails
+/// with `UNKNOWN_FORMAT_VERSION`.
 
 class JsonObjectReader
 {
 public:
     /// Consumes the opening `{`; throws `CORRUPTED_DATA` when the object does not start there.
-    JsonObjectReader(ReadBuffer & in_, KeyStrictness strictness_, std::string_view what_);
+    JsonObjectReader(ReadBuffer & in_, std::string_view what_);
 
     /// An unbound reader, for a decoder that wants one reader outside its row loop and re-points it
     /// per row. `reset` must be called before any read; nothing else is valid on it.
@@ -247,7 +246,7 @@ public:
     /// instructions executed inside the decoder. Reusing one reader amortises that away. The
     /// object-level state -- the key set and the position in the object -- is reset in full, so a
     /// reused reader accepts and rejects exactly what a fresh one would.
-    void reset(ReadBuffer & in_, KeyStrictness strictness_, std::string_view what_);
+    void reset(ReadBuffer & in_, std::string_view what_);
     /// Advances to the next key; false when the closing '}' was consumed. The caller must
     /// consume the value (one read* / skipUnknown) before the next call. Duplicate keys are
     /// rejected with `CORRUPTED_DATA`.
@@ -267,8 +266,7 @@ public:
     /// Reads the bare JSON literals `true` and `false`.
     bool readBool();
     /// Applies the evolution rule for an unrecognized key: `!`-prefixed keys produce
-    /// `UNKNOWN_FORMAT_VERSION`; strict objects produce `CORRUPTED_DATA`; tolerant objects skip
-    /// the value.
+    /// `UNKNOWN_FORMAT_VERSION`; any other unknown key has its value skipped.
     void skipUnknown(const String & key);
 
 private:
@@ -282,7 +280,6 @@ private:
     std::string_view readStringIntoScratch();
 
     ReadBuffer * in = nullptr;
-    KeyStrictness strictness = KeyStrictness::Strict;
     String what;
     std::vector<String> seen_keys;
     String scratch;

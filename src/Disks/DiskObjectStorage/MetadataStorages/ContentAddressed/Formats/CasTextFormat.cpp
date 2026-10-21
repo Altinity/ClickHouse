@@ -166,16 +166,15 @@ auto JsonObjectReader::guarded(F && f)
     }
 }
 
-JsonObjectReader::JsonObjectReader(ReadBuffer & in_, KeyStrictness strictness_, std::string_view what_)
-    : in(&in_), strictness(strictness_), what(what_)
+JsonObjectReader::JsonObjectReader(ReadBuffer & in_, std::string_view what_)
+    : in(&in_), what(what_)
 {
     guarded([&] { assertChar('{', *in); });
 }
 
-void JsonObjectReader::reset(ReadBuffer & in_, KeyStrictness strictness_, std::string_view what_)
+void JsonObjectReader::reset(ReadBuffer & in_, std::string_view what_)
 {
     in = &in_;
-    strictness = strictness_;
     what = what_;
     /// `clear` on both keeps their buffers: that is the whole point of reusing the reader.
     seen_keys.clear();
@@ -320,8 +319,6 @@ void JsonObjectReader::skipUnknown(const String & key)
         if (!key.empty() && key[0] == '!')
             throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
                 "CAS {}: critical key '{}' is not understood by this build", what, key);
-        if (strictness == KeyStrictness::Strict)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown key '{}' in a strict format", what, key);
         skipJSONField(*in, key, jsonReadSettings());
     });
 }
@@ -399,7 +396,7 @@ namespace
 TextHeader parseHeaderObject(std::string_view line, std::string_view what)
 {
     ReadBufferFromMemory buf(line.data(), line.size());
-    JsonObjectReader r(buf, KeyStrictness::Tolerant, what);
+    JsonObjectReader r(buf, what);
     String key;
     if (!r.nextKey(key) || key != "type")
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: header line must start with \"type\"", what);

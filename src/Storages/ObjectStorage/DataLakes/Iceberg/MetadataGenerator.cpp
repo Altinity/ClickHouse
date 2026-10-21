@@ -450,7 +450,7 @@ Poco::JSON::Object::Ptr MetadataGenerator::getParentSnapshot(Int64 parent_snapsh
 
 MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     FileNamesGenerator & generator,
-    const Iceberg::IcebergPathFromMetadata & metadata_file_path,
+    const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path,
     Int64 parent_snapshot_id,
     Int64 added_files,
     Int64 added_records,
@@ -474,7 +474,8 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
 
     auto manifest_list_path = generator.generateManifestListName(snapshot_id, format_version);
     new_snapshot->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
-    new_snapshot->set(Iceberg::f_parent_snapshot_id, parent_snapshot_id);
+    if (parent_snapshot_id != -1)
+        new_snapshot->set(Iceberg::f_parent_snapshot_id, parent_snapshot_id);
 
     auto now = std::chrono::system_clock::now();
     auto ms = duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
@@ -564,9 +565,10 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     else
         metadata_object->getObject(Iceberg::f_refs)->getObject(Iceberg::f_main)->set(Iceberg::f_metadata_snapshot_id, snapshot_id);
 
+    if (!previous_metadata_file_path.empty())
     {
         Poco::JSON::Object::Ptr new_metadata_item = new Poco::JSON::Object;
-        new_metadata_item->set(Iceberg::f_metadata_file, metadata_file_path.serialize());
+        new_metadata_item->set(Iceberg::f_metadata_file, previous_metadata_file_path.serialize());
         new_metadata_item->set(Iceberg::f_timestamp_ms, timestamp);
         getOrCreateArray(metadata_object, Iceberg::f_metadata_log)->add(new_metadata_item);
     }
@@ -737,6 +739,19 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
                             ErrorCodes::BAD_ARGUMENTS,
                             "Cannot drop column '{}' (field id {}): it is referenced by the active sort order",
                             column_name, dropped_field_id);
+                    /// Also check multi-arg V3 sort fields
+                    if (sf->has(Iceberg::f_source_ids))
+                    {
+                        auto ids = sf->getArray(Iceberg::f_source_ids);
+                        for (UInt32 k = 0; k < ids->size(); ++k)
+                        {
+                            if (ids->getElement<Int32>(k) == dropped_field_id)
+                                throw Exception(
+                                    ErrorCodes::BAD_ARGUMENTS,
+                                    "Cannot drop column '{}' (field id {}): it is referenced by the active sort order (multi-arg transform)",
+                                    column_name, dropped_field_id);
+                        }
+                    }
                 }
                 break;
             }
@@ -764,6 +779,19 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
                         ErrorCodes::BAD_ARGUMENTS,
                         "Cannot drop column '{}' (field id {}): it is referenced by the active partition spec",
                         column_name, dropped_field_id);
+                /// Also check multi-arg V3 partition fields
+                if (pf->has(Iceberg::f_source_ids))
+                {
+                    auto ids = pf->getArray(Iceberg::f_source_ids);
+                    for (UInt32 k = 0; k < ids->size(); ++k)
+                    {
+                        if (ids->getElement<Int32>(k) == dropped_field_id)
+                            throw Exception(
+                                ErrorCodes::BAD_ARGUMENTS,
+                                "Cannot drop column '{}' (field id {}): it is referenced by the active partition spec (multi-arg transform)",
+                                column_name, dropped_field_id);
+                    }
+                }
             }
             break;
         }
@@ -779,6 +807,7 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
 {
     if (!type->isNullable())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg spec doesn't allow to add non-nullable columns");
+    Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
     const auto next_schema_id = getNextSchemaId(metadata_object);
 
     auto current_schema = deepCopy(getCurrentSchema());
@@ -839,6 +868,8 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
 
 bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context, bool first, const String & after_column)
 {
+    if (type)
+        Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
     auto current_schema = getCurrentSchema();
 
     auto last_column_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);

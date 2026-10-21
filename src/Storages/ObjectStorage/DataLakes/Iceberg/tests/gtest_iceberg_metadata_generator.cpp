@@ -6,6 +6,7 @@
 
 #include <Common/Exception.h>
 #include <Common/tests/gtest_global_context.h>
+#include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -13,6 +14,7 @@
 #include <DataTypes/DataTypeTuple.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MetadataGenerator.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
 
@@ -624,6 +626,77 @@ TEST(IcebergMetadataGenerator, ModifyColumnWideningRecordsTheNewTypeInANewSchema
 }
 
 
+/// --- Multi-argument transform (Iceberg V3 source-ids) tests ---
+
+/// Helper: make metadata with two columns (x: int, y: string) for multi-arg tests.
+static Poco::JSON::Object::Ptr makeMetadataWithTwoColumns()
+{
+    auto metadata = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    metadata->set(f_format_version, 3);
+    metadata->set(f_current_schema_id, 0);
+    metadata->set(f_last_column_id, 2);
+
+    auto schemas = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+    auto schema = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    schema->set(f_schema_id, 0);
+    schema->set(f_type, "struct");
+    auto fields = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+
+    auto field_x = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    field_x->set(f_id, 1);
+    field_x->set(f_name, "x");
+    field_x->set(f_required, true);
+    field_x->set(f_type, "int");
+    fields->add(field_x);
+
+    auto field_y = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    field_y->set(f_id, 2);
+    field_y->set(f_name, "y");
+    field_y->set(f_required, true);
+    field_y->set(f_type, "string");
+    fields->add(field_y);
+
+    schema->set(f_fields, fields);
+    schemas->add(schema);
+    metadata->set(f_schemas, schemas);
+
+    return metadata;
+}
+
+TEST(IcebergMetadataGenerator, GetIcebergTypeNothingProducesUnknown)
+{
+    Int32 iter = 0;
+    auto [iceberg_type, required] = Iceberg::getIcebergType(std::make_shared<DataTypeNothing>(), iter);
+    ASSERT_TRUE(iceberg_type.isString());
+    EXPECT_EQ(iceberg_type.extract<String>(), "unknown");
+    EXPECT_FALSE(required);
+}
+
+
+TEST(IcebergMetadataGenerator, GetIcebergTypeNullableNothingProducesUnknown)
+{
+    Int32 iter = 0;
+    auto [iceberg_type, required] = Iceberg::getIcebergType(makeNullable(std::make_shared<DataTypeNothing>()), iter);
+    ASSERT_TRUE(iceberg_type.isString());
+    EXPECT_EQ(iceberg_type.extract<String>(), "unknown");
+    EXPECT_FALSE(required);
+}
+
+
+TEST(IcebergMetadataGenerator, AddColumnUnknownTypeRecordsUnknownInSchema)
+{
+    auto metadata = makeMetadataWithGap();
+    metadata->set(f_format_version, 3);
+    MetadataGenerator gen(metadata);
+
+    gen.generateAddColumnMetadata("placeholder", makeNullable(std::make_shared<DataTypeNothing>()));
+
+    auto stored_type = findCurrentFieldType(metadata, "placeholder");
+    ASSERT_TRUE(stored_type.isString());
+    EXPECT_EQ(stored_type.extract<String>(), "unknown");
+}
+
+
 TEST(IcebergMetadataGenerator, ModifyColumnFirstMovesFieldToIndexZero)
 {
     auto metadata = makeMetadataWithGap();
@@ -681,6 +754,63 @@ TEST(IcebergMetadataGenerator, ModifyColumnAfterMovesFieldAfterNamedColumn)
     EXPECT_EQ(names[0], "b");
     EXPECT_EQ(names[1], "a");
     EXPECT_EQ(names[2], "c");
+}
+
+
+TEST(IcebergMetadataGenerator, DropColumnRejectsIfInMultiArgPartitionSpec)
+{
+    auto metadata = makeMetadataWithTwoColumns();
+
+    auto partition_specs = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+    auto spec = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    spec->set(f_spec_id, static_cast<Int64>(1));
+    auto spec_fields = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+
+    auto pf = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    /// Multi-arg: source-ids instead of source-id
+    auto source_ids = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+    source_ids->add(1);
+    source_ids->add(2);
+    pf->set(f_source_ids, source_ids);
+    pf->set("transform", "bucket[16]");
+    pf->set("name", "xy_bucket");
+    spec_fields->add(pf);
+    spec->set(f_fields, spec_fields);
+    partition_specs->add(spec);
+    metadata->set(f_partition_specs, partition_specs);
+    metadata->set(f_default_spec_id, static_cast<Int64>(1));
+
+    /// Dropping either column that participates in the multi-arg transform should be rejected.
+    expectDropRejected(metadata, "x");
+    expectDropRejected(metadata, "y");
+}
+
+
+TEST(IcebergMetadataGenerator, DropColumnRejectsIfInMultiArgSortOrder)
+{
+    auto metadata = makeMetadataWithTwoColumns();
+
+    auto sort_orders = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+    auto sort_order = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    sort_order->set(f_order_id, static_cast<Int64>(1));
+    auto sort_fields = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+
+    auto sf = Poco::JSON::Object::Ptr(new Poco::JSON::Object);
+    auto source_ids = Poco::JSON::Array::Ptr(new Poco::JSON::Array);
+    source_ids->add(1);
+    source_ids->add(2);
+    sf->set(f_source_ids, source_ids);
+    sf->set("transform", "bucket[16]");
+    sf->set("direction", "asc");
+    sf->set("null-order", "nulls-first");
+    sort_fields->add(sf);
+    sort_order->set(f_fields, sort_fields);
+    sort_orders->add(sort_order);
+    metadata->set(f_sort_orders, sort_orders);
+    metadata->set(f_default_sort_order_id, static_cast<Int64>(1));
+
+    expectDropRejected(metadata, "x");
+    expectDropRejected(metadata, "y");
 }
 
 

@@ -43,7 +43,7 @@ GcMaintenanceState decodeGcMaintenanceState(std::string_view data)
     expectHeaderLine(in, FormatId::GcMaintenanceState);
     const String body = readLine(in, traitsFor(FormatId::GcMaintenanceState).line_cap, "cas_gc_maintenance_state");
     ReadBufferFromMemory body_in(body.data(), body.size());
-    JsonObjectReader reader(body_in, KeyStrictness::Strict, "cas_gc_maintenance_state");
+    JsonObjectReader reader(body_in, "cas_gc_maintenance_state");
 
     GcMaintenanceState result;
     bool has_cursor = false;

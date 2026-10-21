@@ -638,6 +638,7 @@ std::unordered_map<String, CHSetting> serverSettings = {
     {"create_index_ignore_unique", trueOrFalseSettingNoOracle},
     {"create_table_empty_primary_key_by_default", trueOrFalseSettingNoOracle},
     {"cross_to_inner_join_rewrite", CHSetting(zeroOneTwo, {"0", "1", "2"}, false)},
+    {"data_lake_delete_data_on_drop", trueOrFalseSettingNoOracle},
     {"database_atomic_wait_for_drop_and_detach_synchronously", trueOrFalseSettingNoOracle},
     {"database_datalake_require_metadata_access", trueOrFalseSettingNoOracle},
     {"database_replicated_allow_explicit_uuid", CHSetting(zeroOneTwo, {}, false)},
@@ -873,7 +874,6 @@ std::unordered_map<String, CHSetting> serverSettings = {
          [](RandomGenerator & rg, FuzzConfig &) { return std::to_string(rg.thresholdGenerator<uint64_t>(0.3, 0.2, 0, 10800)); },
          {},
          false)},
-    {"iceberg_delete_data_on_drop", trueOrFalseSettingNoOracle},
     {"iceberg_expire_default_min_snapshots_to_keep",
      CHSetting(
          [](RandomGenerator & rg, FuzzConfig &) { return std::to_string(rg.thresholdGenerator<uint64_t>(0.2, 0.2, 0, 10)); }, {}, false)},
@@ -1765,6 +1765,7 @@ void loadFuzzerServerSettings(const FuzzConfig & fc)
            "input_format_max_block_size_bytes",
            "input_format_parquet_local_file_min_bytes_for_seek",
            "input_format_parquet_prefer_block_bytes",
+           "input_format_parquet_footer_read_size",
            "input_format_parquet_memory_low_watermark",
            "input_format_parquet_memory_high_watermark",
            "join_runtime_bloom_filter_bytes",

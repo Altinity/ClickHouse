@@ -41,9 +41,20 @@ StorageObjectStorageStableTaskDistributor::StorageObjectStorageStableTaskDistrib
     }
 }
 
-ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t number_of_current_replica)
+DistributedReadTask StorageObjectStorageStableTaskDistributor::getNextTask(size_t number_of_current_replica, bool worker_supports_task_retry)
 {
     LOG_TRACE(log, "Received request from replica {} looking for a file", number_of_current_replica);
+
+    /// One peer that cannot be asked to wait makes the lock useless: that peer would take another
+    /// node's file immediately. Run the rest of the query as if the setting were 0.
+    if (!worker_supports_task_retry && !task_retry_disabled.exchange(true, std::memory_order_relaxed))
+    {
+        LOG_INFO(
+            log,
+            "Replica {} does not support task retry, ignoring `lock_object_storage_task_distribution_ms` for this query",
+            number_of_current_replica);
+    }
+    const bool allow_task_retry = worker_supports_task_retry && !task_retry_disabled.load(std::memory_order_relaxed);
 
     saveLastNodeActivity(number_of_current_replica);
 
@@ -65,7 +76,12 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t numb
         file = getMatchingFileFromIterator(number_of_current_replica);
     // 3. Process unprocessed files if iterator is exhausted
     if (!file)
-        file = getAnyUnprocessedFile(number_of_current_replica);
+    {
+        auto pending = getAnyUnprocessedFile(number_of_current_replica, allow_task_retry);
+        if (pending.retry_after_us)
+            return pending;
+        file = std::move(pending.object);
+    }
 
     if (file)
     {
@@ -82,7 +98,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t numb
             processed_file_list_ptr->second.push_back(file);
     }
 
-    return file;
+    return DistributedReadTask{.object = std::move(file), .retry_after_us = std::nullopt};
 }
 
 size_t StorageObjectStorageStableTaskDistributor::getReplicaForFile(const String & file_path)
@@ -221,7 +237,9 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
     return {};
 }
 
-ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(size_t number_of_current_replica)
+DistributedReadTask StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(
+    size_t number_of_current_replica,
+    bool allow_task_retry)
 {
     /// Limit time of node activity to keep task in queue
     Poco::Timestamp activity_limit;
@@ -240,6 +258,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
             auto number_of_matched_replica = it->second.second;
             auto last_activity = last_node_activity.find(number_of_matched_replica);
             if (lock_object_storage_task_distribution_us <= 0 // file deferring is turned off
+                || !allow_task_retry // this request must not wait: peer is old, or the query already saw one
                 || it->second.second == number_of_current_replica // file is matching with current replica
                 || last_activity == last_node_activity.end() // msut never be happen, last_activity is filled for each replica on start
                 || activity_limit > last_activity->second) // matched replica did not ask for a new files for a while
@@ -257,7 +276,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
                 );
 
                 ProfileEvents::increment(ProfileEvents::ObjectStorageClusterSentToNonMatchedReplica);
-                return next_file;
+                return DistributedReadTask{.object = std::move(next_file), .retry_after_us = std::nullopt};
             }
 
             oldest_activity = std::min(oldest_activity, last_activity->second);
@@ -271,11 +290,12 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
             oldest_activity - activity_limit
         );
 
-        /// All unprocessed files owned by alive replicas with recenlty activity
-        /// Need to retry after (oldest_activity - activity_limit) microseconds
-        RelativePathWithMetadata::CommandInTaskResponse response;
-        response.setRetryAfterUs(oldest_activity - activity_limit);
-        return std::make_shared<ObjectInfo>(response.toString());
+        /// All unprocessed files owned by alive replicas with recently activity.
+        /// The worker waits `(oldest_activity - activity_limit)` microseconds, then asks again.
+        auto retry_after_us = oldest_activity - activity_limit;
+        if (retry_after_us < 0)
+            retry_after_us = 0;
+        return DistributedReadTask{.object = nullptr, .retry_after_us = static_cast<UInt64>(retry_after_us)};
     }
 
     return {};

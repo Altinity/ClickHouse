@@ -28,10 +28,9 @@ two are ordinary `system.*_log` tables and follow the usual flush/retention sett
 
 ## Key metrics {#key-metrics}
 
-Every `CAS`-related `ProfileEvent` carries the uppercase `CAS`/`CASGC` prefix. This is a curated
-subset for a first health pass; the full list groups by object class (`CASBlob*`, `CASManifest*`,
-`CASRoot*`, `CASGC*`, `CASServer*`, `CASOther*`, `CASRef*`, `CASMeta*`) and is enumerated in
-`src/Common/ProfileEvents.cpp`.
+Every `CAS`-related profile event carries a `CAS` or `CASGC` prefix. This table is a curated
+subset for a first health pass. The full list of Antalya-only profile events and metrics, including
+every `CAS*` name, is on [Antalya profile events and metrics](/antalya/metrics-and-events).
 
 | Metric | Healthy range | A spike or nonzero means |
 |---|---|---|
