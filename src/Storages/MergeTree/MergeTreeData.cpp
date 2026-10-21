@@ -6317,23 +6317,6 @@ MergeTreeDataPartFormat MergeTreeData::choosePartFormat(
     return {part_type, storage_type};
 }
 
-MergeTreeDataPartFormat MergeTreeData::choosePartFormatForMutation(const DataPartPtr & source_part) const
-{
-    auto format = source_part->getFormat();
-    if (auto metadata_snapshot = getInMemoryMetadataPtr(getContext(), false); metadata_snapshot->hasUniqueKey())
-    {
-        format.storage_type = MergeTreeDataPartStorageType::Full;
-        return format;
-    }
-
-    format.storage_type = choosePartFormat(
-        source_part->getTotalColumnsSize().data_uncompressed,
-        source_part->rows_count,
-        source_part->info.level,
-        nullptr).storage_type;
-    return format;
-}
-
 MergeTreeDataPartFormat MergeTreeData::normalizePartFormatForDisk(MergeTreeDataPartFormat format, const DiskPtr & disk)
 {
     if (format.storage_type == MergeTreeDataPartStorageType::Packed && !disk->allowsPackedParts())

@@ -383,13 +383,21 @@ EOF
         SELECT 'destination_mutated_enabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
         FROM system.parts
         WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
+    ${CLICKHOUSE_CLIENT} --query "
+        OPTIMIZE TABLE cas_packed_destination FINAL
+        SETTINGS optimize_throw_if_noop = 1"
+    ${CLICKHOUSE_CLIENT} --query "
+        SELECT 'destination_merged_enabled', any(part_storage_type), countIf(disk_name = 'cas_packed_disabled')
+        FROM system.parts
+        WHERE database = currentDatabase() AND table = 'cas_packed_destination' AND active"
     ${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_destination SYNC"
 else
     printf 'destination_initial\tPacked\t0\n'
     printf 'destination_moved_disabled\tPacked\t1\n'
     printf 'destination_mutated_disabled\tFull\t1\n'
     printf 'destination_moved_enabled\tFull\t0\n'
-    printf 'destination_mutated_enabled\tPacked\t0\n'
+    printf 'destination_mutated_enabled\tFull\t0\n'
+    printf 'destination_merged_enabled\tPacked\t0\n'
 fi
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE cas_packed_copy SYNC"

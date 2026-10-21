@@ -348,8 +348,6 @@ public:
     MergeTreeDataPartFormat
     choosePartFormat(size_t bytes_uncompressed, size_t rows_count, UInt32 part_level, ProjectionDescriptionRawPtr projection) const;
 
-    MergeTreeDataPartFormat choosePartFormatForMutation(const DataPartPtr & source_part) const;
-
     static MergeTreeDataPartFormat normalizePartFormatForDisk(MergeTreeDataPartFormat format, const DiskPtr & disk);
 
     /// return pair <exists, pointer to part>. Sometimes we may fail to load existing part (network issues, oom and so on),
