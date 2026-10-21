@@ -52,6 +52,8 @@ read_stats()
 # min_bytes_for_seek = 1 disables the old gap coalescing, so each bloom filter is its own read.
 SEPARATE=$(read_stats 0 1) || { echo "separate read failed"; exit 1; }
 CLUSTER=$(read_stats 67108864 1) || { echo "cluster read failed"; exit 1; }
+# Seek of 0 used to treat a zero-byte gap as a split. ClickHouse writes the filters back-to-back.
+TOUCH=$(read_stats 67108864 0) || { echo "zero-seek coalesce failed"; exit 1; }
 # Enough filters that the seek budget covers the file: one read of the whole object.
 WHOLE=$(read_stats 67108864 1000000000) || { echo "whole-file read failed"; exit 1; }
 # Cap of 1 byte, seek of 1 MiB: bytes_per_read_task is 4 MiB and would swallow this file if the cap were raised.
@@ -62,6 +64,7 @@ NARROW=$(read_stats 512 1) || { echo "narrow read failed"; exit 1; }
 SEPARATE_READS=${SEPARATE%% *}
 SEPARATE_BYTES=${SEPARATE##* }
 CLUSTER_READS=${CLUSTER%% *}
+TOUCH_READS=${TOUCH%% *}
 WHOLE_READS=${WHOLE%% *}
 CAPPED_READS=${CAPPED%% *}
 NARROW_READS=${NARROW%% *}
@@ -69,6 +72,10 @@ NARROW_BYTES=${NARROW##* }
 
 if [ "$CLUSTER_READS" -ge "$SEPARATE_READS" ]; then
     echo "cluster coalesce did not reduce reads: cluster=$CLUSTER separate=$SEPARATE"
+    exit 1
+fi
+if [ "$TOUCH_READS" -ge "$SEPARATE_READS" ]; then
+    echo "zero seek split back-to-back filters: touch=$TOUCH separate=$SEPARATE cluster=$CLUSTER"
     exit 1
 fi
 if [ "$WHOLE_READS" -gt 4 ]; then

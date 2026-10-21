@@ -362,8 +362,10 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const bool end_past_cap = same_group && prospective_end - prospective_start > span_limit;
         const bool group_boundary = initial_req->coalesce_group != r.request->coalesce_group
             && (initial_req->coalesce_group != 0 || r.request->coalesce_group != 0);
+        /// A zero-byte gap is contiguous. `min_bytes_for_seek` of 0 must not split filters written back-to-back.
+        const bool positive_gap = same_group ? r.end < start_offset : true;
         if (group_boundary ||
-            r.end + gap_limit <= start_offset || // short gap
+            (positive_gap && r.end + gap_limit <= start_offset) || // short gap
             r.start + span_limit <= initial_offset || // task not too big
             end_past_cap ||
             (!same_group && !r.request->allow_incidental_read.load(std::memory_order_relaxed))) // range wants to be coalesced
@@ -407,8 +409,10 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const bool end_past_cap = same_group && prospective_end - prospective_start > span_limit;
         const bool group_boundary = initial_req->coalesce_group != r.request->coalesce_group
             && (initial_req->coalesce_group != 0 || r.request->coalesce_group != 0);
+        /// Same zero-gap rule as the left scan.
+        const bool positive_gap = same_group ? end_offset < r.start : true;
         if (group_boundary ||
-            end_offset + gap_limit <= r.start ||
+            (positive_gap && end_offset + gap_limit <= r.start) ||
             (!same_group && initial_offset + span_limit <= r.end) ||
             end_past_cap ||
             (!same_group && !r.request->allow_incidental_read.load(std::memory_order_relaxed)))
