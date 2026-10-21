@@ -739,6 +739,19 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
                             ErrorCodes::BAD_ARGUMENTS,
                             "Cannot drop column '{}' (field id {}): it is referenced by the active sort order",
                             column_name, dropped_field_id);
+                    /// Also check multi-arg V3 sort fields
+                    if (sf->has(Iceberg::f_source_ids))
+                    {
+                        auto ids = sf->getArray(Iceberg::f_source_ids);
+                        for (UInt32 k = 0; k < ids->size(); ++k)
+                        {
+                            if (ids->getElement<Int32>(k) == dropped_field_id)
+                                throw Exception(
+                                    ErrorCodes::BAD_ARGUMENTS,
+                                    "Cannot drop column '{}' (field id {}): it is referenced by the active sort order (multi-arg transform)",
+                                    column_name, dropped_field_id);
+                        }
+                    }
                 }
                 break;
             }
@@ -766,6 +779,19 @@ void MetadataGenerator::generateDropColumnMetadata(const String & column_name)
                         ErrorCodes::BAD_ARGUMENTS,
                         "Cannot drop column '{}' (field id {}): it is referenced by the active partition spec",
                         column_name, dropped_field_id);
+                /// Also check multi-arg V3 partition fields
+                if (pf->has(Iceberg::f_source_ids))
+                {
+                    auto ids = pf->getArray(Iceberg::f_source_ids);
+                    for (UInt32 k = 0; k < ids->size(); ++k)
+                    {
+                        if (ids->getElement<Int32>(k) == dropped_field_id)
+                            throw Exception(
+                                ErrorCodes::BAD_ARGUMENTS,
+                                "Cannot drop column '{}' (field id {}): it is referenced by the active partition spec (multi-arg transform)",
+                                column_name, dropped_field_id);
+                    }
+                }
             }
             break;
         }
@@ -842,7 +868,8 @@ void MetadataGenerator::generateAddColumnMetadata(const String & column_name, Da
 
 bool MetadataGenerator::generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context, bool first, const String & after_column)
 {
-    Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
+    if (type)
+        Iceberg::checkUnknownTypeAllowed(column_name, type, metadata_object->getValue<Int64>(Iceberg::f_format_version));
     auto current_schema = getCurrentSchema();
 
     auto last_column_id = metadata_object->getValue<Int32>(Iceberg::f_last_column_id);

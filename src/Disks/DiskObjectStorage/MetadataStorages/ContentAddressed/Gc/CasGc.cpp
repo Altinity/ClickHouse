@@ -85,6 +85,51 @@ namespace DB::Cas
 namespace
 {
 
+/// Soft limit on the namespace janitor's phase: no page starts after it, the page in progress finishes.
+constexpr uint64_t kJanitorBudgetMs = 20'000;
+
+/// What one janitor delete job did with its chunk.
+struct WriteOnceJobResult
+{
+    uint64_t deleted = 0;
+    uint64_t leaked = 0;
+    uint64_t requests = 0;
+    String error;
+};
+
+/// Deletes `chunk` as one request. A storage that refuses the batch gets one request per key, each
+/// accounted on its own, so a failure late in the chunk leaks only the keys it did not delete.
+void removeChunkWriteOnceCountingKeys(CasOperation & op, const std::vector<WriteOnceKey> & chunk, WriteOnceJobResult & result)
+{
+    ++result.requests;
+    try
+    {
+        op.removeManyWriteOnce(chunk, Retry::standard());
+        result.deleted += chunk.size();
+        return;
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::NOT_IMPLEMENTED)
+            throw;
+    }
+    for (const WriteOnceKey & key : chunk)
+    {
+        ++result.requests;
+        try
+        {
+            op.removeManyWriteOnce({key}, Retry::standard());
+            ++result.deleted;
+        }
+        catch (...)
+        {
+            ++result.leaked;
+            if (result.error.empty())
+                result.error = getCurrentExceptionMessage(false);
+        }
+    }
+}
+
 /// The `on_page_fetched` hook GC passes to every `forEachListedKey`/`recoverRefTable`
 /// call it owns (never passed by fsck/offline-repair callers of those shared helpers) -- one increment
 /// per physical LIST page, never per listed key.
@@ -344,13 +389,14 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     /// `store->poolConfig()` AFTER the null check above.
     meta_writer = std::make_unique<GcMetaWriter>(
         store, logger, static_cast<size_t>(store->poolConfig().gc_meta_pool_size));
-    /// The GC I/O pool (read-ahead and the `pending_deletes` fan-out), built here for the same reason.
+    /// The GC I/O pool (read-ahead, the `pending_deletes` fan-out and the namespace janitor's batch deletes),
+    /// built here for the same reason.
     /// The queue is UNBOUNDED because the hinting sites throttle themselves against
     /// `GcReadAhead::window`; a bounded queue would only move the throttle into
     /// `scheduleOrThrowOnError`, blocking the round thread instead of the hint loop that already knows
     /// how much it wants in flight.
     const size_t io_concurrency = std::max<size_t>(1, store->poolConfig().gc_io_concurrency);
-    /// Keep `shutdown_on_exception` false: every task on this pool (read-ahead and re-delete) is submitted
+    /// Keep `shutdown_on_exception` false: every task on this pool (read-ahead, re-delete, janitor delete) is submitted
     /// through a callback runner that stores its exception in the task's future, and no caller invokes
     /// `wait` on this pool.
     io_pool = std::make_unique<ThreadPool>(
@@ -360,34 +406,130 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     io_pool_refuse_at_for_test = store->poolConfig().gc_io_pool_refuse_at_for_test;
 }
 
-void Gc::runNamespaceJanitorPage(
+void Gc::runNamespaceJanitor(
     const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows)
 {
     GcPhaseTimer t(phase_sink, "namespace_cleanup");
     t.metric("evidence_rows", cleanup_evidence_rows);
     NamespaceJanitorResult janitor_result;
+    bool budget_exhausted = false;
     try
     {
         CasRequests & requests = store->openRequests();
         const Layout & layout = store->layout();
-        NamespaceJanitor janitor(requests, layout, 1000);
-        /// ONE authority read per page, made here rather than from the predicate: the janitor's
-        /// operation samples its liveness before every request, and a page walks up to a thousand keys.
-        refreshAuthority(leased_state.lease.seq);
-        janitor_result = janitor.runOnePage(suppress_destructive, [this] { return authority_held; });
-        for (const String & anomaly : janitor_result.anomalies)
-            LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
-        if (janitor_result.leaked)
-            ProfileEvents::increment(ProfileEvents::CASGCNamespaceCleanupLeaks, janitor_result.leaked);
+        NamespaceJanitor janitor(requests, layout, 1000,
+            [this](CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out)
+            {
+                removeWriteOnceOnIoPool(op, keys, out);
+            });
+        const uint64_t deadline_ms = mono_ms_fn() + kJanitorBudgetMs;
+        while (true)
+        {
+            /// ONE authority read per page, made here rather than from the predicate: the janitor's
+            /// operation samples its liveness before every request, and a page walks up to a thousand keys.
+            refreshAuthority(leased_state.lease.seq);
+            const NamespaceJanitorResult page = janitor.runOnePage(
+                suppress_destructive, [this] { return authority_held; }, /*first_page_of_pass=*/janitor_result.pages == 0);
+            janitor_result.pages += page.pages;
+            janitor_result.keys += page.keys;
+            janitor_result.deleted += page.deleted;
+            janitor_result.leaked += page.leaked;
+            janitor_result.delete_requests += page.delete_requests;
+            for (const String & anomaly : page.anomalies)
+                LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
+            if (!page.more)
+                break;
+            if (mono_ms_fn() >= deadline_ms)
+            {
+                budget_exhausted = true;
+                break;
+            }
+        }
     }
     catch (const std::exception & e)
     {
-        LOG_WARNING(logger, "CAS namespace janitor skipped this round: {}", e.what());
+        LOG_WARNING(logger, "CAS namespace janitor stopped this round: {}", e.what());
     }
+    if (janitor_result.leaked)
+        ProfileEvents::increment(ProfileEvents::CASGCNamespaceCleanupLeaks, janitor_result.leaked);
     t.metric("janitor_pages", janitor_result.pages);
     t.metric("janitor_keys", janitor_result.keys);
     t.metric("janitor_deleted", janitor_result.deleted);
     t.metric("leaked", janitor_result.leaked);
+    t.metric("delete_requests", janitor_result.delete_requests);
+    t.metric("budget_exhausted", budget_exhausted ? 1 : 0);
+}
+
+void Gc::removeWriteOnceOnIoPool(CasOperation & op, const std::vector<WriteOnceKey> & keys, NamespaceJanitorResult & out)
+{
+    const size_t chunk_keys = bulkDeleteChunkKeys();
+    std::vector<std::vector<WriteOnceKey>> chunks;
+    for (size_t begin = 0; begin < keys.size(); begin += chunk_keys)
+        chunks.emplace_back(keys.begin() + begin, keys.begin() + std::min(keys.size(), begin + chunk_keys));
+
+    /// One per chunk, written by its job and read after every job finished.
+    std::vector<WriteOnceJobResult> results(chunks.size());
+    ThreadPoolCallbackRunnerLocal<void> runner(*io_pool, ThreadName::CAS_GC_JANITOR);
+    std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;
+    handles.reserve(chunks.size());
+    SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
+    size_t scheduled = 0;
+    String refusal;
+    for (; scheduled < chunks.size(); ++scheduled)
+    {
+        try
+        {
+            if (io_pool_refuse_at_for_test == scheduled)
+            {
+                io_pool_refuse_at_for_test.reset();
+                throw Exception(ErrorCodes::CANNOT_SCHEDULE_TASK, "Injected CAS namespace janitor enqueue refusal at index {}", scheduled);
+            }
+            /// The round thread waits for every job before it refreshes `authority_held` again.
+            handles.emplace_back(runner.enqueueAndGiveOwnership(
+                [this, chunk = &chunks[scheduled], result = &results[scheduled], admitted_generation = op.generation()]
+                {
+                    try
+                    {
+                        CasOperation job_op = store->openRequests().resume(admitted_generation, [this] { return authority_held; });
+                        removeChunkWriteOnceCountingKeys(job_op, *chunk, *result);
+                    }
+                    catch (...)
+                    {
+                        result->leaked = chunk->size() - result->deleted;
+                        result->error = getCurrentExceptionMessage(false);
+                    }
+                }));
+        }
+        catch (...)
+        {
+            refusal = getCurrentExceptionMessage(false);
+            break;
+        }
+    }
+    ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
+
+    for (size_t i = 0; i < scheduled; ++i)
+    {
+        handles[i]->future.get();
+        out.deleted += results[i].deleted;
+        out.leaked += results[i].leaked;
+        out.delete_requests += results[i].requests;
+        if (results[i].leaked)
+            out.anomalies.push_back(fmt::format(
+                "leaked {} dead-life objects starting at '{}': batch delete failed: {}",
+                results[i].leaked, chunks[i].front().str(), results[i].error));
+    }
+    /// Leak-only like a failed request: the keys stay for the cursor's next pass over this page.
+    uint64_t unscheduled = 0;
+    for (size_t i = scheduled; i < chunks.size(); ++i)
+        unscheduled += chunks[i].size();
+    if (unscheduled)
+    {
+        out.leaked += unscheduled;
+        out.anomalies.push_back(fmt::format(
+            "leaked {} dead-life objects starting at '{}': delete job not scheduled: {}",
+            unscheduled, chunks[scheduled].front().str(), refusal));
+    }
 }
 
 uint64_t removeChunkWriteOnceOrOneByOne(CasOperation & op, const std::vector<WriteOnceKey> & chunk, const Retry & policy)
@@ -842,7 +984,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// DEFER has no `FoldResult`, hence no complete global destructive verdict. The janitor still
         /// takes its bounded page and catalog cut, but suppression keeps both deletes and valid-page
         /// cursor progress at the same position for the bounded forced fold to retry.
-        runNamespaceJanitorPage(state, /*suppress_destructive=*/true, /*cleanup_evidence_rows=*/0);
+        runNamespaceJanitor(state, /*suppress_destructive=*/true, /*cleanup_evidence_rows=*/0);
         return report;   /// no fold, no pre-CAS deletes, no gc/state CAS — sealed generation stays pinned
     }
 
@@ -1347,7 +1489,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     uint64_t cleanup_evidence_rows = 0;
     for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
         cleanup_evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
-    runNamespaceJanitorPage(state, suppress_destructive, cleanup_evidence_rows);
+    runNamespaceJanitor(state, suppress_destructive, cleanup_evidence_rows);
     /// PHASE 17/18 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
     /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
     /// what a reader of a round that reclaimed nothing needs to see.
