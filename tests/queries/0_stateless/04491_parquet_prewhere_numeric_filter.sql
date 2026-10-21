@@ -1,4 +1,4 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-old-analyzer
 
 SET input_format_parquet_use_native_reader_v3 = 1;
 SET input_format_parquet_filter_push_down = 0;
