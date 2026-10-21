@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <string_view>
+#include <Common/StringUtils.h>
 
 #if USE_SSL
 #    include <Common/OpenSSLHelpers.h>
@@ -205,7 +206,7 @@ namespace
             case AuthenticationType::PLAINTEXT_PASSWORD:
             {
                 const auto & password_plaintext = authentication_method.getPasswordHashBinary();
-                return Util::stringToDigest(password) == password_plaintext ? on_success : Authentication::CredentialsCheckResult::Fail;
+                return constantTimeEquals(Util::stringToDigest(password), password_plaintext) ? on_success : Authentication::CredentialsCheckResult::Fail;
             }
             case AuthenticationType::SHA256_PASSWORD:
             {
@@ -298,6 +299,11 @@ namespace
 
                     for (const auto & certificate_subject : ssl_certificate_credentials->getSSLCertificateSubjects().at(type))
                     {
+                        // Subjects are extracted with their exact bytes, so an embedded NUL byte survives. No valid
+                        // hostname or URI contains one, and '*' must not match a span like "evil\0" in
+                        // "evil\0.corp.example.com", so such a subject never matches a wildcard.
+                        if (certificate_subject.contains('\0'))
+                            continue;
                         // Checked before the substr below so its length cannot underflow when prefix and suffix overlap.
                         if (certificate_subject.size() < prefix.size() + suffix.size())
                             continue;

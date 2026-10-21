@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <set>
@@ -703,7 +704,8 @@ struct ContextSharedPart : boost::noncopyable
     std::unique_ptr<DDLWorker> ddl_worker TSA_GUARDED_BY(mutex); /// Process ddl commands from zk.
     LoadTaskPtr ddl_worker_startup_task;                         /// To postpone `ddl_worker->startup()` after all tables startup
     /// Rules for selecting the compression settings, depending on the size of the part.
-    mutable std::unique_ptr<CompressionCodecSelector> compression_codec_selector TSA_GUARDED_BY(mutex);
+    mutable OnceFlag compression_codec_selector_initialized;
+    mutable std::unique_ptr<CompressionCodecSelector> compression_codec_selector;
     /// Storage disk chooser for MergeTree engines
     mutable std::shared_ptr<const DiskSelector> merge_tree_disk_selector TSA_GUARDED_BY(storage_policies_mutex);
     /// Storage policy chooser for MergeTree engines
@@ -1369,6 +1371,7 @@ ContextData::ContextData(const ContextData &o) :
     input_blocks_reader(o.input_blocks_reader),
     user_id(o.user_id),
     current_roles(o.current_roles),
+    external_roles(o.external_roles),
     settings_constraints_and_current_profiles(o.settings_constraints_and_current_profiles),
     access(o.access),
     need_recalculate_access(o.need_recalculate_access),
@@ -2231,15 +2234,16 @@ void Context::setCurrentRolesWithLock(const std::vector<UUID> & new_current_role
 
 void Context::setExternalRolesWithLock(const std::vector<UUID> & new_external_roles, const std::lock_guard<ContextSharedMutex> &)
 {
-    // External roles are roles received from other node, current roles is a collection of roles that were assigned locally
-    if (!new_external_roles.empty())
-    {
-        if (external_roles)
-            external_roles->insert(external_roles->end(), new_external_roles.begin(), new_external_roles.end());
-        else
-            external_roles = std::make_shared<std::vector<UUID>>(new_external_roles);
-        need_recalculate_access = true;
-    }
+    // External roles are roles received from another node; current roles is a collection of roles that were assigned locally.
+    // Replace them unconditionally (rather than append) so that switching the principal via `setUser` clears any external
+    // roles carried over from a previous principal on the same or a copied context. `ContextData`'s copy constructor
+    // preserves `external_roles`, so without this reset a context authenticated with pushed roles would keep them after
+    // `setUser(target_user)` (e.g. `EXECUTE AS target_user`), silently widening the target's privileges.
+    if (new_external_roles.empty())
+        external_roles = nullptr;
+    else
+        external_roles = std::make_shared<std::vector<UUID>>(new_external_roles);
+    need_recalculate_access = true;
 }
 
 void Context::setCurrentRolesImpl(const std::vector<UUID> & new_current_roles, bool throw_if_not_granted, bool skip_if_not_granted, const std::shared_ptr<const User> & user)
@@ -3385,6 +3389,12 @@ StoragePtr Context::getViewSource() const
     return view_source;
 }
 
+
+void Context::clearViewSource()
+{
+    view_source.reset();
+}
+
 bool Context::displaySecretsInShowAndSelect() const
 {
     return shared->server_settings[ServerSetting::display_secrets_in_show_and_select];
@@ -3394,6 +3404,41 @@ Settings Context::getSettingsCopy() const
 {
     SharedLockGuard lock(mutex);
     return *settings;
+}
+
+namespace
+{
+bool isProfileChange(const SettingChange & change)
+{
+    return change.name == "profile";
+}
+
+/// Enforces the constraints on `changes` the way `applySettingsChanges` applies them: a `profile` change
+/// installs a new constraint set for the changes after it. Each run of changes up to the next `profile`
+/// change is enforced against the constraints in force before it, then applied together with that `profile`
+/// change to a scratch copy of `context`, so a rejected list leaves `context` untouched. Returns the enforced list.
+template <typename Enforce>
+SettingsChanges enforceConstraintsAlongProfileChanges(const ContextPtr & context, const SettingsChanges & changes, Enforce && enforce)
+{
+    auto scratch_context = Context::createCopy(context);
+    SettingsChanges enforced;
+    for (auto begin = changes.begin(); begin != changes.end();)
+    {
+        auto profile = std::find_if(begin, changes.end(), isProfileChange);
+        SettingsChanges segment(begin, profile);
+        enforce(*scratch_context, segment);
+        begin = profile;
+        if (profile != changes.end())
+        {
+            segment.push_back(*profile);
+            ++begin;
+        }
+        /// `setCurrentProfile` checks the profile's own settings against the constraints in force before it.
+        scratch_context->applySettingsChanges(segment);
+        enforced.insert(enforced.end(), segment.begin(), segment.end());
+    }
+    return enforced;
+}
 }
 
 void Context::setSettings(const Settings & settings_)
@@ -3556,6 +3601,15 @@ void Context::checkSettingsConstraints(const SettingChange & change, SettingSour
 
 void Context::checkSettingsConstraints(const SettingsChanges & changes, SettingSource source)
 {
+    if (std::ranges::any_of(changes, isProfileChange))
+    {
+        enforceConstraintsAlongProfileChanges(shared_from_this(), changes, [source](Context & context, SettingsChanges & segment)
+        {
+            context.checkSettingsConstraints(std::as_const(segment), source);
+        });
+        return;
+    }
+
     SharedLockGuard lock(mutex);
     settings->checkShorthandChanges(changes);
     getSettingsConstraintsAndCurrentProfilesWithLock()->constraints.check(*settings, changes, source);
@@ -3568,14 +3622,46 @@ void Context::checkSettingsConstraintsForSettingsReset(const std::vector<String>
     getSettingsConstraintsAndCurrentProfilesWithLock()->constraints.checkResetToDefault(*settings, names, source);
 }
 
+void Context::checkSettingsConstraintsForSettingsReset(
+    const std::vector<String> & names, const SettingsChanges & changes_applied_first, SettingSource source)
+{
+    if (std::ranges::none_of(changes_applied_first, isProfileChange))
+    {
+        checkSettingsConstraintsForSettingsReset(names, source);
+        return;
+    }
+    /// The resets take effect after the rest of the statement, so a `profile` change in it decides the constraints.
+    auto scratch_context = Context::createCopy(shared_from_this());
+    scratch_context->applySettingsChanges(changes_applied_first);
+    scratch_context->checkSettingsConstraintsForSettingsReset(names, source);
+}
+
 void Context::checkSettingsConstraints(SettingsChanges & changes, SettingSource source)
 {
+    if (std::ranges::any_of(changes, isProfileChange))
+    {
+        changes = enforceConstraintsAlongProfileChanges(shared_from_this(), changes, [source](Context & context, SettingsChanges & segment)
+        {
+            context.checkSettingsConstraints(segment, source);
+        });
+        return;
+    }
+
     SharedLockGuard lock(mutex);
     checkSettingsConstraintsWithLock(changes, source);
 }
 
 void Context::clampToSettingsConstraints(SettingsChanges & changes, SettingSource source)
 {
+    if (std::ranges::any_of(changes, isProfileChange))
+    {
+        changes = enforceConstraintsAlongProfileChanges(shared_from_this(), changes, [source](Context & context, SettingsChanges & segment)
+        {
+            context.clampToSettingsConstraints(segment, source);
+        });
+        return;
+    }
+
     SharedLockGuard lock(mutex);
     clampToSettingsConstraintsWithLock(changes, source);
 }
@@ -6961,6 +7047,16 @@ std::shared_ptr<SessionLog> Context::getSessionLog() const
 }
 
 
+bool Context::hasSystemLogs() const
+{
+    std::lock_guard lock(mutex_shared_context);
+    if (!shared)
+        return false;
+
+    SharedLockGuard lock2(shared->mutex);
+    return shared->system_logs != nullptr;
+}
+
 std::shared_ptr<ZooKeeperLog> Context::getZooKeeperLog() const
 {
     std::lock_guard lock(mutex_shared_context);
@@ -7199,18 +7295,16 @@ void Context::setDashboardsConfig(const Poco::Util::AbstractConfiguration & conf
 
 CompressionCodecPtr Context::chooseCompressionCodec(size_t part_size, double part_size_ratio) const
 {
-    std::lock_guard lock(shared->mutex);
-
-    if (!shared->compression_codec_selector)
+    callOnce(shared->compression_codec_selector_initialized, [&]
     {
         constexpr auto config_name = "compression";
-        const auto & config = shared->getConfigRefWithLock(lock);
+        auto config = shared->getConfig();
 
-        if (config.has(config_name))
-            shared->compression_codec_selector = std::make_unique<CompressionCodecSelector>(config, "compression");
+        if (config->has(config_name))
+            shared->compression_codec_selector = std::make_unique<CompressionCodecSelector>(*config, config_name);
         else
             shared->compression_codec_selector = std::make_unique<CompressionCodecSelector>();
-    }
+    });
 
     return shared->compression_codec_selector->choose(part_size, part_size_ratio);
 }
