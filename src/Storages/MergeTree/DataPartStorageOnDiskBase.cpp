@@ -51,6 +51,46 @@ namespace ErrorCodes
 
 namespace
 {
+class DataPartStorageIteratorOnDisk final : public IDataPartStorageIterator
+{
+public:
+    DataPartStorageIteratorOnDisk(DiskPtr disk_, DirectoryIteratorPtr it_)
+        : disk(std::move(disk_)), it(std::move(it_))
+    {
+    }
+
+    void next() override { it->next(); }
+    bool isValid() const override { return it->isValid(); }
+    bool isFile() const override { return isValid() && disk->existsFile(it->path()); }
+    std::string name() const override { return it->name(); }
+    std::string path() const override { return it->path(); }
+
+private:
+    DiskPtr disk;
+    DirectoryIteratorPtr it;
+};
+
+class DataPartStorageMergedIterator final : public IDataPartStorageIterator
+{
+public:
+    DataPartStorageMergedIterator(DiskPtr disk_, std::string dir_path_, std::vector<std::string> names_)
+        : disk(std::move(disk_)), dir_path(std::move(dir_path_)), names(std::move(names_))
+    {
+    }
+
+    void next() override { ++pos; }
+    bool isValid() const override { return pos < names.size(); }
+    std::string name() const override { return names[pos]; }
+    std::string path() const override { return fs::path(dir_path) / names[pos]; }
+    bool isFile() const override { return isValid() && disk->existsFile(path()); }
+
+private:
+    DiskPtr disk;
+    std::string dir_path;
+    std::vector<std::string> names;
+    size_t pos = 0;
+};
+
     /// fsync `dir_path` and every subdirectory below it (children first), so that the directory
     /// entries created by a freeze/hardlink clone become durable. Used only for local disks
     /// (on remote/object disks getDirectorySyncGuard() returns nullptr and this is a no-op).
@@ -1341,51 +1381,6 @@ bool DataPartStorageOnDiskBase::existsDirectoryInTransactionOrDisk(const std::st
     if (transaction && transaction->hasInFlightDirectory(path))
         return true;
     return volume->getDisk()->existsDirectory(path);
-}
-
-namespace
-{
-
-class DataPartStorageIteratorOnDisk final : public IDataPartStorageIterator
-{
-public:
-    DataPartStorageIteratorOnDisk(DiskPtr disk_, DirectoryIteratorPtr it_)
-        : disk(std::move(disk_)), it(std::move(it_))
-    {
-    }
-
-    void next() override { it->next(); }
-    bool isValid() const override { return it->isValid(); }
-    bool isFile() const override { return isValid() && disk->existsFile(it->path()); }
-    std::string name() const override { return it->name(); }
-    std::string path() const override { return it->path(); }
-
-private:
-    DiskPtr disk;
-    DirectoryIteratorPtr it;
-};
-
-class DataPartStorageMergedIterator final : public IDataPartStorageIterator
-{
-public:
-    DataPartStorageMergedIterator(DiskPtr disk_, std::string dir_path_, std::vector<std::string> names_)
-        : disk(std::move(disk_)), dir_path(std::move(dir_path_)), names(std::move(names_))
-    {
-    }
-
-    void next() override { ++pos; }
-    bool isValid() const override { return pos < names.size(); }
-    std::string name() const override { return names[pos]; }
-    std::string path() const override { return fs::path(dir_path) / names[pos]; }
-    bool isFile() const override { return isValid() && disk->existsFile(path()); }
-
-private:
-    DiskPtr disk;
-    std::string dir_path;
-    std::vector<std::string> names;
-    size_t pos = 0;
-};
-
 }
 
 DataPartStorageIteratorPtr DataPartStorageOnDiskBase::iterateDirectoryInTransactionOrDisk(const std::string & path) const
