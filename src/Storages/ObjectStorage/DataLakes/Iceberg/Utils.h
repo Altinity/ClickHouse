@@ -94,7 +94,10 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
     const std::optional<String> & table_uuid);
 
 
-std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter);
+/// Maps a ClickHouse type to an Iceberg JSON type. `timestamp_ns` / `timestamptz_ns`
+/// require `format_version` >= 3; lower versions throw instead of writing v3 types
+/// into v1/v2 metadata.
+std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter, UInt64 format_version);
 
 /// Throws if `type` contains `Nothing` at any depth (the Iceberg `unknown` type) and
 /// `format_version` is below 3, the first format version that defines `unknown`.
