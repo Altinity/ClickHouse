@@ -25,7 +25,9 @@ followed by adoption or unconditional, multipart-capable publication; a bounded 
 fanning out multi-blob part materialization in parallel; carry-forward on mutation for `Wide` parts
 (an untouched column is re-referenced, not re-hashed); opt-in `Packed` parts through
 `cas_allow_packed_parts`, with each base or projection `data.packed` archive published as one CAS
-blob. The actual destination disk controls whether a newly written part may use `Packed`.
+blob. `INSERT` and merge select `Packed` from the part-storage thresholds only when the actual
+destination disk allows it. A mutation preserves the source storage type, except that destination
+capability may change `Packed -> Full`; mutation does not provide `Full -> Packed` conversion.
 
 **Read path.** Ref resolution to manifest to ranged blob reads, with a manifest-decode cache and
 a part-folder view cache sitting on that path.
