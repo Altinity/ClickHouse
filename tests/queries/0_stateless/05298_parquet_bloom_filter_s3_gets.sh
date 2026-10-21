@@ -5,6 +5,7 @@
 # A small object is otherwise prefetched in one request, which hides the per-range GETs.
 # max_download_buffer_size keeps that prefetch off. remote_read_min_bytes_for_seek is what the
 # Parquet reader uses as the gap it will still merge, so 1 byte leaves merging to bloom-filter coalescing.
+# Dictionary-filter pushdown is off: each dictionary page is its own GET and is not part of the bloom-filter read.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -44,6 +45,7 @@ s3_gets()
             input_format_parquet_bloom_filter_push_down = 1,
             input_format_parquet_page_filter_push_down = 0,
             input_format_parquet_use_offset_index = 0,
+            input_format_parquet_dictionary_filter_push_down = 0,
             input_format_parquet_bloom_filter_coalesce_max_bytes = ${coalesce_max}
     " 2>&1 | awk '
         $0 ~ /S3GetObject:/ { gets += $(NF-1) }
