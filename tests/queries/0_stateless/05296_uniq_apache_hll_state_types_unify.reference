@@ -1,12 +1,19 @@
-UNION ALL of states with different parameters
-9
-an array of such states has one element type
-Array(AggregateFunction(uniqApacheHLL(8), UInt64))
-if between such states
-AggregateFunction(uniqApacheHLL(8), UInt64)
+the spellings of the same parameters are one type
+Array(AggregateFunction(uniqApacheHLL, UInt64))
+if between states of different estimators
+AggregateFunction(uniqApacheHLL(8, \'HLL_6\'), UInt64)
 a state with a Nullable argument is the same type as well
 Array(AggregateFunction(uniqApacheHLL(8), UInt64))
+a different lg_k is a different type
+Array(Variant(AggregateFunction(uniqApacheHLL(14), UInt64), AggregateFunction(uniqApacheHLL(4), UInt64)))
+a different storage type is a different type
+Array(Variant(AggregateFunction(uniqApacheHLL(8, \'HLL_4\'), UInt64), AggregateFunction(uniqApacheHLL(8, \'HLL_8\'), UInt64)))
 a different argument type is a different type
-Array(Variant(AggregateFunction(uniqApacheHLL(8), UInt64), AggregateFunction(uniqApacheHLL, String)))
+Array(Variant(AggregateFunction(uniqApacheHLL(8), String), AggregateFunction(uniqApacheHLL(8), UInt64)))
+UNION ALL of states with different parameters after a CAST
+9
+a sketch of a higher lg_k keeps its resolution next to a state of a lower one
+1
+1
 changing the parameters of a column is applied
 AggregateFunction(uniqApacheHLL(8), UInt64)	5

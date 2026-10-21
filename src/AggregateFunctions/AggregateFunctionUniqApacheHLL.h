@@ -183,6 +183,17 @@ class AggregateFunctionUniqApacheHLL final : public IAggregateFunctionDataHelper
     datasketches::target_hll_type target_type;
     bool use_composite_estimate;
 
+    static String getTargetTypeName(datasketches::target_hll_type type)
+    {
+        switch (type)
+        {
+            case datasketches::HLL_4: return "HLL_4";
+            case datasketches::HLL_6: return "HLL_6";
+            case datasketches::HLL_8: return "HLL_8";
+        }
+        UNREACHABLE();
+    }
+
 public:
     AggregateFunctionUniqApacheHLL(
         uint8_t lg_config_k_,
@@ -264,9 +275,10 @@ public:
                 [](const auto & lhs, const auto & rhs_type) { return removeNullable(lhs)->equals(*removeNullable(rhs_type)); });
     }
 
-    /// The parameters do not change what a state means, so every spelling of them is the same type wherever a common type is
-    /// needed (`UNION ALL`, arrays, `if`) and wherever a state is accepted by the name of its type. The default parameters
-    /// stand for all of them.
+    /// `lg_k` and the storage type are applied to every sketch that is merged into a state and written, so they stay a part of
+    /// the type: where the types are equal, a common type (`UNION ALL`, arrays, `if`) is taken without a `CAST`, and the states
+    /// are merged into the states of the first type. The estimator does not change the state, so it is not a part of the type.
+    /// The parameters are spelled out, so that the omitted ones are equal to their defaults.
     DataTypePtr getNormalizedStateType() const override
     {
         DataTypes normalized_argument_types;
@@ -274,9 +286,11 @@ public:
         for (const auto & type : this->argument_types)
             normalized_argument_types.emplace_back(type->getNormalizedType());
 
+        const Array normalized_params{Field(static_cast<UInt64>(lg_config_k)), Field(getTargetTypeName(target_type))};
+
         AggregateFunctionProperties properties;
-        auto function = AggregateFunctionFactory::instance().get("uniqApacheHLL", NullsAction::EMPTY, normalized_argument_types, {}, properties);
-        return std::make_shared<DataTypeAggregateFunction>(function, normalized_argument_types, Array{});
+        auto function = AggregateFunctionFactory::instance().get("uniqApacheHLL", NullsAction::EMPTY, normalized_argument_types, normalized_params, properties);
+        return std::make_shared<DataTypeAggregateFunction>(function, normalized_argument_types, normalized_params);
     }
 
     void mergeImpl(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override

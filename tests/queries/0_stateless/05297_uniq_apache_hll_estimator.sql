@@ -19,7 +19,7 @@ SELECT count() = 3 AND uniqExact(r) = 1 AND any(r) BETWEEN 430 AND 470 FROM
 
 SELECT 'the estimator does not change the state, and states of any estimator have one type where a common type is needed';
 SELECT hex(toString(uniqApacheHLLState(11, 'HLL_8', 'COMPOSITE')(number))) = hex(toString(uniqApacheHLLState(11, 'HLL_8', 'DEFAULT')(number))) FROM numbers(1000);
-SELECT length([uniqApacheHLLState(8, 'HLL_6', 'COMPOSITE')(toUInt64(1)), uniqApacheHLLState(toUInt64(2))]);
+SELECT toTypeName([uniqApacheHLLState(8, 'HLL_6', 'COMPOSITE')(toUInt64(1)), uniqApacheHLLState(8, 'HLL_6')(toUInt64(2))]);
 
 SELECT 'a small sketch has the same estimate';
 SELECT uniqApacheHLL(11, 'HLL_8', 'COMPOSITE')(number), uniqApacheHLL(11, 'HLL_8', 'DEFAULT')(number) FROM numbers(100);
