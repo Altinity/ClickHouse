@@ -63,6 +63,7 @@ namespace DB::ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int LIMIT_EXCEEDED;
+    extern const int UNKNOWN_FORMAT_VERSION;
     extern const int NETWORK_ERROR;
     extern const int BAD_ARGUMENTS;
     extern const int S3_ERROR;
@@ -618,20 +619,22 @@ TEST(CASRefCatalogFormat, DecodeRejectsUnknownState)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
-TEST(CASRefCatalogFormat, DecodeRejectsUnknownEntryKey)
+TEST(CASRefCatalogFormat, DecodeSkipsUnknownOrdinaryKeyOnEntryAndTrailer)
 {
-    const String bad = rawCatalog(
-        {R"({"kind":"entry","ns":"a","state":"live","life":"00000000000000000000000000000001","unknown":"x"})"});
-    try
-    {
-        (void)decodeRefCatalog(bad);
-        FAIL() << "expected CORRUPTED_DATA";
-    }
-    catch (const DB::Exception & e)
-    {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-        EXPECT_NE(e.message().find("unknown entry key"), String::npos) << e.message();
-    }
+    const String inc = "00000000000000000000000000000001";
+    const String good = rawCatalog({rawEntryLine("a", "live", inc)});
+    const RefCatalog expected = decodeRefCatalog(good);
+    ASSERT_EQ(expected.entries.size(), 1u);
+    for (size_t line = 1; line < cas_battery_detail::lineCount(good); ++line)
+        EXPECT_EQ(decodeRefCatalog(cas_battery_detail::withExtraKeyInLine(good, line, "unknown")), expected) << "line " << line;
+}
+
+TEST(CASRefCatalogFormat, DecodeRejectsUnknownCriticalKeyOnEntryAndTrailer)
+{
+    const String good = rawCatalog({rawEntryLine("a", "live", "00000000000000000000000000000001")});
+    for (size_t line = 1; line < cas_battery_detail::lineCount(good); ++line)
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+            [&] { (void)decodeRefCatalog(cas_battery_detail::withExtraKeyInLine(good, line, "!unknown")); });
 }
 
 TEST(CASRefCatalogFormat, DecodeRejectsEmptyNamespace)
@@ -669,15 +672,13 @@ TEST(CASRefCatalogFormatDeathTest, NsStateToWordRaisesLogicalErrorOnImpossibleVa
 
 /// ---------- registry row / raw-storage tripwire ----------
 
-/// The registry row is part of the contract, mirroring `gtest_cas_ref_ckpt.cpp`'s
-/// `RegistryRowIsControlStrictWithTightCaps`: Control/Strict decides how the decoder treats unknown
-/// keys, and the caps are the first thing that fires if a foreign object ever lands at the key.
-TEST(CASRefCatalogFormat, RegistryRowIsControlStrictWithRawStorage)
+/// The registry row is part of the contract: the caps are the first thing that fires if a foreign
+/// object ever lands at the key.
+TEST(CASRefCatalogFormat, RegistryRowIsControlWithRawStorage)
 {
     const FormatTraits & traits = traitsFor(FormatId::RefCatalog);
     EXPECT_EQ(traits.type, "cas_ref_catalog");
     EXPECT_EQ(traits.family, TextFamily::Control);
-    EXPECT_EQ(traits.strictness, KeyStrictness::Strict);
     EXPECT_EQ(traits.object_cap, 256u * 1024u * 1024u);
     EXPECT_EQ(traits.line_cap, 4u * 1024u);
     EXPECT_EQ(traitsForType("cas_ref_catalog"), &traits);

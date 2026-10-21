@@ -55,8 +55,11 @@ struct DataSourceDescription
 
     String zookeeper_name;
 
+    bool files_are_whole_objects = false;
+
     bool operator==(const DataSourceDescription & other) const;
     bool sameKind(const DataSourceDescription & other) const;
+    bool canUseNativeCopyWith(const DataSourceDescription & other) const;
 
     String name() const;
 

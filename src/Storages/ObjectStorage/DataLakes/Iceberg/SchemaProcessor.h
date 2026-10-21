@@ -97,6 +97,9 @@ public:
 
     static DataTypePtr getSimpleType(const String & type_name, ContextPtr context_, bool allow_geo_parser = true);
 
+    /// The ClickHouse type the reader derives for a top-level schema field.
+    DataTypePtr getClickHouseFieldType(const Poco::JSON::Object::Ptr & field, ContextPtr context_);
+
     static std::unordered_map<String, Int64> traverseSchema(Poco::JSON::Array::Ptr schema);
 
     void registerSnapshotWithSchemaId(Int64 snapshot_id, Int32 schema_id);

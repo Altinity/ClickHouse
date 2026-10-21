@@ -127,8 +127,25 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
     const auto format_version = getFormatVersionFromManifestFileMetadata();
     FileContentType content_type = FileContentType::DATA;
     if (format_version > 1)
-        content_type = FileContentType(getValueFromRowByName(row_index, c_data_file_content, TypeIndex::Int32).safeGet<UInt64>());
-    const auto status = ManifestEntryStatus(getValueFromRowByName(row_index, f_status, TypeIndex::Int32).safeGet<UInt64>());
+    {
+        /// The value comes from the file and has to be validated: casting an arbitrary integer to
+        /// the enum and switching over it below would be undefined behaviour.
+        const auto content_type_value = getValueFromRowByName(row_index, c_data_file_content, TypeIndex::Int32).safeGet<UInt64>();
+        if (content_type_value > UInt64(FileContentType::EQUALITY_DELETE))
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Cannot read Iceberg table: unexpected value {} of 'data_file.content' in a manifest file",
+                content_type_value);
+        content_type = FileContentType(content_type_value);
+    }
+
+    const auto status_value = getValueFromRowByName(row_index, f_status, TypeIndex::Int32).safeGet<UInt64>();
+    if (status_value > UInt64(ManifestEntryStatus::DELETED))
+        throw Exception(
+            ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "Cannot read Iceberg table: unexpected value {} of 'status' in a manifest file",
+            status_value);
+    const auto status = ManifestEntryStatus(status_value);
 
     const auto snapshot_id_value = getValueFromRowByName(row_index, f_snapshot_id);
     std::optional<Int64> snapshot_id;
@@ -178,6 +195,17 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
         const auto file_sequence_number_value = getValueFromRowByName(row_index, f_file_sequence_number);
         if (!file_sequence_number_value.isNull())
             file_sequence_number = file_sequence_number_value.safeGet<Int64>();
+    }
+
+    std::optional<UInt64> first_row_id;
+
+    if (format_version > 2 && hasPath(c_data_file_first_row_id))
+    {
+        const auto first_row_id_value = getValueFromRowByName(row_index, c_data_file_first_row_id);
+        if (!first_row_id_value.isNull())
+        {
+            first_row_id = first_row_id_value.safeGet<Int64>();
+        }
     }
 
     const auto file_path_from_metadata = IcebergPathFromMetadata::deserialize(
@@ -291,6 +319,7 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                 sequence_number,
                 file_sequence_number,
                 snapshot_id,
+                first_row_id,
                 partition_key_value,
                 columns_infos,
                 value_for_bounds,
@@ -361,6 +390,7 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                 sequence_number,
                 file_sequence_number,
                 snapshot_id,
+                first_row_id,
                 partition_key_value,
                 columns_infos,
                 value_for_bounds,
@@ -395,6 +425,7 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                 sequence_number,
                 file_sequence_number,
                 snapshot_id,
+                first_row_id,
                 partition_key_value,
                 columns_infos,
                 value_for_bounds,
@@ -407,6 +438,9 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                 file_size_in_bytes);
         }
     }
+
+    throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+        "Cannot read Iceberg table: unexpected content type {} of a manifest file entry", UInt64(content_type));
 }
 
 

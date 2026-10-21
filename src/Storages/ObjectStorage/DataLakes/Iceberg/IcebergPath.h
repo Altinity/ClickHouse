@@ -62,9 +62,32 @@ private:
 /// Converts Iceberg metadata paths to actual object storage paths.
 ///
 /// This is the ONLY way to go from a metadata path to a storage path.
+///
+/// `table_root` is the storage directory the metadata `location` field denotes. That is usually the
+/// queried path, but not when the queried path is an ancestor of it; `deriveTableRoot` tells which.
 class IcebergPathResolver
 {
 public:
+    /// What `deriveTableRoot` established about the queried path.
+    enum class RootRelation
+    {
+        Same,              /// The queried path is the table root.
+        AdoptedDescendant, /// The table root is a proper descendant of the queried path.
+        Unknown,           /// Not established; the queried path is used unchanged.
+    };
+
+    struct TableRootDerivation
+    {
+        String table_root;
+        RootRelation relation;
+    };
+
+    /// Locate the table root from where its metadata document actually sits, accepted only if the
+    /// location that document declares names the same directory. Returns `queried_path` unchanged
+    /// whenever the two cannot be shown to agree.
+    static TableRootDerivation
+    deriveTableRoot(const String & table_location, const String & queried_path, const String & metadata_file_key);
+
     IcebergPathResolver(String table_location_, String table_root_, String blob_storage_type_name_ = {}, String blob_storage_namespace_name_ = {})
         : table_location(std::move(table_location_))
         , table_root(std::move(table_root_))
@@ -89,6 +112,8 @@ public:
 
     IcebergPathFromMetadata reverseResolve(const String & storage_path) const
     {
+        if (!table_location.empty() && storage_path.starts_with(table_location))
+            return IcebergPathFromMetadata::deserialize(storage_path);
         if (storage_path.size() > table_root.size()
             && storage_path.starts_with(table_root))
             return IcebergPathFromMetadata::deserialize(table_location + storage_path.substr(table_root.size()));

@@ -658,6 +658,7 @@ DataSourceDescription DiskLocal::getLocalDataSourceDescription(const String & pa
         res.description = path;
     res.is_encrypted = false;
     res.is_cached = false;
+    res.files_are_whole_objects = true;
     return res;
 }
 

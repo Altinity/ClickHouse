@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasEtag.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequests.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
@@ -1001,6 +1002,11 @@ void ObjectStorageBackend::emuForgetDeletedToken(const String & key)
         else
             emu_token_expiry.push_back(EmuTokenExpiry{now_ns, key, it->second});
     }
+}
+
+size_t ObjectStorageBackend::bulkDeleteKeyLimit() const
+{
+    return mode == Mode::Native ? object_storage->batchDeleteKeyLimit() : kBulkDeleteMaxKeys;
 }
 
 void ObjectStorageBackend::removeManyWriteOnce(const std::vector<WriteOnceKey> & keys, TransportAccess & access)

@@ -192,6 +192,9 @@ When reading Parquet files, skip whole row groups based on the WHERE/PREWHERE ex
     DECLARE(Bool, input_format_parquet_bloom_filter_push_down, true, R"(
 When reading Parquet files, skip whole row groups based on the WHERE expressions and bloom filter in the Parquet metadata.
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_footer_read_size, 0, R"(
+Size (in bytes) of the initial tail read that fetches the Parquet footer (`FileMetaData`) when opening a file with reader v3. `0` (default) sizes the read adaptively to the file - 1% of the file size, clamped to `[128 KiB, 2 MiB]` - so it usually covers the whole footer in a single read even for wide files with hundreds of columns. Set a non-zero value to force a fixed initial read size instead of the adaptive one; this is useful for very high-latency object storage where reading a larger tail up front avoids a second round trip. The value is clamped to the file size.
+)", 0) \
     DECLARE(Bool, input_format_parquet_enable_json_parsing, true, R"(
 When reading Parquet files, parse JSON columns as ClickHouse JSON Column.
 )", 0) \
@@ -1315,9 +1318,10 @@ When `format_schema_source` is set to 'query', the following conditions apply:
 - The result of the query is treated as the schema content.
 - This result is cached locally in the `format_schemas` directory.
 - You can clear the local cache using the command: `SYSTEM DROP FORMAT SCHEMA CACHE FOR Files`.
-- Once cached, identical queries are not executed to fetch the schema again until the cache is explicitly cleared
+- Once cached, identical queries from the same user are not executed to fetch the schema again until the cache is explicitly cleared
 - In addition to local cache files, Protobuf messages are also cached in memory. Even after clearing the local cache files, the in-memory cache must be cleared using `SYSTEM DROP FORMAT SCHEMA CACHE [FOR Protobuf]` to fully refresh the schema.
 - Run the query `SYSTEM DROP FORMAT SCHEMA CACHE` to clear the cache for both cache files and Protobuf messages schemas at once.
+- The query is executed on behalf of the user running it, so it is subject to that user's access rights, and its cached result is reused only for the same user. It cannot be executed where there is no user: in a background task, such as a streaming engine consumer, or when `INSERT` data is parsed on the client side. Use `format_schema_source` set to `file` or `string` there.
 )", 0) \
     DECLARE(String, format_schema, "", R"(
 This parameter is useful when you are using formats that require a schema definition, such as [Cap'n Proto](https://capnproto.org/) or [Protobuf](https://developers.google.com/protocol-buffers/). The value depends on the format.
@@ -1526,6 +1530,10 @@ Skip fields with unsupported types while schema inference for format BSON.
     DECLARE(Bool, format_display_secrets_in_show_and_select, false, R"(
 Enables or disables showing secrets in `SHOW` and `SELECT` queries for tables, databases,
 table functions, and dictionaries.
+
+It also controls whether secrets embedded in setting values (such as a password in
+`format_avro_schema_registry_url`) are shown in `system.settings`, `system.processes`,
+`system.settings_profile_elements` and in `SHOW CREATE USER` / `SHOW CREATE SETTINGS PROFILE`.
 
 User wishing to see secrets must also have
 [`display_secrets_in_show_and_select` server setting](../server-configuration-parameters/settings#display_secrets_in_show_and_select)

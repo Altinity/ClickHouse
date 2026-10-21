@@ -61,9 +61,14 @@ String FileContentTypeToString(FileContentType type);
 
 struct PartitionSpecsEntry
 {
-    Int32 source_id;
+    /// For single-argument transforms (V1/V2 and single-arg V3) this holds one element.
+    /// For multi-argument V3 transforms (e.g. bucket over multiple columns) it holds multiple.
+    std::vector<Int32> source_ids;
     String transform_name;
     String partition_name;
+
+    /// Convenience: true when the transform references more than one source column (V3 multi-arg).
+    bool isMultiArg() const { return source_ids.size() > 1; }
 };
 using PartitionSpecification = std::vector<PartitionSpecsEntry>;
 
@@ -86,6 +91,7 @@ struct ParsedManifestFileEntry : boost::noncopyable
     std::optional<Int64> parsed_sequence_number;
     std::optional<Int64> parsed_file_sequence_number;
     std::optional<Int64> parsed_snapshot_id;
+    std::optional<UInt64> parsed_first_row_id;
 
     DB::Row partition_key_value;
     std::unordered_map<Int32, ColumnInfo> columns_infos;
@@ -121,6 +127,7 @@ struct ParsedManifestFileEntry : boost::noncopyable
         std::optional<Int64> written_sequence_number_,
         std::optional<Int64> written_file_sequence_number_,
         std::optional<Int64> written_snapshot_id_,
+        std::optional<UInt64> written_first_row_id_,
         DB::Row partition_key_value_,
         std::unordered_map<Int32, ColumnInfo> columns_infos_,
         std::unordered_map<Int32, std::pair<Field, Field>> value_bounds_,
@@ -140,6 +147,7 @@ struct ParsedManifestFileEntry : boost::noncopyable
         , parsed_sequence_number(written_sequence_number_)
         , parsed_file_sequence_number(written_file_sequence_number_)
         , parsed_snapshot_id(written_snapshot_id_)
+        , parsed_first_row_id(written_first_row_id_)
         , partition_key_value(std::move(partition_key_value_))
         , columns_infos(std::move(columns_infos_))
         , value_bounds(std::move(value_bounds_))
@@ -165,6 +173,7 @@ struct ProcessedManifestFileEntry
     Int64 sequence_number;
     Int32 resolved_schema_id;
     String manifest_file_path;
+    std::optional<UInt64> first_row_id;
 
     String dumpDeletesMatchingInfo() const;
 };

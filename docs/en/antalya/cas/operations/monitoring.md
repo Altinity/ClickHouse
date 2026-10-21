@@ -28,10 +28,9 @@ two are ordinary `system.*_log` tables and follow the usual flush/retention sett
 
 ## Key metrics {#key-metrics}
 
-Every `CAS`-related `ProfileEvent` carries the uppercase `CAS`/`CASGC` prefix. This is a curated
-subset for a first health pass; the full list groups by object class (`CASBlob*`, `CASManifest*`,
-`CASRoot*`, `CASGC*`, `CASServer*`, `CASOther*`, `CASRef*`, `CASMeta*`) and is enumerated in
-`src/Common/ProfileEvents.cpp`.
+Every `CAS`-related profile event carries a `CAS` or `CASGC` prefix. This table is a curated
+subset for a first health pass. The full list of Antalya-only profile events and metrics, including
+every `CAS*` name, is on [Antalya profile events and metrics](/antalya/metrics-and-events).
 
 | Metric | Healthy range | A spike or nonzero means |
 |---|---|---|
@@ -43,7 +42,7 @@ subset for a first health pass; the full list groups by object class (`CASBlob*`
 | `CASRefAppendSealRejected` | Occasional (a deposed writer losing a race is the protocol working); sustained growth is not | A writer keeps retrying after losing its mount and does not yet know it |
 | `CASGCHeartbeatFenceOuts` | Zero on a healthy pool | GC fenced an expired mount; check `system.cas_mounts` for a member that should have cleanly unmounted |
 | `CASGCUnmatchedRemoveDeltas` | Occasional (benign per-key no-op by design) | A persistent nonzero rate means removal deltas are reaching the reducer without their matching activation — a correctness signal worth a look, not an automatic false deletion |
-| `CASGCCondemnMarkerUnconfirmedCarry` | Zero | A durable condemn marker could not be confirmed; deletion is safely postponed but investigate marker write/read failures |
+| `CASGCCondemnMarkerUnconfirmedCarry` | Zero | The graduation read found no `Condemned` marker at the entry's round or later (absent, `Clean`, older round, or unreadable); deletion is postponed and the marker is rewritten, but investigate repeated carries |
 | `CASGCMetaWriteAnomaly` | Zero | The bounded GC metadata pool failed an operation; backend or pool pressure may delay metadata convergence |
 | `CASRefRollbackBestEffortDropFailed` | Zero | A rollback cleanup drop hit a backend failure; refs may remain live and GC may be delayed on that namespace |
 
