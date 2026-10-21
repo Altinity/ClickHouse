@@ -183,10 +183,9 @@ protected:
     DataPartStorageOnDiskBase(VolumePtr volume_, std::string root_path_, std::string part_dir_, DiskTransactionPtr transaction_);
     virtual MutableDataPartStoragePtr create(VolumePtr volume_, std::string root_path_, std::string part_dir_, bool initialize_) const = 0;
 
-    /// Read-your-writes helpers for a part that `transaction` is still assembling. The transaction
-    /// reports staged files and inner directories containing them; committed disk metadata cannot see
-    /// the staged state before commit. Staged file state wins over a committed file at the same path.
-    /// Otherwise these helpers fall through to the disk.
+    /// Read-your-writes helpers for a part that `transaction` is still assembling. File lookups prefer
+    /// staged state and fall back to the disk. Directory existence and iteration expose both committed
+    /// and staged state; iteration returns the union of their immediate children.
     bool existsFileInTransactionOrDisk(const std::string & path) const;
     bool existsDirectoryInTransactionOrDisk(const std::string & path) const;
     DataPartStorageIteratorPtr iterateDirectoryInTransactionOrDisk(const std::string & path) const;
