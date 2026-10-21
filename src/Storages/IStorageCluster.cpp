@@ -306,6 +306,36 @@ void rewriteASTInFunctionsToGlobalIn(ASTPtr & node)
     }
 }
 
+bool queryHasRightOrFullJoin(const ASTPtr & query)
+{
+    if (!query)
+        return false;
+
+    if (const auto * select_query = query->as<ASTSelectQuery>())
+    {
+        const auto tables = select_query->tables();
+        if (!tables)
+            return false;
+
+        for (const auto & child : tables->children)
+        {
+            const auto & element = child->as<ASTTablesInSelectQueryElement &>();
+            if (element.table_join && isRightOrFull(element.table_join->as<ASTTableJoin &>().kind))
+                return true;
+        }
+        return false;
+    }
+
+    const auto * union_query = query->as<ASTSelectWithUnionQuery>();
+    if (!union_query || !union_query->list_of_selects)
+        return false;
+
+    for (const auto & child : union_query->list_of_selects->children)
+        if (queryHasRightOrFullJoin(child))
+            return true;
+    return false;
+}
+
 void rewriteASTJoinsToGlobal(ASTPtr & query)
 {
     ASTSelectQuery * select_query = query->as<ASTSelectQuery>();
@@ -321,6 +351,10 @@ void rewriteASTJoinsToGlobal(ASTPtr & query)
         }
         return;
     }
+
+    /// `RIGHT`/`FULL` preserve broadcast rows, so the whole join stays on the initiator.
+    if (queryHasRightOrFullJoin(query))
+        return;
 
     if (auto tables = select_query->tables())
     {
@@ -389,8 +423,16 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     }
     case ObjectStorageClusterJoinMode::GLOBAL:
     {
+        /// Old analyzer: ship the left scan only. `INNER`/`LEFT`/`CROSS` stay in `query_to_send`.
         if (!query_info.query_tree)
+        {
+            if (queryHasRightOrFullJoin(query_to_send))
+            {
+                auto info = getQueryJoinInfoFromAST(query_to_send);
+                rewriteQueryForInitiatorLocalJoin(query_to_send, query_info, info, context);
+            }
             return;
+        }
 
         auto info = getQueryTreeInfo(query_info.query_tree, context);
 
@@ -1071,9 +1113,12 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr &, SelectQueryInfo & query_info) const
 {
     auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
+    const auto join_info = getQueryJoinInfo(query_info, context);
+    /// `global` still fetches columns for `RIGHT`/`FULL`: those joins stay on the initiator.
+    const bool keep_join_on_initiator = object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
+        || queryHasRightOrFullJoin(query_info.query);
 
-    if (object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
-        && needsInitiatorLocalJoin(getQueryJoinInfo(query_info, context)))
+    if (keep_join_on_initiator && needsInitiatorLocalJoin(join_info))
     {
         return QueryProcessingStage::Enum::FetchColumns;
     }
