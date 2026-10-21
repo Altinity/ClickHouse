@@ -2,7 +2,7 @@ the composite estimate of a merged state does not depend on the order of the mer
 1
 the estimator does not change the state, and states of any estimator have one type where a common type is needed
 1
-2
+Array(AggregateFunction(uniqApacheHLL(8, \'HLL_6\', \'COMPOSITE\'), UInt64))
 a small sketch has the same estimate
 100	100
 the composite estimate of a sketch that is built by inserts does not depend on the order of the inserts
