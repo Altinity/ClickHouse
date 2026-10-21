@@ -95,7 +95,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_gc_interval_sec` | `60` | Seconds between background GC rounds (≥ 1) |
 | `cas_blob_hash` | `cityhash128` | Pool blob content-hash function (`cityhash128` \| `xxh3-128` \| `sha256`). Recorded in the pool at creation; a mismatching config is refused at mount |
 | `cas_blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool. One-way: once admitted, the pool carries both algorithms permanently |
-| `cas_allow_packed_parts` | `false` | Allow creation of new `Packed` MergeTree parts on this disk. The decision uses the actual destination disk, not every disk in its storage policy. Existing `Packed` parts remain readable when this setting is `false` |
+| `cas_allow_packed_parts` | `false` | Allow creation of new `Packed` MergeTree parts on this disk. The decision uses the actual destination disk, not every disk in its storage policy. A `type=cache` disk inherits this capability from the wrapped `CAS` disk; set the key in the `metadata_type=cas` disk block. Existing `Packed` parts remain readable when this setting is `false` |
 | `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Only the preflight probe is skipped — the conditional-write correctness check still runs on every writable mount. **Not available on a writable generation-token (GCS) disk**, which refuses to mount with it: there, the probe battery is the only proof that a token-exact delete carries its generation precondition. Mount such a disk read-only if you need to defer the check |
 | `cas_mount_lease_ttl_ms` | `30000` | Milliseconds for which a mount lease remains valid after a successful claim or renewal (≥ 1). Lower values shorten stale-mount recovery but reduce tolerance for object-storage and scheduling delays |
 | `cas_mount_renew_period_ms` | `10000` | Milliseconds between background mount-lease renewals (≥ 1). It must leave enough time for two attempt envelopes (a renewal write and its settlement read) and the lease safety margin before the TTL expires: `period + 2 × envelope + margin < TTL` |
@@ -115,27 +115,44 @@ entirely before release. Treat this table as a snapshot of the current build, no
 
 ### Enabling `Packed` parts {#enabling-packed-parts}
 
-`cas_allow_packed_parts` delegates the existing MergeTree part-storage choice to a `CAS` disk.
-When it is `true`, the usual `min_bytes_for_full_part_storage` and
+Set `cas_allow_packed_parts` in the block of the `CAS` disk with `metadata_type=cas`. A
+`type=cache` disk above it inherits the capability from the wrapped `CAS` disk and cannot override
+it. The setting delegates the existing MergeTree part-storage choice to that disk. When it is
+`true`, the usual `min_bytes_for_full_part_storage` and
 `min_rows_for_full_part_storage` thresholds, together with `min_level_for_full_part_storage`, may
-select `Packed`; when it is `false`, newly written parts on that destination use `Full`. In a
-heterogeneous storage policy, INSERT, merge, and mutation use the setting of the disk that actually
-receives the new part.
+select `Packed`; when it is `false`, newly written parts on that destination use `Full`. `INSERT`
+and merge first select a format from these thresholds and then apply the capability of the disk that
+actually receives the new part.
+
+A mutation inherits the complete format of its source part. After the destination disk is reserved,
+the result may change from `Packed -> Full` when that disk does not allow `Packed`. A mutation does
+not change `Full -> Packed`, either when thresholds change or when Packed capability is enabled; a
+later merge may select `Packed` from the new thresholds and destination capability.
 
 The setting controls creation, not readability. Existing `Packed` parts can still be opened,
 attached, fetched, and read after the setting is changed to `false`. The setting also does not add
 support for an `encrypted` disk layered over `CAS`; use object-store encryption at rest instead.
 
+For a disk declared in server configuration, `cas_allow_packed_parts` is read when the disk object
+is created. Changing it requires restarting the corresponding server; `SYSTEM RELOAD CONFIG` does
+not change the capability of an existing disk object. For an inline `disk(...)`, the value is stored
+in table metadata, so a restart does not change it and replacing the settings of an existing custom
+disk in place is not supported.
+
 For a rolling upgrade:
 
-1. Upgrade every writer and replica while the key is absent.
-2. After every writer can read and write the new archive layout, add
-   `cas_allow_packed_parts = true` only to the destination disks where `Packed` creation is wanted.
+1. Keep the key absent from every server that still runs an older binary. An older binary rejects
+   an unknown `cas_*` key even when its value is `false`; updated servers may keep the key absent or
+   use its default `false`.
+2. After every server that may open these parts can read and write the new archive layout, set
+   `cas_allow_packed_parts = true` only in the underlying `metadata_type=cas` disk blocks where
+   `Packed` creation is wanted.
+3. Restart the corresponding servers so the new disk objects receive the capability.
 
-For a downgrade, first set the setting to `false` on every writer. This stops new `Packed` parts but
-does not convert existing ones. Remove or fully rewrite all existing `Packed` parts before starting
-an older binary. Finally, remove the `cas_allow_packed_parts` key from the configuration entirely:
-an older parser rejects an unknown `cas_*` key even when its value is `false`.
+Downgrade to a binary without CAS Packed support is not supported in the current MVP. Setting
+`cas_allow_packed_parts = false` does not rewrite existing `Packed` parts and is not a safe downgrade
+procedure. Such an older binary also rejects the unknown `cas_allow_packed_parts` key even when its
+value is `false`.
 
 All servers sharing a pool must run the same `cas_mount_lease_ttl_ms` and `cas_mount_renew_period_ms`.
 Startup reclaim and GC's fence-out both judge liveness by the mount slot's write token holding stable
