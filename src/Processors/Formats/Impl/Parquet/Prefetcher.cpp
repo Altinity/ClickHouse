@@ -351,7 +351,7 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     {
         const RangeState & r = ranges[idx - 1];
         const bool same_group = initial_req->coalesce_group != 0 && r.request->coalesce_group == initial_req->coalesce_group;
-        /// Bloom-filter groups stay inside the group, so a filter is not merged with the column data next to it.
+        /// A bloom-filter group stays inside itself. Column data must not merge with a filter, whichever range starts the read.
         /// `across_gaps` is the small-file path: one read covers the whole object.
         /// The same-group span is the configured cap, even when that cap is below `bytes_per_read_task`.
         /// The cap is the whole task. A bloom body included on the left must share it with later filters.
@@ -360,7 +360,9 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const size_t prospective_start = std::min(start_offset, r.start);
         const size_t prospective_end = std::max(end_offset, r.end);
         const bool end_past_cap = same_group && prospective_end - prospective_start > span_limit;
-        if ((initial_req->coalesce_group != 0 && !same_group) ||
+        const bool group_boundary = initial_req->coalesce_group != r.request->coalesce_group
+            && (initial_req->coalesce_group != 0 || r.request->coalesce_group != 0);
+        if (group_boundary ||
             r.end + gap_limit <= start_offset || // short gap
             r.start + span_limit <= initial_offset || // task not too big
             end_past_cap ||
@@ -403,7 +405,9 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const size_t prospective_start = std::min(start_offset, r.start);
         const size_t prospective_end = std::max(end_offset, r.end);
         const bool end_past_cap = same_group && prospective_end - prospective_start > span_limit;
-        if ((initial_req->coalesce_group != 0 && !same_group) ||
+        const bool group_boundary = initial_req->coalesce_group != r.request->coalesce_group
+            && (initial_req->coalesce_group != 0 || r.request->coalesce_group != 0);
+        if (group_boundary ||
             end_offset + gap_limit <= r.start ||
             (!same_group && initial_offset + span_limit <= r.end) ||
             end_past_cap ||
