@@ -37,6 +37,8 @@ SETTINGS
     allow_experimental_analyzer = 1,
     object_storage_cluster_join_mode = 'allow',
     object_storage_remote_initiator = 1,
-    object_storage_remote_initiator_cluster = 'test_shard_localhost';
+    object_storage_remote_initiator_cluster = 'test_shard_localhost',
+    -- A serialized plan carries the `s3Cluster` arguments with the secret hidden.
+    serialize_query_plan = 0;
 
 DROP TEMPORARY TABLE t_dim_05387;
