@@ -70,6 +70,8 @@ private:
     DirectoryIteratorPtr it;
 };
 
+/// Iterates names prepared by `iterateDirectoryInTransactionOrDisk`: the union of committed and staged
+/// immediate children. `isFile` checks only the disk, so it returns false for a staged-only file.
 class DataPartStorageMergedIterator final : public IDataPartStorageIterator
 {
 public:
@@ -1417,6 +1419,8 @@ StoredObjects DataPartStorageOnDiskBase::getStorageObjectsInTransactionOrDisk(co
     {
         if (auto inflight = transaction->tryGetInFlightStorageObjects(path))
             return std::move(*inflight);
+        /// An in-flight file can exist before it has storage objects, for example while an upload is pending.
+        /// Do not expose a committed object at the same path in that case.
         if (transaction->tryGetInFlightFileSize(path))
             return {};
     }
@@ -1435,10 +1439,14 @@ void DataPartStorageOnDiskBase::prepareReadInTransactionOrDisk(
         if (auto objects = transaction->tryGetInFlightStorageObjects(path))
             inflight_objects = std::move(*objects);
         else if (auto size = transaction->tryGetInFlightFileSize(path))
+            /// `ReadPipeline::build` treats an empty object list as an empty file and does not invoke
+            /// the source. This placeholder makes it invoke the source, which ignores the object and
+            /// reads the staged bytes through the transaction.
             inflight_objects = StoredObjects{StoredObject(path, path, *size)};
 
         if (!inflight_objects.empty())
         {
+            /// Keep the transaction alive for as long as the pipeline can invoke the custom source.
             auto current_transaction = transaction;
             pipeline.setSource(
                 [current_transaction, path](const StoredObject &, const ReadSettings & read_settings, bool, bool)
@@ -1467,6 +1475,8 @@ std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskBase::readFileIfExi
         auto in_flight_size = transaction->tryGetInFlightFileSize(path);
         if (auto buffer = transaction->tryReadFileInFlight(path, settings, read_hint))
             return buffer;
+        /// If the transaction knows this file but cannot read it, this is a logical error.
+        /// Do not fall back to a committed file at the same path.
         if (in_flight_size)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "In-flight file {} cannot be read", path);
     }
