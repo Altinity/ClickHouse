@@ -340,6 +340,8 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
         {
             delete_data_writers[partition_key]->flush();
             delete_data_writers[partition_key]->finalize();
+            delete_data_statistics.at(partition_key).addColumnSizesOnDisk(
+                delete_data_writers[partition_key]->getColumnSizesOnDisk(), getPositionDeleteFileSampleBlock());
             delete_data_write_buffers[partition_key]->finalize();
             {
                 auto delete_bytes = delete_data_write_buffers[partition_key]->count();
@@ -362,6 +364,7 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
         PullingPipelineExecutor executor(pipeline);
 
         auto header = interpreter->getUpdatedHeader();
+        auto update_sample_block = getNonVirtualColumns(header, /*remove_low_cardinality=*/ true);
 
         Block block;
         while (executor.pull(block))
@@ -411,6 +414,8 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
         {
             update_data_writers[partition_key]->flush();
             update_data_writers[partition_key]->finalize();
+            update_data_statistics.at(partition_key).addColumnSizesOnDisk(
+                update_data_writers[partition_key]->getColumnSizesOnDisk(), update_sample_block);
             update_data_write_buffers[partition_key]->finalize();
             {
                 auto update_bytes = update_data_write_buffers[partition_key]->count();

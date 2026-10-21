@@ -36,7 +36,13 @@ ${CLICKHOUSE_CLIENT} --query "
         (id Int32, geometry Point, bbox_xmin Float64, bbox_ymin Float64, bbox_xmax Float64, bbox_ymax Float64)
         ENGINE = IcebergLocal('${ICEBERG_PATH}', 'Parquet');
 
-    INSERT INTO ${TEST_TABLE} VALUES (0, (0, 0), 0, 0, 0, 0);
+    -- The same rows as the fixture that replaces this data file below, so the manifest
+    -- statistics of the data file (e.g. the \`id\` bounds) stay true for the fixture.
+    INSERT INTO ${TEST_TABLE} VALUES
+        (1, (-98, 31), -98, 31, -98, 31),
+        (2, (-97.5, 31.5), -97.5, 31.5, -97.5, 31.5),
+        (3, (-98, 34), -98, 34, -98, 34),
+        (4, (-97.5, 34.5), -97.5, 34.5, -97.5, 34.5);
 "
 
 # Bump the schema by renaming the geometry column. Existing data files still carry `geometry`
@@ -47,7 +53,7 @@ ${CLICKHOUSE_CLIENT} --query "
     ALTER TABLE ${TEST_TABLE} RENAME COLUMN geometry TO geom_renamed;
 "
 
-# Replace the just-inserted (throwaway) data file with a hand-crafted fixture: 2 row groups
+# Replace the just-inserted data file with a hand-crafted fixture: 2 row groups
 # (south Texas ids 1,2; north Texas ids 3,4), real `geospatial_statistics.bbox` metadata on the
 # geometry column and no `covering.bbox` at all.
 DATA_FILE=$(find "${ICEBERG_PATH}/data" -name '*.parquet' | head -n 1)

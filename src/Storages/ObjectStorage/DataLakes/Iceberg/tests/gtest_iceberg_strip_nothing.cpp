@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <Columns/ColumnConst.h>
+#include <Core/Block.h>
+#include <Core/ColumnWithTypeAndName.h>
 #include <Core/Field.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <Processors/Chunk.h>
@@ -165,6 +167,19 @@ std::vector<size_t> fieldIdsOf(const std::vector<std::pair<size_t, T>> & stats)
     return ids;
 }
 
+/// Column sizes are populated from the data file's on-disk column sizes (reported by the output
+/// format at finalize, see MultipleFileWriter), not from `update`. Mirror that here so the size
+/// getters have something to return; the values are irrelevant, only the covered field ids matter.
+void addColumnSizes(DataFileStatistics & stats)
+{
+    Block sample_block({
+        ColumnWithTypeAndName(type("Int64"), "c1"),
+        ColumnWithTypeAndName(type("Nullable(String)"), "c2"),
+        ColumnWithTypeAndName(type("Nullable(Nothing)"), "c3"),
+    });
+    stats.addColumnSizesOnDisk({{"c1", 1}, {"c2", 1}, {"c3", 1}}, sample_block);
+}
+
 }
 
 TEST(IcebergStripNothing, ExcludedColumnsHaveNoStatistics)
@@ -172,6 +187,7 @@ TEST(IcebergStripNothing, ExcludedColumnsHaveNoStatistics)
     DataFileStatistics stats(statisticsSchema());
     stats.excludeColumns({false, false, true});
     stats.update(statisticsChunk());
+    addColumnSizes(stats);
 
     const std::vector<size_t> written = {1, 2};
     EXPECT_EQ(fieldIdsOf(stats.getColumnSizes()), written);
@@ -191,6 +207,7 @@ TEST(IcebergStripNothing, StatisticsWithoutExclusionCoverEveryColumn)
 {
     DataFileStatistics stats(statisticsSchema());
     stats.update(statisticsChunk());
+    addColumnSizes(stats);
 
     const std::vector<size_t> all = {1, 2, 3};
     EXPECT_EQ(fieldIdsOf(stats.getColumnSizes()), all);

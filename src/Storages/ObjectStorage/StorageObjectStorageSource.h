@@ -205,6 +205,11 @@ private:
         const std::string & path_in_archive,
         std::optional<size_t> read_source_index);
 
+    /// Fetch the next object. When `wait_for_retry` is set, a `retry_after_us` response is waited out
+    /// on this thread and another task is requested. The constructor prefetch passes false so one
+    /// waiting slot cannot hold back tasks the other slots already received.
+    ObjectInfoPtr takeNextObject(bool wait_for_retry);
+
     void resolveObjectStorageIfNeeded(const ObjectInfoPtr & object);
 
     ClusterFunctionReadTaskCallback callback;

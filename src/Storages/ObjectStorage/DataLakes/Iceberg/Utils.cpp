@@ -342,8 +342,11 @@ bool writeMetadataFileAndVersionHint(
     const IcebergPathFromMetadata & version_hint_path,
     DB::ObjectStoragePtr object_storage,
     DB::ContextPtr context,
-    bool try_write_version_hint)
+    bool try_write_version_hint,
+    bool * version_hint_names_metadata_file)
 {
+    bool hint_names_metadata_file = false;
+
     auto storage_metadata_path = resolver.resolve(metadata_file_info.path);
     auto storage_version_hint_path = resolver.resolve(version_hint_path);
     try
@@ -397,6 +400,7 @@ bool writeMetadataFileAndVersionHint(
         else if (!try_write_version_hint)
         {
             /// The file does not exist and this writer was not asked to create it.
+            hint_names_metadata_file = true;
             break;
         }
 
@@ -424,6 +428,7 @@ bool writeMetadataFileAndVersionHint(
                     context,
                     write_if_none_match,
                     /* write-if-match */ etag);
+                hint_names_metadata_file = true;
                 break;
             }
             catch (...)
@@ -459,6 +464,9 @@ bool writeMetadataFileAndVersionHint(
             storage_version_hint_path,
             metadata_file_info.version,
             MAX_TRANSACTION_RETRIES);
+
+    if (version_hint_names_metadata_file)
+        *version_hint_names_metadata_file = hint_names_metadata_file;
 
     return true;
 }
@@ -1695,8 +1703,23 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
             auto column_name = source_id_to_column_name[source_id];
             int direction = field->getValue<String>(f_direction) == "asc" ? 1 : -1;
             auto iceberg_transform_name = field->getValue<String>(f_transform);
-            auto clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name,
-                local_context->getSettingsRef()[Setting::iceberg_partition_timezone]);
+            std::optional<TransformAndArgument> clickhouse_transform_name;
+            try
+            {
+                clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name,
+                    local_context->getSettingsRef()[Setting::iceberg_partition_timezone]);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::BAD_ARGUMENTS)
+                    throw;
+            }
+            if (!clickhouse_transform_name.has_value())
+            {
+                /// An unknown or malformed transform is not a reason to reject the table: an Iceberg
+                /// sort order is only an optimization hint, so drop it and read/write the table as unsorted.
+                return KeyDescription{};
+            }
             /// Quote the column name so identifiers with special characters (e.g. `@timestamp`)
             /// produce a parseable ORDER BY clause.
             auto quoted_column_name = backQuoteIfNeed(column_name);
@@ -2046,6 +2069,13 @@ void forEachAvroEntry(
     auto input_stream = std::make_unique<AvroInputStreamReadBufferAdapter>(*manifest_list_buf);
     auto reader_base = std::make_unique<avro::DataFileReaderBase>(std::move(input_stream), MAX_AVRO_SCHEMA_DEPTH);
     avro::DataFileReader<avro::GenericDatum> reader(std::move(reader_base));
+
+    if (reader.readerSchema().root()->type() != avro::AVRO_RECORD)
+        throw Exception(
+            ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "Avro file {} has root schema type {}, but Iceberg manifest-list entries must be records",
+            filename,
+            static_cast<int>(reader.readerSchema().root()->type()));
 
     avro::GenericDatum datum(reader.readerSchema());
     while (reader.read(datum))
