@@ -44,7 +44,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.8.6.20001.altinityantalya",
         {
             {"input_format_parquet_bloom_filter_coalesce_max_bytes", 0, 64 * 1024 * 1024, "Read contiguous Parquet bloom filters, or a small file that has many of them, in one request."},
-        });         
+        });
         addSettingsChanges(settings_changes_history, "26.10",
         {
             {"azure_validate_etag_on_read", false, true, "New setting to detect concurrent in-place overwrites of Azure blobs during a read by pinning every `GET` to the listed `ETag` with `If-Match` and validating the `ETag` of the response, like `s3_validate_etag_on_read` does for S3. `compatibility` with versions before 26.10 restores the previous behavior (no validation)."},

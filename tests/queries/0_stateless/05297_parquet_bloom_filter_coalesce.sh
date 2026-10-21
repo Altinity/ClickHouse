@@ -54,6 +54,8 @@ SEPARATE=$(read_stats 0 1) || { echo "separate read failed"; exit 1; }
 CLUSTER=$(read_stats 67108864 1) || { echo "cluster read failed"; exit 1; }
 # Seek of 0 used to treat a zero-byte gap as a split. ClickHouse writes the filters back-to-back.
 TOUCH=$(read_stats 67108864 0) || { echo "zero-seek coalesce failed"; exit 1; }
+# UInt64 max used to wrap the left-scan cap and split a filter header from its body.
+UNLIMITED=$(read_stats 18446744073709551615 0) || { echo "unlimited coalesce failed"; exit 1; }
 # Enough filters that the seek budget covers the file: one read of the whole object.
 WHOLE=$(read_stats 67108864 1000000000) || { echo "whole-file read failed"; exit 1; }
 # Cap of 1 byte, seek of 1 MiB: bytes_per_read_task is 4 MiB and would swallow this file if the cap were raised.
@@ -65,6 +67,7 @@ SEPARATE_READS=${SEPARATE%% *}
 SEPARATE_BYTES=${SEPARATE##* }
 CLUSTER_READS=${CLUSTER%% *}
 TOUCH_READS=${TOUCH%% *}
+UNLIMITED_READS=${UNLIMITED%% *}
 WHOLE_READS=${WHOLE%% *}
 CAPPED_READS=${CAPPED%% *}
 NARROW_READS=${NARROW%% *}
@@ -76,6 +79,10 @@ if [ "$CLUSTER_READS" -ge "$SEPARATE_READS" ]; then
 fi
 if [ "$TOUCH_READS" -ge "$SEPARATE_READS" ]; then
     echo "zero seek split back-to-back filters: touch=$TOUCH separate=$SEPARATE cluster=$CLUSTER"
+    exit 1
+fi
+if [ "$UNLIMITED_READS" -ge "$SEPARATE_READS" ]; then
+    echo "max coalesce cap split the bloom header from its body: unlimited=$UNLIMITED separate=$SEPARATE touch=$TOUCH"
     exit 1
 fi
 if [ "$WHOLE_READS" -gt 4 ]; then

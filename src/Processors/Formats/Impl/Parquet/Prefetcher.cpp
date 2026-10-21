@@ -366,7 +366,8 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
         const bool positive_gap = same_group ? r.end < start_offset : true;
         if (group_boundary ||
             (positive_gap && r.end + gap_limit <= start_offset) || // short gap
-            r.start + span_limit <= initial_offset || // task not too big
+            /// `end_past_cap` is the same-group cap. This addition wraps when the cap is `UInt64` max.
+            (!same_group && r.start + span_limit <= initial_offset) || // task not too big
             end_past_cap ||
             (!same_group && !r.request->allow_incidental_read.load(std::memory_order_relaxed))) // range wants to be coalesced
             break;

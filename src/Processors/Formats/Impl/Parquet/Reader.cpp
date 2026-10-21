@@ -1138,7 +1138,10 @@ void Reader::initializePrefetches()
                 || column.meta->meta_data.statistics.null_count != 0;
             bool bloom_filter_null_safe = !nullable || !can_be_null || primitive_columns[column_idx].output_nullable;
 
-            if (options.format.parquet.bloom_filter_push_down &&
+            /// A row group outside the requested subset produces no rows. Do not register its filter:
+            /// the count above skips it, and a registered filter would still be read.
+            if (row_group.need_to_process &&
+                options.format.parquet.bloom_filter_push_down &&
                 primitive_columns[column_idx].use_bloom_filter &&
                 !primitive_columns[column_idx].bloom_filter_hashes.empty() &&
                 bloom_filter_null_safe &&
