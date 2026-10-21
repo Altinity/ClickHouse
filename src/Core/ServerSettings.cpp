@@ -1954,6 +1954,8 @@ ChangeableSettingsMap collectChangeableServerSettings(ContextPtr context)
 
             {"allow_feature_tier",
                 {std::to_string(context->getAccessControl().getAllowTierSettings()), ChangeableWithoutRestart::Yes}},
+            {"enable_token_forwarding",
+                {std::to_string(context->getAccessControl().isTokenForwardingEnabled()), ChangeableWithoutRestart::Yes}},
             {"s3queue_disable_streaming",
              {std::to_string(context->getServerSettingsCopy().get("s3queue_disable_streaming").safeGet<bool>()), ChangeableWithoutRestart::Yes}},
             {"message_queue_disable_insertion", {std::to_string(context->getMessageQueueDisableInsertion()), ChangeableWithoutRestart::Yes}},
