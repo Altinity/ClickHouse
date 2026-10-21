@@ -104,7 +104,8 @@ DataFileMetaInfo::DataFileMetaInfo(
     Int32 table_schema_id,
     Int32 file_schema_id,
     const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_,
-    const std::unordered_map<Int32, std::pair<Field, Field>> & value_bounds_)
+    const std::unordered_map<Int32, std::pair<Field, Field>> & value_bounds_,
+    const String & file_path)
 {
 #if USE_AVRO
     std::vector<Int32> column_ids;
@@ -164,12 +165,33 @@ DataFileMetaInfo::DataFileMetaInfo(
 
         columns_info[i_name->second] = {column.second.rows_count, column.second.nulls_count, hyperrectangle};
     }
+
+    /// Missing metrics do not mean the column is absent from the file. Record every column of the
+    /// file schema so the read optimization substitutes NULL only for columns added after the file
+    /// was written. `emplace` keeps the statistics already stored above.
+    size_t columns_without_metrics = 0;
+    if (schema_processor.hasClickhouseTableSchemaById(file_schema_id))
+    {
+        const auto fields = schema_processor.getIcebergTableSchemaById(file_schema_id)->getArray(Iceberg::f_fields);
+        for (size_t i = 0; i < fields->size(); ++i)
+        {
+            const auto field_id = fields->getObject(static_cast<UInt32>(i))->getValue<Int32>(Iceberg::f_id);
+            if (const auto table_field = schema_processor.tryGetFieldCharacteristics(table_schema_id, field_id))
+            {
+                if (columns_info.emplace(table_field->getNameInStorage(), ColumnInfo{}).second)
+                    ++columns_without_metrics;
+            }
+        }
+    }
+    if (columns_without_metrics)
+        LOG_DEBUG(getLogger("DataFileMetaInfo"), "File {} has {} columns without Iceberg metrics", file_path, columns_without_metrics);
 #else
     (void)schema_processor;
     (void)table_schema_id;
     (void)file_schema_id;
     (void)columns_info_;
     (void)value_bounds_;
+    (void)file_path;
 #endif
 }
 
