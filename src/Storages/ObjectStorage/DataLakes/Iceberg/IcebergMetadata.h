@@ -246,6 +246,9 @@ public:
         const ContextPtr & context,
         bool force_fetch_latest_metadata = false) const;
 
+    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot>
+    getState(const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version) const;
+
     const DB::Iceberg::PersistentTableComponents & getPersistentComponents() const
     {
         return persistent_components;
@@ -270,8 +273,6 @@ private:
     Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Int32>
     getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) const;
-    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot>
-    getState(const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version) const;
     Iceberg::IcebergDataSnapshotPtr
     getRelevantDataSnapshotFromTableStateSnapshot(Iceberg::TableStateSnapshot table_state_snapshot, ContextPtr local_context) const;
     StorageObjectStorageConfigurationPtr getConfiguration() const;
@@ -326,7 +327,11 @@ private:
 
     void backgroundMetadataPrefetcherThread();
 
-    void alterPartitionDropImpl(const PartitionCommand & command, ContextPtr context);
+    void alterPartitionDropImpl(
+        const PartitionCommand & command,
+        ContextPtr context,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & storage_id);
 };
 }
 

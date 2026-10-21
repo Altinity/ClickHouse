@@ -6,6 +6,7 @@
 #include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/Utils.h>
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeString.h>
 #include <Functions/FunctionFactory.h>
 #include <Parsers/ASTLiteral.h>
@@ -72,7 +73,7 @@ public:
         const auto & expr_node = args[expr_idx];
 
         const auto expr_type = expr_node->getResultType();
-        if (!expr_type || !isStringOrFixedString(expr_type))
+        if (!expr_type || !isStringOrFixedString(removeLowCardinality(expr_type)))
             return;
 
         const String replacement_func = (func_name == "equals") ? "empty" : "notEmpty";
