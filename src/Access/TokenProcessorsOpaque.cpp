@@ -91,8 +91,8 @@ namespace
 
         if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK)
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
-                            "Failed to get user info by access token, code: {}, reason: {}", response.getStatus(),
-                            response.getReason());
+                            "GET to '{}' returned HTTP {} ({})",
+                            uri.toString(), static_cast<int>(response.getStatus()), response.getReason());
 
         try
         {
