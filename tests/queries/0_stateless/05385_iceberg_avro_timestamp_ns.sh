@@ -7,10 +7,6 @@
 # decimal `bytes`, so the data file disagreed with the table metadata.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# Reading a ClickHouse-written format-version-3 table logs a benign "parsed using v2
-# specification" warning (v3 metadata has no top-level `schema` for the v1 parse to use).
-# That warning would land on stderr, which clickhouse-test turns into a failure.
-CLICKHOUSE_CLIENT_SERVER_LOGS_LEVEL="none"
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
