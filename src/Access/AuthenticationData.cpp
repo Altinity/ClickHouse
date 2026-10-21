@@ -154,6 +154,7 @@ bool AuthenticationData::Util::checkPasswordBcrypt(std::string_view password [[m
 
 bool operator ==(const AuthenticationData & lhs, const AuthenticationData & rhs)
 {
+<<<<<<< HEAD
     /// `MemoryAccessStorage::updateNoLock` short-circuits when the existing
     /// entity equals the new one, so any field omitted from this comparator
     /// becomes invisible to ALTER USER -- same-type ALTER would silently
@@ -162,6 +163,9 @@ bool operator ==(const AuthenticationData & lhs, const AuthenticationData & rhs)
     /// a JWT user via ALTER USER is a no-op (CREATE USER OR REPLACE works
     /// only by accident, via storage->insertOrReplace).
     return (lhs.type == rhs.type) && (lhs.password_hash == rhs.password_hash)
+=======
+    return (lhs.type == rhs.type) && (lhs.password_hash == rhs.password_hash) && (lhs.otp_secret == rhs.otp_secret)
+>>>>>>> 7ecceca9c22 (Merge pull request #125443 from zvonand/fix/multi-auth-ignore-duplicates)
         && (lhs.ldap_server_name == rhs.ldap_server_name) && (lhs.kerberos_realm == rhs.kerberos_realm)
 #if USE_SSL
         && (lhs.ssl_certificate_subjects == rhs.ssl_certificate_subjects)
@@ -169,6 +173,7 @@ bool operator ==(const AuthenticationData & lhs, const AuthenticationData & rhs)
 #if USE_SSH
         && (lhs.ssh_keys == rhs.ssh_keys)
 #endif
+        && (lhs.salt == rhs.salt)
         && (lhs.http_auth_scheme == rhs.http_auth_scheme)
         && (lhs.http_auth_server_name == rhs.http_auth_server_name)
         && (lhs.token_processor_name == rhs.token_processor_name)
