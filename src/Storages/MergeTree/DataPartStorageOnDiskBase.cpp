@@ -72,6 +72,8 @@ private:
 
 /// Iterates names prepared by `iterateDirectoryInTransactionOrDisk`: the union of committed and staged
 /// immediate children. `isFile` checks only the disk, so it returns false for a staged-only file.
+/// `loadProjections` uses this view to find a staged projection's mark file by name before the parent
+/// part commits.
 class DataPartStorageMergedIterator final : public IDataPartStorageIterator
 {
 public:
