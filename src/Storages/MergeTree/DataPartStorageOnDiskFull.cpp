@@ -62,16 +62,24 @@ DataPartStoragePtr DataPartStorageOnDiskFull::getProjection(const std::string & 
 
 bool DataPartStorageOnDiskFull::exists() const
 {
+    /// CAS does not report the top-level part directory through the transaction overlay. A temporary
+    /// part whose transaction was never committed then takes the early return in `removeIfNeeded`
+    /// instead of removing a path that committed metadata does not have. A projection storage asks for
+    /// an inner directory of its parent part, so a staged projection directory is visible here.
     return existsDirectoryInTransactionOrDisk(fs::path(root_path) / part_dir);
 }
 
 bool DataPartStorageOnDiskFull::existsFileImpl(const std::string & name) const
 {
+    /// A part being assembled can have staged files that committed metadata cannot see, for example
+    /// projection temporary blocks on CAS. The helper consults the held transaction before the disk.
     return existsFileInTransactionOrDisk(fs::path(root_path) / part_dir / name);
 }
 
 bool DataPartStorageOnDiskFull::existsDirectory(const std::string & name) const
 {
+    /// A carried-forward projection may be hard-linked into the open part transaction before committed
+    /// metadata exposes its directory. The helper detects staged files below it before falling back to the disk.
     return existsDirectoryInTransactionOrDisk(fs::path(root_path) / part_dir / name);
 }
 
@@ -87,6 +95,8 @@ Poco::Timestamp DataPartStorageOnDiskFull::getFileLastModified(const String & fi
 
 size_t DataPartStorageOnDiskFull::getFileSizeImpl(const String & file_name) const
 {
+    /// A merge gets the size of staged projection temporary files before reading them back. Committed
+    /// metadata cannot expose their sizes until the parent part commits, so consult the transaction first.
     return getFileSizeInTransactionOrDisk(fs::path(root_path) / part_dir / file_name);
 }
 
@@ -107,6 +117,11 @@ std::vector<std::string> DataPartStorageOnDiskFull::getRemotePaths(const std::st
 {
     const std::string path = fs::path(root_path) / part_dir / file_name;
 
+    /// A staged blob that is not pending upload, for example one carried forward by `createHardLink` from a
+    /// committed part, resolves to its pool object. Blobs written by this transaction stay pending until
+    /// commit publishes them. A pending blob has no storage object yet, so do not fall back to a committed
+    /// object at the same logical path. An inline entry yields one synthetic object with an empty remote
+    /// path, the same as a committed inline entry.
     auto objects = getStorageObjectsInTransactionOrDisk(path);
 
     std::vector<std::string> remote_paths;
@@ -133,6 +148,11 @@ void DataPartStorageOnDiskFull::prepareReadImpl(
     std::optional<size_t> read_hint,
     ReadPipeline & pipeline) const
 {
+    /// A projection spill-and-merge can read its own temporary blocks before the parent part commits.
+    /// On CAS a staged blob may still be pending upload or may already be in the pool, for example when
+    /// carried forward from a committed part, while inline content is stored in the staged entry. Committed
+    /// metadata cannot see that state, so the helper installs a source that reads through the held transaction.
+    /// Without a transaction, or if it does not know the path, the helper uses the disk pipeline unchanged.
     prepareReadInTransactionOrDisk(fs::path(root_path) / part_dir / name, settings, read_hint, pipeline);
 }
 
@@ -141,6 +161,10 @@ std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskFull::readFileIfExi
     const ReadSettings & settings,
     std::optional<size_t> read_hint) const
 {
+    /// `readFileIfExists` does not go through `prepareRead`, so it must apply the same transaction overlay.
+    /// Staged blobs, including pending uploads, and inline bytes are served through the transaction before
+    /// commit. If the transaction knows the path but cannot read it, the helper does not expose a
+    /// committed version.
     return readFileIfExistsInTransactionOrDisk(fs::path(root_path) / part_dir / name, settings, read_hint);
 }
 
