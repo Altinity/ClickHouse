@@ -146,7 +146,7 @@ def test_drop_partition_after_position_delete(
 
 
 @pytest.mark.parametrize("storage_type", ["s3", "local"])
-def test_drop_partition_shared_spark_manifest_is_rejected(
+def test_drop_partition_shared_spark_manifest_is_rewritten(
     started_cluster_iceberg_with_spark, storage_type
 ):
     cluster = started_cluster_iceberg_with_spark
@@ -171,19 +171,24 @@ def test_drop_partition_shared_spark_manifest_is_rejected(
     )
 
     create_iceberg_table(storage_type, instance, table_name, cluster)
-    error = instance.query_and_get_error(
+    instance.query(
         f"ALTER TABLE {table_name} DROP PARTITION 1",
         settings={"allow_insert_into_iceberg": 1},
     )
-    assert "NOT_IMPLEMENTED" in error, error
-    assert "rewriting a manifest" in error, error
 
-    expected = "1\tdrop\n2\tkeep-a\n3\tkeep-b\n"
+    expected = "2\tkeep-a\n3\tkeep-b\n"
     assert instance.query(f"SELECT * FROM {table_name} ORDER BY tag") == expected
+
+    local_dir = update_spark_version_hint(cluster, storage_type, table_name)
+    spark_rows = spark.read.format("iceberg").load(local_dir).collect()
+    assert sorted((row["tag"], row["value"]) for row in spark_rows) == [
+        (2, "keep-a"),
+        (3, "keep-b"),
+    ]
 
 
 @pytest.mark.parametrize("storage_type", ["s3", "local"])
-def test_drop_partition_with_spark_evolved_spec_is_rejected(
+def test_drop_partition_with_spark_evolved_spec(
     started_cluster_iceberg_with_spark, storage_type
 ):
     cluster = started_cluster_iceberg_with_spark
@@ -208,10 +213,26 @@ def test_drop_partition_with_spark_evolved_spec_is_rejected(
 
     create_iceberg_table(storage_type, instance, table_name, cluster)
 
+    # Files written before the spec gained `key` span every `key` value of their `tag`
     error = instance.query_and_get_error(
-        f"ALTER TABLE {table_name} DROP PARTITION 1",
+        f"ALTER TABLE {table_name} DROP PARTITION (1, 'c')",
         settings={"allow_insert_into_iceberg": 1},
     )
     assert "NOT_IMPLEMENTED" in error, error
-    assert "evolved partition specs" in error, error
+    assert "does not contain every field of the current spec" in error, error
     assert instance.query(f"SELECT count() FROM {table_name}") == "4\n"
+
+    instance.query(
+        f"ALTER TABLE {table_name} DROP PARTITION (3, 'd')",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    expected = "1\ta\t10\n1\tc\t30\n2\tb\t20\n"
+    assert instance.query(f"SELECT * FROM {table_name} ORDER BY tag, key") == expected
+
+    local_dir = update_spark_version_hint(cluster, storage_type, table_name)
+    spark_rows = spark.read.format("iceberg").load(local_dir).collect()
+    assert sorted((row["tag"], row["key"], row["value"]) for row in spark_rows) == [
+        (1, "a", 10),
+        (1, "c", 30),
+        (2, "b", 20),
+    ]

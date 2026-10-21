@@ -940,7 +940,7 @@ Pipe IcebergMetadata::alterPartition(
     const PartitionCommands & commands,
     ContextPtr context,
     std::shared_ptr<DataLake::ICatalog> catalog,
-    StorageID /*storage_id*/)
+    StorageID storage_id)
 {
     if (!context->getSettingsRef()[Setting::allow_insert_into_iceberg].value)
     {
@@ -948,8 +948,6 @@ Pipe IcebergMetadata::alterPartition(
             ErrorCodes::SUPPORT_IS_DISABLED,
             "Alter iceberg is experimental. To allow its usage, enable setting allow_insert_into_iceberg");
     }
-    if (catalog)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DROP PARTITION is not supported for catalog-backed Iceberg tables");
     if (commands.size() != 1)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
@@ -961,12 +959,16 @@ Pipe IcebergMetadata::alterPartition(
     if (command.part || command.detach)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} is not supported by Iceberg", command.typeToString());
 
-    alterPartitionDropImpl(command, context);
+    alterPartitionDropImpl(command, context, std::move(catalog), storage_id);
     persistent_components.invalidateMetadataCache();
     return {};
 }
 
-void IcebergMetadata::alterPartitionDropImpl(const PartitionCommand & command, ContextPtr context)
+void IcebergMetadata::alterPartitionDropImpl(
+    const PartitionCommand & command,
+    ContextPtr context,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const StorageID & storage_id)
 {
     Iceberg::AlterDropPartitionExecutor executor(
         command,
@@ -977,7 +979,9 @@ void IcebergMetadata::alterPartitionDropImpl(const PartitionCommand & command, C
         persistent_components,
         data_lake_settings,
         write_format,
-        log);
+        log,
+        std::move(catalog),
+        storage_id);
     executor.run();
 }
 
@@ -2257,7 +2261,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
             transaction_id);
         /// Surface a sentinel so the caller treats this as a successful attempt (non-empty
         /// commit info), persists a commit_info znode, and makes the situation visible in
-        /// system.replicated_partition_exports.committed_metadata_file. We do not know the
+        /// system.partition_exports.committed_metadata_file. We do not know the
         /// original committer's paths from here.
         IStorage::ExportPartitionCommitInfo already_committed_info;
         already_committed_info.iceberg_metadata_file = "<committed in a previous run, paths unavailable>";
