@@ -236,8 +236,13 @@ BinPackPlan buildBinPackPlan(
 
     auto spec_fields = partition_spec->getArray(f_fields);
     std::vector<String> partition_columns;
+    std::vector<Int32> partition_source_ids;
     for (UInt32 i = 0; i < spec_fields->size(); ++i)
-        partition_columns.push_back(spec_fields->getObject(i)->getValue<String>(f_name));
+    {
+        auto spec_field = spec_fields->getObject(i);
+        partition_columns.push_back(spec_field->getValue<String>(f_name));
+        partition_source_ids.push_back(spec_field->getValue<Int32>(f_source_id));
+    }
     plan.partition_columns = partition_columns;
 
     /// Resolve partition types.
@@ -262,7 +267,13 @@ BinPackPlan buildBinPackPlan(
         persistent_table_components.schema_processor->addIcebergTableSchema(schemas->getObject(i), context);
 
     auto fields_characteristics = persistent_table_components.schema_processor->tryGetFieldsCharacteristics(
-        static_cast<Int32>(current_schema_id), {});
+        static_cast<Int32>(current_schema_id), partition_source_ids);
+    if (fields_characteristics.size() != partition_source_ids.size())
+        throw Exception(
+            ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "Schema {} does not contain all source columns of partition spec {}",
+            current_schema_id,
+            partition_spec_id);
     Block spec_sample_block;
     for (const auto & nt : fields_characteristics)
         spec_sample_block.insert(ColumnWithTypeAndName(nt.type, nt.name));
