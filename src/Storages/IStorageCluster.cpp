@@ -203,6 +203,12 @@ public:
     {
         auto node_type = node->getNodeType();
 
+        /// `SELECT 1 FROM dim` names a table and projects no column. Column collection misses it.
+        if (collect_columns_from_other_sources
+            && node != source
+            && (node_type == QueryTreeNodeType::TABLE || node_type == QueryTreeNodeType::TABLE_FUNCTION))
+            has_foreign_table = true;
+
         if (node_type != QueryTreeNodeType::COLUMN)
             return;
 
@@ -223,12 +229,14 @@ public:
     }
 
     const NamesAndTypes & getColumns() const { return columns; }
+    bool hasForeignTable() const { return has_foreign_table; }
 
 private:
     std::unordered_set<std::string> names;
     QueryTreeNodePtr source;
     NamesAndTypes columns;
     bool collect_columns_from_other_sources;
+    bool has_foreign_table = false;
 };
 
 bool astContainsSubquery(const ASTPtr & node)
@@ -982,7 +990,8 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
         // SELECT x FROM datalake.table WHERE x IN local.table.
         // Need to modify 'WHERE' on remote node if it contains columns from other sources
         // because remote node might not have those sources.
-        if (!collector_where.getColumns().empty())
+        // `WHERE x IN (SELECT 1 FROM local_table)` has no column from that table.
+        if (!collector_where.getColumns().empty() || collector_where.hasForeignTable())
             info.has_local_columns_in_where = true;
     }
 
