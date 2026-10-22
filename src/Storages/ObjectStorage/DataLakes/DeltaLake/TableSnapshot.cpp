@@ -1089,14 +1089,34 @@ void TableSnapshot::initOrUpdateClusteringColumns() const
     if (clustering_columns.has_value())
         return;
 
+    auto read_domain_metadata = [](const KernelSnapshotState & state)
+    {
+        return KernelUtils::unwrapResult(
+            ffi::get_domain_metadata_internal(
+                state.snapshot.get(),
+                KernelUtils::toDeltaString("delta.clustering"),
+                state.engine.get(),
+                KernelUtils::allocateString),
+            "get_domain_metadata_internal(delta.clustering)");
+    };
+
     auto state = getKernelSnapshotState();
-    auto result = KernelUtils::unwrapResult(
-        ffi::get_domain_metadata_internal(
-            state->snapshot.get(),
-            KernelUtils::toDeltaString("delta.clustering"),
-            state->engine.get(),
-            KernelUtils::allocateString),
-        "get_domain_metadata_internal(delta.clustering)");
+    const auto pre_fingerprint = kernel_state_credentials_fingerprint;
+    decltype(read_domain_metadata(*state)) result = nullptr;
+    try
+    {
+        result = read_domain_metadata(*state);
+    }
+    catch (const DB::Exception & e)
+    {
+        if (!tryRefreshAfterStaleTokenError(e, pre_fingerprint, "clustering metadata read"))
+            throw;
+        /// Invalidate the cached engine so `initOrUpdateSnapshot` rebuilds with the
+        /// freshened credentials, then re-read the domain metadata once.
+        kernel_snapshot_state.reset();
+        initOrUpdateSnapshot();
+        result = read_domain_metadata(*kernel_snapshot_state);
+    }
 
     if (!result)
     {
