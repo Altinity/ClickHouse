@@ -71,6 +71,9 @@ class Job:
         # List of commands to call upon job completion
         post_hooks: List[str] = field(default_factory=list)
 
+        # If True, runner.py restores the submodule cache from S3 before the job starts
+        needs_submodules: bool = False
+
         def parametrize(self, *param_sets: "Job.ParamSet"):
             res = []
             for param_set in param_sets:
