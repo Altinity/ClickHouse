@@ -805,7 +805,7 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
         String catalog_filename = resolver.resolveForCatalog(metadata_info.path);
 
         const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+        if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
             throw Exception(ErrorCodes::INCORRECT_DATA,
                 "Failed to commit Iceberg truncate update to catalog.");
     }
@@ -1057,7 +1057,7 @@ void IcebergMetadata::createInitial(
         /// validation, so a rejected CREATE leaves no trace in the catalog): a catalog
         /// that shares its storage view with the data (e.g. SeaweedFS) refuses to create
         /// a namespace over the plain directory those files would leave behind.
-        catalog->createNamespaceIfNotExists(namespace_name, namespace_location);
+        catalog->createNamespaceIfNotExists(namespace_name, namespace_location, local_context->getForwardedAuthToken());
     }
 
     if (!catalog_writes_metadata_file)
@@ -1113,7 +1113,9 @@ void IcebergMetadata::createInitial(
 
         /// Always ask for a conflict to be reported as `false`, so the files staged above are removed
         /// before `TABLE_ALREADY_EXISTS` is thrown, with or without `IF NOT EXISTS`.
-        if (!catalog->createTable(namespace_name, table_name, catalog_filename, metadata_content_object, compression_method, /* if_not_exists */ true))
+        if (!catalog->createTable(
+                namespace_name, table_name, catalog_filename, metadata_content_object, compression_method, /* if_not_exists */ true,
+                local_context->getForwardedAuthToken()))
         {
             if (!catalog_writes_metadata_file)
             {
@@ -2207,7 +2209,7 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
                     catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + catalog_filename;
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
                 {
                     cleanup(true);
                     return {};
