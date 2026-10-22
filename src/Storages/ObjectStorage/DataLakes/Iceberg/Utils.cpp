@@ -2203,7 +2203,7 @@ PartitionColumnValues getIdentityPartitionColumnValues(
             continue;
 
         const auto name_and_type
-            = schema_processor.tryGetFieldCharacteristics(manifest_file_entry.resolved_schema_id, partition_field.source_id);
+            = schema_processor.tryGetFieldCharacteristics(manifest_file_entry.resolved_schema_id, partition_field.source_ids[0]);
         if (!name_and_type.has_value())
             continue;
 

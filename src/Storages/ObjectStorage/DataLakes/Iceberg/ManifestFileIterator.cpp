@@ -284,7 +284,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
 
         auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
         auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
-        partition_spec_vec.emplace_back(PartitionSpecsEntry{std::move(source_ids), transform_name, partition_name});
+        partition_spec_vec.emplace_back(PartitionSpecsEntry{std::move(source_ids), transform_name, partition_name, static_cast<Int32>(i)});
 
         /// Multi-argument transforms (V3): we cannot evaluate the transform, so skip pruning for this field.
         /// Per the Iceberg V3 spec: "all v3 readers are required to read tables with unknown transforms,
@@ -300,28 +300,18 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
             = schema_processor.tryGetFieldCharacteristics(manifest_schema_id, source_id);
         if (!manifest_file_column_characteristics.has_value())
             continue;
-<<<<<<< HEAD
-        auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
-        auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
-        partition_spec_vec.emplace_back(source_id, transform_name, partition_name, static_cast<Int32>(i));
-=======
->>>>>>> 3a361c425a6b (Merge pull request #2318 from Altinity/iceberg-v3-multi-arg-transforms)
         auto partition_ast = getASTFromTransform(transform_name, numeric_column_name, context_->getSettingsRef()[Setting::iceberg_partition_timezone]);
         /// Unsupported partition key expression
         if (partition_ast == nullptr)
             continue;
 
         partition_key_ast->as<ASTFunction>()->arguments->children.emplace_back(std::move(partition_ast));
-<<<<<<< HEAD
         /// One source column may back several partition fields (e.g. hours(ts) and identity ts).
         /// The tuple key AST keeps one child per field, but getKeyFromAST resolves identifiers
         /// against these input columns, which must contain each source column at most once.
         if (partition_columns_seen.insert(numeric_column_name).second)
             partition_columns_description.emplace_back(numeric_column_name, removeNullable(manifest_file_column_characteristics->type));
-=======
-        partition_columns_description.emplace_back(numeric_column_name, removeNullable(manifest_file_column_characteristics->type));
         partition_key_spec_positions.push_back(i);
->>>>>>> 3a361c425a6b (Merge pull request #2318 from Altinity/iceberg-v3-multi-arg-transforms)
     }
 
     std::optional<DB::KeyDescription> partition_key_description;

@@ -409,26 +409,19 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
 
     if (partition_key_condition.has_value())
     {
-<<<<<<< HEAD
-        Row wrapped_partition_value = partition_value;
-        wrapIntegerPartitionValuesAsDateTime64(wrapped_partition_value, partition_key->data_types);
-
-        std::vector<FieldRef> index_value(wrapped_partition_value.begin(), wrapped_partition_value.end());
-=======
-        const auto & partition_value = entry->parsed_entry->partition_key_value;
-
         /// Project: the Avro tuple has one entry per spec field, but the key only contains the
         /// fields at the positions recorded in `partition_key_spec_positions`.  Pick exactly those.
-        std::vector<FieldRef> index_value;
-        index_value.reserve(partition_key_spec_positions.size());
+        Row wrapped_partition_value;
+        wrapped_partition_value.reserve(partition_key_spec_positions.size());
         for (size_t pos : partition_key_spec_positions)
         {
             if (pos >= partition_value.size())
                 return PruningReturnStatus::NOT_PRUNED; /// fail closed — cannot prune without the value
-            index_value.push_back(FieldRef(partition_value[pos]));
+            wrapped_partition_value.push_back(partition_value[pos]);
         }
+        wrapIntegerPartitionValuesAsDateTime64(wrapped_partition_value, partition_key->data_types);
 
->>>>>>> 3a361c425a6b (Merge pull request #2318 from Altinity/iceberg-v3-multi-arg-transforms)
+        std::vector<FieldRef> index_value(wrapped_partition_value.begin(), wrapped_partition_value.end());
         for (size_t i = 0; i < index_value.size(); ++i)
         {
             auto & field = index_value[i];
@@ -469,7 +462,7 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         {
             for (const auto & partition_field : *entry->common_partition_specification)
             {
-                if (partition_field.source_id != column_id || partition_field.tuple_index < 0
+                if (partition_field.isMultiArg() || partition_field.source_ids[0] != column_id || partition_field.tuple_index < 0
                     || static_cast<size_t>(partition_field.tuple_index) >= partition_value.size())
                     continue;
 

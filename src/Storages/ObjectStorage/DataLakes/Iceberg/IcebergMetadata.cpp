@@ -2072,12 +2072,7 @@ KeyDescription IcebergMetadata::getSortingKey(ContextPtr local_context, TableSta
         persistent_components.table_uuid);
 
     auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
-<<<<<<< HEAD
     auto result = getSortingKeyDescriptionFromMetadata(metadata_object, *persistent_components.schema_processor->getClickHouseTableSchemaById(current_schema_id), local_context);
-    auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
-    result.sort_order_id = sort_order_id;
-=======
-    auto result = getSortingKeyDescriptionFromMetadata(metadata_object, *persistent_components.schema_processor->getClickhouseTableSchemaById(current_schema_id), local_context);
     /// Only attach the sort-order id when the parsed key is non-empty.  When multi-arg or
     /// unsupported transforms truncate the key to empty, pairing a stale sort_order_id with
     /// an empty key would let `isDataSortedBySortingKey` incorrectly claim data is sorted.
@@ -2086,7 +2081,6 @@ KeyDescription IcebergMetadata::getSortingKey(ContextPtr local_context, TableSta
         auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
         result.sort_order_id = sort_order_id;
     }
->>>>>>> 3a361c425a6b (Merge pull request #2318 from Altinity/iceberg-v3-multi-arg-transforms)
     return result;
 }
 
