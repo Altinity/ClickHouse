@@ -2,6 +2,7 @@
 # Tags: no-fasttest
 
 # Many row groups, bloom filters flushed as one block. A selective WHERE must not issue one read per row group.
+# Dictionary-filter pushdown is off: a dictionary-eligible bloom body is a fallback and stays out of this read.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -36,6 +37,7 @@ read_stats()
             input_format_parquet_bloom_filter_push_down = 1,
             input_format_parquet_page_filter_push_down = 0,
             input_format_parquet_use_offset_index = 0,
+            input_format_parquet_dictionary_filter_push_down = 0,
             input_format_parquet_local_file_min_bytes_for_seek = ${min_seek},
             input_format_parquet_bloom_filter_coalesce_max_bytes = ${coalesce_max}
     " 2>&1 | awk '

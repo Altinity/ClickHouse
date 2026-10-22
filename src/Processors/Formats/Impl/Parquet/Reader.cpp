@@ -1156,9 +1156,14 @@ void Reader::initializePrefetches()
                     size_t len = size_t(column.meta->meta_data.bloom_filter_length);
                     max_header_length = std::min(max_header_length, len);
                     column.bloom_filter_data_bytes = len;
+                    /// The body is only a fallback when the dictionary filter can still rule the chunk out.
+                    /// Leave it out of the bloom coalesce group: the header is read first and would
+                    /// otherwise download the body before that filter is tried. A whole-file read still
+                    /// assigns every range to the group.
+                    const uint8_t bloom_data_group = column.use_dictionary_filter ? uint8_t{0} : bloom_group;
                     column.bloom_filter_data_prefetch = prefetcher.registerRange(
                         size_t(column.meta->meta_data.bloom_filter_offset),
-                        len, /*likely_to_be_used=*/ false, bloom_group);
+                        len, /*likely_to_be_used=*/ false, bloom_data_group);
                 }
                 /// bloom_filter_header_prefetch and bloom_filter_data_prefetch overlap, that's ok.
                 column.use_bloom_filter = true;
@@ -1242,8 +1247,10 @@ void Reader::initializePrefetches()
                 size_t end = it == all_offsets.end() ? prefetcher.getFileSize() : *it;
 
                 column.bloom_filter_data_bytes = end - offset;
+                /// Same group rule as the length-known path above.
+                const uint8_t bloom_data_group = column.use_dictionary_filter ? uint8_t{0} : bloom_group;
                 column.bloom_filter_data_prefetch = prefetcher.registerRange(
-                    offset, end - offset, /*likely_to_be_used=*/ false, bloom_group);
+                    offset, end - offset, /*likely_to_be_used=*/ false, bloom_data_group);
             }
         }
     }
