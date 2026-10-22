@@ -14,13 +14,20 @@
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeIndicesSerialization.h>
+#include <Common/FailPoint.h>
 #include <Common/logger_useful.h>
 
 namespace DB
 {
 
+namespace FailPoints
+{
+    extern const char part_storage_fail_commit_transaction[];
+}
+
 namespace ErrorCodes
 {
+    extern const int FAULT_INJECTED;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int NOT_INITIALIZED;
@@ -544,6 +551,11 @@ void DataPartStorageOnDiskPacked::commitTransaction()
 
     if (has_shared_transaction)
         return;
+
+    fiu_do_on(FailPoints::part_storage_fail_commit_transaction,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "part_storage_fail_commit_transaction");
+    });
 
     transaction->commit();
 
