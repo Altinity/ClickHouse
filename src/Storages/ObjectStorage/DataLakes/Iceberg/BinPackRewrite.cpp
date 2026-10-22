@@ -649,14 +649,14 @@ LatestMetadata readLatestMetadata(
             /* force_fetch_latest_metadata */ true,
             /* ignore_explicit_metadata_file_path */ false);
 
-        auto metadata_object = getMetadataJSONObject(
+        auto metadata_object = deepCopy(getMetadataJSONObject(
             catalog_metadata.path,
             object_storage,
             persistent_table_components.metadata_cache,
             context,
             log,
             catalog_metadata.compression_method,
-            persistent_table_components.table_uuid);
+            persistent_table_components.table_uuid));
 
         /// The new metadata file must not reuse the name of a newer file left in the directory.
         const auto max_directory_version = getMaxMetadataFileVersionInDirectory(object_storage, persistent_table_components.table_path);
@@ -677,14 +677,14 @@ LatestMetadata readLatestMetadata(
         /* force_fetch_latest_metadata */ true,
         /* ignore_explicit_metadata_file_path */ true);
 
-    auto metadata_object = getMetadataJSONObject(
+    auto metadata_object = deepCopy(getMetadataJSONObject(
         metadata_file_path,
         object_storage,
         persistent_table_components.metadata_cache,
         context,
         log,
         persistent_table_components.metadata_compression_method,
-        persistent_table_components.table_uuid);
+        persistent_table_components.table_uuid));
 
     return {metadata_version, metadata_object, {}};
 }
