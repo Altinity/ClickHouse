@@ -27,6 +27,7 @@
 #include <Poco/String.h>
 #include <Common/FieldVisitorDump.h>
 #include <Common/Logger.h>
+#include <boost/container_hash/hash.hpp>
 
 #if USE_AVRO
 
@@ -122,7 +123,7 @@ struct PartitionKeyHash
         size_t result = 0;
         FieldVisitorDump dump_visitor;
         for (const auto & value : row)
-            result ^= hasher(applyVisitor(dump_visitor, value));
+            boost::hash_combine(result, hasher(applyVisitor(dump_visitor, value)));
         return result;
     }
 };
