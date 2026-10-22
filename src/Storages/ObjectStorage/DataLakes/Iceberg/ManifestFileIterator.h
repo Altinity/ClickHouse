@@ -101,8 +101,8 @@ public:
 
     bool hasPartitionKey() const;
     const DB::KeyDescription & getPartitionKeyDescription() const;
-    /// Fields with rows count in manifest files are optional
-    /// they can be absent.
+    /// Sums required per-file `record_count` for live entries of the given content type.
+    /// Returns nullopt on negative `record_count` or Int64 overflow (fail closed).
     std::optional<Int64> getRowsCountInAllFilesExcludingDeleted(FileContentType content) const;
     std::optional<Int64> getBytesCountInAllDataFilesExcludingDeleted() const;
 
@@ -160,6 +160,7 @@ private:
     std::atomic<size_t> current_row_index{0};
     std::atomic<bool> fully_initialized{false};
     std::atomic<size_t> active_fetchers{0};
+    std::atomic<bool> logged_missing_snapshot_metadata{false};
 
     /// Cached results accumulated during iteration
     mutable SharedMutex files_mutex;

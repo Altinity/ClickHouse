@@ -38,6 +38,7 @@
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/ColumnNode.h>
 #include <Analyzer/FunctionNode.h>
+#include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/UnionNode.h>
 #include <Analyzer/TableNode.h>
@@ -274,6 +275,50 @@ void deduplicateProjectionAliasesRecursive(const ASTPtr & ast)
         deduplicateProjectionAliasesRecursive(child);
 }
 
+class NormalizeAliasMarkerVisitor : public InDepthQueryTreeVisitor<NormalizeAliasMarkerVisitor>
+{
+public:
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        auto * function_node = node->as<FunctionNode>();
+        if (!function_node || function_node->getFunctionName() != "__aliasMarker")
+            return;
+
+        auto & arguments = function_node->getArguments().getNodes();
+        if (arguments.size() != 2)
+            return;
+
+        while (true)
+        {
+            auto * inner_function = arguments.front()->as<FunctionNode>();
+            if (!inner_function || inner_function->getFunctionName() != "__aliasMarker")
+                break;
+
+            auto & inner_arguments = inner_function->getArguments().getNodes();
+            if (inner_arguments.size() != 2)
+                break;
+
+            arguments.front() = inner_arguments.front();
+        }
+    }
+
+    bool needChildVisit(QueryTreeNodePtr & parent, QueryTreeNodePtr & child)
+    {
+        auto * parent_function = parent->as<FunctionNode>();
+        if (parent_function && parent_function->getFunctionName() == "__aliasMarker")
+            return false;
+
+        auto child_node_type = child->getNodeType();
+        return !(child_node_type == QueryTreeNodeType::QUERY || child_node_type == QueryTreeNodeType::UNION);
+    }
+};
+
+void normalizeAliasMarkersInQueryTree(QueryTreeNodePtr & node)
+{
+    NormalizeAliasMarkerVisitor visitor;
+    visitor.visit(node);
+}
+
 }
 
 ASTPtr queryNodeToDistributedSelectQuery(const QueryTreeNodePtr & query_node)
@@ -282,7 +327,9 @@ ASTPtr queryNodeToDistributedSelectQuery(const QueryTreeNodePtr & query_node)
     /// Now, if cte_name is set for subquery node, AST -> String serialization will only print cte name.
     /// But CTE is defined only for top-level query part, so may not be sent.
     /// Removing cte_name forces subquery to be always printed.
-    auto ast = queryNodeToSelectQuery(query_node, /*set_subquery_cte_name=*/false);
+    auto query_node_to_convert = query_node->clone();
+    normalizeAliasMarkersInQueryTree(query_node_to_convert);
+    auto ast = queryNodeToSelectQuery(query_node_to_convert, /*set_subquery_cte_name=*/false);
 
     deduplicateProjectionAliasesRecursive(ast);
 
@@ -620,6 +667,29 @@ NameSet checkAccessRights(
     return {};
 }
 
+NameSet collectReferencedColumnNames(const QueryTreeNodePtr & node, const QueryTreeNodePtr & table_expression)
+{
+    NameSet column_names;
+    traverseQueryTree(
+        node,
+        [](const QueryTreeNodePtr & parent, const QueryTreeNodePtr &)
+        {
+            /// Don't go inside an ALIAS column expression: a grant on the alias name is sufficient.
+            const auto * column_node = parent->as<ColumnNode>();
+            if (!column_node || !column_node->hasExpression())
+                return true;
+            const auto & column_source = column_node->getColumnSourceOrNull();
+            return !(column_source && column_source->getNodeType() == QueryTreeNodeType::TABLE);
+        },
+        [&](const QueryTreeNodePtr & current)
+        {
+            const auto * column_node = current->as<ColumnNode>();
+            if (column_node && column_node->getColumnSourceOrNull().get() == table_expression.get())
+                column_names.insert(column_node->getColumnName());
+        });
+    return column_names;
+}
+
 static void checkAccessRightsForFilter(const QueryTreeNodePtr & filter_query_tree,
     const QueryTreeNodePtr & table_expression,
     const ContextPtr & query_context)
@@ -650,24 +720,7 @@ static void checkAccessRightsForFilter(const QueryTreeNodePtr & filter_query_tre
         return;
     }
 
-    NameSet column_names;
-    traverseQueryTree(
-        filter_query_tree,
-        [](const QueryTreeNodePtr & parent, const QueryTreeNodePtr &)
-        {
-            /// Don't go inside an ALIAS column expression: a grant on the alias name is sufficient.
-            const auto * column_node = parent->as<ColumnNode>();
-            if (!column_node || !column_node->hasExpression())
-                return true;
-            const auto & column_source = column_node->getColumnSourceOrNull();
-            return !(column_source && column_source->getNodeType() == QueryTreeNodeType::TABLE);
-        },
-        [&](const QueryTreeNodePtr & node)
-        {
-            const auto * column_node = node->as<ColumnNode>();
-            if (column_node && column_node->getColumnSourceOrNull().get() == table_expression.get())
-                column_names.insert(column_node->getColumnName());
-        });
+    NameSet column_names = collectReferencedColumnNames(filter_query_tree, table_expression);
     if (column_names.empty())
         return;
 

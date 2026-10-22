@@ -20,6 +20,7 @@
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 #include <Storages/MergeTree/MergeTreeMutationStatus.h>
 #include <Storages/MergeTree/MergeList.h>
+#include <Storages/MergeTree/ExportList.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/SharedPartColumns.h>
 #include <Storages/MergeTree/MergeTreeDataPartBuilder.h>
@@ -41,6 +42,9 @@
 #include <Common/ThreadPool_fwd.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
 #include <Storages/MergeTree/PatchParts/PatchPartIndex.h>
+#include <Storages/MergeTree/MergeTreePartExportStatus.h>
+#include <Storages/MergeTree/MergeTreePartExportManifest.h>
+#include <Storages/MergeTree/PartitionExportInfo.h>
 
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/ordered_index.hpp>
@@ -622,7 +626,8 @@ public:
         virtual MutationCommands getOnFlyMutationCommandsForPart(const DataPartPtr & part) const = 0;
         virtual PatchParts getPatchesForPart(const DataPartPtr & part) const = 0;
         virtual std::shared_ptr<IMutationsSnapshot> cloneEmpty() const = 0;
-        virtual NameSet getAllUpdatedColumns() const = 0;
+        /// Columns changed on the fly by patches, data mutations and alter mutations of the whole snapshot.
+        virtual NameSet getColumnsChangedOnFly() const = 0;
 
         virtual bool hasPatchParts() const = 0;
         virtual bool hasDataMutations() const = 0;
@@ -654,6 +659,8 @@ public:
     protected:
         NameSet getColumnsUpdatedInPatches() const;
         void addSupportedCommands(const MutationCommands & commands, UInt64 mutation_version, MutationCommands & result_commands) const;
+        /// Adds the columns changed by the commands that are applied on the fly in this snapshot.
+        void addColumnsChangedOnFly(const MutationCommands & commands, NameSet & result) const;
     };
 
     using MutationsSnapshotPtr = std::shared_ptr<const IMutationsSnapshot>;
@@ -1131,6 +1138,37 @@ public:
     /// Moves partition to specified Table
     void movePartitionToTable(const PartitionCommand & command, ContextPtr query_context);
 
+    void exportPartToTable(const PartitionCommand & command, ContextPtr query_context);
+
+    void exportPartToTable(
+        const std::string & part_name,
+        const StoragePtr & destination_storage,
+        const String & transaction_id,
+        ContextPtr query_context,
+        const std::optional<String> & iceberg_metadata_json = std::nullopt,
+        bool allow_outdated_parts = false,
+        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {});
+
+    void exportPartToTable(
+        const std::string & part_name,
+        const StorageID & destination_storage_id,
+        const String & transaction_id,
+        ContextPtr query_context,
+        const std::optional<String> & iceberg_metadata_json = std::nullopt,
+        bool allow_outdated_parts = false,
+        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {});
+
+    void killExportPart(const String & transaction_id);
+
+    virtual void exportPartitionToTable(const PartitionCommand &, ContextPtr)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXPORT PARTITION is not implemented for engine {}", getName());
+    }
+
+    /// Snapshot of this table's partition-export tasks for `system.partition_exports`, taken from
+    /// an in-memory mirror: no disk or ZooKeeper I/O, so it is safe to call from query threads.
+    virtual std::vector<PartitionExportInfo> getPartitionExportsInfo() const { return {}; }
+
     /// Checks that Partition could be dropped right now
     /// Otherwise - throws an exception with detailed information.
     /// We do not use mutex because it is not very important that the size could change during the operation.
@@ -1224,6 +1262,7 @@ public:
         const WriteSettings & write_settings);
 
     virtual std::vector<MergeTreeMutationStatus> getMutationsStatus() const = 0;
+    std::vector<MergeTreeExportStatus> getExportsStatus() const;
 
     /// Returns true if table can create new parts with adaptive granularity
     /// Has additional constraint in replicated version
@@ -1328,6 +1367,11 @@ public:
         , const EnabledMaskingPoliciesPtr & enabled_masking_policies
 #endif
         );
+
+#if CLICKHOUSE_CLOUD
+    /// Commands that apply the enabled masking policies on the fly.
+    static MutationCommands getMaskingPolicyCommands(const StorageID & storage_id, const EnabledMaskingPoliciesPtr & enabled_masking_policies);
+#endif
 
     /// Returns destination disk or volume for the TTL rule according to current storage policy.
     SpacePtr getDestinationForMoveTTL(const TTLDescription & move_ttl) const;
@@ -1445,6 +1489,10 @@ public:
 
     /// Used for streaming queries registration.
     mutable StreamSubscriptionManager subscription_manager;
+
+    mutable std::mutex export_manifests_mutex;
+
+    std::set<MergeTreePartExportManifest> export_manifests;
 
     PinnedPartUUIDsPtr getPinnedPartUUIDs() const;
 
@@ -1565,6 +1613,7 @@ protected:
     friend class VersionMetadataOnKeeper; // for access to log
     friend class MutationsState; // for access to log
     friend class UniqueKeyDenseIndexOps; // for access to log + data_parts_by_info
+    friend class ExportPartTask;
 
     bool require_part_metadata;
 
@@ -1634,6 +1683,8 @@ public:
     size_t getColumnsDescriptionsCacheSize() const;
 
 protected:
+    void startBackgroundMoves();
+
     /// Engine-specific methods
     BrokenPartCallback broken_part_callback;
 
@@ -1925,7 +1976,8 @@ protected:
         const MergeListEntry * merge_entry,
         std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters,
         const Strings & mutation_ids,
-        const std::map<String, UInt64> & projections_duration_ms);
+        const std::map<String, UInt64> & projections_duration_ms,
+        const ExportsListEntry * exports_entry = nullptr);
 
     /// If part is assigned to merge or mutation (possibly replicated)
     /// Should be overridden by children, because they can have different
@@ -2078,6 +2130,8 @@ protected:
     std::mutex refresh_parts_mutex;
 
     BackgroundSchedulePoolTaskHolder refresh_stats_task;
+    /// Set before `refresh_stats_task` is deactivated, so that a running `refreshStatistics` returns between parts.
+    std::atomic_bool refresh_stats_cancelled = false;
 
     mutable std::mutex stats_mutex;
     ConditionSelectivityEstimatorPtr cached_estimator;
@@ -2155,8 +2209,6 @@ private:
     CurrentlyMovingPartsTaggerPtr checkPartsForMove(const DataPartsVector & parts, SpacePtr space);
 
     bool canUsePolymorphicParts(const MergeTreeSettings & settings, String & out_reason) const;
-
-    virtual void startBackgroundMovesIfNeeded() = 0;
 
     bool allow_nullable_key = false;
 

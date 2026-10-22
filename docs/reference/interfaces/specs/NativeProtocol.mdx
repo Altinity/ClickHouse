@@ -84,6 +84,29 @@ SSH challenge-response authentication is available from protocol version 54466 o
 
 For distributed query execution, servers authenticate to one another by proving knowledge of a shared secret — without putting the secret on the wire. Each Query carries a 32-byte SHA-256 `auth_hash` in [`Query`](#query) field 4, computed over a salt, nonce, the configured secret, and the query, which the receiving server recomputes and compares. This is gated by the `INTERSERVER_SECRET` feature (v54441). External clients always send an empty string here. See [Inter-server authentication](#inter-server-authentication).
 
+### Receiver-side size limits {#receiver-side-size-limits}
+
+Almost every string and collection on the wire is length-prefixed, and a receiver may allocate for the declared size before the data behind it arrives. A peer therefore has to bound what it accepts by what the data can plausibly hold — in inter-server mode the server reads `ClientInfo`, the settings and the externally granted roles of a query *before* it verifies the query's `auth_hash`, so these limits apply to unauthenticated input.
+
+The limits the ClickHouse server and `clickhouse-client` enforce, and which an implementation should expect to be rejected against, are:
+
+| Field | Limit |
+|-------|-------|
+| Each `String` of [`ClientHello`](#clienthello) — user, password, database, client name — and the query id of a [`Query`](#query) | 64 KiB |
+| Each `String` of [`ClientInfo`](#clientinfo) — user, query id, host and client names, quota key, user agent, referer, URL, tracestate, JWT | 1 GiB — the generic bound, but read as the bytes arrive rather than allocated up front; `ClientInfo` is forwarded from the other interfaces, whose values can be longer, and persisted in async `Distributed` insert queue files |
+| Number of current roles in [`ClientInfo`](#clientinfo), and the name of each | 65536 entries, 64 KiB each |
+| Number of [`Setting`](#setting) entries and of [`Parameter`](#parameter) entries in a [`Query`](#query) | 65536 each |
+| The name of each [`Setting`](#setting) and of each [`Parameter`](#parameter) | 64 KiB |
+| The value of a [`Setting`](#setting) or a [`Parameter`](#parameter), and the query text | 1 GiB — the generic bound; a parameter is query-sized data, and the query text itself has to be read at this bound before the `auth_hash` covering it can be checked |
+| The serialized externally granted roles of a [`Query`](#query) | 1 MiB in total, 65536 role names, 64 KiB each |
+| Number of tables in a `TablesStatusRequest` / `TablesStatusResponse`, and the length of each database and table name | 100000 tables, 64 KiB per identifier |
+| Number of UUIDs in a `PartUUIDs` packet (client-side) | 1000000 |
+| Number of `out_of_order_buckets` in the block info of a [`Data`](#data) block | 256 — the number of two-level aggregation buckets |
+| Number of `password_complexity_rules` in [`ServerHello`](#serverhello) | see the [note there](#serverhello) |
+| Any other `String` or collection without a dedicated limit | 1 GiB |
+
+Exceeding a limit is answered with an [`Exception`](#exception) carrying `TOO_LARGE_ARRAY_SIZE` (128) or `TOO_LARGE_STRING_SIZE` (131). The values above are what the current server enforces; they are not negotiated, and a client should not rely on the server accepting anything close to them.
+
 ## Versioning and feature gates {#versioning-and-feature-gates}
 
 ### Version negotiation {#version-negotiation}
@@ -144,9 +167,9 @@ When a feature is active, its fields **must** be present on the wire. The protoc
 | SERVER_SETTINGS                 | 54474   | ServerHello            | Server broadcasts its non-default settings as a list at the tail of ServerHello, after `nonce`. Format: `(key, flags, value)` triples terminated by an empty key — same as the Query packet's settings list. |
 | QUERY_AND_LINE_NUMBERS          | 54475   | ClientInfo             | Adds `script_query_number` (VarUInt) and `script_line_number` (VarUInt) at the tail of ClientInfo. Used by clickhouse-client for multi-statement script error attribution; external clients send `0, 0`. |
 | JWT_IN_INTERSERVER              | 54476   | ClientInfo             | Adds a JWT-presence UInt8 + optional `String jwt` at the tail of ClientInfo. External clients (no JWT) send byte `0x00`. (Spelled `DBMS_MIN_REVISON_WITH_JWT_IN_INTERSERVER` in C++ — note the typo in the constant name.) |
-| QUERY_PLAN_SERIALIZATION        | 54477   | ServerHello, QueryPlan packet | ServerHello appends `VarUInt query_plan_serialization_version` after server settings. Also introduces `ClientPacket::QueryPlan` (code `13`) for inter-server delivery of pre-built query plans — external clients never send. |
+| QUERY_PLAN_SERIALIZATION        | 54477   | ServerHello, QueryPlan packet | ServerHello appends `VarUInt query_plan_serialization_version` after server settings. Also introduces `ClientPacket::QueryPlan` (code `13`) for inter-server delivery of pre-built query plans — external clients never send. Query-plan serialization version `10` prefixes the serialized plan with `VarUInt max_threads` and `Bool concurrency_control`; when either is non-default, initiators use SQL shipping for peers below version `10` so the peer builds its plan from the transmitted query settings. |
 | PARALLEL_BLOCK_MARSHALLING      | 54478   | Block (Column)         | Server may wrap columns in `ColumnBLOB` (compressed inline) for parallel processing. Gated on the query having compression enabled AND `rows > 1`; otherwise the regular column wire format applies. Clients that never enable compression on outgoing Query packets see no wire change. |
-| VERSIONED_CLUSTER_FUNCTION_PROTOCOL | 54479 | ServerHello           | Adds `VarUInt cluster_function_protocol_version` at the tail of ServerHello. Used for `*Cluster` table functions (`s3Cluster`, etc.). Current value: `8` (`DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION`); version `7` is reserved for a private-repository feature (Iceberg compaction), and `8` adds an optional `read_source_index` to the inter-server cluster read-task payload (the `ReadTaskResponse` body, which stays unspecified here — see below). External clients decode and ignore. |
+| VERSIONED_CLUSTER_FUNCTION_PROTOCOL | 54479 | ServerHello           | Adds `VarUInt cluster_function_protocol_version` at the tail of ServerHello. Used for `*Cluster` table functions (`s3Cluster`, etc.). Current value: `9` (`DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION`); version `7` is reserved for a private-repository feature (Iceberg compaction), `8` adds an optional `read_source_index` to the inter-server cluster read-task payload (the `ReadTaskResponse` body, which stays unspecified here — see below), and `9` adds Iceberg identity partition columns. External clients decode and ignore. |
 | OUT_OF_ORDER_BUCKETS_IN_AGGREGATION | 54480 | BlockInfo              | Adds field 3 (`out_of_order_buckets: Vec<Int32>`) to BlockInfo's field-tagged stream. Decoded as `[VarUInt count][Int32]*count`. External clients don't emit this themselves; the decoder reads any non-empty list the server sends. |
 | COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS | 54481 | Log, ProfileEvents, TableColumns | Server may wrap [`Log`](#log), [`ProfileEvents`](#profileevents), and [`TableColumns`](#tablecolumns) packet bodies in the [compression frame](/reference/interfaces/specs/NativeFormat#compression-frame). At this version all three bodies travel through the same optionally-compressed output path, which becomes a real compression frame only when the query has `compression = true`. Clients that never enable compression on outgoing Query packets see no wire change. |
 | REPLICATED_SERIALIZATION        | 54482   | Block (Column)         | Server may emit columns with kind_stack `0x04 = REPLICATED` — a dictionary-style compact form for repeated values — see [kind_stack and sparse encoding](/reference/interfaces/specs/NativeFormat#kind-stack-and-sparse-encoding). Below this version the writer expanded such columns before sending. Decoded via index lookup (`elements[indexes[i]]` per row); leaf types plus `Nullable`/`Array`/`Tuple`/`Map`/`Nested`/`LowCardinality` inners supported. |
@@ -435,7 +458,7 @@ Client → Server. The first message after the TCP connection opens.
 
 | # | Field            | Type    | Role      | Description |
 |---|------------------|---------|-----------|-------------|
-| 1 | client_name      | String  | universal | Client identifier (e.g., `"clickhouse-client"`) |
+| 1 | client_name      | String  | universal | Client identifier (e.g., `"clickhouse-client"`). An Altinity Antalya build appends `" (antalya:N)"`, where `N` is its Antalya protocol version. See [Antalya protocol version](/antalya/protocol). |
 | 2 | version_major    | VarUInt | universal | Client major version |
 | 3 | version_minor    | VarUInt | universal | Client minor version |
 | 4 | protocol_version | VarUInt | universal | Client's max supported protocol version |
@@ -449,7 +472,7 @@ Server → Client. The reply to ClientHello on successful authentication.
 
 | # | Field            | Type    | Role      | Condition              | Description |
 |---|------------------|---------|-----------|------------------------|-------------|
-| 1 | server_name      | String  | universal | always                 | Server identifier |
+| 1 | server_name      | String  | universal | always                 | Server identifier. An Altinity Antalya build appends `" (antalya:N)"`, where `N` is its Antalya protocol version; a client may ignore or strip the suffix. See [Antalya protocol version](/antalya/protocol). |
 | 2 | version_major    | VarUInt | universal | always                 | Server major version |
 | 3 | version_minor    | VarUInt | universal | always                 | Server minor version |
 | 4 | protocol_version | VarUInt | universal | always                 | Server's protocol version |
@@ -463,7 +486,7 @@ Server → Client. The reply to ClientHello on successful authentication.
 | 11 | nonce            | UInt64  | inter-server | INTERSERVER_SECRET_V2 (v54462) | 8-byte LE random nonce. The server's inter-server query-signing scheme uses it. External clients MUST decode it (to keep the stream aligned) and SHOULD ignore the value. |
 | 12 | server_settings  | Setting[] | universal | SERVER_SETTINGS (v54474)        | Server's non-default settings broadcast. Format: zero or more `(String key, VarUInt flags, String value)` triples, terminated by an empty key. Same as the [Query packet's settings list](#setting). |
 | 13 | query_plan_serialization_version | VarUInt | universal | QUERY_PLAN_SERIALIZATION (v54477) | Server's supported query-plan serialization version. External clients decode and ignore. |
-| 14 | cluster_function_protocol_version | VarUInt | universal | VERSIONED_CLUSTER_FUNCTION_PROTOCOL (v54479) | Server's `*Cluster` table-function protocol version. Current: `8`. The value gates additive fields in the inter-server cluster read-task payload (the otherwise-unspecified `ReadTaskResponse` body); version `7` is reserved for a private-repository feature (Iceberg compaction), and `8` adds an optional `read_source_index`. External clients do not participate in cluster reads — they decode and ignore this field. |
+| 14 | cluster_function_protocol_version | VarUInt | universal | VERSIONED_CLUSTER_FUNCTION_PROTOCOL (v54479) | Server's `*Cluster` table-function protocol version. Current: `9`. The value gates additive fields in the inter-server cluster read-task payload (the otherwise-unspecified `ReadTaskResponse` body); version `7` is reserved for a private-repository feature (Iceberg compaction), `8` adds an optional `read_source_index`, and `9` adds Iceberg identity partition columns. External clients do not participate in cluster reads — they decode and ignore this field. |
 
 **Rule** — an element of `password_complexity_rules`:
 
@@ -904,11 +927,11 @@ Below version `8` the announcement is fire-and-forget regardless of mode, and th
 | 6    | KeepAlive                 | not specified       | Connection keepalive |
 | 7    | Scalar                    | not specified       | Scalar data block |
 | 8    | IgnoredPartUUIDs          | not specified       | Parts to exclude from query |
-| 9    | ReadTaskResponse          | not specified       | S3 cluster read response |
+| 9    | ReadTaskResponse          | not specified       | S3 cluster read response. When both peers negotiated [Antalya protocol](/antalya/protocol) version 3 or newer, the initiator appends optional Iceberg column statistics and then optional `retry_after_us` for `lock_object_storage_task_distribution_ms` after the upstream payload. If any worker negotiated a lower Antalya version, `retry_after_us` is omitted and that setting is ignored for the query. |
 | 10   | MergeTreeReadTaskResponse | not specified       | Parallel read task response |
 | 11   | SSHChallengeRequest       | [SSH auth](#ssh-authentication) | SSH auth challenge request |
 | 12   | SSHChallengeResponse      | [SSH auth](#ssh-authentication) | SSH auth challenge response |
-| 13   | QueryPlan                 | not specified       | Query plan |
+| 13   | QueryPlan                 | [QueryPlan](#queryplan) | Query plan |
 | 14   | MergeTreeAllRangesAnnouncementResponse | [MergeTreeAllRangesAnnouncementResponse](#mergetreeallrangesannouncementresponse) | Initiator's reply to a follower's [`MergeTreeAllRangesAnnouncement`](#packet-type-reference) (gated on `parallel_replicas_protocol_version ≥ 8` — see [VERSIONED_PARALLEL_REPLICAS_PROTOCOL](#feature-table)). Inter-server only — external clients never send. |
 
 ### Server → Client {#server-to-client}
@@ -934,6 +957,19 @@ Below version `8` the announcement is fire-and-forget regardless of mode, and th
 | 16   | MergeTreeReadTaskRequest       | not specified       | Parallel read task assignment |
 | 17   | TimezoneUpdate                 | [TimezoneUpdate](#timezoneupdate) | Server timezone update |
 | 18   | SSHChallenge                   | [SSH auth](#ssh-authentication) | SSH auth challenge |
+
+### QueryPlan {#queryplan}
+
+`QueryPlan` is an inter-server-only client packet. It follows a [`Query`](#query) whose `stage` is `QueryPlan` (`7`) and contains one serialized plan stream.
+
+| # | Field | Type | Gate | Description |
+|---|---|---|---|---|
+| 1 | serialization_version | VarUInt | universal | Query-plan serialization version, no greater than the receiver's `query_plan_serialization_version` advertised in `ServerHello`. |
+| 2 | max_threads | VarUInt | serialization version ≥ `10` | Plan-level thread limit. `0` means no plan-specific limit. |
+| 3 | concurrency_control | Bool | serialization version ≥ `10` | Whether the plan participates in concurrency control. |
+| 4 | plan | versioned query-plan stream | universal | Serialized plan tree, step settings, headers, and prepared sets. Its internal layout is owned by the query-plan serialization version. |
+
+Before version `10`, fields 2 and 3 are absent. An initiator with either non-default execution limit must not send that older layout: it ships the original SQL query instead, so the older receiver reconstructs the limits from the query settings.
 
 ## Configuration {#configuration}
 

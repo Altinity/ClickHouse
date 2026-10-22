@@ -309,13 +309,23 @@ void ClientInfo::write(WriteBuffer & out, UInt64 server_protocol_revision, bool 
 
     if (server_protocol_revision >= DBMS_MIN_REVISON_WITH_JWT_IN_INTERSERVER)
     {
-        if (!jwt.empty())
-        {
-            writeBinary(static_cast<UInt8>(1), out);
-            writeBinary(jwt, out);
-        }
-        else
-            writeBinary(static_cast<UInt8>(0), out);
+        /// Never serialize the bearer token over the interserver wire.
+        ///
+        /// Distributed queries use this `ClientInfo` to fan out to remote shards
+        /// and replicas. Interserver transport is plaintext by default
+        /// (`interserver_http_port` vs `interserver_https_port`), so writing the
+        /// raw JWT here exposes session credentials on the internal network for
+        /// every distributed query whenever the operator hasn't opted into TLS
+        /// for interserver -- and no code on the receiving side currently reads
+        /// `client_info.jwt`, so the transmission is pure leakage with no
+        /// functional benefit.
+        ///
+        /// The protocol-revision byte is still emitted (always `0` = "no JWT")
+        /// to preserve wire compatibility with peers that expect this field at
+        /// this offset; receivers will read it as "no JWT present" and skip
+        /// the body. The `jwt` member of `ClientInfo` is retained for any
+        /// in-process use within the same node.
+        writeBinary(static_cast<UInt8>(0), out);
     }
 
     /// Sent for all interfaces (not only TCP): the detected client agent must also be preserved
@@ -341,6 +351,18 @@ void ClientInfo::write(WriteBuffer & out, UInt64 server_protocol_revision, bool 
 }
 
 
+/** The strings of `ClientInfo` come from the peer, and in interserver mode `ClientInfo` is read before
+  * the secret hash of the query is checked, so they are read growing as the bytes arrive instead of
+  * being resized to the declared size first: a declared size does not become an allocation on its
+  * own. Their size keeps the generic bound, because `ClientInfo` is also forwarded from the other
+  * interfaces (an HTTP query id or quota key can be long) to the shards of a `Distributed` table and
+  * persisted in the queue files of an async `Distributed` insert, so a tighter bound would make the
+  * server reject what it wrote itself. The number of current roles is bounded, and a role name is an
+  * identifier, so it is bounded as well.
+  */
+static constexpr size_t MAX_CLIENT_INFO_ROLE_NAME_SIZE = 64 * 1024;
+static constexpr size_t MAX_CLIENT_INFO_ROLES = 65536;
+
 void ClientInfo::read(ReadBuffer & in, UInt64 client_protocol_revision, bool with_trailing_fields)
 {
     if (client_protocol_revision < DBMS_MIN_REVISION_WITH_CLIENT_INFO)
@@ -354,11 +376,11 @@ void ClientInfo::read(ReadBuffer & in, UInt64 client_protocol_revision, bool wit
 
     resolve_client_hostname_on_demand = false;
 
-    readBinary(initial_user, in);
-    readBinary(initial_query_id, in);
+    readStringBinaryGrowing(initial_user, in);
+    readStringBinaryGrowing(initial_query_id, in);
 
     String initial_address_string;
-    readBinary(initial_address_string, in);
+    readStringBinaryGrowing(initial_address_string, in);
     /// The wire address must never reach Poco's resolver (getservbyname/DNS, trapped to SIGILL). For a
     /// SECONDARY_QUERY the value is consumed verbatim (system.query_log, interserver authenticate), so a
     /// non-"ip:port" form is corrupted input and is rejected as INCORRECT_DATA. For an INITIAL_QUERY the
@@ -384,9 +406,9 @@ void ClientInfo::read(ReadBuffer & in, UInt64 client_protocol_revision, bool wit
 
     if (interface == Interface::TCP)
     {
-        readBinary(os_user, in);
-        readBinary(client_hostname, in);
-        readBinary(client_name, in);
+        readStringBinaryGrowing(os_user, in);
+        readStringBinaryGrowing(client_hostname, in);
+        readStringBinaryGrowing(client_name, in);
         readVarUInt(client_version_major, in);
         readVarUInt(client_version_minor, in);
         readVarUInt(client_tcp_protocol_version, in);
@@ -397,25 +419,25 @@ void ClientInfo::read(ReadBuffer & in, UInt64 client_protocol_revision, bool wit
         readBinary(read_http_method, in);
         http_method = HTTPMethod(read_http_method);
 
-        readBinary(http_user_agent, in);
+        readStringBinaryGrowing(http_user_agent, in);
 
         if (client_protocol_revision >= DBMS_MIN_REVISION_WITH_X_FORWARDED_FOR_IN_CLIENT_INFO)
-            readBinary(forwarded_for, in);
+            readStringBinaryGrowing(forwarded_for, in);
 
         if (client_protocol_revision >= DBMS_MIN_REVISION_WITH_REFERER_IN_CLIENT_INFO)
-            readBinary(http_referer, in);
+            readStringBinaryGrowing(http_referer, in);
 
         /// See the note in `write`: absent from the embedded `ClientInfo` of the persisted async
         /// `Distributed` insert header, where they are stored as trailing header fields instead.
         if (with_trailing_fields && client_protocol_revision >= DBMS_MIN_REVISION_WITH_HTTP_HANDLER_IN_CLIENT_INFO)
         {
-            readBinary(http_handler_name, in);
-            readBinary(http_request_url, in);
+            readStringBinaryGrowing(http_handler_name, in);
+            readStringBinaryGrowing(http_request_url, in);
         }
     }
 
     if (client_protocol_revision >= DBMS_MIN_REVISION_WITH_QUOTA_KEY_IN_CLIENT_INFO)
-        readBinary(quota_key, in);
+        readStringBinaryGrowing(quota_key, in);
 
     if (client_protocol_revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_DISTRIBUTED_DEPTH)
         readVarUInt(distributed_depth, in);
@@ -436,7 +458,7 @@ void ClientInfo::read(ReadBuffer & in, UInt64 client_protocol_revision, bool wit
         {
             readBinary(client_trace_context.trace_id, in);
             readBinary(client_trace_context.span_id, in);
-            readBinary(client_trace_context.tracestate, in);
+            readStringBinaryGrowing(client_trace_context.tracestate, in);
             readBinary(client_trace_context.trace_flags, in);
         }
     }
@@ -461,11 +483,11 @@ void ClientInfo::read(ReadBuffer & in, UInt64 client_protocol_revision, bool wit
         UInt8 have_jwt = 0;
         readBinary(have_jwt, in);
         if (have_jwt)
-            readBinary(jwt, in);
+            readStringBinaryGrowing(jwt, in);
     }
 
     if (with_trailing_fields && client_protocol_revision >= DBMS_MIN_REVISION_WITH_CLIENT_AGENT_IN_CLIENT_INFO)
-        readBinary(client_agent, in);
+        readStringBinaryGrowing(client_agent, in);
 
     if (with_trailing_fields && client_protocol_revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_INTERNAL_QUERY_FLAG)
         readBinary(is_internal, in);
@@ -477,7 +499,7 @@ void ClientInfo::read(ReadBuffer & in, UInt64 client_protocol_revision, bool wit
         if (have_current_roles)
         {
             std::vector<String> roles;
-            readVectorBinary(roles, in);
+            readVectorBinary(roles, in, MAX_CLIENT_INFO_ROLES, MAX_CLIENT_INFO_ROLE_NAME_SIZE);
             current_roles = std::move(roles);
         }
         else
@@ -601,6 +623,13 @@ void ClientInfo::setFromHTTPRequest(const Poco::Net::HTTPRequest & request)
     for (const auto & header : request)
     {
         /// These headers can contain authentication info and shouldn't be accessible by the user.
+        ///
+        /// The standard HTTP authorization header is `Authorization` (RFC 7235 §4.2);
+        /// `Authentication` is a separate header (RFC 7615) that ClickHouse does not use
+        /// for credentials. Filter both: `Authorization` is the actual credential header
+        /// (Basic, Bearer, etc.) and must not be exposed via `getClientHTTPHeader` or
+        /// relayed through `<forward_headers>` on HTTP auth servers; `Authentication` is
+        /// filtered defensively to preserve prior behavior.
         String key_lowercase = Poco::toLower(header.first);
         if (key_lowercase.starts_with("x-clickhouse") || key_lowercase == "authentication" || key_lowercase == "authorization")
             continue;

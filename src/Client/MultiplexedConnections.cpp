@@ -118,6 +118,17 @@ void MultiplexedConnections::sendQueryPlan(const QueryPlan & query_plan)
     }
 }
 
+bool MultiplexedConnections::supportsQueryPlanSerializationVersion(UInt64 version) const
+{
+    for (const ReplicaState & state : replica_states)
+    {
+        if (state.connection && state.connection->getQueryPlanSerializationVersion() < version)
+            return false;
+    }
+
+    return true;
+}
+
 void MultiplexedConnections::sendExternalTablesData(std::vector<ExternalTablesData> & data)
 {
     std::lock_guard lock(cancel_mutex);
@@ -229,7 +240,7 @@ void MultiplexedConnections::sendQuery(
 void MultiplexedConnections::sendClusterFunctionReadTaskResponse(const ClusterFunctionReadTaskResponse & response)
 {
     std::lock_guard lock(cancel_mutex);
-    if (cancelled)
+    if (cancelled || !current_connection || !current_connection->isConnected())
         return;
     current_connection->sendClusterFunctionReadTaskResponse(response);
 }
@@ -238,7 +249,7 @@ void MultiplexedConnections::sendClusterFunctionReadTaskResponse(const ClusterFu
 void MultiplexedConnections::sendMergeTreeReadTaskResponse(const ParallelReadResponse & response)
 {
     std::lock_guard lock(cancel_mutex);
-    if (cancelled)
+    if (cancelled || !current_connection || !current_connection->isConnected())
         return;
     current_connection->sendMergeTreeReadTaskResponse(response);
 }
@@ -538,9 +549,12 @@ MultiplexedConnections::ReplicaState & MultiplexedConnections::getReplicaForRead
 
 void MultiplexedConnections::invalidateReplica(ReplicaState & state)
 {
+    Connection * old_connection = state.connection;
     state.connection = nullptr;
     state.pool_entry = IConnectionPool::Entry();
     --active_connection_count;
+    if (current_connection == old_connection)
+        current_connection = nullptr;
 }
 
 void MultiplexedConnections::setAsyncCallback(AsyncCallback async_callback)

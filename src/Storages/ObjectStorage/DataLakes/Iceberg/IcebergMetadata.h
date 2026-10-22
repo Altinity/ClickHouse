@@ -1,4 +1,6 @@
 #pragma once
+#include "Storages/ObjectStorage/DataLakes/Iceberg/ChunkPartitioner.h"
+#include "Storages/ObjectStorage/DataLakes/Iceberg/FileNamesGenerator.h"
 #include "config.h"
 
 #if USE_AVRO
@@ -14,6 +16,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 
+#include <atomic>
 #include <optional>
 #include <base/defines.h>
 
@@ -23,12 +26,16 @@
 
 #include <IO/CompressionMethod.h>
 
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataFileEntry.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergIterator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergTableStateSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/SnapshotFilesTraversal.h>
 
 
 namespace DB
@@ -101,11 +108,14 @@ public:
     static Int32 parseTableSchema(
         const Poco::JSON::Object::Ptr & metadata_object,
         Iceberg::IcebergSchemaProcessor & schema_processor,
+        ContextPtr context_,
         LoggerPtr metadata_logger);
 
     bool supportsUpdate() const override { return true; }
     bool supportsWrites() const override { return true; }
     bool supportsParallelInsert() const override { return true; }
+    bool supportsTruncate() const override { return true; }
+    void truncate(ContextPtr context, std::shared_ptr<DataLake::ICatalog> catalog, const StorageID & storage_id) override;
 
     IcebergHistory getHistory(ContextPtr local_context) const;
 
@@ -138,7 +148,41 @@ public:
         ContextPtr context,
         std::shared_ptr<DataLake::ICatalog> catalog) override;
 
+    bool supportsImport(ContextPtr) const override { return true; }
+
+    SinkToStoragePtr import(
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const std::function<void(const std::string &)> & new_file_path_callback,
+        SharedHeader sample_block,
+        const std::string & iceberg_metadata_json_string,
+        const std::optional<FormatSettings> & format_settings,
+        ContextPtr context) override;
+
+    /// Commit an export-partition transaction. All parameters that are saved in ZooKeeper at the
+    /// start of the export operation (schema_id, partition_spec_id, partition_values,
+    /// partition_columns, partition_types) must be provided by the caller.
+    /// The partition spec object is derived from the metadata using partition_spec_id.
+    /// If the live metadata has diverged (schema or partition spec changed) the call throws
+    /// immediately — the caller must restart from scratch.
+    ///
+    /// data_file_paths contains the metadata-path for each exported data file (as recorded in
+    /// ZooKeeper).  For every path a co-located sidecar Avro file (same path, ".avro" extension)
+    /// must exist in the object storage; it supplies record_count and file_size_in_bytes.
+    IStorage::ExportPartitionCommitInfo commitExportPartitionTransaction(
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & table_id,
+        const String & transaction_id,
+        Int64 original_schema_id,
+        Int64 partition_spec_id,
+        const Block & partition_source_block,
+        SharedHeader sample_block,
+        const std::vector<String> & data_file_paths,
+        StorageObjectStorageConfigurationPtr configuration,
+        ContextPtr context) override;
+
     CompressionMethod getCompressionMethod() const { return persistent_components.metadata_compression_method; }
+
+    std::string getTableLocation() const override { return persistent_components.table_location; }
 
     bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override;
     bool optimizeManifestFiles(
@@ -161,11 +205,17 @@ public:
     void modifyFormatSettings(FormatSettings & format_settings, const Context & local_context) const override;
     void addDeleteTransformers(ObjectInfoPtr object_info, QueryPipelineBuilder & builder, const std::optional<FormatSettings> & format_settings, FormatParserSharedResourcesPtr parser_shared_resources, ContextPtr local_context) const override;
     void checkAlterIsPossible(const AlterCommands & commands) override;
+    void checkAlterPartitionIsPossible(const PartitionCommands & commands) const override;
     void alter(
         const AlterCommands & params,
         ContextPtr context,
         const StorageID & storage_id,
         std::shared_ptr<DataLake::ICatalog> catalog) override;
+    Pipe alterPartition(
+        const PartitionCommands & commands,
+        ContextPtr context,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        StorageID storage_id) override;
 
     Pipe executeCommand(
         const String & command_name,
@@ -183,7 +233,8 @@ public:
         StorageMetadataPtr storage_metadata,
         ContextPtr local_context) const override;
 
-    void drop(ContextPtr context) override;
+    void checkCanBeDropped(ContextPtr query_context) const override;
+    void drop(bool delete_data) override;
 
     static DataLakeMetadataPtr createWithDeserialization(
         const ObjectStoragePtr & object_storage,
@@ -191,12 +242,22 @@ public:
         const ContextPtr & local_context,
         ReadBuffer & in);
 
-    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getRelevantState(const ContextPtr & context, bool force_fetch_latest_metadata = false) const;
+    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getRelevantState(
+        const ContextPtr & context,
+        bool force_fetch_latest_metadata = false) const;
+
+    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot>
+    getState(const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version) const;
 
     const DB::Iceberg::PersistentTableComponents & getPersistentComponents() const
     {
         return persistent_components;
     }
+
+    Poco::JSON::Object::Ptr getMetadataJSON(ContextPtr local_context) const;
+
+    std::optional<String> partitionKey(ContextPtr) const override;
+    std::optional<String> sortingKey(ContextPtr) const override;
 
 private:
     static Iceberg::PersistentTableComponents initializePersistentTableComponents(
@@ -212,8 +273,6 @@ private:
     Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Int32>
     getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) const;
-    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot>
-    getState(const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version) const;
     Iceberg::IcebergDataSnapshotPtr
     getRelevantDataSnapshotFromTableStateSnapshot(Iceberg::TableStateSnapshot table_state_snapshot, ContextPtr local_context) const;
     StorageObjectStorageConfigurationPtr getConfiguration() const;
@@ -222,17 +281,57 @@ private:
     /// scoped to the queried path reaches beyond this table there.
     void checkTableRootIsQueriedPath(std::string_view operation) const;
 
+    /// Non-empty return value means the attempt succeeded (covers both the normal
+    /// publish path and the `isExportPartitionTransactionAlreadyCommitted` short-circuit).
+    /// An empty `ExportPartitionCommitInfo` means the caller must retry. The
+    /// short-circuit branch fills `iceberg_metadata_file` with a sentinel note since
+    /// the original committer's paths are not trivially recoverable from inside this call.
+    std::optional<IStorage::ExportPartitionCommitInfo> commitImportPartitionTransactionImpl(
+        FileNamesGenerator & filename_generator,
+        Poco::JSON::Object::Ptr & metadata,
+        Poco::JSON::Object::Ptr & partition_spec,
+        const String & transaction_id,
+        Int64 original_schema_id,
+        Int64 partition_spec_id,
+        const std::vector<Field> & partition_values,
+        const std::vector<String> & partition_columns,
+        const DataTypes & partition_types,
+        SharedHeader sample_block,
+        const std::vector<String> & data_file_paths,
+        const std::vector<IcebergSerializedFileStats> & per_file_stats,
+        Int64 total_data_files,
+        Int64 total_rows,
+        Int64 total_chunks_size,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & table_id,
+        const String & blob_storage_type_name,
+        const String & blob_storage_namespace_name,
+        ContextPtr context);
+
+    std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
+    KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
+
+    /// Files outside the table directory that `iceberg_delete_data_on_drop` deletes.
+    std::vector<Iceberg::ExternalFile> collectExternalFilesToDeleteOnDrop(ContextPtr context) const;
+
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
-    const DB::Iceberg::PersistentTableComponents persistent_components;
+    mutable std::shared_ptr<ExternalStorageCache> external_storages;
+    /// Set by `checkCanBeDropped` once the dropping user is allowed to delete the external files.
+    mutable std::atomic<bool> external_files_drop_authorized = false;
+    DB::Iceberg::PersistentTableComponents persistent_components;
     const DataLakeStorageSettings & data_lake_settings;
     const String write_format;
     BackgroundSchedulePoolTaskHolder background_metadata_prefetch_task;
     ObjectIterator prepared_iterator;
 
-    KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
-
     void backgroundMetadataPrefetcherThread();
+
+    void alterPartitionDropImpl(
+        const PartitionCommand & command,
+        ContextPtr context,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & storage_id);
 };
 }
 

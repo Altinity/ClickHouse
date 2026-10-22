@@ -64,7 +64,7 @@ S3TablesCatalog::S3TablesCatalog(
     const CatalogSettings & catalog_settings_,
     DB::ContextPtr context_,
     bool allow_server_credentials_in_user_queries_)
-    : RestCatalog(warehouse_, base_url_, "", "", false, /* flat_namespaces */false, context_)
+    : RestCatalog(warehouse_, base_url_, "", "", false, catalog_settings_.namespaces, /* flat_namespaces */false, context_)
     , region(region_)
     , storage_endpoint(catalog_settings_.storage_endpoint)
     , signing_service("s3tables")
@@ -170,9 +170,10 @@ CatalogTables S3TablesCatalog::getTables() const
 bool S3TablesCatalog::tryGetTableMetadata(
     const std::string & namespace_name,
     const std::string & table_name,
+    DB::ContextPtr context_,
     TableMetadata & result) const
 {
-    if (!RestCatalog::tryGetTableMetadata(namespace_name, table_name, result))
+    if (!RestCatalog::tryGetTableMetadata(namespace_name, table_name, context_, result))
         return false;
 
     /// For S3 Tables the catalog and the underlying data live in AWS S3 under the same
@@ -230,15 +231,20 @@ bool S3TablesCatalog::tryGetTableMetadata(
     return true;
 }
 
-void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name, bool delete_data) const
+void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name, bool delete_data, bool if_exists) const
 {
     /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-delete.html
     if (!delete_data)
+    {
+        if (if_exists && !existsTable(namespace_name, table_name))
+            return;
+
         throw DB::Exception(
             DB::ErrorCodes::SUPPORT_IS_DISABLED,
-            "S3 Tables cannot drop table {}.{} without deleting its data, and `iceberg_delete_data_on_drop` is disabled. "
-            "Enable `iceberg_delete_data_on_drop` to drop the table together with its data",
+            "S3 Tables cannot drop table {}.{} without deleting its data, and `data_lake_delete_data_on_drop` is disabled. "
+            "Enable `data_lake_delete_data_on_drop` to drop the table together with its data",
             namespace_name, table_name);
+    }
 
     const auto state_snapshot = state.get();
     const std::string endpoint
@@ -253,11 +259,12 @@ void S3TablesCatalog::dropTable(const String & namespace_name, const String & ta
     }
     catch (const DB::HTTPException & ex)
     {
-        if (ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_NOT_FOUND)
-            // 404 is returned by the API when the table does not exist
+        if (if_exists && ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_NOT_FOUND)
+        {
             LOG_DEBUG(log, "S3 Tables: table {}.{} already does not exist (404 on purge-delete)", namespace_name, table_name);
-        else
-            throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to drop table {}", ex.displayText());
+            return;
+        }
+        throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to drop table {}", ex.displayText());
     }
 }
 

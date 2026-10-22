@@ -81,26 +81,46 @@ ColumnMapperPtr createColumnMapper(Poco::JSON::Object::Ptr schema_object);
  *     }
  * }
  */
-class IcebergSchemaProcessor
+class IcebergSchemaProcessor : private WithContext
 {
     static std::string default_link;
 
     using Node = ActionsDAG::Node;
 
 public:
-    explicit IcebergSchemaProcessor(bool allow_geo_parser_ = false) : allow_geo_parser(allow_geo_parser_) {}
+    /// Where a schema copy being registered comes from. metadata.json is the authoritative source;
+    /// the 'schema' key of a manifest file header is only a snapshot of the table schema at the time
+    /// the manifest was written. A schema that came from a manifest is never authoritative: it is
+    /// replaced by the metadata.json copy of the same schema-id whenever that one is registered, and
+    /// it may be ignored if it conflicts with an already registered metadata.json copy.
+    enum class SchemaSource
+    {
+        Metadata,
+        ManifestFile,
+    };
 
-    void addIcebergTableSchema(Poco::JSON::Object::Ptr schema_ptr);
+    explicit IcebergSchemaProcessor(ContextPtr context_, bool allow_geo_parser_ = false)
+        : WithContext(context_), allow_geo_parser(allow_geo_parser_) {}
+
+    void addIcebergTableSchema(
+        Poco::JSON::Object::Ptr schema_ptr,
+        ContextPtr context_,
+        SchemaSource source = SchemaSource::Metadata,
+        bool tolerate_conflicting_manifest_schemas = false);
     std::shared_ptr<NamesAndTypesList> getClickHouseTableSchemaById(Int32 id);
-    std::shared_ptr<const ActionsDAG> getSchemaTransformationDagByIds(Int32 old_id, Int32 new_id);
+    std::shared_ptr<const ActionsDAG> getSchemaTransformationDagByIds(ContextPtr context_, Int32 old_id, Int32 new_id);
     NameAndTypePair getFieldCharacteristics(Int32 schema_version, Int32 source_id) const;
     std::optional<NameAndTypePair> tryGetFieldCharacteristics(Int32 schema_version, Int32 source_id) const;
     NamesAndTypesList tryGetFieldsCharacteristics(Int32 schema_id, const std::vector<Int32> & source_ids) const;
     std::optional<Int32> tryGetColumnIDByName(Int32 schema_id, const std::string & name) const;
     Poco::JSON::Object::Ptr getIcebergTableSchemaById(Int32 id) const;
     bool hasClickHouseTableSchemaById(Int32 id) const;
+    bool isSchemaRegisteredFromMetadata(Int32 id) const;
 
-    static DataTypePtr getSimpleType(const String & type_name, bool allow_geo_parser = true);
+    static DataTypePtr getSimpleType(const String & type_name, ContextPtr context_, bool allow_geo_parser = true);
+
+    /// The ClickHouse type the reader derives for a top-level schema field.
+    DataTypePtr getClickHouseFieldType(const Poco::JSON::Object::Ptr & field, ContextPtr context_);
 
     static std::unordered_map<String, Int64> traverseSchema(Poco::JSON::Array::Ptr schema);
 
@@ -125,12 +145,27 @@ private:
     mutable std::map<std::pair<Int32, std::string>, Int32> clickhouse_ids_by_source_names TSA_GUARDED_BY(mutex);
     std::optional<Int32> current_schema_id TSA_GUARDED_BY(mutex) = 0;
     std::unordered_map<Int64, Int32> schema_id_by_snapshot TSA_GUARDED_BY(mutex);
+    /// Schema-ids whose registered copy came from a manifest file header and has not been confirmed
+    /// by an identical metadata.json copy yet. Such a copy is replaced when metadata.json binds the
+    /// schema-id to a different schema, and two manifest headers disagreeing on such a schema-id is
+    /// an error, because no authoritative copy is left to decide between them.
+    std::unordered_set<Int32> manifest_sourced_schema_ids TSA_GUARDED_BY(mutex);
+
+    /// Forget the schema registered for `schema_id` together with everything derived from it: the
+    /// per-field lookups and the cached schema transformation DAGs in either direction. They are
+    /// keyed by schema-id and never rebuilt once populated, so a stale entry would keep answering.
+    void dropCachedSchema(Int32 schema_id) TSA_REQUIRES(mutex);
 
     NamesAndTypesList getSchemaType(const Poco::JSON::Object::Ptr & schema);
-    DataTypePtr getComplexTypeFromObject(const Poco::JSON::Object::Ptr & type, String & current_full_name, bool is_subfield_of_root);
+    DataTypePtr getComplexTypeFromObject(
+        const Poco::JSON::Object::Ptr & type,
+        String & current_full_name,
+        ContextPtr context_,
+        bool is_subfield_of_root);
     DataTypePtr getFieldType(
         const Poco::JSON::Object::Ptr & field,
         const String & type_key,
+        ContextPtr context_,
         bool required,
         String & current_full_name = default_link,
         bool is_subfield_of_root = false);
@@ -139,7 +174,11 @@ private:
     const Node * getDefaultNodeForField(const Poco::JSON::Object::Ptr & field);
 
     std::shared_ptr<ActionsDAG> getSchemaTransformationDag(
-        const Poco::JSON::Object::Ptr & old_schema, const Poco::JSON::Object::Ptr & new_schema, Int32 old_id, Int32 new_id);
+        const Poco::JSON::Object::Ptr & old_schema,
+        const Poco::JSON::Object::Ptr & new_schema,
+        ContextPtr context_,
+        Int32 old_id,
+        Int32 new_id);
 
     mutable SharedMutex mutex;
     bool allow_geo_parser = true;

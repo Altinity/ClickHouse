@@ -6,6 +6,7 @@
 #include <Storages/MergeTree/BackgroundJobsAssignee.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/prepareReadingFromFormat.h>
+#include "Storages/ObjectStorage/ObjectStorageFilePathGenerator.h"
 #include <Interpreters/ActionsDAG.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
@@ -16,8 +17,10 @@
 #include <Databases/DataLake/ICatalog.h>
 #include <Storages/MutationCommands.h>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include <Storages/IPartitionStrategy.h>
 namespace DB
@@ -59,7 +62,9 @@ public:
         ASTPtr partition_by_ = nullptr,
         ASTPtr order_by_ = nullptr,
         bool is_table_function_ = false,
-        bool lazy_init = false);
+        bool lazy_init = false,
+        bool updated_configuration = false, // avoid double update configuration from cluster and local versions
+        std::optional<std::string> sample_path_ = std::nullopt);
 
     String getName() const override;
 
@@ -92,13 +97,45 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         const ContextPtr & context);
 
+    bool supportsImport(ContextPtr) const override;
+
+    ImportResult import(
+        const std::string & /* file_name */,
+        Block & /* block_with_partition_values */,
+        const std::function<void(const std::string &)> & new_file_path_callback,
+        MergeTreePartExportFileAlreadyExistsPolicy /* file_already_exists_policy */,
+        std::size_t /* max_bytes_per_file */,
+        std::size_t /* max_rows_per_file */,
+        const std::optional<std::string> & /* iceberg_metadata_json_string */,
+        const std::optional<FormatSettings> & /* format_settings_ */,
+        ContextPtr /* context */) override;
+
+    ExportPartitionCommitInfo commitExportPartitionTransaction(
+        const String & transaction_id,
+        const String & partition_id,
+        const Strings & exported_paths,
+        const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
+        ContextPtr local_context) override;
+
+    /// Shared `drop` implementation: removes the table from `catalog` (if any) and drops `configuration`,
+    /// deleting the data only if `delete_data_on_drop` was captured as `true` by `prepareForDrop`.
+    static void dropImpl(
+        const std::optional<bool> & delete_data_on_drop,
+        const std::shared_ptr<DataLake::ICatalog> & catalog,
+        const StorageObjectStorageConfigurationPtr & configuration,
+        const StorageID & storage_id,
+        const LoggerPtr & log);
+
     void truncate(
         const ASTPtr & query,
         const StorageMetadataPtr & metadata_snapshot,
         ContextPtr local_context,
         TableExclusiveLockHolder &) override;
 
+    void checkTableCanBeDropped(ContextPtr query_context) const override { configuration->checkCanBeDropped(query_context); }
     void drop() override;
+
+    void prepareForDrop(ContextPtr query_context) override;
 
     bool supportsPartitionBy() const override { return true; }
 
@@ -155,7 +192,7 @@ public:
 
     static std::pair<ColumnsDescription, std::string> resolveSchemaAndFormatFromData(
         const ObjectStoragePtr & object_storage,
-        const StorageObjectStorageConfigurationPtr & configuration,
+        StorageObjectStorageConfigurationPtr & configuration,
         const std::optional<FormatSettings> & format_settings,
         std::string & sample_path,
         const ContextPtr & context);
@@ -163,6 +200,9 @@ public:
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
     void updateExternalDynamicMetadataIfExists(ContextPtr query_context) override;
+
+    /// Valid once a deferred hive partitioning sample path has been resolved.
+    const NamesAndTypesList & getHivePartitionColumns() const { return hive_partition_columns_to_read_from_file_path; }
 
     std::shared_ptr<IDataLakeMetadata> getExternalMetadata(ContextPtr query_context);
 
@@ -192,7 +232,15 @@ public:
 
     void alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & alter_lock_holder) override;
 
+    Pipe alterPartition(
+        const StorageMetadataPtr & /* metadata_snapshot */, const PartitionCommands & /* commands */, ContextPtr /* context */) override;
+
     void checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const override;
+    void checkAlterPartitionIsPossible(
+        const PartitionCommands & commands,
+        const StorageMetadataPtr & metadata_snapshot,
+        const Settings & settings,
+        ContextPtr context) const override;
 
     ObjectStoragePtr getObjectStorage() const
     {
@@ -264,6 +312,8 @@ protected:
     std::shared_ptr<DataLake::ICatalog> catalog;
     StorageID storage_id;
     BackgroundJobsAssignee background_operations_assignee;
+
+    std::atomic<std::optional<bool>> delete_data_on_drop;
 };
 
 }

@@ -768,6 +768,7 @@ std::unordered_map<String, CHSetting> serverSettings = {
     {"create_index_ignore_unique", trueOrFalseSettingNoOracle},
     {"create_table_empty_primary_key_by_default", trueOrFalseSettingNoOracle},
     {"cross_to_inner_join_rewrite", CHSetting(zeroOneTwo, {"0", "1", "2"}, false)},
+    {"data_lake_delete_data_on_drop", trueOrFalseSettingNoOracle},
     {"data_type_default_nullable", trueOrFalseSettingNoOracle},
     {"database_atomic_wait_for_drop_and_detach_synchronously", trueOrFalseSettingNoOracle},
     {"database_datalake_require_metadata_access", trueOrFalseSettingNoOracle},
@@ -1042,7 +1043,6 @@ std::unordered_map<String, CHSetting> serverSettings = {
          [](RandomGenerator & rg, FuzzConfig &) { return std::to_string(rg.thresholdGenerator<uint64_t>(0.3, 0.2, 0, 10800)); },
          {},
          false)},
-    {"iceberg_delete_data_on_drop", trueOrFalseSettingNoOracle},
     {"iceberg_expire_default_min_snapshots_to_keep",
      CHSetting(
          [](RandomGenerator & rg, FuzzConfig &) { return std::to_string(rg.thresholdGenerator<uint64_t>(0.2, 0.2, 0, 10)); }, {}, false)},
@@ -1843,6 +1843,7 @@ static std::unordered_map<String, CHSetting> serverSettings2 = {
     {"use_page_cache_for_local_disks", trueOrFalseSetting},
     {"use_page_cache_for_object_storage", trueOrFalseSetting},
     {"use_parquet_metadata_cache", trueOrFalseSetting},
+    {"use_puffin_files_cache", trueOrFalseSetting},
     {"use_query_cache", trueOrFalseSetting},
     {"use_roaring_bitmap_iceberg_positional_deletes", trueOrFalseSetting},
     {"use_skip_indexes_if_final_exact_mode", CHSetting(trueOrFalse, {"0", "1"}, true)},

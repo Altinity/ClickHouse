@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <set>
@@ -49,6 +50,7 @@
 #include <Common/JemallocCacheArena.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/MovesList.h>
+#include <Storages/MergeTree/ExportList.h>
 #include <Storages/MergeTree/ReplicatedFetchList.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -58,12 +60,14 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadataFilesCache.h>
 #include <Storages/ObjectStorage/DataLakes/Paimon/PaimonMetadataFilesCache.h>
 #include <Processors/Formats/Impl/ParquetMetadataCache.h>
+#include <Storages/ObjectStorage/DataLakes/PuffinFilesCache.h>
 #include <Storages/StreamingStorageRegistry.h>
 #include <Storages/MergeTree/VectorSimilarityIndexCache.h>
 #include <Storages/Distributed/DistributedSettings.h>
 #include <Storages/CompressionCodecSelector.h>
 #include <IO/AsynchronousReader.h>
 #include <IO/LongConnectionLimit.h>
+#include <IO/ConnectionTimeouts.h>
 #include <IO/S3Settings.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage/AzureBlobStorageCommon.h>
 #include <Disks/DiskLocal.h>
@@ -186,6 +190,8 @@ namespace ProfileEvents
     extern const Event BackupThrottlerSleepMicroseconds;
     extern const Event MergesThrottlerBytes;
     extern const Event MergesThrottlerSleepMicroseconds;
+    extern const Event ExportsThrottlerBytes;
+    extern const Event ExportsThrottlerSleepMicroseconds;
     extern const Event MutationsThrottlerBytes;
     extern const Event MutationsThrottlerSleepMicroseconds;
     extern const Event QueryLocalReadThrottlerBytes;
@@ -287,6 +293,7 @@ namespace CurrentMetrics
     extern const Metric IndexUncompressedCacheCells;
     extern const Metric ZooKeeperSessionExpired;
     extern const Metric ZooKeeperConnectionLossStartedTimestampSeconds;
+    extern const Metric IsSwarmModeEnabled;
 }
 
 
@@ -424,6 +431,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_local_write_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_merges_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_mutations_bandwidth_for_server;
+    extern const ServerSettingsUInt64 max_exports_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_remote_read_network_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_remote_write_network_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_replicated_fetches_network_bandwidth_for_server;
@@ -640,6 +648,7 @@ struct ContextSharedPart : boost::noncopyable
 #if USE_PARQUET
     mutable ParquetMetadataCachePtr parquet_metadata_cache TSA_GUARDED_BY(mutex);   /// Cache of deserialized parquet metadata files.
 #endif
+    mutable PuffinFilesCachePtr puffin_files_cache TSA_GUARDED_BY(mutex);   /// Cache of parsed puffin file content.
     AsynchronousMetrics * asynchronous_metrics TSA_GUARDED_BY(mutex) = nullptr;       /// Points to asynchronous metrics
     mutable PageCachePtr page_cache TSA_GUARDED_BY(mutex);                            /// Userspace page cache.
     ProcessList process_list;                                   /// Executing queries at the moment.
@@ -647,6 +656,7 @@ struct ContextSharedPart : boost::noncopyable
     GlobalOvercommitTracker global_overcommit_tracker;
     MergeList merge_list;                                       /// The list of executable merge (for (Replicated)?MergeTree)
     MovesList moves_list;                                       /// The list of executing moves (for (Replicated)?MergeTree)
+    ExportsList exports_list;                                   /// The list of executing exports (for (Replicated)?MergeTree)
     ReplicatedFetchList replicated_fetch_list;
     RefreshSet refresh_set;                                 /// The list of active refreshes (for MaterializedView)
     ConfigurationPtr users_config TSA_GUARDED_BY(mutex);                              /// Config with the users, profiles and quotas sections.
@@ -698,6 +708,8 @@ struct ContextSharedPart : boost::noncopyable
 
     mutable ThrottlerPtr distributed_cache_read_throttler;  /// A server-wide throttler for distributed cache read
     mutable ThrottlerPtr distributed_cache_write_throttler; /// A server-wide throttler for distributed cache write
+
+    mutable ThrottlerPtr exports_throttler;                 /// A server-wide throttler for exports
 
     MultiVersion<Macros> macros;                            /// Substitutions extracted from config.
     std::unique_ptr<DDLWorker> ddl_worker TSA_GUARDED_BY(mutex); /// Process ddl commands from zk.
@@ -802,6 +814,7 @@ struct ContextSharedPart : boost::noncopyable
     std::map<String, UInt16> server_ports TSA_GUARDED_BY(server_ports_mutex);
 
     std::atomic<bool> shutdown_called = false;
+    std::atomic<bool> swarm_mode_enabled = true;
 
     Stopwatch uptime_watch TSA_GUARDED_BY(mutex);
 
@@ -959,7 +972,7 @@ struct ContextSharedPart : boost::noncopyable
 
         std::lock_guard lock(mutex);
         config = config_value;
-        access_control->setExternalAuthenticatorsConfig(*config_value);
+        access_control->setExternalAuthenticatorsConfig(*config_value, ConnectionTimeouts::getHTTPTimeouts(Settings(), server_settings));
     }
 
     const Poco::Util::AbstractConfiguration & getConfigRefWithLock(const std::lock_guard<ContextSharedMutex> &) const TSA_REQUIRES(this->mutex)
@@ -1000,6 +1013,8 @@ struct ContextSharedPart : boost::noncopyable
       */
     void shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
     {
+        swarm_mode_enabled = false;
+        CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 0);
         bool is_shutdown_called = shutdown_called.exchange(true);
         if (is_shutdown_called)
             return;
@@ -1335,6 +1350,9 @@ struct ContextSharedPart : boost::noncopyable
 
         if (auto bandwidth = server_settings[ServerSetting::max_merges_bandwidth_for_server])
             merges_throttler = std::make_shared<Throttler>(bandwidth, ProfileEvents::MergesThrottlerBytes, ProfileEvents::MergesThrottlerSleepMicroseconds);
+
+        if (auto bandwidth = server_settings[ServerSetting::max_exports_bandwidth_for_server])
+            exports_throttler = std::make_shared<Throttler>(bandwidth, ProfileEvents::ExportsThrottlerBytes, ProfileEvents::ExportsThrottlerSleepMicroseconds);
     }
 };
 
@@ -1369,6 +1387,7 @@ ContextData::ContextData(const ContextData &o) :
     input_blocks_reader(o.input_blocks_reader),
     user_id(o.user_id),
     current_roles(o.current_roles),
+    external_roles(o.external_roles),
     settings_constraints_and_current_profiles(o.settings_constraints_and_current_profiles),
     access(o.access),
     need_recalculate_access(o.need_recalculate_access),
@@ -1511,6 +1530,8 @@ MergeList & Context::getMergeList() { return shared->merge_list; }
 const MergeList & Context::getMergeList() const { return shared->merge_list; }
 MovesList & Context::getMovesList() { return shared->moves_list; }
 const MovesList & Context::getMovesList() const { return shared->moves_list; }
+ExportsList & Context::getExportsList() { return shared->exports_list; }
+const ExportsList & Context::getExportsList() const { return shared->exports_list; }
 ReplicatedFetchList & Context::getReplicatedFetchList() { return shared->replicated_fetch_list; }
 const ReplicatedFetchList & Context::getReplicatedFetchList() const { return shared->replicated_fetch_list; }
 RefreshSet & Context::getRefreshSet() { return shared->refresh_set; }
@@ -2136,8 +2157,9 @@ const AccessControl & Context::getAccessControl() const
 
 void Context::setExternalAuthenticatorsConfig(const Poco::Util::AbstractConfiguration & config)
 {
+    auto token_http_timeouts = ConnectionTimeouts::getHTTPTimeouts(getSettingsRef(), getServerSettings());
     std::lock_guard lock(shared->mutex);
-    shared->access_control->setExternalAuthenticatorsConfig(config);
+    shared->access_control->setExternalAuthenticatorsConfig(config, token_http_timeouts);
 }
 
 std::unique_ptr<GSSAcceptorContext> Context::makeGSSAcceptorContext() const
@@ -2231,15 +2253,16 @@ void Context::setCurrentRolesWithLock(const std::vector<UUID> & new_current_role
 
 void Context::setExternalRolesWithLock(const std::vector<UUID> & new_external_roles, const std::lock_guard<ContextSharedMutex> &)
 {
-    // External roles are roles received from other node, current roles is a collection of roles that were assigned locally
-    if (!new_external_roles.empty())
-    {
-        if (external_roles)
-            external_roles->insert(external_roles->end(), new_external_roles.begin(), new_external_roles.end());
-        else
-            external_roles = std::make_shared<std::vector<UUID>>(new_external_roles);
-        need_recalculate_access = true;
-    }
+    // External roles are roles received from another node; current roles is a collection of roles that were assigned locally.
+    // Replace them unconditionally (rather than append) so that switching the principal via `setUser` clears any external
+    // roles carried over from a previous principal on the same or a copied context. `ContextData`'s copy constructor
+    // preserves `external_roles`, so without this reset a context authenticated with pushed roles would keep them after
+    // `setUser(target_user)` (e.g. `EXECUTE AS target_user`), silently widening the target's privileges.
+    if (new_external_roles.empty())
+        external_roles = nullptr;
+    else
+        external_roles = std::make_shared<std::vector<UUID>>(new_external_roles);
+    need_recalculate_access = true;
 }
 
 void Context::setCurrentRolesImpl(const std::vector<UUID> & new_current_roles, bool throw_if_not_granted, bool skip_if_not_granted, const std::shared_ptr<const User> & user)
@@ -3385,6 +3408,12 @@ StoragePtr Context::getViewSource() const
     return view_source;
 }
 
+
+void Context::clearViewSource()
+{
+    view_source.reset();
+}
+
 bool Context::displaySecretsInShowAndSelect() const
 {
     return shared->server_settings[ServerSetting::display_secrets_in_show_and_select];
@@ -3394,6 +3423,41 @@ Settings Context::getSettingsCopy() const
 {
     SharedLockGuard lock(mutex);
     return *settings;
+}
+
+namespace
+{
+bool isProfileChange(const SettingChange & change)
+{
+    return change.name == "profile";
+}
+
+/// Enforces the constraints on `changes` the way `applySettingsChanges` applies them: a `profile` change
+/// installs a new constraint set for the changes after it. Each run of changes up to the next `profile`
+/// change is enforced against the constraints in force before it, then applied together with that `profile`
+/// change to a scratch copy of `context`, so a rejected list leaves `context` untouched. Returns the enforced list.
+template <typename Enforce>
+SettingsChanges enforceConstraintsAlongProfileChanges(const ContextPtr & context, const SettingsChanges & changes, Enforce && enforce)
+{
+    auto scratch_context = Context::createCopy(context);
+    SettingsChanges enforced;
+    for (auto begin = changes.begin(); begin != changes.end();)
+    {
+        auto profile = std::find_if(begin, changes.end(), isProfileChange);
+        SettingsChanges segment(begin, profile);
+        enforce(*scratch_context, segment);
+        begin = profile;
+        if (profile != changes.end())
+        {
+            segment.push_back(*profile);
+            ++begin;
+        }
+        /// `setCurrentProfile` checks the profile's own settings against the constraints in force before it.
+        scratch_context->applySettingsChanges(segment);
+        enforced.insert(enforced.end(), segment.begin(), segment.end());
+    }
+    return enforced;
+}
 }
 
 void Context::setSettings(const Settings & settings_)
@@ -3556,6 +3620,15 @@ void Context::checkSettingsConstraints(const SettingChange & change, SettingSour
 
 void Context::checkSettingsConstraints(const SettingsChanges & changes, SettingSource source)
 {
+    if (std::ranges::any_of(changes, isProfileChange))
+    {
+        enforceConstraintsAlongProfileChanges(shared_from_this(), changes, [source](Context & context, SettingsChanges & segment)
+        {
+            context.checkSettingsConstraints(std::as_const(segment), source);
+        });
+        return;
+    }
+
     SharedLockGuard lock(mutex);
     settings->checkShorthandChanges(changes);
     getSettingsConstraintsAndCurrentProfilesWithLock()->constraints.check(*settings, changes, source);
@@ -3568,14 +3641,46 @@ void Context::checkSettingsConstraintsForSettingsReset(const std::vector<String>
     getSettingsConstraintsAndCurrentProfilesWithLock()->constraints.checkResetToDefault(*settings, names, source);
 }
 
+void Context::checkSettingsConstraintsForSettingsReset(
+    const std::vector<String> & names, const SettingsChanges & changes_applied_first, SettingSource source)
+{
+    if (std::ranges::none_of(changes_applied_first, isProfileChange))
+    {
+        checkSettingsConstraintsForSettingsReset(names, source);
+        return;
+    }
+    /// The resets take effect after the rest of the statement, so a `profile` change in it decides the constraints.
+    auto scratch_context = Context::createCopy(shared_from_this());
+    scratch_context->applySettingsChanges(changes_applied_first);
+    scratch_context->checkSettingsConstraintsForSettingsReset(names, source);
+}
+
 void Context::checkSettingsConstraints(SettingsChanges & changes, SettingSource source)
 {
+    if (std::ranges::any_of(changes, isProfileChange))
+    {
+        changes = enforceConstraintsAlongProfileChanges(shared_from_this(), changes, [source](Context & context, SettingsChanges & segment)
+        {
+            context.checkSettingsConstraints(segment, source);
+        });
+        return;
+    }
+
     SharedLockGuard lock(mutex);
     checkSettingsConstraintsWithLock(changes, source);
 }
 
 void Context::clampToSettingsConstraints(SettingsChanges & changes, SettingSource source)
 {
+    if (std::ranges::any_of(changes, isProfileChange))
+    {
+        changes = enforceConstraintsAlongProfileChanges(shared_from_this(), changes, [source](Context & context, SettingsChanges & segment)
+        {
+            context.clampToSettingsConstraints(segment, source);
+        });
+        return;
+    }
+
     SharedLockGuard lock(mutex);
     clampToSettingsConstraintsWithLock(changes, source);
 }
@@ -3730,8 +3835,11 @@ void Context::setCurrentQueryId(const String & query_id)
 
     client_info.current_query_id = query_id_to_set;
 
-    if (client_info.query_kind == ClientInfo::QueryKind::INITIAL_QUERY)
+    if (client_info.query_kind == ClientInfo::QueryKind::INITIAL_QUERY
+        && (getApplicationType() != ApplicationType::SERVER || client_info.initial_query_id.empty()))
+    {
         client_info.initial_query_id = client_info.current_query_id;
+    }
 }
 
 void Context::killCurrentQuery() const
@@ -3911,6 +4019,13 @@ void Context::makeQueryContextForMutate(const MergeTreeSettings & merge_tree_set
     classifier.reset(); // It is assumed that there are no active queries running using this classifier, otherwise this will lead to crashes
     (*settings)[Setting::workload]
         = merge_tree_settings[MergeTreeSetting::mutation_workload].value.empty() ? getMutationWorkload() : merge_tree_settings[MergeTreeSetting::mutation_workload];
+}
+
+void Context::makeQueryContextForExportPart()
+{
+    makeQueryContext();
+    classifier.reset(); // It is assumed that there are no active queries running using this classifier, otherwise this will lead to crashes
+    // Export part operations don't have a specific workload setting, so we leave the default workload
 }
 
 void Context::makeSessionContext()
@@ -5233,6 +5348,52 @@ void Context::clearParquetMetadataCache() const
 }
 #endif
 
+void Context::setPuffinFilesCache(const String & cache_policy, size_t max_size_in_bytes, size_t max_entries, double size_ratio)
+{
+    std::lock_guard lock(shared->mutex);
+
+    if (shared->puffin_files_cache)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Puffin files cache has been already created.");
+
+    shared->puffin_files_cache = std::make_shared<PuffinFilesCache>(cache_policy, max_size_in_bytes, max_entries, size_ratio);
+}
+
+void Context::updatePuffinFilesCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size)
+{
+    std::lock_guard lock(shared->mutex);
+
+    if (!shared->puffin_files_cache)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Puffin files cache was not created yet.");
+
+    size_t size = config.getUInt64("puffin_files_cache_size", DEFAULT_PUFFIN_FILES_CACHE_MAX_SIZE);
+    size_t max_entries = config.getUInt64("puffin_files_cache_max_entries", DEFAULT_PUFFIN_FILES_CACHE_MAX_ENTRIES);
+    if (size > max_cache_size)
+    {
+        size = max_cache_size;
+        LOG_DEBUG(shared->log, "Lowered Puffin files cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(size));
+    }
+    shared->puffin_files_cache->setMaxSizeInBytes(size);
+    shared->puffin_files_cache->setMaxCount(max_entries);
+}
+
+std::shared_ptr<PuffinFilesCache> Context::getPuffinFilesCache() const
+{
+    SharedLockGuard lock(shared->mutex);
+
+    if (!shared->puffin_files_cache)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Puffin files cache was not created yet.");
+    return shared->puffin_files_cache;
+}
+
+void Context::clearPuffinFilesCache() const
+{
+    auto cache = getPuffinFilesCache();
+
+    /// Clear the cache without holding context mutex to avoid blocking context for a long time
+    if (cache)
+        cache->clear();
+}
+
 void Context::setQueryConditionCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio)
 {
     std::lock_guard lock(shared->mutex);
@@ -5797,6 +5958,11 @@ ThrottlerPtr Context::getDistributedCacheReadThrottler() const
 ThrottlerPtr Context::getDistributedCacheWriteThrottler() const
 {
     return shared->distributed_cache_write_throttler;
+}
+
+ThrottlerPtr Context::getExportsThrottler() const
+{
+    return shared->exports_throttler;
 }
 
 void Context::reloadRemoteThrottlerConfig(size_t read_bandwidth, size_t write_bandwidth) const
@@ -6621,7 +6787,6 @@ std::shared_ptr<Cluster> Context::getCluster(const std::string & cluster_name) c
     throw Exception(ErrorCodes::CLUSTER_DOESNT_EXIST, "Requested cluster '{}' not found", cluster_name);
 }
 
-
 std::shared_ptr<Cluster> Context::tryGetCluster(const std::string & cluster_name) const
 {
     std::shared_ptr<Cluster> res = nullptr;
@@ -6640,6 +6805,21 @@ std::shared_ptr<Cluster> Context::tryGetCluster(const std::string & cluster_name
     return res;
 }
 
+void Context::unregisterInAutodiscoveryClusters()
+{
+    std::lock_guard lock(shared->clusters_mutex);
+    if (!shared->cluster_discovery)
+        return;
+    shared->cluster_discovery->unregisterAll();
+}
+
+void Context::registerInAutodiscoveryClusters()
+{
+    std::lock_guard lock(shared->clusters_mutex);
+    if (!shared->cluster_discovery)
+        return;
+    shared->cluster_discovery->registerAll();
+}
 
 void Context::reloadClusterConfig() const
 {
@@ -6716,12 +6896,12 @@ void Context::startClusterDiscovery()
 /// On repeating calls updates existing clusters and adds new clusters, doesn't delete old clusters
 void Context::setClustersConfig(const ConfigurationPtr & config, bool enable_discovery, const String & config_name)
 {
+    ClusterDiscovery * discovery_to_update = nullptr;
+    ClusterDiscovery * discovery_just_created_ptr = nullptr;
+    std::unique_ptr<ClusterDiscovery> discovery_to_disable;
+    bool clusters_changed = false;
     {
         std::lock_guard lock(shared->clusters_mutex);
-        if (ConfigHelper::getBool(*config, "allow_experimental_cluster_discovery") && enable_discovery && !shared->cluster_discovery)
-        {
-            shared->cluster_discovery = std::make_unique<ClusterDiscovery>(*config, getGlobalContext(), getMacros());
-        }
 
         /// Do not update clusters if this part of config wasn't changed.
         /// Note: clusters_config must be checked for null separately from clusters, because
@@ -6729,19 +6909,76 @@ void Context::setClustersConfig(const ConfigurationPtr & config, bool enable_dis
         /// shared->clusters using the fallback getConfigRef() without setting shared->clusters_config.
         /// If setClustersConfig() then runs before the config reloader stores its ConfigurationPtr,
         /// dereferencing shared->clusters_config would throw Poco::NullPointerException.
-        if (shared->clusters && shared->clusters_config && isSameConfiguration(*config, *shared->clusters_config, config_name))
-            return;
+        ///
+        /// Still start a discovery object created after server start when only the allow-flag
+        /// flipped (remote_servers subtree unchanged) — otherwise the worker never runs.
+        /// The reverse transition (allow 1 -> 0) must tear discovery down even when remote_servers
+        /// is unchanged; otherwise the worker stays registered until restart.
+        const bool remote_servers_unchanged
+            = shared->clusters && shared->clusters_config
+            && isSameConfiguration(*config, *shared->clusters_config, config_name);
 
-        auto old_clusters_config = shared->clusters_config;
-        shared->clusters_config = config;
+        const bool discovery_enabled
+            = ConfigHelper::getBool(*config, "allow_experimental_cluster_discovery") && enable_discovery;
 
-        if (!shared->clusters)
-            shared->clusters = std::make_shared<Clusters>(*shared->clusters_config, *settings, getMacros(), config_name);
-        else
-            shared->clusters->updateClusters(*shared->clusters_config, *settings, config_name, old_clusters_config);
+        /// Validate discovery before creating the object or committing Clusters so a bad reload
+        /// cannot leave clusters_config advanced while discovery stays on the previous view.
+        /// Also validate when allow is turned off: an existing ClusterDiscovery is still updated.
+        if (!remote_servers_unchanged && (discovery_enabled || shared->cluster_discovery))
+            ClusterDiscovery::validateConfig(*config, getGlobalContext(), config_name);
 
-        ++shared->clusters_version;
+        bool discovery_just_created = false;
+        if (discovery_enabled)
+        {
+            if (!shared->cluster_discovery)
+            {
+                shared->cluster_discovery = std::make_unique<ClusterDiscovery>(*config, getGlobalContext(), getMacros());
+                discovery_just_created = true;
+            }
+        }
+        else if (shared->cluster_discovery)
+        {
+            discovery_to_disable = std::move(shared->cluster_discovery);
+        }
+
+        if (!remote_servers_unchanged)
+        {
+            auto old_clusters_config = shared->clusters_config;
+            shared->clusters_config = config;
+
+            if (!shared->clusters)
+                shared->clusters = std::make_shared<Clusters>(*shared->clusters_config, *settings, getMacros(), config_name);
+            else
+                shared->clusters->updateClusters(*shared->clusters_config, *settings, config_name, old_clusters_config);
+
+            if (shared->cluster_discovery && !discovery_just_created)
+                discovery_to_update = shared->cluster_discovery.get();
+
+            ++shared->clusters_version;
+            clusters_changed = true;
+        }
+
+        /// Constructor already applied config. Start outside this lock if the server is ready;
+        /// otherwise programs/server/Server.cpp calls startClusterDiscovery() after listen.
+        if (discovery_just_created)
+            discovery_just_created_ptr = shared->cluster_discovery.get();
     }
+
+    /// Tear down outside clusters_mutex: joins the worker and may touch ZooKeeper.
+    if (discovery_to_disable)
+        discovery_to_disable->disableAndShutdown();
+
+    /// Apply discovery updates outside clusters_mutex: may start the worker and touch ZooKeeper.
+    if (discovery_to_update)
+        discovery_to_update->updateFromConfig(*config, config_name);
+
+    /// Re-check server readiness without clusters_mutex (isServerCompletelyStarted takes shared->mutex).
+    if (discovery_just_created_ptr && getApplicationType() == ApplicationType::SERVER && isServerCompletelyStarted())
+        discovery_just_created_ptr->start();
+
+    /// Avoid DDL host-id refresh / log noise when remote_servers (and discovery) did not change.
+    /// Still notify when discovery was just created or disabled (e.g. allow-flag-only reload).
+    if (clusters_changed || discovery_to_update || discovery_just_created_ptr || discovery_to_disable)
     {
         SharedLockGuard lock(shared->mutex);
         if (shared->ddl_worker)
@@ -7685,12 +7922,35 @@ void Context::stopServers(const ServerType & server_type) const
     shared->stop_servers_callback(server_type);
 }
 
-
 void Context::shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
 {
     shared->shutdown();
 }
 
+bool Context::stopSwarmMode()
+{
+    bool expected_is_enabled = true;
+    bool is_stopped_now = shared->swarm_mode_enabled.compare_exchange_strong(expected_is_enabled, false);
+    if (is_stopped_now)
+        CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 0);
+    // return true if stop successful
+    return is_stopped_now;
+}
+
+bool Context::startSwarmMode()
+{
+    bool expected_is_enabled = false;
+    bool is_started_now = shared->swarm_mode_enabled.compare_exchange_strong(expected_is_enabled, true);
+    if (is_started_now)
+        CurrentMetrics::set(CurrentMetrics::IsSwarmModeEnabled, 1);
+    // return true if start successful
+    return is_started_now;
+}
+
+bool Context::isSwarmModeEnabled() const
+{
+    return shared->swarm_mode_enabled;
+}
 
 Context::ApplicationType Context::getApplicationType() const
 {

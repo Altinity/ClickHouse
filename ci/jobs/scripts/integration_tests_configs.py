@@ -76,6 +76,16 @@ TEST_CONFIGS = [
         "pins azurite to fixed host port 10000 (Spark emulator mode); concurrent --dist=each workers collide on bind",
     ),
     TC(
+        "test_export_partition_to_object_storage/test_failures.py",
+        True,
+        "paces itself against retry back-off and scheduler ticks while object storage is cut off; host load makes the timings flaky",
+    ),
+    TC(
+        "test_export_partition_to_object_storage/test_replication.py",
+        True,
+        "ZooKeeper can't handle too many parallel requests",
+    ),
+    TC(
         "test_storage_delta/test.py",
         False,
         "starts a Spark JVM + multi-node ClickHouse cluster per module fixture",

@@ -37,6 +37,16 @@ public:
     bool contains_password = false;
     bool contains_hash = false;
     bool jwt_use_authenticator = false;
+    /// IDENTIFIED WITH jwt accepts two optional clauses:
+    ///   PROCESSOR '<token-processor-name>'
+    ///   CLAIMS    '<json>'
+    /// Both are stored in `children` in this order; flags below tell which slots
+    /// are populated (children layout depends on which were specified). The
+    /// processor pin is what protects against the H-14 / H-17 cache-priming
+    /// bypass for SQL-declared JWT users; without it the per-user lookup goes
+    /// through the iterate-all-processors auto-discovery path with empty pin.
+    bool has_jwt_processor = false;
+    bool has_jwt_claims = false;
     /// The method-level deadline from `VALID UNTIL <datetime>` or `VALID FOR <interval>`.
     /// It is registered in `children` (always after the payload children), so that the generic
     /// AST machinery - depth/size limits, clone-based visitors - sees the subtree; assign it

@@ -29,6 +29,7 @@
 #include <Columns/validateColumnType.h>
 
 #include <Common/FieldVisitorToString.h>
+#include <Common/checkStackSize.h>
 #include <Common/typeid_cast.h>
 
 #include <base/unit.h>
@@ -41,6 +42,7 @@
 #include <Storages/IStorage.h>
 
 #include <Interpreters/Context.h>
+#include <Interpreters/misc.h>
 
 #include <Analyzer/ArrayJoinNode.h>
 #include <Analyzer/ColumnNode.h>
@@ -57,6 +59,7 @@
 
 #include <Analyzer/Resolve/IdentifierResolveScope.h>
 
+#include <functional>
 #include <ranges>
 
 namespace DB
@@ -1154,6 +1157,55 @@ std::pair<TableExpressionNodePtr, bool> getExpressionSource(const QueryTreeNodeP
     return {nullptr, false};
 }
 
+namespace
+{
+
+class CollectPrewhereTableExpressionVisitor : public ConstInDepthQueryTreeVisitor<CollectPrewhereTableExpressionVisitor>
+{
+public:
+    const QueryTreeNodePtr & getTableExpression() const
+    {
+        return table_expression;
+    }
+
+    void visitImpl(const QueryTreeNodePtr & node)
+    {
+        const auto * column_node = node->as<ColumnNode>();
+        if (!column_node)
+            return;
+
+        auto column_source = column_node->getColumnSourceOrNull();
+        if (!column_source || (!column_source->as<TableNode>() && !column_source->as<TableFunctionNode>()))
+            return;
+
+        if (!table_expression)
+            table_expression = std::move(column_source);
+    }
+
+    static bool needChildVisit(const QueryTreeNodePtr &, const QueryTreeNodePtr & child_node)
+    {
+        const auto child_type = child_node->getNodeType();
+        return child_type != QueryTreeNodeType::QUERY
+            && child_type != QueryTreeNodeType::UNION
+            && child_type != QueryTreeNodeType::LAMBDA;
+    }
+
+private:
+    QueryTreeNodePtr table_expression;
+};
+
+}
+
+QueryTreeNodePtr getPrewhereTableExpression(const QueryTreeNodePtr & prewhere)
+{
+    if (!prewhere)
+        return {};
+
+    CollectPrewhereTableExpressionVisitor visitor;
+    visitor.visit(prewhere);
+    return visitor.getTableExpression();
+}
+
 /** There are no limits on the maximum size of the result for the subquery.
   * Since the result of the query is not the result of the entire query.
   */
@@ -1291,24 +1343,79 @@ bool hasUnknownColumn(const QueryTreeNodePtr & node, QueryTreeNodePtr table_expr
     return false;
 }
 
-void removeExpressionsThatDoNotDependOnTableIdentifiers(
+namespace
+{
+
+template <typename KeepFunction>
+bool walkOrdinaryFunctions(const QueryTreeNodePtr & node, KeepFunction && keep_function)
+{
+    QueryTreeNodes stack = {node};
+    while (!stack.empty())
+    {
+        auto current = std::move(stack.back());
+        stack.pop_back();
+        if (!current)
+            continue;
+
+        const auto type = current->getNodeType();
+        if (type == QueryTreeNodeType::QUERY || type == QueryTreeNodeType::UNION)
+            return false;
+
+        if (const auto * function = current->as<FunctionNode>())
+        {
+            if (!function->isOrdinaryFunction())
+                return false;
+            auto function_base = function->getFunction();
+            if (!function_base || !keep_function(function_base))
+                return false;
+        }
+
+        for (const auto & child : current->getChildren())
+        {
+            if (child)
+                stack.push_back(child);
+        }
+    }
+    return true;
+}
+
+bool isSafeToDuplicateInQueryTree(const QueryTreeNodePtr & node)
+{
+    return walkOrdinaryFunctions(
+        node,
+        [](const FunctionBasePtr & function_base)
+        {
+            return function_base->isDeterministic()
+                && function_base->isDeterministicInScopeOfQuery()
+                && !function_base->isStateful()
+                && !function_base->isServerConstant()
+                && !functionIsDictGet(function_base->getName())
+                && !functionIsJoinGet(function_base->getName());
+        });
+}
+
+void filterConjunctions(
     QueryTreeNodePtr & expression,
-    const QueryTreeNodePtr & table_expression,
+    const std::function<bool(const QueryTreeNodePtr &)> & keep,
     const ContextPtr & context)
 {
     auto * function = expression->as<FunctionNode>();
     if (!function)
+    {
+        if (!keep(expression))
+            expression = {};
         return;
+    }
 
     if (function->getFunctionName() != "and")
     {
-        if (hasUnknownColumn(expression, table_expression))
-            expression = nullptr;
+        if (!keep(expression))
+            expression = {};
         return;
     }
 
     std::deque<QueryTreeNodePtr> conjunctions;
-    std::deque<QueryTreeNodePtr> processing{ expression };
+    std::deque<QueryTreeNodePtr> processing{expression};
 
     while (!processing.empty())
     {
@@ -1318,10 +1425,7 @@ void removeExpressionsThatDoNotDependOnTableIdentifiers(
         if (auto * function_node = node->as<FunctionNode>())
         {
             if (function_node->getFunctionName() == "and")
-                std::ranges::copy(
-                    function_node->getArguments(),
-                    std::back_inserter(processing)
-                );
+                std::ranges::copy(function_node->getArguments(), std::back_inserter(processing));
             else
                 conjunctions.push_back(node);
         }
@@ -1335,7 +1439,7 @@ void removeExpressionsThatDoNotDependOnTableIdentifiers(
 
     for (const auto & node : processing)
     {
-        if (!hasUnknownColumn(node, table_expression))
+        if (keep(node))
             conjunctions.push_back(node);
     }
 
@@ -1357,11 +1461,37 @@ void removeExpressionsThatDoNotDependOnTableIdentifiers(
     function->resolveAsFunction(function_impl->build(function->getArgumentColumns()));
 }
 
+}
+
+void removeExpressionsThatDoNotDependOnTableIdentifiers(
+    QueryTreeNodePtr & expression,
+    const QueryTreeNodePtr & table_expression,
+    const ContextPtr & context)
+{
+    filterConjunctions(
+        expression,
+        [&](const QueryTreeNodePtr & node) { return !hasUnknownColumn(node, table_expression); },
+        context);
+}
+
+void removeExpressionsThatAreUnsafeToDuplicate(
+    QueryTreeNodePtr & expression,
+    const ContextPtr & context)
+{
+    if (!expression)
+        return;
+
+    filterConjunctions(expression, isSafeToDuplicateInQueryTree, context);
+}
+
 namespace
 {
 
 Field getFieldFromColumnForASTLiteralImpl(const ColumnPtr & column, size_t row, const DataTypePtr & data_type, bool is_inside_object)
 {
+    /// Nesting is part of the value rather than of the query text, so no parser limit bounds it.
+    checkStackSize();
+
     if (isColumnConst(*column))
         return getFieldFromColumnForASTLiteralImpl(assert_cast<const ColumnConst& >(*column).getDataColumnPtr(), 0, data_type, is_inside_object);
 

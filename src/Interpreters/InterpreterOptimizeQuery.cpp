@@ -1,6 +1,7 @@
 #include "config.h"
 
 #include <Storages/IStorage.h>
+#include <Storages/StorageProxy.h>
 #include <Parsers/ASTOptimizeQuery.h>
 #include <Parsers/ASTLiteral.h>
 #include <Interpreters/Context.h>
@@ -13,6 +14,7 @@
 #include <Parsers/ASTExpressionList.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
@@ -47,7 +49,9 @@ BlockIO InterpreterOptimizeQuery::execute()
     getContext()->checkAccess(getRequiredAccess());
 
     auto table_id = getContext()->resolveStorageID(ast);
-    StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
+    /// Resolve before reading the metadata, so the checks below and `optimizeDryRun` see the real
+    /// structure rather than the columns-only one a lazily loaded table reports.
+    StoragePtr table = resolveStorageProxyLoading(DatabaseCatalog::instance().getTable(table_id, getContext()));
     checkStorageSupportsTransactionsIfNeeded(table, getContext());
     auto metadata_snapshot = table->getInMemoryMetadataPtr(getContext(), false);
     auto storage_snapshot = table->getStorageSnapshotWithoutData(metadata_snapshot, getContext());
@@ -59,15 +63,26 @@ BlockIO InterpreterOptimizeQuery::execute()
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "OPTIMIZE MANIFEST is incompatible with FINAL, PARTITION, DEDUPLICATE, CLEANUP, and DRY RUN options");
 
 #if USE_AVRO
-        auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(table.get());
-        if (!object_storage_table)
+        /// Object storage engines are created as StorageObjectStorageCluster, which wraps a plain
+        /// StorageObjectStorage, so both have to be accepted here.
+        auto object_storage_table = castStorage<StorageObjectStorage>(table, DeferredTable::Skip);
+        auto object_storage_cluster_table = castStorage<StorageObjectStorageCluster>(table, DeferredTable::Skip);
+        if (!object_storage_table && !object_storage_cluster_table)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "OPTIMIZE MANIFEST is only supported for Iceberg tables");
 
-        auto iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(object_storage_table->getExternalMetadata(getContext()));
+        auto external_metadata = object_storage_table
+            ? object_storage_table->getExternalMetadata(getContext())
+            : object_storage_cluster_table->getExternalMetadata(getContext());
+
+        auto iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(external_metadata);
         if (!iceberg_metadata)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "OPTIMIZE MANIFEST is only supported for Iceberg tables");
 
-        iceberg_metadata->optimizeManifestFiles(metadata_snapshot, getContext(), object_storage_table->getCatalog(), table_id);
+        auto catalog = object_storage_table
+            ? object_storage_table->getCatalog()
+            : object_storage_cluster_table->getCatalog();
+
+        iceberg_metadata->optimizeManifestFiles(metadata_snapshot, getContext(), catalog, table_id);
         return {};
 #else
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "OPTIMIZE MANIFEST is only supported for Iceberg tables");
@@ -112,7 +127,7 @@ BlockIO InterpreterOptimizeQuery::execute()
 
     if (ast.dry_run)
     {
-        auto * merge_tree_data = dynamic_cast<MergeTreeData *>(table.get());
+        auto * merge_tree_data = castStorage<MergeTreeData>(table, DeferredTable::Load).get();
         if (!merge_tree_data)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "OPTIMIZE DRY RUN is only supported for MergeTree family tables");
 

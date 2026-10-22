@@ -1,0 +1,61 @@
+---
+description: 'How the Antalya fork versions its own wire-protocol changes independently of upstream ClickHouse'
+sidebar_label: 'Antalya Protocol Version'
+sidebar_position: 40
+slug: /antalya/protocol
+title: 'Antalya Protocol Version'
+doc_type: 'reference'
+---
+
+# Antalya protocol version {#antalya-protocol-version}
+
+Antalya versions its own wire-protocol changes with `DBMS_ANTALYA_PROTOCOL_VERSION`, a counter that
+upstream ClickHouse cannot reach, defined in `src/Core/AntalyaProtocol.h`. Both sides advertise it in
+the name string of their `Hello`, on every connection:
+
+```text
+client -> server   "ClickHouse client (antalya:3)"
+server -> client   "ClickHouse (antalya:3)"
+```
+
+Each side parses the peer's suffix, caps the value with `min(own, peer)` and keeps the result. `0`
+means the peer is not an Antalya build. Negotiation is per hop and not transitive: initiator to
+worker and worker to worker negotiate independently.
+
+Version 1 is the advertisement itself.
+
+Version 2 lets the `*Cluster` read-task payload (the `ReadTaskResponse` body) carry the Iceberg
+delete-file paths as absolute URIs, as the manifest spells them, so that a worker can read files
+outside the table location, including files on another object storage. For a worker below version 2
+the initiator strips the scheme and authority as before, and refuses to dispatch a data file that
+needs another storage or whose delete-file keys differ from the resolved keys.
+
+Version 3 appends two optional fields to `ReadTaskResponse`, after the upstream cluster-processing
+payload (including `read_source_index` when that cluster-protocol version writes it). The first is
+Iceberg column statistics (`DataFileMetaInfo`). The second is `retry_after_us`, sent when
+`lock_object_storage_task_distribution_ms` asks a worker to wait before taking another node's file.
+If any worker negotiated a lower version, the initiator ignores that setting for the query and
+assigns files immediately, so every task path stays an object key. On `antalya-26.6` these two
+fields used version 2; here version 2 is the absolute-path layout, so the fields are version 3.
+
+## Adding an Antalya-only wire change {#adding-a-wire-change}
+
+- Bump `DBMS_ANTALYA_PROTOCOL_VERSION` by one and gate the change on the negotiated value.
+- Never bump `DBMS_TCP_PROTOCOL_VERSION`, and never take a slot in
+  `DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION` for a feature upstream does not have.
+- Keep the counter cumulative. A backport takes the whole contiguous range up to the value it needs,
+  or does not bump at all - the `min(own, server)` cap is only sound for a cumulative feature set.
+- Update this page, and update `docs/reference/interfaces/specs/NativeProtocol.mdx` when the change alters
+  a packet layout described there.
+
+## Why a counter of our own {#why-a-counter-of-our-own}
+
+An upstream rebase can reuse the next value of an upstream protocol counter for a different feature.
+Keeping the Antalya counter separate prevents the same version from describing two wire layouts.
+
+## Why the marker rides in the `Hello` name {#why-the-marker-rides-in-the-hello-name}
+
+The marker stays inside the existing name string because adding a field would make older peers read
+it as the next packet. The client writes its `Hello` before it knows the peer, so it always marks
+`client_name`. With `validate_tcp_client_information` enabled, an upstream server rejects an initial
+query from an Antalya client with `CLIENT_INFO_DOES_NOT_MATCH`; an Antalya server ignores the marker.

@@ -18,6 +18,7 @@
 #include <Disks/IO/ReadBufferFromRemoteFSGather.h>
 #include <Disks/IO/AsynchronousBoundedReadBuffer.h>
 #include <IO/AzureBlobStorage/copyAzureBlobStorageFile.h>
+#include <IO/AzureBlobStorage/isRetryableAzureException.h>
 
 #include <azure/storage/files/datalake/datalake_file_client.hpp>
 #include <azure/storage/files/datalake/datalake_options.hpp>
@@ -27,6 +28,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage/AzureBlobStorageCommon.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIteratorAsync.h>
 #include <Interpreters/Context.h>
+#include <Common/ElapsedTimeProfileEventIncrement.h>
 
 
 namespace CurrentMetrics
@@ -39,6 +41,7 @@ namespace CurrentMetrics
 namespace ProfileEvents
 {
     extern const Event AzureListObjects;
+    extern const Event AzureListObjectsMicroseconds;
     extern const Event DiskAzureListObjects;
     extern const Event AzureDeleteObjects;
     extern const Event DiskAzureDeleteObjects;
@@ -54,6 +57,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int AZURE_BLOB_STORAGE_ERROR;
+    extern const int AZURE_OBJECT_CHANGED_DURING_READ;
     extern const int UNSUPPORTED_METHOD;
 }
 
@@ -90,6 +94,7 @@ private:
         ProfileEvents::increment(ProfileEvents::AzureListObjects);
         if (client->IsClientForDisk())
             ProfileEvents::increment(ProfileEvents::DiskAzureListObjects);
+        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AzureListObjectsMicroseconds);
 
         chassert(batch.empty());
         auto blob_list_response = client->ListBlobs(options);
@@ -122,6 +127,37 @@ private:
     Azure::Storage::Blobs::ListBlobsOptions options;
 };
 
+/// Capture by value: buffers may outlive the storage.
+AzureBlobStorage::ContainerClientRefreshCallback makeContainerClientRefresher(
+    const AzureObjectStorage::AzureCredentialsRefreshCallback & credentials_refresh_callback)
+{
+    if (!credentials_refresh_callback)
+        return {};
+
+    return [credentials_refresh_callback]() -> std::unique_ptr<const AzureBlobStorage::ContainerClient>
+    {
+        auto params = credentials_refresh_callback();
+        if (!params)
+            return nullptr;
+        return params->createForContainer();
+    };
+}
+
+WriteBufferFromAzureDataLakeStorage::FileClientRefreshCallback makeDataLakeFileClientRefresher(
+    const AzureObjectStorage::AzureCredentialsRefreshCallback & credentials_refresh_callback, const String & blob_path)
+{
+    if (!credentials_refresh_callback)
+        return {};
+
+    return [credentials_refresh_callback, blob_path]() -> std::optional<Azure::Storage::Files::DataLake::DataLakeFileClient>
+    {
+        auto params = credentials_refresh_callback();
+        if (!params)
+            return {};
+        return makeAdlsGen2FileClient(params->endpoint, params->auth_method, params->client_options, blob_path);
+    };
+}
+
 }
 
 
@@ -133,7 +169,8 @@ AzureObjectStorage::AzureObjectStorage(
     const AzureBlobStorage::ConnectionParams & connection_params_,
     const String & object_namespace_,
     const String & description_,
-    const String & common_key_prefix_)
+    const String & common_key_prefix_,
+    AzureCredentialsRefreshCallback credentials_refresh_callback_)
     : name(name_)
     , auth_method(std::move(auth_method_))
     , client(std::move(client_))
@@ -142,8 +179,37 @@ AzureObjectStorage::AzureObjectStorage(
     , description(description_)
     , common_key_prefix(common_key_prefix_)
     , connection_params(connection_params_)
+    , credentials_refresh_callback(std::move(credentials_refresh_callback_))
     , log(getLogger("AzureObjectStorage"))
 {
+}
+
+bool AzureObjectStorage::tryRefreshClient(const Azure::Core::RequestFailedException & e) const
+{
+    if (!credentials_refresh_callback || !isAzureAccessTokenExpiredError(e))
+        return false;
+
+    auto params = credentials_refresh_callback();
+    if (!params)
+        return false;
+
+    client.set(params->createForContainer());
+    LOG_DEBUG(log, "Refreshed Azure credentials after an authentication failure");
+    return true;
+}
+
+std::optional<Azure::Storage::Files::DataLake::DataLakeFileClient>
+AzureObjectStorage::tryRefreshDataLakeFileClient(const Azure::Core::RequestFailedException & e, const String & blob_path) const
+{
+    if (!credentials_refresh_callback || !isAzureAccessTokenExpiredError(e))
+        return {};
+
+    auto params = credentials_refresh_callback();
+    if (!params)
+        return {};
+
+    LOG_DEBUG(log, "Refreshed Azure credentials for `{}` after an authentication failure", blob_path);
+    return makeAdlsGen2FileClient(params->endpoint, params->auth_method, params->client_options, blob_path);
 }
 
 ObjectStorageKeyGeneratorPtr AzureObjectStorage::createKeyGenerator() const
@@ -153,23 +219,28 @@ ObjectStorageKeyGeneratorPtr AzureObjectStorage::createKeyGenerator() const
 
 bool AzureObjectStorage::exists(const StoredObject & object) const
 {
-    auto client_ptr = client.get();
-
-    ProfileEvents::increment(ProfileEvents::AzureGetProperties);
-    if (client_ptr->IsClientForDisk())
-        ProfileEvents::increment(ProfileEvents::DiskAzureGetProperties);
-
-    try
+    for (size_t attempt = 0; ; ++attempt)
     {
-        auto blob_client = client_ptr->GetBlobClient(object.remote_path);
-        blob_client.GetProperties();
-        return true;
-    }
-    catch (const Azure::Storage::StorageException & e)
-    {
-        if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
-            return false;
-        throw;
+        auto client_ptr = client.get();
+
+        ProfileEvents::increment(ProfileEvents::AzureGetProperties);
+        if (client_ptr->IsClientForDisk())
+            ProfileEvents::increment(ProfileEvents::DiskAzureGetProperties);
+
+        try
+        {
+            auto blob_client = client_ptr->GetBlobClient(object.remote_path);
+            blob_client.GetProperties();
+            return true;
+        }
+        catch (const Azure::Storage::StorageException & e)
+        {
+            if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
+                return false;
+            if (attempt == 0 && tryRefreshClient(e))
+                continue;
+            throw;
+        }
     }
 }
 
@@ -188,8 +259,6 @@ ObjectStorageIteratorPtr AzureObjectStorage::iterate(
 
 void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const
 {
-    auto client_ptr = client.get();
-
     Azure::Storage::Blobs::ListBlobsOptions options;
     options.Prefix = path;
     if (max_keys)
@@ -197,15 +266,40 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
     else
         options.PageSizeHint = settings.get()->list_object_keys_size;
 
+    /// The continuation token stays valid across a credentials refresh, so a page can be re-fetched without restarting the listing.
+    auto list_blobs = [&]
+    {
+        for (size_t attempt = 0; ; ++attempt)
+        {
+            auto client_ptr = client.get();
+            try
+            {
+                auto response = client_ptr->ListBlobs(options);
+
+                ProfileEvents::increment(ProfileEvents::AzureListObjects);
+                if (client_ptr->IsClientForDisk())
+                    ProfileEvents::increment(ProfileEvents::DiskAzureListObjects);
+
+                return response;
+            }
+            catch (const Azure::Core::RequestFailedException & e)
+            {
+                if (attempt == 0 && tryRefreshClient(e))
+                    continue;
+                throw;
+            }
+        }
+    };
+
     /// Re-issue ListBlobs per page through the client wrapper (which strips the endpoint prefix); the SDK's
     /// MoveToNextPage refetches pages 2..N directly and would leave the raw Azure prefix on their blob names.
     while (true)
     {
-        auto blob_list_response = client_ptr->ListBlobs(options);
-
-        ProfileEvents::increment(ProfileEvents::AzureListObjects);
-        if (client_ptr->IsClientForDisk())
-            ProfileEvents::increment(ProfileEvents::DiskAzureListObjects);
+        AzureBlobStorage::ListBlobsPagedResponse blob_list_response;
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AzureListObjectsMicroseconds);
+            blob_list_response = list_blobs();
+        }
 
         for (const auto & blob : blob_list_response.Blobs)
         {
@@ -249,6 +343,26 @@ std::unique_ptr<ReadBufferFromFileBase> AzureObjectStorage::readObject( /// NOLI
             blob_storage_log->local_path = object.local_path;
     }
 
+    /// An object whose size is known to be zero is read as empty without a single `Download`
+    /// request, so no `If-Match` condition pins that read to the generation the caller has seen.
+    /// A blob listed as empty and replaced with a non-empty one since must still be rejected rather
+    /// than returned as a clean empty file, so its generation is checked on the properties instead.
+    if (object.bytes_size == 0 && !object.etag.empty())
+        getObjectMetadataOfListedGeneration(object);
+
+    /// The size of the object recorded in the metadata is a locally known bound, so it is used
+    /// as the right bound of the read rather than trusting the length of whatever the endpoint
+    /// answers with. `UnknownSize` is the only sentinel for "the size was never determined":
+    /// it is the default-constructed value, so a caller that does not know the size leaves it
+    /// there, and `bytes_size == 0` means a genuinely empty object, which must read as empty
+    /// rather than unbounded.
+    /// `S3ObjectStorage::readObject` maps `0` to "no bound" as well, because
+    /// `ReadBufferFromS3::read_until_position` is a plain `size_t` whose `0` already means
+    /// "unbounded" and therefore cannot express the empty range at all.
+    const std::optional<size_t> known_size = object.bytes_size != StoredObject::UnknownSize
+        ? std::optional<size_t>(object.bytes_size)
+        : std::nullopt;
+
     return std::make_unique<ReadBufferFromAzureBlobStorage>(
         client.get(),
         object.remote_path,
@@ -257,9 +371,19 @@ std::unique_ptr<ReadBufferFromFileBase> AzureObjectStorage::readObject( /// NOLI
         settings_ptr->max_single_download_retries,
         use_external_buffer,
         restrict_seek,
-        /* read_until_position */0,
+        /* read_until_position */ known_size,
         std::move(blob_storage_log),
-        connection_params.getContainer());
+        connection_params.getContainer(),
+        /// The size is only a correct bound for the generation of the object it was recorded for,
+        /// so the read is pinned to that generation when the caller has recorded its `ETag`, and
+        /// a replaced object is rejected instead of being truncated to the stale size.
+        object.etag,
+        /// The same size is what the buffer reports as the size of the file, so that a wrapper
+        /// that sizes itself by `getFileSize` (`CachedInMemoryReadBufferFromFile` does, and treats
+        /// an earlier end of the file as corruption) sees the bound the read has, and not the size
+        /// of whatever generation a live `GetProperties` request would meet.
+        /* file_size */ known_size,
+        makeContainerClientRefresher(credentials_refresh_callback));
 }
 
 SmallObjectDataWithMetadata AzureObjectStorage::readSmallObjectAndGetObjectMetadata( /// NOLINT
@@ -268,6 +392,17 @@ SmallObjectDataWithMetadata AzureObjectStorage::readSmallObjectAndGetObjectMetad
     size_t max_size_bytes,
     std::optional<size_t> read_hint) const
 {
+    /// An object whose size is known to be zero is read as empty without issuing a single
+    /// `Download` request, because `readObject` bounds the read by that size. There is then no
+    /// response to take the metadata from, so it is requested explicitly, and the check that
+    /// `readObject` performs on the `ETag` of the response is made on the properties instead.
+    if (object.bytes_size == 0)
+    {
+        SmallObjectDataWithMetadata result;
+        result.metadata = getObjectMetadataOfListedGeneration(object);
+        return result;
+    }
+
     auto buffer = readObject(object, read_settings, read_hint);
     SmallObjectDataWithMetadata result;
     WriteBufferFromString out(result.data);
@@ -324,7 +459,8 @@ std::unique_ptr<WriteBufferFromFileBase> AzureObjectStorage::writeObject( /// NO
             patchSettings(write_settings),
             settings.get(),
             connection_params.getContainer(),
-            std::move(blob_storage_log));
+            std::move(blob_storage_log),
+            makeDataLakeFileClientRefresher(credentials_refresh_callback, object.remote_path));
     }
 
     return std::make_unique<WriteBufferFromAzureBlobStorage>(
@@ -335,7 +471,8 @@ std::unique_ptr<WriteBufferFromFileBase> AzureObjectStorage::writeObject( /// NO
         settings.get(),
         connection_params.getContainer(),
         std::move(blob_storage_log),
-        std::move(scheduler));
+        std::move(scheduler),
+        makeContainerClientRefresher(credentials_refresh_callback));
 }
 
 void AzureObjectStorage::removeObjectImpl(
@@ -344,86 +481,113 @@ void AzureObjectStorage::removeObjectImpl(
     bool if_exists,
     BlobStorageLogWriterPtr blob_storage_log)
 {
-    ProfileEvents::increment(ProfileEvents::AzureDeleteObjects);
-    if (client_ptr->IsClientForDisk())
-        ProfileEvents::increment(ProfileEvents::DiskAzureDeleteObjects);
-
     const auto & path = object.remote_path;
     LOG_TEST(log, "Removing single object: {}", path);
 
-    Stopwatch watch;
-    Int32 error_code = 0;
-    String error_message;
-    bool success = false;
-    try
-    {
-        if (isAdlsGen2Endpoint(connection_params.endpoint))
-        {
-            buildDataLakeFileClient(path)->Delete();
-            success = true;
-        }
-        else
-        {
-            auto delete_info = client_ptr->GetBlobClient(path).Delete();
-            success = delete_info.Value.Deleted;
-            if (!if_exists && !delete_info.Value.Deleted)
-                throw Exception(
-                    ErrorCodes::AZURE_BLOB_STORAGE_ERROR, "Failed to delete file (path: {}) in AzureBlob Storage, reason: {}",
-                    path, delete_info.RawResponse ? delete_info.RawResponse->GetReasonPhrase() : "Unknown");
-        }
-    }
-    catch (const Azure::Storage::StorageException & e)
-    {
-        error_code = static_cast<Int32>(e.StatusCode);
-        error_message = e.Message;
+    const bool is_adls_gen2 = isAdlsGen2Endpoint(connection_params.endpoint);
+    auto current_client = client_ptr;
+    std::optional<Azure::Storage::Files::DataLake::DataLakeFileClient> refreshed_file_client;
 
-        if (!if_exists)
+    for (size_t attempt = 0; ; ++attempt)
+    {
+        ProfileEvents::increment(ProfileEvents::AzureDeleteObjects);
+        if (current_client->IsClientForDisk())
+            ProfileEvents::increment(ProfileEvents::DiskAzureDeleteObjects);
+
+        Stopwatch watch;
+        Int32 error_code = 0;
+        String error_message;
+        bool success = false;
+        try
         {
-            if (blob_storage_log)
-                blob_storage_log->addEvent(
-                    BlobStorageLogElement::EventType::Delete,
-                    /* bucket */ connection_params.getContainer(),
-                    /* remote_path */ path,
-                    object.local_path,
-                    object.bytes_size,
-                    watch.elapsedMicroseconds(),
-                    error_code,
-                    error_message);
+            if (is_adls_gen2)
+            {
+                if (refreshed_file_client)
+                    refreshed_file_client->Delete();
+                else
+                    buildDataLakeFileClient(path)->Delete();
+                success = true;
+            }
+            else
+            {
+                auto delete_info = current_client->GetBlobClient(path).Delete();
+                success = delete_info.Value.Deleted;
+                if (!if_exists && !delete_info.Value.Deleted)
+                    throw Exception(
+                        ErrorCodes::AZURE_BLOB_STORAGE_ERROR, "Failed to delete file (path: {}) in AzureBlob Storage, reason: {}",
+                        path, delete_info.RawResponse ? delete_info.RawResponse->GetReasonPhrase() : "Unknown");
+            }
+        }
+        catch (const Azure::Storage::StorageException & e)
+        {
+            error_code = static_cast<Int32>(e.StatusCode);
+            error_message = e.Message;
+
+            if (attempt == 0)
+            {
+                if (is_adls_gen2)
+                {
+                    refreshed_file_client = tryRefreshDataLakeFileClient(e, path);
+                    if (refreshed_file_client)
+                        continue;
+                }
+                else if (tryRefreshClient(e))
+                {
+                    current_client = client.get();
+                    continue;
+                }
+            }
+
+            if (!if_exists)
+            {
+                if (blob_storage_log)
+                    blob_storage_log->addEvent(
+                        BlobStorageLogElement::EventType::Delete,
+                        /* bucket */ connection_params.getContainer(),
+                        /* remote_path */ path,
+                        object.local_path,
+                        object.bytes_size,
+                        watch.elapsedMicroseconds(),
+                        error_code,
+                        error_message);
+                throw;
+            }
+
+            /// If object doesn't exist.
+            if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
+            {
+                auto elapsed = watch.elapsedMicroseconds();
+                if (blob_storage_log)
+                    blob_storage_log->addEvent(
+                        BlobStorageLogElement::EventType::Delete,
+                        /* bucket */ connection_params.getContainer(),
+                        /* remote_path */ path,
+                        object.local_path,
+                        object.bytes_size,
+                        elapsed,
+                        error_code,
+                        error_message);
+
+                return;
+            }
+
+            tryLogCurrentException(__PRETTY_FUNCTION__);
             throw;
         }
+        auto elapsed = watch.elapsedMicroseconds();
 
-        /// If object doesn't exist.
-        if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
-        {
-            auto elapsed = watch.elapsedMicroseconds();
-            if (blob_storage_log)
-                blob_storage_log->addEvent(
-                    BlobStorageLogElement::EventType::Delete,
-                    /* bucket */ connection_params.getContainer(),
-                    /* remote_path */ path,
-                    object.local_path,
-                    object.bytes_size,
-                    elapsed,
-                    error_code,
-                    error_message);
-            return;
-        }
-
-        tryLogCurrentException(__PRETTY_FUNCTION__);
-        throw;
+        if (blob_storage_log)
+            blob_storage_log->addEvent(
+                BlobStorageLogElement::EventType::Delete,
+                /* bucket */ connection_params.getContainer(),
+                /* remote_path */ path,
+                object.local_path,
+                object.bytes_size,
+                elapsed,
+                success ? 0 : error_code,
+                success ? "" : error_message);
+        return;
     }
-    auto elapsed = watch.elapsedMicroseconds();
-
-    if (blob_storage_log)
-        blob_storage_log->addEvent(
-            BlobStorageLogElement::EventType::Delete,
-            /* bucket */ connection_params.getContainer(),
-            /* remote_path */ path,
-            object.local_path,
-            object.bytes_size,
-            elapsed,
-            success ? 0 : error_code,
-            success ? "" : error_message);
 }
 
 void AzureObjectStorage::removeObjectIfExists(const StoredObject & object)
@@ -433,7 +597,7 @@ void AzureObjectStorage::removeObjectIfExists(const StoredObject & object)
 }
 
 void AzureObjectStorage::removeObjectsBatchIfExists(
-    const StoredObjects & objects,
+    StoredObjectsSpan & rest_objects,
     const std::shared_ptr<const AzureBlobStorage::ContainerClient> & client_ptr,
     BlobStorageLogWriterPtr blob_storage_log)
 {
@@ -460,11 +624,9 @@ void AzureObjectStorage::removeObjectsBatchIfExists(
         }
     };
 
-    StoredObjectsSpan rest_objects = objects;
     while (!rest_objects.empty())
     {
         auto object_batch = rest_objects.first(std::min(rest_objects.size(), AZURE_BATCH_MAX_SUBREQUESTS));
-        SCOPE_EXIT({ rest_objects = rest_objects.last(rest_objects.size() - object_batch.size()); });
 
         Stopwatch watch;
         AzureBlobStorage::BlobContainerBatch requests = client_ptr->CreateBatch();
@@ -529,6 +691,8 @@ void AzureObjectStorage::removeObjectsBatchIfExists(
 
         if (throw_at_end)
             std::rethrow_exception(throw_at_end);
+
+        rest_objects = rest_objects.last(rest_objects.size() - object_batch.size());
     }
 }
 
@@ -537,17 +701,31 @@ void AzureObjectStorage::removeObjectsIfExist(const StoredObjects & objects)
     if (objects.empty())
         return;
 
-    auto client_ptr = client.get();
     auto blob_storage_log = BlobStorageLogWriter::create(name);
 
     if (isAdlsGen2Endpoint(connection_params.endpoint))
     {
+        auto client_ptr = client.get();
         for (const auto & object : objects)
             removeObjectImpl(object, client_ptr, /*if_exists=*/ true, blob_storage_log);
         return;
     }
 
-    removeObjectsBatchIfExists(objects, client_ptr, blob_storage_log);
+    StoredObjectsSpan rest_objects = objects;
+    for (size_t attempt = 0; ; ++attempt)
+    {
+        try
+        {
+            removeObjectsBatchIfExists(rest_objects, client.get(), blob_storage_log);
+            return;
+        }
+        catch (const Azure::Core::RequestFailedException & e)
+        {
+            if (attempt == 0 && tryRefreshClient(e))
+                continue;
+            throw;
+        }
+    }
 }
 
 static void setAzureBlobTag(
@@ -582,27 +760,55 @@ void AzureObjectStorage::tagObjects(const StoredObjects & objects, const std::st
     setAzureBlobTag(client_ptr, blob_names, tag_key, tag_value);
 }
 
+ObjectMetadata AzureObjectStorage::getObjectMetadataOfListedGeneration(const StoredObject & object) const
+{
+    ObjectMetadata metadata = getObjectMetadata(object.remote_path, /* with_tags */ false);
+
+    /// A listing spells the `ETag` without the quotes that the `ETag` header of the properties has.
+    const String listed_etag = ReadBufferFromAzureBlobStorage::quotedETag(object.etag);
+    const String current_etag = ReadBufferFromAzureBlobStorage::quotedETag(metadata.etag);
+    if (!listed_etag.empty() && current_etag != listed_etag)
+        throw Exception(
+            ErrorCodes::AZURE_OBJECT_CHANGED_DURING_READ,
+            "Azure blob {} was replaced during read (ETag changed from {} to {}); retry the query, or set azure_validate_etag_on_read=0 to disable this check for table reads",
+            object.remote_path, listed_etag, current_etag);
+
+    return metadata;
+}
+
 ObjectMetadata AzureObjectStorage::getObjectMetadata(const std::string & path, bool) const
 {
-    auto client_ptr = client.get();
-    auto blob_client = client_ptr->GetBlobClient(path);
-    auto properties = blob_client.GetProperties().Value;
-
-    ProfileEvents::increment(ProfileEvents::AzureGetProperties);
-    if (client_ptr->IsClientForDisk())
-        ProfileEvents::increment(ProfileEvents::DiskAzureGetProperties);
-
-    ObjectMetadata result;
-    result.size_bytes = properties.BlobSize;
-    result.etag = properties.ETag.ToString();
-    if (!properties.Metadata.empty())
+    for (size_t attempt = 0; ; ++attempt)
     {
-        result.attributes.emplace();
-        for (const auto & [key, value] : properties.Metadata)
-            result.attributes[key] = value;
+        auto client_ptr = client.get();
+        try
+        {
+            auto blob_client = client_ptr->GetBlobClient(path);
+            auto properties = blob_client.GetProperties().Value;
+
+            ProfileEvents::increment(ProfileEvents::AzureGetProperties);
+            if (client_ptr->IsClientForDisk())
+                ProfileEvents::increment(ProfileEvents::DiskAzureGetProperties);
+
+            ObjectMetadata result;
+            result.size_bytes = properties.BlobSize;
+            result.etag = properties.ETag.ToString();
+            if (!properties.Metadata.empty())
+            {
+                result.attributes.emplace();
+                for (const auto & [key, value] : properties.Metadata)
+                    result.attributes[key] = value;
+            }
+            result.last_modified = static_cast<std::chrono::system_clock::time_point>(properties.LastModified).time_since_epoch().count();
+            return result;
+        }
+        catch (const Azure::Core::RequestFailedException & e)
+        {
+            if (attempt == 0 && tryRefreshClient(e))
+                continue;
+            throw;
+        }
     }
-    result.last_modified = static_cast<std::chrono::system_clock::time_point>(properties.LastModified).time_since_epoch().count();
-    return result;
 }
 
 std::optional<ObjectMetadata> AzureObjectStorage::tryGetObjectMetadata(const std::string & path, bool with_tags) const

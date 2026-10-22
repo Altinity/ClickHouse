@@ -77,6 +77,11 @@ struct AzureStorageParsedArguments : private StorageParsedArguments
 
     Path blob_path;
     AzureBlobStorage::ConnectionParams connection_params;
+
+    std::optional<std::string> account_name;
+    std::optional<std::string> account_key;
+    std::optional<std::string> client_id;
+    std::optional<std::string> tenant_id;
 };
 
 class StorageAzureConfiguration : public StorageObjectStorageConfiguration
@@ -141,6 +146,7 @@ public:
         onelake_use_blob_endpoint = use_blob_endpoint_;
         is_onelake = true;
     }
+    ASTPtr createArgsWithAccessData() const override;
 
 protected:
     void fromDisk(const String & disk_name, ASTs & args, ContextPtr context, bool with_structure) override;
@@ -152,7 +158,11 @@ private:
     Path blob_path;
     Paths blobs_paths;
     AzureBlobStorage::ConnectionParams connection_params;
-    DiskPtr disk;
+
+    std::optional<std::string> account_name;
+    std::optional<std::string> account_key;
+    std::optional<std::string> client_id;
+    std::optional<std::string> tenant_id;
 
     String onelake_client_id;
     String onelake_client_secret;
@@ -164,8 +174,11 @@ private:
     bool onelake_use_blob_endpoint = true;
     bool is_onelake = false;
 
+    DiskPtr disk;
+
     void initializeFromParsedArguments(const AzureStorageParsedArguments & parsed_arguments);
 };
+
 }
 
 #endif

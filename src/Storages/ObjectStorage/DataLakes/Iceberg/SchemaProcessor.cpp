@@ -21,6 +21,7 @@
 #include <Common/SharedLockGuard.h>
 #include <Common/StringUtils.h>
 #include <base/scope_guard.h>
+#include <Core/Settings.h>
 
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
@@ -28,6 +29,7 @@
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeFixedString.h>
 #include <DataTypes/DataTypeMap.h>
+#include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
@@ -36,6 +38,8 @@
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Formats/FormatFactory.h>
+#include <Interpreters/Context_fwd.h>
+#include <Interpreters/Context.h>
 
 #include <IO/ReadHelpers.h>
 
@@ -51,6 +55,10 @@ extern const int BAD_ARGUMENTS;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
 }
 
+namespace Setting
+{
+extern const SettingsTimezone iceberg_timezone_for_timestamptz;
+}
 
 namespace
 {
@@ -393,10 +401,18 @@ namespace Iceberg
 
 std::string IcebergSchemaProcessor::default_link{};
 
-void IcebergSchemaProcessor::addIcebergTableSchema(Poco::JSON::Object::Ptr schema_ptr)
+void IcebergSchemaProcessor::dropCachedSchema(Int32 schema_id)
 {
-    std::lock_guard lock(mutex);
+    iceberg_table_schemas_by_ids.erase(schema_id);
+    clickhouse_table_schemas_by_ids.erase(schema_id);
+    std::erase_if(transform_dags_by_ids, [schema_id](const auto & item) { return item.first.first == schema_id || item.first.second == schema_id; });
+    std::erase_if(clickhouse_types_by_source_ids, [schema_id](const auto & item) { return item.first.first == schema_id; });
+    std::erase_if(clickhouse_ids_by_source_names, [schema_id](const auto & item) { return item.first.first == schema_id; });
+}
 
+void IcebergSchemaProcessor::addIcebergTableSchema(
+    Poco::JSON::Object::Ptr schema_ptr, ContextPtr context_, SchemaSource source, bool tolerate_conflicting_manifest_schemas)
+{
     Int32 schema_id = schema_ptr->getValue<Int32>(f_schema_id);
 
     /// Databricks UniForm writes a degenerate placeholder schema (e.g. {"schema-id":0,"fields":[]})
@@ -404,54 +420,121 @@ void IcebergSchemaProcessor::addIcebergTableSchema(Poco::JSON::Object::Ptr schem
     if (!schema_ptr->isArray(f_fields) || schema_ptr->getArray(f_fields)->size() == 0)
         return;
 
-    current_schema_id = schema_id;
+    std::unordered_map<String, String> type_mapping;
+    if (allow_geo_parser)
+    {
+        type_mapping[f_geography] = f_binary;
+        type_mapping[f_geometry] = f_binary;
+    }
+
+    Poco::JSON::Object::Ptr registered_schema;
+    {
+        SharedLockGuard lock(mutex);
+        auto it = iceberg_table_schemas_by_ids.find(schema_id);
+        if (it != iceberg_table_schemas_by_ids.end())
+        {
+            const bool registered_from_manifest = manifest_sourced_schema_ids.contains(schema_id);
+            if (source == SchemaSource::ManifestFile && tolerate_conflicting_manifest_schemas && !registered_from_manifest)
+                return;
+            if (source == SchemaSource::ManifestFile || !registered_from_manifest)
+                registered_schema = it->second;
+        }
+    }
+    if (registered_schema && schemasAreIdentical(*registered_schema, *schema_ptr, type_mapping))
+        return;
+
+    std::lock_guard lock(mutex);
+
     if (iceberg_table_schemas_by_ids.contains(schema_id))
     {
         chassert(clickhouse_table_schemas_by_ids.contains(schema_id));
-        std::unordered_map<String, String> type_mapping;
-        if (allow_geo_parser)
+        if (schemasAreIdentical(*iceberg_table_schemas_by_ids.at(schema_id), *schema_ptr, type_mapping))
         {
-            type_mapping[f_geography] = f_binary;
-            type_mapping[f_geometry] = f_binary;
+            /// An identical metadata.json copy confirms a copy that was registered from a manifest header.
+            if (source == SchemaSource::Metadata)
+                manifest_sourced_schema_ids.erase(schema_id);
+            return;
         }
-        /// A schema-id is immutable per the Iceberg spec: re-binding it to different fields is malformed metadata.
-        if (!schemasAreIdentical(*iceberg_table_schemas_by_ids.at(schema_id), *schema_ptr, type_mapping))
+
+        /// The 'schema' key in a manifest file header is only a copy of the table schema at the
+        /// time the manifest was written; metadata.json is the authoritative source. Broken writers
+        /// have been observed storing degraded copies in manifest headers under an already-used
+        /// schema-id (e.g. AWS S3 Tables maintenance jobs writing `timestamp` instead of
+        /// `timestamptz`, or a schema containing only the partition source columns). Other engines
+        /// (Spark, Trino, PyIceberg, DuckDB) resolve schemas from metadata.json and ignore such
+        /// divergent copies that came from a manifest.
+        const bool registered_from_manifest = manifest_sourced_schema_ids.contains(schema_id);
+        if (registered_from_manifest)
+        {
+            if (source == SchemaSource::Metadata)
+            {
+                /// A read registers the metadata.json schemas before it walks any manifest, but the
+                /// maintenance entrypoints (`remove_orphan_files`, `expire_snapshots`, manifest
+                /// compaction, mutation validation) can reach a manifest header first on an empty
+                /// processor. A schema that came from a manifest is never authoritative, so the
+                /// metadata.json copy replaces it, along with everything that was derived from it.
+                LOG_WARNING(
+                    getLogger("IcebergSchemaProcessor"),
+                    "Schema-id {} was registered from a manifest file header and differs from the schema "
+                    "metadata.json binds to that id; replacing the schema that came from the manifest",
+                    schema_id);
+                dropCachedSchema(schema_id);
+                manifest_sourced_schema_ids.erase(schema_id);
+            }
+            else
+            {
+                /// Two manifest headers disagree on a schema-id that metadata.json has not defined:
+                /// there is no authoritative copy to decide which one the data was written with.
+                throw Exception(
+                    ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                    "Iceberg schema with schema-id {} is bound to two different schemas by manifest file headers, "
+                    "and metadata.json does not define it",
+                    schema_id);
+            }
+        }
+        else
+        {
+            if (source == SchemaSource::ManifestFile && tolerate_conflicting_manifest_schemas)
+                return;
+            /// A schema-id is immutable per the Iceberg spec: re-binding it to different fields is malformed metadata.
             throw Exception(
                 ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                 "Iceberg schema with schema-id {} is bound to two different schemas across metadata versions",
                 schema_id);
-    }
-    else
-    {
-        auto fields = schema_ptr->get(f_fields).extract<Poco::JSON::Array::Ptr>();
-        /// A field name is required per the Iceberg spec, and an empty column name is not representable in ClickHouse.
-        for (size_t i = 0; i != fields->size(); ++i)
-        {
-            auto field = fields->getObject(static_cast<UInt32>(i));
-            if (field->getValue<String>(f_name).empty())
-                throw Exception(
-                    ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
-                    "Iceberg schema with schema-id {} has a field with id {} whose name is empty",
-                    schema_id,
-                    field->getValue<Int32>(f_id));
         }
+    }
 
-        auto clickhouse_schema = std::make_shared<NamesAndTypesList>();
-        String current_full_name{};
-        for (size_t i = 0; i != fields->size(); ++i)
-        {
-            auto field = fields->getObject(static_cast<UInt32>(i));
-            auto name = field->getValue<String>(f_name);
-            bool required = field->getValue<bool>(f_required);
-            current_full_name = name;
-            auto type = getFieldType(field, f_type, required, current_full_name, true);
-            clickhouse_schema->push_back(NameAndTypePair{name, type});
-            clickhouse_types_by_source_ids[{schema_id, field->getValue<Int32>(f_id)}] = NameAndTypePair{current_full_name, type};
-            clickhouse_ids_by_source_names[{schema_id, current_full_name}] = field->getValue<Int32>(f_id);
-        }
-        clickhouse_table_schemas_by_ids[schema_id] = clickhouse_schema;
-        iceberg_table_schemas_by_ids[schema_id] = schema_ptr;
+    auto fields = schema_ptr->get(f_fields).extract<Poco::JSON::Array::Ptr>();
+    /// A field name is required per the Iceberg spec, and an empty column name is not representable in ClickHouse.
+    for (size_t i = 0; i != fields->size(); ++i)
+    {
+        auto field = fields->getObject(static_cast<UInt32>(i));
+        if (field->getValue<String>(f_name).empty())
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Iceberg schema with schema-id {} has a field with id {} whose name is empty",
+                schema_id,
+                field->getValue<Int32>(f_id));
     }
+
+    current_schema_id = schema_id;
+    auto clickhouse_schema = std::make_shared<NamesAndTypesList>();
+    String current_full_name{};
+    for (size_t i = 0; i != fields->size(); ++i)
+    {
+        auto field = fields->getObject(static_cast<UInt32>(i));
+        auto name = field->getValue<String>(f_name);
+        bool required = field->getValue<bool>(f_required);
+        current_full_name = name;
+        auto type = getFieldType(field, f_type, context_, required, current_full_name, true);
+        clickhouse_schema->push_back(NameAndTypePair{name, type});
+        clickhouse_types_by_source_ids[{schema_id, field->getValue<Int32>(f_id)}] = NameAndTypePair{current_full_name, type};
+        clickhouse_ids_by_source_names[{schema_id, current_full_name}] = field->getValue<Int32>(f_id);
+    }
+    clickhouse_table_schemas_by_ids[schema_id] = clickhouse_schema;
+    iceberg_table_schemas_by_ids[schema_id] = schema_ptr;
+    if (source == SchemaSource::ManifestFile)
+        manifest_sourced_schema_ids.insert(schema_id);
     current_schema_id = std::nullopt;
 }
 
@@ -499,7 +582,7 @@ NamesAndTypesList IcebergSchemaProcessor::tryGetFieldsCharacteristics(Int32 sche
     return fields;
 }
 
-DataTypePtr IcebergSchemaProcessor::getSimpleType(const String & type_name_arg, bool allow_geo_parser)
+DataTypePtr IcebergSchemaProcessor::getSimpleType(const String & type_name_arg, ContextPtr context_, bool allow_geo_parser)
 {
     /// Parameterized primitive type strings (decimal(P, S), fixed[N], geography(...)) can be
     /// serialized with different inner whitespace across metadata files. Canonicalize by removing
@@ -519,15 +602,21 @@ DataTypePtr IcebergSchemaProcessor::getSimpleType(const String & type_name_arg, 
     if (type_name == f_date)
         return std::make_shared<DataTypeDate32>();
     if (type_name == f_time)
-        return std::make_shared<DataTypeInt64>();
+        return std::make_shared<DataTypeTime64>(6);
     if (type_name == f_timestamp)
         return std::make_shared<DataTypeDateTime64>(6);
     if (type_name == f_timestamptz)
-        return std::make_shared<DataTypeDateTime64>(6, "UTC");
+    {
+        std::string timezone = context_->getSettingsRef()[Setting::iceberg_timezone_for_timestamptz];
+        return std::make_shared<DataTypeDateTime64>(6, timezone);
+    }
     if (type_name == f_timestamp_ns)
         return std::make_shared<DataTypeDateTime64>(9);
     if (type_name == f_timestamptz_ns)
-        return std::make_shared<DataTypeDateTime64>(9, "UTC");
+    {
+        std::string timezone = context_->getSettingsRef()[Setting::iceberg_timezone_for_timestamptz];
+        return std::make_shared<DataTypeDateTime64>(9, timezone);
+    }
     if (type_name == f_string || type_name == f_binary)
         return std::make_shared<DataTypeString>();
 
@@ -541,6 +630,8 @@ DataTypePtr IcebergSchemaProcessor::getSimpleType(const String & type_name_arg, 
     }
     if (type_name == f_uuid)
         return std::make_shared<DataTypeUUID>();
+    if (type_name == f_unknown)
+        return std::make_shared<DataTypeNothing>();
 
     if (type_name.starts_with("fixed[") && type_name.ends_with(']'))
     {
@@ -564,7 +655,11 @@ DataTypePtr IcebergSchemaProcessor::getSimpleType(const String & type_name_arg, 
 }
 
 DataTypePtr
-IcebergSchemaProcessor::getComplexTypeFromObject(const Poco::JSON::Object::Ptr & type, String & current_full_name, bool is_subfield_of_root)
+IcebergSchemaProcessor::getComplexTypeFromObject(
+    const Poco::JSON::Object::Ptr & type,
+    String & current_full_name,
+    ContextPtr context_,
+    bool is_subfield_of_root)
 {
     /// The schema comes from the table metadata and can be nested arbitrarily deeply.
     checkStackSize();
@@ -573,15 +668,15 @@ IcebergSchemaProcessor::getComplexTypeFromObject(const Poco::JSON::Object::Ptr &
     if (type_name == f_list)
     {
         bool element_required = type->getValue<bool>("element-required");
-        auto element_type = getFieldType(type, f_element, element_required);
+        auto element_type = getFieldType(type, f_element, context_, element_required);
         return std::make_shared<DataTypeArray>(element_type);
     }
 
     if (type_name == f_map)
     {
-        auto key_type = getFieldType(type, f_key, true);
+        auto key_type = getFieldType(type, f_key, context_, true);
         auto value_required = type->getValue<bool>("value-required");
-        auto value_type = getFieldType(type, f_value, value_required);
+        auto value_type = getFieldType(type, f_value, context_, value_required);
         return std::make_shared<DataTypeMap>(key_type, value_type);
     }
 
@@ -605,7 +700,7 @@ IcebergSchemaProcessor::getComplexTypeFromObject(const Poco::JSON::Object::Ptr &
 
                 (current_full_name += ".").append(element_names.back());
                 scope_guard guard([&] { current_full_name.resize(current_full_name.size() - element_names.back().size() - 1); });
-                element_types.push_back(getFieldType(field, f_type, required, current_full_name, true));
+                element_types.push_back(getFieldType(field, f_type, context_, required, current_full_name, true));
                 TSA_SUPPRESS_WARNING_FOR_WRITE(clickhouse_types_by_source_ids)
                 [{schema_id, field->getValue<Int32>(f_id)}] = NameAndTypePair{current_full_name, element_types.back()};
 
@@ -614,7 +709,7 @@ IcebergSchemaProcessor::getComplexTypeFromObject(const Poco::JSON::Object::Ptr &
             }
             else
             {
-                element_types.push_back(getFieldType(field, f_type, required));
+                element_types.push_back(getFieldType(field, f_type, context_, required));
             }
         }
 
@@ -625,20 +720,30 @@ IcebergSchemaProcessor::getComplexTypeFromObject(const Poco::JSON::Object::Ptr &
 }
 
 DataTypePtr IcebergSchemaProcessor::getFieldType(
-    const Poco::JSON::Object::Ptr & field, const String & type_key, bool required, String & current_full_name, bool is_subfield_of_root)
+    const Poco::JSON::Object::Ptr & field,
+    const String & type_key,
+    ContextPtr context_,
+    bool required,
+    String & current_full_name,
+    bool is_subfield_of_root)
 {
     if (field->isObject(type_key))
-        return getComplexTypeFromObject(field->getObject(type_key), current_full_name, is_subfield_of_root);
+        return getComplexTypeFromObject(field->getObject(type_key), current_full_name, context_, is_subfield_of_root);
 
     auto type = field->get(type_key);
     if (type.isString())
     {
         const String & type_name = type.extract<String>();
-        auto data_type = getSimpleType(type_name, allow_geo_parser);
+        auto data_type = getSimpleType(type_name, context_, allow_geo_parser);
         return required || !data_type->canBeInsideNullable() ? data_type : makeNullable(data_type);
     }
 
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unexpected 'type' field: {}", type.toString());
+}
+
+DataTypePtr IcebergSchemaProcessor::getClickHouseFieldType(const Poco::JSON::Object::Ptr & field, ContextPtr context_)
+{
+    return getFieldType(field, f_type, context_, field->getValue<bool>(f_required));
 }
 
 /**
@@ -669,7 +774,11 @@ bool IcebergSchemaProcessor::allowPrimitiveTypeConversion(const String & old_typ
 
 // Ids are passed only for error logging purposes
 std::shared_ptr<ActionsDAG> IcebergSchemaProcessor::getSchemaTransformationDag(
-    const Poco::JSON::Object::Ptr & old_schema, const Poco::JSON::Object::Ptr & new_schema, Int32 old_id, Int32 new_id)
+    const Poco::JSON::Object::Ptr & old_schema,
+    const Poco::JSON::Object::Ptr & new_schema,
+    ContextPtr context_,
+    Int32 old_id,
+    Int32 new_id)
 {
     std::unordered_map<size_t, std::pair<Poco::JSON::Object::Ptr, const ActionsDAG::Node *>> old_schema_entries;
     auto old_schema_fields = old_schema->get(f_fields).extract<Poco::JSON::Array::Ptr>();
@@ -681,7 +790,7 @@ std::shared_ptr<ActionsDAG> IcebergSchemaProcessor::getSchemaTransformationDag(
         size_t id = field->getValue<size_t>(f_id);
         auto name = field->getValue<String>(f_name);
         bool required = field->getValue<bool>(f_required);
-        old_schema_entries[id] = {field, &dag->addInput(name, getFieldType(field, f_type, required))};
+        old_schema_entries[id] = {field, &dag->addInput(name, getFieldType(field, f_type, context_, required))};
     }
     auto new_schema_fields = new_schema->get(f_fields).extract<Poco::JSON::Array::Ptr>();
     for (size_t i = 0; i != new_schema_fields->size(); ++i)
@@ -690,7 +799,7 @@ std::shared_ptr<ActionsDAG> IcebergSchemaProcessor::getSchemaTransformationDag(
         size_t id = field->getValue<size_t>(f_id);
         auto name = field->getValue<String>(f_name);
         bool required = field->getValue<bool>(f_required);
-        auto type = getFieldType(field, f_type, required);
+        auto type = getFieldType(field, f_type, context_, required);
         auto old_node_it = old_schema_entries.find(id);
         if (old_node_it != old_schema_entries.end())
         {
@@ -709,7 +818,7 @@ std::shared_ptr<ActionsDAG> IcebergSchemaProcessor::getSchemaTransformationDag(
                         old_id,
                         new_id);
                 }
-                auto old_type = getFieldType(old_json, "type", required);
+                auto old_type = getFieldType(old_json, "type", context_, required);
                 auto transform = std::make_shared<EvolutionFunctionStruct>(DataTypes{type}, DataTypes{old_type}, old_json, field);
                 old_node = &dag->addFunction(transform, std::vector<const Node *>{old_node}, name);
 
@@ -735,14 +844,22 @@ std::shared_ptr<ActionsDAG> IcebergSchemaProcessor::getSchemaTransformationDag(
                 /// a whitespace-only difference is the same type and needs only a rename, not a cast.
                 if (canonicalizeTypeSpacing(old_type) == canonicalizeTypeSpacing(new_type))
                 {
-                    if (old_json->getValue<String>(f_name) != name)
+                    /// Nullability is carried by the separate `required` key, so equal type strings
+                    /// can still resolve to different types. Only relaxing required to optional is
+                    /// legal evolution; the reverse keeps the plain passthrough.
+                    const bool old_required = old_json->getValue<bool>(f_required);
+                    if (old_required && !required && !old_node->result_type->equals(*type))
+                    {
+                        node = &dag->addCast(*old_node, type, name, nullptr);
+                    }
+                    else if (old_json->getValue<String>(f_name) != name)
                     {
                         node = &dag->addAlias(*old_node, name);
                     }
                 }
                 else if (allowPrimitiveTypeConversion(old_type, new_type))
                 {
-                    node = &dag->addCast(*old_node, getFieldType(field, f_type, required), name, nullptr);
+                    node = &dag->addCast(*old_node, getFieldType(field, f_type, context_, required), name, nullptr);
                 }
                 outputs.push_back(node);
             }
@@ -770,7 +887,10 @@ std::shared_ptr<ActionsDAG> IcebergSchemaProcessor::getSchemaTransformationDag(
     return dag;
 }
 
-std::shared_ptr<const ActionsDAG> IcebergSchemaProcessor::getSchemaTransformationDagByIds(Int32 old_id, Int32 new_id)
+std::shared_ptr<const ActionsDAG> IcebergSchemaProcessor::getSchemaTransformationDagByIds(
+    ContextPtr context_,
+    Int32 old_id,
+    Int32 new_id)
 {
     if (old_id == new_id)
         return nullptr;
@@ -789,7 +909,7 @@ std::shared_ptr<const ActionsDAG> IcebergSchemaProcessor::getSchemaTransformatio
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Schema with schema-id {} is unknown", new_id);
 
     return transform_dags_by_ids[{old_id, new_id}]
-        = getSchemaTransformationDag(old_schema_it->second, new_schema_it->second, old_id, new_id);
+        = getSchemaTransformationDag(old_schema_it->second, new_schema_it->second, context_, old_id, new_id);
 }
 
 Poco::JSON::Object::Ptr IcebergSchemaProcessor::getIcebergTableSchemaById(Int32 id) const
@@ -857,6 +977,13 @@ bool IcebergSchemaProcessor::hasClickHouseTableSchemaById(Int32 id) const
     SharedLockGuard lock(mutex);
 
     return clickhouse_table_schemas_by_ids.contains(id);
+}
+
+bool IcebergSchemaProcessor::isSchemaRegisteredFromMetadata(Int32 id) const
+{
+    SharedLockGuard lock(mutex);
+
+    return iceberg_table_schemas_by_ids.contains(id) && !manifest_sourced_schema_ids.contains(id);
 }
 
 std::unordered_map<String, Int64> IcebergSchemaProcessor::traverseSchema(Poco::JSON::Array::Ptr schema)

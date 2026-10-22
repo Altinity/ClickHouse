@@ -18,6 +18,8 @@
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Storages/checkAndGetLiteralArgument.h>
 #include <Poco/UUIDGenerator.h>
+#include <filesystem>
+
 
 namespace DB
 {
@@ -72,14 +74,13 @@ std::optional<String> checkAndGetNewFileOnInsertIfNeeded(
 
 void resolveSchemaAndFormat(
     ColumnsDescription & columns,
-    std::string & format,
     ObjectStoragePtr object_storage,
-    const StorageObjectStorageConfigurationPtr & configuration,
+    StorageObjectStorageConfigurationPtr & configuration,
     std::optional<FormatSettings> format_settings,
     std::string & sample_path,
     const ContextPtr & context)
 {
-    if (format == "auto")
+    if (configuration->getFormat() == "auto")
     {
         if (configuration->isDataLakeConfiguration())
         {
@@ -101,21 +102,23 @@ void resolveSchemaAndFormat(
 
         if (columns.empty())
         {
-            if (format == "auto")
+            if (configuration->getFormat() == "auto")
             {
+                std::string format;
                 std::tie(columns, format) = StorageObjectStorage::resolveSchemaAndFormatFromData(
                     object_storage, configuration, format_settings, sample_path, context);
+                configuration->setFormat(format);
             }
             else
             {
-                chassert(!format.empty());
+                chassert(!configuration->getFormat().empty());
                 columns = StorageObjectStorage::resolveSchemaFromData(object_storage, configuration, format_settings, sample_path, context);
             }
         }
     }
-    else if (format == "auto")
+    else if (configuration->getFormat() == "auto")
     {
-        format = StorageObjectStorage::resolveFormatFromData(object_storage, configuration, format_settings, sample_path, context);
+        configuration->setFormat(StorageObjectStorage::resolveFormatFromData(object_storage, configuration, format_settings, sample_path, context));
     }
 
     validateSupportedColumns(columns, *configuration);
@@ -364,4 +367,5 @@ extern const SettingsBool use_cache_for_count_from_files;
 extern const SettingsString filesystem_cache_name;
 extern const SettingsUInt64 filesystem_cache_boundary_alignment;
 }
+
 }

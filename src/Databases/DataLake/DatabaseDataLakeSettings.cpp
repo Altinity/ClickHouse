@@ -21,6 +21,7 @@ namespace ErrorCodes
     DECLARE(DatabaseDataLakeCatalogType, catalog_type, DatabaseDataLakeCatalogType::NONE, "Catalog type", 0) \
     DECLARE(String, catalog_credential, "", "", 0) \
     DECLARE(Bool, vended_credentials, true, "Use vended credentials (storage credentials) from catalog", 0) \
+    DECLARE(UInt64, vended_credentials_cache_ttl, 300, "Maximum cache entry lifetime (in seconds) for vended credentials. '0' disables caching.", 0) \
     DECLARE(String, auth_scope, "PRINCIPAL_ROLE:ALL", "Authorization scope for client credentials or token exchange", 0) \
     DECLARE(String, oauth_server_uri, "", "OAuth server uri", 0) \
     DECLARE(Bool, oauth_server_use_request_body, true, "Put parameters into request body or query params", 0) \
@@ -33,6 +34,7 @@ namespace ErrorCodes
     DECLARE(String, aws_role_session_name, "", "Session name used for the AWS STS `AssumeRole` call. Optional; defaults to `ClickHouseSession`", 0) \
     DECLARE(String, aws_external_id, "", "External ID passed to AWS STS `AssumeRole`, matching the `sts:ExternalId` condition on the role's trust policy. Use this when the role is owned by a third party, such as ClickHouse Cloud", 0) \
     DECLARE(String, storage_endpoint, "", "Object storage endpoint", 0) \
+    DECLARE(String, default_base_location, "", "Base URI under which CREATE TABLE places new tables. Used only when the catalog does not report `default-base-location`", 0) \
     DECLARE(S3UriStyle, storage_uri_style, S3UriStyle::AUTO, "URL style used when constructing object storage URLs from catalog-provided table locations. Use 'virtual_hosted' when the object storage server requires the bucket in the hostname (e.g. https://bucket.endpoint.com/path/)", 0) \
     DECLARE(String, onelake_tenant_id, "", "Tenant id from azure", 0) \
     DECLARE(String, onelake_client_id, "", "Client id from azure", 0) \
@@ -51,6 +53,7 @@ namespace ErrorCodes
     DECLARE(String, dlf_access_key_id, "", "Access id of DLF token for Paimon REST Catalog", 0) \
     DECLARE(String, dlf_access_key_secret, "", "Access secret of DLF token for Paimon REST Catalog", 0) \
     DECLARE(Bool, force_add_bucket, false, "When constructing object-storage URLs from the catalog-provided table location and storage_endpoint, prepend the bucket/container name even if the endpoint already contains it. Useful for catalogs that hand back paths without the bucket and expect it to be added at URL construction (Polaris-style paths).", 0) \
+    DECLARE(String, namespaces, "*", "Comma-separated list of allowed namespaces", 0) \
     DECLARE(Bool, flat_namespaces, false, "The catalog supports only single-level namespaces, so only top-level namespaces are listed and sub-namespaces are not requested. Set this for Iceberg REST catalogs that reject the `parent` query parameter of the list-namespaces endpoint, such as Apache Polaris federated to AWS Glue, which answers `Glue dataCatalog does not support multipart namespace` with HTTP 400. Some catalogs instead ignore `parent` and echo top-level namespaces back for every parent; without this setting those are listed as fake nested namespaces. Not needed for catalog types that are always flat (`delta_sharing`, BigLake, S3 Tables).", 0) \
 
 #define LIST_OF_DATABASE_ICEBERG_SETTINGS(M, ALIAS) \

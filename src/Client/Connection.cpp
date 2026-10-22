@@ -30,7 +30,9 @@
 #include <Common/OpenSSLHelpers.h>
 #include <Common/formatReadable.h>
 #include <Common/randomSeed.h>
+#include <Core/AntalyaProtocol.h>
 #include <Core/Block.h>
+#include <Core/Protocol.h>
 #include <Core/ProtocolDefines.h>
 #include <Interpreters/ClientInfo.h>
 #include <Interpreters/OpenTelemetrySpanLog.h>
@@ -71,8 +73,11 @@ namespace DB
 {
 namespace Setting
 {
+    extern const SettingsUInt64 input_format_binary_max_type_complexity;
+    extern const SettingsBool input_format_native_decode_types_in_binary_format;
     extern const SettingsString network_compression_method;
     extern const SettingsInt64 network_zstd_compression_level;
+    extern const SettingsBool output_format_native_encode_types_in_binary_format;
 }
 
 namespace FailPoints
@@ -92,6 +97,9 @@ namespace ErrorCodes
     extern const int EMPTY_DATA_PASSED;
     extern const int LOGICAL_ERROR;
     extern const int TOO_LARGE_ARRAY_SIZE;
+#if USE_JWT_CPP && USE_SSL
+    extern const int AUTHENTICATION_FAILED;
+#endif
 }
 
 Connection::~Connection()
@@ -296,7 +304,29 @@ void Connection::connect(const ConnectionTimeouts & timeouts)
     /// if connection was broken it is necessary to cancel it before reconnecting
     disconnect();
 
+#if USE_JWT_CPP && USE_SSL
+    /// Skip fetch when current JWT is still usable; opaque tokens and JWTs without
+    /// a usable `exp` claim are refreshed reactively on rejection below.
+    if (jwt_provider && jwt.empty())
+    {
+        jwt = jwt_provider->getJWT();
+    }
+    else if (jwt_provider && JWTProvider::isJWT(jwt))
+    {
+        const Poco::Timestamp expiry = JWTProvider::getJwtExpiry(jwt);
+        const Poco::Timestamp refresh_threshold = Poco::Timestamp() + Poco::Timespan(30, 0);
+        if (expiry > Poco::Timestamp(0) && expiry < refresh_threshold)
+            jwt = jwt_provider->getJWT();
+    }
+
+    bool jwt_retried_on_rejection = false;
+#endif
+
     ProfileEvents::increment(ProfileEvents::DistributedConnectionConnectCount);
+
+#if USE_JWT_CPP && USE_SSL
+retry_handshake_with_fresh_jwt:
+#endif
     try
     {
         LOG_TRACE(log_wrapper.get(), "Connecting. Database: {}. User: {}{}{}. Bind_Host: {}",
@@ -401,8 +431,11 @@ void Connection::connect(const ConnectionTimeouts & timeouts)
         if (proto_recv_chunked == "chunked")
             in->enableChunked();
 
-        LOG_TRACE(log_wrapper.get(), "Connected to {} server version {}.{}.{}.",
-            server_name, server_version_major, server_version_minor, server_version_patch);
+        LOG_TRACE(log_wrapper.get(), "Connected to {} server version {}.{}.{}{}.",
+            server_name, server_version_major, server_version_minor, server_version_patch,
+            (server_antalya_protocol_version > 0
+                ? ", Antalya protocol: " + std::to_string(server_antalya_protocol_version)
+                : ""));
 
         /// Now that the handshake is complete, use the regular timeouts
         socket->setReceiveTimeout(timeouts.receive_timeout);
@@ -419,6 +452,23 @@ void Connection::connect(const ConnectionTimeouts & timeouts)
         e.addMessage("({})", getDescription(/*with_extra*/ true));
         throw;
     }
+#if USE_JWT_CPP && USE_SSL
+    catch (DB::Exception & e)
+    {
+        disconnect();
+
+        if (e.code() == ErrorCodes::AUTHENTICATION_FAILED && jwt_provider && !jwt_retried_on_rejection)
+        {
+            LOG_DEBUG(log_wrapper.get(),
+                "Server rejected JWT during handshake, fetching a fresh token and retrying once");
+            jwt_retried_on_rejection = true;
+            jwt = jwt_provider->getJWT();
+            goto retry_handshake_with_fresh_jwt;
+        }
+
+        throw;
+    }
+#endif
     catch (Poco::Net::NetException & e)
     {
         disconnect();
@@ -514,7 +564,7 @@ void Connection::sendHello()
                         "Parameters 'default_database', 'user' and 'password' must not contain ASCII control characters");
 
     writeVarUInt(Protocol::Client::Hello, *out);
-    writeStringBinary(std::string(VERSION_NAME) + " " + client_name, *out);
+    writeStringBinary(AntalyaProtocol::appendMarker(std::string(VERSION_NAME) + " " + client_name), *out);
     writeVarUInt(VERSION_MAJOR, *out);
     writeVarUInt(VERSION_MINOR, *out);
     // NOTE For backward compatibility of the protocol, client cannot send its version_patch.
@@ -637,6 +687,7 @@ void Connection::receiveHello()
     {
         readStringBinary(server_name, *in, DBMS_MAX_HELLO_STRING_SIZE);
         sanitizeUntrustedServerString(server_name);
+        server_antalya_protocol_version = AntalyaProtocol::parseMarker(server_name);
         readVarUInt(server_version_major, *in);
         readVarUInt(server_version_minor, *in);
         readVarUInt(server_revision, *in);
@@ -997,23 +1048,6 @@ void Connection::sendQuery(
         client_info = &new_client_info;
     }
 
-#if USE_JWT_CPP && USE_SSL
-    if (jwt_provider && !jwt.empty())
-    {
-        if (JWTProvider::getJwtExpiry(jwt) < (Poco::Timestamp() + Poco::Timespan(30, 0)))
-        {
-            String new_jwt = jwt_provider->getJWT();
-            if (!new_jwt.empty())
-            {
-                jwt = new_jwt;
-                // We have a new token, so we need to reconnect.
-                // The current connection is still using the old token.
-                disconnect();
-            }
-        }
-    }
-#endif
-
     if (!connected)
         connect(timeouts);
 
@@ -1048,6 +1082,22 @@ void Connection::sendQuery(
         compression_codec = CompressionCodecFactory::instance().getDefaultCodec();
 
     query_id = query_id_;
+
+    /// The server applies the binary type encoding settings to the `Native` blocks of every query except a secondary one
+    /// (see `getNativeWireFormatSettings`), and a server sends initial queries to other servers too.
+    query_wire_format_settings.reset();
+    if (settings && !(client_info && client_info->query_kind == ClientInfo::QueryKind::SECONDARY_QUERY))
+    {
+        const bool server_encodes = (*settings)[Setting::output_format_native_encode_types_in_binary_format];
+        const bool server_decodes = (*settings)[Setting::input_format_native_decode_types_in_binary_format];
+        if (server_encodes || server_decodes)
+        {
+            query_wire_format_settings.emplace();
+            query_wire_format_settings->native.decode_types_in_binary_format = server_encodes;
+            query_wire_format_settings->native.encode_types_in_binary_format = server_decodes;
+            query_wire_format_settings->binary.max_binary_type_complexity = (*settings)[Setting::input_format_binary_max_type_complexity];
+        }
+    }
 
     /// Avoid reusing connections that had been left in the intermediate state
     /// (i.e. not all packets had been sent).
@@ -1229,7 +1279,7 @@ void Connection::sendData(const Block & block, const String & name, bool scalar)
         else
             maybe_compressed_out = out;
 
-        block_out = std::make_unique<NativeWriter>(*maybe_compressed_out, server_revision, std::make_shared<const Block>(block.cloneEmpty()), format_settings);
+        block_out = std::make_unique<NativeWriter>(*maybe_compressed_out, server_revision, std::make_shared<const Block>(block.cloneEmpty()), getNativeFormatSettings());
     }
 
     if (scalar)
@@ -1254,7 +1304,7 @@ void Connection::sendData(const Block & block, const String & name, bool scalar)
 void Connection::sendClusterFunctionReadTaskResponse(const ClusterFunctionReadTaskResponse & response)
 {
     writeVarUInt(Protocol::Client::ReadTaskResponse, *out);
-    response.serialize(*out, worker_cluster_function_protocol_version);
+    response.serialize(*out, worker_cluster_function_protocol_version, server_antalya_protocol_version);
     out->finishChunk();
     out->next();
 }
@@ -1577,8 +1627,11 @@ Packet Connection::receivePacket()
                 // materializing it (do not resize a vector to a peer-chosen size).
                 UInt64 num_part_uuids = 0;
                 readVarUInt(num_part_uuids, *in);
-                if (num_part_uuids > DEFAULT_MAX_STRING_SIZE)
-                    throw Exception(ErrorCodes::TOO_LARGE_ARRAY_SIZE, "Too large array size (maximum: {})", DEFAULT_MAX_STRING_SIZE);
+                /// The count comes from the server and is only used to skip the payload, but it
+                /// still decides how much the client reads from the socket, so keep it realistic.
+                static constexpr UInt64 max_part_uuids = 1000000;
+                if (num_part_uuids > max_part_uuids)
+                    throw Exception(ErrorCodes::TOO_LARGE_ARRAY_SIZE, "Too large array size (maximum: {})", max_part_uuids);
                 in->ignore(num_part_uuids * sizeof(UUID));
                 return res;
             }
@@ -1695,7 +1748,7 @@ void Connection::initBlockInput()
         initMaybeCompressedInput();
         /// The server may send marshalled result blocks; their consumers convert them back.
         block_in = std::make_unique<NativeReader>(
-            *maybe_compressed_in, server_revision, format_settings, ISerialization::KindSet::all());
+            *maybe_compressed_in, server_revision, getNativeFormatSettings(), ISerialization::KindSet::all());
     }
 }
 
@@ -1712,7 +1765,7 @@ void Connection::initBlockLogsInput()
         }
 
         /// Have to return superset of SystemLogsQueue::getSampleBlock() columns
-        block_logs_in = std::make_unique<NativeReader>(*logs_buf, server_revision, format_settings);
+        block_logs_in = std::make_unique<NativeReader>(*logs_buf, server_revision, getNativeFormatSettings());
     }
 }
 
@@ -1728,7 +1781,7 @@ void Connection::initBlockProfileEventsInput()
             profile_events_buf = maybe_compressed_in.get();
         }
 
-        block_profile_events_in = std::make_unique<NativeReader>(*profile_events_buf, server_revision, format_settings);
+        block_profile_events_in = std::make_unique<NativeReader>(*profile_events_buf, server_revision, getNativeFormatSettings());
     }
 }
 

@@ -4,6 +4,7 @@
 #include "config.h"
 
 #include <DataTypes/IDataType.h>
+#include <Interpreters/Context_fwd.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/FileNamesGenerator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergPath.h>
 #include <Poco/JSON/Object.h>
@@ -34,7 +35,7 @@ public:
 
     NextMetadataResult generateNextMetadata(
         FileNamesGenerator & generator,
-        const Iceberg::IcebergPathFromMetadata & metadata_file_path,
+        const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path,
         Int64 parent_snapshot_id,
         Int64 added_files,
         Int64 added_records,
@@ -44,18 +45,34 @@ public:
         Int64 num_deleted_rows,
         std::optional<Int64> user_defined_snapshot_id = std::nullopt,
         std::optional<Int64> user_defined_timestamp = std::nullopt,
-        SnapshotOperation operation = SnapshotOperation::Append);
+        SnapshotOperation operation = SnapshotOperation::Append,
+        bool is_truncate = false);
 
+    void generateAddColumnMetadata(const String & column_name, DataTypePtr type, bool first = false, const String & after_column = {});
     /// Create a manifest-only rewrite snapshot (`replace` operation) carrying `total-*` counters forward so `OPTIMIZE ... MANIFEST` is idempotent.
     NextMetadataResult generateManifestOnlySnapshot(
         FileNamesGenerator & generator,
         const Iceberg::IcebergPathFromMetadata & metadata_file_path,
         Int64 parent_snapshot_id);
 
-    void generateAddColumnMetadata(const String & column_name, DataTypePtr type);
     void generateDropColumnMetadata(const String & column_name);
-    void generateModifyColumnMetadata(const String & column_name, DataTypePtr type);
+    /// Returns false when neither the type nor the position changed (true no-op).
+    /// Throws when the requested type differs from the current one but maps to the same Iceberg type.
+    /// `context` supplies the settings used to map the stored Iceberg type back to a ClickHouse
+    /// type (the timestamptz timezone and whether geo types are allowed).
+    bool generateModifyColumnMetadata(const String & column_name, DataTypePtr type, ContextPtr context, bool first = false, const String & after_column = {});
     void generateRenameColumnMetadata(const String & column_name, const String & new_column_name);
+
+    /// A commit attempt can land in the catalog even when the client observes a failure
+    /// (the Iceberg "commit state unknown" case, e.g. a proxy returning 5xx after the catalog
+    /// applied the update). These predicates let a retry detect that the requested change is
+    /// already present instead of applying it a second time and failing.
+    /// `first` and `after_column` are checked against the field order, as for `isModifyColumnApplied`.
+    bool isAddColumnApplied(const String & column_name, DataTypePtr type, bool first = false, const String & after_column = {}) const;
+    bool isDropColumnApplied(const String & column_name) const;
+    bool isRenameColumnApplied(const String & column_name, const String & new_column_name) const;
+    /// `type` may be null for a position-only `MODIFY COLUMN`; `first` and `after_column` are checked against the field order.
+    bool isModifyColumnApplied(const String & column_name, DataTypePtr type, bool first = false, const String & after_column = {}) const;
 
 private:
     Poco::JSON::Object::Ptr metadata_object;
@@ -65,6 +82,11 @@ private:
 
     Int64 getMaxSequenceNumber();
     Poco::JSON::Object::Ptr getParentSnapshot(Int64 parent_snapshot_id);
+
+    /// Returns the schema referenced by `current-schema-id`, or nullptr when it is absent.
+    Poco::JSON::Object::Ptr findCurrentSchema() const;
+    /// Returns the schema referenced by `current-schema-id`, throwing when it is absent.
+    Poco::JSON::Object::Ptr getCurrentSchema() const;
 };
 
 #endif

@@ -783,7 +783,7 @@ void StorageURLSink::cancelBuffers()
         write_buf->cancel();
 }
 
-class PartitionedStorageURLSink : public PartitionedSink
+class PartitionedStorageURLSink : public PartitionedSink::SinkCreator
 {
 public:
     PartitionedStorageURLSink(
@@ -797,7 +797,7 @@ public:
         const CompressionMethod compression_method_,
         const HTTPHeaderEntries & headers_,
         const String & http_method_)
-        : PartitionedSink(partition_strategy_, context_, std::make_shared<const Block>(sample_block_))
+        : partition_strategy(partition_strategy_)
         , uri(uri_)
         , format(format_)
         , format_settings(format_settings_)
@@ -812,7 +812,8 @@ public:
 
     SinkPtr createSinkForPartition(const String & partition_id) override
     {
-        std::string partition_path = partition_strategy->getPathForWrite(uri, partition_id);
+        const auto file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(uri);
+        std::string partition_path = file_path_generator->getPathForWrite(partition_id);
 
         context->getRemoteHostFilter().checkURL(Poco::URI(partition_path));
         return std::make_shared<StorageURLSink>(
@@ -820,6 +821,7 @@ public:
     }
 
 private:
+    std::shared_ptr<IPartitionStrategy> partition_strategy;
     const String uri;
     const String format;
     const std::optional<FormatSettings> format_settings;
@@ -1386,7 +1388,8 @@ void ReadFromURL::initializePipeline(QueryPipelineBuilder & pipeline, const Buil
     pipes.reserve(num_streams);
 
     auto parser_shared_resources = std::make_shared<FormatParserSharedResources>(settings, num_streams);
-    auto format_filter_info = std::make_shared<FormatFilterInfo>(filter_actions_dag, context, nullptr, query_info.row_level_filter, query_info.prewhere_info);
+    auto format_filter_info = std::make_shared<FormatFilterInfo>(
+        info.getFormatFilter(filter_actions_dag), context, nullptr, query_info.row_level_filter, query_info.prewhere_info);
 
     for (size_t i = 0; i < num_streams; ++i)
     {
@@ -1509,7 +1512,7 @@ SinkToStoragePtr IStorageURLBase::write(const ASTPtr & query, const StorageMetad
             has_wildcards,
             /* partition_columns_in_data_file */true);
 
-        return std::make_shared<PartitionedStorageURLSink>(
+        auto sink_creator = std::make_shared<PartitionedStorageURLSink>(
             partition_strategy,
             uri,
             format_name,
@@ -1520,6 +1523,8 @@ SinkToStoragePtr IStorageURLBase::write(const ASTPtr & query, const StorageMetad
             compression_method,
             headers,
             http_method);
+
+        return std::make_shared<PartitionedSink>(partition_strategy, sink_creator, context, std::make_shared<const Block>(metadata_snapshot->getSampleBlock()));
     }
 
     return std::make_shared<StorageURLSink>(
@@ -1882,8 +1887,9 @@ String StorageURL::resolveURLBase(const String & url, const String & base, const
     }
 
     auto scheme_end = base.find("://");
+    /// Not echoed back: the value can carry a credential, and password masking anchors on the `://` it lacks.
     if (scheme_end == String::npos)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "The `{}` setting must contain a scheme (e.g. https://), got: {}", base_setting_name, base);
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "The `{}` setting must contain a scheme (e.g. https://)", base_setting_name);
 
     /// Find the boundary of the path component in the base URL (before '?' or '#').
     auto authority_start = scheme_end + 3; /// skip "://"
@@ -2285,6 +2291,7 @@ public:
     }
 
     StoragePtr getNested() const override { return nested; }
+    StoragePtr tryGetNested() const override { return nested; }
     /// The table was created with `ENGINE = URL(...)`; report it as such for consistency with
     /// `SHOW CREATE TABLE` and `system.tables`, even though reads/writes go to the delegate.
     String getName() const override { return "URL"; }
@@ -2536,6 +2543,7 @@ static StoragePtr tryDispatchURLEngineByScheme(const StorageFactory::Arguments &
         /// `format = auto` that would force re-inference (and external I/O) on every `ATTACH`/restart.
         if (const auto * file = typeid_cast<const StorageFile *>(delegate_storage.get()))
             resolved_format = file->getFormatName();
+        /// NOLINT(storage-cast): the delegate is created right here, it never comes from the catalog.
         else if (const auto * object_storage = typeid_cast<const StorageObjectStorage *>(delegate_storage.get()))
             resolved_format = object_storage->getFormatName();
         else
@@ -2617,7 +2625,7 @@ void registerStorageURL(StorageFactory & factory)
             StorageURL::overrideURLInEngineArgs(object_storage_args, config.url, context, /*skip_userinfo=*/ false);
 
             auto configuration = std::make_shared<StorageWebConfiguration>();
-            StorageObjectStorageConfiguration::initialize(*configuration, object_storage_args, context, /* with_table_structure */ false);
+            configuration->initialize(object_storage_args, context, /* with_table_structure */ false);
 
             /// Same contract as `createStorageObjectStorage`: only a user-issued `CREATE` applies the
             /// `file_like_engine_default_partition_strategy` default; ATTACH / startup / RESTORE must

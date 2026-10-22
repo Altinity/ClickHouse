@@ -18,6 +18,7 @@ namespace ErrorCodes
 {
 extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 extern const int LOGICAL_ERROR;
+extern const int BAD_ARGUMENTS;
 }
 
 class TableFunctionMergeTreeCodecBlockCounts : public ITableFunction
@@ -29,7 +30,10 @@ public:
     /// Refused in line with the other `MergeTree` introspection table functions. This storage holds only the source
     /// table's name and resolves it on every read, so it pins nothing, but the persisted form has no uses and is
     /// refused for all of them alike, so that none of them has to stay correct while outliving its query.
-    bool canBeUsedToCreateTable() const override { return false; }
+    void validateUseToCreateTable() const override
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table function '{}' cannot be used to create a table", getName());
+    }
 
     void parseArguments(const ASTPtr & ast_function, ContextPtr context) override;
     ColumnsDescription getActualTableStructure(ContextPtr context, bool is_insert_query) const override;

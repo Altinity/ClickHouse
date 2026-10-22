@@ -25,6 +25,8 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
+#include <Storages/StorageProxy.h>
 #include <Storages/VirtualColumnUtils.h>
 
 
@@ -221,13 +223,33 @@ protected:
             if (!lock)
                 return false;
 
-            auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(storage.get());
-            if (!object_storage_table || !object_storage_table->isIcebergStorage())
+            /// Object storage tables created by the storage factory are `StorageObjectStorageCluster`
+            /// (it falls back to plain object storage reads when no cluster is configured), while some
+            /// code paths still produce a plain `StorageObjectStorage`. Handle both.
+            auto object_storage_table = castStorage<StorageObjectStorage>(storage, DeferredTable::Skip);
+            auto object_storage_cluster_table = castStorage<StorageObjectStorageCluster>(storage, DeferredTable::Skip);
+
+            if (object_storage_table)
+            {
+                if (!object_storage_table->isIcebergStorage())
+                    return false;
+            }
+            else if (object_storage_cluster_table)
+            {
+                if (!object_storage_cluster_table->isIcebergStorage())
+                    return false;
+            }
+            else
+            {
                 return false;
+            }
 
             try
             {
-                auto iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(object_storage_table->getExternalMetadata(context_copy));
+                auto external_metadata = object_storage_table
+                    ? object_storage_table->getExternalMetadata(context_copy)
+                    : object_storage_cluster_table->getExternalMetadata(context_copy);
+                auto iceberg_metadata = std::dynamic_pointer_cast<IcebergMetadata>(external_metadata);
                 if (!iceberg_metadata)
                     return false;
 
@@ -446,7 +468,7 @@ StorageSystemIcebergFiles::StorageSystemIcebergFiles(const StorageID & table_id_
         {"table", std::make_shared<DataTypeString>(), "Table name."},
         {"snapshot_id", std::make_shared<DataTypeInt64>(), "Snapshot ID at which the file was added."},
         {"content", content_enum, "File content kind."},
-        {"file_path", std::make_shared<DataTypeString>(), "Resolved storage path of the file."},
+        {"file_path", std::make_shared<DataTypeString>(), "Path of the file as written in the manifest, which may be an absolute URI outside the table location."},
         {"file_format", std::make_shared<DataTypeString>(), "File format, e.g. 'PARQUET'."},
         {"record_count", std::make_shared<DataTypeInt64>(), "Number of records in the file."},
         {"file_size_in_bytes", std::make_shared<DataTypeInt64>(), "Size of the file in bytes."},

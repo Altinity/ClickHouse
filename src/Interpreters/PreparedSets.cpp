@@ -327,6 +327,12 @@ SetAndKeyPtr FutureSetFromSubquery::detachSetAndKey()
 
 SetPtr FutureSetFromSubquery::get() const
 {
+    std::lock_guard lock(mutex);
+    return get_unsafe();
+}
+
+SetPtr FutureSetFromSubquery::get_unsafe() const
+{
     if (set_and_key->set != nullptr && set_and_key->set->isCreated())
         return set_and_key->set;
 
@@ -335,6 +341,7 @@ SetPtr FutureSetFromSubquery::get() const
 
 void FutureSetFromSubquery::setQueryPlan(std::unique_ptr<QueryPlan> source_)
 {
+    std::lock_guard lock(mutex);
     source = std::move(source_);
     set_and_key->set->setHeader(source->getCurrentHeader()->getColumnsWithTypeAndName());
 }
@@ -386,6 +393,8 @@ void FutureSetFromSubquery::buildExternalTableFromInplaceSet(StoragePtr external
 
 void FutureSetFromSubquery::setExternalTable(StoragePtr external_table_)
 {
+    std::lock_guard lock(mutex);
+
     if (set_and_key->set->isCreated())
     {
         if (!set_and_key->set->hasExplicitSetElements())
@@ -399,6 +408,7 @@ void FutureSetFromSubquery::setExternalTable(StoragePtr external_table_)
 
 DataTypes FutureSetFromSubquery::getTypes() const
 {
+    std::lock_guard lock(mutex);
     return set_and_key->set->getElementsTypes();
 }
 
@@ -415,6 +425,12 @@ bool FutureSetFromSubquery::hasExternalTable() const
 FutureSet::Hash FutureSetFromSubquery::getHash() const { return hash; }
 
 std::unique_ptr<QueryPlan> FutureSetFromSubquery::build(const SizeLimits & network_transfer_limits, const PreparedSetsCachePtr & prepared_sets_cache)
+{
+    std::lock_guard lock(mutex);
+    return build_unsafe(network_transfer_limits, prepared_sets_cache);
+}
+
+std::unique_ptr<QueryPlan> FutureSetFromSubquery::build_unsafe(const SizeLimits & network_transfer_limits, const PreparedSetsCachePtr & prepared_sets_cache)
 {
     if (set_and_key->set->isCreated())
         return nullptr;
@@ -459,6 +475,8 @@ void FutureSetFromSubquery::prepareForDistributedPlan(const ContextPtr & context
 
 void FutureSetFromSubquery::buildSetInplace(const ContextPtr & context)
 {
+    std::lock_guard lock(mutex);
+
     if (external_table_set)
         external_table_set->buildSetInplace(context);
 
@@ -477,7 +495,7 @@ void FutureSetFromSubquery::buildSetInplace(const ContextPtr & context)
         prepared_sets_cache = nullptr;
     }
 
-    auto plan = build(network_transfer_limits, prepared_sets_cache);
+    auto plan = build_unsafe(network_transfer_limits, prepared_sets_cache);
 
     if (!plan)
         return;
@@ -506,9 +524,9 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
     /// Concurrent index analyses may share this set through cloned filter DAGs, and the build mutates
     /// `set_and_key->set` and `source`. A mutex and not `callOnce` because this build may stop without
     /// creating the set (e.g. a subquery timeout with `overflow_mode = 'break'`) and then be retried.
-    std::lock_guard lock(inplace_build_mutex);
+    std::lock_guard lock(mutex);
 
-    if (auto set = get())
+    if (auto set = get_unsafe())
     {
         if (set->hasExplicitSetElements())
             return set;
@@ -655,7 +673,7 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
         /// `CreatingSetStep` to the canonical `set_and_key` (as this code always did). On a silent failure
         /// `source` is gone, so the deferred build cannot rebuild — exactly the previous behavior; the set
         /// is never reused with partial rows, because the deferred build throws "Not-ready Set" instead.
-        plan = build(network_transfer_limits, prepared_sets_cache);
+        plan = build_unsafe(network_transfer_limits, prepared_sets_cache);
         if (!plan)
             return nullptr;
 
@@ -666,14 +684,10 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
     }
 
     /// Runs the speculative pipeline in its own scope so that `executor`, `pipeline`, and the pipeline
-    /// builder are destroyed before `source` is reset below. On the non-destructive path the cloned plan
-    /// carries an *empty* `QueryPlanResourceHolder` (`QueryPlan::clone` copies the plan nodes only, not the
-    /// resources), so the speculative pipeline relies on the original `source` plan to keep the interpreter
-    /// contexts, storage holders, and table locks alive: processors may use them implicitly, including in
-    /// their destructors — this is exactly what the resource holder normally guarantees for the lifetime of
-    /// the pipeline. Resetting `source` while the pipeline is still alive would release them too early. On
-    /// the destructive fallback `build` moved the resources into the plan, which outlives this call, so the
-    /// ordering is safe there too.
+    /// builder are destroyed before `source` is reset below. `QueryPlan::clone` copies the shared resource
+    /// handles onto the cloned plan, so the speculative pipeline holds the interpreter contexts, storage
+    /// holders, and table locks itself rather than depending on `source` outliving it. On the destructive
+    /// fallback `build` moved the resources into the plan, which outlives this call.
     ///
     /// Returns false when the pipeline stopped without creating the set.
     auto run_plan = [&](QueryPlan & plan_to_run)
@@ -722,8 +736,7 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
     /// In-place build succeeded. On the non-destructive path, publish the fully-created temporary set into
     /// the canonical `set_and_key`; the deferred build is then skipped (it checks `isCreated()` / `get()`),
     /// so the original `source` plan is no longer needed. On the destructive fallback `source` was already
-    /// consumed by `build`, so `reset` is a no-op there. Reset only now, after the pipeline and executor have
-    /// been destroyed, so the resources held by `source` outlive every processor.
+    /// consumed by `build`, so `reset` is a no-op there.
     if (tmp_set_and_key)
         set_and_key->set = tmp_set_and_key->set;
     source.reset();

@@ -4,6 +4,7 @@
 #include <AggregateFunctions/AggregateFunctionGroupBitmapData.h>
 #include <Core/Settings.h>
 #include <Core/ProtocolDefines.h>
+#include <Core/AntalyaProtocol.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <IO/WriteHelpers.h>
@@ -35,15 +36,22 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
         data_lake_metadata = object->data_lake_metadata.value();
 
 #if USE_AVRO
-    if (std::dynamic_pointer_cast<IcebergDataObjectInfo>(object))
-    {
-        iceberg_info = dynamic_cast<IcebergDataObjectInfo &>(*object).info;
-    }
+    if (auto iceberg_object = std::dynamic_pointer_cast<IcebergDataObjectInfo>(object))
+        iceberg_info = iceberg_object->info;
 #endif
 
-    const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
-    path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
+    file_meta_info = object->relative_path_with_metadata.file_meta_info;
+
+    if (object->relative_path_with_metadata.getCommand().isValid())
+        path = object->relative_path_with_metadata.getCommand().toString();
+    else
+    {
+        const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
+        path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
+    }
+
     read_source_index = object->relative_path_with_metadata.read_source_index;
+
     file_bucket_info = object->file_bucket_info;
 }
 
@@ -76,14 +84,69 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
     object->relative_path_with_metadata.read_source_index = read_source_index;
     object->data_lake_metadata = data_lake_metadata;
     object->file_bucket_info = file_bucket_info;
+    if (file_meta_info.has_value())
+        object->relative_path_with_metadata.file_meta_info = file_meta_info;
 
     return object;
 }
 
-void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker_protocol_version) const
+void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker_protocol_version, UInt64 worker_antalya_protocol_version) const
 {
     auto protocol_version
         = std::min(static_cast<UInt64>(worker_protocol_version), static_cast<UInt64>(DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION));
+
+    /// Fail closed: protocol < 2 omits `schema_transform`, so workers would skip data-lake schema
+    /// evolution and return wrong columns / values.
+    if (protocol_version < DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA
+        && data_lake_metadata.schema_transform
+        && !data_lake_metadata.schema_transform->getInputs().empty())
+    {
+        throw Exception(
+            ErrorCodes::UNKNOWN_PROTOCOL,
+            "Worker protocol version {} cannot carry `schema_transform`, which is required for "
+            "distributed data-lake reads with schema evolution (minimum protocol version: {})",
+            protocol_version,
+            DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_METADATA);
+    }
+
+    /// Fail closed: downgrading would omit deletion / selection vectors and return deleted rows.
+    if (protocol_version < DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_EXCLUDED_ROWS
+        && hasNonEmptyExcludedRows(data_lake_metadata))
+    {
+        throw Exception(
+            ErrorCodes::UNKNOWN_PROTOCOL,
+            "Worker protocol version {} cannot carry `excluded_rows`, which is required for distributed "
+            "reads with deletion vectors / selection vectors (minimum protocol version: {})",
+            protocol_version,
+            DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_EXCLUDED_ROWS);
+    }
+
+    /// Fail closed: protocol < 3 omits `iceberg_info`, so workers rebuild a plain `ObjectInfo`
+    /// and lose Iceberg schema IDs / file format / delete transforms.
+    if (protocol_version < DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_METADATA
+        && iceberg_info.has_value())
+    {
+        throw Exception(
+            ErrorCodes::UNKNOWN_PROTOCOL,
+            "Worker protocol version {} cannot carry `iceberg_info` "
+            "(minimum protocol version: {})",
+            protocol_version,
+            DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_METADATA);
+    }
+
+    /// Fail closed: protocol < 4 omits `file_bucket_info`, so each bucket task becomes a full-file
+    /// read and bucket-split cluster queries return duplicated rows.
+    if (protocol_version < DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_FILE_BUCKETS_INFO
+        && file_bucket_info)
+    {
+        throw Exception(
+            ErrorCodes::UNKNOWN_PROTOCOL,
+            "Worker protocol version {} cannot carry `file_bucket_info`, which is required for "
+            "distributed bucket-split reads (minimum protocol version: {})",
+            protocol_version,
+            DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_FILE_BUCKETS_INFO);
+    }
+
     writeVarUInt(protocol_version, out);
     writeStringBinary(path, out);
 
@@ -124,7 +187,7 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
         if (iceberg_info.has_value())
         {
             writeVarUInt(1, out);
-            iceberg_info->serializeForClusterFunctionProtocol(out, protocol_version);
+            iceberg_info->serializeForClusterFunctionProtocol(out, protocol_version, worker_antalya_protocol_version);
         }
         else
         {
@@ -151,9 +214,28 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
             protocol_version,
             DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_READ_SOURCE_INDEX);
     }
+
+    if (worker_antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS)
+    {
+        if (file_meta_info && *file_meta_info)
+        {
+            writeVarUInt(1, out);
+            (*file_meta_info)->serialize(out);
+        }
+        else
+            writeVarUInt(0, out);
+
+        if (retry_after_us)
+        {
+            writeVarUInt(1, out);
+            writeVarUInt(*retry_after_us, out);
+        }
+        else
+            writeVarUInt(0, out);
+    }
 }
 
-void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
+void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in, UInt64 antalya_protocol_version)
 {
     size_t protocol_version = 0;
     readVarUInt(protocol_version, in);
@@ -214,6 +296,23 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
             UInt64 value = 0;
             readVarUInt(value, in);
             read_source_index = value;
+        }
+    }
+
+    if (antalya_protocol_version >= DBMS_ANTALYA_PROTOCOL_VERSION_WITH_READ_TASK_EXTENSIONS)
+    {
+        UInt64 has_file_meta_info = 0;
+        readVarUInt(has_file_meta_info, in);
+        if (has_file_meta_info)
+            file_meta_info = std::make_shared<DataFileMetaInfo>(DataFileMetaInfo::deserialize(in));
+
+        UInt64 has_retry_after_us = 0;
+        readVarUInt(has_retry_after_us, in);
+        if (has_retry_after_us)
+        {
+            UInt64 value = 0;
+            readVarUInt(value, in);
+            retry_after_us = value;
         }
     }
 }

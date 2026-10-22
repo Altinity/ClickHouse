@@ -475,6 +475,22 @@ void RemoteQueryExecutor::sendQueryUnlocked(ClientInfo::QueryKind query_kind, As
     connections = create_connections(async_callback);
     AsyncCallbackSetter<IConnections> async_callback_setter(connections.get(), async_callback);
 
+    /// Plan-level execution limits are serialized beginning with version 10. Before that version,
+    /// sending a plan would silently lose them. Use the original SQL request for old replicas: it
+    /// carries the query settings and lets the remote server build a plan with the same limits.
+    /// This keeps `serialize_query_plan` usable while a cluster is being upgraded.
+    if (query_plan
+        && (query_plan->getMaxThreads() || query_plan->getConcurrencyControl())
+        && !connections->supportsQueryPlanSerializationVersion(DBMS_MIN_QUERY_PLAN_SERIALIZATION_VERSION_WITH_EXECUTION_LIMITS))
+    {
+        LOG_DEBUG(
+            log,
+            "Sending query as SQL because a replica does not support query-plan serialization version {} required for execution limits",
+            DBMS_MIN_QUERY_PLAN_SERIALIZATION_VERSION_WITH_EXECUTION_LIMITS);
+        query_plan.reset();
+        stage = query_plan_fallback_stage;
+    }
+
     const auto & settings = context->getSettingsRef();
     if (isReplicaUnavailable() || needToSkipUnavailableShard())
     {
@@ -497,7 +513,16 @@ void RemoteQueryExecutor::sendQueryUnlocked(ClientInfo::QueryKind query_kind, As
 
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(settings);
     ClientInfo modified_client_info = context->getClientInfo();
-    modified_client_info.query_kind = query_kind;
+
+    /// Doesn't support now "remote('1.1.1.{1,2}')""
+    if (is_remote_function && (shard_count == 1))
+    {
+        modified_client_info.setInitialQuery();
+        modified_client_info.client_name = "ClickHouse server";
+        modified_client_info.interface = ClientInfo::Interface::TCP;
+    }
+    else
+        modified_client_info.query_kind = query_kind;
 
     /// A distributed query must carry a known initiator version: the receiving server uses it for
     /// version-gated compatibility decisions (e.g. whether to enable the analyzer, see `TCPHandler`).
@@ -758,6 +783,8 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::processPacket(Packet packet
             if (!packet.block.empty() && (packet.block.rows() > 0))
             {
                 got_data_from_replica = true;
+                if (extension && extension->replica_info)
+                    replica_has_processed_data.insert(extension->replica_info->number_of_current_replica);
                 return ReadResult(adaptBlockStructure(packet.block, *header));
             }
             break;  /// If the block is empty - we will receive other packets before EndOfStream.
@@ -838,6 +865,19 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::processPacket(Packet packet
         case Protocol::Server::TimezoneUpdate:
             break;
 
+        case Protocol::Server::ConnectionLost:
+            if (extension && extension->task_iterator && extension->task_iterator->supportRerunTask() && extension->replica_info)
+            {
+                if (!replica_has_processed_data.contains(extension->replica_info->number_of_current_replica))
+                {
+                    finished = true;
+                    extension->task_iterator->rescheduleTasksFromReplica(extension->replica_info->number_of_current_replica);
+                    return ReadResult(Block{});
+                }
+            }
+            packet.exception->rethrow();
+            break;
+
         default:
             got_unknown_packet_from_replica = true;
             throw Exception(
@@ -880,7 +920,9 @@ void RemoteQueryExecutor::processReadTaskRequest()
 
     ProfileEvents::increment(ProfileEvents::ReadTaskRequestsReceived);
 
-    auto response = (*extension->task_iterator)(extension->replica_info->number_of_current_replica);
+    auto response = (*extension->task_iterator)(
+        extension->replica_info->number_of_current_replica,
+        connections->getServerAntalyaProtocolVersion());
     connections->sendClusterFunctionReadTaskResponse(*response);
 }
 
@@ -1214,6 +1256,11 @@ void RemoteQueryExecutor::setProfileInfoCallback(ProfileInfoCallback callback)
 {
     LockAndBlocker guard(was_cancelled_mutex);
     profile_info_callback = std::move(callback);
+}
+
+bool RemoteQueryExecutor::skipUnavailableShards() const
+{
+    return context->getSettingsRef()[Setting::skip_unavailable_shards];
 }
 
 bool RemoteQueryExecutor::needToSkipUnavailableShard()

@@ -294,6 +294,15 @@ public:
     /// instead of just copying pointer to this AggregateData. Used in WindowTransform.
     virtual void insertMergeResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena * arena) const;
 
+    /// Undoes one insertResultInto(place, to): removes from `to` exactly the rows that call appended, in
+    /// the reverse of the order it appended them, and leaves every state still owned by `place` alive.
+    /// Callers invoke it from a `catch` block while an exception is in flight, so it must not allocate
+    /// and must not throw. Every insertResultInto appends exactly one top-level row, hence the default.
+    virtual void rollbackInsertResult(ConstAggregateDataPtr __restrict /*place*/, IColumn & to) const noexcept
+    {
+        to.popBack(1);
+    }
+
     /// Used for machine learning methods. Predict result from trained model.
     /// Will insert result into `to` column for rows in range [offset, offset + limit).
     virtual void predictValues(
@@ -444,6 +453,19 @@ public:
     /// but in some functions we can want to process this argument somehow (for example condition argument in If combinator).
     /// This method returns the set of argument indexes that can be always NULL, they will be skipped in combinator Null.
     virtual UnorderedSetWithMemoryTracking<size_t> getArgumentsThatCanBeOnlyNull() const { return {}; }
+
+    /** When the function is wrapped with the Null combinator (or the If combinator over Nullable arguments), the state of the
+      * wrapper has a flag byte and a type that names the Nullable argument. So the state of a Nullable column is not the state of a
+      * plain one: another implementation cannot read it, and the two cannot be mixed.
+      *
+      * A function that only skips NULL values, and whose state of no values is the empty state (example: uniqApacheHLL),
+      * does not need that. If it returns true here, the wrapper only skips NULL rows, and its state has the same bytes and the
+      * same type as the state of this function for a non-Nullable argument.
+      *
+      * It requires returns_default_when_only_null: the result of a function that must return NULL when only NULL values
+      * were seen needs the flag to tell it from the state of no rows.
+      */
+    virtual bool stateIsIndependentOfNullability() const { return false; }
 
     /** Return the nested function if this is an Aggregate Function Combinator.
       * Otherwise return nullptr.

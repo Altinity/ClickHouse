@@ -11,6 +11,8 @@ using OutputFormatPtr = std::shared_ptr<IOutputFormat>;
 
 class StorageObjectStorageSink final : public SinkToStorage
 {
+friend class StorageObjectStorageImporterSink;
+
 public:
     StorageObjectStorageSink(
         const std::string & path_,
@@ -31,6 +33,8 @@ public:
 
     const String & getPath() const { return path; }
 
+    size_t getWrittenBytes() const;
+
     size_t getFileSize() const;
 
 private:
@@ -45,7 +49,7 @@ private:
     void cancelBuffers();
 };
 
-class PartitionedStorageObjectStorageSink final : public PartitionedSink
+class PartitionedStorageObjectStorageSink final : public PartitionedSink::SinkCreator
 {
 public:
     PartitionedStorageObjectStorageSink(

@@ -50,6 +50,14 @@ struct ObjectInfo
 
     virtual std::optional<size_t> getFileSizeHint() const { return std::nullopt; }
 
+    virtual ObjectStoragePtr getResolvedStorage(const ObjectStoragePtr & default_storage) const { return default_storage; }
+
+    /// Manifest spelling used by `_path` and cross-storage cache keys; storage keys alone are not unique.
+    virtual std::optional<String> getPathInDataLakeMetadata() const { return std::nullopt; }
+
+    /// Returns a local dependency that cannot be handed to another replica, including attached delete files.
+    virtual std::optional<String> getExternalLocalPath() const { return std::nullopt; }
+
     std::optional<ObjectMetadata> getObjectMetadata() const { return relative_path_with_metadata.metadata; }
     void setObjectMetadata(const ObjectMetadata & metadata) { relative_path_with_metadata.metadata = metadata; }
 
@@ -58,6 +66,10 @@ struct ObjectInfo
     /// Lazy materialization: if set, read only these rows of the file.
     /// Sorted absolute row indexes within the file, see FormatFilterInfo::rows_to_read.
     std::shared_ptr<const PaddedPODArray<UInt64>> rows_to_read;
+
+    /// Polymorphic copy: preserves the dynamic type (e.g. `IcebergDataObjectInfo` with equality /
+    /// position deletes, resolved storage, and metadata path) where a plain copy would slice it.
+    virtual std::shared_ptr<ObjectInfo> clone() const { return std::make_shared<ObjectInfo>(*this); }
 
     String getIdentifier(bool include_file_bucket_info = true) const;
     String getIdentifierForPath(const String & path, bool include_file_bucket_info = true) const;
@@ -81,6 +93,11 @@ struct IObjectIterator
 
     /// Set `emit_profile_events` flag, propagating to nested iterators if any.
     virtual void setEmitProfileEvents(bool value) { emit_profile_events = value; }
+
+    bool tasks_go_to_other_replicas = false;
+
+    /// Call before the first `next`; propagates to nested iterators.
+    virtual void setTasksGoToOtherReplicas(bool value) { tasks_go_to_other_replicas = value; }
 };
 
 using ObjectIterator = std::shared_ptr<IObjectIterator>;
@@ -105,6 +122,12 @@ public:
     {
         emit_profile_events = value;
         iterator->setEmitProfileEvents(value);
+    }
+
+    void setTasksGoToOtherReplicas(bool value) override
+    {
+        tasks_go_to_other_replicas = value;
+        iterator->setTasksGoToOtherReplicas(value);
     }
 
 private:
@@ -132,6 +155,12 @@ public:
     size_t estimatedKeysCount() override { return iterator->estimatedKeysCount(); }
     std::optional<UInt64> getSnapshotVersion() const override { return iterator->getSnapshotVersion(); }
 
+    void setTasksGoToOtherReplicas(bool value) override
+    {
+        tasks_go_to_other_replicas = value;
+        iterator->setTasksGoToOtherReplicas(value);
+    }
+
 private:
     const ObjectIterator iterator;
     String format;
@@ -144,6 +173,5 @@ private:
     std::queue<ObjectInfoPtr> pending_objects_info;
     const LoggerPtr log = getLogger("GlobIterator");
 };
-
 
 }

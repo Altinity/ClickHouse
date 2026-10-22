@@ -2,6 +2,7 @@
 #include <Processors/QueryPlan/Optimizations/actionsDAGUtils.h>
 
 #include <Core/Field.h>
+#include <Functions/FunctionHelpers.h>
 #include <Functions/IFunction.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnSet.h>
@@ -291,16 +292,7 @@ MatchedTrees::Matches matchTrees(
 }
 
 
-struct PossiblyMonotonicChain
-{
-    const ActionsDAG::Node * input_node = nullptr;
-    std::vector<size_t> non_const_arg_pos;
-    bool changes_order = false;
-    bool is_strict = true;
-};
-
-/// Build a chain of functions which may be monotonic.
-static PossiblyMonotonicChain buildPossiblyMonitinicChain(const ActionsDAG::Node * node)
+PossiblyMonotonicChain buildPossiblyMonotonicChain(const ActionsDAG::Node * node)
 {
     std::vector<size_t> chain;
 
@@ -353,8 +345,7 @@ static PossiblyMonotonicChain buildPossiblyMonitinicChain(const ActionsDAG::Node
     return {node, std::move(chain)};
 }
 
-/// Check whether all the function in chain are monotonic
-static bool isMonotonicChain(const ActionsDAG::Node * node, PossiblyMonotonicChain & chain)
+bool isMonotonicChain(const ActionsDAG::Node * node, PossiblyMonotonicChain & chain)
 {
     auto it = chain.non_const_arg_pos.begin();
     while (node != chain.input_node)
@@ -434,7 +425,7 @@ void applyActionsToSortDescription(
         if (output == output_to_skip)
             continue;
 
-        auto chain = buildPossiblyMonitinicChain(output);
+        auto chain = buildPossiblyMonotonicChain(output);
         if (!chain.input_node)
             break;
 
@@ -550,17 +541,28 @@ std::optional<std::unordered_map<const ActionsDAG::Node *, const ActionsDAG::Nod
     return new_inputs;
 }
 
+ColumnsWithTypeAndName getFunctionArgumentColumns(const ActionsDAG::Node & node)
+{
+    ColumnsWithTypeAndName arguments;
+    arguments.reserve(node.children.size());
+    for (const auto & child : node.children)
+        arguments.push_back({child->column, child->result_type, child->result_name});
+    return arguments;
+}
+
 bool isInjectiveFunction(const ActionsDAG::Node * node)
 {
-    if (node->function_base->isInjective({}))
+    if (node->function_base->isInjective(getFunctionArgumentColumns(*node)))
         return true;
 
-    size_t fixed_args = 0;
-    for (const auto & child : node->children)
-        if (child->type == ActionsDAG::ActionType::COLUMN)
-            ++fixed_args;
-    static const std::vector<String> injective = {"plus", "minus", "negate", "tuple"};
-    return (fixed_args + 1 >= node->children.size()) && (std::ranges::find(injective, node->function_base->getName()) != injective.end());
+    const auto & name = node->function_base->getName();
+    if (node->children.size() != 2 || (name != "plus" && name != "minus"))
+        return false;
+
+    const auto & left = *node->children[0];
+    const auto & right = *node->children[1];
+    return plusMinusWithConstantsIsInjective(
+        {left.column, left.result_type, left.result_name}, {right.column, right.result_type, right.result_name}, node->result_type);
 }
 
 NodeSet removeInjectiveFunctionsFromResultsRecursively(const ActionsDAG & actions)

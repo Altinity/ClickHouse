@@ -8,7 +8,12 @@
 #include <IO/ReadWriteBufferFromHTTP.h>
 #include <IO/HTTPHeaderEntries.h>
 #include <Interpreters/Context_fwd.h>
+#include <base/defines.h>
+#include <chrono>
 #include <filesystem>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <unordered_set>
 #include <Poco/JSON/Object.h>
 
@@ -33,6 +38,15 @@ struct AccessToken
     }
 };
 
+struct VendedStorageCredentials
+{
+    std::shared_ptr<IStorageCredentials> credentials;
+    std::string endpoint;
+    std::optional<std::chrono::system_clock::time_point> expires_at;
+    std::string table_uuid{};
+    std::string location{};
+};
+
 class RestCatalog : public ICatalog, public DB::WithContext
 {
 public:
@@ -44,6 +58,7 @@ public:
         const std::string & auth_header_,
         const std::string & oauth_server_uri_,
         bool oauth_server_use_request_body_,
+        const std::string & namespaces_,
         bool flat_namespaces_,
         DB::ContextPtr context_);
 
@@ -60,21 +75,31 @@ public:
     void getTableMetadata(
         const std::string & namespace_name,
         const std::string & table_name,
+        DB::ContextPtr context_,
         TableMetadata & result) const override;
 
     bool tryGetTableMetadata(
         const std::string & namespace_name,
         const std::string & table_name,
+        DB::ContextPtr context_,
         TableMetadata & result) const override;
 
     std::optional<StorageType> getStorageType() const override;
+
+    String getDefaultBaseLocation() const override;
 
     DB::DatabaseDataLakeCatalogType getCatalogType() const override
     {
         return DB::DatabaseDataLakeCatalogType::ICEBERG_REST;
     }
 
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
+    bool createTable(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr metadata_content,
+        DB::CompressionMethod metadata_compression_method,
+        bool if_not_exists) const override;
 
     bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const override;
 
@@ -83,13 +108,17 @@ public:
         const String & table_name,
         const String & new_metadata_path,
         Poco::JSON::Object::Ptr new_schema,
-        Int32 previous_schema_id) const override;
+        Int32 previous_schema_id,
+        Int32 new_last_column_id,
+        Poco::JSON::Object::Ptr metadata = nullptr) const override;
 
     bool isTransactional() const override { return true; }
 
-    void dropTable(const String & namespace_name, const String & table_name, bool delete_data) const override;
+    void dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const override;
 
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
+
+    void setVendedCredentialsCacheTTL(std::chrono::seconds ttl) override;
 
     struct Config
     {
@@ -141,6 +170,7 @@ protected:
         const std::string & auth_scope_,
         const std::string & oauth_server_uri_,
         bool oauth_server_use_request_body_,
+        const std::string & namespaces_,
         bool flat_namespaces_,
         DB::ContextPtr context_);
 
@@ -158,6 +188,35 @@ protected:
     bool oauth_server_use_request_body;
     bool flat_namespaces = false;
     mutable MultiVersion<AccessToken> access_token;
+
+public:
+    class AllowedNamespaces
+    {
+    public:
+        AllowedNamespaces() {}
+        explicit AllowedNamespaces(const std::string & namespaces_);
+
+        /// Check if nested namespaces (nested=true) or tables (nested=false) are allowed in namespace
+        bool isNamespaceAllowed(const std::string & namespace_, bool nested) const;
+
+    private:
+        /// List of allowed nested namespaces
+        std::unordered_map<std::string, AllowedNamespaces> nested_namespaces;
+        /// Tables from current level are allowed
+        bool allow_tables = false;
+    };
+
+protected:
+    AllowedNamespaces allowed_namespaces;
+
+    static constexpr size_t credentials_cache_cleanup_threshold = 1000;
+
+    static constexpr std::chrono::seconds credentials_expiry_safety_window{60};
+    mutable std::mutex credentials_cache_mutex;
+    std::chrono::seconds vended_credentials_cache_ttl TSA_GUARDED_BY(credentials_cache_mutex){std::chrono::seconds::zero()};
+
+    mutable std::map<std::pair<std::string, std::string>, VendedStorageCredentials> credentials_cache
+        TSA_GUARDED_BY(credentials_cache_mutex);
 
     Poco::Net::HTTPBasicCredentials credentials{};
 
@@ -206,13 +265,19 @@ protected:
     bool getTableMetadataImpl(
         const std::string & namespace_name,
         const std::string & table_name,
-        TableMetadata & result) const;
+        DB::ContextPtr context_,
+        TableMetadata & result,
+        bool allow_credentials_cache = true) const;
 
     /// Load catalog config (special http handler) utilizing information from catalog_state and auth_headers.
     Config loadConfig(const CatalogState & catalog_state, const std::optional<DB::HTTPHeaderEntries> & auth_headers = std::nullopt);
-    virtual DB::HTTPHeaderEntries getAuthHeaders(const CatalogState & catalog_state, bool update_token) const;
+    virtual DB::HTTPHeaderEntries getAuthHeaders(
+        const CatalogState & catalog_state,
+        bool update_token,
+        bool * used_cached_oauth_token) const;
 
     void validateAuthHeaders(const DB::HTTPHeaderEntry & header) const;
+
     static void parseCatalogConfigurationSettings(const Poco::JSON::Object::Ptr & object, Config & result);
 
     virtual void sendRequest(
@@ -222,7 +287,16 @@ protected:
         const String & method,
         bool ignore_result) const;
 
-    std::pair<std::shared_ptr<IStorageCredentials>, String> getCredentialsAndEndpoint(Poco::JSON::Object::Ptr object, const String & location) const;
+    VendedStorageCredentials getCredentialsAndEndpoint(Poco::JSON::Object::Ptr object, const String & location) const;
+
+    std::optional<VendedStorageCredentials> tryGetCachedCredentials(
+        const std::string & namespace_name, const std::string & table_name) const;
+
+    void cacheCredentials(
+        const std::string & namespace_name,
+        const std::string & table_name,
+        const VendedStorageCredentials & parsed,
+        const CatalogStateVersion & state_snapshot) const;
 
     AccessToken retrieveAccessToken(const std::string & client_id, const std::string & client_secret) const;
 
@@ -274,6 +348,7 @@ public:
         const std::string & auth_scope_,
         const std::string & oauth_server_uri_,
         bool oauth_server_use_request_body_,
+        const std::string & namespaces_,
         bool flat_namespaces_,
         DB::ContextPtr context_);
 
@@ -282,7 +357,13 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_ONELAKE;
     }
 
-    DB::HTTPHeaderEntries getAuthHeaders(const CatalogState & catalog_state, bool update_token) const override;
+    /// OneLake keeps data in Azure Data Lake Storage, whatever the catalog reports.
+    std::optional<StorageType> getStorageType() const override { return StorageType::Azure; }
+
+    DB::HTTPHeaderEntries getAuthHeaders(
+        const CatalogState & catalog_state,
+        bool update_token,
+        bool * used_cached_oauth_token) const override;
 
     static void validateSettingsChanges(const DB::SettingsChanges & changes, AuthMode auth_mode);
 
@@ -321,6 +402,7 @@ public:
         const std::string & google_adc_client_secret_,
         const std::string & google_adc_refresh_token_,
         const std::string & google_adc_quota_project_id_,
+        const std::string & namespaces_,
         DB::ContextPtr context_,
         bool allow_server_credentials_in_user_queries_);
 
@@ -329,7 +411,13 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE;
     }
 
-    DB::HTTPHeaderEntries getAuthHeaders(const CatalogState & catalog_state, bool update_token) const override;
+    /// BigLake keeps data in Google Cloud Storage, which is accessed through the S3 API.
+    std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
+
+    DB::HTTPHeaderEntries getAuthHeaders(
+        const CatalogState & catalog_state,
+        bool update_token,
+        bool * used_cached_oauth_token) const override;
 
     const std::string & getGoogleADCClientId() const { return google_adc_client_id; }
     const std::string & getGoogleADCClientSecret() const { return google_adc_client_secret; }
@@ -389,6 +477,7 @@ public:
         const std::string & auth_header_,
         const std::string & oauth_server_uri_,
         bool oauth_server_use_request_body_,
+        const std::string & namespaces_,
         bool flat_namespaces_,
         DB::ContextPtr context_);
 
@@ -410,6 +499,23 @@ protected:
         std::optional<DB::HTTPHeaderEntries> & new_auth_headers,
         std::unique_ptr<AccessToken> & new_access_token) override;
 };
+
+/// Builds the JSON body for a schema-update commit via the Iceberg REST catalog.
+/// Includes an assert-current-schema-id requirement (when previous_schema_id >= 0),
+/// schema deduplication against existing schemas in metadata, and last-column-id
+/// propagation when adding a new schema.
+Poco::JSON::Object::Ptr buildUpdateSchemaRequestBody(
+    const String & namespace_name,
+    const String & table_name,
+    Poco::JSON::Object::Ptr metadata,
+    Poco::JSON::Object::Ptr new_schema,
+    Int32 previous_schema_id,
+    Int32 new_last_column_id);
+
+Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
+    const String & namespace_name,
+    const String & table_name,
+    Poco::JSON::Object::Ptr new_snapshot);
 
 }
 

@@ -5,6 +5,9 @@
                  by default. Allow it for this test. -->
             <s3_allow_server_credentials_in_user_queries>1</s3_allow_server_credentials_in_user_queries>
         </default>
+        <osc>
+            <object_storage_cluster>hidden_cluster_with_username_and_password</object_storage_cluster>
+        </osc>
     </profiles>
     <users>
         <default>
@@ -12,5 +15,13 @@
             <profile>default</profile>
             <named_collection_control>1</named_collection_control>
         </default>
+        <foo>
+            <password>bar</password>
+            <profile>default</profile>
+        </foo>
+        <biz>
+            <password>bar</password>
+            <profile>osc</profile>
+        </biz>
     </users>
 </clickhouse>

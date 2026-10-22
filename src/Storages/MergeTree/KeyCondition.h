@@ -301,6 +301,11 @@ public:
     ///  - `(x < 10 AND x % 2 = 0) OR (x < 20 AND x % 3 = 0)` -> { "(-Inf, +Inf)" } (no partial extraction across OR branches)
     Ranges extractBounds() const;
 
+    /// Same stack algorithm as extractPlainRanges, but for a multi-column key: logical ops apply
+    /// as usual, while atoms that constrain other key columns become the universe for `column_index`.
+    /// Returns false if the RPN contains unsupported atoms for this extraction (same as extractPlainRanges).
+    bool extractPlainRangesForColumn(size_t column_index, Ranges & ranges) const;
+
     /// The expression is stored as Reverse Polish Notation.
     struct RPNElement
     {
@@ -689,6 +694,8 @@ private:
     /// Holds the result of (setting.date_time_overflow_behavior == DateTimeOverflowBehavior::Ignore)
     /// Used to check toDateTime monotonicity.
     bool date_time_overflow_behavior_ignore;
+    /// Consulted only while extracting atoms, so the private copying constructor leaves it unset.
+    bool validate_enum_literals_in_operators = true;
 
     /// Holds whether the key columns are sorted in reverse (ORDER BY ... DESC) or not.
     KeyOrder key_order;

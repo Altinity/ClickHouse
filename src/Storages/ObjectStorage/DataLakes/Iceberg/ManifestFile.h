@@ -1,6 +1,21 @@
 #pragma once
 
 #include "config.h"
+#include <Core/Types.h>
+
+#include <optional>
+
+namespace DB::Iceberg
+{
+
+struct ColumnInfo
+{
+    std::optional<Int64> rows_count;
+    std::optional<Int64> bytes_size;
+    std::optional<Int64> nulls_count;
+};
+
+}
 
 #if USE_AVRO
 
@@ -43,13 +58,6 @@ enum class ManifestFileContentType
 };
 
 String FileContentTypeToString(FileContentType type);
-
-struct ColumnInfo
-{
-    std::optional<Int64> rows_count;
-    std::optional<Int64> bytes_size;
-    std::optional<Int64> nulls_count;
-};
 
 struct PartitionSpecsEntry
 {
@@ -96,6 +104,16 @@ struct ParsedManifestFileEntry : boost::noncopyable
     Int64 record_count;
     Int64 file_size_in_bytes;
 
+    /// Iceberg v3 deletion vector metadata (`content_offset` / `content_size_in_bytes`).
+    /// Present for Puffin containers and for Delta-style `.bin` files that store the same envelope.
+    std::optional<Int64> content_offset;
+    std::optional<Int64> content_size_in_bytes;
+
+    bool isDeletionVector() const
+    {
+        return content_offset.has_value() && content_size_in_bytes.has_value();
+    }
+
     ParsedManifestFileEntry(
         FileContentType content_type_,
         IcebergPathFromMetadata file_path_key_,
@@ -113,7 +131,9 @@ struct ParsedManifestFileEntry : boost::noncopyable
         std::optional<std::vector<Int32>> equality_ids_,
         std::optional<Int32> sort_order_id_,
         Int64 record_count_,
-        Int64 file_size_in_bytes_)
+        Int64 file_size_in_bytes_,
+        std::optional<Int64> content_offset_ = std::nullopt,
+        std::optional<Int64> content_size_in_bytes_ = std::nullopt)
         : content_type(content_type_)
         , file_path_key(std::move(file_path_key_))
         , row_number(row_number_)
@@ -131,6 +151,8 @@ struct ParsedManifestFileEntry : boost::noncopyable
         , sort_order_id(sort_order_id_)
         , record_count(record_count_)
         , file_size_in_bytes(file_size_in_bytes_)
+        , content_offset(content_offset_)
+        , content_size_in_bytes(content_size_in_bytes_)
     {
     }
 };
@@ -149,6 +171,26 @@ struct ProcessedManifestFileEntry
 };
 
 using ProcessedManifestFileEntryPtr = std::shared_ptr<const ProcessedManifestFileEntry>;
+
+/// Sum required per-file `record_count` over live manifest entries.
+/// Returns nullopt if any entry has a negative `record_count` or the sum would overflow `Int64`
+/// (fail closed — do not use optional column `value_counts`, which can disagree for nested fields).
+std::optional<Int64> getRecordCountInAllFilesExcludingDeleted(
+    const std::vector<ProcessedManifestFileEntryPtr> & files);
+
+/// Sum one declared column `bytes_size` per live data-file entry (first column that has it).
+/// Returns nullopt if any file lacks a bytes size, has a negative size, or the sum would overflow
+/// `Int64` (fail closed — same contract as `getRecordCountInAllFilesExcludingDeleted`).
+std::optional<Int64> getBytesSizeInAllDataFilesExcludingDeleted(
+    const std::vector<ProcessedManifestFileEntryPtr> & files);
+
+/// Deletion vectors (Puffin or Delta `.bin`) must identify the data file via the dedicated
+/// `referenced_data_file` manifest field (non-empty). Position-delete lower/upper bounds
+/// must not be used as a fallback.
+void requireDirectReferencedDataFileForPuffinDeletionVector(
+    bool set_from_referenced_data_file_field,
+    const std::optional<IcebergPathFromMetadata> & referenced_path,
+    const IcebergPathFromMetadata & manifest_file_path);
 
 bool operator<(const PartitionSpecification & lhs, const PartitionSpecification & rhs);
 bool operator<(const DB::Row & lhs, const DB::Row & rhs);

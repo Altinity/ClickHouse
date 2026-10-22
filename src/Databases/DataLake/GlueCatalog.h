@@ -4,6 +4,7 @@
 #if USE_AWS_S3 && USE_AVRO
 
 #include <aws/core/auth/AWSCredentials.h>
+#include <aws/glue/model/Column.h>
 #include <Databases/DataLake/ICatalog.h>
 #include <Interpreters/Context_fwd.h>
 #include <Poco/JSON/Object.h>
@@ -49,11 +50,13 @@ public:
     void getTableMetadata(
         const std::string & database_name,
         const std::string & table_name,
+        DB::ContextPtr context_,
         TableMetadata & result) const override;
 
     bool tryGetTableMetadata(
         const std::string & database_name,
         const std::string & table_name,
+        DB::ContextPtr context_,
         TableMetadata & result) const override;
 
     std::optional<StorageType> getStorageType() const override
@@ -67,7 +70,13 @@ public:
         return DB::DatabaseDataLakeCatalogType::GLUE;
     }
 
-    void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
+    bool createTable(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        Poco::JSON::Object::Ptr metadata_content,
+        DB::CompressionMethod metadata_compression_method,
+        bool if_not_exists) const override;
 
     void createNamespaceIfNotExists(const String & namespace_name, const String & location) const override;
 
@@ -78,9 +87,11 @@ public:
         const String & table_name,
         const String & new_metadata_path,
         Poco::JSON::Object::Ptr new_schema,
-        Int32 previous_schema_id) const override;
+        Int32 previous_schema_id,
+        Int32 new_last_column_id,
+        Poco::JSON::Object::Ptr metadata = nullptr) const override;
 
-    void dropTable(const String & namespace_name, const String & table_name, bool delete_data) const override;
+    void dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const override;
 
     /// Returns a callback that re-vends fresh AWS credentials from the configured
     /// credentials provider chain. Invoked by `ReadBufferFromS3` when an S3 call
@@ -103,6 +114,9 @@ private:
     std::string region;
     CatalogSettings settings;
     DB::ASTPtr table_engine_definition;
+    std::unordered_set<std::string> allowed_namespaces;
+
+    bool isNamespaceAllowed(const std::string & namespace_) const;
 
     DataLake::ICatalog::Namespaces getDatabases(const std::string & prefix, size_t limit = 0) const;
     CatalogTables getTablesForDatabase(const std::string & db_name, size_t limit = 0) const;
@@ -114,6 +128,8 @@ private:
     /// `glue_column_type` is the raw Glue type (`"timestamp"` or `"timestamp_nano"`) used as a fallback when the column is not found in Iceberg metadata.
     String getActualTimestampType(const String & column_name, const TableMetadata & table_metadata, const String & glue_column_type) const;
 
+    Poco::JSON::Object::Ptr getIcebergMetadataObject(const TableMetadata & table_metadata) const;
+
     String resolveMetadataPathFromTableLocation(const String & table_location, const TableMetadata & table_metadata) const;
 
     struct ObjectStorageWithPath
@@ -124,6 +140,18 @@ private:
     };
 
     ObjectStorageWithPath createObjectStorageForEarlyTableAccess(const String & s3_location, const TableMetadata & table_metadata) const;
+
+    /// Fetches and caches the parsed Iceberg metadata JSON for `metadata_uri`.
+    /// Returns the cached object on subsequent calls for the same URI.
+    Poco::JSON::Object::Ptr getOrFetchMetadataObject(const String & metadata_uri, const TableMetadata & table_metadata) const;
+
+    /// Shared implementation for updateMetadata / updateSchema that optionally
+    /// sets StorageDescriptor columns in the Glue UpdateTable call.
+    bool updateTableInGlue(
+        const String & namespace_name,
+        const String & table_name,
+        const String & new_metadata_path,
+        const std::vector<Aws::Glue::Model::Column> & columns = {}) const;
 
     mutable DB::CacheBase<String, Poco::JSON::Object::Ptr> metadata_objects;
 };

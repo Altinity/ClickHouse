@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <memory>
 #include <Databases/DataLake/DatabaseDataLake.h>
 #include <Core/SettingsEnums.h>
@@ -19,6 +20,7 @@
 #include <IO/ReadHelpers.h>
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Object.h>
+#include <Poco/URI.h>
 
 
 #if USE_AVRO && USE_PARQUET
@@ -48,6 +50,7 @@
 #include <Common/logger_useful.h>
 
 #include <Formats/FormatFactory.h>
+#include <IO/CompressionMethod.h>
 
 #include <Parsers/ASTColumnDeclaration.h>
 #include <Parsers/ASTCreateQuery.h>
@@ -55,8 +58,11 @@
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTDataType.h>
 #include <Parsers/ASTSetQuery.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/FailPoint.h>
 #include <Common/HTTPHeaderFilter.h>
+#include <base/EnumReflection.h>
 
 namespace DB
 {
@@ -68,10 +74,13 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString auth_header;
     extern const DatabaseDataLakeSettingsString auth_scope;
     extern const DatabaseDataLakeSettingsString storage_endpoint;
+    extern const DatabaseDataLakeSettingsString default_base_location;
     extern const DatabaseDataLakeSettingsS3UriStyle storage_uri_style;
     extern const DatabaseDataLakeSettingsString oauth_server_uri;
     extern const DatabaseDataLakeSettingsBool oauth_server_use_request_body;
     extern const DatabaseDataLakeSettingsBool vended_credentials;
+    extern const DatabaseDataLakeSettingsUInt64 vended_credentials_cache_ttl;
+    extern const DatabaseDataLakeSettingsString object_storage_cluster;
     extern const DatabaseDataLakeSettingsString aws_access_key_id;
     extern const DatabaseDataLakeSettingsString aws_secret_access_key;
     extern const DatabaseDataLakeSettingsString region;
@@ -86,6 +95,7 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsBool onelake_use_blob_endpoint;
     extern const DatabaseDataLakeSettingsString dlf_access_key_id;
     extern const DatabaseDataLakeSettingsString dlf_access_key_secret;
+    extern const DatabaseDataLakeSettingsString namespaces;
     extern const DatabaseDataLakeSettingsString google_project_id;
     extern const DatabaseDataLakeSettingsString google_service_account;
     extern const DatabaseDataLakeSettingsString google_metadata_service;
@@ -105,13 +115,17 @@ namespace Setting
     extern const SettingsBool allow_experimental_database_glue_catalog;
     extern const SettingsBool allow_experimental_database_hms_catalog;
     extern const SettingsBool allow_experimental_database_paimon_rest_catalog;
+    extern const SettingsBool allow_experimental_database_s3_tables;
     extern const SettingsBool use_hive_partitioning;
     extern const SettingsBool log_queries;
     extern const SettingsBool parallel_replicas_for_cluster_engines;
     extern const SettingsString cluster_for_parallel_replicas;
     extern const SettingsBool database_datalake_require_metadata_access;
+    extern const SettingsBool data_lake_delete_data_on_drop;
+    extern const SettingsBool datalake_ignore_unsupported_table_properties;
     extern const SettingsBool s3_allow_server_credentials_in_user_queries;
     extern const SettingsBool show_data_lake_catalogs_in_system_tables;
+    extern const SettingsString iceberg_metadata_compression_method;
 }
 
 namespace DataLakeStorageSetting
@@ -133,6 +147,8 @@ namespace ErrorCodes
     extern const int CANNOT_GET_CREATE_TABLE_QUERY;
     extern const int LOGICAL_ERROR;
     extern const int ACCESS_DENIED;
+    extern const int NOT_IMPLEMENTED;
+    extern const int TABLE_ALREADY_EXISTS;
 }
 
 namespace FailPoints
@@ -149,6 +165,18 @@ namespace
 /// In refresh-token mode a single token, minted with `auth_scope`, serves both the OneLake
 /// catalog and Azure storage requests, so the scope must be the Azure storage audience.
 constexpr auto ONELAKE_STORAGE_AUTH_SCOPE = "https://storage.azure.com/.default";
+
+String getLocationScheme(const std::shared_ptr<DataLake::ICatalog> & catalog)
+{
+    if (auto storage_type = catalog->getStorageType(); storage_type.has_value())
+        return DataLake::storageTypeToScheme(*storage_type);
+
+    throw Exception(
+        ErrorCodes::BAD_ARGUMENTS,
+        "Catalog type '{}' does not report a backing storage type, so the location scheme is unknown. "
+        "Set `default_base_location` on the database or configure the catalog to expose `default-base-location`",
+        catalog->getCatalogType());
+}
 
 /// Translate the database-layer `TablesFilter` into the catalog-layer
 /// `TableNameFilter` so the catalog can restrict which namespaces it lists.
@@ -247,6 +275,7 @@ void DatabaseDataLake::initialize() const
         .aws_access_key_id = settings[DatabaseDataLakeSetting::aws_access_key_id].value,
         .aws_secret_access_key = settings[DatabaseDataLakeSetting::aws_secret_access_key].value,
         .region = settings[DatabaseDataLakeSetting::region].value,
+        .namespaces = settings[DatabaseDataLakeSetting::namespaces].value,
         .aws_role_arn = settings[DatabaseDataLakeSetting::aws_role_arn].value,
         .aws_role_session_name = settings[DatabaseDataLakeSetting::aws_role_session_name].value,
         .aws_external_id = settings[DatabaseDataLakeSetting::aws_external_id].value,
@@ -264,6 +293,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::auth_header],
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
@@ -280,6 +310,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::auth_header],
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
@@ -297,6 +328,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::auth_header],
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
@@ -319,6 +351,7 @@ void DatabaseDataLake::initialize() const
                 onelake_auth_scope,
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
@@ -350,6 +383,7 @@ void DatabaseDataLake::initialize() const
                 google_adc_client_secret,
                 google_adc_refresh_token,
                 google_adc_quota_project_id,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 Context::getGlobalContextInstance(),
                 allow_server_credentials_in_user_queries);
             break;
@@ -360,6 +394,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::warehouse].value,
                 url,
                 settings[DatabaseDataLakeSetting::catalog_credential].value,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -463,6 +498,11 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
 #endif
                 catalog_unavailable_reason);
     }
+
+    const auto settings_version = database_settings.get();
+    catalog_impl->setVendedCredentialsCacheTTL(
+        std::chrono::seconds((*settings_version)[DatabaseDataLakeSetting::vended_credentials_cache_ttl].value));
+
     return catalog_impl;
 }
 
@@ -500,11 +540,14 @@ void DatabaseDataLake::resetCatalog(String reason) const
     catalog_unavailable_reason = std::move(reason);
 }
 
-std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfiguration(
+StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
     DatabaseDataLakeStorageType type,
     DataLakeStorageSettingsPtr storage_settings) const
 {
     /// TODO: add tests for azure, local storage types.
+
+    const auto settings_version = database_settings.get();
+    const DatabaseDataLakeSettings & settings = *settings_version;
 
     auto catalog = getCatalog();
     switch (catalog->getCatalogType())
@@ -537,24 +580,24 @@ std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfigur
 #if USE_AWS_S3
                 case DB::DatabaseDataLakeStorageType::S3:
                 {
-                    return std::make_shared<StorageS3IcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageS3IcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #endif
 #if USE_AZURE_BLOB_STORAGE
                 case DB::DatabaseDataLakeStorageType::Azure:
                 {
-                    return std::make_shared<StorageAzureIcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageAzureIcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #endif
 #if USE_HDFS
                 case DB::DatabaseDataLakeStorageType::HDFS:
                 {
-                    return std::make_shared<StorageHDFSIcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageHDFSIcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #endif
                 case DB::DatabaseDataLakeStorageType::Local:
                 {
-                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
                 /// Fake storage in case when catalog store not only
                 /// primary-type tables (DeltaLake or Iceberg), but for
@@ -566,7 +609,7 @@ std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfigur
                 /// dependencies and the most lightweight
                 case DB::DatabaseDataLakeStorageType::Other:
                 {
-                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #if !USE_AWS_S3 || !USE_AZURE_BLOB_STORAGE || !USE_HDFS
                 default:
@@ -583,7 +626,7 @@ std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfigur
 #if USE_AWS_S3
                 case DB::DatabaseDataLakeStorageType::S3:
                 {
-                    return std::make_shared<StorageS3DeltaLakeConfiguration>(storage_settings);
+                    return std::make_shared<StorageS3DeltaLakeConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #endif
 #if USE_AZURE_BLOB_STORAGE
@@ -594,7 +637,7 @@ std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfigur
 #endif
                 case DB::DatabaseDataLakeStorageType::Local:
                 {
-                    return std::make_shared<StorageLocalDeltaLakeConfiguration>(storage_settings);
+                    return std::make_shared<StorageLocalDeltaLakeConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
                 /// Fake storage in case when catalog store not only
                 /// primary-type tables (DeltaLake or Iceberg), but for
@@ -606,7 +649,7 @@ std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfigur
                 /// dependencies and the most lightweight
                 case DB::DatabaseDataLakeStorageType::Other:
                 {
-                    return std::make_shared<StorageLocalDeltaLakeConfiguration>(storage_settings);
+                    return std::make_shared<StorageLocalDeltaLakeConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
                 default:
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -621,12 +664,12 @@ std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfigur
 #if USE_AWS_S3
                 case DB::DatabaseDataLakeStorageType::S3:
                 {
-                    return std::make_shared<StorageS3IcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageS3IcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #endif
                 case DB::DatabaseDataLakeStorageType::Other:
                 {
-                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
                 default:
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -739,7 +782,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     auto [namespace_name, table_name] = DataLake::parseTableName(name);
 
-    if (!catalog->tryGetTableMetadata(namespace_name, table_name, table_metadata))
+    if (!catalog->tryGetTableMetadata(namespace_name, table_name, context_, table_metadata))
         return nullptr;
     if (ignore_if_not_iceberg && !table_metadata.isDefaultReadableTable())
         return nullptr;
@@ -826,7 +869,8 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
             static_credentials->addCredentialsToEngineArgs(args);
             static_credentials_applied = true;
         }
-        else if (!lightweight && table_metadata.requiresCredentials() && std::find(vended_credentials_catalogs.begin(), vended_credentials_catalogs.end(), catalog->getCatalogType()) == vended_credentials_catalogs.end())
+        else if (!lightweight && table_metadata.requiresCredentials() && std::find(vended_credentials_catalogs.begin(), vended_credentials_catalogs.end(), catalog->getCatalogType()) == vended_credentials_catalogs.end()
+            && table_metadata.getStorageType() != DatabaseDataLakeStorageType::Local)
         {
             throw Exception(
                ErrorCodes::BAD_ARGUMENTS,
@@ -847,9 +891,8 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
         if (!metadata_location.empty())
         {
             metadata_location = table_metadata.getMetadataLocation(metadata_location);
+            (*storage_settings)[DB::DataLakeStorageSetting::iceberg_metadata_file_path] = metadata_location;
         }
-
-        (*storage_settings)[DB::DataLakeStorageSetting::iceberg_metadata_file_path] = metadata_location;
     }
 
     const auto configuration = getConfiguration(storage_type, storage_settings);
@@ -907,7 +950,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     /// with_table_structure = false: because there will be
     /// no table structure in table definition AST.
-    StorageObjectStorageConfiguration::initialize(*configuration, args, context_copy, /* with_table_structure */false);
+    configuration->initialize(args, context_copy, /* with_table_structure */false);
 
     const auto & query_settings = context_->getSettingsRef();
 
@@ -920,7 +963,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     const auto is_secondary_query = context_->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
 
     /// When we applied static credentials from database settings, they are authoritative:
-    /// do not let a catalog-vended refresh callback (e.g. Unity/REST `requestReadCredentials`)
+    /// do not let a catalog-vended refresh callback (e.g. Unity/REST `requestCredentials`)
     /// silently re-fetch credentials and override them. The same holds when the user disabled
     /// `vended_credentials` and no static credentials were applied (e.g. relying on default or
     /// environment S3 auth): the object storage layer invokes the refresh callback after an
@@ -940,77 +983,294 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     const auto catalog_uuid = table_metadata.getTableUUID();
     const UUID table_uuid = catalog_uuid ? parseFromString<UUID>(*catalog_uuid) : UUIDHelpers::Nil;
 
-    if (can_use_parallel_replicas && !is_secondary_query)
-    {
-        auto storage_id = StorageID(getDatabaseName(), name, table_uuid);
-        auto storage_cluster = std::make_shared<StorageObjectStorageCluster>(
-            parallel_replicas_cluster_name,
-            configuration,
-            configuration->createObjectStorage(context_copy, /* is_readonly */ false, get_credentials_refresh_callback(storage_id)),
-            storage_id,
-            columns,
-            ConstraintsDescription{},
-            nullptr,
-            context_,
-            /// Use is_table_function = true,
-            /// because this table is actually stateless like a table function.
-            /* is_table_function */true,
-            getFormatSettings(context_copy),
-            getCatalog());
+    std::string cluster_name = configuration->isClusterSupported() ? settings[DatabaseDataLakeSetting::object_storage_cluster].value : "";
 
-        if (context_->hasQueryContext() && context_->getSettingsRef()[Setting::log_queries])
-            context_->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Storage, storage_cluster->getName());
+    if (cluster_name.empty() && can_use_parallel_replicas && !is_secondary_query)
+        cluster_name = parallel_replicas_cluster_name;
 
-        storage_cluster->startup();
-        return storage_cluster;
-    }
-
-    /// Unlike table functions (s3, url, etc.), DataLake tables are queried as
-    /// `SELECT * FROM catalog.table` — the query sent to shards cannot be rewritten
-    /// into a Cluster table function variant. So when the initiator created a
-    /// StorageObjectStorageCluster (the branch above) and the shard is collaborating
-    /// with it, we need distributed_processing=true to use the task iterator.
-    const bool distributed_processing =
-        context_->getClientInfo().collaborate_with_initiator
-        && can_use_parallel_replicas;
-
-    auto result_storage = std::make_shared<StorageObjectStorage>(
+    auto storage_cluster = std::make_shared<StorageObjectStorageCluster>(
+        cluster_name,
         configuration,
         configuration->createObjectStorage(context_copy, /* is_readonly */ false, get_credentials_refresh_callback(StorageID(getDatabaseName(), name, table_uuid))),
-        context_copy,
         StorageID(getDatabaseName(), name, table_uuid),
         /* columns */columns,
         /* constraints */ConstraintsDescription{},
-        /* comment */"",
+        /* partition_by */nullptr,
+        /* order_by */nullptr,
+        context_copy,
+        /* comment */ "",
         getFormatSettings(context_copy),
         LoadingStrictnessLevel::CREATE,
         getCatalog(),
         /* if_not_exists*/true,
         /* is_datalake_query*/true,
-        distributed_processing,
-        /* partition_by */nullptr,
-        /* order_by */nullptr,
         /// Use is_table_function = true,
         /// because this table is actually stateless like a table function.
         /* is_table_function */true,
         /* lazy_init */true);
 
     if (context_->hasQueryContext() && context_->getSettingsRef()[Setting::log_queries])
-        context_->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Storage, result_storage->getName());
+        context_->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Storage, storage_cluster->getName());
 
-    return result_storage;
+    storage_cluster->startup();
+    return storage_cluster;
+}
+
+void DatabaseDataLake::validateCreateTableEngine(const ASTStorage & storage) const
+{
+    const ASTFunction & engine = *storage.engine;
+    const auto catalog = getCatalog();
+
+    const String family_name = table_engine_definition->as<ASTStorage &>().engine->name;
+
+    if (!engine.name.starts_with(family_name))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "This DataLakeCatalog stores {}-family tables; got table engine '{}'",
+            family_name, engine.name);
+
+    if (catalog->managesTableLocation())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "This DataLakeCatalog assigns table locations itself, so an explicit table `ENGINE` "
+            "is not supported; omit the `ENGINE` clause");
+
+    const auto catalog_storage_type = catalog->getStorageType();
+
+    std::optional<DatabaseDataLakeStorageType> engine_backend;
+    const std::string_view backend_name = std::string_view(engine.name).substr(family_name.size());
+    if (backend_name == "S3")
+        engine_backend = DatabaseDataLakeStorageType::S3;
+    else if (backend_name == "Azure")
+        engine_backend = DatabaseDataLakeStorageType::Azure;
+    else if (backend_name == "HDFS")
+        engine_backend = DatabaseDataLakeStorageType::HDFS;
+    else if (backend_name == "Local")
+        engine_backend = DatabaseDataLakeStorageType::Local;
+    else if (backend_name.empty())
+    {
+        /// The generic family engine picks its backend from the `disk` setting and defaults to S3,
+        /// the same way the storage factory does. An unsupported disk type is rejected by the factory.
+        engine_backend = DatabaseDataLakeStorageType::S3;
+        const Field * disk_name = storage.settings ? storage.settings->changes.tryGet("disk") : nullptr;
+        if (disk_name)
+        {
+            switch (Context::getGlobalContextInstance()->getDisk(disk_name->safeGet<String>())->getObjectStorage()->getType())
+            {
+                case ObjectStorageType::S3:
+                    break;
+                case ObjectStorageType::Azure:
+                    engine_backend = DatabaseDataLakeStorageType::Azure;
+                    break;
+                case ObjectStorageType::Local:
+                    engine_backend = DatabaseDataLakeStorageType::Local;
+                    break;
+                default:
+                    engine_backend.reset();
+                    break;
+            }
+        }
+    }
+
+    if (engine_backend.has_value() && catalog_storage_type.has_value() && *catalog_storage_type != *engine_backend)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Table engine '{}' uses the {} storage backend, but this DataLakeCatalog stores tables on {}. "
+            "The table would be reopened with the catalog's storage backend and become unreadable "
+            "immediately after creation. Use the {}{} engine",
+            engine.name, *engine_backend, *catalog_storage_type, family_name, *catalog_storage_type);
+
+    validateCreateTableEngineArguments(engine);
+}
+
+void DatabaseDataLake::validateCreateTableEngineArguments(const ASTFunction & engine) const
+{
+    static const ASTs no_arguments;
+    const ASTs & engine_args = engine.arguments ? engine.arguments->children : no_arguments;
+
+    const ASTFunction & database_engine = *table_engine_definition->as<ASTStorage &>().engine;
+    const ASTs & database_args = database_engine.arguments ? database_engine.arguments->children : no_arguments;
+
+    const size_t expected_size = std::max<size_t>(database_args.size(), 1);
+    bool arguments_match = engine_args.size() == expected_size;
+    for (size_t i = 1; arguments_match && i < engine_args.size(); ++i)
+        arguments_match = engine_args[i]->getTreeHash(/*ignore_aliases=*/true) == database_args[i]->getTreeHash(/*ignore_aliases=*/true);
+
+    if (!arguments_match)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Table engine '{}' takes the table location followed by the {} remaining argument(s) of the database "
+            "engine, got {} argument(s). A DataLakeCatalog table is reopened from its catalog location and the "
+            "database engine arguments, so per-table storage credentials cannot be preserved",
+            engine.name, expected_size - 1, engine_args.size());
+
+    const auto settings_version = database_settings.get();
+    const DatabaseDataLakeSettings & settings = *settings_version;
+
+    const auto storage_endpoint = settings[DatabaseDataLakeSetting::storage_endpoint].value;
+    if (storage_endpoint.empty())
+        return;
+
+    if (settings[DatabaseDataLakeSetting::storage_uri_style].value == S3UriStyle::VIRTUAL_HOSTED)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "An explicit table `ENGINE` is not supported with `storage_uri_style = 'virtual_hosted'`: "
+            "the table location cannot be guaranteed to survive catalog round-trip reconstruction. "
+            "Omit the `ENGINE` clause and use `default_base_location` instead");
+
+    const auto * location = engine_args[0]->as<ASTLiteral>();
+    if (!location || location->value.getType() != Field::Types::String)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Table engine '{}' requires the table location as a string literal", engine.name);
+
+    String endpoint_prefix = storage_endpoint;
+    while (endpoint_prefix.ends_with('/'))
+        endpoint_prefix.pop_back();
+
+    const auto & location_str = location->value.safeGet<String>();
+    if (!location_str.starts_with(endpoint_prefix + "/"))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Table location '{}' is outside the `storage_endpoint` ('{}') of this DataLakeCatalog. "
+            "The table would be reopened under `storage_endpoint` and become unreadable "
+            "immediately after creation",
+            location_str, storage_endpoint);
+}
+
+String DatabaseDataLake::getNewTableLocation(
+    const DatabaseDataLakeSettings & settings,
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const String & namespace_name,
+    const String & table_name) const
+{
+    String base_location = catalog->getDefaultBaseLocation();
+    if (base_location.empty())
+        base_location = settings[DatabaseDataLakeSetting::default_base_location].value;
+
+    if (!base_location.empty())
+    {
+        if (auto catalog_storage_type = catalog->getStorageType(); catalog_storage_type.has_value()
+            && DataLake::parseStorageTypeFromLocation(base_location) != *catalog_storage_type)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "`default_base_location` uses the {} storage backend, but this DataLakeCatalog stores tables on {}. "
+                "The table would be reopened with the catalog's storage backend and become unreadable "
+                "immediately after creation",
+                DataLake::parseStorageTypeFromLocation(base_location), *catalog_storage_type);
+
+        while (base_location.ends_with('/'))
+            base_location.pop_back();
+        return fmt::format("{}/{}/{}", base_location, namespace_name, table_name);
+    }
+
+    const auto storage_endpoint = settings[DatabaseDataLakeSetting::storage_endpoint].value;
+    if (storage_endpoint.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "CREATE TABLE in DataLakeCatalog requires `default_base_location` or `storage_endpoint`");
+
+    if (catalog->managesTableLocation())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "This DataLakeCatalog assigns table locations itself, so `storage_endpoint` cannot be used "
+            "to place a new table. Set `default_base_location` on the database instead");
+
+    return DataLake::constructTableLocation(
+        getLocationScheme(catalog), storage_endpoint, namespace_name, table_name,
+        settings[DatabaseDataLakeSetting::storage_uri_style]);
+}
+
+void DatabaseDataLake::createTable(
+    ContextPtr context_,
+    const String & name,
+    const StoragePtr & table,
+    const ASTPtr & query)
+{
+    /// Engine-clause path: `IcebergMetadata::createInitial` has already written the metadata and
+    /// registered the table.
+    if (table)
+        return;
+
+    auto catalog = getCatalog();
+
+    const String family_name = table_engine_definition->as<ASTStorage &>().engine->name;
+    if (family_name != "Iceberg")
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "CREATE TABLE without a table engine is not implemented for a {} DataLakeCatalog; "
+            "give an explicit {}-family table engine with the table location",
+            family_name, family_name);
+
+    const auto & create = query->as<ASTCreateQuery &>();
+    const auto [namespace_name, table_name] = DataLake::parseTableName(name);
+
+    ColumnsDescription columns;
+    if (create.columns_list && create.columns_list->columns)
+    {
+        for (const auto & child : create.columns_list->columns->children)
+        {
+            const auto * col_decl = child->as<ASTColumnDeclaration>();
+            if (!col_decl || !col_decl->getType())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid column declaration in CREATE TABLE");
+
+            columns.add(ColumnDescription(col_decl->name, DataTypeFactory::instance().get(col_decl->getType())));
+        }
+    }
+
+    if (columns.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot create table without columns");
+
+    ASTPtr partition_by;
+    ASTPtr order_by;
+    if (create.storage)
+    {
+        if (create.storage->partition_by)
+            partition_by = create.storage->partition_by->clone();
+        if (create.storage->order_by)
+            order_by = create.storage->order_by->clone();
+    }
+
+    const auto settings_version = database_settings.get();
+    const DatabaseDataLakeSettings & settings = *settings_version;
+
+    const String location = getNewTableLocation(settings, catalog, namespace_name, table_name);
+
+    auto metadata_content = Iceberg::createEmptyMetadataFile(
+        location,
+        columns,
+        partition_by,
+        order_by,
+        context_,
+        /*format_version=*/ 2,
+        /*is_catalog_table=*/ true).first;
+
+    const auto compression_method_str = context_->getSettingsRef()[Setting::iceberg_metadata_compression_method].value;
+    const auto compression_method = chooseCompressionMethod(compression_method_str, compression_method_str);
+
+    if (compression_method != CompressionMethod::None)
+    {
+        /// A catalog that writes the first metadata file itself reads the codec from this property.
+        Poco::JSON::Object::Ptr properties = new Poco::JSON::Object;
+        properties->set("write.metadata.compression-codec", toContentEncodingName(compression_method));
+        metadata_content->set("properties", properties);
+    }
+
+    catalog->createNamespaceIfNotExists(namespace_name, /* location */ "");
+
+    const bool created = catalog->createTable(
+        namespace_name, table_name, /* metadata_path */ "", metadata_content, compression_method, create.if_not_exists);
+    if (!created)
+        throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS,
+            "Table {}.{} already exists in the catalog", namespace_name, table_name);
+
+    LOG_INFO(log, "Created table {}.{}", namespace_name, table_name);
 }
 
 void DatabaseDataLake::dropTable( /// NOLINT
     ContextPtr context_,
     const String & name,
-    bool /*sync*/)
+    bool /*sync*/,
+    bool if_exists)
 {
-    auto table = tryGetTable(name, context_);
-    if (table)
-        table->drop();
-    else
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot drop table {} because it does not exist", name);
+    auto catalog = getCatalog();
+    const auto [namespace_name, table_name] = DataLake::parseTableName(name);
+
+    bool purge = context_->getSettingsRef()[Setting::data_lake_delete_data_on_drop];
+    catalog->dropTable(namespace_name, table_name, purge, if_exists);
+
+    LOG_INFO(log, "Dropped table {}.{} from DataLakeCatalog (purge={})", namespace_name, table_name, purge);
 }
 
 DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIterator(
@@ -1359,37 +1619,38 @@ void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_cha
 
 ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
     const String & name,
-    ContextPtr /* context_ */,
+    ContextPtr context_,
     bool throw_on_error) const
 {
     const auto settings_version = database_settings.get();
     const DatabaseDataLakeSettings & settings = *settings_version;
 
     auto catalog = getCatalog();
-    auto table_metadata = DataLake::TableMetadata().withLocation().withSchema();
+    auto table_metadata = DataLake::TableMetadata().withLocation().withSchema().withPartitionAndSortingKeys();
     if (settings[DatabaseDataLakeSetting::force_add_bucket])
         table_metadata.withForceAddBucket();
 
     const auto [namespace_name, table_name] = DataLake::parseTableName(name);
 
-    if (!catalog->tryGetTableMetadata(namespace_name, table_name, table_metadata))
+    if (!catalog->tryGetTableMetadata(namespace_name, table_name, context_, table_metadata))
     {
         if (throw_on_error)
             throw Exception(ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY, "Table `{}` doesn't exist", name);
         return {};
     }
 
+    if (!table_metadata.getUnsupportedProperties().empty()
+        && !context_->getSettingsRef()[Setting::datalake_ignore_unsupported_table_properties])
+    {
+        if (!throw_on_error)
+            return {};
+        throw Exception(ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY,
+            "Cannot represent {} of table {}.{} in CREATE TABLE. "
+            "Set datalake_ignore_unsupported_table_properties = 1 to omit unsupported properties",
+            table_metadata.getUnsupportedProperties(), getDatabaseName(), name);
+    }
+
     auto create_table_query = make_intrusive<ASTCreateQuery>();
-    auto table_storage_define = table_engine_definition->clone();
-
-    auto * storage = table_storage_define->as<ASTStorage>();
-    storage->engine->setKind(ASTFunction::Kind::TABLE_ENGINE);
-    if (!table_metadata.isDefaultReadableTable())
-        storage->engine->name = DataLake::FAKE_TABLE_ENGINE_NAME_FOR_UNREADABLE_TABLES;
-
-    storage->settings = {};
-
-    create_table_query->set(create_table_query->storage, table_storage_define);
 
     auto columns_declare_list = make_intrusive<ASTColumns>();
     auto columns_expression_list = make_intrusive<ASTExpressionList>();
@@ -1408,6 +1669,40 @@ ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
         column_declaration->setType(makeASTDataType(column_type_and_name.type->getName()));
         columns_expression_list->children.emplace_back(column_declaration);
     }
+
+    const auto partition_by = table_metadata.getPartitionBy();
+    const auto order_by = table_metadata.getOrderBy();
+
+    /// The catalog rejects an explicit `ENGINE` in `CREATE TABLE` when it assigns table locations itself,
+    /// so the `ENGINE` clause is omitted to keep the query replayable.
+    if (catalog->managesTableLocation())
+    {
+        if (partition_by || order_by)
+        {
+            auto storage = make_intrusive<ASTStorage>();
+            if (partition_by)
+                storage->set(storage->partition_by, partition_by);
+            if (order_by)
+                storage->set(storage->order_by, order_by);
+            create_table_query->set(create_table_query->storage, storage);
+        }
+        return create_table_query;
+    }
+
+    auto table_storage_define = table_engine_definition->clone();
+
+    auto * storage = table_storage_define->as<ASTStorage>();
+    storage->engine->setKind(ASTFunction::Kind::TABLE_ENGINE);
+    if (!table_metadata.isDefaultReadableTable())
+        storage->engine->name = DataLake::FAKE_TABLE_ENGINE_NAME_FOR_UNREADABLE_TABLES;
+
+    storage->settings = {};
+    if (partition_by)
+        storage->set(storage->partition_by, partition_by);
+    if (order_by)
+        storage->set(storage->order_by, order_by);
+
+    create_table_query->set(create_table_query->storage, table_storage_define);
 
     auto storage_engine_arguments = storage->engine->arguments;
     if (table_metadata.isDefaultReadableTable())
@@ -1669,11 +1964,11 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
             case DatabaseDataLakeCatalogType::S3_TABLES:
             {
                 if (!args.create_query.attach
-                    && !args.context->getSettingsRef()[Setting::allow_experimental_database_iceberg])
+                    && !args.context->getSettingsRef()[Setting::allow_experimental_database_s3_tables])
                 {
                     throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-                                    "DatabaseDataLake with S3 Tables catalog (Iceberg REST) is beta. "
-                                    "To allow its usage, enable setting allow_database_iceberg");
+                                    "DatabaseDataLake with S3 Tables catalog is experimental. "
+                                    "To allow its usage, enable setting allow_experimental_database_s3_tables");
                 }
 
                 engine_func->name = "Iceberg";
@@ -1762,8 +2057,10 @@ The following settings are supported:
 | `auth_header`           | Custom HTTP header for authentication with the catalog service                          |
 | `auth_scope`            | OAuth2 scope for authentication (if using OAuth)                                        |
 | `storage_endpoint`      | Endpoint URL for the underlying storage                                                 |
+| `default_base_location` | Base URI for new tables when the catalog does not report `default-base-location`. New tables are placed under `<default_base_location>/<namespace>/<table>` (e.g. `s3://warehouse/data`) |
 | `oauth_server_uri`      | URI of the OAuth2 authorization server for authentication                               |
 | `vended_credentials`    | Boolean indicating whether to use vended credentials from the catalog (supports AWS S3 and Azure ADLS Gen2) |
+| `vended_credentials_cache_ttl` | Maximum cache entry lifetime (in seconds) for vended credentials (REST catalogs only). Default `300`; `0` disables caching. |
 | `aws_access_key_id`     | AWS access key ID for S3/Glue access (if not using vended credentials)                  |
 | `aws_secret_access_key` | AWS secret access key for S3/Glue access (if not using vended credentials)              |
 | `aws_role_arn`          | ARN of the IAM role to assume for AWS/Glue access. When set, ClickHouse uses AWS STS `AssumeRole` with base credentials from `aws_access_key_id` and `aws_secret_access_key` when both are provided, or from the default AWS credential chain otherwise (the role must trust the identity the server runs under). |
@@ -1773,6 +2070,109 @@ The following settings are supported:
 | `dlf_access_key_id`     | Access key ID for DLF access                                                            |
 | `dlf_access_key_secret` | Access key Secret for DLF access                                                        |
 | `force_add_bucket`      | When constructing object-storage URLs from the catalog-provided table location and `storage_endpoint`, prepend the bucket/container name even if the endpoint already contains it. Default: `false`. Set to `true` for catalogs that hand back paths without the bucket and require it to be added at the URL-construction step (Polaris-style paths). |
+
+## Creating tables {#creating-tables}
+
+An Iceberg table in a `DataLakeCatalog` database can be created directly from ClickHouse.
+
+:::note
+`CREATE TABLE` and `DROP TABLE` require a catalog that can perform catalog mutations. They are supported
+for Iceberg REST catalogs (including OneLake, BigLake, and Delta Sharing) and for the AWS Glue catalog.
+Other catalog types (Hive Metastore, Paimon REST) reject these statements. A Unity catalog stores Delta
+tables, which are created with an explicit `DeltaLake` table engine (see below) and cannot be dropped
+through the catalog.
+:::
+
+The location of a newly created table comes from `default_base_location` (a full `s3://bucket/prefix`) when
+set, otherwise the bucket is derived from `storage_endpoint`. With `storage_uri_style = 'virtual_hosted'` the
+bucket cannot be derived from the endpoint unambiguously, so `default_base_location` is required for
+`CREATE TABLE`.
+
+The table name must be quoted with backticks and include the namespace separated by a dot:
+
+```sql
+CREATE TABLE catalog_db.`namespace.table_name`
+(
+    id Int64,
+    name String,
+    value Float64
+)
+PARTITION BY id
+ORDER BY name
+SETTINGS allow_database_iceberg = 1;
+```
+
+Iceberg accepts only a fixed set of partition transforms, so `PARTITION BY`
+must use one of the following expressions:
+
+| Expression                    | Iceberg transform |
+|-------------------------------|-------------------|
+| `<column>`                    | `identity`        |
+| `toYearNumSinceEpoch(<col>)`  | `year`            |
+| `toMonthNumSinceEpoch(<col>)` | `month`           |
+| `toRelativeDayNum(<col>)`     | `day`             |
+| `toRelativeHourNum(<col>)`    | `hour`            |
+| `icebergTruncate(N, <col>)`   | `truncate[N]`     |
+| `icebergBucket(N, <col>)`     | `bucket[N]`       |
+
+Composite partitioning is supported via `PARTITION BY (expr1, expr2, ...)`.
+Other expressions (e.g. `toYYYYMM`, `intDiv`) are rejected at `CREATE TABLE`.
+
+Only the column names and types, `PARTITION BY`, and `ORDER BY` are persisted into the
+table metadata. Anything else — the storage clauses `PRIMARY KEY`, `SAMPLE BY`, `TTL`, and
+`UNIQUE KEY`; engine `SETTINGS`; indices, constraints, and projections; and the column modifiers
+`DEFAULT`, `MATERIALIZED`, `ALIAS`, `EPHEMERAL`, `COMMENT`, `CODEC`, `TTL`, `STATISTICS`, and `SETTINGS` —
+is rejected rather than silently dropped. This applies both with and without an explicit
+`ENGINE` clause.
+
+An explicit `ENGINE` clause selects the location of the new table; every other engine argument must
+repeat the arguments of the database engine, and the location must be under `storage_endpoint` when it
+is set. A table is reopened from its catalog location together with the database engine arguments, so a
+per-table endpoint or per-table credentials would apply to the `CREATE` only and are rejected instead.
+Explicit table engines are also rejected with `storage_uri_style = 'virtual_hosted'`, because their URLs
+cannot be guaranteed to survive reconstruction from the catalog location. Omit the `ENGINE` clause and
+set `default_base_location` instead.
+
+You can also create an Iceberg table that inherits the schema of an existing table:
+
+```sql
+CREATE TABLE catalog_db.`namespace.table_name`
+AS other_db.source_table
+SETTINGS allow_database_iceberg = 1;
+```
+
+If the source table's `PARTITION BY` and `ORDER BY` use only the expressions
+listed above, they are copied into the new Iceberg table.
+
+## Dropping tables {#dropping-tables}
+
+Tables can be dropped from a `DataLakeCatalog` database.
+`DROP TABLE` sends a delete request to the remote catalog, which removes
+the table entry from the catalog.
+
+```sql
+DROP TABLE catalog_db.`namespace.table_name`
+```
+
+By default, ClickHouse does not request the catalog to delete the underlying data. In order to do it, use the `data_lake_delete_data_on_drop` setting:
+
+```sql
+DROP TABLE catalog_db.`namespace.table_name`
+SETTINGS data_lake_delete_data_on_drop = 1
+```
+
+:::note
+Whether data files are actually deleted depends on the catalog itself.
+The `purgeRequested` flag is sent to the catalog, but the catalog may choose to ignore it.
+
+Some catalogs support only one of the two modes:
+
+- Glue: `DROP TABLE` only removes the catalog entry and never deletes the underlying data files.
+  `DROP TABLE` with `data_lake_delete_data_on_drop = 1` is rejected instead of silently leaving the data behind.
+- S3 Tables (`catalog_type = 's3tables'`): a table cannot be dropped without deleting its data.
+  `DROP TABLE` without `data_lake_delete_data_on_drop = 1` is rejected. With the setting enabled, both
+  the table and its data are permanently deleted.
+:::
 
 ## Examples {#examples}
 
@@ -1803,6 +2203,18 @@ SELECT count() from database_name.table_name;
 )DOCS_MD",
         .syntax = "ENGINE = DataLakeCatalog('catalog_url'[, 'user', 'password']) SETTINGS catalog_type = '...'",
         .related = {}});
+    factory.registerDatabase("Iceberg", create_fn, {
+        .supports_arguments = true,
+        .supports_settings = true,
+        .is_external = true,
+    }, Documentation{
+        .description = R"DOCS_MD(
+The `Iceberg` database engine is the legacy name of [`DataLakeCatalog`](/engines/database-engines/datalake)
+and is kept for compatibility with databases created before the rename. It accepts the same arguments and
+the same settings, and supports the same catalogs. Use `DataLakeCatalog` for new databases.
+)DOCS_MD",
+        .syntax = "ENGINE = Iceberg('catalog_url'[, 'user', 'password']) SETTINGS catalog_type = '...'",
+        .related = {"DataLakeCatalog"}});
 }
 
 }

@@ -96,25 +96,24 @@ bool StorageObjectStorageConfiguration::shouldReloadSchemaForConsistency(Context
 
 
 void StorageObjectStorageConfiguration::initialize(
-    StorageObjectStorageConfiguration & configuration_to_initialize,
     ASTs & engine_args,
     ContextPtr local_context,
     bool with_table_structure,
     const StorageID * table_id)
 {
     std::string disk_name;
-    if (configuration_to_initialize.isDataLakeConfiguration())
+    if (isDataLakeConfiguration())
     {
-        const auto & storage_settings = configuration_to_initialize.getDataLakeSettings();
+        const auto & storage_settings = getDataLakeSettings();
         disk_name = storage_settings[DataLakeStorageSetting::disk].changed
             ? storage_settings[DataLakeStorageSetting::disk].value
             : "";
     }
     if (!disk_name.empty())
-        configuration_to_initialize.fromDisk(disk_name, engine_args, local_context, with_table_structure);
+        fromDisk(disk_name, engine_args, local_context, with_table_structure);
     else if (auto named_collection = tryGetNamedCollectionWithOverrides(engine_args, local_context, true, nullptr, table_id))
     {
-        configuration_to_initialize.fromNamedCollection(*named_collection, local_context);
+        fromNamedCollection(*named_collection, local_context);
 
         /// A base-URL setting (e.g. `s3_base`) rewrote a relative URL coming from the named
         /// collection. Materialize the resolved URL back into the engine args as a `url='...'`
@@ -122,56 +121,66 @@ void StorageObjectStorageConfiguration::initialize(
         /// restart) does not depend on the value of the setting at attach time.
         /// `skip_userinfo=true` keeps credentials that may originate from the base setting
         /// out of the persisted arguments.
-        if (!configuration_to_initialize.url_overridden_by_base_setting.empty())
+        if (!url_overridden_by_base_setting.empty())
             StorageURL::overrideURLInEngineArgs(
-                engine_args, configuration_to_initialize.url_overridden_by_base_setting, local_context, /*skip_userinfo=*/ true);
+                engine_args, url_overridden_by_base_setting, local_context, /*skip_userinfo=*/ true);
     }
     else
-        configuration_to_initialize.fromAST(engine_args, local_context, with_table_structure);
+        fromAST(engine_args, local_context, with_table_structure);
 
-    if (configuration_to_initialize.isNamespaceWithGlobs())
+    if (isNamespaceWithGlobs())
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Expression can not have wildcards inside {} name", configuration_to_initialize.getNamespaceType());
+                        "Expression can not have wildcards inside {} name", getNamespaceType());
 
-    if (configuration_to_initialize.isDataLakeConfiguration())
+    if (isDataLakeConfiguration())
     {
-        if (configuration_to_initialize.partition_strategy_type != PartitionStrategyFactory::StrategyType::NONE)
+        if (getPartitionStrategyType() != PartitionStrategyFactory::StrategyType::NONE)
         {
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The `partition_strategy` argument is incompatible with data lakes");
         }
     }
-    else if (!configuration_to_initialize.partition_strategy_was_set
-        && configuration_to_initialize.partition_strategy_type == PartitionStrategyFactory::StrategyType::NONE
-        && configuration_to_initialize.getRawPath().hasPartitionWildcard()
+    else if (!partition_strategy_was_set
+        && partition_strategy_type == PartitionStrategyFactory::StrategyType::NONE
+        && getRawPath().hasPartitionWildcard()
         && local_context->getSettingsRef()[Setting::file_like_engine_default_partition_strategy].value
             == FileLikeEngineDefaultPartitionStrategy::WILDCARD)
     {
         /// Backwards compatibility: promote to WILDCARD only when it is the effective default strategy.
-        configuration_to_initialize.partition_strategy_type = PartitionStrategyFactory::StrategyType::WILDCARD;
+        setPartitionStrategyType(PartitionStrategyFactory::StrategyType::WILDCARD);
     }
-    if (configuration_to_initialize.format == "auto")
+    if (format == "auto")
     {
-        if (configuration_to_initialize.isDataLakeConfiguration())
+        if (isDataLakeConfiguration())
         {
-            configuration_to_initialize.format = "Parquet";
+            format = "Parquet";
         }
         else
         {
-            configuration_to_initialize.format
+            format
                 = FormatFactory::instance()
-                      .tryGetFormatFromFileName(configuration_to_initialize.isArchive() ? configuration_to_initialize.getPathInArchive() : configuration_to_initialize.getRawPath().path)
+                      .tryGetFormatFromFileName(isArchive() ? getPathInArchive() : getRawPath().path)
                       .value_or("auto");
         }
     }
     else
-        FormatFactory::instance().checkFormatName(configuration_to_initialize.format);
+        FormatFactory::instance().checkFormatName(format);
 
-    /// It might be changed on `StorageObjectStorageConfiguration::initPartitionStrategy`
+    if (partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE)
+    {
+        file_path_generator = std::make_shared<ObjectStorageAppendFilePathGenerator>(
+            getRawPath().path,
+            format);
+    }
+    else
+    {
+        file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(getRawPath().path);
+    }
+
     /// We shouldn't set path for disk setup because path prefix is already set in used object_storage.
     if (disk_name.empty())
-        configuration_to_initialize.read_path = configuration_to_initialize.getRawPath();
+        read_path = file_path_generator->getPathForRead();
 
-    configuration_to_initialize.initialized = true;
+    initialized = true;
 }
 
 String StorageObjectStorageConfiguration::computeSchemaHash(const ColumnsDescription & columns)
@@ -193,6 +202,12 @@ void StorageObjectStorageConfiguration::setSchemaHash(const String & hash)
     boost::replace_all(path.path, SCHEMA_HASH_WILDCARD, schema_hash);
     setRawPath(path);
     setPaths({path});
+
+    /// `file_path_generator` was constructed before `setSchemaHash` ran and still
+    /// holds a copy of the raw path with the unreplaced `{_schema_hash}` placeholder.
+    /// `_schema_hash` is rejected for hive partitioning earlier, so the wildcard
+    /// generator is the only valid variant here.
+    file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(path.path);
 }
 
 void StorageObjectStorageConfiguration::initPartitionStrategy(ASTPtr partition_by, const ColumnsDescription & columns, ContextPtr context)
@@ -281,8 +296,25 @@ void StorageObjectStorageConfiguration::initPartitionStrategy(ASTPtr partition_b
 
     if (partition_strategy)
     {
-        read_path = partition_strategy->getPathForRead(getRawPath().path);
         LOG_DEBUG(getLogger("StorageObjectStorageConfiguration"), "Initialized partition strategy {}", magic_enum::enum_name(partition_strategy_type));
+    }
+
+    /// `initialize()` picks the file path generator from the `partition_strategy_type` known at
+    /// parse time, which is before the strategy can be inferred here (a `PARTITION BY` without an
+    /// explicit `partition_strategy` resolves to `hive` by default). Rebuild the generator once the
+    /// effective strategy is known, otherwise every hive partition would be written to the raw path
+    /// and reads would not look into the partition directories.
+    if (partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE
+        && !std::dynamic_pointer_cast<ObjectStorageAppendFilePathGenerator>(file_path_generator))
+    {
+        /// Keep a read path that does not come from the generator (e.g. set up from a disk) as is.
+        const bool read_path_derived_from_generator
+            = file_path_generator && read_path.path == file_path_generator->getPathForRead();
+
+        file_path_generator = std::make_shared<ObjectStorageAppendFilePathGenerator>(getRawPath().path, format);
+
+        if (read_path_derived_from_generator)
+            read_path = Path{file_path_generator->getPathForRead()};
     }
 }
 
@@ -293,23 +325,23 @@ const StorageObjectStorageConfiguration::Path & StorageObjectStorageConfiguratio
 
 StorageObjectStorageConfiguration::Path StorageObjectStorageConfiguration::getPathForWrite(const std::string & partition_id) const
 {
-    auto raw_path = getRawPath();
+    return getPathForWrite(partition_id, /* filename_override */ "");
+}
 
-    if (!schema_hash.empty())
-        boost::replace_all(raw_path.path, SCHEMA_HASH_WILDCARD, schema_hash);
-
-    if (!partition_strategy)
-    {
-        return raw_path;
-    }
-
-    return Path {partition_strategy->getPathForWrite(raw_path.path, partition_id)};
+StorageObjectStorageConfiguration::Path StorageObjectStorageConfiguration::getPathForWrite(const std::string & partition_id, const std::string & filename_override) const
+{
+    return Path {file_path_generator->getPathForWrite(partition_id, filename_override)};
 }
 
 bool StorageObjectStorageConfiguration::Path::hasPartitionWildcard() const
 {
     static const String PARTITION_ID_WILDCARD = "{_partition_id}";
     return path.contains(PARTITION_ID_WILDCARD);
+}
+
+bool StorageObjectStorageConfiguration::Path::hasExportFilenameWildcard() const
+{
+    return path.find(ObjectStorageWildcardFilePathGenerator::FILE_WILDCARD) != String::npos;
 }
 
 bool StorageObjectStorageConfiguration::Path::hasSchemaHashWildcard() const

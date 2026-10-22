@@ -4,11 +4,13 @@
 #include <Interpreters/Context.h>
 #include <Common/Macros.h>
 #include <Common/Exception.h>
+#include <Common/maskURIPassword.h>
 #include <Common/quoteString.h>
 #include <Common/re2.h>
 #include <IO/Archives/ArchiveUtils.h>
 
 #include <boost/algorithm/string/case_conv.hpp>
+#include <boost/algorithm/string/replace.hpp>
 #include <Poco/Util/AbstractConfiguration.h>
 
 #include <aws/s3/S3EndpointProvider.h>
@@ -18,10 +20,12 @@ namespace DB
 
 struct URIConverter
 {
-    static void modifyURI(Poco::URI & uri, NameToNameMap mapper)
+    static void modifyURI(Poco::URI & uri, NameToNameMap mapper, bool enable_url_encoding = true)
     {
         Macros macros({{"bucket", uri.getHost()}});
-        uri = macros.expand(mapper[uri.getScheme()]).empty() ? uri : Poco::URI(macros.expand(mapper[uri.getScheme()]) + uri.getPathAndQuery());
+        uri = macros.expand(mapper[uri.getScheme()]).empty()
+            ? uri
+            : Poco::URI(macros.expand(mapper[uri.getScheme()]) + uri.getPathAndQuery(), enable_url_encoding);
     }
 };
 
@@ -33,7 +37,35 @@ namespace ErrorCodes
 namespace S3
 {
 
-URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_presigned_query_parameters, S3UriStyle uri_style)
+namespace
+{
+
+/// `Poco::URI::toString` renders the userinfo (`user:password@`) and the query parameters of a presigned
+/// URL verbatim. Exception messages reach `system.query_log` and the server log, which, unlike the query
+/// text, are not masked, so a URI must not be put into them as is.
+String maskedURIString(const Poco::URI & uri)
+{
+    String result = uri.toString();
+    maskURIUserinfo(result);
+    /// With `compatibility_s3_presigned_url_query_in_path` the constructor folds the query of a presigned URL
+    /// into the path by percent-encoding its '?', which `toString` renders as `%3F`, so `maskPresignedURLParameters`
+    /// would not see the parameters. Put the '?' back: `toString` encodes '%' itself as `%25`, so a `%3F` can only
+    /// come from a '?'.
+    boost::replace_all(result, "%3F", "?");
+    maskPresignedURLParameters(result);
+    return result;
+}
+
+/// With `compatibility_s3_presigned_url_query_in_path` the query of a presigned URL ends up in the bucket or the key.
+String maskedQuotedString(String value)
+{
+    maskPresignedURLParameters(value);
+    return quoteString(value);
+}
+
+}
+
+URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_presigned_query_parameters, S3UriStyle uri_style, bool enable_url_encoding)
 {
     /// Case when AWS Private Link Interface is being used
     /// E.g. (bucket.vpce-07a1cd78f1bd55c5f-j3a3vg6w.s3.us-east-1.vpce.amazonaws.com/bucket-name/key)
@@ -45,9 +77,9 @@ URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_pre
     else
         uri_str = uri_;
 
-    uri = Poco::URI(uri_str);
+    uri = Poco::URI(uri_str, enable_url_encoding);
     /// Keep a copy of how Poco parsed the original string before any mapping
-    Poco::URI original_uri(uri_str);
+    Poco::URI original_uri(uri_str, enable_url_encoding);
     bool looks_like_presigned = false;
     for (const auto & [qk, qv] : original_uri.getQueryParameters())
     {
@@ -93,7 +125,7 @@ URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_pre
         }
 
         if (!mapper.empty())
-            URIConverter::modifyURI(uri, mapper);
+            URIConverter::modifyURI(uri, mapper, enable_url_encoding);
     }
 
     storage_name = "S3";
@@ -143,13 +175,13 @@ URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_pre
     case S3UriStyle::VIRTUAL_HOSTED:
     {
         if (!tryInitVirtualHostedStyle(is_using_aws_private_link_interface, false))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid S3 virtual-hosted-style uri: {}", !uri.empty() ? uri.toString() : "");
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid S3 virtual-hosted-style uri: {}", !uri.empty() ? maskedURIString(uri) : "");
         break;
     }
     case S3UriStyle::PATH:
     {
         if (!tryInitPathStyle())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid S3 path-style uri: {}", !uri.empty() ? uri.toString() : "");
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid S3 path-style uri: {}", !uri.empty() ? maskedURIString(uri) : "");
         break;
     }
     }
@@ -215,10 +247,72 @@ bool URI::tryInitVirtualHostedStyle(bool is_using_aws_private_link_interface, bo
     return true;
 }
 
+bool URI::isAWSRegion(std::string_view region)
+{
+    /// List from https://docs.aws.amazon.com/general/latest/gr/s3.html
+    static const std::unordered_set<std::string_view> regions = {
+        "us-east-2",
+        "us-east-1",
+        "us-west-1",
+        "us-west-2",
+        "af-south-1",
+        "ap-east-1",
+        "ap-south-2",
+        "ap-southeast-3",
+        "ap-southeast-5",
+        "ap-southeast-4",
+        "ap-south-1",
+        "ap-northeast-3",
+        "ap-northeast-2",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ap-east-2",
+        "ap-southeast-7",
+        "ap-northeast-1",
+        "ca-central-1",
+        "ca-west-1",
+        "eu-central-1",
+        "eu-west-1",
+        "eu-west-2",
+        "eu-south-1",
+        "eu-west-3",
+        "eu-south-2",
+        "eu-north-1",
+        "eu-central-2",
+        "il-central-1",
+        "mx-central-1",
+        "me-south-1",
+        "me-central-1",
+        "sa-east-1",
+        "us-gov-east-1",
+        "us-gov-west-1"
+    };
+
+    /// 's3-us-west-2' is a legacy region format for S3 storage, equals to 'us-west-2'
+    /// See https://docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html#VirtualHostingBackwardsCompatibility
+    if (region.substr(0, 3) == "s3-")
+        region = region.substr(3);
+
+    return regions.contains(region);
+}
+
 void URI::addRegionToURI(const std::string &region)
 {
     if (auto pos = endpoint.find(".amazonaws.com"); pos != std::string::npos)
+    {
+        if (pos > 0)
+        { /// Check if region is already in endpoint to avoid add it second time
+            auto prev_pos = endpoint.find_last_of("/.", pos - 1);
+            if (prev_pos == std::string::npos)
+                prev_pos = 0;
+            else
+                ++prev_pos;
+            std::string_view endpoint_region = std::string_view(endpoint).substr(prev_pos, pos - prev_pos);
+            if (isAWSRegion(endpoint_region))
+                return;
+        }
         endpoint = endpoint.substr(0, pos) + "." + region + endpoint.substr(pos);
+    }
 }
 
 void URI::validateBucket(const String & bucket, const Poco::URI & uri)
@@ -229,8 +323,8 @@ void URI::validateBucket(const String & bucket, const Poco::URI & uri)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "Bucket name length is out of bounds in virtual hosted style S3 URI: {}{}",
-            quoteString(bucket),
-            !uri.empty() ? " (" + uri.toString() + ")" : "");
+            maskedQuotedString(bucket),
+            !uri.empty() ? " (" + maskedURIString(uri) + ")" : "");
 }
 
 void URI::validateKey(const String & key, const Poco::URI & uri)
@@ -240,8 +334,8 @@ void URI::validateKey(const String & key, const Poco::URI & uri)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "Invalid S3 key: {}{}",
-            quoteString(key),
-            !uri.empty() ? " (" + uri.toString() + ")" : "");
+            maskedQuotedString(key),
+            !uri.empty() ? " (" + maskedURIString(uri) + ")" : "");
     };
 
 

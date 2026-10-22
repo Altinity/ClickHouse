@@ -48,6 +48,7 @@
 #include <Processors/QueryPlan/WindowStep.h>
 #include <Processors/QueryPlan/ReadFromRecursiveCTEStep.h>
 #include <Processors/QueryPlan/ReadFromQueryResultCacheStep.h>
+#include <Processors/QueryPlan/ObjectFilterStep.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 
 #include <Interpreters/ClusterProxy/executeQuery.h>
@@ -64,8 +65,10 @@
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageDummy.h>
 #include <Storages/StorageMerge.h>
+#include <Storages/StorageProxy.h>
 #include <Storages/StorageView.h>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
+#include <Storages/IStorageCluster.h>
 
 #include <AggregateFunctions/IAggregateFunction.h>
 
@@ -173,6 +176,7 @@ namespace Setting
     extern const SettingsBool enable_adaptive_aggregator;
     extern const SettingsUInt64 adaptive_aggregator_freeze_threshold;
     extern const SettingsUInt64 adaptive_aggregator_freeze_threshold_bytes;
+    extern const SettingsBool use_aggregation_memory_tracker;
     extern const SettingsUInt64 max_bytes_to_transfer;
     extern const SettingsUInt64 max_rows_to_transfer;
     extern const SettingsOverflowMode transfer_overflow_mode;
@@ -187,6 +191,7 @@ namespace Setting
     extern const SettingsBool make_distributed_plan;
     extern const SettingsBool query_plan_enable_optimizations;
     extern const SettingsUInt64 query_plan_max_limit_for_top_k_optimization;
+    extern const SettingsBool use_hive_partitioning;
 }
 
 namespace ServerSetting
@@ -237,6 +242,11 @@ void checkStoragesSupportTransactions(const PlannerContextPtr & planner_context)
     }
 }
 
+}
+
+namespace
+{
+
 /** Storages can rely that filters that for storage will be available for analysis before
   * getQueryProcessingStage method will be called.
   *
@@ -277,7 +287,7 @@ FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & 
         const auto * raw = storage_ptr.get();
         if (typeid_cast<const StorageDistributed *>(raw))
             return true;
-        if (parallel_replicas_estimation_enabled && std::dynamic_pointer_cast<MergeTreeData>(storage_ptr))
+        if (parallel_replicas_estimation_enabled && castStorage<MergeTreeData>(storage_ptr, DeferredTable::Load))
             return true;
         if (typeid_cast<const StorageObjectStorageCluster *>(raw))
             return true;
@@ -416,6 +426,8 @@ FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & 
     return res;
 }
 
+}
+
 FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & query_tree_node, const SelectQueryOptions & select_query_options, const ActionsDAG * post_filter)
 {
     if (select_query_options.only_analyze)
@@ -436,6 +448,9 @@ FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & 
 
     return collectFiltersForAnalysis(query_tree_node, table_expressions_nodes, context, post_filter);
 }
+
+namespace
+{
 
 /// Extend lifetime of query context, storages, and table locks
 void extendQueryContextAndStoragesLifetime(QueryPlan & query_plan, const PlannerContextPtr & planner_context)
@@ -646,6 +661,21 @@ ALWAYS_INLINE void addFilterStep(
     query_plan.addStep(std::move(where_step));
 }
 
+template <size_t size>
+ALWAYS_INLINE void addObjectFilterStep(
+    QueryPlan & query_plan,
+    FilterAnalysisResult & filter_analysis_result,
+    const char (&step_description)[size])
+{
+    auto actions = std::move(filter_analysis_result.filter_actions->dag);
+
+    auto where_step = std::make_unique<ObjectFilterStep>(query_plan.getCurrentHeader(),
+        std::move(actions),
+        filter_analysis_result.filter_column_name);
+    where_step->setStepDescription(step_description);
+    query_plan.addStep(std::move(where_step));
+}
+
 Aggregator::Params getAggregatorParams(const PlannerContextPtr & planner_context,
     const AggregationAnalysisResult & aggregation_analysis_result,
     const QueryAnalysisResult & query_analysis_result,
@@ -703,7 +733,8 @@ Aggregator::Params getAggregatorParams(const PlannerContextPtr & planner_context
         settings[Setting::enable_packed_string_keys_in_aggregation],
         settings[Setting::enable_adaptive_aggregator],
         settings[Setting::adaptive_aggregator_freeze_threshold],
-        settings[Setting::adaptive_aggregator_freeze_threshold_bytes]);
+        settings[Setting::adaptive_aggregator_freeze_threshold_bytes],
+        settings[Setting::use_aggregation_memory_tracker]);
 
     return aggregator_params;
 }
@@ -1373,6 +1404,9 @@ void addWithFillStepIfNeeded(QueryPlan & query_plan,
         {
             ActionsDAG rename_dag;
 
+            /// A later item resolves names against every node of the DAG, so the conversions and outputs are added after all items are visited.
+            std::vector<std::tuple<const ActionsDAG::Node *, DataTypePtr, String>> interpolated_columns;
+
             for (auto & interpolate_node : interpolate_list_nodes)
             {
                 auto & interpolate_node_typed = interpolate_node->as<InterpolateNode &>();
@@ -1393,16 +1427,16 @@ void addWithFillStepIfNeeded(QueryPlan & query_plan,
 
                 const auto * expression_to_interpolate = expression_to_interpolate_expression_nodes[0];
                 const auto * interpolate_expression = interpolate_expression_nodes[0];
-                if (!interpolate_expression->result_type->equals(*expression_to_interpolate->result_type))
-                {
-                    interpolate_expression = &interpolate_actions_dag.addCast(*interpolate_expression,
-                        expression_to_interpolate->result_type,
-                        interpolate_expression->result_name,
-                        planner_context->getQueryContext());
-                }
+                interpolated_columns.emplace_back(interpolate_expression, expression_to_interpolate->result_type, interpolate_node_typed.getExpressionName());
+            }
 
-                const auto * alias_node = &interpolate_actions_dag.addAlias(*interpolate_expression, interpolate_node_typed.getExpressionName());
-                interpolate_actions_dag.getOutputs().push_back(alias_node);
+            for (const auto & [interpolate_expression, target_type, target_name] : interpolated_columns)
+            {
+                const auto * interpolated_column = interpolate_expression;
+                if (!interpolated_column->result_type->equals(*target_type))
+                    interpolated_column = &interpolate_actions_dag.addCast(*interpolated_column, target_type, {}, planner_context->getQueryContext());
+
+                interpolate_actions_dag.getOutputs().push_back(&interpolate_actions_dag.addAlias(*interpolated_column, target_name));
             }
 
             if (!rename_dag.getOutputs().empty())
@@ -2120,6 +2154,9 @@ void addBuildSubqueriesForMaterializedCTEsIfNeeded(
                         materialized_cte->cte_name);
 
                 auto cte_options = select_query_options.subquery();
+                /// Gates for a materialized CTE belong to the plan that collected it, where a deeper
+                /// level yields a higher and therefore dominating gate; this CTE's plan is not that plan.
+                cte_options.forceMaterializeCTE(false);
                 Planner cte_planner(
                     cte_subquery,
                     cte_options,
@@ -2670,9 +2707,12 @@ void Planner::buildPlanForQueryNode()
     /// applied later as a plan transformation (QueryPlanOptimizations::applyParallelReplicas). So skip the
     /// old parallel-replicas planning path here (it would emit ReadFromLocalReplica /
     /// ReadFromRemoteParallelReplicas, e.g. inside a view/union inner query) and use the normal plan.
+    /// Same for a plan that is shipped to a shard: those steps are local to the server that planned
+    /// them and have no serialized form, and the shard decides on parallel replicas on its own.
     if (planner_context->getMutableQueryContext()->canUseTaskBasedParallelReplicas()
         && planner_context->getGlobalPlannerContext()->parallel_replicas_node == &query_node
-        && !settings[Setting::parallel_replicas_plan_based])
+        && !settings[Setting::parallel_replicas_plan_based]
+        && !select_query_options.build_logical_plan)
     {
         join_tree_query_plan = buildQueryPlanForParallelReplicas(query_node, planner_context, select_query_info.storage_limits);
     }
@@ -2839,6 +2879,16 @@ void Planner::buildPlanForQueryNode()
 
     if (query_processing_info.isSecondStage() || query_processing_info.isFromAggregationState())
     {
+        if (settings[Setting::use_hive_partitioning]
+            && !query_processing_info.isFirstStage()
+            && expression_analysis_result.hasWhere())
+        {
+            if (typeid_cast<ReadFromCluster *>(query_plan.getRootNode()->step.get()))
+            {
+                addObjectFilterStep(query_plan, expression_analysis_result.getWhere(), "WHERE");
+            }
+        }
+
         if (query_processing_info.isFromAggregationState())
         {
             /// Aggregation was performed on remote shards

@@ -23,7 +23,11 @@ using ContextPtr = std::shared_ptr<const Context>;
 
 class Block;
 
-QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_context, QueryTreeNodePtr query_tree_to_modify, bool allow_global_join_for_right_table);
+QueryTreeNodePtr buildQueryTreeForShard(
+    const PlannerContextPtr & planner_context,
+    QueryTreeNodePtr query_tree_to_modify,
+    bool allow_global_join_for_right_table,
+    bool find_cross_join = false);
 
 /** Replace every `ALIAS` column node with its defining expression, so the expression is evaluated on the shard/replica
   * that reads the real table instead of the column being resolved there as if it were physical.
@@ -34,7 +38,8 @@ QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_contex
   */
 void inlineAliasColumns(QueryTreeNodePtr & query_tree_to_modify);
 
-void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context);
+void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context, bool force_prefer_global_join = false);
+void rewriteInToGlobalIn(QueryTreeNodePtr & query_tree_to_modify, ContextPtr context, bool rewrite_for_distributed = false);
 
 /** When a Distributed/parallel-replicas query is executed up to `WithMergeableState`, the shard's query tree has its
   * `ALIAS` columns inlined into their defining expressions. If several projection (or sort/group/...) items expand to the

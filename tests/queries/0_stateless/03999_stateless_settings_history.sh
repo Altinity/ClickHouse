@@ -13,6 +13,10 @@
 #         has no history row would go unnoticed).
 #     so that the `compatibility` setting keeps working.
 #   * Aliases and obsolete settings are ignored.
+#   * Antalya adds a second snapshot, taken from the previous Antalya release
+#     (03999_settings_26_6_2_20001_antalya.tsv), checked the same two ways. It keeps
+#     `compatibility` working for an upgrade from that release, which the upstream
+#     snapshot alone cannot guarantee.
 #
 # The snapshot only ever needs editing to REMOVE a name (when an old setting is
 # dropped); new settings must never be added to it.
@@ -26,12 +30,28 @@ BASELINE="${CUR_DIR}/03999_settings_history_baseline.tsv"
 # SettingsChangesHistory.cpp (i.e. a default change that predates this test and was never
 # recorded). This list may only SHRINK: each name should be fixed in the history and removed.
 VALUE_DRIFT_IGNORE="${CUR_DIR}/03999_settings_value_drift_ignore.txt"
+# Antalya counterpart of the frozen baseline: the settings of the previous Antalya release
+# (v26.6.2.20001.altinityantalya). A setting missing from it, or whose default differs from
+# it, must be recorded in `SettingsChangesHistory.cpp` so that `compatibility` set to that
+# release restores the value the release had. The upstream baseline cannot catch a default
+# that Antalya overrode and later dropped, because that default is back to the OSS value.
+# Regenerated on a rebase onto a newer upstream release, from the previous Antalya build:
+#   docker run --rm --entrypoint clickhouse \
+#     altinity/clickhouse-server:26.6.2.20001.altinityantalya local \
+#     -q "select name, default from system.settings order by name format TSV" \
+#     > 03999_settings_26_6_2_20001_antalya.tsv
+# An empty file disables the Antalya-side checks.
+ANTALYA_BASELINE="${CUR_DIR}/03999_settings_26_6_2_20001_antalya.tsv"
 
 $CLICKHOUSE_LOCAL --query "
     WITH
         baseline AS
         (
             SELECT name, kind, default FROM file('${BASELINE}', 'TSV', 'name String, kind String, default String')
+        ),
+        antalya_baseline AS
+        (
+            SELECT name, default FROM file('${ANTALYA_BASELINE}', 'TSV', 'name String, default String')
         ),
         value_drift_ignore AS
         (
@@ -64,16 +84,21 @@ $CLICKHOUSE_LOCAL --query "
         -- applied in ascending version order and, within a version, in vector order (the order
         -- they appear in the block). A setting may legitimately appear more than once in the
         -- same block, so ties on version are broken by the entry index - argMax over the tuple
-        -- (version, index) reproduces the effective 'latest' value deterministically. If it
-        -- differs from the current default, a default was changed in code without recording it
-        -- in SettingsChangesHistory.cpp, so the compatibility setting restores a wrong value.
+        -- (version, flavour, index) reproduces the effective 'latest' value deterministically.
+        -- The version key mirrors ClickHouseVersion: the numeric components compared as a
+        -- vector, then the build flavour suffix, so an Antalya block sorts right after the
+        -- upstream release it patches ('26.1' < '26.1.3.20001.altinityantalya' < '26.2').
+        -- If the value differs from the current default, a default was changed in code without
+        -- recording it in SettingsChangesHistory.cpp, so compatibility restores a wrong value.
         session_expected_default AS
         (
-            SELECT name, argMax(new_value, (vnum, idx)) AS expected
+            SELECT name, argMax(new_value, (vnum, vflavour, idx)) AS expected
             FROM
             (
                 SELECT c.1 AS name, c.3 AS new_value,
-                    splitByChar('.', version)[1]::UInt64 * 1000 + splitByChar('.', version)[2]::UInt64 AS vnum,
+                    splitByChar('.', version) AS vparts,
+                    if(vparts[-1] IN ('altinityantalya', 'altinitystable', 'altinitytest'), vparts[-1], '') AS vflavour,
+                    arrayMap(x -> x::UInt64, if(vflavour = '', vparts, arrayPopBack(vparts))) AS vnum,
                     idx
                 FROM system.settings_changes
                 ARRAY JOIN changes AS c, arrayEnumerate(changes) AS idx
@@ -83,11 +108,13 @@ $CLICKHOUSE_LOCAL --query "
         ),
         mergetree_expected_default AS
         (
-            SELECT name, argMax(new_value, (vnum, idx)) AS expected
+            SELECT name, argMax(new_value, (vnum, vflavour, idx)) AS expected
             FROM
             (
                 SELECT c.1 AS name, c.3 AS new_value,
-                    splitByChar('.', version)[1]::UInt64 * 1000 + splitByChar('.', version)[2]::UInt64 AS vnum,
+                    splitByChar('.', version) AS vparts,
+                    if(vparts[-1] IN ('altinityantalya', 'altinitystable', 'altinitytest'), vparts[-1], '') AS vflavour,
+                    arrayMap(x -> x::UInt64, if(vflavour = '', vparts, arrayPopBack(vparts))) AS vnum,
                     idx
                 FROM system.settings_changes
                 ARRAY JOIN changes AS c, arrayEnumerate(changes) AS idx
@@ -194,6 +221,36 @@ $CLICKHOUSE_LOCAL --query "
           AND s.default NOT LIKE 'auto(%'
           AND s.default != b.default
           AND s.name NOT IN (SELECT name FROM mergetree_documented)
+          AND s.name NOT IN (SELECT name FROM value_drift_ignore)
+          AND s.name NOT IN (SELECT name FROM cloud_divergent_settings)
+
+        UNION ALL
+
+        -- Session setting that did not exist in the previous Antalya release and is not
+        -- documented. The frozen upstream baseline is newer, so it does not require a history
+        -- entry for a setting upstream added between that Antalya release and the freeze.
+        SELECT 'PLEASE ADD THE NEW SETTING TO SettingsChangesHistory.cpp (Antalya): ' || name
+        FROM system.settings
+        WHERE alias_for = '' AND is_obsolete = 0
+          AND name NOT IN (SELECT name FROM antalya_baseline)
+          AND name NOT IN (SELECT name FROM session_documented)
+          AND (SELECT count() FROM antalya_baseline) > 0
+
+        UNION ALL
+
+        -- Session default that differs from the previous Antalya release and has no history row.
+        -- Both defaults come from system.settings, so the representation matches - no
+        -- normalization. Catches an Antalya override that was dropped: the default is back to
+        -- the OSS value the frozen upstream baseline holds, so the arms above see no change,
+        -- yet compatibility set to that Antalya release must still restore its value.
+        SELECT 'PLEASE RECORD THE DEFAULT CHANGE IN SettingsChangesHistory.cpp (Antalya): ' || s.name
+            || ' default changed from ' || a.default || ' to ' || s.default || ' since the previous Antalya release but has no history entry'
+        FROM system.settings s
+        JOIN antalya_baseline a ON a.name = s.name
+        WHERE s.is_obsolete = 0 AND s.alias_for = ''
+          AND s.default NOT LIKE 'auto(%'   -- runtime-derived value, machine-specific
+          AND s.default != a.default
+          AND s.name NOT IN (SELECT name FROM session_documented)
           AND s.name NOT IN (SELECT name FROM value_drift_ignore)
           AND s.name NOT IN (SELECT name FROM cloud_divergent_settings)
     )

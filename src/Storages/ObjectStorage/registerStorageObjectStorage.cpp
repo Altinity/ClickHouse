@@ -16,6 +16,7 @@
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
 #include <Storages/ObjectStorage/StorageObjectStorageDefinitions.h>
 #include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <Storages/StorageFactory.h>
 #include <Poco/Logger.h>
 #include <Disks/DiskType.h>
@@ -46,11 +47,20 @@ namespace
 // LocalObjectStorage is only supported for Iceberg Datalake operations where Avro format is required. For regular file access, use FileStorage instead.
 #if USE_AWS_S3 || USE_AZURE_BLOB_STORAGE || USE_HDFS || USE_AVRO
 
-std::shared_ptr<StorageObjectStorage>
+StoragePtr
 createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObjectStorageConfigurationPtr configuration)
 {
     const auto context = args.getLocalContext();
-    StorageObjectStorageConfiguration::initialize(*configuration, args.engine_args, context, false, &args.table_id);
+
+    std::string cluster_name;
+
+    if (args.storage_def->settings)
+    {
+        if (const auto * value = args.storage_def->settings->changes.tryGet("object_storage_cluster"))
+            cluster_name = value->safeGet<std::string>();
+    }
+
+    configuration->initialize(args.engine_args, context, false, &args.table_id);
 
     // Use format settings from global server context + settings from
     // the SETTINGS clause of the create query. Settings from current
@@ -105,24 +115,26 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         && (args.table_id.table_name.ends_with("_s3") || args.table_id.table_name.ends_with("_s3queue")))
         configuration->force_anonymous_load_fallback = true;
 
-    return std::make_shared<StorageObjectStorage>(
+    return std::make_shared<StorageObjectStorageCluster>(
+        cluster_name,
         configuration,
         // We only want to perform write actions (e.g. create a container in Azure) when the table is being created,
         // and we want to avoid it when we load the table after a server restart.
         configuration->createObjectStorage(context, /* is_readonly */ args.mode != LoadingStrictnessLevel::CREATE, std::nullopt),
-        context_copy, /// Use global context.
         args.table_id,
         args.columns,
         args.constraints,
+        partition_by,
+        order_by,
+        context_copy, /// Use global context.
         args.comment,
         format_settings,
         args.mode,
         configuration->getCatalog(context, args.table_id),
         args.query.if_not_exists,
-        /* is_datalake_query*/ false,
-        /* distributed_processing */ false,
-        partition_by,
-        order_by);
+        /* is_datalake_query */ false,
+        /* is_table_function */ false,
+        /* lazy_init */ false);
 }
 
 #endif
@@ -1128,9 +1140,8 @@ void registerStorageIceberg(StorageFactory & factory)
                 }
             }
             else
-#if USE_AWS_S3
-                configuration = std::make_shared<StorageS3IcebergConfiguration>(storage_settings);
-#endif
+                configuration = std::make_shared<StorageIcebergConfiguration>(storage_settings);
+
             if (configuration == nullptr)
             {
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "This storage configuration is not available at this build");
@@ -1236,6 +1247,8 @@ The following table shows how Iceberg data types are mapped to ClickHouse data t
 | `fixed(N)` | `FixedString(N)` | |
 | `decimal(P, S)` | `Decimal(P, S)` | |
 
+Writes use the inverse mapping: `DateTime64(9)` is stored as `timestamp_ns`, and `DateTime64` with an explicit timezone and scale 9 as `timestamptz_ns`, but only when `iceberg_format_version` is 3 or higher. `DateTime` and `DateTime64` with scale 6 or less are stored as `timestamp`. Creating or altering an Iceberg table with `DateTime64` scale 9 on format version 1 or 2 raises an exception.
+
 ### Complex types {#complex-types}
 
 | Iceberg type | ClickHouse type |
@@ -1249,8 +1262,8 @@ The following table shows how Iceberg data types are mapped to ClickHouse data t
 The data type mappings above apply to reads. The following limitations apply when ClickHouse creates or evolves Iceberg schemas and writes data:
 
 - ClickHouse cannot create an Iceberg schema containing `Bool`, `Decimal`, `FixedString`, `Int8`, `UInt8`, `Int16`, or `UInt16`, or add or modify a column to one of these types. The operation fails with an unsupported-type exception. This does not prevent inserting `Bool` or `Decimal` values into existing Iceberg columns.
-- When ClickHouse creates or evolves an Iceberg schema, it maps every `DateTime` and `DateTime64` column to Iceberg `timestamp`, which has microsecond precision and no timezone. ClickHouse cannot generate `timestamptz`, `timestamp_ns`, or `timestamptz_ns` schema types, so higher precision and timezone semantics are not represented in the Iceberg schema.
-- ClickHouse cannot write to an Iceberg table that uses a `decimal`, `fixed`, `timestamp_ns`, or `timestamptz_ns` column as a direct partition field. The operation fails with an unsupported-type exception.
+- When ClickHouse creates or evolves an Iceberg schema, `DateTime` and `DateTime64` with scale 6 or less map to Iceberg `timestamp`. `DateTime64(9)` maps to `timestamp_ns`, and `DateTime64(9)` with an explicit timezone maps to `timestamptz_ns`, but only when `iceberg_format_version` is 3 or higher. Format versions 1 and 2 reject `DateTime64` scale 9. Microsecond `timestamptz` is still not generated.
+- ClickHouse cannot write to an Iceberg table that uses a `decimal` or `fixed` column as a direct partition field. The operation fails with an unsupported-type exception.
 - For data files containing types whose bounds ClickHouse cannot serialize, including `Bool` and `Decimal`, ClickHouse omits all lower and upper column bounds from the Iceberg manifest entry. Column sizes and null counts are still included, and the data remains correct, but readers cannot use manifest-level min-max pruning for those files.
 
 ## Schema evolution {#schema-evolution}
@@ -1267,6 +1280,32 @@ To read a table where the schema has changed after its creation with dynamic sch
 ## Partition pruning {#partition-pruning}
 
 ClickHouse supports partition pruning during SELECT queries for Iceberg tables, which helps optimize query performance by skipping irrelevant data files. To enable partition pruning, set `use_iceberg_partition_pruning = 1`. For more information about iceberg partition pruning address https://iceberg.apache.org/spec/#partitioning
+
+## `DROP PARTITION` {#drop-partition}
+
+`ALTER TABLE ... DROP PARTITION <value>` removes every data file belonging to a single partition and creates a new snapshot that no longer references them. It is supported for local, object-storage and catalog-backed Iceberg tables.
+
+Enable `allow_insert_into_iceberg` to use this operation.
+
+The operation is supported only for Iceberg `format-version` 2 tables. The partition value refers to the table's current partition spec. Files written under an earlier partition spec are dropped when their partition values match every field of the current spec; if such a file's spec does not contain every field of the current spec, the operation fails without changing the table. Manifests that also contain files from other partitions are rewritten without the dropped files. Position-delete and equality-delete files belonging to the partition are dropped together with its data files.
+
+The partition value follows the same rules as for `MergeTree`. For a single-column partition, pass a scalar literal; for a multi-column partition, pass a tuple of values:
+
+```sql
+ALTER TABLE iceberg_table DROP PARTITION 2;
+ALTER TABLE iceberg_table DROP PARTITION (2, 5);
+```
+
+For a partition defined with a transform, you can supply either the already-transformed partition-key value as a literal, or the same transform expression applied to a raw source value. The supported transforms are `identity`, `icebergBucket`, `icebergTruncate`, `toYearNumSinceEpoch`, `toMonthNumSinceEpoch`, `toRelativeDayNum`, and `toRelativeHourNum`. For a single-column partition the transform-expression form must be wrapped in `tuple(...)`:
+
+```sql
+ALTER TABLE iceberg_table DROP PARTITION 0;
+ALTER TABLE iceberg_table DROP PARTITION tuple(icebergBucket(4, 'apple'));
+```
+
+The operation rejects explicitly set `iceberg_snapshot_id` or `iceberg_timestamp_ms` settings, and the `iceberg_metadata_file_path` setting on tables that are not catalog-backed. It modifies the current table state, not a historical snapshot or an explicitly selected metadata version.
+
+The `DROP PARTITION ID '...'` and `DROP PARTITION ALL` forms are not supported. Dropping a partition that does not exist is a no-op. By default, the operation does not physically delete the data files. Earlier snapshots retain access to the removed rows and remain available to time-travel queries until those snapshots expire and their files are cleaned up. Enable `data_lake_delete_data_on_drop` to delete the dropped files from storage after the new snapshot is committed; this breaks time travel to earlier snapshots that reference them.
 
 ## Time travel {#time-travel}
 
@@ -2179,7 +2218,7 @@ Data types supported in Paimon partition keys:
 void registerStorageDeltaLake(StorageFactory & factory);
 void registerStorageDeltaLake(StorageFactory & factory)
 {
-#if USE_AWS_S3
+#   if USE_AWS_S3
     factory.registerStorage(
         DeltaLakeDefinition::storage_engine_name,
         [&](const StorageFactory::Arguments & args)

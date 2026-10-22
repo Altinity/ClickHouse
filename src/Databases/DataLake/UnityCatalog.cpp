@@ -1,5 +1,6 @@
 #include <Databases/DataLake/UnityCatalog.h>
 #include <Interpreters/StorageID.h>
+#include <Core/UUID.h>
 
 #if USE_PARQUET
 
@@ -8,6 +9,7 @@
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Parser.h>
 #include <Common/checkStackSize.h>
+#include <Common/CurrentThread.h>
 #include <IO/ReadHelpers.h>
 #include <IO/Operators.h>
 #include <Core/NamesAndTypes.h>
@@ -15,11 +17,29 @@
 #include <Databases/DataLake/StorageCredentials.h>
 #include <fmt/ranges.h>
 
+#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/split.hpp>
+
+namespace ProfileEvents
+{
+    extern const Event DataLakeUnityCatalogGetTables;
+    extern const Event DataLakeUnityCatalogGetTablesMicroseconds;
+    extern const Event DataLakeUnityCatalogGetTable;
+    extern const Event DataLakeUnityCatalogGetTableMicroseconds;
+    extern const Event DataLakeUnityCatalogGetTableMetadata;
+    extern const Event DataLakeUnityCatalogGetTableMetadataMicroseconds;
+    extern const Event DataLakeUnityCatalogGetCredentials;
+    extern const Event DataLakeUnityCatalogGetCredentialsMicroseconds;
+    extern const Event DataLakeUnityCatalogGetSchemas;
+    extern const Event DataLakeUnityCatalogGetSchemasMicroseconds;
+}
+
 namespace DB::ErrorCodes
 {
     extern const int DATALAKE_DATABASE_ERROR;
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
+    extern const int CATALOG_NAMESPACE_DISABLED;
 }
 
 namespace
@@ -126,20 +146,28 @@ CatalogTables UnityCatalog::listTablesInNamespaceDirect(const std::string & name
 void UnityCatalog::getTableMetadata(
     const std::string & namespace_name,
     const std::string & table_name,
+    DB::ContextPtr context_,
     TableMetadata & result) const
 {
-    if (!tryGetTableMetadata(namespace_name, table_name, result))
+    if (!tryGetTableMetadata(namespace_name, table_name, context_, result))
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "No response from unity catalog");
 }
 
-Poco::JSON::Object::Ptr UnityCatalog::requestReadCredentials(const String & table_id) const
+Poco::JSON::Object::Ptr UnityCatalog::requestCredentials(const String & table_id, const String & operation) const
 {
     Poco::JSON::Object request_body;
     request_body.set("table_id", table_id);
-    request_body.set("operation", "READ");
+    request_body.set("operation", operation);
 
     auto callback = [&request_body] (std::ostream & os) { request_body.stringify(os); };
-    auto [json, _] = postJSONRequest(TEMPORARY_CREDENTIALS_ENDPOINT, callback);
+
+    Poco::Dynamic::Var json;
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeUnityCatalogGetCredentials);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeUnityCatalogGetCredentialsMicroseconds);
+        std::string _;
+        std::tie(json, _) = postJSONRequest(TEMPORARY_CREDENTIALS_ENDPOINT, callback);
+    }
     return json.extract<Poco::JSON::Object::Ptr>();
 }
 
@@ -172,7 +200,7 @@ void UnityCatalog::getCredentials(const String & table_id, TableMetadata & metad
     if (storage_type != StorageType::S3 && storage_type != StorageType::Azure)
         return;
 
-    auto response = requestReadCredentials(table_id);
+    auto response = requestCredentials(table_id, "READ");
 
     std::shared_ptr<IStorageCredentials> creds;
     switch (storage_type)
@@ -193,14 +221,22 @@ void UnityCatalog::getCredentials(const String & table_id, TableMetadata & metad
 bool UnityCatalog::tryGetTableMetadata(
     const std::string & schema_name,
     const std::string & table_name,
+    DB::ContextPtr /* context_ */,
     TableMetadata & result) const
 {
+    if (!isNamespaceAllowed(schema_name))
+        throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", schema_name);
+
     auto full_table_name = warehouse + "." + schema_name + "." + table_name;
     Poco::Dynamic::Var json;
     std::string json_str;
     try
     {
-        std::tie(json, json_str) = getJSONRequest(std::filesystem::path{TABLES_ENDPOINT} / full_table_name);
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeUnityCatalogGetTableMetadata);
+            auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeUnityCatalogGetTableMetadataMicroseconds);
+            std::tie(json, json_str) = getJSONRequest(std::filesystem::path{TABLES_ENDPOINT} / full_table_name);
+        }
         const Poco::JSON::Object::Ptr & object = json.extract<Poco::JSON::Object::Ptr>();
         if (hasValueAndItsNotNone("name", object) && object->get("name").extract<String>() == table_name)
         {
@@ -317,11 +353,18 @@ bool UnityCatalog::tryGetTableMetadata(
 
 bool UnityCatalog::existsTable(const std::string & schema_name, const std::string & table_name) const
 {
+    if (!isNamespaceAllowed(schema_name))
+        throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", schema_name);
+
     String json_str;
     Poco::Dynamic::Var json;
     try
     {
-        std::tie(json, json_str) = getJSONRequest(std::filesystem::path{TABLES_ENDPOINT} / (warehouse + "." + schema_name + "." + table_name));
+        {
+            ProfileEvents::increment(ProfileEvents::DataLakeUnityCatalogGetTable);
+            auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeUnityCatalogGetTableMicroseconds);
+            std::tie(json, json_str) = getJSONRequest(std::filesystem::path{TABLES_ENDPOINT} / (warehouse + "." + schema_name + "." + table_name));
+        }
         const Poco::JSON::Object::Ptr & object = json.extract<Poco::JSON::Object::Ptr>();
         if (hasValueAndItsNotNone("name", object) && object->get("name").extract<String>() == table_name)
             return true;
@@ -349,7 +392,11 @@ CatalogTables UnityCatalog::getTablesForSchema(const std::string & schema, size_
 
         try
         {
-            std::tie(json, json_str) = getJSONRequest(TABLES_ENDPOINT, params);
+            {
+                ProfileEvents::increment(ProfileEvents::DataLakeUnityCatalogGetTables);
+                auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeUnityCatalogGetTablesMicroseconds);
+                std::tie(json, json_str) = getJSONRequest(TABLES_ENDPOINT, params);
+            }
             const Poco::JSON::Object::Ptr & object = json.extract<Poco::JSON::Object::Ptr>();
 
             if (!hasValueAndItsNotNone("tables", object))
@@ -416,7 +463,11 @@ DataLake::ICatalog::Namespaces UnityCatalog::getSchemas(const std::string & base
 
         try
         {
-            std::tie(json, json_str) = getJSONRequest(SCHEMAS_ENDPOINT, params);
+            {
+                ProfileEvents::increment(ProfileEvents::DataLakeUnityCatalogGetSchemas);
+                auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeUnityCatalogGetSchemasMicroseconds);
+                std::tie(json, json_str) = getJSONRequest(SCHEMAS_ENDPOINT, params);
+            }
             const Poco::JSON::Object::Ptr & object = json.extract<Poco::JSON::Object::Ptr>();
 
             auto schemas_object = object->get("schemas").extract<Poco::JSON::Array::Ptr>();
@@ -429,7 +480,7 @@ DataLake::ICatalog::Namespaces UnityCatalog::getSchemas(const std::string & base
                 chassert(schema_info->get("catalog_name").extract<String>() == warehouse);
                 UnityCatalogFullSchemaName schema_name = parseFullSchemaName(schema_info->get("full_name").extract<String>());
 
-                if (schema_name.schema_name.starts_with(base_prefix))
+                if (isNamespaceAllowed(schema_name.schema_name) && schema_name.schema_name.starts_with(base_prefix))
                     schemas.push_back(schema_name.schema_name);
 
                 if (limit && schemas.size() > limit)
@@ -471,6 +522,7 @@ UnityCatalog::UnityCatalog(
     const std::string & catalog_,
     const std::string & base_url_,
     const std::string & catalog_credential_,
+    const std::string & namespaces_,
     DB::ContextPtr context_)
     : ICatalog(catalog_)
     , DB::WithContext(context_)
@@ -478,9 +530,14 @@ UnityCatalog::UnityCatalog(
     , log(getLogger("UnityCatalog(" + catalog_ + ")"))
     , bearer_token(catalog_credential_)
 {
+    boost::split(allowed_namespaces, namespaces_, boost::is_any_of(", "), boost::token_compress_on);
 }
 
-/// getCredentialsConfigurationCallback method is supported only for S3 storage
+bool UnityCatalog::isNamespaceAllowed(const std::string & namespace_) const
+{
+    return allowed_namespaces.contains("*") || allowed_namespaces.contains(namespace_);
+}
+
 ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(const DB::StorageID & table_id)
 {
     if (!table_id.hasUUID())
@@ -489,12 +546,31 @@ ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCa
             "Cannot build a Unity credentials refresh callback for `{}`: StorageID has no UUID",
             table_id.getNameForLogs());
 
-    const String unity_table_id = toString(table_id.uuid);
+    return getCredentialsCallbackForOperation(DB::toString(table_id.uuid), "READ");
+}
 
-    return [this, unity_table_id] () -> std::shared_ptr<IStorageCredentials>    {
-        LOG_DEBUG(log, "Update credentials in the catalog");
+/// `StorageID::uuid` of a `DataLakeCatalog` table is the `table_id` returned by Unity.
+ICatalog::CredentialsRefreshCallback UnityCatalog::getWriteCredentialsConfigurationCallback(const DB::StorageID & table_id)
+{
+    if (table_id.uuid == DB::UUIDHelpers::Nil)
+        throw DB::Exception(
+            DB::ErrorCodes::BAD_ARGUMENTS,
+            "Cannot build a Unity credentials refresh callback for `{}`: the table has no UUID",
+            table_id.getNameForLogs());
 
-        return parseS3Credentials(requestReadCredentials(unity_table_id));
+    return getCredentialsCallbackForOperation(DB::toString(table_id.uuid), "READ_WRITE");
+}
+
+ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsCallbackForOperation(const String & unity_table_id, const String & operation)
+{
+    return [this, unity_table_id, operation] () -> std::shared_ptr<IStorageCredentials>
+    {
+        LOG_DEBUG(log, "Update {} credentials in the catalog", operation);
+
+        auto response = requestCredentials(unity_table_id, operation);
+        if (hasValueAndItsNotNone("azure_user_delegation_sas", response))
+            return parseAzureCredentials(response);
+        return parseS3Credentials(response);
     };
 }
 

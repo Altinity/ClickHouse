@@ -19,6 +19,7 @@
 #include <DataTypes/DataTypeString.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <Core/ServerSettings.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <Processors/ISource.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
@@ -37,10 +38,16 @@ namespace Setting
     extern const SettingsUInt64 max_parser_depth;
 }
 
+namespace ServerSetting
+{
+    extern const ServerSettingsBool allow_experimental_export_merge_tree_partition;
+}
+
 namespace ErrorCodes
 {
     extern const int ACCESS_DENIED;
     extern const int NOT_IMPLEMENTED;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 
@@ -246,6 +253,84 @@ BlockIO InterpreterKillQueryQuery::execute()
             res_io.pipeline = QueryPipeline(std::make_shared<SyncKillQuerySource>(
                 process_list, std::move(queries_to_stop), std::move(processes_block), std::make_shared<const Block>(header)));
         }
+
+        break;
+    }
+    case ASTKillQueryQuery::Type::ExportPartition:
+    {
+        if (!getContext()->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
+        {
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "Exporting merge tree partition is experimental. Set the server setting `allow_experimental_export_merge_tree_partition` to enable it");
+        }
+
+        Block exports_block = getSelectResult(
+            "source_database, source_table, transaction_id, destination_database, destination_table, partition_id",
+            "system.partition_exports");
+
+        if (exports_block.empty())
+            return res_io;
+
+        const ColumnString & src_db_col = typeid_cast<const ColumnString &>(*exports_block.getByName("source_database").column);
+        const ColumnString & src_table_col = typeid_cast<const ColumnString &>(*exports_block.getByName("source_table").column);
+        const ColumnString & dst_db_col = typeid_cast<const ColumnString &>(*exports_block.getByName("destination_database").column);
+        const ColumnString & dst_table_col = typeid_cast<const ColumnString &>(*exports_block.getByName("destination_table").column);
+        const ColumnString & tx_col = typeid_cast<const ColumnString &>(*exports_block.getByName("transaction_id").column);
+
+        auto header = exports_block.cloneEmpty();
+        header.insert(0, {ColumnString::create(), std::make_shared<DataTypeString>(), "kill_status"});
+
+        MutableColumns res_columns = header.cloneEmptyColumns();
+        AccessRightsElements required_access_rights;
+        auto access = getContext()->getAccess();
+        bool access_denied = false;
+
+        for (size_t i = 0; i < exports_block.rows(); ++i)
+        {
+            const auto src_database = src_db_col.getDataAt(i);
+            const auto src_table = src_table_col.getDataAt(i);
+            const auto dst_database = dst_db_col.getDataAt(i);
+            const auto dst_table = dst_table_col.getDataAt(i);
+
+            const auto table_id = StorageID{std::string{src_database}, std::string{src_table}};
+            const auto transaction_id = tx_col.getDataAt(i);
+
+            CancellationCode code = CancellationCode::Unknown;
+            if (!query.test)
+            {
+                auto storage = DatabaseCatalog::instance().tryGetTable(table_id, getContext());
+                if (!storage)
+                    code = CancellationCode::NotFound;
+                else
+                {
+                    ASTAlterCommand alter_command{};
+                    alter_command.type = ASTAlterCommand::EXPORT_PARTITION;
+                    alter_command.move_destination_type = DataDestinationType::TABLE;
+                    alter_command.from_database = src_database;
+                    alter_command.from_table = src_table;
+                    alter_command.to_database = dst_database;
+                    alter_command.to_table = dst_table;
+
+                    required_access_rights = InterpreterAlterQuery::getRequiredAccessForCommand(
+                        alter_command, table_id.database_name, table_id.table_name,
+                        InterpreterAlterQuery::isRowExistsLightweightDeleteMarker(storage, getContext()));
+                    if (!access->isGranted(required_access_rights))
+                    {
+                        access_denied = true;
+                        continue;
+                    }
+                    code = storage->killExportPartition(std::string{transaction_id});
+                }
+            }
+
+            insertResultRow(i, code, exports_block, header, res_columns);
+        }
+
+        if (res_columns[0]->empty() && access_denied)
+            throw Exception(ErrorCodes::ACCESS_DENIED, "Not allowed to kill export partition. "
+                "To execute this query, it's necessary to have the grant {}", required_access_rights.toString());
+
+        res_io.pipeline = QueryPipeline(Pipe(std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(header.cloneWithColumns(std::move(res_columns))))));
 
         break;
     }
@@ -474,17 +559,35 @@ AccessRightsElements InterpreterKillQueryQuery::getRequiredAccessForDDLOnCluster
 {
     const auto & query = query_ptr->as<ASTKillQueryQuery &>();
     AccessRightsElements required_access;
-    if (query.type == ASTKillQueryQuery::Type::Query)
-        required_access.emplace_back(AccessType::KILL_QUERY);
-    else if (query.type == ASTKillQueryQuery::Type::Mutation)
-        required_access.emplace_back(
-                AccessType::ALTER_UPDATE
-                | AccessType::ALTER_DELETE
-                | AccessType::ALTER_MATERIALIZE_INDEX
-                | AccessType::ALTER_MATERIALIZE_COLUMN
-                | AccessType::ALTER_MATERIALIZE_TTL
-                | AccessType::ALTER_REWRITE_PARTS
-            );
+    /// This switch has no `default:`, so a new Type has to be mapped here to compile.
+    switch (query.type)
+    {
+        case ASTKillQueryQuery::Type::Query:
+            required_access.emplace_back(AccessType::KILL_QUERY);
+            break;
+        case ASTKillQueryQuery::Type::Mutation:
+            required_access.emplace_back(
+                    AccessType::ALTER_UPDATE
+                    | AccessType::ALTER_DELETE
+                    | AccessType::ALTER_MATERIALIZE_INDEX
+                    | AccessType::ALTER_MATERIALIZE_COLUMN
+                    | AccessType::ALTER_MATERIALIZE_TTL
+                    | AccessType::ALTER_REWRITE_PARTS
+                );
+            break;
+        /// todo arthur think about this
+        case ASTKillQueryQuery::Type::ExportPartition:
+            required_access.emplace_back(AccessType::ALTER_EXPORT_PARTITION);
+            break;
+        case ASTKillQueryQuery::Type::PartMoveToShard:
+            required_access.emplace_back(AccessType::SELECT, DatabaseCatalog::SYSTEM_DATABASE, "part_moves_between_shards");
+            required_access.emplace_back(AccessType::ALTER_MOVE_PARTITION | AccessType::MOVE_PARTITION_BETWEEN_SHARDS);
+            break;
+        case ASTKillQueryQuery::Type::Transaction:
+            required_access.emplace_back(AccessType::KILL_TRANSACTION);
+            required_access.emplace_back(AccessType::SELECT, DatabaseCatalog::SYSTEM_DATABASE, "transactions");
+            break;
+    }
     return required_access;
 }
 

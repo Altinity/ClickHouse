@@ -346,6 +346,7 @@ bool restCatalogEmpty(CatalogShape shape, bool flat_namespaces = false)
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         flat_namespaces,
         context);
 
@@ -366,6 +367,7 @@ DataLake::ICatalog::Namespaces restCatalogNamespaces(CatalogShape shape, bool fl
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         flat_namespaces,
         context);
 
@@ -386,6 +388,7 @@ bool deltaSharingCatalogEmpty(CatalogShape shape)
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 
@@ -434,6 +437,7 @@ TEST(RestCatalog, RejectedClientCredentialsReportTheOAuthError)
             /* auth_header */"",
             /* oauth_server_uri */"",
             /* oauth_server_use_request_body */true,
+            /* namespaces */"*",
             /* flat_namespaces */false,
             context);
         FAIL() << "expected the rejected client credentials to fail the catalog construction";
@@ -491,6 +495,7 @@ TEST(RestCatalog, OneLakeFlatNamespacesSettingSkipsSubNamespaceListing)
         /* auth_scope */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         /* flat_namespaces */true,
         context);
 
@@ -512,20 +517,21 @@ TEST(RestCatalog, TryGetTableMetadataDistinguishesMissingTableFromOtherErrors)
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 
     auto existing = TableMetadata().withLocation();
-    EXPECT_TRUE(catalog.tryGetTableMetadata("namespace", "table_a", existing));
+    EXPECT_TRUE(catalog.tryGetTableMetadata("namespace", "table_a", context, existing));
     EXPECT_EQ(existing.getLocation(), "s3://bucket/table_a");
     EXPECT_TRUE(catalog.existsTable("namespace", "table_a"));
 
     TableMetadata missing;
-    EXPECT_FALSE(catalog.tryGetTableMetadata("namespace", "missing_table", missing));
+    EXPECT_FALSE(catalog.tryGetTableMetadata("namespace", "missing_table", context, missing));
     EXPECT_FALSE(catalog.existsTable("namespace", "missing_table"));
 
     TableMetadata unauthorized;
-    EXPECT_THROW(catalog.tryGetTableMetadata("namespace", "unauthorized_table", unauthorized), DB::HTTPException);
+    EXPECT_THROW(catalog.tryGetTableMetadata("namespace", "unauthorized_table", context, unauthorized), DB::HTTPException);
     EXPECT_THROW(catalog.existsTable("namespace", "unauthorized_table"), DB::HTTPException);
 }
 
@@ -549,13 +555,14 @@ TEST(RestCatalog, TryGetTableMetadataAuthErrorPropagates)
         /* auth_scope */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 
     TableMetadata metadata;
     try
     {
-        catalog.tryGetTableMetadata("namespace", "expired_token_table", metadata);
+        catalog.tryGetTableMetadata("namespace", "expired_token_table", context, metadata);
         FAIL() << "expected the HTTP 401 from the catalog to propagate";
     }
     catch (const DB::HTTPException & e)
@@ -581,6 +588,7 @@ TEST(RestCatalog, ApplySettingsChangesWithoutAuthenticationRejected)
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 
@@ -603,6 +611,7 @@ TEST(RestCatalog, ApplySettingsChangesCredentialMode)
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 
@@ -645,6 +654,7 @@ TEST(RestCatalog, ApplySettingsChangesAuthHeaderMode)
         /* auth_header */"Authorization: Bearer token-1",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 
@@ -678,6 +688,7 @@ TEST(RestCatalog, OneLakeApplySettingsChangesBearerMode)
         /* auth_scope */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */false,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 
@@ -739,6 +750,7 @@ TEST(RestCatalog, OneLakeRejectsMalformedBearerToken)
                 /* auth_scope */ "",
                 /* oauth_server_uri */ "",
                 /* oauth_server_use_request_body */ false,
+                /* namespaces */"*",
                 /* flat_namespaces */ false,
                 context);
         },
@@ -780,6 +792,7 @@ TEST(RestCatalog, OneLakeRefreshTokenTransparentRenewal)
         /* auth_scope */"https://storage.azure.com/.default",
         /* oauth_server_uri */server.getUrl() + "/token",
         /* oauth_server_use_request_body */true,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 
@@ -822,6 +835,7 @@ TEST(RestCatalog, OneLakeRefreshTokenExpiredThrowsWithAlterHint)
             /* auth_scope */"https://storage.azure.com/.default",
             /* oauth_server_uri */server.getUrl() + "/token",
             /* oauth_server_use_request_body */true,
+            /* namespaces */"*",
             /* flat_namespaces */false,
             context);
         /// ADD_FAILURE (rather than FAIL) does not return from the test, so the
@@ -857,6 +871,7 @@ TEST(RestCatalog, OneLakeApplySettingsChangesRefreshMode)
         /* auth_scope */"https://storage.azure.com/.default",
         /* oauth_server_uri */server.getUrl() + "/token",
         /* oauth_server_use_request_body */true,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 
@@ -911,6 +926,7 @@ TEST(RestCatalog, HorizonCatalogAuthenticatesWithBarePAT)
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */true,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 
@@ -921,7 +937,7 @@ TEST(RestCatalog, HorizonCatalogAuthenticatesWithBarePAT)
 
     TableMetadata metadata;
     metadata.withLocation();
-    catalog.getTableMetadata("namespace", "table_a", metadata);
+    catalog.getTableMetadata("namespace", "table_a", context, metadata);
     EXPECT_TRUE(metadata.hasLocation());
     EXPECT_EQ(metadata.getLocation(), "s3://bucket/table_a");
 }
@@ -943,6 +959,7 @@ TEST(RestCatalog, HorizonCatalogRequiresCredentialOrAuthHeader)
                 /* auth_header */"",
                 /* oauth_server_uri */"",
                 /* oauth_server_use_request_body */true,
+                /* namespaces */"*",
                 /* flat_namespaces */false,
                 context);
         },
@@ -963,6 +980,7 @@ TEST(RestCatalog, HorizonApplySettingsChangesBarePAT)
         /* auth_header */"",
         /* oauth_server_uri */"",
         /* oauth_server_use_request_body */true,
+        /* namespaces */"*",
         /* flat_namespaces */false,
         context);
 

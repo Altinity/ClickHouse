@@ -1,11 +1,10 @@
 #pragma once
 
+#include <Interpreters/Context_fwd.h>
 #include "config.h"
-
-#if USE_AVRO
-
 #include <optional>
 #include <string>
+#include <tuple>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/FileNamesGenerator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
 
@@ -17,9 +16,13 @@
 #include <Poco/JSON/Parser.h>
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+
+#if USE_AVRO
+
 #include <IO/CompressedReadBufferWrapper.h>
 #include <IO/CompressionMethod.h>
 #include <Storages/ColumnsDescription.h>
+#include <unordered_map>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
@@ -42,6 +45,8 @@ class ICatalog;
 namespace DB::Iceberg
 {
 
+Iceberg::MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path);
+
 void writeMessageToFile(
     const String & data,
     const String & filename,
@@ -61,15 +66,21 @@ bool writeMetadataFileAndVersionHint(
     const IcebergPathFromMetadata & version_hint_path,
     DB::ObjectStoragePtr object_storage,
     DB::ContextPtr context,
-    bool try_write_version_hint);
+    bool try_write_version_hint,
+    bool * version_hint_names_metadata_file = nullptr);
 
 struct TransformAndArgument
 {
     String transform_name;
     std::optional<size_t> argument;
+    /// When Iceberg table is partitioned by time, splitting by partitions can be made using different timezone
+    /// (UTC in most cases). This timezone can be set with setting `iceberg_partition_timezone`, value is in this member.
+    /// When Iceberg partition condition converted to ClickHouse function in `parseTransformAndArgument` method
+    /// `time_zone` added as second argument to functions like `toRelativeDayNum`, `toYearNumSinceEpoch`, etc.
+    std::optional<String> time_zone;
 };
 
-std::optional<TransformAndArgument> parseTransformAndArgument(const String & transform_name_src);
+std::optional<TransformAndArgument> parseTransformAndArgument(const String & transform_name_src, const String & time_zone);
 
 CompressionMethod getCompressionMethodFromMetadataFile(const String & path);
 
@@ -83,8 +94,25 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
     const std::optional<String> & table_uuid);
 
 
-std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter);
+/// Maps a ClickHouse type to an Iceberg JSON type. `timestamp_ns` / `timestamptz_ns`
+/// require `format_version` >= 3; lower versions throw instead of writing v3 types
+/// into v1/v2 metadata.
+std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter, UInt64 format_version);
+
+/// Throws if `type` contains `Nothing` at any depth (the Iceberg `unknown` type) and
+/// `format_version` is below 3, the first format version that defines `unknown`.
+void checkUnknownTypeAllowed(const String & column_name, const DataTypePtr & type, Int64 format_version);
+
 Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id);
+Poco::Dynamic::Var getAvroLogicalType(DataTypePtr type);
+
+/// Converts a ClickHouse PARTITION BY AST into the corresponding Iceberg partition-spec JSON object.
+/// column_name_to_source_id maps each column name to the Iceberg field-id from the table schema.
+/// The returned Int32 is the last partition-field-id allocated (useful for tracking the id counter).
+/// Throws if the AST contains expressions that cannot be represented as Iceberg transforms.
+std::pair<Poco::JSON::Object::Ptr, Int32> getPartitionSpec(
+    ASTPtr partition_by,
+    const std::unordered_map<String, Int32> & column_name_to_source_id);
 
 /// Spec: https://iceberg.apache.org/spec/?h=metadata.json#table-metadata-fields
 std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
@@ -93,7 +121,8 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
     ASTPtr partition_by,
     ASTPtr order_by,
     ContextPtr context,
-    UInt64 format_version = 2);
+    UInt64 format_version = 2,
+    bool is_catalog_table = false);
 
 MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     const ObjectStoragePtr & object_storage,
@@ -141,6 +170,13 @@ FileCategory inspectFileCategory(const String & relative_path);
 
 KeyDescription getSortingKeyDescriptionFromMetadata(
     Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context);
+/// Returns Iceberg/Spark-style display string for sort order, e.g. "id desc, hour(ts) asc".
+std::optional<String> getSortingKeyDisplayStringFromMetadata(
+    Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema);
+std::optional<String> getPartitionKeyStringFromMetadata(
+    Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context);
+
+std::tuple<ASTPtr, ASTPtr, String> getPartitionAndSortingKeyASTsFromMetadata(const Poco::JSON::Object::Ptr & metadata_object);
 void sortBlockByKeyDescription(Block & block, const KeyDescription & sort_description, ContextPtr context);
 
 void forEachAvroEntry(

@@ -273,6 +273,9 @@ public:
     /// The number of all shards.
     size_t getShardCount() const { return shards_info.size(); }
 
+    /// The number of all nodes.
+    size_t getAllNodeCount() const;
+
     /// Returns an array of arrays of strings in the format 'escaped_host_name:port' for all replicas of all shards in the cluster.
     std::vector<Strings> getHostIDs() const;
 
@@ -285,7 +288,7 @@ public:
     std::unique_ptr<Cluster> getClusterWithMultipleShards(const std::vector<size_t> & indices) const;
 
     /// Get a new Cluster that contains all servers (all shards with all replicas) from existing cluster as independent shards.
-    std::unique_ptr<Cluster> getClusterWithReplicasAsShards(const Settings & settings, size_t max_replicas_from_shard = 0) const;
+    std::unique_ptr<Cluster> getClusterWithReplicasAsShards(const Settings & settings, size_t max_replicas_from_shard = 0, size_t max_hosts = 0) const;
 
     /// Returns false if cluster configuration doesn't allow to use it for cross-replication.
     /// NOTE: true does not mean, that it's actually a cross-replication cluster.
@@ -295,6 +298,9 @@ public:
     bool areDistributedDDLQueriesAllowed() const { return allow_distributed_ddl_queries; }
 
     const String & getName() const { return name; }
+
+    /// Every replica of the original cluster became a shard of its own, as `clusterAllReplicas` does.
+    bool replicasAsShards() const { return replicas_as_shards; }
 
 private:
     SlotToShard slot_to_shard;
@@ -311,7 +317,7 @@ private:
 
     /// For getClusterWithReplicasAsShards implementation
     struct ReplicasAsShardsTag {};
-    Cluster(ReplicasAsShardsTag, const Cluster & from, const Settings & settings, size_t max_replicas_from_shard);
+    Cluster(ReplicasAsShardsTag, const Cluster & from, const Settings & settings, size_t max_replicas_from_shard, size_t max_hosts);
 
     void addShard(
         const Settings & settings,
@@ -321,6 +327,9 @@ private:
         String current_shard_name = "",
         UInt32 weight = 1,
         bool internal_replication = false);
+
+    /// Reduce size of cluster to max_hosts
+    void constrainShardInfoAndAddressesToMaxHosts(size_t max_hosts);
 
     /// Inter-server secret
     String secret;
@@ -342,6 +351,7 @@ private:
     size_t local_shard_count = 0;
 
     String name;
+    bool replicas_as_shards = false;
 };
 
 using ClusterPtr = std::shared_ptr<Cluster>;

@@ -133,6 +133,8 @@ struct FormatSettings
 
     DateTimeOverflowBehavior date_time_overflow_behavior = DateTimeOverflowBehavior::Ignore;
 
+    bool throwOnDateTimeOverflow() const { return date_time_overflow_behavior == DateTimeOverflowBehavior::Throw; }
+
     bool input_format_ipv4_default_on_conversion_error = false;
     bool input_format_ipv6_default_on_conversion_error = false;
     bool check_conversion_from_numbers_to_enum = true;
@@ -386,6 +388,10 @@ struct FormatSettings
         size_t local_read_min_bytes_for_seek = 8192;
         size_t memory_low_watermark = 2ul << 20;
         size_t memory_high_watermark = 4ul << 30;
+        /// Reader scheduler knobs: share of the column-data memory budget given to compressed
+        /// read-ahead vs decode, and ColumnData's share of the parsing thread pool.
+        double prefetch_memory_fraction = 0.6;
+        double decode_thread_fraction = 0.375;
 
         /// Write.
         UInt64 row_group_rows = 1000000;
@@ -396,6 +402,10 @@ struct FormatSettings
         bool output_datetime_as_uint32 = false;
         bool output_date_as_uint16 = false;
         bool output_enum_as_byte_array = false;
+        /// When false (default), DateTime64 is always written as isAdjustedToUTC=true because
+        /// ClickHouse ticks are UTC. Iceberg sets this so timestamp(_ns) is false and
+        /// timestamptz(_ns) is true, matching TIMESTAMP(*, hasExplicitTimeZone()).
+        bool output_timestamp_adjusted_to_utc_from_timezone = false;
 
         bool parallel_encoding = true;
         bool write_page_index = false;

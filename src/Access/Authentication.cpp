@@ -298,6 +298,11 @@ namespace
 
                     for (const auto & certificate_subject : ssl_certificate_credentials->getSSLCertificateSubjects().at(type))
                     {
+                        // Subjects are extracted with their exact bytes, so an embedded NUL byte survives. No valid
+                        // hostname or URI contains one, and '*' must not match a span like "evil\0" in
+                        // "evil\0.corp.example.com", so such a subject never matches a wildcard.
+                        if (certificate_subject.contains('\0'))
+                            continue;
                         // Checked before the substr below so its length cannot underflow when prefix and suffix overlap.
                         if (certificate_subject.size() < prefix.size() + suffix.size())
                             continue;
@@ -356,7 +361,10 @@ Authentication::CredentialsCheckResult Authentication::areCredentialsValid(
     const ClientInfo & client_info,
     SettingsChanges & settings)
 {
-    if (!credentials.isReady())
+    /// It is OK for TokenCredentials to be not ready:
+    /// When auth request happens, we do not even know the username.
+    /// Token is resolved a bit later and the user information will be put in credentials
+    if (!typeid_cast<const TokenCredentials *>(&credentials) && !credentials.isReady())
         return CredentialsCheckResult::Fail;
 
     if (const auto * gss_acceptor_context = typeid_cast<const GSSAcceptorContext *>(&credentials))
@@ -403,6 +411,18 @@ Authentication::CredentialsCheckResult Authentication::areCredentialsValid(
             CredentialsCheckResult::Success : CredentialsCheckResult::Fail;
     }
 #endif
+
+    if (const auto * token_credentials = typeid_cast<const TokenCredentials *>(&credentials))
+    {
+        if (authentication_method.getType() != AuthenticationType::JWT)
+            return CredentialsCheckResult::Fail;
+
+        return external_authenticators.checkTokenCredentials(
+            *token_credentials,
+            authentication_method.getTokenProcessorName(),
+            authentication_method.getJWTClaims()) ?
+            CredentialsCheckResult::Success : CredentialsCheckResult::Fail;
+    }
 
     if ([[maybe_unused]] const auto * always_allow_credentials = typeid_cast<const AlwaysAllowCredentials *>(&credentials))
         return CredentialsCheckResult::Success;

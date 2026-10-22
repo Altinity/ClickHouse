@@ -16,6 +16,7 @@ from pyiceberg.schema import Schema
 from pyiceberg.table.sorting import SortField, SortOrder
 from pyiceberg.transforms import DayTransform, IdentityTransform
 from helpers.config_cluster import minio_access_key, minio_secret_key
+from helpers.test_tools import TSV
 import decimal
 from pyiceberg.types import (
     DoubleType,
@@ -91,7 +92,7 @@ DEFAULT_SCHEMA = Schema(
     ),
 )
 
-DEFAULT_CREATE_TABLE = "CREATE TABLE {}.`{}.{}`\\n(\\n    `datetime` Nullable(DateTime64(6)),\\n    `symbol` Nullable(String),\\n    `bid` Nullable(Float64),\\n    `ask` Nullable(Float64),\\n    `details` Tuple(created_by Nullable(String)),\\n    `map_string_decimal` Map(String, Nullable(Decimal(9, 2)))\\n)\\nENGINE = Iceberg(\\'http://minio1:9001/warehouse-glue/data/\\', \\'minio\\', \\'[HIDDEN]\\')\n"
+DEFAULT_CREATE_TABLE = "CREATE TABLE {}.`{}.{}`\\n(\\n    `datetime` Nullable(DateTime64(6)),\\n    `symbol` Nullable(String),\\n    `bid` Nullable(Float64),\\n    `ask` Nullable(Float64),\\n    `details` Tuple(created_by Nullable(String)),\\n    `map_string_decimal` Map(String, Nullable(Decimal(9, 2)))\\n)\\nENGINE = Iceberg(\\'http://minio1:9001/warehouse-glue/data/\\', \\'minio\\', \\'[HIDDEN]\\')\\nPARTITION BY toRelativeDayNum(datetime)\\nORDER BY symbol\n"
 
 DEFAULT_PARTITION_SPEC = PartitionSpec(
     PartitionField(
@@ -367,6 +368,7 @@ def started_cluster():
         cluster.add_instance(
             "node1",
             main_configs=[
+                "configs/disks.xml",
                 "configs/query_log.xml",
                 "configs/text_log.xml",
             ],
@@ -808,7 +810,7 @@ def test_timestamps(started_cluster):
     df = pa.Table.from_pylist(data)
     table.append(df)
 
-    assert node.query(f"SHOW CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}`") == f"CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}`\\n(\\n    `timestamp` Nullable(DateTime64(6)),\\n    `timestamptz` Nullable(DateTime64(6, \\'UTC\\'))\\n)\\nENGINE = Iceberg(\\'http://minio1:9001/warehouse-glue/data/\\', \\'minio\\', \\'[HIDDEN]\\')\n"
+    assert node.query(f"SHOW CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}`") == f"CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}`\\n(\\n    `timestamp` Nullable(DateTime64(6)),\\n    `timestamptz` Nullable(DateTime64(6, \\'UTC\\'))\\n)\\nENGINE = Iceberg(\\'http://minio1:9001/warehouse-glue/data/\\', \\'minio\\', \\'[HIDDEN]\\')\\nPARTITION BY toRelativeDayNum(timestamp)\\nORDER BY timestamptz\n"
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`") == "2024-01-01 12:00:00.000000\t2024-01-01 12:00:00.000000\n"
 
 
@@ -896,6 +898,117 @@ def test_create_gzip_metadata(started_cluster):
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`") == "AAPL\n"
 
 
+def test_schema_evolution_show_create_and_drop(started_cluster):
+    """SHOW CREATE TABLE must reflect columns added/dropped via ALTER.
+
+    Reproducer for the bug where GlueCatalog::updateSchema only updated
+    metadata_location but not StorageDescriptor.Columns, causing
+    SHOW CREATE TABLE to return a stale schema and DROP COLUMN to fail
+    with NOT_FOUND_COLUMN_IN_BLOCK.
+    """
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_show_create_drop_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+    table_ref = f"{CATALOG_NAME}.`{root_namespace}.{table_name}`"
+    write_settings = {"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1}
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
+    create_clickhouse_glue_table(started_cluster, node, root_namespace, table_name, "(name Nullable(String))")
+
+    node.query(f"INSERT INTO {table_ref} VALUES ('Alice');", settings=write_settings)
+
+    node.query(f"ALTER TABLE {table_ref} ADD COLUMN column_a Nullable(String);", settings=write_settings)
+    node.query(f"ALTER TABLE {table_ref} ADD COLUMN column_b Nullable(Int64);", settings=write_settings)
+
+    assert node.query(f"SELECT * FROM {table_ref}") == "Alice\t\\N\t\\N\n"
+
+    show_create = node.query(f"SHOW CREATE TABLE {table_ref}")
+    assert "column_a" in show_create, f"column_a missing from SHOW CREATE:\n{show_create}"
+    assert "column_b" in show_create, f"column_b missing from SHOW CREATE:\n{show_create}"
+
+    node.query(f"ALTER TABLE {table_ref} DROP COLUMN column_a;", settings=write_settings)
+
+    show_create = node.query(f"SHOW CREATE TABLE {table_ref}")
+    assert "column_a" not in show_create, f"column_a still in SHOW CREATE after DROP:\n{show_create}"
+    assert "column_b" in show_create, f"column_b missing from SHOW CREATE after DROP:\n{show_create}"
+
+    assert node.query(f"SELECT name, column_b FROM {table_ref}") == "Alice\t\\N\n"
+
+    node.query(f"ALTER TABLE {table_ref} ADD COLUMN column_c Nullable(String);", settings=write_settings)
+    node.query(f"INSERT INTO {table_ref} (name, column_b, column_c) VALUES ('Bob', 42, 'hello');", settings=write_settings)
+
+    show_create = node.query(f"SHOW CREATE TABLE {table_ref}")
+    assert "column_c" in show_create, f"column_c missing from SHOW CREATE:\n{show_create}"
+    assert "column_a" not in show_create, f"column_a reappeared in SHOW CREATE:\n{show_create}"
+
+    result = node.query(f"SELECT name, column_b, column_c FROM {table_ref} ORDER BY name")
+    assert result == "Alice\t\\N\t\\N\nBob\t42\thello\n"
+
+
+def test_native_create_gzip_metadata(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_native_create_gzip_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
+
+    node.query(
+        f"CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}` (x String)",
+        settings={
+            "allow_experimental_database_glue_catalog": 1,
+            "allow_database_glue_catalog": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+            "iceberg_metadata_compression_method": "gzip",
+        },
+    )
+
+    glue_client = boto3.client(
+        "glue", region_name="us-east-1", endpoint_url=get_glue_local_url(started_cluster)
+    )
+    table_info = glue_client.get_table(DatabaseName=root_namespace, Name=table_name)["Table"]
+    metadata_location = table_info["Parameters"]["metadata_location"]
+    assert metadata_location.endswith(".gz.metadata.json"), metadata_location
+
+    assert metadata_location.startswith("s3://"), metadata_location
+    bucket, _, key = metadata_location[len("s3://") :].partition("/")
+    metadata_bytes = started_cluster.minio_client.get_object(bucket, key).read()
+    assert metadata_bytes[:2] == b"\x1f\x8b", metadata_bytes[:16]
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
+    assert node.query(f"SELECT count() FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`") == "0\n"
+
+
+def test_create_table_engine_backend_mismatch_rejected(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_engine_backend_mismatch_{uuid.uuid4()}"
+    root_namespace = f"{test_ref}_namespace"
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME)
+
+    for engine in [
+        "IcebergAzure('http://acc.blob.core.windows.net/cont/tbl/', 'acc', 'key')",
+        "IcebergLocal('/var/lib/clickhouse/user_files/tbl/')",
+        "IcebergHDFS('hdfs://namenode:9000/tbl/')",
+        "Iceberg('/var/lib/clickhouse/user_files/tbl/') SETTINGS disk = 'local_blob_disk'",
+    ]:
+        error = node.query_and_get_error(
+            f"CREATE TABLE {CATALOG_NAME}.`{root_namespace}.mismatch` (x String) ENGINE = {engine}",
+            settings={
+                "allow_experimental_database_glue_catalog": 1,
+                "allow_database_glue_catalog": 1,
+            },
+        )
+        assert (
+            "would be reopened with the catalog's storage backend and become unreadable" in error
+        ), error
+        assert "stores tables on S3" in error, error
+
+
 def test_schema_evolution(started_cluster):
     node = started_cluster.instances["node1"]
 
@@ -978,6 +1091,12 @@ def test_drop_table(started_cluster):
     create_clickhouse_glue_table(started_cluster, node, root_namespace, table_name, "(x String)")
     assert len(catalog.list_tables(root_namespace)) == 1
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`") == ""
+
+    error = node.query_and_get_error(
+        f"DROP TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}` SETTINGS data_lake_delete_data_on_drop = 1"
+    )
+    assert "not supported for the Glue catalog" in error
+    assert len(catalog.list_tables(root_namespace)) == 1
 
     drop_clickhouse_glue_table(node, root_namespace, table_name)
     assert len(catalog.list_tables(root_namespace)) == 0
@@ -1302,6 +1421,45 @@ def test_check_database(started_cluster):
             "SYSTEM DISABLE FAILPOINT check_database_datalake_negative"
         )
 
+
+def test_namespace_filter(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    # Use the same table name in all namespaces
+    table_name = f"table_{uuid.uuid4()}"
+    table2_name = f"table2_{uuid.uuid4()}"
+    namespace_prefix = f"namespace_{uuid.uuid4()}_"
+
+    catalog = load_catalog_impl(started_cluster)
+
+    def create_namespace(suffix):
+        namespace = f"{namespace_prefix}{suffix}"
+        catalog.create_namespace(namespace)
+        create_table(catalog, namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER)
+
+    create_namespace("alpha");
+    create_namespace("bravo");
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME,
+                                    additional_settings={
+                                        "namespaces": f"{namespace_prefix}alpha"
+                                    })
+
+    assert node.query(f"SELECT name FROM system.tables WHERE database='{CATALOG_NAME}' ORDER BY name", settings={"show_data_lake_catalogs_in_system_tables": 1}) == TSV(
+        [
+            [f"{namespace_prefix}alpha.{table_name}"],
+        ])
+
+    assert node.query(f"SELECT count() FROM {CATALOG_NAME}.`{namespace_prefix}alpha.{table_name}`") == "0\n"
+    assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"SELECT count() FROM {CATALOG_NAME}.`{namespace_prefix}bravo.{table_name}`")
+
+    node.query(f"CREATE TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.{table2_name}` (x String) ENGINE = IcebergS3('http://minio1:9001/warehouse-glue/{namespace_prefix}alpha/a1/{table2_name}/', '{minio_access_key}', '{minio_secret_key}')")
+    assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"CREATE TABLE {CATALOG_NAME}.`{namespace_prefix}bravo.{table2_name}` (x String) ENGINE = IcebergS3('http://minio1:9001/warehouse-glue/{namespace_prefix}bravo/{table2_name}/', '{minio_access_key}', '{minio_secret_key}')")
+
+    node.query(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.{table_name}`")
+    assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}bravo.{table_name}`")
+
+
 def test_sts_smoke(started_cluster):
     """Test that STS authentication works with Glue catalog using role_arn and role_session_name"""
     node = started_cluster.instances["node1"]
@@ -1371,9 +1529,102 @@ def test_sts_smoke(started_cluster):
     result = node.query(f"SELECT sum(value) FROM {db_name_success}.`{root_namespace}.{table_name}`")
     assert result.strip() == "60", f"Expected sum to be 60 but got: {result}"
 
+    # `aws_role_session_name` can act as a shared secret (the trust policy can pin it, which is what the
+    # STS mock does), so every display surface hides it while `aws_role_arn` stays visible. This database
+    # carries no other secret, so `[HIDDEN]` can only come from the session name.
+    show_create = node.query(f"SHOW CREATE DATABASE {db_name_success}")
+    assert "miniorole" not in show_create
+    assert "arn::role" in show_create
+    assert "[HIDDEN]" in show_create
+
+    engine_full = node.query(
+        f"SELECT engine_full FROM system.databases WHERE name = '{db_name_success}'"
+    )
+    assert "miniorole" not in engine_full
+    assert "[HIDDEN]" in engine_full
+
+    node.query("SYSTEM FLUSH LOGS system.query_log")
+    logged_create = node.query(
+        f"SELECT arrayStringConcat(groupArray(query), '\\n') FROM system.query_log "
+        f"WHERE query_kind = 'Create' AND type = 'QueryFinish' AND query LIKE '%{db_name_success}%'"
+    )
+    assert "[HIDDEN]" in logged_create
+    assert "miniorole" not in logged_create
+
     # Cleanup
     node.query(f"DROP DATABASE IF EXISTS {db_name_fail} SYNC")
     node.query(f"DROP DATABASE IF EXISTS {db_name_success} SYNC")
+
+
+def test_sts_backup_restore_keeps_role_session_name(started_cluster):
+    """A backup archives the database definition with the real `aws_role_session_name`, although every
+    display surface shows `[HIDDEN]`. The STS mock grants the role only for the session name `miniorole`,
+    so the restored catalog can read its table only if the archived value was the real one."""
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_sts_backup_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+
+    schema = Schema(
+        NestedField(field_id=1, name="id", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="value", field_type=DoubleType(), required=False),
+    )
+    table = create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER, dir=table_name)
+    table.append(
+        pa.Table.from_pylist(
+            [
+                {"id": "row1", "value": 10.0},
+                {"id": "row2", "value": 20.0},
+                {"id": "row3", "value": 30.0},
+            ]
+        )
+    )
+
+    db_name = f"db_backup_{test_ref.replace('-', '_')}"
+    restored_db_name = f"{db_name}_restored"
+    create_clickhouse_glue_database(
+        started_cluster,
+        node,
+        db_name,
+        additional_settings={
+            "aws_role_arn": "arn::role",
+            "aws_role_session_name": "miniorole",
+        },
+        query_settings={"s3_allow_server_credentials_in_user_queries": 1},
+        with_credentials=False,
+    )
+    result = node.query(f"SELECT sum(value) FROM {db_name}.`{root_namespace}.{table_name}`")
+    assert result.strip() == "60", f"Expected sum to be 60 but got: {result}"
+
+    # A DataLakeCatalog database owns no tables, so the backup holds just the database definition. The
+    # default server config allows File backups under its `backups` directory.
+    backup = f"File('{db_name}')"
+    node.query(f"BACKUP DATABASE {db_name} TO {backup}")
+    node.query(f"DROP DATABASE IF EXISTS {restored_db_name} SYNC")
+    node.query(
+        f"RESTORE DATABASE {db_name} AS {restored_db_name} FROM {backup}",
+        settings={
+            "allow_database_glue_catalog": 1,
+            "s3_allow_server_credentials_in_user_queries": 1,
+        },
+    )
+
+    # Readable only with the real session name: the STS mock rejects any other value.
+    result = node.query(f"SELECT sum(value) FROM {restored_db_name}.`{root_namespace}.{table_name}`")
+    assert result.strip() == "60", f"Expected sum to be 60 but got: {result}"
+
+    # The archived value came back, and the display of the restored definition is masked like any other.
+    show_create = node.query(f"SHOW CREATE DATABASE {restored_db_name}")
+    assert "miniorole" not in show_create
+    assert "arn::role" in show_create
+    assert "[HIDDEN]" in show_create
+
+    node.query(f"DROP DATABASE IF EXISTS {restored_db_name} SYNC")
+    node.query(f"DROP DATABASE IF EXISTS {db_name} SYNC")
 
 
 def test_sts_smoke_no_opt_in(started_cluster):

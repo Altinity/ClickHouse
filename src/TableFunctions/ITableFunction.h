@@ -81,7 +81,7 @@ public:
 
     virtual bool supportsReadingSubsetOfColumns(const ContextPtr &) { return true; }
 
-    virtual bool canBeUsedToCreateTable() const { return true; }
+    virtual void validateUseToCreateTable() const {}
 
     /// The name of the named collection the table function arguments were resolved from, or an empty
     /// string. When a permanent table is created from the table function (`CREATE TABLE ... AS f(...)`),
@@ -152,8 +152,6 @@ private:
     /// privileges as if it was S3.
     virtual const char * getNonClusteredStorageEngineName() const;
 
-protected:
-    String getFunctionURINormalized() const;
 };
 
 /// Properties of table function that are independent of argument types and parameters.

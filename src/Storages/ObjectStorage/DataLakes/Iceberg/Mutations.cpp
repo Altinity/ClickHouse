@@ -1,4 +1,5 @@
 #include <Columns/ColumnLowCardinality.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Core/ColumnsWithTypeAndName.h>
@@ -14,6 +15,7 @@
 #include <Formats/FormatFactory.h>
 #include <IO/CompressionMethod.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ProcessList.h>
 #include <Processors/Chunk.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
@@ -46,6 +48,8 @@ extern const int BAD_ARGUMENTS;
 extern const int LOGICAL_ERROR;
 extern const int LIMIT_EXCEEDED;
 extern const int NOT_IMPLEMENTED;
+extern const int SUPPORT_IS_DISABLED;
+extern const int QUERY_WAS_CANCELLED;
 }
 
 namespace DB::DataLakeStorageSetting
@@ -67,6 +71,75 @@ namespace DB::Iceberg
 static constexpr const char * block_datafile_path = "_iceberg_metadata_file_path";
 static constexpr const char * block_row_number = "_row_number";
 static constexpr auto MAX_TRANSACTION_RETRIES = 100;
+
+/// Walk an Iceberg type descriptor and return the highest field id found.
+static Int32 getHighestFieldIdFromType(const Poco::Dynamic::Var & type_var)
+{
+    if (type_var.type() != typeid(Poco::JSON::Object::Ptr))
+        return 0;
+    auto obj = type_var.extract<Poco::JSON::Object::Ptr>();
+    Int32 result = 0;
+
+    auto type_str = obj->optValue<String>(Iceberg::f_type, "");
+    if (type_str == "struct")
+    {
+        auto fields = obj->getArray(Iceberg::f_fields);
+        for (UInt32 i = 0; i < fields->size(); ++i)
+        {
+            auto field = fields->getObject(i);
+            result = std::max(result, field->getValue<Int32>(Iceberg::f_id));
+            result = std::max(result, getHighestFieldIdFromType(field->get(Iceberg::f_type)));
+        }
+    }
+    else if (type_str == "list")
+    {
+        result = std::max(result, obj->getValue<Int32>(Iceberg::f_element_id));
+        result = std::max(result, getHighestFieldIdFromType(obj->get(Iceberg::f_element)));
+    }
+    else if (type_str == "map")
+    {
+        result = std::max(result, obj->getValue<Int32>(Iceberg::f_key_id));
+        result = std::max(result, obj->getValue<Int32>(Iceberg::f_value_id));
+        result = std::max(result, getHighestFieldIdFromType(obj->get(Iceberg::f_key)));
+        result = std::max(result, getHighestFieldIdFromType(obj->get(Iceberg::f_value)));
+    }
+    return result;
+}
+
+/// Whether the schema already reflects `command`. Used after a commit attempt whose outcome is
+/// unknown: the catalog may have applied the update and still reported a failure, in which case
+/// re-applying the same command on the refreshed metadata would fail with "Column already exists"
+/// or "Not found column" for an ALTER that actually succeeded.
+static bool alterAlreadyApplied(const MetadataGenerator & generator, const AlterCommand & command)
+{
+    switch (command.type)
+    {
+        case AlterCommand::Type::ADD_COLUMN:
+            return generator.isAddColumnApplied(command.column_name, command.data_type, command.first, command.after_column);
+        case AlterCommand::Type::DROP_COLUMN:
+            return generator.isDropColumnApplied(command.column_name);
+        case AlterCommand::Type::RENAME_COLUMN:
+            return generator.isRenameColumnApplied(command.column_name, command.rename_to);
+        case AlterCommand::Type::MODIFY_COLUMN:
+            return generator.isModifyColumnApplied(command.column_name, command.data_type, command.first, command.after_column);
+        default:
+            return false;
+    }
+}
+
+/// Return the highest field id across all fields in an Iceberg schema object.
+static Int32 getHighestFieldId(Poco::JSON::Object::Ptr schema)
+{
+    Int32 result = 0;
+    auto fields = schema->getArray(Iceberg::f_fields);
+    for (UInt32 i = 0; i < fields->size(); ++i)
+    {
+        auto field = fields->getObject(i);
+        result = std::max(result, field->getValue<Int32>(Iceberg::f_id));
+        result = std::max(result, getHighestFieldIdFromType(field->get(Iceberg::f_type)));
+    }
+    return result;
+}
 
 struct DeleteFileWriteResult
 {
@@ -151,6 +224,10 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
     Poco::JSON::Object::Ptr data_schema)
 {
     chassert(commands.size() == 1);
+    auto iceberg_format_settings = format_settings;
+    if (!iceberg_format_settings)
+        iceberg_format_settings = getFormatSettings(context);
+    iceberg_format_settings->parquet.output_timestamp_adjusted_to_utc_from_timezone = true;
     DataFileWriteResultByPartitionKey delete_data_result;
     DataFileStatisticsByPartitionKey delete_data_statistics;
     std::unordered_map<ChunkPartitioner::PartitionKey, std::unique_ptr<WriteBuffer>, ChunkPartitioner::PartitionKeyHasher> delete_data_write_buffers;
@@ -221,7 +298,7 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                     column_mapper->setIcebergStringPaths({String(IcebergPositionDeleteTransform::data_file_path_column_name)});
                     FormatFilterInfoPtr format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr);
                     auto output_format = FormatFactory::instance().getOutputFormat(
-                        write_format, *write_buffer, delete_file_sample_block, context, format_settings, format_filter_info);
+                        write_format, *write_buffer, delete_file_sample_block, context, iceberg_format_settings, format_filter_info);
 
                     delete_data_write_buffers[partition_key] = std::move(write_buffer);
                     delete_data_writers[partition_key] = std::move(output_format);
@@ -267,6 +344,8 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
         {
             delete_data_writers[partition_key]->flush();
             delete_data_writers[partition_key]->finalize();
+            delete_data_statistics.at(partition_key).addColumnSizesOnDisk(
+                delete_data_writers[partition_key]->getColumnSizesOnDisk(), getPositionDeleteFileSampleBlock());
             delete_data_write_buffers[partition_key]->finalize();
             {
                 auto delete_bytes = delete_data_write_buffers[partition_key]->count();
@@ -289,6 +368,7 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
         PullingPipelineExecutor executor(pipeline);
 
         auto header = interpreter->getUpdatedHeader();
+        auto update_sample_block = getNonVirtualColumns(header, /*remove_low_cardinality=*/ true);
 
         Block block;
         while (executor.pull(block))
@@ -322,7 +402,7 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                     ColumnMapperPtr data_column_mapper = createColumnMapper(data_schema);
                     FormatFilterInfoPtr data_format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, data_column_mapper, nullptr, nullptr);
                     auto data_output_format = FormatFactory::instance().getOutputFormat(
-                        write_format, *data_write_buffer, data_block, context, format_settings, data_format_filter_info);
+                        write_format, *data_write_buffer, data_block, context, iceberg_format_settings, data_format_filter_info);
 
                     update_data_write_buffers[partition_key] = std::move(data_write_buffer);
                     it = update_data_writers.emplace(partition_key, std::move(data_output_format)).first;
@@ -338,6 +418,8 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
         {
             update_data_writers[partition_key]->flush();
             update_data_writers[partition_key]->finalize();
+            update_data_statistics.at(partition_key).addColumnSizesOnDisk(
+                update_data_writers[partition_key]->getColumnSizesOnDisk(), update_sample_block);
             update_data_write_buffers[partition_key]->finalize();
             {
                 auto update_bytes = update_data_write_buffers[partition_key]->count();
@@ -361,6 +443,7 @@ static bool writeMetadataFiles(
     const DataFileWriteResultWithStats & delete_files,
     const DataFileWriteResultWithStats & data_files,
     ObjectStoragePtr object_storage,
+    ExternalStorageCache & external_storages,
     ContextPtr context,
     FileNamesGenerator & filename_generator,
     const Iceberg::IcebergPathResolver & path_resolver,
@@ -372,13 +455,14 @@ static bool writeMetadataFiles(
     Poco::JSON::Object::Ptr partititon_spec,
     Int32 partition_spec_id,
     std::optional<ChunkPartitioner> & chunk_partitioner,
-    SharedHeader data_sample_block)
+    SharedHeader data_sample_block,
+    const Iceberg::IcebergPathFromMetadata & previous_metadata_file_path)
 {
     auto delete_sample_block = std::make_shared<const Block>(getPositionDeleteFileSampleBlock());
 
     auto metadata_info = filename_generator.generateMetadataPathWithInfo();
     Int64 parent_snapshot = -1;
-    if (metadata->has(Iceberg::f_current_snapshot_id))
+    if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
         parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
 
     auto sum_files = [](const DataFileWriteResultWithStats & set) -> std::tuple<Int64, Int64, Int64>
@@ -406,7 +490,7 @@ static bool writeMetadataFiles(
 
     auto result = MetadataGenerator(metadata).generateNextMetadata(
         filename_generator,
-        metadata_info.path,
+        previous_metadata_file_path,
         parent_snapshot,
         /* added_files */ data_files_count,
         /* added_records */ data_rows,
@@ -525,6 +609,7 @@ static bool writeMetadataFiles(
                 path_resolver,
                 metadata,
                 object_storage,
+                external_storages,
                 context,
                 manifest_entries,
                 new_snapshot,
@@ -612,7 +697,8 @@ void validateSnapshotDataFileFormatsForMutation(
     const PersistentTableComponents & persistent_table_components,
     ContextPtr context,
     LoggerPtr log,
-    Int32 current_schema_id)
+    Int32 current_schema_id,
+    ExternalStorageCache & external_storages)
 {
     if (!metadata->has(f_current_snapshot_id) || metadata->isNull(f_current_snapshot_id))
         return;
@@ -638,11 +724,11 @@ void validateSnapshotDataFileFormatsForMutation(
         return;
 
     auto manifest_list_path = IcebergPathFromMetadata::deserialize(current_snapshot->getValue<String>(f_manifest_list));
-    auto manifest_list_entries = getManifestList(object_storage, persistent_table_components, context, manifest_list_path, log);
+    auto manifest_list_entries = getManifestList(object_storage, persistent_table_components, context, manifest_list_path, log, external_storages);
     for (const auto & manifest_list_entry : manifest_list_entries)
     {
         auto files_handle = getManifestFileEntriesHandle(
-            object_storage, persistent_table_components, context, log, manifest_list_entry, current_schema_id);
+            object_storage, persistent_table_components, context, log, manifest_list_entry, current_schema_id, external_storages);
 
         for (const auto & file_entry : files_handle.getFilesWithoutDeleted(FileContentType::DATA))
         {
@@ -652,7 +738,7 @@ void validateSnapshotDataFileFormatsForMutation(
                     ErrorCodes::NOT_IMPLEMENTED,
                     "Iceberg DELETE and UPDATE require all data files in the current snapshot to be Parquet, "
                     "but data file `{}` has format `{}`",
-                    file_entry->parsed_entry->file_path_key.serialize(),
+                    file_entry->parsed_entry->file_path_key,
                     file_format);
         }
     }
@@ -666,6 +752,7 @@ void mutate(
     StorageMetadataPtr storage_metadata,
     StorageID storage_id,
     ObjectStoragePtr object_storage,
+    ExternalStorageCache & external_storages,
     const DataLakeStorageSettings & data_lake_settings,
     const PersistentTableComponents & persistent_table_components,
     const String & write_format,
@@ -700,9 +787,22 @@ void mutate(
         filename_generator.setCompressionMethod(compression_method);
 
         auto metadata = getMetadataJSONObject(metadata_path, object_storage, persistent_table_components.metadata_cache, context, log, compression_method, persistent_table_components.table_uuid);
+        auto previous_metadata_path = persistent_table_components.path_resolver.reverseResolve(metadata_path);
 
-        if (metadata->getValue<Int32>(f_format_version) < 2)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Mutations are supported only for the second version of iceberg format");
+        /// Iceberg v3 writers must not add new position-delete files; row-level deletes require
+        /// deletion vectors. Fail closed before any object writes until ClickHouse can write DVs.
+        const Int32 format_version = metadata->getValue<Int32>(f_format_version);
+        if (format_version < 2)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Mutations are supported only for Iceberg format version 2");
+        if (format_version >= 3)
+        {
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "Iceberg DELETE and UPDATE mutations are not supported for format version {}. "
+                "ClickHouse writes parquet position-delete files, which Iceberg v3+ writers must not add; "
+                "writing deletion vectors is not implemented yet",
+                format_version);
+        }
         auto partition_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
         auto partitions_specs = metadata->getArray(Iceberg::f_partition_specs);
         Poco::JSON::Object::Ptr partititon_spec;
@@ -731,13 +831,13 @@ void mutate(
         /// metadata version, so a concurrent writer that commits non-Parquet
         /// data files between iterations is caught by the next retry.
         validateSnapshotDataFileFormatsForMutation(
-            metadata, object_storage, persistent_table_components, context, log, static_cast<Int32>(current_schema_id));
+            metadata, object_storage, persistent_table_components, context, log, static_cast<Int32>(current_schema_id), external_storages);
 
         TableStateSnapshot current_iceberg_snapshot;
         current_iceberg_snapshot.metadata_file_path = metadata_path;
         current_iceberg_snapshot.metadata_version = last_version;
         current_iceberg_snapshot.schema_id = static_cast<Int32>(current_schema_id);
-        if (metadata->has(Iceberg::f_current_snapshot_id))
+        if (metadata->has(Iceberg::f_current_snapshot_id) && !metadata->isNull(Iceberg::f_current_snapshot_id))
         {
             Int64 snapshot_id_val = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
             if (snapshot_id_val >= 0)
@@ -770,6 +870,7 @@ void mutate(
                     mutation_files->delete_file,
                     mutation_files->data_file,
                     object_storage,
+                    external_storages,
                     context,
                     filename_generator,
                     persistent_table_components.path_resolver,
@@ -781,7 +882,8 @@ void mutate(
                     partititon_spec,
                     static_cast<Int32>(partition_spec_id),
                     chunk_partitioner,
-                    sample_block))
+                    sample_block,
+                    previous_metadata_path))
                 continue;
         }
         break;
@@ -806,8 +908,13 @@ void alter(
 
     size_t i = 0;
     bool succeeded = false;
+    /// Set once we hand a commit to storage or to the catalog, i.e. once its outcome can be unknown.
+    bool commit_attempted = false;
     while (i < MAX_TRANSACTION_RETRIES)
     {
+        if (auto elem = context->getProcessListElement(); elem && elem->isKilled())
+            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "ALTER TABLE cancelled during retry loop");
+
         auto log = getLogger("IcebergMutations");
         auto [last_version, metadata_path, compression_method] = getLatestMetadataFileAndVersionWithCatalog(
             object_storage,
@@ -831,10 +938,21 @@ void alter(
 
         auto metadata_json_generator = MetadataGenerator(metadata);
 
+        if (commit_attempted && alterAlreadyApplied(metadata_json_generator, params[0]))
+        {
+            LOG_WARNING(
+                log,
+                "A previous ALTER TABLE commit attempt for {} was reported as failed but is present in the "
+                "table metadata, treating the operation as succeeded",
+                storage_id.getNameForLogs());
+            succeeded = true;
+            break;
+        }
+
         switch (params[0].type)
         {
             case AlterCommand::Type::ADD_COLUMN:
-                metadata_json_generator.generateAddColumnMetadata(params[0].column_name, params[0].data_type);
+                metadata_json_generator.generateAddColumnMetadata(params[0].column_name, params[0].data_type, params[0].first, params[0].after_column);
                 break;
             case AlterCommand::Type::DROP_COLUMN:
                 if (params[0].clear)
@@ -842,8 +960,13 @@ void alter(
                 metadata_json_generator.generateDropColumnMetadata(params[0].column_name);
                 break;
             case AlterCommand::Type::MODIFY_COLUMN:
-                metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type);
+            {
+                if (!metadata_json_generator.generateModifyColumnMetadata(params[0].column_name, params[0].data_type, context, params[0].first, params[0].after_column))
+                {
+                    succeeded = true;
+                }
                 break;
+            }
             case AlterCommand::Type::RENAME_COLUMN:
                 metadata_json_generator.generateRenameColumnMetadata(params[0].column_name, params[0].rename_to);
                 break;
@@ -851,14 +974,18 @@ void alter(
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Unknown type of alter {}", params[0].type);
         }
 
+        if (succeeded)
+            break;
+
         const auto new_schema_id = metadata->getValue<Int32>(Iceberg::f_current_schema_id);
         Poco::JSON::Object::Ptr new_schema;
         auto schemas = metadata->getArray(Iceberg::f_schemas);
-        for (UInt32 schema_index = 0; schema_index < schemas->size(); ++schema_index)
+        for (auto schema_index = schemas->size(); schema_index > 0; --schema_index)
         {
-            if (schemas->getObject(schema_index)->getValue<Int32>(Iceberg::f_schema_id) == new_schema_id)
+            auto candidate = schemas->getObject(static_cast<unsigned>(schema_index - 1));
+            if (candidate->getValue<Int32>(Iceberg::f_schema_id) == new_schema_id)
             {
-                new_schema = schemas->getObject(schema_index);
+                new_schema = candidate;
                 break;
             }
         }
@@ -872,6 +999,7 @@ void alter(
         const bool catalog_writes_metadata_file = catalog && catalog->isTransactional();
         if (!catalog_writes_metadata_file)
         {
+            commit_attempted = true;
             if (!writeMetadataFileAndVersionHint(
                     persistent_table_components.path_resolver,
                     metadata_info,
@@ -890,7 +1018,11 @@ void alter(
         {
             auto catalog_filename = persistent_table_components.path_resolver.resolveForCatalog(metadata_info.path);
             const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-            if (!catalog->updateSchema(namespace_name, table_name, catalog_filename, new_schema, previous_schema_id))
+            const auto new_last_column_id = std::max(
+                metadata->getValue<Int32>(Iceberg::f_last_column_id),
+                getHighestFieldId(new_schema));
+            commit_attempted = true;
+            if (!catalog->updateSchema(namespace_name, table_name, catalog_filename, new_schema, previous_schema_id, new_last_column_id, metadata))
             {
                 ++i;
                 continue;
@@ -902,7 +1034,9 @@ void alter(
     }
 
     if (!succeeded)
-        throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Too many unsuccessed retries to alter iceberg table");
+        throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+            "ALTER TABLE commit did not succeed after {} retries (concurrent modification or catalog rejection)",
+            MAX_TRANSACTION_RETRIES);
 
     /// Invalidate the metadata files cache so that subsequent operations on this table see the
     /// schema we just wrote. See `PersistentTableComponents::invalidateMetadataCache` for the

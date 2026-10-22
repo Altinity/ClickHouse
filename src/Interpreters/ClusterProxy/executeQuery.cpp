@@ -30,6 +30,7 @@
 #include <Parsers/stripQuerySettings.h>
 #include <Planner/Utils.h>
 #include <Processors/QueryPlan/ParallelReplicasLocalPlan.h>
+#include <Processors/QueryPlan/DistributedCreateLocalPlan.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/ReadFromLocalReplica.h>
 #include <Processors/QueryPlan/ReadFromMergeTree.h>
@@ -429,34 +430,23 @@ static ContextMutablePtr updateSettingsAndClientInfoForCluster(const Cluster & c
         new_settings[Setting::additional_table_filters].value.push_back(std::move(tuple));
     }
 
-    /// disable parallel replicas if cluster contains only shards with 1 replica
-    if (context->canUseTaskBasedParallelReplicas())
+    if (context->canUseTaskBasedParallelReplicas() && is_remote_function)
     {
-        bool disable_parallel_replicas = false;
-        if (is_remote_function)
-        {
-            if (cluster.getName().empty()) // disable parallel replicas with remote() table functions w/o configured cluster
-                disable_parallel_replicas = true;
-            else
-                new_settings[Setting::cluster_for_parallel_replicas] = cluster.getName();
-        }
-
-        if (!disable_parallel_replicas)
-        {
-            disable_parallel_replicas = true;
-            for (const auto & shard : cluster.getShardsInfo())
-            {
-                if (shard.getAllNodeCount() > 1)
-                {
-                    disable_parallel_replicas = false;
-                    break;
-                }
-            }
-        }
-
-        if (disable_parallel_replicas)
+        /// `remote()` without a configured cluster has no cluster to scope parallel replicas to.
+        if (cluster.getName().empty())
             new_settings[Setting::allow_experimental_parallel_reading_from_replicas] = 0;
+        else
+            new_settings[Setting::cluster_for_parallel_replicas] = cluster.getName();
     }
+    /// Parallel replicas are not disabled here for a cluster whose every shard has one replica:
+    /// `new_settings` is what the shard receives, and its own table may be a `Distributed` table over a
+    /// cluster that can use them. Whether this hop uses them is decided per shard below, and a shard
+    /// that cannot declines on its own, see `canUseParallelReplicasOnInitiator`.
+
+    /// `clusterAllReplicas` already reads every replica as a shard of its own, so there is nothing left
+    /// for parallel replicas to split
+    if (context->canUseTaskBasedParallelReplicas() && cluster.replicasAsShards())
+        new_settings[Setting::allow_experimental_parallel_reading_from_replicas] = 0;
 
     if (settings[Setting::max_execution_time_leaf].totalMicroseconds() > 0)
     {
@@ -545,7 +535,8 @@ void executeQuery(
     const std::string & sharding_key_column_name,
     const DistributedSettings & distributed_settings,
     AdditionalShardFilterGenerator shard_filter_generator,
-    bool is_remote_function)
+    bool is_remote_function,
+    std::span<const SelectQueryInfo> additional_query_infos)
 {
     const Settings & settings = context->getSettingsRef();
 
@@ -589,6 +580,8 @@ void executeQuery(
                 unavailable_shard_tracker = std::make_shared<UnavailableShardTracker>(shards, max_num, max_ratio);
         }
     }
+
+    const bool has_additional_query_infos = !additional_query_infos.empty();
 
     if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
     {
@@ -695,9 +688,38 @@ void executeQuery(
             std::move(unavailable_shard_tracker));
 
         read_from_remote->setStepDescription("Read from remote replica");
+        /// The remote node is allowed to act as an initiator (and distribute the query further, e.g. over a swarm)
+        /// only when `remote()` wraps a table function, like `remote(host, s3Cluster(...))`.
+        /// For `remote(host, db, table)` the remote node must stay a secondary query: for intermediate processing
+        /// stages it returns a header made of internal column identifiers which the initiator matches by name,
+        /// and query tree optimizations enabled for initial queries change those names (see
+        /// 04045_merge_function_missing_columns_remote).
+        read_from_remote->setIsRemoteFunction(is_remote_function && table_func_ptr != nullptr);
         plan->addStep(std::move(read_from_remote));
         plan->addInterpreterContext(new_context);
         plans.emplace_back(std::move(plan));
+    }
+
+    if (has_additional_query_infos)
+    {
+        if (!header)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Header is not initialized for local hybrid plan creation");
+
+        const Block & header_block = *header;
+        for (const auto & additional_query_info : additional_query_infos)
+        {
+            auto additional_plan = createLocalPlan(
+                additional_query_info.query,
+                header_block,
+                context,
+                processed_stage,
+                0,  /// shard_num is not applicable for local hybrid plans
+                1,  /// shard_count is not applicable for local hybrid plans
+                false,
+                "");
+
+            plans.emplace_back(std::move(additional_plan));
+        }
     }
 
     if (plans.empty())
@@ -715,6 +737,8 @@ void executeQuery(
         input_headers.emplace_back(plan->getCurrentHeader());
 
     auto union_step = std::make_unique<UnionStep>(std::move(input_headers));
+    if (has_additional_query_infos)
+        union_step->setStepDescription("Hybrid");
     query_plan.unitePlans(std::move(union_step), std::move(plans));
 }
 
