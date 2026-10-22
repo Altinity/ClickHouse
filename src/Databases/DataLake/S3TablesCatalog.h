@@ -36,7 +36,11 @@ public:
 
     DB::DatabaseDataLakeCatalogType getCatalogType() const override { return DB::DatabaseDataLakeCatalogType::S3_TABLES; }
 
+<<<<<<< HEAD
     CatalogTables getTables() const override;
+=======
+    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
 
@@ -48,6 +52,7 @@ public:
         DB::ContextPtr context_,
         TableMetadata & result) const override;
 
+<<<<<<< HEAD
     void dropTable(const String & namespace_name, const String & table_name, bool delete_data, bool if_exists) const override;
 
 protected:
@@ -68,6 +73,22 @@ protected:
         Poco::JSON::Object::Ptr request_body,
         const String & method,
         bool ignore_result) const override;
+=======
+    bool managesTableLocation() const override { return true; }
+
+    void dropTable(
+        const String & namespace_name,
+        const String & table_name,
+        bool delete_data,
+        bool if_exists,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
+
+    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
+
+protected:
+    DB::HTTPHeaderEntries getAuthHeaders(const AuthContext & auth_context) const override;
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
 private:
     const String region;

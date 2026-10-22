@@ -166,6 +166,7 @@ StorageObjectStorage::StorageObjectStorage(
     , is_table_function(is_table_function_)
     , log(getLogger(fmt::format("Storage{}({})", configuration->getEngineName(), table_id_.getFullTableName())))
     , catalog(catalog_)
+    , catalog_auth_token(catalog_ && context ? context->getForwardedAuthToken() : DB::ForwardedAuthTokenPtr{})
     , storage_id(table_id_)
     , background_operations_assignee(*this, table_id_, BackgroundJobsAssignee::Type::DataProcessing, Context::getGlobalContextInstance())
 {
@@ -1060,12 +1061,13 @@ void StorageObjectStorage::prepareForDrop(ContextPtr query_context)
 
 void StorageObjectStorage::drop()
 {
-    dropImpl(delete_data_on_drop.load(), catalog, configuration, storage_id, log);
+    dropImpl(delete_data_on_drop.load(), catalog, catalog_auth_token, configuration, storage_id, log);
 }
 
 void StorageObjectStorage::dropImpl(
     const std::optional<bool> & delete_data_on_drop,
     const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const DB::ForwardedAuthTokenPtr & catalog_auth_token,
     const StorageObjectStorageConfigurationPtr & configuration,
     const StorageID & storage_id,
     const LoggerPtr & log)
@@ -1086,7 +1088,7 @@ void StorageObjectStorage::dropImpl(
     if (catalog)
     {
         const auto [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        catalog->dropTable(namespace_name, table_name, delete_data, /* if_exists */ false);
+        catalog->dropTable(namespace_name, table_name, delete_data, /* if_exists */ false, catalog_auth_token);
     }
     configuration->drop(delete_data);
 }

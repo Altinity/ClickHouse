@@ -82,13 +82,17 @@ public:
 
     ~PaimonRestCatalog() override = default;
 
-    bool empty() const override;
+    bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
+<<<<<<< HEAD
     CatalogTables getTables() const override;
+=======
+    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
-    Namespaces getNamespaces() const override;
+    Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool existsTable(const String & database_name, const String & table_name) const override;
+    bool existsTable(const String & database_name, const String & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void getTableMetadata(const String & database_name, const String & table_name, DB::ContextPtr context_, TableMetadata & result) const override;
 
@@ -134,7 +138,11 @@ private:
 
     void forEachTables(const String & database, DB::Names & tables, StopCondition stop_condition = {}, ExecuteFunc execute_func = {}) const;
 
+<<<<<<< HEAD
     CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name) const override;
+=======
+    DB::Names listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     Poco::JSON::Object::Ptr requestRest(
         const String & endpoint,

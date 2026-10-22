@@ -9,9 +9,10 @@
 #include <Common/tests/gtest_global_context.h>
 #include <Databases/DataLake/HTTPBasedCatalogUtils.h>
 #include <Databases/DataLake/RestCatalog.h>
-#include <IO/HTTPCommon.h>
+#include <Databases/DataLake/tests/rest_catalog_test_server.h>
 #include <Interpreters/Context.h>
 
+<<<<<<< HEAD
 #include <Poco/AutoPtr.h>
 #include <Poco/Net/HTTPRequestHandler.h>
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
@@ -27,9 +28,13 @@
 #include <atomic>
 #include <iterator>
 #include <memory>
+=======
+#include <functional>
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 #include <string>
 
 using namespace DataLake;
+using namespace RestCatalogTest;
 
 namespace ProfileEvents
 {
@@ -42,10 +47,12 @@ namespace DB
 {
 namespace ErrorCodes
 {
-    extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
+<<<<<<< HEAD
     extern const int NOT_IMPLEMENTED;
     extern const int DATALAKE_DATABASE_ERROR;
+=======
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 }
 }
 
@@ -70,42 +77,79 @@ enum class CatalogShape
     OAuthTokenRejected,
 };
 
+<<<<<<< HEAD
 void writeJSON(Poco::Net::HTTPServerResponse & response, const std::string & body, Poco::Net::HTTPResponse::HTTPStatus status = Poco::Net::HTTPResponse::HTTP_OK)
 {
     response.setStatus(status);
     response.setContentType("application/json");
     response.setContentLength(body.size());
     response.send() << body;
+=======
+std::string getParent(const std::string & query)
+{
+    Poco::URI uri;
+    uri.setRawQuery(query);
+    for (const auto & [key, value] : uri.getQueryParameters())
+        if (key == "parent")
+            return value;
+    return {};
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 }
 
-void writeError(Poco::Net::HTTPServerResponse & response, Poco::Net::HTTPResponse::HTTPStatus status, const std::string & body)
+void installShape(ServerState & state, CatalogShape shape)
 {
-    response.setStatus(status);
-    response.setContentType("application/json");
-    response.setContentLength(body.size());
-    response.send() << body;
+    state.setRoute("/v1/namespaces", [shape](const RecordedRequest & request)
+    {
+        const auto parent = getParent(request.query);
+        if (parent.empty())
+        {
+            if (shape == CatalogShape::NestedTableThenEmptySibling)
+                return json(R"({"namespaces":[["parent"],["empty_later"]]})");
+            return json(R"({"namespaces":[["namespace"]]})");
+        }
+
+        if (shape == CatalogShape::NestedTableThenEmptySibling && parent == "parent")
+            return json(R"({"namespaces":[["leaf_with_table"]]})");
+        return json(R"({"namespaces":[]})");
+    });
+
+    state.setRoute("/v1/namespaces/namespace/tables", [shape](const RecordedRequest &)
+    {
+        if (shape == CatalogShape::TopLevelTable)
+            return json(R"({"identifiers":[{"name":"table_a"}]})");
+        return json(R"({"identifiers":[]})");
+    });
+
+    state.setStaticRoute("/v1/namespaces/parent/tables", R"({"identifiers":[]})");
+    state.setStaticRoute("/v1/namespaces/empty_later/tables", R"({"identifiers":[]})");
+    state.setStaticRoute("/v1/namespaces/parent%1Fleaf_with_table/tables", R"({"identifiers":[{"name":"table_a"}]})");
 }
 
-std::string getRawPath(const std::string & uri)
+void installTokenEndpoint(ServerState & state)
 {
-    const auto query_pos = uri.find('?');
-    if (query_pos == std::string::npos)
-        return uri;
-    return uri.substr(0, query_pos);
+    state.setStaticRoute("/v1/oauth/tokens", R"({"token_type":"Bearer","expires_in":3600,"access_token":"mock-access-token"})");
 }
 
-class RestCatalogRequestHandler final : public Poco::Net::HTTPRequestHandler
+void installTableRoutes(ServerState & state)
 {
+<<<<<<< HEAD
 public:
     RestCatalogRequestHandler(CatalogShape shape_, int token_expires_in_seconds_, std::atomic<size_t> & token_requests_)
         : shape(shape_)
         , token_expires_in_seconds(token_expires_in_seconds_)
         , token_requests(token_requests_)
+=======
+    state.setStaticRoute(
+        "/v1/namespaces/namespace/tables/table_a", R"({"metadata":{"table-uuid":"11111111-2222-3333-4444-555555555555"}})");
+    state.setRoute("/v1/namespaces/namespace/tables/missing_table", [](const RecordedRequest &)
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     {
-    }
-
-    void handleRequest(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response) override
+        return respondWithStatus(
+            404, R"({"error":{"message":"Table does not exist","type":"NoSuchTableException","code":404}})");
+    });
+    state.setRoute("/v1/namespaces/namespace/tables/unauthorized_table", [](const RecordedRequest &)
     {
+<<<<<<< HEAD
         Poco::URI uri(request.getURI());
         const auto path = getRawPath(request.getURI());
         const auto params = uri.getQueryParameters();
@@ -318,6 +362,12 @@ private:
     Poco::AutoPtr<Poco::Net::HTTPServerParams> server_params;
     std::unique_ptr<Poco::Net::HTTPServer> server;
 };
+=======
+        return respondWithStatus(
+            401, R"({"error":{"message":"The access token has expired","type":"NotAuthorizedException","code":401}})");
+    });
+}
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
 void expectThrowsCode(std::function<void()> fn, int expected_code)
 {
@@ -334,7 +384,9 @@ void expectThrowsCode(std::function<void()> fn, int expected_code)
 
 bool restCatalogEmpty(CatalogShape shape, bool flat_namespaces = false)
 {
-    RestCatalogTestServer server(shape);
+    TestServer server;
+    installShape(*server, shape);
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -392,7 +444,7 @@ bool deltaSharingCatalogEmpty(CatalogShape shape)
         /* flat_namespaces */false,
         context);
 
-    return catalog.empty();
+    return catalog.empty(/* auth_token */ {});
 }
 
 }
@@ -576,7 +628,8 @@ TEST(RestCatalog, TryGetTableMetadataAuthErrorPropagates)
 
 TEST(RestCatalog, ApplySettingsChangesWithoutAuthenticationRejected)
 {
-    RestCatalogTestServer server(CatalogShape::Empty);
+    TestServer server;
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -599,7 +652,9 @@ TEST(RestCatalog, ApplySettingsChangesWithoutAuthenticationRejected)
 
 TEST(RestCatalog, ApplySettingsChangesCredentialMode)
 {
-    RestCatalogTestServer server(CatalogShape::Empty);
+    TestServer server;
+    installTokenEndpoint(*server);
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -642,7 +697,8 @@ TEST(RestCatalog, ApplySettingsChangesCredentialMode)
 
 TEST(RestCatalog, ApplySettingsChangesAuthHeaderMode)
 {
-    RestCatalogTestServer server(CatalogShape::Empty);
+    TestServer server;
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -673,7 +729,8 @@ TEST(RestCatalog, ApplySettingsChangesAuthHeaderMode)
 
 TEST(RestCatalog, OneLakeApplySettingsChangesBearerMode)
 {
-    RestCatalogTestServer server(CatalogShape::Empty);
+    TestServer server;
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -914,7 +971,9 @@ TEST(RestCatalog, HorizonParseCredentialKeepsColonsInSecret)
 
 TEST(RestCatalog, HorizonCatalogAuthenticatesWithBarePAT)
 {
-    RestCatalogTestServer server(CatalogShape::TopLevelTable);
+    TestServer server;
+    installTableRoutes(*server);
+
     auto context = DB::Context::createCopy(getContext().context);
     context->makeQueryContext();
 
@@ -930,6 +989,7 @@ TEST(RestCatalog, HorizonCatalogAuthenticatesWithBarePAT)
         /* flat_namespaces */false,
         context);
 
+<<<<<<< HEAD
     EXPECT_EQ(catalog.getCatalogType(), DB::DatabaseDataLakeCatalogType::ICEBERG_HORIZON);
     EXPECT_TRUE(catalog.getStateSnapshot()->client_id.empty());
     EXPECT_EQ(catalog.getStateSnapshot()->client_secret, "horizon-pat-without-colon");
@@ -994,6 +1054,19 @@ TEST(RestCatalog, HorizonApplySettingsChangesBarePAT)
     DB::SettingsChanges mode_switch;
     mode_switch.emplace_back("auth_header", "Authorization: Bearer token");
     expectThrowsCode([&] { catalog.applySettingsChanges(mode_switch); }, DB::ErrorCodes::BAD_ARGUMENTS);
+=======
+    TableMetadata existing;
+    EXPECT_TRUE(catalog.tryGetTableMetadata("namespace", "table_a", context, existing));
+    EXPECT_TRUE(catalog.existsTable("namespace", "table_a", /* auth_token */ {}));
+
+    TableMetadata missing;
+    EXPECT_FALSE(catalog.tryGetTableMetadata("namespace", "missing_table", context, missing));
+    EXPECT_FALSE(catalog.existsTable("namespace", "missing_table", /* auth_token */ {}));
+
+    TableMetadata unauthorized;
+    EXPECT_THROW(catalog.tryGetTableMetadata("namespace", "unauthorized_table", context, unauthorized), DB::HTTPException);
+    EXPECT_THROW(catalog.existsTable("namespace", "unauthorized_table", /* auth_token */ {}), DB::HTTPException);
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 }
 
 #endif

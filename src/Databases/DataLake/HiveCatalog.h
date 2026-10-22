@@ -32,13 +32,17 @@ public:
 
     ~HiveCatalog() override = default;
 
-    bool empty() const override;
+    bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
+<<<<<<< HEAD
     CatalogTables getTables() const override;
+=======
+    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
-    Namespaces getNamespaces() const override;
+    Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool existsTable(const std::string & namespace_name, const std::string & table_name) const override;
+    bool existsTable(const std::string & namespace_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void getTableMetadata(
         const std::string & namespace_name,
@@ -62,7 +66,11 @@ private:
     template <typename Func>
     void executeWithRetry(Func && func) const;
 
+<<<<<<< HEAD
     CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name) const override;
+=======
+    DB::Names listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     String base_url;
 

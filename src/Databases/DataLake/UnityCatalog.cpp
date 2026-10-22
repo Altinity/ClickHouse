@@ -106,7 +106,7 @@ std::pair<Poco::Dynamic::Var, std::string> UnityCatalog::postJSONRequest(const s
     return makeHTTPRequestAndReadJSON(base_url / route, context, bearer_token, {}, {}, Poco::Net::HTTPRequest::HTTP_POST, out_stream_callaback);
 }
 
-bool UnityCatalog::empty() const
+bool UnityCatalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     auto all_schemas = getSchemas("");
     for (const auto & schema : all_schemas)
@@ -118,7 +118,11 @@ bool UnityCatalog::empty() const
     return true;
 }
 
+<<<<<<< HEAD
 CatalogTables UnityCatalog::getTables() const
+=======
+DB::Names UnityCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 {
     CatalogTables result;
 
@@ -132,13 +136,17 @@ CatalogTables UnityCatalog::getTables() const
     return result;
 }
 
-DataLake::ICatalog::Namespaces UnityCatalog::getNamespaces() const
+DataLake::ICatalog::Namespaces UnityCatalog::getNamespaces(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     /// Unity schemas are flat — they cannot contain nested namespaces.
     return getSchemas("");
 }
 
+<<<<<<< HEAD
 CatalogTables UnityCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
+=======
+DB::Names UnityCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 {
     return getTablesForSchema(namespace_name);
 }
@@ -351,7 +359,7 @@ bool UnityCatalog::tryGetTableMetadata(
     }
 }
 
-bool UnityCatalog::existsTable(const std::string & schema_name, const std::string & table_name) const
+bool UnityCatalog::existsTable(const std::string & schema_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     if (!isNamespaceAllowed(schema_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", schema_name);
@@ -538,7 +546,13 @@ bool UnityCatalog::isNamespaceAllowed(const std::string & namespace_) const
     return allowed_namespaces.contains("*") || allowed_namespaces.contains(namespace_);
 }
 
+<<<<<<< HEAD
 ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(const DB::StorageID & table_id)
+=======
+/// getCredentialsConfigurationCallback method is supported only for S3 storage
+ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(
+    const DB::StorageID & table_id, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 {
     if (!table_id.hasUUID())
         throw DB::Exception(

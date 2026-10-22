@@ -287,6 +287,9 @@ public:
     void setTokenAuthEnabled(bool enable);
     bool isTokenAuthEnabled() const;
 
+    void setTokenForwardingEnabled(bool enable);
+    bool isTokenForwardingEnabled() const;
+
 private:
     class ContextAccessCache;
     class CustomSettingsPrefixes;
@@ -326,7 +329,11 @@ private:
     std::atomic_bool enable_read_write_grants = false;
     std::atomic_bool allow_impersonate_user = false;
     std::atomic_bool enable_token_auth = true;
+<<<<<<< HEAD
     std::atomic_bool readonly_restricts_set_role = false;
+=======
+    std::atomic_bool enable_token_forwarding = false;
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 };
 
 }

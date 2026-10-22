@@ -655,8 +655,18 @@ static bool writeMetadataFiles(
             const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
             if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
             {
+<<<<<<< HEAD
                 cleanup();
                 return false;
+=======
+                auto catalog_filename = path_resolver.resolveForCatalog(metadata_info.path);
+                const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
+                {
+                    cleanup();
+                    return false;
+                }
+>>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
             }
         }
     }
@@ -1022,7 +1032,7 @@ void alter(
                 metadata->getValue<Int32>(Iceberg::f_last_column_id),
                 getHighestFieldId(new_schema));
             commit_attempted = true;
-            if (!catalog->updateSchema(namespace_name, table_name, catalog_filename, new_schema, previous_schema_id, new_last_column_id, metadata))
+            if (!catalog->updateSchema(namespace_name, table_name, catalog_filename, new_schema, previous_schema_id, new_last_column_id, metadata, context->getForwardedAuthToken()))
             {
                 ++i;
                 continue;
