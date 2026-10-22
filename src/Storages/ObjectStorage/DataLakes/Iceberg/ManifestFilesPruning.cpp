@@ -368,6 +368,77 @@ std::optional<Range> rangeOfPartitionValue(const String & transform_name, const 
     return {};
 }
 
+/// `WHERE` keeps a row only when the predicate is true. A comparison with SQL NULL is not true,
+/// so the non-null min/max is enough to reject the file. `IS NULL` is true for a null, and an
+/// atom the index cannot read may be true for a null, so those stay.
+bool mayBeTrueOnNull(const DB::KeyCondition & condition)
+{
+    enum class Truth : uint8_t
+    {
+        IsNotTrue,
+        IsTrue,
+        MayBeTrue,
+    };
+
+    std::vector<Truth> stack;
+    for (const auto & element : condition.getRPN())
+    {
+        switch (element.function)
+        {
+            case DB::KeyCondition::RPNElement::FUNCTION_IN_RANGE:
+            case DB::KeyCondition::RPNElement::FUNCTION_NOT_IN_RANGE:
+            case DB::KeyCondition::RPNElement::FUNCTION_IN_SET:
+            case DB::KeyCondition::RPNElement::FUNCTION_NOT_IN_SET:
+            case DB::KeyCondition::RPNElement::FUNCTION_IS_NOT_NULL:
+            case DB::KeyCondition::RPNElement::ALWAYS_FALSE:
+                stack.push_back(Truth::IsNotTrue);
+                break;
+            case DB::KeyCondition::RPNElement::FUNCTION_IS_NULL:
+            case DB::KeyCondition::RPNElement::ALWAYS_TRUE:
+                stack.push_back(Truth::IsTrue);
+                break;
+            case DB::KeyCondition::RPNElement::FUNCTION_UNKNOWN:
+            case DB::KeyCondition::RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE:
+            case DB::KeyCondition::RPNElement::FUNCTION_POINT_IN_POLYGON:
+                stack.push_back(Truth::MayBeTrue);
+                break;
+            case DB::KeyCondition::RPNElement::FUNCTION_NOT:
+            {
+                if (stack.empty())
+                    return true;
+                if (stack.back() == Truth::IsNotTrue)
+                    stack.back() = Truth::IsTrue;
+                else if (stack.back() == Truth::IsTrue)
+                    stack.back() = Truth::IsNotTrue;
+                break;
+            }
+            case DB::KeyCondition::RPNElement::FUNCTION_AND:
+            case DB::KeyCondition::RPNElement::FUNCTION_OR:
+            {
+                if (stack.size() < 2)
+                    return true;
+                const Truth right = stack.back();
+                stack.pop_back();
+                const Truth left = stack.back();
+                const bool is_and = element.function == DB::KeyCondition::RPNElement::FUNCTION_AND;
+                if (is_and && (left == Truth::IsNotTrue || right == Truth::IsNotTrue))
+                    stack.back() = Truth::IsNotTrue;
+                else if (!is_and && (left == Truth::IsTrue || right == Truth::IsTrue))
+                    stack.back() = Truth::IsTrue;
+                else if (left == right)
+                    stack.back() = left;
+                else
+                    stack.back() = Truth::MayBeTrue;
+                break;
+            }
+        }
+    }
+
+    if (stack.size() != 1)
+        return true;
+    return stack.back() != Truth::IsNotTrue;
+}
+
 }
 
 PruningReturnStatus ManifestFilesPruner::canBePruned(
@@ -433,8 +504,12 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         }
 
         auto rect_it = entry_hyperrectangles.find(column_id);
-        if (has_no_nulls && rect_it != entry_hyperrectangles.end()
-            && !key_condition.mayBeTrueInRange(1, &rect_it->second.left, &rect_it->second.right, data_types))
+        /// A null in the file does not make a null-rejecting predicate true, so the non-null
+        /// bounds still prune. A predicate that can match null keeps the file unless the
+        /// manifest says the column has no nulls.
+        if (rect_it != entry_hyperrectangles.end()
+            && !key_condition.mayBeTrueInRange(1, &rect_it->second.left, &rect_it->second.right, data_types)
+            && (has_no_nulls || !mayBeTrueOnNull(key_condition)))
         {
             return PruningReturnStatus::MIN_MAX_INDEX_PRUNED;
         }
