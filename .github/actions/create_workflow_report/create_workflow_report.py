@@ -29,7 +29,10 @@ DATABASE_USER_VAR = "CLICKHOUSE_TEST_STAT_LOGIN"
 DATABASE_PASSWORD_VAR = "CLICKHOUSE_TEST_STAT_PASSWORD"
 S3_BUCKET = "altinity-build-artifacts"
 GITHUB_REPO = "Altinity/ClickHouse"
+GITHUB_GIT_URL = f"https://github.com/{GITHUB_REPO}.git"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+# Release tags are fetched here rather than refs/tags/ so local tags are never touched.
+RELEASE_TAG_REF_PREFIX = "refs/workflow-report/tags/"
 # Resolve from this file so discovery works from repo root or the action folder.
 KNOWN_FAILS_FILE = (
     Path(__file__).resolve().parents[3] / "tests" / "broken_tests.yaml"
@@ -232,8 +235,10 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> pd.DataFram
 
 
 def _git_rev_parse(ref: str, cwd: str | None) -> str | None:
+    # Peel to a commit so a raw SHA that is not in the object store fails.
+    # git rev-parse --verify <40-hex> succeeds even when the object is missing.
     p = subprocess.run(
-        ["git", "rev-parse", "--verify", ref],
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -253,7 +258,7 @@ def _git_is_ancestor(ancestor: str, descendant: str, cwd: str | None) -> bool:
 
 
 def _git_log_merge_prs(
-    baseline: str, branch_ref: str, cwd: str | None, repo: str
+    baseline: str, commit_sha: str, cwd: str | None, repo: str
 ) -> pd.DataFrame:
     p = subprocess.run(
         [
@@ -261,7 +266,7 @@ def _git_log_merge_prs(
             "-c",
             "core.quotepath=false",
             "log",
-            f"{baseline}..{branch_ref}",
+            f"{baseline}..{commit_sha}",
             "--merges",
             "--format=%H%x09%s",
         ],
@@ -297,15 +302,11 @@ def _git_log_merge_prs(
     return df
 
 
-def _find_release_baseline(
-    branch_ref: str, repo: str, cwd: str | None
-) -> tuple[str | None, str | None]:
-    """Return (tag_name, tag_sha) for the latest
-    non-draft release tag that is an ancestor of branch_ref.
-    Version-tag refs skip the matching release so the range is previous→this tag.
-    """
+def _get_github_releases(repo: str) -> list[dict]:
+    """Non-draft GitHub releases of repo, newest first."""
     if not GITHUB_TOKEN:
-        return None, None
+        print("GITHUB_TOKEN is not set; skipping GitHub releases lookup")
+        return []
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
@@ -318,31 +319,44 @@ def _find_release_baseline(
         raise Exception(
             f"GitHub API request failed: {response.status_code} {response.text}"
         )
+    return [rel for rel in response.json() if not rel.get("draft")]
+
+
+def _find_release_baseline(
+    branch_ref: str,
+    releases: list[dict],
+    cwd: str | None,
+    commit_sha: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Return (tag_name, tag_sha, published_date YYYY-MM-DD) for the latest
+    release tag in releases that is an ancestor of commit_sha.
+    Version-tag refs skip the matching release so the range is previous→this tag.
+    """
     parsed = _parse_release_ref(branch_ref)
     skip_current = parsed is not None and parsed[2] is not None
-    for rel in response.json():
-        if rel.get("draft"):
-            continue
+    for rel in releases:
         tag_name = rel.get("tag_name")
         if not tag_name:
             continue
-        tag_sha = _git_rev_parse(tag_name, cwd)
+        tag_sha = _release_tag_sha(tag_name, cwd)
         if not tag_sha:
             continue
-        if not _git_is_ancestor(tag_sha, branch_ref, cwd):
+        if not _git_is_ancestor(tag_sha, commit_sha, cwd):
             continue
-        if skip_current and _git_is_ancestor(branch_ref, tag_sha, cwd):
+        if skip_current and _git_is_ancestor(commit_sha, tag_sha, cwd):
             continue
-        return tag_name, tag_sha
-    return None, None
+        published_at = rel.get("published_at") or rel.get("created_at") or ""
+        published_date = published_at[:10] if published_at else None
+        return tag_name, tag_sha, published_date
+    return None, None, None
 
 
-def _find_rebase_baseline(branch_ref: str, cwd: str | None) -> str | None:
+def _find_rebase_baseline(commit_sha: str, cwd: str | None) -> str | None:
     p = subprocess.run(
         [
             "git",
             "log",
-            branch_ref,
+            commit_sha,
             "--reverse",
             "-i",
             "-E",
@@ -382,11 +396,113 @@ def _git_commit_time(sha: str, cwd: str | None) -> str | None:
     )
 
 
+def _git_is_shallow(cwd: str | None) -> bool:
+    p = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return p.stdout.strip() == "true"
+
+
+def _git_fetch(options: list[str], refspecs: list[str], cwd: str | None) -> None:
+    p = subprocess.run(
+        ["git", "fetch", *options, GITHUB_GIT_URL, *refspecs],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if p.returncode != 0:
+        raise Exception(f"git fetch failed: {p.stderr.strip()}")
+
+
+def _release_tag_sha(tag_name: str, cwd: str | None) -> str | None:
+    return _git_rev_parse(f"{RELEASE_TAG_REF_PREFIX}{tag_name}", cwd)
+
+
+def _read_autogenerated_versions(sha: str, cwd: str | None) -> tuple[int, int]:
+    p = subprocess.run(
+        ["git", "show", f"{sha}:cmake/autogenerated_versions.txt"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    major = re.search(r"SET\(VERSION_MAJOR (\d+)\)", p.stdout)
+    minor = re.search(r"SET\(VERSION_MINOR (\d+)\)", p.stdout)
+    if not major or not minor:
+        raise Exception(f"Cannot read version from {sha}")
+    return int(major.group(1)), int(minor.group(1))
+
+
+def _filter_releases_to_version_line(
+    releases: list[dict],
+    branch_ref: str,
+    commit_sha: str,
+    cwd: str | None,
+) -> list[dict]:
+    """Keep GitHub releases that belong on commit_sha's version line."""
+    parsed = _parse_release_ref(branch_ref)
+    if parsed is not None:
+        flavour, minor_version, _ = parsed
+        suffix = f"altinity{flavour}"
+        prefix = f"v{minor_version}."
+        return [
+            rel
+            for rel in releases
+            if (tag := rel.get("tag_name"))
+            and tag.startswith(prefix)
+            and tag.endswith(f".{suffix}")
+        ]
+    major, minor = _read_autogenerated_versions(commit_sha, cwd)
+    prefix = f"v{major}.{minor}."
+    return [
+        rel
+        for rel in releases
+        if (tag := rel.get("tag_name")) and tag.startswith(prefix)
+    ]
+
+
+def _fetch_release_tags(releases: list[dict], cwd: str) -> None:
+    """Fetch release tags into RELEASE_TAG_REF_PREFIX; skip tags missing remotely."""
+    for rel in releases:
+        tag_name = rel.get("tag_name")
+        if not tag_name:
+            continue
+        try:
+            _git_fetch(
+                ["--no-tags"],
+                [f"+refs/tags/{tag_name}:{RELEASE_TAG_REF_PREFIX}{tag_name}"],
+                cwd,
+            )
+        except Exception as e:
+            # NOTE (strtgbb): one deleted remote tag must not abort the section, but
+            # if it is the newest release the baseline moves back to an older one
+            print(f"WARNING: skipping release tag {tag_name}: {e}")
+
+
+def _fetch_commit(commit_sha: str, cwd: str) -> None:
+    """Fetch the workflow commit from GITHUB_GIT_URL.
+
+    Local checkouts might be a different branch and might not have the run SHA yet.
+    --filter/--unshallow would convert a full clone into a partial one, so those
+    options are used only when the checkout is already shallow.
+    """
+    if _git_is_shallow(cwd):
+        _git_fetch(["--filter=tree:0", "--unshallow"], [commit_sha], cwd)
+    else:
+        _git_fetch(["--no-tags"], [commit_sha], cwd)
+
+
 def get_prs_in_release_dataframe(
     branch_ref: str = "HEAD",
     *,
     repo: str = GITHUB_REPO,
     cwd: str,
+    commit_sha: str,
 ) -> tuple[pd.DataFrame, str | None]:
     f"""
     PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
@@ -394,57 +510,33 @@ def get_prs_in_release_dataframe(
     Merge commits whose subject is from the upstream repository (ClickHouse/) are omitted.
     Columns: pr_number, pr_name, labels.
 
+    commit_sha is the workflow commit from the GitHub Actions API.
+
     Returns (dataframe, baseline commit time as UTC YYYY-MM-DDTHH:MM:SSZ or None).
     """
-    branch_sha = _git_rev_parse(branch_ref, cwd)
-    if not branch_sha:
-        raise Exception(f"Cannot resolve branch ref: {branch_ref!r}")
+    _fetch_commit(commit_sha, cwd)
+    resolved = _git_rev_parse(commit_sha, cwd)
+    if not resolved:
+        raise Exception(f"Cannot resolve commit: {commit_sha!r}")
+    commit_sha = resolved
 
-    # CI often checks out with --depth=1 and --no-tags; fetch tags once, then deepen
-    # in steps until a baseline is reachable.
-    # Observed baseline distances are ~1k commits and grow slowly, so DEEPEN_CAP sits
-    # well above that; the cap exists so a failed lookup fails fast instead of fetching
-    # the branch's entire (100k+ commit) history.
-    DEEPEN_STEP = 250
-    DEEPEN_CAP = 10000
-
-    subprocess.run(
-        ["git", "fetch", "--tags", "origin"],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
+    releases = _filter_releases_to_version_line(
+        _get_github_releases(repo), branch_ref, commit_sha, cwd
     )
+    _fetch_release_tags(releases, cwd)
 
-    parsed = _parse_release_ref(branch_ref)
-    fetch_ref = (
-        f"refs/tags/{branch_ref}"
-        if parsed is not None and parsed[2] is not None
-        else branch_ref
+    _, baseline_sha, _ = _find_release_baseline(
+        branch_ref, releases, cwd, commit_sha=commit_sha
     )
-
-    baseline_sha = None
-    for _ in range(DEEPEN_CAP // DEEPEN_STEP):
-        subprocess.run(
-            ["git", "fetch", f"--deepen={DEEPEN_STEP}", "origin", fetch_ref],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        _, baseline_sha = _find_release_baseline(branch_ref, repo, cwd)
-        if not baseline_sha:
-            baseline_sha = _find_rebase_baseline(branch_ref, cwd)
-        if baseline_sha:
-            break
+    if not baseline_sha:
+        baseline_sha = _find_rebase_baseline(commit_sha, cwd)
 
     if not baseline_sha:
         raise Exception(
-            "No release tag on this branch and no rebase bootstrap merge found "
-            f"within {DEEPEN_CAP} commits"
+            "No release tag on this branch and no rebase bootstrap merge found"
         )
 
-    df = _git_log_merge_prs(baseline_sha, branch_ref, cwd, repo)
+    df = _git_log_merge_prs(baseline_sha, commit_sha, cwd, repo)
     return (
         _enrich_prs_in_release_merge_prs(df, repo),
         _git_commit_time(baseline_sha, cwd),
@@ -455,18 +547,18 @@ def _parse_release_ref(ref_name: str) -> tuple[str, str, str | None] | None:
     """Parse a release ref into (flavour, minor_version, full_version).
 
     Handles version tags (``v25.8.28.10001.altinitystable``) and release
-    branches (``stable-25.8``). ``full_version`` is None for branches, which
+    branches (``stable-25.8``, ``antalya-25.8``, ``fips-25.3``). ``full_version`` is None for branches, which
     carry no patch or tweak. Returns None for refs without a version.
     """
     # Match tag
     match = re.match(
-        r"^v((\d+\.\d+)\.\d+\.\d+)\.altinity(stable|antalya|test)$", ref_name
+        r"^v((\d+\.\d+)\.\d+\.\d+)\.altinity(stable|antalya|fips|test)$", ref_name
     )
     if match:
-        flavour = "antalya" if match.group(3) == "antalya" else "stable"
+        flavour = match.group(3) if match.group(3) in ("antalya", "fips") else "stable"
         return flavour, match.group(2), match.group(1)
     # Match branch
-    match = re.match(r"^(stable|antalya)-(\d+\.\d+)$", ref_name)
+    match = re.match(r"^(stable|antalya|fips)-(\d+\.\d+)$", ref_name)
     if match:
         return match.group(1), match.group(2), None
     return None
@@ -1316,7 +1408,7 @@ def create_workflow_report(
     if pr_number == 0 and not mark_preview:
         try:
             prs_df, baseline_time = get_prs_in_release_dataframe(
-                branch_name, cwd=os.getcwd()
+                branch_name, cwd=os.getcwd(), commit_sha=commit_sha
             )
             results_dfs["prs_in_release"] = prs_df
             prs_in_release_search_url = _prs_in_release_search_url(
