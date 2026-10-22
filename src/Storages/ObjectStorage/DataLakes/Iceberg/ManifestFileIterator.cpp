@@ -485,6 +485,10 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
                     continue;
                 }
 
+                /// Mixed-scale timestamp stats can decode to lower > upper; skip min/max for this column.
+                if (DB::Range::less(*right, *left))
+                    continue;
+
                 hyperrectangles.emplace(column_id, DB::Range(*left, true, *right, true));
             }
         }

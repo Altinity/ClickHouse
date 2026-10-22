@@ -10,6 +10,7 @@
 #include <Core/Range.h>
 #include <Core/Settings.h>
 #include <Core/TypeId.h>
+#include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTime64.h>
@@ -291,6 +292,31 @@ Int64 getTimeValueInMicroseconds(const Field & field, DataTypePtr type)
     throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected Time or Time64, got {}", type->getName());
 }
 
+Int64 getDateTime64ValueForIcebergBounds(const Field & field, DataTypePtr type)
+{
+    if (type->isNullable())
+        return getDateTime64ValueForIcebergBounds(field, assert_cast<const DataTypeNullable *>(type.get())->getNestedType());
+
+    if (!WhichDataType(type).isDateTime64())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected DateTime64, got {}", type->getName());
+
+    /// Manifest rewrite reads the Avro `long` back as Int64 (contrib Avro has no `timestamp-nanos`).
+    if (field.getType() == Field::Types::Int64)
+        return field.safeGet<Int64>();
+    if (field.getType() == Field::Types::UInt64)
+        return static_cast<Int64>(field.safeGet<UInt64>());
+
+    const auto scale = getDecimalScale(*type);
+    const auto value = field.safeGet<Decimal64>().getValue().value;
+    if (scale == 9)
+        return value;
+    if (scale > 6)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+
+    /// Iceberg `timestamp` bounds are microseconds. DateTime64(s) for s < 6 stores coarser ticks.
+    return value * DataTypeDateTime64::getScaleMultiplier(6 - scale).value;
+}
+
 std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
 {
     switch (type->getTypeId())
@@ -326,7 +352,7 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
         case TypeIndex::Time64:
             return dumpValue(getTimeValueInMicroseconds(field, type));
         case TypeIndex::DateTime64:
-            return dumpValue(field.safeGet<Decimal64>().getValue().value);
+            return dumpValue(getDateTime64ValueForIcebergBounds(field, type));
         case TypeIndex::String:
         {
             auto value = field.safeGet<String>();
@@ -746,8 +772,9 @@ void generateManifestFile(
 
     auto adapter = std::make_unique<OutputStreamWriteBufferAdapter>(buf);
     avro::DataFileWriter<avro::GenericDatum> writer(std::move(adapter), schema);
-    /// avro-cpp's compiled schema loses the Iceberg field-id/element-id attributes; write the
-    /// original id-carrying JSON as the avro.schema header so external readers can plan a scan.
+    /// avro-cpp's compiled schema loses Iceberg field-id attributes, and `toJson` drops
+    /// unknown logical types such as `timestamp-nanos`. Write the original JSON as the
+    /// `avro.schema` header so external readers keep both.
     writer.setMetadata(Iceberg::f_avro_schema, schema_representation);
     writer.setMetadata(Iceberg::f_schema, json_representation);
     writer.setMetadata(Iceberg::f_schema_id, std::to_string(schema_object_to_write->getValue<Int32>(Iceberg::f_schema_id)));
