@@ -504,7 +504,11 @@ static bool writeMetadataFiles(
     auto manifest_entries_in_storage = std::make_shared<Strings>();
     std::vector<Iceberg::IcebergPathFromMetadata> manifest_entries;
     std::vector<Int64> manifest_entry_sizes;
+<<<<<<< HEAD
     std::vector<Iceberg::FileContentType> per_entry_content_types;
+=======
+    std::vector<Int64> manifest_entry_row_counts;
+>>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
     std::vector<std::vector<std::pair<Field, DataTypePtr>>> entry_partition_summaries;
 
     auto hint_path = filename_generator.generateVersionHint();
@@ -538,7 +542,11 @@ static bool writeMetadataFiles(
             auto manifest_entry_path = filename_generator.generateManifestEntryName();
             manifest_entries_in_storage->push_back(path_resolver.resolve(manifest_entry_path));
             manifest_entries.push_back(manifest_entry_path);
+<<<<<<< HEAD
             per_entry_content_types.push_back(content_type);
+=======
+            manifest_entry_row_counts.push_back(delete_filename.total_rows);
+>>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
 
             /// The manifest holds a single partition tuple, which becomes its manifest-list field summary.
             if (chunk_partitioner)
@@ -604,6 +612,7 @@ static bool writeMetadataFiles(
                 DBMS_DEFAULT_BUFFER_SIZE,
                 context->getWriteSettings());
 
+<<<<<<< HEAD
             chassert(!per_entry_content_types.empty());
             generateManifestList(
                 path_resolver,
@@ -623,6 +632,35 @@ static bool writeMetadataFiles(
                 /* entry_partition_spec_ids */ {},
                 entry_partition_summaries);
             buffer_manifest_list->finalize();
+=======
+            try
+            {
+                generateManifestList(
+                    path_resolver,
+                    metadata,
+                    object_storage,
+                    secondary_storages,
+                    context,
+                    manifest_entries,
+                    new_snapshot,
+                    manifest_entry_sizes,
+                    *buffer_manifest_list,
+                    content_type,
+                    /* use_previous_snapshots */ true,
+                    /* per_entry_content_types */ {},
+                    /* entry_counts */ {},
+                    /* carry_forward_manifest_paths */ {},
+                    /* entry_partition_spec_ids */ {},
+                    entry_partition_summaries,
+                    manifest_entry_row_counts);
+                buffer_manifest_list->finalize();
+            }
+            catch (...)
+            {
+                cleanup();
+                throw;
+            }
+>>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
         }
 
         std::string json_representation = stringifyJSON(metadata, 4);

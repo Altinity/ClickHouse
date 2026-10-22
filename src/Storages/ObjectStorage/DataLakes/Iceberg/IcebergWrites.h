@@ -139,7 +139,15 @@ void generateManifestFile(
     /// overrides both the record count / file size AND the column statistics for the corresponding file.
     const std::vector<IcebergSerializedFileStats> & per_file_stats = {});
 
+<<<<<<< HEAD
 /// Per manifest-list entry file/row counts and lineage for rewritten manifests.
+=======
+/// Per manifest-list entry file/row counts for rewritten manifests. Reported as existing
+/// counts when the rewritten manifest preserves entry lineage (a metadata-only rewrite:
+/// its entries stay EXISTING), or as added counts when the manifest is regenerated
+/// without lineage (its entries are emitted as ADDED, and the manifest-list entry must
+/// agree with the manifest it points to).
+>>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
 struct ManifestListEntryCounts
 {
     Int64 files_count = 0;
@@ -151,11 +159,14 @@ struct ManifestListEntryCounts
     /// forward from an earlier snapshot or contains only pre-existing files (metadata-only
     /// rewrite), so its counts are reported as existing_*.
     bool counts_are_added = false;
+<<<<<<< HEAD
     /// When set, override the entry's `added_snapshot_id` / `sequence_number`, preserving the
     /// lineage of a manifest that was first added by an earlier snapshot and is carried
     /// forward into this manifest list.
     std::optional<Int64> added_snapshot_id;
     std::optional<Int64> added_sequence_number;
+=======
+>>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
 };
 
 struct PreviousManifestAction
@@ -186,7 +197,11 @@ void generateManifestList(
     const std::unordered_set<String> & carry_forward_manifest_paths = {},
     const std::vector<Int64> & entry_partition_spec_ids = {},
     const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {},
+<<<<<<< HEAD
     const PreviousManifestActions & previous_manifest_actions = {});
+=======
+    const std::vector<Int64> & entry_row_counts = {});
+>>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
 
 std::string getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path);
 

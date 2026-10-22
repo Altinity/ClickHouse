@@ -1238,6 +1238,7 @@ static void writeMetadataFiles(
                 }
             }
 
+<<<<<<< HEAD
             /// The manifest's original lineage, taken from the source manifest-list entry: the
             /// snapshot that actually added the manifest may already be expired from table
             /// metadata, in which case `plan.manifest_file_to_first_snapshot` (first *retained*
@@ -1268,10 +1269,16 @@ static void writeMetadataFiles(
             /// manifest lists of later snapshots that carry it forward do not claim they added
             /// it; the sequence numbers use the remapped value, consistent with the entries
             /// written into the regenerated manifest below.
+=======
+            /// Record the manifest's actual content counts for its manifest-list entries. The
+            /// files keep their original data sequence numbers, so min_sequence_number is the
+            /// sequence number of the snapshot whose manifest is being rewritten.
+>>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
             {
                 Int64 manifest_rows = 0;
                 for (const auto rows : file_row_counts)
                     manifest_rows += static_cast<Int64>(rows);
+<<<<<<< HEAD
                 ManifestListEntryCounts counts;
                 counts.files_count = static_cast<Int64>(data_files_vec.size());
                 counts.rows_count = manifest_rows;
@@ -1279,6 +1286,13 @@ static void writeMetadataFiles(
                 counts.added_snapshot_id = manifest_lineage.added_snapshot_id;
                 counts.added_sequence_number = remapped_sequence_number;
                 manifest_file_counts[manifest_entry->patched_path] = counts;
+=======
+                const Int64 manifest_min_sequence_number = snapshot->has(Iceberg::f_metadata_sequence_number)
+                    ? snapshot->getValue<Int64>(Iceberg::f_metadata_sequence_number)
+                    : 0;
+                manifest_file_counts[manifest_entry->patched_path]
+                    = {static_cast<Int64>(data_files_vec.size()), manifest_rows, manifest_min_sequence_number, /* counts_are_added */ true};
+>>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
             }
             generateManifestFile(
                 metadata_object,
@@ -1348,21 +1362,35 @@ static void writeMetadataFiles(
         /// Pass the actual per-manifest counts: without them generateManifestList stamps the
         /// snapshot summary's `added-records` into EVERY entry, so any consumer summing the
         /// manifest-list row counts (including our own trivial count) would multiply the
+<<<<<<< HEAD
         /// table's row count by the number of manifests. Each manifest's entries are emitted
         /// as ADDED in the snapshot that first added it, so its counts are reported as
         /// added_* only in that snapshot's manifest list; manifest lists of later snapshots
         /// carry the manifest forward and report the counts as existing_*, preserving the
         /// original added_snapshot_id / sequence_number.
         const Int64 list_snapshot_id = new_snapshots[i].snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);
+=======
+        /// table's row count by the number of manifests. The regenerated manifests carry no
+        /// entry lineage -- their entries are emitted as ADDED -- so the counts are reported
+        /// as added to keep the manifest-list entries consistent with the manifests they
+        /// point to.
+>>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
         std::vector<ManifestListEntryCounts> entry_counts;
         entry_counts.reserve(renamed_manifest_entries.size());
         for (const auto & entry : renamed_manifest_entries)
         {
+<<<<<<< HEAD
             ManifestListEntryCounts counts;
             if (auto it = manifest_file_counts.find(entry); it != manifest_file_counts.end())
                 counts = it->second;
             counts.counts_are_added = counts.added_snapshot_id.has_value() && *counts.added_snapshot_id == list_snapshot_id;
             entry_counts.push_back(counts);
+=======
+            if (auto it = manifest_file_counts.find(entry); it != manifest_file_counts.end())
+                entry_counts.push_back(it->second);
+            else
+                entry_counts.push_back({});
+>>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
         }
         auto buffer_manifest_list = object_storage->writeObject(
             StoredObject(path_resolver.resolve(renamed_manifest_list)),
