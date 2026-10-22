@@ -235,7 +235,8 @@ bool DisksApp::processQueryText(const String & text)
         {
             int code = err.code();
             error_string = getExceptionMessageForLogging(err, true, false);
-            last_command_exit_code = code;
+            if (command && command->command_name.starts_with("cas-"))
+                last_command_exit_code = code;
             if (code == ErrorCodes::BAD_ARGUMENTS)
             {
                 if (command.get())
@@ -252,12 +253,14 @@ bool DisksApp::processQueryText(const String & text)
         catch (std::exception & err)
         {
             error_string = err.what();
-            last_command_exit_code = ErrorCodes::STD_EXCEPTION;
+            if (command && command->command_name.starts_with("cas-"))
+                last_command_exit_code = ErrorCodes::STD_EXCEPTION;
         }
         catch (...) // Ok: report unknown exception
         {
             error_string = "Unknown exception";
-            last_command_exit_code = ErrorCodes::STD_EXCEPTION;
+            if (command && command->command_name.starts_with("cas-"))
+                last_command_exit_code = ErrorCodes::STD_EXCEPTION;
         }
         if (error_string.has_value())
         {
