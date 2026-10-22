@@ -239,12 +239,12 @@ void MultipleFileWriter::startNewFile()
     buffer = object_storage->writeObject(
         StoredObject(storage_path), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
 
-    if (format_settings)
-    {
-        format_settings->parquet.write_page_index = true;
-        format_settings->parquet.bloom_filter_push_down = true;
-        format_settings->parquet.filter_push_down = true;
-    }
+    if (!format_settings)
+        format_settings = getFormatSettings(context);
+    format_settings->parquet.write_page_index = true;
+    format_settings->parquet.bloom_filter_push_down = true;
+    format_settings->parquet.filter_push_down = true;
+    format_settings->parquet.output_timestamp_adjusted_to_utc_from_timezone = true;
     /// The ORC String/FixedString logical-type handling lives in ORCBlockOutputFormat, keyed on
     /// the column mapper, so it covers the compaction/mutation rewrite paths too.
     FormatFilterInfoPtr format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr);
