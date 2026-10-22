@@ -119,6 +119,7 @@ void registerAggregateFunctionUniqApacheHLL(AggregateFunctionFactory & factory)
 Calculates the approximate number of different argument values using an [Apache DataSketches](https://datasketches.apache.org/docs/HLL/HllSketches.html) HyperLogLog sketch.
 
 The `-State` and `-Merge` combinators exchange Apache DataSketches HLL sketches with a varint length prefix.
+To import a raw sketch (e.g. from Spark), use `CAST(addVarUIntLengthPrefix(sketch) AS AggregateFunction(uniqApacheHLL, UInt64))`; to export one, use `removeVarUIntLengthPrefix(toString(state))`.
 
 For interoperability, integers of at most 64 bits are hashed as 8-byte integers, floating-point values as IEEE-754 doubles, strings as raw bytes, `UUID` values as canonical 16 bytes, and `IPv6` addresses in network order.
 `Date`, `Date32`, `DateTime` and `DateTime64` use their underlying integer values. External producers must use the same unit; for example, `DateTime64(3)` uses epoch milliseconds.
@@ -134,6 +135,7 @@ A `Nullable` argument gives the same state as a non-`Nullable` one, a bare DataS
 Merging can switch from the HIP estimator to the less accurate composite estimator, and the HIP estimate of a union of small sketches depends on the order of the merges, so with the default estimator results can depend on partitioning across threads, parts and shards.
 The `estimator` parameter `'COMPOSITE'` makes the result depend only on the registers of the sketch and not on the order of the inserts and of the merges, at the cost of a lower accuracy for sketches of a few hundred distinct values. It does not change the state.
 Merging a lower-resolution sketch permanently lowers the result's resolution, regardless of the declared `lg_k`.
+States with different `lg_k` or `type` are different types, so `CAST` them to one type before combining them with `UNION ALL`, arrays or `if`.
     )";
     FunctionDocumentation::Syntax syntax = "uniqApacheHLL([lg_k, [type, [estimator]]])(x)";
     FunctionDocumentation::Arguments arguments = {
