@@ -5,11 +5,7 @@
 #include <Databases/DataLake/Common.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
-<<<<<<< HEAD
-=======
 #include <Common/FormUrlEncode.h>
-#include <Common/ProfileEvents.h>
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 #include <Common/RemoteHostFilter.h>
 #include <Common/config_version.h>
 #include <Common/logger_useful.h>
@@ -104,17 +100,14 @@ namespace ProfileEvents
 {
     extern const Event DataLakeRestCatalogCredentialsVended;
     extern const Event DataLakeRestCatalogCredentialsCacheHits;
-<<<<<<< HEAD
     extern const Event OneLakeAccessTokenRequests;
     extern const Event OneLakeAccessTokenRequestFailures;
     extern const Event OneLakeAccessTokenRequestMicroseconds;
     extern const Event OneLakeAccessTokenExpirations;
-=======
     extern const Event DataLakeRestCatalogTokenExchange;
     extern const Event DataLakeRestCatalogTokenExchangeMicroseconds;
     extern const Event DataLakeRestCatalogTokenExchangeFailures;
     extern const Event DataLakeRestCatalogUserTokenCacheHits;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     extern const Event DataLakeRestCatalogLoadConfig;
     extern const Event DataLakeRestCatalogLoadConfigMicroseconds;
     extern const Event DataLakeRestCatalogGetNamespaces;
@@ -509,13 +502,9 @@ RestCatalog::RestCatalog(
     const std::string & oauth_server_uri_,
     bool oauth_server_use_request_body_,
     const std::string & namespaces_,
-<<<<<<< HEAD
     bool flat_namespaces_,
-    DB::ContextPtr context_)
-=======
     DB::ContextPtr context_,
     const TokenForwardingConfig & token_forwarding_)
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     : ICatalog(warehouse_)
     , DB::WithContext(context_)
     , base_url(correctAPIURI(base_url_))
@@ -523,15 +512,12 @@ RestCatalog::RestCatalog(
     , auth_scope(auth_scope_)
     , oauth_server_uri(oauth_server_uri_)
     , oauth_server_use_request_body(oauth_server_use_request_body_)
-<<<<<<< HEAD
     , flat_namespaces(flat_namespaces_)
-=======
     , token_forwarding(token_forwarding_)
     , user_token_cache(
           CurrentMetrics::end(),
           CurrentMetrics::DataLakeCatalogUserTokenCacheEntries,
           user_token_cache_max_entries)
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     , allowed_namespaces(namespaces_)
 {
     CatalogState initial_state;
@@ -545,21 +531,17 @@ RestCatalog::RestCatalog(
         initial_state.auth_header = parseAuthHeader(auth_header_);
         validateAuthHeaders(initial_state.auth_header.value());
     }
-<<<<<<< HEAD
-    /// `loadConfig` reaches the virtual `createReadBuffer`, but no catalog constructed through this
-    /// ctor (`OneLakeCatalog`, `BigLakeCatalog`) overrides it, so the base implementation is the intended
-    /// target. `S3TablesCatalog` overrides it and uses the separate ctor, calling `loadConfig` afterwards.
-    /// NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall)
-    initial_state.config = loadConfig(initial_state);
-=======
 
     /// Defer `/v1/config` until a query supplies the user token needed to authenticate it.
     if (!token_forwarding.forward_user_token)
     {
+        /// `loadConfig` reaches the virtual `createReadBuffer`, but no catalog constructed through this
+        /// ctor (`OneLakeCatalog`, `BigLakeCatalog`) overrides it, so the base implementation is the intended
+        /// target. `S3TablesCatalog` overrides it and uses the separate ctor, calling `loadConfig` afterwards.
+        /// NOLINTNEXTLINE(clang-analyzer-optin.cplusplus.VirtualCall)
         initial_state.config = loadConfig(initial_state, /* generation */ 0, /* auth_token */ {});
         initial_state.config_loaded = true;
     }
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     state.set(std::make_unique<const CatalogState>(std::move(initial_state)));
 }
 
@@ -579,14 +561,11 @@ RestCatalog::RestCatalog(
     , auth_scope(auth_scope_)
     , oauth_server_uri(oauth_server_uri_)
     , oauth_server_use_request_body(oauth_server_use_request_body_)
-<<<<<<< HEAD
     , flat_namespaces(flat_namespaces_)
-=======
     , user_token_cache(
           CurrentMetrics::end(),
           CurrentMetrics::DataLakeCatalogUserTokenCacheEntries,
           user_token_cache_max_entries)
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     , allowed_namespaces(namespaces_)
 {
 }
@@ -629,11 +608,7 @@ RestCatalog::Config RestCatalog::loadConfig(
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogLoadConfig);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogLoadConfigMicroseconds);
-<<<<<<< HEAD
-        auto buf = createReadBuffer(catalog_state, CONFIG_ENDPOINT, params, /* headers */ {}, auth_headers);
-=======
-        auto buf = createReadBuffer(catalog_state, generation, CONFIG_ENDPOINT, auth_token, params, /* headers */{}, auth_headers);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        auto buf = createReadBuffer(catalog_state, generation, CONFIG_ENDPOINT, auth_token, params, /* headers */ {}, auth_headers);
         readJSONObjectPossiblyInvalid(json_str, *buf);
     }
 
@@ -679,14 +654,7 @@ void RestCatalog::validateAuthHeaders(const DB::HTTPHeaderEntry & header) const
     getContext()->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(header_to_check);
 }
 
-<<<<<<< HEAD
-DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
-    const CatalogState & catalog_state,
-    bool update_token,
-    bool * used_cached_oauth_token) const
-=======
 DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const AuthContext & auth_context) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 {
     fiu_do_on(DB::FailPoints::check_database_datalake_negative,
     {
@@ -705,9 +673,6 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const AuthContext & auth_conte
         return DB::HTTPHeaderEntries{catalog_state.auth_header.value()};
     }
 
-<<<<<<< HEAD
-    /// Option 2: user provided grant_type and client credentials for OAuthClientCredentialsRequest.
-=======
     if (token_forwarding.forward_user_token)
     {
         DB::HTTPHeaderEntries headers;
@@ -718,8 +683,7 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(const AuthContext & auth_conte
         return headers;
     }
 
-    /// We would make OAuthClientCredentialsRequest
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    /// Option 2: user provided grant_type and client credentials for OAuthClientCredentialsRequest.
     /// https://github.com/apache/iceberg/blob/3badfe0c1fcf0c0adfc7aa4a10f0b50365c48cf9/open-api/rest-catalog-open-api.yaml#L3498C5-L3498C34
     /// Horizon accepts a secret-only credential (PAT/JWT as `client_secret` with empty `client_id`).
     if (!catalog_state.client_id.empty() || !catalog_state.client_secret.empty())
@@ -996,22 +960,6 @@ void RestCatalog::commitSettingsChanges(ICatalog::PreparedSettingsChangesPtr pre
     if (!prepared_auth || !prepared_auth->new_state)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Settings changes to commit were not prepared by this catalog");
 
-<<<<<<< HEAD
-    state.set(std::move(prepared_auth->new_state));
-    if (prepared_auth->new_access_token)
-        access_token.set(std::move(prepared_auth->new_access_token));
-
-    std::lock_guard lock(credentials_cache_mutex);
-    credentials_cache.clear();
-}
-
-void RestCatalog::setVendedCredentialsCacheTTL(std::chrono::seconds ttl)
-{
-    std::lock_guard lock(credentials_cache_mutex);
-    if (ttl != vended_credentials_cache_ttl)
-    {
-        vended_credentials_cache_ttl = ttl;
-=======
     {
         std::lock_guard lock(auth_publish_mutex);
         state.set(std::move(prepared_auth->new_state));
@@ -1025,7 +973,16 @@ void RestCatalog::setVendedCredentialsCacheTTL(std::chrono::seconds ttl)
     user_token_cache.clear();
     {
         std::lock_guard lock(credentials_cache_mutex);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        credentials_cache.clear();
+    }
+}
+
+void RestCatalog::setVendedCredentialsCacheTTL(std::chrono::seconds ttl)
+{
+    std::lock_guard lock(credentials_cache_mutex);
+    if (ttl != vended_credentials_cache_ttl)
+    {
+        vended_credentials_cache_ttl = ttl;
         credentials_cache.clear();
     }
 }
@@ -1066,27 +1023,18 @@ void RestCatalog::applySettingsChangesToState(
     }
 }
 
-<<<<<<< HEAD
-DB::HTTPHeaderEntries OneLakeCatalog::getAuthHeaders(
-    const CatalogState & catalog_state,
-    bool update_token,
-    bool * used_cached_oauth_token) const
+DB::HTTPHeaderEntries OneLakeCatalog::getAuthHeaders(const AuthContext & auth_context) const
 {
     DB::HTTPHeaderEntries headers;
-    if (!catalog_state.refresh_token.empty())
+    if (!auth_context.catalog_state.refresh_token.empty())
     {
-        const auto token = getValidAccessToken(catalog_state, update_token);
+        const auto token = getValidAccessToken(auth_context.catalog_state, auth_context.update_token);
         headers.emplace_back("Authorization", "Bearer " + token.token);
     }
     else
     {
-        headers = RestCatalog::getAuthHeaders(catalog_state, update_token, used_cached_oauth_token);
+        headers = RestCatalog::getAuthHeaders(auth_context);
     }
-=======
-DB::HTTPHeaderEntries OneLakeCatalog::getAuthHeaders(const AuthContext & auth_context) const
-{
-    auto headers = RestCatalog::getAuthHeaders(auth_context);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     headers.emplace_back("User-Agent", fmt::format("ClickHouse/{}{} OneLake-Catalog", VERSION_STRING, VERSION_OFFICIAL));
     return headers;
 }
@@ -1229,7 +1177,8 @@ HorizonCatalog::HorizonCatalog(
             "or `auth_header` (Authorization: Bearer <token>)");
     }
 
-    initial_state.config = loadConfig(initial_state);
+    initial_state.config = loadConfig(initial_state, /* generation */ 0, /* auth_token */ {});
+    initial_state.config_loaded = true;
     state.set(std::make_unique<const CatalogState>(std::move(initial_state)));
 }
 
@@ -1321,47 +1270,13 @@ AccessToken RestCatalog::requestToken(Poco::URI url, const Poco::URI::QueryParam
 {
     String body;
 
-<<<<<<< HEAD
-    if (oauth_server_uri.empty() && !oauth_server_use_request_body)
-    {
-        url = Poco::URI(base_url / oauth_tokens_endpoint);
-
-        Poco::URI::QueryParameters params = {
-            {"grant_type", "client_credentials"},
-            {"scope", auth_scope},
-            {"client_secret", client_secret},
-        };
-        /// Snowflake Horizon OAuth uses secret-only credentials (PAT/JWT); omit empty client_id.
-        if (!client_id.empty())
-            params.emplace_back("client_id", client_id);
-=======
     if (use_query_parameters)
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
         url.setQueryParameters(params);
     else
     {
-<<<<<<< HEAD
-        String encoded_auth_scope;
-        String encoded_client_secret;
-        Poco::URI::encode(auth_scope, auth_scope, encoded_auth_scope);
-        Poco::URI::encode(client_secret, client_secret, encoded_client_secret);
-
-        body = fmt::format(
-            "grant_type=client_credentials&scope={}&client_secret={}",
-            encoded_auth_scope, encoded_client_secret);
-        if (!client_id.empty())
-        {
-            String encoded_client_id;
-            Poco::URI::encode(client_id, client_id, encoded_client_id);
-            body += "&client_id=" + encoded_client_id;
-        }
-        body_size = body.size();
-        out_stream_callback = [&](std::ostream & os)
-=======
         DB::WriteBufferFromOwnString wb;
         bool first = true;
         for (const auto & [name, value] : params)
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
         {
             if (!first)
                 wb << "&";
@@ -1391,34 +1306,46 @@ AccessToken RestCatalog::requestToken(Poco::URI url, const Poco::URI::QueryParam
     std::string json_str;
     Poco::StreamCopier::copyToString(rs, json_str);
 
-<<<<<<< HEAD
-    /// The body of a failed response is an OAuth error object, safe to show.
+    /// The body of a failed client credentials request is an OAuth error object, safe to show.
     /// The URL is omitted: its query string can carry `client_secret`.
-    if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK)
+    const bool has_subject_token = std::ranges::any_of(params, [](const auto & param) { return param.first == "subject_token"; });
+    if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK && !has_subject_token)
         throw DB::Exception(
             DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
             "OAuth token request failed with status {} ({}): {}",
             static_cast<int>(response.getStatus()), response.getReason(), json_str);
 
-    Poco::JSON::Parser parser;
-    Poco::Dynamic::Var res_json = parser.parse(json_str);
-    const Poco::JSON::Object::Ptr & object = res_json.extract<Poco::JSON::Object::Ptr>();
+    /// OAuth error bodies of a token exchange may echo the subject token, so exclude them from exceptions.
+    const auto describe_endpoint = [&url, &response]
+    {
+        return fmt::format(
+            "OAuth token endpoint {}://{}:{}{} returned HTTP {}",
+            url.getScheme(), url.getHost(), url.getPort(), url.getPath(),
+            static_cast<int>(response.getStatus()));
+    };
 
-    if (!object->has("access_token"))
+    Poco::JSON::Object::Ptr object;
+    try
+    {
+        object = Poco::JSON::Parser().parse(json_str).extract<Poco::JSON::Object::Ptr>();
+    }
+    catch (const Poco::Exception &)
+    {
+        object = nullptr;
+    }
+    if (!object)
         throw DB::Exception(
-            DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
-            "OAuth token response has no `access_token` field: {}",
-            json_str);
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "{} with a body that is not a JSON object", describe_endpoint());
 
     AccessToken token;
-    token.token = object->getValue<String>("access_token");
+    if (!object->has("access_token"))
+        throw DB::Exception(
+            DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "{} with no `access_token` field", describe_endpoint());
+    token.token = object->get("access_token").extract<String>();
 
     if (object->has("expires_in"))
     {
-        Int64 expires_in = object->getValue<Int64>("expires_in");
-        /// Use 90% of the token lifetime as the validity window so that short-lived tokens
-        /// (e.g. expires_in=300) still get a sensible buffer instead of going non-positive.
-        token.expires_at = std::chrono::system_clock::now() + std::chrono::seconds(expires_in * 9 / 10);
+        token.expires_at = tokenExpiresAt(object->getValue<Int64>("expires_in"));
     }
 
     return token;
@@ -1520,44 +1447,14 @@ AccessToken OneLakeCatalog::retrieveAccessTokenViaRefreshToken(const CatalogStat
     Poco::JSON::Parser parser;
     Poco::Dynamic::Var res_json = parser.parse(json_str);
     const Poco::JSON::Object::Ptr & object = res_json.extract<Poco::JSON::Object::Ptr>();
-=======
-    /// OAuth error bodies may echo the subject token, so exclude them from exceptions.
-    const auto describe_endpoint = [&url, &response]
-    {
-        return fmt::format(
-            "OAuth token endpoint {}://{}:{}{} returned HTTP {}",
-            url.getScheme(), url.getHost(), url.getPort(), url.getPath(),
-            static_cast<int>(response.getStatus()));
-    };
-
-    Poco::JSON::Object::Ptr object;
-    try
-    {
-        object = Poco::JSON::Parser().parse(json_str).extract<Poco::JSON::Object::Ptr>();
-    }
-    catch (const Poco::Exception &)
-    {
-        object = nullptr;
-    }
-    if (!object)
-        throw DB::Exception(
-            DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "{} with a body that is not a JSON object", describe_endpoint());
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     AccessToken token;
-    if (!object->has("access_token"))
-        throw DB::Exception(
-            DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "{} with no `access_token` field", describe_endpoint());
     token.token = object->get("access_token").extract<String>();
 
     if (object->has("expires_in"))
     {
-<<<<<<< HEAD
         Int64 expires_in = object->getValue<Int64>("expires_in");
         token.expires_at = std::chrono::system_clock::now() + std::chrono::seconds(expires_in * 9 / 10);
-=======
-        token.expires_at = tokenExpiresAt(object->getValue<Int64>("expires_in"));
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     }
 
     /// The response also carries a rotated `refresh_token`. It is deliberately ignored:
@@ -1572,12 +1469,14 @@ AccessToken RestCatalog::retrieveAccessToken(const std::string & client_id, cons
 {
     static constexpr auto oauth_tokens_endpoint = "oauth/tokens";
 
-    const Poco::URI::QueryParameters params = {
+    Poco::URI::QueryParameters params = {
         {"grant_type", "client_credentials"},
         {"scope", auth_scope},
-        {"client_id", client_id},
         {"client_secret", client_secret},
     };
+    /// Snowflake Horizon OAuth uses secret-only credentials (PAT/JWT); omit empty client_id.
+    if (!client_id.empty())
+        params.emplace_back("client_id", client_id);
     const auto url = oauth_server_uri.empty() ? Poco::URI(base_url / oauth_tokens_endpoint) : Poco::URI(oauth_server_uri);
 
     ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
@@ -1628,14 +1527,7 @@ BigLakeCatalog::BigLakeCatalog(
     state.set(std::make_unique<const CatalogState>(std::move(initial_state)));
 }
 
-<<<<<<< HEAD
-DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
-    const CatalogState & catalog_state,
-    bool update_token,
-    bool * used_cached_oauth_token) const
-=======
 DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(const AuthContext & auth_context) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 {
     /// Google Cloud OAuth2 for BigLake.
     /// Uses GCP metadata service or Application Default Credentials to get access token.
@@ -1674,11 +1566,7 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(const AuthContext & auth_co
         return headers;
     }
 
-<<<<<<< HEAD
-    return RestCatalog::getAuthHeaders(catalog_state, update_token, used_cached_oauth_token);
-=======
     return RestCatalog::getAuthHeaders(auth_context);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 }
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() const
@@ -1842,9 +1730,6 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
 
     auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
     {
-<<<<<<< HEAD
-        auto result_headers = auth_headers ? *auth_headers : getAuthHeaders(catalog_state, update_token, &used_cached_oauth_token);
-=======
         AuthContext auth_context{
             .catalog_state = catalog_state,
             .generation = generation,
@@ -1857,7 +1742,6 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
             .used_cached_oauth_token = &used_cached_oauth_token,
         };
         auto result_headers = auth_headers ? *auth_headers : getAuthHeaders(auth_context);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
         std::move(headers.begin(), headers.end(), std::back_inserter(result_headers));
 
         return DB::BuilderRWBufferFromHTTP(url)
@@ -1928,11 +1812,7 @@ bool RestCatalog::empty(const DB::ForwardedAuthTokenPtr & auth_token) const
     return !found_table;
 }
 
-<<<<<<< HEAD
-CatalogTables RestCatalog::getTables() const
-=======
-DB::Names RestCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables RestCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     loadConfigIfNeeded(auth_token);
 
@@ -1992,22 +1872,17 @@ RestCatalog::Namespaces RestCatalog::getNamespaces(const DB::ForwardedAuthTokenP
     return namespaces;
 }
 
-<<<<<<< HEAD
-CatalogTables RestCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
+CatalogTables RestCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
+    loadConfigIfNeeded(auth_token);
+
     /// A REST catalog is Iceberg-only, so every listed table is readable.
     CatalogTables result;
-    auto names = listTablesInNamespace(namespace_name);
+    auto names = listTablesInNamespace(namespace_name, auth_token);
     result.reserve(names.size());
     for (auto & name : names)
         result.push_back(CatalogTable{.name = std::move(name)});
     return result;
-=======
-DB::Names RestCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const
-{
-    loadConfigIfNeeded(auth_token);
-    return listTablesInNamespace(namespace_name, auth_token);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 }
 
 void RestCatalog::getNamespacesRecursive(
@@ -2047,16 +1922,10 @@ void RestCatalog::getNamespacesRecursive(
             }
         }
 
-<<<<<<< HEAD
         if (!hasFlatNamespaces())
-=======
-        if (allowed_namespaces.isNamespaceAllowed(current_namespace, /*nested*/ true))
-            getNamespacesRecursive(current_namespace, result, stop_condition, func, auth_token);
-        else
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
         {
             if (allowed_namespaces.isNamespaceAllowed(current_namespace, /*nested*/ true))
-                getNamespacesRecursive(current_namespace, result, stop_condition, func);
+                getNamespacesRecursive(current_namespace, result, stop_condition, func, auth_token);
             else
             {
                 LOG_DEBUG(log, "Nested namespaces in namespace {} are filtered", current_namespace);
@@ -2081,7 +1950,6 @@ Poco::URI::QueryParameters RestCatalog::createParentNamespaceParams(const std::s
     return {{"parent", parent_param}};
 }
 
-<<<<<<< HEAD
 bool RestCatalog::hasFlatNamespaces() const
 {
     /// Catalogs whose namespaces are single-level and which ignore or reject the `parent` filter when
@@ -2096,10 +1964,7 @@ bool RestCatalog::hasFlatNamespaces() const
         || type == DB::DatabaseDataLakeCatalogType::S3_TABLES;
 }
 
-RestCatalog::Namespaces RestCatalog::listChildNamespaces(const std::string & base_namespace) const
-=======
 RestCatalog::Namespaces RestCatalog::listChildNamespaces(const std::string & base_namespace, const DB::ForwardedAuthTokenPtr & auth_token) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 {
     const auto state_snapshot = getStateSnapshot();
 
@@ -2130,11 +1995,8 @@ RestCatalog::Namespaces RestCatalog::listChildNamespaces(const std::string & bas
             ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetNamespaces);
             auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetNamespacesMicroseconds);
             auto buf = createReadBuffer(
-<<<<<<< HEAD
-                *state_snapshot, state_snapshot->config.prefix / NAMESPACES_ENDPOINT, params, /* headers */ {}, /* auth_headers */ std::nullopt);
-=======
-                *state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / NAMESPACES_ENDPOINT, auth_token, params);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+                *state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / NAMESPACES_ENDPOINT, auth_token, params,
+                /* headers */ {}, /* auth_headers */ std::nullopt);
             String next_page_token;
             auto page_namespaces = parseNamespaces(*buf, base_namespace, next_page_token);
             LOG_DEBUG(
@@ -2299,12 +2161,9 @@ DB::Names RestCatalog::listTablesInNamespace(const std::string & base_namespace,
 
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetTables);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetTablesMicroseconds);
-<<<<<<< HEAD
         auto buf = createReadBuffer(
-            *state_snapshot, state_snapshot->config.prefix / endpoint, params, /* headers */ {}, /* auth_headers */ std::nullopt);
-=======
-        auto buf = createReadBuffer(*state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / endpoint, auth_token, params);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+            *state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / endpoint, auth_token, params,
+            /* headers */ {}, /* auth_headers */ std::nullopt);
 
         /// Pass through the remaining limit so that single-page short-circuiting still works
         /// when the caller is in `empty()` (limit=1) and the first page already contains a row.
@@ -2570,11 +2429,8 @@ bool RestCatalog::getTableMetadataImpl(
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetTableMetadata);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetTableMetadataMicroseconds);
         auto buf = createReadBuffer(
-<<<<<<< HEAD
-            *state_snapshot, state_snapshot->config.prefix / endpoint, /* params */ {}, headers, /* auth_headers */ std::nullopt);
-=======
-            *state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / endpoint, auth_token, /* params */{}, headers);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+            *state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / endpoint, auth_token, /* params */ {}, headers,
+            /* auth_headers */ std::nullopt);
 
         if (buf->eof())
         {
@@ -2653,11 +2509,7 @@ bool RestCatalog::getTableMetadataImpl(
             if (parsed.credentials)
             {
                 result.setStorageCredentials(parsed.credentials);
-<<<<<<< HEAD
-                cacheCredentials(namespace_name, table_name, parsed, state_snapshot);
-=======
-                cacheCredentials(credentials_key, parsed);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+                cacheCredentials(credentials_key, parsed, state_snapshot.state);
             }
             if (!parsed.endpoint.empty())
                 result.setEndpoint(parsed.endpoint);
@@ -2711,22 +2563,18 @@ void RestCatalog::sendRequest(
 
     auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
     {
-<<<<<<< HEAD
-        DB::HTTPHeaderEntries headers = getAuthHeaders(catalog_state, update_token, &used_cached_oauth_token);
-=======
         AuthContext auth_context{
             .catalog_state = catalog_state,
             .generation = generation,
             .update_token = update_token,
             .method = method,
             .url = url,
-            .extra_headers = extra_headers,
+            .extra_headers = {},
             .body = body_str,
             .auth_token = auth_token,
             .used_cached_oauth_token = &used_cached_oauth_token,
         };
         DB::HTTPHeaderEntries headers = getAuthHeaders(auth_context);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
         headers.emplace_back("Content-Type", "application/json");
         headers.emplace_back("X-Iceberg-Access-Delegation", "vended-credentials");
         return DB::BuilderRWBufferFromHTTP(url)
@@ -2814,11 +2662,9 @@ void RestCatalog::createNamespaceIfNotExists(const String & namespace_name, cons
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogCreateNamespace);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogCreateNamespaceMicroseconds);
-<<<<<<< HEAD
-        sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
-=======
-        sendRequest(*state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        sendRequest(
+            *state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token,
+            Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
     }
     catch (const DB::HTTPException & e)
     {
@@ -2887,11 +2733,9 @@ bool RestCatalog::createTable(
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogCreateTable);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogCreateTableMicroseconds);
-<<<<<<< HEAD
-        sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
-=======
-        sendRequest(*state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        sendRequest(
+            *state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token,
+            Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
     }
     catch (const DB::HTTPException & ex)
     {
@@ -2923,11 +2767,9 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
     {
         ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUpdateTable);
         auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogUpdateTableMicroseconds);
-<<<<<<< HEAD
-        sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
-=======
-        sendRequest(*state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        sendRequest(
+            *state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token,
+            Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
     }
     catch (const DB::HTTPException & ex)
     {
@@ -2971,11 +2813,9 @@ bool RestCatalog::updateSchema(
 
     try
     {
-<<<<<<< HEAD
-        sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
-=======
-        sendRequest(*state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        sendRequest(
+            *state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token,
+            Poco::Net::HTTPRequest::HTTP_POST, /* ignore_result */ false);
     }
     catch (const DB::HTTPException & ex)
     {
@@ -3169,12 +3009,7 @@ std::optional<VendedStorageCredentials> RestCatalog::tryGetCachedCredentials(con
     if (vended_credentials_cache_ttl <= std::chrono::seconds::zero())
         return std::nullopt;
 
-<<<<<<< HEAD
-    auto it = credentials_cache.find({namespace_name, table_name});
-=======
-    std::lock_guard lock(credentials_cache_mutex);
     auto it = credentials_cache.find(key);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     if (it == credentials_cache.end())
         return std::nullopt;
     if (std::chrono::system_clock::now() >= it->second.expires_at.value())
@@ -3186,15 +3021,10 @@ std::optional<VendedStorageCredentials> RestCatalog::tryGetCachedCredentials(con
     return it->second;
 }
 
-<<<<<<< HEAD
 void RestCatalog::cacheCredentials(
-    const std::string & namespace_name,
-    const std::string & table_name,
+    const CredentialsCacheKey & key,
     const VendedStorageCredentials & parsed,
     const CatalogStateVersion & state_snapshot) const
-=======
-void RestCatalog::cacheCredentials(const CredentialsCacheKey & key, const VendedStorageCredentials & parsed) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 {
     if (!parsed.credentials || parsed.credentials->isEmpty())
         return;
@@ -3217,10 +3047,6 @@ void RestCatalog::cacheCredentials(const CredentialsCacheKey & key, const Vended
 
     if (credentials_cache.size() >= credentials_cache_cleanup_threshold)
         std::erase_if(credentials_cache, [&now](const auto & entry) { return now >= entry.second.expires_at.value(); });
-<<<<<<< HEAD
-    credentials_cache[{namespace_name, table_name}]
-        = VendedStorageCredentials{parsed.credentials, parsed.endpoint, refresh_after, parsed.table_uuid, parsed.location};
-=======
 
     while (credentials_cache.size() >= credentials_cache_max_entries)
     {
@@ -3232,8 +3058,7 @@ void RestCatalog::cacheCredentials(const CredentialsCacheKey & key, const Vended
     }
 
     credentials_cache[key]
-        = VendedStorageCredentials{parsed.credentials, parsed.endpoint, refresh_after, parsed.table_uuid};
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        = VendedStorageCredentials{parsed.credentials, parsed.endpoint, refresh_after, parsed.table_uuid, parsed.location};
 }
 
 ICatalog::CredentialsRefreshCallback RestCatalog::getCredentialsConfigurationCallback(
@@ -3256,11 +3081,8 @@ ICatalog::CredentialsRefreshCallback RestCatalog::getCredentialsConfigurationCal
             ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogGetCredentials);
             auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogGetCredentialsMicroseconds);
             auto buf = createReadBuffer(
-<<<<<<< HEAD
-                *state_snapshot, state_snapshot->config.prefix / endpoint, /* params */ {}, headers, /* auth_headers */ std::nullopt);
-=======
-                *state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / endpoint, auth_token, /* params */{}, headers);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+                *state_snapshot, state_snapshot.generation, state_snapshot->config.prefix / endpoint, auth_token, /* params */ {}, headers,
+                /* auth_headers */ std::nullopt);
 
             if (buf->eof())
             {
@@ -3305,17 +3127,11 @@ ICatalog::CredentialsRefreshCallback RestCatalog::getCredentialsConfigurationCal
         }
 
         auto parsed = getCredentialsAndEndpoint(config_object, location);
-<<<<<<< HEAD
         parsed.table_uuid = table_uuid;
         parsed.location = location;
-        cacheCredentials(namespace_name, table_name, parsed, state_snapshot);
-=======
-        if (metadata_object)
-            parsed.table_uuid = parseTableUuid(metadata_object);
-        /// Refresh the per-table cache so subsequent queries reuse these freshly vended credentials.
         cacheCredentials(
-            {state_snapshot.generation, getCredentialsCachePrincipal(auth_token), namespace_name, table_name}, parsed);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+            {state_snapshot.generation, getCredentialsCachePrincipal(auth_token), namespace_name, table_name}, parsed,
+            state_snapshot.state);
         return parsed.credentials;
     };
 }

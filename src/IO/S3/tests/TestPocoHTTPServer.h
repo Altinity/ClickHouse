@@ -16,11 +16,7 @@
 #include <Poco/URI.h>
 #include <Poco/AutoPtr.h>
 #include <Poco/SharedPtr.h>
-<<<<<<< HEAD
-=======
 #include <Poco/StreamCopier.h>
-#include <Poco/ThreadPool.h>
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 #include <fmt/format.h>
 
 /// Keep-alive is disabled so a handler thread exits right after sending the response: it does

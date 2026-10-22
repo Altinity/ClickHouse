@@ -136,16 +136,10 @@ S3TablesCatalog::S3TablesCatalog(
     state.set(std::make_unique<const CatalogState>(std::move(initial_state)));
 }
 
-<<<<<<< HEAD
 /// S3 Tables only supports a single level of namespaces (no nesting), so we list the root
 /// namespaces directly with `listChildNamespaces("")` instead of the base class's recursive
 /// `getNamespacesRecursive`.
-CatalogTables S3TablesCatalog::getTables() const
-=======
-/// S3 Tables only supports a single level of namespaces (no nesting),
-/// so we use flat listChildNamespaces() instead of the base class's getNamespacesRecursive().
-DB::Names S3TablesCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables S3TablesCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     auto namespaces = listChildNamespaces("", auth_token);
 
@@ -159,11 +153,7 @@ DB::Names S3TablesCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_toke
         runner.enqueueAndKeepTrack(
             [&, ns]
             {
-<<<<<<< HEAD
-                auto tables_in_ns = listTablesInNamespace(ns);
-=======
-                auto tables_in_ns = RestCatalog::listTablesInNamespace(ns, auth_token);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+                auto tables_in_ns = listTablesInNamespace(ns, auth_token);
                 std::lock_guard lock(mutex);
                 std::move(tables_in_ns.begin(), tables_in_ns.end(), std::back_inserter(tables));
             });
@@ -225,19 +215,8 @@ bool S3TablesCatalog::tryGetTableMetadata(
         result.setEndpoint(endpoint);
     }
 
-<<<<<<< HEAD
     if (auto props = result.getDataLakeSpecificProperties();
         props && !props->iceberg_metadata_file_location.empty())
-=======
-    return true;
-}
-
-ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfigurationCallback(
-    const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token)
-{
-    auto base_cb = RestCatalog::getCredentialsConfigurationCallback(storage_id, auth_token);
-    return [this, base_callback = std::move(base_cb)] () -> std::shared_ptr<IStorageCredentials>
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     {
         const String & loc = props->iceberg_metadata_file_location;
         auto scheme_end = loc.find("://");
@@ -281,15 +260,9 @@ void S3TablesCatalog::dropTable(
     Poco::JSON::Object::Ptr request_body = nullptr;
     try
     {
-<<<<<<< HEAD
-        sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_DELETE, true);
-        LOG_INFO(log, "S3 Tables: dropped table {}.{} (purgeRequested=True)", namespace_name, table_name);
-=======
-        ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogDropTable);
-        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogDropTableMicroseconds);
         sendRequest(
             *state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token, Poco::Net::HTTPRequest::HTTP_DELETE, true);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        LOG_INFO(log, "S3 Tables: dropped table {}.{} (purgeRequested=True)", namespace_name, table_name);
     }
     catch (const DB::HTTPException & ex)
     {
@@ -302,17 +275,8 @@ void S3TablesCatalog::dropTable(
     }
 }
 
-<<<<<<< HEAD
 namespace
 {
-=======
-DB::HTTPHeaderEntries S3TablesCatalog::getAuthHeaders(const AuthContext & auth_context) const
-{
-    DB::HTTPHeaderEntries all_signed;
-    signRequestWithAWSV4(
-        auth_context.method, auth_context.url, auth_context.extra_headers, auth_context.body,
-        *signer, region, "s3tables", all_signed);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
 /// `signRequestWithAWSV4` returns the full set of headers that the AWS SDK kept on
 /// the signed request (input headers + signed auth). We only want the SigV4-specific
@@ -343,7 +307,9 @@ DB::HTTPHeaderEntries extractSigV4AuthHeaders(DB::HTTPHeaderEntries && all_signe
 
 DB::ReadWriteBufferFromHTTPPtr S3TablesCatalog::createReadBuffer(
     const CatalogState & /* catalog_state */,
+    UInt64 /* generation */,
     const std::string & endpoint,
+    const DB::ForwardedAuthTokenPtr & /* auth_token */,
     const Poco::URI::QueryParameters & params,
     const DB::HTTPHeaderEntries & headers,
     const std::optional<DB::HTTPHeaderEntries> & /* auth_headers */) const
@@ -379,8 +345,10 @@ DB::ReadWriteBufferFromHTTPPtr S3TablesCatalog::createReadBuffer(
 
 void S3TablesCatalog::sendRequest(
     const CatalogState & /* catalog_state */,
+    UInt64 /* generation */,
     const String & endpoint,
     Poco::JSON::Object::Ptr request_body,
+    const DB::ForwardedAuthTokenPtr & /* auth_token */,
     const String & method,
     bool ignore_result) const
 {

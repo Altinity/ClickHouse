@@ -43,11 +43,7 @@ public:
 
     bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-<<<<<<< HEAD
-    CatalogTables getTables() const override;
-=======
-    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    CatalogTables getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
@@ -148,17 +144,10 @@ private:
 
     bool isNamespaceAllowed(const std::string & namespace_) const;
 
-<<<<<<< HEAD
-    DataLake::ICatalog::Namespaces getDatabases(const std::string & prefix, size_t limit = 0) const;
-    CatalogTables getTablesForDatabase(const std::string & db_name, size_t limit = 0) const;
-    CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name) const override;
-    void setCredentials(TableMetadata & metadata) const;
-=======
     DataLake::ICatalog::Namespaces getDatabases(const AuthenticatedClient & client, const std::string & prefix, size_t limit = 0) const;
-    DB::Names getTablesForDatabase(const AuthenticatedClient & client, const std::string & db_name, size_t limit = 0) const;
-    DB::Names listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
+    CatalogTables getTablesForDatabase(const AuthenticatedClient & client, const std::string & db_name, size_t limit = 0) const;
+    CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
     void setCredentials(const AuthenticatedClient & client, TableMetadata & metadata) const;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     /// The Glue catalog does not store detailed information about the types of timestamp columns, such as whether the column is timestamp or timestamptz.
     /// This method allows to clarify the actual type of the timestamp column.

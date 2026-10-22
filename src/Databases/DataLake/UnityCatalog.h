@@ -29,11 +29,7 @@ public:
 
     bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-<<<<<<< HEAD
-    CatalogTables getTables() const override;
-=======
-    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    CatalogTables getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
@@ -74,13 +70,8 @@ private:
 
     DataLake::ICatalog::Namespaces getSchemas(const std::string & base_prefix, size_t limit = 0) const;
 
-<<<<<<< HEAD
     CatalogTables getTablesForSchema(const std::string & schema, size_t limit = 0) const;
-    CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name) const override;
-=======
-    DB::Names getTablesForSchema(const std::string & schema, size_t limit = 0) const;
-    DB::Names listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
     void getCredentials(const String & table_id, TableMetadata & metadata) const;
 
     Poco::JSON::Object::Ptr requestCredentials(const String & table_id, const String & operation) const;
@@ -93,16 +84,12 @@ private:
         const std::string & table_name,
         TableMetadata & result) const;
 
-<<<<<<< HEAD
-    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & table_id) override;
+    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & table_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
 
     ICatalog::CredentialsRefreshCallback getWriteCredentialsConfigurationCallback(const DB::StorageID & table_id) override;
 
     ICatalog::CredentialsRefreshCallback getCredentialsCallbackForOperation(const String & unity_table_id, const String & operation);
-=======
-    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
-        const DB::StorageID & table_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 };
 
 }

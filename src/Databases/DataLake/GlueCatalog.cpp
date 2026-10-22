@@ -215,7 +215,6 @@ namespace DataLake
 namespace
 {
 
-<<<<<<< HEAD
 /// A Glue table is readable only if it is an Iceberg table. `table_type` is available in
 /// both the bulk `GetTables` listing and `tryGetTableMetadata`, so the two stay consistent.
 bool isReadableGlueTable(const Aws::Glue::Model::Table & table)
@@ -224,7 +223,8 @@ bool isReadableGlueTable(const Aws::Glue::Model::Table & table)
     auto it = parameters.find("table_type");
     const std::string table_type = it != parameters.end() ? it->second : "";
     return Poco::toUpper(table_type) == "ICEBERG";
-=======
+}
+
 /// STS `RoleSessionName`: 2-64 characters matching `[\w+=,.@-]*`.
 /// If the principal does not fit as is, a hash of the full principal is appended to keep names of different principals distinct.
 std::string makeRoleSessionName(const std::string & principal)
@@ -245,7 +245,6 @@ std::string makeRoleSessionName(const std::string & principal)
 
     std::string readable = sanitized.empty() ? "ClickHouseUser" : sanitized.substr(0, max_length - hash_suffix_length);
     return readable + "-" + getHexUIntLowercase(sipHash64(principal));
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 }
 
 }
@@ -478,11 +477,7 @@ DataLake::ICatalog::Namespaces GlueCatalog::getDatabases(const AuthenticatedClie
     return result;
 }
 
-<<<<<<< HEAD
-CatalogTables GlueCatalog::getTablesForDatabase(const std::string & db_name, size_t limit) const
-=======
-DB::Names GlueCatalog::getTablesForDatabase(const AuthenticatedClient & client, const std::string & db_name, size_t limit) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables GlueCatalog::getTablesForDatabase(const AuthenticatedClient & client, const std::string & db_name, size_t limit) const
 {
     LOG_TEST(log, "Getting tables for database '{}' with limit {}", db_name, limit);
     CatalogTables result;
@@ -545,18 +540,11 @@ DB::Names GlueCatalog::getTablesForDatabase(const AuthenticatedClient & client, 
     return result;
 }
 
-<<<<<<< HEAD
-CatalogTables GlueCatalog::getTables() const
-{
-    auto databases = getDatabases("");
-    CatalogTables result;
-=======
-DB::Names GlueCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) const
+CatalogTables GlueCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     auto client = getClient(auth_token);
     auto databases = getDatabases(client, "");
-    DB::Names result;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    CatalogTables result;
     for (const auto & database : databases)
     {
         auto tables_in_database = getTablesForDatabase(client, database);
@@ -571,27 +559,14 @@ DataLake::ICatalog::Namespaces GlueCatalog::getNamespaces(const DB::ForwardedAut
     return getDatabases(getClient(auth_token), "");
 }
 
-<<<<<<< HEAD
-CatalogTables GlueCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
-=======
-DB::Names GlueCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables GlueCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     return getTablesForDatabase(getClient(auth_token), namespace_name);
 }
 
 bool GlueCatalog::existsTable(const std::string & database_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-<<<<<<< HEAD
-    if (!isNamespaceAllowed(database_name))
-        throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", database_name);
-
-    TableMetadata metadata;
-    return tryGetTableMetadata(database_name, table_name, getContext(), metadata);
-}
-=======
     auto client = getClient(auth_token);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     if (!isNamespaceAllowed(database_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", database_name);
@@ -866,16 +841,12 @@ String GlueCatalog::getActualTimestampType(
     const TableMetadata & table_metadata,
     const String & glue_column_type) const
 {
-<<<<<<< HEAD
     auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
     if (!table_specific_properties.has_value())
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Failed to read table metadata, reason why table is unreadable: {}", table_metadata.getReasonWhyTableIsUnreadable());
 
-    auto metadata_object = getOrFetchMetadataObject(table_specific_properties->iceberg_metadata_file_location, table_metadata);
+    auto metadata_object = getOrFetchMetadataObject(client, table_specific_properties->iceberg_metadata_file_location, table_metadata);
     return resolveTimestampTypeFromMetadata(metadata_object, column_name, glue_column_type);
-=======
-    return resolveTimestampTypeFromMetadata(getIcebergMetadataObject(client, table_metadata), column_name, glue_column_type);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 }
 
 Poco::JSON::Object::Ptr GlueCatalog::getIcebergMetadataObject(const AuthenticatedClient & client, const TableMetadata & table_metadata) const

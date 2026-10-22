@@ -409,9 +409,6 @@ DB::SettingsChanges CatalogSettings::allChanged() const
     return changes;
 }
 
-<<<<<<< HEAD
-CatalogTables ICatalog::getTables(const TableNameFilter & filter) const
-=======
 void ICatalog::validateForwardedToken(
     const DB::ContextPtr & context, const DB::ForwardedAuthTokenPtr & auth_token, const std::string & catalog_description) const
 {
@@ -434,8 +431,7 @@ void ICatalog::validateForwardedToken(
             catalog_description);
 }
 
-DB::Names ICatalog::getTables(const TableNameFilter & filter, const DB::ForwardedAuthTokenPtr & auth_token) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables ICatalog::getTables(const TableNameFilter & filter, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     switch (filter.kind)
     {
@@ -469,13 +465,8 @@ DB::Names ICatalog::getTables(const TableNameFilter & filter, const DB::Forwarde
             if (fixed_prefix.empty())
                 return getTables(auth_token);
 
-<<<<<<< HEAD
             CatalogTables result;
-            for (const auto & namespace_name : getNamespaces())
-=======
-            DB::Names result;
             for (const auto & namespace_name : getNamespaces(auth_token))
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
             {
                 const std::string namespace_prefix = namespace_name + ".";
                 if (!startsWith(namespace_prefix, fixed_prefix) && !startsWith(fixed_prefix, namespace_prefix))

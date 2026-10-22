@@ -118,11 +118,7 @@ bool UnityCatalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
     return true;
 }
 
-<<<<<<< HEAD
-CatalogTables UnityCatalog::getTables() const
-=======
-DB::Names UnityCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables UnityCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     CatalogTables result;
 
@@ -142,11 +138,7 @@ DataLake::ICatalog::Namespaces UnityCatalog::getNamespaces(const DB::ForwardedAu
     return getSchemas("");
 }
 
-<<<<<<< HEAD
-CatalogTables UnityCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
-=======
-DB::Names UnityCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables UnityCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     return getTablesForSchema(namespace_name);
 }
@@ -546,13 +538,8 @@ bool UnityCatalog::isNamespaceAllowed(const std::string & namespace_) const
     return allowed_namespaces.contains("*") || allowed_namespaces.contains(namespace_);
 }
 
-<<<<<<< HEAD
-ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(const DB::StorageID & table_id)
-=======
-/// getCredentialsConfigurationCallback method is supported only for S3 storage
 ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(
     const DB::StorageID & table_id, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 {
     if (!table_id.hasUUID())
         throw DB::Exception(

@@ -411,19 +411,14 @@ void Session::authenticate(const Credentials & credentials_, const Poco::Net::So
     chassert(!auth_result.user_name.empty());
     prepared_client_info->current_user = auth_result.user_name;
     prepared_client_info->authenticated_user = auth_result.user_name;
-<<<<<<< HEAD
     prepared_client_info->current_address = Poco::Net::SocketAddress(address);
     prepared_client_info->connection_address = Poco::Net::SocketAddress(connection_address ? *connection_address : address);
-=======
-    prepared_client_info->current_address = std::make_shared<Poco::Net::SocketAddress>(address);
-    prepared_client_info->connection_address = std::make_shared<Poco::Net::SocketAddress>(connection_address ? *connection_address : address);
 
     if (const auto * token_credentials = typeid_cast<const TokenCredentials *>(&credentials_))
     {
         if (global_context->getAccessControl().isTokenForwardingEnabled())
             forwarded_auth_token = makeForwardedAuthToken(*token_credentials, auth_result.user_name);
     }
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 }
 
 void Session::checkIfUserIsStillValid() const

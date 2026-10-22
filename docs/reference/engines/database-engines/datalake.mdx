@@ -55,25 +55,16 @@ The following settings are supported:
 | `storage_endpoint`      | Endpoint URL for the underlying storage                                                 |
 | `oauth_server_uri`      | URI of the OAuth2 authorization server for authentication                               |
 | `vended_credentials`    | Boolean indicating whether to use vended credentials from the catalog (supports AWS S3 and Azure ADLS Gen2) |
-<<<<<<< HEAD:docs/reference/engines/database-engines/datalake.mdx
 | `aws_access_key_id`     | AWS access key ID for S3/Glue access (if not using vended credentials)                  |
 | `aws_secret_access_key` | AWS secret access key for S3/Glue access (if not using vended credentials)              |
 | `aws_role_arn`          | ARN of the IAM role to assume for AWS/Glue access. When set, ClickHouse uses AWS STS `AssumeRole` with base credentials from `aws_access_key_id` and `aws_secret_access_key` when both are provided, or from the default AWS credential chain otherwise (the role must trust the identity the server runs under). |
 | `aws_role_session_name` | Session name used for the AWS STS `AssumeRole` call. Optional; defaults to `ClickHouseSession`. |
 | `aws_external_id`       | External ID passed to AWS STS `AssumeRole`, matching the `sts:ExternalId` condition on the role's trust policy. Use this when the role is owned by a third party, such as ClickHouse Cloud. |
 | `region`                | AWS region for the service (e.g., `us-east-1`)                                          |
+| `aws_sts_endpoint`      | Custom AWS STS endpoint for Glue role assumption                                               |
 | `dlf_access_key_id`     | Access key ID for DLF access                                                            |
 | `dlf_access_key_secret` | Access key Secret for DLF access                                                        |
 | `force_add_bucket`      | When constructing object-storage URLs from the catalog-provided table location and `storage_endpoint`, prepend the bucket/container name even if the endpoint already contains it. Default: `false`. Set to `true` for catalogs that hand back paths without the bucket and require it to be added at the URL-construction step (Polaris-style paths). |
-=======
-| `vended_credentials_cache_ttl` | Maximum cache entry lifetime (in seconds) for vended credentials (REST catalogs only). Default `300`; `0` disables caching. |
-| `aws_access_key_id`     | AWS access key ID for S3/Glue access (if not using vended credentials)                        |
-| `aws_secret_access_key` | AWS secret access key for S3/Glue access (if not using vended credentials)                    |
-| `region`                | AWS region for the service (e.g., `us-east-1`)                                                |
-| `aws_sts_endpoint`      | Custom AWS STS endpoint for Glue role assumption                                               |
-| `dlf_access_key_id`     | Access key ID for DLF access                                                                  |
-| `dlf_access_key_secret` | Access key Secret for DLF access                                                              |
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake):docs/en/engines/database-engines/datalake.md
 | `namespaces`            | Comma-separated list of namespaces, implemented for catalog types: `rest`, `glue` and `unity` |
 | `oauth_forward_user_token` | Authenticate to the catalog as the user running the query instead of as the shared service identity. Iceberg REST and Glue only. See [Forwarding the user's identity to the catalog](#user-token-forwarding) |
 | `oauth_token_exchange_uri` | Empty (the default) forwards the user's token unchanged; non-empty performs an RFC 8693 token exchange at this URL first |

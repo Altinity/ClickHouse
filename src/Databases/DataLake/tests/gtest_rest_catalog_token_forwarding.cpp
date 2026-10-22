@@ -108,8 +108,17 @@ std::shared_ptr<RestCatalog> makeCatalog(
         /* oauth_server_uri */ "",
         /* oauth_server_use_request_body */ true,
         /* namespaces */ "*",
+        /* flat_namespaces */ false,
         context,
         forwarding);
+}
+
+DB::Names tableNames(const CatalogTables & tables)
+{
+    DB::Names names;
+    for (const auto & table : tables)
+        names.push_back(table.name);
+    return names;
 }
 
 void loadTable(RestCatalog & catalog, const DB::ForwardedAuthTokenPtr & auth_token)
@@ -166,7 +175,7 @@ TEST_F(RestCatalogTokenForwarding, PassesUserTokenToCatalog)
     forwarding.forward_user_token = true;
     auto catalog = makeCatalog(server, context, forwarding);
 
-    ASSERT_EQ(catalog->getTables(makeToken()), DB::Names{"ns.t"});
+    ASSERT_EQ(tableNames(catalog->getTables(makeToken())), DB::Names{"ns.t"});
     for (const auto * path : {CONFIG_PATH, NAMESPACES_PATH, NS_TABLES_PATH})
     {
         const auto requests = server->requestsTo(path);
@@ -192,8 +201,8 @@ TEST_F(RestCatalogTokenForwarding, ExchangesAndCachesEachUserTokenSeparately)
     {
         auto auth_token = DB::makeForwardedAuthToken(DB::TokenCredentials(token), "alice");
         server->clearRequests();
-        ASSERT_EQ(catalog->getTables(auth_token), DB::Names{"ns.t"});
-        ASSERT_EQ(catalog->getTables(auth_token), DB::Names{"ns.t"});
+        ASSERT_EQ(tableNames(catalog->getTables(auth_token)), DB::Names{"ns.t"});
+        ASSERT_EQ(tableNames(catalog->getTables(auth_token)), DB::Names{"ns.t"});
 
         const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
         ASSERT_EQ(exchanges.size(), 1u);
@@ -250,7 +259,7 @@ TEST_F(RestCatalogTokenForwarding, RejectedConfigReloadDoesNotPublishPreparedUse
     auto alice = makeToken();
     auto context = makeQueryContext();
     auto catalog = makeCatalog(server, context, exchangeAt(server.getUrl() + IDP_TOKEN_PATH));
-    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    ASSERT_EQ(tableNames(catalog->getTables(alice)), DB::Names{"ns.t"});
     server->clearRequests();
     server->setRoute(CONFIG_PATH, [](const RecordedRequest &) { return respondWithStatus(403); });
 
@@ -260,7 +269,7 @@ TEST_F(RestCatalogTokenForwarding, RejectedConfigReloadDoesNotPublishPreparedUse
     ASSERT_EQ(server->countRequestsTo(CONFIG_PATH), 1u);
     EXPECT_EQ(server->requestsTo(CONFIG_PATH).front().header("Authorization"), "Bearer rotated_secret_session");
     EXPECT_EQ(server->countRequestsTo(CATALOG_TOKEN_PATH), 0u);
-    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    ASSERT_EQ(tableNames(catalog->getTables(alice)), DB::Names{"ns.t"});
     for (const auto & request : server->requestsTo(NAMESPACES_PATH))
         EXPECT_EQ(request.header("Authorization"), "Bearer secret_session");
 }
@@ -369,7 +378,7 @@ TEST_F(RestCatalogTokenForwarding, ConfigLoadDoesNotRollBackAConcurrentCredentia
     parked.release();
     in_flight.join();
 
-    ASSERT_EQ(catalog->getTables(alice), DB::Names{"ns.t"});
+    ASSERT_EQ(tableNames(catalog->getTables(alice)), DB::Names{"ns.t"});
 
     const auto exchanges = server->requestsTo(IDP_TOKEN_PATH);
     ASSERT_GE(exchanges.size(), 2u);

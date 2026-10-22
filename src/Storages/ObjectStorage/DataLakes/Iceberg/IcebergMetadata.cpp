@@ -1152,11 +1152,7 @@ void IcebergMetadata::createInitial(
         /// validation, so a rejected CREATE leaves no trace in the catalog): a catalog
         /// that shares its storage view with the data (e.g. SeaweedFS) refuses to create
         /// a namespace over the plain directory those files would leave behind.
-<<<<<<< HEAD
-        catalog->createNamespaceIfNotExists(namespace_name, /* location */ "");
-=======
-        catalog->createNamespaceIfNotExists(namespace_name, namespace_location, local_context->getForwardedAuthToken());
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        catalog->createNamespaceIfNotExists(namespace_name, /* location */ "", local_context->getForwardedAuthToken());
     }
 
     if (!catalog_writes_metadata)

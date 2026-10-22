@@ -402,9 +402,16 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 settings[DatabaseDataLakeSetting::namespaces].value,
-<<<<<<< HEAD
                 settings[DatabaseDataLakeSetting::flat_namespaces].value,
-                Context::getGlobalContextInstance());
+                Context::getGlobalContextInstance(),
+                DataLake::TokenForwardingConfig{
+                    .forward_user_token = settings[DatabaseDataLakeSetting::oauth_forward_user_token].value,
+                    .token_exchange_uri = settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value,
+                    .subject_token_type = settings[DatabaseDataLakeSetting::oauth_subject_token_type].value,
+                    .requested_token_type = settings[DatabaseDataLakeSetting::oauth_requested_token_type].value,
+                    .forward_actor_token = settings[DatabaseDataLakeSetting::oauth_forward_actor_token].value,
+                    .user_token_cache_ttl = settings[DatabaseDataLakeSetting::oauth_user_token_cache_ttl].value,
+                });
             break;
         }
         case DB::DatabaseDataLakeCatalogType::ICEBERG_DELTA_SHARING:
@@ -440,17 +447,6 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::namespaces].value,
                 settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
-=======
-                Context::getGlobalContextInstance(),
-                DataLake::TokenForwardingConfig{
-                    .forward_user_token = settings[DatabaseDataLakeSetting::oauth_forward_user_token].value,
-                    .token_exchange_uri = settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value,
-                    .subject_token_type = settings[DatabaseDataLakeSetting::oauth_subject_token_type].value,
-                    .requested_token_type = settings[DatabaseDataLakeSetting::oauth_requested_token_type].value,
-                    .forward_actor_token = settings[DatabaseDataLakeSetting::oauth_forward_actor_token].value,
-                    .user_token_cache_ttl = settings[DatabaseDataLakeSetting::oauth_user_token_cache_ttl].value,
-                });
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
             break;
         }
         case DB::DatabaseDataLakeCatalogType::ICEBERG_ONELAKE:
@@ -1097,7 +1093,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
             return std::nullopt;
         if (!with_vended_credentials && !catalog_manages_provider_chain)
             return std::nullopt;
-        return catalog->getCredentialsConfigurationCallback(storage_id);
+        return catalog->getCredentialsConfigurationCallback(storage_id, DataLake::getForwardedAuthToken(context_));
     };
 
     const auto catalog_uuid = table_metadata.getTableUUID();
@@ -1111,15 +1107,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     auto storage_cluster = std::make_shared<StorageObjectStorageCluster>(
         cluster_name,
         configuration,
-<<<<<<< HEAD
         configuration->createObjectStorage(context_copy, /* is_readonly */ false, get_credentials_refresh_callback(StorageID(getDatabaseName(), name, table_uuid))),
-=======
-        configuration->createObjectStorage(
-            context_copy,
-            /* is_readonly */ false,
-            catalog->getCredentialsConfigurationCallback(
-                StorageID(getDatabaseName(), name, table_uuid), DataLake::getForwardedAuthToken(context_))),
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
         StorageID(getDatabaseName(), name, table_uuid),
         /* columns */columns,
         /* constraints */ConstraintsDescription{},
@@ -1368,7 +1356,6 @@ void DatabaseDataLake::createTable(
     const auto compression_method_str = context_->getSettingsRef()[Setting::iceberg_metadata_compression_method].value;
     const auto compression_method = chooseCompressionMethod(compression_method_str, compression_method_str);
 
-<<<<<<< HEAD
     if (compression_method != CompressionMethod::None)
     {
         /// A catalog that writes the first metadata file itself reads the codec from this property.
@@ -1377,15 +1364,8 @@ void DatabaseDataLake::createTable(
         metadata_content->set("properties", properties);
     }
 
-    catalog->createNamespaceIfNotExists(namespace_name, /* location */ "");
-=======
-    /// The namespace's default location is the namespace base, not this first table's directory.
-    String namespace_location = location;
-    if (const String table_suffix = "/" + table_name; namespace_location.ends_with(table_suffix))
-        namespace_location.resize(namespace_location.size() - table_suffix.size());
     const auto auth_token = DataLake::getForwardedAuthToken(context_);
-    catalog->createNamespaceIfNotExists(namespace_name, namespace_location, auth_token);
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    catalog->createNamespaceIfNotExists(namespace_name, /* location */ "", auth_token);
 
     const bool created = catalog->createTable(
         namespace_name, table_name, /* metadata_path */ "", metadata_content, compression_method, create.if_not_exists, auth_token);
@@ -1457,11 +1437,7 @@ DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIteratorImpl(
             throw Exception(ErrorCodes::DATALAKE_DATABASE_ERROR, "Injected catalog listing failure");
         });
 
-<<<<<<< HEAD
-        catalog_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter));
-=======
-        iceberg_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter), DataLake::getForwardedAuthToken(context_));
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        catalog_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter), DataLake::getForwardedAuthToken(context_));
     }
     catch (...)
     {
@@ -1610,11 +1586,7 @@ std::vector<LightWeightTableDetails> DatabaseDataLake::getLightweightTablesItera
             throw Exception(ErrorCodes::DATALAKE_DATABASE_ERROR, "Injected catalog listing failure");
         });
 
-<<<<<<< HEAD
-        catalog_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter));
-=======
-        iceberg_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter), DataLake::getForwardedAuthToken(context_));
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+        catalog_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter), DataLake::getForwardedAuthToken(context_));
     }
     catch (...)
     {
@@ -1637,11 +1609,7 @@ std::vector<LightWeightTableDetails> DatabaseDataLake::getLightweightTablesItera
     return result;
 }
 
-<<<<<<< HEAD
-VectorWithMemoryTracking<String> DatabaseDataLake::getAllTableNames(ContextPtr /*context*/) const
-=======
-Strings DatabaseDataLake::getAllTableNames(ContextPtr context_) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+VectorWithMemoryTracking<String> DatabaseDataLake::getAllTableNames(ContextPtr context_) const
 {
     VectorWithMemoryTracking<String> result;
 
@@ -1650,8 +1618,7 @@ Strings DatabaseDataLake::getAllTableNames(ContextPtr context_) const
     /// must not fail even when the catalog is temporarily unreachable.
     try
     {
-<<<<<<< HEAD
-        DataLake::CatalogTables tables = getCatalog()->getTables();
+        DataLake::CatalogTables tables = getCatalog()->getTables(DataLake::getForwardedAuthToken(context_));
         result.reserve(tables.size());
         for (auto & table : tables)
         {
@@ -1660,9 +1627,6 @@ Strings DatabaseDataLake::getAllTableNames(ContextPtr context_) const
                 continue;
             result.push_back(std::move(table.name));
         }
-=======
-        result = getCatalog()->getTables(DataLake::getForwardedAuthToken(context_));
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
     }
     catch (...)
     {

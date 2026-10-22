@@ -84,23 +84,15 @@ public:
         const std::string & oauth_server_uri_,
         bool oauth_server_use_request_body_,
         const std::string & namespaces_,
-<<<<<<< HEAD
         bool flat_namespaces_,
-        DB::ContextPtr context_);
-=======
         DB::ContextPtr context_,
         const TokenForwardingConfig & token_forwarding_ = {});
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     ~RestCatalog() override = default;
 
     bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-<<<<<<< HEAD
-    CatalogTables getTables() const override;
-=======
-    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    CatalogTables getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
@@ -263,11 +255,7 @@ protected:
     std::string auth_scope;
     std::string oauth_server_uri;
     bool oauth_server_use_request_body;
-<<<<<<< HEAD
     bool flat_namespaces = false;
-    mutable MultiVersion<AccessToken> access_token;
-
-=======
     /// Shared service or actor token; never store a user token here.
     mutable MultiVersion<AccessToken> access_token;
 
@@ -284,21 +272,6 @@ protected:
     /// Never hold this across a network request.
     mutable std::mutex auth_publish_mutex;
 
-    /// TTL for caching vended credentials per table (0 means no caching).
-    std::atomic<std::chrono::seconds> vended_credentials_cache_ttl{std::chrono::seconds::zero()};
-
-    /// Sweep trigger threshold, not capacity!
-    static constexpr size_t credentials_cache_cleanup_threshold = 1000;
-
-    static constexpr size_t credentials_cache_max_entries = 10000;
-
-    static constexpr std::chrono::seconds credentials_expiry_safety_window{60};
-    mutable std::mutex credentials_cache_mutex;
-
-    mutable std::map<CredentialsCacheKey, VendedStorageCredentials> credentials_cache
-        TSA_GUARDED_BY(credentials_cache_mutex);
-
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 public:
     class AllowedNamespaces
     {
@@ -321,11 +294,13 @@ protected:
 
     static constexpr size_t credentials_cache_cleanup_threshold = 1000;
 
+    static constexpr size_t credentials_cache_max_entries = 10000;
+
     static constexpr std::chrono::seconds credentials_expiry_safety_window{60};
     mutable std::mutex credentials_cache_mutex;
     std::chrono::seconds vended_credentials_cache_ttl TSA_GUARDED_BY(credentials_cache_mutex){std::chrono::seconds::zero()};
 
-    mutable std::map<std::pair<std::string, std::string>, VendedStorageCredentials> credentials_cache
+    mutable std::map<CredentialsCacheKey, VendedStorageCredentials> credentials_cache
         TSA_GUARDED_BY(credentials_cache_mutex);
 
     Poco::Net::HTTPBasicCredentials credentials{};
@@ -338,16 +313,10 @@ protected:
         const CatalogState & catalog_state,
         UInt64 generation,
         const std::string & endpoint,
-<<<<<<< HEAD
+        const DB::ForwardedAuthTokenPtr & auth_token,
         const Poco::URI::QueryParameters & params,
         const DB::HTTPHeaderEntries & headers,
         const std::optional<DB::HTTPHeaderEntries> & auth_headers) const;
-=======
-        const DB::ForwardedAuthTokenPtr & auth_token,
-        const Poco::URI::QueryParameters & params = {},
-        const DB::HTTPHeaderEntries & headers = {},
-        const std::optional<DB::HTTPHeaderEntries> & auth_headers = std::nullopt) const;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     Poco::URI::QueryParameters createParentNamespaceParams(const std::string & base_namespace) const;
 
@@ -377,11 +346,7 @@ protected:
     /// `limit` is a soft cap on the number of returned names; 0 means no limit.
     DB::Names listTablesInNamespace(const std::string & base_namespace, const DB::ForwardedAuthTokenPtr & auth_token, size_t limit = 0) const;
 
-<<<<<<< HEAD
-    CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name) const override;
-=======
-    DB::Names listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     DB::Names parseTables(DB::ReadBuffer & buf, const std::string & base_namespace, size_t limit, String & next_page_token) const;
 
@@ -401,13 +366,6 @@ protected:
         const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Load catalog config (special http handler) utilizing information from catalog_state and auth_headers.
-<<<<<<< HEAD
-    Config loadConfig(const CatalogState & catalog_state, const std::optional<DB::HTTPHeaderEntries> & auth_headers = std::nullopt);
-    virtual DB::HTTPHeaderEntries getAuthHeaders(
-        const CatalogState & catalog_state,
-        bool update_token,
-        bool * used_cached_oauth_token) const;
-=======
     Config loadConfig(
         const CatalogState & catalog_state,
         UInt64 generation,
@@ -422,7 +380,6 @@ protected:
         const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthTokenPtr & auth_token, bool update_token) const;
 
     bool shouldRetryWithFreshToken(Poco::Net::HTTPResponse::HTTPStatus status) const;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     void validateAuthHeaders(const DB::HTTPHeaderEntry & header) const;
 
@@ -433,29 +390,20 @@ protected:
         UInt64 generation,
         const String & endpoint,
         Poco::JSON::Object::Ptr request_body,
-<<<<<<< HEAD
+        const DB::ForwardedAuthTokenPtr & auth_token,
         const String & method,
         bool ignore_result) const;
-=======
-        const DB::ForwardedAuthTokenPtr & auth_token,
-        const String & method = Poco::Net::HTTPRequest::HTTP_POST,
-        bool ignore_result = false) const;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     VendedStorageCredentials getCredentialsAndEndpoint(Poco::JSON::Object::Ptr object, const String & location) const;
 
     String getCredentialsCachePrincipal(const DB::ForwardedAuthTokenPtr & auth_token) const;
 
-<<<<<<< HEAD
-    void cacheCredentials(
-        const std::string & namespace_name,
-        const std::string & table_name,
-        const VendedStorageCredentials & parsed,
-        const CatalogStateVersion & state_snapshot) const;
-=======
     std::optional<VendedStorageCredentials> tryGetCachedCredentials(const CredentialsCacheKey & key) const;
 
-    void cacheCredentials(const CredentialsCacheKey & key, const VendedStorageCredentials & parsed) const;
+    void cacheCredentials(
+        const CredentialsCacheKey & key,
+        const VendedStorageCredentials & parsed,
+        const CatalogStateVersion & state_snapshot) const;
 
     MultiVersion<AccessToken>::Version publishServiceToken(AccessToken minted, UInt64 generation) const;
 
@@ -464,7 +412,6 @@ protected:
     AccessToken exchangeUserToken(
         const CatalogState & catalog_state, UInt64 generation, const DB::ForwardedAuthToken & auth_token,
         const AccessToken * prepared_actor_token = nullptr) const;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     AccessToken retrieveAccessToken(const std::string & client_id, const std::string & client_secret) const;
 
@@ -525,14 +472,7 @@ public:
     /// OneLake keeps data in Azure Data Lake Storage, whatever the catalog reports.
     std::optional<StorageType> getStorageType() const override { return StorageType::Azure; }
 
-<<<<<<< HEAD
-    DB::HTTPHeaderEntries getAuthHeaders(
-        const CatalogState & catalog_state,
-        bool update_token,
-        bool * used_cached_oauth_token) const override;
-=======
     DB::HTTPHeaderEntries getAuthHeaders(const AuthContext & auth_context) const override;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     static void validateSettingsChanges(const DB::SettingsChanges & changes, AuthMode auth_mode);
 
@@ -583,14 +523,7 @@ public:
     /// BigLake keeps data in Google Cloud Storage, which is accessed through the S3 API.
     std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
 
-<<<<<<< HEAD
-    DB::HTTPHeaderEntries getAuthHeaders(
-        const CatalogState & catalog_state,
-        bool update_token,
-        bool * used_cached_oauth_token) const override;
-=======
     DB::HTTPHeaderEntries getAuthHeaders(const AuthContext & auth_context) const override;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
 
     const std::string & getGoogleADCClientId() const { return google_adc_client_id; }
     const std::string & getGoogleADCClientSecret() const { return google_adc_client_secret; }

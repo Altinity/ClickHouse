@@ -431,11 +431,7 @@ bool PaimonRestCatalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) 
     return tables.empty();
 }
 
-<<<<<<< HEAD
-CatalogTables PaimonRestCatalog::getTables() const
-=======
-DB::Names PaimonRestCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables PaimonRestCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     DB::Strings databases;
     DB::Names tables;
@@ -458,11 +454,7 @@ DataLake::ICatalog::Namespaces PaimonRestCatalog::getNamespaces(const DB::Forwar
     return databases;
 }
 
-<<<<<<< HEAD
-CatalogTables PaimonRestCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
-=======
-DB::Names PaimonRestCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables PaimonRestCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     DB::Names tables;
     forEachTables(namespace_name, tables, {});

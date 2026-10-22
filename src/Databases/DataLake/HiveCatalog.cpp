@@ -154,11 +154,7 @@ bool HiveCatalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
     return result.empty();
 }
 
-<<<<<<< HEAD
-CatalogTables HiveCatalog::getTables() const
-=======
-DB::Names HiveCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables HiveCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     CatalogTables result;
     DB::Names databases;
@@ -184,11 +180,7 @@ DataLake::ICatalog::Namespaces HiveCatalog::getNamespaces(const DB::ForwardedAut
     return databases;
 }
 
-<<<<<<< HEAD
-CatalogTables HiveCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
-=======
-DB::Names HiveCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+CatalogTables HiveCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     DB::Names current_tables;
     /// Retry transient `TTransportException` (same wrapper as `getTables`) rather

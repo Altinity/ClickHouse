@@ -1386,21 +1386,6 @@ void AwsAuthSTSAssumeRoleCredentialsProvider::Reload()
     LOG_TRACE(logger, "Successfully retrieved credentials");
 }
 
-<<<<<<< HEAD
-/// Actionable tail of the "server-managed credentials refused" messages. In ClickHouse Cloud the
-/// setting is fixed by a profile constraint and cannot be enabled per query, so the Cloud build points
-/// to the supported access method (an IAM role) instead of naming a setting the user cannot change.
-#if CLICKHOUSE_CLOUD
-#define S3_SERVER_CREDENTIALS_HINT \
-    "Grant access through an IAM role passed as extra_credentials(role_arn = '...'), or provide explicit " \
-    "credentials (use NOSIGN for public buckets). See " \
-    "https://clickhouse.com/docs/products/cloud/guides/data-sources/accessing-s3-data-securely"
-#else
-#define S3_SERVER_CREDENTIALS_HINT \
-    "Provide explicit credentials, use NOSIGN for public buckets, grant access through an IAM role passed " \
-    "as extra_credentials(role_arn = '...'), or enable the setting `s3_allow_server_credentials_in_user_queries`."
-#endif
-=======
 AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider::AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider(
     std::string role_arn_,
     std::string session_name_,
@@ -1461,7 +1446,20 @@ std::string AwsAuthSTSAssumeRoleWithWebIdentityCredentialsProvider::getLastError
     Aws::Utils::Threading::ReaderLockGuard guard(m_reloadLock);
     return last_error;
 }
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+
+/// Actionable tail of the "server-managed credentials refused" messages. In ClickHouse Cloud the
+/// setting is fixed by a profile constraint and cannot be enabled per query, so the Cloud build points
+/// to the supported access method (an IAM role) instead of naming a setting the user cannot change.
+#if CLICKHOUSE_CLOUD
+#define S3_SERVER_CREDENTIALS_HINT \
+    "Grant access through an IAM role passed as extra_credentials(role_arn = '...'), or provide explicit " \
+    "credentials (use NOSIGN for public buckets). See " \
+    "https://clickhouse.com/docs/products/cloud/guides/data-sources/accessing-s3-data-securely"
+#else
+#define S3_SERVER_CREDENTIALS_HINT \
+    "Provide explicit credentials, use NOSIGN for public buckets, grant access through an IAM role passed " \
+    "as extra_credentials(role_arn = '...'), or enable the setting `s3_allow_server_credentials_in_user_queries`."
+#endif
 
 std::shared_ptr<Aws::Auth::AWSCredentialsProvider> getCredentialsProvider(
     const DB::S3::PocoHTTPClientConfiguration & configuration,

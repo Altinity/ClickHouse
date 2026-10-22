@@ -1748,18 +1748,7 @@ void TCPHandler::processTablesStatusRequest()
     TablesStatusResponse response;
     try
     {
-<<<<<<< HEAD
-        auto resolved_id = context_to_resolve_table_names->tryResolveStorageID({table_name.database, table_name.table});
-        StoragePtr table = DatabaseCatalog::instance().tryGetTable(resolved_id, context_to_resolve_table_names);
-        if (!table)
-            continue;
-
-        TableStatus status;
-        /// The initiator asks about this table by name, so a lazily loaded replica is loaded to report its delay.
-        if (auto * replicated_table = castStorage<StorageReplicatedMergeTree>(table, DeferredTable::Load).get())
-=======
         for (const QualifiedTableName & table_name: request.tables)
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
         {
             auto resolved_id = context_to_resolve_table_names->tryResolveStorageID({table_name.database, table_name.table});
             StoragePtr table = DatabaseCatalog::instance().tryGetTable(resolved_id, context_to_resolve_table_names);
@@ -1767,7 +1756,8 @@ void TCPHandler::processTablesStatusRequest()
                 continue;
 
             TableStatus status;
-            if (auto * replicated_table = dynamic_cast<StorageReplicatedMergeTree *>(table.get()))
+            /// The initiator asks about this table by name, so a lazily loaded replica is loaded to report its delay.
+            if (auto * replicated_table = castStorage<StorageReplicatedMergeTree>(table, DeferredTable::Load).get())
             {
                 status.is_replicated = true;
                 status.absolute_delay = static_cast<UInt32>(replicated_table->getAbsoluteDelay());

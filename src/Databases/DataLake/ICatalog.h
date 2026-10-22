@@ -235,30 +235,18 @@ public:
     /// Does catalog have any tables?
     virtual bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
-<<<<<<< HEAD
     /// Fetch the list of tables (names contain full namespaces). Each entry carries an
     /// `is_readable` flag so listings can drop unreadable tables without a metadata fetch.
-    virtual CatalogTables getTables() const = 0;
-=======
-    /// Fetch tables' names list.
-    /// Contains full namespaces in names.
-    virtual DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    virtual CatalogTables getTables(const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
     /// Enumerate every namespace as a full dot-separated path (hierarchical catalogs
     /// return every nested level; flat catalogs their single-level names).
     virtual Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
-<<<<<<< HEAD
     /// Fetch the list of tables restricted by the `name` predicate (see `TableNameFilter`);
     /// each entry carries an `is_readable` flag like getTables(). Default impl prunes
     /// namespaces via `getNamespaces()`.
-    virtual CatalogTables getTables(const TableNameFilter & filter) const;
-=======
-    /// Fetch fully-qualified table names, restricted by the `name` predicate (see
-    /// `TableNameFilter`). Default impl prunes namespaces via `getNamespaces()`.
-    virtual DB::Names getTables(const TableNameFilter & filter, const DB::ForwardedAuthTokenPtr & auth_token) const;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    virtual CatalogTables getTables(const TableNameFilter & filter, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Check that a table exists in a given namespace.
     virtual bool existsTable(
@@ -390,13 +378,8 @@ protected:
         const std::string & catalog_description) const;
 
     /// List tables directly in `namespace_name` (non-recursive), as fully-qualified
-<<<<<<< HEAD
     /// `namespace.table` entries carrying an `is_readable` flag like getTables().
-    virtual CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name) const = 0;
-=======
-    /// `namespace.table` names.
-    virtual DB::Names listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
->>>>>>> 893adc4f4879 (Merge pull request #2329 from Altinity/feature/antalya-26.6/aouth-forward-to-datalake)
+    virtual CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
     /// Name of the warehouse,
     /// which is sometimes also called "catalog name".
