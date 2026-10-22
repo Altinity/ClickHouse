@@ -780,8 +780,28 @@ bool applyTrivialCountIfPossible(
     /// Set a special flag in query info so the storage will see it and optimize count in read() method.
     select_query_info.optimize_trivial_count = true;
 
+<<<<<<< HEAD
     /// Get number of rows
     std::optional<UInt64> num_rows = storage->totalRows(query_context);
+=======
+    /// Do not apply trivial count optimization if we're the follower. Because if every follower blindly returns totalRows(),
+    /// the result will be R times the actual count of rows, where R is the number of replicas.
+    /// It's important to make this check after we've set the `select_query_info.optimize_trivial_count` flag, so that storage could apply
+    /// some optimization during the read phase.
+    /// TODO: We could still avoid reading data for MergeTree on the followers: we could read the parts metadata for the set of parts
+    /// we were handed out by the initiator. This would require consuming the `select_query_info.optimize_trivial_count` during the read
+    /// phase and acting accordingly.
+    if (query_context->canUseParallelReplicasOnFollower())
+        return false;
+
+    /// Get number of rows.
+    /// MergeTree maintains total count for all parts in Active state and it simply returns that number for trivial
+    /// `select count() from table` query. But if we have current transaction, then we should return number of rows in current snapshot
+    /// (that may include parts in Outdated state), so the totalRows for transactional case should return the number of rows visible for
+    /// the current transaction.
+    const auto & storage_snapshot = table_node ? table_node->getStorageSnapshot() : table_function_node->getStorageSnapshot();
+    std::optional<UInt64> num_rows = storage->totalRowsInSnapshot(storage_snapshot, query_context);
+>>>>>>> c1146e5434f9 (Merge pull request #126267 from ClickHouse/iceberg-cache-parsed-metadata-json)
     if (!num_rows)
         return false;
 
