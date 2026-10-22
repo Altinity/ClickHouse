@@ -136,8 +136,8 @@ void generateManifestFile(
     /// describe only its own data file, else the shared `data_file_statistics` is used for every entry.
     const std::vector<const DataFileStatistics *> * per_file_fresh_statistics = nullptr);
 
-/// Per manifest-list entry file/row counts for a rewrite whose manifests carry explicit entry statuses.
-struct ManifestListEntryExistingCounts
+/// Per manifest-list entry file/row counts for a rewrite; the caller supplies counts matching the entry statuses it wrote.
+struct ManifestListEntryCounts
 {
     Int64 existing_files_count = 0;
     Int64 existing_rows_count = 0;
@@ -162,10 +162,11 @@ void generateManifestList(
     Iceberg::FileContentType content_type,
     bool use_previous_snapshots = true,
     const std::vector<Iceberg::FileContentType> & per_entry_content_types = {},
-    const std::vector<ManifestListEntryExistingCounts> & existing_entry_counts = {},
+    const std::vector<ManifestListEntryCounts> & entry_counts = {},
     const std::unordered_set<String> & carry_forward_manifest_paths = {},
     const std::vector<Int64> & entry_partition_spec_ids = {},
-    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {});
+    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {},
+    const std::vector<Int64> & entry_row_counts = {});
 
 std::string getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path);
 

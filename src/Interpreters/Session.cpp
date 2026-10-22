@@ -3,6 +3,7 @@
 #include <base/isSharedPtrUnique.h>
 #include <Access/AccessControl.h>
 #include <Access/Credentials.h>
+#include <Access/ForwardedAuthToken.h>
 #include <Access/ContextAccess.h>
 #include <Access/User.h>
 #include <Access/Role.h>
@@ -409,6 +410,12 @@ void Session::authenticate(const Credentials & credentials_, const Poco::Net::So
     prepared_client_info->authenticated_user = auth_result.user_name;
     prepared_client_info->current_address = std::make_shared<Poco::Net::SocketAddress>(address);
     prepared_client_info->connection_address = std::make_shared<Poco::Net::SocketAddress>(connection_address ? *connection_address : address);
+
+    if (const auto * token_credentials = typeid_cast<const TokenCredentials *>(&credentials_))
+    {
+        if (global_context->getAccessControl().isTokenForwardingEnabled())
+            forwarded_auth_token = makeForwardedAuthToken(*token_credentials, auth_result.user_name);
+    }
 }
 
 void Session::checkIfUserIsStillValid()
@@ -580,6 +587,7 @@ ContextMutablePtr Session::makeSessionContext()
 
     /// Copy prepared client info to the new session context.
     new_session_context->setClientInfo(*prepared_client_info);
+    new_session_context->setForwardedAuthToken(forwarded_auth_token);
     prepared_client_info.reset();
 
     /// Set user information for the new context: current profiles, roles, access rights.
@@ -651,6 +659,11 @@ ContextMutablePtr Session::makeSessionContext(const String & session_name_, std:
             max_sessions_for_user = max_session_for_user_field->safeGet<UInt64>();
     }
 
+    /// Refresh reused named sessions only while they still represent the authenticated user.
+    /// An `EXECUTE AS` session must not regain the original token.
+    const bool runs_as_authenticated_user = new_session_context->getAccess()->getUserID() == user_id;
+    new_session_context->setForwardedAuthToken(runs_as_authenticated_user ? forwarded_auth_token : nullptr);
+
     /// Session context is ready.
     session_context = std::move(new_session_context);
     named_session = new_named_session;
@@ -710,6 +723,10 @@ ContextMutablePtr Session::makeQueryContextImpl(const ClientInfo * client_info_t
         query_context->setClientInfo(*client_info_to_move);
     else if (client_info_to_copy && (client_info_to_copy != &getClientInfo()))
         query_context->setClientInfo(*client_info_to_copy);
+
+    /// A session context may have cleared its token for `EXECUTE AS`; do not restore it in the query copy.
+    if (!from_session_context)
+        query_context->setForwardedAuthToken(forwarded_auth_token);
 
     /// Copy current user's name and address if it was authenticated after query_client_info was initialized.
     if (prepared_client_info && !prepared_client_info->current_user.empty())

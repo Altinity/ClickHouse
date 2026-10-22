@@ -168,6 +168,123 @@ struct BinPackPlan
 };
 
 
+/// Result of scanning the manifest list: data files grouped by manifest, live delete entries,
+/// and manifest paths that should be carried forward unchanged.
+struct ManifestScanResult
+{
+    std::unordered_map<String, std::vector<DataFileRecord>> files_by_manifest;
+    std::vector<DeleteRecord> delete_records;
+    size_t small_files_total = 0;
+    std::unordered_set<String> carry_forward_manifest_paths;
+};
+
+/// Scan the manifest list and collect data file records, delete records, and carry-forward paths.
+ManifestScanResult scanManifestList(
+    const ManifestFileCacheKeys & manifest_list,
+    ObjectStoragePtr object_storage,
+    const PersistentTableComponents & persistent_table_components,
+    ContextPtr context,
+    SecondaryStorages & secondary_storages,
+    Int32 partition_spec_id,
+    Int32 current_schema_id,
+    UInt64 min_file_size,
+    LoggerPtr log)
+{
+    ManifestScanResult result;
+
+    for (const auto & manifest_file : manifest_list)
+    {
+        if (manifest_file.content_type == ManifestFileContentType::DELETE)
+        {
+            result.carry_forward_manifest_paths.insert(manifest_file.manifest_file_path.serialize());
+
+            /// Record live delete entries so data files they can apply to are left out of the rewrite.
+            auto deletes_handle = getManifestFileEntriesHandle(
+                object_storage, persistent_table_components, context, log,
+                manifest_file, current_schema_id, secondary_storages);
+
+            for (const auto delete_content_type : {FileContentType::POSITION_DELETE, FileContentType::EQUALITY_DELETE})
+            {
+                for (const auto & delete_file : deletes_handle.getFilesWithoutDeleted(delete_content_type))
+                {
+                    const auto & entry = delete_file->parsed_entry;
+                    DeleteRecord record;
+                    record.content_type = delete_content_type;
+                    record.sequence_number = delete_file->sequence_number;
+                    record.partition_key = entry->partition_key_value;
+                    record.partition_spec_id = manifest_file.partition_spec_id;
+                    record.lower_reference_data_file_path = entry->lower_reference_data_file_path;
+                    record.upper_reference_data_file_path = entry->upper_reference_data_file_path;
+                    result.delete_records.push_back(std::move(record));
+                }
+            }
+            continue;
+        }
+
+        if (manifest_file.partition_spec_id != partition_spec_id)
+        {
+            /// New manifests are written with the default partition spec and a single partition
+            /// tuple per manifest; entries written under an older spec would be recorded with
+            /// wrong partition values, so such manifests are carried forward unchanged.
+            result.carry_forward_manifest_paths.insert(manifest_file.manifest_file_path.serialize());
+            continue;
+        }
+
+        auto files_handle = getManifestFileEntriesHandle(
+            object_storage, persistent_table_components, context, log,
+            manifest_file, current_schema_id, secondary_storages);
+
+        auto & manifest_records = result.files_by_manifest[manifest_file.manifest_file_path.serialize()];
+        for (const auto & data_file : files_handle.getFilesWithoutDeleted(FileContentType::DATA))
+        {
+            const auto & entry = data_file->parsed_entry;
+            DataFileRecord record;
+            record.file_path = entry->file_path_key;
+            record.record_count = entry->record_count;
+            record.file_size_in_bytes = entry->file_size_in_bytes;
+            record.file_format = entry->file_format;
+            record.schema_id = data_file->resolved_schema_id;
+            record.partition_key = entry->partition_key_value;
+            record.sort_order_id = entry->sort_order_id;
+            record.snapshot_id = entry->parsed_snapshot_id;
+            if (!record.snapshot_id.has_value())
+                record.snapshot_id = manifest_file.added_snapshot_id;
+            record.sequence_number = entry->parsed_sequence_number;
+            if (!record.sequence_number.has_value())
+                record.sequence_number = manifest_file.added_sequence_number;
+            record.file_sequence_number = entry->parsed_file_sequence_number;
+            if (!record.file_sequence_number.has_value())
+                record.file_sequence_number = manifest_file.added_sequence_number;
+
+            /// Carry over per-column stats.
+            for (const auto & [field_id, col_info] : entry->columns_infos)
+            {
+                if (col_info.bytes_size.has_value())
+                    record.column_stats.column_sizes.emplace_back(field_id, *col_info.bytes_size);
+                if (col_info.rows_count.has_value())
+                    record.column_stats.value_counts.emplace_back(field_id, *col_info.rows_count);
+                if (col_info.nulls_count.has_value())
+                    record.column_stats.null_value_counts.emplace_back(field_id, *col_info.nulls_count);
+            }
+            for (const auto & [field_id, bounds] : entry->value_bounds)
+            {
+                if (!bounds.first.isNull())
+                    record.column_stats.lower_bounds.emplace_back(field_id, bounds.first.safeGet<String>());
+                if (!bounds.second.isNull())
+                    record.column_stats.upper_bounds.emplace_back(field_id, bounds.second.safeGet<String>());
+            }
+
+            record.source_manifest_path = manifest_file.manifest_file_path.serialize();
+            record.is_candidate = static_cast<UInt64>(entry->file_size_in_bytes) < min_file_size;
+            if (record.is_candidate)
+                ++result.small_files_total;
+            manifest_records.push_back(std::move(record));
+        }
+    }
+
+    return result;
+}
+
 BinPackPlan buildBinPackPlan(
     Poco::JSON::Object::Ptr metadata_object,
     const PersistentTableComponents & persistent_table_components,
@@ -287,101 +404,15 @@ BinPackPlan buildBinPackPlan(
         IcebergPathFromMetadata::deserialize(current_manifest_list_path),
         log, secondary_storages);
 
-    /// Every live data file, grouped by the manifest that lists it.
-    std::unordered_map<String, std::vector<DataFileRecord>> files_by_manifest;
-    /// Live delete entries, used to keep the rewrite away from files they can apply to.
-    std::vector<DeleteRecord> delete_records;
-    size_t small_files_total = 0;
+    auto scan = scanManifestList(
+        manifest_list, object_storage, persistent_table_components, context,
+        secondary_storages, partition_spec_id, static_cast<Int32>(current_schema_id),
+        min_file_size, log);
 
-    for (const auto & manifest_file : manifest_list)
-    {
-        if (manifest_file.content_type == ManifestFileContentType::DELETE)
-        {
-            plan.carry_forward_manifest_paths.insert(manifest_file.manifest_file_path.serialize());
-
-            /// Record live delete entries so data files they can apply to are left out of the rewrite.
-            auto deletes_handle = getManifestFileEntriesHandle(
-                object_storage, persistent_table_components, context, log,
-                manifest_file, static_cast<Int32>(current_schema_id), secondary_storages);
-
-            for (const auto delete_content_type : {FileContentType::POSITION_DELETE, FileContentType::EQUALITY_DELETE})
-            {
-                for (const auto & delete_file : deletes_handle.getFilesWithoutDeleted(delete_content_type))
-                {
-                    const auto & entry = delete_file->parsed_entry;
-                    DeleteRecord record;
-                    record.content_type = delete_content_type;
-                    record.sequence_number = delete_file->sequence_number;
-                    record.partition_key = entry->partition_key_value;
-                    record.partition_spec_id = manifest_file.partition_spec_id;
-                    record.lower_reference_data_file_path = entry->lower_reference_data_file_path;
-                    record.upper_reference_data_file_path = entry->upper_reference_data_file_path;
-                    delete_records.push_back(std::move(record));
-                }
-            }
-            continue;
-        }
-
-        if (manifest_file.partition_spec_id != partition_spec_id)
-        {
-            /// New manifests are written with the default partition spec and a single partition
-            /// tuple per manifest; entries written under an older spec would be recorded with
-            /// wrong partition values, so such manifests are carried forward unchanged.
-            plan.carry_forward_manifest_paths.insert(manifest_file.manifest_file_path.serialize());
-            continue;
-        }
-
-        auto files_handle = getManifestFileEntriesHandle(
-            object_storage, persistent_table_components, context, log,
-            manifest_file, static_cast<Int32>(current_schema_id), secondary_storages);
-
-        auto & manifest_records = files_by_manifest[manifest_file.manifest_file_path.serialize()];
-        for (const auto & data_file : files_handle.getFilesWithoutDeleted(FileContentType::DATA))
-        {
-            const auto & entry = data_file->parsed_entry;
-            DataFileRecord record;
-            record.file_path = entry->file_path_key;
-            record.record_count = entry->record_count;
-            record.file_size_in_bytes = entry->file_size_in_bytes;
-            record.file_format = entry->file_format;
-            record.schema_id = data_file->resolved_schema_id;
-            record.partition_key = entry->partition_key_value;
-            record.sort_order_id = entry->sort_order_id;
-            record.snapshot_id = entry->parsed_snapshot_id;
-            if (!record.snapshot_id.has_value())
-                record.snapshot_id = manifest_file.added_snapshot_id;
-            record.sequence_number = entry->parsed_sequence_number;
-            if (!record.sequence_number.has_value())
-                record.sequence_number = manifest_file.added_sequence_number;
-            record.file_sequence_number = entry->parsed_file_sequence_number;
-            if (!record.file_sequence_number.has_value())
-                record.file_sequence_number = manifest_file.added_sequence_number;
-
-            /// Carry over per-column stats.
-            for (const auto & [field_id, col_info] : entry->columns_infos)
-            {
-                if (col_info.bytes_size.has_value())
-                    record.column_stats.column_sizes.emplace_back(field_id, *col_info.bytes_size);
-                if (col_info.rows_count.has_value())
-                    record.column_stats.value_counts.emplace_back(field_id, *col_info.rows_count);
-                if (col_info.nulls_count.has_value())
-                    record.column_stats.null_value_counts.emplace_back(field_id, *col_info.nulls_count);
-            }
-            for (const auto & [field_id, bounds] : entry->value_bounds)
-            {
-                if (!bounds.first.isNull())
-                    record.column_stats.lower_bounds.emplace_back(field_id, bounds.first.safeGet<String>());
-                if (!bounds.second.isNull())
-                    record.column_stats.upper_bounds.emplace_back(field_id, bounds.second.safeGet<String>());
-            }
-
-            record.source_manifest_path = manifest_file.manifest_file_path.serialize();
-            record.is_candidate = static_cast<UInt64>(entry->file_size_in_bytes) < min_file_size;
-            if (record.is_candidate)
-                ++small_files_total;
-            manifest_records.push_back(std::move(record));
-        }
-    }
+    plan.carry_forward_manifest_paths = std::move(scan.carry_forward_manifest_paths);
+    auto & files_by_manifest = scan.files_by_manifest;
+    auto & delete_records = scan.delete_records;
+    size_t small_files_total = scan.small_files_total;
 
     /// Exclude from the rewrite every small file that a live delete could still apply to,
     /// following the Iceberg scan-planning rules: a position delete applies to data files with
@@ -680,6 +711,499 @@ bool hasLivePositionDeletes(
     return false;
 }
 
+/// Per-bin result produced by Phase 1 (rewriting) and consumed by Phase 3 (manifest writing).
+struct BinResult
+{
+    Row partition_key;
+    std::vector<IcebergPathFromMetadata> merged_file_paths;
+    std::vector<UInt64> merged_file_row_counts;
+    std::vector<UInt64> merged_file_byte_counts;
+    std::vector<DataFileStatisticsPtr> merged_file_stats;
+    /// The old files that were replaced.
+    std::vector<IcebergPathFromMetadata> old_file_paths;
+    std::vector<UInt64> old_file_row_counts;
+    std::vector<UInt64> old_file_byte_counts;
+    std::vector<DataFileEntryLineage> old_file_lineage;
+    std::vector<DataFileColumnStatistics> old_file_stats;
+    std::vector<String> old_file_formats;
+    std::vector<std::optional<Int32>> old_file_sort_order_ids;
+};
+
+/// Aggregated totals from Phase 1.
+struct RewriteResult
+{
+    std::vector<BinResult> bin_results;
+    Int64 total_added_files = 0;
+    Int64 total_added_records = 0;
+    Int64 total_added_files_size = 0;
+};
+
+/// Phase 1: Read small files from each bin and write merged data files.
+RewriteResult rewriteBins(
+    BinPackPlan & plan,
+    const PersistentTableComponents & persistent_table_components,
+    ObjectStoragePtr object_storage,
+    SecondaryStorages & secondary_storages,
+    ContextPtr context,
+    Poco::JSON::Object::Ptr current_schema,
+    IcebergSchemaProcessor & schema_processor,
+    Int32 current_schema_id_int,
+    SharedHeader sample_block,
+    ColumnMapperPtr current_schema_column_mapper,
+    FileNamesGenerator & generator,
+    const IcebergPathResolver & path_resolver,
+    const String & write_format,
+    UInt64 target_size,
+    std::vector<IcebergPathFromMetadata> & new_data_file_paths,
+    LoggerPtr log)
+{
+    const auto & settings = context->getSettingsRef();
+    RewriteResult result;
+
+    for (auto & bin : plan.bins)
+    {
+        BinResult bin_result;
+        bin_result.partition_key = bin.partition_key;
+
+        /// Prepare the MultipleFileWriter for this bin.
+        MultipleFileWriter writer(
+            /* max_data_file_num_rows */ 0,  /// no row limit; size limit is used
+            /* max_data_file_num_bytes */ target_size,
+            current_schema->getArray(f_fields),
+            generator,
+            path_resolver,
+            object_storage,
+            context,
+            std::nullopt, /// format_settings
+            write_format,
+            sample_block,
+            [&](const std::string & path)
+            {
+                new_data_file_paths.push_back(IcebergPathFromMetadata::deserialize(path));
+            });
+
+        /// Read each source file and feed into the writer.
+        for (auto & file_entry : bin.files)
+        {
+            auto [resolved_storage, resolved_key] = resolveObjectStorageForPath(
+                persistent_table_components.table_location,
+                file_entry.file_path.serialize(),
+                object_storage, secondary_storages, context,
+                path_resolver);
+
+            RelativePathWithMetadata object_info(resolved_key);
+            ObjectStoragePtr storage_to_use = resolved_storage ? resolved_storage : object_storage;
+            auto read_buffer = createReadBuffer(object_info, storage_to_use, context, log);
+
+            auto parser_shared_resources = std::make_shared<FormatParserSharedResources>(
+                settings, /*num_streams_=*/1);
+
+            const String source_format = file_entry.file_format.empty() ? write_format : file_entry.file_format;
+            const bool is_parquet = Poco::toLower(source_format) == "parquet";
+
+            /// Like `SELECT`, read a file with the schema it was written with (Parquet columns are
+            /// matched by field id when present, by name otherwise) and then evolve it to the
+            /// current schema, so renamed, retyped, added and dropped columns are handled.
+            SharedHeader read_header = sample_block;
+            ColumnMapperPtr column_mapper = is_parquet ? current_schema_column_mapper : nullptr;
+            std::shared_ptr<ExpressionActions> schema_transform;
+            if (file_entry.schema_id != current_schema_id_int)
+            {
+                read_header = makeHeaderFromSchema(schema_processor, file_entry.schema_id);
+                column_mapper = is_parquet ? schema_processor.getColumnMapperById(file_entry.schema_id) : nullptr;
+                auto dag = schema_processor.getSchemaTransformationDagByIds(context, file_entry.schema_id, current_schema_id_int);
+                schema_transform = std::make_shared<ExpressionActions>(dag->clone());
+            }
+
+            auto input_format = FormatFactory::instance().getInput(
+                source_format,
+                *read_buffer,
+                *read_header,
+                context,
+                8192,
+                std::nullopt, /// format_settings
+                parser_shared_resources,
+                std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr),
+                true, /// is_remote_fs
+                CompressionMethod::None,
+                false);
+
+            while (true)
+            {
+                if (auto elem = context->getProcessListElement(); elem && elem->isKilled())
+                    throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "OPTIMIZE TABLE cancelled during bin-pack rewrite");
+
+                auto chunk = input_format->read();
+                if (chunk.empty())
+                    break;
+
+                if (schema_transform)
+                {
+                    size_t num_rows = chunk.getNumRows();
+                    Block block = read_header->cloneWithColumns(chunk.detachColumns());
+                    schema_transform->execute(block, num_rows);
+
+                    Columns columns;
+                    columns.reserve(sample_block->columns());
+                    for (const auto & column : *sample_block)
+                        columns.push_back(block.getByName(column.name).column->convertToFullColumnIfConst());
+                    chunk = Chunk(std::move(columns), num_rows);
+                }
+
+                writer.consume(chunk);
+            }
+
+            /// Track old file info for the delete manifest.
+            bin_result.old_file_paths.push_back(file_entry.file_path);
+            bin_result.old_file_row_counts.push_back(static_cast<UInt64>(file_entry.record_count));
+            bin_result.old_file_byte_counts.push_back(static_cast<UInt64>(file_entry.file_size_in_bytes));
+            bin_result.old_file_formats.push_back(file_entry.file_format);
+            bin_result.old_file_sort_order_ids.push_back(file_entry.sort_order_id);
+            bin_result.old_file_stats.push_back(std::move(file_entry.column_stats));
+
+            /// Per the spec, the `snapshot_id` of a DELETED entry is the snapshot that deleted the file,
+            /// so `added_snapshot_id` stays unset and the new `replace` snapshot id is written.
+            DataFileEntryLineage lineage;
+            lineage.sequence_number = file_entry.sequence_number;
+            lineage.file_sequence_number = file_entry.file_sequence_number;
+            lineage.status_override = ManifestEntryStatus::DELETED;
+            bin_result.old_file_lineage.push_back(lineage);
+        }
+
+        writer.finalize();
+
+        bin_result.merged_file_paths = writer.getDataFiles();
+        bin_result.merged_file_row_counts = writer.getDataFileRowCounts();
+        bin_result.merged_file_byte_counts = writer.getDataFileByteCounts();
+        bin_result.merged_file_stats = writer.getPerFileStatistics();
+        if (bin_result.merged_file_stats.size() != bin_result.merged_file_paths.size())
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Bin-pack writer returned {} statistics for {} merged files",
+                bin_result.merged_file_stats.size(), bin_result.merged_file_paths.size());
+
+        for (size_t i = 0; i < bin_result.merged_file_paths.size(); ++i)
+        {
+            result.total_added_files++;
+            result.total_added_records += static_cast<Int64>(bin_result.merged_file_row_counts[i]);
+            result.total_added_files_size += static_cast<Int64>(bin_result.merged_file_byte_counts[i]);
+        }
+
+        result.bin_results.push_back(std::move(bin_result));
+    }
+
+    return result;
+}
+
+/// Collected manifest metadata for the manifest list.
+struct ManifestListInput
+{
+    std::vector<IcebergPathFromMetadata> manifest_paths;
+    std::vector<Int64> manifest_sizes;
+    std::vector<ManifestListEntryCounts> entry_counts;
+    std::vector<Int64> entry_partition_spec_ids;
+};
+
+/// Phase 3: Write manifest files (delete, add, and kept manifests).
+ManifestListInput writeManifests(
+    const std::vector<BinResult> & bin_results,
+    const BinPackPlan & plan,
+    Poco::JSON::Object::Ptr metadata_object,
+    Poco::JSON::Object::Ptr snapshot,
+    SharedHeader sample_block,
+    FileNamesGenerator & generator,
+    const IcebergPathResolver & path_resolver,
+    ObjectStoragePtr object_storage,
+    ContextPtr context,
+    const String & write_format,
+    std::vector<IcebergPathFromMetadata> & new_manifest_paths)
+{
+    ManifestListInput mli;
+
+    /// Write one data manifest for a set of entries sharing a partition key and record it
+    /// for the manifest list. `existing_counts` must match the statuses of the written entries.
+    auto write_manifest_for_entries = [&](
+        const Row & partition_key,
+        const std::vector<IcebergPathFromMetadata> & paths,
+        const std::vector<UInt64> & row_counts,
+        const std::vector<UInt64> & byte_counts,
+        const std::vector<String> & formats,
+        const std::vector<DataFileColumnStatistics> & stats,
+        const std::vector<std::optional<Int32>> & sort_order_ids,
+        const std::vector<DataFileEntryLineage> & lineage,
+        const std::optional<DataFileStatistics> & data_file_statistics,
+        ManifestListEntryCounts existing_counts)
+    {
+        auto manifest_path = generator.generateManifestEntryName();
+        auto storage_path = path_resolver.resolve(manifest_path);
+        new_manifest_paths.push_back(manifest_path);
+
+        auto buf = object_storage->writeObject(
+            StoredObject(storage_path), WriteMode::Rewrite, std::nullopt,
+            DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+
+        generateManifestFile(
+            metadata_object,
+            plan.partition_columns,
+            partition_key,
+            plan.partition_types,
+            paths,
+            row_counts,
+            byte_counts,
+            data_file_statistics,
+            sample_block,
+            snapshot,
+            write_format,
+            plan.partition_spec,
+            plan.partition_spec_id,
+            *buf,
+            FileContentType::DATA,
+            std::nullopt, /// user_defined_sequence_number
+            {}, /// per_file_stats
+            formats,
+            stats,
+            sort_order_ids,
+            lineage);
+
+        buf->finalize();
+        Int64 manifest_size = buf->count();
+        if (manifest_size == 0)
+            manifest_size = object_storage->getObjectMetadata(storage_path, false).size_bytes;
+
+        mli.manifest_paths.push_back(manifest_path);
+        mli.manifest_sizes.push_back(manifest_size);
+        mli.entry_counts.push_back(existing_counts);
+        mli.entry_partition_spec_ids.push_back(plan.partition_spec_id);
+    };
+
+    const Int64 new_sequence_number = snapshot->getValue<Int64>(f_metadata_sequence_number);
+
+    for (const auto & bin_result : bin_results)
+    {
+        /// Delete manifest: old files marked DELETED.
+        Int64 deleted_min_seq = std::numeric_limits<Int64>::max();
+        for (const auto & lineage : bin_result.old_file_lineage)
+            deleted_min_seq = std::min(deleted_min_seq, lineage.sequence_number.value_or(0));
+
+        ManifestListEntryCounts deleted_counts;
+        deleted_counts.min_sequence_number = deleted_min_seq;
+        deleted_counts.deleted_files_count = static_cast<Int64>(bin_result.old_file_paths.size());
+        deleted_counts.deleted_rows_count = static_cast<Int64>(
+            std::accumulate(bin_result.old_file_row_counts.begin(), bin_result.old_file_row_counts.end(), UInt64{0}));
+
+        write_manifest_for_entries(
+            bin_result.partition_key,
+            bin_result.old_file_paths,
+            bin_result.old_file_row_counts,
+            bin_result.old_file_byte_counts,
+            bin_result.old_file_formats,
+            bin_result.old_file_stats,
+            bin_result.old_file_sort_order_ids,
+            bin_result.old_file_lineage,
+            std::nullopt,
+            deleted_counts);
+
+        /// Add manifests: one per merged file, because `generateManifestFile` applies a single
+        /// statistics object to every entry of a manifest.
+        for (size_t i = 0; i < bin_result.merged_file_paths.size(); ++i)
+        {
+            std::optional<DataFileStatistics> merged_stats;
+            if (bin_result.merged_file_stats[i])
+                merged_stats = *bin_result.merged_file_stats[i];
+
+            ManifestListEntryCounts added_counts;
+            added_counts.min_sequence_number = new_sequence_number;
+            added_counts.added_files_count = 1;
+            added_counts.added_rows_count = static_cast<Int64>(bin_result.merged_file_row_counts[i]);
+
+            write_manifest_for_entries(
+                bin_result.partition_key,
+                {bin_result.merged_file_paths[i]},
+                {bin_result.merged_file_row_counts[i]},
+                {bin_result.merged_file_byte_counts[i]},
+                {}, /// formats
+                {}, /// stats
+                {}, /// sort_order_ids
+                {}, /// lineage
+                merged_stats,
+                added_counts);
+        }
+    }
+
+    /// Kept manifests: live data files from touched manifests that were not merged (large
+    /// files, single-file partitions, files excluded because of deletes). They stay in the
+    /// new snapshot as EXISTING entries with their original snapshot id and sequence numbers.
+    for (const auto & [partition_key, kept_files] : plan.kept_groups)
+    {
+        std::vector<IcebergPathFromMetadata> kept_paths;
+        std::vector<UInt64> kept_row_counts;
+        std::vector<UInt64> kept_byte_counts;
+        std::vector<String> kept_formats;
+        std::vector<DataFileColumnStatistics> kept_stats;
+        std::vector<std::optional<Int32>> kept_sort_order_ids;
+        std::vector<DataFileEntryLineage> kept_lineage;
+        kept_paths.reserve(kept_files.size());
+        kept_row_counts.reserve(kept_files.size());
+        kept_byte_counts.reserve(kept_files.size());
+        kept_formats.reserve(kept_files.size());
+        kept_stats.reserve(kept_files.size());
+        kept_sort_order_ids.reserve(kept_files.size());
+        kept_lineage.reserve(kept_files.size());
+
+        Int64 kept_min_seq = std::numeric_limits<Int64>::max();
+        Int64 kept_total_rows = 0;
+        for (const auto & kept : kept_files)
+        {
+            kept_paths.push_back(kept.file_path);
+            kept_row_counts.push_back(static_cast<UInt64>(kept.record_count));
+            kept_byte_counts.push_back(static_cast<UInt64>(kept.file_size_in_bytes));
+            kept_formats.push_back(kept.file_format);
+            kept_stats.push_back(kept.column_stats);
+            kept_sort_order_ids.push_back(kept.sort_order_id);
+
+            DataFileEntryLineage lineage;
+            lineage.added_snapshot_id = kept.snapshot_id;
+            lineage.sequence_number = kept.sequence_number;
+            lineage.file_sequence_number = kept.file_sequence_number;
+            kept_lineage.push_back(lineage);
+
+            kept_min_seq = std::min(kept_min_seq, kept.sequence_number.value_or(0));
+            kept_total_rows += kept.record_count;
+        }
+
+        write_manifest_for_entries(
+            partition_key,
+            kept_paths,
+            kept_row_counts,
+            kept_byte_counts,
+            kept_formats,
+            kept_stats,
+            kept_sort_order_ids,
+            kept_lineage,
+            std::nullopt,
+            {static_cast<Int64>(kept_files.size()), kept_total_rows, kept_min_seq});
+    }
+
+    return mli;
+}
+
+/// Phase 4: Write the manifest list file.
+void writeManifestList(
+    const ManifestListInput & mli,
+    const BinPackPlan & plan,
+    const MetadataGenerator::NextMetadataResult & snapshot_result,
+    const IcebergPathResolver & path_resolver,
+    Poco::JSON::Object::Ptr metadata_object,
+    ObjectStoragePtr object_storage,
+    SecondaryStorages & secondary_storages,
+    ContextPtr context,
+    IcebergPathFromMetadata & manifest_list_path)
+{
+    auto storage_manifest_list_path = path_resolver.resolve(snapshot_result.manifest_list_path);
+    manifest_list_path = snapshot_result.manifest_list_path;
+
+    auto buf = object_storage->writeObject(
+        StoredObject(storage_manifest_list_path), WriteMode::Rewrite, std::nullopt,
+        DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+
+    generateManifestList(
+        path_resolver,
+        metadata_object,
+        object_storage,
+        secondary_storages,
+        context,
+        mli.manifest_paths,
+        snapshot_result.snapshot,
+        mli.manifest_sizes,
+        *buf,
+        FileContentType::DATA,
+        false, /// use_previous_snapshots
+        {}, /// per_entry_content_types
+        mli.entry_counts,
+        plan.carry_forward_manifest_paths,
+        mli.entry_partition_spec_ids);
+
+    buf->finalize();
+}
+
+/// Phase 5: Commit metadata file and version hint. Returns the commit outcome.
+BinPackCommitResult commitMetadata(
+    Poco::JSON::Object::Ptr metadata_object,
+    Poco::JSON::Object::Ptr snapshot,
+    const GeneratedMetadataFileWithInfo & generated_metadata_info,
+    FileNamesGenerator & generator,
+    const IcebergPathResolver & path_resolver,
+    const PersistentTableComponents & persistent_table_components,
+    ObjectStoragePtr object_storage,
+    ContextPtr context,
+    const DataLakeStorageSettings & data_lake_settings,
+    bool & keep_files_on_error,
+    const std::function<void()> & cleanup,
+    LoggerPtr log)
+{
+    std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::JSON::Stringifier::stringify(metadata_object, oss, 4);
+    std::string json_representation = removeEscapedSlashes(oss.str());
+
+    auto hint_path = generator.generateVersionHint();
+
+    const auto commit_result = tryWriteMetadataFileAndVersionHint(
+        path_resolver,
+        generated_metadata_info,
+        json_representation,
+        hint_path,
+        object_storage,
+        context,
+        data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]);
+
+    if (commit_result == MetadataCommitResult::Conflict)
+    {
+        LOG_INFO(log, "Bin-pack commit conflict detected, cleaning up");
+        cleanup();
+        return BinPackCommitResult::Conflict;
+    }
+
+    if (commit_result == MetadataCommitResult::Unknown)
+    {
+        /// From here on the new metadata may be live and reference the new files,
+        /// so they are removed only once another writer is known to own this version.
+        keep_files_on_error = true;
+
+        const Int64 new_snapshot_id = snapshot->getValue<Int64>(f_metadata_snapshot_id);
+        MetadataFileOwner owner = MetadataFileOwner::Absent;
+        String verification_error;
+        try
+        {
+            owner = getMetadataFileOwner(
+                generated_metadata_info.path, generated_metadata_info.compression_method, new_snapshot_id,
+                persistent_table_components, object_storage, context, log);
+        }
+        catch (...)
+        {
+            verification_error = getCurrentExceptionMessage(false);
+        }
+
+        if (!verification_error.empty() || owner == MetadataFileOwner::Absent)
+            throw Exception(
+                ErrorCodes::UNFINISHED,
+                "Outcome of writing Iceberg metadata file {} for bin-pack snapshot {} is unknown{}. "
+                "Files written by this attempt were left in place",
+                generated_metadata_info.path.serialize(), new_snapshot_id,
+                verification_error.empty() ? "" : fmt::format(" and could not be verified: {}", verification_error));
+
+        if (owner == MetadataFileOwner::Other)
+        {
+            LOG_INFO(log, "Bin-pack commit conflict detected after a failed metadata write, cleaning up");
+            keep_files_on_error = false;
+            cleanup();
+            return BinPackCommitResult::Conflict;
+        }
+        LOG_INFO(log, "Bin-pack metadata write reported an error, but snapshot {} is committed", new_snapshot_id);
+    }
+
+    return BinPackCommitResult::Committed;
+}
+
 BinPackCommitResult executeBinPackCompaction(
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
@@ -778,161 +1302,11 @@ BinPackCommitResult executeBinPackCompaction(
         const ColumnMapperPtr current_schema_column_mapper = createColumnMapper(current_schema);
 
         /// Phase 1: Read small files and write merged data files.
-        /// For each bin, read all source files and write a merged file via MultipleFileWriter.
-        Int64 total_added_files = 0;
-        Int64 total_added_records = 0;
-        Int64 total_added_files_size = 0;
-
-        /// Track info per bin for manifest writing.
-        struct BinResult
-        {
-            Row partition_key;
-            std::vector<IcebergPathFromMetadata> merged_file_paths;
-            std::vector<UInt64> merged_file_row_counts;
-            std::vector<UInt64> merged_file_byte_counts;
-            std::vector<DataFileStatisticsPtr> merged_file_stats;
-            /// The old files that were replaced.
-            std::vector<IcebergPathFromMetadata> old_file_paths;
-            std::vector<UInt64> old_file_row_counts;
-            std::vector<UInt64> old_file_byte_counts;
-            std::vector<DataFileEntryLineage> old_file_lineage;
-            std::vector<DataFileColumnStatistics> old_file_stats;
-            std::vector<String> old_file_formats;
-            std::vector<std::optional<Int32>> old_file_sort_order_ids;
-        };
-        std::vector<BinResult> bin_results;
-
-        for (auto & bin : plan.bins)
-        {
-            BinResult result;
-            result.partition_key = bin.partition_key;
-
-            /// Prepare the MultipleFileWriter for this bin.
-            MultipleFileWriter writer(
-                /* max_data_file_num_rows */ 0,  /// no row limit; size limit is used
-                /* max_data_file_num_bytes */ target_size,
-                current_schema->getArray(f_fields),
-                generator,
-                path_resolver,
-                object_storage,
-                context,
-                std::nullopt, /// format_settings
-                write_format,
-                sample_block,
-                [&](const std::string & path)
-                {
-                    new_data_file_paths.push_back(IcebergPathFromMetadata::deserialize(path));
-                });
-
-            /// Read each source file and feed into the writer.
-            for (auto & file_entry : bin.files)
-            {
-                auto [resolved_storage, resolved_key] = resolveObjectStorageForPath(
-                    persistent_table_components.table_location,
-                    file_entry.file_path.serialize(),
-                    object_storage, secondary_storages, context,
-                    path_resolver);
-
-                RelativePathWithMetadata object_info(resolved_key);
-                ObjectStoragePtr storage_to_use = resolved_storage ? resolved_storage : object_storage;
-                auto read_buffer = createReadBuffer(object_info, storage_to_use, context, log);
-
-                auto parser_shared_resources = std::make_shared<FormatParserSharedResources>(
-                    settings, /*num_streams_=*/1);
-
-                const String source_format = file_entry.file_format.empty() ? write_format : file_entry.file_format;
-                const bool is_parquet = Poco::toLower(source_format) == "parquet";
-
-                /// Like `SELECT`, read a file with the schema it was written with (Parquet columns are
-                /// matched by field id when present, by name otherwise) and then evolve it to the
-                /// current schema, so renamed, retyped, added and dropped columns are handled.
-                SharedHeader read_header = sample_block;
-                ColumnMapperPtr column_mapper = is_parquet ? current_schema_column_mapper : nullptr;
-                std::shared_ptr<ExpressionActions> schema_transform;
-                if (file_entry.schema_id != current_schema_id_int)
-                {
-                    read_header = makeHeaderFromSchema(schema_processor, file_entry.schema_id);
-                    column_mapper = is_parquet ? schema_processor.getColumnMapperById(file_entry.schema_id) : nullptr;
-                    auto dag = schema_processor.getSchemaTransformationDagByIds(context, file_entry.schema_id, current_schema_id_int);
-                    schema_transform = std::make_shared<ExpressionActions>(dag->clone());
-                }
-
-                auto input_format = FormatFactory::instance().getInput(
-                    source_format,
-                    *read_buffer,
-                    *read_header,
-                    context,
-                    8192,
-                    std::nullopt, /// format_settings
-                    parser_shared_resources,
-                    std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr),
-                    true, /// is_remote_fs
-                    CompressionMethod::None,
-                    false);
-
-                while (true)
-                {
-                    if (auto elem = context->getProcessListElement(); elem && elem->isKilled())
-                        throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "OPTIMIZE TABLE cancelled during bin-pack rewrite");
-
-                    auto chunk = input_format->read();
-                    if (chunk.empty())
-                        break;
-
-                    if (schema_transform)
-                    {
-                        size_t num_rows = chunk.getNumRows();
-                        Block block = read_header->cloneWithColumns(chunk.detachColumns());
-                        schema_transform->execute(block, num_rows);
-
-                        Columns columns;
-                        columns.reserve(sample_block->columns());
-                        for (const auto & column : *sample_block)
-                            columns.push_back(block.getByName(column.name).column->convertToFullColumnIfConst());
-                        chunk = Chunk(std::move(columns), num_rows);
-                    }
-
-                    writer.consume(chunk);
-                }
-
-                /// Track old file info for the delete manifest.
-                result.old_file_paths.push_back(file_entry.file_path);
-                result.old_file_row_counts.push_back(static_cast<UInt64>(file_entry.record_count));
-                result.old_file_byte_counts.push_back(static_cast<UInt64>(file_entry.file_size_in_bytes));
-                result.old_file_formats.push_back(file_entry.file_format);
-                result.old_file_sort_order_ids.push_back(file_entry.sort_order_id);
-                result.old_file_stats.push_back(std::move(file_entry.column_stats));
-
-                /// Per the spec, the `snapshot_id` of a DELETED entry is the snapshot that deleted the file,
-                /// so `added_snapshot_id` stays unset and the new `replace` snapshot id is written.
-                DataFileEntryLineage lineage;
-                lineage.sequence_number = file_entry.sequence_number;
-                lineage.file_sequence_number = file_entry.file_sequence_number;
-                lineage.status_override = ManifestEntryStatus::DELETED;
-                result.old_file_lineage.push_back(lineage);
-            }
-
-            writer.finalize();
-
-            result.merged_file_paths = writer.getDataFiles();
-            result.merged_file_row_counts = writer.getDataFileRowCounts();
-            result.merged_file_byte_counts = writer.getDataFileByteCounts();
-            result.merged_file_stats = writer.getPerFileStatistics();
-            if (result.merged_file_stats.size() != result.merged_file_paths.size())
-                throw Exception(
-                    ErrorCodes::LOGICAL_ERROR,
-                    "Bin-pack writer returned {} statistics for {} merged files",
-                    result.merged_file_stats.size(), result.merged_file_paths.size());
-
-            for (size_t i = 0; i < result.merged_file_paths.size(); ++i)
-            {
-                total_added_files++;
-                total_added_records += static_cast<Int64>(result.merged_file_row_counts[i]);
-                total_added_files_size += static_cast<Int64>(result.merged_file_byte_counts[i]);
-            }
-
-            bin_results.push_back(std::move(result));
-        }
+        auto rewrite = rewriteBins(
+            plan, persistent_table_components, object_storage, secondary_storages, context,
+            current_schema, schema_processor, current_schema_id_int, sample_block,
+            current_schema_column_mapper, generator, path_resolver, write_format,
+            target_size, new_data_file_paths, log);
 
         /// Phase 2: Generate the replace snapshot.
         auto generated_metadata_info = generator.generateMetadataPathWithInfo();
@@ -940,283 +1314,37 @@ BinPackCommitResult executeBinPackCompaction(
             generator,
             generated_metadata_info.path,
             plan.current_snapshot_id,
-            total_added_files,
-            total_added_records,
-            total_added_files_size,
+            rewrite.total_added_files,
+            rewrite.total_added_records,
+            rewrite.total_added_files_size,
             plan.removed_data_files,
             plan.removed_records,
             plan.removed_files_size,
             plan.num_partitions);
 
         /// Phase 3: Write manifest files.
-        /// We write three types of manifests:
-        /// - Delete manifests: DELETED entries for old files (one per bin)
-        /// - Add manifests: ADDED entries for new merged files (one per bin)
-        /// - Kept manifests: EXISTING entries for files of touched manifests that were not merged
-        std::vector<IcebergPathFromMetadata> all_new_manifest_paths;
-        std::vector<Int64> all_manifest_sizes;
-        std::vector<ManifestListEntryExistingCounts> all_existing_counts;
-        std::vector<Int64> all_entry_partition_spec_ids;
-
-        /// Write one data manifest for a set of entries sharing a partition key and record it
-        /// for the manifest list. `existing_counts` must match the statuses of the written entries.
-        auto write_manifest_for_entries = [&](
-            const Row & partition_key,
-            const std::vector<IcebergPathFromMetadata> & paths,
-            const std::vector<UInt64> & row_counts,
-            const std::vector<UInt64> & byte_counts,
-            const std::vector<String> & formats,
-            const std::vector<DataFileColumnStatistics> & stats,
-            const std::vector<std::optional<Int32>> & sort_order_ids,
-            const std::vector<DataFileEntryLineage> & lineage,
-            const std::optional<DataFileStatistics> & data_file_statistics,
-            ManifestListEntryExistingCounts existing_counts)
-        {
-            auto manifest_path = generator.generateManifestEntryName();
-            auto storage_path = path_resolver.resolve(manifest_path);
-            new_manifest_paths.push_back(manifest_path);
-
-            auto buf = object_storage->writeObject(
-                StoredObject(storage_path), WriteMode::Rewrite, std::nullopt,
-                DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
-
-            generateManifestFile(
-                metadata_object,
-                plan.partition_columns,
-                partition_key,
-                plan.partition_types,
-                paths,
-                row_counts,
-                byte_counts,
-                data_file_statistics,
-                sample_block,
-                snapshot_result.snapshot,
-                write_format,
-                plan.partition_spec,
-                plan.partition_spec_id,
-                *buf,
-                FileContentType::DATA,
-                std::nullopt, /// user_defined_sequence_number
-                {}, /// per_file_stats
-                formats,
-                stats,
-                sort_order_ids,
-                lineage);
-
-            buf->finalize();
-            Int64 manifest_size = buf->count();
-            if (manifest_size == 0)
-                manifest_size = object_storage->getObjectMetadata(storage_path, false).size_bytes;
-
-            all_new_manifest_paths.push_back(manifest_path);
-            all_manifest_sizes.push_back(manifest_size);
-            all_existing_counts.push_back(existing_counts);
-            all_entry_partition_spec_ids.push_back(plan.partition_spec_id);
-        };
-
-        const Int64 new_sequence_number = snapshot_result.snapshot->getValue<Int64>(f_metadata_sequence_number);
-
-        for (auto & bin_result : bin_results)
-        {
-            /// Delete manifest: old files marked DELETED.
-            Int64 deleted_min_seq = std::numeric_limits<Int64>::max();
-            for (const auto & lineage : bin_result.old_file_lineage)
-                deleted_min_seq = std::min(deleted_min_seq, lineage.sequence_number.value_or(0));
-
-            ManifestListEntryExistingCounts deleted_counts;
-            deleted_counts.min_sequence_number = deleted_min_seq;
-            deleted_counts.deleted_files_count = static_cast<Int64>(bin_result.old_file_paths.size());
-            deleted_counts.deleted_rows_count = static_cast<Int64>(
-                std::accumulate(bin_result.old_file_row_counts.begin(), bin_result.old_file_row_counts.end(), UInt64{0}));
-
-            write_manifest_for_entries(
-                bin_result.partition_key,
-                bin_result.old_file_paths,
-                bin_result.old_file_row_counts,
-                bin_result.old_file_byte_counts,
-                bin_result.old_file_formats,
-                bin_result.old_file_stats,
-                bin_result.old_file_sort_order_ids,
-                bin_result.old_file_lineage,
-                std::nullopt,
-                deleted_counts);
-
-            /// Add manifests: one per merged file, because `generateManifestFile` applies a single
-            /// statistics object to every entry of a manifest.
-            for (size_t i = 0; i < bin_result.merged_file_paths.size(); ++i)
-            {
-                std::optional<DataFileStatistics> merged_stats;
-                if (bin_result.merged_file_stats[i])
-                    merged_stats = *bin_result.merged_file_stats[i];
-
-                ManifestListEntryExistingCounts added_counts;
-                added_counts.min_sequence_number = new_sequence_number;
-                added_counts.added_files_count = 1;
-                added_counts.added_rows_count = static_cast<Int64>(bin_result.merged_file_row_counts[i]);
-
-                write_manifest_for_entries(
-                    bin_result.partition_key,
-                    {bin_result.merged_file_paths[i]},
-                    {bin_result.merged_file_row_counts[i]},
-                    {bin_result.merged_file_byte_counts[i]},
-                    {}, /// formats
-                    {}, /// stats
-                    {}, /// sort_order_ids
-                    {}, /// lineage
-                    merged_stats,
-                    added_counts);
-            }
-        }
-
-        /// Kept manifests: live data files from touched manifests that were not merged (large
-        /// files, single-file partitions, files excluded because of deletes). They stay in the
-        /// new snapshot as EXISTING entries with their original snapshot id and sequence numbers.
-        for (const auto & [partition_key, kept_files] : plan.kept_groups)
-        {
-            std::vector<IcebergPathFromMetadata> kept_paths;
-            std::vector<UInt64> kept_row_counts;
-            std::vector<UInt64> kept_byte_counts;
-            std::vector<String> kept_formats;
-            std::vector<DataFileColumnStatistics> kept_stats;
-            std::vector<std::optional<Int32>> kept_sort_order_ids;
-            std::vector<DataFileEntryLineage> kept_lineage;
-            kept_paths.reserve(kept_files.size());
-            kept_row_counts.reserve(kept_files.size());
-            kept_byte_counts.reserve(kept_files.size());
-            kept_formats.reserve(kept_files.size());
-            kept_stats.reserve(kept_files.size());
-            kept_sort_order_ids.reserve(kept_files.size());
-            kept_lineage.reserve(kept_files.size());
-
-            Int64 kept_min_seq = std::numeric_limits<Int64>::max();
-            Int64 kept_total_rows = 0;
-            for (const auto & kept : kept_files)
-            {
-                kept_paths.push_back(kept.file_path);
-                kept_row_counts.push_back(static_cast<UInt64>(kept.record_count));
-                kept_byte_counts.push_back(static_cast<UInt64>(kept.file_size_in_bytes));
-                kept_formats.push_back(kept.file_format);
-                kept_stats.push_back(kept.column_stats);
-                kept_sort_order_ids.push_back(kept.sort_order_id);
-
-                DataFileEntryLineage lineage;
-                lineage.added_snapshot_id = kept.snapshot_id;
-                lineage.sequence_number = kept.sequence_number;
-                lineage.file_sequence_number = kept.file_sequence_number;
-                kept_lineage.push_back(lineage);
-
-                kept_min_seq = std::min(kept_min_seq, kept.sequence_number.value_or(0));
-                kept_total_rows += kept.record_count;
-            }
-
-            write_manifest_for_entries(
-                partition_key,
-                kept_paths,
-                kept_row_counts,
-                kept_byte_counts,
-                kept_formats,
-                kept_stats,
-                kept_sort_order_ids,
-                kept_lineage,
-                std::nullopt,
-                {static_cast<Int64>(kept_files.size()), kept_total_rows, kept_min_seq});
-        }
+        auto mli = writeManifests(
+            rewrite.bin_results, plan, metadata_object, snapshot_result.snapshot,
+            sample_block, generator, path_resolver, object_storage, context,
+            write_format, new_manifest_paths);
 
         /// Phase 4: Write manifest list.
-        {
-            auto storage_manifest_list_path = path_resolver.resolve(snapshot_result.manifest_list_path);
-            manifest_list_path = snapshot_result.manifest_list_path;
-
-            auto buf = object_storage->writeObject(
-                StoredObject(storage_manifest_list_path), WriteMode::Rewrite, std::nullopt,
-                DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
-
-            generateManifestList(
-                path_resolver,
-                metadata_object,
-                object_storage,
-                secondary_storages,
-                context,
-                all_new_manifest_paths,
-                snapshot_result.snapshot,
-                all_manifest_sizes,
-                *buf,
-                FileContentType::DATA,
-                false, /// use_previous_snapshots
-                {}, /// per_entry_content_types
-                all_existing_counts,
-                plan.carry_forward_manifest_paths,
-                all_entry_partition_spec_ids);
-
-            buf->finalize();
-        }
+        writeManifestList(
+            mli, plan, snapshot_result, path_resolver, metadata_object,
+            object_storage, secondary_storages, context, manifest_list_path);
 
         /// Phase 5: Commit metadata.
-        {
-            std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-            Poco::JSON::Stringifier::stringify(metadata_object, oss, 4);
-            std::string json_representation = removeEscapedSlashes(oss.str());
+        auto commit = commitMetadata(
+            metadata_object, snapshot_result.snapshot, generated_metadata_info,
+            generator, path_resolver, persistent_table_components, object_storage,
+            context, data_lake_settings, keep_files_on_error, cleanup, log);
 
-            auto hint_path = generator.generateVersionHint();
-
-            const auto commit_result = tryWriteMetadataFileAndVersionHint(
-                path_resolver,
-                generated_metadata_info,
-                json_representation,
-                hint_path,
-                object_storage,
-                context,
-                data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]);
-
-            if (commit_result == MetadataCommitResult::Conflict)
-            {
-                LOG_INFO(log, "Bin-pack commit conflict detected, cleaning up");
-                cleanup();
-                return BinPackCommitResult::Conflict;
-            }
-
-            if (commit_result == MetadataCommitResult::Unknown)
-            {
-                /// From here on the new metadata may be live and reference the new files,
-                /// so they are removed only once another writer is known to own this version.
-                keep_files_on_error = true;
-
-                const Int64 new_snapshot_id = snapshot_result.snapshot->getValue<Int64>(f_metadata_snapshot_id);
-                MetadataFileOwner owner = MetadataFileOwner::Absent;
-                String verification_error;
-                try
-                {
-                    owner = getMetadataFileOwner(
-                        generated_metadata_info.path, generated_metadata_info.compression_method, new_snapshot_id,
-                        persistent_table_components, object_storage, context, log);
-                }
-                catch (...)
-                {
-                    verification_error = getCurrentExceptionMessage(false);
-                }
-
-                if (!verification_error.empty() || owner == MetadataFileOwner::Absent)
-                    throw Exception(
-                        ErrorCodes::UNFINISHED,
-                        "Outcome of writing Iceberg metadata file {} for bin-pack snapshot {} is unknown{}. "
-                        "Files written by this attempt were left in place",
-                        generated_metadata_info.path.serialize(), new_snapshot_id,
-                        verification_error.empty() ? "" : fmt::format(" and could not be verified: {}", verification_error));
-
-                if (owner == MetadataFileOwner::Other)
-                {
-                    LOG_INFO(log, "Bin-pack commit conflict detected after a failed metadata write, cleaning up");
-                    keep_files_on_error = false;
-                    cleanup();
-                    return BinPackCommitResult::Conflict;
-                }
-                LOG_INFO(log, "Bin-pack metadata write reported an error, but snapshot {} is committed", new_snapshot_id);
-            }
-        }
+        if (commit != BinPackCommitResult::Committed)
+            return commit;
 
         LOG_INFO(log, "Bin-pack compaction committed: {} bins, {} new files ({} records, {} bytes), "
                  "{} old files removed ({} records, {} bytes)",
-                 plan.bins.size(), total_added_files, total_added_records, total_added_files_size,
+                 plan.bins.size(), rewrite.total_added_files, rewrite.total_added_records, rewrite.total_added_files_size,
                  plan.removed_data_files, plan.removed_records, plan.removed_files_size);
         return BinPackCommitResult::Committed;
     }

@@ -280,17 +280,17 @@ TEST(IcebergBinPackRewrite, ManifestListCountsMatchEntryStatuses)
     auto snapshot = makeReplaceSnapshot(metadata);
     const Int64 new_sequence_number = snapshot->getValue<Int64>(f_metadata_sequence_number);
 
-    ManifestListEntryExistingCounts deleted_counts;
+    ManifestListEntryCounts deleted_counts;
     deleted_counts.min_sequence_number = 1;
     deleted_counts.deleted_files_count = 3;
     deleted_counts.deleted_rows_count = 30;
 
-    ManifestListEntryExistingCounts added_counts;
+    ManifestListEntryCounts added_counts;
     added_counts.min_sequence_number = new_sequence_number;
     added_counts.added_files_count = 1;
     added_counts.added_rows_count = 30;
 
-    ManifestListEntryExistingCounts kept_counts;
+    ManifestListEntryCounts kept_counts;
     kept_counts.min_sequence_number = 1;
     kept_counts.existing_files_count = 2;
     kept_counts.existing_rows_count = 50;
@@ -318,7 +318,7 @@ TEST(IcebergBinPackRewrite, ManifestListCountsMatchEntryStatuses)
     auto entries = readAvroRecords(buf.str());
     ASSERT_EQ(entries.size(), 3);
 
-    auto check = [](const avro::GenericDatum & datum, const ManifestListEntryExistingCounts & expected)
+    auto check = [](const avro::GenericDatum & datum, const ManifestListEntryCounts & expected)
     {
         const auto & entry = datum.value<avro::GenericRecord>();
         EXPECT_EQ(entry.field(f_added_files_count).value<Int32>(), expected.added_files_count);
