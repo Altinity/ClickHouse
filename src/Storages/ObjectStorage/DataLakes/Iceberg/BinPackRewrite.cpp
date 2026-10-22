@@ -657,7 +657,6 @@ MetadataFileOwner getMetadataFileOwner(
 
 } // anonymous namespace
 
-
 bool hasLivePositionDeletes(
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
@@ -710,6 +709,9 @@ bool hasLivePositionDeletes(
     }
     return false;
 }
+
+namespace
+{
 
 /// Per-bin result produced by Phase 1 (rewriting) and consumed by Phase 3 (manifest writing).
 struct BinResult
@@ -1203,6 +1205,8 @@ BinPackCommitResult commitMetadata(
 
     return BinPackCommitResult::Committed;
 }
+
+} // anonymous namespace
 
 BinPackCommitResult executeBinPackCompaction(
     const PersistentTableComponents & persistent_table_components,
