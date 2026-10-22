@@ -959,7 +959,9 @@ namespace
         case SnapshotSummaryOperation::OVERWRITE: {
             const auto & update = summary->getUpdate<Iceberg::SnapshotSummaryUpdateOverwrite>();
             /// current compaction (OPTIME TABLE my_iceberg) supports only overwrites wich has only position delete files
-            if (update.added_files == 0 && (update.added_position_deletes == update.added_delete_files) && update.added_position_deletes != 0)
+            if (update.added_files == 0 && update.added_delete_files != 0
+                && update.added_position_delete_files == update.added_delete_files
+                && update.added_equality_delete_files == 0)
                 return std::nullopt;
             throw DB::Exception(ErrorCodes::NOT_IMPLEMENTED, "Unsupported snapshot's operation type {}", summary->getOperation());
         }
