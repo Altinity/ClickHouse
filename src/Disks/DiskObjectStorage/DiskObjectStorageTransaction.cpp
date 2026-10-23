@@ -291,7 +291,7 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
 
     WriteSettings enriched_settings = updateIOSchedulingSettings(settings, read_resource_name, write_resource_name);
 
-    /// [TXN-ONE-PIPELINE] Give the metadata storage a chance to own the write (e.g. a content-addressed
+    /// Give the metadata storage a chance to own the write (e.g. a content-addressed
     /// hash-on-write buffer whose blob key is known only after the last byte). It returns a fully-wrapped
     /// buffer (hash-on-write + append RMW + inline/blob split + autocommit/lifetime pin using `owner`), or
     /// nullptr to fall through to the generic up-front-key streaming path below. Called BEFORE the append
@@ -468,9 +468,7 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
     /// We always use mode Rewrite because we simulate append using metadata and different files
     object.bytes_size = std::move(write_blob_function)(blob_path, WriteMode::Rewrite, /*object_attributes=*/std::nullopt);
 
-    /// [TXN-ONE-PIPELINE] Routed through addOperation for uniformity. Unreachable on CA (Audit 6):
-    /// generateObjectKeyForPath above throws NOT_IMPLEMENTED first, so CA never reaches this metadata
-    /// effect and never queues. On ordinary storage addOperation queues exactly as before.
+    /// Unreachable on a content-addressed storage: generateObjectKeyForPath above throws NOT_IMPLEMENTED first.
     addOperation([object, mode](MetadataTransactionPtr tx)
     {
         if (mode == WriteMode::Rewrite)
@@ -492,7 +490,7 @@ void DiskObjectStorageTransaction::createHardLink(const std::string & src_path, 
     /// For CA `addOperation` runs eagerly (call-time), which is load-bearing for read-your-writes: a
     /// carried-forward projection hardlinked into the open whole-part transaction during a mutation must
     /// be visible to `loadProjections` (same finalize, before commit) via the directory overlay. Deferring
-    /// it to commit replay would hide it until after `loadProjections` ran (B58/B63). The metadata-level
+    /// it to commit replay would hide it until after `loadProjections` ran. The metadata-level
     /// `createHardLink` is an idempotent map assignment, so eager staging is equivalent to the queued
     /// replay — commit publishes the manifest from the staging.
     addOperation([src_path, dst_path](MetadataTransactionPtr tx)
@@ -643,10 +641,7 @@ void DiskObjectStorageTransaction::copyFileImpl(
         return;
     }
 
-    /// [TXN-ONE-PIPELINE] Routed through addOperation for uniformity. Unreachable on CA (Audit 6):
-    /// copyFileImpl calls generateObjectKeyForPath above, which throws NOT_IMPLEMENTED on CA before this
-    /// point (and the empty-source case returns via the real writeFile above), so CA never queues here.
-    /// On ordinary storage addOperation queues exactly as before.
+    /// Unreachable on a content-addressed storage: copyFileImpl's generateObjectKeyForPath throws NOT_IMPLEMENTED first.
     addOperation([blobs_to_create, missing_locations, to_file_path](MetadataTransactionPtr tx)
     {
         for (const auto & blob : blobs_to_create)

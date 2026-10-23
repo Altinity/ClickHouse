@@ -497,7 +497,7 @@ void DataPartStorageOnDiskBase::backup(
 
     auto disk = volume->getDisk();
 
-    /// B34: the temporary-hard-link BACKUP path (used for Ordinary, non-UUID databases) calls
+    /// The temporary-hard-link BACKUP path (used for Ordinary, non-UUID databases) calls
     /// disk->createHardLink with a non-part-shaped temp path, which on a CAS disk
     /// would otherwise surface as a raw LOGICAL_ERROR. Fail closed with a clear message instead.
     /// The pointer-holding path (make_temporary_hard_links=false, used by Atomic/UUID databases)
@@ -505,7 +505,7 @@ void DataPartStorageOnDiskBase::backup(
     if (make_temporary_hard_links && disk->isContentAddressed())
         throw Exception(
             ErrorCodes::SUPPORT_IS_DISABLED,
-            "BACKUP via temporary hard links is not supported on a CAS disk yet (B16/B34); "
+            "BACKUP via temporary hard links is not supported on a CAS disk yet; "
             "use an Atomic database (which backs up via pointer-holding) instead; disk '{}'",
             disk->getName());
 
@@ -615,12 +615,8 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
 {
     auto disk = volume->getDisk();
 
-    /// A CAS disk models a part as one atomic unit (N files -> one manifest -> one ref).
-    /// The per-file createHardLink autocommit Backup uses with no enclosing transaction would publish a
-    /// one-file ref per file and overwrite the destination, leaving the clone with only its last file
-    /// (the B21 corruption mode — seen as system.detached_parts listing metadata_version.txt instead of
-    /// the detached part dir, B36). When the caller did not supply a transaction, run the whole clone
-    /// through ONE self-created disk transaction so all files land in a single content-addressed part.
+    /// A content-addressed disk publishes a part as one unit, so a clone without an enclosing transaction
+    /// runs through one self-created transaction instead of per-file autocommits.
     DiskTransactionPtr owned_transaction;
     if (!params.external_transaction && disk->isContentAddressed())
         owned_transaction = disk->createTransaction();
@@ -661,15 +657,8 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
             clone_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
         IMergeTreeDataPart::writeInvalidatedSystemColumnsFile(*clone_transaction, fs::path(to) / dir_path, params.invalidated_columns_to_write, write_settings);
 
-        /// When the caller wants a fresh metadata version written into the clone (the Replicated queue
-        /// clone path — `executeReplaceRange`/`replacePartitionFrom`/`movePartitionToTable` set
-        /// `metadata_version_to_write`), write `metadata_version.txt` INSIDE the clone transaction so it
-        /// is part of the single whole-part commit. On a content-addressed disk the part is published
-        /// atomically at `commit`; a separate post-clone autocommit `writeFile` of this part file (what
-        /// `cloneAndLoadDataPart` does for non-CA disks) would hit the per-file-autocommit guard (B21).
-        /// `cloneAndLoadDataPart`'s own post-clone write now runs unconditionally (the freeze special
-        /// case was dropped with all-tree Task 10): identical bytes land as a byte-equal repoint
-        /// no-op, differing bytes as a legal repoint.
+        /// Write `metadata_version.txt` inside the clone transaction so it is part of the single whole-part
+        /// commit; `cloneAndLoadDataPart`'s own later write lands as a byte-equal no-op.
         if (params.metadata_version_to_write.has_value())
         {
             chassert(!params.keep_metadata_version);

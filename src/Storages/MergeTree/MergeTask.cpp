@@ -1562,9 +1562,6 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::calculateProjectionForBlock(
             *global_ctx->data, result, projection, global_ctx->new_data_part.get(), ++ctx->projection_block_num, global_ctx->context);
 
         tmp_part->finalize();
-        /// A borrowed (CA) temp projection sub-part rides the parent's whole-part transaction and is
-        /// committed by the parent's single commit; the storage makes commitTransaction a no-op there,
-        /// so this can be called unconditionally (B58).
         tmp_part->part->getDataPartStorage().commitTransaction();
         ctx->projection_parts[projection.name].emplace_back(std::move(tmp_part->part));
     }
@@ -1607,8 +1604,6 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::finalizeProjections() const
                 *global_ctx->data, result, projection, global_ctx->new_data_part.get(), ++ctx->projection_block_num, global_ctx->context);
 
             temp_part->finalize();
-            /// See the matching note above: a borrowed (CA) temp projection sub-part rides the parent
-            /// transaction, so commitTransaction is a no-op and can be called unconditionally.
             temp_part->part->getDataPartStorage().commitTransaction();
             ctx->projection_parts[projection.name].emplace_back(std::move(temp_part->part));
         }

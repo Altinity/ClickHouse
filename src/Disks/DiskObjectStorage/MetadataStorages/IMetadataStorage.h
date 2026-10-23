@@ -117,7 +117,7 @@ public:
         throwNotImplemented();
     }
 
-    /// [TXN-ONE-PIPELINE] Optional per-metadata write buffer. Returns a ready-to-use buffer when the
+    /// Optional per-metadata write buffer. Returns a ready-to-use buffer when the
     /// metadata implementation owns its write mechanism (e.g. a content-addressed hash-on-write buffer
     /// whose blob key is known only after the last byte). `owner` is the disk transaction that must be
     /// kept alive for the returned buffer's lifetime and, when `autocommit`, committed from the finalize

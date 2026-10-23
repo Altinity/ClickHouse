@@ -376,10 +376,7 @@ bool ReadBufferFromS3::processException(size_t read_offset, size_t attempt) cons
         bucket, key, version_id.empty() ? "Latest" : version_id, read_offset, attempt, request_settings[S3RequestSetting::max_single_read_retries].value,
         getCurrentExceptionMessage(/* with_stacktrace = */ false));
 
-    /// Stop retrying once the query is cancelled (B117): otherwise a killed query's reads keep
-    /// retrying a transient error (e.g. a dropped connection) for many attempts with backoff,
-    /// zombying for minutes and adding load. The SDK's own RetryStrategy makes the same check
-    /// (src/IO/S3/Client.cpp), but this outer ReadBufferFromS3 retry loop did not.
+    /// A cancelled query must not keep retrying a transient read error (the SDK's RetryStrategy applies the same rule).
     if (CurrentThread::isInitialized() && CurrentThread::get().isQueryCanceled())
         return false;
 

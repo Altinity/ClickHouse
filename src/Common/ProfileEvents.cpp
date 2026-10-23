@@ -819,8 +819,8 @@ The server successfully detected this situation and will download merged part fr
     M(S3ListObjects, "Number of S3 API ListObjects calls.", ValueType::Number) \
     M(S3ListObjectsMicroseconds, "Time of S3 API ListObjects execution.", ValueType::Microseconds) \
     M(S3HeadObject,  "Number of S3 API HeadObject calls.", ValueType::Number) \
-    /* CA per-namespace S3 op instrumentation (B168 P0). 80 = 8 namespaces × 10 ops; attributes the */ \
-    /* S3 op-count (PUTs/HEADs/404s/412s/LISTs) by CA operation type via the InstrumentedBackend seam. */ \
+    /* CA per-namespace S3 op instrumentation: one event per (namespace, op) cell of the table in */ \
+    /* CasInstrumentedBackend.cpp; attributes PUTs/HEADs/404s/412s/LISTs to the CA operation type. */ \
     M(CASBlobPut,        "Number of CAS blob PUT requests. Grows with blob uploads and indicates storage write traffic.", ValueType::Number) \
     M(CASBlobPutDeduplicated,   "Number of CAS blob deduplicating PUT requests. Grows when uploads reuse existing content.", ValueType::Number) \
     M(CASBlobOverwrite,  "Number of CAS blob overwrite requests. Growing values indicate repeated replacement writes.", ValueType::Number) \
