@@ -44,8 +44,32 @@ ORDER BY event_time_microseconds;
 `skipped`) and `reason` are the two columns to read first; `detail` is a
 `Map(LowCardinality(String), String)` of decision-specific facts (`condemn_round`,
 `superseded_token`, `code`, `site`) worth `arrayJoin(detail)` when the summary columns alone do not
-explain the decision. See [`system.cas_log`](/operations/system-tables/cas_log) for the full column
+explain the decision. A `ref_move` row (a committed part renamed in place) is keyed by the old part name
+and carries the new one in `detail['dst_ref']`, so a search by the final name must also match `dst_ref`. See [`system.cas_log`](/operations/system-tables/cas_log) for the full column
 reference.
+
+### A query failed with CAS_OWNERSHIP_CONFLICT {#ownership-conflict}
+
+Error code 1039. The committed reference a writer had read was moved, dropped or repointed by another
+writer before the writer's own change landed: a rename found the destination name already committed
+with other content, the source renamed away, or a live precommit under the destination; a standalone
+write into a committed part found the part renamed or dropped meanwhile. The source part is untouched;
+a destination reference the failed cross-table rename itself created is taken back.
+
+The writer must re-resolve the part before trying again. Background work (replication queue entries,
+merges, mutations) retries on its own and records the message in `system.replication_queue.last_exception`;
+a user command (`ATTACH PART`, `MOVE PARTITION TO TABLE`, `ALTER ... MATERIALIZE`) reports the error
+and is rerun by the user. A conflict that repeats on every retry names two parts that really collide
+under one name — look at both sides:
+
+```sql
+SELECT event_time_microseconds, event_type, ref_name, detail['dst_ref'] AS dst_ref, reason
+FROM system.cas_log
+WHERE disk_name = 'cas' AND (ref_name IN ('<src_part>', '<dst_part>') OR detail['dst_ref'] IN ('<src_part>', '<dst_part>'))
+ORDER BY event_time_microseconds;
+```
+
+`ProfileEvents.CASOwnershipConflict` counts every refusal.
 
 ### Why GC is not reclaiming {#why-not-reclaiming}
 
@@ -266,7 +290,12 @@ decommissioning a pool member is a migration/scale-down operation, not an incide
 
 A delete request sent before a restart can still reach the object store later and remove a marker GC relies on,
 so a blob can be lost; nothing bounds when such requests stop. Entries the old version already scheduled for
-deletion are deleted by the upgraded GC without a fresh marker read. Downgrades follow the same procedure.
+deletion are deleted by the upgraded GC without a fresh marker read. A downgrade within 26.6.x follows the same
+procedure; a pool whose reader floor was raised to 2 by a writable 26.8 mount cannot be downgraded (see
+[Upgrading a pool from 26.6.x](../configuration.md#upgrading-from-26-6)).
+
+The decommission tool opens the pool with the server's CAS disk configuration and never admits a new
+`cas_blob_hash` into the pool: run it with the algorithm the pool already records.
 
 ## The CLICKHOUSE_USER_FILES gotcha when reproducing a test manually {#user-files-gotcha}
 

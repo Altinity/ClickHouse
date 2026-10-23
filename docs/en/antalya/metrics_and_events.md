@@ -252,6 +252,8 @@ These counters cover ref-log appends, recovery, snapshots, and reachability edge
 | `CASRefRecoveryStragglerAdopted` | `Number` | Number of straggler ref-log transactions a recovery compare-and-swap walk met at the slot it tried to seal and adopted, re-sealing at the new T+1. Non-zero means writes from a dying epoch were still materializing when recovery ran. |
 | `CASRefRecoveryStreamHole` | `Number` | Number of times CAS ref-table recovery found a 404 BELOW a durable same-epoch witness -- a hole in a stream INV-1 makes dense. Restarted while the restart budget lasts (a racing cleanup is the innocent explanation), then reported as corruption. Any sustained non-zero value is data loss, not noise. |
 | `CASRefRepoint` | `Number` | Number of CAS committed-reference repoints that republish a manifest. Growth indicates standalone part updates or removals. |
+| `CASRefMove` | `Number` | Number of CAS committed-reference renames done as one ref-log owner move, with no manifest republication. |
+| `CASOwnershipConflict` | `Number` | Number of CAS operations refused with `CAS_OWNERSHIP_CONFLICT`: the committed reference the writer had read was moved, dropped or repointed before its change landed. |
 | `CASRefRollbackBestEffortDropFailed` | `Number` | Number of rollback cleanup drops that hit a backend failure. A non-zero value means refs may remain live and GC may be delayed. |
 | `CASRefSnapshotPublishBackoff` | `Number` | Number of CAS ref-table snapshot publications put into backoff after a non-committed result. A non-zero value indicates write failure or uncertainty. |
 | `CASRefSnapshotPublishDispatched` | `Number` | Number of background CAS ref-table snapshot publications started. High values indicate frequent threshold or read-triggered publishing. |

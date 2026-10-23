@@ -195,9 +195,10 @@ writer_epoch)` they run `1, 2, 3, …` with no holes, and a new mount epoch rest
 as `CORRUPTED_DATA`.
 
 The op vocabulary is deliberately tiny: `NamespaceBirth`, `OwnerTransition{old?, new?}`,
-`SetPublishedAt`, `RemoveNamespace`. There are exactly four legal `OwnerTransition` shapes — add
-precommit, remove precommit, remove committed, and promote — enumerated identically by the state
-machine and by `GC`'s edge extractor, so the two readers of the format cannot drift.
+`SetPublishedAt`, `RemoveNamespace`. There are exactly five legal `OwnerTransition` shapes — add
+precommit, remove precommit, remove committed, promote, and move (a committed ref changes its name,
+keeping its manifest; format generation 2) — classified once (`classifyOwnerTransitionShape`) for the
+state machine and for `GC`'s edge extractor, so the two readers of the format cannot drift.
 
 Logs are pure conditional creates on write-once keys. There is no append-to-object and no
 `CAS`-swapped mutable pointer anywhere in the ref lane. The writer never deletes ref objects; only
