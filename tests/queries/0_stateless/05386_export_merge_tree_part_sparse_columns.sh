@@ -25,10 +25,10 @@ query() {
     $CLICKHOUSE_CLIENT --query "$1"
 }
 
-source_settings="ratio_of_defaults_for_sparse_serialization = 0.9, min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0, index_granularity = 8192, index_granularity_bytes = '10Mi'"
+source_settings="ratio_of_defaults_for_sparse_serialization = 0.9, serialization_info_version = 'with_types', min_bytes_for_wide_part = 0, min_rows_for_wide_part = 0, index_granularity = 8192, index_granularity_bytes = '10Mi'"
 insert_settings="max_insert_threads = 1, max_block_size = 300000, max_insert_block_size = 300000, min_insert_block_size_rows = 300000, min_insert_block_size_bytes = 0"
 # One row group holds every chunk of the part.
-export_settings="allow_experimental_export_merge_tree_part = 1, output_format_parquet_row_group_size = 1000000, output_format_parquet_row_group_size_bytes = 536870912"
+export_settings="allow_experimental_export_merge_tree_part = 1, allow_insert_into_iceberg = 1, output_format_parquet_row_group_size = 1000000, output_format_parquet_row_group_size_bytes = 536870912"
 
 echo "---- Sparse column cast to a wider type, first granule without zeros"
 query "CREATE TABLE $src (id Int64, f UInt8) ENGINE = MergeTree ORDER BY id SETTINGS $source_settings, nullable_serialization_version = 'basic'"
