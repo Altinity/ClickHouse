@@ -283,9 +283,11 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                 groups.emplace(parsed->root_namespace.string(), parsed->ref.writer_epoch, parsed->ref.build_sequence);
             return true;
         }, Retry::standard());
+        const std::set<String> server_roots = listServerRoots(*admin);
         for (const auto & [ns_str, writer_epoch, build_sequence] : groups)
             report.manifest_debris_removed += sweepNamespace(
-                *admin, RootNamespace(ns_str), BuildPrefix{writer_epoch, build_sequence}, &report.warnings);
+                *admin, RootNamespace(ns_str), BuildPrefix{writer_epoch, build_sequence}, server_roots,
+                &report.warnings);
     }
 
     /// Drain the victim's own `<pool_prefix>/staging/<srid>/` area. The live-mount staging helper uses

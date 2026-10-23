@@ -47,8 +47,8 @@ class GcRoundPlanSignatureAccess
 public:
     using FoldSignature = decltype(&Gc::fold);
     using ExpectedFoldSignature = Gc::FoldResult (Gc::*)(
-        GcState &, std::optional<Etag> &, RoundReport &, uint64_t, const RefPlan &, UniversePolicy,
-        GcRoundWorkBudget &);
+        GcState &, std::optional<Etag> &, RoundReport &, uint64_t, const RefPlan &, const std::set<String> &,
+        UniversePolicy, GcRoundWorkBudget &);
     using BuilderSignature = decltype(&buildRefWalkPlan);
     using ExpectedBuilderSignature = RefPlan (*)(RoundInput &&);
 

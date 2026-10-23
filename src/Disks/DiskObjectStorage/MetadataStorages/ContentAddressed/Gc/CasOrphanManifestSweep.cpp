@@ -45,7 +45,12 @@ void onGcEnumerationPage()
 /// mount there is no deletion authority, so the caller must leave the prefix untouched. The mount's
 /// `writer_epoch` and `min_active_build_sequence` are the single durable epoch/floor pair used for eligibility, including
 /// across process replacement and the retired sentinel.
+///
+/// `listed_server_roots` is the caller's own LIST of `gc/server-roots/`: a prefix it does not name has no
+/// mount body to read, so only the prefixes it names are tried. A mount younger than that LIST is then
+/// not found, which retains -- the same answer an absent mount gives -- until the caller's next LIST.
 std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & layout, const RootNamespace & ns,
+                                            const std::set<String> & listed_server_roots,
                                             uint64_t * reads = nullptr)
 {
     const String & value = ns.string();
@@ -57,7 +62,7 @@ std::optional<MountLease> floorForNamespace(CasOperation & op, const Layout & la
             break;
 
         const String server_root_id = value.substr(0, pos);
-        if (!server_root_id.empty())
+        if (!server_root_id.empty() && listed_server_roots.contains(server_root_id))
         {
             if (reads)
                 ++*reads;
@@ -180,9 +185,9 @@ struct NamespaceProtection
 /// and applies) consumes one unit of `GcRoundWorkBudget::sweep_recovery_op_budget`, shared with every
 /// other namespace this round touches. A hinting reader may prefetch up to one window of logs beyond
 /// the charged position before the walk reaches them -- those prefetches are not charged, since the
-/// budget bounds decoded work, not requests in flight -- and a hint issued past an epoch's seal is
-/// discarded rather than taken, bounding the waste of one crossing to one window, counted in
-/// `CASGCReadAheadWasted`. Exhaustion sets `NamespaceProtection::recovery_incomplete` and stops
+/// budget bounds decoded work, not requests in flight -- and only ids in `listed_logs` (the round's
+/// LIST of this life's stream) are hinted, so no hint lands past an epoch's seal, where no id exists.
+/// Exhaustion sets `NamespaceProtection::recovery_incomplete` and stops
 /// the walk — it is deliberately NOT plumbed into `recoverRefTableDetailedFromAuthority` itself: that
 /// function is a shared recovery primitive also used by `fsck` (which needs a COMPLETE table to audit)
 /// and the GC rebuild path (which needs a complete table to reconstruct in-degree from scratch), so
@@ -190,8 +195,9 @@ struct NamespaceProtection
 /// Reaching the budget before even calling `recoverRefTableDetailedFromAuthority` (already spent by an
 /// earlier namespace) skips that call entirely and reports incomplete immediately.
 NamespaceProtection activeManifestKeys(
-    CasOperation & op, KeyReader & reader, const Layout & layout, const CatalogEntry & catalog_entry,
-    const RefCkpt & ckpt, const std::optional<RefCoverage> & coverage, GcRoundWorkBudget * work_budget = nullptr)
+    CasOperation & op, KeyReader & reader, const std::set<RefTxnId> & listed_logs, const Layout & layout,
+    const CatalogEntry & catalog_entry, const RefCkpt & ckpt, const std::optional<RefCoverage> & coverage,
+    GcRoundWorkBudget * work_budget = nullptr)
 {
     NamespaceProtection protection;
     if (work_budget && !work_budget->sweepRecoveryOpAvailable())
@@ -207,7 +213,7 @@ NamespaceProtection activeManifestKeys(
     /// The exact row and `_ckpt` come from the caller's frozen catalog cut. Do not resolve `ns` here:
     /// a later catalog cut can name a reborn life and turn this old life into an apparent orphan.
     const RecoveredRefTable recovered = recoverRefTableDetailedFromAuthority(
-        op, layout, catalog_entry, ckpt, &reader);
+        op, layout, catalog_entry, ckpt, &reader, listed_logs);
     if (work_budget)
         ++work_budget->sweep_recovery_ops_used;   /// one coarse unit for the snapshot+tail recovery itself
     const RefTableState & state = recovered.state;
@@ -296,12 +302,12 @@ NamespaceProtection activeManifestKeys(
     }
 
     /// Guards the walk's most recently hinted-but-not-yet-taken range (from `arm`'s `from` up to one
-    /// window) so that an early exit from the loop below -- the work-budget `break`, the corrupted-tail
-    /// `throw`, or the missing-cursor epoch cross -- frees it instead of leaving it pinned against the
-    /// SAME reader for whatever this page reads next (later candidates, later namespaces). An ordinary
-    /// same-epoch advance re-arms it on the new position without discarding: those hints are still
-    /// wanted. A seal crossing discards explicitly, right where the crossing happens, and disarms so
-    /// this guard's own destructor does not repeat it.
+    /// window) so that an early exit from the loop below -- the work-budget `break` or the corrupted-tail
+    /// `throw` -- frees it instead of leaving it pinned against the SAME reader for whatever this page
+    /// reads next (later candidates, later namespaces). Every advance re-arms it on the new position
+    /// without discarding: a same-epoch advance still wants those hints, and an epoch crossing (a seal
+    /// or a missing cursor) has none, since `hintRefLogsWithinEpoch` hints only listed ids and no id
+    /// past a seal is ever listed.
     struct OutstandingHintGuard
     {
         KeyReader & reader;
@@ -317,13 +323,11 @@ NamespaceProtection activeManifestKeys(
             committed_through = committed_through_;
             armed = true;
         }
-        void discardNow()
+        ~OutstandingHintGuard()
         {
             if (armed)
                 discardRefLogHintsOfEpoch(reader, layout, life, from, committed_through);
-            armed = false;
         }
-        ~OutstandingHintGuard() { discardNow(); }
     } outstanding_hints{reader, layout, life};
 
     while (id <= *ckpt.committed_through)
@@ -342,7 +346,7 @@ NamespaceProtection activeManifestKeys(
         if (id.ref_sequence < std::numeric_limits<uint64_t>::max())
         {
             const RefTxnId hint_from{id.writer_epoch, id.ref_sequence + 1};
-            hintRefLogsWithinEpoch(reader, layout, life, hint_from, *ckpt.committed_through);
+            hintRefLogsWithinEpoch(reader, layout, life, hint_from, *ckpt.committed_through, listed_logs);
             outstanding_hints.arm(hint_from, *ckpt.committed_through);
         }
         const auto got = reader.take(layout.refLogKey(life, id));
@@ -357,9 +361,6 @@ NamespaceProtection activeManifestKeys(
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS orphan sweep: committed tail log {} is absent under the supplied _ckpt frontier",
                     renderRefTxnId(id));
-            /// The old epoch's hints past this missing cursor do not exist either; discard them before
-            /// crossing, exactly as the seal path below does.
-            outstanding_hints.discardNow();
             id = cross_from_missing_cursor(*prior);
             prior.reset();
             prior_is_seal.reset();
@@ -380,7 +381,6 @@ NamespaceProtection activeManifestKeys(
         {
             if (is_seal)
             {
-                outstanding_hints.discardNow();
                 prior.reset();
                 prior_is_seal.reset();
             }
@@ -529,9 +529,10 @@ namespace
 /// do not replace that authority check with a frozen-sequence or judged-dead guess. Compare
 /// `writer_epoch` first, then `build_sequence`, so old-epoch
 /// debris drains after a process restart even when its build_sequence is above the current min_active_build_sequence.
-bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & prefix)
+bool prefixEligibleOn(CasOperation & op, const Layout & layout, const RootNamespace & ns, const BuildPrefix & prefix,
+                      const std::set<String> & listed_server_roots)
 {
-    return prefixEligibleUnder(floorForNamespace(op, layout, ns), prefix);
+    return prefixEligibleUnder(floorForNamespace(op, layout, ns, listed_server_roots), prefix);
 }
 
 }
@@ -551,18 +552,28 @@ bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPre
     return w.min_active_build_sequence > prefix.build_sequence;
 }
 
-bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix)
+std::set<String> listServerRoots(Pool & store)
 {
     CasOperation op = store.openRequests().admit();
-    return prefixEligibleOn(op, store.layout(), ns, prefix);
+    std::set<String> server_roots;
+    for (const MountInfo & mount : listMounts(op, store.layout(), /*now_ms=*/0, /*skew_margin_ms=*/0))
+        server_roots.insert(mount.srid);
+    return server_roots;
+}
+
+bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
+                    const std::set<String> & listed_server_roots)
+{
+    CasOperation op = store.openRequests().admit();
+    return prefixEligibleOn(op, store.layout(), ns, prefix, listed_server_roots);
 }
 
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
-                        std::vector<String> * warnings)
+                        const std::set<String> & listed_server_roots, std::vector<String> * warnings)
 {
     const Layout & layout = store.layout();
     CasOperation op = store.openRequests().admit();
-    if (!prefixEligibleOn(op, layout, ns, prefix))
+    if (!prefixEligibleOn(op, layout, ns, prefix, listed_server_roots))
         return 0;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
 
     /// Build the protection view. A missing snapshot body, an invalid transaction, or an incomplete
@@ -597,7 +608,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
             return 0;
         }
         InlineKeyReader reader(op);
-        protection = activeManifestKeys(op, reader, layout, *catalog_entry, ckpt->ckpt, view.coverage);
+        protection = activeManifestKeys(op, reader, /*listed_logs=*/{}, layout, *catalog_entry, ckpt->ckpt, view.coverage);
         view.tail_removal_targets = protection.tail_removal_targets;
 
     }
@@ -670,6 +681,8 @@ ManifestSweepResult planManifestCursorPage(
     uint64_t list_budget,
     uint64_t nomination_budget,
     bool catalog_recovery_authoritative,
+    const std::set<String> & listed_server_roots,
+    const std::map<NamespaceLifePhysicalId, std::set<RefTxnId>> & listed_ref_logs,
     GcRoundWorkBudget * work_budget,
     ThreadPool * read_pool,
     size_t read_concurrency)
@@ -765,7 +778,7 @@ ManifestSweepResult planManifestCursorPage(
             if (floor_inserted)
             {
                 ++result.floor_lookups;
-                floor_it->second = floorForNamespace(op, layout, parsed->ns, &result.floor_reads);
+                floor_it->second = floorForNamespace(op, layout, parsed->ns, listed_server_roots, &result.floor_reads);
             }
             if (!prefixEligibleUnder(floor_it->second, parsed->prefix))
             {
@@ -838,8 +851,11 @@ ManifestSweepResult planManifestCursorPage(
                     }
                     else
                     {
+                        static const std::set<RefTxnId> kNothingListed;
+                        const auto listed_it = listed_ref_logs.find(catalog_entry->incarnation);
                         NamespaceProtection protection = activeManifestKeys(
-                            op, *reader, layout, *catalog_entry, ckpt->ckpt, view_it->second.coverage, work_budget);
+                            op, *reader, listed_it != listed_ref_logs.end() ? listed_it->second : kNothingListed,
+                            layout, *catalog_entry, ckpt->ckpt, view_it->second.coverage, work_budget);
                         if (protection.recovery_incomplete)
                         {
                             /// The committed-tail walk stopped early: `active`/`tail_removal_targets`

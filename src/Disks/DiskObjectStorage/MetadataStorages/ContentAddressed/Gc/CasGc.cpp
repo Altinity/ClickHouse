@@ -851,11 +851,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
 
     /// PHASE 3/18 `heartbeat_floor`: one LIST of `gc/server-roots/`, one GET per mount slot, and a fence
-    /// PUT per newly-fenced mount.
+    /// PUT per newly-fenced mount. The srids that LIST returned outlive the phase: the orphan sweep and
+    /// the fold's dead-precommit check resolve each namespace's mount from them rather than probing
+    /// every prefix of its name.
+    std::set<String> listed_server_roots;
     {
         GcPhaseTimer t(phase_sink, "heartbeat_floor");
-        const HeartbeatFloor floor = computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn(),
-                                                           stable_threshold_ms, mount_obs);
+        HeartbeatFloor floor = computeHeartbeatFloor(op, layout, now_ms_fn(), mono_ms_fn(),
+                                                     stable_threshold_ms, mount_obs);
+        listed_server_roots = std::move(floor.listed_srids);
         report.fence_outs = floor.fenced_now;
         if (floor.fenced_now > 0)
             ProfileEvents::increment(ProfileEvents::CASGCHeartbeatFenceOuts, floor.fenced_now);
@@ -1018,7 +1022,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
     /// It emits phases 5..10 of its own.
-    FoldResult folded = fold(state, state_etag, report, new_round, *walk_plan, policy, round_work_budget);
+    FoldResult folded = fold(state, state_etag, report, new_round, *walk_plan, listed_server_roots, policy,
+                             round_work_budget);
 
     /// THE ROUND'S DESTRUCTIVE GATE, read once, here, and consulted at EVERY destructive site below.
     /// It is available this early because `fold` computes it (see `FoldResult::suppress_destructive`),
@@ -1989,7 +1994,8 @@ void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
 
 Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                         RoundReport & report,
-                        uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy,
+                        uint64_t current_round, const RefPlan & walk_plan,
+                        const std::set<String> & listed_server_roots, UniversePolicy policy,
                         GcRoundWorkBudget & work_budget)
 {
     CasOperation op = store->openRequests().admit();
@@ -2856,16 +2862,19 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             /// an invalid body is a per-namespace hold: the key belongs to exactly one namespace, so it
             /// can never be grounds for discarding another namespace's fold.
             ///
-            /// LOOKAHEAD over this epoch's next arithmetic positions, and never past the ceiling the
-            /// test above enforces: `committed_through` was snapshotted before the walk and bounds
-            /// what this round may read at all, so every position hinted here is one this walk goes on
-            /// to read unless something stops it first. A hold or an epoch crossing stops it, leaving
-            /// at most a window's worth of bodies fetched and untaken -- bounded, counted, and never a
-            /// read the sequential walk would not have made.
+            /// LOOKAHEAD over this epoch's next arithmetic positions that the round's LIST returned
+            /// (`listing`, the one `witnessAbove` reads), and never past the ceiling the test above
+            /// enforces: `committed_through` was snapshotted before the walk and bounds what this round
+            /// may read at all, so every position hinted here is one this walk goes on to read unless
+            /// something stops it first. Ids within an epoch are dense, so the first unlisted one ends
+            /// the run: past the epoch's seal no id exists, and an id younger than the LIST is simply
+            /// taken inline. A hold stops the walk, leaving at most a window's worth of bodies fetched
+            /// and untaken -- bounded, counted, and never a read the sequential walk would not have made.
             for (uint64_t ahead_k = 1; ahead_k <= reads.window(); ++ahead_k)
             {
                 const RefTxnId ahead{expected->writer_epoch, expected->ref_sequence + ahead_k};
-                if (*grounding->committed_through < ahead)
+                if (*grounding->committed_through < ahead
+                    || !std::binary_search(listing.logs.begin(), listing.logs.end(), ahead))
                     break;
                 reads.hintRead(layout.refLogKey(life, ahead));
             }
@@ -2991,7 +3000,8 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
                 if (edge.change > 0 && edge.owner_kind == RefOwnerKind::Precommit
                     && prefixEligible(*store, ns,
                            BuildPrefix{.writer_epoch = edge.manifest_id.ref.writer_epoch,
-                                       .build_sequence = edge.manifest_id.ref.build_sequence}))
+                                       .build_sequence = edge.manifest_id.ref.build_sequence},
+                           listed_server_roots))
                 {
                     ProfileEvents::increment(ProfileEvents::CASGCDeadPrecommitSkipped);
                     ++intake_dead_precommits_skipped;
@@ -3574,6 +3584,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             /// cut and `_ckpt` frontier the round's own universe came from -- which is exactly what an
             /// authoritative universe means, and is why this is the gate's term and not a separate one.
             universe_authoritative,
+            listed_server_roots, ref_scan.logs_by_life,
             &work_budget, io_pool.get(), store->poolConfig().gc_io_concurrency);
         for (const ManifestSweepResult::Nomination & nomination : result.orphan_sweep.nominations)
             orphan_source_retirements.insert(
@@ -4832,6 +4843,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// not provably build-dead (the watermark fact) — over-protect. An unowned manifest that later
     /// dies without journal evidence leaks its edges until a future rebuild (documented, bounded,
     /// fsck-visible); provably-dead ones stay excluded (the orphan sweep owns their bodies).
+    const std::set<String> server_roots = listServerRoots(*store);
     for (const String & ns_str : seen_ns)
     {
         const RootNamespace ns{ns_str};
@@ -4846,7 +4858,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             if (!parsed)
                 return true;   /// foreign key shape — debris
             const ManifestRef & mref = parsed->ref;
-            if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}))
+            if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}, server_roots))
                 return true;   /// provably dead — the orphan sweep's territory, never an edge
             const ManifestId id{ns, mref};
             if (foldManifestEdges(reads, id, +1, deltas, mf_cleanup_unused, /*txn_ordinal=*/0))
