@@ -266,13 +266,8 @@ ManifestFileCacheKeys getManifestList(
             }
 
             manifest_file_cache_keys.emplace_back(
-<<<<<<< HEAD
                 manifest_file_name, manifest_length, added_sequence_number, added_snapshot_id.safeGet<Int64>(), content_type,
-                partition_spec_id);
-=======
-                manifest_file_name, static_cast<size_t>(manifest_length), added_sequence_number,
-                added_snapshot_id.safeGet<Int64>(), content_type, partition_spec_id, first_row_id);
->>>>>>> bfd4b9b13ca5 (Merge pull request #2308 from Altinity/backports/antalya-26.6/115603)
+                partition_spec_id, first_row_id);
 
             auto dump_row_metadata = [&]()->String { return manifest_list_deserializer.getContent(i); };
             insertRowToLogTable(

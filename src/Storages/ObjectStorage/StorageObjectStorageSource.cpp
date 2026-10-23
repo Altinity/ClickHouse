@@ -73,15 +73,12 @@
 #include <base/sleep.h>
 #include <Common/ProfileEvents.h>
 #include <Core/SettingsEnums.h>
-<<<<<<< HEAD
 #include <Core/Field.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeString.h>
-=======
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
->>>>>>> bfd4b9b13ca5 (Merge pull request #2308 from Altinity/backports/antalya-26.6/115603)
 
 #include <Storages/MergeTree/MarkRange.h>
 #include <Interpreters/Cache/QueryConditionCache.h>
@@ -1476,20 +1473,17 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             initial_header = sample_header;
             schema_changed = true;
         }
-<<<<<<< HEAD
         std::vector<std::pair<String, Field>> identity_partition_columns;
 #if USE_AVRO
         if (const auto * iceberg_info = dynamic_cast<const IcebergDataObjectInfo *>(object_info.get()))
             identity_partition_columns = iceberg_info->info.identity_partition_columns;
 #endif
-=======
 
         for (const auto & column_name : row_lineage_columns)
         {
             if (!initial_header.has(column_name))
                 initial_header.insert({rowLineageColumnType()->createColumn(), rowLineageColumnType(), column_name});
         }
->>>>>>> bfd4b9b13ca5 (Merge pull request #2308 from Altinity/backports/antalya-26.6/115603)
 
         /// Save stripped filters if we need to apply them as fallback FilterTransforms
         /// later in the pipeline when the file format doesn't support PREWHERE.
@@ -1865,7 +1859,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
     /// Add ExtractColumnsTransform to extract requested columns/subcolumns
     /// from chunk read by IInputFormat.
-<<<<<<< HEAD
     /// Tuple element reads request nested fields like `t.a` as separate columns. If the data lake
     /// schema transform has rebuilt the whole `t` instead (e.g. the file was written before `t`
     /// was added), extract `t.a` as a subcolumn of `t`.
@@ -1899,11 +1892,10 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             return std::make_shared<MaterializingTransform>(header, /*remove_special_representations=*/ false);
         });
     }
-=======
+
     NamesAndTypesList columns_to_extract = requested_columns_copy;
     for (const auto & column_name : row_lineage_columns)
         columns_to_extract.emplace_back(column_name, rowLineageColumnType());
->>>>>>> bfd4b9b13ca5 (Merge pull request #2308 from Altinity/backports/antalya-26.6/115603)
 
     builder.addSimpleTransform([&](const SharedHeader & header)
     {

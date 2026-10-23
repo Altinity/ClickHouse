@@ -95,11 +95,8 @@ IcebergDataObjectInfo::IcebergDataObjectInfo(
           /* equality_deletes_objects */ {},
           data_manifest_file_entry_->parsed_entry->record_count,
           data_manifest_file_entry_->parsed_entry->file_size_in_bytes,
-<<<<<<< HEAD
-          std::move(identity_partition_columns_)}
-=======
+          std::move(identity_partition_columns_),
           data_manifest_file_entry_->first_row_id}
->>>>>>> bfd4b9b13ca5 (Merge pull request #2308 from Altinity/backports/antalya-26.6/115603)
     , resolved_storage(std::move(resolved_storage_))
 {
     chassert(resolved_key_.empty() == (resolved_storage == nullptr));
@@ -278,7 +275,6 @@ void IcebergObjectSerializableInfo::serializeForClusterFunctionProtocol(WriteBuf
             writeVarUInt(0, out);
         }
     }
-<<<<<<< HEAD
     if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_IDENTITY_PARTITION_COLUMNS)
     {
         writeVarUInt(identity_partition_columns.size(), out);
@@ -286,7 +282,8 @@ void IcebergObjectSerializableInfo::serializeForClusterFunctionProtocol(WriteBuf
         {
             writeStringBinary(name, out);
             writeFieldBinary(value, out);
-=======
+        }
+    }
 
     if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_CDC_READING)
     {
@@ -298,7 +295,6 @@ void IcebergObjectSerializableInfo::serializeForClusterFunctionProtocol(WriteBuf
         else
         {
             writeVarUInt(0, out);
->>>>>>> bfd4b9b13ca5 (Merge pull request #2308 from Altinity/backports/antalya-26.6/115603)
         }
     }
 }
@@ -388,7 +384,6 @@ void IcebergObjectSerializableInfo::deserializeForClusterFunctionProtocol(ReadBu
             file_size_in_bytes = std::nullopt;
         }
     }
-<<<<<<< HEAD
     if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_IDENTITY_PARTITION_COLUMNS)
     {
         size_t identity_partition_columns_size = 0;
@@ -400,7 +395,8 @@ void IcebergObjectSerializableInfo::deserializeForClusterFunctionProtocol(ReadBu
             String name;
             readStringBinary(name, in);
             identity_partition_columns.emplace_back(std::move(name), readFieldBinary(in));
-=======
+        }
+    }
 
     if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_ICEBERG_CDC_READING)
     {
@@ -415,7 +411,6 @@ void IcebergObjectSerializableInfo::deserializeForClusterFunctionProtocol(ReadBu
         else
         {
             first_row_id = std::nullopt;
->>>>>>> bfd4b9b13ca5 (Merge pull request #2308 from Altinity/backports/antalya-26.6/115603)
         }
     }
 }

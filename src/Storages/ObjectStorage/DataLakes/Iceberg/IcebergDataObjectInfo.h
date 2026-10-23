@@ -40,11 +40,8 @@ struct IcebergObjectSerializableInfo
     std::vector<Iceberg::EqualityDeleteObject> equality_deletes_objects;
     std::optional<Int64> record_count;
     std::optional<Int64> file_size_in_bytes;
-<<<<<<< HEAD
     std::vector<std::pair<String, Field>> identity_partition_columns;
-=======
     std::optional<UInt64> first_row_id;
->>>>>>> bfd4b9b13ca5 (Merge pull request #2308 from Altinity/backports/antalya-26.6/115603)
 
     bool requires_external_storage = false;
 
