@@ -152,10 +152,10 @@ PoolMeta decodePoolMeta(std::string_view data)
     validatePoolBlobHeaderLen(pm.blob_header_len, ErrorCodes::CORRUPTED_DATA, "pool meta");
     validatePoolAlgosUsed(pm.algos_used, ErrorCodes::CORRUPTED_DATA, "pool meta");
 
-    if (G_BUILD < pm.min_reader_generation)
+    if (const uint32_t ceiling = currentReadCeiling(); ceiling < pm.min_reader_generation)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
             "CAS pool meta: pool requires reader generation {} but this build supports at most {}",
-            pm.min_reader_generation, G_BUILD);
+            pm.min_reader_generation, ceiling);
 
     return pm;
 }

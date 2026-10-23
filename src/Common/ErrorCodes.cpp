@@ -694,6 +694,7 @@
     M(1021, AZURE_OBJECT_CHANGED_DURING_READ) \
     M(1037, CAS_WRITE_UNATTRIBUTED) \
     M(1038, CAS_DELETE_MARKER) \
+    M(1039, CAS_OWNERSHIP_CONFLICT) \
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -710,7 +711,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
-    constexpr ErrorCode END = 1038;
+    constexpr ErrorCode END = 1039;
 
 #if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
     /** One `ErrorPairHolder` per error code, each holding two `Error` structs - the last message,

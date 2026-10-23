@@ -234,7 +234,7 @@ TEST(CASTextHeader, WriteExpectSniffGate)
     const String wrong = "{\"type\":\"cas_owner\",\"v\":1}\n";
     DB::ReadBufferFromMemory in2(wrong.data(), wrong.size());
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { expectHeaderLine(in2, FormatId::PoolMeta); });
-    const String future = fmt::format("{{\"type\":\"cas_pool_meta\",\"v\":{}}}\n", currentCompatibilityVersion() + 1);
+    const String future = fmt::format("{{\"type\":\"cas_pool_meta\",\"v\":{}}}\n", G_BUILD + 1);
     DB::ReadBufferFromMemory in3(future.data(), future.size());
     expectCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { expectHeaderLine(in3, FormatId::PoolMeta); });
 

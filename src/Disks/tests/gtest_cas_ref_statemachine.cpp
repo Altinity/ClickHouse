@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <base/scope_guard.h>
 #include <algorithm>
 #include <cstdint>
 #include <optional>
@@ -14,10 +16,12 @@
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
+extern const int UNKNOWN_FORMAT_VERSION;
 }
 
 using namespace DB::Cas;
 using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::expectThrowsCodeWithMessage;
 
 namespace
 {
@@ -77,6 +81,15 @@ RefOp removeCommittedOp(const String & name, const ManifestRef & mref)
     RefOp op;
     op.kind = RefOpKind::OwnerTransition;
     op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, name, mref};
+    return op;
+}
+
+RefOp moveOp(const String & from, const String & to, const ManifestRef & mref)
+{
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, from, mref};
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Committed, to, mref};
     return op;
 }
 
@@ -146,6 +159,45 @@ RefTableSnapshot buildCollidingBaseSnapshotForTest()
 /// ===================================================================================
 /// NamespaceBirth
 /// ===================================================================================
+
+namespace
+{
+String headerLineOf(const String & encoded)
+{
+    return encoded.substr(0, encoded.find('\n'));
+}
+}
+
+TEST(CASRefLogGeneration, MoveTxnStampsCompatibility2)
+{
+    const auto m = manifestRef(1, 1, 1);
+    const String encoded = encodeRefLogTxn(makeTxn(kNs, RefTxnId{1, 2}, {moveOp("tmp_a", "a", m)}));
+    EXPECT_NE(headerLineOf(encoded).find("\"v\":2"), String::npos) << headerLineOf(encoded);
+    EXPECT_TRUE(refLogTxnContainsMove(makeTxn(kNs, RefTxnId{1, 2}, {moveOp("tmp_a", "a", m)})));
+}
+
+TEST(CASRefLogGeneration, NonMoveTxnStampsCompatibility1)
+{
+    const auto m = manifestRef(1, 1, 1);
+    const String encoded = encodeRefLogTxn(makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", m), promoteOp("a", m)}));
+    EXPECT_NE(headerLineOf(encoded).find("\"v\":1"), String::npos) << headerLineOf(encoded);
+}
+
+TEST(CASRefLogGeneration, ReaderWithCeiling1RejectsMoveTxnBeforeParsingOps)
+{
+    const auto m = manifestRef(1, 1, 1);
+    const RefTxnId id{1, 2};
+    String encoded = encodeRefLogTxn(makeTxn(kNs, id, {moveOp("tmp_a", "a", m)}));
+    /// Corrupt the op line (third line) so that a reader which got past the header would report a
+    /// body error; a generation-1 reader must reject on the header alone.
+    const size_t second_nl = encoded.find('\n', encoded.find('\n') + 1);
+    encoded.replace(second_nl + 1, 1, "?");
+    setReadCeilingForTest(1);
+    SCOPE_EXIT({ setReadCeilingForTest(std::nullopt); });
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRefLogTxn(encoded, kNs, id); });
+    setReadCeilingForTest(std::nullopt);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(encoded, kNs, id); });
+}
 
 TEST(CASRefStateMachine, BirthFromNeverBornAccepts)
 {
@@ -1442,4 +1494,87 @@ TEST(CASRefBudgetSize, AccessorsEqualFullEncodeRandomized)
         EXPECT_EQ(encodedSnapshotBudgetSize(state), true_snapshot);
         EXPECT_EQ(encodedRemovalBudgetSize(state), true_removal);
     }
+}
+
+TEST(CASRefStateMachine, MoveAccepts)
+{
+    RefTableState state;
+    const auto m = manifestRef(1, 1, 1);
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("tmp_a", m), promoteOp("tmp_a", m), setPublishedAtOp("tmp_a", m, 777)}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {moveOp("tmp_a", "a", m)}));
+    EXPECT_FALSE(state.getCommitted().contains("tmp_a"));
+    ASSERT_TRUE(state.getCommitted().contains("a"));
+    EXPECT_EQ(state.getCommitted().find("a")->second.manifest_ref, m);
+    EXPECT_EQ(state.getCommitted().find("a")->second.published_at_ms, 777u) << "publication time travels with the part";
+    /// The manifest keeps its single owner: a second owner under another name is still rejected.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {addPrecommitOp("x", m)})); });
+}
+
+TEST(CASRefStateMachine, MoveThenSetPublishedAtRestamps)
+{
+    RefTableState state;
+    const auto m = manifestRef(1, 1, 1);
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("tmp_a", m), promoteOp("tmp_a", m), setPublishedAtOp("tmp_a", m, 777)}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {moveOp("tmp_a", "a", m), setPublishedAtOp("a", m, 999)}));
+    EXPECT_FALSE(state.getCommitted().contains("tmp_a"));
+    ASSERT_TRUE(state.getCommitted().contains("a"));
+    EXPECT_EQ(state.getCommitted().find("a")->second.manifest_ref, m);
+    EXPECT_EQ(state.getCommitted().find("a")->second.published_at_ms, 999u);
+}
+
+TEST(CASRefStateMachine, MoveRejectsStaleSource)
+{
+    RefTableState state;
+    const auto m1 = manifestRef(1, 1, 1);
+    const auto m2 = manifestRef(1, 2, 1);
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", m1), promoteOp("a", m1)}));
+    const RefTableState before = state;
+    expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "to move is absent", [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {moveOp("a", "b", m2)})); });
+    expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "to move is absent", [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {moveOp("zzz", "b", m1)})); });
+    expectStatesEqual(before, state);
+}
+
+TEST(CASRefStateMachine, MoveRejectsOccupiedOrPrecommittedDestination)
+{
+    RefTableState state;
+    const auto m1 = manifestRef(1, 1, 1);
+    const auto m2 = manifestRef(1, 2, 1);
+    const auto m3 = manifestRef(1, 3, 1);
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
+        {birthOp(), addPrecommitOp("a", m1), promoteOp("a", m1), addPrecommitOp("b", m2), promoteOp("b", m2), addPrecommitOp("c", m3)}));
+    const RefTableState before = state;
+    expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "is already committed", [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {moveOp("a", "b", m1)})); });
+    expectThrowsCodeWithMessage(DB::ErrorCodes::CORRUPTED_DATA, "has a live precommit", [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {moveOp("a", "c", m1)})); });
+    expectStatesEqual(before, state);
+}
+
+TEST(CASRefStateMachine, MoveRejectsDifferentManifestsOrSameName)
+{
+    RefTableState state;
+    const auto m1 = manifestRef(1, 1, 1);
+    const auto m2 = manifestRef(1, 2, 1);
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", m1), promoteOp("a", m1)}));
+    RefOp bad = moveOp("a", "b", m1);
+    bad.new_binding->manifest_ref = m2;
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {bad})); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {moveOp("a", "a", m1)})); });
+}
+
+TEST(CASRefStateMachine, MoveMaintainsBodyByteCountersForUnequalNames)
+{
+    RefTableState moved;
+    RefTableState direct;
+    const auto m = manifestRef(1, 1, 1);
+    applyRefLogTxn(moved, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("tmp_insert_all_1_1_0", m), promoteOp("tmp_insert_all_1_1_0", m)}));
+    applyRefLogTxn(moved, makeTxn(kNs, RefTxnId{1, 2}, {moveOp("tmp_insert_all_1_1_0", "all_1_1_0", m)}));
+    applyRefLogTxn(direct, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("all_1_1_0", m), promoteOp("all_1_1_0", m)}));
+    EXPECT_EQ(moved.getSnapshotBodyBytes(), direct.getSnapshotBodyBytes());
+    EXPECT_EQ(moved.getRemovalBodyBytes(), direct.getRemovalBodyBytes());
+}
+
+TEST(CASRefIntake, ManifestEdgesMoveEmitsNone)
+{
+    const auto m = manifestRef(1, 1, 1);
+    const auto edges = manifestEdgesOfTxn(makeTxn(kNs, RefTxnId{1, 2}, {moveOp("tmp_a", "a", m)}));
+    EXPECT_TRUE(edges.empty());
 }

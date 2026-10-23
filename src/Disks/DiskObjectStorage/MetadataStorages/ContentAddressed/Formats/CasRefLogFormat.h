@@ -69,6 +69,17 @@ struct RefOp
     bool operator==(const RefOp &) const = default;
 };
 
+/// The `SetPublishedAt` op: restamps `ref_name`'s publication time while it still names `expected_manifest_ref`.
+inline RefOp makeSetPublishedAtOp(String ref_name, const ManifestRef & expected_manifest_ref, uint64_t published_at_ms)
+{
+    RefOp op;
+    op.kind = RefOpKind::SetPublishedAt;
+    op.ref_name = std::move(ref_name);
+    op.expected_manifest_ref = expected_manifest_ref;
+    op.published_at_ms = published_at_ms;
+    return op;
+}
+
 /// The complete immutable body of one ref transaction log object. `ns` and `txn_id` are repeated in
 /// the body even though both are key-derived. `decodeRefLogTxn` compares them with the values supplied
 /// from the object key, rejecting a valid body copied under a different key as corruption.
@@ -118,6 +129,9 @@ inline constexpr size_t ref_op_max_bytes = 4096;
 /// non-canonical `ref_name`, an out-of-range `manifest_ref`, an unknown op kind, or an op-count/byte
 /// limit violation over the encoded text.
 String encodeRefLogTxn(const RefLogTxn & txn);
+
+/// True iff the transaction carries an owner move; such a log is stamped `G_REF_MOVE`.
+bool refLogTxnContainsMove(const RefLogTxn & txn);
 
 /// Decode canonical text after the caller has opened the stored `.zst` object. `expected_ns` and
 /// `expected_txn_id` come from the object key; the decoded body must equal them, otherwise the body/key
@@ -198,5 +212,30 @@ struct RefLogMetaPeek
 /// constants, because a caller that spelled those keys itself would silently stop matching the first
 /// time they are renamed, and this reader has no output an ordinary test would miss.
 std::optional<RefLogMetaPeek> peekRefLogMeta(const String & sealed_bytes);
+
+/// The five legal `owner_transition` shapes, decided purely from the (old_binding, new_binding)
+/// optionals and their `RefOwnerKind`s -- no state read. The state machine, the codecs and the GC
+/// fold's edge extractor all switch over this single classification instead of each carrying their
+/// own shape predicates, so a shape one consumer does not recognize cannot silently acquire
+/// divergent meaning in another.
+enum class OwnerTransitionShape : uint8_t
+{
+    AddPrecommit,      /// no old_binding, new_binding.kind == Precommit
+    RemovePrecommit,   /// old_binding.kind == Precommit, no new_binding
+    RemoveCommitted,   /// old_binding.kind == Committed, no new_binding
+    Promote,           /// old_binding.kind == Precommit, new_binding.kind == Committed, SAME ref_name
+                       /// and manifest_ref
+    Move,              /// old = Committed(src), new = Committed(dst), DIFFERENT ref_name, SAME manifest_ref
+};
+
+/// Classify `op`'s (old_binding, new_binding) shape into one of the five legal transitions. Anything
+/// else -- neither binding, old+new naming DIFFERENT manifests, a promote whose old/new ref_name
+/// disagree, or any other kind combination -- throws `CORRUPTED_DATA` naming the offending combination
+/// instead of falling through to a caller that would otherwise assign it accidental meaning.
+[[nodiscard]] OwnerTransitionShape classifyOwnerTransitionShape(const RefOp & op);
+
+/// Same classification, but returns `std::nullopt` for an unrecognized shape instead of throwing. For
+/// callers that must not reject a shape the codec itself does not validate.
+[[nodiscard]] std::optional<OwnerTransitionShape> tryClassifyOwnerTransitionShape(const RefOp & op);
 
 }

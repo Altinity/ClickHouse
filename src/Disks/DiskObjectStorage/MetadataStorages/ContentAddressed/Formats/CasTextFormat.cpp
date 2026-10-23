@@ -335,12 +335,12 @@ namespace ContainerWire
 }
 }
 
-void writeHeaderLine(CasJsonWriter & out, FormatId id)
+void writeHeaderLine(CasJsonWriter & out, FormatId id, uint32_t compatibility_version)
 {
     const FormatTraits & t = traitsFor(id);
     bool first = true;
     writeStringField(out, ContainerWire::type, t.type, first);
-    writeNumberField(out, ContainerWire::version, currentCompatibilityVersion(), first);
+    writeNumberField(out, ContainerWire::version, compatibility_version, first);
     closeObject(out, first);
     writeChar('\n', out);
 }

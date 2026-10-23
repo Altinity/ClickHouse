@@ -704,28 +704,59 @@ TEST(CASPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
     EXPECT_EQ(sh_obj->cls, FsckClass::PendingGc);
 }
 
+TEST(CASPoolMetaFloor, CreateOrValidateUsesTheRequestedInitialFloor)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    OperationForTest meta_op(*backend);
+    const PoolMeta pm = PoolMeta::createOrValidate(*meta_op, layout, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true,
+                                                   /*initial_min_reader_generation*/ 1);
+    EXPECT_EQ(pm.min_reader_generation, 1u);
+}
+
+TEST(CASPoolMetaFloor, HashAdmissionDoesNotRaiseTheFloorPastTheAlgorithmsNeed)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    OperationForTest meta_op(*backend);
+    const PoolMeta before = PoolMeta::createOrValidate(*meta_op, layout, 256, BlobHashAlgo::CityHash128, false, true, 1);
+    const PoolMeta admitted = PoolMeta::createOrValidate(*meta_op, layout, 256, BlobHashAlgo::XXH3_128, /*allow_new*/ true, /*allow_mint*/ false, 1);
+    ASSERT_EQ(admitted.algos_used.size(), 2u) << "the algorithm must have been admitted";
+    EXPECT_EQ(admitted.min_reader_generation, before.min_reader_generation) << "admission must not touch the floor";
+    EXPECT_EQ(admitted.min_reader_generation, 1u);
+}
+
+TEST(CASPoolMetaFloor, RaiseMinReaderGenerationIsMonotone)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    OperationForTest meta_op(*backend);
+    PoolMeta::createOrValidate(*meta_op, layout, 256, BlobHashAlgo::CityHash128, false, true, 1);
+    EXPECT_EQ(PoolMeta::raiseMinReaderGeneration(*meta_op, layout, 2).min_reader_generation, 2u);
+    EXPECT_EQ(PoolMeta::raiseMinReaderGeneration(*meta_op, layout, 1).min_reader_generation, 2u) << "never lowered";
+    EXPECT_EQ(PoolMeta::raiseMinReaderGeneration(*meta_op, layout, 2).min_reader_generation, 2u);
+    const PoolMeta reread = PoolMeta::createOrValidate(*meta_op, layout, 256, BlobHashAlgo::CityHash128);
+    EXPECT_EQ(reread.min_reader_generation, 2u);
+}
+
 /// ============================================================================================
 /// CAS reader-generation gate (`CasFormat.h`'s `G_BUILD`). This test's assertions read `G_BUILD`
 /// itself rather than a hardcoded generation number, so a future bump does not silently make them
-/// false. `PoolMeta::createOrValidate`'s open-time CAS-raise targets `G_BUILD`, and `decodePoolMeta`
-/// fail-closes BOTH on a FUTURE `min_reader_generation` AND on a BACKWARD pool whose header
+/// false. A new pool starts at `G_REF_MOVE`, and hash admission never raises it past the
+/// algorithm's own requirement. `decodePoolMeta` fail-closes BOTH on a FUTURE `min_reader_generation` AND on a BACKWARD pool whose header
 /// `compatibility_version` is below the format-generation baseline (see `CasPoolMetaFormat.cpp`).
-/// ============================================================================================
-
-TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
+TEST(CASPluggableHash, ReaderGenerationFloorIsGenerationTwoAndGatesFailClosed)
 {
-    /// A freshly opened/created pool records `min_reader_generation == G_BUILD` (the open-time
-    /// CAS-raise, `PoolMeta::createOrValidate`, always targets this build's own floor).
+    /// A new pool is stamped at generation 2, not at the build's read ceiling.
     {
         auto backend = std::make_shared<InMemoryBackend>();
         auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-        EXPECT_EQ(store->poolMeta().min_reader_generation, G_BUILD);
+        EXPECT_EQ(store->poolMeta().min_reader_generation, G_REF_MOVE);
 
         const auto meta_bytes = readAt(*backend, store->layout().poolMetaKey());
         ASSERT_TRUE(meta_bytes.has_value());
-        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, G_BUILD);
+        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, G_REF_MOVE);
     }
-
     /// FORWARD gate: a pool-meta carrying `min_reader_generation == G_BUILD + 1` (one generation past
     /// THIS build's floor) fails closed at open -- the startup gate (`decodePoolMeta`) rejects it.
     {
@@ -750,8 +781,8 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
         PoolMeta pm = PoolMeta::createOrValidate(*meta_op, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128, /*allow_new*/ false, /*allow_mint*/ true);
         const String fresh_bytes = encodePoolMeta(pm);
 
-        const String from = "\"v\":" + std::to_string(G_BUILD);
-        const String to = "\"v\":" + std::to_string(G_BUILD - 1);
+        const String from = "\"v\":" + std::to_string(G_WRITE_FLOOR);
+        const String to = "\"v\":" + std::to_string(G_WRITE_FLOOR - 1);
         const auto pos = fresh_bytes.find(from);
         ASSERT_NE(pos, String::npos);   // sanity: a fresh pool stamps the header at the floor
         String downgraded = fresh_bytes;

@@ -102,7 +102,7 @@ std::string_view runMarkerToWireWord(RunMarker marker);
 /// Its fail-closed inverse: an unknown word is `CORRUPTED_DATA`.
 RunMarker runMarkerFromWireWord(std::string_view w);
 
-/// Write the typed header line `{"type":"cas_run","v":G_BUILD,"kind":"<kind>"}\n` with a fixed key
+/// Write the typed header line `{"type":"cas_run","v":<currentCompatibilityVersion()>,"kind":"<kind>"}\n` with a fixed key
 /// order for byte-determinism. The `kind` field distinguishes the record schema within the run
 /// family, so a reader can reject a valid run of the wrong kind before interpreting any records.
 void writeRunHeaderLine(WriteBuffer & out, std::string_view kind);

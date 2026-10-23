@@ -2936,7 +2936,7 @@ Gc::FoldResult Gc::fold(GcState & state, std::optional<Etag> & /*state_etag*/,
             {
                 txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns_str, log_id);
                 /// Extraction shares the decode try-block: an unrecognized owner_transition shape
-                /// (`manifestEdgesOfTxn` -> `classifyOwnerTransitionShape`, Pool/CasRefProtocol.cpp) is
+                /// (`manifestEdgesOfTxn` -> `classifyOwnerTransitionShape`, Formats/CasRefLogFormat.cpp) is
                 /// exactly as untrustworthy as an undecodable body -- both mean this log cannot be
                 /// folded -- so both get the SAME per-namespace hold below. Do
                 /// NOT widen this catch over `foldManifestEdges` -- only intake, not the fold itself,

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <thread>
@@ -5266,6 +5267,125 @@ TEST(CASRefWriterAppendLane, SameRefMutationsSplitAcrossFlushes)
     const auto resolved = store->resolveRef(ns, "a");
     ASSERT_TRUE(resolved.has_value());
     EXPECT_TRUE(resolved->published_at_ms == 1 || resolved->published_at_ms == 2);
+}
+
+namespace
+{
+
+/// The two ops of an owner move `src` -> `dst` of the committed manifest `m`.
+std::vector<RefOp> ownerMoveOps(const String & src, const String & dst, const ManifestRef & m)
+{
+    RefOp move;
+    move.kind = RefOpKind::OwnerTransition;
+    move.old_binding = RefOwnerBinding{RefOwnerKind::Committed, src, m};
+    move.new_binding = RefOwnerBinding{RefOwnerKind::Committed, dst, m};
+    return {move};
+}
+
+/// An add/remove precommit pair on `ref`: ordinary ref-scoped work that leaves the live state unchanged.
+std::vector<RefOp> precommitPairOps(const String & ref, uint64_t epoch)
+{
+    const ManifestRef m{epoch, 1, 1};
+    RefOp add;
+    add.kind = RefOpKind::OwnerTransition;
+    add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, ref, m};
+    RefOp remove;
+    remove.kind = RefOpKind::OwnerTransition;
+    remove.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, ref, m};
+    return {add, remove};
+}
+
+/// Queues `first` as the parked leader's own item and `second` behind it, releases the leader once both
+/// are pending, and returns how many ref-log objects the two mutations needed.
+uint64_t logObjectsForTwoQueuedMutations(
+    const PoolPtr & store, const std::shared_ptr<CountingBackend> & backend, const RootNamespace & ns,
+    std::function<void()> first, std::function<void()> second)
+{
+    std::mutex m;
+    std::condition_variable cv;
+    bool entered = false;
+    store->setRefPreCarveHookForTest([&]
+    {
+        std::unique_lock lk(m);
+        if (entered)
+            return;
+        entered = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return store->refQueuePendingForTest(ns) >= 2; });
+    });
+    const uint64_t put_before = backend->putTotal();
+    std::thread t_first(first);
+    {
+        std::unique_lock lk(m);
+        cv.wait(lk, [&] { return entered; });
+    }
+    std::thread t_second(second);
+    while (store->refQueuePendingForTest(ns) < 2)
+        std::this_thread::yield();
+    cv.notify_all();
+    t_first.join();
+    t_second.join();
+    store->setRefPreCarveHookForTest(nullptr);
+    return backend->putTotal() - put_before;
+}
+
+}
+
+/// An owner move names two refs, so it must not serialize unrelated refs: two moves on disjoint
+/// name pairs share one `_log` object.
+TEST(CASRefWriterAppendLane, TwoMovesOnDisjointRefsCoBatch)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/move_cobatch"};
+    const ManifestId id_a = publishEmptyPart(store, ns, "a");
+    const ManifestId id_c = publishEmptyPart(store, ns, "c");
+
+    const uint64_t puts = logObjectsForTwoQueuedMutations(store, backend, ns,
+        [&]
+        {
+            store->appendRefOps(ns, MutationScope::refs("a", "b"),
+                [&](const RefTableState &) { return ownerMoveOps("a", "b", id_a.ref); },
+                RootMutationOrigin::Writer, RootMutationKind::Move);
+        },
+        [&]
+        {
+            store->appendRefOps(ns, MutationScope::refs("c", "d"),
+                [&](const RefTableState &) { return ownerMoveOps("c", "d", id_c.ref); },
+                RootMutationOrigin::Writer, RootMutationKind::Move);
+        });
+
+    EXPECT_EQ(puts, 1u) << "moves on disjoint refs must flush as one log";
+    EXPECT_FALSE(store->resolveRef(ns, "a").has_value());
+    EXPECT_FALSE(store->resolveRef(ns, "c").has_value());
+    EXPECT_TRUE(store->resolveRef(ns, "b").has_value());
+    EXPECT_TRUE(store->resolveRef(ns, "d").has_value());
+}
+
+/// A move and a mutation of the move's destination name touch the same ref, so they must not share a
+/// batch: the second would be validated against a state that does not yet contain the first.
+TEST(CASRefWriterAppendLane, MoveAndRefOpOnSameNameDoNotCoBatch)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/move_samename"};
+    const ManifestId id_a = publishEmptyPart(store, ns, "a");
+
+    const uint64_t puts = logObjectsForTwoQueuedMutations(store, backend, ns,
+        [&]
+        {
+            store->appendRefOps(ns, MutationScope::refs("a", "b"),
+                [&](const RefTableState &) { return ownerMoveOps("a", "b", id_a.ref); },
+                RootMutationOrigin::Writer, RootMutationKind::Move);
+        },
+        [&]
+        {
+            store->appendRefOps(ns, MutationScope::ref("b"),
+                [&](const RefTableState &) { return precommitPairOps("b", 900000010); },
+                RootMutationOrigin::Writer, RootMutationKind::Publish);
+        });
+
+    EXPECT_EQ(puts, 2u) << "a move and a mutation of its destination must flush as two logs";
 }
 
 /// ===================================================================================

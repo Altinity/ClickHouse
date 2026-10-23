@@ -879,6 +879,8 @@ The server successfully detected this situation and will download merged part fr
     M(CASBlobDelete,     "Number of CAS blob DELETE requests. Grows with cleanup and GC deletion activity.", ValueType::Number) \
     M(CASBlobList,       "Number of CAS blob LIST requests. Growing values indicate more object enumeration.", ValueType::Number) \
     M(CASRefRepoint, "Number of CAS committed-reference repoints that republish a manifest. Growth indicates standalone part updates or removals.", ValueType::Number) \
+    M(CASRefMove, "Number of CAS committed-reference renames done as one ref-log owner move, with no manifest republication.", ValueType::Number) \
+    M(CASOwnershipConflict, "Number of CAS operations refused with CAS_OWNERSHIP_CONFLICT: the committed reference the writer had read was moved, dropped or repointed before its change landed.", ValueType::Number) \
     M(CASManifestPut,        "Number of CAS manifest PUT requests. Grows with manifest creation and indicates metadata write traffic.", ValueType::Number) \
     M(CASManifestPutDeduplicated,   "Number of CAS deduplicating manifest PUT requests. Grows when existing manifests are reused.", ValueType::Number) \
     M(CASManifestOverwrite,  "Number of CAS manifest overwrite requests. Growing values indicate repeated manifest replacement.", ValueType::Number) \

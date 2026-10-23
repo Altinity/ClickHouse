@@ -73,7 +73,7 @@ EnvelopeHeader maxReachableHeader(const String & ref)
 String blobEnvelopeWithFutureVersion(std::string_view text)
 {
     const String v_now = fmt::format("\"v\":{}", currentCompatibilityVersion());
-    const String v_next = fmt::format("\"v\":{}", currentCompatibilityVersion() + 1);
+    const String v_next = fmt::format("\"v\":{}", G_BUILD + 1);
     String future(text);
     const size_t version_pos = future.find(v_now);
     if (version_pos == String::npos || v_next.size() < v_now.size())

@@ -5,6 +5,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasHotKeys.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRetry.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasWriteResult.h>
+#include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <IO/ReadBuffer.h>
 #include <base/types.h>
 
@@ -12,6 +14,16 @@
 #include <exception>
 #include <functional>
 #include <memory>
+
+namespace ProfileEvents
+{
+    extern const Event CASOwnershipConflict;
+}
+
+namespace DB::ErrorCodes
+{
+    extern const int CAS_OWNERSHIP_CONFLICT;
+}
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -87,6 +99,17 @@ bool isDeterministicLocalFailure(int code);
 /// Both entry points route through the SAME construction internally, so the error code / message shape
 /// has exactly one place that decides it.
 std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why);
+
+/// Throw `CAS_OWNERSHIP_CONFLICT`: the committed ref a caller read moved, dropped or changed owner before the
+/// caller's write landed; the caller must re-resolve the part before trying again. Counted in
+/// `ProfileEvents::CASOwnershipConflict`, so every conflict site goes through here (the counter counts
+/// throws; a ref-log builder that is re-run counts again).
+template <typename... Args>
+[[noreturn]] void throwCasOwnershipConflict(FormatStringHelper<Args...> fmt, Args &&... args)
+{
+    ProfileEvents::increment(ProfileEvents::CASOwnershipConflict);
+    throw Exception(ErrorCodes::CAS_OWNERSHIP_CONFLICT, std::move(fmt), std::forward<Args>(args)...);
+}
 
 /// Throw the recoverable "this content-addressed disk cannot serve the request right now" condition.
 /// Sibling of `throwCasWriteRetryLater`, same class for the same reasons, differing only in what it

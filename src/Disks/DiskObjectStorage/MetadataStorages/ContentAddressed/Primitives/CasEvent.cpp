@@ -28,6 +28,7 @@ String toString(CasEventType type)
         case CasEventType::RefPublish:            return "ref_publish";
         case CasEventType::RefDrop:               return "ref_drop";
         case CasEventType::RefRepoint:            return "ref_repoint";
+        case CasEventType::RefMove:               return "ref_move";
         case CasEventType::RootAdd:               return "root_add";
         case CasEventType::RootRemove:            return "root_remove";
         case CasEventType::RootRepoint:           return "root_repoint";

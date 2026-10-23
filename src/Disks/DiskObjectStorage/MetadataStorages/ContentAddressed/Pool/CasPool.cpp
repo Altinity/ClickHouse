@@ -535,8 +535,10 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// closed instead (spec §2 [C4][D2]).
     CasOperation meta_op = bootstrap_requests.admit();
     PoolMeta meta = PoolMeta::createOrValidate(
-        meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, config.blob_hash_allow_new,
-        /*allow_mint=*/!config.read_only);
+        meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo,
+        /*allow_new=*/config.blob_hash_allow_new && !config.read_only,   /// an observe open validates, never admits
+        /*allow_mint=*/!config.read_only,
+        /*initial_min_reader_generation=*/G_REF_MOVE);
     config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
@@ -561,6 +563,20 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// constructed and anchored on a writable open.
     if (!store->config.read_only)
         mountWritable(store, store->config.server_id, MountClaimPolicy::WaitForExpiry);
+
+    if (!store->config.read_only && store->meta.min_reader_generation < G_REF_MOVE)
+    {
+        /// One-way, so it is done only by a node that has actually mounted (identity and lease held) and
+        /// can therefore emit owner moves; from here on a generation-1 build refuses to mount this pool.
+        CasOperation raise_op = store->gc_requests.admit();
+        const uint64_t floor_before = store->meta.min_reader_generation;
+        const PoolMeta raised = PoolMeta::raiseMinReaderGeneration(raise_op, store->pool_layout, G_REF_MOVE);
+        LOG_WARNING(getLogger("CasPool"),
+            "Content-addressed pool '{}': min_reader_generation raised {} -> {}; generation-1 readers can no longer mount this pool",
+            u128ToHex(store->meta.pool_id), floor_before, raised.min_reader_generation);
+        /// Only the floor is written: background workers started by `mountWritable` already read the rest of `meta`.
+        store->meta.min_reader_generation = raised.min_reader_generation;
+    }
 
     return store;
 }
@@ -954,7 +970,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// minting a fresh identity here (spec §2 [C4][D2]).
     CasOperation meta_op = bootstrap_requests.admit();
     PoolMeta meta = PoolMeta::createOrValidate(
-        meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, config.blob_hash_allow_new,
+        meta_op, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, /*allow_new=*/false,   /// a tool never admits a new algorithm
         /*allow_mint=*/false);
     config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below

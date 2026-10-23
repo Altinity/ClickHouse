@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 
 namespace DB
 {
@@ -28,6 +29,12 @@ namespace
 /// history once had.
 constexpr FormatChangePoint BASELINE[] = {{1, 1}};
 
+/// Generation 2 adds the committed-owner move; a log carrying one is unreadable to a generation-1 reader.
+constexpr FormatChangePoint REF_LOG_HISTORY[] = {{1, 1}, {2, 2}};
+/// `encodeRefLogTxn` stamps `G_REF_MOVE` on a Move-bearing log; the history must say the same.
+static_assert(REF_LOG_HISTORY[std::size(REF_LOG_HISTORY) - 1].min_reader == G_REF_MOVE);
+static_assert(REF_LOG_HISTORY[std::size(REF_LOG_HISTORY) - 1].generation <= G_BUILD);
+
 }
 
 std::span<const FormatChangePoint> changePoints(FormatId id)
@@ -35,6 +42,7 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
     switch (id)
     {
         case FormatId::RefLog:
+            return REF_LOG_HISTORY;
         case FormatId::RefSnapshot:
         case FormatId::RefCkpt:
         case FormatId::RefCatalog:
@@ -64,17 +72,32 @@ uint32_t currentWriterVersion()
 
 uint32_t currentCompatibilityVersion()
 {
-    /// Until roster-based write-down is implemented, every object carries the current build as its
-    /// compatibility floor.
-    return G_BUILD;
+    return G_WRITE_FLOOR;
+}
+
+namespace
+{
+std::atomic<uint32_t> read_ceiling_override{0};
+}
+
+void setReadCeilingForTest(std::optional<uint32_t> ceiling)
+{
+    read_ceiling_override.store(ceiling.value_or(0));
+}
+
+uint32_t currentReadCeiling()
+{
+    const uint32_t override_ceiling = read_ceiling_override.load();
+    return override_ceiling ? override_ceiling : G_BUILD;
 }
 
 void checkCompatibility(uint32_t compatibility_version, std::string_view what)
 {
-    if (compatibility_version > G_BUILD)
+    const uint32_t ceiling = currentReadCeiling();
+    if (compatibility_version > ceiling)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
             "CAS {}: object requires reader generation {} but this build supports at most {}",
-            what, compatibility_version, G_BUILD);
+            what, compatibility_version, ceiling);
 }
 
 namespace

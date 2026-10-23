@@ -520,7 +520,7 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
         return refuse(ProfileEvents::CASRelinkConfirmRefusedLaneBroken, "the lane is Writing with nothing carved");
     const auto covers = [&](const MutationScope & scope)
     {
-        return scope.kind == MutationScope::Kind::WholeShard || scope.ref_name == ref_name;
+        return scope.kind == MutationScope::Kind::WholeShard || scope.names(ref_name);
     };
     for (const auto & item : rt.pending)
         if (covers(item->scope))
@@ -2727,24 +2727,24 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
 
 namespace
 {
-/// The first ref name `op` mutates that differs from `scope_ref`, or nullptr when every name it
-/// carries is `scope_ref` or it carries none (`NamespaceBirth`, `RemoveNamespace` and `EpochSeal` are
+/// The first ref name `op` mutates that `scope` does not name, or nullptr when every name it
+/// carries is named by `scope` or it carries none (`NamespaceBirth`, `RemoveNamespace` and `EpochSeal` are
 /// namespace-level and name no ref). Naming no ref is not the same as moving no ref: a
 /// `RemoveNamespace` moves every row of the namespace, so its caller rejects it under a `Ref` scope
 /// on its own rather than reading an answer out of this function. Both bindings of an
 /// `OwnerTransition` count -- a promotion names the ref twice -- because this check runs before the
 /// transition's shape is validated, so either binding may still carry any name at this point.
-const String * refNamedOutsideScope(const RefOp & op, const String & scope_ref)
+const String * refNamedOutsideScope(const RefOp & op, const MutationScope & scope)
 {
     if (op.kind == RefOpKind::OwnerTransition)
     {
-        if (op.old_binding && op.old_binding->ref_name != scope_ref)
+        if (op.old_binding && !scope.names(op.old_binding->ref_name))
             return &op.old_binding->ref_name;
-        if (op.new_binding && op.new_binding->ref_name != scope_ref)
+        if (op.new_binding && !scope.names(op.new_binding->ref_name))
             return &op.new_binding->ref_name;
         return nullptr;
     }
-    if (op.kind == RefOpKind::SetPublishedAt && op.ref_name != scope_ref)
+    if (op.kind == RefOpKind::SetPublishedAt && !scope.names(op.ref_name))
         return &op.ref_name;
     return nullptr;
 }
@@ -2973,11 +2973,15 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             }
             if (carve_hook_for_test)
                 carve_hook_for_test(CarvePhaseForTest::PlanSeenRefs);
-            if (!seen_refs.insert(candidate->scope.ref_name).second)
+            const auto & cand_scope = candidate->scope;
+            bool already_seen = false;
+            cand_scope.forEachName([&](const String & name) { already_seen = already_seen || seen_refs.contains(name); });
+            if (already_seen)
             {
                 scope_cut = true;
                 break;
             }
+            cand_scope.forEachName([&](const String & name) { seen_refs.insert(name); });
             if (carve_hook_for_test)
                 carve_hook_for_test(CarvePhaseForTest::PlanBatchGrow);
             batch.reserve(selected + 1);
@@ -3144,12 +3148,12 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                     /// check alone, so it is rejected here rather than left to any later one.
                     if (op.kind == RefOpKind::RemoveNamespace)
                         throw Exception(ErrorCodes::LOGICAL_ERROR,
-                            "ref mutation on namespace '{}' is scoped to ref '{}' but its {} op moves every ref",
-                            ns.string(), it->scope.ref_name, refOpKindToWireWord(op.kind));
-                    if (const String * other = refNamedOutsideScope(op, it->scope.ref_name))
+                            "ref mutation on namespace '{}' is scoped to ref {} but its {} op moves every ref",
+                            ns.string(), it->scope.namesForLog(), refOpKindToWireWord(op.kind));
+                    if (const String * other = refNamedOutsideScope(op, it->scope))
                         throw Exception(ErrorCodes::LOGICAL_ERROR,
-                            "ref mutation on namespace '{}' is scoped to ref '{}' but its {} op names ref '{}'",
-                            ns.string(), it->scope.ref_name, refOpKindToWireWord(op.kind), *other);
+                            "ref mutation on namespace '{}' is scoped to ref {} but its {} op names ref '{}'",
+                            ns.string(), it->scope.namesForLog(), refOpKindToWireWord(op.kind), *other);
                 }
             }
 
@@ -4905,12 +4909,7 @@ void CasRefLedger::updateRefPublishedAt(const RootNamespace & ns, const String &
 
             mutator(update);
 
-            RefOp op;
-            op.kind = RefOpKind::SetPublishedAt;
-            op.ref_name = ref_name;
-            op.expected_manifest_ref = it->second.manifest_ref;
-            op.published_at_ms = update.published_at_ms;
-            return {op};
+            return {makeSetPublishedAtOp(ref_name, it->second.manifest_ref, update.published_at_ms)};
         },
         RootMutationOrigin::Writer, RootMutationKind::UpdateRefPublishedAt);
 }

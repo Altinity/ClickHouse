@@ -18,7 +18,7 @@ enum class CasEventType
 {
     BlobPut, BlobReuseAdopt, BlobReuseResurrect, BlobRetire, BlobRetireReplaced, BlobDelete, BlobForget,
     ManifestPut, ManifestDelete,
-    RefPublish, RefDrop, RefRepoint, RootAdd, RootRemove, RootRepoint, IndegZero,
+    RefPublish, RefDrop, RefRepoint, RefMove, RootAdd, RootRemove, RootRepoint, IndegZero,
     GcFoldBegin, GcFoldEnd, GcRetireObserve, GcRetireDecision, GcRecheckVerdict,
     GcFence, GcCursorAdvance, GcShardReclaim, GcFenceOut, GcRebuild, GcFoldClamp,
     /// One GC round anomaly, with the context of the decision it forced. `gc_fold_end` reports only a

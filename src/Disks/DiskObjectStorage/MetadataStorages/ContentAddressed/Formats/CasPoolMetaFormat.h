@@ -34,9 +34,10 @@ struct PoolMeta
 
     /// Creates the pool metadata if `_pool_meta` is absent, or validates and possibly admits the
     /// configured hash algorithm if it already exists. Initial creation validates the supplied header
-    /// size and records this build's reader-generation floor. Reopen ignores the supplied header size,
-    /// because changing it would move the blob payload offset for existing objects; a new hash algorithm
-    /// is rejected unless `allow_new` is set, and concurrent admission is retried from fresh metadata.
+    /// size and records `initial_min_reader_generation` as the reader-generation floor. Reopen ignores
+    /// the supplied header size, because changing it would move the blob payload offset for existing
+    /// objects; a new hash algorithm is rejected unless `allow_new` is set, and concurrent admission is
+    /// retried from fresh metadata.
     ///
     /// `allow_mint` gates the create-if-absent path: minting a fresh `_pool_meta` is a
     /// consequential write that establishes a brand-new pool identity, so it is permitted ONLY on the
@@ -52,17 +53,22 @@ struct PoolMeta
     static PoolMeta createOrValidate(
         CasOperation &, const Layout &, uint64_t blob_header_len, uint64_t gc_shards,
         BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false,
-        bool allow_mint = false);
+        bool allow_mint = false, uint64_t initial_min_reader_generation = G_WRITE_FLOOR);
+
+    /// Monotone CAS-max on `min_reader_generation`: raises the floor to `generation` when it is lower,
+    /// never lowers it, returns the resulting meta. Separate from hash admission, which returns without
+    /// writing once the algorithm is admitted.
+    static PoolMeta raiseMinReaderGeneration(CasOperation & op, const Layout & layout, uint64_t generation);
 
     /// Convenience for single-shard callers. Production pool opening passes the configured value to
     /// the explicit overload above; this preserves compact single-shard codec/unit fixtures.
     static PoolMeta createOrValidate(
         CasOperation & op, const Layout & layout, uint64_t blob_header_len,
         BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false,
-        bool allow_mint = false)
+        bool allow_mint = false, uint64_t initial_min_reader_generation = G_WRITE_FLOOR)
     {
         return createOrValidate(
-            op, layout, blob_header_len, /*gc_shards=*/1, blob_hash_algo, allow_new, allow_mint);
+            op, layout, blob_header_len, /*gc_shards=*/1, blob_hash_algo, allow_new, allow_mint, initial_min_reader_generation);
     }
 };
 

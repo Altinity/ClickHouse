@@ -48,6 +48,8 @@ TEST(CASFormat, EveryClassResetToTheBaselineGeneration)
 {
     for (auto id : allRegisteredFormatIds())
     {
+        if (id == FormatId::RefLog)
+            continue;
         const auto cps = changePoints(id);
         ASSERT_EQ(cps.size(), 1u) << "FormatId " << static_cast<int>(id);
         EXPECT_EQ(cps.front().generation, 1u);
@@ -63,7 +65,22 @@ TEST(CASFormat, EveryClassResetToTheBaselineGeneration)
 TEST(CASFormat, CurrentVersionsAreGBuild)
 {
     EXPECT_EQ(currentWriterVersion(), G_BUILD);
-    EXPECT_EQ(currentCompatibilityVersion(), G_BUILD);
+    EXPECT_EQ(currentCompatibilityVersion(), G_WRITE_FLOOR);
+}
+
+TEST(CASFormat, RefLogHistoryRecordsTheOwnerMoveGeneration)
+{
+    const auto cps = changePoints(FormatId::RefLog);
+    ASSERT_EQ(cps.size(), 2u);
+    EXPECT_EQ(cps.back().generation, 2u);
+    EXPECT_EQ(cps.back().min_reader, 2u) << "a Move-bearing log is meaningless to a generation-1 reader";
+}
+
+TEST(CASFormat, ReadCeilingIsAboveTheWriteFloor)
+{
+    EXPECT_EQ(G_BUILD, 2u);
+    EXPECT_EQ(currentCompatibilityVersion(), G_WRITE_FLOOR);
+    EXPECT_EQ(G_WRITE_FLOOR, 1u);
 }
 
 TEST(CASFormat, CheckCompatibilityPassesWhenKnown)

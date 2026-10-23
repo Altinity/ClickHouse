@@ -413,7 +413,7 @@ TEST(CASRecordStream, HeaderGates)
     /// Future version -> UNKNOWN_FORMAT_VERSION.
     {
         const String s = fmt::format(
-            "{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n{{\"n\":0}}\n", currentCompatibilityVersion() + 1);
+            "{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n{{\"n\":0}}\n", G_BUILD + 1);
         ReadBufferFromMemory in(s.data(), s.size());
         try
         {

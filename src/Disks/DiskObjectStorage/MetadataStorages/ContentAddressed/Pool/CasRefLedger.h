@@ -504,7 +504,7 @@ public:
         if (it == ref_name_slots.end())
             return false;
         for (const auto & item : it->second.current->carved)
-            if (item->scope.kind == MutationScope::Kind::Ref && item->scope.ref_name == ref_name)
+            if (item->scope.names(ref_name))
                 return item->done;
         return false;
     }

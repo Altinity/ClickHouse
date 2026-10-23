@@ -277,13 +277,21 @@ void validateEpochSealGrammarContextual(const RefLogTxn & txn, uint64_t life_epo
             txn.txn_id.writer_epoch, life_epoch);
 }
 
+bool refLogTxnContainsMove(const RefLogTxn & txn)
+{
+    for (const RefOp & op : txn.ops)
+        if (op.kind == RefOpKind::OwnerTransition && tryClassifyOwnerTransitionShape(op) == OwnerTransitionShape::Move)
+            return true;
+    return false;
+}
+
 String encodeRefLogTxn(const RefLogTxn & txn)
 {
     checkRefTxnIdNonzero(txn.txn_id, "RefLogTxn", "txn_id");
     validateEpochSealGrammarStructural(txn);
 
     CasJsonWriter out(512);
-    writeHeaderLine(out, FormatId::RefLog);
+    writeHeaderLine(out, FormatId::RefLog, refLogTxnContainsMove(txn) ? G_REF_MOVE : currentCompatibilityVersion());
 
     writeLogMeta(out, txn.ns, txn.txn_id, txn.prev_epoch_seal);
 
@@ -480,6 +488,49 @@ std::optional<RefLogMetaPeek> peekRefLogMeta(const String & sealed_bytes)
         /// peek identifies a writer, it does not certify an object.
         return std::nullopt;
     }
+}
+
+std::optional<OwnerTransitionShape> tryClassifyOwnerTransitionShape(const RefOp & op)
+{
+    const bool has_old = op.old_binding.has_value();
+    const bool has_new = op.new_binding.has_value();
+
+    if (!has_old && has_new && op.new_binding->kind == RefOwnerKind::Precommit)
+        return OwnerTransitionShape::AddPrecommit;
+
+    if (has_old && !has_new && op.old_binding->kind == RefOwnerKind::Precommit)
+        return OwnerTransitionShape::RemovePrecommit;
+
+    if (has_old && !has_new && op.old_binding->kind == RefOwnerKind::Committed)
+        return OwnerTransitionShape::RemoveCommitted;
+
+    if (has_old && has_new && op.old_binding->kind == RefOwnerKind::Precommit
+        && op.new_binding->kind == RefOwnerKind::Committed
+        && op.old_binding->ref_name == op.new_binding->ref_name
+        && op.old_binding->manifest_ref == op.new_binding->manifest_ref)
+        return OwnerTransitionShape::Promote;
+
+    if (has_old && has_new && op.old_binding->kind == RefOwnerKind::Committed
+        && op.new_binding->kind == RefOwnerKind::Committed
+        && op.old_binding->ref_name != op.new_binding->ref_name
+        && op.old_binding->manifest_ref == op.new_binding->manifest_ref)
+        return OwnerTransitionShape::Move;
+
+    return std::nullopt;
+}
+
+OwnerTransitionShape classifyOwnerTransitionShape(const RefOp & op)
+{
+    if (const auto shape = tryClassifyOwnerTransitionShape(op))
+        return *shape;
+
+    const bool has_old = op.old_binding.has_value();
+    const bool has_new = op.new_binding.has_value();
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "owner_transition does not match any legal transition shape (has_old={}, old_kind={}, "
+        "has_new={}, new_kind={})",
+        has_old, has_old ? std::to_string(static_cast<uint8_t>(op.old_binding->kind)) : "n/a",
+        has_new, has_new ? std::to_string(static_cast<uint8_t>(op.new_binding->kind)) : "n/a");
 }
 
 }

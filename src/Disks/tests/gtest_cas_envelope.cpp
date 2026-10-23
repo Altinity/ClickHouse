@@ -22,7 +22,7 @@ TEST(CASEnvelope, BlobRoundTripNoExtensions)
 
     const EnvelopeHeader d = decodeEnvelopeHeader(obj, obj.size(), ObjectKind::Blob);
     EXPECT_EQ(d.kind, ObjectKind::Blob);
-    EXPECT_EQ(d.compatibility_version, G_BUILD);
+    EXPECT_EQ(d.compatibility_version, G_WRITE_FLOOR);
     EXPECT_FALSE(d.provenance.has_value());    /// none set -> the ts/by/op/ch keys are absent
     EXPECT_FALSE(d.intended_ref.has_value());  /// none set -> the ref key is omitted
     EXPECT_EQ(d.header_len, 256u);
