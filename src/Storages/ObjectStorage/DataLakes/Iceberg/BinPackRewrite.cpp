@@ -27,13 +27,13 @@
 #include <Poco/String.h>
 #include <Common/FieldVisitorDump.h>
 #include <Common/Logger.h>
-#include <boost/container_hash/hash.hpp>
 
 #if USE_AVRO
 
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int INCORRECT_DATA;
     extern const int LOGICAL_ERROR;
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int QUERY_WAS_CANCELLED;
@@ -123,7 +123,7 @@ struct PartitionKeyHash
         size_t result = 0;
         FieldVisitorDump dump_visitor;
         for (const auto & value : row)
-            boost::hash_combine(result, hasher(applyVisitor(dump_visitor, value)));
+            result ^= hasher(applyVisitor(dump_visitor, value));
         return result;
     }
 };
@@ -875,6 +875,31 @@ RewriteResult rewriteBins(
 
         writer.finalize();
 
+        if (writer.getDataFiles().empty())
+        {
+            /// The sources yielded no rows. Replacing files that should hold rows with nothing would
+            /// lose them, so the attempt fails before any of them is marked DELETED.
+            const auto has_rows = std::any_of(
+                bin.files.begin(), bin.files.end(), [](const DataFileRecord & file) { return file.record_count != 0; });
+            if (has_rows)
+                throw Exception(
+                    ErrorCodes::INCORRECT_DATA,
+                    "Bin-pack read no rows from {} data files of a partition whose manifest entries report rows",
+                    bin.files.size());
+
+            /// Rewriting empty files would only replace them with nothing; they stay as they are.
+            for (size_t i = 0; i < bin.files.size(); ++i)
+            {
+                auto & file = bin.files[i];
+                file.column_stats = std::move(bin_result.old_file_stats[i]);
+                plan.removed_data_files--;
+                plan.removed_records -= file.record_count;
+                plan.removed_files_size -= file.file_size_in_bytes;
+                plan.kept_groups[file.partition_key].push_back(std::move(file));
+            }
+            continue;
+        }
+
         bin_result.merged_file_paths = writer.getDataFiles();
         bin_result.merged_file_row_counts = writer.getDataFileRowCounts();
         bin_result.merged_file_byte_counts = writer.getDataFileByteCounts();
@@ -894,6 +919,11 @@ RewriteResult rewriteBins(
 
         result.bin_results.push_back(std::move(bin_result));
     }
+
+    std::unordered_set<Row, PartitionKeyHash, PartitionKeyEqual> affected_partitions;
+    for (const auto & bin_result : result.bin_results)
+        affected_partitions.insert(bin_result.partition_key);
+    plan.num_partitions = static_cast<Int64>(affected_partitions.size());
 
     return result;
 }
@@ -1312,6 +1342,12 @@ BinPackCommitResult executeBinPackCompaction(
             current_schema, schema_processor, current_schema_id_int, sample_block,
             current_schema_column_mapper, generator, path_resolver, write_format,
             target_size, new_data_file_paths, log);
+
+        if (rewrite.bin_results.empty())
+        {
+            LOG_INFO(log, "All bin-pack candidates are empty data files; nothing to compact");
+            return BinPackCommitResult::Committed;
+        }
 
         /// Phase 2: Generate the replace snapshot.
         auto generated_metadata_info = generator.generateMetadataPathWithInfo();

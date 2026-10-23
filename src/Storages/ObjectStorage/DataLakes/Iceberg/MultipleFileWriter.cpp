@@ -330,6 +330,10 @@ void MultipleFileWriter::consume(const Chunk & chunk)
 
 void MultipleFileWriter::finalize()
 {
+    /// No chunk was consumed, so no file was started.
+    if (!buffer)
+        return;
+
     output_format->flush();
     output_format->finalize();
     buffer->finalize();

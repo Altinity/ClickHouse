@@ -809,3 +809,63 @@ def test_optimize_rejects_table_upgraded_to_v3(started_cluster_iceberg_no_spark)
     instance.query(f"DROP TABLE IF EXISTS {table_name}")
     create_iceberg_table("local", instance, table_name, started_cluster_iceberg_no_spark)
     assert instance.query(f"SELECT id, value FROM {table_name} ORDER BY id").strip() == data_before
+
+
+@pytest.mark.parametrize("format_version", [2])
+def test_bin_pack_rejects_files_that_read_as_empty(started_cluster_iceberg_no_spark, format_version):
+    """Data files whose manifest entries report rows but whose contents read as zero rows must not
+    be replaced: OPTIMIZE fails with `INCORRECT_DATA` and the table keeps its files and snapshot."""
+    instance = started_cluster_iceberg_no_spark.instances["node1"]
+    table_name = "test_bin_pack_empty_read_" + get_uuid_str()
+    table_dir = f"/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}"
+
+    create_iceberg_table(
+        "local",
+        instance,
+        table_name,
+        started_cluster_iceberg_no_spark,
+        "(id Int64, value String)",
+        format_version=format_version,
+    )
+
+    for batch in range(2):
+        values = ", ".join(f"({batch * 10 + i}, 'row_{batch * 10 + i}')" for i in range(10))
+        instance.query(
+            f"INSERT INTO {table_name} VALUES {values}",
+            settings={"allow_insert_into_iceberg": 1},
+        )
+
+    assert _count_data_files(instance, table_name) == 2
+    summary_before = _get_latest_snapshot_summary(instance, table_name)
+
+    # Overwrite each data file with a valid Parquet file that holds no rows.
+    instance.exec_in_container(
+        [
+            "bash",
+            "-c",
+            f"for f in {table_dir}/data/*.parquet; do"
+            " clickhouse local --query \"SELECT * FROM file('$f', Parquet) WHERE 0 FORMAT Parquet\" > \"$f.empty\""
+            " && mv \"$f.empty\" \"$f\"; done",
+        ]
+    )
+    list_data_files = f"ls -1 {table_dir}/data | sort"
+    data_files_before = instance.exec_in_container(["bash", "-c", list_data_files])
+
+    error = instance.query_and_get_error(
+        f"OPTIMIZE TABLE {table_name}",
+        settings={
+            "allow_experimental_iceberg_compaction": 1,
+            "iceberg_target_data_file_size_bytes": 10 * 1024 * 1024,
+            "iceberg_min_data_file_size_bytes": 10 * 1024 * 1024,
+        },
+    )
+    assert "INCORRECT_DATA" in error, error
+
+    # Nothing may have been rewritten or removed.
+    assert instance.exec_in_container(["bash", "-c", list_data_files]) == data_files_before
+    assert _count_data_files(instance, table_name) == 2
+    summary_after = _get_latest_snapshot_summary(instance, table_name)
+    assert summary_after.get("operation") != "replace"
+    assert summary_after == summary_before
+
+    instance.query(f"DROP TABLE IF EXISTS {table_name}")

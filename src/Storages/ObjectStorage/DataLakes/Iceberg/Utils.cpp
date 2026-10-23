@@ -322,18 +322,8 @@ MetadataCommitResult tryWriteMetadataFileAndVersionHint(
     auto storage_metadata_path = resolver.resolve(metadata_file_info.path);
     auto storage_version_hint_path = resolver.resolve(version_hint_path);
 
-    bool metadata_exists = false;
-    try
-    {
-        metadata_exists = object_storage->exists(StoredObject(storage_metadata_path));
-    }
-    catch (...)
-    {
-        /// Nothing has been written yet.
-        tryLogCurrentException(__PRETTY_FUNCTION__);
-        return MetadataCommitResult::Conflict;
-    }
-    if (metadata_exists)
+    /// A failure here is a storage error, not a lost race, so it propagates to the caller.
+    if (object_storage->exists(StoredObject(storage_metadata_path)))
         return MetadataCommitResult::Conflict;
 
     try

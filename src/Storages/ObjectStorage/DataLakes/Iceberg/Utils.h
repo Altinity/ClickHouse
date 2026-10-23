@@ -67,6 +67,7 @@ enum class MetadataCommitResult : uint8_t
 
 /// Tries to write metadata file and version hint file. Uses If-None-Match header to avoid overwriting existing files.
 /// Will try to write hint multiple times, but will not report failure to write hint.
+/// Throws if checking whether the metadata file exists fails, since nothing has been written then.
 MetadataCommitResult tryWriteMetadataFileAndVersionHint(
     const IcebergPathResolver & resolver,
     const DB::GeneratedMetadataFileWithInfo & metadata_file_info,
