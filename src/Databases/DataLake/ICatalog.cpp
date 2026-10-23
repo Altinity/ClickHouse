@@ -14,11 +14,15 @@
 #include <Common/FailPoint.h>
 #include <Poco/URI.h>
 
+#include <Access/AccessControl.h>
+#include <Interpreters/Context.h>
+
 namespace DB::ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
+    extern const int CATALOG_USER_TOKEN_NOT_AVAILABLE;
 }
 
 namespace DB::DatabaseDataLakeSetting
@@ -405,20 +409,42 @@ DB::SettingsChanges CatalogSettings::allChanged() const
     return changes;
 }
 
-CatalogTables ICatalog::getTables(const TableNameFilter & filter) const
+void ICatalog::validateForwardedToken(
+    const DB::ContextPtr & context, const DB::ForwardedAuthTokenPtr & auth_token, const std::string & catalog_description) const
+{
+    /// Recheck the hot-reloadable switch so existing sessions stop forwarding when it is disabled.
+    if (!context->getGlobalContext()->getAccessControl().isTokenForwardingEnabled())
+    {
+        onTokenForwardingDisabled();
+
+        throw DB::Exception(
+            DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE,
+            "Catalog `{}` requires token forwarding. Set `enable_token_forwarding = 1` and reconnect.",
+            catalog_description);
+    }
+
+    if (!auth_token || auth_token->token.empty())
+        throw DB::Exception(
+            DB::ErrorCodes::CATALOG_USER_TOKEN_NOT_AVAILABLE,
+            "Cannot authenticate to catalog `{}`: this session carries no bearer token. "
+            "Authenticate with an `Authorization: Bearer` HTTP header or `--jwt` for the native protocol.",
+            catalog_description);
+}
+
+CatalogTables ICatalog::getTables(const TableNameFilter & filter, const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     switch (filter.kind)
     {
         case TableNameFilter::Kind::All:
-            return getTables();
+            return getTables(auth_token);
 
         case TableNameFilter::Kind::Equals:
         {
             /// `name = 'ns.table'` -> list only namespace `ns`; the outer filter keeps the exact row.
             const auto pos = filter.value.rfind('.');
             if (pos == std::string::npos)
-                return getTables();
-            return listTablesInNamespaceDirect(filter.value.substr(0, pos));
+                return getTables(auth_token);
+            return listTablesInNamespaceDirect(filter.value.substr(0, pos), auth_token);
         }
 
         case TableNameFilter::Kind::Like:
@@ -437,15 +463,15 @@ CatalogTables ICatalog::getTables(const TableNameFilter & filter) const
             /// A leading wildcard (e.g. `%foo%`) yields an empty prefix, so we must list all namespaces and tables.
             /// Calling getTables() is better as its parallel.
             if (fixed_prefix.empty())
-                return getTables();
+                return getTables(auth_token);
 
             CatalogTables result;
-            for (const auto & namespace_name : getNamespaces())
+            for (const auto & namespace_name : getNamespaces(auth_token))
             {
                 const std::string namespace_prefix = namespace_name + ".";
                 if (!startsWith(namespace_prefix, fixed_prefix) && !startsWith(fixed_prefix, namespace_prefix))
                     continue;
-                auto tables = listTablesInNamespaceDirect(namespace_name);
+                auto tables = listTablesInNamespaceDirect(namespace_name, auth_token);
                 std::move(tables.begin(), tables.end(), std::back_inserter(result));
             }
             return result;
@@ -460,19 +486,20 @@ bool ICatalog::createTable(
     const String & /*new_metadata_path*/,
     Poco::JSON::Object::Ptr /*metadata_content*/,
     DB::CompressionMethod /*metadata_compression_method*/,
-    bool /*if_not_exists*/) const
+    bool /*if_not_exists*/,
+    const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
         "CREATE TABLE is not supported for this DataLakeCatalog catalog type; "
         "it is available only for Iceberg REST (including OneLake, BigLake, Delta Sharing) and Glue catalogs");
 }
 
-void ICatalog::createNamespaceIfNotExists(const String & /*namespace_name*/, const String & /*location*/) const
+void ICatalog::createNamespaceIfNotExists(const String & /*namespace_name*/, const String & /*location*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "createNamespaceIfNotExists is not implemented");
 }
 
-bool ICatalog::updateMetadata(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*new_snapshot*/) const
+bool ICatalog::updateMetadata(const String & /*namespace_name*/, const String & /*table_name*/, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr /*new_snapshot*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "updateMetadata is not implemented");
 }
@@ -484,19 +511,26 @@ bool ICatalog::updateSchema(
     Poco::JSON::Object::Ptr /*new_schema*/,
     Int32 /*previous_schema_id*/,
     Int32 /*new_last_column_id*/,
-    Poco::JSON::Object::Ptr /*metadata*/) const
+    Poco::JSON::Object::Ptr /*metadata*/,
+    const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "updateSchema is not implemented");
 }
 
-void ICatalog::dropTable(const String & /*namespace_name*/, const String & /*table_name*/, bool /*purge*/, bool /*if_exists*/) const
+void ICatalog::dropTable(
+    const String & /*namespace_name*/,
+    const String & /*table_name*/,
+    bool /*purge*/,
+    bool /*if_exists*/,
+    const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
         "DROP TABLE is not supported for this DataLakeCatalog catalog type; "
         "it is available only for Iceberg REST (including OneLake, BigLake, Delta Sharing) and Glue catalogs");
 }
 
-ICatalog::PreparedSettingsChangesPtr ICatalog::prepareSettingsChanges(const DB::SettingsChanges & /*changes*/)
+ICatalog::PreparedSettingsChangesPtr ICatalog::prepareSettingsChanges(
+    const DB::SettingsChanges & /*changes*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
 {
     throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "Settings of a catalog of this type cannot be altered");
 }

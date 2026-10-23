@@ -936,7 +936,8 @@ bool AlterDropPartitionExecutor::commitMetadataJSON(
     /// Assume readers can reach the snapshot until the catalog says it rejected the commit.
     published = true;
     if (!catalog->updateMetadata(
-            namespace_name, table_name, components.path_resolver.resolveForCatalog(metadata_info.path), manifest_list_result.new_snapshot))
+            namespace_name, table_name, components.path_resolver.resolveForCatalog(metadata_info.path), manifest_list_result.new_snapshot,
+            context->getForwardedAuthToken()))
     {
         if (!catalogCommittedSnapshot(new_snapshot_id))
         {
