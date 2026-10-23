@@ -707,7 +707,8 @@ void DataPartStorageOnDiskPacked::resetReader(const ReadSettings & read_settings
     auto data_path = getRelativeDataPath();
     if (existsFileInTransactionOrDisk(data_path))
     {
-        auto buffer = readArchive(read_settings, std::nullopt);
+        /// Only the archive index is read here; a full-size (prefetching) buffer per part load is waste.
+        auto buffer = readArchive(read_settings.adjustBufferSize(4096), std::nullopt);
         reader.emplace(*buffer);
     }
 }

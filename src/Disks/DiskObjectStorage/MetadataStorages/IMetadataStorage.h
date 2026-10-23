@@ -369,6 +369,7 @@ public:
     /// disk transaction delegates writes to the metadata transaction's content-addressed buffer.
     virtual bool isContentAddressed() const { return false; }
 
+    /// Whether a new part may be written in the `Packed` storage format (see `IDisk::allowsPackedParts`).
     virtual bool allowsPackedParts() const { return true; }
 
     /// True when a file write through this metadata storage publishes atomically, i.e. no partial
