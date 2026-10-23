@@ -101,6 +101,8 @@ const KeyCondition::AtomMap KeyCondition::atom_map
             {
                 out.function = RPNElement::FUNCTION_IN_RANGE;
                 out.range = Range(value);
+                /// `NULL <=> c` is false, so `NOT (key <=> c)` is true and must keep a chunk that has NULL.
+                out.false_on_null = true;
                 return true;
             }
         },
@@ -6946,9 +6948,19 @@ bool KeyCondition::mayBeTrueOnNull(size_t key_column) const
             case RPNElement::FUNCTION_NOT_IN_RANGE:
             case RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE:
             case RPNElement::FUNCTION_POINT_IN_POLYGON:
-                /// A bare comparison is unknown on NULL. `assumeNotNull` and other wrappers can make it true.
-                stack.push_back(uses_this_column && element.monotonic_functions_chain.empty()
-                    ? TruthOnNull::isUnknown() : TruthOnNull::any());
+                /// A bare comparison is unknown on NULL. `<=>` is false. `assumeNotNull` can make either one true.
+                if (!uses_this_column || !element.monotonic_functions_chain.empty())
+                {
+                    stack.push_back(TruthOnNull::any());
+                }
+                else if (element.false_on_null)
+                {
+                    stack.push_back(TruthOnNull::isFalse());
+                }
+                else
+                {
+                    stack.push_back(TruthOnNull::isUnknown());
+                }
                 break;
             case RPNElement::FUNCTION_IN_SET:
             case RPNElement::FUNCTION_NOT_IN_SET:

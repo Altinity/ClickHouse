@@ -53,6 +53,9 @@ report "partner_id = 'sg2o27m' OR partner_id IS NULL"
 report "assumeNotNull(partner_id) = ''"
 report "partner_id IN ('sg2o27m', NULL)" ", transform_null_in = 1"
 report "partner_id NOT IN ('zzz')" ", transform_null_in = 1"
+# `NULL <=> c` is false, so the positive form still prunes. `NOT (NULL <=> c)` is true, so the `zzz` group stays.
+report "partner_id <=> 'sg2o27m'"
+report "NOT (partner_id <=> 'zzz')"
 
 # One row group with three small pages. Every page has nulls, so this also checks that page
 # min/max stays usable for a null-rejecting predicate.
@@ -90,4 +93,5 @@ report_pages()
 echo '--- rows, read pages, pruned pages ---'
 report_pages "partner_id = 'sg2o27m'"
 report_pages "partner_id = 'sg2o27m' OR partner_id IS NULL"
+report_pages "NOT (partner_id <=> 'zzz')"
 

@@ -361,6 +361,10 @@ public:
         /// Whether to relax the key condition (e.g., for LIKE queries without a perfect prefix).
         bool relaxed = false;
 
+        /// `isNotDistinctFrom` (`<=>`) with a non-NULL constant is false when the column is NULL.
+        /// A normal comparison is unknown. `NOT` of this atom is therefore true for NULL.
+        bool false_on_null = false;
+
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
         Range range = Range::createWholeUniverse();
 
