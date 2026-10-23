@@ -83,7 +83,7 @@ on:
   workflow_dispatch:{DISPATCH_INPUTS_BLOCK}
 
 concurrency:
-  group: ${{{{{{{{ github.workflow }}}}}}}}
+  group: ${{{{{{{{ github.workflow }}}}}}}}-${{{{{{{{ github.ref }}}}}}}}
 
 env:
   PYTHONUNBUFFERED: 1
@@ -103,7 +103,7 @@ jobs:
 
 name: {NAME}
 concurrency:
-  group: ${{{{{{{{ github.workflow }}}}}}}}
+  group: ${{{{{{{{ github.workflow }}}}}}}}-${{{{{{{{ github.ref }}}}}}}}
   cancel-in-progress: true
 on:
   workflow_dispatch:{DISPATCH_INPUTS_BLOCK}{WORKFLOW_CALL}{TAG_PUSH_TRIGGER}
