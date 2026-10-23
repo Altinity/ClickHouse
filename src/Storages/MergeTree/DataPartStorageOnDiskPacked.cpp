@@ -574,14 +574,6 @@ void DataPartStorageOnDiskPacked::commitTransaction()
     FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_after_commit_transaction);
 }
 
-void DataPartStorageOnDiskPacked::checkpointTransaction()
-{
-    if (isContentAddressed())
-        return;
-
-    IDataPartStorage::checkpointTransaction();
-}
-
 #if CLICKHOUSE_CLOUD
 TransactionCommitOutcomeVariant DataPartStorageOnDiskPacked::tryCommitTransaction(const TransactionCommitOptionsVariant & options)
 {
