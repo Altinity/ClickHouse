@@ -84,7 +84,7 @@ RUN clickhouse-keeper --version \
     && chown root:clickhouse "${DEFAULT_LOG_DIR}" \
     && chmod ugo+Xrw -R "${DEFAULT_DATA_DIR}" "${DEFAULT_LOG_DIR}" "${DEFAULT_CONFIG_DIR}"
 
-RUN apk upgrade --no-cache libcrypto3 libssl3
+RUN apk update && apk upgrade --no-cache
 
 # /var/lib/clickhouse is necessary due to the current default configuration for Keeper
 VOLUME "${DEFAULT_DATA_DIR}" /var/lib/clickhouse
