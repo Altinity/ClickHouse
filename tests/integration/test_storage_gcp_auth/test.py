@@ -197,13 +197,12 @@ def test_gcp_auth_ordinary_contract(started_cluster):
         for request in requests:
             headers = request["headers"]
             assert headers.get("authorization", "").startswith("Bearer "), request
-            for name in (
-                "x-goog-if-generation-match",
-                "if-match",
-                "if-none-match",
-                "x-amz-copy-source",
-                "x-goog-copy-source",
-            ):
+            forbidden = ["x-goog-if-generation-match", "if-none-match", "x-amz-copy-source", "x-goog-copy-source"]
+            # Upstream 26.8 pins every read to the ETag it captured at setup (`s3_validate_etag_on_read`):
+            # an If-Match on a GET or HEAD is upstream semantics. Conditional writes stay CAS-only.
+            if request["method"] not in ("GET", "HEAD"):
+                forbidden.append("if-match")
+            for name in forbidden:
                 assert name not in headers, request
             assert not [name for name in headers if name.startswith("x-goog-meta-")], request
 

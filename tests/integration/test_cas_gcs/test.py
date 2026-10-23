@@ -863,7 +863,10 @@ def test_ordinary_goog4_traffic_keeps_upstream_semantics():
         assert record["request_class"] == "ordinary_non_cas", record
         assert headers.get("authorization", "").startswith("GOOG4-HMAC-SHA256 "), record
         assert "x-goog-if-generation-match" not in headers, record
-        assert "if-match" not in headers, record
+        # Upstream 26.8 pins every read to the ETag it captured at setup (`s3_validate_etag_on_read`):
+        # an If-Match on a GET or HEAD is upstream semantics. Conditional writes stay CAS-only.
+        if record["method"] not in ("GET", "HEAD"):
+            assert "if-match" not in headers, record
         assert "if-none-match" not in headers, record
         assert "x-amz-copy-source" not in headers, record
         assert "x-goog-copy-source" not in headers, record
