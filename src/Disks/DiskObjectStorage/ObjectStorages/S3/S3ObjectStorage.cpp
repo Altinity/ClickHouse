@@ -35,7 +35,6 @@
 #include <Common/ProfileEvents.h>
 #include <Common/StringUtils.h>
 #include <Common/logger_useful.h>
-#include <Common/StackTrace.h>
 #include <Common/MultiVersion.h>
 #include <Common/Macros.h>
 #include <Common/ElapsedTimeProfileEventIncrement.h>
@@ -99,7 +98,6 @@ namespace ErrorCodes
     extern const int CANNOT_READ_ALL_DATA;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
-    extern const int S3_ERROR;
 }
 
 namespace
@@ -303,8 +301,7 @@ auto S3ObjectStorage::refreshAndRetryOnExpiredCredentials(Fn && fn) const
 bool S3ObjectStorage::exists(const StoredObject & object) const
 {
     auto settings_ptr = s3_settings.get();
-    const bool e = S3::objectExists(*client.get(), uri.bucket, object.remote_path, {});
-    return e;
+    return S3::objectExists(*client.get(), uri.bucket, object.remote_path, {});
 }
 
 std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObject( /// NOLINT
