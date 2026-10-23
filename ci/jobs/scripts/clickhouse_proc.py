@@ -321,9 +321,14 @@ class ClickHouseProc:
         ):
             print("Failed to start rustfs")
             return False
-        # The `test` bucket the storage policy expects.
+        # The `test` bucket the storage policy expects. The stateless-test image ships the client at
+        # /opt/aistor/mc or /mc.
+        mc = next((p for p in ("/opt/aistor/mc", "/mc") if Path(p).is_file()), None)
+        if mc is None:
+            print("minio client not found at /opt/aistor/mc or /mc")
+            return False
         res = Shell.check(
-            "/mc alias set carustfs http://localhost:11121 clickhouse clickhouse && /mc mb --ignore-existing carustfs/test",
+            f"{mc} alias set carustfs http://localhost:11121 clickhouse clickhouse && {mc} mb --ignore-existing carustfs/test",
             verbose=True,
         )
         if not res:
