@@ -229,6 +229,7 @@ namespace Setting
     extern const SettingsBool enable_lazy_columns_replication;
     extern const SettingsBool serialize_string_in_memory_with_zero_byte;
     extern const SettingsBool use_hive_partitioning;
+    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
 }
 
 namespace ServerSetting
@@ -814,6 +815,13 @@ InterpreterSelectQuery::InterpreterSelectQuery(
     }
 
     joined_tables.rewriteDistributedInAndJoins(query_ptr);
+
+    if (storage && !settings[Setting::allow_experimental_analyzer]
+        && settings[Setting::object_storage_cluster_join_mode] == ObjectStorageClusterJoinMode::GLOBAL
+        && dynamic_cast<const IStorageCluster *>(storage.get()))
+    {
+        IStorageCluster::rewriteASTForGlobalJoin(query_ptr);
+    }
 
     max_streams = getMaxThreadsForAvailableMemory(
         settings[Setting::max_threads], settings[Setting::max_threads_min_free_memory_per_thread]);

@@ -10,6 +10,7 @@
 #include <Core/Range.h>
 #include <Core/Settings.h>
 #include <Core/TypeId.h>
+#include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTime64.h>
@@ -291,6 +292,31 @@ Int64 getTimeValueInMicroseconds(const Field & field, DataTypePtr type)
     throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected Time or Time64, got {}", type->getName());
 }
 
+Int64 getDateTime64ValueForIcebergBounds(const Field & field, DataTypePtr type)
+{
+    if (type->isNullable())
+        return getDateTime64ValueForIcebergBounds(field, assert_cast<const DataTypeNullable *>(type.get())->getNestedType());
+
+    if (!WhichDataType(type).isDateTime64())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected DateTime64, got {}", type->getName());
+
+    /// Manifest rewrite reads the Avro `long` back as Int64 (contrib Avro has no `timestamp-nanos`).
+    if (field.getType() == Field::Types::Int64)
+        return field.safeGet<Int64>();
+    if (field.getType() == Field::Types::UInt64)
+        return static_cast<Int64>(field.safeGet<UInt64>());
+
+    const auto scale = getDecimalScale(*type);
+    const auto value = field.safeGet<Decimal64>().getValue().value;
+    if (scale == 9)
+        return value;
+    if (scale > 6)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+
+    /// Iceberg `timestamp` bounds are microseconds. DateTime64(s) for s < 6 stores coarser ticks.
+    return value * DataTypeDateTime64::getScaleMultiplier(6 - scale).value;
+}
+
 std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
 {
     switch (type->getTypeId())
@@ -326,7 +352,7 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
         case TypeIndex::Time64:
             return dumpValue(getTimeValueInMicroseconds(field, type));
         case TypeIndex::DateTime64:
-            return dumpValue(field.safeGet<Decimal64>().getValue().value);
+            return dumpValue(getDateTime64ValueForIcebergBounds(field, type));
         case TypeIndex::String:
         {
             auto value = field.safeGet<String>();
@@ -746,8 +772,9 @@ void generateManifestFile(
 
     auto adapter = std::make_unique<OutputStreamWriteBufferAdapter>(buf);
     avro::DataFileWriter<avro::GenericDatum> writer(std::move(adapter), schema);
-    /// avro-cpp's compiled schema loses the Iceberg field-id/element-id attributes; write the
-    /// original id-carrying JSON as the avro.schema header so external readers can plan a scan.
+    /// avro-cpp's compiled schema loses Iceberg field-id attributes, and `toJson` drops
+    /// unknown logical types such as `timestamp-nanos`. Write the original JSON as the
+    /// `avro.schema` header so external readers keep both.
     writer.setMetadata(Iceberg::f_avro_schema, schema_representation);
     writer.setMetadata(Iceberg::f_schema, json_representation);
     writer.setMetadata(Iceberg::f_schema_id, std::to_string(schema_object_to_write->getValue<Int32>(Iceberg::f_schema_id)));
@@ -1063,7 +1090,8 @@ void generateManifestList(
     const std::vector<ManifestListEntryCounts> & entry_counts,
     const std::unordered_set<String> & carry_forward_manifest_paths,
     const std::vector<Int64> & entry_partition_spec_ids,
-    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries)
+    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries,
+    const PreviousManifestActions & previous_manifest_actions)
 {
     chassert(
         per_entry_content_types.empty() || per_entry_content_types.size() == manifest_entry_names.size(),
@@ -1326,6 +1354,20 @@ void generateManifestList(
                         if (!carry_forward_manifest_paths.empty()
                             && !carry_forward_manifest_paths.contains(old_manifest_path.value<std::string>()))
                             return;
+
+                        const PreviousManifestAction * action = nullptr;
+                        if (!previous_manifest_actions.empty())
+                        {
+                            auto action_it = previous_manifest_actions.find(
+                                old_entry.field(Iceberg::f_manifest_path).value<std::string>());
+                            if (action_it != previous_manifest_actions.end())
+                                action = &action_it->second;
+                        }
+
+                        if (action && version == 1)
+                            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                                "Replacing a manifest of a format version 1 table is not supported");
+
                         avro::GenericDatum new_datum(schema.root());
                         avro::GenericRecord & new_entry = new_datum.value<avro::GenericRecord>();
 
@@ -1378,6 +1420,20 @@ void generateManifestList(
                             add_field_to_datum(Iceberg::f_sequence_number);
                             add_field_to_datum(Iceberg::f_min_sequence_number);
                         }
+
+                        if (action)
+                        {
+                            new_entry.field(Iceberg::f_manifest_path) = action->new_path.serialize();
+                            new_entry.field(Iceberg::f_manifest_length) = action->new_length;
+                            new_entry.field(Iceberg::f_added_files_count) = static_cast<Int32>(0);
+                            new_entry.field(Iceberg::f_existing_files_count) = action->new_existing_files_count;
+                            new_entry.field(Iceberg::f_deleted_files_count) = static_cast<Int32>(0);
+                            new_entry.field(Iceberg::f_added_rows_count) = static_cast<Int64>(0);
+                            new_entry.field(Iceberg::f_existing_rows_count) = action->new_existing_rows_count;
+                            new_entry.field(Iceberg::f_deleted_rows_count) = static_cast<Int64>(0);
+                            new_entry.field(Iceberg::f_min_sequence_number) = action->new_min_sequence_number;
+                        }
+
                         writer.write(new_datum);
                     });
                 break;
@@ -1903,7 +1959,7 @@ bool IcebergStorageSink::initializeMetadata()
                 auto catalog_filename = resolver.resolveForCatalog(metadata_info.path);
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot, context->getForwardedAuthToken()))
                 {
                     cleanup(true);
                     return false;
@@ -2006,6 +2062,7 @@ void IcebergImportSink::consume(Chunk & chunk)
     if (isCancelled())
         return;
 
+    consumed_rows = true;
     writer->consume(chunk);
 }
 
@@ -2045,6 +2102,9 @@ void IcebergImportSink::onException(std::exception_ptr /* exception */)
 
 void IcebergImportSink::finalizeBuffers()
 {
+    if (!consumed_rows)
+        return;
+
     writer->finalize();
 }
 

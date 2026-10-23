@@ -1707,13 +1707,16 @@ void pushOrderByIntoView(
 bool parallelReplicasEnabledForStorage(const StoragePtr & current_storage, const ContextPtr & context, const Settings & query_settings)
 {
     const auto * table_ptr = current_storage.get();
+    /// `getTargetTable` and `getUnderlyingMergeTreeStorageForParallelReplicas` return a `StoragePtr` by value.
+    /// A catalog lookup can be the only owner of that storage, so it has to stay alive for the checks below.
+    StoragePtr underlying_storage;
 
     if (query_settings[Setting::parallel_replicas_allow_view_over_mergetree])
     {
         const auto * view = typeid_cast<const StorageView *>(current_storage.get());
         if (view)
         {
-            auto underlying_storage = view->getUnderlyingMergeTreeStorageForParallelReplicas(context);
+            underlying_storage = view->getUnderlyingMergeTreeStorageForParallelReplicas(context);
             if (!underlying_storage)
                 return false;
 
@@ -1731,7 +1734,8 @@ bool parallelReplicasEnabledForStorage(const StoragePtr & current_storage, const
         if (mv->isRefreshable())
             return false;
 
-        table_ptr = mv->getTargetTable().get();
+        underlying_storage = mv->getTargetTable();
+        table_ptr = underlying_storage.get();
     }
 
     if (!table_ptr->isMergeTree())
@@ -3596,6 +3600,7 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
     size_t joins_count = 0;
     bool is_full_join = false;
     bool is_right_join = false;
+    bool is_paste_join = false;
     bool is_global_join = false;
     bool is_right_join_with_remote_table = false;
     int first_join_pos = -1;
@@ -3627,6 +3632,8 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
                 is_full_join = true;
             if (join_kind == JoinKind::Right)
                 is_right_join = true;
+            if (join_kind == JoinKind::Paste)
+                is_paste_join = true;
 
             if (join_node.getLocality() == JoinLocality::Global)
                 is_global_join = true;
@@ -3715,7 +3722,8 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
       * With `object_storage_cluster_join_mode = 'global'`, `IStorageCluster` must receive a
       * supported full query so it can materialize the right side and send a `GLOBAL JOIN` to
       * remote nodes. `RIGHT JOIN` and `FULL JOIN` stay on the initiator because broadcasting their
-      * preserved right side would make every shard emit the same unmatched rows.
+      * preserved right side would make every shard emit the same unmatched rows. `PASTE JOIN` stays
+      * there too: each shard would pair its own rows with the broadcast right side.
       *
       * `StorageDistributed` has sophisticated query planning logic to handle JOINs and should
       * NOT be wrapped (wrapping breaks tests like 03577_server_constant_folding), except for the
@@ -3728,7 +3736,8 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
             == ObjectStorageClusterJoinMode::GLOBAL
         && joins_count > 0
         && !is_right_join
-        && !is_full_join;
+        && !is_full_join
+        && !is_paste_join;
 
     if (has_multiple_tables && !use_global_join)
     {

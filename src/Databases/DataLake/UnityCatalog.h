@@ -27,13 +27,13 @@ public:
 
     ~UnityCatalog() override = default;
 
-    bool empty() const override;
+    bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    CatalogTables getTables() const override;
+    CatalogTables getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    Namespaces getNamespaces() const override;
+    Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
-    bool existsTable(const std::string & schema_name, const std::string & table_name) const override;
+    bool existsTable(const std::string & schema_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void getTableMetadata(
         const std::string & namespace_name,
@@ -71,7 +71,7 @@ private:
     DataLake::ICatalog::Namespaces getSchemas(const std::string & base_prefix, size_t limit = 0) const;
 
     CatalogTables getTablesForSchema(const std::string & schema, size_t limit = 0) const;
-    CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name) const override;
+    CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
     void getCredentials(const String & table_id, TableMetadata & metadata) const;
 
     Poco::JSON::Object::Ptr requestCredentials(const String & table_id, const String & operation) const;
@@ -84,7 +84,8 @@ private:
         const std::string & table_name,
         TableMetadata & result) const;
 
-    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & table_id) override;
+    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & table_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
 
     ICatalog::CredentialsRefreshCallback getWriteCredentialsConfigurationCallback(const DB::StorageID & table_id) override;
 

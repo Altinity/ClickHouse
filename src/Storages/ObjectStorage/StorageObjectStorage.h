@@ -1,4 +1,5 @@
 #pragma once
+#include <Access/ForwardedAuthToken.h>
 #include <Core/SchemaInferenceMode.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Parsers/IAST_fwd.h>
@@ -99,7 +100,7 @@ public:
 
     bool supportsImport(ContextPtr) const override;
 
-    SinkToStoragePtr import(
+    ImportResult import(
         const std::string & /* file_name */,
         Block & /* block_with_partition_values */,
         const std::function<void(const std::string &)> & new_file_path_callback,
@@ -122,6 +123,7 @@ public:
     static void dropImpl(
         const std::optional<bool> & delete_data_on_drop,
         const std::shared_ptr<DataLake::ICatalog> & catalog,
+        const DB::ForwardedAuthTokenPtr & catalog_auth_token,
         const StorageObjectStorageConfigurationPtr & configuration,
         const StorageID & storage_id,
         const LoggerPtr & log);
@@ -310,6 +312,7 @@ protected:
     LoggerPtr log;
 
     std::shared_ptr<DataLake::ICatalog> catalog;
+    DB::ForwardedAuthTokenPtr catalog_auth_token;
     StorageID storage_id;
     BackgroundJobsAssignee background_operations_assignee;
 
