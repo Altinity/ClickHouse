@@ -32,6 +32,7 @@ public:
     CommandCaGcRebuild() : ICommand("CommandCaGcRebuild")
     {
         command_name = "cas-gc-rebuild";
+        exits_nonzero_on_error = true;
         description = "Disaster recovery: rebuild a content-addressed pool's gc/state baseline from raw owner "
                       "state after the GC guard has refused every round (see CORRUPTED_DATA in the gc log). "
                       "Requires a read-only-opened disk; never run against a disk a live server has mounted.";

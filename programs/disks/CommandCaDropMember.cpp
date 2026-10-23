@@ -24,6 +24,7 @@ public:
     CommandCaDropMember() : ICommand("CommandCaDropMember")
     {
         command_name = "cas-drop-member";
+        exits_nonzero_on_error = true;
         description = "Decommission a DEAD pool member: erase its namespaces, debris, staging, roots "
                       "objects and mount slot. Refuses a live member. Open the CA disk read-only "
                       "(the admin claim is made internally).";

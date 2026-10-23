@@ -20,6 +20,7 @@ public:
     CommandCaGcDryRun() : ICommand("CommandCaGcDryRun")
     {
         command_name = "cas-gc-dryrun";
+        exits_nonzero_on_error = true;
         description = "Preview the next GC round's deletes for a content-addressed pool (read-only, no deletes).";
     }
 

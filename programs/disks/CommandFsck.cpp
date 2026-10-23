@@ -22,6 +22,7 @@ public:
     CommandFsck() : ICommand("CommandFsck")
     {
         command_name = "cas-fsck";
+        exits_nonzero_on_error = true;
         description = "Independently verify content-addressed pool reachability (read-only). "
                       "Exits nonzero if any reachable object is missing (dangling).";
         options_description.add_options()("detail", "list per-object rows (class, key, size, reachable_from)")(
@@ -177,6 +178,14 @@ public:
                 "cas-fsck: {} key(s) under this pool name are malformed or unresolvable — no current "
                 "writer could have produced them, or their catalog incarnation is ambiguous/unreadable "
                 "(the keys are listed as `lifeless-key` rows under --detail)", report.lifeless_keys);
+        /// Debris nothing names. Only a complete scan can say so: a namespace-scoped scan classifies the
+        /// orphan manifests of other namespaces as unreachable by construction, and a partial scan has not
+        /// seen every referrer.
+        if (report.unreachable > 0 && namespace_prefix.empty() && !partial && !report.partial)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "cas-fsck: {} object(s) are reachable from no ref (listed as `unreachable` rows under --detail)",
+                report.unreachable);
     }
 };
 

@@ -1,0 +1,5 @@
+clean_fsck 0
+unreachable_fsck 1
+dangling_fsck 1
+remove_missing 0
+fsck_then_list 1
