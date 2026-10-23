@@ -18,6 +18,7 @@ class RunConfig(MetaClasses.Serializable):
     cache_jobs: Dict[str, Cache.CacheRecord]
     filtered_jobs: Dict[str, str]
     sha: str
+    submodule_cache_hash: str
     custom_data: Dict[str, Any]
 
     @classmethod
@@ -34,6 +35,7 @@ class RunConfig(MetaClasses.Serializable):
         for job_name, cache_jobs in cache_jobs.items():
             cache_jobs_deserialized[job_name] = Cache.CacheRecord.from_dict(cache_jobs)
         obj["cache_jobs"] = cache_artifacts_deserialized
+        obj.setdefault("submodule_cache_hash", "")
         return RunConfig(**obj)
 
     @classmethod
