@@ -242,6 +242,8 @@ static struct InitFiu
     ONCE(disk_object_storage_fail_commit_metadata_transaction) \
     ONCE(disk_object_storage_fail_precommit_metadata_transaction) \
     REGULAR(part_storage_fail_commit_transaction) \
+    PAUSEABLE_ONCE(part_storage_pause_before_commit_transaction) \
+    PAUSEABLE_ONCE(part_storage_pause_after_commit_transaction) \
     ONCE(write_file_operation_fail_on_read) \
     REGULAR(slowdown_parallel_replicas_local_plan_read) \
     REGULAR(slowdown_skip_index_read_result_build) \

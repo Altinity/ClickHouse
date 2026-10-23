@@ -10817,33 +10817,16 @@ void MergeTreeData::Transaction::clear()
     precommitted_parts_need_rename.clear();
 }
 
+/// Renames only. The part's storage transaction is committed by the writer before this call, so on a
+/// content-addressed disk the rename is one owner move of an already published part.
 void MergeTreeData::Transaction::renameParts()
 {
-    /// Materialize every part of this transaction: perform the deferred tmp->final renames, then
-    /// close each part's disk-storage transaction, making the parts DURABLE on their disks.
-    ///
-    /// Contract: after renameParts returns, every part of this transaction is durable at its
-    /// final name. commit only flips in-memory visibility (its commitTransaction loop remains as
-    /// a safety net for paths that do not come through here); rollback compensates with new
-    /// operations over committed disk state (removing a rolled-back part reclaims its disk data;
-    /// on a content-addressed disk that drops the published ref).
-    ///
-    /// Ordering is load-bearing: every call site invokes renameParts BEFORE its external Keeper
-    /// commit decision. A part must be durable before its block_id/part-znode is registered,
-    /// otherwise a fault between the Keeper commit and the disk commit leaves a phantom part whose
-    /// surviving block_id silently dedups a byte-identical client retry (acked data loss). This
-    /// also keeps the disk commit (network I/O on object storages) off the data_parts lock, which
-    /// Transaction::commit holds.
     for (const auto & part_need_rename : precommitted_parts_need_rename)
     {
         LOG_TEST(data.log, "Renaming part to {}", part_need_rename->name);
         part_need_rename->renameTo(part_need_rename->name, true);
     }
     precommitted_parts_need_rename.clear();
-
-    for (const auto & part : precommitted_parts)
-        if (part->getDataPartStorage().hasActiveTransaction())
-            part->getDataPartStorage().commitTransaction();
 }
 
 MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit()
@@ -10865,7 +10848,14 @@ MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit(DataPartsLock 
 
         for (const auto & part : precommitted_parts)
             if (part->getDataPartStorage().hasActiveTransaction())
+            {
+                /// A content-addressed commit is object-store I/O; every writer commits it before the parts lock.
+                if (part->getDataPartStorage().isContentAddressed())
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "Part {} on a content-addressed disk reached Transaction::commit with an open storage transaction; "
+                        "commit it before taking the parts lock", part->name);
                 part->getDataPartStorage().commitTransaction();
+            }
 
         /// Collect covered parts and call addNewPartAndRemoveCovered before NOEXCEPT_SCOPE,
         /// because lockRemovalTID inside addNewPartAndRemoveCovered can throw SERIALIZATION_ERROR.

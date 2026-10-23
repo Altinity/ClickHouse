@@ -22,6 +22,8 @@ namespace DB
 namespace FailPoints
 {
     extern const char part_storage_fail_commit_transaction[];
+    extern const char part_storage_pause_before_commit_transaction[];
+    extern const char part_storage_pause_after_commit_transaction[];
 }
 
 namespace ErrorCodes
@@ -283,8 +285,14 @@ void DataPartStorageOnDiskFull::commitTransaction()
         throw Exception(ErrorCodes::FAULT_INJECTED, "part_storage_fail_commit_transaction");
     });
 
+    /// Lets a test hold the part inside its storage commit and prove that no MergeTree lock is held here.
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_before_commit_transaction);
+
     transaction->commit();
     transaction.reset();
+
+    /// Lets a test stop the process between the durable commit and the rename that follows.
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_after_commit_transaction);
 }
 
 void DataPartStorageOnDiskFull::checkpointTransaction()

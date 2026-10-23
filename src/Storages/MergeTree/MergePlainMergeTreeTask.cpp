@@ -154,9 +154,7 @@ void MergePlainMergeTreeTask::prepare()
 void MergePlainMergeTreeTask::finish()
 {
     new_part = merge_task->getFuture().get();
-    /// A content-addressed part is published once, under its final name, when the transaction commits after the rename.
-    if (!new_part->getDataPartStorage().isContentAddressed())
-        new_part->getDataPartStorage().commitTransaction();
+    new_part->getDataPartStorage().commitTransaction();
 
     MergeTreeData::Transaction transaction(storage, txn.get());
     storage.merger_mutator.renameMergedTemporaryPart(new_part, future_part->parts, txn, transaction);
