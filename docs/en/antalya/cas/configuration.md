@@ -259,6 +259,8 @@ A 26.8 server renames a committed part with one ref-log `Move` record (`cas_log`
 
 Upgrade order: stop every 26.6.x server that mounts the pool, upgrade all of them to 26.8, then start them. There is no per-server switch: a 26.8 server always raises the floor on its first writable mount. With GC enabled on the 26.6.x servers, follow [Upgrading a pool with GC enabled](operations/debugging.md#upgrade-gc) first. A 26.6.x server that stays up after the raise cannot re-mount the pool on its own: after a lost mount lease or fence it stays unmounted until it is upgraded.
 
+Replication while the versions are mixed: a 26.6.x replica that fetches from a 26.8 server can fail the fetch. Both builds advertise replication protocol version 10 with different meanings — 26.8 sends `invalidated_system_columns.txt`, which a 26.6.x receiver counts into the checksums. Fetches resume once both sides run 26.8; a fetch-by-relink needs the `relink_confirm` capability, which only 26.8 advertises.
+
 What a 26.6.x server does if it meets a generation-2 pool: it refuses to mount after a restart (`UNKNOWN_FORMAT_VERSION` at startup: `CAS pool meta: pool requires reader generation 2 but this build supports at most 1`). An already mounted 26.6.x server keeps serving namespaces that have no `ref_move` record; direct recovery of a namespace that has one cannot cross the record until a later generation-1 snapshot gives it a new base; its GC round holds on the undecodable log and performs no deletions. Fetch-by-relink is protected by namespace ownership and the mount fence, not by the log version. No data is deleted or lost. Downgrading a pool whose floor is 2 is not supported.
 
 ## Server-level settings {#server-settings}
