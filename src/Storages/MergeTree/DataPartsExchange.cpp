@@ -158,17 +158,6 @@ constexpr auto CA_CONFIRM_ANSWER_PROVEN = "yes";
 /// same safe outcome as a refusal.
 constexpr auto CA_CONFIRM_ANSWER_UNPROVEN = "unproven";
 
-/// Resolve a disk to the content-addressed exchange facade, or nullptr if the disk is not CA. The
-/// cast targets the purpose-built INTERFACE (IContentAddressedExchange), never the concrete
-/// metadata-storage class. Used by both the relink sender (the part's
-/// disk) and the relink receiver (the target disk).
-IContentAddressedExchange * tryGetContentAddressedExchange(const DiskPtr & disk)
-{
-    if (!disk || !disk->isContentAddressed())
-        return nullptr;
-    return dynamic_cast<IContentAddressedExchange *>(disk->getMetadataStorage().get());
-}
-
 /// Simple functor for tracking fetch progress in system.replicated_fetches table.
 struct ReplicatedFetchReadCallback
 {

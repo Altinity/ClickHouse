@@ -413,7 +413,7 @@ void PaimonRestCatalog::forEachTables(
 }
 
 
-bool PaimonRestCatalog::empty() const
+bool PaimonRestCatalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     DB::Strings databases;
     DB::Names tables;
@@ -427,7 +427,7 @@ bool PaimonRestCatalog::empty() const
     return tables.empty();
 }
 
-DB::Names PaimonRestCatalog::getTables() const
+DB::Names PaimonRestCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     DB::Strings databases;
     DB::Names tables;
@@ -436,7 +436,22 @@ DB::Names PaimonRestCatalog::getTables() const
     return tables;
 }
 
-bool PaimonRestCatalog::existsTable(const String & database_name, const String & table_name) const
+DataLake::ICatalog::Namespaces PaimonRestCatalog::getNamespaces(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
+{
+    /// Paimon REST databases are flat — they cannot contain nested namespaces.
+    DB::Strings databases;
+    forEachDatabase(databases, {}, {});
+    return databases;
+}
+
+DB::Names PaimonRestCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
+{
+    DB::Names tables;
+    forEachTables(namespace_name, tables, {});
+    return tables;
+}
+
+bool PaimonRestCatalog::existsTable(const String & database_name, const String & table_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     try
     {

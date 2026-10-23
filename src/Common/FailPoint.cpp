@@ -35,6 +35,8 @@ static struct InitFiu
     ONCE(replicated_merge_tree_commit_zk_fail_after_op) \
     ONCE(replicated_queue_fail_next_entry) \
     REGULAR(replicated_queue_unfail_entries) \
+    ONCE(transaction_metadata_store_fail) \
+    ONCE(transaction_mutation_csn_store_fail) \
     ONCE(replicated_merge_tree_insert_quorum_fail_0) \
     REGULAR(replicated_merge_tree_commit_zk_fail_when_recovering_from_hw_fault) \
     REGULAR(rmt_dedup_conflict_part_name_missing) \
@@ -226,6 +228,7 @@ static struct InitFiu
     REGULAR(datalake_simulate_missing_table_state) \
     REGULAR(datalake_get_tables_throw) \
     PAUSEABLE_ONCE(drop_database_before_exclusive_ddl_lock) \
+    PAUSEABLE_ONCE(create_or_replace_before_rename) \
     REGULAR(storage_merge_tree_background_schedule_merge_fail) \
     REGULAR(patch_parts_reverse_column_order) \
     REGULAR(wide_part_writer_fail_in_add_streams) \
@@ -243,7 +246,8 @@ static struct InitFiu
     REGULAR(cas_relink_sender_omit_pool_cookie) \
     REGULAR(cas_relink_receiver_drop_forced_disk) \
     ONCE(cas_gc_scheduler_fail_before_heartbeat_worker_start) \
-    ONCE(cas_gc_scheduler_fail_before_worker_start)
+    ONCE(cas_gc_scheduler_fail_before_worker_start) \
+    ONCE(zk_send_thread_request_window_throw)
 
 namespace FailPoints
 {

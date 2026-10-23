@@ -88,6 +88,7 @@
 #include <Core/SettingsQuirks.h>
 #include <Core/UUID.h>
 #include <Access/AccessControl.h>
+#include <Access/resolveSetting.h>
 #include <Access/ContextAccess.h>
 #include <Access/EnabledRolesInfo.h>
 #include <Access/EnabledRowPolicies.h>
@@ -1280,6 +1281,7 @@ ContextData::ContextData()
 ContextData::ContextData(const ContextData &o) :
     shared(o.shared),
     client_info(o.client_info),
+    forwarded_auth_token(o.forwarded_auth_token),
     external_tables_initializer_callback(o.external_tables_initializer_callback),
     input_initializer_callback(o.input_initializer_callback),
     input_blocks_reader(o.input_blocks_reader),
@@ -3386,8 +3388,14 @@ void Context::checkMergeTreeSettingsConstraints(const MergeTreeSettings & merge_
 void Context::resetSettingsToDefaultValue(const std::vector<String> & names)
 {
     std::lock_guard lock(mutex);
-    for (const String & name: names)
+    for (const String & name : names)
+    {
         settings->setDefaultValue(name);
+        /// `Settings` stores a `merge_tree_`-prefixed name as a custom setting, under the exact name that
+        /// wrote it. Resetting one name of a setting therefore has to clear what its other names wrote.
+        for (const auto & equivalent_name : settingEquivalentNames(name))
+            settings->setDefaultValue(equivalent_name);
+    }
 }
 
 std::shared_ptr<const SettingsConstraintsAndProfileIDs> Context::getSettingsConstraintsAndCurrentProfilesWithLock() const
@@ -7470,6 +7478,11 @@ void Context::setClientInfo(const ClientInfo & client_info_)
 {
     client_info = client_info_;
     need_recalculate_access = true;
+}
+
+void Context::setForwardedAuthToken(ForwardedAuthTokenPtr token)
+{
+    forwarded_auth_token = std::move(token);
 }
 
 void Context::setClientName(const String & client_name)

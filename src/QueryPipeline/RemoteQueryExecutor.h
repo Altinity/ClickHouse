@@ -49,7 +49,7 @@ public:
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method rescheduleTasksFromReplica is not implemented");
     }
-    virtual ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica) const = 0;
+    virtual ClusterFunctionReadTaskResponsePtr operator()(size_t number_of_current_replica, UInt64 antalya_protocol_version = 0) const = 0;
 };
 
 /// This class allows one to launch queries on remote replicas of one shard and get results

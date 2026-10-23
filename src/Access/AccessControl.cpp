@@ -295,6 +295,7 @@ void AccessControl::setupFromMainConfig(const Poco::Util::AbstractConfiguration 
     setPasswordComplexityRulesFromConfig(config_);
 
     setTokenAuthEnabled(config_.getBool("enable_token_auth", true));
+    setTokenForwardingEnabled(config_.getBool("enable_token_forwarding", false));
 
     setBcryptWorkfactor(config_.getInt("bcrypt_workfactor", 12));
 
@@ -587,11 +588,6 @@ scope_guard AccessControl::subscribeForChanges(const std::vector<UUID> & ids, co
     return changes_notifier->subscribeForChanges(ids, handler);
 }
 
-scope_guard AccessControl::subscribeForBatchFinished(const OnBatchFinishedHandler & handler) const
-{
-    return changes_notifier->subscribeForBatchFinished(handler);
-}
-
 bool AccessControl::insertImpl(const UUID & id, const AccessEntityPtr & entity, bool replace_if_exists, bool throw_if_exists, UUID * conflicting_id)
 {
     if (MultipleAccessStorage::insertImpl(id, entity, replace_if_exists, throw_if_exists, conflicting_id))
@@ -705,6 +701,7 @@ void AccessControl::setExternalAuthenticatorsConfig(const Poco::Util::AbstractCo
     /// value in place -- operators who toggle token auth off in response to an
     /// IdP outage or a credential leak would see no effect until restart.
     setTokenAuthEnabled(config.getBool("enable_token_auth", true));
+    setTokenForwardingEnabled(config.getBool("enable_token_forwarding", false));
     external_authenticators->setConfiguration(config, getLogger(), token_http_timeouts, isTokenAuthEnabled());
 }
 
@@ -993,5 +990,15 @@ void AccessControl::setTokenAuthEnabled(bool enable)
 bool AccessControl::isTokenAuthEnabled() const
 {
     return enable_token_auth;
+}
+
+void AccessControl::setTokenForwardingEnabled(bool enable)
+{
+    enable_token_forwarding = enable;
+}
+
+bool AccessControl::isTokenForwardingEnabled() const
+{
+    return enable_token_forwarding;
 }
 }

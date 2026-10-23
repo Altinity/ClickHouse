@@ -126,17 +126,20 @@ AsynchronousInsertQueue::InsertQuery::InsertQuery(
     const String & current_user_,
     const String & initial_user_,
     const String & authenticated_user_,
+    const ForwardedAuthTokenPtr & forwarded_auth_token_,
     const Settings & settings_,
     AsynchronousInsertQueueDataKind data_kind_)
     : query(query_->clone())
-    , query_str(query->formatWithSecretsOneLine())
+    , query_str_with_secrets(query->formatWithSecretsOneLine())
     , user_id(user_id_)
     , current_roles(current_roles_)
     , current_user(current_user_)
     , initial_user(initial_user_)
     , authenticated_user(authenticated_user_)
+    , forwarded_auth_token(forwarded_auth_token_)
     , settings(std::make_unique<Settings>(settings_))
     , data_kind(data_kind_)
+    , forwarded_auth_token_fingerprint(forwarded_auth_token ? forwarded_auth_token->fingerprint : String{})
 {
     SipHash siphash;
 
@@ -160,6 +163,9 @@ AsynchronousInsertQueue::InsertQuery::InsertQuery(
         siphash.update(identity_field);
     }
 
+    siphash.update(forwarded_auth_token_fingerprint.size());
+    siphash.update(forwarded_auth_token_fingerprint);
+
     setting_changes = settings->changes();
     for (auto it = setting_changes.begin(); it != setting_changes.end();)
     {
@@ -181,12 +187,14 @@ AsynchronousInsertQueue::InsertQuery::InsertQuery(
 AsynchronousInsertQueue::InsertQuery::InsertQuery(const InsertQuery & other)
 {
     query = other.query->clone();
-    query_str = other.query_str;
+    query_str_with_secrets = other.query_str_with_secrets;
     user_id = other.user_id;
     current_roles = other.current_roles;
     current_user = other.current_user;
     initial_user = other.initial_user;
     authenticated_user = other.authenticated_user;
+    forwarded_auth_token = other.forwarded_auth_token;
+    forwarded_auth_token_fingerprint = other.forwarded_auth_token_fingerprint;
     settings = std::make_unique<Settings>(*other.settings);
     data_kind = other.data_kind;
     hash = other.hash;
@@ -199,12 +207,14 @@ AsynchronousInsertQueue::InsertQuery::operator=(const InsertQuery & other)
     if (this != &other)
     {
         query = other.query->clone();
-        query_str = other.query_str;
+        query_str_with_secrets = other.query_str_with_secrets;
         user_id = other.user_id;
         current_roles = other.current_roles;
         current_user = other.current_user;
         initial_user = other.initial_user;
         authenticated_user = other.authenticated_user;
+        forwarded_auth_token = other.forwarded_auth_token;
+        forwarded_auth_token_fingerprint = other.forwarded_auth_token_fingerprint;
         settings = std::make_unique<Settings>(*other.settings);
         data_kind = other.data_kind;
         hash = other.hash;
@@ -560,6 +570,7 @@ AsynchronousInsertQueue::PushResult AsynchronousInsertQueue::pushDataChunk(ASTPt
         client_info.current_user,
         client_info.initial_user,
         client_info.authenticated_user,
+        query_context->getForwardedAuthToken(),
         settings,
         data_kind};
     InsertDataPtr data_to_process;
@@ -1015,6 +1026,7 @@ try
     insert_context->setCurrentUserName(key.current_user);
     insert_context->setInitialUserName(key.initial_user);
     insert_context->setAuthenticatedUserName(key.authenticated_user);
+    insert_context->setForwardedAuthToken(key.forwarded_auth_token);
 
     insert_context->setSettings(*key.settings);
 
@@ -1128,10 +1140,7 @@ try
             return it->second;
         };
 
-        if (entry->chunk.getDataKind() == AsynchronousInsertQueueDataKind::Parsed)
-            elem.query_for_logging = key.query_str;
-        else
-            elem.query_for_logging = get_query_by_format(entry->format);
+        elem.query_for_logging = get_query_by_format(entry->format);
 
         if (is_flush_error)
         {

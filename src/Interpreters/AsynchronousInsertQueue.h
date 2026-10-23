@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Access/ForwardedAuthToken.h>
 #include <Core/Block.h>
 #include <Parsers/IAST_fwd.h>
 #include <Processors/Chunk.h>
@@ -84,7 +85,8 @@ public:
     {
     public:
         ASTPtr query;
-        String query_str;
+        /// Never log it, use `serializeQuery` on `query` instead.
+        String query_str_with_secrets;
         std::optional<UUID> user_id;
         std::vector<UUID> current_roles;
         /// Client identity of the originating INSERT query (ClientInfo user names).
@@ -95,6 +97,7 @@ public:
         String current_user;
         String initial_user;
         String authenticated_user;
+        ForwardedAuthTokenPtr forwarded_auth_token;
         std::unique_ptr<Settings> settings;
 
         AsynchronousInsertQueueDataKind data_kind;
@@ -107,6 +110,7 @@ public:
             const String & current_user_,
             const String & initial_user_,
             const String & authenticated_user_,
+            const ForwardedAuthTokenPtr & forwarded_auth_token_,
             const Settings & settings_,
             AsynchronousInsertQueueDataKind data_kind_);
 
@@ -116,7 +120,14 @@ public:
         StorageID getStorageID() const;
 
     private:
-        auto toTupleCmp() const { return std::tie(data_kind, query_str, user_id, current_roles, current_user, initial_user, authenticated_user, setting_changes); }
+        auto toTupleCmp() const
+        {
+            return std::tie(
+                data_kind, query_str_with_secrets, user_id, current_roles, current_user, initial_user,
+                authenticated_user, forwarded_auth_token_fingerprint, setting_changes);
+        }
+
+        String forwarded_auth_token_fingerprint;
 
         std::vector<SettingChange> setting_changes;
     };

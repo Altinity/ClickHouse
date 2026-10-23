@@ -33,7 +33,9 @@ public:
 
     DB::DatabaseDataLakeCatalogType getCatalogType() const override { return DB::DatabaseDataLakeCatalogType::S3_TABLES; }
 
-    DB::Names getTables() const override;
+    DB::Names getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
+
+    std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
 
     bool tryGetTableMetadata(
         const std::string & namespace_name,
@@ -41,19 +43,20 @@ public:
         DB::ContextPtr context_,
         TableMetadata & result) const override;
 
-    void dropTable(const String & namespace_name, const String & table_name) const override;
+    bool managesTableLocation() const override { return true; }
 
-    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
+    void dropTable(
+        const String & namespace_name,
+        const String & table_name,
+        bool delete_data,
+        bool if_exists,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
+
+    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
 
 protected:
-    DB::HTTPHeaderEntries getAuthHeaders(
-        const CatalogState & catalog_state,
-        bool update_token,
-        const String & method = {},
-        const Poco::URI & url = {},
-        const DB::HTTPHeaderEntries & extra_headers = {},
-        const String & body = {},
-        bool * used_cached_oauth_token = nullptr) const override;
+    DB::HTTPHeaderEntries getAuthHeaders(const AuthContext & auth_context) const override;
 
 private:
     const String region;

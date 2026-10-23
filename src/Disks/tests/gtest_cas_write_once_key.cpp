@@ -30,3 +30,25 @@ TEST(CASWriteOnceKey, FactoriesMintTheSameStringsAsThePlainKeyFunctions)
     EXPECT_TRUE(layout.parseManifestKey(layout.writeOnceManifestKey(manifest).str()).has_value());
     EXPECT_TRUE(layout.parseRefObjectKey(layout.writeOnceRefLogKey(life, id).str()).has_value());
 }
+
+TEST(CASWriteOnceKey, StreamKeyMintedFromAListedKeyMustBeThatKey)
+{
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"test/aa@cas@"}, DB::UInt128(0x1234));
+    const RefTxnId id{5, 7};
+
+    for (const String & listed : {layout.refLogKey(life, id), layout.refSnapshotKey(life, id)})
+    {
+        const auto parsed = layout.parseRefObjectKey(listed);
+        ASSERT_TRUE(parsed.has_value()) << listed;
+        const auto minted = layout.writeOnceStreamKey(*parsed, listed);
+        ASSERT_TRUE(minted.has_value()) << listed;
+        EXPECT_EQ(minted->str(), listed);
+    }
+
+    const auto parsed_log = layout.parseRefObjectKey(layout.refLogKey(life, id));
+    ASSERT_TRUE(parsed_log.has_value());
+    EXPECT_FALSE(layout.writeOnceStreamKey(*parsed_log, layout.refSnapshotKey(life, id)).has_value());
+    EXPECT_FALSE(layout.writeOnceStreamKey(*parsed_log, layout.refLogKey(life, RefTxnId{5, 8})).has_value());
+    EXPECT_FALSE(layout.writeOnceStreamKey(*parsed_log, "q" + layout.refLogKey(life, id).substr(1)).has_value());
+}

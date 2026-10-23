@@ -55,6 +55,13 @@ UInt64 parseMarker(std::string_view name)
     return std::min<UInt64>(version, DBMS_ANTALYA_PROTOCOL_VERSION);
 }
 
+std::string_view removeMarker(std::string_view name)
+{
+    if (parseMarker(name) == 0)
+        return name;
+    return name.substr(0, name.rfind(MARKER_PREFIX));
+}
+
 }
 
 }

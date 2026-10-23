@@ -74,8 +74,10 @@ void deleteFileFromS3(
     else
     {
         const auto & err = outcome.GetError();
-        throw S3Exception(err.GetErrorType(), "{} (Code: {}) while removing object with path {} from S3",
-                          err.GetMessage(), static_cast<size_t>(err.GetErrorType()), key);
+        throw S3Exception(
+            PreformattedMessage::create("{} (Code: {}) while removing object with path {} from S3",
+                err.GetMessage(), static_cast<size_t>(err.GetErrorType()), key),
+            err.GetErrorType(), err.GetExceptionName());
     }
 }
 

@@ -890,6 +890,16 @@ namespace
 
     Default value: `true` (token authentication is enabled).
     )", 0) \
+    DECLARE(Bool, enable_token_forwarding, false, R"(
+    Retain authenticated bearer tokens for forwarding through the `DataLakeCatalog`
+    setting `oauth_forward_user_token`. Supports Iceberg REST and AWS STS for Glue.
+    When disabled, tokens are not retained in sessions for forwarding.
+
+    Database creators choose the endpoints that receive users' tokens. Grant `CREATE DATABASE`
+    only to trusted users and restrict `remote_url_allow_hosts`.
+
+    Default value: `false`.
+    )", 0) \
     DECLARE(UInt64, concurrent_threads_soft_limit_num, 0, R"(
     The maximum number of query processing threads, excluding threads for retrieving data from remote servers, allowed to run all queries. This is not a hard limit. In case if the limit is reached the query will still get at least one thread to run. Query can upscale to desired number of threads during execution if more threads become available.
 
@@ -1944,6 +1954,8 @@ ChangeableSettingsMap collectChangeableServerSettings(ContextPtr context)
 
             {"allow_feature_tier",
                 {std::to_string(context->getAccessControl().getAllowTierSettings()), ChangeableWithoutRestart::Yes}},
+            {"enable_token_forwarding",
+                {std::to_string(context->getAccessControl().isTokenForwardingEnabled()), ChangeableWithoutRestart::Yes}},
             {"s3queue_disable_streaming",
              {std::to_string(context->getServerSettingsCopy().get("s3queue_disable_streaming").safeGet<bool>()), ChangeableWithoutRestart::Yes}},
             {"message_queue_disable_insertion", {std::to_string(context->getMessageQueueDisableInsertion()), ChangeableWithoutRestart::Yes}},
@@ -2080,8 +2092,8 @@ void ServerSettings::dumpToSystemServerSettingsColumns(ServerSettingColumnsParam
         const bool is_changeable = (changeable_settings_it != changeable_settings.end());
 
         res_columns[0]->insert(setting_path.empty() ? setting_name : setting_path);
-        res_columns[1]->insert(is_changeable ? changeable_settings_it->second.first : setting.getValueString());
-        res_columns[2]->insert(setting.getDefaultValueString());
+        res_columns[1]->insert(is_changeable ? changeable_settings_it->second.first : setting.getValueString(/* show_secrets */ true));
+        res_columns[2]->insert(setting.getDefaultValueString(/* show_secrets */ true));
         res_columns[3]->insert(setting.isValueChanged());
         res_columns[4]->insert(setting.getDescription());
         res_columns[5]->insert(setting.getTypeName());

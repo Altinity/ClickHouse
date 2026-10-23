@@ -121,6 +121,19 @@ TEST(IcebergSchemaProcessor, GetSimpleTypeDecimal)
     EXPECT_EQ(type->getName(), "Decimal(10, 2)");
 }
 
+TEST(IcebergSchemaProcessor, GetSimpleTypeUnknown)
+{
+    auto type = IcebergSchemaProcessor::getSimpleType("unknown", getContext().context);
+    EXPECT_EQ(type->getName(), "Nothing");
+}
+
+TEST(IcebergSchemaProcessor, UnknownFieldInSchemaProducesNullableNothing)
+{
+    auto schema = parseSchema(R"json({"schema-id":0,"fields":[{"id":1,"name":"placeholder","required":false,"type":"unknown"}]})json");
+    IcebergSchemaProcessor processor(getContext().context);
+    EXPECT_NO_THROW(processor.addIcebergTableSchema(schema, getContext().context));
+}
+
 TEST(IcebergSchemaProcessor, GetSimpleTypeUnknownThrows)
 {
     EXPECT_THROW(IcebergSchemaProcessor::getSimpleType("unknown_type", getContext().context), DB::Exception);
