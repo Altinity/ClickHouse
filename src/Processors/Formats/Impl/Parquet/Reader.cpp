@@ -329,26 +329,29 @@ void Reader::getHyperrectangleForRowGroup(const parq::RowGroup * meta, Hyperrect
             bool can_be_null = !column_meta.statistics.__isset.null_count ||
                             column_meta.statistics.null_count != 0;
             bool null_as_default = options.format.null_as_default && !column_info.output_nullable;
+            /// NULL itself can satisfy the filter (`assumeNotNull`, `nullIn`), so bounds cannot reject the row group.
+            bool null_can_match = can_be_null && column_info.output_nullable && format_filter_info->key_condition
+                && format_filter_info->key_condition->mayBeTrueOnNull(column_info.idx_in_output_block);
 
             if (nullable && always_null)
             {
                 /// Single-point range containing either the default value or one of the infinities.
                 if (null_as_default)
                     range.right = range.left = output_block_type.getDefault();
-                else
+                else if (!null_can_match)
                     range.right = range.left;
                 continue;
             }
+
+            if (null_can_match)
+                continue;
 
             if (column_meta.statistics.__isset.min_value)
                 column_info.decoder.decodeField(column_meta.statistics.min_value, /*is_max=*/ false, *column_info.decoded_type, output_block_type, range.left);
             if (column_meta.statistics.__isset.max_value)
                 column_info.decoder.decodeField(column_meta.statistics.max_value, /*is_max=*/ true, *column_info.decoded_type, output_block_type, range.right);
 
-            /// Min/max ignores nulls. Widen the range only when SQL NULL can satisfy the filter.
-            bool include_null = can_be_null && (!column_info.output_nullable || !format_filter_info->key_condition
-                || format_filter_info->key_condition->mayBeTrueOnNull(column_info.idx_in_output_block));
-            adjustRangeFromIndexIfNeeded(range, column_info, include_null);
+            adjustRangeFromIndexIfNeeded(range, column_info, can_be_null && !(column_info.output_nullable && format_filter_info->key_condition));
         }
         catch (Exception & e)
         {

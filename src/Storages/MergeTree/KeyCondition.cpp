@@ -6944,12 +6944,17 @@ bool KeyCondition::mayBeTrueOnNull(size_t key_column) const
         {
             case RPNElement::FUNCTION_IN_RANGE:
             case RPNElement::FUNCTION_NOT_IN_RANGE:
-            case RPNElement::FUNCTION_IN_SET:
-            case RPNElement::FUNCTION_NOT_IN_SET:
             case RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE:
             case RPNElement::FUNCTION_POINT_IN_POLYGON:
-                /// `x = 1` and `x != 1` are both unknown when `x` is NULL.
-                stack.push_back(uses_this_column ? TruthOnNull::isUnknown() : TruthOnNull::any());
+                /// A bare comparison is unknown on NULL. `assumeNotNull` and other wrappers can make it true.
+                stack.push_back(uses_this_column && element.monotonic_functions_chain.empty()
+                    ? TruthOnNull::isUnknown() : TruthOnNull::any());
+                break;
+            case RPNElement::FUNCTION_IN_SET:
+            case RPNElement::FUNCTION_NOT_IN_SET:
+                /// `nullIn` / `notNullIn` (`transform_null_in`) can match NULL. A normal `IN` does not, but the
+                /// RPN does not record which one this is, so keep the chunk.
+                stack.push_back(TruthOnNull::any());
                 break;
             case RPNElement::FUNCTION_IS_NULL:
                 stack.push_back(uses_this_column ? TruthOnNull::isTrue() : TruthOnNull::any());

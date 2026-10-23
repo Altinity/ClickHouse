@@ -36,7 +36,7 @@ report()
         WHERE ${predicate}
         SETTINGS
             input_format_parquet_bloom_filter_push_down = 0,
-            input_format_parquet_dictionary_filter_push_down = 0" 2>&1)
+            input_format_parquet_dictionary_filter_push_down = 0${2:-}" 2>&1)
     echo "${output}" | awk '
         /^[0-9]+$/ { rows = $1 }
         /ParquetReadRowGroups:/ { read += $(NF-1) }
@@ -49,6 +49,10 @@ report "partner_id = 'sg2o27m'"
 report "NOT partner_id = 'sg2o27m'"
 report "partner_id IS NULL"
 report "partner_id = 'sg2o27m' OR partner_id IS NULL"
+# NULL itself matches: a monotonic wrapper, and `IN` / `NOT IN` under `transform_null_in`.
+report "assumeNotNull(partner_id) = ''"
+report "partner_id IN ('sg2o27m', NULL)" ", transform_null_in = 1"
+report "partner_id NOT IN ('zzz')" ", transform_null_in = 1"
 
 # One row group with three small pages. Every page has nulls, so this also checks that page
 # min/max stays usable for a null-rejecting predicate.
