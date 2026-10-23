@@ -281,14 +281,13 @@ the same node while the cluster is stable, which helps local caches. See
 ### Joins against local tables {#joins}
 
 A swarm query can `JOIN` a table that exists only on the initiator. Workers do not have that table,
-so you must choose how the join is rewritten with `object_storage_cluster_join_mode`
-(requires `allow_experimental_analyzer = 1` unless the value is `allow`):
+so you must choose how the join is rewritten with `object_storage_cluster_join_mode`:
 
 | Value | Behaviour |
 | --- | --- |
-| `allow` (default) | Leave the join as written. Use this when both sides are object-storage cluster scans, or when workers can see the right-hand table. |
-| `local` | Send only the object-storage scan to the swarm; perform the join on the initiator. |
-| `global` | Read the right-hand side on the initiator first and ship it to workers as a temporary table. |
+| `allow` (default) | Send only the object-storage scan to the swarm; perform the join on the initiator. The right table does not need to exist on workers. |
+| `local` | Deprecated alias of `allow`. |
+| `global` | Read the right-hand side on the initiator first and ship it to workers as a temporary table. `INNER`, `LEFT`, and `CROSS` run on the workers. `RIGHT` and `FULL` stay on the initiator. |
 
 ```sql
 SELECT *
@@ -467,5 +466,5 @@ connections drain.
 | `object_storage_max_nodes` | Cap on how many hosts from that cluster run a given query. `0` = all. |
 | `object_storage_remote_initiator` | Run the cluster query on a random swarm node instead of coordinating from the client-facing initiator. |
 | `object_storage_remote_initiator_cluster` | Cluster used only to pick that remote initiator. When empty, `object_storage_cluster` is used. |
-| `object_storage_cluster_join_mode` | How to rewrite `JOIN`s when workers cannot see the right-hand table: `allow`, `local`, `global`. |
+| `object_storage_cluster_join_mode` | How to rewrite `JOIN`s when workers cannot see the right-hand table: `allow` (initiator-local join), `local` (deprecated alias of `allow`), `global`. |
 | `lock_object_storage_task_distribution_ms` | How long a free worker waits before stealing another node's files. Higher values favor cache locality. Default `500`. |
