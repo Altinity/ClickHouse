@@ -276,9 +276,10 @@ clickhouse-disks -C config.xml --disk cas cas-gc-rebuild --force
 ```
 
 Exit code of a non-interactive `--query`: 1 when any `cas-*` command in it threw (`cas-fsck` throws on
-`dangling`, `chain_broken`, `corrupted_runs`, `lifeless_keys`, and on `unreachable > 0` for a complete
-scan — not with `--namespace` or `--partial`), whatever ran after it; the upstream commands keep
-`clickhouse-disks`'s "always 0" contract, as do an unknown command and a parse error.
+`dangling`, `chain_broken`, `corrupted_runs` and `lifeless_keys`; `unreachable` is a soft count that
+includes the GC pipeline and in-flight builds), and so does a `cas-*` command given bad arguments,
+whatever ran after it; the upstream commands keep `clickhouse-disks`'s "always 0" contract, as does an
+unknown command name.
 
 `cas-drop-member` — the offline twin of `SYSTEM CAS DROP POOL MEMBER` — is covered on the
 [migration page](/antalya/cas/operations/migration#decommission) alongside the SQL form, since

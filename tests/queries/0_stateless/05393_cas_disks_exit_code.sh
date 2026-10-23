@@ -33,31 +33,35 @@ SETTINGS disk = disk(
 INSERT INTO t_disks_exit SELECT number, toString(number) FROM numbers(1000);
 EOF
 
-# Prints "<label> <exit code>"; the command's own output is not part of the oracle.
+OUT="${CLICKHOUSE_TMP}/${CLICKHOUSE_TEST_UNIQUE_NAME}_disks.out"
+# Prints "<label> <exit code> <how many lines of the command's output match the pattern>".
 function disks()
 {
-    local label="$1" disk="$2" query="$3"
-    clickhouse-disks -C "$config" --disk "$disk" --query "$query" > /dev/null 2>&1
-    echo "$label $?"
+    local label="$1" disk="$2" query="$3" pattern="$4"
+    clickhouse-disks -C "$config" --disk "$disk" --query "$query" > "$OUT" 2>&1
+    local rc=$?
+    echo "$label $rc $(grep -c -E "$pattern" "$OUT")"
 }
 
-disks clean_fsck cas_ro_05393 "cas-fsck"
+disks clean_fsck cas_ro_05393 "cas-fsck" 'dangling=0 unreachable=0'
 
-# A canonical blob key nothing references: a copy of a live blob under another hash.
+# A canonical blob key nothing references is a soft finding (the GC pipeline and in-flight builds look the
+# same from outside), reported but not an error.
 blob=$(find "${POOL_DIR}" -path '*/blobs/*' -type f ! -name '*.meta' | head -1)
 stray="$(dirname "$blob")/$(basename "$blob" | tr '0-9a-f' '1-9a-f0')"
 cp "$blob" "$stray"
-disks unreachable_fsck cas_ro_05393 "cas-fsck"
+disks unreachable_fsck cas_ro_05393 "cas-fsck" 'dangling=0 unreachable=1'
 
-# A blob a committed manifest names is gone.
+# A blob a committed manifest names is gone: a hard finding.
 rm -f "$blob"
-disks dangling_fsck cas_ro_05393 "cas-fsck"
+disks dangling_fsck cas_ro_05393 "cas-fsck" 'reachable object\(s\) MISSING'
 
 # An upstream command that throws keeps the upstream contract.
-disks remove_missing local_05393 "remove no_such_path_05393"
+disks remove_missing local_05393 "remove no_such_path_05393" "no_such_path_05393 on disk local_05393 doesn't exist"
 
-# One failing cas-* command decides the exit code of the whole query.
-disks fsck_then_list cas_ro_05393 "cas-fsck; list ."
+# One failing cas-* command decides the exit code of the whole query; the next command still runs.
+disks fsck_then_next cas_ro_05393 "cas-fsck; current_disk_with_path" 'MISSING|^Disk: cas_ro_05393$'
+rm -f "$OUT"
 
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_disks_exit SYNC"
 ${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal --query "SYSTEM CAS FORGET '${DISK_NAME}'"

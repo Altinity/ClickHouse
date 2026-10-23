@@ -564,13 +564,14 @@ void DataPartStorageOnDiskPacked::commitTransaction()
 
     transaction->commit();
 
-    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_after_commit_transaction);
-
     if (!reader)
         reader.emplace(volume->getDisk(), getRelativeDataPath(), getReadSettings());
 
     transaction.reset();
     is_precommitted = false;
+
+    /// Lets a test stop the process between the durable commit and the rename that follows.
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_after_commit_transaction);
 }
 
 void DataPartStorageOnDiskPacked::checkpointTransaction()
