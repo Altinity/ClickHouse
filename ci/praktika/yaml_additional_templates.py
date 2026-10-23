@@ -140,7 +140,6 @@ class AltinityWorkflowTemplates:
           clean: true
           ref: ${{ fromJson(needs.config_workflow.outputs.data).git_ref }}
           submodules: true
-          fetch-depth: 0
           filter: tree:0
       - name: Install aws cli
         uses: unfor19/install-aws-cli-action@v1
@@ -149,7 +148,8 @@ class AltinityWorkflowTemplates:
           arch: arm64
       - name: Create source tar
         run: |
-          cd .. && tar czf $RUNNER_TEMP/build_source.src.tar.gz ClickHouse/
+          rm -f $RUNNER_TEMP/*.src.tar.gz
+          cd .. && tar czf $RUNNER_TEMP/build_source.src.tar.gz --exclude='ClickHouse/.git' ClickHouse/
       - name: Upload source tar
         run: |
           if [ "$PR_NUMBER" -eq 0 ]; then
