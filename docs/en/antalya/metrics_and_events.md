@@ -327,7 +327,6 @@ These counters cover conditional writes made without transparent SDK retries.
 | `CASConditionalWriteAttempts` | `Number` | Number of CAS conditional-write HTTP attempts made without transparent SDK retries. Growth indicates CAS metadata or reference updates. |
 | `CASConditionalWriteCommitted` | `Number` | Number of CAS conditional writes completed successfully. Growth indicates successful conditional-update activity. |
 | `CASConditionalWriteDefiniteFailure` | `Number` | Number of CAS conditional writes rejected with certainty before applying. A non-zero value indicates invalid requests, oversized entities, or access denial. |
-| `CASConditionalWriteFenceLostPostWrite` | `Number` | Number of CAS writes that succeeded but lost the final mount-fence check. A non-zero value indicates late responses after the mount lifecycle changed. |
 | `CASConditionalWriteUnresolved` | `Number` | Number of CAS conditional writes with an unknown outcome after conflict, timeout, connection loss, or server error. A non-zero value indicates backend instability or state requiring resolution. |
 
 #### Hot-key lane {#cas-hot-key}
