@@ -614,20 +614,22 @@ def interserver_request(node, target_host, params):
     return headers, int(size)
 
 
-def test_version_mix_legacy_peer_gets_bytes():
-    """Task 16 step 7 — version mix: a peer that does not promise to confirm is served BYTES.
+def test_relink_is_selected_by_the_capability_not_the_version():
+    """A relink is offered to a peer that advertises `cas_capabilities=relink_confirm`; the replication
+    protocol version never selects it.
 
-    This is the sender-side half of the mixed-build gate, and it is the half that is reachable without a
-    second binary: the offer is gated on `client_protocol_version >= 11` (`..._WITH_CA_CONFIRM`), so a
-    peer advertising 10 — a build that would relink WITHOUT confirming — must get the byte stream.
-    Degrading to bytes, never to an unconfirmed relink, is the whole point of moving the gate to 11.
+    The capability is the receiver's promise to confirm the offer against its source before it promotes.
+    It travels as its own request parameter so that the protocol version stays upstream's: a peer that
+    advertises a higher version for some other upstream feature, but never heard of relink, must get the
+    byte stream, and this build must answer it with upstream's version ceiling, not a number upstream may
+    reuse with another meaning.
 
-    The control request (identical, but advertising 11) is what makes the negative meaningful: it proves
-    the request is otherwise perfectly relinkable, so the absence of an offer in the v10 case is the
-    version gate and not a malformed request.
-
-    The receiver-side row-1 branch — a genuinely OLD sender that offers a relink with NO source token —
-    is NOT covered here; see the report accompanying this task.
+    Three raw requests at the sender, identical except for the two knobs:
+      - version 10 with the capability: the offer (control, and the proof that the capability selects it);
+      - version 11 without the capability: bytes, `server_protocol_version=10`;
+      - version 10 without the capability: bytes.
+    The receiver-side branch — a genuinely OLD sender that offers a relink with NO source token — is not
+    covered here.
     """
     node1 = cluster.instances["node1"]
     node2 = cluster.instances["node2"]
@@ -655,28 +657,39 @@ def test_version_mix_legacy_peer_gets_bytes():
         ("compress", "false"),
         ("cas_pool_uuid", pool_uuid),
     ]
+    capability = ("cas_capabilities", "relink_confirm")
 
-    # CONTROL — a confirm-capable peer: an offer, with a token, and a tiny manifest-only body.
+    # CONTROL — a confirm-capable peer at upstream's version: an offer, with a token, and a tiny
+    # manifest-only body.
+    headers_capable, size_capable = interserver_request(
+        node2, "node1", base + [("client_protocol_version", "10"), capability]
+    )
+    assert "cas_relink=part_manifest_v2" in headers_capable, headers_capable
+    assert "cas_source_token=" in headers_capable, headers_capable
+    assert "server_protocol_version=10" in headers_capable, headers_capable
+
+    # THE CASE UNDER TEST — a higher version without the capability: no offer, upstream's ceiling in the
+    # answer, and the part's bytes.
     headers_v11, size_v11 = interserver_request(
         node2, "node1", base + [("client_protocol_version", "11")]
     )
-    assert "cas_relink=part_manifest_v2" in headers_v11, headers_v11
-    assert "cas_source_token=" in headers_v11, headers_v11
+    assert "cas_relink" not in headers_v11, headers_v11
+    assert "cas_source_token" not in headers_v11, headers_v11
+    assert "server_protocol_version=10" in headers_v11, headers_v11
 
-    # THE CASE UNDER TEST — a peer advertising the pre-confirm version: no offer, and the part's bytes.
-    headers_v10, size_v10 = interserver_request(
+    # Positive proof that bytes ACTUALLY moved rather than the request merely succeeding: the response
+    # carries the whole part, orders of magnitude more than the manifest-only relink payload.
+    assert size_v11 > 20 * size_capable, (
+        "the peer without the capability should have received the part's bytes, got {} bytes against "
+        "the relink offer's {}".format(size_v11, size_capable)
+    )
+
+    # A pre-capability peer at upstream's version: bytes as well.
+    headers_v10, _ = interserver_request(
         node2, "node1", base + [("client_protocol_version", "10")]
     )
     assert "cas_relink" not in headers_v10, headers_v10
-    assert "cas_source_token" not in headers_v10, headers_v10
     assert "server_protocol_version=10" in headers_v10, headers_v10
-
-    # Positive proof that bytes ACTUALLY moved rather than the request merely succeeding: the v10
-    # response carries the whole part, orders of magnitude more than the manifest-only relink payload.
-    assert size_v10 > 20 * size_v11, (
-        "the v10 peer should have received the part's bytes, got {} bytes against the relink offer's "
-        "{}".format(size_v10, size_v11)
-    )
 
     drop_everywhere(table)
 
