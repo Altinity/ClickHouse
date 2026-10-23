@@ -1,4 +1,5 @@
 #include <Storages/MergeTree/DataPartStorageOnDiskPacked.h>
+#include <Common/FailPoint.h>
 
 #include <IO/Expect404ResponseScope.h>
 #include <IO/Operators.h>
@@ -19,8 +20,16 @@
 namespace DB
 {
 
+namespace FailPoints
+{
+    extern const char part_storage_fail_commit_transaction[];
+    extern const char part_storage_pause_before_commit_transaction[];
+    extern const char part_storage_pause_after_commit_transaction[];
+}
+
 namespace ErrorCodes
 {
+    extern const int FAULT_INJECTED;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
     extern const int NOT_INITIALIZED;
@@ -545,7 +554,17 @@ void DataPartStorageOnDiskPacked::commitTransaction()
     if (has_shared_transaction)
         return;
 
+    /// The same fault-injection seams as the Full storage: a test fails or holds the close of the PART's
+    /// disk transaction whatever storage format the randomized settings picked.
+    fiu_do_on(FailPoints::part_storage_fail_commit_transaction,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "part_storage_fail_commit_transaction");
+    });
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_before_commit_transaction);
+
     transaction->commit();
+
+    FailPointInjection::pauseFailPoint(FailPoints::part_storage_pause_after_commit_transaction);
 
     if (!reader)
         reader.emplace(volume->getDisk(), getRelativeDataPath(), getReadSettings());
