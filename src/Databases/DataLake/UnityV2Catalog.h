@@ -33,11 +33,11 @@ public:
 
     ~UnityV2Catalog() override;
 
-    bool empty() const override;
-    CatalogTables getTables() const override;
-    Namespaces getNamespaces() const override;
-    CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name) const override;
-    bool existsTable(const std::string & schema_name, const std::string & table_name) const override;
+    bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const override;
+    CatalogTables getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
+    Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const override;
+    CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
+    bool existsTable(const std::string & schema_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     bool createTable(
         const String & namespace_name,
@@ -45,10 +45,11 @@ public:
         const String & table_location,
         Poco::JSON::Object::Ptr metadata_content,
         DB::CompressionMethod metadata_compression_method,
-        bool if_not_exists) const override;
+        bool if_not_exists,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     /// Only checks that the schema exists. Unity schemas carry ownership and grants, so `CREATE TABLE` must not create them.
-    void createNamespaceIfNotExists(const String & namespace_name, const String & location) const override;
+    void createNamespaceIfNotExists(const String & namespace_name, const String & location, const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     void getTableMetadata(
         const std::string & namespace_name,
@@ -76,7 +77,7 @@ public:
     }
 
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
-        const DB::StorageID & table_id, const TableMetadata & table_metadata) override;
+        const DB::StorageID & table_id, const TableMetadata & table_metadata, const DB::ForwardedAuthTokenPtr & auth_token) override;
 
     /// Iceberg tables go through the Iceberg REST endpoint, which commits atomically.
     /// Without this, a write would leave metadata files in the table location before failing.
@@ -87,7 +88,8 @@ public:
         const String & namespace_name,
         const String & table_name,
         const String & new_metadata_path,
-        Poco::JSON::Object::Ptr new_snapshot) const override;
+        Poco::JSON::Object::Ptr new_snapshot,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
     bool updateSchema(
         const String & namespace_name,
@@ -96,7 +98,8 @@ public:
         Poco::JSON::Object::Ptr new_schema,
         Int32 previous_schema_id,
         Int32 new_last_column_id,
-        Poco::JSON::Object::Ptr metadata = nullptr) const override;
+        Poco::JSON::Object::Ptr metadata,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
 private:
     const std::string base_url_str;

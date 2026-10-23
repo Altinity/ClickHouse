@@ -302,7 +302,7 @@ DataLakeTableFormat UnityV2Catalog::detectTableFormat(const Poco::JSON::Object::
     return DataLakeTableFormat::UNKNOWN;
 }
 
-bool UnityV2Catalog::empty() const
+bool UnityV2Catalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     auto all_schemas = getSchemas("");
     for (const auto & schema : all_schemas)
@@ -313,7 +313,7 @@ bool UnityV2Catalog::empty() const
     return true;
 }
 
-CatalogTables UnityV2Catalog::getTables() const
+CatalogTables UnityV2Catalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     CatalogTables result;
     auto all_schemas = getSchemas("");
@@ -325,18 +325,18 @@ CatalogTables UnityV2Catalog::getTables() const
     return result;
 }
 
-DataLake::ICatalog::Namespaces UnityV2Catalog::getNamespaces() const
+DataLake::ICatalog::Namespaces UnityV2Catalog::getNamespaces(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     /// Unity schemas are flat — they cannot contain nested namespaces.
     return getSchemas("");
 }
 
-CatalogTables UnityV2Catalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
+CatalogTables UnityV2Catalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     return getTablesForSchema(namespace_name);
 }
 
-bool UnityV2Catalog::existsTable(const std::string & schema_name, const std::string & table_name) const
+bool UnityV2Catalog::existsTable(const std::string & schema_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     auto full_table_name = fmt::format("{}.{}.{}", warehouse, schema_name, table_name);
     try
@@ -382,7 +382,8 @@ bool UnityV2Catalog::createTable(
     const String & table_location,
     Poco::JSON::Object::Ptr metadata_content,
     DB::CompressionMethod metadata_compression_method,
-    bool if_not_exists) const
+    bool if_not_exists,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     /// Iceberg metadata carries `schemas`, Delta metadata carries `fields`.
     if (!metadata_content->has("fields"))
@@ -391,7 +392,7 @@ bool UnityV2Catalog::createTable(
         return requestWithRetry([&](bool force_refresh)
         {
             return getIcebergRestCatalog(force_refresh)->createTable(
-                namespace_name, table_name, table_location, metadata_content, metadata_compression_method, if_not_exists);
+                namespace_name, table_name, table_location, metadata_content, metadata_compression_method, if_not_exists, auth_token);
         });
     }
 
@@ -419,7 +420,7 @@ bool UnityV2Catalog::createTable(
     return true;
 }
 
-void UnityV2Catalog::createNamespaceIfNotExists(const String & namespace_name, const String & /* location */) const
+void UnityV2Catalog::createNamespaceIfNotExists(const String & namespace_name, const String & /* location */, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     checkNamespaceExists(namespace_name);
 }
@@ -428,12 +429,13 @@ bool UnityV2Catalog::updateMetadata(
     const String & namespace_name,
     const String & table_name,
     const String & new_metadata_path,
-    Poco::JSON::Object::Ptr new_snapshot) const
+    Poco::JSON::Object::Ptr new_snapshot,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     /// `false` means a commit conflict (HTTP 409) and the caller retries, so the result is passed through unchanged.
     return requestWithRetry([&](bool force_refresh)
     {
-        return getIcebergRestCatalog(force_refresh)->updateMetadata(namespace_name, table_name, new_metadata_path, new_snapshot);
+        return getIcebergRestCatalog(force_refresh)->updateMetadata(namespace_name, table_name, new_metadata_path, new_snapshot, auth_token);
     });
 }
 
@@ -444,12 +446,13 @@ bool UnityV2Catalog::updateSchema(
     Poco::JSON::Object::Ptr new_schema,
     Int32 previous_schema_id,
     Int32 new_last_column_id,
-    Poco::JSON::Object::Ptr metadata) const
+    Poco::JSON::Object::Ptr metadata,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     return requestWithRetry([&](bool force_refresh)
     {
         return getIcebergRestCatalog(force_refresh)->updateSchema(
-            namespace_name, table_name, new_metadata_path, new_schema, previous_schema_id, new_last_column_id, metadata);
+            namespace_name, table_name, new_metadata_path, new_schema, previous_schema_id, new_last_column_id, metadata, auth_token);
     });
 }
 
@@ -686,18 +689,18 @@ std::shared_ptr<IStorageCredentials> UnityV2Catalog::parseAzureCredentials(const
 
 /// Only S3 refreshes credentials: `StorageAzureConfiguration::createObjectStorage` discards the callback.
 ICatalog::CredentialsRefreshCallback UnityV2Catalog::getCredentialsConfigurationCallback(
-    const DB::StorageID & table_id, const TableMetadata & table_metadata)
+    const DB::StorageID & table_id, const TableMetadata & table_metadata, const DB::ForwardedAuthTokenPtr & auth_token)
 {
     /// Iceberg credentials are vended by the Iceberg REST catalog.
     if (table_metadata.getTableFormat() == DataLakeTableFormat::ICEBERG)
     {
-        return [this, table_id, table_metadata]() -> std::shared_ptr<IStorageCredentials>
+        return [this, table_id, table_metadata, auth_token]() -> std::shared_ptr<IStorageCredentials>
         {
             /// Resolved per call, because refreshing the token replaces `iceberg_rest_catalog`.
             return requestWithRetry([&](bool force_refresh) -> std::shared_ptr<IStorageCredentials>
             {
                 auto rest_catalog = getIcebergRestCatalog(force_refresh);
-                auto refresh = rest_catalog->getCredentialsConfigurationCallback(table_id, table_metadata);
+                auto refresh = rest_catalog->getCredentialsConfigurationCallback(table_id, table_metadata, auth_token);
                 return refresh ? (*refresh)() : nullptr;
             });
         };

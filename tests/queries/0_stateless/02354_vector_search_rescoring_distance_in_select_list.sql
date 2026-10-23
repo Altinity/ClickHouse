@@ -1,6 +1,8 @@
 -- Tags: no-fasttest, no-ordinary-database, no-parallel-replicas
 --- no-parallel-replicas: Because the test records and verifies
 --- _distance values returned from the rescoring optimization.
+--- Distances are rounded to 1 decimal: USearch's SimSIMD kernels and its scalar
+--- fallback disagree in the last bits (0.203125 vs 0.1875 for id 7).
 
 -- Issue #85514
 --

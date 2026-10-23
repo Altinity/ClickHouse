@@ -26,6 +26,12 @@ namespace ErrorCodes
     DECLARE(String, auth_scope, "PRINCIPAL_ROLE:ALL", "Authorization scope for client credentials or token exchange", 0) \
     DECLARE(String, oauth_server_uri, "", "OAuth server uri", 0) \
     DECLARE(Bool, oauth_server_use_request_body, true, "Put parameters into request body or query params", 0) \
+    DECLARE(Bool, oauth_forward_user_token, false, "Authenticate to Iceberg REST or Glue using the querying user's token. Requires `enable_token_forwarding`", 0) \
+    DECLARE(String, oauth_token_exchange_uri, "", "RFC 8693 token-exchange endpoint for Iceberg REST. Empty forwards the token unchanged. Requires `oauth_forward_user_token` and a non-empty `catalog_credential`", 0) \
+    DECLARE(String, oauth_subject_token_type, "urn:ietf:params:oauth:token-type:access_token", "RFC 8693 `subject_token_type` of the forwarded user token. Used only when `oauth_token_exchange_uri` is set", 0) \
+    DECLARE(String, oauth_requested_token_type, "urn:ietf:params:oauth:token-type:access_token", "RFC 8693 `requested_token_type`; empty omits the field. Used only when `oauth_token_exchange_uri` is set", 0) \
+    DECLARE(Bool, oauth_forward_actor_token, false, "Include the service principal token as the RFC 8693 `actor_token`. Requires `oauth_token_exchange_uri` and an endpoint that supports delegation", 0) \
+    DECLARE(UInt64, oauth_user_token_cache_ttl, 300, "Maximum lifetime (in seconds) of a cached per-user session token obtained by token exchange; '0' disables caching. Used only when `oauth_token_exchange_uri` is set", 0) \
     DECLARE(String, warehouse, "", "Warehouse name inside the catalog", 0) \
     DECLARE(String, auth_header, "", "Authorization header of format 'Authorization: <scheme> <auth_info>'", 0) \
     DECLARE(String, aws_access_key_id, "", "AWS access key id used to connect to the Glue catalog, and forwarded as a static S3 storage credential for non-Glue DataLakeCatalog table reads when vended_credentials = false", 0) \
@@ -34,6 +40,7 @@ namespace ErrorCodes
     DECLARE(String, aws_role_arn, "", "ARN of the IAM role to assume for AWS/Glue access. When set, ClickHouse uses AWS STS `AssumeRole` with base credentials from `aws_access_key_id` and `aws_secret_access_key` when both are provided, or from the default AWS credential chain otherwise (the role must trust the identity the server runs under)", 0) \
     DECLARE(String, aws_role_session_name, "", "Session name used for the AWS STS `AssumeRole` call. Optional; defaults to `ClickHouseSession`", 0) \
     DECLARE(String, aws_external_id, "", "External ID passed to AWS STS `AssumeRole`, matching the `sts:ExternalId` condition on the role's trust policy. Use this when the role is owned by a third party, such as ClickHouse Cloud", 0) \
+    DECLARE(String, aws_sts_endpoint, "", "Custom AWS STS endpoint for Glue catalog", 0) \
     DECLARE(String, storage_endpoint, "", "Object storage endpoint", 0) \
     DECLARE(String, default_base_location, "", "Base URI under which CREATE TABLE places new tables. Used only when the catalog does not report `default-base-location`", 0) \
     DECLARE(S3UriStyle, storage_uri_style, S3UriStyle::AUTO, "URL style used when constructing object storage URLs from catalog-provided table locations. Use 'virtual_hosted' when the object storage server requires the bucket in the hostname (e.g. https://bucket.endpoint.com/path/)", 0) \

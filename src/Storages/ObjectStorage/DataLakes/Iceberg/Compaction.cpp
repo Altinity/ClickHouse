@@ -227,6 +227,29 @@ static Plan getPlan(
     if (initial_metadata_object->getValue<Int32>(Iceberg::f_format_version) != 2)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Compaction is supported only for format_version 2.");
 
+    /// `writeMetadataFiles` partitions by the default spec only after the rewritten data files are written,
+    /// so an unsupported spec must be rejected here, before any object is created.
+    {
+        const auto default_spec_id = initial_metadata_object->getValue<Int64>(Iceberg::f_default_spec_id);
+        const auto partition_specs = initial_metadata_object->getArray(Iceberg::f_partition_specs);
+        Poco::JSON::Object::Ptr default_spec;
+        for (UInt32 i = 0; i < partition_specs->size(); ++i)
+        {
+            auto candidate = partition_specs->getObject(i);
+            if (candidate->getValue<Int64>(Iceberg::f_spec_id) == default_spec_id)
+            {
+                default_spec = candidate;
+                break;
+            }
+        }
+        if (!default_spec)
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Iceberg metadata does not contain a partition spec entry matching default-spec-id {}",
+                default_spec_id);
+        ChunkPartitioner::checkPartitionSpecSupportedForWrites(default_spec->getArray(Iceberg::f_fields));
+    }
+
     auto current_schema_id = initial_metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
     auto schemas = initial_metadata_object->getArray(Iceberg::f_schemas);
     Poco::JSON::Array::Ptr current_schema;
@@ -423,8 +446,12 @@ static void writeDataFiles(
 
         FormatFilterInfoPtr output_format_filter_info
             = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper, nullptr, nullptr);
+        auto write_format_settings = format_settings;
+        if (!write_format_settings)
+            write_format_settings = getFormatSettings(context);
+        write_format_settings->parquet.output_timestamp_adjusted_to_utc_from_timezone = true;
         auto output_format = FormatFactory::instance().getOutputFormat(
-            write_format, *write_buffer, *sample_block, context, format_settings, output_format_filter_info);
+            write_format, *write_buffer, *sample_block, context, write_format_settings, output_format_filter_info);
 
         while (true)
         {
@@ -564,6 +591,7 @@ static bool writeConsolidatedManifestFile(
         ResolvedPartitionSpec resolved;
         resolved.spec = spec;
         auto spec_fields = spec->getArray(f_fields);
+        ChunkPartitioner::checkPartitionSpecSupportedForWrites(spec_fields);
 
         /// Partition field names and the schema source-ids they transform.
         std::vector<Int32> source_ids;
@@ -984,7 +1012,7 @@ static bool writeConsolidatedManifestFile(
             {
                 auto catalog_filename = path_resolver.resolveForCatalog(generated_metadata_info.path);
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot.snapshot))
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot.snapshot, context->getForwardedAuthToken()))
                 {
                     LOG_INFO(log, "Metadata commit conflict detected via catalog, cleaning up temporary files");
                     cleanup();
@@ -1063,7 +1091,9 @@ static void writeMetadataFiles(
     auto log = getLogger("IcebergCompaction");
 
     ColumnsDescription columns_description = ColumnsDescription::fromNamesAndTypes(sample_block_->getNamesAndTypes());
-    auto [metadata_object, metadata_object_str] = createEmptyMetadataFile(table_path, columns_description, nullptr, nullptr, context);
+    const auto format_version = plan.initial_metadata_object->getValue<UInt64>(Iceberg::f_format_version);
+    auto [metadata_object, metadata_object_str] = createEmptyMetadataFile(
+        table_path, columns_description, nullptr, nullptr, context, format_version);
 
     auto current_schema_id = metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
     Poco::JSON::Object::Ptr current_schema;
