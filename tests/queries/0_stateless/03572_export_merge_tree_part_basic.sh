@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-cas-storage
+# Tags: no-fasttest
 # Tag no-fasttest: requires s3 storage
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

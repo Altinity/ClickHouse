@@ -69,10 +69,15 @@ inline constexpr std::string_view kCasArchiveSuffix = "@cas@";
 /// table-dir (last) segment in both cases. Pure; no ClickHouse dependency.
 std::string mirroredArchiveNamespace(const std::string & table_uuid);
 
-/// Reserved table-level subdirectory: TABLE_DIR/deduplication_logs/FILE is structurally
-/// indistinguishable from a part file in the Atomic layout, so the name is reserved — never a part
-/// dir; its contents are table-level verbatim files. ClickHouse part names never take this form.
+/// Reserved table-level subdirectories: TABLE_DIR/<name>/FILE is structurally indistinguishable from
+/// a part file in the Atomic layout, so these names are reserved — never a part dir; their contents
+/// are table-level verbatim files. ClickHouse part names never take these forms.
 inline constexpr std::string_view kDeduplicationLogsDirName = "deduplication_logs";
+inline constexpr std::string_view kPartitionExportsDirName = "partition_exports";   /// EXPORT PARTITION descriptors
+inline bool isReservedTableSubdir(std::string_view name)
+{
+    return name == kDeduplicationLogsDirName || name == kPartitionExportsDirName;
+}
 
 /// The result of splitting a part path. `table_uuid` is a bare UUID for an Atomic table and the
 /// joined `data/<db>/<tbl>` path for a non-Atomic table. For detached or moving paths,

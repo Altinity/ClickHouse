@@ -8256,65 +8256,6 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     can_execute_alter_on_disk = std::ranges::contains(supported_commands, command.type);
                     break;
                 }
-                case MetadataStorageType::CAS:
-                {
-                    /// On a CAS disk whole-part publication is transactional. Same-disk clones use
-                    /// `DataPartStorageOnDiskBase::freeze`; cross-disk clones use
-                    /// `DataPartStorageOnDiskBase::freezeRemote`, which streams source bytes into ONE CA
-                    /// transaction. When both disks share a pool, the publish dedup-resolves existing blobs
-                    /// and becomes a ref repoint, although the sequential source read still happens.
-                    /// `moveDirectory` re-keys the detached-staging → active rename into a complete active
-                    /// ref — so these are SUPPORTED and verified (read back identical data, survive restart):
-                    /// `ATTACH PARTITION`/`ATTACH PART` (re-clone of the table's own
-                    /// detached parts), `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` (parses to
-                    /// `REPLACE_PARTITION`), and `MOVE PARTITION ... TO TABLE`. The pointer-unlink commands
-                    /// `DROP PARTITION` / `DETACH PARTITION` / `DROP DETACHED PARTITION` are also fine.
-                    /// `FETCH PARTITION`/`FETCH PART` is also SUPPORTED — it is a `ReplicatedMergeTree` op
-                    /// (now supported on CA), and a `to_detached` fetch takes the byte-fetch path: the
-                    /// downloaded files content-address into the `detached/` namespace (relink-into-detached
-                    /// is deferred, see backlog). `ALTER ... FETCH PART` parses to the same `FETCH_PARTITION`
-                    /// command type (with `part=true`), so this entry covers both.
-                    /// `FREEZE PARTITION`/`FREEZE ALL` and `UNFREEZE PARTITION`/`UNFREEZE ALL` are now SUPPORTED:
-                    /// a freeze publishes each part as its own ref in the `shadow/` namespace (a GC root sharing
-                    /// the live blobs zero-copy — no byte copy); UNFREEZE removes the backup's refs.
-                    /// `FORGET PARTITION` is SUPPORTED on CA — it only manipulates ZooKeeper partition metadata
-                    /// (removes block-number nodes from ZooKeeper) and does not write, clone, or touch any part
-                    /// files on disk, so it is safe on a content-addressed disk.
-                    /// `EXPORT PARTITION` is SUPPORTED because the reason this list exists does not apply
-                    /// to it. The rejection below is about commands that clone parts file-by-file;
-                    /// exporting does not clone at all. `ExportPartTask` reads the source part through
-                    /// `MergeTreeSequentialSource` (`MergeTreeSequentialSourceType::Export`) and writes
-                    /// rows into the destination through a `SinkToStorage` on an ordinary query
-                    /// pipeline, so the source's part files are only READ, under `readLockParts`, and
-                    /// nothing is hard-linked or copied on the content-addressed disk. The command's
-                    /// own bookkeeping is ZooKeeper-side.
-                    /// NOTE: `MOVE_PARTITION` also admits cross-disk
-                    /// `MOVE ... TO DISK/VOLUME` (this check cannot distinguish the destination); that uses
-                    /// the byte-copy `clonePart` path (NOT the corrupting per-file hardlink), but only
-                    /// same-disk `MOVE ... TO TABLE` is verified here — cross-disk is a follow-up to verify.
-                    const static auto supported_commands = {
-                        PartitionCommand::DROP_PARTITION,
-                        PartitionCommand::DROP_DETACHED_PARTITION,
-                        PartitionCommand::FORGET_PARTITION,
-                        PartitionCommand::ATTACH_PARTITION,
-                        PartitionCommand::REPLACE_PARTITION,
-                        PartitionCommand::MOVE_PARTITION,
-                        PartitionCommand::FETCH_PARTITION,
-                        PartitionCommand::FREEZE_PARTITION,
-                        PartitionCommand::FREEZE_ALL_PARTITIONS,
-                        PartitionCommand::UNFREEZE_PARTITION,
-                        PartitionCommand::UNFREEZE_ALL_PARTITIONS,
-                        PartitionCommand::EXPORT_PARTITION,
-                    };
-
-                    if (!std::ranges::contains(supported_commands, command.type))
-                        throw Exception(
-                            ErrorCodes::SUPPORT_IS_DISABLED,
-                            "Partition operation ALTER TABLE {} is not supported on a CAS disk yet "
-                            "(it clones parts file-by-file with no transaction, which would corrupt the clone); disk '{}'",
-                            command.typeToString(), disk->getName());
-                    break;
-                }
                 case MetadataStorageType::StaticWeb:
                 case MetadataStorageType::WebIndex:
                 {
@@ -8325,6 +8266,9 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                 case MetadataStorageType::Local:
                 case MetadataStorageType::Keeper:
                 case MetadataStorageType::Memory:
+                /// CAS: every partition command clones parts through `freeze`, `freezeRemote` or `clonePart`, which
+                /// publish the clone as one part; a new command type that copies files one by one must not land here.
+                case MetadataStorageType::CAS:
                 {
                     can_execute_alter_on_disk = true;
                     break;
