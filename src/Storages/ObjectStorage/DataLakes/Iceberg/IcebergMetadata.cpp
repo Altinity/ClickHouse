@@ -517,7 +517,11 @@ IcebergMetadata::getIcebergDataSnapshot(Poco::JSON::Object::Ptr metadata_object,
 }
 
 bool IcebergMetadata::optimize(
-    const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings)
+    const StorageMetadataPtr & metadata_snapshot,
+    ContextPtr context,
+    const std::optional<FormatSettings> & format_settings,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const StorageID & storage_id)
 {
     checkTableRootIsQueriedPath("OPTIMIZE");
 
@@ -579,7 +583,9 @@ bool IcebergMetadata::optimize(
             *secondary_storages,
             data_lake_settings,
             context,
-            write_format);
+            write_format,
+            catalog,
+            storage_id);
 
         if (result == Iceberg::BinPackCommitResult::Committed)
         {

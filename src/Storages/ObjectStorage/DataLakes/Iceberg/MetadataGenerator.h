@@ -89,6 +89,17 @@ private:
     Int64 getMaxSequenceNumber();
     Poco::JSON::Object::Ptr getParentSnapshot(Int64 parent_snapshot_id);
 
+    /// Appends a `replace` snapshot with the given `summary`, makes it current and records it in the logs.
+    /// `summary` gets `total-*` counters equal to the parent totals shifted by the deltas.
+    NextMetadataResult appendReplaceSnapshot(
+        FileNamesGenerator & generator,
+        const Iceberg::IcebergPathFromMetadata & metadata_file_path,
+        Int64 parent_snapshot_id,
+        Poco::JSON::Object::Ptr summary,
+        Int64 records_delta,
+        Int64 files_size_delta,
+        Int64 data_files_delta);
+
     /// Returns the schema referenced by `current-schema-id`, or nullptr when it is absent.
     Poco::JSON::Object::Ptr findCurrentSchema() const;
     /// Returns the schema referenced by `current-schema-id`, throwing when it is absent.

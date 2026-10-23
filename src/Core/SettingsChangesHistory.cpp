@@ -39,6 +39,12 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "26.6.8.20003.altinityantalya",
+        {
+            {"iceberg_target_data_file_size_bytes", 536870912, 536870912, "Target file size for Iceberg bin-packing compaction (default 512 MiB)."},
+            {"iceberg_min_data_file_size_bytes", 402653184, 402653184, "Files below this size are candidates for Iceberg bin-packing compaction (default 384 MiB)."},
+        });
+
         addSettingsChanges(settings_changes_history, "26.6.4.20001.altinityantalya",
         {
             {"input_format_parquet_footer_read_size", 65536, 0, "New setting to override the adaptive Parquet footer initial read size with a fixed number of bytes; 0 keeps the adaptive behavior. Before this setting the reader always read a fixed 64 KiB tail."},
@@ -48,8 +54,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
-            {"iceberg_target_data_file_size_bytes", 536870912, 536870912, "Target file size for Iceberg bin-packing compaction (default 512 MiB)."},
-            {"iceberg_min_data_file_size_bytes", 402653184, 402653184, "Files below this size are candidates for Iceberg bin-packing compaction (default 384 MiB)."},
             {"data_lake_delete_data_on_drop", false, false, "New setting that unifies dropping of data lake data; the released `iceberg_delete_data_on_drop` is kept as an alias for it."},
             {"datalake_ignore_unsupported_table_properties", false, false, "New setting: allow `CREATE TABLE` and `SHOW CREATE TABLE` in a `DataLakeCatalog` to omit unsupported table properties."},
         });

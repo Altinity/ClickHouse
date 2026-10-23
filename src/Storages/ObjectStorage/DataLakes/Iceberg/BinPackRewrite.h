@@ -21,7 +21,7 @@ namespace DB::Iceberg
 enum class BinPackCommitResult : uint8_t
 {
     Committed,
-    /// Another writer committed first; nothing written by this attempt is left behind, so it can be retried.
+    /// Another writer committed first, or the catalog did not accept the snapshot; the attempt can be retried.
     Conflict,
 };
 
@@ -42,6 +42,8 @@ bool hasLivePositionDeletes(
 ///
 /// Leaves all other files, manifests, and snapshot history untouched.
 ///
+/// When `catalog` is set, the new metadata is committed to it as well.
+///
 /// Throws, without removing the files it wrote, when the outcome of the metadata commit cannot be determined.
 BinPackCommitResult executeBinPackCompaction(
     const PersistentTableComponents & persistent_table_components,
@@ -49,7 +51,9 @@ BinPackCommitResult executeBinPackCompaction(
     SecondaryStorages & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
     ContextPtr context,
-    const String & write_format);
+    const String & write_format,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const StorageID & storage_id);
 
 }
 

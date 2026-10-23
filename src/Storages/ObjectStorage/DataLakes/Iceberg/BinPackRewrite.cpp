@@ -5,6 +5,8 @@
 #include <unordered_set>
 
 #include <Core/Settings.h>
+#include <Databases/DataLake/Common.h>
+#include <Databases/DataLake/ICatalog.h>
 #include <Formats/FormatFactory.h>
 #include <Formats/FormatParserSharedResources.h>
 #include <IO/CompressionMethod.h>
@@ -27,6 +29,7 @@
 #include <Poco/String.h>
 #include <Common/FieldVisitorDump.h>
 #include <Common/Logger.h>
+#include <boost/container_hash/hash.hpp>
 
 #if USE_AVRO
 
@@ -123,7 +126,7 @@ struct PartitionKeyHash
         size_t result = 0;
         FieldVisitorDump dump_visitor;
         for (const auto & value : row)
-            result ^= hasher(applyVisitor(dump_visitor, value));
+            boost::hash_combine(result, hasher(applyVisitor(dump_visitor, value)));
         return result;
     }
 };
@@ -935,6 +938,7 @@ struct ManifestListInput
     std::vector<Int64> manifest_sizes;
     std::vector<ManifestListEntryCounts> entry_counts;
     std::vector<Int64> entry_partition_spec_ids;
+    std::vector<std::vector<std::pair<Field, DataTypePtr>>> entry_partition_summaries;
 };
 
 /// Phase 3: Write manifest files (delete, add, and kept manifests).
@@ -1007,6 +1011,13 @@ ManifestListInput writeManifests(
         mli.manifest_sizes.push_back(manifest_size);
         mli.entry_counts.push_back(existing_counts);
         mli.entry_partition_spec_ids.push_back(plan.partition_spec_id);
+
+        /// Every manifest written here holds one partition tuple, so the summary bounds are exactly that tuple.
+        std::vector<std::pair<Field, DataTypePtr>> partition_summary;
+        partition_summary.reserve(plan.partition_types.size());
+        for (size_t i = 0; i < plan.partition_types.size(); ++i)
+            partition_summary.emplace_back(i < partition_key.size() ? partition_key[i] : Field{}, plan.partition_types[i]);
+        mli.entry_partition_summaries.push_back(std::move(partition_summary));
     };
 
     const Int64 new_sequence_number = snapshot->getValue<Int64>(f_metadata_sequence_number);
@@ -1154,13 +1165,14 @@ void writeManifestList(
         {}, /// per_entry_content_types
         mli.entry_counts,
         plan.carry_forward_manifest_paths,
-        mli.entry_partition_spec_ids);
+        mli.entry_partition_spec_ids,
+        mli.entry_partition_summaries);
 
     buf->finalize();
 }
 
-/// Phase 5: Commit metadata file and version hint. Returns the commit outcome.
-BinPackCommitResult commitMetadata(
+/// Writes the metadata file and version hint to storage. Returns the commit outcome.
+BinPackCommitResult writeMetadataToStorage(
     Poco::JSON::Object::Ptr metadata_object,
     Poco::JSON::Object::Ptr snapshot,
     const GeneratedMetadataFileWithInfo & generated_metadata_info,
@@ -1198,10 +1210,7 @@ BinPackCommitResult commitMetadata(
 
     if (commit_result == MetadataCommitResult::Unknown)
     {
-        /// From here on the new metadata may be live and reference the new files,
-        /// so they are removed only once another writer is known to own this version.
-        keep_files_on_error = true;
-
+        /// The files are removed only once another writer is known to own this version.
         const Int64 new_snapshot_id = snapshot->getValue<Int64>(f_metadata_snapshot_id);
         MetadataFileOwner owner = MetadataFileOwner::Absent;
         String verification_error;
@@ -1237,6 +1246,59 @@ BinPackCommitResult commitMetadata(
     return BinPackCommitResult::Committed;
 }
 
+/// Phase 5: Commit the new metadata to storage and, for a catalog table, to the catalog.
+BinPackCommitResult commitMetadata(
+    Poco::JSON::Object::Ptr metadata_object,
+    Poco::JSON::Object::Ptr snapshot,
+    const GeneratedMetadataFileWithInfo & generated_metadata_info,
+    FileNamesGenerator & generator,
+    const IcebergPathResolver & path_resolver,
+    const PersistentTableComponents & persistent_table_components,
+    ObjectStoragePtr object_storage,
+    ContextPtr context,
+    const DataLakeStorageSettings & data_lake_settings,
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const StorageID & storage_id,
+    bool & keep_files_on_error,
+    const std::function<void()> & cleanup,
+    LoggerPtr log)
+{
+    /// From here on the new metadata may become live and reference the new files, so an exception
+    /// must not remove them. Paths that know the snapshot did not land call `cleanup` themselves.
+    keep_files_on_error = true;
+
+    /// A transactional catalog writes the metadata file itself and is the source of truth for the
+    /// current metadata, so the storage-side metadata file and version hint are not written for it.
+    const bool catalog_writes_metadata_file = catalog && catalog->isTransactional();
+    if (!catalog_writes_metadata_file)
+    {
+        const auto storage_result = writeMetadataToStorage(
+            metadata_object, snapshot, generated_metadata_info, generator, path_resolver,
+            persistent_table_components, object_storage, context, data_lake_settings,
+            keep_files_on_error, cleanup, log);
+        if (storage_result != BinPackCommitResult::Committed)
+            return storage_result;
+    }
+
+    if (catalog)
+    {
+        const auto catalog_filename = path_resolver.resolveForCatalog(generated_metadata_info.path);
+        const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
+        if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, snapshot, context->getForwardedAuthToken()))
+        {
+            /// A catalog reports both a lost race and a request whose outcome is unknown (a timeout or
+            /// a 5xx response) as a rejection, so the snapshot may still be live: the files stay.
+            LOG_WARNING(
+                log,
+                "Catalog did not accept bin-pack snapshot {}; files written by this attempt were left in place",
+                snapshot->getValue<Int64>(f_metadata_snapshot_id));
+            return BinPackCommitResult::Conflict;
+        }
+    }
+
+    return BinPackCommitResult::Committed;
+}
+
 } // anonymous namespace
 
 BinPackCommitResult executeBinPackCompaction(
@@ -1245,7 +1307,9 @@ BinPackCommitResult executeBinPackCompaction(
     SecondaryStorages & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
     ContextPtr context,
-    const String & write_format)
+    const String & write_format,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const StorageID & storage_id)
 {
     LoggerPtr log = getLogger("IcebergBinPack");
 
@@ -1280,7 +1344,7 @@ BinPackCommitResult executeBinPackCompaction(
     CompressionMethod compression_method = persistent_table_components.metadata_compression_method;
 
     FileNamesGenerator generator(
-        path_resolver.getTableLocation(), false, compression_method, write_format);
+        path_resolver.getTableLocation(), catalog != nullptr && catalog->isTransactional(), compression_method, write_format);
     generator.setVersion(metadata_version + 1);
 
     MetadataGenerator metadata_generator(metadata_object);
@@ -1378,7 +1442,7 @@ BinPackCommitResult executeBinPackCompaction(
         auto commit = commitMetadata(
             metadata_object, snapshot_result.snapshot, generated_metadata_info,
             generator, path_resolver, persistent_table_components, object_storage,
-            context, data_lake_settings, keep_files_on_error, cleanup, log);
+            context, data_lake_settings, catalog, storage_id, keep_files_on_error, cleanup, log);
 
         if (commit != BinPackCommitResult::Committed)
             return commit;
