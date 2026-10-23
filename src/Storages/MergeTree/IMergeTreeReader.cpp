@@ -314,7 +314,7 @@ void IMergeTreeReader::performRequiredConversions(Columns & res_columns) const
                             "Expected {}, got {}", num_columns, res_columns.size());
         }
 
-        const auto & column_defaults = storage_snapshot->metadata->getColumns().getDefaults();
+        const auto & storage_columns = storage_snapshot->metadata->getColumns();
 
         /// Start with columns whose types need conversion, collecting any DEFAULT dependencies.
         Block copy_block;
@@ -333,10 +333,10 @@ void IMergeTreeReader::performRequiredConversions(Columns & res_columns) const
             if (isNullableOrLowCardinalityNullable(column_in_part.type)
                 && !isNullableOrLowCardinalityNullable(name_and_type->type))
             {
-                if (auto it = column_defaults.find(name_and_type->name); it != column_defaults.end())
+                if (auto column_default = storage_columns.getDefault(name_and_type->name))
                 {
                     RequiredSourceColumnsVisitor::Data columns_context;
-                    RequiredSourceColumnsVisitor(columns_context).visit(it->second.expression);
+                    RequiredSourceColumnsVisitor(columns_context).visit(column_default->expression);
                     auto dependencies = columns_context.requiredColumns();
                     default_dependencies.insert(dependencies.begin(), dependencies.end());
                 }
@@ -359,7 +359,7 @@ void IMergeTreeReader::performRequiredConversions(Columns & res_columns) const
             }
         }
 
-        DB::performRequiredConversions(copy_block, required_columns, data_part_info_for_read->getContext(), column_defaults);
+        DB::performRequiredConversions(copy_block, required_columns, data_part_info_for_read->getContext(), storage_columns.getDefaults());
 
         /// Move columns from block.
         name_and_type = required_columns.begin();
