@@ -1,6 +1,7 @@
--- Tags: no-parallel, zookeeper
+-- Tags: no-parallel, zookeeper, no-encrypted-storage
 -- zookeeper: SYSTEM SYNC TRANSACTION LOG reads the transaction log from Keeper after access is granted.
 -- no-parallel: creates a temporary user; avoid concurrent GRANT/DROP races on the same name pattern.
+-- no-encrypted-storage: transactions are not enabled in the encrypted storage configuration.
 
 DROP USER IF EXISTS user_test_04651;
 CREATE USER user_test_04651;
