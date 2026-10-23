@@ -140,7 +140,7 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 ///
 /// ---- ContentAddressedMetadataStorage ----
 /// Factory (never gated): getType, getPath, supportsChmod, supportsStat, isReadOnly, isContentAddressed,
-///   transactionIsStagingOverlay, supportsAtomicFileWrites, supportsTransactionalMutableFiles,
+///   appliesOperationsEagerly, supportsAtomicFileWrites, supportsTransactionalMutableFiles,
 ///   areBlobPathsRandom, getHardlinkCount, createTransaction (I/O-free -- allocates a txn), getPoolUUID,
 ///   serverRootId, scratchPath, stagingBackend, objectStorage, gcHealth,
 ///   lifecycleSnapshot (both non-store()-gated introspection reads for system.cas_mounts --

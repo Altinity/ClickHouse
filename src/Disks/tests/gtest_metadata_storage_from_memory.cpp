@@ -22,8 +22,25 @@
 namespace fs = std::filesystem;
 using namespace DB;
 
+namespace DB::ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
 namespace
 {
+
+/// Reaches the protected queue of `DiskObjectStorageTransaction` to plant the deferred operation that
+/// `addOperation` never queues on an eager storage. Never instantiated; it only names the member.
+struct QueueProbe : DiskObjectStorageTransaction
+{
+    static void plantDeferredOperation(const DiskTransactionPtr & tx)
+    {
+        auto * object_tx = dynamic_cast<DiskObjectStorageTransaction *>(tx.get());
+        ASSERT_TRUE(object_tx);
+        (object_tx->*(&QueueProbe::operations_to_execute)).emplace_back([](MetadataTransactionPtr) {});
+    }
+};
 
 std::shared_ptr<MetadataStorageFromMemory> makeWritableStorage()
 {
@@ -653,3 +670,62 @@ TEST_F(DiskObjectStorageOverMemoryMetadataTest, UndoRemovesRewrittenBlobs)
     tx->undo();
     EXPECT_EQ(countBlobs(), 0u);
 }
+
+/// An eager storage must never see a queued operation at commit: both commit entry points fail closed
+/// with LOGICAL_ERROR in release builds and abort under DEBUG_OR_SANITIZER_BUILD.
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST_F(DiskObjectStorageOverMemoryMetadataTest, CommitRefusesQueuedOperationOnEagerStorage)
+{
+    auto wrapped = disk->wrapWithMemoryMetadata();
+    ASSERT_TRUE(wrapped->getMetadataStorage()->appliesOperationsEagerly());
+    auto tx = wrapped->createTransaction();
+    QueueProbe::plantDeferredOperation(tx);
+
+    try
+    {
+        tx->commit();
+        FAIL() << "commit accepted a queued operation on an eager storage";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::LOGICAL_ERROR);
+        EXPECT_NE(e.message().find("must not queue deferred operations"), String::npos) << e.message();
+    }
+}
+
+TEST_F(DiskObjectStorageOverMemoryMetadataTest, TryCommitRefusesQueuedOperationOnEagerStorage)
+{
+    auto wrapped = disk->wrapWithMemoryMetadata();
+    auto tx = wrapped->createTransaction();
+    QueueProbe::plantDeferredOperation(tx);
+
+    try
+    {
+        tx->tryCommit(NoCommitOptions{});
+        FAIL() << "tryCommit accepted a queued operation on an eager storage";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::LOGICAL_ERROR);
+        EXPECT_NE(e.message().find("must not queue deferred operations"), String::npos) << e.message();
+    }
+}
+#else
+using DiskObjectStorageOverMemoryMetadataDeathTest = DiskObjectStorageOverMemoryMetadataTest;
+
+TEST_F(DiskObjectStorageOverMemoryMetadataDeathTest, CommitRefusesQueuedOperationOnEagerStorageAborts)
+{
+    auto wrapped = disk->wrapWithMemoryMetadata();
+    auto tx = wrapped->createTransaction();
+    QueueProbe::plantDeferredOperation(tx);
+    EXPECT_DEATH(tx->commit(), "must not queue deferred operations");
+}
+
+TEST_F(DiskObjectStorageOverMemoryMetadataDeathTest, TryCommitRefusesQueuedOperationOnEagerStorageAborts)
+{
+    auto wrapped = disk->wrapWithMemoryMetadata();
+    auto tx = wrapped->createTransaction();
+    QueueProbe::plantDeferredOperation(tx);
+    EXPECT_DEATH(tx->tryCommit(NoCommitOptions{}), "must not queue deferred operations");
+}
+#endif

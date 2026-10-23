@@ -265,9 +265,9 @@ public:
     /// mutating entries through it.
     CasOpAdmission checkOpAdmitted(CasOpClass op) const;
 
-    /// Content-addressed transactions are eager staging overlays: each mutating disk-transaction
-    /// method reaches the metadata transaction immediately rather than entering the FIFO queue.
-    bool transactionIsStagingOverlay() const override { return true; }
+    /// Each mutating disk-transaction method reaches the metadata transaction immediately rather than
+    /// entering the FIFO queue; the effects stay in the transaction-private staging until commit.
+    bool appliesOperationsEagerly() const override { return true; }
     bool supportsAtomicFileWrites() const override { return true; }
     bool supportsTransactionalMutableFiles() const override { return true; }
     bool areBlobPathsRandom() const override { return false; }

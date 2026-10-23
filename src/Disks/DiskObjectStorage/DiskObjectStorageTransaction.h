@@ -41,7 +41,7 @@ protected:
     std::unordered_map<Location, StoredObjects> written_blobs;
 
     /// Execute the operation right away if the metadata storage applies operations eagerly
-    /// (or its transaction is an eager staging overlay, e.g. CA), otherwise queue it until commit.
+    /// (memory, CA), otherwise queue it until commit.
     void addOperation(std::function<void(MetadataTransactionPtr tx)> op);
 
 public:
