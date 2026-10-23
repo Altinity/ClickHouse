@@ -2497,13 +2497,7 @@ void InterpreterSelectQuery::addPrewhereAliasActions()
             columns.insert(prewhere_required_columns.begin(), prewhere_required_columns.end());
         }
 
-<<<<<<< HEAD
-        if (row_level_filter)
-=======
-        /// A row policy that will not be pushed into the storage read is applied as an ordinary
-        /// FilterStep above it, so its columns are read normally and are not PREWHERE columns.
-        if (row_level_filter && include_row_level_filter && shouldPushRowLevelFilterToStorage())
->>>>>>> 4ede48259fe (Merge pull request #123436 from mkmkme/fix/row-policy-alias-distributed-26.8)
+        if (row_level_filter && include_row_level_filter)
         {
             auto row_level_required_columns = row_level_filter->actions.getRequiredColumns().getNames();
             columns.insert(row_level_required_columns.begin(), row_level_required_columns.end());
@@ -2620,13 +2614,7 @@ void InterpreterSelectQuery::addPrewhereAliasActions()
     const auto & supported_prewhere_columns = storage->supportedPrewhereColumns();
     if (supported_prewhere_columns.has_value())
     {
-<<<<<<< HEAD
-        NameSet required_columns_from_prewhere = get_prewhere_columns();
-=======
         NameSet required_columns_from_prewhere = get_prewhere_columns(/*include_row_level_filter=*/ true);
-        const auto & table_columns = metadata_snapshot->getColumns();
-        const bool include_subcolumns = storage->supportedPrewhereColumnsIncludeSubcolumns();
->>>>>>> 4ede48259fe (Merge pull request #123436 from mkmkme/fix/row-policy-alias-distributed-26.8)
 
         for (const auto & column_name : required_columns_from_prewhere)
         {
