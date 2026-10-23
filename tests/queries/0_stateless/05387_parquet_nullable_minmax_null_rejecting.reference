@@ -1,0 +1,8 @@
+--- rows, read row groups, pruned row groups ---
+99 1 3
+198 2 2
+103 4 0
+202 4 0
+--- rows, read pages, pruned pages ---
+900 2 1
+1200 3 0

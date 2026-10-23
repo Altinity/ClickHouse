@@ -33,7 +33,8 @@ echo '--- a matching row is returned, including null ---'
 ${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache=0 --query "
     SELECT count() FROM nullable_minmax WHERE partner_id = 'sg2o27m';
     SELECT count() FROM nullable_minmax WHERE partner_id IS NULL;
-    SELECT count() FROM nullable_minmax WHERE partner_id = 'aaa';"
+    SELECT count() FROM nullable_minmax WHERE partner_id = 'aaa';
+    SELECT count() FROM nullable_minmax WHERE NOT partner_id = 'sg2o27m';"
 
 echo '--- min/max prunes a file with nulls when the predicate rejects null ---'
 ${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache=0 --query "
@@ -43,6 +44,8 @@ ${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache=0 --query "
         SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_eq_low';
     SELECT count() FROM nullable_minmax WHERE partner_id IS NULL
         SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_is_null';
+    SELECT count() FROM nullable_minmax WHERE NOT partner_id = 'sg2o27m'
+        SETTINGS log_comment = '${CLICKHOUSE_DATABASE}_not_probe';
     SYSTEM FLUSH LOGS query_log;"
 
 ${CLICKHOUSE_CLIENT} --query "
@@ -52,10 +55,12 @@ ${CLICKHOUSE_CLIENT} --query "
         AND log_comment IN (
             '${CLICKHOUSE_DATABASE}_eq_probe',
             '${CLICKHOUSE_DATABASE}_eq_low',
-            '${CLICKHOUSE_DATABASE}_is_null')
+            '${CLICKHOUSE_DATABASE}_is_null',
+            '${CLICKHOUSE_DATABASE}_not_probe')
     GROUP BY log_comment
     ORDER BY indexOf(
-        ['${CLICKHOUSE_DATABASE}_eq_probe', '${CLICKHOUSE_DATABASE}_eq_low', '${CLICKHOUSE_DATABASE}_is_null'],
+        ['${CLICKHOUSE_DATABASE}_eq_probe', '${CLICKHOUSE_DATABASE}_eq_low',
+         '${CLICKHOUSE_DATABASE}_is_null', '${CLICKHOUSE_DATABASE}_not_probe'],
         log_comment)
     SETTINGS enable_parallel_replicas = 0"
 

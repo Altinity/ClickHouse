@@ -345,7 +345,10 @@ void Reader::getHyperrectangleForRowGroup(const parq::RowGroup * meta, Hyperrect
             if (column_meta.statistics.__isset.max_value)
                 column_info.decoder.decodeField(column_meta.statistics.max_value, /*is_max=*/ true, *column_info.decoded_type, output_block_type, range.right);
 
-            adjustRangeFromIndexIfNeeded(range, column_info, can_be_null);
+            /// Min/max ignores nulls. Widen the range only when SQL NULL can satisfy the filter.
+            bool include_null = can_be_null && (!column_info.output_nullable || !format_filter_info->key_condition
+                || format_filter_info->key_condition->mayBeTrueOnNull(column_info.idx_in_output_block));
+            adjustRangeFromIndexIfNeeded(range, column_info, include_null);
         }
         catch (Exception & e)
         {
@@ -778,6 +781,18 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
 
         if (options.format.parquet.filter_push_down && format_filter_info->key_condition)
         {
+            /// An all-null column has no finite min/max. Drop the row group when SQL NULL cannot match.
+            if (std::any_of(primitive_columns.begin(), primitive_columns.end(), [&](const PrimitiveColumnInfo & column_info)
+                {
+                    if (!column_info.used_by_key_condition || !column_info.output_nullable)
+                        return false;
+                    const auto & column_meta = meta->columns.at(column_info.column_idx).meta_data;
+                    return column_meta.__isset.statistics && column_meta.statistics.__isset.null_count
+                        && column_meta.statistics.null_count == column_meta.num_values
+                        && !format_filter_info->key_condition->mayBeTrueOnNull(column_info.idx_in_output_block);
+                }))
+                continue;
+
             if (!format_filter_info->key_condition->checkInHyperrectangle(
                     hyperrectangle, extended_sample_block_data_types).can_be_true)
                 continue;
@@ -2002,7 +2017,9 @@ void Reader::applyColumnIndex(ColumnChunk & column, const PrimitiveColumnInfo & 
                 column_info.decoder.decodeField(column_index.min_values[page_idx], /*is_max=*/ false, *column_info.decoded_type, output_block_type, range.left);
                 column_info.decoder.decodeField(column_index.max_values[page_idx], /*is_max=*/ true, *column_info.decoded_type, output_block_type, range.right);
 
-                adjustRangeFromIndexIfNeeded(range, column_info, can_be_null);
+                /// Nullability is checked against each extracted condition below. A nullable
+                /// ClickHouse output can therefore keep the finite range from the column index.
+                adjustRangeFromIndexIfNeeded(range, column_info, can_be_null && !column_info.output_nullable);
             }
 
             /// All conjunctive predicates on this column (e.g. two `pointInPolygon` calls sharing
@@ -2024,6 +2041,9 @@ void Reader::applyColumnIndex(ColumnChunk & column, const PrimitiveColumnInfo & 
                     if (c.spatial_key_condition_idx != SIZE_MAX
                         && (can_be_null || always_null
                             || !spatialBboxStatsHaveNoNulls(*row_group.meta, c.spatial_key_condition_idx)))
+                        return true;
+                    if (column_info.output_nullable && can_be_null
+                        && c.condition->mayBeTrueOnNull(column_info.idx_in_output_block))
                         return true;
                     return c.condition->checkInHyperrectangle(hyperrectangle, extended_sample_block_data_types).can_be_true;
                 });

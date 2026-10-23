@@ -195,6 +195,9 @@ public:
         const FieldRef * right_keys,
         const DataTypes & data_types) const;
 
+    /// Whether the condition can be true when `key_column` is SQL NULL. Other columns stay arbitrary.
+    bool mayBeTrueOnNull(size_t key_column) const;
+
     /// Checks that the index can not be used
     /// FUNCTION_UNKNOWN will be AND'ed (if any).
     bool alwaysUnknownOrTrue() const;
