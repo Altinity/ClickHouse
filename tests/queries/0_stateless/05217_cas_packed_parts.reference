@@ -1,0 +1,66 @@
+cas_packed_disabled	Full
+cas_packed_local	Packed
+cas_packed_wide	Packed
+compact_initial	Compact	4	Packed
+wide_initial	Wide	1	Packed
+compact_aggregate	40000	799980000	19980000
+wide_aggregate	10000	49995000	4995000
+compact_row	0	0
+compact_row	39999	999
+wide_row	0	0
+wide_row	9999	999
+compact_minmax	80
+wide_minmax	20
+compact_projection_parts	2	2
+wide_projection_parts	2	2
+compact_check_insert 1
+wide_check_insert 1
+compact_blob_put	3
+wide_blob_put	3
+compact_merged	1	Packed
+wide_merged	1	Packed
+compact_projection_active	2
+wide_projection_active	2
+compact_projection_query	0	40	780000
+compact_projection_query	1	40	780040
+compact_projection_query	2	40	780080
+wide_projection_query	0	10	45000
+wide_projection_query	1	10	45010
+wide_projection_query	2	10	45020
+compact_after_update	40000	799980000	19980001
+compact_update_storage	Packed
+compact_after_delete	39999	799979999	19980000
+compact_delete_storage	Packed
+wide_after_update	10000	49995000	4995001
+wide_update_storage	Packed
+wide_after_delete	9999	49994999	4995000
+wide_delete_storage	Packed
+unfreeze_parts	1
+compact_partition_reload	39999	799979999	19980000
+wide_partition_reload	9999	49994999	4995000
+compact_table_reload	39999	799979999	19980000
+wide_table_reload	9999	49994999	4995000
+compact_check_attach 1
+wide_check_attach 1
+copy_rows	39999	799979999	19980000
+copy_storage	Packed
+copy_projection_active	2
+copy_projection_parts	2	2
+copy_check_attach 1
+copy_after_source_drop	39999	799979999	19980000
+copy_after_reload	39999	799979999	19980000
+destination_initial	Packed	0
+destination_moved_disabled	Packed	1
+destination_mutated_disabled	Full	1
+destination_moved_enabled	Full	0
+destination_mutated_enabled	Full	0
+destination_merged_enabled	Packed	0
+default_gc_drained 1
+default_fsck_unreachable 0
+default_fsck_dangling 0
+destination_gc_drained 1
+destination_fsck_unreachable 0
+destination_fsck_dangling 0
+disabled_gc_drained 1
+disabled_fsck_unreachable 0
+disabled_fsck_dangling 0

@@ -24,7 +24,9 @@ namespace
         const S3::Client & client,
         const String & bucket,
         const String & key,
-        const String & version_id)
+        const String & version_id,
+        ObjectStorageRequestMode request_mode = ObjectStorageRequestMode::Default,
+        size_t attempt_seed = 0)
     {
         ProfileEvents::increment(ProfileEvents::S3HeadObject);
         if (client.isClientForDisk())
@@ -37,6 +39,11 @@ namespace
 
         if (!version_id.empty())
             req.SetVersionId(version_id);
+
+        req.setNativeConditional(request_mode == ObjectStorageRequestMode::NativeConditional);
+
+        if (attempt_seed != 0)
+            S3::setClickHouseAttemptNumber(req, attempt_seed);
 
         return client.HeadObject(req);
     }
@@ -67,9 +74,11 @@ namespace
         const String & key,
         const String & version_id,
         bool with_metadata,
-        bool with_tags)
+        bool with_tags,
+        ObjectStorageRequestMode request_mode = ObjectStorageRequestMode::Default,
+        size_t attempt_seed = 0)
     {
-        auto outcome = headObject(client, bucket, key, version_id);
+        auto outcome = headObject(client, bucket, key, version_id, request_mode, attempt_seed);
         if (!outcome.IsSuccess())
             return {std::nullopt, outcome.GetError()};
 
@@ -141,11 +150,13 @@ ObjectInfo getObjectInfoIfExists(
     const String & key,
     const String & version_id,
     bool with_metadata,
-    bool with_tags)
+    bool with_tags,
+    ObjectStorageRequestMode request_mode,
+    size_t attempt_seed)
 {
     Expect404ResponseScope scope; // 404 is not an error
 
-    auto [object_info, error] = tryGetObjectInfo(client, bucket, key, version_id, with_metadata, with_tags);
+    auto [object_info, error] = tryGetObjectInfo(client, bucket, key, version_id, with_metadata, with_tags, request_mode, attempt_seed);
     if (object_info)
         return *object_info;
 

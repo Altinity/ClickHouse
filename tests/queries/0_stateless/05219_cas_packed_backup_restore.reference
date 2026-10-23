@@ -1,0 +1,7 @@
+source_data	5	9	150
+source_storage	Packed
+restored_data	5	9	150
+restored_storage	Packed
+projection	1	2	40
+projection	2	2	70
+projection	3	1	40

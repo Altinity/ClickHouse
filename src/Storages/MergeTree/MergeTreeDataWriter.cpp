@@ -920,6 +920,7 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
     /// every subsequent load of the part.
     if (metadata_snapshot->hasUniqueKey())
         part_format.storage_type = MergeTreeDataPartStorageType::Full;
+    part_format = MergeTreeData::normalizePartFormatForDisk(part_format, data_part_volume->getDisk());
 
     auto new_data_part = data.getDataPartBuilder(part_name, data_part_volume, part_dir, getReadSettings(), PartDirIntent::CreateFresh)
         .withPartFormat(part_format)
@@ -1126,6 +1127,8 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeProjectionPartImpl(
     auto projection_part_storage = new_data_part->getDataPartStoragePtr();
     auto data_settings = data.getSettings(&projection.settings_changes);
 
+    /// A temp projection sub-part opens a transaction only if it owns one; a borrowed (CA) projection
+    /// storage makes beginTransaction a no-op, so the `isContentAddressed()` branch is no longer needed.
     if (is_temp)
         projection_part_storage->beginTransaction();
 
