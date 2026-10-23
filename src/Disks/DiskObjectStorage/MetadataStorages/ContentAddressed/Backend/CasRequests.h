@@ -102,8 +102,10 @@ std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why);
 
 /// Throw `CAS_OWNERSHIP_CONFLICT`: the committed ref a caller read moved, dropped or changed owner before the
 /// caller's write landed; the caller must re-resolve the part before trying again. Counted in
-/// `ProfileEvents::CASOwnershipConflict`, so every conflict site goes through here (the counter counts
-/// throws; a ref-log builder that is re-run counts again).
+/// `ProfileEvents::CASOwnershipConflict`, so every conflict site goes through here. The counter counts
+/// throws on the throwing thread: inside an `appendRefOps` builder that is the append leader, which may be
+/// another query's thread, so per-query attribution in `system.query_log` is best-effort; the global
+/// counter is exact (a builder runs once per append).
 template <typename... Args>
 [[noreturn]] void throwCasOwnershipConflict(FormatStringHelper<Args...> fmt, Args &&... args)
 {
