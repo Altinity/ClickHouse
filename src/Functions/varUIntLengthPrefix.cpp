@@ -1,4 +1,7 @@
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
+#include <DataTypes/DataTypeNothing.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
@@ -92,21 +95,44 @@ public:
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo &) const override { return true; }
     bool useDefaultImplementationForConstants() const override { return true; }
 
+    bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForVariant() const override { return true; }
+    bool useDefaultImplementationForDynamic() const override { return true; }
+    bool canBeExecutedOnDefaultArguments() const override { return false; }
+
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
-        checkIsStringOrFixedString(getName(), arguments[0]);
-        return std::make_shared<DataTypeString>();
+        if (arguments[0]->onlyNull())
+            return makeNullable(std::make_shared<DataTypeNothing>());
+
+        checkIsStringOrFixedString(getName(), removeNullable(arguments[0]));
+
+        DataTypePtr result_type = std::make_shared<DataTypeString>();
+        if (arguments[0]->isNullable())
+            return makeNullable(result_type);
+        return result_type;
     }
 
-    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
-        const IColumn & column = *arguments[0].column;
+        if (result_type->onlyNull())
+            return result_type->createColumnConstWithDefaultValue(input_rows_count);
+
+        const auto * nullable_column = checkAndGetColumn<ColumnNullable>(arguments[0].column.get());
+        const IColumn & column = nullable_column ? nullable_column->getNestedColumn() : *arguments[0].column;
+        const NullMap * null_map = nullable_column ? &nullable_column->getNullMapData() : nullptr;
 
         auto result = ColumnString::create();
         result->reserve(input_rows_count);
 
         for (size_t row = 0; row < input_rows_count; ++row)
         {
+            if (null_map && (*null_map)[row])
+            {
+                result->insertDefault();
+                continue;
+            }
+
             const std::string_view value = column.getDataAt(row);
 
             UInt64 length = 0;
@@ -145,6 +171,8 @@ public:
             result->insertData(value.data() + prefix_size, rest);
         }
 
+        if (nullable_column)
+            return ColumnNullable::create(std::move(result), nullable_column->getNullMapColumnPtr());
         return result;
     }
 };
