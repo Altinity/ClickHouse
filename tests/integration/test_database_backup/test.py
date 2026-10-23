@@ -16,9 +16,10 @@ instance = cluster.add_instance(
 # `test_database_backup_metadata_with_quoted_locator_loads_on_restart` rewrites a database metadata file
 # in place, and such a file only exists when the metadata lives on the local disk, so that test runs on an
 # instance which keeps the local database disk.
+# Its own CAS server root: two servers claiming one `cas_server_root_id` on the same bucket refuse to start.
 instance_local_metadata = cluster.add_instance(
     "instance_local_metadata",
-    main_configs=["configs/backups.xml"],
+    main_configs=["configs/backups_local_metadata.xml"],
     stay_alive=True,
     with_minio=True,
     with_remote_database_disk=False,
