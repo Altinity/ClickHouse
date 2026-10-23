@@ -1093,11 +1093,8 @@ void generateManifestList(
     const std::unordered_set<String> & carry_forward_manifest_paths,
     const std::vector<Int64> & entry_partition_spec_ids,
     const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries,
-<<<<<<< HEAD
-    const PreviousManifestActions & previous_manifest_actions)
-=======
+    const PreviousManifestActions & previous_manifest_actions,
     const std::vector<Int64> & entry_row_counts)
->>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
 {
     chassert(
         per_entry_content_types.empty() || per_entry_content_types.size() == manifest_entry_names.size(),
@@ -1113,15 +1110,12 @@ void generateManifestList(
         entry_counts.empty() || entry_counts.size() == manifest_entry_names.size(),
         "entry_counts size does not match number of manifest entries");
     const bool manifest_rewrite = !entry_counts.empty();
-<<<<<<< HEAD
-=======
     if (!manifest_rewrite && entry_row_counts.size() != manifest_entry_names.size())
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
             "Iceberg manifest list needs one row count per manifest entry, got {} counts for {} entries",
             entry_row_counts.size(),
             manifest_entry_names.size());
->>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
 
     Int32 version = metadata->getValue<Int32>(Iceberg::f_format_version);
     String schema_representation;
@@ -1221,105 +1215,6 @@ void generateManifestList(
     Int64 next_first_row_id = 0;
     if (version > 2)
     {
-<<<<<<< HEAD
-        avro::GenericDatum entry_datum(schema.root());
-        avro::GenericRecord & entry = entry_datum.value<avro::GenericRecord>();
-
-        const Iceberg::FileContentType entry_content
-            = per_entry_content_types.empty() ? content_type : per_entry_content_types[entry_idx];
-
-        entry.field(Iceberg::f_manifest_path) = manifest_entry_names[entry_idx].serialize();
-        entry.field(Iceberg::f_manifest_length) = manifest_entry_sizes[entry_idx];
-        entry.field(Iceberg::f_partition_spec_id) = entry_partition_spec_ids.empty()
-            ? metadata->getValue<Int64>(Iceberg::f_default_spec_id)
-            : entry_partition_spec_ids[entry_idx];
-        if (version > 1)
-        {
-            entry.field(Iceberg::f_content) = static_cast<Int32>(entry_content);
-            /// For a manifest rewrite, sequence_number is the sequence number of the snapshot
-            /// that first added the manifest (preserved for carried-forward manifests), and
-            /// min_sequence_number is the per-manifest minimum of the preserved original
-            /// sequence numbers.
-            const Int64 new_sequence_number = new_snapshot->getValue<Int64>(Iceberg::f_metadata_sequence_number);
-            entry.field(Iceberg::f_sequence_number) = manifest_rewrite
-                ? entry_counts[entry_idx].added_sequence_number.value_or(new_sequence_number)
-                : new_sequence_number;
-            entry.field(Iceberg::f_min_sequence_number)
-                = manifest_rewrite ? entry_counts[entry_idx].min_sequence_number : new_sequence_number;
-        }
-
-        /// For a manifest rewrite, preserve the id of the snapshot that first added the
-        /// manifest: a carried-forward manifest must not claim it was added by a later snapshot.
-        entry.field(Iceberg::f_added_snapshot_id) = manifest_rewrite && entry_counts[entry_idx].added_snapshot_id
-            ? *entry_counts[entry_idx].added_snapshot_id
-            : new_snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);
-        auto summary = new_snapshot->getObject(Iceberg::f_summary);
-        if (manifest_rewrite)
-        {
-            /// The counts must agree per entry with the manifest's entry statuses: a manifest
-            /// whose entries are ADDED in this snapshot reports added_* counts, while a
-            /// carried-forward manifest (or a metadata-only rewrite that preserves lineage,
-            /// whose entries stay EXISTING) reports existing_* counts.
-            const auto & counts = entry_counts[entry_idx];
-            setVersionedField(entry, counts.counts_are_added ? counts.files_count : 0, Iceberg::f_added_files_count);
-            setVersionedField(entry, counts.counts_are_added ? 0 : counts.files_count, Iceberg::f_existing_files_count);
-            setVersionedField(entry, 0, Iceberg::f_deleted_files_count);
-            setVersionedField(entry, counts.counts_are_added ? counts.rows_count : 0, Iceberg::f_added_rows_count);
-            setVersionedField(entry, counts.counts_are_added ? 0 : counts.rows_count, Iceberg::f_existing_rows_count);
-            setVersionedField(entry, 0, Iceberg::f_deleted_rows_count);
-
-            write_partition_summary(entry, entry_idx);
-
-            writer.write(entry_datum);
-            continue;
-        }
-
-        if (version == 1)
-        {
-            setVersionedField(entry, 1, Iceberg::f_added_files_count);
-            setVersionedField(entry, std::stoi(summary->getValue<String>(Iceberg::f_total_data_files)), Iceberg::f_existing_files_count);
-            setVersionedField(entry, 0, Iceberg::f_deleted_files_count);
-            if (summary->has(Iceberg::f_added_position_deletes))
-                setVersionedField(entry, summary->getValue<Int64>(Iceberg::f_added_position_deletes), Iceberg::f_deleted_rows_count);
-            else
-                setVersionedField(entry, 0, Iceberg::f_deleted_rows_count);
-        }
-        else
-        {
-            entry.field(Iceberg::f_added_files_count) = 1;
-            /// This manifest only contains newly added files; no pre-existing entries.
-            entry.field(Iceberg::f_existing_files_count) = 0;
-            entry.field(Iceberg::f_deleted_files_count) = 0;
-            if (summary->has(Iceberg::f_added_position_deletes))
-                entry.field(Iceberg::f_deleted_rows_count) = summary->getValue<Int64>(Iceberg::f_added_position_deletes);
-            else
-                entry.field(Iceberg::f_deleted_rows_count) = 0;
-        }
-
-        if (entry_content == Iceberg::FileContentType::DATA)
-        {
-            setVersionedField(
-                entry,
-                summary->has(Iceberg::f_added_records) ? summary->getValue<Int64>(Iceberg::f_added_records) : 0,
-                Iceberg::f_added_rows_count);
-        }
-        else
-        {
-            setVersionedField(
-                entry,
-                summary->has(Iceberg::f_added_position_deletes) ? summary->getValue<Int64>(Iceberg::f_added_position_deletes) : 0,
-                Iceberg::f_added_rows_count);
-        }
-        setVersionedField(
-            entry,
-            0,
-            Iceberg::f_existing_rows_count);
-        setVersionedField(entry, 0, Iceberg::f_deleted_rows_count);
-
-        write_partition_summary(entry, entry_idx);
-
-        writer.write(entry_datum);
-=======
         if (manifest_rewrite)
             throw Exception(
                 ErrorCodes::NOT_IMPLEMENTED,
@@ -1331,7 +1226,6 @@ void generateManifestList(
                 "Snapshot of a format-version 3 Iceberg table has no '{}', cannot assign row ids to the added data files",
                 Iceberg::f_first_row_id);
         next_first_row_id = new_snapshot->getValue<Int64>(Iceberg::f_first_row_id);
->>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
     }
 
     /// Copy entries from the parent snapshot's manifest list: `use_previous_snapshots` copies all, `carry_forward_manifest_paths` copies only the listed manifests.
@@ -1453,7 +1347,8 @@ void generateManifestList(
                             add_field_to_datum(Iceberg::f_sequence_number);
                             add_field_to_datum(Iceberg::f_min_sequence_number);
                         }
-<<<<<<< HEAD
+                        if (version > 2)
+                            add_field_to_datum(Iceberg::f_manifest_first_row_id);
 
                         if (action)
                         {
@@ -1468,10 +1363,6 @@ void generateManifestList(
                             new_entry.field(Iceberg::f_min_sequence_number) = action->new_min_sequence_number;
                         }
 
-=======
-                        if (version > 2)
-                            add_field_to_datum(Iceberg::f_manifest_first_row_id);
->>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
                         writer.write(new_datum);
                     });
                 break;
@@ -1494,40 +1385,30 @@ void generateManifestList(
         if (version > 1)
         {
             entry.field(Iceberg::f_content) = static_cast<Int32>(entry_content);
-            /// For a manifest rewrite, min_sequence_number is the per-manifest minimum of the preserved original sequence numbers.
+            /// For a manifest rewrite, sequence_number is the sequence number of the snapshot
+            /// that first added the manifest (preserved for carried-forward manifests), and
+            /// min_sequence_number is the per-manifest minimum of the preserved original
+            /// sequence numbers.
             const Int64 new_sequence_number = new_snapshot->getValue<Int64>(Iceberg::f_metadata_sequence_number);
-            entry.field(Iceberg::f_sequence_number) = new_sequence_number;
+            entry.field(Iceberg::f_sequence_number) = manifest_rewrite
+                ? entry_counts[entry_idx].added_sequence_number.value_or(new_sequence_number)
+                : new_sequence_number;
             entry.field(Iceberg::f_min_sequence_number)
                 = manifest_rewrite ? entry_counts[entry_idx].min_sequence_number : new_sequence_number;
         }
 
-        auto set_versioned_field = [&](const auto & value, const String & field_name)
-        {
-            if (version == 1)
-            {
-                size_t field_index = 0;
-                if (!schema.root()->nameIndex(field_name, field_index))
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Not found field {} in schema", field_name);
-
-                const avro::NodePtr & union_schema = schema.root()->leafAt(static_cast<UInt32>(field_index));
-
-                avro::GenericUnion field(union_schema);
-                field.selectBranch(1);
-                field.datum() = avro::GenericDatum(value);
-                entry.field(field_name) = avro::GenericDatum(union_schema, field);
-            }
-            else
-            {
-                entry.field(field_name) = value;
-            }
-        };
-        entry.field(Iceberg::f_added_snapshot_id) = new_snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);
+        /// For a manifest rewrite, preserve the id of the snapshot that first added the
+        /// manifest: a carried-forward manifest must not claim it was added by a later snapshot.
+        entry.field(Iceberg::f_added_snapshot_id) = manifest_rewrite && entry_counts[entry_idx].added_snapshot_id
+            ? *entry_counts[entry_idx].added_snapshot_id
+            : new_snapshot->getValue<Int64>(Iceberg::f_metadata_snapshot_id);
         auto summary = new_snapshot->getObject(Iceberg::f_summary);
         if (manifest_rewrite)
         {
-            /// The counts must agree with the manifest's entry statuses: a metadata-only
-            /// rewrite (`replace`) preserves lineage and its entries stay EXISTING, while a
-            /// regenerated manifest without lineage emits its entries as ADDED.
+            /// The counts must agree per entry with the manifest's entry statuses: a manifest
+            /// whose entries are ADDED in this snapshot reports added_* counts, while a
+            /// carried-forward manifest (or a metadata-only rewrite that preserves lineage,
+            /// whose entries stay EXISTING) reports existing_* counts.
             const auto & counts = entry_counts[entry_idx];
             setVersionedField(entry, counts.counts_are_added ? counts.files_count : 0, Iceberg::f_added_files_count);
             setVersionedField(entry, counts.counts_are_added ? 0 : counts.files_count, Iceberg::f_existing_files_count);
@@ -1536,7 +1417,6 @@ void generateManifestList(
             setVersionedField(entry, counts.counts_are_added ? 0 : counts.rows_count, Iceberg::f_existing_rows_count);
             setVersionedField(entry, 0, Iceberg::f_deleted_rows_count);
 
-            /// Recompute the `partitions` summary so pruning bounds survive the rewrite (lower_bound == upper_bound per field).
             write_partition_summary(entry, entry_idx);
 
             writer.write(entry_datum);
@@ -1545,11 +1425,13 @@ void generateManifestList(
 
         if (version == 1)
         {
-            set_versioned_field(1, Iceberg::f_added_files_count);
-            set_versioned_field(std::stoi(summary->getValue<String>(Iceberg::f_total_data_files)), Iceberg::f_existing_files_count);
-            set_versioned_field(0, Iceberg::f_deleted_files_count);
+            setVersionedField(entry, 1, Iceberg::f_added_files_count);
+            setVersionedField(entry, std::stoi(summary->getValue<String>(Iceberg::f_total_data_files)), Iceberg::f_existing_files_count);
+            setVersionedField(entry, 0, Iceberg::f_deleted_files_count);
             if (summary->has(Iceberg::f_added_position_deletes))
-                set_versioned_field(summary->getValue<Int64>(Iceberg::f_added_position_deletes), Iceberg::f_deleted_rows_count);
+                setVersionedField(entry, summary->getValue<Int64>(Iceberg::f_added_position_deletes), Iceberg::f_deleted_rows_count);
+            else
+                setVersionedField(entry, 0, Iceberg::f_deleted_rows_count);
         }
         else
         {
@@ -1557,10 +1439,12 @@ void generateManifestList(
             /// This manifest only contains newly added files; no pre-existing entries.
             entry.field(Iceberg::f_existing_files_count) = 0;
             entry.field(Iceberg::f_deleted_files_count) = 0;
-
             if (summary->has(Iceberg::f_added_position_deletes))
                 entry.field(Iceberg::f_deleted_rows_count) = summary->getValue<Int64>(Iceberg::f_added_position_deletes);
+            else
+                entry.field(Iceberg::f_deleted_rows_count) = 0;
         }
+
         const Int64 added_rows_count = entry_row_counts[entry_idx];
         setVersionedField(entry, added_rows_count, Iceberg::f_added_rows_count);
         setVersionedField(
@@ -2050,11 +1934,7 @@ bool IcebergStorageSink::initializeMetadata()
             {
                 generateManifestList(
                     persistent_table_components.path_resolver,
-<<<<<<< HEAD
                     metadata, object_storage, *external_storages, context,
-=======
-                    metadata, object_storage, *secondary_storages, context,
->>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
                     manifest_entries,
                     new_snapshot,
                     manifest_entry_sizes,
@@ -2066,6 +1946,7 @@ bool IcebergStorageSink::initializeMetadata()
                     /* carry_forward_manifest_paths = */ {},
                     /* entry_partition_spec_ids = */ {},
                     entry_partition_summaries,
+                    /* previous_manifest_actions = */ {},
                     manifest_entry_row_counts);
                 buffer_manifest_list->finalize();
             }

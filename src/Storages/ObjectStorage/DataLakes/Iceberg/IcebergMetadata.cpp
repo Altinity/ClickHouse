@@ -2450,17 +2450,14 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
             try
             {
                 generateManifestList(
-<<<<<<< HEAD
-                    resolver, metadata, object_storage, *external_storages, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true);
-=======
-                    resolver, metadata, object_storage, *secondary_storages, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true,
+                    resolver, metadata, object_storage, *external_storages, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true,
                     /* per_entry_content_types */ {},
                     /* entry_counts */ {},
                     /* carry_forward_manifest_paths */ {},
                     /* entry_partition_spec_ids */ {},
                     /* entry_partition_summaries */ {},
+                    /* previous_manifest_actions */ {},
                     /* entry_row_counts */ {total_rows});
->>>>>>> f40907511d2d (Merge pull request #2456 from Altinity/backport-116171-iceberg-v3-cdc-writes)
                 buffer_manifest_list->finalize();
             }
             catch (...)
