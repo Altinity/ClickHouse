@@ -1,3 +1,4 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasClock.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
@@ -64,12 +65,6 @@ UInt128 mintU128()
     const UInt64 hi = thread_local_rng();
     const UInt64 lo = thread_local_rng();
     return (static_cast<UInt128>(hi) << 64) | lo;
-}
-
-uint64_t nowMs()
-{
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
 bool isDeterministicBlobPublicationFailure(const std::exception & error)
@@ -311,7 +306,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
         header.kind = ObjectKind::Blob;
         header.incarnation_tag = mintU128();
         header.build_id = build_id;
-        header.provenance = Provenance{nowMs(), pool_config.server_id, VERSION_INTEGER, info.op};
+        header.provenance = Provenance{Cas::nowMs(), pool_config.server_id, VERSION_INTEGER, info.op};
         header.intended_ref = info.intended_ref;
         return encodeEnvelopeHeader(header, static_cast<uint32_t>(pool_meta.blob_header_len));
     };
@@ -812,10 +807,10 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
     });
 }
 
-bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & id, bool allow_repoint)
+bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & id,
+    PublishPolicy policy)
 {
     requireAlive();
-
     if (id.root_namespace != target_ns)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "promote: manifest namespace '{}' != target namespace '{}'",
@@ -840,7 +835,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
 
     /// The intended-repoint operation is an atomic composition of `WDropRef` and `WPromote`: the
     /// manifest the ref currently commits,
-    /// when this promote is retiring it via an intended repoint (`allow_repoint`) rather than the
+    /// when this promote is retiring it via an intended repoint (`PublishPolicy::replaceIfCurrent`) rather than the
     /// ordinary first-time-commit path. Set inside the closure below; read after it returns to decide
     /// whether the `RefRepoint` audit event fires.
     std::optional<ManifestRef> repoint_old;
@@ -865,7 +860,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         /// keep `this`), and `repoint_old`/`created` are OUTPUTS read after the call returns (so they stay
         /// references). The ref-lane leadership guard is the real fix; both residual by-reference captures
         /// are safe because the guard guarantees the closure is never invoked after this frame unwinds.
-        [this, final_ref_name, id, promote_build_id, allow_repoint, body, &repoint_old, &created]
+        [this, final_ref_name, id, promote_build_id, policy, body, &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>
         {
             created = !state.getCommitted().contains(final_ref_name);
@@ -878,6 +873,15 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             if (const auto it = state.getCommitted().find(final_ref_name);
                 it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
                 return {};
+
+            if (policy.expected)
+            {
+                const auto cur = state.getCommitted().find(final_ref_name);
+                if (cur == state.getCommitted().end() || !(cur->second.manifest_ref == *policy.expected))
+                    throwCasOwnershipConflict("promote: committed ref '{}' no longer names the manifest this repoint read ({}); it was moved, "
+                        "dropped or repointed concurrently — re-resolve the part before retrying",
+                        final_ref_name, manifestRefDebugString(*policy.expected));
+            }
 
             /// NO writer-side view refresh here:
             /// Gate A): promote-time view freshness is not load-bearing — `Materialized` leaves are
@@ -951,24 +955,22 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                     store->layout().blobKey(e.ref));
             }
 
-            /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest —
-            /// that would orphan the old manifest (its owner-removal `-1` is never emitted) UNLESS the
-            /// caller opted into an intended repoint (`allow_repoint`, modeled as the `WDropRef`+`WPromote`
-            /// composition) -- a standalone
-            /// write/remove on an already-committed part. Without the flag
-            /// this enforces the model's `RefFreeFor` guard (`WPromote` requires it) exactly as before. A
-            /// re-promote of the SAME manifest_ref is idempotent and allowed regardless (the state
-            /// machine's own promote precondition below would reject it as "precommit absent" anyway once
-            /// idempotent republish skips this call — see `republishRef`). Fail-closed with ABORTED (not
-            /// LOGICAL_ERROR): a conflicting durable state the caller handles, never a must-not-happen
-            /// invariant.
+            /// Refuse to overwrite a live committed ref that names a DIFFERENT manifest: that would orphan the
+            /// old manifest (its owner-removal `-1` is never emitted). `PublishPolicy::create` keeps the
+            /// model's `RefFreeFor` guard (`WPromote` requires it); `replaceIfCurrent` opts into an intended
+            /// repoint (a standalone write/remove on an already-committed part), modeled as the
+            /// `WDropRef`+`WPromote` composition. A re-promote of the SAME manifest_ref is idempotent and allowed
+            /// regardless (the state machine's own promote precondition below would reject it as "precommit
+            /// absent" anyway once idempotent republish skips this call — see `republishRef`). The refusal is
+            /// write-retry-later, not LOGICAL_ERROR: a conflicting durable state the caller handles, never a
+            /// must-not-happen invariant.
             if (const auto it = state.getCommitted().find(final_ref_name);
                 it != state.getCommitted().end() && !(it->second.manifest_ref == id.ref))
             {
-                if (!allow_repoint)
+                if (!policy.expected)
                     throwCasWriteRetryLater(fmt::format(
                         "promote: ref '{}' already names a different committed manifest — refusing to overwrite "
-                        "(unique-ref invariant; use republishRef for an intended repoint)", final_ref_name));
+                        "(unique-ref invariant; an intended repoint goes through repointRef)", final_ref_name));
                 repoint_old = it->second.manifest_ref;
             }
 
@@ -1003,12 +1005,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             transition.new_binding = RefOwnerBinding{RefOwnerKind::Committed, final_ref_name, id.ref};
             ops.push_back(transition);
 
-            RefOp set_published_at;
-            set_published_at.kind = RefOpKind::SetPublishedAt;
-            set_published_at.ref_name = final_ref_name;
-            set_published_at.expected_manifest_ref = id.ref;
-            set_published_at.published_at_ms = nowMs();
-            ops.push_back(set_published_at);
+            ops.push_back(makeSetPublishedAtOp(final_ref_name, id.ref, Cas::nowMs()));
             return ops;
         },
         RootMutationOrigin::Writer, RootMutationKind::Promote);
@@ -1041,7 +1038,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// owned by `CachedPartFolderAccess::repointRef`,
     /// the user-facing primitive that calls into this promote -- adding them here too would double-fire
     /// once the caller-level instrumentation is installed. This event alone is per-call-site accurate regardless of which caller opted
-    /// into `allow_repoint`.
+    /// into a replacing `PublishPolicy`.
     if (repoint_old)
     {
         try
@@ -1054,7 +1051,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                 e.object_kind = CasEventObjectKind::Manifest;
                 e.object_hash = manifestRefDebugString(id.ref);
                 e.outcome = "repointed";
-                e.reason = "promote(allow_repoint=true): committed ref retargeted from an old manifest to a "
+                e.reason = "promote: committed ref retargeted from an old manifest to a "
                            "new one in one ref-log record -- standalone write/remove on a committed part";
                 e.detail = {{"old_manifest", manifestRefDebugString(*repoint_old)}};
             });

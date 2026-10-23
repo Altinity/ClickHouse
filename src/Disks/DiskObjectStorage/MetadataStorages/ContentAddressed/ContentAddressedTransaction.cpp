@@ -105,6 +105,19 @@ namespace
 /// large eager file.
 constexpr size_t INLINE_CAP = 1024 * 1024;   /// 1 MiB
 
+bool hasTopLevelFile(const std::vector<Cas::ManifestEntry> & entries)
+{
+    return std::any_of(entries.begin(), entries.end(),
+        [](const Cas::ManifestEntry & e) { return e.path.find('/') == std::string::npos; });
+}
+
+/// A committed manifest with no top-level file is not a part: it is the scratch of a sub-storage nested
+/// under the part's directory (`createTemporaryTextIndexStorage`), committed at the part's own name.
+bool isNestedScratchManifest(const std::vector<Cas::ManifestEntry> & entries)
+{
+    return !hasTopLevelFile(entries);
+}
+
 }
 
 ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_)
@@ -150,7 +163,22 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
 ContentAddressedTransaction::PartStaging &
 ContentAddressedTransaction::stagingFor(const ContentAddressedMetadataStorage::Route & r)
 {
-    return parts[{r.ns.string(), r.ref}];
+    const auto key = std::make_pair(r.ns.string(), r.ref);
+    auto it = parts.find(key);
+    if (it != parts.end())
+        return it->second;
+    /// Reading through `getView` leaves the retained view behind, so the unlink burst's memoized
+    /// ForceFresh proof (`force_fresh_validated_refs`) can start from this read instead of repeating it.
+    /// The record is inserted only after the read succeeds, so a throwing `getView` leaves no empty record.
+    std::optional<Cas::ManifestRef> base;
+    if (const auto view = metadata_storage.partAccess()->getView({r.ns, r.ref}, Cas::Freshness::ForceFresh))
+    {
+        base = view->manifestId().ref;
+        force_fresh_validated_refs.insert(r.refKey().cacheKey());
+    }
+    PartStaging & st = parts[key];
+    st.base_manifest_ref = base;
+    return st;
 }
 
 Cas::PartWriteTxn & ContentAddressedTransaction::buildFor(
@@ -368,7 +396,25 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// per-part file that is now an ordinary tree entry, or a marks-only removal with no writes).
     if (!st.entries.empty() || !st.content_removed.empty())
     {
-        if (auto view = metadata_storage.partAccess()->getView({ns, ref}, Cas::Freshness::ForceFresh))
+        auto view = metadata_storage.partAccess()->getView({ns, ref}, Cas::Freshness::ForceFresh);
+        /// A build that stages the part's own top-level files replaces a nested scratch manifest at the
+        /// same name instead of merging into it.
+        if (view && st.build && (!st.base_manifest_ref || *st.base_manifest_ref == view->manifestId().ref)
+            && isNestedScratchManifest(view->manifest()->entries) && hasTopLevelFile(st.entries))
+        {
+            if (metadata_storage.partAccess()->dropRefExact({ns, ref}, view->manifestId().ref)
+                == Cas::Removal::Mismatch)
+                Cas::throwCasOwnershipConflict("ContentAddressedTransaction: scratch ref {}/{} was repointed while this transaction was staging the part",
+                    ns.string(), ref);
+            st.base_manifest_ref.reset();
+            view.reset();
+        }
+        if (st.base_manifest_ref && (!view || !(view->manifestId().ref == *st.base_manifest_ref)))
+            Cas::throwCasOwnershipConflict("ContentAddressedTransaction: committed part {}/{} was moved, dropped or repointed while its rewrite was staged; "
+                "the operation must be re-resolved", ns.string(), ref);
+        if (!st.base_manifest_ref && view)
+            Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {}/{} was published by another writer while this transaction was staging it", ns.string(), ref);
+        if (view)
         {
             if (st.build)
             {
@@ -408,8 +454,8 @@ void ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             /// Capture the exact `CommitOutcome` IMMEDIATELY -- into the caller-provided slot, before
             /// the scratch-build `abandon()` below (which can itself throw), and before the test-only
             /// after-promote hook (which can run arbitrary test code) -- so a later throw in either
-            /// cannot lose it (Task 2/3's publish-before-any-throwable-post-commit-work ordering).
-            const Cas::CommitOutcome oc = metadata_storage.partAccess()->repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other);
+            /// cannot lose it (publish before any throwable post-commit work).
+            const Cas::CommitOutcome oc = metadata_storage.partAccess()->repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other, *st.base_manifest_ref);
             out_slot = oc;   /// always created=false here: this block only runs once `view` already resolved
             /// Test-only: models a concurrent writer racing in right after this transaction's own
             /// confirm (e.g. repointing `ref` again). A no-op in production.
@@ -1026,9 +1072,9 @@ void ContentAddressedTransaction::createDirectoryRecursive(const std::string &)
 void ContentAddressedTransaction::removeDirectory(const std::string & path)
 {
     /// CONTRACT: `removeDirectory`/`moveDirectory` mutate durable refs at CALL TIME, not at commit —
-    /// this is the everything-immediate model, not a missed "defer to commit" opportunity. `renameParts`
-    /// is the actual commit point; anything that goes wrong after one of these calls is undone by a
-    /// COMPENSATING operation over already-committed state, the same way upstream MergeTree's own
+    /// this is the everything-immediate model, not a missed "defer to commit" opportunity. A part is
+    /// committed after `finalize` and renamed afterwards; anything that goes wrong after one of these
+    /// calls is undone by a COMPENSATING operation over already-committed state, the same way upstream MergeTree's own
     /// `rollbackPartsToTemporaryState` and outdated-part cleanup run over committed disk state rather
     /// than an in-memory intent log. Recording these as staged intents and applying them at commit would
     /// duplicate that compensation machinery for no correctness gain.
@@ -1054,6 +1100,7 @@ void ContentAddressedTransaction::removeDirectory(const std::string & path)
         {
             st->content_removed.clear();
             st->entries.clear();
+            st->base_manifest_ref.reset();
             if (st->build)
             {
                 st->build->abandon();
@@ -1156,7 +1203,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
             return;
     }
 
-    /// Table-level SUBDIRECTORY (deduplication_logs/): remove every verbatim file under it.
+    /// Table-level SUBDIRECTORY (deduplication_logs/, partition_exports/): remove every verbatim file under it.
     if (auto tf = Cas::parseTableFilePath(path))
     {
         /// The READABLE resolution, which is the non-creating one (`namespaceFilesLifeIfReadable` answers
@@ -1361,11 +1408,15 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
         /// destination staging is freshly-created/empty so there is no collision at all; this only
         /// matters if some future op-order stages the same mutable file under BOTH keys.
         bool had_staged_source = false;
+        /// The committed manifest the source staging was based on (a rename of a committed part with
+        /// staged edits, e.g. a rollback's `delete_tmp_`); the re-key below drops it from the overlay.
+        std::optional<Cas::ManifestRef> staged_source_base;
         if (auto src_it = parts.find(src_key); src_it != parts.end())
         {
             had_staged_source = true;
             PartStaging & dst_st = parts[dst_key];
             PartStaging & src_st = src_it->second;
+            staged_source_base = src_st.base_manifest_ref;
             for (auto & entry : src_st.entries)
             {
                 /// A genuine collision (both src and dst independently
@@ -1418,10 +1469,9 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             /// A freshly-written part finalized tmp->final is re-keyed in the
             /// overlay above (entries/marks/pending blobs/build moved src->dst). The durable publish
             /// happens only in this transaction's commit (the existing publishStaging loop), not in
-            /// this method. `MergeTree` calls that commit from `Transaction::renameParts` while off
-            /// the `data_parts` lock and before the
-            /// Keeper multi. No early-published ref to compensate on abort within this method
-            /// (see ~ContentAddressedTransaction).
+            /// this method. `MergeTree` commits a part right after `finalize` and renames it afterwards,
+            /// so this re-key serves a rename staged before any commit. No early-published ref to
+            /// compensate on abort within this method (see ~ContentAddressedTransaction).
         }
 
         if (had_staged_source)
@@ -1429,16 +1479,45 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             /// A nested text-index sub-storage (MergeTask/MutateTask createTemporaryTextIndexStorage)
             /// may have DURABLY published a committed scratch ref at THIS part's own path holding only
             /// `<part>/text_index_tmp/` files. That ref is not ours and is not staged; drop it now so the
-            /// overlay we publish in commit() is the authoritative manifest. Independent of our publish
-            /// timing (it targets an already-committed foreign ref), so it stays a call-time drop.
-            metadata_storage.partAccess()->dropRefIfPresent(src->refKey());
+            /// overlay we publish in commit() is the authoritative manifest. The same goes for the base of
+            /// our own staged edits (its content now rides the destination staging). Anything else committed
+            /// under the staged name is another writer's part: refuse, as `publishStaging` does for the same state.
+            const auto committed_at_src = metadata_storage.partAccess()->getView(src->refKey(), Cas::Freshness::ForceFresh);
+            if (staged_source_base && !committed_at_src)
+                Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {} was dropped while its staged edits were being renamed; "
+                    "the operation must be re-resolved", path_from);
+            if (committed_at_src)
+            {
+                const Cas::ManifestRef committed_ref = committed_at_src->manifestId().ref;
+                const auto & base_entries = committed_at_src->manifest()->entries;
+                const bool ours = staged_source_base && *staged_source_base == committed_ref;
+                if (!ours && !isNestedScratchManifest(base_entries))
+                    Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {} was published as a part by another writer while a staged part is renamed from it",
+                        path_from);
+                /// Our staged edits ride on their base: rename the committed ref now (durable at this call, like
+                /// every committed-part rename) and give the destination staging that manifest as its base, so
+                /// `publishStaging` merges the delta into it under the new name the way it does for an edit in
+                /// place; files neither removed nor rewritten survive. The rename is conditional on the manifest
+                /// the ownership check read.
+                if (ours && !isNestedScratchManifest(base_entries))
+                {
+                    const auto renamed = metadata_storage.partAccess()->renameCommittedRef(src->refKey(), dst->refKey(), committed_ref);
+                    if (!renamed)
+                        Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {} was dropped while a staged part was renamed from it", path_from);
+                    parts[dst_key].base_manifest_ref = *renamed;
+                    return;
+                }
+                if (metadata_storage.partAccess()->dropRefExact(src->refKey(), committed_ref) == Cas::Removal::Mismatch)
+                    Cas::throwCasOwnershipConflict("ContentAddressedTransaction: {} was repointed while a staged part was renamed from it", path_from);
+            }
             return;
         }
 
-        /// Move any COMMITTED source ref (a merge/mutation result rename, DETACH, ATTACH, a
+        /// Rename any COMMITTED source ref (a merge/mutation result rename, DETACH, ATTACH, a
         /// delete_tmp_ rename, an early-committed child ref being renamed away). Absent = a pure
-        /// staged/tmp move - nothing durable to touch.
-        metadata_storage.partAccess()->republishRef(src->refKey(), dst->refKey());
+        /// staged/tmp move, or a rename of a part whose publish never happened (a rollback's delete_tmp_
+        /// rename of an unpublished part) - nothing durable to touch. The facade picks the mechanism.
+        metadata_storage.partAccess()->renameCommittedRef(src->refKey(), dst->refKey());
         return;
     }
 
@@ -1529,6 +1608,9 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
             "ContentAddressed: moveFile requires two part-file paths: {} -> {}", path_from, path_to);
 
     auto & src_st = stagingFor(*src);
+    /// The destination part may already be committed (an atomic `.tmp -> final` rename of a mutable
+    /// file inside it), so it needs its base manifest like any other write to a committed part. A
+    /// directory re-key in `moveDirectory` fills `parts[dst_key]` directly: its destination is always a new name.
     auto & dst_st = stagingFor(*dst);
 
     /// Staged content entry re-keys in place (cross-part included; dependencies follow the entries).

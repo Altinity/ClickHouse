@@ -19,6 +19,7 @@ namespace DB::ErrorCodes
 {
 extern const int NOT_IMPLEMENTED;
 extern const int INVALID_STATE;
+extern const int CAS_OWNERSHIP_CONFLICT;
 }
 
 /// [TXN-ONE-PIPELINE] CA publish-at-commit lock-scope tests.
@@ -182,44 +183,119 @@ TEST(CASTransactionLockScope, CommittedRefMoveDoesNotSpuriouslyPublish)
     EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0"));
 }
 
-/// [TXN-ONE-PIPELINE] B183 migration gate: a scratch ref durably published at the part's own (tmp)
-/// BUILD path by a nested sub-storage must be dropped on the staged-source tmp->final finalize, and
-/// commit() must publish the AUTHORITATIVE staged manifest (not the scratch content). This mirrors
-/// `createTemporaryTextIndexStorage`, which publishes scratch under the new_data_part's STILL-TMP
-/// relative path (`MergeTask.cpp` uses `getDataPartStorage().getRelativePath()`) — i.e. the SOURCE of
-/// the tmp->final rename, which is exactly what `moveDirectory`'s `dropRefIfPresent(src->refKey())`
-/// drops. (The plan's destination-path scenario would not reproduce this: `publishStaging`'s
-/// repoint-merge would carry the scratch file forward.)
+namespace
+{
+
+const std::string scratch_table = "a77/a77a77a7-7777-4777-8777-777777777777/";
+const std::string scratch_tmp_part = scratch_table + "tmp_merge_all_1_1_0";
+
+/// The nested text-index sub-storage (`createTemporaryTextIndexStorage`): a SEPARATE transaction that
+/// durably publishes a ref at the part's tmp name holding only `text_index_tmp/` files.
+void commitNestedScratch(DB::ContentAddressedMetadataStorage & storage)
+{
+    auto scratch_tx = storage.createTransaction();
+    writeFileTx(*scratch_tx, scratch_tmp_part + "/text_index_tmp/scratch.bin", "scratch");
+    scratch_tx->commit(DB::NoCommitOptions{});
+}
+
+/// MergeTree's order after `finalize`: commit the part at its tmp name, then rename it in place.
+void commitAndRenamePart(DB::ContentAddressedMetadataStorage & storage, DB::IMetadataTransaction & tx)
+{
+    tx.commit(DB::NoCommitOptions{});
+    auto rename_tx = storage.createTransaction();
+    rename_tx->moveDirectory(scratch_tmp_part, scratch_table + "all_1_1_0");
+    rename_tx->commit(DB::NoCommitOptions{});
+}
+
+void expectAuthoritativeManifestOnly(DB::ContentAddressedMetadataStorage & storage)
+{
+    const auto ns = storage.liveNamespace("a77a77a7-7777-4777-8777-777777777777");
+    const auto resolved = storage.store()->resolveRef(ns, "all_1_1_0");
+    ASSERT_TRUE(resolved.has_value());
+    const auto manifest = storage.store()->readManifest(resolved->manifest_id);
+    EXPECT_TRUE(findByName(manifest.entries, "data.bin"));
+    EXPECT_FALSE(findByName(manifest.entries, "scratch.bin")) << "the nested scratch must not be merged into the part";
+    EXPECT_FALSE(storage.existsDirectory(scratch_tmp_part));
+}
+
+}
+
+/// A merge commits the nested scratch ref, then writes the part's files (`MergeTask` text-index
+/// stage): the part transaction stages over the committed scratch and must publish its own manifest.
 TEST(CASTransactionLockScope, StagedFinalizeDropsForeignScratchRef)
 {
     auto storage = openTxStorage();
+    commitNestedScratch(*storage);
+    ASSERT_TRUE(storage->existsDirectory(scratch_tmp_part));
 
-    /// A SEPARATE transaction (the nested text-index sub-storage) durably publishes a committed ref at
-    /// the tmp BUILD path holding only a scratch file under `text_index_tmp/`.
-    {
-        auto scratch_tx = storage->createTransaction();
-        writeFileTx(*scratch_tx, "a77/a77a77a7-7777-4777-8777-777777777777/tmp_merge_all_1_1_0/text_index_tmp/scratch.bin", "scratch");
-        scratch_tx->commit(DB::NoCommitOptions{});
-    }
-    ASSERT_TRUE(storage->existsDirectory("a77/a77a77a7-7777-4777-8777-777777777777/tmp_merge_all_1_1_0"));
-
-    /// The real part build: stage the authoritative data.bin under the SAME tmp path, then finalize
-    /// tmp->final. The staged-source finalize drops the foreign scratch ref at the tmp path.
     auto tx = storage->createTransaction();
-    writeFileTx(*tx, "a77/a77a77a7-7777-4777-8777-777777777777/tmp_merge_all_1_1_0/data.bin", std::string(50000, 'D'));
-    tx->moveDirectory("a77/a77a77a7-7777-4777-8777-777777777777/tmp_merge_all_1_1_0", "a77/a77a77a7-7777-4777-8777-777777777777/all_1_1_0");
+    writeFileTx(*tx, scratch_tmp_part + "/data.bin", std::string(50000, 'D'));
+    writeFileTx(*tx, scratch_tmp_part + "/checksums.txt", "checksums");
+    commitAndRenamePart(*storage, *tx);
+
+    expectAuthoritativeManifestOnly(*storage);
+}
+
+/// A mutation stages the part (hardlinks, written columns) before the nested scratch commits: the
+/// scratch appears under a ref the part transaction staged as new.
+TEST(CASTransactionLockScope, ScratchCommittedWhilePartIsStagedIsDropped)
+{
+    auto storage = openTxStorage();
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, scratch_tmp_part + "/data.bin", std::string(50000, 'D'));
+    commitNestedScratch(*storage);
+    writeFileTx(*tx, scratch_tmp_part + "/checksums.txt", "checksums");
+    commitAndRenamePart(*storage, *tx);
+
+    expectAuthoritativeManifestOnly(*storage);
+}
+
+/// The scratch rule covers only a manifest with no top-level file: a part another writer publishes at
+/// the staged name still conflicts.
+TEST(CASTransactionLockScope, PartPublishedWhileStagedStillConflicts)
+{
+    auto storage = openTxStorage();
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, scratch_tmp_part + "/data.bin", std::string(50000, 'D'));
+    {
+        auto other = storage->createTransaction();
+        writeFileTx(*other, scratch_tmp_part + "/checksums.txt", "other");
+        other->commit(DB::NoCommitOptions{});
+    }
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { tx->commit(DB::NoCommitOptions{}); });
+    EXPECT_TRUE(storage->existsFile(scratch_tmp_part + "/checksums.txt"));
+}
+
+/// The staged-source rename applies the same rule as the commit: a scratch at the staged name is dropped,
+/// a part another writer published there after staging began is a conflict, never a silent drop.
+TEST(CASTransactionLockScope, RenameOfStagedPartOverACommittedPartConflicts)
+{
+    auto storage = openTxStorage();
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, scratch_tmp_part + "/data.bin", std::string(50000, 'D'));
+    {
+        auto other = storage->createTransaction();
+        writeFileTx(*other, scratch_tmp_part + "/checksums.txt", "other");
+        other->commit(DB::NoCommitOptions{});
+    }
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT,
+        [&] { tx->moveDirectory(scratch_tmp_part, scratch_table + "all_1_1_0"); });
+    EXPECT_TRUE(storage->existsFile(scratch_tmp_part + "/checksums.txt"));
+    EXPECT_FALSE(storage->existsDirectory(scratch_table + "all_1_1_0"));
+}
+
+/// A second scratch commit onto a scratch ref stages no top-level file, so it merges as an ordinary
+/// write onto a committed ref.
+TEST(CASTransactionLockScope, ScratchOntoScratchMerges)
+{
+    auto storage = openTxStorage();
+    commitNestedScratch(*storage);
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, scratch_tmp_part + "/text_index_tmp/scratch2.bin", "scratch2");
     tx->commit(DB::NoCommitOptions{});
 
-    /// The published manifest is the authoritative one (has data.bin), not the scratch ref.
-    const auto ns = storage->liveNamespace("a77a77a7-7777-4777-8777-777777777777");
-    const auto resolved = storage->store()->resolveRef(ns, "all_1_1_0");
-    ASSERT_TRUE(resolved.has_value());
-    const auto manifest = storage->store()->readManifest(resolved->manifest_id);
-    EXPECT_TRUE(findByName(manifest.entries, "data.bin"));
-    EXPECT_FALSE(findByName(manifest.entries, "scratch.bin"));
-
-    /// The foreign scratch ref at the tmp build path is gone (dropped, not carried forward).
-    EXPECT_FALSE(storage->existsDirectory("a77/a77a77a7-7777-4777-8777-777777777777/tmp_merge_all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile(scratch_tmp_part + "/text_index_tmp/scratch.bin"));
+    EXPECT_TRUE(storage->existsFile(scratch_tmp_part + "/text_index_tmp/scratch2.bin"));
 }
 
 /// [TXN-ONE-PIPELINE] After a tmp->final re-key, a read THROUGH the open transaction resolves the

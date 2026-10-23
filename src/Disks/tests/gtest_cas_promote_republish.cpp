@@ -17,14 +17,14 @@
 ///   between `promote(dst)` and `dropRef(src)` finds dst ALREADY committed with the (same) content it is
 ///   about to re-publish, but re-stages+re-promotes anyway, minting a fresh manifest and orphaning the
 ///   first attempt's manifest. The fix (Task 3) makes the re-drive idempotent (content-keyed, not
-///   ManifestId-keyed) when dst matches, and fail-closed (`ABORTED`) when dst holds different content.
+///   ManifestId-keyed) when dst matches, and fail-closed (`CAS_OWNERSHIP_CONFLICT`) when dst holds different content.
 ///
 /// These tests are EXPECTED TO FAIL pre-fix -- that failure IS the bug reproducing. They must not be
 /// weakened to pass; Tasks 2/3 make them pass.
 
 namespace DB::ErrorCodes
 {
-extern const int ABORTED;
+extern const int CAS_OWNERSHIP_CONFLICT;
 extern const int NETWORK_ERROR;
 extern const int LOGICAL_ERROR;
 }
@@ -226,13 +226,13 @@ TEST(CASPromoteRepublish, RepublishReDriveOverCommittedDstIsIdempotent)
 /// between the crashed attempt and the re-drive. That side channel is gone -- `metadata_version.txt`
 /// etc. are ordinary manifest entries now, so a src drift of that kind changes `entries`, and
 /// `republishRef`'s idempotency check (`dst_manifest->entries != src_manifest->entries`) now correctly
-/// treats it as a genuine content conflict (ABORTED) rather than silently resyncing a side payload --
+/// treats it as a genuine content conflict (CAS_OWNERSHIP_CONFLICT) rather than silently resyncing a side payload --
 /// there is no longer a "same content, drifted sidecar" state to re-sync. `RepublishReDriveOver-
 /// CommittedDstIsIdempotent` above remains the live coverage for the idempotent-skip path itself.
 
 /// Companion conflict case: a re-drive where dst is committed to DIFFERENT content than src is a
 /// genuine conflict (an ATTACH-onto-existing-name collision), not a re-drive -- it must fail closed
-/// (ABORTED), never silently drop src (which would lose src's content) nor silently overwrite dst.
+/// (CAS_OWNERSHIP_CONFLICT), never silently drop src (which would lose src's content) nor silently overwrite dst.
 /// This scenario reaches the SAME `promote`-over-different-committed-ref guard as BUG 1a, so pre-fix it
 /// behaves the same way BUG 1a does: no throw (silent overwrite), which is also a leak/data-loss risk.
 TEST(CASPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
@@ -263,11 +263,11 @@ TEST(CASPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
         tx->moveDirectory(src_path, dst_path);
         tx->commit(DB::NoCommitOptions{});
         FAIL() << "PRE-FIX: republishRef silently overwrote dst's different content "
-                  "(promote-over-committed leak); POST-FIX must throw ABORTED and leave src intact";
+                  "(promote-over-committed leak); POST-FIX must throw CAS_OWNERSHIP_CONFLICT and leave src intact";
     }
     catch (const DB::Exception & e)
     {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT);
     }
 }
 

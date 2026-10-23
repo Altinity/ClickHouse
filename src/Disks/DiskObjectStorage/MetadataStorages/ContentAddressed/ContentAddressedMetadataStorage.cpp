@@ -1635,7 +1635,7 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
         /// A path with a part-shaped component followed by more components: a file or nested
         /// directory of a live, detached or moving part IF that ref resolves (shadow is routed
         /// above). For an Atomic table path, the parser calls every first component after the
-        /// table root except `deduplication_logs` the part component; a non-Atomic table path
+        /// table root except a reserved subdir (`deduplication_logs`, `partition_exports`) the part component; a non-Atomic table path
         /// anchors on the rightmost part-shaped component instead. Either way, whether this really
         /// is a part is decided by the ref at answer time, not by the path:
         /// `existsDirectory`/`listDirectory` take the old table-subdirectory branch when it does
@@ -1652,7 +1652,7 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
         /// No sub-shape matched: fall through, identical to today's post-`if (p)` continuation.
     }
 
-    /// A table-level SUBDIRECTORY (deduplication_logs/...).
+    /// A table-level SUBDIRECTORY (deduplication_logs/, partition_exports/).
     if (auto tf = Cas::parseTableFilePath(path))
     {
         dr.shape = DirShape::TableSubdir;
@@ -2338,17 +2338,18 @@ public:
                     ref_name, e.message());
                 return CaRelinkPromote::Unresolved;
             }
-            /// The same retryable class the staging half classifies: a body-absent precommit, a
-            /// precommit binding that is no longer the live owner, or a ref conflict. `promote` has
+            /// The same retryable class the staging half classifies: a body-absent precommit or a precommit
+            /// binding that is no longer the live owner (`ABORTED`), or a ref already committed with other
+            /// content (write-retry-later `NETWORK_ERROR`; an ownership conflict propagates). `promote` has
             /// already abandoned the build on its way out, so the `+1` is released and the sender's
             /// bytes are a sound recovery. Anything else propagates -- it is not a known-safe
             /// mechanism failure, and the receiver must not silently turn it into a byte fetch.
             if (e.code() != ErrorCodes::ABORTED && e.code() != ErrorCodes::NETWORK_ERROR)
                 throw;
             LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
-                "Relink of part {} could not be promoted (body-absent precommit, precommit not the live "
-                "owner, or a ref conflict): {}; the caller may fetch the bytes from the same source",
-                ref_name, e.message());
+                "Relink of part {} could not be promoted (one of: body-absent precommit, precommit not the live "
+                "owner, a ref already committed with other content, a retry-later backend outcome; code {}): {}; the caller may fetch the bytes from the same source",
+                ref_name, e.code(), e.message());
             return CaRelinkPromote::MechanismFallbackAllowed;
         }
     }
@@ -2455,7 +2456,8 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
     catch (const Exception & e)
     {
         /// `ABORTED` or `NETWORK_ERROR` means a body-absent precommit, a precommit binding that is no
-        /// longer the live owner, a ref conflict, or — since the transient-classifier round — this node's
+        /// longer the live owner (`ABORTED`), a ref already committed with other content (write-retry-later
+        /// `NETWORK_ERROR`; an ownership conflict propagates), or — since the transient-classifier round — this node's
         /// own mount fence refusing the work (`throwCasTransientUnavailable`): all retryable, and the
         /// sender still has the part, so the caller may fetch its bytes. `prepareEntries` abandons its own
         /// build before propagating, so nothing is staged and no `+1` is left behind. The fence case needs
@@ -2466,7 +2468,7 @@ CaRelinkPrepare ContentAddressedMetadataStorage::prepareAdoptFromManifest(
         if (e.code() != ErrorCodes::ABORTED && e.code() != ErrorCodes::NETWORK_ERROR)
             throw;
         LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} deferred (body-absent precommit, "
-            "precommit not the live owner, or a ref conflict): {}; caller falls back to a byte fetch", part_path, e.message());
+            "precommit not the live owner, or a ref already committed with other content): {}; caller falls back to a byte fetch", part_path, e.message());
         return CaRelinkPrepare::MechanismFallbackAllowed;
     }
 }

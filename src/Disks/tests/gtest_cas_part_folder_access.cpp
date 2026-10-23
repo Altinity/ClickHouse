@@ -1,12 +1,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
 #include <Poco/Exception.h>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <atomic>
 #include <latch>
 #include <thread>
 #include <type_traits>
@@ -17,6 +19,7 @@ namespace DB::ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
+    extern const int CAS_OWNERSHIP_CONFLICT;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int MEMORY_LIMIT_EXCEEDED;
@@ -26,6 +29,8 @@ namespace DB::ErrorCodes
 namespace ProfileEvents
 {
 extern const Event CASRefRollbackBestEffortDropFailed;
+extern const Event CASOwnershipConflict;
+extern const Event CASRefMove;
 }
 
 using namespace DB;
@@ -328,6 +333,47 @@ TEST(CASPartFolderAccess, RepublishRefMovesCommittedRef)
     EXPECT_EQ(view->inlineBytes("txn_version.txt"), std::optional<String>("v1"));   /// carried over
 }
 
+TEST(CASPartFolderAccess, RepointAbortsWhenCommittedRefMovedBeforePromote)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+
+    publishPart(store, ns, "p", {inlineEntry("f", "v1")});
+    const Cas::ManifestRef expected_old = access.resolve({ns, "p"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+
+    /// A standalone rewrite of a committed part stages its new manifest first ...
+    auto prepared = access.prepareEntries({ns, "p"}, {inlineEntry("f", "v2")}, Cas::ProvenanceOp::Other);
+    /// ... and while it is in flight another writer takes the committed ref away (a rename or a drop).
+    access.dropRef({ns, "p"});
+
+    expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { prepared.promote(Cas::PublishPolicy::replaceIfCurrent(expected_old)); });
+    EXPECT_FALSE(access.existsRef({ns, "p"}, Cas::Freshness::ForceFresh))
+        << "a repoint must not recreate a ref that was moved away under it";
+}
+
+TEST(CASPartFolderAccess, RepointAbortsWhenCommittedRefRepointedBeforePromote)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+
+    publishPart(store, ns, "p", {inlineEntry("f", "v1")});
+    const Cas::ManifestRef expected_old = access.resolve({ns, "p"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+
+    auto prepared = access.prepareEntries({ns, "p"}, {inlineEntry("f", "v2")}, Cas::ProvenanceOp::Other);
+    access.repointRef({ns, "p"}, {inlineEntry("f", "v3")}, Cas::ProvenanceOp::Other, expected_old);   /// the other writer wins
+
+    const uint64_t conflicts_before = ProfileEvents::global_counters[ProfileEvents::CASOwnershipConflict];
+    expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { prepared.promote(Cas::PublishPolicy::replaceIfCurrent(expected_old)); });
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASOwnershipConflict], conflicts_before + 1) << "every conflict is counted";
+    auto view = access.getView({ns, "p"}, Cas::Freshness::ForceFresh);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->inlineBytes("f"), std::optional<String>("v3")) << "the newer binding must survive";
+}
+
 TEST(CASPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -350,8 +396,170 @@ TEST(CASPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
     /// Conflict: dst committed with DIFFERENT content — fail closed, src untouched.
     publishPart(store, ns, "src2", {inlineEntry("f", "one")});
     publishPart(store, ns, "dst2", {inlineEntry("f", "two")});
-    expectThrowsCode(ErrorCodes::ABORTED, [&] { access.republishRef({ns, "src2"}, {ns, "dst2"}); });
+    expectThrowsCode(ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.republishRef({ns, "src2"}, {ns, "dst2"}); });
     EXPECT_TRUE(access.existsRef({ns, "src2"}, Cas::Freshness::ForceFresh));
+}
+
+TEST(CASPartFolderAccess, DropRefExactDistinguishesRemovedGoneMismatch)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+
+    publishPart(store, ns, "p", {inlineEntry("f", "v1")});
+    const Cas::ManifestRef m1 = access.resolve({ns, "p"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+    access.repointRef({ns, "p"}, {inlineEntry("f", "v2")}, Cas::ProvenanceOp::Other, m1);
+    const Cas::ManifestRef m2 = access.resolve({ns, "p"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+
+    EXPECT_EQ(access.dropRefExact({ns, "p"}, m1), Cas::Removal::Mismatch);
+    EXPECT_TRUE(access.existsRef({ns, "p"}, Cas::Freshness::ForceFresh));
+    EXPECT_EQ(access.dropRefExact({ns, "p"}, m2), Cas::Removal::Removed);
+    EXPECT_FALSE(access.existsRef({ns, "p"}, Cas::Freshness::ForceFresh));
+    EXPECT_EQ(access.dropRefExact({ns, "p"}, m2), Cas::Removal::Gone);
+}
+
+TEST(CASPartFolderAccess, RepublishRefAbortsAndCompensatesWhenSourceRepointedAfterPublish)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+
+    publishPart(store, ns, "src", {inlineEntry("f", "same")});
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, [&]
+    {
+        access.repointRef({ns, "src"}, {inlineEntry("f", "newer")}, Cas::ProvenanceOp::Other, access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref);
+    });
+    expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, nullptr);
+
+    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh)) << "the destination this call created must be compensated";
+    EXPECT_EQ(access.getView({ns, "src"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("newer"));
+}
+
+TEST(CASPartFolderAccess, RepublishRefCompensatesPreexistingEqualDestinationOnMismatch)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+
+    publishPart(store, ns, "src", {inlineEntry("f", "same")});
+    publishPart(store, ns, "dst", {inlineEntry("f", "same")});   /// a previous attempt already promoted dst
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, [&]
+    {
+        access.repointRef({ns, "src"}, {inlineEntry("f", "newer")}, Cas::ProvenanceOp::Other, access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref);
+    });
+    expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, nullptr);
+
+    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh))
+        << "a content-equal destination is stale once the source was repointed, whoever created it";
+    EXPECT_EQ(access.getView({ns, "src"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("newer"));
+}
+
+/// With no destination to complete, the retry-later exception reaches the caller unchanged.
+TEST(CASPartFolderAccess, RepublishRefRethrowsNetworkErrorWhenDestinationIsAbsent)
+{
+    auto backend = std::make_shared<PromoteDefiniteFailureBackend>();
+    auto store = Cas::Pool::open(backend, Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const Cas::RootNamespace ns{"srv/t1"};
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "same")});
+
+    backend->fault_key_substr = store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)) + "_log/";
+    backend->skip = 1;
+    backend->fault_count = 2;
+    expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
+
+    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh));
+    EXPECT_TRUE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh)) << "nothing was moved";
+}
+
+TEST(CASPartFolderAccess, RepublishRefCompletesWhenSourceAlreadyTakenByIdenticalMove)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    Cas::CachedPartFolderAccess other(store);
+
+    publishPart(store, ns, "src", {inlineEntry("f", "same")});
+    /// Between our destination publish and our source drop an identical rename (a queue re-drive) sees
+    /// the byte-equal destination, removes the source and reports success.
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, [&] { EXPECT_TRUE(other.republishRef({ns, "src"}, {ns, "dst"})); });
+    EXPECT_TRUE(access.republishRef({ns, "src"}, {ns, "dst"}));
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeSourceDrop, nullptr);
+
+    EXPECT_TRUE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh)) << "the completed rename must not be compensated away";
+    EXPECT_FALSE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+}
+
+/// Two identical renames racing from the start never conflict: each either completes the move (true) or
+/// finds the source already gone (false, when the other thread finished before it resolved the source).
+TEST(CASPartFolderAccess, TwoIdenticalRepublishesNeverConflict)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess a(store);
+    Cas::CachedPartFolderAccess b(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "same")});
+
+    std::latch go{2};
+    std::atomic<int> ok{0};
+    std::atomic<int> source_gone{0};
+    auto run = [&](Cas::CachedPartFolderAccess & access)
+    {
+        go.arrive_and_wait();
+        if (access.republishRef({ns, "src"}, {ns, "dst"}))
+            ++ok;
+        else
+            ++source_gone;
+    };
+    std::thread t1(run, std::ref(a));
+    std::thread t2(run, std::ref(b));
+    t1.join();
+    t2.join();
+    EXPECT_GE(ok.load(), 1) << "at least the first rename completes";
+    EXPECT_EQ(ok.load() + source_gone.load(), 2) << "neither thread threw";
+    EXPECT_TRUE(a.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh));
+    EXPECT_FALSE(a.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+}
+
+TEST(CASPartFolderAccess, RepublishRefRejectsDestinationPublishedWithOtherContentDuringPublish)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+
+    publishPart(store, ns, "src", {inlineEntry("f", "mine")});
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeDestinationPublish, [&] { publishPart(store, ns, "dst", {inlineEntry("f", "other")}); });
+    expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeDestinationPublish, nullptr);
+
+    EXPECT_EQ(access.getView({ns, "src"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("mine"));
+    EXPECT_EQ(access.getView({ns, "dst"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("other"));
+}
+
+TEST(CASPartFolderAccess, RepublishRefCompletesWhenIdenticalRenameTakesDestinationDuringPublish)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    Cas::CachedPartFolderAccess other(store);
+
+    publishPart(store, ns, "src", {inlineEntry("f", "same")});
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeDestinationPublish, [&] { EXPECT_TRUE(other.republishRef({ns, "src"}, {ns, "dst"})); });
+    EXPECT_TRUE(access.republishRef({ns, "src"}, {ns, "dst"}));
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeDestinationPublish, nullptr);
+
+    EXPECT_EQ(access.getView({ns, "dst"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("same"));
+    EXPECT_FALSE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
 }
 
 /// Task 7: `publishEntries`'s `catch (...) { build->abandon(); throw; }` must leave no live-epoch
@@ -1173,4 +1381,212 @@ TEST(CASPartFolderAccess, PreparedPartWriteIsNotMoveAssignable)
     EXPECT_FALSE(std::is_move_assignable_v<Cas::PreparedPartWrite>)
         << "a move assignment cannot discharge a terminal duty that may fail to be discharged";
     EXPECT_TRUE(std::is_move_constructible_v<Cas::PreparedPartWrite>);
+}
+
+TEST(CASPartFolderAccess, MoveRefExactMovesWithoutANewManifest)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "tmp_insert_all_1_1_0", {inlineEntry("f", "v1")});
+    const auto before = access.resolve({ns, "tmp_insert_all_1_1_0"}, Cas::Freshness::ForceFresh)->manifest_id;
+
+    EXPECT_TRUE(access.moveRefExact({ns, "tmp_insert_all_1_1_0"}, {ns, "all_1_1_0"}, before.ref));
+    EXPECT_FALSE(access.existsRef({ns, "tmp_insert_all_1_1_0"}, Cas::Freshness::ForceFresh));
+    EXPECT_EQ(access.resolve({ns, "all_1_1_0"}, Cas::Freshness::ForceFresh)->manifest_id, before) << "same manifest, no republication";
+    EXPECT_FALSE(access.moveRefExact({ns, "tmp_insert_all_1_1_0"}, {ns, "all_1_1_0"}, before.ref)) << "replay is idempotent";
+}
+
+TEST(CASPartFolderAccess, MoveRefExactRestampsPublishedAt)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "tmp_a", {inlineEntry("f", "v1")});
+    const auto before = access.resolve({ns, "tmp_a"}, Cas::Freshness::ForceFresh);
+    ASSERT_TRUE(before);
+    const uint64_t published_before = before->published_at_ms;
+    /// The stamp has millisecond resolution; make the move strictly later.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    EXPECT_TRUE(access.moveRefExact({ns, "tmp_a"}, {ns, "a"}, before->manifest_id.ref));
+    const auto after = access.resolve({ns, "a"}, Cas::Freshness::ForceFresh);
+    ASSERT_TRUE(after);
+    EXPECT_GT(after->published_at_ms, published_before);
+    EXPECT_EQ(after->manifest_id, before->manifest_id);
+}
+
+TEST(CASPartFolderAccess, MoveRefExactAbortsOnRepointedSourceAndOccupiedDestination)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "v1")});
+    const auto m1 = access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeMoveAppend, [&] { access.repointRef({ns, "src"}, {inlineEntry("f", "v2")}, Cas::ProvenanceOp::Other, m1); });
+    expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.moveRefExact({ns, "src"}, {ns, "dst"}, m1); });
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeMoveAppend, nullptr);
+    EXPECT_EQ(access.getView({ns, "src"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("v2"));
+    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh));
+
+    const auto m2 = access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+    publishPart(store, ns, "dst", {inlineEntry("f", "other")});
+    expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.moveRefExact({ns, "src"}, {ns, "dst"}, m2); });
+    EXPECT_TRUE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+}
+
+/// A cross-namespace rename (`MOVE PARTITION TO TABLE`) republishes: the facade never asks for a Move there.
+TEST(CASPartFolderAccess, RenameCommittedRefRepublishesAcrossNamespaces)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    const Cas::RootNamespace other{"srv/t2"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "v1")});
+    const uint64_t moves_before = ProfileEvents::global_counters[ProfileEvents::CASRefMove];
+    ASSERT_TRUE(access.renameCommittedRef({ns, "src"}, {other, "dst"}).has_value());
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefMove], moves_before);
+    EXPECT_FALSE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+    EXPECT_EQ(access.getView({other, "dst"}, Cas::Freshness::ForceFresh)->inlineBytes("f"), std::optional<String>("v1"));
+    EXPECT_FALSE(access.renameCommittedRef({ns, "src"}, {other, "dst"}).has_value()) << "an absent source renames nothing";
+}
+
+TEST(CASPartFolderAccess, RenameCommittedRefConflictsWhenSourceNamesAnotherManifest)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "v1")});
+    publishPart(store, ns, "other", {inlineEntry("f", "v2")});
+    const auto m_src = access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+    const auto m_other = access.resolve({ns, "other"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+    const uint64_t moves_before = ProfileEvents::global_counters[ProfileEvents::CASRefMove];
+    const uint64_t conflicts_before = ProfileEvents::global_counters[ProfileEvents::CASOwnershipConflict];
+    /// The caller read `other`'s manifest for `src`: a concurrent repoint happened in between.
+    expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.renameCommittedRef({ns, "src"}, {ns, "dst"}, m_other); });
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASOwnershipConflict], conflicts_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefMove], moves_before) << "nothing moved";
+    EXPECT_TRUE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh));
+    /// With the manifest the source really names the rename is one Move and returns that manifest.
+    const auto renamed = access.renameCommittedRef({ns, "src"}, {ns, "dst"}, m_src);
+    ASSERT_TRUE(renamed.has_value());
+    EXPECT_TRUE(*renamed == m_src);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefMove], moves_before + 1);
+}
+
+TEST(CASPartFolderAccess, MoveRefExactAbortsOnDestinationPrecommit)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "v1")});
+    const auto m = access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+    auto prepared = access.prepareEntries({ns, "dst"}, {inlineEntry("f", "other")}, Cas::ProvenanceOp::Other);   /// live precommit under dst
+    expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.moveRefExact({ns, "src"}, {ns, "dst"}, m); });
+    prepared.abort();
+    EXPECT_TRUE(access.existsRef({ns, "src"}, Cas::Freshness::ForceFresh));
+}
+
+TEST(CASPartFolderAccess, SecondMoveFailureLeavesFirstMoved)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "tmp_a", {inlineEntry("f", "a")});
+    publishPart(store, ns, "tmp_b", {inlineEntry("f", "b")});
+    const auto ma = access.resolve({ns, "tmp_a"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+    const auto mb = access.resolve({ns, "tmp_b"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+    EXPECT_TRUE(access.moveRefExact({ns, "tmp_a"}, {ns, "a"}, ma));
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeMoveAppend, [&] { access.repointRef({ns, "tmp_b"}, {inlineEntry("f", "b2")}, Cas::ProvenanceOp::Other, mb); });
+    expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { access.moveRefExact({ns, "tmp_b"}, {ns, "b"}, mb); });
+    access.setHookForTest(Cas::CachedPartFolderAccess::TestHook::BeforeMoveAppend, nullptr);
+    /// Documented: a multi-part rename is atomic per part only; the first move stays.
+    EXPECT_TRUE(access.existsRef({ns, "a"}, Cas::Freshness::ForceFresh));
+    EXPECT_FALSE(access.existsRef({ns, "b"}, Cas::Freshness::ForceFresh));
+}
+
+TEST(CASPartFolderAccess, SnapshotAfterMoveRecoversOnlyTheDestination)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const Cas::RootNamespace ns{"srv/t1"};
+    {
+        auto store = openPoolForTest(backend);
+        Cas::CachedPartFolderAccess access(store);
+        publishPart(store, ns, "tmp_a", {inlineEntry("f", "a")});
+        const auto ma = access.resolve({ns, "tmp_a"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+        EXPECT_TRUE(access.moveRefExact({ns, "tmp_a"}, {ns, "a"}, ma));
+        EXPECT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
+        store->waitForSnapshotPublishSettleForTest(ns);
+    }
+    auto reopened = openPoolForTest(backend);   /// recovery from the snapshot, not from the move log
+    Cas::CachedPartFolderAccess access(reopened);
+    EXPECT_TRUE(access.existsRef({ns, "a"}, Cas::Freshness::ForceFresh));
+    EXPECT_FALSE(access.existsRef({ns, "tmp_a"}, Cas::Freshness::ForceFresh));
+}
+
+TEST(CASPartFolderAccess, TwoMovesFromOneSourceOneWins)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src", {inlineEntry("f", "v1")});
+    const auto m = access.resolve({ns, "src"}, Cas::Freshness::ForceFresh)->manifest_id.ref;
+
+    std::latch go{2};
+    std::atomic<int> ok{0};
+    std::atomic<int> aborted{0};
+    auto run = [&](const String & dst)
+    {
+        go.arrive_and_wait();
+        try
+        {
+            if (access.moveRefExact({ns, "src"}, {ns, dst}, m)) ++ok;
+        }
+        catch (const DB::Exception & e)
+        {
+            if (e.code() == DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT) ++aborted; else throw;
+        }
+    };
+    std::thread t1(run, "a");
+    std::thread t2(run, "b");
+    t1.join();
+    t2.join();
+    EXPECT_EQ(ok.load(), 1);
+    EXPECT_EQ(aborted.load(), 1);
+    EXPECT_EQ(access.existsRef({ns, "a"}, Cas::Freshness::ForceFresh) + access.existsRef({ns, "b"}, Cas::Freshness::ForceFresh), 1);
+}
+
+TEST(CASPartFolderAccess, MoveRetryAfterAmbiguousAppendIsIdempotent)
+{
+    auto backend = std::make_shared<Cas::tests::LatchedChunkFaultBackend>();
+    auto store = openPoolForTest(backend);
+    auto clock = Cas::tests::VirtualRetryClock::installOn(store);
+    const Cas::RootNamespace ns{"srv/t1"};
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
+    Cas::CachedPartFolderAccess access(store, cacheOn());
+    publishPart(store, ns, "tmp_a", {inlineEntry("f", "a")});
+    const auto expected = access.resolve({ns, "tmp_a"}, Cas::Freshness::ForceFresh)->manifest_id;
+
+    /// The move's ref-log object lands; only the acknowledgement and the verifying read are lost.
+    backend->fault_substr = store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)) + "_log/";
+    backend->mode = Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
+    backend->latched = true;
+    expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { access.moveRefExact({ns, "tmp_a"}, {ns, "a"}, expected.ref); });
+
+    backend->latched = false;
+    backend->mode = Cas::tests::ChunkFaultBackend::Mode::None;
+    backend->fault_count = 0;
+    backend->fail_read_once_key.clear();
+    EXPECT_FALSE(access.moveRefExact({ns, "tmp_a"}, {ns, "a"}, expected.ref)) << "the landed move is not repeated";
+    EXPECT_FALSE(access.existsRef({ns, "tmp_a"}, Cas::Freshness::ForceFresh));
+    EXPECT_EQ(access.resolve({ns, "a"}, Cas::Freshness::ForceFresh)->manifest_id, expected);
 }

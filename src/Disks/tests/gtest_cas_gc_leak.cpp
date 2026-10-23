@@ -152,7 +152,8 @@ ManifestId publishPartBReplacement(
     build->precommitAdd(ns, ref, id);
     build->putBlob(idOf(payload_a), BlobSource::fromString(payload_a));
     build->putBlob(idOf(payload_b), BlobSource::fromString(payload_b));
-    build->promote(ns, ref, build->buildId(), id, /*allow_repoint=*/true);
+    const auto current = s->resolveRef(ns, ref);
+    build->promote(ns, ref, build->buildId(), id, current ? PublishPolicy::replaceIfCurrent(current->manifest_id.ref) : PublishPolicy::create());
     return id;
 }
 

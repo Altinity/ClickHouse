@@ -215,8 +215,9 @@ public:
     /// nothing about the window that follows it.
     ///
     /// On `MechanismFallbackAllowed` nothing was staged and `out` is null: the manifest did not decode,
-    /// or the local staging hit the retryable class (a body-absent precommit, a precommit that is no
-    /// longer the live owner, a ref conflict -- `ABORTED`/`NETWORK_ERROR`). Any OTHER error propagates.
+    /// or the local staging hit the retryable class (a body-absent precommit or a precommit that is no
+    /// longer the live owner -- `ABORTED`; a ref already committed with other content -- write-retry-later
+    /// `NETWORK_ERROR`). Any OTHER error propagates, an ownership conflict included.
     ///
     /// Promotion trusts the adopted references through the durable manifest edge -- it does not re-read
     /// each blob body -- the same interserver trust as an ordinary `ReplicatedMergeTree` fetch. A blob

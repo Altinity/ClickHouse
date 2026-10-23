@@ -3,8 +3,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/CacheBase.h>
+#include <Common/Exception.h>
+#include <Common/LockMemoryExceptionInThread.h>
+#include <Common/Logger.h>
 #include <Common/CurrentMetrics.h>
 #include <base/types.h>
+#include <array>
 #include <functional>
 #include <future>
 #include <map>
@@ -167,7 +171,7 @@ public:
     /// can throw. On a failure that is PROVEN to have committed nothing the build is abandoned (the
     /// catch-abandon-rethrow discipline the atomic `publishEntries` has always applied); the original
     /// error propagates in either case.
-    CommitOutcome promote(bool allow_repoint = false);
+    CommitOutcome promote(PublishPolicy policy = {});
     /// Durably abandons the write: appends the EXACT precommit removal so the manifest's `+1` is
     /// released. Propagates an append failure -- the caller may retry, and the destructor is the
     /// backstop if it does not.
@@ -250,7 +254,7 @@ public:
     /// direction). Committed-ref mutations anywhere else in wiring are style-check failures.
 
     /// Completes a staged transaction with the atomic owner move and invalidates the affected view.
-    /// `allow_repoint` permits replacing a committed ref that names a different manifest. The returned
+    /// `policy` says how a committed ref under the same name is treated (see `PublishPolicy`). The returned
     /// `CommitOutcome` is exact: `created` is derived INSIDE `PartWriteTxn::promote`'s `appendRefOps`
     /// builder (the same in-closure-output pattern as that builder's own `repoint_old`), not read back
     /// afterward.
@@ -262,7 +266,7 @@ public:
     /// between; without it an allocation failure in the post-commit work lands in the caller's
     /// failed-promote handler with the ref already published.
     CommitOutcome promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
-                      const Cas::ManifestId & manifest_id, bool allow_repoint = false,
+                      const Cas::ManifestId & manifest_id, PublishPolicy policy = {},
                       bool * commit_recorded = nullptr);
     /// The first half of the committed-publish sequence: adopt evidence over `entries`, stage a fresh
     /// manifest, and precommit it -- then STOP. The receiver's `+1` is durable, the promote is deferred
@@ -280,20 +284,38 @@ public:
     /// Implemented as `prepareEntries` immediately followed by `promote`, so the atomic callers and the
     /// confirm-interposed relink path share one protocol sequence.
     CommitOutcome publishEntries(const PartRefKey & dst, const std::vector<Cas::ManifestEntry> & entries,
-                        Cas::ProvenanceOp op, bool allow_repoint = false);
-    /// Moves a committed ref by publishing the source entries at `dst` and then dropping `src`.
-    /// Returns false when the source is absent; a pre-existing destination with different content
-    /// is rejected rather than silently discarding the source.
+                        Cas::ProvenanceOp op, PublishPolicy policy = {});
+    /// Moves a committed ref by publishing the source entries at `dst` and then dropping `src` only
+    /// while it still names the republished manifest. Returns false when the source is absent; a
+    /// pre-existing destination with different content is rejected rather than silently discarding the
+    /// source. Throws `CAS_OWNERSHIP_CONFLICT` (after taking back a destination this call created) when
+    /// the source was repointed meanwhile.
     bool republishRef(const PartRefKey & src, const PartRefKey & dst);
-    /// Republishes an already committed part with `entries` (for a standalone write or removal):
-    /// republishes `key`'s manifest with `entries`. Byte-equal candidate (same decoded entries as the
-    /// currently committed manifest) is a ZERO-pool-mutation no-op, returns false. Otherwise republishes
-    /// a byte-equal candidate returns false without pool mutation; an effective repoint publishes
-    /// through `publishEntries(allow_repoint=true)`, emits the repoint audit signals, invalidates the
-    /// cached view, and returns the exact `CommitOutcome` (`created` is false on both the byte-equal
-    /// no-op path -- `manifest_ref` names the manifest ALREADY committed, unchanged -- and on an
-    /// effective repoint of an existing ref). `key` must already resolve.
-    CommitOutcome repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op);
+    /// Rename of a committed ref inside the table namespace without republishing content: one ref-log
+    /// append (`OwnerTransitionShape::Move`). `expected` is the manifest the caller resolved for `src`;
+    /// any other current binding is a concurrent writer and aborts with `CAS_OWNERSHIP_CONFLICT` (never
+    /// falls back to dropping it). Not `ABORTED` on purpose: the replication queue logs `ABORTED` at INFO as
+    /// a cancelled task and does not record it on the entry; a conflict is recorded and retried. Returns
+    /// false when the move is already complete (src absent, dst bound to `expected`), so a retried rename
+    /// is idempotent.
+    bool moveRefExact(const PartRefKey & src, const PartRefKey & dst, const Cas::ManifestRef & expected);
+    /// Renames a committed ref, choosing the mechanism: one owner `Move` inside a namespace when the
+    /// destination is free, `republishRef` otherwise (another namespace, or a destination an earlier
+    /// attempt already published). `expected`, when set, is the manifest the caller read for `src`; any
+    /// other current binding is a concurrent writer and throws `CAS_OWNERSHIP_CONFLICT`. Returns the
+    /// manifest now bound to `dst`, or nullopt when `src` was absent and nothing was renamed.
+    std::optional<Cas::ManifestRef> renameCommittedRef(
+        const PartRefKey & src, const PartRefKey & dst, const std::optional<Cas::ManifestRef> & expected = std::nullopt);
+    /// Republishes an already committed part with `entries` (a standalone write or removal on it).
+    /// `expected` is the manifest the caller resolved before staging: the repoint throws
+    /// `CAS_OWNERSHIP_CONFLICT` unless the committed ref still names exactly it, and never creates the ref.
+    /// A byte-equal candidate (same decoded entries as the committed manifest) is a ZERO-pool-mutation
+    /// no-op. Otherwise it publishes through `publishEntries` with `PublishPolicy::replaceIfCurrent`,
+    /// emits the repoint audit signals and invalidates the cached view. Returns the exact `CommitOutcome`;
+    /// `created` is false on both paths, and on the no-op path `manifest_ref` names the manifest already
+    /// committed, unchanged.
+    CommitOutcome repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op,
+                             const Cas::ManifestRef & expected);
     /// Drops a committed ref and invalidates its retained view after the drop succeeds.
     void dropRef(const PartRefKey & key);
     /// Idempotent removal: absent ref is success; a drop racing between resolve and the shard
@@ -302,15 +324,21 @@ public:
     /// Best-effort destructor/rollback cleanup: never throws, logs failure, and relies on GC to reclaim
     /// lingering debris. The view is invalidated even when the durable ref state becomes unknown.
     void dropRefBestEffort(const PartRefKey & key) noexcept;
-    /// Conditional rollback drop: removes `key`'s committed ref ONLY if its CURRENT committed manifest
-    /// binding equals `expected` (typically the `manifest_ref` from a `CommitOutcome` this caller
-    /// itself just produced). A ref repointed by someone else since then -- or already absent -- is
-    /// left untouched; the caller's stale rollback attempt must never clobber a newer commit. Reads
-    /// the committed binding and emits the removal op inside ONE `appendRefOps` builder (mirrors
-    /// `dropRef`'s underlying protocol call, guarded by the equality check inside the same closure).
-    /// `noexcept`: best-effort rollback context, like `dropRefBestEffort` -- swallows and logs a
-    /// failure rather than propagating it. Returns whether it actually removed the ref.
+    /// Conditional rollback drop: `dropRefExact` for a best-effort context. Removes `key`'s committed ref
+    /// ONLY if it still names `expected` (typically the `manifest_ref` of a `CommitOutcome` this caller
+    /// itself just produced); a ref repointed by someone else since then -- or already absent -- is left
+    /// untouched, the stale rollback must never clobber a newer commit. `noexcept` like `dropRefBestEffort`:
+    /// a failure is logged and counted, not propagated. Returns whether it actually removed the ref.
     bool dropRefIfMatches(const PartRefKey & key, const ManifestRef & expected) noexcept;
+    /// Foreground exact removal: removes `key` only while it still names `expected` and reports what it
+    /// found (`Removed`, `Gone`, `Mismatch`) instead of folding every outcome into a bool. Backend failures
+    /// propagate — a rename decides between success and a conflict on this, so nothing is swallowed here.
+    Removal dropRefExact(const PartRefKey & key, const Cas::ManifestRef & expected);
+    /// Test seams inside a rename: each runs once right before the named step, so a test can inject a
+    /// racing writer there. `republishRef` publishes the destination, then drops the source; `moveRefExact`
+    /// appends the Move.
+    enum class TestHook : uint8_t { BeforeDestinationPublish, BeforeSourceDrop, BeforeMoveAppend, Count };
+    void setHookForTest(TestHook hook, std::function<void()> fn) { hooks_for_test[static_cast<size_t>(hook)] = std::move(fn); }
     /// Drops all refs in a namespace and removes every retained view belonging to that namespace.
     void dropNamespace(const Cas::RootNamespace & ns);
 
@@ -360,6 +388,29 @@ private:
         const PartRefKey & key, const Cas::Resolved & resolved, Freshness freshness) const;
     /// Removes a retained view and records the invalidation for diagnostics.
     void eraseView(const PartRefKey & key);
+    std::array<std::function<void()>, static_cast<size_t>(TestHook::Count)> hooks_for_test;
+    void runHookForTest(TestHook hook) const
+    {
+        if (const auto & fn = hooks_for_test[static_cast<size_t>(hook)])
+            fn();
+    }
+    /// Emits the event `build` returns when a sink is installed. It runs after the durable mutation it
+    /// describes, so neither building nor emitting may fail the caller: both happen inside the guard, and
+    /// the handler locks the memory tracker before it logs.
+    template <typename Build>
+    void emitAuditBestEffort(const char * failure_message, Build && build) const noexcept
+    {
+        try
+        {
+            if (store->hasEventSink())
+                store->emitEvent(build());
+        }
+        catch (...)
+        {
+            LockMemoryExceptionInThread lock_memory_tracker(VariableContext::Global);
+            tryLogCurrentException(getLogger("CachedPartFolderAccess"), failure_message);
+        }
+    }
     /// Emits the same `RefResolve` `CasEvent` `CasRefLedger::resolveRef` would have emitted for
     /// `resolved`, a no-op when no sink is installed. Used by `getView`, which defers the emit from its
     /// own `resolve(..., ResolveAudit::Deferred)` call so it can skip it on a warm view-cache hit that

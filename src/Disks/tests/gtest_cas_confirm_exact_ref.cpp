@@ -307,7 +307,7 @@ PoolPtr openPoolWithConfig(const BackendPtr & backend, PoolConfig config)
 /// A legal blob-free part: an empty-entry manifest is enough to drive a real precommit+promote pair
 /// through the append lane and leave a committed ref behind. Returns the committed `ManifestId`.
 ManifestId publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref,
-                            bool allow_repoint = false)
+                            bool replace = false)
 {
     PartWriteInfo info;
     info.intended_namespace = ns;
@@ -315,7 +315,7 @@ ManifestId publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const S
     auto build = s->beginPartWrite(info);
     const ManifestId id = build->stageManifest({});
     build->precommitAdd(ns, ref, id);
-    build->promote(ns, ref, build->buildId(), id, allow_repoint);
+    build->promote(ns, ref, build->buildId(), id, replace ? PublishPolicy::replaceIfCurrent(s->resolveRef(ns, ref).value().manifest_id.ref) : PublishPolicy::create());
     return id;
 }
 
@@ -399,7 +399,7 @@ TEST(CASConfirmExactRef, RepointedRefIsNo)
     const ManifestId first = publishEmptyPart(store, ns, "x");
     ASSERT_EQ(store->confirmExactRef(ns, "x", first.ref), ConfirmAnswer::Yes);
 
-    const ManifestId second = publishEmptyPart(store, ns, "x", /*allow_repoint=*/true);
+    const ManifestId second = publishEmptyPart(store, ns, "x", /*replace=*/true);
     ASSERT_NE(first.ref, second.ref) << "a repoint must mint a fresh ManifestRef (the ABA barrier)";
 
     EXPECT_EQ(store->confirmExactRef(ns, "x", first.ref), ConfirmAnswer::No);
@@ -1191,6 +1191,100 @@ TEST(CASConfirmExactRef, UntouchedRefConfirmsWhileAnotherRefIsQueued)
 }
 
 
+/// A queued owner move names exactly its two refs: a confirm of any other ref still answers `Yes`,
+/// while both the source and the destination are refused for as long as the move is queued.
+TEST(CASConfirmExactRef, ConfirmExactRefIsNotRefusedByAMoveOnOtherRefs)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_move_scope"};
+
+    const ManifestId id_a = publishEmptyPart(store, ns, "a");
+    const ManifestId id_c = publishEmptyPart(store, ns, "c");
+    ASSERT_EQ(store->confirmExactRef(ns, "c", id_c.ref), ConfirmAnswer::Yes);
+
+    LeaderLatch latch;
+    latch.arm(store);
+    std::thread mover([&]
+    {
+        store->appendRefOps(ns, MutationScope::refs("a", "b"),
+            [&](const RefTableState &) -> std::vector<RefOp>
+            {
+                RefOp move;
+                move.kind = RefOpKind::OwnerTransition;
+                move.old_binding = RefOwnerBinding{RefOwnerKind::Committed, "a", id_a.ref};
+                move.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "b", id_a.ref};
+                return {move};
+            },
+            RootMutationOrigin::Writer, RootMutationKind::Move);
+    });
+    latch.awaitEntered();
+
+    const uint64_t in_flight_before = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
+    const ConfirmAnswer other = store->confirmExactRef(ns, "c", id_c.ref);
+    const uint64_t in_flight_after_other = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
+    const ConfirmAnswer source = store->confirmExactRef(ns, "a", id_a.ref);
+    const ConfirmAnswer destination = store->confirmExactRef(ns, "b", id_a.ref);
+    const uint64_t in_flight_after_both = refusalCount(ProfileEvents::CASRelinkConfirmRefusedRefMutationInFlight);
+
+    latch.release();
+    mover.join();
+    store->setRefPreCarveHookForTest(nullptr);
+
+    EXPECT_EQ(other, ConfirmAnswer::Yes);
+    EXPECT_EQ(in_flight_after_other - in_flight_before, 0u);
+    EXPECT_EQ(source, ConfirmAnswer::Unknown);
+    EXPECT_EQ(destination, ConfirmAnswer::Unknown);
+    EXPECT_EQ(in_flight_after_both - in_flight_after_other, 2u);
+    EXPECT_EQ(store->confirmExactRef(ns, "b", id_a.ref), ConfirmAnswer::Yes);
+}
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
+/// The flush-time scope check accepts ops naming either ref of a two-ref scope and rejects a third.
+TEST(CASConfirmExactRef, MoveOpsOutsideTheirScopeFailTheFlushCheck)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_move_misscoped"};
+    const ManifestId id_a = publishEmptyPart(store, ns, "a");
+
+    const uint64_t writes_before = backend->writeTotal();
+    RefOp move;
+    move.kind = RefOpKind::OwnerTransition;
+    move.old_binding = RefOwnerBinding{RefOwnerKind::Committed, "a", id_a.ref};
+    move.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "c", id_a.ref};
+    try
+    {
+        store->appendRefOps(ns, MutationScope::refs("a", "b"),
+                            [move](const RefTableState &) { return std::vector<RefOp>{move}; },
+                            RootMutationOrigin::Writer, RootMutationKind::Move);
+        FAIL() << "a move scoped to refs 'a' and 'b' whose op binds ref 'c' must be refused";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+    }
+    EXPECT_EQ(backend->writeTotal(), writes_before) << "the refusal must happen before any object is written";
+    EXPECT_EQ(store->confirmExactRef(ns, "a", id_a.ref), ConfirmAnswer::Yes);
+}
+#else
+TEST(CASConfirmExactRefDeathTest, MoveOpsOutsideTheirScopeFailTheFlushCheckAborts)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/confirm_move_misscoped"};
+    const ManifestId id_a = publishEmptyPart(store, ns, "a");
+    RefOp move;
+    move.kind = RefOpKind::OwnerTransition;
+    move.old_binding = RefOwnerBinding{RefOwnerKind::Committed, "a", id_a.ref};
+    move.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "c", id_a.ref};
+    EXPECT_DEATH(store->appendRefOps(ns, MutationScope::refs("a", "b"),
+                                     [move](const RefTableState &) { return std::vector<RefOp>{move}; },
+                                     RootMutationOrigin::Writer, RootMutationKind::Move),
+                 "names ref 'c'");
+}
+#endif
+
 /// Rule 3's `WholeShard` arm. A mutation that declares no ref is one that may move EVERY row, so it
 /// refuses every ref for as long as it is queued or carved -- unlike a `Ref`-scoped neighbour, which
 /// refuses only its own. In production `dropNamespaceImpl` and `sweepStalePrecommitsNow` are the two
@@ -1292,7 +1386,7 @@ TEST(CASConfirmExactRef, SameRefRepointDurableButNotInstalledIsUnknown)
     });
 
     ManifestId m2;
-    std::thread repointer([&] { m2 = publishEmptyPart(store, ns, "x", /*allow_repoint=*/true); });
+    std::thread repointer([&] { m2 = publishEmptyPart(store, ns, "x", /*replace=*/true); });
     bool parked = false;
     {
         std::unique_lock lk(hold->m);

@@ -152,6 +152,12 @@ TEST(CASPartPathParser, ParseTableFilePathNested)
     ASSERT_TRUE(tf.has_value());
     EXPECT_EQ(tf->table_uuid, "a11a11a1-1111-4111-8111-111111111111");
     EXPECT_EQ(tf->tail, "deduplication_logs/deduplication_log_1.txt");
+    // So is partition_exports/: an EXPORT PARTITION descriptor and its .tmp are table-level files.
+    EXPECT_FALSE(isPartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/partition_exports/0123.json.tmp"));
+    auto pe = parseTableFilePath("a11/a11a11a1-1111-4111-8111-111111111111/partition_exports/0123.json");
+    ASSERT_TRUE(pe.has_value());
+    EXPECT_EQ(pe->table_uuid, "a11a11a1-1111-4111-8111-111111111111");
+    EXPECT_EQ(pe->tail, "partition_exports/0123.json");
 
     auto flat = parseTableFilePath("a11/a11a11a1-1111-4111-8111-111111111111/format_version.txt");
     ASSERT_TRUE(flat.has_value());
@@ -329,7 +335,7 @@ TEST(CASPartPathParser, SplitCacheEvictionStaysCorrect)
     EXPECT_EQ(splitCacheMissesForTest(), misses_before_reparse + 1);
 }
 
-/// ==== M-W Task 2: the read side over Cas::Pool ====
+/// ==== The read side over Cas::Pool ====
 /// Fixture: publish parts through the CORE API, then read through the IMetadataStorage surface of
 /// the rewritten ContentAddressedMetadataStorage (real ctor over a Local object storage; the
 /// backend self-selects EmulatedSingleProcess token semantics).
@@ -342,6 +348,7 @@ namespace DB::ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
     extern const int BAD_ARGUMENTS;
+    extern const int CAS_OWNERSHIP_CONFLICT;
 }
 
 namespace DB::ContentAddressedSetting
@@ -889,7 +896,7 @@ TEST(CASWiringRoute, DirShapeDispatchOrderIsStable)
     EXPECT_FALSE(storage->classifyDirectoryForTest("data/db/tbl/all_1_1_0/columns.txt").tf.has_value());
 }
 
-/// ==== M-W Task 3: the write path through IMetadataTransaction ====
+/// ==== The write path through IMetadataTransaction ====
 
 
 namespace
@@ -925,6 +932,14 @@ TEST(CASWiring, LocalStagingRemainsDefault)
     DB::RelativePathsWithMetadata staged;
     object_storage->listObjects(storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
     EXPECT_TRUE(staged.empty());
+}
+
+/// `DiskObjectStorageTransaction::addOperation` dispatches on this flag; the in-flight read-your-writes overlay and the
+/// eager `createHardLink` staging both rely on CA never entering the deferred queue.
+TEST(CASWiring, AppliesOperationsEagerly)
+{
+    auto storage = openWiringStorage();
+    EXPECT_TRUE(storage->appliesOperationsEagerly());
 }
 
 TEST(CASWiringWrite, ContentRoundTripThroughTransaction)
@@ -1043,7 +1058,7 @@ TEST(CASWiringWrite, VerbatimFilesDurableOnFinalizeAndAppendable)
               std::optional<String>("commands\ncsn 42\n"));
 }
 
-/// ==== M-W Tasks 5-7: carry-forward, renames, removals, detached/ATTACH/FREEZE ====
+/// ==== Carry-forward, renames, removals, detached/ATTACH/FREEZE ====
 
 TEST(CASWiringOps, HardLinkCarriesForwardWithoutReupload)
 {
@@ -1093,6 +1108,97 @@ TEST(CASWiringOps, CommittedPartRenameMovesTheRef)
     EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
     EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_1_1_0"));
     EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_1_1_0/data.bin"));
+}
+
+TEST(CASWiringOps, StagedRewriteAbortsWhenPartMovedBeforeCommit)
+{
+    auto storage = openWiringStorage();
+    const String table = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, table + "all_1_1_0/data.bin", "bytes");
+    tx->commit(DB::NoCommitOptions{});
+
+    /// A standalone rewrite of a committed part is staged ...
+    auto rewrite = storage->createTransaction();
+    writeThroughTransaction(*rewrite, table + "all_1_1_0/txn_version.txt", "v2");
+    /// ... and before it commits the part is renamed away by another transaction.
+    auto mover = storage->createTransaction();
+    mover->moveDirectory(table + "all_1_1_0", table + "all_1_1_0_moved");
+    mover->commit(DB::NoCommitOptions{});
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT, [&] { rewrite->commit(DB::NoCommitOptions{}); });
+    EXPECT_FALSE(storage->existsDirectory(table + "all_1_1_0")) << "the rewrite must not recreate the part under its old name";
+    EXPECT_TRUE(storage->existsFile(table + "all_1_1_0_moved/data.bin"));
+}
+
+/// A committed part edited and renamed in one transaction keeps every file the edit did not touch: the
+/// base manifest's entries ride the destination staging (the same merge `publishStaging` applies in place).
+TEST(CASWiringOps, StagedEditOfCommittedPartSurvivesRename)
+{
+    auto storage = openWiringStorage();
+    const String table = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, table + "all_1_1_0/data.bin", "bytes");
+    writeThroughTransaction(*tx, table + "all_1_1_0/count.txt", "1");
+    tx->commit(DB::NoCommitOptions{});
+
+    auto edit = storage->createTransaction();
+    writeThroughTransaction(*edit, table + "all_1_1_0/txn_version.txt", "v2");
+    edit->unlinkFile(table + "all_1_1_0/count.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+    auto & ca_edit = dynamic_cast<DB::ContentAddressedTransaction &>(*edit);
+    ca_edit.moveDirectory(table + "all_1_1_0", table + "all_1_1_0_moved");
+    edit->commit(DB::NoCommitOptions{});
+
+    EXPECT_FALSE(storage->existsDirectory(table + "all_1_1_0"));
+    auto names = storage->listDirectory(table + "all_1_1_0_moved");
+    std::sort(names.begin(), names.end());
+    EXPECT_EQ(names, (std::vector<std::string>{"data.bin", "txn_version.txt"}));
+    EXPECT_EQ(storage->tryGetInManifestBytes(table + "all_1_1_0_moved/txn_version.txt"), std::optional<String>("v2"));
+    EXPECT_EQ(storage->getFileSize(table + "all_1_1_0_moved/data.bin"), 5u);
+}
+
+/// The rename of a staged edit is conditional on the base the edit was staged against: a part dropped or
+/// republished by another writer in the meantime is a conflict, never a delta-only part under the new name.
+TEST(CASWiringOps, RenameOfStagedEditConflictsWhenBaseWasDropped)
+{
+    auto storage = openWiringStorage();
+    const String table = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, table + "all_1_1_0/data.bin", "bytes");
+    tx->commit(DB::NoCommitOptions{});
+
+    auto edit = storage->createTransaction();
+    writeThroughTransaction(*edit, table + "all_1_1_0/txn_version.txt", "v2");
+    const DB::Cas::PartRefKey key{storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0"};
+    const auto base = storage->partAccess()->resolve(key, DB::Cas::Freshness::ForceFresh)->manifest_id.ref;
+    ASSERT_EQ(storage->partAccess()->dropRefExact(key, base), DB::Cas::Removal::Removed);
+
+    auto & ca_edit = dynamic_cast<DB::ContentAddressedTransaction &>(*edit);
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT,
+        [&] { ca_edit.moveDirectory(table + "all_1_1_0", table + "all_1_1_0_moved"); });
+    EXPECT_FALSE(storage->existsDirectory(table + "all_1_1_0_moved"));
+}
+
+TEST(CASWiringOps, RenameOfStagedEditConflictsWhenBaseWasRepublished)
+{
+    auto storage = openWiringStorage();
+    const String table = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, table + "all_1_1_0/data.bin", "bytes");
+    tx->commit(DB::NoCommitOptions{});
+
+    auto edit = storage->createTransaction();
+    writeThroughTransaction(*edit, table + "all_1_1_0/txn_version.txt", "v2");
+    /// Another writer commits an edit of the same part first: the committed manifest is no longer our base.
+    auto other = storage->createTransaction();
+    writeThroughTransaction(*other, table + "all_1_1_0/columns.txt", "c");
+    other->commit(DB::NoCommitOptions{});
+
+    auto & ca_edit = dynamic_cast<DB::ContentAddressedTransaction &>(*edit);
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CAS_OWNERSHIP_CONFLICT,
+        [&] { ca_edit.moveDirectory(table + "all_1_1_0", table + "all_1_1_0_moved"); });
+    EXPECT_TRUE(storage->existsFile(table + "all_1_1_0/columns.txt")) << "the other writer's part is untouched";
+    EXPECT_FALSE(storage->existsDirectory(table + "all_1_1_0_moved"));
 }
 
 TEST(CASWiringOps, ProjectionTmpRenameRekeysStagedEntries)
@@ -1237,6 +1343,27 @@ TEST(CASWiringOps, VerbatimMoveAndUnlink)
     EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mutation_5.txt"));
     ca_tx.unlinkFile("a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt", false, false);
     EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt"));
+}
+
+/// `MergeTreePartitionExportScheduler::persist` writes `partition_exports/<key>.json.tmp` and renames it over
+/// `<key>.json`; `load` lists the directory. The reserved subdir keeps both as table-level verbatim files
+/// instead of parsing `partition_exports` as a part name.
+TEST(CASWiringOps, PartitionExportDescriptorIsATableLevelFile)
+{
+    auto storage = openWiringStorage();
+    const String dir = "a11/a11a11a1-1111-4111-8111-111111111111/partition_exports";
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, dir + "/0123.json.tmp", "{\"status\":\"PENDING\"}");
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    ca_tx.replaceFile(dir + "/0123.json.tmp", dir + "/0123.json");
+    tx->commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(storage->existsDirectory(dir));
+    EXPECT_EQ(storage->listDirectory(dir), (std::vector<std::string>{"0123.json"}));
+    EXPECT_FALSE(storage->existsFile(dir + "/0123.json.tmp"));
+    EXPECT_EQ(storage->tryGetInManifestBytes(dir + "/0123.json"), std::optional<String>("{\"status\":\"PENDING\"}"));
+    /// No part ref was minted for the reserved name.
+    EXPECT_FALSE(storage->partAccess()->existsRef({storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "partition_exports"}, DB::Cas::Freshness::ForceFresh));
 }
 
 TEST(CASWiringOps, UnlinkHonorsIfExistsForPartFiles)
@@ -1482,7 +1609,7 @@ TEST(CASWiringOps, FreezeViaHardLinksIntoShadow)
     EXPECT_FALSE(storage->existsDirectory("shadow/bk1"));
 }
 
-/// ==== M-W Task 8: in-flight read-your-writes (B59) ====
+/// ==== In-flight read-your-writes ====
 
 TEST(CASWiringInFlight, StagedFilesVisibleBeforeCommit)
 {
@@ -1534,7 +1661,7 @@ namespace DB::ErrorCodes
     extern const int NOT_IMPLEMENTED;
 }
 
-/// ==== M-W Task 10: the GC scheduler end-to-end through the wiring ====
+/// ==== The GC scheduler end-to-end through the wiring ====
 
 TEST(CASWiringGc, DroppedPartIsReclaimedByRounds)
 {
@@ -1646,7 +1773,7 @@ TEST(CASWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
         << "not just recognized as unreachable; unreachable=" << after.unreachable;
 }
 
-/// ==== M-W Task 11 / B7: the DataPartsExchange facade (manifest relink, part_manifest_v2) ====
+/// ==== The DataPartsExchange facade (manifest relink, part_manifest_v2) ====
 
 /// Publish-then-confirm (Task 14) split the receiver's adoption into `prepare` + `promote`, with the
 /// interserver confirm interposed between them. The confirm belongs to `Fetcher`, not to the storage, so
@@ -3086,4 +3213,112 @@ TEST(CASWiring, TryFromDiskOnLocalDiskIsExceptionFreeAndCountsNoError)
         << "tryFromDisk on a non-content-addressed disk must not construct (and thereby count) "
            "a NOT_IMPLEMENTED exception — it runs per disk on every asynchronous-metrics tick";
     std::filesystem::remove_all(tmp);
+}
+
+TEST(CASWiringOps, CommittedPlainRenameIsOneOwnerMove)
+{
+    auto storage = openWiringStorage();
+    const String table = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, table + "tmp_insert_all_1_1_0/data.bin", "bytes");
+    tx->commit(DB::NoCommitOptions{});
+    const String blob_before = storage->getStorageObjects(table + "tmp_insert_all_1_1_0/data.bin")[0].remote_path;
+
+    std::vector<DB::Cas::CasEvent> events;
+    storage->store()->setEventSink([&](const DB::Cas::CasEvent & e) { events.push_back(e); });
+    auto tx2 = storage->createTransaction();
+    tx2->moveDirectory(table + "tmp_insert_all_1_1_0", table + "all_1_1_0");
+    tx2->commit(DB::NoCommitOptions{});
+    storage->store()->setEventSink(nullptr);
+
+    EXPECT_EQ(storage->getStorageObjects(table + "all_1_1_0/data.bin")[0].remote_path, blob_before);
+    const auto moves = std::count_if(events.begin(), events.end(), [](const auto & e) { return e.type == DB::Cas::CasEventType::RefMove; });
+    const auto publishes = std::count_if(events.begin(), events.end(), [](const auto & e) { return e.type == DB::Cas::CasEventType::BuildPublish; });
+    EXPECT_EQ(moves, 1);
+    EXPECT_EQ(publishes, 0);
+    const auto mv = std::find_if(events.begin(), events.end(), [](const auto & e) { return e.type == DB::Cas::CasEventType::RefMove; });
+    ASSERT_NE(mv, events.end());
+    EXPECT_EQ(mv->ref_name, "tmp_insert_all_1_1_0");
+    EXPECT_EQ(mv->detail.at("dst_ref"), "all_1_1_0");
+}
+
+TEST(CASWiringOps, CrossNamespacePartDirectoryMoveRepublishes)
+{
+    auto storage = openWiringStorage();
+    const String table_a = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    const String table_b = "a11/b22b22b2-2222-4222-8222-222222222222/";
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, table_a + "all_1_1_0/data.bin", "bytes");
+    tx->commit(DB::NoCommitOptions{});
+    std::vector<DB::Cas::CasEvent> events;
+    storage->store()->setEventSink([&](const DB::Cas::CasEvent & e) { events.push_back(e); });
+    auto tx2 = storage->createTransaction();
+    tx2->moveDirectory(table_a + "all_1_1_0", table_b + "all_1_1_0");
+    tx2->commit(DB::NoCommitOptions{});
+    storage->store()->setEventSink(nullptr);
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto & e) { return e.type == DB::Cas::CasEventType::RefMove; }), 0);
+    EXPECT_TRUE(storage->existsDirectory(table_b + "all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory(table_a + "all_1_1_0"));
+}
+
+TEST(CASWiringOps, DetachRenameIsOneOwnerMove)
+{
+    auto storage = openWiringStorage();
+    const String table = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, table + "all_1_1_0/data.bin", "bytes");
+    tx->commit(DB::NoCommitOptions{});
+    std::vector<DB::Cas::CasEvent> events;
+    storage->store()->setEventSink([&](const DB::Cas::CasEvent & e) { events.push_back(e); });
+    auto tx2 = storage->createTransaction();
+    tx2->moveDirectory(table + "all_1_1_0", table + "detached/all_1_1_0");
+    tx2->commit(DB::NoCommitOptions{});
+    storage->store()->setEventSink(nullptr);
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto & e) { return e.type == DB::Cas::CasEventType::RefMove; }), 1);
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto & e) { return e.type == DB::Cas::CasEventType::BuildPublish; }), 0);
+    EXPECT_TRUE(storage->existsDirectory(table + "detached/all_1_1_0"));
+}
+
+TEST(CASWiringOps, MovingToLiveRenameIsOneOwnerMove)
+{
+    auto storage = openWiringStorage();
+    const String table = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, table + "moving/all_1_1_0/data.bin", "bytes");
+    tx->commit(DB::NoCommitOptions{});
+    std::vector<DB::Cas::CasEvent> events;
+    storage->store()->setEventSink([&](const DB::Cas::CasEvent & e) { events.push_back(e); });
+    auto tx2 = storage->createTransaction();
+    tx2->moveDirectory(table + "moving/all_1_1_0", table + "all_1_1_0");
+    tx2->commit(DB::NoCommitOptions{});
+    storage->store()->setEventSink(nullptr);
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto & e) { return e.type == DB::Cas::CasEventType::RefMove; }), 1);
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto & e) { return e.type == DB::Cas::CasEventType::BuildPublish; }), 0);
+    EXPECT_TRUE(storage->existsDirectory(table + "all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory(table + "moving/all_1_1_0"));
+}
+
+TEST(CASWiringOps, RedriveOverEqualCommittedDestinationCompletesTheMove)
+{
+    auto storage = openWiringStorage();
+    const String table = "a11/a11a11a1-1111-4111-8111-111111111111/";
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, table + "tmp_X/data.bin", "same-bytes");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    {
+        auto tx = storage->createTransaction();
+        writeThroughTransaction(*tx, table + "X/data.bin", "same-bytes");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    std::vector<DB::Cas::CasEvent> events;
+    storage->store()->setEventSink([&](const DB::Cas::CasEvent & e) { events.push_back(e); });
+    auto tx2 = storage->createTransaction();
+    ASSERT_NO_THROW(tx2->moveDirectory(table + "tmp_X", table + "X"));
+    ASSERT_NO_THROW(tx2->commit(DB::NoCommitOptions{}));
+    storage->store()->setEventSink(nullptr);
+    EXPECT_FALSE(storage->existsDirectory(table + "tmp_X"));
+    EXPECT_TRUE(storage->existsDirectory(table + "X"));
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto & e) { return e.type == DB::Cas::CasEventType::RefMove; }), 0);
 }
