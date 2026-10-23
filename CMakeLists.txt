@@ -493,6 +493,22 @@ if (ENABLE_THINLTO AND NOT ENABLE_TESTS AND NOT SANITIZE)
         set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO} -Wl,--lto-whole-program-visibility")
     endif()
 
+    # Persistent ThinLTO cache. lld stores the optimized native object of every
+    # module keyed by the module hash, its import set and the LTO flags, and
+    # reuses it on the next link when nothing in that key changed. Only the
+    # backend codegen of the link is cached; the thin-link and the final native
+    # link still run in full. Entries are content-addressed, so concurrent
+    # writers cannot corrupt each other.
+    set (THINLTO_CACHE_DIR "" CACHE PATH "Directory for the ThinLTO cache (lld --thinlto-cache-dir); empty disables the cache")
+    set (THINLTO_CACHE_POLICY "prune_after=336h:cache_size_bytes=100g" CACHE STRING "Pruning policy for the ThinLTO cache (lld --thinlto-cache-policy)")
+    if (THINLTO_CACHE_DIR)
+        if (NOT LINKER_NAME MATCHES "lld")
+            message (FATAL_ERROR "THINLTO_CACHE_DIR requires lld, but LINKER_NAME is '${LINKER_NAME}'")
+        endif ()
+        message (STATUS "Using ThinLTO cache in ${THINLTO_CACHE_DIR} with policy '${THINLTO_CACHE_POLICY}'")
+        set (CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO} -Wl,--thinlto-cache-dir=${THINLTO_CACHE_DIR} -Wl,--thinlto-cache-policy=${THINLTO_CACHE_POLICY}")
+    endif ()
+
     if (ENABLE_CFI)
         # CFI checks: virtual dispatch type safety and bad downcasts via static_cast.
         # cfi-icall is omitted because C function pointers in contrib libraries (compiled without
