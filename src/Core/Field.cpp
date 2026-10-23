@@ -9,6 +9,7 @@
 #include <Common/FieldVisitorDump.h>
 #include <Common/FieldVisitorToString.h>
 #include <Common/FieldVisitorWriteBinary.h>
+#include <Common/checkStackSize.h>
 
 
 using namespace std::literals;
@@ -31,6 +32,9 @@ T DecimalField<T>::getScaleMultiplier() const
 
 Field getBinaryValue(UInt8 type, ReadBuffer & buf)
 {
+    /// Containers are read recursively, and the nesting depth comes from the data.
+    checkStackSize();
+
     switch (static_cast<Field::Types::Which>(type))
     {
         case Field::Types::Null:
