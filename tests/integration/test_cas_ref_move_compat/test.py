@@ -45,10 +45,13 @@ def test_old_pool_floor_and_old_reader(start_cluster):
     old.query("INSERT INTO t_old SELECT number FROM numbers(100)")
 
     # The new build mounts it: the first writable mount raises the floor to 2 before any rename, so the
-    # new build's first rename is already an owner move.
+    # new build's first rename is already an owner move. The server is stopped while the disk config lands:
+    # a running server's config reloader would mount the pool (and raise the floor) before the restart, and
+    # the log line asserted below would belong to a process whose log the restart discards.
+    new.stop_clickhouse()
     for name in ("storage_conf.xml", "server_root_id_new.xml"):
         new.copy_file_to_container(os.path.join(CONFIG_DIR, name), f"/etc/clickhouse-server/config.d/{name}")
-    new.restart_clickhouse()
+    new.start_clickhouse()
     new.query("CREATE TABLE t_new (a UInt64) ENGINE = MergeTree ORDER BY a SETTINGS storage_policy = 'cas_shared'")
     new.query("INSERT INTO t_new SELECT number FROM numbers(100)")
     assert _count(new, "event_type = 'ref_move'") == 1
