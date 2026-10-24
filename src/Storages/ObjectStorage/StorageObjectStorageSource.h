@@ -1,4 +1,7 @@
 #pragma once
+
+#include <deque>
+#include <future>
 #include <optional>
 #include <Common/re2.h>
 #include <Interpreters/Context_fwd.h>
@@ -86,7 +89,19 @@ protected:
     FormatFilterInfoPtr format_filter_info;
 
     ReadFromFormatInfo read_from_format_info;
-    const std::shared_ptr<ThreadPool> create_reader_pool;
+    /// Dedicated single-thread pool, used by create_reader_pool below at the default
+    /// `object_storage_max_files_to_prefetch` of 1 - the same private per-source pool `master` (i.e.
+    /// before this setting existed) uses unconditionally - so prefetches cannot contend with
+    /// unrelated queries on the server-wide pool. Constructing it is cheap (threads are spawned
+    /// lazily on schedule), so it's unconditional even though it goes unused above 1, where a pool
+    /// sized from the setting would make the thread count `streams * max_files_to_prefetch`,
+    /// unbounded by anything global - create_reader_pool falls back to the shared
+    /// `context_->getPrefetchThreadpool()` (the same one `MergeTreePrefetchedReadPool` submits to)
+    /// instead.
+    std::shared_ptr<ThreadPool> own_reader_pool;
+    /// Because the shared pool outlives this source, outstanding futures must be waited for in the
+    /// destructor - the scheduled work captures `this`.
+    ThreadPool & create_reader_pool;
 
     std::shared_ptr<IObjectIterator> file_iterator;
     SchemaCache & schema_cache;
@@ -122,6 +137,10 @@ protected:
 
         ObjectInfoPtr getObjectInfo() const { return object_info; }
         const IInputFormat * getInputFormat() const { return dynamic_cast<const IInputFormat *>(source.get()); }
+        /// Non-const overload so a freshly-built, not-yet-current reader can be primed (see
+        /// `createReaderAsync`) without exposing mutable access more broadly.
+        IInputFormat * getInputFormat() { return dynamic_cast<IInputFormat *>(source.get()); }
+        ReadBuffer * readBuffer() const { return read_buf.get(); }
 
     private:
         ObjectInfoPtr object_info;
@@ -136,7 +155,33 @@ protected:
 
     ReaderHolder reader;
     ThreadPoolCallbackRunnerUnsafe<ReaderHolder> create_reader_scheduler;
-    std::future<ReaderHolder> reader_future;
+
+    /// Depth of the file-lookahead queue below (>= 1; from `object_storage_max_files_to_prefetch`).
+    /// This bounds `reader_futures` only, so a stream holds up to this many queued readers *plus*
+    /// the one in `reader` it is currently being pulled from. Of the queued ones only those beyond
+    /// the first are primed (see refillReaderFutures), so at the default of 1 nothing is primed
+    /// ahead at all and the behaviour matches what it was before this setting existed.
+    const size_t max_files_to_prefetch;
+    /// Upcoming files' readers. Built on create_reader_pool and primed (createReaderAsync ->
+    /// prefetch()) so their background reads are already in flight by the time generate() reaches
+    /// them. Queued in submission order, but *which* file a slot ends up holding is not: the queued
+    /// tasks race each other for file_iterator->next(), so a slot queued earlier can resolve to
+    /// nothing while a slot queued later already holds a file. Consumed via takeNextQueuedReader.
+    std::deque<std::future<ReaderHolder>> reader_futures;
+
+    /// Fills reader_futures back up to max_files_to_prefetch entries. Only futures beyond the first
+    /// are primed (see createReaderAsync): the first preserves the pre-existing pipeline-object-only
+    /// lookahead, so max_files_to_prefetch=1 (the default) primes nothing and behaves exactly as
+    /// before this setting existed. No-op once file_iterator is exhausted (createReaderAsync's
+    /// result will resolve to an empty/false ReaderHolder, which callers already handle).
+    void refillReaderFutures();
+
+    /// Pops the oldest queued reader, skipping slots that resolved to no file. Returns an empty
+    /// holder only once every queued slot has been drained and none of them held a file.
+    /// An empty slot on its own does not mean the file list is exhausted - queued tasks race for
+    /// file_iterator->next(), so an earlier-queued slot can come up empty while later-queued slots
+    /// already hold files that have been fetched and must still be read.
+    ReaderHolder takeNextQueuedReader();
 
     /// Recreate ReadBuffer and Pipeline for each file.
     static ReaderHolder createReader(
@@ -157,7 +202,9 @@ protected:
 
     ReaderHolder createReader();
 
-    std::future<ReaderHolder> createReaderAsync();
+    /// If `prime` is set, calls IInputFormat::prefetch() on the built reader (see FormatFactory
+    /// formats' prefetch() override) to start its background reads before it becomes `reader`.
+    std::future<ReaderHolder> createReaderAsync(bool prime);
 
     void addNumRowsToCache(const ObjectInfo & object_info, size_t num_rows);
     void lazyInitialize();
