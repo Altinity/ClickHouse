@@ -412,7 +412,10 @@ TableNodePtr executeSubqueryNode(const QueryTreeNodePtr & subquery_node,
     ContextMutablePtr & mutable_context,
     size_t subquery_depth)
 {
-    const auto subquery_hash = subquery_node->getTreeHash();
+    auto subquery_node_to_execute = subquery_node->clone();
+    finalizeAliasMarkersForDistributedSerialization(subquery_node_to_execute, mutable_context);
+
+    const auto subquery_hash = subquery_node_to_execute->getTreeHash();
     const auto temporary_table_name = fmt::format("_data_{}", toString(subquery_hash));
 
     const auto & external_tables = mutable_context->getExternalTables();
@@ -430,7 +433,7 @@ TableNodePtr executeSubqueryNode(const QueryTreeNodePtr & subquery_node,
     auto context_copy = Context::createCopy(mutable_context);
     updateContextForSubqueryExecution(context_copy);
 
-    InterpreterSelectQueryAnalyzer interpreter(subquery_node, context_copy, subquery_options);
+    InterpreterSelectQueryAnalyzer interpreter(subquery_node_to_execute, context_copy, subquery_options);
     auto & query_plan = interpreter.getQueryPlan();
 
     auto sample_block_with_unique_names = *query_plan.getCurrentHeader();

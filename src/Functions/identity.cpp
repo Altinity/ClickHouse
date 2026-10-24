@@ -38,7 +38,7 @@ REGISTER_FUNCTION(AliasMarker)
 {
     factory.registerFunction<FunctionAliasMarker>(FunctionDocumentation{
         .description = R"(
-Internal function that marks ALIAS column expressions for the analyzer. Not intended for direct use.
+Internal function. Not for direct use.
 )",
         .syntax = {"__aliasMarker(expr, alias_name)"},
         .arguments = {
