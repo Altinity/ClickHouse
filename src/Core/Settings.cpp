@@ -680,6 +680,9 @@ Check each uploaded object to s3 with head request to be sure that upload was su
     DECLARE(Bool, s3_validate_etag_on_read, true, R"(
 When reading an object from S3 (or an S3-compatible store such as GCS), check that every GET request returns the same ETag that was observed when the object was listed. A single file read issues many ranged GET requests; if the object is overwritten in place between them (for example by an external writer rewriting a fixed key), the reads can otherwise be stitched together from two different object generations and surface as a corrupted checksum or parse error. When a mismatch is detected the read fails with `S3_OBJECT_CHANGED_DURING_READ` instead of returning inconsistent data. Disable only for workloads that intentionally read objects that are being overwritten and can tolerate inconsistent reads.
 )", 0) \
+    DECLARE(Bool, azure_validate_etag_on_read, true, R"(
+When reading a blob from Azure Blob Storage through the `azureBlobStorage` / `azureBlobStorageCluster` table functions or the `AzureBlobStorage` table engine, pin every `GET` request to the generation of the blob that was observed when it was listed by sending its `ETag` in `If-Match`, and check the `ETag` of the response. A single file read issues many ranged `GET` requests; if the blob is overwritten in place between them (for example by an external writer rewriting a fixed key), the reads can otherwise be stitched together from two different generations of the blob and surface as a corrupted checksum or parse error. The size recorded at listing time is also used as the right bound of the read, so it is only correct for the generation it was recorded for. When a mismatch is detected the read fails with `AZURE_OBJECT_CHANGED_DURING_READ` instead of returning inconsistent data. Disable only for workloads that intentionally read blobs that are being overwritten and can tolerate inconsistent reads.
+)", 0) \
     DECLARE(Bool, azure_check_objects_after_upload, false, R"(
 Check each uploaded object in azure blob storage to be sure that upload was successful
 )", 0) \
@@ -1277,6 +1280,9 @@ From what number of keys, a two-level aggregation starts. 0 - the threshold is n
 )", 0) \
     DECLARE(UInt64, group_by_two_level_threshold_bytes, 50000000, R"(
 From what size of the aggregation state in bytes, a two-level aggregation begins to be used. 0 - the threshold is not set. Two-level aggregation is used when at least one of the thresholds is triggered.
+)", 0) \
+    DECLARE(Bool, use_aggregation_memory_tracker, false, R"(
+Measure the size of the aggregation state compared with `group_by_two_level_threshold_bytes` with the memory tracker dedicated to the aggregation. When disabled, the size is measured as the growth of the memory usage of the whole query since the aggregation was created, so an aggregation with a small state can be converted to two-level.
 )", 0) \
     DECLARE(Bool, distributed_aggregation_memory_efficient, true, R"(
 Is the memory-saving mode of distributed aggregation enabled.
@@ -2508,6 +2514,8 @@ Possible values:
 )", 0) \
     DECLARE(Int64, http_zlib_compression_level, 3, R"(
 Sets the level of data compression in the response to an HTTP request if [enable_http_compression = 1](#enable_http_compression).
+
+The setting applies only to the zlib-based methods: `gzip` and `deflate`. The level for other methods (such as `zstd`, `lz4`, `br`, `xz`) is set by [output_format_compression_level](#output_format_compression_level).
 
 Possible values: Numbers from 1 to 12. Levels above `9` require the default build with `libdeflate`; a build without `libdeflate` supports levels 1 to 9.
 )", 0) \
@@ -4147,6 +4155,9 @@ Approximate probability of failure for a keeper request during backup or restore
     DECLARE(UInt64, backup_restore_s3_retry_attempts, 1000, R"(
 Setting for Aws::Client::RetryStrategy, Aws::Client does retries itself, 0 means no retries. It takes place only for backup/restore.
 )", 0) \
+    DECLARE(UInt64, backup_s3_expired_token_retry_timeout_ms, 120000, R"(
+Maximum time in milliseconds to retry an S3 request whose response identifies `ExpiredToken` during backup or restore. Retries also stop at `backup_restore_s3_retry_attempts`. Zero disables these retries. AWS S3 `HEAD` responses expose only a generic HTTP status, so this retry does not cover `HEAD` metadata requests.
+)", 0) \
     DECLARE(UInt64, backup_restore_s3_retry_initial_backoff_ms, 25, R"(
 Initial backoff delay in milliseconds before the first retry attempt during backup and restore. Each subsequent retry increases the delay exponentially, up to the maximum specified by `backup_restore_s3_retry_max_backoff_ms`
 )", 0) \
@@ -4565,6 +4576,11 @@ Possible values:
     DECLARE(Bool, allow_execute_multiif_columnar, true, R"(
 Allow execute multiIf function columnar
 )", 0) \
+    DECLARE(Bool, allow_executable_tables, true, R"(
+Allow reading through the `executable` table function and from `Executable` and `ExecutablePool` tables.
+
+Disabling this refuses reads only: creating, attaching, dropping and describing such tables still works. `ExecutablePool` processes that have already started are left running rather than terminated, but each read is still refused until the setting is enabled again.
+)", 0) \
     DECLARE(Bool, formatdatetime_f_prints_single_zero, false, R"(
 Formatter '%f' in function 'formatDateTime' prints a single zero instead of six zeros if the formatted value has no fractional seconds.
 )", 0) \
@@ -4981,7 +4997,7 @@ Patterns recognised:
 - `col > 0`, `col >= 1`, `col < 1`, `col <= 0` on unsigned integer columns.
 - Bare `col` / `NOT col` on `Int*`, `UInt*`, `Bool` columns (truthy test).
 
-The equality patterns are not applied to `Float*`, `Enum*`, `Nullable`, `LowCardinality`,
+The equality patterns are not applied to `Float*`, `Enum*`, `Date32`, `Nullable`, `LowCardinality`,
 or composite types (`Tuple`, `Array`, `Map`, ...) — for these the count is served from the
 regular scan path.
 
@@ -6437,6 +6453,8 @@ For example, if `url_base` is `https://example.com/def/`, then:
 - `data.csv` resolves to `https://example.com/def/data.csv`
 - `/test/data.csv` resolves to `https://example.com/test/data.csv`
 - `//other.com/test/data.csv` resolves to `https://other.com/test/data.csv`
+
+When the relative URL comes from a [named collection](/concepts/features/configuration/server-config/named-collections), resolving it counts as an override of the `url` key of the collection and requires the `SHOW NAMED COLLECTIONS SECRETS` privilege on that collection.
 )", 0) \
     DECLARE(String, s3_base, "", R"(
 The base URL used to resolve relative URLs in the [s3](../../sql-reference/table-functions/s3.md) table function and the [S3](../../engines/table-engines/integrations/s3.md) table engine, as well as in the table functions that share their configuration (`s3Cluster`, `gcs`, `oss`).
@@ -6446,6 +6464,8 @@ When set, a URL without a scheme is resolved against `s3_base` per RFC 3986, usi
 For example, if `s3_base` is `s3://clickhouse-public-datasets/`, then `s3('hits_compatible/hits.csv')` reads `s3://clickhouse-public-datasets/hits_compatible/hits.csv`.
 
 The base URL can use any form accepted by the `s3` table function, e.g. `s3://bucket/`, `https://bucket.s3.amazonaws.com/` or `https://endpoint/bucket/`.
+
+When the relative URL comes from a [named collection](/concepts/features/configuration/server-config/named-collections), resolving it counts as an override of the `url` key of the collection and requires the `SHOW NAMED COLLECTIONS SECRETS` privilege on that collection.
 )", 0) \
     DECLARE(UInt64, database_replicated_initial_query_timeout_sec, 300, R"(
 Sets how long initial DDL query should wait for Replicated database to process previous DDL queue entries in seconds.
@@ -6704,6 +6724,20 @@ Possible values:
     DECLARE(Bool, query_plan_filter_push_down, true, R"(
 Toggles a query-plan-level optimization which moves filters down in the execution plan.
 Only takes effect if setting [query_plan_enable_optimizations](#query_plan_enable_optimizations) is 1.
+
+:::note
+This is an expert-level setting which should only be used for debugging by developers. The setting may change in future in backward-incompatible ways or be removed.
+:::
+
+Possible values:
+
+- 0 - Disable
+- 1 - Enable
+)", 0) \
+    DECLARE(Bool, query_plan_filter_push_down_below_limit_by, true, R"(
+Toggles pushing filters on `LIMIT BY` key columns below the `LIMIT BY` step.
+Only takes effect if setting [query_plan_enable_optimizations](#query_plan_enable_optimizations) is 1.
+It is read independently of [query_plan_filter_push_down](#query_plan_filter_push_down): the push-down pass also runs, with that setting off, once a `JOIN` runtime filter has been added.
 
 :::note
 This is an expert-level setting which should only be used for debugging by developers. The setting may change in future in backward-incompatible ways or be removed.
@@ -7065,6 +7099,17 @@ If enabled, any URL parameter not recognized as a known parameter, setting, or `
 
 - A plain `name=value` becomes the equality `` `name` = 'value' `` (the identifier is back-quoted, the value is quoted as a string literal).
 - A comparison operator (`!=`, `>`, `<`, `>=`, `<=`, `<>`) makes it a comparison: either split across the parameter (`?a!=2`, `?a>=2`) or written inline when the URL has no `=` to split on (`?a<>2`, `?f(x)>3`), in which case the reassembled `name[=value]` is parsed as a full SQL expression.
+)", 0) \
+    DECLARE(Bool, http_x_clickhouse_format_overrides_output_format, true, R"(
+Controls which setting the `X-ClickHouse-Format` HTTP header maps to.
+
+If enabled (the default), the header is an alias for the `output_format` setting: it is an explicit override of the response format that wins over the `FORMAT` clause in the query and over the file extension in the URL path.
+
+If disabled, the header is an alias for the `default_format` setting, as it was before version 26.8: it only selects the format used when the query has no `FORMAT` clause and no other format override is applied.
+
+In both cases the header overrides the URL parameter of the same name (`output_format` or `default_format`, respectively) and never changes how the request body of an `INSERT` is parsed.
+
+This is a compatibility setting for the HTTP interface: the header is consumed before the query is parsed, so it must be supplied via a URL parameter or a user profile, not via an in-query `SETTINGS` clause. Like `output_format` and `default_format` themselves, it can always be changed in read-only mode (`readonly = 1`), so a read-only user can pass it as a URL parameter.
 )", 0) \
     \
     DECLARE(UInt64, function_range_max_elements_in_block, 500000000, R"(
@@ -8014,9 +8059,6 @@ a   Tuple(
     DECLARE(Bool, create_table_empty_primary_key_by_default, true, R"(
 Allow to create *MergeTree tables with empty primary key when ORDER BY and PRIMARY KEY not specified
 )", 0) \
-    DECLARE(Bool, allow_named_collection_override_by_default, true, R"(
-Allow named collections' fields override by default.
-)", 0) \
     DECLARE(SQLSecurityType, default_normal_view_sql_security, SQLSecurityType::INVOKER, R"(
 Allows to set default `SQL SECURITY` option while creating a normal view. [More about SQL security](/reference/statements/create/view#sql_security).
 
@@ -8100,6 +8142,11 @@ Default partition strategy for file like engines. Applied only to `CREATE` queri
 )", 0) \
     DECLARE(Bool, use_iceberg_partition_pruning, true, R"(
 Use Iceberg partition pruning for Iceberg tables
+)", 0) \
+    DECLARE(Bool, iceberg_tolerate_conflicting_manifest_schemas, true, R"(
+If enabled and the schema-id of an Iceberg manifest file is already registered from metadata.json, the metadata.json schema is used and the copy in the `schema` key of the manifest file header is ignored without being compared. If disabled, the manifest header copy is compared with the metadata.json schema, and a conflict fails the query with an ICEBERG_SPECIFICATION_VIOLATION error.
+
+The manifest header schema is only a copy of the table schema at the time the manifest was written, and some writers (e.g. AWS S3 Tables maintenance jobs) have been observed storing degraded copies there. Other query engines resolve schemas from metadata.json and ignore divergent header copies, so the default follows them. A conflict between two metadata.json schema definitions still always fails the query.
 )", 0) \
     DECLARE(Bool, optimize_distinct_in_order, true, R"(
 Enable DISTINCT optimization if some columns in DISTINCT form a prefix of sorting. For example, prefix of sorting key in merge tree or ORDER BY statement
@@ -8322,6 +8369,14 @@ SELECT ll.Date FROM (SELECT * FROM t AS ll LEFT JOIN t1 ON ll.k = t1.k LEFT JOIN
 
 Takes effect only when the analyzer is enabled (`enable_analyzer = 1`).
 )", 0) \
+    DECLARE(Bool, analyzer_compatibility_allow_cte_redefinition, false, R"(
+Allow a Common Table Expression name to be defined more than once in a single `WITH` clause. A reference to such a name binds to the latest definition that is not being resolved at that moment: a redefinition can read the previous definition of the same name, and the query body reads the last one. This matches the query analysis that ClickHouse used before v24.3, where a later definition silently shadowed the earlier ones. One shape differs from that analysis: a CTE declared between two definitions of a name also binds to the last definition, where the old analysis bound it to the definition visible at its declaration point. By default a redefinition is rejected with `MULTIPLE_EXPRESSIONS_FOR_ALIAS`. A CTE declared as `MATERIALIZED` and a CTE in a `WITH RECURSIVE` clause cannot be redefined even when the setting is enabled.
+
+Possible values:
+
+- 0 - A CTE name can be defined only once in a `WITH` clause.
+- 1 - A later definition of a CTE name shadows the earlier ones.
+)", 0) \
     DECLARE(Bool, enable_identifier_resolve_cache, true, R"(
 Enable the identifier resolution cache in the query analyzer. The cache shares resolved alias nodes to prevent AST explosion when the same alias is referenced multiple times. Set to false to disable caching if incorrect results are suspected.
 )", 0) \
@@ -8439,7 +8494,7 @@ Allow extracting common expressions from disjunctions in WHERE, PREWHERE, ON, HA
 Populate constant comparison in AND chains to enhance filtering ability. Support operators `<`, `<=`, `>`, `>=`, `=` and mix of them. For example, `(a < b) AND (b < c) AND (c < 5)` would be `(a < b) AND (b < c) AND (c < 5) AND indexHint(b < 5) AND indexHint(a < 5)`. The derived comparisons are wrapped in `indexHint`: they participate in index analysis (primary key, partition key, skipping indexes) and prune the read set, but cost nothing per row and do not affect PREWHERE. A comparison derived through expressions of different tables stays executable (`(t1.a < t2.b) AND (t2.b < 5)` derives plain `t1.a < 5`): it is the only condition that can be pushed below the join, where it filters a join input the original chain cannot reach. Derived comparisons that contradict an existing condition are also added as plain conditions, so the `AND` folds to `false`.
 )", 0) \
     DECLARE(Bool, optimize_redundant_comparisons, true, R"(
-Detect conflicting and redundant comparison conditions on the same expression within AND chains. For example, `a < 1 AND a > 5` would be rewritten to `false`.
+Detect conflicting and redundant comparison conditions on the same expression within AND chains. For example, `a < 1 AND a > 5` would be rewritten to `false`. A contradiction between two `equals` on the same expression (for example, `a = 1 AND a = 2`) is detected independently of this setting.
 )", 0) \
     DECLARE(UInt64, optimize_and_compare_chain_max_hash_work, 5'000'000, R"(
 Work budget for the `optimize_and_compare_chain` optimization during query analysis, measured in the number of query-tree nodes hashed by `getTreeHash` (the dominant cost of this optimization). Once a query has hashed more than this many nodes while applying the optimization, it stops applying it for the rest of the query. This bounds analysis time for queries with very many or very large `AND`-chains of comparisons, where the optimization can otherwise dominate analysis while folding nothing. Stopping early is always safe: it only forgoes an optimization and never changes results. Set to `0` to disable the budget (unlimited).
@@ -8735,21 +8790,21 @@ Initial delay in milliseconds before the first retry of a failed AI function API
     DECLARE(Bool, ai_function_throw_on_error, true, R"(
 If true (default), an AI function call that fails permanently after exhausting all retries aborts the query with an exception. If false, the failed row receives the default value for the column type (empty string for String) and processing continues.
 )", BETA) \
-    DECLARE(UInt64, ai_function_max_input_tokens_per_query, 1000000, R"(
-Maximum total input (prompt) tokens across all AI function API calls in a single query. Tracked cumulatively from provider responses. Note that this limit may be exceeded by up to one call's worth of input tokens per in-flight request, since a call's input tokens are not known until its response arrives. Like the other AI quotas, it is enforced per server / query fragment, not summed across a distributed query, and must be set in the top-level query - a sub-query `SETTINGS` override is ignored. Set to 0 to disable.
+    DECLARE(UInt64, ai_function_max_input_tokens_per_query, 0, R"(
+Maximum total input (prompt) tokens across all AI function API calls in a single query. 0 (default) disables the limit. Tracked cumulatively from provider responses. Note that this limit may be exceeded by up to one call's worth of input tokens per in-flight request, since a call's input tokens are not known until its response arrives. Like the other AI quotas, it is enforced per server / query fragment, not summed across a distributed query, and must be set in the top-level query - a sub-query `SETTINGS` override is ignored.
 
 This limit is only enforced for providers that report a `usage` object in their response (OpenAI, Anthropic, vLLM). Providers that omit token usage (notably HuggingFace TEI) cause the counter to stay at 0 — use `ai_function_max_api_calls_per_query` instead to bound such calls.
 )", BETA) \
-    DECLARE(UInt64, ai_function_max_output_tokens_per_query, 500000, R"(
-Maximum total output (completion) tokens across all AI function API calls in a single query. Tracked cumulatively from provider responses. Note that this limit may be exceeded by up to one call's worth of output tokens per in-flight request, since a call's output tokens are not known until its response arrives. Like the other AI quotas, it is enforced per server / query fragment, not summed across a distributed query, and must be set in the top-level query - a sub-query `SETTINGS` override is ignored. Set to 0 to disable.
+    DECLARE(UInt64, ai_function_max_output_tokens_per_query, 0, R"(
+Maximum total output (completion) tokens across all AI function API calls in a single query. 0 (default) disables the limit. Tracked cumulatively from provider responses. Note that this limit may be exceeded by up to one call's worth of output tokens per in-flight request, since a call's output tokens are not known until its response arrives. Like the other AI quotas, it is enforced per server / query fragment, not summed across a distributed query, and must be set in the top-level query - a sub-query `SETTINGS` override is ignored.
 
 This limit is only enforced for providers that report a `usage` object in their response (OpenAI, Anthropic, vLLM). It does not apply to the embedding functions (`aiEmbed`, `aiSimilarity`), which never produce output tokens.
 )", BETA) \
-    DECLARE(UInt64, ai_function_max_api_calls_per_query, 1000, R"(
-Maximum number of HTTP requests that AI functions may dispatch per query. Enforced independently by each server and query fragment: within one execution context it is an exact cap shared by every AI function, block, and thread there, but a distributed query (across shards or parallel-replica fragments) may dispatch up to this many requests per shard/fragment. It must be set in the top-level query - a sub-query `SETTINGS` override is ignored. Set to 0 to disable.
+    DECLARE(UInt64, ai_function_max_api_calls_per_query, 0, R"(
+Maximum number of HTTP requests that AI functions may dispatch per query. 0 (default) disables the limit. Enforced independently by each server and query fragment: within one execution context it is an exact cap shared by every AI function, block, and thread there, but a distributed query (across shards or parallel-replica fragments) may dispatch up to this many requests per shard/fragment. It must be set in the top-level query - a sub-query `SETTINGS` override is ignored.
 )", BETA) \
     DECLARE(Bool, ai_function_throw_on_quota_exceeded, true, R"(
-If true (default), exceeding an AI function quota limit (`ai_function_max_input_tokens_per_query`, `ai_function_max_output_tokens_per_query`, or `ai_function_max_api_calls_per_query`) aborts the query with an exception. If false, remaining rows receive the default value for the column type (empty string for String). Like the quota limits, this must be set in the top-level query - a sub-query `SETTINGS` override is ignored.
+If true (default), exceeding an AI function quota limit (`ai_function_max_input_tokens_per_query`, `ai_function_max_output_tokens_per_query`, or `ai_function_max_api_calls_per_query`) aborts the query with an exception. All three limits are disabled by default, so this has no effect until one of them is set. If false, remaining rows receive the default value for the column type (empty string for String). Like the quota limits, this must be set in the top-level query - a sub-query `SETTINGS` override is ignored.
 )", BETA) \
     DECLARE(NonZeroUInt64, ai_function_embedding_max_batch_size, 100, R"(
 Maximum number of texts to include in a single HTTP request made by the embedding functions (`aiEmbed`, `aiSimilarity`). Texts are grouped into batches of this size to reduce API call overhead. For example, 500 unique texts with a batch size of 100 result in 5 HTTP requests.
@@ -8885,9 +8940,12 @@ Maximal selectivity of the filter to use the hint built from the inverted text i
 )", 0) \
     DECLARE(Bool, use_text_index_like_evaluation_by_dictionary_scan, true, R"(
 Enable evaluation of LIKE/ILIKE queries by scanning the inverted text index dictionary.
+
+The accelerated patterns are `%value%`, `value%` and `%value`, as well as the `startsWith` and `endsWith` calls that `optimize_rewrite_like_perfect_affix` rewrites into `value%` and `%value`.
 )", 0) \
     DECLARE(UInt64, text_index_like_min_pattern_length, 4, R"(
-Minimum length of the alphanumeric needle in a LIKE/ILIKE pattern required to use the text index LIKE evaluation by the dictionary scan.
+Minimum length of the alphanumeric needle in a LIKE/ILIKE pattern, or of a `startsWith`/`endsWith` needle,
+required to use the text index LIKE evaluation by the dictionary scan.
 Patterns shorter than this threshold match too many dictionary tokens and are skipped to avoid expensive scans.
 
 Requires `use_text_index_like_evaluation_by_dictionary_scan` to be enabled.
@@ -9314,7 +9372,8 @@ Enable experimental table function `eval`.
     MAKE_OBSOLETE(M, Bool, use_text_index_dictionary_cache, false) \
     MAKE_OBSOLETE(M, Bool, query_plan_use_logical_join_step, true) \
     MAKE_OBSOLETE(M, Bool, query_plan_use_new_logical_join_step, true) \
-    MAKE_OBSOLETE(M, UInt64, cloud_mode_database_engine, 1)
+    MAKE_OBSOLETE(M, UInt64, cloud_mode_database_engine, 1) \
+    MAKE_OBSOLETE(M, Bool, allow_named_collection_override_by_default, true)
     /** The section above is for obsolete settings. Do not add anything there. */
 #endif /// __CLION_IDE__
 
@@ -9903,11 +9962,16 @@ void writeQueryParameters(const NameToNameMap & parameters, WriteBuffer & out)
 NameToNameMap readQueryParameters(ReadBuffer & in)
 {
     NameToNameMap parameters;
+    size_t num_parameters = 0;
     while (true)
     {
-        String name = BaseSettingsHelpers::readString(in);
+        String name = BaseSettingsHelpers::readName(in);
         if (name.empty())
             break;
+
+        if (++num_parameters > MAX_SETTINGS_IN_A_SEQUENCE)
+            BaseSettingsHelpers::throwTooManySettings("query parameters");
+
         std::ignore = BaseSettingsHelpers::readFlags(in);
         String value;
         ReadBufferFromOwnString buf(BaseSettingsHelpers::readString(in));

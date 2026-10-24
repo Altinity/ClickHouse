@@ -50,6 +50,7 @@
 #include <Storages/MaterializedView/RefreshTask.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/StorageFactory.h>
+#include <Storages/StorageProxy.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/TimeSeries/normalizeTimeSeriesDefinition.h>
@@ -831,7 +832,10 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
     {
         String as_database_name = getContext()->resolveDatabase(create.as_database);
         getContext()->checkAccess(AccessType::SHOW_COLUMNS, as_database_name, create.as_table);
-        StoragePtr as_storage = DatabaseCatalog::instance().getTable({as_database_name, create.as_table}, getContext());
+        /// A lazily loaded source reports only its columns, so the indices, projections, constraints
+        /// and comment copied below would silently come out empty.
+        StoragePtr as_storage = resolveStorageProxyLoading(
+            DatabaseCatalog::instance().getTable({as_database_name, create.as_table}, getContext()));
 
         /// as_storage->getColumns() and setEngine(...) must be called under structure lock of other_table for CREATE ... AS other_table.
         as_storage_lock = as_storage->lockForShare(getContext()->getCurrentQueryId(), getContext()->getSettingsRef()[Setting::lock_acquire_timeout]);
@@ -857,7 +861,7 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
 
             /// CREATE TABLE AS should copy PRIMARY KEY, ORDER BY, and similar clauses.
             /// Note: only supports the source table engine is using the new syntax.
-            if (const auto * merge_tree_data = dynamic_cast<const MergeTreeData *>(as_storage.get()))
+            if (const auto * merge_tree_data = castStorage<MergeTreeData>(as_storage, DeferredTable::Load).get())
             {
                 if (merge_tree_data->format_version >= MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING)
                 {
@@ -1314,6 +1318,8 @@ namespace
         {
             *ptr = nullptr;
         });
+        /// children keeps the old nodes, and hasSecretParts reads them
+        storage.children.clear();
 
         auto engine_ast = make_intrusive<ASTFunction>();
         engine_ast->name = "Null";
@@ -1460,11 +1466,23 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
         String as_database_name = getContext()->resolveDatabase(create.as_database);
         String as_table_name = create.as_table;
 
+        /// check SHOW COLUMNS first, else the error tells a user who cannot see the table that it
+        /// holds credentials
+        getContext()->checkAccess(AccessType::SHOW_COLUMNS, as_database_name, as_table_name);
+
         ASTPtr as_create_ptr = DatabaseCatalog::instance().getDatabase(as_database_name)->getCreateTableQuery(as_table_name, getContext());
 
         const auto & as_create = as_create_ptr->as<ASTCreateQuery &>();
 
         const String qualified_name = backQuoteIfNeed(as_database_name) + "." + backQuoteIfNeed(as_table_name);
+
+        /// SHOW CREATE TABLE masks credentials, so a copy of them gives the source data to a user who
+        /// cannot SELECT it. SHOW COLUMNS already shows the rest
+        auto check_access_to_inherited_definition = [&](const IAST & definition)
+        {
+            if (definition.hasSecretParts())
+                getContext()->checkAccess(AccessType::SELECT, as_database_name, as_table_name);
+        };
 
         if (as_create.is_ordinary_view)
             throw Exception(ErrorCodes::INCORRECT_QUERY, "Cannot CREATE a table AS {}, it is a View", qualified_name);
@@ -1494,6 +1512,7 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
             /// clauses were specified for the new table; otherwise keep the explicit storage definition.
             if (!create.storage)
             {
+                check_access_to_inherited_definition(*as_create.as_table_function);
                 create.set(create.as_table_function, as_create.as_table_function->ptr());
                 return;
             }
@@ -1502,10 +1521,50 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
         {
             storage_def = boost::static_pointer_cast<ASTStorage>(as_create.storage->ptr());
             create.is_time_series_table = as_create.is_time_series_table;
+
+            /// normalizeTimeSeriesDefinition copies the settings and the inner engines of the source,
+            /// and this query inherits each one it does not give itself
+            if (as_create.is_time_series_table && as_create.storage->settings
+                && !(create.storage && create.storage->settings))
+                check_access_to_inherited_definition(*as_create.storage->settings);
+            if (as_create.is_time_series_table && as_create.targets)
+                for (const auto & target : as_create.targets->targets)
+                    if (target.inner_engine && !create.getTargetInnerEngine(target.kind))
+                        check_access_to_inherited_definition(*target.inner_engine);
         }
         else
         {
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot set engine, it's a bug.");
+        }
+
+        if (storage_def)
+        {
+            /// check what the server stores: settings in this query replace the source settings, and
+            /// Null can replace an external engine
+            auto inherited = boost::static_pointer_cast<ASTStorage>(storage_def->clone());
+            if (create.storage)
+            {
+                /// inheritStorageFromSource keeps the clauses this query gives, so drop them here too
+                if (create.storage->partition_by)
+                    inherited->reset(inherited->partition_by);
+                if (create.storage->primary_key)
+                    inherited->reset(inherited->primary_key);
+                if (create.storage->order_by)
+                    inherited->reset(inherited->order_by);
+                if (create.storage->sample_by)
+                    inherited->reset(inherited->sample_by);
+                if (create.storage->ttl_table)
+                    inherited->reset(inherited->ttl_table);
+                if (create.storage->unique_key)
+                    inherited->reset(inherited->unique_key);
+                if (inherited->settings && create.storage->settings)
+                    for (const auto & change : create.storage->settings->changes)
+                        inherited->settings->changes.removeSetting(change.name);
+            }
+            replaceExternalEngineWithNullIfNeeded(
+                *inherited, getContext()->getSettingsRef()[Setting::restore_replace_external_engines_to_null]);
+
+            check_access_to_inherited_definition(*inherited);
         }
     }
 
@@ -1666,6 +1725,16 @@ bool isReplicated(const ASTStorage & storage)
         return false;
     const auto & storage_name = storage.engine->name;
     return storage_name.starts_with("Replicated") || storage_name.starts_with("Shared");
+}
+
+/// The drop privilege matching the kind of an existing table.
+AccessType getDropAccessType(const IStorage & table)
+{
+    if (table.isView())
+        return AccessType::DROP_VIEW;
+    if (table.isDictionary())
+        return AccessType::DROP_DICTIONARY;
+    return AccessType::DROP_TABLE;
 }
 
 }
@@ -2442,7 +2511,7 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
 
     if (!create.attach && getContext()->getSettingsRef()[Setting::database_replicated_allow_only_replicated_engine])
     {
-        bool is_replicated_storage = typeid_cast<const StorageReplicatedMergeTree *>(res.get()) != nullptr;
+        bool is_replicated_storage = castStorage<StorageReplicatedMergeTree>(res, DeferredTable::Skip) != nullptr;
         if (!is_replicated_storage && res->storesDataOnDisk() && database && database->getEngineName() == "Replicated")
             throw Exception(ErrorCodes::UNKNOWN_STORAGE,
                             "Only tables with a Replicated engine "
@@ -2454,7 +2523,9 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
                         "ATTACH ... FROM ... query is not supported for {} table engine, "
                         "because such tables do not store any data on disk. Use CREATE instead.", res->getName());
 
-    auto * replicated_storage = typeid_cast<StorageReplicatedMergeTree *>(res.get());
+    /// `res` is the storage this query just built, and for a table function it is a proxy that
+    /// resolving would run during CREATE.
+    auto * replicated_storage = castStorage<StorageReplicatedMergeTree>(res, DeferredTable::Skip).get();
     if (replicated_storage)
     {
         const auto probability = getContext()->getSettingsRef()[Setting::create_replicated_merge_tree_fault_injection_probability];
@@ -2840,12 +2911,7 @@ BlockIO InterpreterCreateQuery::doCreateOrReplaceTable(ASTCreateQuery & create,
                 {
                     /// The replaced table is dropped after the swap, under an internal temporary name that
                     /// grants cannot cover, so check the drop privilege for its kind here, on its real name.
-                    AccessType drop_access = AccessType::DROP_TABLE;
-                    if (to_drop->isView())
-                        drop_access = AccessType::DROP_VIEW;
-                    else if (to_drop->isDictionary())
-                        drop_access = AccessType::DROP_DICTIONARY;
-                    current_context->checkAccess(drop_access, to_drop_id);
+                    current_context->checkAccess(getDropAccessType(*to_drop), to_drop_id);
                     to_drop->checkTableSizeBelowDropLimit(current_context);
                 }
             });
@@ -3095,7 +3161,8 @@ StoragePtr InterpreterCreateQuery::getValidatedAtomicPopulateSource(const ASTCre
     if (context->hasQueryContext())
         context->getQueryContext()->dropStorageCacheEntry(*ref_dependencies.mv_from_dependency);
 
-    auto source = DatabaseCatalog::instance().tryGetTable(*ref_dependencies.mv_from_dependency, context);
+    auto source = resolveStorageProxyLoading(
+        DatabaseCatalog::instance().tryGetTable(*ref_dependencies.mv_from_dependency, context));
 
     /// The view's SELECT was validated against the source before the view was published, so the source
     /// existed then; not finding it now means it was dropped, renamed or exchanged away in the window
@@ -3451,6 +3518,32 @@ BlockIO InterpreterCreateQuery::execute()
                 && create.storage->engine->name == "Backup" && create.storage->engine->arguments)
                 DatabaseBackup::parseAndAuthorizeLocator(create.storage->engine->arguments->children, getContext());
 
+            /// this branch returns before setEngine, and the worker builds AS src with no user, so
+            /// check the inherited definition here, on a copy of the query
+            if (!create.as_table.empty())
+            {
+                /// a worker resolves a name without a database in its own database, so set ours, as
+                /// the UUIDs above do
+                create.as_database = getContext()->resolveDatabase(create.as_database);
+
+                /// OLDEST_VERSION sends no settings, so a worker replaces nothing with Null. check
+                /// what the worker builds, not what our settings give
+                auto preflight_context = Context::createCopy(getContext());
+                if (on_cluster_version == DDLLogEntry::OLDEST_VERSION)
+                {
+                    preflight_context->setSetting("restore_replace_external_engines_to_null", false);
+                    preflight_context->setSetting("restore_replace_external_table_functions_to_null", false);
+                }
+
+                ASTPtr inherited_query = query_ptr->clone();
+                auto & inherited = inherited_query->as<ASTCreateQuery &>();
+                InterpreterCreateQuery(inherited_query, preflight_context).setEngine(inherited);
+
+                /// getRequiredAccess sees no engine, because this query holds none of its own
+                if (inherited.storage && inherited.storage->engine)
+                    getContext()->checkAccess(AccessType::TABLE_ENGINE, inherited.storage->engine->name);
+            }
+
             return executeQueryOnCluster(create);
         }
     }
@@ -3508,6 +3601,16 @@ AccessRightsElements InterpreterCreateQuery::getRequiredAccess() const
                 required_access.emplace_back(AccessType::DROP_TABLE, create.getDatabase(), create.getTable());
             required_access.emplace_back(AccessType::CREATE_TABLE, create.getDatabase(), create.getTable());
         }
+    }
+
+    /// Replicated and ON CLUSTER replays run with full access, so the drop privilege for the replaced
+    /// table's kind must be required here, on its real name, while the query still runs as the user.
+    if ((create.replace_table || create.create_or_replace || create.replace_view) && !create.isTemporary())
+    {
+        String database_name = getContext()->resolveDatabase(create.getDatabase());
+        if (auto database = DatabaseCatalog::instance().tryGetDatabase(database_name))
+            if (auto table = database->tryGetTable(create.getTable(), getContext()))
+                required_access.emplace_back(getDropAccessType(*table), database_name, create.getTable());
     }
 
     if (create.targets)
