@@ -843,7 +843,7 @@ MountClaimResult claimMount(
     /// clean-marked, not (yet) proven-dead, not unsafe-authorized lease may simply be a live twin, and
     /// `expires_at_ms` alone can never distinguish that from a dead predecessor across two different
     /// clocks.
-    const bool clean_marker = existing.isFarewell();
+    const bool clean_marker = existing.isCleanRelease();
     const bool proven_dead = proven_dead_incarnation && *proven_dead_incarnation == got->etag;
     const bool unsafe_authorized = unsafe_reclaim_authorization && *unsafe_reclaim_authorization == got->etag;
     if (existing.gc_fenced || clean_marker || proven_dead || unsafe_authorized)
@@ -894,7 +894,7 @@ void fenceOwnClaim(CasOperation & op, const Layout & l, const String & srid, UIn
             if (!observed)
                 return std::nullopt;
             const MountLease body = decodeMountLease(observed->bytes);
-            if (!body.isHeldBy(our_uuid, our_epoch) || body.gc_fenced || body.isFarewell())
+            if (!body.isHeldBy(our_uuid, our_epoch) || body.gc_fenced || body.isCleanRelease())
                 return std::nullopt;
             return encodeMountLease(body.fencedCopy());
         },
@@ -1147,7 +1147,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                     obs.erase(srid);   /// terminal — no further observation needed
                     return std::nullopt;
                 }
-                if (m.isFarewell())
+                if (m.isCleanRelease())
                 {
                     ++floor.terminated;
                     obs.erase(srid);   /// terminal — no further observation needed
@@ -1246,7 +1246,7 @@ std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(CasOperation & op, 
             return true;
         }
 
-        if (m.gc_fenced || m.isFarewell())
+        if (m.gc_fenced || m.isCleanRelease())
             return true;   /// terminal: fenced out by GC, or the holder's own graceful farewell.
 
         slots.push_back(NonTerminalMountSlot{srid, fmt::format(
@@ -1288,7 +1288,7 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
         }
         if (info.lease.gc_fenced)
             info.state = "fenced";
-        else if (info.lease.isFarewell())
+        else if (info.lease.isCleanRelease())
             info.state = "terminated";
         else if (now_ms <= info.lease.expires_at_ms + skew_margin_ms)
             info.state = "live";
@@ -1318,7 +1318,7 @@ FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fen
 {
     if (lease.gc_fenced)
         return FenceCertificate::GcFenced;
-    if (lease.isFarewell())
+    if (lease.isCleanRelease())
         return FenceCertificate::CleanFarewell;
     if (lease.writer_epoch != fence_writer_epoch)
         return FenceCertificate::SupersededEpoch;

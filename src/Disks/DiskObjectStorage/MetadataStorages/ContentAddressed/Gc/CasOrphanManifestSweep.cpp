@@ -546,7 +546,7 @@ bool prefixEligibleUnder(const std::optional<MountLease> & floor, const BuildPre
         return true;
     if (prefix.writer_epoch > w.writer_epoch)
         return false;
-    if (w.isFarewell())
+    if (w.isCleanRelease())
         return true;   /// farewell/retired sentinel: every seq is retired
     return w.min_active_build_sequence > prefix.build_sequence;
 }
