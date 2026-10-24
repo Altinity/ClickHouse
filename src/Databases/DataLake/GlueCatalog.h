@@ -119,6 +119,12 @@ public:
         const String & column_name,
         const String & glue_column_type);
 
+    using FieldTypes = std::unordered_map<String, String>;
+
+    static FieldTypes getCurrentSchemaFieldTypes(const Poco::JSON::Object::Ptr & metadata_object);
+
+    static String resolveTimestampType(const FieldTypes & field_types, const String & column_name, const String & glue_column_type);
+
 private:
     struct AuthenticatedClient
     {
@@ -135,6 +141,11 @@ private:
     mutable DB::CacheBase<String, AuthenticatedClient> user_clients;
 
     AuthenticatedClient getClient(const DB::ForwardedAuthTokenPtr & auth_token) const;
+
+    struct FieldTypesWeightFunction
+    {
+        size_t operator()(const FieldTypes & field_types) const;
+    };
 
     const LoggerPtr log;
     std::string region;
@@ -188,6 +199,7 @@ private:
         const std::vector<Aws::Glue::Model::Column> & columns = {}) const;
 
     mutable DB::CacheBase<String, Poco::JSON::Object::Ptr> metadata_objects;
+    mutable DB::CacheBase<String, FieldTypes, std::hash<String>, FieldTypesWeightFunction> current_schema_field_types;
 };
 
 }

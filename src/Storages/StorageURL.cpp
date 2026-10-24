@@ -50,6 +50,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/thread_local_rng.h>
 #include <Common/logger_useful.h>
+#include <Common/maskURIPassword.h>
 
 #include <TableFunctions/TableFunctionURL.h>
 
@@ -269,7 +270,7 @@ IStorageURLBase::IStorageURLBase(
 
 namespace
 {
-    HTTPHeaderEntries getHeaders(const HTTPHeaderEntries & headers_)
+    HTTPHeaderEntries getHeaders(const HTTPHeaderEntries & headers_, const ContextPtr & context)
     {
         HTTPHeaderEntries headers(headers_.begin(), headers_.end());
 
@@ -277,12 +278,12 @@ namespace
         const auto & current_trace_context = OpenTelemetry::CurrentContext();
         if (current_trace_context.isTraceEnabled())
         {
-            headers.emplace_back("traceparent", current_trace_context.composeTraceparentHeader());
-
+            /// The user headers are checked in the `StorageURL` constructor; `tracestate` comes from the client as is.
+            HTTPHeaderEntries trace_headers{{"traceparent", current_trace_context.composeTraceparentHeader()}};
             if (!current_trace_context.tracestate.empty())
-            {
-                headers.emplace_back("tracestate", current_trace_context.tracestate);
-            }
+                trace_headers.emplace_back("tracestate", current_trace_context.tracestate);
+            context->getHTTPHeaderFilter().checkAndNormalizeHeaders(trace_headers);
+            headers.insert(headers.end(), trace_headers.begin(), trace_headers.end());
         }
 
         return headers;
@@ -387,7 +388,7 @@ StorageURLSource::StorageURLSource(
     , format_settings(format_settings_)
     , parser_shared_resources(std::move(parser_shared_resources_))
     , format_filter_info(std::move(format_filter_info_))
-    , headers(getHeaders(headers_))
+    , headers(getHeaders(headers_, context_))
     , need_only_count(need_only_count_)
     , storage_id(std::move(storage_id_))
     , hive_partition_columns_to_read_from_file_path(info.hive_partition_columns_to_read_from_file_path)
@@ -996,7 +997,14 @@ namespace
             format = format_name;
         }
 
-        String getLastFilePath() const override { return current_url_option; }
+        String getLastFilePath() const override
+        {
+            /// `current_url_option` is kept raw for requests and schema cache keys, but the diagnostic
+            /// path can reach the client, server log and `system.query_log`, so mask credentials here.
+            String masked = current_url_option;
+            maskURICredentials(masked);
+            return masked;
+        }
 
         bool supportsLastReadBufferRecreation() const override { return true; }
 
@@ -2197,11 +2205,16 @@ void StorageURL::overrideURLInEngineArgs(ASTs & args, const String & resolved_ur
 StorageURL::Configuration StorageURL::getConfiguration(ASTs & args, const ContextPtr & local_context, const StorageID * table_id)
 {
     StorageURL::Configuration configuration;
+    const auto & url_base = local_context->getSettingsRef()[Setting::url_base].value;
 
     if (auto named_collection = tryGetNamedCollectionWithOverrides(args, local_context, true, nullptr, table_id))
     {
         StorageURL::processNamedCollectionResult(configuration, *named_collection);
         evalArgsAndCollectHeaders(args, configuration.headers, local_context, false);
+
+        /// Resolving the stored `url` against `url_base` replaces it, which could send the stored credentials to another host.
+        if (resolveURLBase(configuration.url, url_base) != configuration.url)
+            checkNamedCollectionOverride(*named_collection, "url", local_context);
     }
     else
     {
@@ -2221,7 +2234,6 @@ StorageURL::Configuration StorageURL::getConfiguration(ASTs & args, const Contex
     /// For the URL engine, the resolved URL is later materialized into the engine args
     /// AST by `addInferredEngineArgsToCreateQuery`, so DETACH/ATTACH and server restart
     /// reproduce the originally-resolved URL even if `url_base` is later changed or unset.
-    const auto & url_base = local_context->getSettingsRef()[Setting::url_base].value;
     configuration.url = resolveURLBase(configuration.url, url_base);
 
     if (configuration.format == "auto")
