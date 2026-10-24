@@ -44,6 +44,8 @@
 #include <aws/s3/model/Tag.h>
 #include <aws/s3/model/Tagging.h>
 
+#include <unordered_set>
+
 namespace ProfileEvents
 {
     extern const Event S3ListObjects;
@@ -620,6 +622,147 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatches(
     return refreshAndRetryOnExpiredCredentials(
         [&] { return removeObjectIfTokenMatchesImpl(
             object, etag, clientForRetryProfile(request), request.attempt_number); });
+}
+
+std::vector<ConditionalRemoveResult> S3ObjectStorage::removeObjectsIfTokensMatch(
+    const std::vector<ConditionalRemoveObject> & objects, const ObjectStorageControlRequest & request)
+{
+    if (objects.empty())
+        return {};
+    if (objects.size() == 1)
+        return {removeObjectIfTokenMatches(objects.front().object, objects.front().expected_token, request)};
+
+    std::vector<Aws::S3::Model::ObjectIdentifier> identifiers;
+    identifiers.reserve(objects.size());
+    for (const ConditionalRemoveObject & object : objects)
+    {
+        Aws::S3::Model::ObjectIdentifier identifier;
+        identifier.SetKey(object.object.remote_path);
+        identifier.SetETag(object.expected_token);
+        identifiers.push_back(std::move(identifier));
+    }
+    Aws::S3::Model::Delete delete_request;
+    delete_request.SetObjects(std::move(identifiers));
+    delete_request.SetQuiet(false);
+    S3::DeleteObjectsRequest request_s3;
+    request_s3.SetBucket(uri.bucket);
+    request_s3.SetDelete(std::move(delete_request));
+    if (request.attempt_number != 0)
+        S3::setClickhouseAttemptNumber(request_s3, request.attempt_number);
+    auto blob_storage_log = BlobStorageLogWriter::create(disk_name);
+    const auto log_object = [&](const StoredObject & object, Int32 error_code, const String & error_message)
+    {
+        if (blob_storage_log)
+            blob_storage_log->addEvent(
+                BlobStorageLogElement::EventType::Delete,
+                uri.bucket,
+                object.remote_path,
+                object.local_path,
+                object.bytes_size,
+                0,
+                error_code,
+                error_message);
+    };
+    const auto log_all = [&](Int32 error_code, const String & error_message)
+    {
+        for (const auto & object : objects)
+            log_object(object.object, error_code, error_message);
+    };
+    const auto outcome = refreshAndRetryOnExpiredCredentials([&]
+    {
+        ProfileEvents::increment(ProfileEvents::DiskS3DeleteObjects);
+        auto current_outcome = clientForRetryProfile(request)->DeleteObjects(request_s3);
+        if (!current_outcome.IsSuccess())
+        {
+            const auto & error = current_outcome.GetError();
+            log_all(static_cast<Int32>(error.GetErrorType()), error.GetMessage());
+            if (error.GetExceptionName() == "InvalidRequest" || error.GetExceptionName() == "InvalidArgument"
+                || error.GetExceptionName() == "NotImplemented")
+            {
+                s3_capabilities.setIsBatchDeleteSupported(false);
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED, "{} does not support DeleteObjects", getName());
+            }
+            throw S3Exception(
+                PreformattedMessage::create("{} while conditionally removing objects from S3", error.GetMessage()),
+                error.GetErrorType(), error.GetExceptionName());
+        }
+        return current_outcome;
+    });
+    s3_capabilities.setIsBatchDeleteSupported(true);
+
+    std::unordered_set<String> expected_keys;
+    expected_keys.reserve(objects.size());
+    for (const ConditionalRemoveObject & object : objects)
+        expected_keys.insert(object.object.remote_path);
+
+    std::unordered_set<String> response_keys;
+    response_keys.reserve(objects.size());
+    for (const auto & deleted : outcome.GetResult().GetDeleted())
+    {
+        const String key = deleted.GetKey();
+        if (!expected_keys.contains(key) || !response_keys.insert(key).second)
+        {
+            log_all(static_cast<Int32>(Aws::S3::S3Errors::UNKNOWN), "DeleteObjects response has unexpected or duplicate keys");
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "S3 conditional DeleteObjects response has unexpected or duplicate key {}", key);
+        }
+    }
+    for (const auto & error : outcome.GetResult().GetErrors())
+    {
+        const String key = error.GetKey();
+        if (!expected_keys.contains(key) || !response_keys.insert(key).second)
+        {
+            log_all(static_cast<Int32>(Aws::S3::S3Errors::UNKNOWN), "DeleteObjects response has unexpected or duplicate keys");
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "S3 conditional DeleteObjects response has unexpected or duplicate key {}", key);
+        }
+    }
+    if (response_keys.size() != objects.size())
+    {
+        log_all(static_cast<Int32>(Aws::S3::S3Errors::UNKNOWN), "DeleteObjects response omitted keys");
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "S3 conditional DeleteObjects response omitted keys");
+    }
+
+    std::vector<ConditionalRemoveResult> results;
+    results.reserve(objects.size());
+    std::optional<Aws::S3::S3Errors> first_error_code;
+    String first_error_name;
+    String first_error_message;
+    String first_error_key;
+    for (const ConditionalRemoveObject & object : objects)
+    {
+        const auto deleted = std::find_if(outcome.GetResult().GetDeleted().begin(), outcome.GetResult().GetDeleted().end(),
+            [&](const auto & entry) { return entry.GetKey() == object.object.remote_path; });
+        if (deleted != outcome.GetResult().GetDeleted().end())
+        {
+            log_object(object.object, 0, "");
+            results.push_back({ConditionalRemoveOutcome::Removed, deleted->GetDeleteMarker()});
+            continue;
+        }
+        const auto error = std::find_if(outcome.GetResult().GetErrors().begin(), outcome.GetResult().GetErrors().end(),
+            [&](const auto & entry) { return entry.GetKey() == object.object.remote_path; });
+        if (error == outcome.GetResult().GetErrors().end())
+        {
+            log_all(static_cast<Int32>(Aws::S3::S3Errors::UNKNOWN), "DeleteObjects response omitted keys");
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "S3 conditional DeleteObjects response omitted key {}", object.object.remote_path);
+        }
+        const auto code = classifyDeleteObjectsErrorCode(error->GetCode());
+        log_object(object.object, static_cast<Int32>(code), error->GetMessage());
+        if (error->GetCode() == "PreconditionFailed")
+            results.push_back({ConditionalRemoveOutcome::TokenMismatch, false});
+        else if (error->GetCode() == "NoSuchKey")
+            results.push_back({ConditionalRemoveOutcome::NotFound, false});
+        else if (!first_error_code)
+        {
+            first_error_code = code;
+            first_error_name = error->GetCode();
+            first_error_message = error->GetMessage();
+            first_error_key = error->GetKey();
+        }
+    }
+    if (first_error_code)
+        throw S3Exception(
+            PreformattedMessage::create("{} while conditionally removing object {} from S3", first_error_message, first_error_key),
+            *first_error_code, first_error_name);
+    return results;
 }
 
 ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatchesImpl(

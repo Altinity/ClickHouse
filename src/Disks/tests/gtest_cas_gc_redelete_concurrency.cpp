@@ -82,6 +82,15 @@ public:
         return InMemoryBackend::remove(key, expected_value, access);
     }
 
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        for (const RawConditionalRemove & removal : removals)
+            if (takeFault(remove_keys, removal.key))
+                throw std::runtime_error("injected worker remove fault for key " + removal.key);
+        return InMemoryBackend::removeManyByConditional(removals, access);
+    }
+
     std::optional<RawMeta> head(const String & key, TransportAccess & access) override
     {
         if (takeFault(head_keys, key))
@@ -165,6 +174,16 @@ public:
         return result;
     }
 
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        std::vector<RawRemoval> results;
+        results.reserve(removals.size());
+        for (const RawConditionalRemove & removal : removals)
+            results.push_back(remove(removal.key, removal.expected_token, access));
+        return results;
+    }
+
 private:
     std::set<String> blob_keys;
     size_t k_overlap = 1;
@@ -184,7 +203,8 @@ PoolPtr openPoolWithIoConcurrency(
     uint64_t gc_shards = 1,
     uint64_t outcome_entry_budget = 0,
     CasEventSink event_sink = {},
-    std::optional<size_t> refuse_at_for_test = std::nullopt)
+    std::optional<size_t> refuse_at_for_test = std::nullopt,
+    uint64_t gc_bulk_delete_chunk_keys = kBulkDeleteMaxKeys)
 {
     PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.gc_io_concurrency = concurrency;
@@ -192,6 +212,8 @@ PoolPtr openPoolWithIoConcurrency(
     config.gc_round_outcome_entry_budget = outcome_entry_budget;
     config.event_sink = std::move(event_sink);
     config.gc_io_pool_refuse_at_for_test = refuse_at_for_test;
+    config.gc_bulk_delete_chunk_keys = gc_bulk_delete_chunk_keys;
+    config.skip_access_check = true;
     return Pool::open(std::move(backend), std::move(config));
 }
 
@@ -362,6 +384,46 @@ TEST(CASGCRedeleteConcurrency, ParallelRedeleteReclaimsEveryBlob)
     EXPECT_EQ(rows->total("jobs_failed"), 0u);
 }
 
+TEST(CASGCRedeleteConcurrency, ConditionalDeleteBatchesAreRecorded)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, std::nullopt, 2);
+    Gc gc(store, kGc);
+    publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kReplacedBlob));
+
+    auto rows = std::make_shared<PendingDeletesRows>();
+    gc.setPhaseSink(recordPendingDeletes(rows));
+    const RoundReport rep = runRegularRoundReclaiming(gc);
+    store->renewWatermarkOnce();
+
+    EXPECT_EQ(rep.deleted, kBlobs);
+    ASSERT_EQ(rows->rows.size(), 1u);
+    EXPECT_EQ(rows->total("delete_batches"), 3u);
+}
+
+TEST(CASGCRedeleteConcurrency, DeleteWaveEnqueueRefusalWaitsForSubmittedChunks)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    backend->pinConditionalBatchDeleteSupport(true);
+    auto store = openPoolWithIoConcurrency(backend, 4, 1, 0, {}, kBlobs + 1, 2);
+    Gc gc(store, kGc);
+    publishThenDrop(*backend, store, gc);
+    ASSERT_NO_FATAL_FAILURE(driveUntilAllGraduated(*backend, gc, store, kReplacedBlob));
+
+    RoundReport progress;
+    EXPECT_THROW(
+        gc.runRegularRound({}, /*allow_steal*/ true, UniversePolicy::Authoritative, &progress),
+        DB::Exception);
+    store->renewWatermarkOnce();
+
+    EXPECT_EQ(progress.redeleted, 2u);
+    EXPECT_EQ(progress.redelete_failed, 1u);
+    EXPECT_EQ(runRegularRoundReclaiming(gc).redeleted, kBlobs);
+    EXPECT_TRUE(allBlobsAbsent(*backend, *store));
+}
+
 TEST(CASGCRedeleteConcurrency, BlobDeletesActuallyOverlap)
 {
     auto backend = std::make_shared<BlobRemoveWitnessBackend>();
@@ -521,6 +583,21 @@ public:
 
     RawRemoval remove(const String & key, const String & expected_value, TransportAccess & access) override
     {
+        injectReplacement(key, access);
+        return InMemoryBackend::remove(key, expected_value, access);
+    }
+
+    std::vector<RawRemoval> removeManyByConditional(
+        const std::vector<RawConditionalRemove> & removals, TransportAccess & access) override
+    {
+        for (const RawConditionalRemove & removal : removals)
+            injectReplacement(removal.key, access);
+        return InMemoryBackend::removeManyByConditional(removals, access);
+    }
+
+private:
+    void injectReplacement(const String & key, TransportAccess & access)
+    {
         if (armed.load() && key == raced_key && armed.exchange(false))
         {
             raced_on_worker.store(std::this_thread::get_id() != owner);
@@ -528,10 +605,8 @@ public:
             if (current)
                 replacement_committed.store(InMemoryBackend::write(key, current->bytes, current->value, access).has_value());
         }
-        return InMemoryBackend::remove(key, expected_value, access);
     }
 
-private:
     String raced_key;
     std::thread::id owner;
     std::atomic<bool> armed{false};
@@ -707,11 +782,11 @@ void expectBodiesPresentOnlyFor(Backend & backend, const Pool & store, const std
         EXPECT_EQ(blobAbsent(backend, store.layout(), blobHash(b)), !present.contains(b)) << "blob " << b;
 }
 
-struct ApplyHookState
+struct RecordHookState
 {
     std::atomic<bool> armed{false};
     BlobRef target{};
-    size_t applied = 0;
+    size_t recorded = 0;
 };
 
 }
@@ -990,22 +1065,22 @@ TEST(CASGCRedeleteConcurrency, ShardedPoolDeletesEveryShard)
     EXPECT_EQ(shards_with_rows, expected_shards);
 }
 
-TEST(CASGCRedeleteConcurrency, ApplyPhaseFaultLeavesEveryEntryForTheNextRound)
+TEST(CASGCRedeleteConcurrency, RecordPhaseFaultLeavesEveryEntryForTheNextRound)
 {
-    auto state = std::make_shared<ApplyHookState>();
+    auto state = std::make_shared<RecordHookState>();
     auto backend = std::make_shared<InMemoryBackend>();
     PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.gc_io_concurrency = 4;
-    config.gc_redelete_apply_hook_for_test = [state](const BlobRef & ref)
+    config.gc_redelete_record_hook_for_test = [state](const BlobRef & ref)
     {
         if (!state->armed.load())
             return;
         if (ref == state->target)
         {
             state->armed.store(false);
-            throw std::runtime_error("injected apply fault");
+            throw std::runtime_error("injected record fault");
         }
-        ++state->applied;
+        ++state->recorded;
     };
     auto store = Pool::open(backend, std::move(config));
     Gc gc(store, kGc);
@@ -1027,10 +1102,10 @@ TEST(CASGCRedeleteConcurrency, ApplyPhaseFaultLeavesEveryEntryForTheNextRound)
     }
     store->renewWatermarkOnce();
 
-    EXPECT_NE(message.find("injected apply fault"), String::npos) << message;
-    EXPECT_EQ(progress.redeleted, state->applied);
-    EXPECT_EQ(failedCounter() - failed_before, 0u) << "a failed apply is not a failed delete";
-    EXPECT_TRUE(allBlobsAbsent(*backend, *store)) << "every delete finished before the apply walk started";
+    EXPECT_NE(message.find("injected record fault"), String::npos) << message;
+    EXPECT_EQ(progress.redeleted, state->recorded);
+    EXPECT_EQ(failedCounter() - failed_before, 0u) << "a failed record is not a failed delete";
+    EXPECT_TRUE(allBlobsAbsent(*backend, *store)) << "every delete finished before the record walk started";
 
     const RoundReport next = runRegularRoundReclaiming(gc);
     EXPECT_EQ(next.redeleted, kBlobs);
@@ -1163,4 +1238,90 @@ TEST(CASGCRedeleteConcurrency, RoundsWithoutRedeletesWriteNoOutcomeLog)
     for (const auto & [key, rows] : logs)
         ADD_FAILURE() << "a round without redeletes or spares wrote the outcome log " << key << " with " << rows.size() << " row(s)";
     EXPECT_TRUE(logs.empty());
+}
+
+namespace
+{
+
+Gc::RedeleteBlobState liveRedeleteBlobState(CasOperation & op, const String & key)
+{
+    Gc::RedeleteBlobState redelete_blob_state;
+    redelete_blob_state.blob_key = key;
+    redelete_blob_state.live_token = std::get<Committed>(op.create(key, "v", Retry::once())).etag;
+    return redelete_blob_state;
+}
+
+Gc::RedeleteBlobState settledRedeleteBlobState(const String & key, Removal removal)
+{
+    Gc::RedeleteBlobState redelete_blob_state;
+    redelete_blob_state.blob_key = key;
+    redelete_blob_state.removal = removal;
+    return redelete_blob_state;
+}
+
+std::vector<std::vector<size_t>> chunkIndices(const std::vector<Gc::ConditionalDeleteChunk> & chunks)
+{
+    std::vector<std::vector<size_t>> indices;
+    for (const auto & chunk : chunks)
+        indices.push_back(chunk.indices);
+    return indices;
+}
+
+}
+
+TEST(CASGCConditionalDeleteChunks, OnlyLiveTokensWithoutErrorsAreChunked)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    OperationForTest op(backend);
+    std::vector<Gc::RedeleteBlobState> redelete_blob_states;
+    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "a"));
+    redelete_blob_states.push_back(settledRedeleteBlobState("gone", Removal::Gone));
+    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "b"));
+    redelete_blob_states.push_back(settledRedeleteBlobState("replaced", Removal::Mismatch));
+    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "failed"));
+    redelete_blob_states.back().error = std::make_exception_ptr(std::runtime_error("head failed"));
+    redelete_blob_states.emplace_back();
+    redelete_blob_states.push_back(liveRedeleteBlobState(*op, "c"));
+
+    const auto chunks = Gc::prepareConditionalDeleteChunks(redelete_blob_states, 10);
+
+    ASSERT_EQ(chunkIndices(chunks), (std::vector<std::vector<size_t>>{{0, 2, 6}}));
+    const auto & removals = chunks.front().removals;
+    ASSERT_EQ(removals.size(), 3u);
+    for (size_t pos = 0; pos < removals.size(); ++pos)
+    {
+        const auto & redelete_blob_state = redelete_blob_states[chunks.front().indices[pos]];
+        EXPECT_EQ(removals[pos].key, redelete_blob_state.blob_key);
+        EXPECT_EQ(removals[pos].expected_token, *redelete_blob_state.live_token);
+    }
+}
+
+TEST(CASGCConditionalDeleteChunks, ChunksAreBoundedByChunkKeys)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    OperationForTest op(backend);
+    std::vector<Gc::RedeleteBlobState> redelete_blob_states;
+    for (const String key : {"a", "b", "c", "d", "e"})
+        redelete_blob_states.push_back(liveRedeleteBlobState(*op, key));
+
+    EXPECT_EQ(
+        chunkIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 2)),
+        (std::vector<std::vector<size_t>>{{0, 1}, {2, 3}, {4}}));
+    EXPECT_EQ(
+        chunkIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 1)),
+        (std::vector<std::vector<size_t>>{{0}, {1}, {2}, {3}, {4}}));
+    EXPECT_EQ(
+        chunkIndices(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 5)),
+        (std::vector<std::vector<size_t>>{{0, 1, 2, 3, 4}}));
+}
+
+TEST(CASGCConditionalDeleteChunks, NothingEligibleGivesNoChunks)
+{
+    std::vector<Gc::RedeleteBlobState> redelete_blob_states;
+    redelete_blob_states.push_back(settledRedeleteBlobState("gone", Removal::Gone));
+    redelete_blob_states.push_back(settledRedeleteBlobState("replaced", Removal::Mismatch));
+    redelete_blob_states.emplace_back();
+
+    EXPECT_TRUE(Gc::prepareConditionalDeleteChunks(redelete_blob_states, 2).empty());
+    EXPECT_TRUE(Gc::prepareConditionalDeleteChunks({}, 2).empty());
 }

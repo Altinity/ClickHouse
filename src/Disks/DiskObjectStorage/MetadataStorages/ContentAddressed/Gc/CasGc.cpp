@@ -574,29 +574,57 @@ size_t Gc::bulkDeleteChunkKeys() const
     return std::clamp<size_t>(std::min(configured, storage_limit), 1, kBulkDeleteMaxKeys);
 }
 
-Gc::RedeleteIo Gc::performRedeleteIo(const RetiredEntry & entry, const Layout & layout, CasOperation & op)
+size_t Gc::conditionalDeleteChunkKeys() const
 {
-    RedeleteIo io;
-    io.blob_key = layout.blobKey(entry.ref);
+    const uint64_t configured = store->poolConfig().gc_bulk_delete_chunk_keys;
+    const uint64_t storage_limit = store->poolBackendPtr()->conditionalBatchDeleteKeyLimit();
+    return std::clamp<size_t>(std::min(configured, storage_limit), 1, kBulkDeleteMaxKeys);
+}
+
+void Gc::observeRetiredBlob(
+    const RetiredEntry & entry, const Layout & layout, CasOperation & op, RedeleteBlobState & redelete_blob_state)
+{
+    redelete_blob_state.blob_key = layout.blobKey(entry.ref);
     /// The condemned incarnation is a PERSISTED pair and cannot itself be a precondition, so
     /// the round observes the blob and compares the two renderings. Observing first also
     /// settles the absent case without spending a conditional delete against a key that is
     /// already gone.
-    const std::optional<Meta> observed = op.head(io.blob_key, Retry::standard());
-    if (observed)
-        io.del = entry.token.matches(observed->etag) ? op.remove(io.blob_key, observed->etag, Retry::standard()) : Removal::Mismatch;
-    return io;
+    const std::optional<Meta> observed = op.head(redelete_blob_state.blob_key, Retry::standard());
+    if (!observed)
+        redelete_blob_state.removal = Removal::Gone;
+    else if (entry.token.matches(observed->etag))
+        redelete_blob_state.live_token = observed->etag;
+    else
+        redelete_blob_state.removal = Removal::Mismatch;
 }
 
-void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteIo & io)
+std::vector<Gc::ConditionalDeleteChunk> Gc::prepareConditionalDeleteChunks(
+    const std::vector<RedeleteBlobState> & redelete_blob_states, size_t chunk_keys)
 {
-    if (const auto & hook = store->poolConfig().gc_redelete_apply_hook_for_test)
+    std::vector<ConditionalDeleteChunk> chunks;
+    for (size_t i = 0; i < redelete_blob_states.size(); ++i)
+    {
+        const RedeleteBlobState & redelete_blob_state = redelete_blob_states[i];
+        if (redelete_blob_state.error || !redelete_blob_state.live_token)
+            continue;
+        if (chunks.empty() || chunks.back().indices.size() == chunk_keys)
+            chunks.emplace_back();
+        chunks.back().indices.push_back(i);
+        chunks.back().removals.push_back({redelete_blob_state.blob_key, *redelete_blob_state.live_token});
+    }
+    return chunks;
+}
+
+void Gc::recordRedeleteSuccess(RedeleteRoundContext & ctx, const RetiredEntry & entry, const RedeleteBlobState & redelete_blob_state)
+{
+    if (const auto & hook = store->poolConfig().gc_redelete_record_hook_for_test)
         hook(entry.ref);
-    const OutcomeKind outcome_kind = io.del == Removal::Removed ? OutcomeKind::Deleted
-        : io.del == Removal::Gone                               ? OutcomeKind::Absent
-                                                                : OutcomeKind::Replaced;
+    const Removal removal = *redelete_blob_state.removal;
+    const OutcomeKind outcome_kind = removal == Removal::Removed ? OutcomeKind::Deleted
+        : removal == Removal::Gone                               ? OutcomeKind::Absent
+                                                                 : OutcomeKind::Replaced;
     OutcomeEntry outcome{.kind = entry.kind, .ref = entry.ref, .token = entry.token, .outcome = outcome_kind};
-    const String del_outcome{removalName(io.del)};
+    const String removal_outcome{removalName(removal)};
     /// The single content-delete site is attributable per row. A mismatch (a writer recreated
     /// the incarnation) is terminal-OK: the fresh incarnation is a live object.
     EventEmitter{*store}.emit(
@@ -608,11 +636,11 @@ void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & e
             e.token = renderIncarnation(entry.token);
             e.round = ctx.new_round;
             e.gen = ctx.snap_generation;
-            e.outcome = del_outcome;
+            e.outcome = removal_outcome;
             e.reason = "delete_pending published by a prior pass; exact-incarnation delete (pre-CAS)";
-            e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}, {"key", io.blob_key}};
+            e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}, {"key", redelete_blob_state.blob_key}};
         });
-    /// The audit row is observability only -- the delete in `performRedeleteIo` already executed
+    /// The audit row is observability only -- the delete in `redeleteBlobs` already executed
     /// regardless of this cap. Skipping it here bounds the per-shard `GcOutcomes` body without
     /// skipping or deferring any destructive work.
     if (ctx.round_work_budget.outcomeEntryAvailable())
@@ -622,18 +650,27 @@ void Gc::applyRedeleteOutcome(RedeleteRoundContext & ctx, const RetiredEntry & e
     }
     ++ctx.report.redeleted;
     ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
+}
+
+void Gc::scheduleBlobMetaDeletes(
+    const std::vector<RetiredEntry> & entries, const std::vector<RedeleteBlobState> & redelete_blob_states)
+{
     /// Drop the per-hash meta only on a removal or a proven absence — a mismatch means a
     /// writer already published a fresh incarnation at this hash, and that writer's own
     /// republication path (`PartWriteTxn::ensureBlobPresent`) reconciles the meta back to Clean
     /// right after the publication; deleting it here would race that legitimate Clean write for
     /// no reason (the meta is advisory, but there is no reason to touch it on that path at all).
-    if (io.del == Removal::Removed || io.del == Removal::Gone)
+    for (size_t i = 0; i < redelete_blob_states.size(); ++i)
     {
-        meta_writer->scheduleConfirmedMetaDelete(entry.ref, entry.condemn_round);
+        const RedeleteBlobState & redelete_blob_state = redelete_blob_states[i];
+        if (redelete_blob_state.error)
+            continue;
+        if (redelete_blob_state.removal == Removal::Removed || redelete_blob_state.removal == Removal::Gone)
+            meta_writer->scheduleConfirmedMetaDelete(entries[i].ref, entries[i].condemn_round);
     }
 }
 
-void Gc::reportRedeleteFailure(
+void Gc::recordRedeleteFailure(
     RedeleteRoundContext & ctx,
     const RetiredEntry & entry,
     const Layout & layout,
@@ -649,6 +686,78 @@ void Gc::reportRedeleteFailure(
         unsent_count ? fmt::format("; {} re-delete entries were not submitted", *unsent_count) : String{});
 }
 
+Gc::IoJobsResult Gc::runRedeleteIoJobs(
+    ThreadPool & pool,
+    size_t concurrency,
+    size_t count,
+    size_t refuse_offset,
+    CasOperation & op,
+    const std::function<void(size_t, CasOperation &)> & job)
+{
+    IoJobsResult result;
+    result.errors.resize(count);
+    if (concurrency <= 1 || count <= 1)
+    {
+        for (; result.scheduled < count; ++result.scheduled)
+        {
+            try
+            {
+                job(result.scheduled, op);
+            }
+            catch (...)
+            {
+                result.errors[result.scheduled] = std::current_exception();
+            }
+        }
+        return result;
+    }
+
+    result.on_pool = true;
+    ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::CAS_GC_REDELETE);
+    std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;
+    handles.reserve(count);
+    SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
+    const uint64_t admitted_generation = op.generation();
+    try
+    {
+        for (; result.scheduled < count; ++result.scheduled)
+        {
+            if (io_pool_refuse_at_for_test == refuse_offset + result.scheduled)
+            {
+                io_pool_refuse_at_for_test.reset();
+                throw Exception(
+                    ErrorCodes::CANNOT_SCHEDULE_TASK,
+                    "Injected CAS GC re-delete enqueue refusal at index {}",
+                    refuse_offset + result.scheduled);
+            }
+            handles.emplace_back(runner.enqueueAndGiveOwnership(
+                [&job, index = result.scheduled, pool_store = store, admitted_generation]
+                {
+                    CasOperation job_op = pool_store->openRequests().resume(admitted_generation);
+                    job(index, job_op);
+                }));
+        }
+    }
+    catch (...)
+    {
+        result.schedule_error = IndexedException{result.scheduled, std::current_exception()};
+    }
+
+    ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
+    for (size_t i = 0; i < handles.size(); ++i)
+    {
+        try
+        {
+            handles[i]->future.get();
+        }
+        catch (...)
+        {
+            result.errors[i] = std::current_exception();
+        }
+    }
+    return result;
+}
+
 void Gc::redeleteBlobs(
     RedeleteRoundContext & ctx,
     const std::vector<RetiredEntry> & entries,
@@ -657,102 +766,99 @@ void Gc::redeleteBlobs(
     const Layout & layout,
     CasOperation & op)
 {
-    std::vector<RedeleteIo> io_results(entries.size());
-    std::vector<std::exception_ptr> io_errors(entries.size());
-    std::optional<IndexedException> schedule_error;
-    size_t scheduled = 0;
-    if (concurrency <= 1 || entries.size() <= 1)
-    {
-        for (size_t i = 0; i < entries.size(); ++i)
-        {
-            try
-            {
-                io_results[i] = performRedeleteIo(entries[i], layout, op);
-            }
-            catch (...)
-            {
-                io_errors[i] = std::current_exception();
-            }
-        }
-        scheduled = entries.size();
-    }
-    else
-    {
-        ThreadPoolCallbackRunnerLocal<void> runner(pool, ThreadName::CAS_GC_REDELETE);
-        std::vector<std::shared_ptr<ThreadPoolCallbackRunnerLocal<void>::Task>> handles;
-        handles.reserve(entries.size());
-        SCOPE_EXIT_SAFE({ ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles); });
+    std::vector<RedeleteBlobState> redelete_blob_states(entries.size());
+    const IoJobsResult observe_jobs = runRedeleteIoJobs(
+        pool,
+        concurrency,
+        entries.size(),
+        0,
+        op,
+        [&](size_t index, CasOperation & job_op) { observeRetiredBlob(entries[index], layout, job_op, redelete_blob_states[index]); });
+    if (observe_jobs.on_pool)
+        ctx.jobs_scheduled += observe_jobs.scheduled;
+    for (size_t i = 0; i < observe_jobs.scheduled; ++i)
+        redelete_blob_states[i].error = observe_jobs.errors[i];
 
-        const uint64_t admitted_generation = op.generation();
-        try
+    const std::vector<ConditionalDeleteChunk> delete_chunks
+        = prepareConditionalDeleteChunks(redelete_blob_states, conditionalDeleteChunkKeys());
+    const IoJobsResult delete_jobs = runRedeleteIoJobs(
+        pool,
+        concurrency,
+        delete_chunks.size(),
+        entries.size(),
+        op,
+        [&](size_t chunk, CasOperation & job_op)
         {
-            for (; scheduled < entries.size(); ++scheduled)
-            {
-                if (io_pool_refuse_at_for_test == scheduled)
-                {
-                    io_pool_refuse_at_for_test.reset();
-                    throw Exception(ErrorCodes::CANNOT_SCHEDULE_TASK, "Injected CAS GC re-delete enqueue refusal at index {}", scheduled);
-                }
-                handles.emplace_back(runner.enqueueAndGiveOwnership(
-                    [slot = &io_results[scheduled],
-                     entry = entries[scheduled],
-                     layout_ptr = &layout,
-                     pool_store = store,
-                     admitted_generation]
-                    {
-                        CasOperation job_op = pool_store->openRequests().resume(admitted_generation);
-                        *slot = performRedeleteIo(entry, *layout_ptr, job_op);
-                    }));
-            }
-        }
-        catch (...)
-        {
-            schedule_error = IndexedException{scheduled, std::current_exception()};
-        }
-        ctx.jobs_scheduled += handles.size();
-
-        ThreadPoolCallbackRunnerLocal<void>::waitForAllToFinish(handles);
-        for (size_t i = 0; i < handles.size(); ++i)
-        {
-            try
-            {
-                handles[i]->future.get();
-            }
-            catch (...)
-            {
-                io_errors[i] = std::current_exception();
-            }
-        }
-    }
-
-    std::optional<IndexedException> first_error;
-    for (size_t i = 0; i < scheduled; ++i)
+            const ConditionalDeleteChunk & delete_chunk = delete_chunks[chunk];
+            const auto outcomes = job_op.removeManyByConditional(delete_chunk.removals, Retry::standard());
+            for (size_t pos = 0; pos < delete_chunk.indices.size(); ++pos)
+                redelete_blob_states[delete_chunk.indices[pos]].removal = outcomes[pos];
+        });
+    ctx.delete_batches += delete_jobs.scheduled;
+    for (size_t chunk = 0; chunk < delete_jobs.scheduled; ++chunk)
     {
-        if (!io_errors[i])
+        if (!delete_jobs.errors[chunk])
             continue;
-        reportRedeleteFailure(ctx, entries[i], layout, io_errors[i]);
-        if (!first_error)
-            first_error = IndexedException{i, io_errors[i]};
-    }
-    if (schedule_error)
-    {
-        reportRedeleteFailure(
-            ctx, entries[schedule_error->index], layout, schedule_error->exception, entries.size() - schedule_error->index);
-        if (!first_error || schedule_error->index < first_error->index)
-            first_error = schedule_error;
+        for (const size_t index : delete_chunks[chunk].indices)
+            redelete_blob_states[index].error = delete_jobs.errors[chunk];
     }
 
-    /// Every submitted delete of the batch has already run. If `applyRedeleteOutcome` throws, the batch stays deleted
-    /// but unrecorded: the round fails before its outcome logs and `gc/state` commit, every entry stays
-    /// `delete_pending`, and the next round records the deleted ones as `Absent`.
-    for (size_t i = 0; i < scheduled; ++i)
+    std::vector<RedeleteScheduleFailure> schedule_failures;
+    if (observe_jobs.schedule_error)
+        schedule_failures.push_back({*observe_jobs.schedule_error, entries.size() - observe_jobs.schedule_error->index});
+    if (delete_jobs.schedule_error)
     {
-        if (!io_errors[i])
-            applyRedeleteOutcome(ctx, entries[i], io_results[i]);
+        size_t delete_unsent = 0;
+        for (size_t chunk = delete_jobs.schedule_error->index; chunk < delete_chunks.size(); ++chunk)
+            delete_unsent += delete_chunks[chunk].indices.size();
+        schedule_failures.push_back(
+            {{delete_chunks[delete_jobs.schedule_error->index].indices.front(), delete_jobs.schedule_error->exception}, delete_unsent});
     }
-
+    const std::optional<IndexedException> first_error
+        = recordRedeleteResults(ctx, entries, layout, redelete_blob_states, observe_jobs.scheduled, schedule_failures);
+    scheduleBlobMetaDeletes(entries, redelete_blob_states);
     if (first_error)
         std::rethrow_exception(first_error->exception);
+}
+
+std::optional<Gc::IndexedException> Gc::recordRedeleteResults(
+    RedeleteRoundContext & ctx,
+    const std::vector<RetiredEntry> & entries,
+    const Layout & layout,
+    const std::vector<RedeleteBlobState> & redelete_blob_states,
+    size_t observed,
+    const std::vector<RedeleteScheduleFailure> & schedule_failures)
+{
+    std::optional<IndexedException> first_error;
+    auto keep_first_error = [&](const IndexedException & error)
+    {
+        if (!first_error || error.index < first_error->index)
+            first_error = error;
+    };
+
+    for (size_t i = 0; i < observed; ++i)
+    {
+        const std::exception_ptr & error = redelete_blob_states[i].error;
+        if (!error)
+            continue;
+        recordRedeleteFailure(ctx, entries[i], layout, error);
+        keep_first_error({i, error});
+    }
+    for (const RedeleteScheduleFailure & failure : schedule_failures)
+    {
+        recordRedeleteFailure(ctx, entries[failure.error.index], layout, failure.error.exception, failure.unsent);
+        keep_first_error(failure.error);
+    }
+
+    /// Every submitted delete of the batch has already run. If `recordRedeleteSuccess` throws, the batch stays deleted
+    /// but unrecorded: the round fails before its outcome logs and `gc/state` commit, every entry stays
+    /// `delete_pending`, and the next round records the deleted ones as `Absent`.
+    for (size_t i = 0; i < observed; ++i)
+    {
+        if (!redelete_blob_states[i].error && redelete_blob_states[i].removal)
+            recordRedeleteSuccess(ctx, entries[i], redelete_blob_states[i]);
+    }
+    return first_error;
 }
 
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy,
@@ -1055,10 +1161,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     const uint64_t graduated_before = report.graduated;
     const uint64_t redelete_failed_before = report.redelete_failed;
     uint64_t redelete_jobs_scheduled = 0;
+    uint64_t redelete_delete_batches = 0;
     const auto record_redelete_job_metrics = [&]
     {
         pending_deletes_timer->metric("jobs_scheduled", redelete_jobs_scheduled);
         pending_deletes_timer->metric("jobs_failed", report.redelete_failed - redelete_failed_before);
+        pending_deletes_timer->metric("delete_batches", redelete_delete_batches);
     };
     SCOPE_EXIT_SAFE({
         if (pending_deletes_timer)
@@ -1092,7 +1200,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             .round_work_budget = round_work_budget,
             .report = report,
             .outcomes = outcomes,
-            .jobs_scheduled = redelete_jobs_scheduled};
+            .jobs_scheduled = redelete_jobs_scheduled,
+            .delete_batches = redelete_delete_batches};
         redeleteBlobs(redelete_ctx, redelete_now, *io_pool, store->poolConfig().gc_io_concurrency, layout, op);
         for (const RetiredEntry & entry : merge.spared)
         {

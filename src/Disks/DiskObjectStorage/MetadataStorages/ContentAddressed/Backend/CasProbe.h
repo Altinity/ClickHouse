@@ -5,6 +5,11 @@
 namespace DB::Cas
 {
 
+struct CapabilityProbeResult
+{
+    bool conditional_batch_delete_supported = false;
+};
+
 /// Run the capability battery against `op`, using throwaway keys under `probe_prefix`.
 ///
 /// `op` must already be admitted. The two store-level precondition hooks —
@@ -31,6 +36,6 @@ namespace DB::Cas
 /// Cleanup of the probe key is best-effort and runs unconditionally: after the battery completes, or on
 /// the failure path immediately before the check-failing exception is rethrown. Cleanup itself suppresses
 /// exceptions so that it cannot hide the capability-check failure.
-void runCapabilityProbe(CasOperation & op, const String & probe_prefix);
+CapabilityProbeResult runCapabilityProbe(CasOperation & op, const String & probe_prefix);
 
 }
