@@ -1105,9 +1105,11 @@ TEST(ContentAddressedTransaction, StagingEpochMatchesAdmissionGeneration)
     const uint64_t epoch_before = pool->liveWriterEpoch();
     const std::string path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin";
 
+    /// Kept alive to the end: an abandoned transaction deletes its staging object, and the final
+    /// assertion counts this write's key under the old epoch.
+    auto first_tx = metadata_storage->createTransaction();
     {
-        auto tx = metadata_storage->createTransaction();
-        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+        auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*first_tx);
         writeThroughS3Transaction(ca_tx, path, std::string(300, 'x'));
         DB::RelativePathsWithMetadata staged;
         object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
