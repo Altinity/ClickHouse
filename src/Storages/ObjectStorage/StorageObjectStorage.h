@@ -125,6 +125,7 @@ public:
     bool supportsPrewhere() const override;
     bool canMoveConditionsToPrewhere() const override;
     std::optional<NameSet> supportedPrewhereColumns() const override;
+    std::optional<NameSet> supportedAutomaticPrewhereColumns(const StorageMetadataPtr & metadata) const override;
     ColumnSizeByName getColumnSizes() const override;
 
     bool prefersLargeBlocks() const override;

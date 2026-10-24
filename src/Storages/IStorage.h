@@ -146,6 +146,8 @@ public:
     /// This is needed for engines whose aggregates data from multiple tables, like Merge.
     virtual std::optional<NameSet> supportedPrewhereColumns() const { return std::nullopt; }
 
+    virtual std::optional<NameSet> supportedAutomaticPrewhereColumns(const StorageMetadataPtr & /* metadata */) const { return supportedPrewhereColumns(); }
+
     /// Returns true if the storage supports optimization of moving conditions to PREWHERE section.
     virtual bool canMoveConditionsToPrewhere() const { return supportsPrewhere(); }
 
