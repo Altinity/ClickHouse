@@ -13,7 +13,6 @@
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypeString.h>
 #include <DataTypes/NestedUtils.h>
 
 #include <Disks/IVolume.h>
@@ -59,7 +58,6 @@
 #include <Parsers/parseQuery.h>
 
 #include <Analyzer/ColumnNode.h>
-#include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/TableFunctionNode.h>
@@ -218,7 +216,6 @@ namespace Setting
     extern const SettingsBool skip_unavailable_shards;
     extern const SettingsBool enable_global_with_statement;
     extern const SettingsBool allow_experimental_hybrid_table;
-    extern const SettingsBool enable_alias_marker;
 }
 
 namespace DistributedSetting
@@ -1135,7 +1132,11 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
          * (including fully-resolved ALIAS expressions) and rewrite the whole query tree
          * so all references to the replaced table share the same column source and
          * the same alias semantics. This keeps SELECT and WHERE consistent before
+<<<<<<< HEAD
          * inlineAliasColumns() performs final alias expansion.
+=======
+         * inlineAliasColumns performs final alias expansion.
+>>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
          */
         ReplaceColumnNodesForTableExpressionVisitor replace_query_columns_visitor(
             replacement_table_expression,
@@ -1144,7 +1145,11 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         replace_query_columns_visitor.visit(query_tree_to_modify);
     }
 
+<<<<<<< HEAD
     inlineAliasColumns(query_tree_to_modify);
+=======
+    inlineAliasColumns(query_tree_to_modify, query_context);
+>>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
 
     const auto & settings = query_context->getSettingsRef();
 
@@ -1157,8 +1162,9 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         rewriteJoinToGlobalJoinIfNeeded(query_node.getJoinTreeNode());
     }
 
+    /// `buildQueryTreeForShard` materializes the marker ids on the way out, after the `__tableN` renumbering they are
+    /// built from.
     return buildQueryTreeForShard(query_info.planner_context, query_tree_to_modify, /*allow_global_join_for_right_table*/ false);
-
 }
 
 std::optional<std::pair<String, String>> tryGetParamTypeAndName(const ASTPtr & node)

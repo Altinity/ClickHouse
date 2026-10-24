@@ -3,8 +3,12 @@
 #include <optional>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/UnionNode.h>
+<<<<<<< HEAD
 #include <Analyzer/createUniqueAliasesIfNecessary.h>
 #include <base/scope_guard.h>
+=======
+#include <Analyzer/Utils.h>
+>>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
 #include <Columns/ColumnConst.h>
 #include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
@@ -1631,6 +1635,8 @@ std::optional<QueryPipeline> executeInsertSelectWithParallelReplicas(
     {
         InterpreterSelectQueryAnalyzer analyzer(query_ast.select, new_context, {});
         const auto & query_tree = analyzer.getQueryTree();
+        /// This parallel `INSERT SELECT` path renders directly, bypassing `queryNodeToDistributedSelectQuery`.
+        assertNoPendingAliasMarkersForDistributedSerialization(query_tree);
         auto select_ast = query_tree->toAST();
 
         auto new_query_ast = query_ast.clone();
