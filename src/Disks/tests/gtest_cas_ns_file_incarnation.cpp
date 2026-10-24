@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include "cas_test_helpers.h"
 #include <algorithm>
+#include <functional>
 
 /// Namespace files are keyed by an opaque LIFE, not by its name: `cas/ns/state/<life_id>/_files/<name>`
 /// (Stage B Task 4b, directive design change 2). This file pins the three properties that re-key exists
@@ -30,6 +31,11 @@
 /// bytes present while that evidence is adopted; their later reclamation belongs to the perpetual
 /// janitor and is not a precondition for same-name reuse.
 
+namespace DB::ErrorCodes
+{
+extern const int NETWORK_ERROR;
+}
+
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 
@@ -52,6 +58,28 @@ void publishWithProductionBirth(const PoolPtr & store, const RootNamespace & ns,
     build->precommitAdd(ns, ref, id);
     build->promote(ns, ref, build->buildId(), id);
 }
+
+/// Runs `after_catalog_read` once, right after the `fire_on_read`-th read of `catalog_key` returns: the
+/// window between a cold reader's last catalog GET and its runtime insertion, where no hook exists.
+class CatalogReadRaceBackend : public CountingBackend
+{
+public:
+    String catalog_key;
+    size_t fire_on_read = 0;
+    std::function<void()> after_catalog_read;
+
+    std::optional<DB::Cas::Backend::Raw> read(const String & key, DB::Cas::TransportAccess & access) override
+    {
+        auto result = CountingBackend::read(key, access);
+        if (after_catalog_read && key == catalog_key && --fire_on_read == 0)
+        {
+            auto once = std::move(after_catalog_read);
+            after_catalog_read = nullptr;
+            once();
+        }
+        return result;
+    }
+};
 
 }
 
@@ -121,6 +149,167 @@ TEST(CASNsFileIncarnation, ColdReaderUsesCatalogCutWhileOldFileSurvivesRemoval)
 
     for (const String & key : backend->touchedKeys())
         EXPECT_EQ(key.find("/_cleanup/"), String::npos) << key;
+}
+
+/// A cold reader sees the row `Live` in both catalog reads; removal and the GC drain retire that life
+/// before the reader inserts its runtime. The reader must not publish a runtime for the retired life,
+/// and the next writer must get a fresh life whose acknowledged file survives GC.
+TEST(CASNsFileIncarnation, ColdReaderDoesNotRepublishALifeRetiredAfterItsCatalogRead)
+{
+    auto backend = std::make_shared<CatalogReadRaceBackend>();
+    const RootNamespace ns{kNsString};
+    std::optional<NamespaceLifeId> retired_life;
+    {
+        PoolPtr writer = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        publishWithProductionBirth(writer, ns, "predecessor");
+        retired_life = writer->namespaceLife(ns);
+    }
+
+    /// A fresh pool holds no runtime for `ns`, so the reader below takes the cold path.
+    PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
+
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    Gc gc(store, kGcId);
+    bool retired = false;
+    backend->catalog_key = layout.refCatalogKey();
+    backend->fire_on_read = 2;
+    backend->after_catalog_read = [&]
+    {
+        store->dropNamespace(ns);
+        (void)runRegularRoundReclaiming(gc);
+        (void)runRegularRoundReclaiming(gc);
+        retired = !CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns).has_value();
+    };
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceFilesLifeIfReadable(ns); });
+    ASSERT_TRUE(retired) << "the race must fire after the reader's second catalog read and drain the row";
+    EXPECT_NE(store->refTableLifeForTest(ns), retired_life)
+        << "a runtime for the retired life was published";
+
+    const NamespaceLifeId writer_life = store->namespaceLife(ns);
+    EXPECT_NE(writer_life, *retired_life);
+    const String bytes = "fresh-life\n";
+    store->putNamespaceFile(writer_life, kFile, bytes);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+    EXPECT_EQ(store->getNamespaceFile(writer_life, kFile), std::optional<String>{bytes})
+        << "an acknowledged namespace file was swept";
+}
+
+/// The cold MUTABLE admission (`namespaceLife`) has the same window between its one catalog read and
+/// its runtime insertion.
+TEST(CASNsFileIncarnation, ColdWriterDoesNotRepublishALifeRetiredAfterItsCatalogRead)
+{
+    auto backend = std::make_shared<CatalogReadRaceBackend>();
+    const RootNamespace ns{kNsString};
+    std::optional<NamespaceLifeId> retired_life;
+    {
+        PoolPtr writer = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        publishWithProductionBirth(writer, ns, "predecessor");
+        retired_life = writer->namespaceLife(ns);
+    }
+
+    PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
+
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    Gc gc(store, kGcId);
+    bool retired = false;
+    backend->catalog_key = layout.refCatalogKey();
+    backend->fire_on_read = 1;
+    backend->after_catalog_read = [&]
+    {
+        store->dropNamespace(ns);
+        (void)runRegularRoundReclaiming(gc);
+        (void)runRegularRoundReclaiming(gc);
+        retired = !CasRefCatalog::lifeIfCataloged(catalog_op, layout, ns).has_value();
+    };
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceLife(ns); });
+    ASSERT_TRUE(retired) << "the race must fire after the writer's catalog read and drain the row";
+    EXPECT_NE(store->refTableLifeForTest(ns), retired_life) << "a runtime for the retired life was published";
+}
+
+/// A recovered runtime whose stream holds the terminal removal, with no local removal in progress (its
+/// removal-admission flag is clear): `namespaceLife` must not hand that life to a writer, on the cold
+/// call that recovers it or on the warm call that finds it resident.
+TEST(CASNsFileIncarnation, NamespaceLifeRefusesARecoveredTerminalLife)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{kNsString};
+    {
+        RefOp remove_op;
+        remove_op.kind = RefOpKind::RemoveNamespace;
+        appendRefLogSeed(*backend, layout, ns, {remove_op});
+    }
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    CasRequests catalog_requests = DB::Cas::tests::openRequestsForTest(backend);
+    CasOperation catalog_op = catalog_requests.admit();
+    const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(catalog_op, layout);
+    const auto row = std::find_if(catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    ASSERT_NE(row, catalog.catalog.entries.end());
+    ASSERT_EQ(row->state, NsState::Live) << "a Removing row would be refused for a different reason";
+    const NamespaceLifeId terminal_life = NamespaceLifeId::fromCatalogEntry(row->ns, row->incarnation);
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceLife(ns); });
+    ASSERT_EQ(store->refTableLifeForTest(ns), std::optional<NamespaceLifeId>{terminal_life})
+        << "the cold call must have recovered the terminal runtime and left it resident";
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceLife(ns); });
+}
+
+/// A delayed retirement callback for a predecessor arrives while a successor is resident. It must
+/// still advance the name's record, and the record must survive the successor's eviction: otherwise a
+/// cold admission that read the predecessor's row could insert it once the slot empties.
+TEST(CASNsFileIncarnation, RetirementWithASuccessorResidentIsRecordedAndSurvivesEviction)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.gc_fold_max_defer_rounds = 0;
+    config.ref_table_cache_bytes = 1;
+    PoolPtr store = Pool::open(backend, std::move(config));
+    const RootNamespace ns{kNsString};
+    const RootNamespace other{"00/bb@cas@"};
+
+    publishWithProductionBirth(store, ns, "predecessor");
+    const NamespaceLifeId predecessor = store->namespaceLife(ns);
+    store->dropNamespace(ns);
+    Gc gc(store, kGcId);
+    (void)runRegularRoundReclaiming(gc);
+    (void)runRegularRoundReclaiming(gc);
+
+    publishWithProductionBirth(store, ns, "successor");
+    const NamespaceLifeId successor = store->namespaceLife(ns);
+    ASSERT_NE(successor, predecessor);
+    const uint64_t successor_runtime = store->refTableRuntimeIdentityForTest(ns);
+    ASSERT_NE(successor_runtime, 0u);
+    const uint64_t retirements_before = store->refNameRetirementsForTest(ns);
+
+    store->invalidateRemovedCatalogLife(predecessor);
+
+    EXPECT_EQ(store->refNameRetirementsForTest(ns), retirements_before + 1)
+        << "a predecessor's retirement must be recorded even with a successor resident";
+    EXPECT_EQ(store->refTableRuntimeIdentityForTest(ns), successor_runtime)
+        << "and must not detach the successor";
+    EXPECT_EQ(store->namespaceLife(ns), successor);
+
+    /// A 1-byte budget evicts the idle successor when another table is touched.
+    publishWithProductionBirth(store, other, "x");
+    ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u) << "the successor must have been evicted";
+    EXPECT_EQ(store->refNameRetirementsForTest(ns), retirements_before + 1)
+        << "eviction must keep a slot that records a retirement";
 }
 
 /// The non-minting reader assignment site accepts exactly a catalog `Live` row. `Creating`,

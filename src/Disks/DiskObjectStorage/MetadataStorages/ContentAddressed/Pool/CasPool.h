@@ -1135,6 +1135,10 @@ public:
     {
         return ref_ledger.refTableRuntimeAdmittedFenceGenerationForTest(ns);
     }
+    uint64_t refNameRetirementsForTest(const RootNamespace & ns) const
+    {
+        return ref_ledger.refNameRetirementsForTest(ns);
+    }
     std::optional<NamespaceLifeId> refTableLifeForTest(const RootNamespace & ns)
     {
         return ref_ledger.refTableLifeForTest(ns);
