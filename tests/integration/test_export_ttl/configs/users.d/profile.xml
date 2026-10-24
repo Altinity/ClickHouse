@@ -1,0 +1,26 @@
+<clickhouse>
+    <profiles>
+        <default>
+            <s3_retry_attempts>3</s3_retry_attempts>
+            <allow_experimental_export_ttl>1</allow_experimental_export_ttl>
+        </default>
+        <!-- Settings of the tasks of an `EXPORT` TTL that must fail quickly, see `ttl_export_settings_profile`. -->
+        <ttl_export_fail_fast>
+            <s3_retry_attempts>3</s3_retry_attempts>
+            <export_merge_tree_task_timeout_seconds>10</export_merge_tree_task_timeout_seconds>
+            <export_merge_tree_retry_initial_backoff_seconds>1</export_merge_tree_retry_initial_backoff_seconds>
+            <export_merge_tree_retry_max_backoff_seconds>1</export_merge_tree_retry_max_backoff_seconds>
+        </ttl_export_fail_fast>
+        <!-- A failing part is retried every second, and its task does not time out during a test. -->
+        <ttl_export_quick_retry>
+            <s3_retry_attempts>3</s3_retry_attempts>
+            <export_merge_tree_retry_initial_backoff_seconds>1</export_merge_tree_retry_initial_backoff_seconds>
+            <export_merge_tree_retry_max_backoff_seconds>1</export_merge_tree_retry_max_backoff_seconds>
+        </ttl_export_quick_retry>
+        <!-- Iceberg partition transforms of time values are computed in this time zone. -->
+        <ttl_export_tokyo>
+            <s3_retry_attempts>3</s3_retry_attempts>
+            <iceberg_partition_timezone>Asia/Tokyo</iceberg_partition_timezone>
+        </ttl_export_tokyo>
+    </profiles>
+</clickhouse>

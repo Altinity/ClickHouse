@@ -1235,6 +1235,7 @@ TTLDescription::TTLDescription(const TTLDescription & other)
     , aggregate_descriptions(other.aggregate_descriptions)
     , destination_type(other.destination_type)
     , destination_name(other.destination_name)
+    , destination_database(other.destination_database)
     , if_exists(other.if_exists)
     , recompression_codec(other.recompression_codec)
 {
@@ -1266,6 +1267,7 @@ TTLDescription & TTLDescription::operator=(const TTLDescription & other)
     aggregate_descriptions = other.aggregate_descriptions;
     destination_type = other.destination_type;
     destination_name = other.destination_name;
+    destination_database = other.destination_database;
     if_exists = other.if_exists;
 
     if (other.recompression_codec)
@@ -1415,6 +1417,11 @@ ExpressionAndSets TTLDescription::buildExpression(const ContextPtr & context) co
     return buildExpressionAndSets(ast, expression_columns, context);
 }
 
+void TTLDescription::checkExpressionIsStrict(const ContextPtr & context) const
+{
+    checkTTLExpression(buildExpression(context).expression, result_column, /*allow_suspicious=*/ false);
+}
+
 ExpressionAndSets TTLDescription::buildWhereExpression(const ContextPtr & context) const
 {
     if (where_expression_ast)
@@ -1477,6 +1484,7 @@ TTLDescription TTLDescription::getTTLFromAST(
         result.mode = ttl_element->mode;
         result.destination_type = ttl_element->destination_type;
         result.destination_name = ttl_element->destination_name;
+        result.destination_database = ttl_element->destination_database;
         result.if_exists = ttl_element->if_exists;
 
         if (ttl_element->mode == TTLMode::DELETE)
@@ -1581,6 +1589,7 @@ TTLTableDescription::TTLTableDescription(const TTLTableDescription & other)
  , move_ttl(other.move_ttl)
  , recompression_ttl(other.recompression_ttl)
  , group_by_ttl(other.group_by_ttl)
+ , export_ttl(other.export_ttl)
 {
 }
 
@@ -1599,6 +1608,7 @@ TTLTableDescription & TTLTableDescription::operator=(const TTLTableDescription &
     move_ttl = other.move_ttl;
     recompression_ttl = other.recompression_ttl;
     group_by_ttl = other.group_by_ttl;
+    export_ttl = other.export_ttl;
 
     return *this;
 }
@@ -1642,6 +1652,12 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
         else if (ttl.mode == TTLMode::GROUP_BY)
         {
             result.group_by_ttl.emplace_back(std::move(ttl));
+        }
+        else if (ttl.mode == TTLMode::EXPORT)
+        {
+            if (!result.export_ttl.empty())
+                throw Exception(ErrorCodes::BAD_TTL_EXPRESSION, "More than one EXPORT TTL expression is not allowed");
+            result.export_ttl.emplace_back(std::move(ttl));
         }
         else
         {

@@ -22,7 +22,10 @@
 #include <Columns/ColumnConst.h>
 #include <Compression/CompressedReadBuffer.h>
 #include <Storages/MergeTree/ExportPartTask.h>
-#include <Storages/MergeTree/ExportPartitionUtils.h>
+#include <Storages/MergeTree/ExportTaskUtils.h>
+#include <Storages/MergeTree/ExportTTLIndex.h>
+#include <Storages/MergeTree/ExportTTLScheduler.h>
+#include <Storages/MergeTree/IExportTTLIndex.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
@@ -234,6 +237,7 @@ namespace DB
 namespace Setting
 {
     extern const SettingsBool allow_drop_detached;
+    extern const SettingsBool allow_experimental_export_ttl;
     extern const SettingsBool allow_experimental_analyzer;
     extern const SettingsBool enable_full_text_index;
     extern const SettingsBool allow_non_metadata_alters;
@@ -270,6 +274,7 @@ namespace Setting
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
     extern const SettingsBool allow_insert_into_iceberg;
+    extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
 }
 
 namespace MergeTreeSetting
@@ -361,6 +366,7 @@ namespace MergeTreeSetting
 
 namespace ServerSetting
 {
+    extern const ServerSettingsBool allow_experimental_export_merge_tree_partition;
     extern const ServerSettingsDouble mark_cache_prewarm_ratio;
     extern const ServerSettingsDouble primary_index_cache_prewarm_ratio;
     extern const ServerSettingsDouble index_mark_cache_prewarm_ratio;
@@ -410,6 +416,8 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
     extern const int PENDING_MUTATIONS_NOT_ALLOWED;
+    extern const int EXPORT_PARTITION_ALREADY_EXPORTED;
+    extern const int PARTITION_EXPORT_FAILED;
 }
 
 namespace FailPoints
@@ -1258,6 +1266,179 @@ void MergeTreeData::checkProperties(
     }
 
     checkKeyExpression(*new_sorting_key.expression, new_sorting_key.sample_block, "Sorting", allow_nullable_key_);
+
+    /// A replica applying an ALTER of another replica has no query context, and the ALTER was already validated.
+    if (!attach && local_context)
+        checkExportTTL(new_metadata, old_metadata, local_context);
+}
+
+StorageID MergeTreeData::getExportTTLDestination(const TTLDescription & export_ttl) const
+{
+    return getExportTTLDestination(getStorageID(), export_ttl);
+}
+
+StorageID MergeTreeData::getExportTTLDestination(const StorageID & table_id, const TTLDescription & export_ttl)
+{
+    return StorageID(
+        export_ttl.destination_database.empty() ? table_id.database_name : export_ttl.destination_database,
+        export_ttl.destination_name);
+}
+
+ExportTTLDeleteGate MergeTreeData::getExportTTLDeleteGate() const
+{
+    ExportTTLDeleteGate gate;
+    const auto metadata = getInMemoryMetadataPtr(nullptr, false);
+    const auto export_ttls = metadata->getExportTTLs();
+    gate.enabled = !export_ttls.empty();
+    if (gate.enabled)
+    {
+        const auto destination = getExportTTLDestination(export_ttls.front());
+        gate.destination_key = ExportTTLUtils::destinationKey(destination.database_name, destination.table_name);
+    }
+    gate.now = time(nullptr);
+    return gate;
+}
+
+ExportedBlocksPtr MergeTreeData::getLatestExportedBlocks() const
+{
+    const auto * index = getExportTTLIndex();
+    const auto snapshot = index ? index->getLatest() : nullptr;
+    return snapshot ? snapshot->exported_blocks : nullptr;
+}
+
+std::vector<ExportTTLPartitionInfo> MergeTreeData::getExportTTLInfo() const
+{
+    if (!export_ttl_scheduler)
+        return {};
+    return export_ttl_scheduler->getInfo();
+}
+
+void MergeTreeData::checkExportTTL(
+    const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata, ContextPtr local_context) const
+{
+    const auto export_ttls = new_metadata.getExportTTLs();
+    if (export_ttls.empty())
+        return;
+
+    /// The settings of the table after the ALTER. They are checked even if the export TTL does not
+    /// change, so that `enable_block_number_column` cannot be turned off under it.
+    auto new_settings = getDefaultSettings();
+    if (new_metadata.settings_changes)
+    {
+        auto changes = new_metadata.settings_changes->as<const ASTSetQuery &>().changes;
+        MergeTreeSettings::resolveDiskSetting(changes, local_context, /*is_loading_from_existing_metadata=*/true);
+        new_settings->applyChanges(changes, local_context, /*is_loading_from_existing_metadata=*/true);
+    }
+    checkBlockNumberColumnForExportTTL(*new_settings);
+
+    const auto describe = [](const TTLDescriptions & ttls) -> String
+    {
+        if (ttls.empty())
+            return {};
+        return ttls.front().expression_ast->formatWithSecretsOneLine() + " " + ttls.front().destination_database + "." + ttls.front().destination_name;
+    };
+
+    /// An ALTER that does not change the export TTL does not revalidate it.
+    if (describe(export_ttls) == describe(old_metadata.getExportTTLs()))
+        return;
+
+    checkExportTTLIsSupportedByDisk(new_metadata);
+    validateExportTTL(getStorageID(), new_metadata, std::move(new_settings), local_context);
+
+    /// The other replicas apply the ALTER from the replication log without validating it.
+    checkReplicasSupportExportTTL();
+}
+
+void MergeTreeData::checkBlockNumberColumnForExportTTL(const MergeTreeSettings & settings)
+{
+    /// Merges keep the block number of every row only with it, which is how the exported rows of a
+    /// merged part are told apart from the others.
+    if (!settings[MergeTreeSetting::enable_block_number_column])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "`TTL ... EXPORT TO TABLE` requires the MergeTree setting `enable_block_number_column = 1`");
+}
+
+void MergeTreeData::checkIncomingPartForExportTTL(const IMergeTreeDataPart & part, const StorageInMemoryMetadata & metadata) const
+{
+    /// The `EXPORT` TTL tells the rows of a part apart by `_block_number`, which must lie in the part's
+    /// block range. A part brought in gets one new block number, while the values it stores keep the
+    /// block numbers of the table it came from. A part that doesn't store them reports its new block
+    /// number. A patch part stores the block numbers of the rows it changes.
+    if (!metadata.hasAnyExportTTL() || part.info.isPatch() || !part.getColumns().contains(BlockNumberColumn::name))
+        return;
+
+    throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+        "Cannot add part {} to table {} with `TTL ... EXPORT TO TABLE`: the part stores `_block_number` values "
+        "that don't match the block number it gets in the table. Insert its rows with `INSERT ... SELECT` instead",
+        part.name, getStorageID().getNameForLogs());
+}
+
+void MergeTreeData::checkExportTTLIsSupportedByDisk(const StorageInMemoryMetadata & metadata) const
+{
+    if (supportsReplication() || !metadata.hasAnyExportTTL())
+        return;
+
+    const auto disk = getDisks().front();
+    if (disk->isContentAddressed())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "`TTL ... EXPORT TO TABLE` is not supported for a MergeTree table on the content-addressed disk {}",
+            disk->getName());
+}
+
+void MergeTreeData::validateExportTTL(
+    const StorageID & table_id, const StorageInMemoryMetadata & new_metadata, const MergeTreeSettingsPtr & settings, ContextPtr local_context)
+{
+    const auto export_ttls = new_metadata.getExportTTLs();
+    if (export_ttls.empty())
+        return;
+
+    if (!local_context->getSettingsRef()[Setting::allow_experimental_export_ttl])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "`TTL ... EXPORT TO TABLE` is experimental. Set `allow_experimental_export_ttl` to enable it");
+
+    if (!local_context->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "`TTL ... EXPORT TO TABLE` requires the server setting `allow_experimental_export_merge_tree_partition`");
+
+    checkBlockNumberColumnForExportTTL(*settings);
+
+    /// It decides when rows are copied elsewhere once and for all, so it must be a deterministic
+    /// function of the rows even when suspicious TTL expressions are allowed.
+    export_ttls.front().checkExpressionIsStrict(local_context);
+
+    const auto destination_id = getExportTTLDestination(table_id, export_ttls.front());
+    if (destination_id.database_name == table_id.database_name && destination_id.table_name == table_id.table_name)
+        throw Exception(ErrorCodes::BAD_TTL_EXPRESSION, "A table cannot be the destination of its own EXPORT TTL");
+
+    const auto destination = DatabaseCatalog::instance().tryGetTable(destination_id, local_context);
+    if (!destination)
+        throw Exception(ErrorCodes::BAD_TTL_EXPRESSION, "The destination table {} of the EXPORT TTL does not exist", destination_id.getNameForLogs());
+
+    if (destination->getStorageID().database_name == table_id.database_name && destination->getStorageID().table_name == table_id.table_name)
+        throw Exception(ErrorCodes::BAD_TTL_EXPRESSION, "A table cannot be the destination of its own EXPORT TTL");
+
+    if (!destination->supportsImport(local_context))
+        throw Exception(ErrorCodes::BAD_TTL_EXPRESSION,
+            "The destination table {} of the EXPORT TTL must be an Iceberg or object storage table that supports importing MergeTree parts",
+            destination_id.getNameForLogs());
+
+    const auto source_metadata = std::make_shared<StorageInMemoryMetadata>(new_metadata);
+    const auto destination_metadata = destination->getInMemoryMetadataPtr(local_context, false);
+    auto schema_context = Context::createCopy(local_context);
+    ExportTTLUtils::allowLossyCasts(*schema_context);
+    ExportTaskUtils::verifyExportSchemaCastable(source_metadata, destination_metadata, destination->getStorageID(), schema_context);
+
+    /// Whether the rows of a group of parts land in a single destination partition can only be proven
+    /// from the parts, which is done when the group is exported. What can never be proven is refused here.
+    try
+    {
+        ExportTaskUtils::verifyPartitionKeyCanBeCompatible(source_metadata, destination_metadata, destination, settings, local_context);
+    }
+    catch (Exception & e)
+    {
+        e.addMessage("while checking the partition key of the destination {} of the EXPORT TTL", destination_id.getNameForLogs());
+        throw;
+    }
 }
 
 void MergeTreeData::checkMetadataProperties(
@@ -7239,7 +7420,8 @@ void MergeTreeData::exportPartToTable(
     ContextPtr query_context,
     const std::optional<String> & iceberg_metadata_json,
     bool allow_outdated_parts,
-    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback)
+    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback,
+    const ExportBlockNumberRanges & block_ranges)
 {
     auto dest_storage = DatabaseCatalog::instance().getTable(destination_storage_id, query_context);
 
@@ -7248,7 +7430,7 @@ void MergeTreeData::exportPartToTable(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
     }
 
-    exportPartToTable(part_name, dest_storage, transaction_id, query_context, iceberg_metadata_json, allow_outdated_parts, completion_callback);
+    exportPartToTable(part_name, dest_storage, transaction_id, query_context, iceberg_metadata_json, allow_outdated_parts, completion_callback, block_ranges);
 }
 
 void MergeTreeData::exportPartToTable(
@@ -7258,7 +7440,8 @@ void MergeTreeData::exportPartToTable(
     ContextPtr query_context,
     const std::optional<String> & iceberg_metadata_json_,
     bool allow_outdated_parts,
-    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback)
+    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback,
+    const ExportBlockNumberRanges & block_ranges)
 {
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
@@ -7273,7 +7456,7 @@ void MergeTreeData::exportPartToTable(
             "To allow its usage, enable the setting `allow_insert_into_iceberg`.");
     }
 
-    ExportPartitionUtils::verifyExportSchemaCastable(
+    ExportTaskUtils::verifyExportSchemaCastable(
         source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
 
     auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
@@ -7318,7 +7501,7 @@ void MergeTreeData::exportPartToTable(
             metadata_object->stringify(oss);
             iceberg_metadata_json = oss.str();
 
-            ExportPartitionUtils::verifyIcebergPartitionCompatibility(
+            ExportTaskUtils::verifyIcebergPartitionCompatibility(
                 metadata_object,
                 source_metadata_ptr,
                 destination_metadata_ptr,
@@ -7336,7 +7519,7 @@ void MergeTreeData::exportPartToTable(
         /// Plain (hive) object storage writes every row of the part to the one directory computed from
         /// the destination PARTITION BY on the part's min row, so the source partition must map to a
         /// single destination partition. Equivalent or finer source keys are accepted.
-        ExportPartitionUtils::verifyPlainPartitionCompatibility(
+        ExportTaskUtils::verifyPlainPartitionCompatibility(
             source_metadata_ptr,
             destination_metadata_ptr,
             {part},
@@ -7403,6 +7586,7 @@ void MergeTreeData::exportPartToTable(
             source_metadata_ptr,
             iceberg_metadata_json,
             completion_callback);
+        manifest.block_ranges = block_ranges;
 
         std::lock_guard lock(export_manifests_mutex);
 
@@ -7438,6 +7622,107 @@ void MergeTreeData::killExportPart(const String & transaction_id)
         }
         return false;
     });
+}
+
+void MergeTreeData::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
+{
+    if (!query_context->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Exporting merge tree partition is experimental. Set the server setting `allow_experimental_export_merge_tree_partition` to enable it "
+            "(on all replicas of a replicated table).\n"
+            "If you are exporting to an Apache Iceberg table, you also need to enable the setting `allow_insert_into_iceberg` on the initiator "
+            "(query, session or profile) - the export task inherits it.");
+
+    /// EXPORT PARTITION ALL: expand into one sub-call per active partition id.
+    /// Failure handling is controlled by `export_merge_tree_partition_all_on_error`.
+    if (const auto * partition_ast = command.partition->as<ASTPartition>(); partition_ast && partition_ast->all)
+    {
+        auto partition_id_set = getAllPartitionIds();
+        if (partition_id_set.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table {} has no active partitions to export", getStorageID().getNameForLogs());
+
+        /// Sort for deterministic ordering (so failure messages and tests are stable).
+        std::vector<String> partition_ids(partition_id_set.begin(), partition_id_set.end());
+        std::sort(partition_ids.begin(), partition_ids.end());
+
+        const auto & on_error_setting = query_context->getSettingsRef()[Setting::export_merge_tree_partition_all_on_error];
+        const ExportPartitionAllOnError on_error = on_error_setting.value;
+
+        LOG_INFO(log, "EXPORT PARTITION ALL: scheduling export for {} partitions, on_error={}",
+                 partition_ids.size(), on_error_setting.toString());
+
+        std::vector<std::pair<String, String>> failures; /// (partition_id, message)
+        size_t skipped_conflicts = 0;
+
+        for (const auto & partition_id : partition_ids)
+        {
+            PartitionCommand sub = command;
+            auto synthetic = make_intrusive<ASTPartition>();
+            synthetic->setPartitionID(make_intrusive<ASTLiteral>(partition_id));
+            sub.partition = synthetic;
+
+            try
+            {
+                exportPartitionToTable(sub, query_context);
+            }
+            catch (const Exception & e)
+            {
+                switch (on_error)
+                {
+                    case ExportPartitionAllOnError::throw_first:
+                        throw;
+                    case ExportPartitionAllOnError::skip_conflicts:
+                        if (e.code() == ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED)
+                        {
+                            ++skipped_conflicts;
+                            LOG_INFO(log, "EXPORT PARTITION ALL: skipping partition {} (already exported): {}",
+                                     partition_id, e.message());
+                            break;
+                        }
+                        throw;
+                    case ExportPartitionAllOnError::collect:
+                        LOG_WARNING(log, "EXPORT PARTITION ALL: partition {} failed: {}", partition_id, e.message());
+                        failures.emplace_back(partition_id, e.message());
+                        break;
+                }
+            }
+        }
+
+        if (!failures.empty())
+        {
+            String aggregated = fmt::format(
+                "EXPORT PARTITION ALL: {}/{} partitions failed to schedule. Per-partition errors:",
+                failures.size(), partition_ids.size());
+            for (const auto & [pid, msg] : failures)
+                aggregated += fmt::format("\n  {}: {}", pid, msg);
+            throw Exception(ErrorCodes::PARTITION_EXPORT_FAILED, "{}", aggregated);
+        }
+
+        if (skipped_conflicts > 0)
+            LOG_INFO(log, "EXPORT PARTITION ALL: skipped {} partitions due to existing exports", skipped_conflicts);
+
+        return;
+    }
+
+    const auto dest_database = query_context->resolveDatabase(command.to_database);
+    const auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
+    if (dest_storage->getStorageID() == getStorageID())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
+
+    ExportPartsRequest request;
+    request.destination = dest_storage;
+    request.partition_id = getPartitionIDFromQuery(command.partition, query_context);
+    request.source = ExportTaskSource::query;
+    request.query_id = query_context->getCurrentQueryId();
+    {
+        auto data_parts_lock = lockParts();
+        request.parts = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, request.partition_id, data_parts_lock);
+    }
+
+    if (request.parts.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} doesn't exist", request.partition_id);
+
+    exportParts(request, query_context);
 }
 
 void MergeTreeData::movePartitionToShard(const ASTPtr & /*partition*/, bool /*move_part*/, const String & /*to*/, ContextPtr /*query_context*/)
@@ -7967,7 +8252,11 @@ void MergeTreeData::restorePartFromBackup(std::shared_ptr<RestoredPartsHolder> r
         restore_tx->commit();
 
     if (auto part = loadPartRestoredFromBackup(part_name, disk, temp_part_dir, detach_if_broken))
+    {
+        const auto metadata_snapshot = getInMemoryMetadataPtr(getContext(), false);
+        checkIncomingPartForExportTTL(*part, *metadata_snapshot);
         restored_parts_holder->addPart(part);
+    }
     else
         restored_parts_holder->increaseNumBrokenParts();
 }
@@ -8923,6 +9212,7 @@ MergeTreeData::MutableDataPartsVector MergeTreeData::tryLoadPartsToAttach(const 
     LOG_DEBUG(log, "Checking {} parts", renamed_parts.old_and_new_names.size());
     MutableDataPartsVector loaded_parts;
     loaded_parts.reserve(renamed_parts.old_and_new_names.size());
+    const auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
 
     for (const auto & [part_name, old_dir, new_dir, disk] : renamed_parts.old_and_new_names)
     {
@@ -8942,6 +9232,7 @@ MergeTreeData::MutableDataPartsVector MergeTreeData::tryLoadPartsToAttach(const 
             .build();
 
         loadPartAndFixMetadataImpl(part, local_context);
+        checkIncomingPartForExportTTL(*part, *metadata_snapshot);
 
         chassert(!part->version->getInfo().isRemoved());
         loaded_parts.push_back(part);
