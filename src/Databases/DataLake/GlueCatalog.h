@@ -126,7 +126,6 @@ public:
     static String resolveTimestampType(const FieldTypes & field_types, const String & column_name, const String & glue_column_type);
 
 private:
-<<<<<<< HEAD
     struct AuthenticatedClient
     {
         std::shared_ptr<Aws::Glue::GlueClient> client;
@@ -143,14 +142,11 @@ private:
 
     AuthenticatedClient getClient(const DB::ForwardedAuthTokenPtr & auth_token) const;
 
-=======
     struct FieldTypesWeightFunction
     {
         size_t operator()(const FieldTypes & field_types) const;
     };
 
-    std::unique_ptr<Aws::Glue::GlueClient> glue_client;
->>>>>>> v26.8.34.13-lts
     const LoggerPtr log;
     std::string region;
     CatalogSettings settings;
@@ -202,6 +198,7 @@ private:
         const DB::ForwardedAuthTokenPtr & auth_token,
         const std::vector<Aws::Glue::Model::Column> & columns = {}) const;
 
+    mutable DB::CacheBase<String, Poco::JSON::Object::Ptr> metadata_objects;
     mutable DB::CacheBase<String, FieldTypes, std::hash<String>, FieldTypesWeightFunction> current_schema_field_types;
 };
 

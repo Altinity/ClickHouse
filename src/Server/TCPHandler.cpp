@@ -2504,12 +2504,8 @@ ClusterFunctionReadTaskResponsePtr TCPHandler::receiveClusterFunctionReadTaskRes
         case Protocol::Client::ReadTaskResponse:
         {
             auto task = std::make_shared<ClusterFunctionReadTaskResponse>();
-<<<<<<< HEAD
             task->deserialize(*in, client_antalya_protocol_version);
-=======
-            task->deserialize(*in);
             state.at_packet_boundary = true;
->>>>>>> v26.8.34.13-lts
             return task;
         }
 

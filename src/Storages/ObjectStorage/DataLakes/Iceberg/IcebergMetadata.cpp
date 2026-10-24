@@ -398,16 +398,12 @@ Int32 IcebergMetadata::parseTableSchema(
 {
     const auto format_version = metadata_object->getValue<Int32>(f_format_version);
 
-<<<<<<< HEAD
-    /// v2 and v3 (and later) store schemas in the `schemas` array. Only v1 has a top-level `schema`.
-    /// Using the v1 parser first for v3 looks like a spec violation and logs a false warning.
-    if (format_version >= 2)
-=======
     if (metadata_object->has(f_last_column_id) && !metadata_object->isNull(f_last_column_id))
         schema_processor.updateLastColumnId(metadata_object->getValue<Int32>(f_last_column_id));
 
-    if (format_version == 2)
->>>>>>> v26.8.34.13-lts
+    /// v2 and v3 (and later) store schemas in the `schemas` array. Only v1 has a top-level `schema`.
+    /// Using the v1 parser first for v3 looks like a spec violation and logs a false warning.
+    if (format_version >= 2)
     {
         auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
         schema_processor.addIcebergTableSchema(schema, context_);

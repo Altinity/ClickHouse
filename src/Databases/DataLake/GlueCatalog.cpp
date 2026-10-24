@@ -21,11 +21,8 @@
 
 #include <Common/Exception.h>
 #include <Common/CurrentMetrics.h>
-<<<<<<< HEAD
 #include <Common/CurrentThread.h>
-=======
 #include <base/unit.h>
->>>>>>> v26.8.34.13-lts
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
 
@@ -127,10 +124,11 @@ namespace ProfileEvents
 
 namespace CurrentMetrics
 {
-<<<<<<< HEAD
     extern const Metric MarkCacheBytes;
     extern const Metric MarkCacheFiles;
     extern const Metric DataLakeCatalogUserClientCacheEntries;
+    extern const Metric GlueCatalogSchemaCacheBytes;
+    extern const Metric GlueCatalogSchemaCacheEntries;
 }
 
 namespace
@@ -212,10 +210,6 @@ Poco::JSON::Object::Ptr getCurrentSchemaFromMetadata(const Poco::JSON::Object::P
     return schema;
 }
 
-=======
-    extern const Metric GlueCatalogSchemaCacheBytes;
-    extern const Metric GlueCatalogSchemaCacheEntries;
->>>>>>> v26.8.34.13-lts
 }
 
 namespace DataLake
@@ -274,6 +268,7 @@ GlueCatalog::GlueCatalog(
     , region(settings_.region)
     , settings(settings_)
     , table_engine_definition(table_engine_definition_)
+    , metadata_objects(CurrentMetrics::MarkCacheBytes, CurrentMetrics::MarkCacheFiles, 1024)
     , current_schema_field_types(CurrentMetrics::GlueCatalogSchemaCacheBytes, CurrentMetrics::GlueCatalogSchemaCacheEntries, 16_MiB)
 {
     DB::S3::CredentialsConfiguration creds_config;
@@ -854,15 +849,12 @@ String GlueCatalog::getActualTimestampType(
     if (!table_specific_properties.has_value())
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Failed to read table metadata, reason why table is unreadable: {}", table_metadata.getReasonWhyTableIsUnreadable());
 
-<<<<<<< HEAD
-    auto metadata_object = getOrFetchMetadataObject(client, table_specific_properties->iceberg_metadata_file_location, table_metadata);
-    return resolveTimestampTypeFromMetadata(metadata_object, column_name, glue_column_type);
-=======
     const String & metadata_uri = table_specific_properties->iceberg_metadata_file_location;
 
-    auto [field_types, _] = current_schema_field_types.getOrSet(metadata_uri, [&]
+    /// The metadata is read with the user's credentials, so a user must not get an entry fetched by another user.
+    auto [field_types, _] = current_schema_field_types.getOrSet(client.token_fingerprint + metadata_uri, [&]
     {
-        auto [object_storage, bucket_name, metadata_path] = createObjectStorageForEarlyTableAccess(metadata_uri, table_metadata);
+        auto [object_storage, bucket_name, metadata_path] = createObjectStorageForEarlyTableAccess(client, metadata_uri, table_metadata);
         auto compression_method = DB::Iceberg::getCompressionMethodFromMetadataFile(metadata_uri);
         auto metadata_object = DB::Iceberg::getMetadataJSONObject(
             metadata_path, object_storage, nullptr, getContext(), log, compression_method, std::nullopt);
@@ -870,7 +862,6 @@ String GlueCatalog::getActualTimestampType(
     });
 
     return resolveTimestampType(*field_types, column_name, glue_column_type);
->>>>>>> v26.8.34.13-lts
 }
 
 Poco::JSON::Object::Ptr GlueCatalog::getIcebergMetadataObject(const AuthenticatedClient & client, const TableMetadata & table_metadata) const
@@ -921,10 +912,6 @@ String GlueCatalog::resolveTimestampType(const FieldTypes & field_types, const S
     return glue_column_type == "timestamp_nano" ? "timestamp_ns" : "timestamp";
 }
 
-<<<<<<< HEAD
-GlueCatalog::ObjectStorageWithPath GlueCatalog::createObjectStorageForEarlyTableAccess(
-    const AuthenticatedClient & client, const String & s3_location, const TableMetadata & table_metadata) const
-=======
 size_t GlueCatalog::FieldTypesWeightFunction::operator()(const FieldTypes & field_types) const
 {
     size_t result = 0;
@@ -933,8 +920,8 @@ size_t GlueCatalog::FieldTypesWeightFunction::operator()(const FieldTypes & fiel
     return result;
 }
 
-GlueCatalog::ObjectStorageWithPath GlueCatalog::createObjectStorageForEarlyTableAccess(const String & s3_location, const TableMetadata & table_metadata) const
->>>>>>> v26.8.34.13-lts
+GlueCatalog::ObjectStorageWithPath GlueCatalog::createObjectStorageForEarlyTableAccess(
+    const AuthenticatedClient & client, const String & s3_location, const TableMetadata & table_metadata) const
 {
     DB::ASTStorage * storage = table_engine_definition->as<DB::ASTStorage>();
     DB::ASTs args = storage->engine->arguments->children;

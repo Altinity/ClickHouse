@@ -46,7 +46,6 @@ TEST(IOTestS3URI, PathStyleWithKey)
     ASSERT_EQ(uri_with_no_key_and_with_slash.key, "key/key/key/key");
 }
 
-<<<<<<< HEAD
 TEST(IOTestS3URI, ResolveS3Endpoint)
 {
     using namespace DB;
@@ -70,7 +69,8 @@ TEST(IOTestS3URI, ResolveS3Endpoint)
 
     ASSERT_EQ(S3::expandRegionToAmazonPath("us-gov-west-1"),
               "https://s3.us-gov-west-1.amazonaws.com");
-=======
+}
+
 namespace DB::ErrorCodes
 {
 extern const int UNACCEPTABLE_URL;
@@ -133,7 +133,6 @@ TEST(IOTestS3URI, CheckRemoteHostFilter)
     /// A <host> entry keeps working for S3 URLs: every bucket on that host is allowed.
     allowed("https://allowed.example.com/any-bucket/key");
     allowed("http://allowed.example.com:8080/any-bucket/key");
->>>>>>> v26.8.34.13-lts
 }
 
 #endif

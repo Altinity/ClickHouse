@@ -248,7 +248,6 @@ bool URI::tryInitVirtualHostedStyle(bool is_using_aws_private_link_interface, bo
     return true;
 }
 
-<<<<<<< HEAD
 bool URI::isAWSRegion(std::string_view region)
 {
     /// List from https://docs.aws.amazon.com/general/latest/gr/s3.html
@@ -296,7 +295,8 @@ bool URI::isAWSRegion(std::string_view region)
         region = region.substr(3);
 
     return regions.contains(region);
-=======
+}
+
 bool URI::checkRemoteHostFilter(const RemoteHostFilter & filter, bool throw_on_error) const
 {
     Poco::URI endpoint_uri(endpoint);
@@ -304,7 +304,6 @@ bool URI::checkRemoteHostFilter(const RemoteHostFilter & filter, bool throw_on_e
         return true;
 
     return filter.checkURL(uri, throw_on_error);
->>>>>>> v26.8.34.13-lts
 }
 
 void URI::addRegionToURI(const std::string &region)
