@@ -428,7 +428,7 @@ public:
     /// OBSERVATION clock: monotonic on this
     /// process, injected for tests, defaults to `Pool::bootMs()`, and the ONLY clock the heartbeat
     /// gate's own fence-out threshold is measured against (mirrors `claimMountAwaitingExpiry`'s
-    /// `mono_ms_fn`, but at heartbeat-gate granularity — one GC round is one observation tick).
+    /// `mono_ms_fn`).
     /// Everything else in the round stays deterministic/clock-free.
     ///
     /// `log_` is the logger every round-engine log line is emitted through; pass a disk/srid-scoped
@@ -1015,6 +1015,9 @@ private:
     /// leader (after a steal, or a process restart) starts empty, which only delays fencing an
     /// already-dead mount by one extra round (safe: never fences early).
     MountObservationMap mount_obs;
+    /// Srids `computeHeartbeatFloor` already warned about for a lease length different from ours.
+    /// In-memory: a new leader names each mismatched holder once more.
+    std::set<String> lease_mismatch_warned;
 
     /// Throttle for the orphan sweep's retention rollup. The premise retains on any pass whose epochs are
     /// not closed-and-folded, so an unconditional `LOG_INFO` would repeat the same sentence for as long as
