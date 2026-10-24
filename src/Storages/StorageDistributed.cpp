@@ -13,7 +13,6 @@
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypeString.h>
 #include <DataTypes/NestedUtils.h>
 
 #include <Disks/IVolume.h>
@@ -59,7 +58,6 @@
 #include <Parsers/parseQuery.h>
 
 #include <Analyzer/ColumnNode.h>
-#include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/TableFunctionNode.h>
@@ -218,7 +216,6 @@ namespace Setting
     extern const SettingsBool skip_unavailable_shards;
     extern const SettingsBool enable_global_with_statement;
     extern const SettingsBool allow_experimental_hybrid_table;
-    extern const SettingsBool enable_alias_marker;
 }
 
 namespace DistributedSetting
@@ -1144,7 +1141,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         replace_query_columns_visitor.visit(query_tree_to_modify);
     }
 
-    inlineAliasColumns(query_tree_to_modify);
+    inlineAliasColumns(query_tree_to_modify, query_context);
 
     const auto & settings = query_context->getSettingsRef();
 
@@ -1157,8 +1154,9 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         rewriteJoinToGlobalJoinIfNeeded(query_node.getJoinTreeNode());
     }
 
+    /// `buildQueryTreeForShard` materializes the marker ids on the way out, after the `__tableN` renumbering they are
+    /// built from.
     return buildQueryTreeForShard(query_info.planner_context, query_tree_to_modify, /*allow_global_join_for_right_table*/ false);
-
 }
 
 std::optional<std::pair<String, String>> tryGetParamTypeAndName(const ASTPtr & node)
