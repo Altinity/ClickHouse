@@ -252,7 +252,7 @@ def test_optimize_v3_rejected(started_cluster_iceberg_with_spark):
         f"OPTIMIZE TABLE {TABLE_NAME};",
         settings={"allow_experimental_iceberg_compaction": 1},
     )
-    assert "Compaction is supported only for format_version 2" in error_message
+    assert "OPTIMIZE TABLE is supported only for Iceberg format_version 2" in error_message
 
     # No new metadata was committed, and every metadata file is still format-version 3.
     assert list_metadata_files() == metadata_files_before

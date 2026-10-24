@@ -90,6 +90,7 @@ private:
     /// Per `sample_block` column: whether it is left out of the data file, so statistics must not describe it.
     std::vector<bool> getStatisticsExcludedColumns() const;
 
+    /// Rollover thresholds for the current data file; 0 means "no limit".
     UInt64 max_data_file_num_rows;
     UInt64 max_data_file_num_bytes;
     Poco::JSON::Array::Ptr schema;
