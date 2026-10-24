@@ -1,0 +1,19 @@
+field	value
+binary_version	26.6.2.20000.altinityantalya
+git_rev	647dbf9dfe9
+build_type	RelWithDebInfo
+workload_hash	d9ce020cbea7954b34aeac3cd3cf2a9d119682b2b202bfdebf8223f1c6103309
+dirty	no
+scale	1.0
+counts	cycle=iterations:25,rows_per_insert:1000;wide_insert=inserts:500,rows_per_insert:20000;attach_200=parts:200,rows_per_part:10000;mutation=parts:100,rows_per_part:10000;lwd_concurrent=parts:50,rows_per_part:100000;select_subset=parts:200,rows_per_part:50000;dup_content=tables:20,rows:1000000
+gc	on
+repeats	3
+policy_order	k1=cas,s3,s3plain,cas_cached,s3_cached,s3plain_cached;k2=s3,s3plain,cas_cached,s3_cached,s3plain_cached,cas;k3=s3plain,cas_cached,s3_cached,s3plain_cached,cas,s3
+config_hash	cas=e212a3db7b9ef15601e3c27ab200819ff2b76ce06a2084d49209ec6d9b6db662;s3=af565251a90ecb3f5f21479a79100844a64bd85680bd5ace70d6e93185fdc9f8;s3plain=0e83d18e8247b9d397011d8382b6bd96c1dda44088e8b5f67f9be2886478b5f3;cas_cached=b58833a0cbaa11507e717761ac067588636c37eb8839daf1af7d465446493c74;s3_cached=319b8566ceb1ef4c8dabc1e45ac6b25f0035d7929f27b5bcbadf6686535d0911;s3plain_cached=54cea88a77992eba75c6f2c7f0fa237760e8c240eec29565a33e8afadf3f3890
+config_dir	/home/mfilimonov/workspace/ClickHouse/master/tmp/cas321/runs/20260930T055649Z/config
+store	rustfs/rustfs:1.0.0-rc.3
+store_version	unknown
+host	mfilimonov-MS-7E12
+kernel	6.14.0-37-generic
+date	2026-09-30T05:56:49+00:00
+flags	utils/cas-yardstick/yardstick.py run --binary /home/mfilimonov/workspace/ClickHouse/master/build/programs/clickhouse --repeats 3 --runs-dir /home/mfilimonov/workspace/ClickHouse/master/tmp/cas321/runs

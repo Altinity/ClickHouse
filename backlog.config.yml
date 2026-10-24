@@ -1,0 +1,66 @@
+project_name: "CAS backlog"
+default_status: "To Do"
+statuses: ["To Do", "In Progress", "Done"]
+priorities: ["Critical", "High", "Medium", "Low"]
+types: ["bug", "feature", "enhancement", "task", "chore", "docs", "spike", "design", "research", "upstream"]
+labels:
+  - "area:gc"
+  - "area:ref-ledger"
+  - "area:mounts"
+  - "area:write-path"
+  - "area:read-path"
+  - "area:backend"
+  - "area:gcs"
+  - "area:formats"
+  - "area:replication"
+  - "area:fsck"
+  - "area:observability"
+  - "area:testing"
+  - "area:ci"
+  - "area:docs"
+  - "area:upstream"
+  - "area:tooling"
+  - "area:soak"
+  - "complexity:trivial"
+  - "complexity:small"
+  - "complexity:medium"
+  - "complexity:large"
+  - "complexity:epic"
+  - "risk:low"
+  - "risk:medium"
+  - "risk:high"
+  - "touches:protocol"
+  - "touches:on-s3-format"
+  - "touches:upstream-code"
+  - "touches:settings"
+  - "confidence:solid"
+  - "confidence:plausible"
+  - "confidence:speculative"
+  - "confidence:contested"
+  - "needs:decision"
+  - "needs:measurement"
+  - "needs:spec"
+  - "needs:repro"
+  - "origin:2031-triage"
+  - "origin:otel-demo-audit"
+  - "origin:canary"
+  - "origin:soak"
+  - "origin:review"
+  - "origin:issue"
+definition_of_done:
+  - "CAS* gtest gate green (utils/cas-gate); LOGICAL_ERROR expectations are death tests"
+  - "ASan lane green for touched suites"
+  - "Docs updated where user-visible (docs/en/antalya/cas) and the spec if the on-S3 format is touched (frozen since 26.6.4: new version + compatibility path)"
+  - "No fallback paths added; failures propagate"
+date_format: yyyy-mm-dd
+max_column_width: 20
+auto_open_browser: false
+default_port: 6420
+remote_operations: false
+auto_commit: false
+filesystem_only: false
+bypass_git_hooks: false
+check_active_branches: false
+active_branch_days: 30
+task_prefix: "cas"
+backlog_directory: "docs/superpowers/cas/backlog"

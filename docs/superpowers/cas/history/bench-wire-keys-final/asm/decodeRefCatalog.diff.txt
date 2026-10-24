@@ -1,0 +1,45 @@
+=== Diff Mode ===
+Match method: mangled_symbol
+
+--- Before ---
+Binary: ~/workspace/ClickHouse/cas-p2-before/build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
+Function: DB::Cas::decodeRefCatalog(std::__1::basic_string_view<char, std::__1::char_traits<char> >)
+Build ID: cccbca33e4c37d55...
+Instructions: 1361  Bytes: 7087
+Spill: 27.6%  Branch: 15.9%  Call: 8.4%
+Blocks: 283  Loops: 5
+
++++ After +++
+Binary: build/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/benchmarks/benchmark_cas_ref_protocol
+Function: DB::Cas::decodeRefCatalog(std::__1::basic_string_view<char, std::__1::char_traits<char> >)
+Build ID: 469d1aa112b7e3f0...
+Instructions: 1355  Bytes: 7012
+Spill: 27.2%  Branch: 16.2%  Call: 8.4%
+Blocks: 282  Loops: 4
+
+=== Deltas ===
+  instruction_count: -6
+  byte_size: -75
+  branch_count: +2
+  call_count: 0
+  spill_store_count: -3
+  spill_load_count: -5
+  spill_density: -0.47%
+  branch_density: +0.22%
+  call_density: +0.03%
+  block_count: -1
+  loop_count: -1
+
+=== Finding Changes ===
+  - [high] Register spills in loop at L5 (10.0% of 10 insns)
+
+=== Timing ===
+  probe: 16ms
+  inspect_before: 6ms
+  resolve_before: 213ms
+  disassemble_before: 80ms
+  inspect_after: 8ms
+  resolve_after: 222ms
+  disassemble_after: 83ms
+  diff_total: 615ms
+

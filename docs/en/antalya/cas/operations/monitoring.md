@@ -156,3 +156,40 @@ ORDER BY disk, server_root_id;
 process-local — `NULL` on every row describing a peer's mount — so this query is only informative
 run against the node whose GC leadership you are checking; run it on each node to see the whole
 pool's view of itself.
+
+## Dashboards {#dashboards}
+
+Two Grafana dashboards for the Altinity ClickHouse datasource ship in the repository:
+`utils/cas-grafana/dashboards/cas-overview.json` (`CAS / Overview`, for people who run the cluster) and
+`utils/cas-grafana/dashboards/cas-drilldown.json` (`CAS / Drilldown`, for support). Import steps and the
+datasource grants are in `utils/cas-grafana/README.md`.
+
+The Overview has six status tiles. Grey `no data` on any tile means the source table has no rows in the
+selected range; because the system logs may sit on the CAS disk itself, treat it as a warning, not as green.
+
+- **Storage online** — hosts in the cluster that did not answer, disks whose `lifecycle` is not `live`
+  (`system.cas_mounts`), `CASMountLeaseLost` in the range, and seconds since the last `metric_log` row.
+  Red on any host missing, any disk not live, any lease loss, or metrics older than 10 minutes.
+- **Writes safe** — `CASRequestGaveUp` (red above zero) and `CASConditionalWriteUnresolved /
+  CASConditionalWriteAttempts` (yellow above 0.1%; 0.03% is the otel.demo baseline).
+- **GC: last success** — minutes since the last `Finish` row with outcome `Success` or `Deferred` in
+  `system.cas_gc_log`, any disk, last 7 days regardless of the range (yellow after 30 minutes, red after
+  2 hours), and rounds with outcome `Error`, `Aborted` or `Stopped` in the range (red above zero).
+- **Garbage trend** — over the last 10 `Success` rounds, `(entries_condemned − entries_redeleted) /
+  entries_condemned` as a percentage (yellow above 25%, red above 50%) and the net object count. Near zero
+  is steady state; it rises for about an hour after a restart. This replaces `cas_mounts.pending_reclaim`,
+  which is process-local and goes negative after a restart.
+- **Integrity** — `cas_log` rows with `event_type` in `read_missing`, `dangling_access`, `corrupt_dangle`,
+  `corrupt_decode`, `snap_journal_incoherent`, `exception` (red above zero); `anomalies` summed over `Finish`
+  rows (yellow); the latest `CASGCWedgedNamespaces_<disk>` (red); `CASRefNeedsRecovery` (red).
+- **S3 throttling** — `S3ReadRequestsThrottling + S3WriteRequestsThrottling` per minute (yellow above zero,
+  red above 10) and `blob_storage_log` rows with a non-empty `error` per hour, excluding the storage's
+  expected answers to concurrent writes of one object (`PreconditionFailed`, 412, and
+  `ConditionalRequestConflict`, 409); yellow above 5 per hour, red above 50.
+
+Each tile links to `CAS / Drilldown`, which keeps the time range and variables. Its rows are collapsed and
+prefixed `GC:`, `Writes:`, `S3:`; the last row lists every `CAS*` counter that moved in the range.
+
+## Measuring CAS against plain S3 {#cas-yardstick}
+
+`utils/cas-yardstick` runs a fixed set of workload cards on a CAS disk and on two ordinary S3 disks, and reports wall time, S3 API calls and bytes with paired ratios. Start its S3 store with `utils/cas-yardstick/rustfs.sh start` and stop it with `rustfs.sh stop` afterwards. Check the pipeline with `yardstick.py run --smoke --binary <clickhouse>`. Measure often with `yardstick.py run --quick --binary <clickhouse>`, and fully with `yardstick.py run --binary <clickhouse>`. The accepted reference run is in `utils/cas-yardstick/reference/`, and the README at `utils/cas-yardstick/README.md` lists the cards, the capability matrix and how to compare a run with it.

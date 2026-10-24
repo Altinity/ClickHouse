@@ -1,0 +1,24 @@
+<clickhouse>
+    <!-- R4: sample the query profiler at 10ms so a 20-min soak yields enough system.trace_log
+         stacks to judge whether the RefCowMap change (R1) removed the whole-map
+         std::__tree copy_construct_tree from the CPU top. Default period is 1s (too sparse). -->
+    <profiles>
+        <default>
+            <!-- Cap in-flight S3 requests at what this fixture's RustFS will serve. It refuses past
+                 its disk-read concurrency ceiling (256, set in configs/rustfs.env) while ClickHouse
+                 defaults s3_max_connections to 1024, so the client may hold four times what the store
+                 admits. The mismatch is concurrency, not rate: a wedged S21 averaged only ~51
+                 requests/s while 20,057 of 58,160 reads came back throttled, so a max_get_rps cap
+                 could never bind. S21 hung 2 of 2 runs on an otherwise idle host (load 2.1, iowait 0%)
+                 before this was set (2026-09-01).
+
+                 It belongs HERE and not in the disk block: `s3_max_connections` is declared in
+                 Core/Settings.cpp, so it is a profile setting. The per-disk S3RequestSettings list has
+                 max_get_rps but no max_connections, so putting it there is a silent no-op, which is
+                 exactly the mistake this comment exists to stop the next reader repeating. -->
+            <s3_max_connections>192</s3_max_connections>
+            <query_profiler_real_time_period_ns>10000000</query_profiler_real_time_period_ns>
+            <query_profiler_cpu_time_period_ns>10000000</query_profiler_cpu_time_period_ns>
+        </default>
+    </profiles>
+</clickhouse>

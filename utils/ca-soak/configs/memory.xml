@@ -1,0 +1,18 @@
+<clickhouse>
+    <!-- B165: fail CLOSED on memory before the kernel OOM-kills the node. The docker-compose
+         `mem_limit` sets a per-container cgroup limit (the MemoryWorker uses cgroups as its source),
+         so this ratio caps ClickHouse at ~0.9 of that limit. On exceed, ClickHouse throws
+         MEMORY_LIMIT_EXCEEDED on the offending allocation and logs it (with a stack for background
+         work like the CA GC) into /var/log/clickhouse-server — which is bind-mounted to the host and
+         survives `docker compose down -v`. The node stays alive and the consumer is NAMED, instead
+         of a silent kernel OOM-kill that destroys all evidence (soak #7 / B165). -->
+    <max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>
+
+    <!-- Sample background and idle allocations, not only per-query ones. This knob defaults to 0,
+         meaning off, and the per-query `memory_profiler_step` cannot fire when no query is running,
+         which is exactly the case an idle-growth question asks about. Without this,
+         `system.trace_log` holds no `Memory` rows for an idle window, so the question comes back
+         unanswerable rather than answered. It belongs here and not in `profiling.xml`: that file is
+         mounted into `users.d`, where a server setting is ignored. 4 MiB keeps the rate modest. -->
+    <total_memory_profiler_step>4194304</total_memory_profiler_step>
+</clickhouse>

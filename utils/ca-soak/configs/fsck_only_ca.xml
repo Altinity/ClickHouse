@@ -1,0 +1,31 @@
+<clickhouse>
+    <!-- fsck-ONLY config for `clickhouse disks -C /etc/clickhouse-server/fsck-only.xml`.
+         The read-only shadow disk of the pool must NOT be visible to the SERVER: MergeTree part
+         discovery finds the pool's parts on it and fails table load with UNKNOWN_DISK ("found on
+         disk 'ca_ro' which is not defined in the storage policy") on ANY server restart with CA
+         tables attached (ROADMAP "Read-only fsck shadow disk breaks table load on restart"; hit live
+         on the GCS stand 2026-07-03 AND confirmed on the default RustFS stand 2026-07-06 on a fresh
+         table + graceful restart). Keeping ca_ro out of config.d/ (this file is mounted at
+         /etc/clickhouse-server/fsck-only.xml, OUTSIDE config.d) makes the server ignore it while
+         clickhouse-disks -C can still fsck read-only over the same live pool.
+
+         Read-only open skips the mount claim, so the srid is only an identifier; fsck's reachability
+         walk covers the WHOLE pool (all server roots), so one shared config fscks the whole pool from
+         either node. -->
+    <storage_configuration>
+        <disks>
+            <ca_ro>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_server_root_id>ca_soak_ch1</cas_server_root_id> <!-- literal: clickhouse-disks -C does not load the server macros -->
+                <cas_gc_enabled>0</cas_gc_enabled>
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+                <readonly>true</readonly>
+            </ca_ro>
+        </disks>
+    </storage_configuration>
+</clickhouse>

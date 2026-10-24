@@ -1,0 +1,9 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <ca>
+                <gc_round_graduation_budget>5</gc_round_graduation_budget>
+            </ca>
+        </disks>
+    </storage_configuration>
+</clickhouse>

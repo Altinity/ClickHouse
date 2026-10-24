@@ -198,3 +198,14 @@ tests/casa_del_dolor/_instances*
 ci/praktika/json_test.html
 ci/praktika/json_test.html.gz
 ci/praktika/json.html.gz
+
+# SDD scratch (briefs, reports, review diffs, progress ledger) — never committed
+.superpowers/
+
+# ca-soak run artifacts: per-scenario container log archives, sometimes hundreds of MB each.
+# `git add -A utils/ca-soak` swept 380 of these into a commit on 2026-07-26 and the push was
+# rejected with "pack exceeds maximum allowed size (2.00 GiB)". They are run output, never source.
+utils/ca-soak/scenarios/_archive_*.tgz
+utils/ca-soak/logs/
+utils/ca-soak/logs_*/
+utils/ca-soak/tmp/

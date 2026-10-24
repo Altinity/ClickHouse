@@ -1,0 +1,79 @@
+{
+  "quiesced_now": 1785102368,
+  "fsck_final": {
+    "reachable": 34,
+    "dangling": 0,
+    "unreachable": 12,
+    "pending_gc": 0,
+    "awaiting_gc": 0,
+    "unaccounted": 0,
+    "stale_edge": 12,
+    "corrupted_runs": 0,
+    "snapshot_oracle_mismatches": 0,
+    "snapshot_oracle_checked": 0,
+    "physical_bytes": 26527058439,
+    "referenced_logical_bytes": 90917553715,
+    "distinct_blobs": 34,
+    "total_blob_refs": 78,
+    "dedup_ratio": 2.29412,
+    "exit_code": 0
+  },
+  "dryrun_count": 0,
+  "gc_residual_unreachable": 12,
+  "gc_fixpoint_history": [
+    12,
+    12,
+    12
+  ],
+  "pool_shape": {
+    "blobs": {
+      "objects": 1546,
+      "bytes": 26527985469
+    },
+    "_manifests": {
+      "objects": 22,
+      "bytes": 2608472
+    },
+    "refs": {
+      "objects": 209,
+      "bytes": 212913
+    },
+    "roots": {
+      "objects": 0,
+      "bytes": 0
+    },
+    "_files": {
+      "objects": 2,
+      "bytes": 1004
+    },
+    "gc": {
+      "objects": 13,
+      "bytes": 20115
+    },
+    "_pool_meta": {
+      "objects": 1,
+      "bytes": 607
+    },
+    "other": {
+      "objects": 0,
+      "bytes": 0
+    },
+    "_ok": true,
+    "_total": {
+      "objects": 1793,
+      "bytes": 26530828580
+    }
+  },
+  "gc_summary": {
+    "failed": 0,
+    "failed_benign": 0,
+    "not_a_leader": 130,
+    "success": 26,
+    "deleted_total": 30705,
+    "manifests_deleted_total": 114912,
+    "spared_total": 226,
+    "replaced_total": 0,
+    "rows_total": 190
+  },
+  "ca_event_bad_total": {}
+}

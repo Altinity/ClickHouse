@@ -1,0 +1,1829 @@
+policy	card	phase	metric	median	min	max	repeats	per_unit	mark
+cas	cycle	cold	wall	4.2494547930546105	4.086237737908959	4.25476694596	3	0.021247273965273053	
+cas	cycle	cold	median_op_ms	164.96383951744065	158.8753469986841	165.86786799598485	3	0.8248191975872032	
+cas	cycle	cold	p90_op_ms	173.94092886243016	166.33221376687288	181.4272389281541	3	0.8697046443121508	
+cas	cycle	cold	GET	16609	16607	16610	3	83.045	~
+cas	cycle	cold	PUT	12828	12823	12829	3	64.14	~
+cas	cycle	cold	HEAD	1000	1000	1000	3	5.0	
+cas	cycle	cold	LIST	1400	1400	1400	3	7.0	
+cas	cycle	cold	DELETE	200	200	200	3	1.0	
+cas	cycle	cold	COPY	0	0	0	3	0.0	
+cas	cycle	cold	ABORT	0	0	0	3	0.0	
+cas	cycle	cold	bytes_read	104642884	104640652	104643028	3	523214.42	
+cas	cycle	cold	bytes_written	13343410	13322685	13345396	3	66717.05	
+cas	cycle	cold	gc_rounds	0	0	0	3	0.0	
+cas	cycle	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	cycle	cold	S3ReadRequestsErrors	814	812	815	3	4.07	
+cas	cycle	cold	S3WriteRequestsErrors	11	9	12	3	0.055	
+cas	cycle	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	cycle	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	cycle	cold	CASRequestAttempt	31437	31430	31439	3	157.185	
+cas	cycle	cold	CASRootGet	6200	6200	6200	3	31.0	
+cas	cycle	cold	CASRootPut	5400	5400	5400	3	27.0	
+cas	cycle	cold	CASBlobPut	17	14	17	3	0.085	
+cas	cycle	cold	CASBlobHead	586	586	589	3	2.93	
+cas	cycle	cold	CASBlobHeadMiss	14	11	14	3	0.07	
+cas	cycle	cold	CASManifestPut	1800	1800	1800	3	9.0	
+cas	cycle	cold	CASManifestGet	3000	3000	3000	3	15.0	
+cas	cycle	cold	CASOtherGet	5801	5801	5801	3	29.005	
+cas	cycle	cold	CASHotKeyQueueWaitMicroseconds	2212000	2166000	2448000	3	11060.0	
+cas	cycle	cold	CASRefQueueWaitMicroseconds	16444027	15807790	16474812	3	82220.135	
+cas	cycle	hot	wall	4.304612944019027	4.180082108010538	5.112943644984625	3	0.021523064720095134	noisy
+cas	cycle	hot	median_op_ms	170.38412694819272	164.98355800285935	192.16851243982092	3	0.8519206347409636	
+cas	cycle	hot	p90_op_ms	178.99873588467017	174.50547982007265	273.41726733138785	3	0.8949936794233508	
+cas	cycle	hot	GET	16600	16600	16600	3	83.0	
+cas	cycle	hot	PUT	12800	12800	12801	3	64.0	~
+cas	cycle	hot	HEAD	1000	1000	1000	3	5.0	
+cas	cycle	hot	LIST	1400	1400	1400	3	7.0	
+cas	cycle	hot	DELETE	200	200	200	3	1.0	
+cas	cycle	hot	COPY	0	0	0	3	0.0	
+cas	cycle	hot	ABORT	0	0	0	3	0.0	
+cas	cycle	hot	bytes_read	297176944	297174981	297179292	3	1485884.72	
+cas	cycle	hot	bytes_written	33169681	33169075	33169940	3	165848.405	
+cas	cycle	hot	gc_rounds	0	0	0	3	0.0	
+cas	cycle	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	cycle	hot	S3ReadRequestsErrors	800	800	800	3	4.0	
+cas	cycle	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	cycle	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	cycle	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	cycle	hot	CASRequestAttempt	31400	31400	31401	3	157.0	
+cas	cycle	hot	CASRootGet	6200	6200	6200	3	31.0	
+cas	cycle	hot	CASRootPut	5400	5400	5400	3	27.0	
+cas	cycle	hot	CASBlobPut	0	0	0	3	0.0	
+cas	cycle	hot	CASBlobHead	600	600	600	3	3.0	
+cas	cycle	hot	CASBlobHeadMiss	0	0	0	3	0.0	
+cas	cycle	hot	CASManifestPut	1800	1800	1800	3	9.0	
+cas	cycle	hot	CASManifestGet	3000	3000	3000	3	15.0	
+cas	cycle	hot	CASOtherGet	5800	5800	5800	3	29.0	
+cas	cycle	hot	CASHotKeyQueueWaitMicroseconds	2860000	2747000	3301000	3	14300.0	
+cas	cycle	hot	CASRefQueueWaitMicroseconds	16908978	16353027	19619744	3	84544.89	
+cas	wide_insert	cold	wall	19.4437775289407	17.80775886401534	22.512115308083594	3	0.0388875550578814	noisy
+cas	wide_insert	cold	median_op_ms	36.437755450606346	35.28863954124972	37.9223424824886	3	0.07287551090121269	
+cas	wide_insert	cold	p90_op_ms	43.52826789254323	36.55364491278306	48.75319529091939	3	0.08705653578508646	
+cas	wide_insert	cold	GET	4000	2504	4757	3	8.0	~
+cas	wide_insert	cold	PUT	3510	3507	3514	3	7.02	~
+cas	wide_insert	cold	HEAD	500	500	500	3	1.0	
+cas	wide_insert	cold	LIST	3	0	4	3	0.006	~
+cas	wide_insert	cold	DELETE	0	0	1	3	0.0	~
+cas	wide_insert	cold	COPY	0	0	0	3	0.0	
+cas	wide_insert	cold	ABORT	0	0	0	3	0.0	
+cas	wide_insert	cold	bytes_read	2277200	1177301	2358635	3	4554.4	noisy
+cas	wide_insert	cold	bytes_written	1241475895	1241475625	1241519003	3	2482951.79	
+cas	wide_insert	cold	gc_rounds	0	0	1	3	0.0	
+cas	wide_insert	cold	gc_rounds_overlapping	0	0	1	3	0.0	
+cas	wide_insert	cold	S3ReadRequestsErrors	506	500	510	3	1.012	
+cas	wide_insert	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	wide_insert	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	wide_insert	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	wide_insert	cold	CASRequestAttempt	8013	6511	8776	3	16.026	
+cas	wide_insert	cold	CASRootGet	1996	1004	2812	3	3.992	
+cas	wide_insert	cold	CASRootPut	1003	1003	1003	3	2.006	
+cas	wide_insert	cold	CASBlobPut	1000	1000	1000	3	2.0	
+cas	wide_insert	cold	CASBlobHead	0	0	0	3	0.0	
+cas	wide_insert	cold	CASBlobHeadMiss	500	500	500	3	1.0	
+cas	wide_insert	cold	CASManifestPut	500	500	500	3	1.0	
+cas	wide_insert	cold	CASManifestGet	926	500	996	3	1.852	
+cas	wide_insert	cold	CASOtherGet	1001	1000	1004	3	2.002	
+cas	wide_insert	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	wide_insert	cold	CASRefQueueWaitMicroseconds	3057234	2628434	3342078	3	6114.468	
+cas	wide_insert	hot	wall	24.539093828992918	18.53122931101825	28.913951021037064	3	0.049078187657985835	noisy
+cas	wide_insert	hot	median_op_ms	38.50349399726838	35.93811101745814	38.64163043908775	3	0.07700698799453676	
+cas	wide_insert	hot	p90_op_ms	46.61243096925318	39.94339214405045	47.70370398182422	3	0.09322486193850636	
+cas	wide_insert	hot	GET	9649	2508	9931	3	19.298	~
+cas	wide_insert	hot	PUT	4022	3514	4023	3	8.044	~
+cas	wide_insert	hot	HEAD	1000	500	1000	3	2.0	~
+cas	wide_insert	hot	LIST	9	0	9	3	0.018	~
+cas	wide_insert	hot	DELETE	4	0	4	3	0.008	~
+cas	wide_insert	hot	COPY	0	0	0	3	0.0	
+cas	wide_insert	hot	ABORT	0	0	0	3	0.0	
+cas	wide_insert	hot	bytes_read	5947614	1177379	6099935	3	11895.228	noisy
+cas	wide_insert	hot	bytes_written	1242149190	1241905022	1242149723	3	2484298.38	
+cas	wide_insert	hot	gc_rounds	1	0	1	3	0.002	
+cas	wide_insert	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	wide_insert	hot	S3ReadRequestsErrors	502	500	502	3	1.004	
+cas	wide_insert	hot	S3WriteRequestsErrors	0	0	1	3	0.0	
+cas	wide_insert	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	wide_insert	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	wide_insert	hot	CASRequestAttempt	14681	6522	14962	3	29.362	
+cas	wide_insert	hot	CASRootGet	4333	1004	4556	3	8.666	
+cas	wide_insert	hot	CASRootPut	1004	1004	1004	3	2.008	
+cas	wide_insert	hot	CASBlobPut	1000	1000	1000	3	2.0	
+cas	wide_insert	hot	CASBlobHead	500	0	500	3	1.0	
+cas	wide_insert	hot	CASBlobHeadMiss	500	500	500	3	1.0	
+cas	wide_insert	hot	CASManifestPut	500	500	500	3	1.0	
+cas	wide_insert	hot	CASManifestGet	3783	500	3843	3	7.566	
+cas	wide_insert	hot	CASOtherGet	1006	1000	1006	3	2.012	
+cas	wide_insert	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	wide_insert	hot	CASRefQueueWaitMicroseconds	3563905	3035534	3817915	3	7127.81	
+cas	attach_200	cold	wall	0.12280153308529407	0.10947714792564511	0.13287236995529383	3	0.0006140076654264703	noisy
+cas	attach_200	cold	median_op_ms	122.79793294146657	109.47149805724621	132.8691199887544	3	0.6139896647073328	
+cas	attach_200	cold	p90_op_ms	122.79793294146657	109.47149805724621	132.8691199887544	3	0.6139896647073328	
+cas	attach_200	cold	GET	358	358	358	3	1.79	
+cas	attach_200	cold	PUT	2	2	2	3	0.01	
+cas	attach_200	cold	HEAD	0	0	0	3	0.0	
+cas	attach_200	cold	LIST	1005	1005	1005	3	5.025	
+cas	attach_200	cold	DELETE	0	0	0	3	0.0	
+cas	attach_200	cold	COPY	0	0	0	3	0.0	
+cas	attach_200	cold	ABORT	0	0	0	3	0.0	
+cas	attach_200	cold	bytes_read	251797	251531	251818	3	1258.985	
+cas	attach_200	cold	bytes_written	319	319	319	3	1.595	
+cas	attach_200	cold	gc_rounds	0	0	0	3	0.0	
+cas	attach_200	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	attach_200	cold	S3ReadRequestsErrors	2	2	2	3	0.01	
+cas	attach_200	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	attach_200	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	attach_200	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	attach_200	cold	CASRequestAttempt	1365	1365	1365	3	6.825	
+cas	attach_200	cold	CASRootGet	156	156	156	3	0.78	
+cas	attach_200	cold	CASRootPut	1	1	1	3	0.005	
+cas	attach_200	cold	CASBlobPut	0	0	0	3	0.0	
+cas	attach_200	cold	CASBlobHead	0	0	0	3	0.0	
+cas	attach_200	cold	CASBlobHeadMiss	0	0	0	3	0.0	
+cas	attach_200	cold	CASManifestPut	0	0	0	3	0.0	
+cas	attach_200	cold	CASManifestGet	200	200	200	3	1.0	
+cas	attach_200	cold	CASOtherGet	2	2	2	3	0.01	
+cas	attach_200	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	attach_200	cold	CASRefQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	attach_200	hot	wall	0.03713976894505322	0.03638668707571924	0.03728441405110061	3	0.0001856988447252661	
+cas	attach_200	hot	median_op_ms	37.135679041966796	36.38324700295925	37.27913403417915	3	0.18567839520983398	
+cas	attach_200	hot	p90_op_ms	37.135679041966796	36.38324700295925	37.27913403417915	3	0.18567839520983398	
+cas	attach_200	hot	GET	3	3	3	3	0.015	
+cas	attach_200	hot	PUT	0	0	0	3	0.0	
+cas	attach_200	hot	HEAD	0	0	0	3	0.0	
+cas	attach_200	hot	LIST	1005	1005	1005	3	5.025	
+cas	attach_200	hot	DELETE	0	0	0	3	0.0	
+cas	attach_200	hot	COPY	0	0	0	3	0.0	
+cas	attach_200	hot	ABORT	0	0	0	3	0.0	
+cas	attach_200	hot	bytes_read	3	3	3	3	0.015	
+cas	attach_200	hot	bytes_written	0	0	0	3	0.0	
+cas	attach_200	hot	gc_rounds	0	0	0	3	0.0	
+cas	attach_200	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	attach_200	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+cas	attach_200	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	attach_200	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	attach_200	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	attach_200	hot	CASRequestAttempt	1008	1008	1008	3	5.04	
+cas	attach_200	hot	CASRootGet	3	3	3	3	0.015	
+cas	attach_200	hot	CASRootPut	0	0	0	3	0.0	
+cas	attach_200	hot	CASBlobPut	0	0	0	3	0.0	
+cas	attach_200	hot	CASBlobHead	0	0	0	3	0.0	
+cas	attach_200	hot	CASBlobHeadMiss	0	0	0	3	0.0	
+cas	attach_200	hot	CASManifestPut	0	0	0	3	0.0	
+cas	attach_200	hot	CASManifestGet	0	0	0	3	0.0	
+cas	attach_200	hot	CASOtherGet	0	0	0	3	0.0	
+cas	attach_200	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	attach_200	hot	CASRefQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	mutation	cold	wall	4.507153193932027	4.106434162007645	5.9041074010310695	3	0.045071531939320265	noisy
+cas	mutation	cold	median_op_ms	4507.148973993026	4106.430882005952	5904.102650936693	3	45.07148973993026	
+cas	mutation	cold	p90_op_ms	4507.148973993026	4106.430882005952	5904.102650936693	3	45.07148973993026	
+cas	mutation	cold	GET	702	702	702	3	7.02	
+cas	mutation	cold	PUT	704	704	704	3	7.04	
+cas	mutation	cold	HEAD	103	103	103	3	1.03	
+cas	mutation	cold	LIST	0	0	0	3	0.0	
+cas	mutation	cold	DELETE	1	1	1	3	0.01	
+cas	mutation	cold	COPY	0	0	0	3	0.0	
+cas	mutation	cold	ABORT	0	0	0	3	0.0	
+cas	mutation	cold	bytes_read	16578085	16578085	16578085	3	165780.85	
+cas	mutation	cold	bytes_written	16505315	16505047	16505351	3	165053.15	
+cas	mutation	cold	gc_rounds	0	0	0	3	0.0	
+cas	mutation	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	mutation	cold	S3ReadRequestsErrors	102	102	102	3	1.02	
+cas	mutation	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	mutation	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	mutation	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	mutation	cold	CASRequestAttempt	1310	1310	1310	3	13.1	
+cas	mutation	cold	CASRootGet	202	202	202	3	2.02	
+cas	mutation	cold	CASRootPut	203	203	203	3	2.03	
+cas	mutation	cold	CASBlobPut	200	200	200	3	2.0	
+cas	mutation	cold	CASBlobHead	0	0	0	3	0.0	
+cas	mutation	cold	CASBlobHeadMiss	100	100	100	3	1.0	
+cas	mutation	cold	CASManifestPut	100	100	100	3	1.0	
+cas	mutation	cold	CASManifestGet	100	100	100	3	1.0	
+cas	mutation	cold	CASOtherGet	200	200	200	3	2.0	
+cas	mutation	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	mutation	cold	CASRefQueueWaitMicroseconds	604414	563589	640229	3	6044.14	
+cas	mutation	hot	wall	4.80660640494898	4.580626277951524	5.416582868085243	3	0.04806606404948979	
+cas	mutation	hot	median_op_ms	4806.60277500283	4580.622417968698	5416.579207987525	3	48.0660277500283	
+cas	mutation	hot	p90_op_ms	4806.60277500283	4580.622417968698	5416.579207987525	3	48.0660277500283	
+cas	mutation	hot	GET	702	702	702	3	7.02	
+cas	mutation	hot	PUT	705	704	705	3	7.05	~
+cas	mutation	hot	HEAD	103	103	103	3	1.03	
+cas	mutation	hot	LIST	0	0	0	3	0.0	
+cas	mutation	hot	DELETE	1	1	1	3	0.01	
+cas	mutation	hot	COPY	0	0	0	3	0.0	
+cas	mutation	hot	ABORT	0	0	0	3	0.0	
+cas	mutation	hot	bytes_read	16582806	16582806	16582806	3	165828.06	
+cas	mutation	hot	bytes_written	16509141	16508585	16509172	3	165091.41	
+cas	mutation	hot	gc_rounds	0	0	0	3	0.0	
+cas	mutation	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	mutation	hot	S3ReadRequestsErrors	102	102	102	3	1.02	
+cas	mutation	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	mutation	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	mutation	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	mutation	hot	CASRequestAttempt	1311	1310	1311	3	13.11	
+cas	mutation	hot	CASRootGet	202	202	202	3	2.02	
+cas	mutation	hot	CASRootPut	203	203	203	3	2.03	
+cas	mutation	hot	CASBlobPut	200	200	200	3	2.0	
+cas	mutation	hot	CASBlobHead	0	0	0	3	0.0	
+cas	mutation	hot	CASBlobHeadMiss	100	100	100	3	1.0	
+cas	mutation	hot	CASManifestPut	100	100	100	3	1.0	
+cas	mutation	hot	CASManifestGet	100	100	100	3	1.0	
+cas	mutation	hot	CASOtherGet	200	200	200	3	2.0	
+cas	mutation	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	mutation	hot	CASRefQueueWaitMicroseconds	650670	616531	671072	3	6506.7	
+cas	lwd_concurrent	cold	wall	10.795050610904582	10.655687405029312	11.83389430004172	3	0.13493813263630727	
+cas	lwd_concurrent	cold	median_op_ms	1206.2962669879198	1099.9485945212655	1235.9944334602915	3	15.078703337348998	
+cas	lwd_concurrent	cold	p90_op_ms	1495.630666287616	1313.9078965527005	1584.025659575127	3	18.6953833285952	
+cas	lwd_concurrent	cold	GET	198856	140170	215826	3	2485.7	~
+cas	lwd_concurrent	cold	PUT	756	751	805	3	9.45	~
+cas	lwd_concurrent	cold	HEAD	155	154	186	3	1.9375	~
+cas	lwd_concurrent	cold	LIST	0	0	0	3	0.0	
+cas	lwd_concurrent	cold	DELETE	0	0	0	3	0.0	
+cas	lwd_concurrent	cold	COPY	0	0	0	3	0.0	
+cas	lwd_concurrent	cold	ABORT	0	0	0	3	0.0	
+cas	lwd_concurrent	cold	bytes_read	2316523563	2261558210	2328457590	3	28956544.5375	
+cas	lwd_concurrent	cold	bytes_written	2160417	1831845	2506174	3	27005.2125	noisy
+cas	lwd_concurrent	cold	gc_rounds	0	0	0	3	0.0	
+cas	lwd_concurrent	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	lwd_concurrent	cold	S3ReadRequestsErrors	149	148	176	3	1.8625	
+cas	lwd_concurrent	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	lwd_concurrent	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	lwd_concurrent	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	lwd_concurrent	cold	CASRequestAttempt	1455	1446	1532	3	18.1875	
+cas	lwd_concurrent	cold	CASRootGet	181	181	183	3	2.2625	
+cas	lwd_concurrent	cold	CASRootPut	181	181	183	3	2.2625	
+cas	lwd_concurrent	cold	CASBlobPut	298	296	352	3	3.725	
+cas	lwd_concurrent	cold	CASBlobHead	6	6	10	3	0.075	
+cas	lwd_concurrent	cold	CASBlobHeadMiss	149	148	176	3	1.8625	
+cas	lwd_concurrent	cold	CASManifestPut	91	90	91	3	1.1375	
+cas	lwd_concurrent	cold	CASManifestGet	173	170	173	3	2.1625	
+cas	lwd_concurrent	cold	CASOtherGet	181	180	182	3	2.2625	
+cas	lwd_concurrent	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	lwd_concurrent	cold	CASRefQueueWaitMicroseconds	1710082	1635907	1723252	3	21376.025	
+cas	lwd_concurrent	hot	wall	13.567538022063673	12.920469773001969	14.73176474205684	3	0.1695942252757959	
+cas	lwd_concurrent	hot	median_op_ms	1298.0319139896892	1205.5712779983878	1482.0791405509226	3	16.225398924871115	
+cas	lwd_concurrent	hot	p90_op_ms	1725.6611057789996	1611.7902962258086	1780.6597603135742	3	21.570763822237495	
+cas	lwd_concurrent	hot	GET	247545	205180	271926	3	3094.3125	~
+cas	lwd_concurrent	hot	PUT	771	764	799	3	9.6375	~
+cas	lwd_concurrent	hot	HEAD	188	173	203	3	2.35	~
+cas	lwd_concurrent	hot	LIST	4	4	4	3	0.05	
+cas	lwd_concurrent	hot	DELETE	1	1	1	3	0.0125	
+cas	lwd_concurrent	hot	COPY	0	0	0	3	0.0	
+cas	lwd_concurrent	hot	ABORT	0	0	0	3	0.0	
+cas	lwd_concurrent	hot	bytes_read	2486640550	2395860884	2511657268	3	31083006.875	
+cas	lwd_concurrent	hot	bytes_written	3071261	2650365	3963801	3	38390.7625	noisy
+cas	lwd_concurrent	hot	gc_rounds	1	1	1	3	0.0125	
+cas	lwd_concurrent	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	lwd_concurrent	hot	S3ReadRequestsErrors	290	286	300	3	3.625	
+cas	lwd_concurrent	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	lwd_concurrent	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	lwd_concurrent	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	lwd_concurrent	hot	CASRequestAttempt	2899	2836	2931	3	36.2375	
+cas	lwd_concurrent	hot	CASRootGet	1322	1271	1322	3	16.525	
+cas	lwd_concurrent	hot	CASRootPut	184	182	186	3	2.3	
+cas	lwd_concurrent	hot	CASBlobPut	306	298	326	3	3.825	
+cas	lwd_concurrent	hot	CASBlobHead	39	10	50	3	0.4875	
+cas	lwd_concurrent	hot	CASBlobHeadMiss	153	149	163	3	1.9125	
+cas	lwd_concurrent	hot	CASManifestPut	92	91	93	3	1.15	
+cas	lwd_concurrent	hot	CASManifestGet	377	372	378	3	4.7125	
+cas	lwd_concurrent	hot	CASOtherGet	187	187	190	3	2.3375	
+cas	lwd_concurrent	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	lwd_concurrent	hot	CASRefQueueWaitMicroseconds	2231438	1681483	2238824	3	27892.975	
+cas	select_subset	cold	wall	0.11757702799513936	0.11521290091332048	0.12798791797831655	3	0.11757702799513936	
+cas	select_subset	cold	median_op_ms	117.57405800744891	115.21000100765377	127.98327801283449	3	117.57405800744891	
+cas	select_subset	cold	p90_op_ms	117.57405800744891	115.21000100765377	127.98327801283449	3	117.57405800744891	
+cas	select_subset	cold	GET	200	200	200	3	200.0	
+cas	select_subset	cold	PUT	0	0	0	3	0.0	
+cas	select_subset	cold	HEAD	0	0	0	3	0.0	
+cas	select_subset	cold	LIST	0	0	0	3	0.0	
+cas	select_subset	cold	DELETE	0	0	0	3	0.0	
+cas	select_subset	cold	COPY	0	0	0	3	0.0	
+cas	select_subset	cold	ABORT	0	0	0	3	0.0	
+cas	select_subset	cold	bytes_read	381998304	381998304	381998304	3	381998304.0	
+cas	select_subset	cold	bytes_written	0	0	0	3	0.0	
+cas	select_subset	cold	gc_rounds	0	0	0	3	0.0	
+cas	select_subset	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	select_subset	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+cas	select_subset	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	select_subset	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	select_subset	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	select_subset	cold	CASRequestAttempt	0	0	0	3	0.0	
+cas	select_subset	cold	CASRootGet	0	0	0	3	0.0	
+cas	select_subset	cold	CASRootPut	0	0	0	3	0.0	
+cas	select_subset	cold	CASBlobPut	0	0	0	3	0.0	
+cas	select_subset	cold	CASBlobHead	0	0	0	3	0.0	
+cas	select_subset	cold	CASBlobHeadMiss	0	0	0	3	0.0	
+cas	select_subset	cold	CASManifestPut	0	0	0	3	0.0	
+cas	select_subset	cold	CASManifestGet	0	0	0	3	0.0	
+cas	select_subset	cold	CASOtherGet	0	0	0	3	0.0	
+cas	select_subset	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	select_subset	cold	CASRefQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	select_subset	hot	wall	0.10866622603498399	0.10668740805704147	0.10915942501742393	3	0.10866622603498399	
+cas	select_subset	hot	median_op_ms	108.66117593832314	106.6836480749771	109.15570496581495	3	108.66117593832314	
+cas	select_subset	hot	p90_op_ms	108.66117593832314	106.6836480749771	109.15570496581495	3	108.66117593832314	
+cas	select_subset	hot	GET	200	200	200	3	200.0	
+cas	select_subset	hot	PUT	0	0	0	3	0.0	
+cas	select_subset	hot	HEAD	0	0	0	3	0.0	
+cas	select_subset	hot	LIST	0	0	0	3	0.0	
+cas	select_subset	hot	DELETE	0	0	0	3	0.0	
+cas	select_subset	hot	COPY	0	0	0	3	0.0	
+cas	select_subset	hot	ABORT	0	0	0	3	0.0	
+cas	select_subset	hot	bytes_read	381998304	381998304	381998304	3	381998304.0	
+cas	select_subset	hot	bytes_written	0	0	0	3	0.0	
+cas	select_subset	hot	gc_rounds	0	0	0	3	0.0	
+cas	select_subset	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	select_subset	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+cas	select_subset	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	select_subset	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	select_subset	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	select_subset	hot	CASRequestAttempt	0	0	0	3	0.0	
+cas	select_subset	hot	CASRootGet	0	0	0	3	0.0	
+cas	select_subset	hot	CASRootPut	0	0	0	3	0.0	
+cas	select_subset	hot	CASBlobPut	0	0	0	3	0.0	
+cas	select_subset	hot	CASBlobHead	0	0	0	3	0.0	
+cas	select_subset	hot	CASBlobHeadMiss	0	0	0	3	0.0	
+cas	select_subset	hot	CASManifestPut	0	0	0	3	0.0	
+cas	select_subset	hot	CASManifestGet	0	0	0	3	0.0	
+cas	select_subset	hot	CASOtherGet	0	0	0	3	0.0	
+cas	select_subset	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	select_subset	hot	CASRefQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	dup_content	cold	wall	1.1129447859711945	1.1001326140249148	1.1155243299435824	3	0.05564723929855973	
+cas	dup_content	cold	median_op_ms	49.54516451107338	49.48508198140189	50.26153853395954	3	2.477258225553669	
+cas	dup_content	cold	p90_op_ms	55.52632639883086	54.16916387621313	55.930938851088285	3	2.776316319941543	
+cas	dup_content	cold	GET	435	435	435	3	21.75	
+cas	dup_content	cold	PUT	192	192	192	3	9.6	
+cas	dup_content	cold	HEAD	140	140	140	3	7.0	
+cas	dup_content	cold	LIST	100	100	100	3	5.0	
+cas	dup_content	cold	DELETE	0	0	0	3	0.0	
+cas	dup_content	cold	COPY	0	0	0	3	0.0	
+cas	dup_content	cold	ABORT	0	0	0	3	0.0	
+cas	dup_content	cold	bytes_read	280689	280686	280694	3	14034.45	
+cas	dup_content	cold	bytes_written	8237131	8237116	8237138	3	411856.55	
+cas	dup_content	cold	gc_rounds	0	0	0	3	0.0	
+cas	dup_content	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	dup_content	cold	S3ReadRequestsErrors	66	66	66	3	3.3	
+cas	dup_content	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	dup_content	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	dup_content	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	dup_content	cold	CASRequestAttempt	867	867	867	3	43.35	
+cas	dup_content	cold	CASRootGet	140	140	140	3	7.0	
+cas	dup_content	cold	CASRootPut	80	80	80	3	4.0	
+cas	dup_content	cold	CASBlobPut	12	12	12	3	0.6	
+cas	dup_content	cold	CASBlobHead	114	114	114	3	5.7	
+cas	dup_content	cold	CASBlobHeadMiss	6	6	6	3	0.3	
+cas	dup_content	cold	CASManifestPut	20	20	20	3	1.0	
+cas	dup_content	cold	CASManifestGet	20	20	20	3	1.0	
+cas	dup_content	cold	CASOtherGet	161	161	161	3	8.05	
+cas	dup_content	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	dup_content	cold	CASRefQueueWaitMicroseconds	141269	139837	144839	3	7063.45	
+cas	dup_content	hot	wall	1.0107415620004758	1.0035591069608927	1.0230564980302006	3	0.050537078100023794	
+cas	dup_content	hot	median_op_ms	49.8261260217987	49.31062099058181	50.51099945558235	3	2.491306301089935	
+cas	dup_content	hot	p90_op_ms	52.37977447686717	52.024290652479976	53.61498701386154	3	2.6189887238433585	
+cas	dup_content	hot	GET	440	440	440	3	22.0	
+cas	dup_content	hot	PUT	180	180	180	3	9.0	
+cas	dup_content	hot	HEAD	140	140	140	3	7.0	
+cas	dup_content	hot	LIST	100	100	100	3	5.0	
+cas	dup_content	hot	DELETE	0	0	0	3	0.0	
+cas	dup_content	hot	COPY	0	0	0	3	0.0	
+cas	dup_content	hot	ABORT	0	0	0	3	0.0	
+cas	dup_content	hot	bytes_read	738829	738822	738834	3	36941.45	
+cas	dup_content	hot	bytes_written	221662	221656	221666	3	11083.1	
+cas	dup_content	hot	gc_rounds	0	0	0	3	0.0	
+cas	dup_content	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas	dup_content	hot	S3ReadRequestsErrors	60	60	60	3	3.0	
+cas	dup_content	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas	dup_content	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas	dup_content	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas	dup_content	hot	CASRequestAttempt	860	860	860	3	43.0	
+cas	dup_content	hot	CASRootGet	140	140	140	3	7.0	
+cas	dup_content	hot	CASRootPut	80	80	80	3	4.0	
+cas	dup_content	hot	CASBlobPut	0	0	0	3	0.0	
+cas	dup_content	hot	CASBlobHead	120	120	120	3	6.0	
+cas	dup_content	hot	CASBlobHeadMiss	0	0	0	3	0.0	
+cas	dup_content	hot	CASManifestPut	20	20	20	3	1.0	
+cas	dup_content	hot	CASManifestGet	20	20	20	3	1.0	
+cas	dup_content	hot	CASOtherGet	160	160	160	3	8.0	
+cas	dup_content	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas	dup_content	hot	CASRefQueueWaitMicroseconds	142223	140884	145036	3	7111.15	
+s3	cycle	cold	wall	3.146171022905037	3.0913116569863632	3.6339280100073665	3	0.015730855114525183	
+s3	cycle	cold	median_op_ms	121.17203051457182	120.67990947980434	131.92285952391103	3	0.6058601525728591	
+s3	cycle	cold	p90_op_ms	148.62648920388892	127.95833417912945	175.82704891683534	3	0.7431324460194446	
+s3	cycle	cold	GET	1200	1200	1200	3	6.0	
+s3	cycle	cold	PUT	6200	6200	6200	3	31.0	
+s3	cycle	cold	HEAD	0	0	0	3	0.0	
+s3	cycle	cold	LIST	0	0	0	3	0.0	
+s3	cycle	cold	DELETE	409	368	424	3	2.045	~
+s3	cycle	cold	COPY	0	0	0	3	0.0	
+s3	cycle	cold	ABORT	0	0	0	3	0.0	
+s3	cycle	cold	bytes_read	2458600	2458600	2458600	3	12293.0	
+s3	cycle	cold	bytes_written	4987800	4987800	4987800	3	24939.0	
+s3	cycle	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	cycle	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	cycle	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	cycle	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	cycle	hot	wall	3.105711353942752	3.0175874589476734	3.2214431710308418	3	0.015528556769713759	
+s3	cycle	hot	median_op_ms	132.3928699712269	121.31512351334095	139.12263797828928	3	0.6619643498561345	
+s3	cycle	hot	p90_op_ms	142.02937192749232	136.6483124671504	144.51934001408517	3	0.7101468596374616	
+s3	cycle	hot	GET	1200	1200	1200	3	6.0	
+s3	cycle	hot	PUT	6200	6200	6200	3	31.0	
+s3	cycle	hot	HEAD	0	0	0	3	0.0	
+s3	cycle	hot	LIST	0	0	0	3	0.0	
+s3	cycle	hot	DELETE	372	372	387	3	1.86	~
+s3	cycle	hot	COPY	0	0	0	3	0.0	
+s3	cycle	hot	ABORT	0	0	0	3	0.0	
+s3	cycle	hot	bytes_read	2458600	2458600	2458600	3	12293.0	
+s3	cycle	hot	bytes_written	4987800	4987800	4987800	3	24939.0	
+s3	cycle	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	cycle	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	cycle	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	cycle	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	wide_insert	cold	wall	13.636688301921822	13.286059708916582	13.661493791965768	3	0.027273376603843644	
+s3	wide_insert	cold	median_op_ms	25.853845989331603	25.75374598382041	26.133291015867144	3	0.051707691978663206	
+s3	wide_insert	cold	p90_op_ms	27.466306870337576	27.011648018378764	27.591386949643493	3	0.05493261374067515	
+s3	wide_insert	cold	GET	0	0	0	3	0.0	
+s3	wide_insert	cold	PUT	5000	5000	5000	3	10.0	
+s3	wide_insert	cold	HEAD	0	0	0	3	0.0	
+s3	wide_insert	cold	LIST	0	0	0	3	0.0	
+s3	wide_insert	cold	DELETE	0	0	0	3	0.0	
+s3	wide_insert	cold	COPY	0	0	0	3	0.0	
+s3	wide_insert	cold	ABORT	0	0	0	3	0.0	
+s3	wide_insert	cold	bytes_read	0	0	0	3	0.0	
+s3	wide_insert	cold	bytes_written	1242334690	1242334690	1242334690	3	2484669.38	
+s3	wide_insert	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	wide_insert	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	wide_insert	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	wide_insert	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	wide_insert	hot	wall	14.07117075601127	13.187298879027367	18.6562199780019	3	0.02814234151202254	noisy
+s3	wide_insert	hot	median_op_ms	26.066667516715825	25.727335014380515	30.37973097525537	3	0.05213333503343165	
+s3	wide_insert	hot	p90_op_ms	30.38364885142073	27.055247663520277	38.34948380244896	3	0.060767297702841463	
+s3	wide_insert	hot	GET	0	0	0	3	0.0	
+s3	wide_insert	hot	PUT	5000	5000	5000	3	10.0	
+s3	wide_insert	hot	HEAD	0	0	0	3	0.0	
+s3	wide_insert	hot	LIST	0	0	0	3	0.0	
+s3	wide_insert	hot	DELETE	0	0	0	3	0.0	
+s3	wide_insert	hot	COPY	0	0	0	3	0.0	
+s3	wide_insert	hot	ABORT	0	0	0	3	0.0	
+s3	wide_insert	hot	bytes_read	0	0	0	3	0.0	
+s3	wide_insert	hot	bytes_written	1242732648	1242732648	1242732648	3	2485465.296	
+s3	wide_insert	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	wide_insert	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	wide_insert	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	wide_insert	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	attach_200	cold	wall	0.05045846803113818	0.04975575499702245	0.05919142498169094	3	0.00025229234015569093	
+s3	attach_200	cold	median_op_ms	50.45416799839586	49.75165508221835	59.18715498410165	3	0.2522708399919793	
+s3	attach_200	cold	p90_op_ms	50.45416799839586	49.75165508221835	59.18715498410165	3	0.2522708399919793	
+s3	attach_200	cold	GET	1801	1801	1801	3	9.005	
+s3	attach_200	cold	PUT	0	0	0	3	0.0	
+s3	attach_200	cold	HEAD	0	0	0	3	0.0	
+s3	attach_200	cold	LIST	0	0	0	3	0.0	
+s3	attach_200	cold	DELETE	0	0	0	3	0.0	
+s3	attach_200	cold	COPY	0	0	0	3	0.0	
+s3	attach_200	cold	ABORT	0	0	0	3	0.0	
+s3	attach_200	cold	bytes_read	165417	165417	165417	3	827.085	
+s3	attach_200	cold	bytes_written	0	0	0	3	0.0	
+s3	attach_200	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	attach_200	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	attach_200	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	attach_200	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	attach_200	hot	wall	0.029386715963482857	0.026709830039180815	0.030137111083604395	3	0.0001469335798174143	
+s3	attach_200	hot	median_op_ms	29.382835957221687	26.70609997585416	30.133130960166454	3	0.14691417978610843	
+s3	attach_200	hot	p90_op_ms	29.382835957221687	26.70609997585416	30.133130960166454	3	0.14691417978610843	
+s3	attach_200	hot	GET	1801	1801	1801	3	9.005	
+s3	attach_200	hot	PUT	0	0	0	3	0.0	
+s3	attach_200	hot	HEAD	0	0	0	3	0.0	
+s3	attach_200	hot	LIST	0	0	0	3	0.0	
+s3	attach_200	hot	DELETE	0	0	0	3	0.0	
+s3	attach_200	hot	COPY	0	0	0	3	0.0	
+s3	attach_200	hot	ABORT	0	0	0	3	0.0	
+s3	attach_200	hot	bytes_read	165417	165417	165417	3	827.085	
+s3	attach_200	hot	bytes_written	0	0	0	3	0.0	
+s3	attach_200	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	attach_200	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	attach_200	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	attach_200	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	mutation	cold	wall	3.3780347330030054	2.7666913750581443	5.288251924910583	3	0.033780347330030054	noisy
+s3	mutation	cold	median_op_ms	3378.0318029457703	2766.6872550034896	5288.24862500187	3	33.7803180294577	
+s3	mutation	cold	p90_op_ms	3378.0318029457703	2766.6872550034896	5288.24862500187	3	33.7803180294577	
+s3	mutation	cold	GET	300	300	300	3	3.0	
+s3	mutation	cold	PUT	1101	1101	1101	3	11.01	
+s3	mutation	cold	HEAD	0	0	0	3	0.0	
+s3	mutation	cold	LIST	0	0	0	3	0.0	
+s3	mutation	cold	DELETE	0	0	0	3	0.0	
+s3	mutation	cold	COPY	0	0	0	3	0.0	
+s3	mutation	cold	ABORT	0	0	0	3	0.0	
+s3	mutation	cold	bytes_read	8251898	8251898	8251898	3	82518.98	
+s3	mutation	cold	bytes_written	16265591	16265591	16265591	3	162655.91	
+s3	mutation	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	mutation	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	mutation	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	mutation	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	mutation	hot	wall	3.6807357979705557	3.514357984997332	5.018711682059802	3	0.03680735797970556	noisy
+s3	mutation	hot	median_op_ms	3680.7325379922986	3514.3544749589637	5018.707402050495	3	36.807325379922986	
+s3	mutation	hot	p90_op_ms	3680.7325379922986	3514.3544749589637	5018.707402050495	3	36.807325379922986	
+s3	mutation	hot	GET	200	200	200	3	2.0	
+s3	mutation	hot	PUT	1101	1101	1101	3	11.01	
+s3	mutation	hot	HEAD	0	0	0	3	0.0	
+s3	mutation	hot	LIST	0	0	0	3	0.0	
+s3	mutation	hot	DELETE	0	0	0	3	0.0	
+s3	mutation	hot	COPY	0	0	0	3	0.0	
+s3	mutation	hot	ABORT	0	0	0	3	0.0	
+s3	mutation	hot	bytes_read	8247264	8247264	8247264	3	82472.64	
+s3	mutation	hot	bytes_written	16264681	16264681	16264681	3	162646.81	
+s3	mutation	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	mutation	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	mutation	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	mutation	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	lwd_concurrent	cold	wall	9.431867539999075	9.121765964082442	9.850218455074355	3	0.11789834424998843	
+s3	lwd_concurrent	cold	median_op_ms	950.7904900237918	926.4458554680459	983.3038790384308	3	11.884881125297397	
+s3	lwd_concurrent	cold	p90_op_ms	1284.3077203375287	1188.001629000064	1324.6470490237698	3	16.05384650421911	
+s3	lwd_concurrent	cold	GET	130551	125546	132224	3	1631.8875	~
+s3	lwd_concurrent	cold	PUT	1663	1659	1676	3	20.7875	~
+s3	lwd_concurrent	cold	HEAD	0	0	0	3	0.0	
+s3	lwd_concurrent	cold	LIST	0	0	0	3	0.0	
+s3	lwd_concurrent	cold	DELETE	0	0	0	3	0.0	
+s3	lwd_concurrent	cold	COPY	0	0	0	3	0.0	
+s3	lwd_concurrent	cold	ABORT	0	0	0	3	0.0	
+s3	lwd_concurrent	cold	bytes_read	2114313573	2109012365	2130470072	3	26428919.6625	
+s3	lwd_concurrent	cold	bytes_written	2204249	2088282	2421605	3	27553.1125	
+s3	lwd_concurrent	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	lwd_concurrent	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	lwd_concurrent	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	lwd_concurrent	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	lwd_concurrent	hot	wall	13.063860344933346	12.577439853921533	13.3076994799776	3	0.16329825431166684	
+s3	lwd_concurrent	hot	median_op_ms	1287.6122595043853	1239.4804435316473	1346.0339970188215	3	16.095153243804816	
+s3	lwd_concurrent	hot	p90_op_ms	1702.6823143474758	1604.720225383062	1716.7917190585285	3	21.283528929343447	
+s3	lwd_concurrent	hot	GET	196473	190833	197323	3	2455.9125	~
+s3	lwd_concurrent	hot	PUT	1719	1676	1719	3	21.4875	~
+s3	lwd_concurrent	hot	HEAD	0	0	0	3	0.0	
+s3	lwd_concurrent	hot	LIST	0	0	0	3	0.0	
+s3	lwd_concurrent	hot	DELETE	0	0	0	3	0.0	
+s3	lwd_concurrent	hot	COPY	0	0	0	3	0.0	
+s3	lwd_concurrent	hot	ABORT	0	0	0	3	0.0	
+s3	lwd_concurrent	hot	bytes_read	2323530043	2310648926	2351952626	3	29044125.5375	
+s3	lwd_concurrent	hot	bytes_written	4458512	2920714	4946158	3	55731.4	noisy
+s3	lwd_concurrent	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	lwd_concurrent	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	lwd_concurrent	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	lwd_concurrent	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	select_subset	cold	wall	0.13582432898692787	0.13160850293934345	0.13630459399428219	3	0.13582432898692787	
+s3	select_subset	cold	median_op_ms	135.81947900820524	131.60507299471647	136.30188500974327	3	135.81947900820524	
+s3	select_subset	cold	p90_op_ms	135.81947900820524	131.60507299471647	136.30188500974327	3	135.81947900820524	
+s3	select_subset	cold	GET	400	400	400	3	400.0	
+s3	select_subset	cold	PUT	0	0	0	3	0.0	
+s3	select_subset	cold	HEAD	0	0	0	3	0.0	
+s3	select_subset	cold	LIST	0	0	0	3	0.0	
+s3	select_subset	cold	DELETE	0	0	0	3	0.0	
+s3	select_subset	cold	COPY	0	0	0	3	0.0	
+s3	select_subset	cold	ABORT	0	0	0	3	0.0	
+s3	select_subset	cold	bytes_read	382062209	382062209	382062209	3	382062209.0	
+s3	select_subset	cold	bytes_written	0	0	0	3	0.0	
+s3	select_subset	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	select_subset	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	select_subset	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	select_subset	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	select_subset	hot	wall	0.11026357603259385	0.10684879508335143	0.11661784397438169	3	0.11026357603259385	
+s3	select_subset	hot	median_op_ms	110.26070604566485	106.84533510357141	116.61346408072859	3	110.26070604566485	
+s3	select_subset	hot	p90_op_ms	110.26070604566485	106.84533510357141	116.61346408072859	3	110.26070604566485	
+s3	select_subset	hot	GET	200	200	200	3	200.0	
+s3	select_subset	hot	PUT	0	0	0	3	0.0	
+s3	select_subset	hot	HEAD	0	0	0	3	0.0	
+s3	select_subset	hot	LIST	0	0	0	3	0.0	
+s3	select_subset	hot	DELETE	0	0	0	3	0.0	
+s3	select_subset	hot	COPY	0	0	0	3	0.0	
+s3	select_subset	hot	ABORT	0	0	0	3	0.0	
+s3	select_subset	hot	bytes_read	381998304	381998304	381998304	3	381998304.0	
+s3	select_subset	hot	bytes_written	0	0	0	3	0.0	
+s3	select_subset	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	select_subset	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	select_subset	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	select_subset	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	dup_content	cold	wall	1.2285167800728232	1.2254089410416782	1.3299292129231617	3	0.06142583900364116	
+s3	dup_content	cold	median_op_ms	60.51456002751365	58.65466658724472	61.11760396743193	3	3.0257280013756827	
+s3	dup_content	cold	p90_op_ms	69.1339491517283	62.7319801133126	77.90703126229346	3	3.456697457586415	
+s3	dup_content	cold	GET	0	0	0	3	0.0	
+s3	dup_content	cold	PUT	300	300	300	3	15.0	
+s3	dup_content	cold	HEAD	0	0	0	3	0.0	
+s3	dup_content	cold	LIST	0	0	0	3	0.0	
+s3	dup_content	cold	DELETE	0	0	0	3	0.0	
+s3	dup_content	cold	COPY	0	0	0	3	0.0	
+s3	dup_content	cold	ABORT	0	0	0	3	0.0	
+s3	dup_content	cold	bytes_read	0	0	0	3	0.0	
+s3	dup_content	cold	bytes_written	162579380	162579380	162579380	3	8128969.0	
+s3	dup_content	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	dup_content	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	dup_content	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	dup_content	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3	dup_content	hot	wall	1.202140191104263	1.2006645268993452	1.5462703079683706	3	0.060107009555213156	noisy
+s3	dup_content	hot	median_op_ms	60.01620995812118	59.95651404373348	60.12122001266107	3	3.000810497906059	
+s3	dup_content	hot	p90_op_ms	61.6944917361252	60.98161145346239	66.1881222971715	3	3.08472458680626	
+s3	dup_content	hot	GET	0	0	0	3	0.0	
+s3	dup_content	hot	PUT	300	300	300	3	15.0	
+s3	dup_content	hot	HEAD	0	0	0	3	0.0	
+s3	dup_content	hot	LIST	0	0	0	3	0.0	
+s3	dup_content	hot	DELETE	0	0	0	3	0.0	
+s3	dup_content	hot	COPY	0	0	0	3	0.0	
+s3	dup_content	hot	ABORT	0	0	0	3	0.0	
+s3	dup_content	hot	bytes_read	0	0	0	3	0.0	
+s3	dup_content	hot	bytes_written	162579380	162579380	162579380	3	8128969.0	
+s3	dup_content	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3	dup_content	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3	dup_content	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3	dup_content	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	cycle	cold	wall	18.550780560006388	18.204565854975954	18.595797594985925	3	0.09275390280003194	
+s3plain	cycle	cold	median_op_ms	741.9787314720452	737.5835305429064	742.5353950238787	3	3.709893657360226	
+s3plain	cycle	cold	p90_op_ms	769.6632790379226	766.6206368245184	770.628695609048	3	3.848316395189613	
+s3plain	cycle	cold	GET	1200	1200	1200	3	6.0	
+s3plain	cycle	cold	PUT	8800	8800	8800	3	44.0	
+s3plain	cycle	cold	HEAD	7200	7200	7200	3	36.0	
+s3plain	cycle	cold	LIST	0	0	0	3	0.0	
+s3plain	cycle	cold	DELETE	13400	13400	13400	3	67.0	
+s3plain	cycle	cold	COPY	6200	6200	6200	3	31.0	
+s3plain	cycle	cold	ABORT	0	0	0	3	0.0	
+s3plain	cycle	cold	bytes_read	2458600	2458600	2458600	3	12293.0	
+s3plain	cycle	cold	bytes_written	5131000	5131000	5131000	3	25655.0	
+s3plain	cycle	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain	cycle	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain	cycle	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	cycle	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	cycle	hot	wall	17.60763522994239	16.982667507021688	18.744283688021824	3	0.08803817614971195	
+s3plain	cycle	hot	median_op_ms	729.4700680067763	657.6781434705481	740.7699479954317	3	3.6473503400338814	
+s3plain	cycle	hot	p90_op_ms	771.1799904936925	755.419569008518	856.9289231789298	3	3.8558999524684623	
+s3plain	cycle	hot	GET	1200	1200	1200	3	6.0	
+s3plain	cycle	hot	PUT	8800	8800	8800	3	44.0	
+s3plain	cycle	hot	HEAD	7200	7200	7200	3	36.0	
+s3plain	cycle	hot	LIST	0	0	0	3	0.0	
+s3plain	cycle	hot	DELETE	13400	13400	13400	3	67.0	
+s3plain	cycle	hot	COPY	6200	6200	6201	3	31.0	~
+s3plain	cycle	hot	ABORT	0	0	0	3	0.0	
+s3plain	cycle	hot	bytes_read	2458600	2458600	2458600	3	12293.0	
+s3plain	cycle	hot	bytes_written	5131000	5131000	5131000	3	25655.0	
+s3plain	cycle	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain	cycle	hot	S3WriteRequestsErrors	0	0	1	3	0.0	
+s3plain	cycle	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	cycle	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	wide_insert	cold	wall	16.14451802300755	14.628166140057147	19.10517165705096	3	0.0322890360460151	noisy
+s3plain	wide_insert	cold	median_op_ms	31.472326489165425	28.26286799972877	31.512905494309962	3	0.06294465297833085	
+s3plain	wide_insert	cold	p90_op_ms	34.128284198231995	29.50572893023491	36.50789193343371	3	0.06825656839646399	
+s3plain	wide_insert	cold	GET	0	0	0	3	0.0	
+s3plain	wide_insert	cold	PUT	6000	6000	6000	3	12.0	
+s3plain	wide_insert	cold	HEAD	500	500	500	3	1.0	
+s3plain	wide_insert	cold	LIST	0	0	0	3	0.0	
+s3plain	wide_insert	cold	DELETE	0	0	0	3	0.0	
+s3plain	wide_insert	cold	COPY	0	0	0	3	0.0	
+s3plain	wide_insert	cold	ABORT	0	0	0	3	0.0	
+s3plain	wide_insert	cold	bytes_read	0	0	0	3	0.0	
+s3plain	wide_insert	cold	bytes_written	1242400758	1242400758	1242400758	3	2484801.516	
+s3plain	wide_insert	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain	wide_insert	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain	wide_insert	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	wide_insert	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	wide_insert	hot	wall	14.849031095043756	14.603367579984479	18.719299586024135	3	0.029698062190087512	noisy
+s3plain	wide_insert	hot	median_op_ms	28.59052299754694	28.47068349365145	30.954322952311486	3	0.05718104599509388	
+s3plain	wide_insert	hot	p90_op_ms	30.01148608746007	30.009002902079374	40.04576621809974	3	0.06002297217492014	
+s3plain	wide_insert	hot	GET	0	0	0	3	0.0	
+s3plain	wide_insert	hot	PUT	6000	6000	6000	3	12.0	
+s3plain	wide_insert	hot	HEAD	500	500	500	3	1.0	
+s3plain	wide_insert	hot	LIST	0	0	0	3	0.0	
+s3plain	wide_insert	hot	DELETE	0	0	0	3	0.0	
+s3plain	wide_insert	hot	COPY	0	0	0	3	0.0	
+s3plain	wide_insert	hot	ABORT	0	0	0	3	0.0	
+s3plain	wide_insert	hot	bytes_read	0	0	0	3	0.0	
+s3plain	wide_insert	hot	bytes_written	1242799152	1242799152	1242799152	3	2485598.304	
+s3plain	wide_insert	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain	wide_insert	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain	wide_insert	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	wide_insert	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	attach_200	cold	wall	0.046594477025792	0.045982675976119936	0.05248116794973612	3	0.00023297238512896002	
+s3plain	attach_200	cold	median_op_ms	46.58945696428418	45.97852600272745	52.47692798729986	3	0.2329472848214209	
+s3plain	attach_200	cold	p90_op_ms	46.58945696428418	45.97852600272745	52.47692798729986	3	0.2329472848214209	
+s3plain	attach_200	cold	GET	1801	1801	1801	3	9.005	
+s3plain	attach_200	cold	PUT	0	0	0	3	0.0	
+s3plain	attach_200	cold	HEAD	0	0	0	3	0.0	
+s3plain	attach_200	cold	LIST	0	0	0	3	0.0	
+s3plain	attach_200	cold	DELETE	0	0	0	3	0.0	
+s3plain	attach_200	cold	COPY	0	0	0	3	0.0	
+s3plain	attach_200	cold	ABORT	0	0	0	3	0.0	
+s3plain	attach_200	cold	bytes_read	165417	165417	165417	3	827.085	
+s3plain	attach_200	cold	bytes_written	0	0	0	3	0.0	
+s3plain	attach_200	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain	attach_200	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain	attach_200	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	attach_200	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	attach_200	hot	wall	0.04143440502230078	0.039444491965696216	0.0462858360260725	3	0.0002071720251115039	
+s3plain	attach_200	hot	median_op_ms	41.43025598023087	39.440941996872425	46.28169606439769	3	0.20715127990115434	
+s3plain	attach_200	hot	p90_op_ms	41.43025598023087	39.440941996872425	46.28169606439769	3	0.20715127990115434	
+s3plain	attach_200	hot	GET	1801	1801	1801	3	9.005	
+s3plain	attach_200	hot	PUT	0	0	0	3	0.0	
+s3plain	attach_200	hot	HEAD	0	0	0	3	0.0	
+s3plain	attach_200	hot	LIST	0	0	0	3	0.0	
+s3plain	attach_200	hot	DELETE	0	0	0	3	0.0	
+s3plain	attach_200	hot	COPY	0	0	0	3	0.0	
+s3plain	attach_200	hot	ABORT	0	0	0	3	0.0	
+s3plain	attach_200	hot	bytes_read	165417	165417	165417	3	827.085	
+s3plain	attach_200	hot	bytes_written	0	0	0	3	0.0	
+s3plain	attach_200	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain	attach_200	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain	attach_200	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	attach_200	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	mutation	cold	status	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	3		
+s3plain	mutation	hot	status	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	3		
+s3plain	lwd_concurrent	cold	status	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	3		
+s3plain	lwd_concurrent	hot	status	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	3		
+s3plain	select_subset	cold	wall	0.1347945430316031	0.12810607498977333	0.13722773792687804	3	0.1347945430316031	
+s3plain	select_subset	cold	median_op_ms	134.7904730355367	128.10284504666924	137.22252799198031	3	134.7904730355367	
+s3plain	select_subset	cold	p90_op_ms	134.7904730355367	128.10284504666924	137.22252799198031	3	134.7904730355367	
+s3plain	select_subset	cold	GET	400	400	400	3	400.0	
+s3plain	select_subset	cold	PUT	0	0	0	3	0.0	
+s3plain	select_subset	cold	HEAD	0	0	0	3	0.0	
+s3plain	select_subset	cold	LIST	0	0	0	3	0.0	
+s3plain	select_subset	cold	DELETE	0	0	0	3	0.0	
+s3plain	select_subset	cold	COPY	0	0	0	3	0.0	
+s3plain	select_subset	cold	ABORT	0	0	0	3	0.0	
+s3plain	select_subset	cold	bytes_read	382062209	382062209	382062209	3	382062209.0	
+s3plain	select_subset	cold	bytes_written	0	0	0	3	0.0	
+s3plain	select_subset	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain	select_subset	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain	select_subset	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	select_subset	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	select_subset	hot	wall	0.10592404298949987	0.10377175197936594	0.10592446802183986	3	0.10592404298949987	
+s3plain	select_subset	hot	median_op_ms	105.92040803749114	103.76815206836909	105.9206830104813	3	105.92040803749114	
+s3plain	select_subset	hot	p90_op_ms	105.92040803749114	103.76815206836909	105.9206830104813	3	105.92040803749114	
+s3plain	select_subset	hot	GET	200	200	200	3	200.0	
+s3plain	select_subset	hot	PUT	0	0	0	3	0.0	
+s3plain	select_subset	hot	HEAD	0	0	0	3	0.0	
+s3plain	select_subset	hot	LIST	0	0	0	3	0.0	
+s3plain	select_subset	hot	DELETE	0	0	0	3	0.0	
+s3plain	select_subset	hot	COPY	0	0	0	3	0.0	
+s3plain	select_subset	hot	ABORT	0	0	0	3	0.0	
+s3plain	select_subset	hot	bytes_read	381998304	381998304	381998304	3	381998304.0	
+s3plain	select_subset	hot	bytes_written	0	0	0	3	0.0	
+s3plain	select_subset	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain	select_subset	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain	select_subset	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	select_subset	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	dup_content	cold	wall	1.418051749933511	1.3633372529875487	1.4380460620159283	3	0.07090258749667555	
+s3plain	dup_content	cold	median_op_ms	66.24126993119717	65.11001545004547	67.31815100647509	3	3.3120634965598583	
+s3plain	dup_content	cold	p90_op_ms	79.43916702643037	73.38869380764663	81.5631942008622	3	3.9719583513215184	
+s3plain	dup_content	cold	GET	0	0	0	3	0.0	
+s3plain	dup_content	cold	PUT	380	380	380	3	19.0	
+s3plain	dup_content	cold	HEAD	60	60	60	3	3.0	
+s3plain	dup_content	cold	LIST	0	0	0	3	0.0	
+s3plain	dup_content	cold	DELETE	0	0	0	3	0.0	
+s3plain	dup_content	cold	COPY	0	0	0	3	0.0	
+s3plain	dup_content	cold	ABORT	0	0	0	3	0.0	
+s3plain	dup_content	cold	bytes_read	0	0	0	3	0.0	
+s3plain	dup_content	cold	bytes_written	162583940	162583940	162583940	3	8129197.0	
+s3plain	dup_content	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain	dup_content	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain	dup_content	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	dup_content	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	dup_content	hot	wall	1.8575402590213344	1.3452192939585075	1.919569391058758	3	0.09287701295106672	noisy
+s3plain	dup_content	hot	median_op_ms	66.4774039760232	65.85182150593027	91.59959299722686	3	3.32387019880116	
+s3plain	dup_content	hot	p90_op_ms	71.30787171190605	70.55478792171925	99.58381588803604	3	3.5653935855953023	
+s3plain	dup_content	hot	GET	0	0	0	3	0.0	
+s3plain	dup_content	hot	PUT	380	380	380	3	19.0	
+s3plain	dup_content	hot	HEAD	60	60	60	3	3.0	
+s3plain	dup_content	hot	LIST	0	0	0	3	0.0	
+s3plain	dup_content	hot	DELETE	0	0	0	3	0.0	
+s3plain	dup_content	hot	COPY	0	0	0	3	0.0	
+s3plain	dup_content	hot	ABORT	0	0	0	3	0.0	
+s3plain	dup_content	hot	bytes_read	0	0	0	3	0.0	
+s3plain	dup_content	hot	bytes_written	162583940	162583940	162583940	3	8129197.0	
+s3plain	dup_content	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain	dup_content	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain	dup_content	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain	dup_content	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	cycle	cold	wall	4.777466400060803	4.2345197449903935	10.720842654933222	3	0.023887332000304014	noisy
+cas_cached	cycle	cold	median_op_ms	166.4483739878051	163.9400630374439	175.96030404092744	3	0.8322418699390255	
+cas_cached	cycle	cold	p90_op_ms	183.29734716098756	171.71491188928485	281.37722169049084	3	0.9164867358049378	
+cas_cached	cycle	cold	GET	16413	16412	16413	3	82.065	~
+cas_cached	cycle	cold	PUT	12827	12827	12830	3	64.135	~
+cas_cached	cycle	cold	HEAD	1000	1000	1000	3	5.0	
+cas_cached	cycle	cold	LIST	1400	1400	1400	3	7.0	
+cas_cached	cycle	cold	DELETE	200	200	200	3	1.0	
+cas_cached	cycle	cold	COPY	0	0	0	3	0.0	
+cas_cached	cycle	cold	ABORT	0	0	0	3	0.0	
+cas_cached	cycle	cold	bytes_read	109262183	109258091	109268313	3	546310.915	
+cas_cached	cycle	cold	bytes_written	13328319	13316779	13343901	3	66641.595	
+cas_cached	cycle	cold	gc_rounds	0	0	0	3	0.0	
+cas_cached	cycle	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	cycle	cold	S3ReadRequestsErrors	815	814	815	3	4.075	
+cas_cached	cycle	cold	S3WriteRequestsErrors	11	11	12	3	0.055	
+cas_cached	cycle	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	cycle	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	cycle	cold	CASRequestAttempt	31837	31836	31840	3	159.185	
+cas_cached	cycle	cold	CASRootGet	6200	6200	6200	3	31.0	
+cas_cached	cycle	cold	CASRootPut	5400	5400	5400	3	27.0	
+cas_cached	cycle	cold	CASBlobPut	16	15	18	3	0.08	
+cas_cached	cycle	cold	CASBlobHead	587	585	588	3	2.935	
+cas_cached	cycle	cold	CASBlobHeadMiss	13	12	15	3	0.065	
+cas_cached	cycle	cold	CASManifestPut	1800	1800	1800	3	9.0	
+cas_cached	cycle	cold	CASManifestGet	3000	3000	3000	3	15.0	
+cas_cached	cycle	cold	CASOtherGet	6201	6201	6201	3	31.005	
+cas_cached	cycle	cold	CASHotKeyQueueWaitMicroseconds	3076000	2051000	3994000	3	15380.0	
+cas_cached	cycle	cold	CASRefQueueWaitMicroseconds	16720133	16309756	50565674	3	83600.665	
+cas_cached	cycle	hot	wall	4.409628891036846	4.301240882021375	4.871028990950435	3	0.02204814445518423	
+cas_cached	cycle	hot	median_op_ms	173.36394602898508	170.37775949575007	174.22078951494768	3	0.8668197301449254	
+cas_cached	cycle	hot	p90_op_ms	185.28942168923095	178.22985496604815	185.76581107918173	3	0.9264471084461547	
+cas_cached	cycle	hot	GET	16400	16400	16400	3	82.0	
+cas_cached	cycle	hot	PUT	12800	12800	12801	3	64.0	~
+cas_cached	cycle	hot	HEAD	1000	1000	1000	3	5.0	
+cas_cached	cycle	hot	LIST	1400	1400	1400	3	7.0	
+cas_cached	cycle	hot	DELETE	200	200	200	3	1.0	
+cas_cached	cycle	hot	COPY	0	0	0	3	0.0	
+cas_cached	cycle	hot	ABORT	0	0	0	3	0.0	
+cas_cached	cycle	hot	bytes_read	315082277	315074823	315086622	3	1575411.385	
+cas_cached	cycle	hot	bytes_written	33151989	33151740	33152011	3	165759.945	
+cas_cached	cycle	hot	gc_rounds	0	0	0	3	0.0	
+cas_cached	cycle	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	cycle	hot	S3ReadRequestsErrors	800	800	800	3	4.0	
+cas_cached	cycle	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	cycle	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	cycle	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	cycle	hot	CASRequestAttempt	31800	31800	31801	3	159.0	
+cas_cached	cycle	hot	CASRootGet	6200	6200	6200	3	31.0	
+cas_cached	cycle	hot	CASRootPut	5400	5400	5400	3	27.0	
+cas_cached	cycle	hot	CASBlobPut	0	0	0	3	0.0	
+cas_cached	cycle	hot	CASBlobHead	600	600	600	3	3.0	
+cas_cached	cycle	hot	CASBlobHeadMiss	0	0	0	3	0.0	
+cas_cached	cycle	hot	CASManifestPut	1800	1800	1800	3	9.0	
+cas_cached	cycle	hot	CASManifestGet	3000	3000	3000	3	15.0	
+cas_cached	cycle	hot	CASOtherGet	6200	6200	6200	3	31.0	
+cas_cached	cycle	hot	CASHotKeyQueueWaitMicroseconds	2634000	2511000	2676000	3	13170.0	
+cas_cached	cycle	hot	CASRefQueueWaitMicroseconds	17011148	16683732	20389547	3	85055.74	
+cas_cached	wide_insert	cold	wall	18.147200903040357	18.071416469989344	24.918358625029214	3	0.03629440180608071	noisy
+cas_cached	wide_insert	cold	median_op_ms	35.647897981107235	35.433272540103644	36.30226297536865	3	0.07129579596221447	
+cas_cached	wide_insert	cold	p90_op_ms	38.54372299974784	37.02172158518806	44.20115305110812	3	0.07708744599949569	
+cas_cached	wide_insert	cold	GET	2504	2504	4516	3	5.008	~
+cas_cached	wide_insert	cold	PUT	3507	3507	3515	3	7.014	~
+cas_cached	wide_insert	cold	HEAD	500	500	500	3	1.0	
+cas_cached	wide_insert	cold	LIST	0	0	4	3	0.0	~
+cas_cached	wide_insert	cold	DELETE	0	0	1	3	0.0	~
+cas_cached	wide_insert	cold	COPY	0	0	0	3	0.0	
+cas_cached	wide_insert	cold	ABORT	0	0	0	3	0.0	
+cas_cached	wide_insert	cold	bytes_read	1177557	1177383	2193519	3	2355.114	noisy
+cas_cached	wide_insert	cold	bytes_written	1241475403	1241475393	1241513082	3	2482950.806	
+cas_cached	wide_insert	cold	gc_rounds	0	0	1	3	0.0	
+cas_cached	wide_insert	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	wide_insert	cold	S3ReadRequestsErrors	500	500	510	3	1.0	
+cas_cached	wide_insert	cold	S3WriteRequestsErrors	0	0	1	3	0.0	
+cas_cached	wide_insert	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	wide_insert	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	wide_insert	cold	CASRequestAttempt	6511	6511	8536	3	13.022	
+cas_cached	wide_insert	cold	CASRootGet	1004	1004	2641	3	2.008	
+cas_cached	wide_insert	cold	CASRootPut	1003	1003	1003	3	2.006	
+cas_cached	wide_insert	cold	CASBlobPut	1000	1000	1000	3	2.0	
+cas_cached	wide_insert	cold	CASBlobHead	0	0	0	3	0.0	
+cas_cached	wide_insert	cold	CASBlobHeadMiss	500	500	500	3	1.0	
+cas_cached	wide_insert	cold	CASManifestPut	500	500	500	3	1.0	
+cas_cached	wide_insert	cold	CASManifestGet	500	500	855	3	1.0	
+cas_cached	wide_insert	cold	CASOtherGet	1000	1000	1004	3	2.0	
+cas_cached	wide_insert	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	wide_insert	cold	CASRefQueueWaitMicroseconds	2855216	2846003	2964198	3	5710.432	
+cas_cached	wide_insert	hot	wall	18.627301772939973	18.076856632018462	19.59654022497125	3	0.03725460354587994	
+cas_cached	wide_insert	hot	median_op_ms	36.44289850490168	35.70516797481105	36.47092403843999	3	0.07288579700980335	
+cas_cached	wide_insert	hot	p90_op_ms	38.65982941351831	37.07701376406476	41.81312603177503	3	0.07731965882703662	
+cas_cached	wide_insert	hot	GET	3090	2508	10349	3	6.18	~
+cas_cached	wide_insert	hot	PUT	3516	3514	4020	3	7.032	~
+cas_cached	wide_insert	hot	HEAD	500	500	1000	3	1.0	~
+cas_cached	wide_insert	hot	LIST	4	0	13	3	0.008	~
+cas_cached	wide_insert	hot	DELETE	0	0	5	3	0.0	~
+cas_cached	wide_insert	hot	COPY	0	0	0	3	0.0	
+cas_cached	wide_insert	hot	ABORT	0	0	0	3	0.0	
+cas_cached	wide_insert	hot	bytes_read	1447489	1177504	6311937	3	2894.978	noisy
+cas_cached	wide_insert	hot	bytes_written	1241905096	1241904517	1242149457	3	2483810.192	
+cas_cached	wide_insert	hot	gc_rounds	0	0	1	3	0.0	
+cas_cached	wide_insert	hot	gc_rounds_overlapping	0	0	1	3	0.0	
+cas_cached	wide_insert	hot	S3ReadRequestsErrors	500	500	502	3	1.0	
+cas_cached	wide_insert	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	wide_insert	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	wide_insert	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	wide_insert	hot	CASRequestAttempt	7109	6522	15380	3	14.218	
+cas_cached	wide_insert	hot	CASRootGet	1403	1004	4895	3	2.806	
+cas_cached	wide_insert	hot	CASRootPut	1004	1004	1004	3	2.008	
+cas_cached	wide_insert	hot	CASBlobPut	1000	1000	1000	3	2.0	
+cas_cached	wide_insert	hot	CASBlobHead	0	0	500	3	0.0	
+cas_cached	wide_insert	hot	CASBlobHeadMiss	500	500	500	3	1.0	
+cas_cached	wide_insert	hot	CASManifestPut	500	500	500	3	1.0	
+cas_cached	wide_insert	hot	CASManifestGet	667	500	3921	3	1.334	
+cas_cached	wide_insert	hot	CASOtherGet	1002	1000	1007	3	2.004	
+cas_cached	wide_insert	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	wide_insert	hot	CASRefQueueWaitMicroseconds	2954402	2877148	3016799	3	5908.804	
+cas_cached	attach_200	cold	wall	0.1284577710321173	0.11209563398733735	0.1381148099899292	3	0.0006422888551605865	noisy
+cas_cached	attach_200	cold	median_op_ms	128.45365097746253	112.09208401851356	138.11116002034396	3	0.6422682548873127	
+cas_cached	attach_200	cold	p90_op_ms	128.45365097746253	112.09208401851356	138.11116002034396	3	0.6422682548873127	
+cas_cached	attach_200	cold	GET	358	358	358	3	1.79	
+cas_cached	attach_200	cold	PUT	2	2	2	3	0.01	
+cas_cached	attach_200	cold	HEAD	0	0	0	3	0.0	
+cas_cached	attach_200	cold	LIST	1005	1005	1005	3	5.025	
+cas_cached	attach_200	cold	DELETE	0	0	0	3	0.0	
+cas_cached	attach_200	cold	COPY	0	0	0	3	0.0	
+cas_cached	attach_200	cold	ABORT	0	0	0	3	0.0	
+cas_cached	attach_200	cold	bytes_read	251738	251647	251805	3	1258.69	
+cas_cached	attach_200	cold	bytes_written	320	319	321	3	1.6	
+cas_cached	attach_200	cold	gc_rounds	0	0	0	3	0.0	
+cas_cached	attach_200	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	attach_200	cold	S3ReadRequestsErrors	2	2	2	3	0.01	
+cas_cached	attach_200	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	attach_200	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	attach_200	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	attach_200	cold	CASRequestAttempt	1365	1365	1365	3	6.825	
+cas_cached	attach_200	cold	CASRootGet	156	156	156	3	0.78	
+cas_cached	attach_200	cold	CASRootPut	1	1	1	3	0.005	
+cas_cached	attach_200	cold	CASBlobPut	0	0	0	3	0.0	
+cas_cached	attach_200	cold	CASBlobHead	0	0	0	3	0.0	
+cas_cached	attach_200	cold	CASBlobHeadMiss	0	0	0	3	0.0	
+cas_cached	attach_200	cold	CASManifestPut	0	0	0	3	0.0	
+cas_cached	attach_200	cold	CASManifestGet	200	200	200	3	1.0	
+cas_cached	attach_200	cold	CASOtherGet	2	2	2	3	0.01	
+cas_cached	attach_200	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	attach_200	cold	CASRefQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	attach_200	hot	wall	0.037031327025033534	0.03637199196964502	0.037719728075899184	3	0.00018515663512516767	
+cas_cached	attach_200	hot	median_op_ms	37.027566926553845	36.36795200873166	37.71574795246124	3	0.18513783463276923	
+cas_cached	attach_200	hot	p90_op_ms	37.027566926553845	36.36795200873166	37.71574795246124	3	0.18513783463276923	
+cas_cached	attach_200	hot	GET	3	3	3	3	0.015	
+cas_cached	attach_200	hot	PUT	0	0	0	3	0.0	
+cas_cached	attach_200	hot	HEAD	0	0	0	3	0.0	
+cas_cached	attach_200	hot	LIST	1005	1005	1005	3	5.025	
+cas_cached	attach_200	hot	DELETE	0	0	0	3	0.0	
+cas_cached	attach_200	hot	COPY	0	0	0	3	0.0	
+cas_cached	attach_200	hot	ABORT	0	0	0	3	0.0	
+cas_cached	attach_200	hot	bytes_read	3	3	3	3	0.015	
+cas_cached	attach_200	hot	bytes_written	0	0	0	3	0.0	
+cas_cached	attach_200	hot	gc_rounds	0	0	0	3	0.0	
+cas_cached	attach_200	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	attach_200	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+cas_cached	attach_200	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	attach_200	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	attach_200	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	attach_200	hot	CASRequestAttempt	1008	1008	1008	3	5.04	
+cas_cached	attach_200	hot	CASRootGet	3	3	3	3	0.015	
+cas_cached	attach_200	hot	CASRootPut	0	0	0	3	0.0	
+cas_cached	attach_200	hot	CASBlobPut	0	0	0	3	0.0	
+cas_cached	attach_200	hot	CASBlobHead	0	0	0	3	0.0	
+cas_cached	attach_200	hot	CASBlobHeadMiss	0	0	0	3	0.0	
+cas_cached	attach_200	hot	CASManifestPut	0	0	0	3	0.0	
+cas_cached	attach_200	hot	CASManifestGet	0	0	0	3	0.0	
+cas_cached	attach_200	hot	CASOtherGet	0	0	0	3	0.0	
+cas_cached	attach_200	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	attach_200	hot	CASRefQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	mutation	cold	wall	5.398095162934624	4.509178795968182	5.917549286969006	3	0.053980951629346234	noisy
+cas_cached	mutation	cold	median_op_ms	5398.091502953321	4509.175646002404	5917.546066921204	3	53.98091502953321	
+cas_cached	mutation	cold	p90_op_ms	5398.091502953321	4509.175646002404	5917.546066921204	3	53.98091502953321	
+cas_cached	mutation	cold	GET	702	702	702	3	7.02	
+cas_cached	mutation	cold	PUT	704	704	704	3	7.04	
+cas_cached	mutation	cold	HEAD	103	103	103	3	1.03	
+cas_cached	mutation	cold	LIST	0	0	0	3	0.0	
+cas_cached	mutation	cold	DELETE	1	1	1	3	0.01	
+cas_cached	mutation	cold	COPY	0	0	0	3	0.0	
+cas_cached	mutation	cold	ABORT	0	0	0	3	0.0	
+cas_cached	mutation	cold	bytes_read	16578085	16578085	16578085	3	165780.85	
+cas_cached	mutation	cold	bytes_written	16505471	16505426	16505498	3	165054.71	
+cas_cached	mutation	cold	gc_rounds	0	0	0	3	0.0	
+cas_cached	mutation	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	mutation	cold	S3ReadRequestsErrors	102	102	102	3	1.02	
+cas_cached	mutation	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	mutation	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	mutation	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	mutation	cold	CASRequestAttempt	1310	1310	1310	3	13.1	
+cas_cached	mutation	cold	CASRootGet	202	202	202	3	2.02	
+cas_cached	mutation	cold	CASRootPut	203	203	203	3	2.03	
+cas_cached	mutation	cold	CASBlobPut	200	200	200	3	2.0	
+cas_cached	mutation	cold	CASBlobHead	0	0	0	3	0.0	
+cas_cached	mutation	cold	CASBlobHeadMiss	100	100	100	3	1.0	
+cas_cached	mutation	cold	CASManifestPut	100	100	100	3	1.0	
+cas_cached	mutation	cold	CASManifestGet	100	100	100	3	1.0	
+cas_cached	mutation	cold	CASOtherGet	200	200	200	3	2.0	
+cas_cached	mutation	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	mutation	cold	CASRefQueueWaitMicroseconds	636171	626612	658885	3	6361.71	
+cas_cached	mutation	hot	wall	4.180771359940991	3.592980168061331	5.251258941018023	3	0.04180771359940991	noisy
+cas_cached	mutation	hot	median_op_ms	4180.767569923773	3592.976967920549	5251.254850998521	3	41.807675699237734	
+cas_cached	mutation	hot	p90_op_ms	4180.767569923773	3592.976967920549	5251.254850998521	3	41.807675699237734	
+cas_cached	mutation	hot	GET	502	502	502	3	5.02	
+cas_cached	mutation	hot	PUT	705	704	705	3	7.05	~
+cas_cached	mutation	hot	HEAD	103	103	103	3	1.03	
+cas_cached	mutation	hot	LIST	0	0	0	3	0.0	
+cas_cached	mutation	hot	DELETE	1	1	1	3	0.01	
+cas_cached	mutation	hot	COPY	0	0	0	3	0.0	
+cas_cached	mutation	hot	ABORT	0	0	0	3	0.0	
+cas_cached	mutation	hot	bytes_read	8335542	8335542	8335542	3	83355.42	
+cas_cached	mutation	hot	bytes_written	16509277	16508924	16509351	3	165092.77	
+cas_cached	mutation	hot	gc_rounds	0	0	0	3	0.0	
+cas_cached	mutation	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	mutation	hot	S3ReadRequestsErrors	102	102	102	3	1.02	
+cas_cached	mutation	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	mutation	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	mutation	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	mutation	hot	CASRequestAttempt	1311	1310	1311	3	13.11	
+cas_cached	mutation	hot	CASRootGet	202	202	202	3	2.02	
+cas_cached	mutation	hot	CASRootPut	203	203	203	3	2.03	
+cas_cached	mutation	hot	CASBlobPut	200	200	200	3	2.0	
+cas_cached	mutation	hot	CASBlobHead	0	0	0	3	0.0	
+cas_cached	mutation	hot	CASBlobHeadMiss	100	100	100	3	1.0	
+cas_cached	mutation	hot	CASManifestPut	100	100	100	3	1.0	
+cas_cached	mutation	hot	CASManifestGet	100	100	100	3	1.0	
+cas_cached	mutation	hot	CASOtherGet	200	200	200	3	2.0	
+cas_cached	mutation	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	mutation	hot	CASRefQueueWaitMicroseconds	635189	629502	657900	3	6351.89	
+cas_cached	lwd_concurrent	cold	wall	8.073117809020914	7.547068724990822	8.868736898060888	3	0.10091397261276143	
+cas_cached	lwd_concurrent	cold	median_op_ms	847.222441516351	783.4451585658826	959.2817990342155	3	10.590280518954387	
+cas_cached	lwd_concurrent	cold	p90_op_ms	1154.0750542888418	1063.4331052773632	1285.7173825264908	3	14.425938178610522	
+cas_cached	lwd_concurrent	cold	GET	694	671	757	3	8.675	~
+cas_cached	lwd_concurrent	cold	PUT	714	692	776	3	8.925	~
+cas_cached	lwd_concurrent	cold	HEAD	152	122	170	3	1.9	~
+cas_cached	lwd_concurrent	cold	LIST	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	cold	DELETE	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	cold	COPY	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	cold	ABORT	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	cold	bytes_read	23343165	23268195	24233744	3	291789.5625	
+cas_cached	lwd_concurrent	cold	bytes_written	1586544	1519629	1911787	3	19831.8	noisy
+cas_cached	lwd_concurrent	cold	gc_rounds	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	cold	S3ReadRequestsErrors	136	120	162	3	1.7	
+cas_cached	lwd_concurrent	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	cold	CASRequestAttempt	1404	1350	1487	3	17.55	
+cas_cached	lwd_concurrent	cold	CASRootGet	181	177	181	3	2.2625	
+cas_cached	lwd_concurrent	cold	CASRootPut	181	177	181	3	2.2625	
+cas_cached	lwd_concurrent	cold	CASBlobPut	272	240	324	3	3.4	
+cas_cached	lwd_concurrent	cold	CASBlobHead	8	2	16	3	0.1	
+cas_cached	lwd_concurrent	cold	CASBlobHeadMiss	136	120	162	3	1.7	
+cas_cached	lwd_concurrent	cold	CASManifestPut	90	88	90	3	1.125	
+cas_cached	lwd_concurrent	cold	CASManifestGet	172	168	173	3	2.15	
+cas_cached	lwd_concurrent	cold	CASOtherGet	180	176	180	3	2.25	
+cas_cached	lwd_concurrent	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	cold	CASRefQueueWaitMicroseconds	1187579	1053702	1201299	3	14844.7375	
+cas_cached	lwd_concurrent	hot	wall	9.1599210659042	8.870686384034343	10.188036601059139	3	0.1144990133238025	
+cas_cached	lwd_concurrent	hot	median_op_ms	931.6909310291521	866.8451105477288	1022.777890029829	3	11.646136637864402	
+cas_cached	lwd_concurrent	hot	p90_op_ms	1181.4097670605406	1075.84948905278	1299.1783405654132	3	14.767622088256758	
+cas_cached	lwd_concurrent	hot	GET	714	669	723	3	8.925	~
+cas_cached	lwd_concurrent	hot	PUT	778	694	792	3	9.725	~
+cas_cached	lwd_concurrent	hot	HEAD	171	123	188	3	2.1375	~
+cas_cached	lwd_concurrent	hot	LIST	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	hot	DELETE	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	hot	COPY	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	hot	ABORT	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	hot	bytes_read	3388683	2860317	3636938	3	42358.5375	noisy
+cas_cached	lwd_concurrent	hot	bytes_written	2812504	2465177	3035346	3	35156.3	noisy
+cas_cached	lwd_concurrent	hot	gc_rounds	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	hot	S3ReadRequestsErrors	161	119	166	3	2.0125	
+cas_cached	lwd_concurrent	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	hot	CASRequestAttempt	1498	1358	1545	3	18.725	
+cas_cached	lwd_concurrent	hot	CASRootGet	182	182	184	3	2.275	
+cas_cached	lwd_concurrent	hot	CASRootPut	182	182	184	3	2.275	
+cas_cached	lwd_concurrent	hot	CASBlobPut	322	238	332	3	4.025	
+cas_cached	lwd_concurrent	hot	CASBlobHead	10	4	22	3	0.125	
+cas_cached	lwd_concurrent	hot	CASBlobHeadMiss	161	119	166	3	2.0125	
+cas_cached	lwd_concurrent	hot	CASManifestPut	91	91	92	3	1.1375	
+cas_cached	lwd_concurrent	hot	CASManifestGet	175	173	175	3	2.1875	
+cas_cached	lwd_concurrent	hot	CASOtherGet	182	182	184	3	2.275	
+cas_cached	lwd_concurrent	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	lwd_concurrent	hot	CASRefQueueWaitMicroseconds	1276355	1128886	1704517	3	15954.4375	
+cas_cached	select_subset	cold	wall	0.1551413229899481	0.14568023500032723	0.15517910197377205	3	0.1551413229899481	
+cas_cached	select_subset	cold	median_op_ms	155.13822296634316	145.6769850337878	155.17626190558076	3	155.13822296634316	
+cas_cached	select_subset	cold	p90_op_ms	155.13822296634316	145.6769850337878	155.17626190558076	3	155.13822296634316	
+cas_cached	select_subset	cold	GET	200	200	200	3	200.0	
+cas_cached	select_subset	cold	PUT	0	0	0	3	0.0	
+cas_cached	select_subset	cold	HEAD	0	0	0	3	0.0	
+cas_cached	select_subset	cold	LIST	0	0	0	3	0.0	
+cas_cached	select_subset	cold	DELETE	0	0	0	3	0.0	
+cas_cached	select_subset	cold	COPY	0	0	0	3	0.0	
+cas_cached	select_subset	cold	ABORT	0	0	0	3	0.0	
+cas_cached	select_subset	cold	bytes_read	401741950	401741950	401741950	3	401741950.0	
+cas_cached	select_subset	cold	bytes_written	0	0	0	3	0.0	
+cas_cached	select_subset	cold	gc_rounds	0	0	0	3	0.0	
+cas_cached	select_subset	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	select_subset	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+cas_cached	select_subset	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	select_subset	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	select_subset	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASRequestAttempt	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASRootGet	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASRootPut	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASBlobPut	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASBlobHead	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASBlobHeadMiss	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASManifestPut	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASManifestGet	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASOtherGet	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	select_subset	cold	CASRefQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	select_subset	hot	wall	0.008924892055802047	0.007892140070907772	0.008951714029535651	3	0.008924892055802047	
+cas_cached	select_subset	hot	median_op_ms	8.920002030208707	7.888530031777918	8.948344038799405	3	8.920002030208707	
+cas_cached	select_subset	hot	p90_op_ms	8.920002030208707	7.888530031777918	8.948344038799405	3	8.920002030208707	
+cas_cached	select_subset	hot	GET	0	0	0	3	0.0	
+cas_cached	select_subset	hot	PUT	0	0	0	3	0.0	
+cas_cached	select_subset	hot	HEAD	0	0	0	3	0.0	
+cas_cached	select_subset	hot	LIST	0	0	0	3	0.0	
+cas_cached	select_subset	hot	DELETE	0	0	0	3	0.0	
+cas_cached	select_subset	hot	COPY	0	0	0	3	0.0	
+cas_cached	select_subset	hot	ABORT	0	0	0	3	0.0	
+cas_cached	select_subset	hot	bytes_read	0	0	0	3	0.0	
+cas_cached	select_subset	hot	bytes_written	0	0	0	3	0.0	
+cas_cached	select_subset	hot	gc_rounds	0	0	0	3	0.0	
+cas_cached	select_subset	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	select_subset	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+cas_cached	select_subset	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	select_subset	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	select_subset	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASRequestAttempt	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASRootGet	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASRootPut	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASBlobPut	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASBlobHead	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASBlobHeadMiss	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASManifestPut	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASManifestGet	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASOtherGet	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	select_subset	hot	CASRefQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	dup_content	cold	wall	1.0797558659687638	1.0790693139424548	1.1054141509812325	3	0.05398779329843819	
+cas_cached	dup_content	cold	median_op_ms	48.899543995503336	48.50577749311924	48.95045456942171	3	2.444977199775167	
+cas_cached	dup_content	cold	p90_op_ms	55.08630855474621	54.607282183133066	55.78477116068825	3	2.7543154277373105	
+cas_cached	dup_content	cold	GET	435	435	435	3	21.75	
+cas_cached	dup_content	cold	PUT	192	192	192	3	9.6	
+cas_cached	dup_content	cold	HEAD	140	140	140	3	7.0	
+cas_cached	dup_content	cold	LIST	100	100	100	3	5.0	
+cas_cached	dup_content	cold	DELETE	0	0	0	3	0.0	
+cas_cached	dup_content	cold	COPY	0	0	0	3	0.0	
+cas_cached	dup_content	cold	ABORT	0	0	0	3	0.0	
+cas_cached	dup_content	cold	bytes_read	280687	280683	280687	3	14034.35	
+cas_cached	dup_content	cold	bytes_written	8237130	8237122	8237130	3	411856.5	
+cas_cached	dup_content	cold	gc_rounds	0	0	0	3	0.0	
+cas_cached	dup_content	cold	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	dup_content	cold	S3ReadRequestsErrors	66	66	66	3	3.3	
+cas_cached	dup_content	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	dup_content	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	dup_content	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	dup_content	cold	CASRequestAttempt	867	867	867	3	43.35	
+cas_cached	dup_content	cold	CASRootGet	140	140	140	3	7.0	
+cas_cached	dup_content	cold	CASRootPut	80	80	80	3	4.0	
+cas_cached	dup_content	cold	CASBlobPut	12	12	12	3	0.6	
+cas_cached	dup_content	cold	CASBlobHead	114	114	114	3	5.7	
+cas_cached	dup_content	cold	CASBlobHeadMiss	6	6	6	3	0.3	
+cas_cached	dup_content	cold	CASManifestPut	20	20	20	3	1.0	
+cas_cached	dup_content	cold	CASManifestGet	20	20	20	3	1.0	
+cas_cached	dup_content	cold	CASOtherGet	161	161	161	3	8.05	
+cas_cached	dup_content	cold	CASHotKeyQueueWaitMicroseconds	0	0	1000	3	0.0	
+cas_cached	dup_content	cold	CASRefQueueWaitMicroseconds	138469	138317	140984	3	6923.45	
+cas_cached	dup_content	hot	wall	1.007771102944389	0.987046226975508	1.010665099020116	3	0.050388555147219447	
+cas_cached	dup_content	hot	median_op_ms	49.172627506777644	48.95041952840984	49.71300048055127	3	2.458631375338882	
+cas_cached	dup_content	hot	p90_op_ms	53.42508031753823	50.360481231473386	53.73742397641763	3	2.6712540158769116	
+cas_cached	dup_content	hot	GET	440	440	440	3	22.0	
+cas_cached	dup_content	hot	PUT	180	180	180	3	9.0	
+cas_cached	dup_content	hot	HEAD	140	140	140	3	7.0	
+cas_cached	dup_content	hot	LIST	100	100	100	3	5.0	
+cas_cached	dup_content	hot	DELETE	0	0	0	3	0.0	
+cas_cached	dup_content	hot	COPY	0	0	0	3	0.0	
+cas_cached	dup_content	hot	ABORT	0	0	0	3	0.0	
+cas_cached	dup_content	hot	bytes_read	738822	738818	738829	3	36941.1	
+cas_cached	dup_content	hot	bytes_written	221642	221637	221659	3	11082.1	
+cas_cached	dup_content	hot	gc_rounds	0	0	0	3	0.0	
+cas_cached	dup_content	hot	gc_rounds_overlapping	0	0	0	3	0.0	
+cas_cached	dup_content	hot	S3ReadRequestsErrors	60	60	60	3	3.0	
+cas_cached	dup_content	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+cas_cached	dup_content	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	dup_content	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas_cached	dup_content	hot	CASRequestAttempt	860	860	860	3	43.0	
+cas_cached	dup_content	hot	CASRootGet	140	140	140	3	7.0	
+cas_cached	dup_content	hot	CASRootPut	80	80	80	3	4.0	
+cas_cached	dup_content	hot	CASBlobPut	0	0	0	3	0.0	
+cas_cached	dup_content	hot	CASBlobHead	120	120	120	3	6.0	
+cas_cached	dup_content	hot	CASBlobHeadMiss	0	0	0	3	0.0	
+cas_cached	dup_content	hot	CASManifestPut	20	20	20	3	1.0	
+cas_cached	dup_content	hot	CASManifestGet	20	20	20	3	1.0	
+cas_cached	dup_content	hot	CASOtherGet	160	160	160	3	8.0	
+cas_cached	dup_content	hot	CASHotKeyQueueWaitMicroseconds	0	0	0	3	0.0	
+cas_cached	dup_content	hot	CASRefQueueWaitMicroseconds	137338	137159	139563	3	6866.9	
+s3_cached	cycle	cold	wall	3.098650573985651	3.089561945060268	3.1064625459257513	3	0.015493252869928255	
+s3_cached	cycle	cold	median_op_ms	119.64296450605616	118.58564795693383	120.34503847826272	3	0.5982148225302808	
+s3_cached	cycle	cold	p90_op_ms	134.39483164111152	127.40571979666129	136.65590188466012	3	0.6719741582055576	
+s3_cached	cycle	cold	GET	1200	1200	1200	3	6.0	
+s3_cached	cycle	cold	PUT	6200	6200	6200	3	31.0	
+s3_cached	cycle	cold	HEAD	0	0	0	3	0.0	
+s3_cached	cycle	cold	LIST	0	0	0	3	0.0	
+s3_cached	cycle	cold	DELETE	404	403	408	3	2.02	~
+s3_cached	cycle	cold	COPY	0	0	0	3	0.0	
+s3_cached	cycle	cold	ABORT	0	0	0	3	0.0	
+s3_cached	cycle	cold	bytes_read	4534000	4534000	4534000	3	22670.0	
+s3_cached	cycle	cold	bytes_written	4987800	4987800	4987800	3	24939.0	
+s3_cached	cycle	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	cycle	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	cycle	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	cycle	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	cycle	hot	wall	3.051463208044879	3.0036233769496903	3.1092889269348234	3	0.015257316040224395	
+s3_cached	cycle	hot	median_op_ms	122.74877849267796	119.93597151013091	130.60406752629206	3	0.6137438924633898	
+s3_cached	cycle	hot	p90_op_ms	137.28833446512	130.9685749351047	142.34875416150317	3	0.6864416723255999	
+s3_cached	cycle	hot	GET	1200	1200	1200	3	6.0	
+s3_cached	cycle	hot	PUT	6200	6200	6200	3	31.0	
+s3_cached	cycle	hot	HEAD	0	0	0	3	0.0	
+s3_cached	cycle	hot	LIST	0	0	0	3	0.0	
+s3_cached	cycle	hot	DELETE	396	380	396	3	1.98	~
+s3_cached	cycle	hot	COPY	0	0	0	3	0.0	
+s3_cached	cycle	hot	ABORT	0	0	0	3	0.0	
+s3_cached	cycle	hot	bytes_read	4534000	4534000	4534000	3	22670.0	
+s3_cached	cycle	hot	bytes_written	4987800	4987800	4987800	3	24939.0	
+s3_cached	cycle	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	cycle	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	cycle	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	cycle	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	wall	13.648276485968381	13.300550283980556	14.778540767962113	3	0.027296552971936762	
+s3_cached	wide_insert	cold	median_op_ms	26.22258651535958	26.153744489420205	28.745060495566577	3	0.05244517303071916	
+s3_cached	wide_insert	cold	p90_op_ms	27.69464396405965	27.472419664263725	31.64160003652796	3	0.0553892879281193	
+s3_cached	wide_insert	cold	GET	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	PUT	5000	5000	5000	3	10.0	
+s3_cached	wide_insert	cold	HEAD	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	LIST	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	DELETE	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	COPY	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	ABORT	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	bytes_read	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	bytes_written	1242334690	1242334690	1242334690	3	2484669.38	
+s3_cached	wide_insert	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	wide_insert	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	wall	13.40301497199107	13.34110887395218	14.068324316991493	3	0.026806029943982138	
+s3_cached	wide_insert	hot	median_op_ms	25.843654526397586	25.793279462959617	26.3292514719069	3	0.05168730905279517	
+s3_cached	wide_insert	hot	p90_op_ms	27.063746994826943	26.89099602866918	31.356710975524038	3	0.054127493989653885	
+s3_cached	wide_insert	hot	GET	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	PUT	5000	5000	5000	3	10.0	
+s3_cached	wide_insert	hot	HEAD	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	LIST	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	DELETE	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	COPY	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	ABORT	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	bytes_read	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	bytes_written	1242732648	1242732648	1242732648	3	2485465.296	
+s3_cached	wide_insert	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	wide_insert	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	attach_200	cold	wall	0.08172842499334365	0.0746587619651109	0.08717529301065952	3	0.00040864212496671826	
+s3_cached	attach_200	cold	median_op_ms	81.72361506149173	74.65350197162479	87.17108296696097	3	0.40861807530745864	
+s3_cached	attach_200	cold	p90_op_ms	81.72361506149173	74.65350197162479	87.17108296696097	3	0.40861807530745864	
+s3_cached	attach_200	cold	GET	1801	1801	1801	3	9.005	
+s3_cached	attach_200	cold	PUT	0	0	0	3	0.0	
+s3_cached	attach_200	cold	HEAD	0	0	0	3	0.0	
+s3_cached	attach_200	cold	LIST	0	0	0	3	0.0	
+s3_cached	attach_200	cold	DELETE	0	0	0	3	0.0	
+s3_cached	attach_200	cold	COPY	0	0	0	3	0.0	
+s3_cached	attach_200	cold	ABORT	0	0	0	3	0.0	
+s3_cached	attach_200	cold	bytes_read	165417	165417	165417	3	827.085	
+s3_cached	attach_200	cold	bytes_written	0	0	0	3	0.0	
+s3_cached	attach_200	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	attach_200	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	attach_200	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	attach_200	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	attach_200	hot	wall	0.015118550043553114	0.014961033943109214	0.015661414014175534	3	7.559275021776557e-05	
+s3_cached	attach_200	hot	median_op_ms	15.115289948880672	14.958204003050923	15.658124000765383	3	0.07557644974440336	
+s3_cached	attach_200	hot	p90_op_ms	15.115289948880672	14.958204003050923	15.658124000765383	3	0.07557644974440336	
+s3_cached	attach_200	hot	GET	0	0	0	3	0.0	
+s3_cached	attach_200	hot	PUT	0	0	0	3	0.0	
+s3_cached	attach_200	hot	HEAD	0	0	0	3	0.0	
+s3_cached	attach_200	hot	LIST	0	0	0	3	0.0	
+s3_cached	attach_200	hot	DELETE	0	0	0	3	0.0	
+s3_cached	attach_200	hot	COPY	0	0	0	3	0.0	
+s3_cached	attach_200	hot	ABORT	0	0	0	3	0.0	
+s3_cached	attach_200	hot	bytes_read	0	0	0	3	0.0	
+s3_cached	attach_200	hot	bytes_written	0	0	0	3	0.0	
+s3_cached	attach_200	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	attach_200	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	attach_200	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	attach_200	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	mutation	cold	wall	3.5568839280167595	3.503771001007408	5.147985546034761	3	0.035568839280167595	noisy
+s3_cached	mutation	cold	median_op_ms	3556.88052799087	3503.768380964175	5147.982235997915	3	35.5688052799087	
+s3_cached	mutation	cold	p90_op_ms	3556.88052799087	3503.768380964175	5147.982235997915	3	35.5688052799087	
+s3_cached	mutation	cold	GET	300	300	300	3	3.0	
+s3_cached	mutation	cold	PUT	1101	1101	1101	3	11.01	
+s3_cached	mutation	cold	HEAD	0	0	0	3	0.0	
+s3_cached	mutation	cold	LIST	0	0	0	3	0.0	
+s3_cached	mutation	cold	DELETE	0	0	0	3	0.0	
+s3_cached	mutation	cold	COPY	0	0	0	3	0.0	
+s3_cached	mutation	cold	ABORT	0	0	0	3	0.0	
+s3_cached	mutation	cold	bytes_read	8251898	8251898	8251898	3	82518.98	
+s3_cached	mutation	cold	bytes_written	16265591	16265591	16265591	3	162655.91	
+s3_cached	mutation	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	mutation	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	mutation	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	mutation	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	mutation	hot	wall	4.780202116002329	4.566613461938687	5.153163537033834	3	0.047802021160023286	
+s3_cached	mutation	hot	median_op_ms	4780.198985943571	4566.60971196834	5153.160026995465	3	47.80198985943571	
+s3_cached	mutation	hot	p90_op_ms	4780.198985943571	4566.60971196834	5153.160026995465	3	47.80198985943571	
+s3_cached	mutation	hot	GET	0	0	0	3	0.0	
+s3_cached	mutation	hot	PUT	1101	1101	1101	3	11.01	
+s3_cached	mutation	hot	HEAD	0	0	0	3	0.0	
+s3_cached	mutation	hot	LIST	0	0	0	3	0.0	
+s3_cached	mutation	hot	DELETE	0	0	0	3	0.0	
+s3_cached	mutation	hot	COPY	0	0	0	3	0.0	
+s3_cached	mutation	hot	ABORT	0	0	0	3	0.0	
+s3_cached	mutation	hot	bytes_read	0	0	0	3	0.0	
+s3_cached	mutation	hot	bytes_written	16264681	16264681	16264681	3	162646.81	
+s3_cached	mutation	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	mutation	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	mutation	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	mutation	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	cold	wall	7.036047918954864	6.820585704990663	8.679379837936722	3	0.0879505989869358	noisy
+s3_cached	lwd_concurrent	cold	median_op_ms	751.0630119941197	729.7251224517822	868.8201585318893	3	9.388287649926497	
+s3_cached	lwd_concurrent	cold	p90_op_ms	991.2014536326751	888.7118825572543	1313.861639087554	3	12.390018170408439	
+s3_cached	lwd_concurrent	cold	GET	282	239	295	3	3.525	~
+s3_cached	lwd_concurrent	cold	PUT	1573	1569	1620	3	19.6625	~
+s3_cached	lwd_concurrent	cold	HEAD	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	cold	LIST	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	cold	DELETE	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	cold	COPY	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	cold	ABORT	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	cold	bytes_read	22764015	22292317	22803829	3	284550.1875	
+s3_cached	lwd_concurrent	cold	bytes_written	1570261	1569430	1698199	3	19628.2625	
+s3_cached	lwd_concurrent	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	hot	wall	9.337417584029026	8.888203451992013	9.496302730985917	3	0.11671771980036283	
+s3_cached	lwd_concurrent	hot	median_op_ms	896.0267339716665	803.3338424866088	926.7182399635203	3	11.200334174645832	
+s3_cached	lwd_concurrent	hot	p90_op_ms	1163.407178397756	1135.8603348955512	1331.8390482920222	3	14.54258972997195	
+s3_cached	lwd_concurrent	hot	GET	249	243	285	3	3.1125	~
+s3_cached	lwd_concurrent	hot	PUT	1629	1599	1650	3	20.3625	~
+s3_cached	lwd_concurrent	hot	HEAD	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	hot	LIST	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	hot	DELETE	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	hot	COPY	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	hot	ABORT	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	hot	bytes_read	2003121	1850612	2406919	3	25039.0125	noisy
+s3_cached	lwd_concurrent	hot	bytes_written	2080558	1883824	2408759	3	26006.975	noisy
+s3_cached	lwd_concurrent	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	lwd_concurrent	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	select_subset	cold	wall	0.1661065820371732	0.16515765304211527	0.1743200389901176	3	0.1661065820371732	
+s3_cached	select_subset	cold	median_op_ms	166.10038198996335	165.15398293267936	174.3171289563179	3	166.10038198996335	
+s3_cached	select_subset	cold	p90_op_ms	166.10038198996335	165.15398293267936	174.3171289563179	3	166.10038198996335	
+s3_cached	select_subset	cold	GET	400	400	400	3	400.0	
+s3_cached	select_subset	cold	PUT	0	0	0	3	0.0	
+s3_cached	select_subset	cold	HEAD	0	0	0	3	0.0	
+s3_cached	select_subset	cold	LIST	0	0	0	3	0.0	
+s3_cached	select_subset	cold	DELETE	0	0	0	3	0.0	
+s3_cached	select_subset	cold	COPY	0	0	0	3	0.0	
+s3_cached	select_subset	cold	ABORT	0	0	0	3	0.0	
+s3_cached	select_subset	cold	bytes_read	401754655	401754655	401754655	3	401754655.0	
+s3_cached	select_subset	cold	bytes_written	0	0	0	3	0.0	
+s3_cached	select_subset	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	select_subset	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	select_subset	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	select_subset	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	select_subset	hot	wall	0.009325644932687283	0.008240469032898545	0.00946568907238543	3	0.009325644932687283	
+s3_cached	select_subset	hot	median_op_ms	9.32252500206232	8.23826901614666	9.462669026106596	3	9.32252500206232	
+s3_cached	select_subset	hot	p90_op_ms	9.32252500206232	8.23826901614666	9.462669026106596	3	9.32252500206232	
+s3_cached	select_subset	hot	GET	0	0	0	3	0.0	
+s3_cached	select_subset	hot	PUT	0	0	0	3	0.0	
+s3_cached	select_subset	hot	HEAD	0	0	0	3	0.0	
+s3_cached	select_subset	hot	LIST	0	0	0	3	0.0	
+s3_cached	select_subset	hot	DELETE	0	0	0	3	0.0	
+s3_cached	select_subset	hot	COPY	0	0	0	3	0.0	
+s3_cached	select_subset	hot	ABORT	0	0	0	3	0.0	
+s3_cached	select_subset	hot	bytes_read	0	0	0	3	0.0	
+s3_cached	select_subset	hot	bytes_written	0	0	0	3	0.0	
+s3_cached	select_subset	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	select_subset	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	select_subset	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	select_subset	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	dup_content	cold	wall	1.261640656972304	1.2501886400859803	1.2692903659772128	3	0.0630820328486152	
+s3_cached	dup_content	cold	median_op_ms	60.73780596489087	60.64361002063379	62.82446102704853	3	3.0368902982445434	
+s3_cached	dup_content	cold	p90_op_ms	67.81398011371493	67.09071404766291	70.26826324872673	3	3.3906990056857467	
+s3_cached	dup_content	cold	GET	0	0	0	3	0.0	
+s3_cached	dup_content	cold	PUT	300	300	300	3	15.0	
+s3_cached	dup_content	cold	HEAD	0	0	0	3	0.0	
+s3_cached	dup_content	cold	LIST	0	0	0	3	0.0	
+s3_cached	dup_content	cold	DELETE	0	0	0	3	0.0	
+s3_cached	dup_content	cold	COPY	0	0	0	3	0.0	
+s3_cached	dup_content	cold	ABORT	0	0	0	3	0.0	
+s3_cached	dup_content	cold	bytes_read	0	0	0	3	0.0	
+s3_cached	dup_content	cold	bytes_written	162579380	162579380	162579380	3	8128969.0	
+s3_cached	dup_content	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	dup_content	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	dup_content	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	dup_content	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	dup_content	hot	wall	1.2177479420788586	1.2020250039640814	1.3674475679872558	3	0.060887397103942933	
+s3_cached	dup_content	hot	median_op_ms	60.901993012521416	59.38639852683991	64.99457097379491	3	3.045099650626071	
+s3_cached	dup_content	hot	p90_op_ms	63.189250451978296	62.312180548906326	71.24542652163655	3	3.159462522598915	
+s3_cached	dup_content	hot	GET	0	0	0	3	0.0	
+s3_cached	dup_content	hot	PUT	300	300	300	3	15.0	
+s3_cached	dup_content	hot	HEAD	0	0	0	3	0.0	
+s3_cached	dup_content	hot	LIST	0	0	0	3	0.0	
+s3_cached	dup_content	hot	DELETE	0	0	0	3	0.0	
+s3_cached	dup_content	hot	COPY	0	0	0	3	0.0	
+s3_cached	dup_content	hot	ABORT	0	0	0	3	0.0	
+s3_cached	dup_content	hot	bytes_read	0	0	0	3	0.0	
+s3_cached	dup_content	hot	bytes_written	162579380	162579380	162579380	3	8128969.0	
+s3_cached	dup_content	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3_cached	dup_content	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3_cached	dup_content	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3_cached	dup_content	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	cycle	cold	wall	18.65858699788805	18.55725806497503	18.905135042965412	3	0.09329293498944026	
+s3plain_cached	cycle	cold	median_op_ms	750.1594780478626	747.8435109951533	752.3108285386115	3	3.7507973902393132	
+s3plain_cached	cycle	cold	p90_op_ms	779.4136699754745	777.3579264408909	780.5589732481167	3	3.8970683498773724	
+s3plain_cached	cycle	cold	GET	1200	1200	1200	3	6.0	
+s3plain_cached	cycle	cold	PUT	8800	8800	8800	3	44.0	
+s3plain_cached	cycle	cold	HEAD	7200	7200	7200	3	36.0	
+s3plain_cached	cycle	cold	LIST	0	0	0	3	0.0	
+s3plain_cached	cycle	cold	DELETE	13400	13400	13400	3	67.0	
+s3plain_cached	cycle	cold	COPY	6200	6200	6200	3	31.0	
+s3plain_cached	cycle	cold	ABORT	0	0	0	3	0.0	
+s3plain_cached	cycle	cold	bytes_read	4534000	4534000	4534000	3	22670.0	
+s3plain_cached	cycle	cold	bytes_written	5131000	5131000	5131000	3	25655.0	
+s3plain_cached	cycle	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	cycle	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	cycle	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	cycle	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	cycle	hot	wall	18.46873466600664	18.107781457016245	18.684808571008034	3	0.0923436733300332	
+s3plain_cached	cycle	hot	median_op_ms	748.0229725479148	742.1556079643779	752.9769485117868	3	3.740114862739574	
+s3plain_cached	cycle	hot	p90_op_ms	774.8618927085772	772.1885875798762	781.9672135054134	3	3.874309463542886	
+s3plain_cached	cycle	hot	GET	1200	1200	1200	3	6.0	
+s3plain_cached	cycle	hot	PUT	8800	8800	8800	3	44.0	
+s3plain_cached	cycle	hot	HEAD	7200	7200	7200	3	36.0	
+s3plain_cached	cycle	hot	LIST	0	0	0	3	0.0	
+s3plain_cached	cycle	hot	DELETE	13400	13400	13400	3	67.0	
+s3plain_cached	cycle	hot	COPY	6200	6200	6200	3	31.0	
+s3plain_cached	cycle	hot	ABORT	0	0	0	3	0.0	
+s3plain_cached	cycle	hot	bytes_read	4534000	4534000	4534000	3	22670.0	
+s3plain_cached	cycle	hot	bytes_written	5131000	5131000	5131000	3	25655.0	
+s3plain_cached	cycle	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	cycle	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	cycle	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	cycle	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	wide_insert	cold	wall	14.914319809991866	14.361341114039533	15.704278918914497	3	0.02982863961998373	
+s3plain_cached	wide_insert	cold	median_op_ms	28.575714502949268	28.149839024990797	30.706993013154715	3	0.057151429005898535	
+s3plain_cached	wide_insert	cold	p90_op_ms	31.192261073738337	29.687111487146467	34.05381798511371	3	0.062384522147476675	
+s3plain_cached	wide_insert	cold	GET	0	0	0	3	0.0	
+s3plain_cached	wide_insert	cold	PUT	6000	6000	6000	3	12.0	
+s3plain_cached	wide_insert	cold	HEAD	500	500	500	3	1.0	
+s3plain_cached	wide_insert	cold	LIST	0	0	0	3	0.0	
+s3plain_cached	wide_insert	cold	DELETE	0	0	0	3	0.0	
+s3plain_cached	wide_insert	cold	COPY	0	0	0	3	0.0	
+s3plain_cached	wide_insert	cold	ABORT	0	0	0	3	0.0	
+s3plain_cached	wide_insert	cold	bytes_read	0	0	0	3	0.0	
+s3plain_cached	wide_insert	cold	bytes_written	1242400758	1242400758	1242400758	3	2484801.516	
+s3plain_cached	wide_insert	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	wide_insert	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	wide_insert	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	wide_insert	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	wide_insert	hot	wall	18.389474543975666	14.768500812002458	20.48657451895997	3	0.03677894908795133	noisy
+s3plain_cached	wide_insert	hot	median_op_ms	30.06833593826741	28.668476501479745	32.64293004758656	3	0.06013667187653482	
+s3plain_cached	wide_insert	hot	p90_op_ms	42.09114691475406	32.039779995102435	66.084851231426	3	0.08418229382950812	
+s3plain_cached	wide_insert	hot	GET	0	0	0	3	0.0	
+s3plain_cached	wide_insert	hot	PUT	6000	6000	6000	3	12.0	
+s3plain_cached	wide_insert	hot	HEAD	500	500	500	3	1.0	
+s3plain_cached	wide_insert	hot	LIST	0	0	0	3	0.0	
+s3plain_cached	wide_insert	hot	DELETE	0	0	0	3	0.0	
+s3plain_cached	wide_insert	hot	COPY	0	0	0	3	0.0	
+s3plain_cached	wide_insert	hot	ABORT	0	0	0	3	0.0	
+s3plain_cached	wide_insert	hot	bytes_read	0	0	0	3	0.0	
+s3plain_cached	wide_insert	hot	bytes_written	1242799152	1242799152	1242799152	3	2485598.304	
+s3plain_cached	wide_insert	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	wide_insert	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	wide_insert	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	wide_insert	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	wall	0.0824669849826023	0.07858213898725808	0.08519107603933662	3	0.0004123349249130115	
+s3plain_cached	attach_200	cold	median_op_ms	82.46255503036082	78.57863896060735	85.18722595181316	3	0.4123127751518041	
+s3plain_cached	attach_200	cold	p90_op_ms	82.46255503036082	78.57863896060735	85.18722595181316	3	0.4123127751518041	
+s3plain_cached	attach_200	cold	GET	1801	1801	1801	3	9.005	
+s3plain_cached	attach_200	cold	PUT	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	HEAD	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	LIST	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	DELETE	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	COPY	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	ABORT	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	bytes_read	165417	165417	165417	3	827.085	
+s3plain_cached	attach_200	cold	bytes_written	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	attach_200	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	wall	0.027128802030347288	0.026576282922178507	0.027467007050290704	3	0.00013564401015173644	
+s3plain_cached	attach_200	hot	median_op_ms	27.126102009788156	26.573452982120216	27.463907026685774	3	0.13563051004894078	
+s3plain_cached	attach_200	hot	p90_op_ms	27.126102009788156	26.573452982120216	27.463907026685774	3	0.13563051004894078	
+s3plain_cached	attach_200	hot	GET	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	PUT	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	HEAD	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	LIST	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	DELETE	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	COPY	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	ABORT	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	bytes_read	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	bytes_written	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	attach_200	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	mutation	cold	status	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	3		
+s3plain_cached	mutation	hot	status	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	3		
+s3plain_cached	lwd_concurrent	cold	status	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	3		
+s3plain_cached	lwd_concurrent	hot	status	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	UNSUPPORTED (mutations are not supported on the immutable s3plain disk)	3		
+s3plain_cached	select_subset	cold	wall	0.1672832790063694	0.15290669002570212	0.18645224999636412	3	0.1672832790063694	noisy
+s3plain_cached	select_subset	cold	median_op_ms	167.27823892142624	152.90333004668355	186.44760991446674	3	167.27823892142624	
+s3plain_cached	select_subset	cold	p90_op_ms	167.27823892142624	152.90333004668355	186.44760991446674	3	167.27823892142624	
+s3plain_cached	select_subset	cold	GET	400	400	400	3	400.0	
+s3plain_cached	select_subset	cold	PUT	0	0	0	3	0.0	
+s3plain_cached	select_subset	cold	HEAD	0	0	0	3	0.0	
+s3plain_cached	select_subset	cold	LIST	0	0	0	3	0.0	
+s3plain_cached	select_subset	cold	DELETE	0	0	0	3	0.0	
+s3plain_cached	select_subset	cold	COPY	0	0	0	3	0.0	
+s3plain_cached	select_subset	cold	ABORT	0	0	0	3	0.0	
+s3plain_cached	select_subset	cold	bytes_read	401754655	401754655	401754655	3	401754655.0	
+s3plain_cached	select_subset	cold	bytes_written	0	0	0	3	0.0	
+s3plain_cached	select_subset	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	select_subset	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	select_subset	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	select_subset	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	wall	0.009338555042631924	0.009241273044608533	0.010014568106271327	3	0.009338555042631924	
+s3plain_cached	select_subset	hot	median_op_ms	9.335834998637438	9.236452984623611	10.011288104578853	3	9.335834998637438	
+s3plain_cached	select_subset	hot	p90_op_ms	9.335834998637438	9.236452984623611	10.011288104578853	3	9.335834998637438	
+s3plain_cached	select_subset	hot	GET	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	PUT	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	HEAD	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	LIST	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	DELETE	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	COPY	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	ABORT	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	bytes_read	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	bytes_written	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	select_subset	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	dup_content	cold	wall	1.8307177249807864	1.354878555983305	3.4941497570835054	3	0.09153588624903933	noisy
+s3plain_cached	dup_content	cold	median_op_ms	77.66476552933455	65.56963053299114	152.29072648799047	3	3.8832382764667273	
+s3plain_cached	dup_content	cold	p90_op_ms	83.43031981494278	75.02233152044937	257.66682432731614	3	4.171515990747139	
+s3plain_cached	dup_content	cold	GET	0	0	0	3	0.0	
+s3plain_cached	dup_content	cold	PUT	380	380	380	3	19.0	
+s3plain_cached	dup_content	cold	HEAD	60	60	60	3	3.0	
+s3plain_cached	dup_content	cold	LIST	0	0	0	3	0.0	
+s3plain_cached	dup_content	cold	DELETE	0	0	0	3	0.0	
+s3plain_cached	dup_content	cold	COPY	0	0	0	3	0.0	
+s3plain_cached	dup_content	cold	ABORT	0	0	0	3	0.0	
+s3plain_cached	dup_content	cold	bytes_read	0	0	0	3	0.0	
+s3plain_cached	dup_content	cold	bytes_written	162583940	162583940	162583940	3	8129197.0	
+s3plain_cached	dup_content	cold	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	dup_content	cold	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	dup_content	cold	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	dup_content	cold	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	dup_content	hot	wall	1.6458762380061671	1.3168283570557833	3.52676605200395	3	0.08229381190030835	noisy
+s3plain_cached	dup_content	hot	median_op_ms	81.80185046512634	65.370618540328	138.67529248818755	3	4.090092523256317	
+s3plain_cached	dup_content	hot	p90_op_ms	87.12836988270283	70.96608617575839	164.2275448073633	3	4.356418494135141	
+s3plain_cached	dup_content	hot	GET	0	0	0	3	0.0	
+s3plain_cached	dup_content	hot	PUT	380	380	380	3	19.0	
+s3plain_cached	dup_content	hot	HEAD	60	60	60	3	3.0	
+s3plain_cached	dup_content	hot	LIST	0	0	0	3	0.0	
+s3plain_cached	dup_content	hot	DELETE	0	0	0	3	0.0	
+s3plain_cached	dup_content	hot	COPY	0	0	0	3	0.0	
+s3plain_cached	dup_content	hot	ABORT	0	0	0	3	0.0	
+s3plain_cached	dup_content	hot	bytes_read	0	0	0	3	0.0	
+s3plain_cached	dup_content	hot	bytes_written	162583940	162583940	162583940	3	8129197.0	
+s3plain_cached	dup_content	hot	S3ReadRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	dup_content	hot	S3WriteRequestsErrors	0	0	0	3	0.0	
+s3plain_cached	dup_content	hot	DiskS3ReadRequestRetryableErrors	0	0	0	3	0.0	
+s3plain_cached	dup_content	hot	DiskS3WriteRequestRetryableErrors	0	0	0	3	0.0	
+cas/s3	cycle	cold	ratio:cas/s3:wall	1.32184593186328	1.1708451389909	1.3506750784103432	3		
+cas/s3	cycle	cold	ratio:cas/s3:GET	13.840833333333334	13.839166666666667	13.841666666666667	3		
+cas/s3	cycle	cold	ratio:cas/s3:PUT	2.069032258064516	2.068225806451613	2.069193548387097	3		
+cas/s3	cycle	cold	ratio:cas/s3:bytes_read	42.561979988611405	42.5610721548849	42.562038558529245	3		
+cas/s3	cycle	cold	ratio:cas/s3:bytes_written	2.675209511207346	2.671054372669313	2.6756076827459	3		
+cas/s3plain	cycle	cold	ratio:cas/s3plain:wall	0.2290714818877221	0.21973984805097854	0.233719770076089	3		
+cas/s3plain	cycle	cold	ratio:cas/s3plain:GET	13.840833333333334	13.839166666666667	13.841666666666667	3		
+cas/s3plain	cycle	cold	ratio:cas/s3plain:PUT	1.4577272727272728	1.457159090909091	1.457840909090909	3		
+cas/s3plain	cycle	cold	ratio:cas/s3plain:bytes_read	42.561979988611405	42.5610721548849	42.562038558529245	3		
+cas/s3plain	cycle	cold	ratio:cas/s3plain:bytes_written	2.6005476515299164	2.5965084778795555	2.6009347105827323	3		
+cas/s3	cycle	hot	ratio:cas/s3:wall	1.3459338720270493	1.3362374300837279	1.6943812613695273	3		
+cas/s3	cycle	hot	ratio:cas/s3:GET	13.833333333333334	13.833333333333334	13.833333333333334	3		
+cas/s3	cycle	hot	ratio:cas/s3:PUT	2.064516129032258	2.064516129032258	2.0646774193548385	3		
+cas/s3	cycle	hot	ratio:cas/s3:bytes_read	120.87242495729276	120.87162653542667	120.87337997234198	3		
+cas/s3	cycle	hot	ratio:cas/s3:bytes_written	6.650162596736036	6.650041100284695	6.650214523437187	3		
+cas/s3plain	cycle	hot	ratio:cas/s3plain:wall	0.25347095456230495	0.22300570016883278	0.29038218807996935	3		
+cas/s3plain	cycle	hot	ratio:cas/s3plain:GET	13.833333333333334	13.833333333333334	13.833333333333334	3		
+cas/s3plain	cycle	hot	ratio:cas/s3plain:PUT	1.4545454545454546	1.4545454545454546	1.4546590909090908	3		
+cas/s3plain	cycle	hot	ratio:cas/s3plain:bytes_read	120.87242495729276	120.87162653542667	120.87337997234198	3		
+cas/s3plain	cycle	hot	ratio:cas/s3plain:bytes_written	6.464564607289027	6.464446501656597	6.464615084778796	3		
+cas/s3	wide_insert	cold	ratio:cas/s3:wall	1.423254134944998	1.3403340986089458	1.6508491511763128	3		
+cas/s3	wide_insert	cold	ratio:cas/s3:GET	0 → 4000	0 → 4000	0 → 4000	3		
+cas/s3	wide_insert	cold	ratio:cas/s3:PUT	0.702	0.7014	0.7028	3		
+cas/s3	wide_insert	cold	ratio:cas/s3:bytes_read	0 → 2277200	0 → 2277200	0 → 2277200	3		
+cas/s3	wide_insert	cold	ratio:cas/s3:bytes_written	0.9993087249298335	0.9993085075970952	0.9993434241138353	3		
+cas/s3plain	wide_insert	cold	ratio:cas/s3plain:wall	1.1030220189068207	1.0177232572398676	1.5389567696006252	3		
+cas/s3plain	wide_insert	cold	ratio:cas/s3plain:GET	0 → 4000	0 → 4000	0 → 4000	3		
+cas/s3plain	wide_insert	cold	ratio:cas/s3plain:PUT	0.585	0.5845	0.5856666666666667	3		
+cas/s3plain	wide_insert	cold	ratio:cas/s3plain:bytes_read	0 → 2277200	0 → 2277200	0 → 2277200	3		
+cas/s3plain	wide_insert	cold	ratio:cas/s3plain:bytes_written	0.9992555840021469	0.9992553666809659	0.9992902813409262	3		
+cas/s3	wide_insert	hot	ratio:cas/s3:wall	1.4052331323505294	1.3153304290969816	2.0548361982377967	3		
+cas/s3	wide_insert	hot	ratio:cas/s3:GET	0 → 9649	0 → 9649	0 → 9649	3		
+cas/s3	wide_insert	hot	ratio:cas/s3:PUT	0.8044	0.7028	0.8046	3		
+cas/s3	wide_insert	hot	ratio:cas/s3:bytes_read	0 → 5947614	0 → 5947614	0 → 5947614	3		
+cas/s3	wide_insert	hot	ratio:cas/s3:bytes_written	0.9995305040058785	0.9993340273136527	0.9995309328994147	3		
+cas/s3plain	wide_insert	hot	ratio:cas/s3plain:wall	1.5446064575313638	1.2689695859205337	1.6525720548314744	3		
+cas/s3plain	wide_insert	hot	ratio:cas/s3plain:GET	0 → 9649	0 → 9649	0 → 9649	3		
+cas/s3plain	wide_insert	hot	ratio:cas/s3plain:PUT	0.6703333333333333	0.5856666666666667	0.6705	3		
+cas/s3plain	wide_insert	hot	ratio:cas/s3plain:bytes_read	0 → 5947614	0 → 5947614	0 → 5947614	3		
+cas/s3plain	wide_insert	hot	ratio:cas/s3plain:bytes_written	0.9994770176669705	0.9992805514884999	0.9994774465375561	3		
+cas/s3	attach_200	cold	ratio:cas/s3:wall	2.24479086280477	2.200291160935988	2.4337150507524843	3		
+cas/s3	attach_200	cold	ratio:cas/s3:GET	0.19877845641310382	0.19877845641310382	0.19877845641310382	3		
+cas/s3	attach_200	cold	ratio:cas/s3:PUT	0 → 2	0 → 2	0 → 2	3		
+cas/s3	attach_200	cold	ratio:cas/s3:bytes_read	1.5221954212686726	1.5205873640556895	1.522322373153908	3		
+cas/s3	attach_200	cold	ratio:cas/s3:bytes_written	0 → 319	0 → 319	0 → 319	3		
+cas/s3plain	attach_200	cold	ratio:cas/s3plain:wall	2.380834642648888	2.3399161619822815	2.8516763882067693	3		
+cas/s3plain	attach_200	cold	ratio:cas/s3plain:GET	0.19877845641310382	0.19877845641310382	0.19877845641310382	3		
+cas/s3plain	attach_200	cold	ratio:cas/s3plain:PUT	0 → 2	0 → 2	0 → 2	3		
+cas/s3plain	attach_200	cold	ratio:cas/s3plain:bytes_read	1.5221954212686726	1.5205873640556895	1.522322373153908	3		
+cas/s3plain	attach_200	cold	ratio:cas/s3plain:bytes_written	0 → 319	0 → 319	0 → 319	3		
+cas/s3	attach_200	hot	ratio:cas/s3:wall	1.268750618389335	1.2323599578613396	1.362295717432248	3		
+cas/s3	attach_200	hot	ratio:cas/s3:GET	0.001665741254858412	0.001665741254858412	0.001665741254858412	3		
+cas/s3	attach_200	hot	ratio:cas/s3:PUT	0 → 0	0 → 0	0 → 0	3		
+cas/s3	attach_200	hot	ratio:cas/s3:bytes_read	1.813598360507082e-05	1.813598360507082e-05	1.813598360507082e-05	3		
+cas/s3	attach_200	hot	ratio:cas/s3:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas/s3plain	attach_200	hot	ratio:cas/s3plain:wall	0.8781756865130617	0.80240030501194	0.9452375272959742	3		
+cas/s3plain	attach_200	hot	ratio:cas/s3plain:GET	0.001665741254858412	0.001665741254858412	0.001665741254858412	3		
+cas/s3plain	attach_200	hot	ratio:cas/s3plain:PUT	0 → 0	0 → 0	0 → 0	3		
+cas/s3plain	attach_200	hot	ratio:cas/s3plain:bytes_read	1.813598360507082e-05	1.813598360507082e-05	1.813598360507082e-05	3		
+cas/s3plain	attach_200	hot	ratio:cas/s3plain:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas/s3	mutation	cold	ratio:cas/s3:wall	1.6290769670098477	0.7765201469816662	1.7477935745741833	3		
+cas/s3	mutation	cold	ratio:cas/s3:GET	2.34	2.34	2.34	3		
+cas/s3	mutation	cold	ratio:cas/s3:PUT	0.6394187102633969	0.6394187102633969	0.6394187102633969	3		
+cas/s3	mutation	cold	ratio:cas/s3:bytes_read	2.009002656116205	2.009002656116205	2.009002656116205	3		
+cas/s3	mutation	cold	ratio:cas/s3:bytes_written	1.0147381057349838	1.0147216292356054	1.0147403189960942	3		
+cas/s3	mutation	hot	ratio:cas/s3:wall	1.3058819401270785	0.9127095892608683	1.5412723721397878	3		
+cas/s3	mutation	hot	ratio:cas/s3:GET	3.51	3.51	3.51	3		
+cas/s3	mutation	hot	ratio:cas/s3:PUT	0.6403269754768393	0.6394187102633969	0.6403269754768393	3		
+cas/s3	mutation	hot	ratio:cas/s3:bytes_read	2.0107039134432947	2.0107039134432947	2.0107039134432947	3		
+cas/s3	mutation	hot	ratio:cas/s3:bytes_written	1.0150301134095405	1.0149959289087809	1.0150320193799067	3		
+cas/s3	lwd_concurrent	cold	ratio:cas/s3:wall	1.1681605784435587	1.1445294969553443	1.2013839443271912	3		
+cas/s3	lwd_concurrent	cold	ratio:cas/s3:GET	1.5232054905745647	1.116483201376388	1.6322755324298162	3		
+cas/s3	lwd_concurrent	cold	ratio:cas/s3:PUT	0.4546001202645821	0.448090692124105	0.48523206751054854	3		
+cas/s3	lwd_concurrent	cold	ratio:cas/s3:bytes_read	1.0929313772589808	1.0696418160864731	1.0983925942985167	3		
+cas/s3	lwd_concurrent	cold	ratio:cas/s3:bytes_written	1.0345427485368355	0.7564590426597236	1.1369740895878824	3		
+cas/s3	lwd_concurrent	hot	ratio:cas/s3:wall	1.0787201671915319	0.9709018296093741	1.1276731649822305	3		
+cas/s3	lwd_concurrent	hot	ratio:cas/s3:GET	1.2545167061112998	1.0751809173465805	1.3840375013360615	3		
+cas/s3	lwd_concurrent	hot	ratio:cas/s3:PUT	0.44851657940663175	0.4444444444444444	0.4767303102625298	3		
+cas/s3	lwd_concurrent	hot	ratio:cas/s3:bytes_read	1.0701994396377168	1.0186688530689818	1.0869921604005714	3		
+cas/s3	lwd_concurrent	hot	ratio:cas/s3:bytes_written	0.6209387164744838	0.5944505700556598	1.3571342486802884	3		
+cas/s3	select_subset	cold	ratio:cas/s3:wall	0.8626050270915416	0.8482493657259953	0.9724897337165549	3		
+cas/s3	select_subset	cold	ratio:cas/s3:GET	0.5	0.5	0.5	3		
+cas/s3	select_subset	cold	ratio:cas/s3:PUT	0 → 0	0 → 0	0 → 0	3		
+cas/s3	select_subset	cold	ratio:cas/s3:bytes_read	0.9998327366630495	0.9998327366630495	0.9998327366630495	3		
+cas/s3	select_subset	cold	ratio:cas/s3:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas/s3plain	select_subset	cold	ratio:cas/s3plain:wall	0.872268456502523	0.8395744377475042	0.9990776626989296	3		
+cas/s3plain	select_subset	cold	ratio:cas/s3plain:GET	0.5	0.5	0.5	3		
+cas/s3plain	select_subset	cold	ratio:cas/s3plain:PUT	0 → 0	0 → 0	0 → 0	3		
+cas/s3plain	select_subset	cold	ratio:cas/s3plain:bytes_read	0.9998327366630495	0.9998327366630495	0.9998327366630495	3		
+cas/s3plain	select_subset	cold	ratio:cas/s3plain:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas/s3	select_subset	hot	ratio:cas/s3:wall	0.967567096005527	0.931814740622846	1.0216252315458494	3		
+cas/s3	select_subset	hot	ratio:cas/s3:GET	1.0	1.0	1.0	3		
+cas/s3	select_subset	hot	ratio:cas/s3:PUT	0 → 0	0 → 0	0 → 0	3		
+cas/s3	select_subset	hot	ratio:cas/s3:bytes_read	1.0	1.0	1.0	3		
+cas/s3	select_subset	hot	ratio:cas/s3:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas/s3plain	select_subset	hot	ratio:cas/s3plain:wall	1.0305443593032488	1.007202679885485	1.0471657648855275	3		
+cas/s3plain	select_subset	hot	ratio:cas/s3plain:GET	1.0	1.0	1.0	3		
+cas/s3plain	select_subset	hot	ratio:cas/s3plain:PUT	0 → 0	0 → 0	0 → 0	3		
+cas/s3plain	select_subset	hot	ratio:cas/s3plain:bytes_read	1.0	1.0	1.0	3		
+cas/s3plain	select_subset	hot	ratio:cas/s3plain:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas/s3	dup_content	cold	ratio:cas/s3:wall	0.895496611743229	0.8387847406492253	0.9082231642810752	3		
+cas/s3	dup_content	cold	ratio:cas/s3:GET	0 → 435	0 → 435	0 → 435	3		
+cas/s3	dup_content	cold	ratio:cas/s3:PUT	0.64	0.64	0.64	3		
+cas/s3	dup_content	cold	ratio:cas/s3:bytes_read	0 → 280689	0 → 280689	0 → 280689	3		
+cas/s3	dup_content	cold	ratio:cas/s3:bytes_written	0.05066528731995411	0.05066519505733138	0.05066533037584471	3		
+cas/s3plain	dup_content	cold	ratio:cas/s3plain:wall	0.7758056883865467	0.7739284681959423	0.8182306523929266	3		
+cas/s3plain	dup_content	cold	ratio:cas/s3plain:GET	0 → 435	0 → 435	0 → 435	3		
+cas/s3plain	dup_content	cold	ratio:cas/s3plain:PUT	0.5052631578947369	0.5052631578947369	0.5052631578947369	3		
+cas/s3plain	dup_content	cold	ratio:cas/s3plain:bytes_read	0 → 280689	0 → 280689	0 → 280689	3		
+cas/s3plain	dup_content	cold	ratio:cas/s3plain:bytes_written	0.050663866308074464	0.05066377404803943	0.05066390936275748	3		
+cas/s3	dup_content	hot	ratio:cas/s3:wall	0.834810377680695	0.6536642117434689	0.8520752259352508	3		
+cas/s3	dup_content	hot	ratio:cas/s3:GET	0 → 440	0 → 440	0 → 440	3		
+cas/s3	dup_content	hot	ratio:cas/s3:PUT	0.6	0.6	0.6	3		
+cas/s3	dup_content	hot	ratio:cas/s3:bytes_read	0 → 738829	0 → 738829	0 → 738829	3		
+cas/s3	dup_content	hot	ratio:cas/s3:bytes_written	0.0013634078319157078	0.0013633709268666173	0.0013634324352817682	3		
+cas/s3plain	dup_content	hot	ratio:cas/s3plain:wall	0.5402623722888401	0.526545988234888	0.7605128045849722	3		
+cas/s3plain	dup_content	hot	ratio:cas/s3plain:GET	0 → 440	0 → 440	0 → 440	3		
+cas/s3plain	dup_content	hot	ratio:cas/s3plain:PUT	0.47368421052631576	0.47368421052631576	0.47368421052631576	3		
+cas/s3plain	dup_content	hot	ratio:cas/s3plain:bytes_read	0 → 738829	0 → 738829	0 → 738829	3		
+cas/s3plain	dup_content	hot	ratio:cas/s3plain:bytes_written	0.00136336959234719	0.0013633326883331772	0.0013633941950231985	3		
+cas_cached/s3_cached	cycle	cold	ratio:cas_cached/s3_cached:wall	1.5417893324821612	1.37058904151792	3.4511417718504385	3		
+cas_cached/s3_cached	cycle	cold	ratio:cas_cached/s3_cached:GET	13.6775	13.676666666666666	13.6775	3		
+cas_cached/s3_cached	cycle	cold	ratio:cas_cached/s3_cached:PUT	2.0688709677419355	2.0688709677419355	2.0693548387096774	3		
+cas_cached/s3_cached	cycle	cold	ratio:cas_cached/s3_cached:bytes_read	24.098408248786942	24.097505734450817	24.09976025584473	3		
+cas_cached/s3_cached	cycle	cold	ratio:cas_cached/s3_cached:bytes_written	2.6721839287862386	2.66987028349172	2.6753079514014195	3		
+cas_cached/s3plain_cached	cycle	cold	ratio:cas_cached/s3plain_cached:wall	0.25744462804436574	0.2269475038742052	0.5670862773827389	3		
+cas_cached/s3plain_cached	cycle	cold	ratio:cas_cached/s3plain_cached:GET	13.6775	13.676666666666666	13.6775	3		
+cas_cached/s3plain_cached	cycle	cold	ratio:cas_cached/s3plain_cached:PUT	1.4576136363636363	1.4576136363636363	1.4579545454545455	3		
+cas_cached/s3plain_cached	cycle	cold	ratio:cas_cached/s3plain_cached:bytes_read	24.098408248786942	24.097505734450817	24.09976025584473	3		
+cas_cached/s3plain_cached	cycle	cold	ratio:cas_cached/s3plain_cached:bytes_written	2.5976065094523486	2.5953574351978173	2.6006433443773145	3		
+cas_cached/s3_cached	cycle	hot	ratio:cas_cached/s3_cached:wall	1.4450866978868688	1.3833519441570818	1.6217176322209799	3		
+cas_cached/s3_cached	cycle	hot	ratio:cas_cached/s3_cached:GET	13.666666666666666	13.666666666666666	13.666666666666666	3		
+cas_cached/s3_cached	cycle	hot	ratio:cas_cached/s3_cached:PUT	2.064516129032258	2.064516129032258	2.0646774193548385	3		
+cas_cached/s3_cached	cycle	hot	ratio:cas_cached/s3_cached:bytes_read	69.49322386413763	69.49157984119982	69.49418217909131	3		
+cas_cached/s3_cached	cycle	hot	ratio:cas_cached/s3_cached:bytes_written	6.646615541922291	6.646565620113076	6.64661995268455	3		
+cas_cached/s3plain_cached	cycle	hot	ratio:cas_cached/s3plain_cached:wall	0.23876183023805972	0.2375354977765522	0.2606946157590549	3		
+cas_cached/s3plain_cached	cycle	hot	ratio:cas_cached/s3plain_cached:GET	13.666666666666666	13.666666666666666	13.666666666666666	3		
+cas_cached/s3plain_cached	cycle	hot	ratio:cas_cached/s3plain_cached:PUT	1.4545454545454546	1.4545454545454546	1.4546590909090908	3		
+cas_cached/s3plain_cached	cycle	hot	ratio:cas_cached/s3plain_cached:bytes_read	69.49322386413763	69.49157984119982	69.49418217909131	3		
+cas_cached/s3plain_cached	cycle	hot	ratio:cas_cached/s3plain_cached:bytes_written	6.461116546482168	6.461068017930228	6.461120834145391	3		
+cas_cached/s3_cached	wide_insert	cold	ratio:cas_cached/s3_cached:wall	1.3643947442458229	1.2228146711998618	1.825751306448654	3		
+cas_cached/s3_cached	wide_insert	cold	ratio:cas_cached/s3_cached:GET	0 → 2504	0 → 2504	0 → 2504	3		
+cas_cached/s3_cached	wide_insert	cold	ratio:cas_cached/s3_cached:PUT	0.7014	0.7014	0.703	3		
+cas_cached/s3_cached	wide_insert	cold	ratio:cas_cached/s3_cached:bytes_read	0 → 1177557	0 → 1177557	0 → 1177557	3		
+cas_cached/s3_cached	wide_insert	cold	ratio:cas_cached/s3_cached:bytes_written	0.9993083289012883	0.9993083208519276	0.999338658087379	3		
+cas_cached/s3plain_cached	wide_insert	cold	ratio:cas_cached/s3plain_cached:wall	1.2636146414835727	1.1507320115299167	1.6707673526173905	3		
+cas_cached/s3plain_cached	wide_insert	cold	ratio:cas_cached/s3plain_cached:GET	0 → 2504	0 → 2504	0 → 2504	3		
+cas_cached/s3plain_cached	wide_insert	cold	ratio:cas_cached/s3plain_cached:PUT	0.5845	0.5845	0.5858333333333333	3		
+cas_cached/s3plain_cached	wide_insert	cold	ratio:cas_cached/s3plain_cached:bytes_read	0 → 1177557	0 → 1177557	0 → 1177557	3		
+cas_cached/s3plain_cached	wide_insert	cold	ratio:cas_cached/s3plain_cached:bytes_written	0.9992551879946615	0.9992551799457289	0.9992855155679163	3		
+cas_cached/s3_cached	wide_insert	hot	ratio:cas_cached/s3_cached:wall	1.3929548241436875	1.3487156934312574	1.3962333977581736	3		
+cas_cached/s3_cached	wide_insert	hot	ratio:cas_cached/s3_cached:GET	0 → 3090	0 → 3090	0 → 3090	3		
+cas_cached/s3_cached	wide_insert	hot	ratio:cas_cached/s3_cached:PUT	0.7032	0.7028	0.804	3		
+cas_cached/s3_cached	wide_insert	hot	ratio:cas_cached/s3_cached:bytes_read	0 → 1447489	0 → 1447489	0 → 1447489	3		
+cas_cached/s3_cached	wide_insert	hot	ratio:cas_cached/s3_cached:bytes_written	0.9993340868598473	0.999333620951109	0.9995307188549858	3		
+cas_cached/s3plain_cached	wide_insert	hot	ratio:cas_cached/s3plain_cached:wall	1.0656389435222342	0.9092443324627418	1.2240143303731468	3		
+cas_cached/s3plain_cached	wide_insert	hot	ratio:cas_cached/s3plain_cached:GET	0 → 3090	0 → 3090	0 → 3090	3		
+cas_cached/s3plain_cached	wide_insert	hot	ratio:cas_cached/s3plain_cached:PUT	0.586	0.5856666666666667	0.67	3		
+cas_cached/s3plain_cached	wide_insert	hot	ratio:cas_cached/s3plain_cached:bytes_read	0 → 1447489	0 → 1447489	0 → 1447489	3		
+cas_cached/s3plain_cached	wide_insert	hot	ratio:cas_cached/s3plain_cached:bytes_written	0.999280611031508	0.9992801451477012	0.9994772325045809	3		
+cas_cached/s3_cached	attach_200	cold	ratio:cas_cached/s3_cached:wall	1.4735570893511067	1.371562390887466	1.849947767074844	3		
+cas_cached/s3_cached	attach_200	cold	ratio:cas_cached/s3_cached:GET	0.19877845641310382	0.19877845641310382	0.19877845641310382	3		
+cas_cached/s3_cached	attach_200	cold	ratio:cas_cached/s3_cached:PUT	0 → 2	0 → 2	0 → 2	3		
+cas_cached/s3_cached	attach_200	cold	ratio:cas_cached/s3_cached:bytes_read	1.5218387469244394	1.521288622088419	1.5222437838916194	3		
+cas_cached/s3_cached	attach_200	cold	ratio:cas_cached/s3_cached:bytes_written	0 → 320	0 → 320	0 → 320	3		
+cas_cached/s3plain_cached	attach_200	cold	ratio:cas_cached/s3plain_cached:wall	1.5576872497426393	1.3158142753775954	1.7575852702650945	3		
+cas_cached/s3plain_cached	attach_200	cold	ratio:cas_cached/s3plain_cached:GET	0.19877845641310382	0.19877845641310382	0.19877845641310382	3		
+cas_cached/s3plain_cached	attach_200	cold	ratio:cas_cached/s3plain_cached:PUT	0 → 2	0 → 2	0 → 2	3		
+cas_cached/s3plain_cached	attach_200	cold	ratio:cas_cached/s3plain_cached:bytes_read	1.5218387469244394	1.521288622088419	1.5222437838916194	3		
+cas_cached/s3plain_cached	attach_200	cold	ratio:cas_cached/s3plain_cached:bytes_written	0 → 320	0 → 320	0 → 320	3		
+cas_cached/s3_cached	attach_200	hot	ratio:cas_cached/s3_cached:wall	2.4084497122519157	2.405785731096273	2.4751850150095747	3		
+cas_cached/s3_cached	attach_200	hot	ratio:cas_cached/s3_cached:GET	0 → 3	0 → 3	0 → 3	3		
+cas_cached/s3_cached	attach_200	hot	ratio:cas_cached/s3_cached:PUT	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3_cached	attach_200	hot	ratio:cas_cached/s3_cached:bytes_read	0 → 3	0 → 3	0 → 3	3		
+cas_cached/s3_cached	attach_200	hot	ratio:cas_cached/s3_cached:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3plain_cached	attach_200	hot	ratio:cas_cached/s3plain_cached:wall	1.3685883792007563	1.3482112178160162	1.3903941660860841	3		
+cas_cached/s3plain_cached	attach_200	hot	ratio:cas_cached/s3plain_cached:GET	0 → 3	0 → 3	0 → 3	3		
+cas_cached/s3plain_cached	attach_200	hot	ratio:cas_cached/s3plain_cached:PUT	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3plain_cached	attach_200	hot	ratio:cas_cached/s3plain_cached:bytes_read	0 → 3	0 → 3	0 → 3	3		
+cas_cached/s3plain_cached	attach_200	hot	ratio:cas_cached/s3plain_cached:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3_cached	mutation	cold	ratio:cas_cached/s3_cached:wall	1.2677329053249151	1.0485839780751736	1.688908688743524	3		
+cas_cached/s3_cached	mutation	cold	ratio:cas_cached/s3_cached:GET	2.34	2.34	2.34	3		
+cas_cached/s3_cached	mutation	cold	ratio:cas_cached/s3_cached:PUT	0.6394187102633969	0.6394187102633969	0.6394187102633969	3		
+cas_cached/s3_cached	mutation	cold	ratio:cas_cached/s3_cached:bytes_read	2.009002656116205	2.009002656116205	2.009002656116205	3		
+cas_cached/s3_cached	mutation	cold	ratio:cas_cached/s3_cached:bytes_written	1.0147476965331295	1.0147449299567413	1.0147493564789622	3		
+cas_cached/s3_cached	mutation	hot	ratio:cas_cached/s3_cached:wall	0.8113018983184546	0.786793145075166	1.0985432861591296	3		
+cas_cached/s3_cached	mutation	hot	ratio:cas_cached/s3_cached:GET	0 → 502	0 → 502	0 → 502	3		
+cas_cached/s3_cached	mutation	hot	ratio:cas_cached/s3_cached:PUT	0.6403269754768393	0.6394187102633969	0.6403269754768393	3		
+cas_cached/s3_cached	mutation	hot	ratio:cas_cached/s3_cached:bytes_read	0 → 8335542	0 → 8335542	0 → 8335542	3		
+cas_cached/s3_cached	mutation	hot	ratio:cas_cached/s3_cached:bytes_written	1.0150384750859853	1.015016771616978	1.015043024821698	3		
+cas_cached/s3_cached	lwd_concurrent	cold	ratio:cas_cached/s3_cached:wall	1.1473938071502072	0.8695400899501278	1.3002896351806827	3		
+cas_cached/s3_cached	lwd_concurrent	cold	ratio:cas_cached/s3_cached:GET	2.379432624113475	2.352542372881356	3.1673640167364017	3		
+cas_cached/s3_cached	lwd_concurrent	cold	ratio:cas_cached/s3_cached:PUT	0.45506692160611856	0.4271604938271605	0.4933248569612206	3		
+cas_cached/s3_cached	lwd_concurrent	cold	ratio:cas_cached/s3_cached:bytes_read	1.0254414697934437	1.0203635100052715	1.0870895116016877	3		
+cas_cached/s3_cached	lwd_concurrent	cold	ratio:cas_cached/s3_cached:bytes_written	0.9682680973347011	0.9342509329000901	1.2174963270437207	3		
+cas_cached/s3_cached	lwd_concurrent	hot	ratio:cas_cached/s3_cached:wall	0.9809908342935822	0.9341200081048151	1.1462425062711419	3		
+cas_cached/s3_cached	lwd_concurrent	hot	ratio:cas_cached/s3_cached:GET	2.6867469879518073	2.536842105263158	2.9382716049382718	3		
+cas_cached/s3_cached	lwd_concurrent	hot	ratio:cas_cached/s3_cached:PUT	0.4715151515151515	0.434021263289556	0.4861878453038674	3		
+cas_cached/s3_cached	lwd_concurrent	hot	ratio:cas_cached/s3_cached:bytes_read	1.5456059941251867	1.407892413496258	1.8156357004893864	3		
+cas_cached/s3_cached	lwd_concurrent	hot	ratio:cas_cached/s3_cached:bytes_written	1.3086026083116045	1.167615357119579	1.4589095809874082	3		
+cas_cached/s3_cached	select_subset	cold	ratio:cas_cached/s3_cached:wall	0.8899798548045484	0.8770286716737405	0.9395816610096858	3		
+cas_cached/s3_cached	select_subset	cold	ratio:cas_cached/s3_cached:GET	0.5	0.5	0.5	3		
+cas_cached/s3_cached	select_subset	cold	ratio:cas_cached/s3_cached:PUT	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3_cached	select_subset	cold	ratio:cas_cached/s3_cached:bytes_read	0.9999683762220503	0.9999683762220503	0.9999683762220503	3		
+cas_cached/s3_cached	select_subset	cold	ratio:cas_cached/s3_cached:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3plain_cached	select_subset	cold	ratio:cas_cached/s3plain_cached:wall	0.9276426364637647	0.8320699964359421	0.9527394450552805	3		
+cas_cached/s3plain_cached	select_subset	cold	ratio:cas_cached/s3plain_cached:GET	0.5	0.5	0.5	3		
+cas_cached/s3plain_cached	select_subset	cold	ratio:cas_cached/s3plain_cached:PUT	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3plain_cached	select_subset	cold	ratio:cas_cached/s3plain_cached:bytes_read	0.9999683762220503	0.9999683762220503	0.9999683762220503	3		
+cas_cached/s3plain_cached	select_subset	cold	ratio:cas_cached/s3plain_cached:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3_cached	select_subset	hot	ratio:cas_cached/s3_cached:wall	0.9428676547002723	0.8462835683615898	1.0863112274067885	3		
+cas_cached/s3_cached	select_subset	hot	ratio:cas_cached/s3_cached:GET	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3_cached	select_subset	hot	ratio:cas_cached/s3_cached:PUT	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3_cached	select_subset	hot	ratio:cas_cached/s3_cached:bytes_read	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3_cached	select_subset	hot	ratio:cas_cached/s3_cached:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3plain_cached	select_subset	hot	ratio:cas_cached/s3plain_cached:wall	0.9585759240770885	0.7880659442483149	0.9657643500760897	3		
+cas_cached/s3plain_cached	select_subset	hot	ratio:cas_cached/s3plain_cached:GET	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3plain_cached	select_subset	hot	ratio:cas_cached/s3plain_cached:PUT	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3plain_cached	select_subset	hot	ratio:cas_cached/s3plain_cached:bytes_read	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3plain_cached	select_subset	hot	ratio:cas_cached/s3plain_cached:bytes_written	0 → 0	0 → 0	0 → 0	3		
+cas_cached/s3_cached	dup_content	cold	ratio:cas_cached/s3_cached:wall	0.8636743538915094	0.8552905361594914	0.870891468659487	3		
+cas_cached/s3_cached	dup_content	cold	ratio:cas_cached/s3_cached:GET	0 → 435	0 → 435	0 → 435	3		
+cas_cached/s3_cached	dup_content	cold	ratio:cas_cached/s3_cached:PUT	0.64	0.64	0.64	3		
+cas_cached/s3_cached	dup_content	cold	ratio:cas_cached/s3_cached:bytes_read	0 → 280687	0 → 280687	0 → 280687	3		
+cas_cached/s3_cached	dup_content	cold	ratio:cas_cached/s3_cached:bytes_written	0.05066528116911259	0.05066523196238047	0.05066528116911259	3		
+cas_cached/s3plain_cached	dup_content	cold	ratio:cas_cached/s3plain_cached:wall	0.5894241909706641	0.3163614120259971	0.7969392247005707	3		
+cas_cached/s3plain_cached	dup_content	cold	ratio:cas_cached/s3plain_cached:GET	0 → 435	0 → 435	0 → 435	3		
+cas_cached/s3plain_cached	dup_content	cold	ratio:cas_cached/s3plain_cached:PUT	0.5052631578947369	0.5052631578947369	0.5052631578947369	3		
+cas_cached/s3plain_cached	dup_content	cold	ratio:cas_cached/s3plain_cached:bytes_read	0 → 280687	0 → 280687	0 → 280687	3		
+cas_cached/s3plain_cached	dup_content	cold	ratio:cas_cached/s3plain_cached:bytes_written	0.05066386015740546	0.05066381095205345	0.05066386015740546	3		
+cas_cached/s3_cached	dup_content	hot	ratio:cas_cached/s3_cached:wall	0.8105505194207006	0.7390887392543413	0.8383944590344835	3		
+cas_cached/s3_cached	dup_content	hot	ratio:cas_cached/s3_cached:GET	0 → 440	0 → 440	0 → 440	3		
+cas_cached/s3_cached	dup_content	hot	ratio:cas_cached/s3_cached:PUT	0.6	0.6	0.6	3		
+cas_cached/s3_cached	dup_content	hot	ratio:cas_cached/s3_cached:bytes_read	0 → 738822	0 → 738822	0 → 738822	3		
+cas_cached/s3_cached	dup_content	hot	ratio:cas_cached/s3_cached:bytes_written	0.0013632848150854063	0.001363254060877831	0.0013633893793911626	3		
+cas_cached/s3plain_cached	dup_content	hot	ratio:cas_cached/s3plain_cached:wall	0.5997086562056615	0.2865699295380946	0.7653017931642992	3		
+cas_cached/s3plain_cached	dup_content	hot	ratio:cas_cached/s3plain_cached:GET	0 → 440	0 → 440	0 → 440	3		
+cas_cached/s3plain_cached	dup_content	hot	ratio:cas_cached/s3plain_cached:PUT	0.47368421052631576	0.47368421052631576	0.47368421052631576	3		
+cas_cached/s3plain_cached	dup_content	hot	ratio:cas_cached/s3plain_cached:bytes_read	0 → 738822	0 → 738822	0 → 738822	3		
+cas_cached/s3plain_cached	dup_content	hot	ratio:cas_cached/s3plain_cached:bytes_written	0.0013632465789671477	0.0013632158256221371	0.0013633511403401838	3		

@@ -1,0 +1,2542 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "datasource": {
+          "type": "vertamedia-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "orange",
+        "name": "Restart",
+        "target": {
+          "annotation": true,
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT toUInt64(event_time) * 1000 AS time, concat('Restart: ', host) AS text, 'restart' AS tags\nFROM (SELECT hostName() AS host, event_time, value,\n             lagInFrame(value, 1) OVER (PARTITION BY hostName() ORDER BY event_time) AS prev\n      FROM clusterAllReplicas('$cluster', system.asynchronous_metric_log)\n      WHERE metric = 'Uptime' AND hostName() IN ($host) AND $timeFilter)\nWHERE prev > value\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "asynchronous_metric_log"
+        }
+      },
+      {
+        "datasource": {
+          "type": "vertamedia-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "red",
+        "name": "Lease lost",
+        "target": {
+          "annotation": true,
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT toUInt64(event_time) * 1000 AS time, concat('Lease lost: ', hostName()) AS text, 'lease' AS tags\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE ProfileEvent_CASMountLeaseLost > 0 AND hostName() IN ($host) AND $timeFilter\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      }
+    ]
+  },
+  "description": "Health of content-addressed (CAS) storage for people who run the cluster: is storage online, are writes safe, is garbage collection keeping up, is anything wrong. Details for support engineers are on CAS / Drilldown.",
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [
+    {
+      "icon": "dashboard",
+      "includeVars": true,
+      "keepTime": true,
+      "title": "CAS / Drilldown",
+      "type": "link",
+      "url": "/d/cas-drilldown/cas-drilldown?${__url_time_range}&${__all_variables}"
+    },
+    {
+      "icon": "doc",
+      "targetBlank": true,
+      "title": "Operations: monitoring",
+      "type": "link",
+      "url": "https://docs.altinity.com/antalya/cas/operations/monitoring"
+    }
+  ],
+  "panels": [
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Every host can read and write the shared storage right now. Hosts not reporting: hosts in the cluster that did not answer. Disks not live: storage disks that lost their connection to the pool. Lease lost: how many times a host lost its write permission in the selected period. Metrics age: seconds since the last metrics row; when the storage is down the server stops writing its own logs, so a growing age is itself a warning. What to do: check the host and its object storage endpoint; see Drilldown \u2192 Writes: lease and Writes: mounts now.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "match": "null",
+                "result": {
+                  "color": "#8e8e8e",
+                  "index": 0,
+                  "text": "no data"
+                }
+              },
+              "type": "special"
+            }
+          ],
+          "noValue": "no data",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Hosts not reporting"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Disks not live"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Lease lost"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Metrics age (s)"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 120
+                    },
+                    {
+                      "color": "red",
+                      "value": 600
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "interval": "5m",
+      "links": [
+        {
+          "targetBlank": false,
+          "title": "Open CAS / Drilldown",
+          "url": "/d/cas-drilldown/cas-drilldown?${__url_time_range}&${__all_variables}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "text": {
+          "titleSize": 12,
+          "valueSize": 20
+        },
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT\n    (SELECT count() FROM system.clusters WHERE cluster = '$cluster') - uniqExact(host) AS \"Hosts not reporting\",\n    countIf(lifecycle != 'live') AS \"Disks not live\"\nFROM (SELECT hostName() AS host, disk, any(lifecycle) AS lifecycle\n      FROM clusterAllReplicas('$cluster', system.cas_mounts)\n      WHERE disk IN ($disk)\n      GROUP BY host, disk)\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_mounts"
+        },
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT if(count() = 0, NULL, sum(ProfileEvent_CASMountLeaseLost)) AS \"Lease lost\",\n    dateDiff('second', max(event_time), now()) AS \"Metrics age (s)\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "B",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      ],
+      "title": "Storage online",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Writes to the shared storage are confirmed. Gave up: writes abandoned after all retries (any value needs a look). Unresolved %: share of writes whose answer from the storage was lost and had to be re-checked by reading back; 0.03% is normal on a healthy backend, a rise means storage timeouts. What to do: check object-storage latency and errors; see Drilldown \u2192 Writes: conditional writes and S3: errors and throttling.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "match": "null",
+                "result": {
+                  "color": "#8e8e8e",
+                  "index": 0,
+                  "text": "no data"
+                }
+              },
+              "type": "special"
+            }
+          ],
+          "noValue": "no data",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Gave up"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Unresolved %"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "unit",
+                "value": "percent"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "id": 2,
+      "links": [
+        {
+          "targetBlank": false,
+          "title": "Open CAS / Drilldown",
+          "url": "/d/cas-drilldown/cas-drilldown?${__url_time_range}&${__all_variables}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "text": {
+          "titleSize": 12,
+          "valueSize": 20
+        },
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT if(count() = 0, NULL, sum(ProfileEvent_CASRequestGaveUp)) AS \"Gave up\",\n    if(sum(ProfileEvent_CASConditionalWriteAttempts) = 0, NULL,\n       round(100 * sum(ProfileEvent_CASConditionalWriteUnresolved) / sum(ProfileEvent_CASConditionalWriteAttempts), 3)) AS \"Unresolved %\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      ],
+      "title": "Writes safe",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Garbage collection frees storage that deleted or merged data no longer needs. Rounds normally finish every 5\u201310 minutes. Minutes since last success: time since the last completed round anywhere in the cluster; yellow after 30 minutes, red after 2 hours. Failed rounds: rounds in the selected period that ended with an error or were aborted (an event count: no rows means none). What to do: open Drilldown \u2192 GC: rounds for the error text; a long-running round is normal after a large deletion, a stopped one is not.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "match": "null",
+                "result": {
+                  "color": "#8e8e8e",
+                  "index": 0,
+                  "text": "no data"
+                }
+              },
+              "type": "special"
+            }
+          ],
+          "noValue": "no data",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Minutes since last success"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 30
+                    },
+                    {
+                      "color": "red",
+                      "value": 120
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "unit",
+                "value": "m"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Failed rounds"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "id": 3,
+      "links": [
+        {
+          "targetBlank": false,
+          "title": "Open CAS / Drilldown",
+          "url": "/d/cas-drilldown/cas-drilldown?${__url_time_range}&${__all_variables}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "text": {
+          "titleSize": 12,
+          "valueSize": 20
+        },
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT if(count() = 0, NULL, dateDiff('minute', max(event_time), now())) AS \"Minutes since last success\" /* now */\nFROM clusterAllReplicas('$cluster', system.cas_gc_log)\nWHERE disk_name IN ($disk) AND event_type = 'Finish' AND outcome IN ('Success', 'Deferred') AND event_date >= today() - 7\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_gc_log"
+        },
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT countIf(outcome IN ('Error', 'Aborted', 'Stopped')) AS \"Failed rounds\"\nFROM clusterAllReplicas('$cluster', system.cas_gc_log)\nWHERE disk_name IN ($disk) AND event_type = 'Finish' AND $timeFilter\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "B",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_gc_log"
+        }
+      ],
+      "title": "GC: last success",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Is garbage collection keeping up with deletions? Each round marks objects for deletion and deletes objects marked earlier. Backlog growth: over the last 10 rounds, the share of newly marked objects that were not yet deleted; near zero is steady state, it rises for about an hour after a server restart and recovers by itself. Yellow above 25%, red above 50%. Net objects: marked minus deleted over those rounds. What to do: if red for more than two hours, open Drilldown \u2192 GC: stage flow and GC: round cost.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "match": "null",
+                "result": {
+                  "color": "#8e8e8e",
+                  "index": 0,
+                  "text": "no data"
+                }
+              },
+              "type": "special"
+            }
+          ],
+          "noValue": "no data",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Backlog growth %, last 10 rounds"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 25
+                    },
+                    {
+                      "color": "red",
+                      "value": 50
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "unit",
+                "value": "percent"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Net objects, last 10 rounds"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "id": 4,
+      "links": [
+        {
+          "targetBlank": false,
+          "title": "Open CAS / Drilldown",
+          "url": "/d/cas-drilldown/cas-drilldown?${__url_time_range}&${__all_variables}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "text": {
+          "titleSize": 12,
+          "valueSize": 20
+        },
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT if(count() = 0, NULL, round(100 * sum(net) / greatest(sum(cond), 1), 1)) AS \"Backlog growth %, last 10 rounds\",\n       if(count() = 0, NULL, sum(net)) AS \"Net objects, last 10 rounds\" /* now */\nFROM (SELECT toInt64(entries_condemned) - toInt64(entries_redeleted) AS net, toInt64(entries_condemned) AS cond\n      FROM clusterAllReplicas('$cluster', system.cas_gc_log)\n      WHERE disk_name IN ($disk) AND event_type = 'Finish' AND outcome = 'Success' AND event_date >= today() - 7\n      ORDER BY event_time DESC LIMIT 10)\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_gc_log"
+        }
+      ],
+      "title": "Garbage trend",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Signals that must stay at zero. Integrity events: the storage found data that should exist but does not, or could not be decoded (an event log: no rows means no events, so this field cannot show 'no data'; the Storage online tile's Metrics age tells whether logging itself stopped). GC anomalies: garbage collection hit an inconsistency and worked around it; a value that stays above zero across rounds deserves a look. Wedged lanes and Lanes needing recovery: a table's write queue to the shared storage is stuck. What to do: any red value is a support case; keep the selected time range and open Drilldown \u2192 Needs attention and GC: anomalies.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "match": "null",
+                "result": {
+                  "color": "#8e8e8e",
+                  "index": 0,
+                  "text": "no data"
+                }
+              },
+              "type": "special"
+            }
+          ],
+          "noValue": "no data",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Integrity events"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "GC anomalies"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Lanes needing recovery"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Wedged lanes"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "id": 5,
+      "links": [
+        {
+          "targetBlank": false,
+          "title": "Open CAS / Drilldown",
+          "url": "/d/cas-drilldown/cas-drilldown?${__url_time_range}&${__all_variables}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "text": {
+          "titleSize": 12,
+          "valueSize": 20
+        },
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT count() AS \"Integrity events\"\nFROM clusterAllReplicas('$cluster', system.cas_log)\nWHERE disk_name IN ($disk) AND event_type IN ('read_missing', 'dangling_access', 'corrupt_dangle', 'corrupt_decode', 'snap_journal_incoherent', 'exception') AND $timeFilter\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_log"
+        },
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT if(count() = 0, NULL, sum(anomalies)) AS \"GC anomalies\"\nFROM clusterAllReplicas('$cluster', system.cas_gc_log)\nWHERE disk_name IN ($disk) AND event_type = 'Finish' AND $timeFilter\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "B",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_gc_log"
+        },
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT if(count() = 0, NULL, sum(ProfileEvent_CASRefNeedsRecovery)) AS \"Lanes needing recovery\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "C",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        },
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT if(count() = 0, NULL, max(v)) AS \"Wedged lanes\"\nFROM (SELECT hostName() AS host, argMax(value, event_time) AS v\n      FROM clusterAllReplicas('$cluster', system.asynchronous_metric_log)\n      WHERE hostName() IN ($host) AND metric LIKE 'CASGCWedgedNamespaces_%'\n        AND replaceOne(metric, 'CASGCWedgedNamespaces_', '') IN ($disk) AND $timeFilter\n      GROUP BY host)\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "D",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "asynchronous_metric_log"
+        }
+      ],
+      "title": "Integrity",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "The object storage is answering at full speed. Throttling per minute: requests the storage slowed down (HTTP 429/503) per minute over the selected period; zero is normal, bursts follow a server restart. S3 errors: failed uploads or deletes per hour, not counting the storage's expected answers to concurrent writes of the same object (HTTP 412 and 409); a few per day are normal and retried, yellow above 5 per hour, red above 50. What to do: sustained throttling means the request rate is above the bucket's limit; see Drilldown \u2192 S3: by verb and S3: errors and throttling.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "match": "null",
+                "result": {
+                  "color": "#8e8e8e",
+                  "index": 0,
+                  "text": "no data"
+                }
+              },
+              "type": "special"
+            }
+          ],
+          "noValue": "no data",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Throttling per minute"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.01
+                    },
+                    {
+                      "color": "red",
+                      "value": 10
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "S3 errors per hour"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 5
+                    },
+                    {
+                      "color": "red",
+                      "value": 50
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "id": 6,
+      "links": [
+        {
+          "targetBlank": false,
+          "title": "Open CAS / Drilldown",
+          "url": "/d/cas-drilldown/cas-drilldown?${__url_time_range}&${__all_variables}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "text": {
+          "titleSize": 12,
+          "valueSize": 20
+        },
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT if(count() = 0, NULL,\n       round(60 * (sum(ProfileEvent_S3ReadRequestsThrottling) + sum(ProfileEvent_S3WriteRequestsThrottling))\n             / greatest(dateDiff('second', min(event_time), max(event_time)), 1), 2)) AS \"Throttling per minute\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        },
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT round(countIf(error != '' AND error NOT LIKE '%PreconditionFailed%' AND error NOT LIKE '%ConditionalRequestConflict%')\n             / greatest(($__to - $__from) / 3600000, 1), 1) AS \"S3 errors per hour\"\nFROM clusterAllReplicas('$cluster', system.blob_storage_log)\nWHERE disk_name IN ($disk) AND $timeFilter\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "B",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "blob_storage_log"
+        }
+      ],
+      "title": "S3 throttling",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 7
+      },
+      "id": 7,
+      "panels": [],
+      "title": "Needs attention",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Recent events that need a person: integrity findings, garbage-collection rounds that failed or were aborted, failed storage-lease renewals or reconnects, and hosts fenced out of the pool. Empty is good. What to do: read the Details column; the same events appear with full context on the Drilldown.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Time"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "dateTimeAsIso"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "id": 8,
+      "options": {
+        "cellHeight": "sm",
+        "showHeader": true,
+        "sortBy": []
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT toUInt64(event_time) * 1000 AS \"Time\", host AS \"Host\", what AS \"What happened\", detail AS \"Details\"\nFROM (\n    SELECT event_time, hostName() AS host, concat('Integrity: ', toString(event_type)) AS what,\n           concat(namespace, ' ', ref_name, ' ', toString(reason)) AS detail\n    FROM clusterAllReplicas('$cluster', system.cas_log)\n    WHERE disk_name IN ($disk) AND event_type IN ('read_missing', 'dangling_access', 'corrupt_dangle', 'corrupt_decode', 'snap_journal_incoherent', 'exception') AND $timeFilter\n    UNION ALL\n    SELECT event_time, hostName() AS host, concat('GC round ', toString(round), ': ', toString(outcome)) AS what, error AS detail\n    FROM clusterAllReplicas('$cluster', system.cas_gc_log)\n    WHERE disk_name IN ($disk) AND event_type = 'Finish' AND outcome IN ('Error', 'Aborted', 'Stopped') AND $timeFilter\n    UNION ALL\n    SELECT event_time, hostName() AS host, concat('Storage lease: ', toString(event_type), ' ', toString(outcome)) AS what,\n           concat(toString(reason), ' ', toString(detail)) AS detail\n    FROM clusterAllReplicas('$cluster', system.cas_log)\n    WHERE disk_name IN ($disk) AND event_type IN ('mount_remount', 'watermark_renew') AND outcome = 'failed' AND $timeFilter\n    UNION ALL\n    SELECT event_time, hostName() AS host, 'GC fenced out an expired host' AS what, concat(toString(reason), ' ', toString(detail)) AS detail\n    FROM clusterAllReplicas('$cluster', system.cas_log)\n    WHERE disk_name IN ($disk) AND event_type = 'gc_fence_out' AND $timeFilter\n)\nORDER BY \"Time\" DESC LIMIT 100\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_log"
+        }
+      ],
+      "title": "Needs attention",
+      "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "id": 9,
+      "panels": [],
+      "title": "Storage and writes",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Each host renews its write permission every 10 s. Retries and recoveries mean the storage answered slowly; Lost means a host was cut off and had to reconnect.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 17
+      },
+      "id": 10,
+      "interval": "5m",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT $timeSeries AS t, sum(ProfileEvent_CASMountRenewalAttempts) / $interval AS \"Attempts\", sum(ProfileEvent_CASMountRenewalRetries) / $interval AS \"Retries\", sum(ProfileEvent_CASMountRenewalRecovered) / $interval AS \"Recovered\", sum(ProfileEvent_CASMountLeaseLost) / $interval AS \"Lost\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nGROUP BY t ORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      ],
+      "title": "Storage lease renewals per second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Committed: writes the storage confirmed. Unresolved: writes whose confirmation was lost and had to be re-checked by reading back; normally a tiny fraction of committed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 17
+      },
+      "id": 11,
+      "interval": "5m",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT $timeSeries AS t, sum(ProfileEvent_CASConditionalWriteCommitted) / $interval AS \"Committed\", sum(ProfileEvent_CASConditionalWriteUnresolved) / $interval AS \"Unresolved\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nGROUP BY t ORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      ],
+      "title": "Writes: committed vs unresolved per second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Average time an INSERT, merge or delete waited for the shared storage's write queue. About 200 ms is normal on otel.demo; a sustained rise slows every INSERT.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 17
+      },
+      "id": 12,
+      "interval": "5m",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT $timeSeries AS t, sum(ProfileEvent_CASRefQueueWaitMicroseconds) / greatest(sum(ProfileEvent_CASRefBatchedMutations), 1) / 1000 AS \"Wait per operation\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nGROUP BY t ORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      ],
+      "title": "Insert delay caused by storage (ms per operation)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "id": 13,
+      "panels": [],
+      "title": "Garbage collection",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "How many garbage-collection rounds finished, colored by outcome. Success and Deferred are healthy (Deferred = nothing to do). Error, Aborted or Stopped bars need a look at Needs attention.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "bars",
+            "fillOpacity": 25,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "always",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*Success$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*Deferred$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*(Error|Aborted|Stopped)$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*NotALeader$"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#8e8e8e",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 26
+      },
+      "id": 14,
+      "interval": "30m",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT $timeSeries AS t, toString(outcome) AS outcome, count()\nFROM clusterAllReplicas('$cluster', system.cas_gc_log)\nWHERE disk_name IN ($disk) AND hostName() IN ($host) AND event_type = 'Finish' AND $timeFilter\nGROUP BY t, outcome ORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_gc_log"
+        }
+      ],
+      "title": "GC rounds per 30 minutes, by outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Wall-clock time of each finished round. Rounds take a few minutes on otel.demo; a long round after a large deletion is normal, a round that never finishes is not.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "points",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "always",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 26
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT toUInt64(event_time) * 1000 AS t, toString(outcome) AS outcome, duration_ms\nFROM clusterAllReplicas('$cluster', system.cas_gc_log)\nWHERE disk_name IN ($disk) AND hostName() IN ($host) AND event_type = 'Finish' AND $timeFilter\nORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_gc_log"
+        }
+      ],
+      "title": "GC round duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Marked: objects a round found to be garbage. Deleted: objects it physically removed. Over time the two lines should track each other; deleted staying below marked for many rounds means the backlog grows.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 26
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT toUInt64(event_time) * 1000 AS t, entries_condemned AS \"Marked\", entries_redeleted AS \"Deleted\"\nFROM clusterAllReplicas('$cluster', system.cas_gc_log)\nWHERE disk_name IN ($disk) AND hostName() IN ($host) AND event_type = 'Finish' AND outcome = 'Success' AND $timeFilter\nORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_gc_log"
+        }
+      ],
+      "title": "GC per round: marked vs deleted objects",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Running total of marked minus deleted objects since the start of the selected period. Flat or falling is healthy; a line that keeps rising means garbage is being found faster than it is removed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 26
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT t, sum(net) OVER (ORDER BY t) AS \"Net backlog change\"\nFROM (SELECT toUInt64(event_time) * 1000 AS t, toInt64(entries_condemned) - toInt64(entries_redeleted) AS net\n      FROM clusterAllReplicas('$cluster', system.cas_gc_log)\n      WHERE disk_name IN ($disk) AND hostName() IN ($host) AND event_type = 'Finish' AND outcome = 'Success' AND $timeFilter)\nORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_gc_log"
+        }
+      ],
+      "title": "GC backlog change over the selected period",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "id": 18,
+      "panels": [],
+      "title": "Objects",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "What the shared storage holds right now, as counted by the last garbage-collection round. Tables: tables with data in the storage. Write-log entries: records of inserts and deletes not yet compacted away. The total counts of data objects, parts and part descriptions are not available yet.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "options": {
+                "match": "null",
+                "result": {
+                  "color": "#8e8e8e",
+                  "index": 0,
+                  "text": "no data"
+                }
+              },
+              "type": "special"
+            }
+          ],
+          "noValue": "no data",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Tables"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Write-log entries"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 35
+      },
+      "id": 19,
+      "links": [
+        {
+          "targetBlank": false,
+          "title": "Open CAS / Drilldown",
+          "url": "/d/cas-drilldown/cas-drilldown?${__url_time_range}&${__all_variables}"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "text": {
+          "titleSize": 12,
+          "valueSize": 20
+        },
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "table",
+          "intervalFactor": 1,
+          "query": "SELECT if(countIf(mapContains(phase_metrics, 'namespaces_seen')) = 0, NULL, argMaxIf(phase_metrics['namespaces_seen'], event_time, mapContains(phase_metrics, 'namespaces_seen'))) AS \"Tables\", if(countIf(mapContains(phase_metrics, 'ref_log_keys_listed')) = 0, NULL, argMaxIf(phase_metrics['ref_log_keys_listed'], event_time, mapContains(phase_metrics, 'ref_log_keys_listed'))) AS \"Write-log entries\" /* now */\nFROM clusterAllReplicas('$cluster', system.cas_gc_log)\nWHERE disk_name IN ($disk) AND hostName() IN ($host) AND event_type = 'Phase' AND event_date >= today() - 7\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "cas_gc_log"
+        }
+      ],
+      "title": "Tables and write logs",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Data objects are the pieces of table data in the shared storage. New: objects uploaded; Deleted: objects removed by garbage collection. Over days the two should balance; deleted staying at zero while new grows means garbage collection is not removing anything.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 35
+      },
+      "id": 20,
+      "interval": "5m",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT $timeSeries AS t, sum(ProfileEvent_CASBlobHeadMiss) / $interval AS \"New\", sum(ProfileEvent_CASBlobDelete) / $interval AS \"Deleted\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nGROUP BY t ORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      ],
+      "title": "Data objects: new vs deleted per second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Every data part has one description object in the shared storage. New ones appear on insert and merge, deleted ones follow part removal.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 35
+      },
+      "id": 21,
+      "interval": "5m",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT $timeSeries AS t, sum(ProfileEvent_CASManifestPut) / $interval AS \"New\", sum(ProfileEvent_CASManifestDelete) / $interval AS \"Deleted\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nGROUP BY t ORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      ],
+      "title": "Part descriptions: new vs deleted per second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Each insert or delete appends an entry to the table's write log in the shared storage; garbage collection compacts old entries away. Written staying above cleaned for a long time means the logs keep growing.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 35
+      },
+      "id": 22,
+      "interval": "5m",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT $timeSeries AS t, sum(ProfileEvent_CASRootPut) / $interval AS \"Written\", sum(ProfileEvent_CASRootDelete) / $interval AS \"Cleaned\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nGROUP BY t ORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      ],
+      "title": "Write-log entries: written vs cleaned per second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Bytes written to the shared storage: table data, part descriptions, write logs and GC state. This is traffic, not the amount stored; stored totals are not available yet.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "id": 23,
+      "interval": "5m",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT $timeSeries AS t, multiIf(p2 = 'blobs', 'Table data', p2 = 'cas' AND p3 = 'manifests', 'Part descriptions',\n                                     p2 = 'cas' AND p3 = 'ns', 'Write logs', p2 = 'gc', 'GC state', 'Other') AS kind, sum(data_size) / $interval\nFROM (SELECT event_time, event_date, data_size, splitByChar('/', remote_path)[2] AS p2, splitByChar('/', remote_path)[3] AS p3\n      FROM clusterAllReplicas('$cluster', system.blob_storage_log)\n      WHERE disk_name IN ($disk) AND hostName() IN ($host) AND event_type IN ('Upload', 'MultiPartUploadWrite') AND $timeFilter)\nGROUP BY t, kind ORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "blob_storage_log"
+        }
+      ],
+      "title": "Data uploaded per second, by kind",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      },
+      "id": 24,
+      "panels": [],
+      "title": "S3 requests",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "All requests the cluster sends to the object storage. Cost drivers are PUT and LIST; GET and HEAD are cheap. Spikes of LIST follow a server restart.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 25,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 52
+      },
+      "id": 25,
+      "interval": "5m",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT $timeSeries AS t, sum(ProfileEvent_S3PutObject) / $interval AS \"PUT\", sum(ProfileEvent_S3GetObject) / $interval AS \"GET\", sum(ProfileEvent_S3HeadObject) / $interval AS \"HEAD\", sum(ProfileEvent_S3ListObjects) / $interval AS \"LIST\", sum(ProfileEvent_S3DeleteObjects) / $interval AS \"DELETE\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nGROUP BY t ORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      ],
+      "title": "S3 requests per second, by type",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "vertamedia-clickhouse-datasource",
+        "uid": "${datasource}"
+      },
+      "description": "Requests the object storage slowed down (HTTP 429/503). Zero is normal; bursts follow a restart; a steady rate means the request rate is above the bucket's limit.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 8,
+            "lineWidth": 1,
+            "pointSize": 4,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 52
+      },
+      "id": 26,
+      "interval": "5m",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "database": "system",
+          "datasource": {
+            "type": "vertamedia-clickhouse-datasource",
+            "uid": "${datasource}"
+          },
+          "dateColDataType": "event_date",
+          "dateTimeColDataType": "event_time",
+          "dateTimeType": "DATETIME",
+          "extrapolate": false,
+          "format": "time_series",
+          "intervalFactor": 1,
+          "query": "SELECT $timeSeries AS t, sum(ProfileEvent_S3ReadRequestsThrottling) / $interval AS \"Read throttling\", sum(ProfileEvent_S3WriteRequestsThrottling) / $interval AS \"Write throttling\"\nFROM clusterAllReplicas('$cluster', system.metric_log)\nWHERE hostName() IN ($host) AND $timeFilter\nGROUP BY t ORDER BY t\nSETTINGS skip_unavailable_shards = 1",
+          "rawQuery": "",
+          "refId": "A",
+          "round": "0s",
+          "skip_comments": false,
+          "table": "metric_log"
+        }
+      ],
+      "title": "S3 throttling events per second",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 41,
+  "tags": [
+    "cas",
+    "clickhouse"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "query": "vertamedia-clickhouse-datasource",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "vertamedia-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "definition": "SELECT DISTINCT cluster FROM system.clusters WHERE cluster NOT IN ('default') AND cluster NOT LIKE 'all-%' ORDER BY cluster",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Cluster",
+        "multi": false,
+        "name": "cluster",
+        "options": [],
+        "query": "SELECT DISTINCT cluster FROM system.clusters WHERE cluster NOT IN ('default') AND cluster NOT LIKE 'all-%' ORDER BY cluster",
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "vertamedia-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "definition": "SELECT DISTINCT hostName() FROM clusterAllReplicas('$cluster', system.one) SETTINGS skip_unavailable_shards = 1",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Host",
+        "multi": true,
+        "name": "host",
+        "options": [],
+        "query": "SELECT DISTINCT hostName() FROM clusterAllReplicas('$cluster', system.one) SETTINGS skip_unavailable_shards = 1",
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "vertamedia-clickhouse-datasource",
+          "uid": "${datasource}"
+        },
+        "definition": "SELECT DISTINCT disk_name FROM clusterAllReplicas('$cluster', system.cas_gc_log) WHERE event_date >= today() - 7 ORDER BY disk_name SETTINGS skip_unavailable_shards = 1",
+        "hide": 0,
+        "includeAll": true,
+        "label": "CAS disk",
+        "multi": true,
+        "name": "disk",
+        "options": [],
+        "query": "SELECT DISTINCT disk_name FROM clusterAllReplicas('$cluster', system.cas_gc_log) WHERE event_date >= today() - 7 ORDER BY disk_name SETTINGS skip_unavailable_shards = 1",
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "CAS / Overview",
+  "uid": "cas-overview",
+  "version": 0
+}

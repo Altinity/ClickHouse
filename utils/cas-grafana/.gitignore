@@ -1,0 +1,4 @@
+local.env
+.netrc
+__pycache__/
+dashboards/*.exported.json
