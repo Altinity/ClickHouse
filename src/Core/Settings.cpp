@@ -9561,7 +9561,7 @@ Enable experimental table function `eval`.
     MAKE_OBSOLETE(M, Bool, query_plan_use_logical_join_step, true) \
     MAKE_OBSOLETE(M, Bool, query_plan_use_new_logical_join_step, true) \
     MAKE_OBSOLETE(M, UInt64, cloud_mode_database_engine, 1) \
-    MAKE_OBSOLETE(M, Bool, allow_retries_in_cluster_requests, false)
+    MAKE_OBSOLETE(M, Bool, allow_retries_in_cluster_requests, false) \
     MAKE_OBSOLETE(M, Bool, allow_named_collection_override_by_default, true)
     /** The section above is for obsolete settings. Do not add anything there. */
 #endif /// __CLION_IDE__

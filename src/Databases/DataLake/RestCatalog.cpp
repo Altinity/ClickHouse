@@ -2550,7 +2550,6 @@ void RestCatalog::sendRequest(
     LOG_TEST(log, "REST catalog {} {} body ({} bytes): {}", method, endpoint, body_str.size(), body_str);
 
     const auto & context = getContext();
-    context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
 
     DB::ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback;
     if (!body_str.empty())
@@ -2580,6 +2579,7 @@ void RestCatalog::sendRequest(
         DB::HTTPHeaderEntries headers = getAuthHeaders(auth_context);
         headers.emplace_back("Content-Type", "application/json");
         headers.emplace_back("X-Iceberg-Access-Delegation", "vended-credentials");
+        context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
         return DB::BuilderRWBufferFromHTTP(url)
             .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
             .withMethod(method)
