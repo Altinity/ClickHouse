@@ -52,9 +52,11 @@
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/Serializations/ISerialization.h>
 #include <DataTypes/hasNullable.h>
+#include <Disks/IDiskTransaction.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/TemporaryFileOnDisk.h>
 #include <Disks/createVolume.h>
+#include <IO/copyData.h>
 #include <Formats/FormatFactory.h>
 #include <IO/Operators.h>
 #include <IO/S3Common.h>
@@ -6435,6 +6437,13 @@ MergeTreeDataPartFormat MergeTreeData::choosePartFormat(
     return {part_type, storage_type};
 }
 
+MergeTreeDataPartFormat MergeTreeData::normalizePartFormatForDisk(MergeTreeDataPartFormat format, const DiskPtr & disk)
+{
+    if (format.storage_type == MergeTreeDataPartStorageType::Packed && !disk->allowsPackedParts())
+        format.storage_type = MergeTreeDataPartStorageType::Full;
+    return format;
+}
+
 MergeTreeDataPartBuilder MergeTreeData::getDataPartBuilder(
     const String & name, const VolumePtr & volume, const String & part_dir, const ReadSettings & read_settings_, PartDirIntent intent) const
 {
@@ -8257,6 +8266,9 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                 case MetadataStorageType::Local:
                 case MetadataStorageType::Keeper:
                 case MetadataStorageType::Memory:
+                /// CAS: every partition command clones parts through `freeze`, `freezeRemote` or `clonePart`, which
+                /// publish the clone as one part; a new command type that copies files one by one must not land here.
+                case MetadataStorageType::CAS:
                 {
                     can_execute_alter_on_disk = true;
                     break;
@@ -9304,6 +9316,14 @@ void MergeTreeData::restorePartFromBackup(std::shared_ptr<RestoredPartsHolder> r
     /// Copy files from the backup to the directory `tmp_part_dir`.
     disk->createDirectories(temp_part_dir);
 
+    /// A content-addressed disk publishes a part as ONE manifest (N files -> one ref) atomically, so the
+    /// per-file copyFileToDisk autocommit below is rejected for content part files. Route the restore
+    /// through one whole-part transaction (mirrors DataPartStorageOnDiskBase::freeze's owned_transaction):
+    /// all files land in a single content-addressed part at tmp_restore_<part>, published by tx->commit().
+    DiskTransactionPtr restore_tx;
+    if (disk->isContentAddressed())
+        restore_tx = disk->createTransaction();
+
     for (const String & filename : filenames)
     {
         /// Needs to create subdirectories before copying the files. Subdirectories are used to represent projections.
@@ -9327,9 +9347,23 @@ void MergeTreeData::restorePartFromBackup(std::shared_ptr<RestoredPartsHolder> r
             continue;
         }
 
-        size_t file_size = backup->copyFileToDisk(part_path_in_backup_fs / filename, disk, temp_part_dir / filename, WriteMode::Rewrite, fsync_files);
-        reservation->update(reservation->getSize() - file_size);
+        if (restore_tx)
+        {
+            auto in = backup->readFile(part_path_in_backup_fs / filename);
+            auto out = restore_tx->writeFile(temp_part_dir / filename, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, getContext()->getWriteSettings());
+            copyData(*in, *out);
+            out->finalize();
+            reservation->update(reservation->getSize() - backup->getFileSize(part_path_in_backup_fs / filename));
+        }
+        else
+        {
+            size_t file_size = backup->copyFileToDisk(part_path_in_backup_fs / filename, disk, temp_part_dir / filename, WriteMode::Rewrite, fsync_files);
+            reservation->update(reservation->getSize() - file_size);
+        }
     }
+
+    if (restore_tx)
+        restore_tx->commit();
 
     if (auto part = loadPartRestoredFromBackup(part_name, disk, temp_part_dir, detach_if_broken))
         restored_parts_holder->addPart(part);
@@ -10783,6 +10817,8 @@ void MergeTreeData::Transaction::clear()
     precommitted_parts_need_rename.clear();
 }
 
+/// Renames only. The part's storage transaction is committed by the writer before this call, so on a
+/// content-addressed disk the rename is one owner move of an already published part.
 void MergeTreeData::Transaction::renameParts()
 {
     for (const auto & part_need_rename : precommitted_parts_need_rename)
@@ -10812,7 +10848,14 @@ MergeTreeData::DataPartsVector MergeTreeData::Transaction::commit(DataPartsLock 
 
         for (const auto & part : precommitted_parts)
             if (part->getDataPartStorage().hasActiveTransaction())
+            {
+                /// A content-addressed commit is object-store I/O; every writer commits it before the parts lock.
+                if (part->getDataPartStorage().isContentAddressed())
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "Part {} on a content-addressed disk reached Transaction::commit with an open storage transaction; "
+                        "commit it before taking the parts lock", part->name);
                 part->getDataPartStorage().commitTransaction();
+            }
 
         /// Collect covered parts and call addNewPartAndRemoveCovered before NOEXCEPT_SCOPE,
         /// because lockRemovalTID inside addNewPartAndRemoveCovered can throw SERIALIZATION_ERROR.

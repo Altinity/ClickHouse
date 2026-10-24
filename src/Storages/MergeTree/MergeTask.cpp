@@ -594,8 +594,12 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
         std::optional<MergeTreeDataPartBuilder> builder;
         if (global_ctx->parent_part)
         {
+            /// On a content-addressed disk a part is one atomic unit, so a projection sub-part is written
+            /// through the parent part's transaction; elsewhere it keeps its own sub-transaction.
+            const bool use_parent_transaction = global_ctx->parent_part->getDataPartStorage().isContentAddressed();
             /// Non-initializing, so nothing is seeded from an existing directory.
-            auto data_part_storage = global_ctx->parent_part->getDataPartStorage().getProjectionNoInitialize(local_tmp_part_basename,  /* use parent transaction */ false);
+            auto data_part_storage = global_ctx->parent_part->getDataPartStorage().getProjectionNoInitialize(
+                local_tmp_part_basename, use_parent_transaction);
             builder.emplace(*global_ctx->data, global_ctx->future_part->name, data_part_storage, getReadSettings(), PartDirIntent::CreateFresh);
             builder->withParentPart(global_ctx->parent_part);
         }
@@ -618,6 +622,8 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     if (global_ctx->parent_part && data_part_storage->exists())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Projection merge directory {} already exists", data_part_storage->getFullPath());
 
+    /// A borrowed projection sub-part shares the parent's already-open transaction; the storage makes
+    /// beginTransaction a no-op in that case, so this can be called unconditionally.
     data_part_storage->beginTransaction();
 
     global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot);
