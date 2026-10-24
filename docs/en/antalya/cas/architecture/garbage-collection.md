@@ -194,7 +194,8 @@ token of each `mount` object.
   deletes
 - **Safety:** fences only after this leader's *own* monotonic clock has watched the mount's
   write-token hold unchanged for `L + 5% + cas_mount_renew_period_ms`, where `L` is the longer of this server's
-  `cas_mount_lease_ttl_ms` and the lease the slot's body declares (defaults 30 s and 10 s); the write is
+  `cas_mount_lease_ttl_ms` and the lease the slot's body declares (defaults 30 s and 10 s), and only at the
+  start of a round, so a killed member becomes `fenced` up to one GC round later than that; the write is
   guarded by that exact token. A completed fence-out stays valid even if this GC later loses
   leadership. `expires_at_ms` (another host's wall clock) is never trusted.
 - **Fails the round if:** nothing — a per-mount `PUT` conflict is re-observed and re-classified
@@ -1026,12 +1027,12 @@ checksum disagrees with its seal).
 
 | Command | Effect |
 |---|---|
-| `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder makes progress. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
+| `SYSTEM CAS GC RUN [<disk>]` | One synchronous round execution on the contacted node; only the lease holder (the GC leader, `is_leader = 1` in `system.cas_mounts`) makes progress, and on any other node the command does nothing. The disk is optional: without it every content-addressed disk on the node runs one round. It runs even while the scheduler is stopped |
 | `SYSTEM CAS GC STOP <disk>` / `SYSTEM CAS GC START <disk>` | Stop or resume future background rounds on that disk's scheduler, preserving its identity. The disk is required |
 | `SYSTEM CAS GC REBUILD [FORCE] <disk>` (`clickhouse-disks cas-gc-rebuild`) | Fail-closed disaster-recovery path for a lost or corrupt `GC` baseline — the `CORRUPTED_DATA` errors that name it in their message (missing adopted seal, snapshot without a surviving log, cursor/apply mismatch). An `ABORTED` commit conflict or a `LOGICAL_ERROR` delete marker is not a reason to rebuild. It deliberately over-protects — it prefers bounded leaks over risking an under-count — and cannot delete live data directly: deletions it produces still flow through the normal round's condemn, graduate, exact-token path. The disk is required |
 | `clickhouse-disks cas-gc-dryrun` | Opens the disk read-only, constructs a non-leader `GC`, and prints what would be deleted with a reason per entry. Write-free, resolves runs through the seal's references. Documented caveat: it does not fold new owner events, so away from quiescence it can **over-report** — the subset guarantee holds only at quiescence, and its output must never feed a real delete |
 
-`SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — permanent removal of a dead
+`SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'` — removal of a dead
 replica, distinct from ordinary `GC` — is covered on the
 [mounts-and-leases page](/antalya/cas/architecture/mounts-and-leases#mount-lifecycle).
 `SYSTEM CAS FSCK <disk>` (`clickhouse-disks cas-fsck`) and its `dangling`/`unreachable` vocabulary

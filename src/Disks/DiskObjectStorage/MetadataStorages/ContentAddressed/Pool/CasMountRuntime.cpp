@@ -1028,7 +1028,7 @@ std::unique_lock<std::mutex> CasMountRuntime::lockTerminalPublication()
     return lock;
 }
 
-void CasMountRuntime::enterIdentityLost()
+void CasMountRuntime::enterIdentityLost(const String & reason)
 {
     /// `TransientNotLive -> IdentityLost`, one way. The compare-exchange FROM `TransientNotLive` gives
     /// the brief's "from TransientNotLive only" precondition, idempotency (a second call finds the state
@@ -1063,12 +1063,11 @@ void CasMountRuntime::enterIdentityLost()
 
     ProfileEvents::increment(ProfileEvents::CASIdentityLost);
     LOG_WARNING(getLogger("CasPool"),
-        "Content-addressed pool '{}' entered IdentityLost: the pool sentinels (_pool_meta and the owner "
-        "anchor) are authoritatively absent (both KeyAbsent). This is a fail-loud TERMINAL state: "
+        "Content-addressed pool '{}' entered IdentityLost: {}. This is a fail-loud TERMINAL state: "
         "store-class access now fails loud and this pool's remount + GC threads self-exit. "
         "Recover by restart or SYSTEM CAS FORGET — a matching-sentinel restore does NOT "
         "auto-revive this disk.",
-        server_root_id);
+        server_root_id, reason);
 }
 
 void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
@@ -1241,7 +1240,7 @@ void CasMountRuntime::finishTeardown(bool drained)
     {
         LOG_WARNING(
             getLogger("CasPool"),
-            "CAS store shutdown with an unresolved ref-log PUT: skipping the clean-release marker; "
+            "CAS store shutdown with an unresolved write: skipping the clean-release marker; "
             "the next mount will treat this end as unclean");
     }
 }
