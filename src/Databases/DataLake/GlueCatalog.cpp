@@ -21,7 +21,11 @@
 
 #include <Common/Exception.h>
 #include <Common/CurrentMetrics.h>
+<<<<<<< HEAD
 #include <Common/CurrentThread.h>
+=======
+#include <base/unit.h>
+>>>>>>> v26.8.34.13-lts
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
 
@@ -123,6 +127,7 @@ namespace ProfileEvents
 
 namespace CurrentMetrics
 {
+<<<<<<< HEAD
     extern const Metric MarkCacheBytes;
     extern const Metric MarkCacheFiles;
     extern const Metric DataLakeCatalogUserClientCacheEntries;
@@ -207,6 +212,10 @@ Poco::JSON::Object::Ptr getCurrentSchemaFromMetadata(const Poco::JSON::Object::P
     return schema;
 }
 
+=======
+    extern const Metric GlueCatalogSchemaCacheBytes;
+    extern const Metric GlueCatalogSchemaCacheEntries;
+>>>>>>> v26.8.34.13-lts
 }
 
 namespace DataLake
@@ -265,7 +274,7 @@ GlueCatalog::GlueCatalog(
     , region(settings_.region)
     , settings(settings_)
     , table_engine_definition(table_engine_definition_)
-    , metadata_objects(CurrentMetrics::MarkCacheBytes, CurrentMetrics::MarkCacheFiles, 1024)
+    , current_schema_field_types(CurrentMetrics::GlueCatalogSchemaCacheBytes, CurrentMetrics::GlueCatalogSchemaCacheEntries, 16_MiB)
 {
     DB::S3::CredentialsConfiguration creds_config;
     creds_config.use_environment_credentials = true;
@@ -845,8 +854,23 @@ String GlueCatalog::getActualTimestampType(
     if (!table_specific_properties.has_value())
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Failed to read table metadata, reason why table is unreadable: {}", table_metadata.getReasonWhyTableIsUnreadable());
 
+<<<<<<< HEAD
     auto metadata_object = getOrFetchMetadataObject(client, table_specific_properties->iceberg_metadata_file_location, table_metadata);
     return resolveTimestampTypeFromMetadata(metadata_object, column_name, glue_column_type);
+=======
+    const String & metadata_uri = table_specific_properties->iceberg_metadata_file_location;
+
+    auto [field_types, _] = current_schema_field_types.getOrSet(metadata_uri, [&]
+    {
+        auto [object_storage, bucket_name, metadata_path] = createObjectStorageForEarlyTableAccess(metadata_uri, table_metadata);
+        auto compression_method = DB::Iceberg::getCompressionMethodFromMetadataFile(metadata_uri);
+        auto metadata_object = DB::Iceberg::getMetadataJSONObject(
+            metadata_path, object_storage, nullptr, getContext(), log, compression_method, std::nullopt);
+        return std::make_shared<FieldTypes>(getCurrentSchemaFieldTypes(metadata_object));
+    });
+
+    return resolveTimestampType(*field_types, column_name, glue_column_type);
+>>>>>>> v26.8.34.13-lts
 }
 
 Poco::JSON::Object::Ptr GlueCatalog::getIcebergMetadataObject(const AuthenticatedClient & client, const TableMetadata & table_metadata) const
@@ -863,28 +887,54 @@ String GlueCatalog::resolveTimestampTypeFromMetadata(
     const String & column_name,
     const String & glue_column_type)
 {
+    return resolveTimestampType(getCurrentSchemaFieldTypes(metadata_object), column_name, glue_column_type);
+}
+
+GlueCatalog::FieldTypes GlueCatalog::getCurrentSchemaFieldTypes(const Poco::JSON::Object::Ptr & metadata_object)
+{
+    FieldTypes result;
     auto current_schema_id = metadata_object->getValue<Int64>("current-schema-id");
     auto schemas = metadata_object->getArray(DB::Iceberg::f_schemas);
     for (size_t i = 0; i < schemas->size(); ++i)
     {
         auto schema = schemas->getObject(static_cast<UInt32>(i));
-        if (schema->getValue<Int64>("schema-id") == current_schema_id)
+        if (schema->getValue<Int64>("schema-id") != current_schema_id)
+            continue;
+
+        auto fields = schema->getArray(DB::Iceberg::f_fields);
+        for (size_t j = 0; j < fields->size(); ++j)
         {
-            auto fields = schema->getArray(DB::Iceberg::f_fields);
-            for (size_t j = 0; j < fields->size(); ++j)
-            {
-                auto field = fields->getObject(static_cast<UInt32>(j));
-                if (field->getValue<String>(DB::Iceberg::f_name) == column_name)
-                    return field->getValue<String>(DB::Iceberg::f_type);
-            }
+            auto field = fields->getObject(static_cast<UInt32>(j));
+            auto type = field->get(DB::Iceberg::f_type);
+            if (type.isString())
+                result.emplace(field->getValue<String>(DB::Iceberg::f_name), type.extract<String>());
         }
     }
+    return result;
+}
+
+String GlueCatalog::resolveTimestampType(const FieldTypes & field_types, const String & column_name, const String & glue_column_type)
+{
+    if (auto it = field_types.find(column_name); it != field_types.end())
+        return it->second;
 
     return glue_column_type == "timestamp_nano" ? "timestamp_ns" : "timestamp";
 }
 
+<<<<<<< HEAD
 GlueCatalog::ObjectStorageWithPath GlueCatalog::createObjectStorageForEarlyTableAccess(
     const AuthenticatedClient & client, const String & s3_location, const TableMetadata & table_metadata) const
+=======
+size_t GlueCatalog::FieldTypesWeightFunction::operator()(const FieldTypes & field_types) const
+{
+    size_t result = 0;
+    for (const auto & [name, type] : field_types)
+        result += sizeof(FieldTypes::value_type) + name.size() + type.size();
+    return result;
+}
+
+GlueCatalog::ObjectStorageWithPath GlueCatalog::createObjectStorageForEarlyTableAccess(const String & s3_location, const TableMetadata & table_metadata) const
+>>>>>>> v26.8.34.13-lts
 {
     DB::ASTStorage * storage = table_engine_definition->as<DB::ASTStorage>();
     DB::ASTs args = storage->engine->arguments->children;

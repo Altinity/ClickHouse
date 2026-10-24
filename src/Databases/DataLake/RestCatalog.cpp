@@ -1743,6 +1743,8 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
         };
         auto result_headers = auth_headers ? *auth_headers : getAuthHeaders(auth_context);
         std::move(headers.begin(), headers.end(), std::back_inserter(result_headers));
+        /// The auth headers may carry a token from the OAuth server or values from the database settings.
+        context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(result_headers);
 
         return DB::BuilderRWBufferFromHTTP(url)
             .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
@@ -2548,6 +2550,7 @@ void RestCatalog::sendRequest(
     LOG_TEST(log, "REST catalog {} {} body ({} bytes): {}", method, endpoint, body_str.size(), body_str);
 
     const auto & context = getContext();
+    context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
 
     DB::ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback;
     if (!body_str.empty())
