@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -67,21 +68,22 @@ struct MountRenewOperationEnvironment
     /// Facts the mount fence cannot see (park requested, pool no longer live, shutdown). FALSE ends
     /// the renewal exactly as a lost fence does; the engine does not need to know which refused.
     std::function<bool()> live;
-    /// Sampled ONCE before the write. A renewal refused before its first attempt is reported as
+    /// Sampled before each engine call. A call refused before its first attempt ends the renewal as
     /// `NotAttempted` rather than terminal only when this node had already been asked to stop --
     /// sampling it afterwards would read a flag that the refusal itself may have set.
     std::function<bool()> cancelled;
+    RequestObserver requests;
+    /// The background renewal's wait after the store refused a request: the store said it cannot serve
+    /// it, and each engine call may refresh the credentials once, so a pace of one spacing would hammer
+    /// the store and refresh every second.
+    uint64_t refusal_pause_ms = 0;
 };
 
 /// Validate a `server_root_id` — the explicit, configured identity of the content-addressed layout
-/// subtree a server owns. It is a clean relative path: it composes into the
-/// object-key tree (`gc/server-roots/<srid>/...`, `roots/<srid>/...`), so the same hygiene the layout
-/// applies to a namespace applies here (mirrors `CasLayout.h::checkNamespace`):
-///   - non-empty;
-///   - no leading/trailing '/', no empty segment ("//");
-///   - no '.' or '..' segment;
-///   - total length <= 255;
-///   - no segment equal to the reserved "_files" / "_manifests".
+/// subtree a server owns. It composes into object keys (`gc/server-roots/<srid>/...`, `roots/<srid>/...`)
+/// as ONE path component: non-empty, at most 255 bytes, no '/', not '.' or '..', not the reserved
+/// "_files" / "_manifests". A '/' is refused even for an id that already owns its owner object, because
+/// decommission and the staging sweep select a member's objects by key prefix.
 /// Throws `ErrorCodes::BAD_ARGUMENTS` on any violation. Fail closed — there is no sanitizing fallback.
 inline void validateServerRootId(const String & id)
 {
@@ -92,27 +94,22 @@ inline void validateServerRootId(const String & id)
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
             "server_root_id '{}' is too long ({} > 255 bytes)", id, id.size());
 
-    size_t start = 0;
-    while (true)
-    {
-        size_t end = id.find('/', start);
-        const String segment = id.substr(start, end == String::npos ? String::npos : end - start);
-        if (segment.empty())
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' has an empty segment (leading/trailing or doubled '/')", id);
-        if (segment == "." || segment == "..")
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' uses a relative segment ('.' or '..')", id);
-        if (segment == "_files")
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' uses the reserved segment '_files'", id);
-        if (segment == "_manifests")
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "server_root_id '{}' uses the reserved segment '_manifests'", id);
-        if (end == String::npos)
-            break;
-        start = end + 1;
-    }
+    if (id.find('/') != String::npos)
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' contains '/'. A decommission selects a member's objects by key prefix, so a "
+            "member 'a/b' would be drained by a decommission of 'a'. Recreate the server that uses this id under a new "
+            "<cas_server_root_id> without '/'; the objects of the old id stay in the pool and are not visible "
+            "under the new id",
+            id);
+    if (id == "." || id == "..")
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' uses a relative segment ('.' or '..')", id);
+    if (id == "_files")
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' uses the reserved segment '_files'", id);
+    if (id == "_manifests")
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+            "server_root_id '{}' uses the reserved segment '_manifests'", id);
 }
 
 /// The per-server-root control objects (owner, epoch, and mount lease) and their text codecs are kept
@@ -146,9 +143,9 @@ std::optional<UInt128> readOwnerUuid(CasOperation & op, const Layout & l, const 
 ///   - owner present, equal `our_uuid`, and not tombstoned → ok (return);
 ///   - owner present and tombstoned → throw `CORRUPTED_DATA` (explicitly retired — fail closed);
 ///   - owner present, different → throw `CORRUPTED_DATA` (foreign owner — fail closed);
-///   - owner absent AND the subtree is provably empty → `create` the owner (claim);
 ///   - owner absent BUT the subtree is non-empty → throw `CORRUPTED_DATA` (identity lost over
-///     existing data — never silently re-claim).
+///     existing data — never silently re-claim);
+///   - owner absent, subtree provably empty → `create` the owner (claim).
 /// The owner object is never deleted and never reassigned to a different UUID.
 void claimOwnerOrThrow(
     CasOperation & op, const Layout & l, const String & srid, UInt128 our_uuid,
@@ -185,9 +182,8 @@ uint64_t allocateWriterEpoch(CasOperation & op, const Layout & l, const String &
                              const ObserveRefCatalog & observe_catalog);
 
 /// Which certificate of death, or the operator's explicit unsafe authorization, justified a
-/// same-uuid, different-epoch mount reclaim. `None` when no
-/// reclaim of that kind happened (a fresh claim, a
-/// same-epoch refresh, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
+/// same-uuid, older-epoch mount reclaim. `None` when no reclaim of that kind happened (a fresh
+/// claim, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
 enum class MountPriorState
 {
     None,
@@ -202,12 +198,13 @@ enum class MountPriorState
 /// already settled who may write; the lease settles whether a live incarnation currently holds the
 /// slot. Decision over `get(mountKey)`:
 ///   - absent → write our body via `create` → `Claimed`;
-///   - same `server_uuid` AND same `writer_epoch` as (our_uuid, our_epoch) → it is OUR OWN claim
-///     (a replay / the renewer adopting it):
-///       - `gc_fenced` → terminal for THIS (uuid, epoch) — a fence costs an epoch, so refreshing it
-///         in place would reactivate a fenced incarnation → `FencedSelf` (no write);
-///       - otherwise → refresh (`replace` to bump seq + fresh `expires_at_ms`) → `Claimed`;
-///   - same `server_uuid`, DIFFERENT `writer_epoch` → reclaimed ONLY on a certificate of death, or the
+///   - same `server_uuid` and a NEWER `writer_epoch` than `our_epoch` → throw `ABORTED`, no write: an
+///     older allocation never replaces a newer incarnation, whatever certifies its end;
+///   - same `server_uuid` AND same `writer_epoch` → another process was allocated our epoch; never
+///     refreshed:
+///       - `gc_fenced` → terminal for THIS (uuid, epoch) → `FencedSelf` (no write);
+///       - otherwise → `LiveDoubleStart` (no write);
+///   - same `server_uuid`, OLDER `writer_epoch` → reclaimed ONLY on a certificate of death, or the
 ///     operator's explicit unsafe authorization, that
 ///     needs no fresh wall-clock trust (see
 ///     `claimMountAwaitingExpiry` below for how a plain "looks expired" reading is turned into one):
@@ -248,8 +245,8 @@ struct MountClaimResult
     /// rather than the proposal, because a caller cannot check a convention it cannot see.
     std::optional<MountLease> body;
     /// Which certificate of death, or the operator's explicit unsafe authorization, justified a
-    /// same-uuid, different-epoch `Claimed` reclaim (`None` for
-    /// every other `Kind`, and for the absent-slot / same-epoch-refresh `Claimed` cases).
+    /// same-uuid, older-epoch `Claimed` reclaim (`None` for
+    /// every other `Kind`, and for the absent-slot `Claimed` case).
     MountPriorState prior = MountPriorState::None;
     /// The incarnation of the body this result observed, for
     /// `LiveDoubleStart` only (a fresh `Claimed`/`FencedSelf`/`ForeignOwner` write/observe has no
@@ -273,6 +270,8 @@ public:
         : DB::Exception(msg, DB::ErrorCodes::ABORTED) {}
 };
 
+/// A caller never claims twice with one `writer_epoch`; a retry allocates a new one. That is why a
+/// body of our own `(uuid, epoch)` found in the slot belongs to another process.
 /// `proven_dead_incarnation`: the incarnation of a same-uuid, different-epoch lease that the CALLER
 /// already proved dead by observation (see `claimMountAwaitingExpiry`) — matching it against the
 /// CURRENTLY observed incarnation is the ONLY way (besides `gc_fenced` / the clean marker) a
@@ -298,15 +297,15 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
 
 /// Observation-based mount claim for restart recovery.
 /// Wraps `claimMount` in a loop:
-///   - first attempt decided immediately for `Claimed` (fresh / refreshed / reclaimed via `Fenced` or
-///     `Clean`), `ForeignOwner`, or `FencedSelf`;
-///   - a `LiveDoubleStart` from OUR OWN uuid (a stale lease from a prior incarnation of this server,
+///   - first attempt decided immediately for `Claimed` (fresh / reclaimed via `Fenced` or `Clean`),
+///     `ForeignOwner`, `FencedSelf`, or a `LiveDoubleStart` on our own (uuid, epoch);
+///   - a `LiveDoubleStart` from OUR OWN uuid with an older epoch (a stale lease from a prior incarnation of this server,
 ///     OR a genuinely live twin — the two are indistinguishable from a bare read) is resolved by
 ///     WATCHING the lease's incarnation on OUR OWN clock (`mono_ms_fn`), NEVER by comparing the
 ///     lease's stamped `expires_at_ms` against any clock: once the observed incarnation has held stable for
-///     the full rate-bound threshold (`ttl_ms + ttl_ms / 20 + poll_interval_ms` — the lease TTL, a 5%
-///     clock-drift allowance, and one poll interval of discreteness. This rate bound ensures that a
-///     holder which last renewed before the observation began can no longer be within its lease.
+///     the threshold `mountObservationThresholdMs(ttl_ms, declaredMountLeaseMs(body), poll_interval_ms)` —
+///     after it, a holder that last renewed before the observation began is outside its own lease,
+///     whichever lease it runs;
 ///     that incarnation is handed to `claimMount` as `proven_dead_incarnation`, which then reclaims
 ///     incarnation-guarded (`prior = UncleanObserved`). If the incarnation changes DURING the wait (the
 ///     holder renewed, or a genuine twin is alive) the observation RESTARTS from the new one; bounded to
@@ -319,14 +318,16 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
 /// tests drive fake clocks with no real sleeping. `on_wait_start` (default no-op) fires once per
 /// observation-window start (including restarts), with the currently-observed lease and the
 /// threshold, for an operator-visible startup log.
-/// All callers share this one formula, not duplicated arithmetic, so a future fix or an added term
-/// applies everywhere at once -- but the callers deliberately pass DIFFERENT `cadence_ms` values, so
-/// the resulting thresholds are close, not identical: the startup reopen wait below passes half the
-/// renewal period (`max(1, floor(mount_renew_period_ms / 2))`), while GC's heartbeat fence-out
-/// (`Gc/CasGc.cpp`) passes the full renewal period. `cadence_ms` is the caller's own poll or
-/// heartbeat interval; the additional interval accounts for observation discreteness, while
-/// `ttl_ms / 20` allows for a five-percent clock-rate difference.
-uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms);
+/// The lease a mount body declares: `expires_at_ms - started_at_ms` when `started_at_ms` is set and the
+/// interval is positive, else 0. A body without the stamps decodes them as 0; a farewell stamps them equal.
+uint64_t declaredMountLeaseMs(const MountLease & m);
+
+/// How long an observer watches one slot's token on its own clock before treating the holder as dead:
+/// `L + L / 20 + cadence_ms` with `L = max(own_lease_ms, declared_lease_ms)`, saturating at `UINT64_MAX`.
+/// The longer lease wins: a holder may write for its own lease after its last confirmed renewal,
+/// whatever the observer's lease is. `L / 20` allows a five-percent clock-rate difference; `cadence_ms`
+/// is the observer's own poll step (restart reclaim: `max(1, mount_renew_period / 2)`; GC: the period).
+uint64_t mountObservationThresholdMs(uint64_t own_lease_ms, uint64_t declared_lease_ms, uint64_t cadence_ms);
 
 /// Bounded number of observation restarts `claimMountAwaitingExpiry` allows before giving up on a
 /// same-uuid slot whose write-token keeps changing (see the function comment above): each restart
@@ -346,13 +347,16 @@ MountClaimResult claimMountAwaitingExpiry(
 
 /// One `server_root_id`'s cross-round incarnation-stability observation,
 /// owned by the GC leader instance (`Cas::Gc::mount_obs`) and threaded through consecutive
-/// `computeHeartbeatFloor` calls — one GC round is one observation tick. Mirrors
-/// `claimMountAwaitingExpiry`'s observation loop, but at heartbeat-gate granularity rather than a
-/// tight poll loop.
+/// `computeHeartbeatFloor` calls. `first_seen_mono_ms` is the reading taken when the slot read
+/// that first returned `etag` came back.
 struct MountIncarnationObservation
 {
     Etag etag;
     uint64_t first_seen_mono_ms = 0;
+
+    /// `sample_ms` is taken before the read that confirmed `etag`. A sample older than the sighting
+    /// says nothing about how long the token held, so it never counts as held.
+    bool heldFor(uint64_t threshold_ms, uint64_t sample_ms) const;
 };
 
 /// Keyed by `server_root_id`. In-memory only: a fresh leader (after a steal, or a process restart)
@@ -371,12 +375,13 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 ///     terminated marker;
 ///   - otherwise, observation-based liveness (the same
 ///     principle `claimMountAwaitingExpiry` uses for a mount's OWN reopen, applied here to the GC's
-///     fence-out): `obs` remembers, per srid, the incarnation last seen and the leader's OWN
-///     monotonic clock reading (`mono_now_ms`) at the moment it first saw it. A body whose
+///     fence-out): `obs` remembers, per srid, the incarnation last seen and the reading of the
+///     leader's OWN monotonic clock (`mono_ms_fn`) when it first saw it. A body whose
 ///     CURRENT incarnation differs from (or is absent from) `obs` is (re)started fresh — counted `live`,
 ///     never fenced this call, regardless of what its stamped `expires_at_ms` claims (a bare
 ///     wall-clock stamp is never trusted — see `claimMount`'s "certificate of death" doc). Only once
-///     the SAME incarnation has held for `>= stable_threshold_ms` OF THE LEADER'S OWN CLOCK does the body
+///     the SAME incarnation has held, on the leader's own clock, for
+///     `mountObservationThresholdMs(observer_lease_ms, declaredMountLeaseMs(body), cadence_ms)` does the body
 ///     become FENCE-eligible;
 ///   - FENCE-eligible → one incarnation-guarded `replace` preserving the WHOLE body, setting
 ///     `gc_fenced = true` and `seq + 1`. On `Committed` → excluded (`fenced_now`); on `Conflict`
@@ -386,10 +391,14 @@ using MountObservationMap = std::map<String, MountIncarnationObservation>;
 ///
 /// `now_ms` is WALL clock, used only for the audit/diagnostic log line — it never participates in the
 /// fence decision (mirrors `claimMountAwaitingExpiry`'s `now_ms_fn` vs `mono_ms_fn` split).
-/// `mono_now_ms` is the OBSERVATION clock: the caller's OWN monotonic reading, never compared against
-/// any other node's clock. `obs` is owned by the caller and threaded across consecutive calls (one GC
+/// `mono_ms_fn` is the OBSERVATION clock: the caller's OWN monotonic clock, never compared against
+/// any other node's clock. It is sampled once at entry for the stability test and after the read for
+/// each sighting. `obs` is owned by the caller and threaded across consecutive calls (one GC
 /// leader instance, `Cas::Gc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
 /// fencing one round, never fences early).
+/// A body whose declared lease is non-zero and differs from `observer_lease_ms` is named in one `WARNING`
+/// per srid; `lease_mismatch_warned` holds the srids already named and is pruned like `obs`. The check
+/// never changes a classification or a write.
 ///
 /// The fence-out is BOTH safety and liveness. Safety: a sleeper's later renewal permanently fails
 /// (its `replace` now mismatches the fenced incarnation → `tripMountLost`), so it can never re-arm
@@ -407,8 +416,9 @@ struct HeartbeatFloor
 };
 
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
-                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
-                                     MountObservationMap & obs);
+                                     const std::function<uint64_t()> & mono_ms_fn,
+                                     uint64_t observer_lease_ms, uint64_t cadence_ms, MountObservationMap & obs,
+                                     std::set<String> & lease_mismatch_warned);
 
 /// One `gc/server-roots/<srid>/mount` slot whose holder is not provably finished with the prefix.
 struct NonTerminalMountSlot
@@ -522,12 +532,13 @@ bool isCreatorFenceTerminal(CasOperation & op, const Layout & layout, const Stri
 ///   - foreign uuid → fail closed;
 ///   - absent → `create`; expired-our-uuid (any epoch) → `replace` reclaim.
 ///
-/// PLANES. Only the RENEWAL is admitted under the mount fence, because only a renewal writes under
-/// authority the fence is tracking. The claim and the farewell are admitted off it: a self-remount
-/// claims with the fence already latched lost, so a claim gated on the fence could never reclaim, and
-/// a farewell refused because the fence has run down would leave the slot looking live until GC
-/// fences it out. Neither is unguarded: a claim's safety is its own conditional write, and a caller
-/// that has shutdown facts hands them over as a `Liveness`.
+/// PLANES. The bounded renewal (`renew`: startup and direct calls) is admitted under the mount fence,
+/// because it writes under the authority the fence tracks. The background renewal, the claim, the
+/// remount re-anchor and the farewell run on the lease plane, whose fence is open: the background
+/// renewal must outlive its lease, a self-remount claims with the fence already latched lost, and a
+/// farewell refused because the fence ran down would leave the slot looking live until GC fences it
+/// out. None is unguarded: every write is conditional, and a caller with shutdown facts hands them
+/// over as a `Liveness`.
 class MountLeaseRenewer
 {
 public:
@@ -545,7 +556,7 @@ public:
     /// Adopt the already-claimed mount. Returns the exact pre-I/O BOOTTIME anchor. `liveness` carries
     /// the caller's shutdown terms; the mount fence is deliberately not consulted here.
     uint64_t start(Liveness liveness = {});
-    /// The steady-state renewal, admitted under the mount fence.
+    /// The bounded renewal, admitted under the mount fence: the startup re-anchor and direct calls.
     MountRenewResult renew(const MountRenewOperationEnvironment & environment);
     /// The remount's re-anchor, which is bootstrap control rather than steady state: a remount renews
     /// BEFORE it arms the fence for the new incarnation, so the fence is still latched lost and an
@@ -553,6 +564,10 @@ public:
     /// renewer's own open plane, the one the claim and the farewell use, so there is no plane for a
     /// caller to get wrong. Same policy and same verdicts as `renew`.
     MountRenewResult renewForRemount(const MountRenewOperationEnvironment & environment = {});
+    /// The background renewal, on the lease plane, retried until a definitive answer: a commit, a
+    /// conflict the read observed, a local failure, or `environment.live` refusing. A refusal sends the
+    /// same body again, and a refused precondition whose read failed repeats only the read.
+    MountRenewResult renewUntilDefinitive(const MountRenewOperationEnvironment & environment);
     void release();
 
     MountLeaseRenewerState state() const { return renewer_state; }
@@ -564,8 +579,14 @@ private:
     /// The incarnation every guarded write of this slot names. Engaged for exactly the states that
     /// admit such a write: `start` establishes it and each committed renewal replaces it.
     const Etag & precondition() const;
-    /// One renewal admitted on `plane`; `renew` and `renewForRemount` differ only in which they pass.
-    MountRenewResult renewOn(CasRequests & plane, const MountRenewOperationEnvironment & environment);
+    /// One renewal admitted on `plane`. `renew` and `renewForRemount` pass `until_definitive = false` (bounded by
+    /// the lease); `renewUntilDefinitive` passes `true` (the background renewal's unbounded retry).
+    MountRenewResult renewOn(CasRequests & plane, const MountRenewOperationEnvironment & environment, bool until_definitive);
+    /// Repeats the read of a slot whose precondition was refused until it observes the slot: one spacing
+    /// after the write attempt that started at `write_started_boot_ms`, then `refusal_pause_ms` after each
+    /// refused read. `NotObserved` only when `op` is no longer admitted.
+    Observation readUntilObserved(CasOperation & op, const Retry & policy,
+                                  const MountRenewOperationEnvironment & environment, uint64_t write_started_boot_ms) const;
     Etag claim(CasOperation & op, const String & body);
     [[noreturn]] void throwRenewConflict(const Observation & seen) const;
     MountRenewResult terminalResult(MountRenewResult result);
@@ -591,17 +612,18 @@ private:
     /// The incarnation our last landed write created; every renewal and the farewell name it as the
     /// precondition. Unset only before `start` has landed one.
     std::optional<Etag> last_etag;
+    /// The bytes `last_etag` names. A read that returns them under that token says the slot did not move.
+    String last_body;
     uint64_t confirmed_deadline_boot_ms = 0;
     uint64_t last_committed_attempt_start_boot_ms = 0;
 };
 
 /// Mount-lease-scoped staging sweeper for objects left behind by S3-native staging.
 ///
-/// A leaked S3 staging object happens two ways: (1) an exception between blob publication succeeding and
-/// `cleanupPendingTempFiles` deleting the staging key (`ContentAddressedTransaction.cpp`), or (2) an
-/// aborted/cancelled transaction whose pending blobs were staged but never promoted — by design,
-/// `cleanupPendingTempFiles` deliberately leaves an S3 staging object in place on the abort path (never a
-/// bare `fs::remove` on a remote key), so this sweeper is its ONLY reclaimer. Debris from either case is
+/// A leaked S3 staging object is one whose transaction never ran `cleanupPendingTempFiles` (the process
+/// died, or an exception hit between `sink->finalize()` and `on_finalized` registering the key in
+/// `CaContentWriteBuffer::finalizeImpl`) or whose best-effort delete on commit or abort was lost. While
+/// the member lives, this sweeper is its only reclaimer. Debris from either case is
 /// bounded to `staging/<mount_id>/` — the ONE mount that could ever have written under that prefix, since
 /// every staging key this mount ever mints comes from `ContentAddressedMetadataStorage::stagingKeyPrefix()`
 /// (`physicalKey(pool_prefix + "/staging/" + server_root_id)`), keyed by THIS mount's own `server_root_id`.

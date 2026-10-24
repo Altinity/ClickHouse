@@ -43,6 +43,8 @@ private:
     Int32 current_schema_id;
     Int32 initial_schema_id;
     const DB::KeyDescription * partition_key;
+    /// Which positions in the Avro partition tuple correspond to the kept partition-key columns.
+    std::vector<size_t> partition_key_spec_positions;
     std::optional<DB::KeyCondition> partition_key_condition;
 
     std::unordered_map<Int32, DB::KeyCondition> min_max_key_conditions;

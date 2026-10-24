@@ -34,7 +34,7 @@ different semantics: `PartWriteTxn::ensureBlobPresent` owns `HEAD`, freshness me
 `publishBlob` only moves the selected bytes.
 
 Writer readiness is represented by `BlobDependencyProof`, not by token presence. `Materialized`
-means the writer observed a present non-condemned body or completed publication and metadata
+means the writer observed a present body with a `Clean` marker or completed publication and metadata
 reconciliation. `TrustedManifest` means a durable source manifest proves the blob and requires no
 blob I/O. Pending state and writer tokens are not stored in the dependency record.
 
@@ -133,6 +133,14 @@ battery, skipping the battery used to skip it too, which is exactly why the thir
   retry can outlive the writer's mount lease and obscure whether a conditional operation actually
   committed, so retries on the conditional path must be explicit CAS state-machine transitions, not
   transparent client behavior.
+
+Blob publication is unconditional and does not use that profile, but its object-creating request
+(`PutObject`, `CopyObject`, `CompleteMultipartUpload`) is also sent once. On a store with
+content-derived ETags, a resent body that lands after GC deleted its incarnation brings that ETag
+back, and the pending exact-ETag delete then removes a live body. The request runs on a clone of the
+disk client with the disk's `request_timeout_ms`, no adaptive first-attempt timeouts, and the connect
+timeout capped as for the control plane. `CreateMultipartUpload`, `UploadPart` and `UploadPartCopy`
+keep the disk client's retries.
 
 A third staging check requires `supportsCopyMode(ObjectStorageCopyMode::NativeOnly)` when
 `cas_staging_backend = s3`. Writable mount fails closed when native same-store copy is unavailable; it

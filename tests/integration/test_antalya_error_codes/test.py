@@ -18,6 +18,7 @@ ERRORS = [
     (10004, "PARTITION_EXPORT_FAILED"),
     (10005, "CAS_WRITE_UNATTRIBUTED"),
     (10006, "CAS_DELETE_MARKER"),
+    (10007, "CATALOG_USER_TOKEN_NOT_AVAILABLE"),
 ]
 SETTINGS = {"allow_custom_error_code_in_throwif": 1}
 
@@ -31,7 +32,7 @@ def started_cluster():
         cluster.shutdown()
 
 
-@pytest.mark.parametrize("code", [-1, 1009, 10000, 10007, 2147483647])
+@pytest.mark.parametrize("code", [-1, 1009, 10000, 10008, 2147483647])
 def test_unknown_code_is_not_logged_as_sentinel(code):
     message = f"unknown code {code} must not become sentinel"
     error = origin.query_and_get_error(
@@ -110,7 +111,7 @@ def test_local_observability(code, name):
     assert int(metric.group(1)) > 0
 
 
-@pytest.mark.parametrize("code,name", [ERRORS[0], ERRORS[-1], (10007, "")])
+@pytest.mark.parametrize("code,name", [ERRORS[0], ERRORS[-1], (10008, "")])
 def test_distributed_rethrow(code, name):
     table = f"vendor_error_{code}"
     message = f"Antalya distributed error {code}"

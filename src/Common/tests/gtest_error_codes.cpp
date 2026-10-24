@@ -46,14 +46,14 @@ TEST(ErrorCodes, AntalyaIdentity)
         EXPECT_EQ(DB::ErrorCodes::getErrorCodeByName(entry.name), entry.code);
     }
     EXPECT_EQ(DB::ErrorCodes::getErrorCodeByName("BAD_ARGUMENTS"), DB::ErrorCodes::BAD_ARGUMENTS);
-    for (int code : {-1, 10000, 10007, std::numeric_limits<int>::max()})
+    for (int code : {-1, 10000, 10008, std::numeric_limits<int>::max()})
         EXPECT_TRUE(DB::ErrorCodes::getName(code).empty());
     EXPECT_THROW(DB::ErrorCodes::getErrorCodeByName("NOT_A_REGISTERED_ERROR"), DB::Exception);
 }
 
 TEST(ErrorCodes, ExceptionWireIdentity)
 {
-    for (int code : {10001, 10006, 10007, -1, std::numeric_limits<int>::max()})
+    for (int code : {10001, 10006, 10008, -1, std::numeric_limits<int>::max()})
     {
         auto original = DB::Exception::createDeprecated("wire identity", code);
         DB::WriteBufferFromOwnString output;
@@ -108,7 +108,7 @@ TEST(ErrorCodes, UnknownAccountingDoesNotPolluteAntalya)
     const auto vendor_slot = DB::ErrorCodes::size() - 1;
     const auto before = DB::ErrorCodes::getValue(vendor_slot).get();
     const auto sentinel = DB::ErrorCodes::end() - 1;
-    for (int code : {-1, DB::ErrorCodes::end(), 10000, 10007, std::numeric_limits<int>::max()})
+    for (int code : {-1, DB::ErrorCodes::end(), 10000, 10008, std::numeric_limits<int>::max()})
     {
         const auto count = DB::ErrorCodes::getValue(sentinel).get().local.count;
         const auto index = DB::ErrorCodes::increment(code, false, "unknown", "unknown", {});

@@ -795,6 +795,8 @@ The server successfully detected this situation and will download merged part fr
     M(CASBlobCompareSwapConflict,"Number of CAS blob compare-and-swap conflicts. A non-zero value indicates concurrent update contention.", ValueType::Number) \
     M(CASBlobHead,       "Number of successful backend HEAD requests under CAS blob paths that found an object, aggregated across all callers.", ValueType::Number) \
     M(CASBlobHeadMiss,   "Number of successful backend HEAD requests under CAS blob paths that found no object, aggregated across all callers.", ValueType::Number) \
+    M(CASBlobPublishAttemptFailed, "Number of CAS blob publication attempts that failed with an ambiguous or retryable error. The writer observes the blob again and publishes a fresh envelope, up to the attempt limit.", ValueType::Number) \
+    M(CASBlobPublishGaveUp, "Number of CAS blob publications that ended with an exception after at least one failed attempt, for example at the attempt limit or the deadline.", ValueType::Number) \
     M(CASBlobBodyPutAvoided, "Number of physical CAS blob body publications avoided after a safe presence observation found the object present. Growing values indicate saved upload traffic.", ValueType::Number) \
     M(CASBlobUploadFanoutBatches, "Number of CAS intra-part blob-upload fan-out invocations (one per part publish that had at least one unique blob to upload). Compare with CASBlobUploadFanoutTasks for the average number of unique blobs uploaded per part.", ValueType::Number) \
     M(CASBlobUploadFanoutTasks, "Number of CAS blob-upload tasks dispatched to the fan-out pool (one per unique blob ref across all part publishes). Duplicate references within a part collapse to one task.", ValueType::Number) \
@@ -918,8 +920,8 @@ The server successfully detected this situation and will download merged part fr
     M(CASMetaPut,          "Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates metadata reconciliation or write contention.", ValueType::Number) \
     M(CASMetaCompareSwap,          "Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention.", ValueType::Number) \
     M(CASMetaDelete,       "Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity.", ValueType::Number) \
-    M(CASMetaCreateClean,  "Number of absent-body publication paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation.", ValueType::Number) \
-    M(CASMetaAdoptBackfill, "Number of blob-adoption paths that attempted a missing-metadata Clean backfill. Counts the attempt, not a guaranteed metadata creation.", ValueType::Number) \
+    M(CASMetaCreateClean,  "Number of publications after an absent body or an absent marker that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation.", ValueType::Number) \
+    M(CASMetaAbsentRepublish, "Number of blob publication attempts started because the body was present but its freshness marker was absent; such a body is republished, never adopted. Counts attempts, including ones that fail.", ValueType::Number) \
     M(CASMetaResurrectClean, "Number of condemned-body replacement paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata reset.", ValueType::Number) \
     M(CASGCMetaOps, "Number of per-hash metadata operations executed by CAS GC. Growing values indicate more GC candidates or metadata work.", ValueType::Number) \
     M(CASGCEnumerationPages, "Number of CAS GC LIST pages fetched while enumerating the object universe. Growing values indicate a larger universe or more frequent scans.", ValueType::Number) \
@@ -956,8 +958,8 @@ The server successfully detected this situation and will download merged part fr
     M(CASMountRenewalRetries, "Number of physical conditional renewal PUTs sent after the first attempt of one logical CAS mount-lease renewal.", ValueType::Number) \
     M(CASMountRenewalResolved, "Number of CAS mount-lease renewals whose committed outcome was proved by an exact resolving GET.", ValueType::Number) \
     M(CASMountRenewalRecovered, "Number of logical CAS mount-lease renewals that committed after a physical retry or exact resolving GET.", ValueType::Number) \
-    M(CASMountRenewalDeadlineExceeded, "Number of logical CAS mount-lease renewals stopped by the external lease-safety deadline. Growth means the last confirmed lease no longer had enough safe time for another physical attempt.", ValueType::Number) \
-    M(CASMountLeaseLost, "Counts exactly once per operational CAS mount-lease Live-to-TransientNotLive loss/recovery generation. The initiating external loss or the first ordinary terminal renewal consumer owns the increment, including external lease-safety deadline exhaustion; parked/classification/shutdown paths do not duplicate it.", ValueType::Number) \
+    M(CASMountRenewalDeadlineExceeded, "Number of bounded CAS mount-lease renewals (the startup and remount re-anchors, and the background renewal of a pool opened for decommission) stopped by the external lease-safety deadline. Growth means the last confirmed lease no longer had enough safe time for another physical attempt.", ValueType::Number) \
+    M(CASMountLeaseLost, "Counts exactly once per operational CAS mount-lease Live-to-TransientNotLive loss/recovery generation. The initiating external loss or the first ordinary terminal renewal consumer owns the increment; parked/classification/shutdown paths do not duplicate it.", ValueType::Number) \
     M(CASRemountAttempts, "Number of invocations of the CAS whole-chain remount attempt.", ValueType::Number) \
     M(CASRemountSucceeded, "Number of CAS whole-chain remount attempts that restored Live under a fresh writer epoch.", ValueType::Number) \
     M(CASRemountFailed, "Number of CAS whole-chain remount attempts that returned without restoring Live, including caught step exceptions.", ValueType::Number) \
@@ -981,7 +983,7 @@ The server successfully detected this situation and will download merged part fr
     M(S3CompleteMultipartUpload, "Number of S3 API CompleteMultipartUpload calls.", ValueType::Number) \
     M(S3PutObject, "Number of S3 API PutObject calls.", ValueType::Number) \
     M(S3GetObject, "Number of S3 API GetObject calls.", ValueType::Number) \
-    M(S3SingleAttemptRetryConsultations, "Number of AWS SDK retry consultations refused by the single-attempt S3 retry profile. Non-zero means the SDK attempted a transparent retry on a write that must make exactly one HTTP attempt.", ValueType::Number) \
+    M(S3SingleAttemptRetryConsultations, "Number of AWS SDK retry consultations refused by a single-attempt S3 client: the clone used by the single-attempt retry profile, or the clone that sends the object-creating requests of a write that forbids a resend. Non-zero means a request on such a client failed and was not resent.", ValueType::Number) \
     \
     M(DiskS3DeleteObjects, "Number of DiskS3 API DeleteObject(s) calls.", ValueType::Number) \
     M(DiskS3CopyObject, "Number of DiskS3 API CopyObject calls.", ValueType::Number) \
@@ -1736,6 +1738,10 @@ The server successfully detected this situation and will download merged part fr
     M(ObjectStorageListObjectsCachePrefixMatchHits, "Number of times object storage list objects operation hit the cache using prefix matching.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsVended, "Number of table metadata requests to REST catalog asking to vend storage credentials.", ValueType::Number) \
     M(DataLakeRestCatalogCredentialsCacheHits, "Number of table metadata requests to REST catalog reusing cached storage credentials.", ValueType::Number) \
+    M(DataLakeRestCatalogTokenExchange, "Number of RFC 8693 token exchanges performed to obtain a session token for the querying user.", ValueType::Number) \
+    M(DataLakeRestCatalogTokenExchangeMicroseconds, "Total time of RFC 8693 token exchanges.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogTokenExchangeFailures, "Number of RFC 8693 token exchanges that failed.", ValueType::Number) \
+    M(DataLakeRestCatalogUserTokenCacheHits, "Number of times a previously exchanged per-user session token was reused.", ValueType::Number) \
     \
     M(DataLakeRestCatalogLoadConfig, "Number of 'load config' requests to Iceberg REST catalog.", ValueType::Number) \
     M(DataLakeRestCatalogLoadConfigMicroseconds, "Total time of 'load config' requests to Iceberg REST catalog.", ValueType::Microseconds) \
@@ -1774,6 +1780,10 @@ The server successfully detected this situation and will download merged part fr
     M(DataLakeGlueCatalogUpdateTableMicroseconds, "Total time of 'update table' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
     M(DataLakeGlueCatalogDropTable, "Number of 'drop table' requests to Iceberg Glue catalog.", ValueType::Number) \
     M(DataLakeGlueCatalogDropTableMicroseconds, "Total time of 'drop table' requests to Iceberg Glue catalog.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogAssumeRoleWithWebIdentity, "Number of AWS STS `AssumeRoleWithWebIdentity` calls made to turn a forwarded user token into credentials for the Glue catalog.", ValueType::Number) \
+    M(DataLakeGlueCatalogAssumeRoleWithWebIdentityMicroseconds, "Total time of AWS STS `AssumeRoleWithWebIdentity` calls made for forwarded user tokens.", ValueType::Microseconds) \
+    M(DataLakeGlueCatalogAssumeRoleWithWebIdentityFailures, "Number of AWS STS `AssumeRoleWithWebIdentity` calls that returned no credentials.", ValueType::Number) \
+    M(DataLakeGlueCatalogUserClientCacheHits, "Number of times a Glue client built for a forwarded user token was reused.", ValueType::Number) \
     \
     M(DataLakeUnityCatalogGetTables, "Number of 'get tables' requests to Iceberg Unity catalog.", ValueType::Number) \
     M(DataLakeUnityCatalogGetTablesMicroseconds, "Total time of 'get tables' requests to Iceberg Unity catalog.", ValueType::Microseconds) \

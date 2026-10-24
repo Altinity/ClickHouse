@@ -9,6 +9,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
 #include <Core/UUID.h>
+#include <base/arithmeticOverflow.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
@@ -294,7 +295,7 @@ void emitMountRenewEvent(
         event.type = CasEventType::WatermarkRenew;
         event.outcome = String{outcome};
         event.reason = outcome == "recovered"
-            ? "CAS mount renewal recovered before its confirmed lease-safety deadline"
+            ? "CAS mount renewal committed after a retry or a settling read"
             : "CAS mount renewal ended without retained authority and fenced the mount";
         event.detail = {
             {"server_root_id", *context.server_root_id},
@@ -381,12 +382,13 @@ void deliverMountRenewObservability(
                 LOG_INFO(
                     getLogger("CasMountLeaseRenewer"),
                     "CAS mount renewal '{}' recovered after {} physical attempts in {} ms "
-                    "(classification={}, confirmed_deadline_boot_ms={})",
+                    "(classification={}, confirmed_deadline_boot_ms={}, remaining_confirmed_budget_ms={})",
                     *context.server_root_id,
                     context.attempts_sent,
                     elapsedSince(context.observability_start_boot_ms, now_boot_ms),
                     classification,
-                    context.confirmed_deadline_boot_ms);
+                    context.confirmed_deadline_boot_ms,
+                    remainingConfirmedBudget(context, now_boot_ms));
             }
             catch (...)
             {
@@ -408,12 +410,13 @@ void deliverMountRenewObservability(
                 LOG_WARNING(
                     getLogger("CasMountLeaseRenewer"),
                     "CAS mount renewal '{}' fenced after {} physical attempts in {} ms "
-                    "(classification={}, confirmed_deadline_boot_ms={})",
+                    "(classification={}, confirmed_deadline_boot_ms={}, remaining_confirmed_budget_ms={})",
                     *context.server_root_id,
                     context.attempts_sent,
                     elapsedSince(context.observability_start_boot_ms, now_boot_ms),
                     classification,
-                    context.confirmed_deadline_boot_ms);
+                    context.confirmed_deadline_boot_ms,
+                    remainingConfirmedBudget(context, now_boot_ms));
             }
             catch (...)
             {
@@ -444,10 +447,10 @@ void throwIfOwnerRetired(const OwnerObject & owner, const String & srid)
         return;
 
     throw Exception(ErrorCodes::CORRUPTED_DATA,
-        "CAS server-root '{}' was explicitly decommissioned by an operator (tombstoned at {} ms) "
-        "and is refusing to silently resume — if you genuinely intend to bring this server-root "
-        "back, manually clear the owner object's tombstone field and restart "
-        "(same manual-recovery pattern as an owner anchor lost over existing data)",
+        "CAS server-root '{}' was explicitly decommissioned (owner tombstoned at {} ms by "
+        "SYSTEM CAS DROP POOL MEMBER) and refuses to start again: writer epochs of a retired id must never "
+        "repeat. To run a server on this pool again, configure a new <cas_server_root_id> for this disk and "
+        "keep the local uuid file. Do not clear the tombstone by hand.",
         srid, *owner.retired_at_ms);
 }
 }
@@ -539,17 +542,21 @@ void claimOwnerOrThrow(
             throwIfOwnerRetired(*owner, srid);
             return;
         }
-        /// Mirror mountDoubleStartMessage's operator guidance: the by-far most common cause is a
-        /// REGENERATED local ClickHouse uuid file (wiped /var/lib/clickhouse, a pod rescheduled
-        /// without a persistent volume) while the pool kept the old identity — name it and the
-        /// recovery options instead of a bare refusal.
+        /// The common cause is a regenerated local uuid file (wiped /var/lib/clickhouse, a pod recreated
+        /// without a persistent volume) while the pool kept the old identity; name it and the supported
+        /// ways out, with the hand delete last: it is refused anyway while the subtree holds data.
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS server-root '{}' is owned by a different server (owner server_uuid={}, ours={}) — refusing to claim. "
-            "This usually means THIS server's local uuid file was regenerated (e.g. /var/lib/clickhouse was wiped, "
-            "or the container/pod was recreated without a persistent volume) while the pool kept the old identity. "
-            "Recover by restoring the old local uuid file; or configure a fresh <cas_server_root_id> for this disk; "
-            "or — only after verifying that NO server uses this root — manually delete the owner object '{}' and restart.",
-            srid, u128ToHex(owner->server_uuid), u128ToHex(our_uuid), key);
+            "Either this server's local uuid file was regenerated (/var/lib/clickhouse wiped, or a pod recreated "
+            "without a persistent volume) while the pool kept the old identity, or two servers are configured with "
+            "the same <cas_server_root_id>. Recover by restoring the old uuid file, or by starting this "
+            "server under a new <cas_server_root_id>. To reclaim the old id's data once its owning server is "
+            "permanently gone, decommission it — SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '<disk>' on a "
+            "surviving member (offline: clickhouse-disks cas-drop-member) — once its slot in system.cas_mounts is "
+            "'terminated' or 'fenced'. "
+            "Deleting the owner object '{}' by hand is a last resort, only after verifying that NO server uses this "
+            "root; it is refused while the subtree still holds data.",
+            srid, u128ToHex(owner->server_uuid), u128ToHex(our_uuid), srid, key);
     }
 
     /// Owner absent. Claiming is allowed ONLY over a provably-empty subtree; an absent owner over
@@ -817,10 +824,23 @@ MountClaimResult claimMount(
         return {.kind = MountClaimResult::ForeignOwner, .body = existing, .etag = std::nullopt};
     }
 
-    /// Same uuid + same epoch: it is OUR OWN claim — but a FENCED body is terminal for this
-    /// (uuid, epoch): the GC dropped its ack from the floor when it fenced. Refreshing it in place
-    /// would reactivate a fenced incarnation — a fence permanently consumes this `(server_uuid,
-    /// writer_epoch)` pair, so the caller must re-open with a fresh `writer_epoch`.
+    /// An older allocation that reached the slot late must not replace a newer incarnation of this
+    /// server: recovery seals only epochs below the live one, so a late write of the newer epoch would
+    /// never be sealed out.
+    if (existing.writer_epoch > our_epoch)
+    {
+        emitMountEvent(sink, CasEventType::MountConflict, srid, "newer_epoch", &existing,
+            "same server_uuid, newer writer_epoch in the mount slot — refusing to replace it");
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS mount slot '{}' holds writer_epoch {} of this server_uuid, newer than the writer_epoch {} "
+            "this claim allocated: another start or a decommission of server_root_id '{}' allocated after "
+            "this one. Refusing to replace the newer incarnation ({})",
+            key, existing.writer_epoch, our_epoch, srid, describeMountHolder(existing));
+    }
+
+    /// Our own `(uuid, epoch)` is in the slot, but this call has written nothing: the engine settles a
+    /// sent attempt inside the write itself. Another process was allocated the same epoch, and its body
+    /// is never replaced. A fenced one is terminal for the pair; the caller takes a fresh epoch.
     if (existing.writer_epoch == our_epoch)
     {
         if (existing.gc_fenced)
@@ -830,20 +850,12 @@ MountClaimResult claimMount(
                 "recover with a fresh writer_epoch");
             return {.kind = MountClaimResult::FencedSelf, .body = existing, .etag = std::nullopt};
         }
-        const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
-        if (const std::optional<Observation> raced
-                = conflictOrThrow(op.replace(key, encodeMountLease(body), got->etag, Retry::standard()),
-                                  fmt::format("CAS mount slot refresh of '{}'", key)))
-            /// The mount changed under us between the read and the write, so `got->etag` is KNOWN
-            /// STALE -- that mismatch is exactly why the write was refused. What the write's resolve
-            /// read observed is current, and it is that pair that is reported.
-            return racedDoubleStart(*raced);
-        emitMountEvent(sink, CasEventType::MountClaim, srid, "refresh", &existing,
-            "own claim replayed — refreshed seq + expiry");
-        return {.kind = MountClaimResult::Claimed, .body = body, .etag = std::nullopt};
+        emitMountEvent(sink, CasEventType::MountConflict, srid, "same_epoch_occupied", &existing,
+            "own (uuid, epoch) is already in the mount slot, written by another process — refusing to write");
+        return {.kind = MountClaimResult::LiveDoubleStart, .body = existing, .etag = got->etag};
     }
 
-    /// Same uuid, DIFFERENT epoch: reclaim ONLY on a certificate of death that needs no fresh
+    /// Same uuid, OLDER epoch: reclaim ONLY on a certificate of death that needs no fresh
     /// wall-clock trust — never by comparing `expires_at_ms` against `now_ms`:
     ///   - `gc_fenced` → the fence-out is terminal for that incarnation by construction (its renewer's
     ///     every renewal fails the token guard forever, so it can never write again) — there is no
@@ -918,9 +930,8 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
         " - LIVENESS: this wait judges the holder alive by its write token holding stable on THIS server's\n"
         "   own clock for the full observation threshold; the stamped expires_at_ms above never enters that\n"
         "   judgment on its own -- it is a writer-stamped diagnostic (also shown in system.cas_mounts), not\n"
-        "   an authorization. Every server sharing this pool must run the SAME cas_mount_lease_ttl_ms and\n"
-        "   cas_mount_renew_period_ms: a server configured with a shorter threshold than its peers can fence\n"
-        "   out a healthy one.\n"
+        "   an authorization. The threshold uses the longer of this server's cas_mount_lease_ttl_ms and the\n"
+        "   lease the holder's body declares (expires_at_ms - started_at_ms).\n"
         " - If the local ClickHouse uuid file was regenerated, restore the old uuid file, or remove the stale\n"
         "   owner object gc/server-roots/{}/owner only after verifying no server uses this root.\n"
         " - As a LAST RESORT, after verifying that NO server is writing this root, manually delete the mount\n"
@@ -932,9 +943,22 @@ String mountDoubleStartMessage(const String & srid, const std::optional<MountLea
         srid, identity, srid, srid);
 }
 
-uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms)
+uint64_t declaredMountLeaseMs(const MountLease & m)
 {
-    return ttl_ms + ttl_ms / 20 + cadence_ms;
+    if (m.started_at_ms == 0 || m.expires_at_ms <= m.started_at_ms)
+        return 0;
+    return m.expires_at_ms - m.started_at_ms;
+}
+
+uint64_t mountObservationThresholdMs(uint64_t own_lease_ms, uint64_t declared_lease_ms, uint64_t cadence_ms)
+{
+    const uint64_t lease_ms = std::max(own_lease_ms, declared_lease_ms);
+    uint64_t threshold_ms = 0;
+    /// A wrapped sum would fence early; waiting forever is the safe side.
+    if (common::addOverflow(lease_ms, lease_ms / 20, threshold_ms)
+        || common::addOverflow(threshold_ms, cadence_ms, threshold_ms))
+        return std::numeric_limits<uint64_t>::max();
+    return threshold_ms;
 }
 
 MountClaimResult claimMountAwaitingExpiry(
@@ -949,13 +973,9 @@ MountClaimResult claimMountAwaitingExpiry(
     /// A zero poll interval would spin; a single-ms floor keeps the loop a real (bounded) wait.
     const uint64_t poll = poll_interval_ms == 0 ? 1 : poll_interval_ms;
 
-    /// Rate-bound observation threshold: the full lease TTL, plus a 5% allowance for clock-rate
-    /// mismatch between the holder's and our own local clock, plus one poll interval for observation
-    /// discreteness. It is measured only with OUR OWN clock (`mono_ms_fn`); no cross-node wall-clock
-    /// comparison participates in this loop. `poll` here is half the renewal period (the caller's own
-    /// poll cadence), so this threshold is close to, but not identical to, GC's heartbeat fence-out
-    /// threshold, which passes the full renewal period into the same shared helper.
-    const uint64_t threshold_ms = mountObservationThresholdMs(ttl_ms, poll);
+    /// Set when an observation starts, from the observed body; one token is one body, so the threshold
+    /// of an observation never changes.
+    uint64_t threshold_ms = 0;
 
     std::optional<Etag> observed;
     uint64_t observed_since = 0;
@@ -968,6 +988,13 @@ MountClaimResult claimMountAwaitingExpiry(
             threshold_met ? observed : std::nullopt, sink, /*unsafe_reclaim_authorization=*/{});
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
+        /// Observation certifies only an older epoch dead; a body of our own pair is never replaced,
+        /// so waiting on it could not end.
+        if (r.body && r.body->server_uuid == our_uuid && r.body->writer_epoch == our_epoch)
+            return r;
+        /// A raced write observed a newer epoch of ours; the re-read refuses it with the newer-epoch error.
+        if (r.body && r.body->server_uuid == our_uuid && r.body->writer_epoch > our_epoch)
+            return claimMount(op, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, std::nullopt, sink, {});
 
         /// `claimMount` already read the current body, and a raced write reports whatever its own
         /// resolve read observed. Reuse `r.etag` whenever it is set instead of re-reading the SAME key
@@ -1005,7 +1032,10 @@ MountClaimResult claimMountAwaitingExpiry(
                 return r;
             observed = *current_etag;
             observed_since = mono_ms_fn();
-            if (on_wait_start && r.body)
+            if (!r.body)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount '{}': observed a mount token without its body", srid);
+            threshold_ms = mountObservationThresholdMs(ttl_ms, declaredMountLeaseMs(*r.body), poll);
+            if (on_wait_start)
                 on_wait_start(*r.body, threshold_ms);
             LOG_INFO(getLogger("CasMountLease"),
                 "Attempting to mount content-addressed server root {} after node change or hard "
@@ -1017,11 +1047,37 @@ MountClaimResult claimMountAwaitingExpiry(
     }
 }
 
+bool MountIncarnationObservation::heldFor(uint64_t threshold_ms, uint64_t sample_ms) const
+{
+    return sample_ms >= first_seen_mono_ms && sample_ms - first_seen_mono_ms >= threshold_ms;
+}
+
+namespace
+{
+/// The setting is local, so different values are legal; a longer one slows recovery after its holder's
+/// crash, which the operator should know about.
+void warnOnceIfHolderLeaseDiffers(
+    const String & srid, const MountLease & holder, uint64_t observer_lease_ms, std::set<String> & warned)
+{
+    const uint64_t declared_ms = declaredMountLeaseMs(holder);
+    if (declared_ms == 0 || declared_ms == observer_lease_ms || !warned.insert(srid).second)
+        return;
+    LOG_WARNING(getLogger("CasHeartbeatFloor"),
+        "This server is configured with cas_mount_lease_ttl_ms={} but the holder of slot {} (hostname={}, pid={}) "
+        "declares a lease of {} ms. Observers wait for the longer of the two; a longer lease on one server "
+        "delays recovery after that server's crash.",
+        observer_lease_ms, srid, holder.hostname, holder.pid, declared_ms);
+}
+}
+
 HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64_t now_ms,
-                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
-                                     MountObservationMap & obs)
+                                     const std::function<uint64_t()> & mono_ms_fn,
+                                     uint64_t observer_lease_ms, uint64_t cadence_ms, MountObservationMap & obs,
+                                     std::set<String> & lease_mismatch_warned)
 {
     HeartbeatFloor floor;
+    /// Taken before any read: it can confirm that a token held, never date a sighting.
+    const uint64_t round_start_ms = mono_ms_fn();
 
     /// `obs` is keyed by every srid this leader has EVER observed, but a
     /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CAS
@@ -1052,6 +1108,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
         /// holder's own renewal installed, and the observation check below then sees the new
         /// incarnation and restarts the window -- which counts the slot `live` and declines the write.
         /// That is why no arm that counts a slot ever also asks for a fence-out body.
+        uint64_t threshold_ms = 0;
         WriteResult fenced_out = op.readModifyWrite(key,
             [&](const std::optional<Object> & observed) -> std::optional<String>
             {
@@ -1076,6 +1133,9 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                     return std::nullopt;
                 }
 
+                warnOnceIfHolderLeaseDiffers(srid, m, observer_lease_ms, lease_mismatch_warned);
+                threshold_ms = mountObservationThresholdMs(observer_lease_ms, declaredMountLeaseMs(m), cadence_ms);
+
                 /// Observation-based liveness: stable ONLY if the SAME incarnation was already being
                 /// watched and has now held for the full threshold on our OWN monotonic clock. Anything
                 /// else — no prior observation, or a changed incarnation (a live renewal, including one
@@ -1083,12 +1143,13 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 /// counts as `live` this call.
                 const auto it = obs.find(srid);
                 const bool stable = it != obs.end() && it->second.etag == observed->etag
-                    && mono_now_ms - it->second.first_seen_mono_ms >= stable_threshold_ms;
+                    && it->second.heldFor(threshold_ms, round_start_ms);
 
                 if (!stable)
                 {
+                    /// A sample from before this read would count the walk to the slot as time watched.
                     if (it == obs.end() || it->second.etag != observed->etag)
-                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_now_ms});
+                        obs.insert_or_assign(srid, MountIncarnationObservation{observed->etag, mono_ms_fn()});
                     ++floor.live;
                     return std::nullopt;
                 }
@@ -1111,7 +1172,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                 "CAS GC fenced out mount lease for content-addressed server root {} at "
                 "wall-clock ms {}: its write incarnation held unchanged for >= {} ms on the GC "
                 "leader's own monotonic clock (token-stability observation)",
-                srid, now_ms, stable_threshold_ms);
+                srid, now_ms, threshold_ms);
             return true;
         }
         /// Declined: the decision above already classified and counted this slot, and asked for no
@@ -1122,9 +1183,10 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
         return true;
     }, Retry::standard());
 
-    /// Prune every `obs` entry for a srid this pass's walk never saw at all.
+    /// Prune every `obs` and `lease_mismatch_warned` entry for a srid this pass's walk never saw at all.
     for (auto it = obs.begin(); it != obs.end(); )
         it = seen_srids.contains(it->first) ? std::next(it) : obs.erase(it);
+    std::erase_if(lease_mismatch_warned, [&](const String & s) { return !seen_srids.contains(s); });
 
     return floor;
 }
@@ -1454,6 +1516,7 @@ uint64_t MountLeaseRenewer::start(Liveness liveness)
 
     seq = 1;
     last_etag = etag;
+    last_body = body;
     last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
     const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
     confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
@@ -1560,16 +1623,49 @@ MountRenewResult MountLeaseRenewer::terminalResult(MountRenewResult result)
 
 MountRenewResult MountLeaseRenewer::renew(const MountRenewOperationEnvironment & environment)
 {
-    return renewOn(mount_requests, environment);
+    return renewOn(mount_requests, environment, /*until_definitive=*/false);
 }
 
 MountRenewResult MountLeaseRenewer::renewForRemount(const MountRenewOperationEnvironment & environment)
 {
-    return renewOn(open_requests, environment);
+    return renewOn(open_requests, environment, /*until_definitive=*/false);
+}
+
+MountRenewResult MountLeaseRenewer::renewUntilDefinitive(const MountRenewOperationEnvironment & environment)
+{
+    return renewOn(open_requests, environment, /*until_definitive=*/true);
+}
+
+Observation MountLeaseRenewer::readUntilObserved(
+    CasOperation & op, const Retry & policy, const MountRenewOperationEnvironment & environment,
+    uint64_t write_started_boot_ms) const
+{
+    const auto boot_clock = environment.boot_ms ? environment.boot_ms : boot_ms_fn;
+    uint64_t pause_ms = Retry::pauseAfterAttempt(*policy.attempt_spacing_ms, write_started_boot_ms, boot_clock());
+    while (op.admitted())
+    {
+        op.pause(pause_ms);
+        try
+        {
+            std::optional<Object> got = op.read(key, policy);
+            if (!got)
+                return ProvenAbsent{};
+            return std::move(*got);
+        }
+        catch (const Exception & e)
+        {
+            if (isDeterministicLocalFailure(e.code()))
+                throw;
+            /// Without a deadline the read repeats a transport fault itself, so what reaches here is
+            /// the store's refusal or a stop, which `op.admitted` tells apart.
+            pause_ms = environment.refusal_pause_ms;
+        }
+    }
+    return NotObserved{};
 }
 
 MountRenewResult MountLeaseRenewer::renewOn(
-    CasRequests & plane, const MountRenewOperationEnvironment & environment)
+    CasRequests & plane, const MountRenewOperationEnvironment & environment, bool until_definitive)
 {
     const MountRenewObservabilityRegistration observability_registration = beginMountRenewObservabilityCall();
     const MountRenewObservabilityCallGuard observability_guard(observability_registration);
@@ -1582,10 +1678,11 @@ MountRenewResult MountLeaseRenewer::renewOn(
             static_cast<uint32_t>(renewer_state));
 
     const auto boot_clock = environment.boot_ms ? environment.boot_ms : boot_ms_fn;
-    /// Sampled BEFORE the write. A refused admission is reported as "never attempted" only when this
-    /// node had already been asked to stop, and reading the flag afterwards could not tell that apart
-    /// from a flag the refusal itself set.
-    const bool cancelled = environment.cancelled && environment.cancelled();
+    /// Sampled BEFORE each engine call. A refused admission is reported as "never attempted" only when
+    /// this node had already been asked to stop, and reading the flag afterwards could not tell that
+    /// apart from a flag the refusal itself set.
+    const auto sample_cancelled = [&] { return environment.cancelled && environment.cancelled(); };
+    bool cancelled = sample_cancelled();
 
     const uint64_t wall_ms = now_ms_fn();
     const uint64_t attempt_start_boot_ms = boot_clock();
@@ -1609,17 +1706,70 @@ MountRenewResult MountLeaseRenewer::renewOn(
     result.attempt_start_boot_ms = attempt_start_boot_ms;
 
     CasOperation op = plane.admit(environment.live);
+    /// Counted here rather than taken from one engine call: the background renewal may span several.
+    uint32_t attempts_sent = 0;
+    uint64_t last_attempt_start_boot_ms = attempt_start_boot_ms;
+    op.observeRequests(RequestObserver{
+        .on_write_attempt = [&](uint32_t)
+        {
+            ++attempts_sent;
+            last_attempt_start_boot_ms = boot_clock();
+            if (environment.requests.on_write_attempt)
+                environment.requests.on_write_attempt(attempts_sent);
+        },
+        .on_failure = environment.requests.on_failure,
+    });
+    const Etag expected = precondition();
+    const Retry policy = until_definitive
+        ? Retry::untilDefinitive()
+        : Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count()));
     std::optional<WriteResult> written;
     try
     {
-        written = op.replace(key, body, precondition(),
-            Retry::untilLeaseSafe(confirmed_deadline_boot_ms, static_cast<uint64_t>(lease_safety_margin.count())));
+        written = op.replace(key, body, expected, policy);
+        while (until_definitive)
+        {
+            uint64_t pause_ms = 0;
+            if (std::holds_alternative<Refused>(*written))
+            {
+                /// `writeLoop` refuses only when no attempt of the call is unclear, so no copy of ours
+                /// can land behind a new call with the same tuple.
+                pause_ms = environment.refusal_pause_ms;
+            }
+            else if (Conflict * conflict = std::get_if<Conflict>(&*written))
+            {
+                if (std::holds_alternative<NotObserved>(conflict->seen))
+                    conflict->seen = readUntilObserved(op, policy, environment, last_attempt_start_boot_ms);
+                if (std::holds_alternative<NotObserved>(conflict->seen))
+                {
+                    /// Counted as sent: the refused precondition says the slot may have moved, so a farewell
+                    /// naming our last token could meet a holder entitled to it.
+                    written = GaveUp{GaveUp::Why::FenceLost, GaveUp::Source::Policy, /*sent_any=*/true, NotObserved{}, attempts_sent};
+                    break;
+                }
+                /// Our last confirmed body under the token we named: the slot did not move. A new call is
+                /// safe because a call with an unclear attempt returns `Conflict` only once the token
+                /// moved, so this call left no copy of ours that could land.
+                const Object * seen = std::get_if<Object>(&conflict->seen);
+                if (!seen || seen->etag != expected || seen->bytes != last_body)
+                    break;
+                pause_ms = Retry::pauseAfterAttempt(*policy.attempt_spacing_ms, last_attempt_start_boot_ms, boot_clock());
+            }
+            else
+            {
+                break;
+            }
+            op.pause(pause_ms);
+            cancelled = sample_cancelled();
+            written = op.replace(key, body, expected, policy);
+        }
     }
     catch (...)
     {
         /// The engine surfaces a deterministic local failure unchanged rather than reissuing it.
         markMountRenewTermination(MountRenewTerminalClassification::DeterministicFailure);
         result.failure = std::current_exception();
+        result.attempts_sent = attempts_sent;
         return terminalResult(std::move(result));
     }
 
@@ -1627,22 +1777,23 @@ MountRenewResult MountLeaseRenewer::renewOn(
     {
         seq = next_seq;
         last_etag = std::move(committed->etag);
+        last_body = body;
         last_committed_attempt_start_boot_ms = attempt_start_boot_ms;
         const uint64_t ttl_ms = static_cast<uint64_t>(ttl.count());
         confirmed_deadline_boot_ms = attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
             ? std::numeric_limits<uint64_t>::max()
             : attempt_start_boot_ms + ttl_ms;
         result.outcome = MountRenewOutcome::Committed;
-        result.attempts_sent = committed->attempts_sent;
+        result.attempts_sent = attempts_sent;
         result.resolved_by_read = committed->resolved_by_read;
-        result.sent_any = committed->attempts_sent != 0;
+        result.sent_any = attempts_sent != 0;
         return result;
     }
 
     if (const Conflict * conflict = std::get_if<Conflict>(&*written))
     {
         result.sent_any = true;
-        result.attempts_sent = conflict->attempts_sent;
+        result.attempts_sent = attempts_sent;
         try
         {
             throwRenewConflict(conflict->seen);
@@ -1657,7 +1808,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
     if (const Refused * refused = std::get_if<Refused>(&*written))
     {
         result.sent_any = true;
-        result.attempts_sent = refused->attempts_sent;
+        result.attempts_sent = attempts_sent;
         markMountRenewTermination(MountRenewTerminalClassification::DeterministicFailure);
         result.failure = std::make_exception_ptr(Exception(
             refused->store_error,
@@ -1667,13 +1818,15 @@ MountRenewResult MountLeaseRenewer::renewOn(
 
     if (const GaveUp * gave_up = std::get_if<GaveUp>(&*written))
     {
-        result.sent_any = gave_up->sent_any;
-        result.attempts_sent = gave_up->attempts_sent;
+        /// Across every engine call of this renewal, not only the call that gave up.
+        result.sent_any = attempts_sent != 0;
+        result.attempts_sent = attempts_sent;
         if (gave_up->why == GaveUp::Why::Deadline)
             result.deadline_source = gave_up->deadline_source;
 
-        /// Nothing was sent and the node was already stopping: the lease is exactly as it was, so this
-        /// is a renewal that never ran, not one that lost its authority.
+        /// The call that gave up sent nothing, every earlier call of a series ended in a refusal or in a
+        /// read that found the slot as our last commit left it, and the node was already stopping: the
+        /// renewal never ran and the farewell may still hand the slot back.
         if (gave_up->why == GaveUp::Why::FenceLost && !gave_up->sent_any && cancelled)
         {
             markMountRenewTermination(MountRenewTerminalClassification::Cancelled);
@@ -1685,7 +1838,8 @@ MountRenewResult MountLeaseRenewer::renewOn(
         switch (gave_up->why)
         {
             case GaveUp::Why::FenceLost:
-                classification = cancelled
+                /// Sampled again: a stop that arrived during the call still names why it ended.
+                classification = sample_cancelled()
                     ? MountRenewTerminalClassification::Cancelled
                     : MountRenewTerminalClassification::FenceOrLifecycleLost;
                 break;
@@ -1704,7 +1858,7 @@ MountRenewResult MountLeaseRenewer::renewOn(
             "observation: {})",
             key,
             terminalClassificationName(classification),
-            gave_up->sent_any ? "at least one" : "no",
+            result.sent_any ? "at least one" : "no",
             detail::renderObservation(gave_up->last_seen)));
         return terminalResult(std::move(result));
     }
@@ -1762,6 +1916,7 @@ void MountLeaseRenewer::terminate(CasOperation & op)
     {
         seq += 1;
         last_etag = std::move(committed->etag);
+        last_body = body;
         emitMountEvent(
             event_sink, CasEventType::MountRelease, srid, "farewell", nullptr,
             "graceful release -- lease stamped already-expired and watermark retired");
