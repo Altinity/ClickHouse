@@ -8,14 +8,25 @@ doc_type: 'guide'
 
 # Token-based authentication {#token-based-authentication}
 
-ClickHouse can authenticate users with access tokens issued by an Identity Provider (IdP): JWTs or opaque OAuth 2.0 tokens. Clients pass the token with `clickhouse-client --jwt <token>` or the HTTP header `Authorization: Bearer <token>`.
+ClickHouse can authenticate users with access tokens issued by an external Identity Provider (IdP). Clients pass the token with `clickhouse-client --jwt <token>` or the HTTP header `Authorization: Bearer <token>`.
 
 A token can authenticate:
 
 - a user defined in ClickHouse with the `jwt` authentication method — see [Users defined in ClickHouse](#enabling-jwt-auth);
 - a user that is not defined in ClickHouse at all, when the IdP is configured as an [external user directory](#idp-external-user-directory). Such users are created on first login.
 
-In both cases the token is validated by a **token processor**.
+In both cases the token is validated by a **token processor** defined in `config.xml`.
+
+## Glossary {#glossary}
+
+- **Identity Provider (IdP)** — An external service that authenticates users and issues tokens: Keycloak, Okta, Microsoft Entra ID, Google, and others.
+- **Access token** — A string the client presents to ClickHouse as proof of the user's identity. It is either a JWT or an opaque token, depending on the provider.
+- **JWT (JSON Web Token)** — A signed token that carries data about the user. ClickHouse can verify it locally, without contacting the IdP.
+- **Opaque token** — A token that is just a random string. Only the IdP can tell whether it is valid and whom it belongs to.
+- **Claim** — A field in a JWT, or in the IdP's response about a token. Some of them are provider-specific, some are standard, e.g. `sub` is the user ID, `iss` (*issuer*) is the IdP that issued the token, `aud` (*audience*) is the application it was issued for and `exp` is its expiration time.
+- **JWKS (JSON Web Key Set)** — The set of public keys that verify a JWT's signature, usually published by the IdP at a pre-defined URL.
+- **Group** — A group (entity) the user belongs to at the IdP. ClickHouse can map groups to its own roles.
+- **Token processor** — A bridge between ClickHouse and an IdP. It validates a token, either locally or by asking the IdP, and passes the user name and groups from the token to ClickHouse.
 
 ## Token processors {#token-processors}
 
@@ -32,9 +43,9 @@ Token processors are defined in the `token_processors` section of `config.xml`; 
 </clickhouse>
 ```
 
-Token authentication is enabled by default. Set `<enable_token_auth>0</enable_token_auth>` in `config.xml` to disable it: token processors are then not parsed, the `token` user directory is unavailable, and all token logins are rejected.
+Token authentication is enabled by default. Set `<enable_token_auth>0</enable_token_auth>` in `config.xml` to disable it system-wide: token processors are then not parsed, the `token` user directory is unavailable, and all token-based logins are rejected.
 
-Parameters common to all processors:
+Parameters common to all token processors:
 
 - `type` — Processor type, case-insensitive. Mandatory. One of:
   - `jwt_static_key`, `jwt_static_jwks`, `jwt_dynamic_jwks` — validate a JWT locally ([JWT processors](#jwt));
@@ -48,7 +59,7 @@ Parameters common to all processors:
 Parameters that do not apply to the configured `type` are ignored.
 
 :::tip
-If the IdP issues JWT access tokens ([RFC 9068](https://datatracker.ietf.org/doc/html/rfc9068)), use `jwt_dynamic_jwks`: tokens are verified locally, without a request to the IdP. `google` and `openid` are for opaque tokens, or for when you want the IdP itself to confirm each token.
+If the IdP issues JWT access tokens ([RFC 9068](https://datatracker.ietf.org/doc/html/rfc9068)), use `jwt_dynamic_jwks`: tokens are verified locally, without a request to the IdP. `openid` is a good fit for opaque tokens, or for when you want the IdP itself to confirm each token.
 :::
 
 ### JWT processors {#jwt}
@@ -215,7 +226,13 @@ Introspection needs a separate confidential OAuth client representing ClickHouse
 
 ## Users defined in ClickHouse {#enabling-jwt-auth}
 
-A user can authenticate with a token if `jwt` is one of its authentication methods. In `users.xml`, where a user has exactly one authentication method, the `jwt` section replaces `password`.
+A user can authenticate with a token if `jwt` is one of its authentication methods. 
+
+:::tip
+Locally-defined users are only _authenticated_ with tokens; no role mapping is done.
+:::
+
+In `users.xml`, where a user has exactly one authentication method, the `jwt` section replaces `password`.
 
 ```sql
 CREATE USER alice IDENTIFIED WITH jwt PROCESSOR 'my_processor' CLAIMS '{"resource_access":{"account":{"roles":["view-profile"]}}}';
@@ -272,6 +289,7 @@ Only one `token` section is allowed.
 - `processor` — Name of the token processor. Mandatory.
 - `common_roles` — Roles granted to every user from this directory.
 - `default_profile` — Settings profile assigned to every user from this directory. If the profile does not exist, users are created without it.
+- `profiles_mapping` — Settings profiles assigned by group; see [Settings profiles](#idp-settings-profiles).
 - `networks` — Addresses that users from this directory may connect from, in the same format as [`networks`](/concepts/features/configuration/settings/settings-users#user-namenetworks) in `users.xml`. Default: any address.
 
 The user's groups (from `groups_claim`) are turned into role names by three optional steps, applied in this order:
@@ -284,28 +302,35 @@ The user is granted every resulting role that exists in ClickHouse.
 
 ### Settings profiles {#idp-settings-profiles}
 
-To give different settings to different groups of users, for example to users connecting from Grafana, attach a settings profile to a role and grant the role through the group mapping:
+To give different settings to different groups of users, for example to users connecting from Grafana, map groups to settings profiles with `profiles_mapping`:
 
 ```sql
 CREATE SETTINGS PROFILE grafana_profile SETTINGS max_execution_time = 60, readonly = 1;
-CREATE ROLE grafana_users SETTINGS PROFILE 'grafana_profile';
 ```
 
 ```xml
 <token>
     <processor>my_processor</processor>
-    <roles_mapping>
+    <default_profile>token_users_profile</default_profile>
+    <profiles_mapping>
         <map>
             <from>grafana-viewers</from>
-            <to>grafana_users</to>
+            <to>grafana_profile</to>
         </map>
-    </roles_mapping>
+    </profiles_mapping>
 </token>
 ```
 
-Users with the `grafana-viewers` group get the `grafana_users` role and the settings of `grafana_profile`. This works for roles from `common_roles`, `roles_filter` and `roles_transform` as well.
+Users with the `grafana-viewers` group get `grafana_profile` in addition to `default_profile`. `from` is the group exactly as it comes in the token: `roles_mapping`, `roles_filter` and `roles_transform` do not apply. Profiles are reassigned on every login, so a user who leaves a group loses its profile.
 
-If a setting is defined in several places, `default_profile` overrides role profiles, which override the server's [default profile](/reference/settings/server-settings/settings/default#default_profile). Keep the settings that differ per group out of `default_profile`.
+If a setting is defined in several places, the first source in this list wins:
+
+1. Profiles from `profiles_mapping`. When the user is in several mapped groups, the entry that comes later in `profiles_mapping` wins.
+2. `default_profile`.
+3. Profiles of the user's roles. A profile can be attached to a role with `CREATE ROLE ... SETTINGS PROFILE '...'`; when several roles set the same setting, which one wins is undefined.
+4. The server's [default profile](/reference/settings/server-settings/settings/default#default_profile).
+
+In distributed queries, the resulting settings are sent to the other nodes with the query, so the profiles only need to exist on the node the user connects to.
 
 ## Forwarding the token to external services {#token-forwarding}
 
