@@ -1,0 +1,31 @@
+<clickhouse>
+    <token_processors>
+        <hs256_groups>
+            <type>jwt_static_key</type>
+            <algo>HS256</algo>
+            <static_key>profiles_mapping_test_secret</static_key>
+            <static_key_in_base64>false</static_key_in_base64>
+            <allow_no_expiration>true</allow_no_expiration>
+        </hs256_groups>
+    </token_processors>
+
+    <user_directories>
+        <token>
+            <processor>hs256_groups</processor>
+            <common_roles>
+                <r_common />
+            </common_roles>
+            <default_profile>p_default</default_profile>
+            <profiles_mapping>
+                <map>
+                    <from>g_analysts</from>
+                    <to>p_analysts</to>
+                </map>
+                <map>
+                    <from>g_fast</from>
+                    <to>p_fast</to>
+                </map>
+            </profiles_mapping>
+        </token>
+    </user_directories>
+</clickhouse>
