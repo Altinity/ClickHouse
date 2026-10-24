@@ -45,6 +45,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"azure_validate_etag_on_read", false, true, "New setting to detect concurrent in-place overwrites of Azure blobs during a read by pinning every `GET` to the listed `ETag` with `If-Match` and validating the `ETag` of the response, like `s3_validate_etag_on_read` does for S3. `compatibility` with versions before 26.10 restores the previous behavior (no validation)."},
         });
+        addSettingsChanges(settings_changes_history, "26.8.27.20001.altinityantalya",
+        {
+            {"input_format_parquet_footer_read_size", 65536, 0, "New setting to override the adaptive Parquet footer initial read size with a fixed number of bytes; 0 keeps the adaptive behavior. Before this setting the reader always read a fixed 64 KiB tail. `compatibility` with 26.8 restores that fixed read."},
+        });
         addSettingsChanges(settings_changes_history, "26.8",
         {
             {"use_aggregation_memory_tracker", false, false, "New setting. In this release it is disabled by default, which restores the two-level conversion of `GROUP BY` from before 26.7 (https://github.com/ClickHouse/ClickHouse/pull/107490)."},
