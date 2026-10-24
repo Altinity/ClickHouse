@@ -1746,25 +1746,40 @@ void TCPHandler::processTablesStatusRequest()
     }
 
     TablesStatusResponse response;
-    for (const QualifiedTableName & table_name: request.tables)
+    try
     {
-        auto resolved_id = context_to_resolve_table_names->tryResolveStorageID({table_name.database, table_name.table});
-        StoragePtr table = DatabaseCatalog::instance().tryGetTable(resolved_id, context_to_resolve_table_names);
-        if (!table)
-            continue;
-
-        TableStatus status;
-        /// The initiator asks about this table by name, so a lazily loaded replica is loaded to report its delay.
-        if (auto * replicated_table = castStorage<StorageReplicatedMergeTree>(table, DeferredTable::Load).get())
+        for (const QualifiedTableName & table_name: request.tables)
         {
-            status.is_replicated = true;
-            status.absolute_delay = static_cast<UInt32>(replicated_table->getAbsoluteDelay());
-            status.is_readonly = replicated_table->isTableReadOnly();
-        }
-        else
-            status.is_replicated = false;
+            auto resolved_id = context_to_resolve_table_names->tryResolveStorageID({table_name.database, table_name.table});
+            StoragePtr table = DatabaseCatalog::instance().tryGetTable(resolved_id, context_to_resolve_table_names);
+            if (!table)
+                continue;
 
-        response.table_states_by_id.emplace(table_name, std::move(status));
+            TableStatus status;
+            /// The initiator asks about this table by name, so a lazily loaded replica is loaded to report its delay.
+            if (auto * replicated_table = castStorage<StorageReplicatedMergeTree>(table, DeferredTable::Load).get())
+            {
+                status.is_replicated = true;
+                status.absolute_delay = static_cast<UInt32>(replicated_table->getAbsoluteDelay());
+                status.is_readonly = replicated_table->isTableReadOnly();
+            }
+            else
+                status.is_replicated = false;
+
+            response.table_states_by_id.emplace(table_name, std::move(status));
+        }
+    }
+    catch (const Exception & e)
+    {
+        /// Before the first query is authenticated with the interserver secret, the connection is closed on any exception.
+        if (is_interserver_mode && !is_interserver_authenticated)
+            throw;
+
+        /// The request is read completely and nothing is written yet, so the exception can be sent
+        /// to the client (it expects either `TablesStatusResponse` or `Exception`) and the connection kept.
+        tryLogCurrentException(log, "Cannot get status of tables");
+        sendException(e, send_exception_with_stack_trace);
+        return;
     }
 
     writeVarUInt(Protocol::Server::TablesStatusResponse, *out);

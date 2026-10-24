@@ -164,6 +164,7 @@ ManifestFilesPruner::ManifestFilesPruner(
     if (manifest_file.hasPartitionKey())
     {
         partition_key = &manifest_file.getPartitionKeyDescription();
+        partition_key_spec_positions = manifest_file.getPartitionKeySpecPositions();
         ActionsDAGWithInversionPushDown inverted_dag(transformed_dag->getOutputs().front(), context, /* boolean_context */ true);
         partition_key_condition.emplace(
             inverted_dag, context, partition_key->column_names, partition_key->expression, true /* single_point */);
@@ -408,7 +409,16 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
 
     if (partition_key_condition.has_value())
     {
-        Row wrapped_partition_value = partition_value;
+        /// Project: the Avro tuple has one entry per spec field, but the key only contains the
+        /// fields at the positions recorded in `partition_key_spec_positions`.  Pick exactly those.
+        Row wrapped_partition_value;
+        wrapped_partition_value.reserve(partition_key_spec_positions.size());
+        for (size_t pos : partition_key_spec_positions)
+        {
+            if (pos >= partition_value.size())
+                return PruningReturnStatus::NOT_PRUNED; /// fail closed — cannot prune without the value
+            wrapped_partition_value.push_back(partition_value[pos]);
+        }
         wrapIntegerPartitionValuesAsDateTime64(wrapped_partition_value, partition_key->data_types);
 
         std::vector<FieldRef> index_value(wrapped_partition_value.begin(), wrapped_partition_value.end());
@@ -426,7 +436,7 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         }
 
         bool can_be_true = partition_key_condition->mayBeTrueInRange(
-            partition_value.size(), index_value.data(), index_value.data(), partition_key->data_types);
+            index_value.size(), index_value.data(), index_value.data(), partition_key->data_types);
 
         if (!can_be_true)
         {
@@ -452,7 +462,7 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         {
             for (const auto & partition_field : *entry->common_partition_specification)
             {
-                if (partition_field.source_id != column_id || partition_field.tuple_index < 0
+                if (partition_field.isMultiArg() || partition_field.source_ids[0] != column_id || partition_field.tuple_index < 0
                     || static_cast<size_t>(partition_field.tuple_index) >= partition_value.size())
                     continue;
 

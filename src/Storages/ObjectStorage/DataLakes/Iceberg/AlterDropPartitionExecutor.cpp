@@ -133,7 +133,7 @@ std::vector<size_t> mapTargetFieldsToSpecPositions(
     {
         for (size_t j = 0; j < entry_spec.size(); ++j)
         {
-            if (entry_spec[j].source_id == signature[i].column_id
+            if (!entry_spec[j].isMultiArg() && entry_spec[j].source_ids[0] == signature[i].column_id
                 && Poco::toLower(entry_spec[j].transform_name) == signature[i].transform)
             {
                 positions[i] = j;
@@ -936,7 +936,8 @@ bool AlterDropPartitionExecutor::commitMetadataJSON(
     /// Assume readers can reach the snapshot until the catalog says it rejected the commit.
     published = true;
     if (!catalog->updateMetadata(
-            namespace_name, table_name, components.path_resolver.resolveForCatalog(metadata_info.path), manifest_list_result.new_snapshot))
+            namespace_name, table_name, components.path_resolver.resolveForCatalog(metadata_info.path), manifest_list_result.new_snapshot,
+            context->getForwardedAuthToken()))
     {
         if (!catalogCommittedSnapshot(new_snapshot_id))
         {
