@@ -30,6 +30,7 @@
 #include <Databases/DatabaseFactory.h>
 #include <Databases/DataLake/UnityCatalog.h>
 #include <Databases/DataLake/RestCatalog.h>
+#include <Databases/DataLake/UnityV2Catalog.h>
 #include <Databases/DataLake/GlueCatalog.h>
 #include <Databases/DataLake/PaimonRestCatalog.h>
 #if USE_AWS_S3 && USE_SSL
@@ -71,6 +72,7 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsDatabaseDataLakeCatalogType catalog_type;
     extern const DatabaseDataLakeSettingsString warehouse;
     extern const DatabaseDataLakeSettingsString catalog_credential;
+    extern const DatabaseDataLakeSettingsBool use_unity_catalog_v2;
     extern const DatabaseDataLakeSettingsString auth_header;
     extern const DatabaseDataLakeSettingsString auth_scope;
     extern const DatabaseDataLakeSettingsString storage_endpoint;
@@ -78,6 +80,12 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsS3UriStyle storage_uri_style;
     extern const DatabaseDataLakeSettingsString oauth_server_uri;
     extern const DatabaseDataLakeSettingsBool oauth_server_use_request_body;
+    extern const DatabaseDataLakeSettingsBool oauth_forward_user_token;
+    extern const DatabaseDataLakeSettingsString oauth_token_exchange_uri;
+    extern const DatabaseDataLakeSettingsString oauth_subject_token_type;
+    extern const DatabaseDataLakeSettingsString oauth_requested_token_type;
+    extern const DatabaseDataLakeSettingsBool oauth_forward_actor_token;
+    extern const DatabaseDataLakeSettingsUInt64 oauth_user_token_cache_ttl;
     extern const DatabaseDataLakeSettingsBool vended_credentials;
     extern const DatabaseDataLakeSettingsUInt64 vended_credentials_cache_ttl;
     extern const DatabaseDataLakeSettingsString object_storage_cluster;
@@ -87,6 +95,7 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString aws_role_arn;
     extern const DatabaseDataLakeSettingsString aws_role_session_name;
     extern const DatabaseDataLakeSettingsString aws_external_id;
+    extern const DatabaseDataLakeSettingsString aws_sts_endpoint;
     extern const DatabaseDataLakeSettingsString onelake_tenant_id;
     extern const DatabaseDataLakeSettingsString onelake_client_id;
     extern const DatabaseDataLakeSettingsString onelake_client_secret;
@@ -105,6 +114,7 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString google_adc_quota_project_id;
     extern const DatabaseDataLakeSettingsString google_adc_credentials_file;
     extern const DatabaseDataLakeSettingsBool force_add_bucket;
+    extern const DatabaseDataLakeSettingsBool flat_namespaces;
 }
 
 namespace Setting
@@ -257,6 +267,105 @@ void DatabaseDataLake::validateSettings()
             ErrorCodes::BAD_ARGUMENTS, "`warehouse` setting cannot be empty. "
             "Please specify 'SETTINGS warehouse=<warehouse_name>' in the CREATE DATABASE query");
     }
+
+    validateTokenForwardingSettings();
+}
+
+void DatabaseDataLake::validateTokenForwardingSettings() const
+{
+    const auto settings_version = database_settings.get();
+    const DatabaseDataLakeSettings & settings = *settings_version;
+
+    if (!settings[DatabaseDataLakeSetting::oauth_forward_user_token].value)
+    {
+        if (settings[DatabaseDataLakeSetting::oauth_forward_actor_token].value)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "`oauth_forward_actor_token` requires `oauth_forward_user_token = 1`");
+        return;
+    }
+
+    const auto catalog_type = settings[DatabaseDataLakeSetting::catalog_type].value;
+
+    if (catalog_type != DB::DatabaseDataLakeCatalogType::ICEBERG_REST && catalog_type != DB::DatabaseDataLakeCatalogType::GLUE)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "`oauth_forward_user_token` is only supported for `catalog_type = 'rest'` and "
+            "`catalog_type = 'glue'`");
+
+    if (catalog_type == DB::DatabaseDataLakeCatalogType::GLUE)
+    {
+        validateGlueTokenForwardingSettings(settings);
+        return;
+    }
+
+    if (!settings[DatabaseDataLakeSetting::auth_header].value.empty())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "`oauth_forward_user_token` cannot be combined with `auth_header`");
+
+    const auto & exchange_uri = settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value;
+    if (!exchange_uri.empty() && settings[DatabaseDataLakeSetting::catalog_credential].value.empty())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "`oauth_token_exchange_uri` requires a non-empty `catalog_credential`");
+
+    if (exchange_uri.empty() && settings[DatabaseDataLakeSetting::oauth_forward_actor_token].value)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "`oauth_forward_actor_token` requires a non-empty `oauth_token_exchange_uri`");
+
+    static const std::array<std::string_view, 6> valid_token_types = {
+        "urn:ietf:params:oauth:token-type:access_token",
+        "urn:ietf:params:oauth:token-type:refresh_token",
+        "urn:ietf:params:oauth:token-type:id_token",
+        "urn:ietf:params:oauth:token-type:saml1",
+        "urn:ietf:params:oauth:token-type:saml2",
+        "urn:ietf:params:oauth:token-type:jwt",
+    };
+    auto check_token_type = [&](std::string_view setting_name, const std::string & value, bool empty_allowed)
+    {
+        if (value.empty() && empty_allowed)
+            return;
+        if (std::find(valid_token_types.begin(), valid_token_types.end(), value) == valid_token_types.end())
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "`{}` must be one of the token type URNs defined by RFC 8693, got `{}`",
+                setting_name, value);
+    };
+    check_token_type(
+        "oauth_subject_token_type",
+        settings[DatabaseDataLakeSetting::oauth_subject_token_type].value,
+        /* empty_allowed */ false);
+    check_token_type(
+        "oauth_requested_token_type",
+        settings[DatabaseDataLakeSetting::oauth_requested_token_type].value,
+        /* empty_allowed */ true);
+}
+
+void DatabaseDataLake::validateGlueTokenForwardingSettings(const DatabaseDataLakeSettings & settings)
+{
+    if (settings[DatabaseDataLakeSetting::aws_role_arn].value.empty())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "`oauth_forward_user_token` requires a non-empty `aws_role_arn` for a Glue catalog");
+
+    if (!settings[DatabaseDataLakeSetting::aws_access_key_id].value.empty()
+        || !settings[DatabaseDataLakeSetting::aws_secret_access_key].value.empty())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "`oauth_forward_user_token` cannot be combined with `aws_access_key_id` / "
+            "`aws_secret_access_key` for a Glue catalog");
+
+    if (!settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value.empty())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "`oauth_token_exchange_uri` is only supported for `catalog_type = 'rest'`");
+
+    if (settings[DatabaseDataLakeSetting::oauth_forward_actor_token].value)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "`oauth_forward_actor_token` is only supported for `catalog_type = 'rest'`");
 }
 
 void DatabaseDataLake::initialize() const
@@ -278,6 +387,8 @@ void DatabaseDataLake::initialize() const
         .aws_role_arn = settings[DatabaseDataLakeSetting::aws_role_arn].value,
         .aws_role_session_name = settings[DatabaseDataLakeSetting::aws_role_session_name].value,
         .aws_external_id = settings[DatabaseDataLakeSetting::aws_external_id].value,
+        .aws_sts_endpoint = settings[DatabaseDataLakeSetting::aws_sts_endpoint].value,
+        .forward_user_token = settings[DatabaseDataLakeSetting::oauth_forward_user_token].value,
     };
 
     switch (settings[DatabaseDataLakeSetting::catalog_type].value)
@@ -293,7 +404,16 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 settings[DatabaseDataLakeSetting::namespaces].value,
-                Context::getGlobalContextInstance());
+                settings[DatabaseDataLakeSetting::flat_namespaces].value,
+                Context::getGlobalContextInstance(),
+                DataLake::TokenForwardingConfig{
+                    .forward_user_token = settings[DatabaseDataLakeSetting::oauth_forward_user_token].value,
+                    .token_exchange_uri = settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value,
+                    .subject_token_type = settings[DatabaseDataLakeSetting::oauth_subject_token_type].value,
+                    .requested_token_type = settings[DatabaseDataLakeSetting::oauth_requested_token_type].value,
+                    .forward_actor_token = settings[DatabaseDataLakeSetting::oauth_forward_actor_token].value,
+                    .user_token_cache_ttl = settings[DatabaseDataLakeSetting::oauth_user_token_cache_ttl].value,
+                });
             break;
         }
         case DB::DatabaseDataLakeCatalogType::ICEBERG_DELTA_SHARING:
@@ -309,6 +429,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 settings[DatabaseDataLakeSetting::namespaces].value,
+                settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -326,6 +447,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 settings[DatabaseDataLakeSetting::namespaces].value,
+                settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -348,6 +470,7 @@ void DatabaseDataLake::initialize() const
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
                 settings[DatabaseDataLakeSetting::namespaces].value,
+                settings[DatabaseDataLakeSetting::flat_namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -385,11 +508,28 @@ void DatabaseDataLake::initialize() const
         }
         case DB::DatabaseDataLakeCatalogType::UNITY:
         {
-            catalog_impl = std::make_shared<DataLake::UnityCatalog>(
+            if (!settings[DatabaseDataLakeSetting::use_unity_catalog_v2])
+            {
+                catalog_impl = std::make_shared<DataLake::UnityCatalog>(
+                    settings[DatabaseDataLakeSetting::warehouse].value,
+                    url,
+                    settings[DatabaseDataLakeSetting::catalog_credential].value,
+                    settings[DatabaseDataLakeSetting::namespaces].value,
+                    Context::getGlobalContextInstance());
+                break;
+            }
+
+            /// Databricks OIDC expects `all-apis`; the default `auth_scope` value targets Iceberg REST catalogs.
+            const std::string unity_auth_scope = settings[DatabaseDataLakeSetting::auth_scope].changed
+                ? settings[DatabaseDataLakeSetting::auth_scope].value
+                : "all-apis";
+            catalog_impl = std::make_shared<DataLake::UnityV2Catalog>(
                 settings[DatabaseDataLakeSetting::warehouse].value,
                 url,
                 settings[DatabaseDataLakeSetting::catalog_credential].value,
-                settings[DatabaseDataLakeSetting::namespaces].value,
+                unity_auth_scope,
+                settings[DatabaseDataLakeSetting::auth_header].value,
+                settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -537,7 +677,8 @@ void DatabaseDataLake::resetCatalog(String reason) const
 
 StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
     DatabaseDataLakeStorageType type,
-    DataLakeStorageSettingsPtr storage_settings) const
+    DataLakeStorageSettingsPtr storage_settings,
+    DataLake::DataLakeTableFormat table_format) const
 {
     /// TODO: add tests for azure, local storage types.
 
@@ -545,7 +686,14 @@ StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
     const DatabaseDataLakeSettings & settings = *settings_version;
 
     auto catalog = getCatalog();
-    switch (catalog->getCatalogType())
+    auto catalog_type = catalog->getCatalogType();
+
+    /// `UnityV2Catalog` serves both formats. Its Iceberg tables need the same configuration as an
+    /// Iceberg REST catalog, so route them to that arm; the legacy catalog never reports Iceberg.
+    if (catalog_type == DatabaseDataLakeCatalogType::UNITY && table_format == DataLake::DataLakeTableFormat::ICEBERG)
+        catalog_type = DatabaseDataLakeCatalogType::ICEBERG_REST;
+
+    switch (catalog_type)
     {
         case DatabaseDataLakeCatalogType::ICEBERG_ONELAKE:
         {
@@ -728,13 +876,13 @@ std::string DatabaseDataLake::getStorageEndpointForTable(const DataLake::TableMe
 
 bool DatabaseDataLake::empty() const
 {
-    return getCatalog()->empty();
+    return getCatalog()->empty(/* auth_token */ {});
 }
 
-bool DatabaseDataLake::isTableExist(const String & name, ContextPtr /* context_ */) const
+bool DatabaseDataLake::isTableExist(const String & name, ContextPtr context_) const
 {
     const auto [namespace_name, table_name] = DataLake::parseTableName(name);
-    return getCatalog()->existsTable(namespace_name, table_name);
+    return getCatalog()->existsTable(namespace_name, table_name, DataLake::getForwardedAuthToken(context_));
 }
 
 StoragePtr DatabaseDataLake::tryGetTable(const String & name, ContextPtr context_)  const
@@ -890,7 +1038,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
         }
     }
 
-    const auto configuration = getConfiguration(storage_type, storage_settings);
+    const auto configuration = getConfiguration(storage_type, storage_settings, table_metadata.getTableFormat());
 
     /// HACK: Hacky-hack to enable lazy load
     ContextMutablePtr context_copy = Context::createCopy(context_);
@@ -958,7 +1106,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     const auto is_secondary_query = context_->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
 
     /// When we applied static credentials from database settings, they are authoritative:
-    /// do not let a catalog-vended refresh callback (e.g. Unity/REST `requestReadCredentials`)
+    /// do not let a catalog-vended refresh callback (e.g. Unity/REST `requestCredentials`)
     /// silently re-fetch credentials and override them. The same holds when the user disabled
     /// `vended_credentials` and no static credentials were applied (e.g. relying on default or
     /// environment S3 auth): the object storage layer invokes the refresh callback after an
@@ -972,7 +1120,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
             return std::nullopt;
         if (!with_vended_credentials && !catalog_manages_provider_chain)
             return std::nullopt;
-        return catalog->getCredentialsConfigurationCallback(storage_id);
+        return catalog->getCredentialsConfigurationCallback(storage_id, table_metadata, DataLake::getForwardedAuthToken(context_));
     };
 
     const auto catalog_uuid = table_metadata.getTableUUID();
@@ -1011,7 +1159,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     return storage_cluster;
 }
 
-void DatabaseDataLake::validateCreateTableEngine(const ASTStorage & storage) const
+void DatabaseDataLake::validateCreateTableEngine(const ASTStorage & storage, ContextPtr context_) const
 {
     const ASTFunction & engine = *storage.engine;
     const auto catalog = getCatalog();
@@ -1029,6 +1177,7 @@ void DatabaseDataLake::validateCreateTableEngine(const ASTStorage & storage) con
             "This DataLakeCatalog assigns table locations itself, so an explicit table `ENGINE` "
             "is not supported; omit the `ENGINE` clause");
 
+    catalog->loadConfigIfNeeded(DataLake::getForwardedAuthToken(context_));
     const auto catalog_storage_type = catalog->getStorageType();
 
     std::optional<DatabaseDataLakeStorageType> engine_backend;
@@ -1242,10 +1391,11 @@ void DatabaseDataLake::createTable(
         metadata_content->set("properties", properties);
     }
 
-    catalog->createNamespaceIfNotExists(namespace_name, /* location */ "");
+    const auto auth_token = DataLake::getForwardedAuthToken(context_);
+    catalog->createNamespaceIfNotExists(namespace_name, /* location */ "", auth_token);
 
     const bool created = catalog->createTable(
-        namespace_name, table_name, /* metadata_path */ "", metadata_content, compression_method, create.if_not_exists);
+        namespace_name, table_name, /* metadata_path */ "", metadata_content, compression_method, create.if_not_exists, auth_token);
     if (!created)
         throw Exception(ErrorCodes::TABLE_ALREADY_EXISTS,
             "Table {}.{} already exists in the catalog", namespace_name, table_name);
@@ -1263,7 +1413,7 @@ void DatabaseDataLake::dropTable( /// NOLINT
     const auto [namespace_name, table_name] = DataLake::parseTableName(name);
 
     bool purge = context_->getSettingsRef()[Setting::data_lake_delete_data_on_drop];
-    catalog->dropTable(namespace_name, table_name, purge, if_exists);
+    catalog->dropTable(namespace_name, table_name, purge, if_exists, DataLake::getForwardedAuthToken(context_));
 
     LOG_INFO(log, "Dropped table {}.{} from DataLakeCatalog (purge={})", namespace_name, table_name, purge);
 }
@@ -1298,7 +1448,7 @@ DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIteratorWithHint(
 DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIteratorImpl(
     ContextPtr context_,
     const FilterByNameFunction & filter_by_table_name,
-    bool skip_not_loaded,
+    bool /*skip_not_loaded*/,
     const TablesFilter & tables_filter,
     bool keep_unresolved_tables) const
 {
@@ -1314,7 +1464,7 @@ DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIteratorImpl(
             throw Exception(ErrorCodes::DATALAKE_DATABASE_ERROR, "Injected catalog listing failure");
         });
 
-        catalog_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter));
+        catalog_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter), DataLake::getForwardedAuthToken(context_));
     }
     catch (...)
     {
@@ -1347,13 +1497,15 @@ DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIteratorImpl(
             futures.emplace_back(promises.back()->get_future());
 
             pool.scheduleOrThrow(
-                [this, table_name, skip_not_loaded, context_, keep_unresolved_tables, promise=promises.back()]() mutable
+                [this, table_name, context_, keep_unresolved_tables, promise=promises.back()]() mutable
                 {
                     StoragePtr storage = nullptr;
                     try
                     {
                         LOG_INFO(log, "Get table information for table {}", table_name);
-                        storage = tryGetTableImpl(table_name, context_, false, skip_not_loaded);
+                        /// Tables marked unreadable at metadata time are skipped, not an error;
+                        /// direct access still reports the reason.
+                        storage = tryGetTableImpl(table_name, context_, /*lightweight*/ false, /*ignore_if_not_iceberg*/ true);
                     }
                     catch (...)
                     {
@@ -1463,7 +1615,7 @@ std::vector<LightWeightTableDetails> DatabaseDataLake::getLightweightTablesItera
             throw Exception(ErrorCodes::DATALAKE_DATABASE_ERROR, "Injected catalog listing failure");
         });
 
-        catalog_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter));
+        catalog_tables = getCatalog()->getTables(toCatalogTableNameFilter(tables_filter), DataLake::getForwardedAuthToken(context_));
     }
     catch (...)
     {
@@ -1486,7 +1638,7 @@ std::vector<LightWeightTableDetails> DatabaseDataLake::getLightweightTablesItera
     return result;
 }
 
-VectorWithMemoryTracking<String> DatabaseDataLake::getAllTableNames(ContextPtr /*context*/) const
+VectorWithMemoryTracking<String> DatabaseDataLake::getAllTableNames(ContextPtr context_) const
 {
     VectorWithMemoryTracking<String> result;
 
@@ -1495,7 +1647,7 @@ VectorWithMemoryTracking<String> DatabaseDataLake::getAllTableNames(ContextPtr /
     /// must not fail even when the catalog is temporarily unreachable.
     try
     {
-        DataLake::CatalogTables tables = getCatalog()->getTables();
+        DataLake::CatalogTables tables = getCatalog()->getTables(DataLake::getForwardedAuthToken(context_));
         result.reserve(tables.size());
         for (auto & table : tables)
         {
@@ -1522,18 +1674,18 @@ ASTPtr DatabaseDataLake::getCreateDatabaseQueryImpl() const
     return create_query;
 }
 
-void DatabaseDataLake::checkDatabase() const
+void DatabaseDataLake::checkDatabase(ContextPtr context_) const
 {
     auto catalog = getCatalog();
     /// This function checks if we can access catalog and get tables list.
     /// We do not check if there are tables in catalog, because even if catalog is empty, it still can be valid and working.
-    std::ignore = catalog->empty();
+    std::ignore = catalog->empty(DataLake::getForwardedAuthToken(context_));
 
 
     LOG_TEST(log, "Database '{}' is OK", getDatabaseName());
 }
 
-void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_changes, ContextPtr /*query_context*/)
+void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_changes, ContextPtr query_context)
 {
     const auto current_settings = database_settings.get();
 
@@ -1544,6 +1696,10 @@ void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_cha
 
     auto new_settings = std::make_unique<DatabaseDataLakeSettings>(*current_settings);
     new_settings->applyChanges(settings_changes);
+
+    /// Switching the Unity implementation replaces the catalog object rather than altering it in place.
+    const bool implementation_changed = (*new_settings)[DatabaseDataLakeSetting::use_unity_catalog_v2].value
+        != (*current_settings)[DatabaseDataLakeSetting::use_unity_catalog_v2].value;
 
     ASTPtr new_engine_definition;
     {
@@ -1572,7 +1728,17 @@ void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_cha
         storage->set(storage->settings, storage_settings_ast);
     }
 
+    /// `use_unity_catalog_v2` is consumed by the database, not by the catalog object, so it is
+    /// never handed to the catalog. Re-applying the current value is a metadata-only no-op.
+    SettingsChanges catalog_settings_changes;
+    for (const auto & change : settings_changes)
+    {
+        if (change.name != DatabaseDataLakeSettings::getSettingName(DatabaseDataLakeSetting::use_unity_catalog_v2))
+            catalog_settings_changes.push_back(change);
+    }
+
     std::shared_ptr<DataLake::ICatalog> local_catalog_snapshot;
+    if (!implementation_changed)
     {
         std::lock_guard lock(catalog_mutex);
         local_catalog_snapshot = catalog_impl;
@@ -1581,8 +1747,9 @@ void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_cha
     /// Prepare the new catalog state without publishing it: validation, the eager token
     /// fetch and the config reload may throw, and then nothing has changed yet.
     DataLake::ICatalog::PreparedSettingsChangesPtr prepared_catalog_changes;
-    if (local_catalog_snapshot)
-        prepared_catalog_changes = local_catalog_snapshot->prepareSettingsChanges(settings_changes);
+    const bool alter_catalog = local_catalog_snapshot && !catalog_settings_changes.empty();
+    if (alter_catalog)
+        prepared_catalog_changes = local_catalog_snapshot->prepareSettingsChanges(catalog_settings_changes, DataLake::getForwardedAuthToken(query_context));
 
     /// Persist the new metadata before publishing anything: if the write fails, the live
     /// state is untouched and matches the old metadata on disk. The create query is built
@@ -1594,7 +1761,7 @@ void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_cha
     DatabaseCatalog::instance().updateMetadataFile(getDatabaseName(), new_create_query);
 
     /// Publish. Nothing below throws.
-    if (local_catalog_snapshot)
+    if (alter_catalog)
         local_catalog_snapshot->commitSettingsChanges(std::move(prepared_catalog_changes));
     database_settings.set(std::move(new_settings));
     {
@@ -1603,9 +1770,9 @@ void DatabaseDataLake::applySettingsChanges(const SettingsChanges & settings_cha
     }
     if (!local_catalog_snapshot)
     {
-        /// The catalog was not built when the ALTER started. If a concurrent query
-        /// built it meanwhile, it used the old settings: drop it so the next access
-        /// rebuilds it with the new ones. Also clear a recorded construction failure
+        /// The catalog was not built when the ALTER started, or the implementation was switched.
+        /// If a concurrent query built it meanwhile, it used the old settings: drop it so the next
+        /// access rebuilds it with the new ones. Also clear a recorded construction failure
         /// (e.g. credentials lost on RESTORE) for the same reason.
         std::lock_guard lock(catalog_mutex);
         resetCatalog(/* reason */ "");
@@ -1690,6 +1857,10 @@ ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
     storage->engine->setKind(ASTFunction::Kind::TABLE_ENGINE);
     if (!table_metadata.isDefaultReadableTable())
         storage->engine->name = DataLake::FAKE_TABLE_ENGINE_NAME_FOR_UNREADABLE_TABLES;
+    else if (table_metadata.getTableFormat() != DataLake::DataLakeTableFormat::UNKNOWN)
+        /// Mixed-format catalogs (e.g. `UnityV2Catalog`) set the format per table; single-format
+        /// catalogs leave it UNKNOWN and keep the database-level table engine name.
+        storage->engine->name = String(catalog->getTableEngineName(table_metadata));
 
     storage->settings = {};
     if (partition_by)
@@ -1750,6 +1921,34 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
             else
             {
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid auth header format. Expected 'HeaderName: HeaderValue'");
+            }
+        }
+
+        /// Validate only on `CREATE` so older persisted databases can still attach at startup.
+        if (!args.create_query.attach)
+        {
+            const bool forwarding = database_settings[DatabaseDataLakeSetting::oauth_forward_user_token].value;
+            static constexpr std::array<std::string_view, 5> exchange_only_settings = {
+                "oauth_token_exchange_uri",
+                "oauth_subject_token_type",
+                "oauth_requested_token_type",
+                "oauth_forward_actor_token",
+                "oauth_user_token_cache_ttl",
+            };
+
+            for (const auto & change : database_settings.allChanged())
+            {
+                const auto & name = change.name;
+                if (std::find(exchange_only_settings.begin(), exchange_only_settings.end(), name) == exchange_only_settings.end())
+                    continue;
+                if (!forwarding)
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "`{}` has no effect without `oauth_forward_user_token = 1`", name);
+                if (name != "oauth_token_exchange_uri" && database_settings[DatabaseDataLakeSetting::oauth_token_exchange_uri].value.empty())
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "`{}` has no effect without `oauth_token_exchange_uri`", name);
             }
         }
 
@@ -2046,9 +2245,10 @@ The following settings are supported:
 
 | Setting                 | Description                                                                             |
 |-------------------------|-----------------------------------------------------------------------------------------|
-| `catalog_type`          | Type of catalog: `glue`, `unity` (Delta), `rest` (Iceberg), `hive`, `onelake` (Iceberg), `delta_sharing` (Iceberg, flat namespaces), `horizon` (Snowflake Horizon Iceberg REST) |
+| `catalog_type`          | Type of catalog: `glue`, `unity` (Delta, or Delta and Iceberg with `use_unity_catalog_v2`), `rest` (Iceberg), `hive`, `onelake` (Iceberg), `delta_sharing` (Iceberg, flat namespaces), `horizon` (Snowflake Horizon Iceberg REST) |
 | `warehouse`             | The warehouse/database name to use in the catalog.                                      |
 | `catalog_credential`    | Authentication credential for the catalog (e.g., API key or token)                      |
+| `use_unity_catalog_v2`  | For `catalog_type = 'unity'`: use the new implementation, which serves both Delta Lake and Iceberg tables. Default: `false`. Set it on `CREATE`, or change it for an existing database with `ALTER DATABASE ... MODIFY SETTING`. |
 | `auth_header`           | Custom HTTP header for authentication with the catalog service                          |
 | `auth_scope`            | OAuth2 scope for authentication (if using OAuth)                                        |
 | `storage_endpoint`      | Endpoint URL for the underlying storage                                                 |
@@ -2174,6 +2374,22 @@ Some catalogs support only one of the two modes:
 See below sections for examples of using the `DataLakeCatalog` engine:
 
 * [Unity Catalog](/guides/use-cases/data-warehousing/unity-catalog)
+* Unity Catalog with Delta Lake and Iceberg tables
+    With `use_unity_catalog_v2 = 1`, the `unity` catalog serves both Delta Lake and Iceberg tables,
+    detecting the format of each table.
+```sql
+CREATE DATABASE database_name
+ENGINE = DataLakeCatalog('https://<workspace>.cloud.databricks.com/api/2.1/unity-catalog')
+SETTINGS
+    catalog_type = 'unity',
+    use_unity_catalog_v2 = 1,
+    warehouse = 'my_catalog',
+    catalog_credential = '<client_id>:<client_secret>';
+SHOW TABLES FROM database_name;
+SELECT count() FROM database_name.`schema_name.table_name`;
+```
+    `catalog_credential` accepts an OAuth service principal as `<client_id>:<client_secret>`,
+    a personal access token (`dapi...`), or a pre-obtained OAuth token.
 * [Glue Catalog](/guides/use-cases/data-warehousing/glue-catalog)
 * OneLake Catalog
     Can be used by enabling `allow_experimental_database_iceberg` or `allow_database_iceberg`.

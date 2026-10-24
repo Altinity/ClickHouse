@@ -158,6 +158,17 @@ struct ManifestListEntryCounts
     std::optional<Int64> added_sequence_number;
 };
 
+struct PreviousManifestAction
+{
+    Iceberg::IcebergPathFromMetadata new_path;
+    Int64 new_length = 0;
+    Int32 new_existing_files_count = 0;
+    Int64 new_existing_rows_count = 0;
+    Int64 new_min_sequence_number = 0;
+};
+
+using PreviousManifestActions = std::unordered_map<String, PreviousManifestAction>;
+
 void generateManifestList(
     const Iceberg::IcebergPathResolver & path_resolver,
     Poco::JSON::Object::Ptr metadata,
@@ -174,7 +185,9 @@ void generateManifestList(
     const std::vector<ManifestListEntryCounts> & entry_counts = {},
     const std::unordered_set<String> & carry_forward_manifest_paths = {},
     const std::vector<Int64> & entry_partition_spec_ids = {},
-    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {});
+    const std::vector<std::vector<std::pair<Field, DataTypePtr>>> & entry_partition_summaries = {},
+    const PreviousManifestActions & previous_manifest_actions = {},
+    const std::vector<Int64> & entry_row_counts = {});
 
 std::string getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path);
 
@@ -279,6 +292,7 @@ private:
     const String& write_format;
     SharedHeader sample_block;
     std::unique_ptr<MultipleFileWriter> writer;
+    bool consumed_rows = false;
     const DataLakeStorageSettings & data_lake_settings;
     std::function<void(const std::string &)> new_file_path_callback;
 };

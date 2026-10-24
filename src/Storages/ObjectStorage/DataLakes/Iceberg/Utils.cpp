@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_set>
 #include <config.h>
+#include <fmt/ranges.h>
 #include <Core/ColumnsWithTypeAndName.h>
 #include <Core/Settings.h>
 #include <Core/TypeId.h>
@@ -342,8 +343,11 @@ bool writeMetadataFileAndVersionHint(
     const IcebergPathFromMetadata & version_hint_path,
     DB::ObjectStoragePtr object_storage,
     DB::ContextPtr context,
-    bool try_write_version_hint)
+    bool try_write_version_hint,
+    bool * version_hint_names_metadata_file)
 {
+    bool hint_names_metadata_file = false;
+
     auto storage_metadata_path = resolver.resolve(metadata_file_info.path);
     auto storage_version_hint_path = resolver.resolve(version_hint_path);
     try
@@ -397,6 +401,7 @@ bool writeMetadataFileAndVersionHint(
         else if (!try_write_version_hint)
         {
             /// The file does not exist and this writer was not asked to create it.
+            hint_names_metadata_file = true;
             break;
         }
 
@@ -424,6 +429,7 @@ bool writeMetadataFileAndVersionHint(
                     context,
                     write_if_none_match,
                     /* write-if-match */ etag);
+                hint_names_metadata_file = true;
                 break;
             }
             catch (...)
@@ -459,6 +465,9 @@ bool writeMetadataFileAndVersionHint(
             storage_version_hint_path,
             metadata_file_info.version,
             MAX_TRANSACTION_RETRIES);
+
+    if (version_hint_names_metadata_file)
+        *version_hint_names_metadata_file = hint_names_metadata_file;
 
     return true;
 }
@@ -626,7 +635,7 @@ void checkUnknownTypeAllowed(const String & column_name, const DataTypePtr & typ
 }
 
 /// Returns type and required
-std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter)
+std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter, UInt64 format_version)
 {
     switch (type->getTypeId())
     {
@@ -653,8 +662,30 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
         case TypeIndex::Date32:
             return {"date", true};
         case TypeIndex::DateTime:
-        case TypeIndex::DateTime64:
             return {"timestamp", true};
+        case TypeIndex::DateTime64:
+        {
+            /// Iceberg `timestamp` is microseconds; `timestamp_ns` is nanoseconds and is
+            /// allowed only in format version 3. Writing it into v1/v2 metadata is invalid.
+            const auto scale = getDecimalScale(*type);
+            if (scale == 9)
+            {
+                if (format_version < 3)
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Iceberg type {} requires format version 3 or higher, got version {}",
+                        type->getName(),
+                        format_version);
+
+                auto date_time64 = std::static_pointer_cast<const DataTypeDateTime64>(type);
+                if (date_time64->hasExplicitTimeZone())
+                    return {Iceberg::f_timestamptz_ns, true};
+                return {Iceberg::f_timestamp_ns, true};
+            }
+            if (scale <= 6)
+                return {Iceberg::f_timestamp, true};
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+        }
         case TypeIndex::Time:
             return {"time", true};
         case TypeIndex::Time64:
@@ -694,7 +725,7 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
                 field->set(Iceberg::f_name, type_tuple->getNameByPosition(iter_names));
                 /// Recurse on the element itself: `getNormalizedType` would rename a nested
                 /// tuple's elements to "1", "2", ... (`DataTypeTuple::getNormalizedType`).
-                auto child_type = getIcebergType(element, iter);
+                auto child_type = getIcebergType(element, iter, format_version);
                 field->set(Iceberg::f_required, child_type.second);
                 field->set(Iceberg::f_type, child_type.first);
                 fields->add(field);
@@ -710,7 +741,7 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
 
             field->set(Iceberg::f_type, "list");
             field->set(Iceberg::f_element_id, ++iter);
-            auto child_type = getIcebergType(type_array->getNestedType(), iter);
+            auto child_type = getIcebergType(type_array->getNestedType(), iter, format_version);
             field->set(Iceberg::f_required, false);
             field->set(Iceberg::f_element, child_type.first);
             field->set(Iceberg::f_element_required, child_type.second);
@@ -725,8 +756,8 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
             field->set(Iceberg::f_key_id, ++iter);
             field->set(Iceberg::f_value_id, ++iter);
 
-            field->set(Iceberg::f_key, getIcebergType(type_map->getKeyType(), iter).first);
-            auto value_type = getIcebergType(type_map->getValueType(), iter);
+            field->set(Iceberg::f_key, getIcebergType(type_map->getKeyType(), iter, format_version).first);
+            auto value_type = getIcebergType(type_map->getValueType(), iter, format_version);
             field->set(Iceberg::f_value, value_type.first);
             field->set(Iceberg::f_value_required, value_type.second);
             return {field, true};
@@ -734,7 +765,7 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
         case TypeIndex::Nullable:
         {
             auto type_nullable = std::static_pointer_cast<const DataTypeNullable>(type);
-            return {getIcebergType(type_nullable->getNestedType(), iter).first, false};
+            return {getIcebergType(type_nullable->getNestedType(), iter, format_version).first, false};
         }
         case TypeIndex::Variant:
         {
@@ -775,12 +806,16 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
         }
         case TypeIndex::DateTime64:
         {
-            if (getDecimalScale(*type) != 6)
+            /// Iceberg `timestamp` is microseconds; `timestamp_ns` is nanoseconds (v3).
+            /// contrib Avro has no `timestamp-nanos` enum, so it stores the logical type
+            /// as `NONE` and the value as `long`; other engines still see the annotation.
+            const auto scale = getDecimalScale(*type);
+            if (scale != 6 && scale != 9)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
 
             Poco::JSON::Object::Ptr timestamp_type = new Poco::JSON::Object;
             timestamp_type->set("type", "long");
-            timestamp_type->set("logicalType", "timestamp-micros");
+            timestamp_type->set("logicalType", scale == 9 ? "timestamp-nanos" : "timestamp-micros");
             timestamp_type->set("adjust-to-utc", assert_cast<const DataTypeDateTime64 &>(*type).hasExplicitTimeZone());
             return timestamp_type;
         }
@@ -1228,7 +1263,7 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
         Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
         field->set(Iceberg::f_id, ++iter_for_initial_columns);
         field->set(Iceberg::f_name, column.name);
-        auto type = getIcebergType(column.type, iter);
+        auto type = getIcebergType(column.type, iter, format_version);
         field->set(Iceberg::f_required, type.second);
         field->set(Iceberg::f_type, type.first);
         column_name_to_source_id[column.name] = iter_for_initial_columns;
@@ -1691,12 +1726,38 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
         for (UInt32 field_index = 0; field_index < fields->size(); ++field_index)
         {
             auto field = fields->getObject(field_index);
+
+            /// Iceberg V3: multi-argument transforms use `source-ids` instead of `source-id`.
+            /// We cannot evaluate multi-arg transforms.  Data sorted by (f1, f2, f3) is only
+            /// guaranteed sorted by prefixes — never by a suffix — so stop at the first
+            /// unrepresentable field and return only the prefix before it.
+            if (field->has(f_source_ids))
+                break;
+
+            if (!field->has(f_source_id))
+                break;
+
             auto source_id = field->getValue<Int64>(f_source_id);
             auto column_name = source_id_to_column_name[source_id];
             int direction = field->getValue<String>(f_direction) == "asc" ? 1 : -1;
             auto iceberg_transform_name = field->getValue<String>(f_transform);
-            auto clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name,
-                local_context->getSettingsRef()[Setting::iceberg_partition_timezone]);
+            std::optional<TransformAndArgument> clickhouse_transform_name;
+            try
+            {
+                clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name,
+                    local_context->getSettingsRef()[Setting::iceberg_partition_timezone]);
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::BAD_ARGUMENTS)
+                    throw;
+            }
+            if (!clickhouse_transform_name.has_value())
+            {
+                /// An unknown or malformed transform is not a reason to reject the table: an Iceberg
+                /// sort order is only an optimization hint, so drop it and read/write the table as unsorted.
+                return KeyDescription{};
+            }
             /// Quote the column name so identifiers with special characters (e.g. `@timestamp`)
             /// produce a parseable ORDER BY clause.
             auto quoted_column_name = backQuoteIfNeed(column_name);
@@ -1728,6 +1789,28 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
         return KeyDescription{};
     order_by_str.pop_back();
     return KeyDescription::parse(order_by_str, column_description, {}, local_context, true);
+}
+
+/// Format a multi-argument partition field for display in Iceberg/Spark style, e.g. "bucket(16, a, b)".
+static String formatPartitionFieldDisplayMultiArg(const String & iceberg_transform_name, const std::vector<String> & column_names)
+{
+    std::string name = Poco::toLower(iceberg_transform_name);
+    String columns_joined = fmt::format("{}", fmt::join(column_names, ", "));
+
+    if (name.starts_with("bucket") && name.back() == ']')
+    {
+        auto p = name.find('[');
+        if (p != std::string::npos)
+            return "bucket(" + name.substr(p + 1, name.size() - p - 2) + ", " + columns_joined + ")";
+    }
+    if (name.starts_with("truncate") && name.back() == ']')
+    {
+        auto p = name.find('[');
+        if (p != std::string::npos)
+            return "truncate(" + name.substr(p + 1, name.size() - p - 2) + ", " + columns_joined + ")";
+    }
+    /// Fallback for unknown multi-arg transforms: show as transform(col1, col2, ...)
+    return name + "(" + columns_joined + ")";
 }
 
 /// Format one partition field for display in Iceberg/Spark style, e.g. "day(ts)" or "bucket(16, id)".
@@ -1791,12 +1874,32 @@ std::optional<String> getPartitionKeyStringFromMetadata(Poco::JSON::Object::Ptr 
     for (UInt32 i = 0; i < fields->size(); ++i)
     {
         auto field = fields->getObject(i);
+        auto iceberg_transform_name = field->getValue<String>(f_transform);
+
+        /// Iceberg V3 multi-argument transform: `source-ids` is an array of column IDs.
+        if (field->has(f_source_ids))
+        {
+            auto source_ids_array = field->getArray(f_source_ids);
+            std::vector<String> column_names;
+            for (UInt32 idx = 0; idx < source_ids_array->size(); ++idx)
+            {
+                auto sid = source_ids_array->getElement<Int64>(idx);
+                auto it = source_id_to_column_name.find(sid);
+                if (it == source_id_to_column_name.end())
+                    return std::nullopt;
+                column_names.push_back(it->second);
+            }
+            part_exprs.push_back(formatPartitionFieldDisplayMultiArg(iceberg_transform_name, column_names));
+            continue;
+        }
+
+        if (!field->has(f_source_id))
+            return std::nullopt;
         auto source_id = field->getValue<Int64>(f_source_id);
         auto it = source_id_to_column_name.find(source_id);
         if (it == source_id_to_column_name.end())
             return std::nullopt;
         String column_name = it->second;
-        auto iceberg_transform_name = field->getValue<String>(f_transform);
         part_exprs.push_back(formatPartitionFieldDisplay(iceberg_transform_name, column_name));
     }
     String result;
@@ -1831,14 +1934,38 @@ std::optional<String> getSortingKeyDisplayStringFromMetadata(Poco::JSON::Object:
         for (UInt32 j = 0; j < sort_fields->size(); ++j)
         {
             auto field = sort_fields->getObject(j);
-            auto source_id = field->getValue<Int64>(f_source_id);
-            auto it = source_id_to_column_name.find(source_id);
-            if (it == source_id_to_column_name.end())
-                return std::nullopt;
-            String column_name = it->second;
-            String direction = field->getValue<String>(f_direction) == "asc" ? " asc" : " desc";
             auto iceberg_transform_name = field->getValue<String>(f_transform);
-            String expr = formatPartitionFieldDisplay(iceberg_transform_name, column_name);
+            String direction = field->getValue<String>(f_direction) == "asc" ? " asc" : " desc";
+            String expr;
+
+            /// Iceberg V3 multi-argument transform
+            if (field->has(f_source_ids))
+            {
+                auto source_ids_array = field->getArray(f_source_ids);
+                std::vector<String> column_names;
+                for (UInt32 idx = 0; idx < source_ids_array->size(); ++idx)
+                {
+                    auto sid = source_ids_array->getElement<Int64>(idx);
+                    auto it = source_id_to_column_name.find(sid);
+                    if (it == source_id_to_column_name.end())
+                        return std::nullopt;
+                    column_names.push_back(it->second);
+                }
+                expr = formatPartitionFieldDisplayMultiArg(iceberg_transform_name, column_names);
+            }
+            else if (field->has(f_source_id))
+            {
+                auto source_id = field->getValue<Int64>(f_source_id);
+                auto it = source_id_to_column_name.find(source_id);
+                if (it == source_id_to_column_name.end())
+                    return std::nullopt;
+                expr = formatPartitionFieldDisplay(iceberg_transform_name, it->second);
+            }
+            else
+            {
+                return std::nullopt;
+            }
+
             if (!result.empty())
                 result += ", ";
             result += expr + direction;
@@ -2047,6 +2174,13 @@ void forEachAvroEntry(
     auto reader_base = std::make_unique<avro::DataFileReaderBase>(std::move(input_stream), MAX_AVRO_SCHEMA_DEPTH);
     avro::DataFileReader<avro::GenericDatum> reader(std::move(reader_base));
 
+    if (reader.readerSchema().root()->type() != avro::AVRO_RECORD)
+        throw Exception(
+            ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "Avro file {} has root schema type {}, but Iceberg manifest-list entries must be records",
+            filename,
+            static_cast<int>(reader.readerSchema().root()->type()));
+
     avro::GenericDatum datum(reader.readerSchema());
     while (reader.read(datum))
         callback(datum);
@@ -2069,11 +2203,31 @@ PartitionColumnValues getIdentityPartitionColumnValues(
             continue;
 
         const auto name_and_type
-            = schema_processor.tryGetFieldCharacteristics(manifest_file_entry.resolved_schema_id, partition_field.source_id);
+            = schema_processor.tryGetFieldCharacteristics(manifest_file_entry.resolved_schema_id, partition_field.source_ids[0]);
         if (!name_and_type.has_value())
             continue;
 
-        Field value = convertFieldToTypeOrThrow(partition_key_value[partition_field.tuple_index], *name_and_type->type);
+        const Field & raw_value = partition_key_value[partition_field.tuple_index];
+        /// Avro has no `timestamp-nanos` logical type, so `timestamp_ns` / `timestamptz_ns` (and
+        /// similarly `Time64`) identity partition values arrive as a raw Int64 of ticks at the
+        /// column's scale. `convertFieldToType` would treat that integer as whole seconds and
+        /// overflow while rescaling, so wrap the ticks directly instead (mirrors the pruning path).
+        Field value;
+        if (!raw_value.isNull() && raw_value.getType() == Field::Types::Int64)
+        {
+            auto target_type = removeNullable(name_and_type->type);
+            WhichDataType which(target_type);
+            if (which.isDateTime64())
+                value = DecimalField<DateTime64>(DateTime64(raw_value.safeGet<Int64>()), getDecimalScale(*target_type));
+            else if (which.isTime64())
+                value = DecimalField<Time64>(Time64(raw_value.safeGet<Int64>()), getDecimalScale(*target_type));
+            else
+                value = convertFieldToTypeOrThrow(raw_value, *name_and_type->type);
+        }
+        else
+        {
+            value = convertFieldToTypeOrThrow(raw_value, *name_and_type->type);
+        }
         if (value.isNull())
             continue;
 

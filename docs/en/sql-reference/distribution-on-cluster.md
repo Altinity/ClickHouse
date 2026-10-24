@@ -16,6 +16,8 @@ This improves cache efficiency by minimizing data movement among nodes.
 
 Each node begins processing files for which it is the primary node. After completing its assigned files, a node may take tasks from other nodes, either immediately or after waiting for `lock_object_storage_task_distribution_ms` milliseconds if the primary node does not request new files during that interval. The default value of `lock_object_storage_task_distribution_ms` is 500 milliseconds. This setting balances between caching efficiency and workload redistribution when nodes are imbalanced.
 
+The wait is a field of `ReadTaskResponse` and is sent only when every worker negotiated Antalya protocol version 3. If any worker negotiated a lower version, including an upstream node, the setting is ignored for that query and files are assigned immediately.
+
 ## `SYSTEM STOP SWARM MODE` command {#system-stop-swarm-mode}
 
 If a node needs to shut down gracefully, the command `SYSTEM STOP SWARM MODE` prevents the node from receiving new tasks for *Cluster-family queries. The node finishes processing already assigned files before it can safely shut down without errors.
@@ -24,6 +26,6 @@ Receiving new tasks can be resumed with the command `SYSTEM START SWARM MODE`.
 
 ## Joins {#joins}
 
-[`object_storage_cluster_join_mode`](/operations/settings/settings#object_storage_cluster_join_mode) chooses where a `JOIN` of a `*Cluster` table function, or of a table with `object_storage_cluster` set, is executed, and which table is sent to the nodes. With `allow` and `local` the nodes read the left table and the join runs on the initiator. With `global`, an `INNER`, `LEFT`, or `CROSS` join runs on the nodes and the initiator sends the right table (every table after the first, for `CROSS JOIN`). A `RIGHT` or `FULL` join stays on the initiator.
+[`object_storage_cluster_join_mode`](/operations/settings/settings#object_storage_cluster_join_mode) chooses where a `JOIN` of a `*Cluster` table function, or of a table with `object_storage_cluster` set, is executed, and which table is sent to the nodes. With `allow` the nodes read the left table and the join runs on the initiator. `local` is a deprecated alias of `allow`. With `global`, an `INNER`, `LEFT`, or `CROSS` join runs on the nodes and the initiator sends the right table (every table after the first, for `CROSS JOIN`). A `RIGHT`, `FULL`, or `PASTE` join stays on the initiator.
 
 The same rules for a `Distributed` table, including which side of a `GLOBAL` `RIGHT` join is sent, are described in [Distributed JOIN](/sql-reference/statements/select/join.md#distributed-join).

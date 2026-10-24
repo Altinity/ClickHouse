@@ -11,6 +11,8 @@
 #include <Storages/ObjectStorage/DataLakes/Common/AvroForIcebergDeserializer.h>
 #include <Storages/KeyDescription.h>
 
+#include <atomic>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 
@@ -90,14 +92,19 @@ public:
         IcebergSchemaProcessor & schema_processor,
         Int64 inherited_sequence_number,
         Int64 inherited_snapshot_id,
+        std::optional<UInt64> inherited_first_row_id,
         DB::ContextPtr context,
         std::shared_ptr<const ActionsDAG> filter_dag_,
-        Int32 table_snapshot_schema_id_);
+        Int32 table_snapshot_schema_id_,
+        const std::atomic<bool> * stop_flag = nullptr);
 
     ManifestFileEntriesHandle getFilesWithoutDeletedHandle() const;
 
     bool hasPartitionKey() const;
     const DB::KeyDescription & getPartitionKeyDescription() const;
+    /// Returns the spec-field positions (indices into the Avro partition tuple) that correspond
+    /// to the kept partition key columns.  The pruner uses this to project partition values.
+    const std::vector<size_t> & getPartitionKeySpecPositions() const { return partition_key_spec_positions; }
     /// Sums required per-file `record_count` for live entries of the given content type.
     /// Returns nullopt on negative `record_count` or Int64 overflow (fail closed).
     std::optional<Int64> getRowsCountInAllFilesExcludingDeleted(FileContentType content) const;
@@ -125,13 +132,16 @@ private:
         IcebergSchemaProcessor & schema_processor,
         Int64 inherited_sequence_number,
         Int64 inherited_snapshot_id,
+        std::optional<UInt64> inherited_first_row_id,
         DB::ContextPtr context,
         Int32 manifest_schema_id,
         std::shared_ptr<const PartitionSpecification> common_partition_specification,
         std::optional<DB::KeyDescription> partition_key_description,
+        std::vector<size_t> partition_key_spec_positions,
         size_t total_rows,
         std::shared_ptr<const ActionsDAG> filter_dag,
-        Int32 table_snapshot_schema_id);
+        Int32 table_snapshot_schema_id,
+        const std::atomic<bool> * stop_flag);
 
     ProcessedManifestFileEntryPtr processRow(size_t row_index);
 
@@ -143,17 +153,23 @@ private:
     // always zero in case of format version 1
     const Int64 inherited_sequence_number;
     const Int64 inherited_snapshot_id;
+    std::vector<std::optional<UInt64>> entry_first_row_ids;
     const DB::ContextPtr context;
     const Int32 manifest_schema_id;
     const std::shared_ptr<const PartitionSpecification> common_partition_specification;
     const std::optional<DB::KeyDescription> partition_key_description;
+    /// Indices (into the Avro partition tuple) of the spec fields that were kept for pruning.
+    const std::vector<size_t> partition_key_spec_positions;
     const Int32 table_snapshot_schema_id;
 
     /// Iteration state
     const size_t total_rows;
+    /// When set and observed true, `next` gives up between rows and returns nullptr as on EOF.
+    const std::atomic<bool> * const stop_flag;
     std::atomic<size_t> current_row_index{0};
     std::atomic<bool> fully_initialized{false};
     std::atomic<size_t> active_fetchers{0};
+    std::atomic<bool> logged_missing_snapshot_metadata{false};
 
     /// Cached results accumulated during iteration
     mutable SharedMutex files_mutex;

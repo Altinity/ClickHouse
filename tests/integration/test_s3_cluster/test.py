@@ -163,7 +163,8 @@ def started_cluster():
             "c2.s0_0_1",
             main_configs=["configs/cluster.xml", "configs/named_collections.xml", "configs/hidden_clusters.xml"],
             user_configs=["configs/users.xml"],
-            macros={"replica": "replica2", "shard": "shard1"},
+            # Must be unique per instance: the database disk prefix is .../test-{shard}|{replica}
+            macros={"replica": "replica2_c2", "shard": "shard1"},
             with_zookeeper=True,
             stay_alive=True,
         )
@@ -1466,7 +1467,8 @@ def test_global_join_executes_on_shards(started_cluster):
 
 
 @pytest.mark.parametrize("join_mode", ["local", "global"])
-def test_joins(started_cluster, join_mode):
+@pytest.mark.parametrize("allow_experimental_analyzer", [0, 1])
+def test_joins(started_cluster, join_mode, allow_experimental_analyzer):
     node = started_cluster.instances["s0_0_0"]
 
     # Table join_table only exists on the node 's0_0_0'.
@@ -1500,7 +1502,7 @@ def test_joins(started_cluster, join_mode):
             join_table AS t2
         ON t1.value = t2.id
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='{join_mode}';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}', allow_experimental_analyzer={allow_experimental_analyzer};
         """
     )
 
@@ -1523,7 +1525,7 @@ def test_joins(started_cluster, join_mode):
                 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
         ON t1.value = t2.id
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='{join_mode}';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}', allow_experimental_analyzer={allow_experimental_analyzer};
         """
     )
 
@@ -1541,7 +1543,7 @@ def test_joins(started_cluster, join_mode):
         ON t1.value = t2.id
         WHERE (t1.value % 2)
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='{join_mode}';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}', allow_experimental_analyzer={allow_experimental_analyzer};
         """
     )
 
@@ -1560,7 +1562,7 @@ def test_joins(started_cluster, join_mode):
         ON t1.value = t2.id
         WHERE (t2.id % 2)
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='{join_mode}';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}', allow_experimental_analyzer={allow_experimental_analyzer};
         """
     )
 
@@ -1578,7 +1580,7 @@ def test_joins(started_cluster, join_mode):
         ON t1.value = t2.id
         WHERE (t1.value % 2) AND ((t2.id % 3) == 2)
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='{join_mode}';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}', allow_experimental_analyzer={allow_experimental_analyzer};
         """
     )
 
@@ -1594,7 +1596,7 @@ def test_joins(started_cluster, join_mode):
                 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
         WHERE value IN (SELECT id FROM join_table)
         ORDER BY name
-        SETTINGS object_storage_cluster_join_mode='{join_mode}';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}', allow_experimental_analyzer={allow_experimental_analyzer};
         """
     )
     res = list(map(str.split, result6.splitlines()))
@@ -1609,7 +1611,7 @@ def test_joins(started_cluster, join_mode):
                 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
         WHERE value GLOBAL IN (SELECT id FROM join_table)
         ORDER BY name
-        SETTINGS object_storage_cluster_join_mode='{join_mode}';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}', allow_experimental_analyzer={allow_experimental_analyzer};
         """
     )
     res = list(map(str.split, result6.splitlines()))
@@ -1626,7 +1628,7 @@ def test_joins(started_cluster, join_mode):
             join_table AS t2
         ON 1
         GROUP BY ALL
-        SETTINGS object_storage_cluster_join_mode='{join_mode}';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}', allow_experimental_analyzer={allow_experimental_analyzer};
         """
     )
     assert result7.strip() == "625"
@@ -1642,7 +1644,7 @@ def test_joins(started_cluster, join_mode):
             join_table AS t2
         ON 1
         GROUP BY ALL
-        SETTINGS object_storage_cluster_join_mode='{join_mode}';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}', allow_experimental_analyzer={allow_experimental_analyzer};
         """
     )
     res = list(map(str.split, result8.splitlines()))

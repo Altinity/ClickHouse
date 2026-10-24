@@ -2,6 +2,7 @@
 
 #include <Common/SettingsChanges.h>
 #include <Access/AuthenticationData.h>
+#include <Access/ForwardedAuthToken.h>
 #include <Interpreters/ClientCertificateInfo.h>
 #include <Interpreters/ClientInfo.h>
 #include <Interpreters/Context_fwd.h>
@@ -62,7 +63,7 @@ public:
 
     // Verifies whether the user's validity extends beyond the current time.
     // Throws an exception if the user's validity has expired.
-    void checkIfUserIsStillValid();
+    void checkIfUserIsStillValid() const;
 
     /// Writes a row about login failure into session log (if enabled)
     void onAuthenticationFailure(const std::optional<String> & user_name, const Poco::Net::SocketAddress & address_, const Exception & e);
@@ -128,6 +129,8 @@ private:
 
     /// ClientInfo that will be copied to a session context when it's created.
     std::optional<ClientInfo> prepared_client_info;
+
+    ForwardedAuthTokenPtr forwarded_auth_token;
 
     mutable UserPtr user;
     std::optional<UUID> user_id;

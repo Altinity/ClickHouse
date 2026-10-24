@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>
+#include <Access/ForwardedAuthToken.h>
 #include <optional>
 #include <Core/Types.h>
 #include <Core/NamesAndTypes.h>
@@ -14,6 +15,7 @@
 #include <Poco/JSON/Object.h>
 
 #include <functional>
+#include <string_view>
 #include <unordered_map>
 
 namespace DB
@@ -48,6 +50,14 @@ public:
 
 private:
     std::unordered_map<DB::DatabaseDataLakeCatalogType, Validator> validators;
+};
+
+enum class DataLakeTableFormat : uint8_t
+{
+    UNKNOWN,
+    DELTA,
+    ICEBERG,
+    PAIMON,
 };
 
 struct DataLakeSpecificProperties
@@ -101,6 +111,8 @@ public:
 
     void setTableUUID(const std::string & uuid_) { table_uuid = uuid_; }
     std::optional<std::string> getTableUUID() const { return table_uuid; }
+    void setTableFormat(DataLakeTableFormat format) { table_format = format; }
+    DataLakeTableFormat getTableFormat() const { return table_format; }
 
     bool requiresLocation() const { return with_location; }
     bool requiresSchema() const { return with_schema; }
@@ -157,6 +169,7 @@ private:
 
     std::string reason_why_table_is_not_readable;
     std::optional<std::string> table_uuid;
+    DataLakeTableFormat table_format = DataLakeTableFormat::UNKNOWN;
 
     bool is_default_readable_table = true;
 
@@ -212,6 +225,8 @@ struct CatalogSettings
     String aws_role_arn;
     String aws_role_session_name;
     String aws_external_id;
+    String aws_sts_endpoint;
+    bool forward_user_token = false;
 
     DB::SettingsChanges allChanged() const;
 };
@@ -227,28 +242,45 @@ public:
     explicit ICatalog(const std::string & warehouse_) : warehouse(warehouse_) {}
 
     virtual DB::DatabaseDataLakeCatalogType getCatalogType() const = 0;
+
+    /// Format of the data lake table served for `table_metadata`. Catalogs serving a single
+    /// format rely on the database-level table engine and never set the format per table;
+    /// mixed-format catalogs (e.g. `UnityV2Catalog`) set it in `getTableMetadata`.
+    virtual DataLakeTableFormat getTableFormat(const TableMetadata & table_metadata) const
+    {
+        return table_metadata.getTableFormat();
+    }
+
+    /// Table storage engine name for `table_metadata` ("DeltaLake", "Iceberg", "Paimon",
+    /// or the fake engine for unreadable tables). Throws LOGICAL_ERROR when a readable
+    /// table has no known format; callers handling single-format catalogs (which never set
+    /// the format) must check `getTableFormat() != UNKNOWN` first and keep their
+    /// database-level engine name otherwise.
+    std::string_view getTableEngineName(const TableMetadata & table_metadata) const;
+
     virtual ~ICatalog() = default;
 
     /// Does catalog have any tables?
-    virtual bool empty() const = 0;
+    virtual bool empty(const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
     /// Fetch the list of tables (names contain full namespaces). Each entry carries an
     /// `is_readable` flag so listings can drop unreadable tables without a metadata fetch.
-    virtual CatalogTables getTables() const = 0;
+    virtual CatalogTables getTables(const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
     /// Enumerate every namespace as a full dot-separated path (hierarchical catalogs
     /// return every nested level; flat catalogs their single-level names).
-    virtual Namespaces getNamespaces() const = 0;
+    virtual Namespaces getNamespaces(const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
     /// Fetch the list of tables restricted by the `name` predicate (see `TableNameFilter`);
     /// each entry carries an `is_readable` flag like getTables(). Default impl prunes
     /// namespaces via `getNamespaces()`.
-    virtual CatalogTables getTables(const TableNameFilter & filter) const;
+    virtual CatalogTables getTables(const TableNameFilter & filter, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Check that a table exists in a given namespace.
     virtual bool existsTable(
         const std::string & namespace_naem,
-        const std::string & table_name) const = 0;
+        const std::string & table_name,
+        const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
     /// Get table metadata in the given namespace.
     /// Throw exception if table does not exist.
@@ -270,6 +302,9 @@ public:
     /// E.g. one of S3, Azure, Local, HDFS.
     virtual std::optional<StorageType> getStorageType() const = 0;
 
+    /// Loads catalog-wide configuration with the given token if it has not been loaded yet.
+    virtual void loadConfigIfNeeded(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const {}
+
     /// Catalog-wide base location for new tables, e.g. `s3://warehouse/data`. Empty if unknown.
     virtual String getDefaultBaseLocation() const { return ""; }
 
@@ -287,15 +322,16 @@ public:
         const String & new_metadata_path,
         Poco::JSON::Object::Ptr metadata_content,
         DB::CompressionMethod metadata_compression_method,
-        bool if_not_exists) const;
+        bool if_not_exists,
+        const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Creates the namespace unless it already exists.
-    virtual void createNamespaceIfNotExists(const String & namespace_name, const String & location) const;
+    virtual void createNamespaceIfNotExists(const String & namespace_name, const String & location, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     virtual bool managesTableLocation() const { return false; }
 
     /// Updates metadata in catalog.
-    virtual bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const;
+    virtual bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Commit a schema evolution (ADD/DROP/MODIFY/RENAME COLUMN) to the catalog.
     /// `new_metadata_path` is the path of the freshly written `vN.metadata.json`; it is used by
@@ -311,11 +347,13 @@ public:
         Poco::JSON::Object::Ptr new_schema,
         Int32 previous_schema_id,
         Int32 new_last_column_id,
-        Poco::JSON::Object::Ptr metadata = nullptr) const;
+        Poco::JSON::Object::Ptr metadata,
+        const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Drop table from catalog.
     /// If `purge`, the catalog is also asked to delete the underlying data files.
-    virtual void dropTable(const String & namespace_name, const String & table_name, bool purge, bool if_exists) const;
+    virtual void dropTable(
+        const String & namespace_name, const String & table_name, bool purge, bool if_exists, const DB::ForwardedAuthTokenPtr & auth_token) const;
 
     /// Does the catalog support transactions or anything like that?
     /// For example, the Iceberg REST catalog supports atomic operations "compare if snapshot X is equal to" and "add new snapshot Y".
@@ -323,12 +361,20 @@ public:
     /// The Glue catalog does not support such operation.
     virtual bool isTransactional() const { return false; }
 
-    virtual CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & /*storage_id*/)
+    /// The callback outlives the query context, so retain the token directly.
+    virtual CredentialsRefreshCallback getCredentialsConfigurationCallback(
+        const DB::StorageID & /*storage_id*/, const TableMetadata & /*table_metadata*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
     {
         return std::nullopt;
     }
 
+    virtual void onTokenForwardingDisabled() const {}
+
     virtual void setVendedCredentialsCacheTTL(std::chrono::seconds /*ttl*/) {}
+    virtual CredentialsRefreshCallback getWriteCredentialsConfigurationCallback(const DB::StorageID & /*storage_id*/)
+    {
+        return std::nullopt;
+    }
 
     /// Result of `prepareSettingsChanges`: the new catalog state built off to the side,
     /// ready to be published by `commitSettingsChanges`.
@@ -342,20 +388,26 @@ public:
     /// state without publishing anything (may throw, may do network I/O). The state
     /// becomes visible only after `commitSettingsChanges`, so the caller can persist
     /// the changes in between and abandon the prepared state on failure.
-    virtual PreparedSettingsChangesPtr prepareSettingsChanges(const DB::SettingsChanges & changes);
+    virtual PreparedSettingsChangesPtr prepareSettingsChanges(
+        const DB::SettingsChanges & changes, const DB::ForwardedAuthTokenPtr & auth_token = {});
 
     /// Publish the state built by `prepareSettingsChanges`. Must not fail.
     virtual void commitSettingsChanges(PreparedSettingsChangesPtr prepared);
 
-    void applySettingsChanges(const DB::SettingsChanges & changes)
+    void applySettingsChanges(const DB::SettingsChanges & changes, const DB::ForwardedAuthTokenPtr & auth_token = {})
     {
-        commitSettingsChanges(prepareSettingsChanges(changes));
+        commitSettingsChanges(prepareSettingsChanges(changes, auth_token));
     }
 
 protected:
+    void validateForwardedToken(
+        const DB::ContextPtr & context,
+        const DB::ForwardedAuthTokenPtr & auth_token,
+        const std::string & catalog_description) const;
+
     /// List tables directly in `namespace_name` (non-recursive), as fully-qualified
     /// `namespace.table` entries carrying an `is_readable` flag like getTables().
-    virtual CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name) const = 0;
+    virtual CatalogTables listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & auth_token) const = 0;
 
     /// Name of the warehouse,
     /// which is sometimes also called "catalog name".

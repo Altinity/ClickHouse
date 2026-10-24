@@ -63,13 +63,23 @@ public:
     const String & getOriginalClusterName() const { return cluster_name; }
     virtual String getClusterName(ContextPtr /* context */) const { return getOriginalClusterName(); }
 
-protected:
-    virtual void updateBeforeRead(const ContextPtr &) {}
+    /// Old interpreter: rewrite JOIN / IN to GLOBAL JOIN / GLOBAL IN so GlobalSubqueriesVisitor can broadcast right tables.
+    static void rewriteASTForGlobalJoin(ASTPtr & query);
+
+    /// Prepare the `SELECT ... FROM f(...)` query (`f` is a table function) for the other nodes of the cluster: add the
+    /// structure and format arguments so that the nodes do not infer the schema again, and turn a plain table
+    /// function (`url`, `s3`, ...) that `parallel_replicas_for_cluster_engines` converted into this cluster
+    /// storage into its `*Cluster` variant with the cluster name argument, so that the nodes take their read
+    /// tasks from the initiator instead of reading every file on their own. Called by `read` and by the
+    /// distributed `INSERT ... SELECT` in `InterpreterInsertQuery`, which forwards the query the same way.
     virtual void updateQueryToSendIfNeeded(
         ASTPtr & /*query*/,
         const StorageSnapshotPtr & /*storage_snapshot*/,
         const ContextPtr & /*context*/,
         bool /*make_cluster_function*/) {}
+
+protected:
+    virtual void updateBeforeRead(const ContextPtr &) {}
     void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);
 
     virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
@@ -167,6 +177,14 @@ private:
     };
 
     static QueryTreeInfo getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context);
+    static QueryTreeInfo getQueryJoinInfoFromAST(const ASTPtr & query);
+    static QueryTreeInfo getQueryJoinInfo(const SelectQueryInfo & query_info, const ContextPtr & context);
+    static bool needsInitiatorLocalJoin(const QueryTreeInfo & info);
+    static void rewriteQueryForInitiatorLocalJoin(
+        ASTPtr & query_to_send,
+        const SelectQueryInfo & query_info,
+        const QueryTreeInfo & info,
+        const ContextPtr & context);
 };
 
 

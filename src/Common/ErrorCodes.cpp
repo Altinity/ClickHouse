@@ -663,6 +663,7 @@
     M(781, AI_PROVIDER_RESPONSE_TRUNCATED) \
     M(782, AI_PROVIDER_RESPONSE_INCOMPLETE) \
     M(783, CATALOG_NAMESPACE_DISABLED) \
+    M(784, CATALOG_USER_TOKEN_NOT_AVAILABLE) \
 \
     M(900, DISTRIBUTED_CACHE_ERROR) \
     M(901, CANNOT_USE_DISTRIBUTED_CACHE) \
@@ -691,6 +692,7 @@
     M(1016, PENDING_MUTATIONS_NOT_ALLOWED) \
     M(1017, EXPORT_PARTITION_ALREADY_EXPORTED) \
     M(1018, PARTITION_EXPORT_FAILED) \
+    M(1021, AZURE_OBJECT_CHANGED_DURING_READ) \
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -707,7 +709,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
-    constexpr ErrorCode END = 1018;
+    constexpr ErrorCode END = 1021;
 
 #if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
     /** One `ErrorPairHolder` per error code, each holding two `Error` structs - the last message,

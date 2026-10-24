@@ -1,6 +1,8 @@
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <unordered_set>
+#include "config.h"
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnsNumber.h>
 #include <Common/CurrentThread.h>
@@ -30,6 +32,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ProcessList.h>
+#include <Interpreters/castColumn.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Processors/Formats/Impl/ParquetMetadataCache.h>
@@ -74,6 +77,8 @@
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypesNumber.h>
 
 #include <Storages/MergeTree/MarkRange.h>
 #include <Interpreters/Cache/QueryConditionCache.h>
@@ -99,6 +104,11 @@ namespace CurrentMetrics
 
 namespace DB
 {
+namespace FailPoints
+{
+extern const char object_storage_source_pause_before_virtual_columns[];
+}
+
 namespace ErrorCodes
 {
     extern const int CANNOT_COMPILE_REGEXP;
@@ -209,6 +219,34 @@ namespace Setting
     extern const SettingsBool s3_validate_etag_on_read;
     extern const SettingsBool use_object_storage_list_objects_cache;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
+    extern const SettingsBool azure_validate_etag_on_read;
+}
+
+namespace
+{
+    DataTypePtr rowLineageColumnType()
+    {
+        return makeNullable(std::make_shared<DataTypeInt64>());
+    }
+
+    Names getMaterializedRowLineageColumns(
+        [[maybe_unused]] const ObjectInfo & object_info,
+        [[maybe_unused]] const ReadFromFormatInfo & read_from_format_info,
+        [[maybe_unused]] const String & format_name)
+    {
+        Names result;
+#if USE_AVRO
+        if (Poco::toLower(format_name) != "parquet" || !dynamic_cast<const IcebergDataObjectInfo *>(&object_info))
+            return result;
+
+        for (const auto * name : {"_row_id", "_last_updated_sequence_number"})
+        {
+            if (read_from_format_info.requested_virtual_columns.contains(name))
+                result.emplace_back(name);
+        }
+#endif
+        return result;
+    }
 }
 
 static void logIcebergFileStats(const ObjectInfoPtr & object_info, const LoggerPtr & log)
@@ -564,6 +602,8 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
         if (configuration->isDataLakeConfiguration()
             && (!storage_metadata || !storage_metadata->datalake_table_state.has_value()))
         {
+            configuration->lazyInitializeIfNeeded(object_storage, local_context);
+
             if (auto state = configuration->getTableStateSnapshot(local_context))
             {
                 auto fixed_metadata = storage_metadata
@@ -702,6 +742,32 @@ Chunk StorageObjectStorageSource::generate()
 
             const auto path = getUniqueStoragePathIdentifier(*configuration, *object_info, false);
 
+            ColumnPtr materialized_row_ids;
+            ColumnPtr materialized_last_updated_sequence_numbers;
+            /// Without an input format the chunk comes from the count-from-cache path, which reads no
+            /// file and therefore carries no row lineage columns.
+            if (const auto lineage_columns = reader.getInputFormat()
+                    ? getMaterializedRowLineageColumns(
+                          *object_info, read_from_format_info, object_info->getFileFormat().value_or(configuration->getFormat()))
+                    : Names{};
+                !lineage_columns.empty())
+            {
+                auto columns = chunk.detachColumns();
+                chassert(columns.size() >= lineage_columns.size());
+                const size_t first_lineage_column = columns.size() - lineage_columns.size();
+
+                for (size_t i = 0; i < lineage_columns.size(); ++i)
+                {
+                    if (lineage_columns[i] == "_row_id")
+                        materialized_row_ids = columns[first_lineage_column + i];
+                    else
+                        materialized_last_updated_sequence_numbers = columns[first_lineage_column + i];
+                }
+
+                columns.resize(first_lineage_column);
+                chunk.setColumns(std::move(columns), num_rows);
+            }
+
             /// The order is important, hive partition columns must be added before virtual columns
             /// because they are part of the schema
             if (!read_from_format_info.hive_partition_columns_to_read_from_file_path.empty())
@@ -717,9 +783,16 @@ Chunk StorageObjectStorageSource::generate()
             std::string path_for_virtual_column = object_info->getPathInDataLakeMetadata().value_or(path);
 
             const String * iceberg_metadata_file_path = nullptr;
+            std::optional<UInt64> last_updated_sequence_number;
+            std::optional<UInt64> first_row_id;
 #if USE_AVRO
             if (const auto * iceberg_info = dynamic_cast<const IcebergDataObjectInfo *>(object_info.get()))
+            {
                 iceberg_metadata_file_path = &iceberg_info->info.data_object_file_path_key.serialize();
+                first_row_id = iceberg_info->info.first_row_id;
+                if (first_row_id.has_value())
+                    last_updated_sequence_number = iceberg_info->info.sequence_number;
+            }
 #endif
 
             std::optional<size_t> object_size;
@@ -727,6 +800,8 @@ Chunk StorageObjectStorageSource::generate()
                 object_size = object_info->fileSizeInArchive();
             else if (object_metadata->is_size_known)
                 object_size = object_metadata->size_bytes;
+
+            FailPointInjection::pauseFailPoint(FailPoints::object_storage_source_pause_before_virtual_columns);
 
             VirtualColumnUtils::addRequestedFileLikeStorageVirtualsToChunk(
                 chunk,
@@ -745,6 +820,10 @@ Chunk StorageObjectStorageSource::generate()
                     .tags = &(object_metadata->tags),
                     .data_lake_snapshot_version = file_iterator->getSnapshotVersion(),
                     .iceberg_metadata_file_path = iceberg_metadata_file_path,
+                    .last_updated_sequence_number = last_updated_sequence_number,
+                    .first_row_id = first_row_id,
+                    .materialized_row_ids = materialized_row_ids,
+                    .materialized_last_updated_sequence_numbers = materialized_last_updated_sequence_numbers,
                 },
                 read_context,
                 format_settings);
@@ -859,6 +938,11 @@ Chunk StorageObjectStorageSource::generate()
 
                                     const auto column_pos = read_from_format_info.source_header.getPositionByName(name_and_type.name);
                                     auto partition_column = name_and_type.type->createColumnConst(chunk.getNumRows(), value)->convertToFullColumnIfConst();
+                                    /// The `_delta_log` type differs from the declared one when the columns were
+                                    /// specified rather than inferred, and the block follows the declared schema.
+                                    const auto & declared_type = read_from_format_info.source_header.getByPosition(column_pos).type;
+                                    if (!name_and_type.type->equals(*declared_type))
+                                        partition_column = castColumn({partition_column, name_and_type.type, name_and_type.name}, declared_type);
                                     /// This column is filled with default value now, remove it.
                                     chunk.erase(column_pos);
                                     /// Add correct values.
@@ -1126,9 +1210,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
     ProfileEvents::increment(ProfileEvents::ObjectStorageClusterProcessedTasks);
 
+    std::unique_ptr<ReadBuffer> read_buf; /// Destroyed last: `builder` and `source` hold the input format reading it.
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
-    std::unique_ptr<ReadBuffer> read_buf;
     std::optional<Int64> rows_count_from_metadata;
 
     auto try_get_num_rows_from_cache = [&]() -> std::optional<size_t>
@@ -1173,6 +1257,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     std::unordered_set<String> constant_columns;
 
     NamesAndTypesList requested_columns_copy = read_from_format_info.requested_columns;
+    Names row_lineage_columns;
 
     std::unordered_map<String, std::pair<size_t, NameAndTypePair>> requested_columns_list;
     {
@@ -1351,6 +1436,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     {
         const auto format_name = object_info->getFileFormat().value_or(configuration->getFormat());
         const bool input_format_does_not_read_file = Poco::toLower(format_name) == "one";
+        row_lineage_columns = getMaterializedRowLineageColumns(*object_info, read_from_format_info, format_name);
 
         CompressionMethod compression_method = {};
         if (input_format_does_not_read_file)
@@ -1392,6 +1478,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (const auto * iceberg_info = dynamic_cast<const IcebergDataObjectInfo *>(object_info.get()))
             identity_partition_columns = iceberg_info->info.identity_partition_columns;
 #endif
+
+        for (const auto & column_name : row_lineage_columns)
+        {
+            if (!initial_header.has(column_name))
+                initial_header.insert({rowLineageColumnType()->createColumn(), rowLineageColumnType(), column_name});
+        }
 
         /// Save stripped filters if we need to apply them as fallback FilterTransforms
         /// later in the pipeline when the file format doesn't support PREWHERE.
@@ -1676,6 +1768,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         if (schema_transform.has_value())
         {
+            for (const auto & column_name : row_lineage_columns)
+            {
+                const auto & input = schema_transform->addInput(column_name, rowLineageColumnType());
+                schema_transform->getOutputs().push_back(&input);
+            }
+
             auto schema_modifying_actions = std::make_shared<ExpressionActions>(std::move(schema_transform.value()));
             builder.addSimpleTransform([&](const SharedHeader & header)
             {
@@ -1795,9 +1893,13 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         });
     }
 
+    NamesAndTypesList columns_to_extract = requested_columns_copy;
+    for (const auto & column_name : row_lineage_columns)
+        columns_to_extract.emplace_back(column_name, rowLineageColumnType());
+
     builder.addSimpleTransform([&](const SharedHeader & header)
     {
-        return std::make_shared<ExtractColumnsTransform>(header, requested_columns_copy);
+        return std::make_shared<ExtractColumnsTransform>(header, columns_to_extract);
     });
 
     auto pipeline = std::make_unique<QueryPipeline>(QueryPipelineBuilder::getPipeline(std::move(builder)));
@@ -1860,16 +1962,24 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// 2. object etag suggests a cache key in case we use filesystem cache
     /// 3. object etag as a cache key for parquet metadata caching
     /// 4. object etag to detect a concurrent in-place overwrite during the read
+    /// Whether the read is pinned to the generation of the object seen at listing time. Each backend
+    /// that supports it has its own setting, because they are documented per backend and a user may
+    /// want to opt out of the check for one store but not the other.
+    bool validate_etag_on_read = false;
+    if (object_storage->getType() == ObjectStorageType::S3)
+        validate_etag_on_read = settings[Setting::s3_validate_etag_on_read];
+    else if (object_storage->getType() == ObjectStorageType::Azure)
+        validate_etag_on_read = settings[Setting::azure_validate_etag_on_read];
+
     if (!object_info.metadata)
     {
         object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
     }
-    else if (!object_info.metadata->is_fetched && settings[Setting::s3_validate_etag_on_read]
-             && object_storage->getType() == ObjectStorageType::S3)
+    else if (!object_info.metadata->is_fetched && validate_etag_on_read)
     {
-        /// Refresh the s3Cluster skip_object_metadata placeholder to obtain its size + ETag for read-time
-        /// validation (it carries no tags, so the with_tags=false HEAD drops nothing). A real fetch that
-        /// merely lacks an ETag (e.g. GCS) has is_fetched=true and is left as-is - no extra HEAD.
+        /// Refresh the cluster function's skip_object_metadata placeholder to obtain its size + ETag for
+        /// read-time validation (it carries no tags, so the with_tags=false HEAD drops nothing). A real fetch
+        /// that merely lacks an ETag (e.g. GCS) has is_fetched=true and is left as-is - no extra HEAD.
         object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
     }
 
@@ -1935,13 +2045,18 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// filename to `readWithDistributedCache` (it ends up in `getFileName()` and in
     /// `system.distributed_cache_log.filename`). Use the object path so the DC log
     /// shows a useful name rather than an empty string.
-    const auto stored_object_size = is_size_known ? object_size : StoredObject::UnknownSize;
+    /// The size is used by the object storage as the right bound of the read, so it must come from a
+    /// real listing or HEAD: the skip_object_metadata placeholder is default-constructed, and its
+    /// `size_bytes == 0` would otherwise read every non-empty object as empty.
+    const auto stored_object_size = is_size_known && object_info.metadata->is_fetched
+        ? object_size
+        : StoredObject::UnknownSize;
     StoredObject stored_object(object_info.getPath(), object_info.getPath(), stored_object_size, object_info.read_source_index);
 
     /// Pin the read to the object generation seen here (etag from the LIST/HEAD): a GET with a
-    /// different ETag means an in-place overwrite, reported as S3_OBJECT_CHANGED_DURING_READ
-    /// instead of torn cross-generation data.
-    if (settings[Setting::s3_validate_etag_on_read] && object_info.metadata.has_value())
+    /// different ETag means an in-place overwrite, reported as S3_OBJECT_CHANGED_DURING_READ or
+    /// AZURE_OBJECT_CHANGED_DURING_READ instead of torn cross-generation data.
+    if (validate_etag_on_read && object_info.metadata.has_value())
         stored_object.etag = object_info.metadata->etag;
     pipeline.setSource(object_storage, StoredObjects{stored_object}, modified_read_settings);
 
@@ -2379,10 +2494,7 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     for (size_t i = 0; i < max_threads_count; ++i)
         objects.push_back(pool_scheduler([this]() -> ObjectInfoPtr
         {
-            auto task = callback();
-            if (!task || task->isEmpty())
-                return nullptr;
-            return task->getObjectInfo();
+            return takeNextObject(/*wait_for_retry=*/ false);
         }, Priority{}));
 
     pool.wait();
@@ -2391,10 +2503,7 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     {
         auto object = object_future.get();
         if (object)
-        {
-            resolveObjectStorageIfNeeded(object);
             buffer.push_back(object);
-        }
     }
 }
 
@@ -2417,13 +2526,12 @@ static size_t getKnownArchiveSize(const ObjectInfoPtr & object_info)
     return object_metadata->size_bytes;
 }
 
-ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
+ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::takeNextObject(bool wait_for_retry)
 {
-    size_t current_index = index.fetch_add(1, std::memory_order_relaxed);
-
-    ObjectInfoPtr object_info;
-    if (current_index >= buffer.size())
+    while (true)
     {
+        /// Recheck after each `retry_after_us` wait. `SYSTEM STOP SWARM MODE` during that wait
+        /// must not be followed by another task request.
         if (!getContext()->isSwarmModeEnabled())
         {
             LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
@@ -2438,8 +2546,35 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
         if (!task || task->isEmpty())
             return nullptr;
 
-        object_info = task->getObjectInfo();
+        if (task->retry_after_us)
+        {
+            if (!wait_for_retry)
+                return nullptr;
+
+            /// The wait stays on the worker so the initiator thread is not blocked.
+            /// TODO: wait asynchronously instead of sleeping in this thread.
+            auto wait_time = std::min<UInt64>(100000, *task->retry_after_us);
+            ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
+            sleepForMicroseconds(wait_time);
+            continue;
+        }
+
+        auto object_info = task->getObjectInfo();
         resolveObjectStorageIfNeeded(object_info);
+        return object_info;
+    }
+}
+
+ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
+{
+    size_t current_index = index.fetch_add(1, std::memory_order_relaxed);
+
+    ObjectInfoPtr object_info;
+    if (current_index >= buffer.size())
+    {
+        object_info = takeNextObject(/*wait_for_retry=*/ true);
+        if (!object_info)
+            return nullptr;
     }
     else
     {

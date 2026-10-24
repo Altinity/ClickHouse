@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Access/ForwardedAuthToken.h>
 #include <Core/Block.h>
 #include <Parsers/IAST_fwd.h>
 #include <Processors/Chunk.h>
@@ -97,6 +98,7 @@ public:
         String current_user;
         String initial_user;
         String authenticated_user;
+        ForwardedAuthTokenPtr forwarded_auth_token;
         std::unique_ptr<Settings> settings;
 
         AsynchronousInsertQueueDataKind data_kind;
@@ -109,6 +111,7 @@ public:
             const String & current_user_,
             const String & initial_user_,
             const String & authenticated_user_,
+            const ForwardedAuthTokenPtr & forwarded_auth_token_,
             const Settings & settings_,
             AsynchronousInsertQueueDataKind data_kind_);
 
@@ -118,7 +121,14 @@ public:
         StorageID getStorageID() const;
 
     private:
-        auto toTupleCmp() const { return std::tie(data_kind, query_str_with_secrets, user_id, current_roles, current_user, initial_user, authenticated_user, setting_changes); }
+        auto toTupleCmp() const
+        {
+            return std::tie(
+                data_kind, query_str_with_secrets, user_id, current_roles, current_user, initial_user,
+                authenticated_user, forwarded_auth_token_fingerprint, setting_changes);
+        }
+
+        String forwarded_auth_token_fingerprint;
 
         std::vector<SettingChange> setting_changes;
     };
@@ -215,6 +225,16 @@ private:
             }
 
             ready_promise.set_value();
+
+            if (in_flight_flushes && in_flight_flushes->fetch_sub(1) == 1)
+                in_flight_flushes->notify_all();
+        }
+
+        void trackFlush(std::atomic<size_t> & counter)
+        {
+            chassert(!in_flight_flushes);
+            in_flight_flushes = &counter;
+            ++counter;
         }
 
         using EntryPtr = std::shared_ptr<Entry>;
@@ -224,6 +244,7 @@ private:
         std::shared_future<void> ready_future;
         size_t size_in_bytes = 0;
         Milliseconds timeout_ms = Milliseconds::zero();
+        std::atomic<size_t> * in_flight_flushes = nullptr;
     };
 
     using InsertDataPtr = std::unique_ptr<InsertData>;
@@ -248,6 +269,9 @@ private:
     {
         mutable std::mutex mutex;
         mutable std::condition_variable are_tasks_available;
+        /// Counts batches removed by producers or the deadline worker, including those
+        /// still waiting for pool admission. Released when the batch is destroyed.
+        std::atomic<size_t> in_flight_flushes{0};
 
         Queue queue TSA_GUARDED_BY(mutex);
         QueueIteratorByKey iterators TSA_GUARDED_BY(mutex);
@@ -273,6 +297,9 @@ private:
     const size_t pool_size;
     const bool flush_on_shutdown;
 
+    /// Batches and jobs point into these vectors: `InsertData::in_flight_flushes` refers to a shard, and
+    /// `processData` receives the shard's flush time history by reference. Keep them declared before
+    /// `pool` and `dump_by_first_update_threads`, so they are destroyed after the threads that use them.
     std::vector<QueueShard> queue_shards;
     std::vector<QueueShardFlushTimeHistory> flush_time_history_per_queue_shard;
 
@@ -311,7 +338,7 @@ private:
     void processBatchDeadlines(size_t shard_num);
     void scheduleDataProcessingJob(const InsertQuery & key, InsertDataPtr data, ContextPtr global_context, size_t shard_num, ThreadGroupPtr current_query_thread_group = nullptr);
 
-    static void processData(
+    void processData(
         InsertQuery key, InsertDataPtr data, ContextPtr global_context, ThreadGroupPtr current_query_thread_group, QueueShardFlushTimeHistory & queue_shard_flush_time_history);
 
     template <typename LogFunc>
