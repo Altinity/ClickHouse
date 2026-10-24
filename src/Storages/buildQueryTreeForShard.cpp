@@ -82,7 +82,6 @@ namespace ErrorCodes
 namespace
 {
 
-<<<<<<< HEAD
 /// The side of a global join that is materialized into a temporary table on the initiator, the other
 /// one being read by each replica: the right side, except for a RIGHT JOIN reached through a path
 /// that allows the right table to be the one read with replicas.
@@ -98,12 +97,6 @@ QueryTreeNodePtr & getMaterializedTableExpressionNode(JoinNode & join_node, bool
 /// A JOIN / CROSS_JOIN / ARRAY_JOIN source puts a `ListNode` of the joined sides in the expression child,
 /// which is not an alias body. The expression is cloned so each occurrence gets its own copy: that lets
 /// one occurrence be aliased (a projection output) without mutating another (a reference in ORDER BY).
-=======
-/// Return a clone of the defining expression of an inlineable `ALIAS` column node, or nullptr otherwise.
-/// A JOIN / CROSS_JOIN / ARRAY_JOIN source puts a `ListNode` of the joined sides in the expression child, which is not
-/// an alias body. The expression is cloned so each occurrence gets its own copy: that lets one occurrence be aliased
-/// (a projection output) without mutating another (a reference in `ORDER BY`).
->>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
 QueryTreeNodePtr getInlineableAliasColumnExpression(const QueryTreeNodePtr & node)
 {
     const auto * column_node = node->as<ColumnNode>();
@@ -119,121 +112,6 @@ QueryTreeNodePtr getInlineableAliasColumnExpression(const QueryTreeNodePtr & nod
     return column_node->getExpression()->clone();
 }
 
-<<<<<<< HEAD
-void inlineAliasColumnsImpl(QueryTreeNodePtr & node);
-void inlineAliasColumnsInExpression(QueryTreeNodePtr & node);
-
-/// A `JOIN USING` key is a `ColumnNode` whose expression is a `ListNode` recording how the key resolves on
-/// each side, and a side's entry can itself be an `ALIAS` column. Such an entry keeps the key's name as an
-/// alias when inlined, because the shipped SQL renders the entry rather than the key: `USING (x AS a)` is
-/// what lets a remote server resolve a key that exists only as an `ALIAS` column of the initiator's table.
-/// The alias also tells `rejectUnshippableJoinUsingKeys` which keys no remote server can resolve, and it
-/// reads the entry expecting exactly this shape.
-void inlineJoinUsingKeys(QueryTreeNodePtr & join_expression)
-{
-    auto * using_list = join_expression->as<ListNode>();
-    if (!using_list)
-        return;
-
-    for (auto & using_node : using_list->getNodes())
-    {
-        auto * using_column = using_node->as<ColumnNode>();
-        if (!using_column || !using_column->hasExpression())
-            continue;
-
-        auto * key_sides = using_column->getExpression()->as<ListNode>();
-        if (!key_sides)
-            continue;
-
-        for (auto & side : key_sides->getNodes())
-        {
-            const auto * side_column = side->as<ColumnNode>();
-            auto expression = getInlineableAliasColumnExpression(side);
-            if (!expression)
-                continue;
-
-            const String key_name = side_column->getColumnName();
-            inlineAliasColumnsInExpression(expression);
-            expression->setAlias(key_name);
-            side = expression;
-        }
-    }
-}
-
-/// Inline `ALIAS` columns inside an expression subtree without assigning any alias. Nested subqueries are
-/// handed back to `inlineAliasColumnsImpl` so their own projection columns keep their names.
-void inlineAliasColumnsInExpression(QueryTreeNodePtr & node)
-{
-    if (node->as<QueryNode>() || node->as<UnionNode>())
-    {
-        inlineAliasColumnsImpl(node);
-        return;
-    }
-
-    /// An `ALIAS` column may be defined over another one, so keep unwrapping.
-    while (auto expression = getInlineableAliasColumnExpression(node))
-        node = expression;
-
-    auto * join_node = node->as<JoinNode>();
-    const bool using_join = join_node && join_node->isUsingJoinExpression();
-
-    for (auto & child : node->getChildren())
-    {
-        if (!child)
-            continue;
-
-        if (using_join && child == join_node->getJoinExpression())
-            inlineJoinUsingKeys(child);
-        else
-            inlineAliasColumnsInExpression(child);
-    }
-}
-
-/// Inline `ALIAS` columns into their defining expressions, so the expression is evaluated on the
-/// shard/replica reading the real table instead of the column being resolved there as if it were physical.
-///
-/// The defining expression keeps the column's logical name as an alias only when the `ALIAS` column is a
-/// top-level projection item, so the mergeable-state output column keeps its name. Inside expression
-/// clauses (`WHERE`/`GROUP BY`/`ORDER BY`/`HAVING`/`JOIN ON`) no alias is set; otherwise two same-named
-/// `ALIAS` columns from different `JOIN` sources land in one scope with different bodies and the remote
-/// side throws `MULTIPLE_EXPRESSIONS_FOR_ALIAS` (https://github.com/ClickHouse/ClickHouse/issues/107990).
-void inlineAliasColumnsImpl(QueryTreeNodePtr & node)
-{
-    if (auto * union_node = node->as<UnionNode>())
-    {
-        for (auto & query : union_node->getQueries().getNodes())
-            inlineAliasColumnsImpl(query);
-        return;
-    }
-
-    auto * query_node = node->as<QueryNode>();
-    if (!query_node)
-    {
-        inlineAliasColumnsInExpression(node);
-        return;
-    }
-
-    for (auto & projection_item : query_node->getProjection().getNodes())
-    {
-        const auto * column_node = projection_item->as<ColumnNode>();
-        if (auto expression = getInlineableAliasColumnExpression(projection_item))
-        {
-            const String output_alias = column_node->getColumnName();
-            inlineAliasColumnsInExpression(expression);
-            expression->setAlias(output_alias);
-            projection_item = expression;
-        }
-        else
-        {
-            inlineAliasColumnsInExpression(projection_item);
-        }
-    }
-
-    for (auto & child : query_node->getChildren())
-        if (child && child != query_node->getProjectionNode())
-            inlineAliasColumnsInExpression(child);
-}
-=======
 /// Wrap an inlined `ALIAS` expression in `__aliasMarker` so it carries the identity of the column it came from.
 ///
 /// The id goes in as a live `ColumnNode`, not as a finished string. Later analyzer passes still have to run --
@@ -432,7 +310,6 @@ struct AliasColumnInliner
                 inlineExpression(child);
     }
 };
->>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
 
 /// Visitor that collect column source to columns mapping from query and all subqueries
 class CollectColumnSourceToColumnsVisitor : public InDepthQueryTreeVisitor<CollectColumnSourceToColumnsVisitor>
@@ -1158,16 +1035,10 @@ void rejectUnshippableJoinUsingKeys(const QueryTreeNodePtr & root)
 
 }
 
-<<<<<<< HEAD
-void inlineAliasColumns(QueryTreeNodePtr & query_tree_to_modify)
-{
-    inlineAliasColumnsImpl(query_tree_to_modify);
-=======
 void inlineAliasColumns(QueryTreeNodePtr & query_tree_to_modify, const ContextPtr & context)
 {
     const AliasColumnInliner inliner{context, context->getSettingsRef()[Setting::enable_alias_marker]};
     inliner.inlineQuery(query_tree_to_modify);
->>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
 }
 
 QueryTreeNodePtr buildQueryTreeForShard(
@@ -1573,7 +1444,7 @@ String actionNameAfterAliasInlining(const QueryTreeNodePtr & node, const Planner
     /// (the shard works on the inlined query tree). Action names come from the column identifier or the
     /// expression rather than the SQL alias, so inlining without aliasing is what this needs.
     auto node_clone = node->clone();
-    inlineAliasColumnsInExpression(node_clone);
+    AliasColumnInliner{planner_context.getQueryContext(), /*use_alias_marker=*/false}.inlineExpression(node_clone);
 
     /// `buildQueryTreeForShard` performs one more naming-relevant rewrite after inlining ALIAS columns:
     /// `ReplaceLongConstWithScalarVisitor` turns over-threshold constants into `__getScalar('<hash>')` calls

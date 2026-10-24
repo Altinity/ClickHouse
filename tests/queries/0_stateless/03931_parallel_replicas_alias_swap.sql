@@ -40,7 +40,7 @@ SETTINGS log_comment = '03931_dist_ast';
 SELECT 'pr_query_ast';
 SELECT countIf(explain LIKE '%Convert distributed names%') > 0,
        countIf(explain LIKE '%ReadFromRemoteParallelReplicas%') > 0
-FROM (EXPLAIN PLAN SELECT x, a1, a2 FROM (SELECT x, a1, a2 FROM t_local_03931)
+FROM (EXPLAIN PLAN compact = 0 SELECT x, a1, a2 FROM (SELECT x, a1, a2 FROM t_local_03931)
       GROUP BY x, a1, a2 ORDER BY x);
 SELECT x, a1, a2 FROM (SELECT x, a1, a2 FROM t_local_03931)
 GROUP BY x, a1, a2 ORDER BY x
@@ -50,7 +50,7 @@ SET serialize_query_plan = 1;
 SELECT 'pr_query_plan';
 SELECT countIf(explain LIKE '%Convert distributed names%') > 0,
        countIf(explain LIKE '%ReadFromRemoteParallelReplicas%') > 0
-FROM (EXPLAIN PLAN SELECT x, a1, a2 FROM (SELECT x, a1, a2 FROM t_local_03931)
+FROM (EXPLAIN PLAN compact = 0 SELECT x, a1, a2 FROM (SELECT x, a1, a2 FROM t_local_03931)
       GROUP BY x, a1, a2 ORDER BY x);
 SELECT x, a1, a2 FROM (SELECT x, a1, a2 FROM t_local_03931)
 GROUP BY x, a1, a2 ORDER BY x

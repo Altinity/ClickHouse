@@ -3,12 +3,9 @@
 #include <optional>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/UnionNode.h>
-<<<<<<< HEAD
+#include <Analyzer/Utils.h>
 #include <Analyzer/createUniqueAliasesIfNecessary.h>
 #include <base/scope_guard.h>
-=======
-#include <Analyzer/Utils.h>
->>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
 #include <Columns/ColumnConst.h>
 #include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
@@ -1271,7 +1268,7 @@ void executeQueryWithParallelReplicas(
     /// Inline ALIAS columns before shipping the query, mirroring the Distributed/remote() path.
     /// buildQueryTreeForShard below rebuilds a shipped table expression from names and types only, which
     /// would drop an ALIAS column's expression and make the replica read it as physical.
-    inlineAliasColumns(modified_query_tree);
+    inlineAliasColumns(modified_query_tree, context);
     rewriteJoinToGlobalJoin(modified_query_tree, context);
     modified_query_tree = buildQueryTreeForShard(planner_context, modified_query_tree, /*allow_global_join_for_right_table*/ true);
 

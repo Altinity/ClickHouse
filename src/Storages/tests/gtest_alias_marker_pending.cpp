@@ -32,10 +32,10 @@ using namespace DB;
 namespace
 {
 
-class MarkerTestTableNode final : public IQueryTreeNode
+class MarkerTestTableNode final : public ITableExpressionNode
 {
 public:
-    MarkerTestTableNode() : IQueryTreeNode(0) {}
+    MarkerTestTableNode() : ITableExpressionNode(0) {}
 
     QueryTreeNodeType getNodeType() const override { return QueryTreeNodeType::TABLE; }
     void dumpTreeImpl(WriteBuffer &, FormatState &, size_t) const override {}
@@ -110,7 +110,7 @@ TEST(AliasMarkerPending, ProjectionAliasOnJoinUsingSide)
     auto join = std::make_shared<JoinNode>(left, right, using_list,
         JoinLocality::Unspecified, JoinStrictness::All, JoinKind::Inner, true);
     auto query = std::make_shared<QueryNode>(context);
-    query->getJoinTree() = join;
+    query->getJoinTreeNode() = join;
     QueryTreeNodePtr root = query;
 
     inlineAliasColumns(root, context);

@@ -29,16 +29,6 @@ QueryTreeNodePtr buildQueryTreeForShard(
     bool allow_global_join_for_right_table,
     bool find_cross_join = false);
 
-<<<<<<< HEAD
-/** Replace every `ALIAS` column node with its defining expression, so the expression is evaluated on the shard/replica
-  * that reads the real table instead of the column being resolved there as if it were physical.
-  *
-  * Must be applied to any query tree that is about to be shipped, before `buildQueryTreeForShard`: that function rebuilds
-  * a shipped table expression from column names and types only, which drops an `ALIAS` column's resolved expression and
-  * leaves the remote side asking storage for a column it does not have (`NO_SUCH_COLUMN_IN_TABLE`).
-  */
-void inlineAliasColumns(QueryTreeNodePtr & query_tree_to_modify);
-=======
 /** Replace every `ALIAS` column node with its defining expression, so the expression is evaluated on the shard that reads
   * the real table instead of the column being resolved there as if it were physical.
   *
@@ -55,7 +45,6 @@ void inlineAliasColumns(QueryTreeNodePtr & query_tree_to_modify);
   * columns from different sources collide in one scope, and the shard then throws `MULTIPLE_EXPRESSIONS_FOR_ALIAS`.
   */
 void inlineAliasColumns(QueryTreeNodePtr & query_tree_to_modify, const ContextPtr & context);
->>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
 
 void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context, bool force_prefer_global_join = false);
 void rewriteInToGlobalIn(QueryTreeNodePtr & query_tree_to_modify, ContextPtr context, bool rewrite_for_distributed = false);

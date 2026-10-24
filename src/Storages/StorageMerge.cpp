@@ -1730,32 +1730,6 @@ ReadFromMerge::RowPolicyData::RowPolicyData(RowPolicyFilterPtr row_policy_filter
     actions_dag.getOutputs() = std::move(new_outputs);
 
     filter_actions = std::make_shared<ExpressionActions>(actions_dag.clone(), ExpressionActionsSettings(local_context, CompileExpressions::yes));
-<<<<<<< HEAD
-=======
-    const auto & required_columns = filter_actions->getRequiredColumnsWithTypes();
-    const auto & sample_block_columns = filter_actions->getSampleBlock().getNamesAndTypesList();
-
-    NamesAndTypesList added;
-    NamesAndTypesList deleted;
-    sample_block_columns.getDifference(required_columns, added, deleted);
-    if (deleted.empty() && added.empty() && expr->as<ASTIdentifier>()
-        && actions_dag.findInOutputs(expr->getColumnName()).type == ActionsDAG::ActionType::INPUT)
-    {
-        /// A bare column policy filters on an existing input, which must remain available after filtering.
-        filter_column_name = expr->getColumnName();
-        remove_filter_column = false;
-    }
-    else if (deleted.empty() && added.size() == 1)
-    {
-        filter_column_name = added.getNames().front();
-    }
-    else
-    {
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Cannot determine row level filter; {} columns deleted, {} columns added",
-            deleted.size(), added.size());
-    }
->>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
 }
 
 void ReadFromMerge::RowPolicyData::extendNames(Names & names) const

@@ -1132,11 +1132,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
          * (including fully-resolved ALIAS expressions) and rewrite the whole query tree
          * so all references to the replaced table share the same column source and
          * the same alias semantics. This keeps SELECT and WHERE consistent before
-<<<<<<< HEAD
          * inlineAliasColumns() performs final alias expansion.
-=======
-         * inlineAliasColumns performs final alias expansion.
->>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
          */
         ReplaceColumnNodesForTableExpressionVisitor replace_query_columns_visitor(
             replacement_table_expression,
@@ -1145,11 +1141,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         replace_query_columns_visitor.visit(query_tree_to_modify);
     }
 
-<<<<<<< HEAD
-    inlineAliasColumns(query_tree_to_modify);
-=======
     inlineAliasColumns(query_tree_to_modify, query_context);
->>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
 
     const auto & settings = query_context->getSettingsRef();
 

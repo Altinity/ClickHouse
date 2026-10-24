@@ -1124,9 +1124,6 @@ void resolveAggregateFunctionNodeByName(FunctionNode & function_node, const Stri
     function_node.resolveAsAggregateFunction(std::move(aggregate_function));
 }
 
-<<<<<<< HEAD
-std::pair<TableExpressionNodePtr, bool> getExpressionSource(const QueryTreeNodePtr & node)
-=======
 namespace
 {
 
@@ -1202,8 +1199,7 @@ void assertNoPendingAliasMarkersForDistributedSerialization(const QueryTreeNodeP
     }
 }
 
-std::pair<QueryTreeNodePtr, bool> getExpressionSource(const QueryTreeNodePtr & node)
->>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
+std::pair<TableExpressionNodePtr, bool> getExpressionSource(const QueryTreeNodePtr & node)
 {
     if (const auto * column = node->as<ColumnNode>())
     {

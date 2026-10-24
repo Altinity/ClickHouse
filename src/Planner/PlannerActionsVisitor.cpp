@@ -95,7 +95,6 @@ String calculateActionNodeNameWithCastIfNeeded(const ConstantNode & constant_nod
     return buffer.str();
 }
 
-<<<<<<< HEAD
 bool containsQueryOrUnionInSourceExpression(const QueryTreeNodePtr & node)
 {
     if (node->getNodeType() == QueryTreeNodeType::QUERY || node->getNodeType() == QueryTreeNodeType::UNION)
@@ -110,7 +109,8 @@ bool containsQueryOrUnionInSourceExpression(const QueryTreeNodePtr & node)
             return true;
 
     return false;
-=======
+}
+
 /// Return a two-argument `__aliasMarker`'s string id, or an empty string when it has none.
 /// A three-argument pending marker always resolves to its payload in an intermediate plan.
 String tryExtractAliasMarkerId(const QueryTreeNodePtr & id_argument)
@@ -119,7 +119,6 @@ String tryExtractAliasMarkerId(const QueryTreeNodePtr & id_argument)
         return id_node->getValue().safeGet<String>();
 
     return {};
->>>>>>> 8058ab2e09ae (Merge pull request #2409 from Altinity/mkmkme/26.6/alias-marker)
 }
 
 class ActionNodeNameHelper
