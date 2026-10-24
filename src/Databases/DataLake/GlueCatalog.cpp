@@ -786,7 +786,7 @@ void GlueCatalog::setCredentials(const AuthenticatedClient & client, TableMetada
 }
 
 ICatalog::CredentialsRefreshCallback GlueCatalog::getCredentialsConfigurationCallback(
-    const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token)
+    const DB::StorageID & storage_id, const TableMetadata & /*table_metadata*/, const DB::ForwardedAuthTokenPtr & auth_token)
 {
     /// The AWS SDK credentials provider chain (instance profile, STS assume-role,
     /// web-identity, etc.) refreshes its cached credentials internally before

@@ -109,7 +109,7 @@ public:
     /// fails with `ExpiredToken`, so that a long-running read can recover without
     /// the user having to restart the query.
     ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(
-        const DB::StorageID & storage_id, const DB::ForwardedAuthTokenPtr & auth_token) override;
+        const DB::StorageID & storage_id, const TableMetadata & table_metadata, const DB::ForwardedAuthTokenPtr & auth_token) override;
 
     /// Resolves the precise Iceberg timestamp type for `column_name` by searching the current schema
     /// in the Iceberg `metadata_object`. Falls back to `"timestamp_ns"` when `glue_column_type` is
