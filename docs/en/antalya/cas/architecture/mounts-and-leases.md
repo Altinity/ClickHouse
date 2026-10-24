@@ -51,11 +51,21 @@ and never reassigned — decommission only tombstones it in place.
 | Observed at `gc/server-roots/<server_root_id>/owner` | Action |
 |---|---|
 | present, same `server_uuid`, not tombstoned | proceed |
-| present, `retired_at_ms` set | `CORRUPTED_DATA` — explicitly decommissioned; the refusal says to configure a new `cas_server_root_id` |
+| present, `retired_at_ms` set | `CORRUPTED_DATA` for a server start or remount; the decommission admin accepts its own victim's tombstone |
 | present, different `server_uuid` | `CORRUPTED_DATA` — names the regenerated-uuid-file cause and, for a dead owner, `SYSTEM CAS DROP POOL MEMBER` |
+| absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | absent, subtree non-empty | `CORRUPTED_DATA` — identity lost over existing data |
 | absent, subtree provably empty | `putIfAbsent` the owner (claim) |
 | lost the `putIfAbsent` race | re-read; equal uuid proceeds, else `CORRUPTED_DATA` |
+
+The owner carries `owner_life`, a counter every owner write sets to the read value + 1 by `If-Match`, so
+two owner writes never repeat their bytes and a delayed `If-Match` against an older incarnation cannot
+land. A process records the life it started under; after every mount claim (start, self-remount,
+decommission) it reads the owner once more and requires its own `server_uuid` and that life
+(`recheckOwnerAfterClaim`); otherwise it fences its own mount body and fails, so a successor does not wait
+the refused lease out. A self-remount also compares the life before it allocates an epoch: an owner at
+another life, not retired, moves the pool to `IdentityLost` instead of retrying. `retirement_verified`
+marks a decommission whose claim, tombstone and farewell all held.
 
 "Provably empty" requires both an authoritative decoded catalog naming no life owned by `server_root_id` and
 a 1-key `LIST` probe finding nothing under `cas/manifests/<server_root_id>/` or `roots/<server_root_id>/`.
@@ -145,8 +155,7 @@ lease the slot's body declares (`expires_at_ms − started_at_ms`). A body witho
 non-positive interval (a farewell), declares nothing. A re-mounting server waits out a predecessor the
 same way with the step `max(1, floor(period/2))`. `period` is always the observer's own. The two stamps
 are compared only with each other, never with the observer's clock. `expires_at_ms` alone is a
-writer-stamped diagnostic used by `system.cas_mounts` and the non-authoritative decommission
-epoch-recovery precheck. Local fencing is derived from the confirmed request's pre-I/O `BOOTTIME`
+writer-stamped diagnostic used by `system.cas_mounts`. Local fencing is derived from the confirmed request's pre-I/O `BOOTTIME`
 anchor plus the TTL, and wall-clock `now` stays audit-only.
 
 `cas_mount_lease_ttl_ms` is local to each server. It is how long this server may write after its last
@@ -165,8 +174,14 @@ the first renewal attempt of a period can begin, where `envelope = attempt_timeo
 
 | Counter | Storage | Scope | Protects against |
 |---|---|---|---|
-| `writer_epoch` | durable, `gc/server-roots/<server_root_id>/epoch` (`ServerEpoch::next_writer_epoch`, CAS-bumped by `allocateWriterEpoch`) | across crashes and restarts | a same-`(uuid, epoch)` twin: a present mount under a normal claim attempt is `CORRUPTED_DATA` |
+| `writer_epoch` | durable, `gc/server-roots/<server_root_id>/epoch` (`ServerEpoch::next_writer_epoch`, CAS-bumped by `allocateWriterEpoch`); never deleted: a retired `server_root_id` keeps its counter | across crashes and restarts | a same-`(uuid, epoch)` twin: a present mount under a normal claim attempt is `CORRUPTED_DATA` |
 | `build_seq` | in-memory only, `CasMountRuntime::next_build_seq`, reset to 1 on every process start | one process incarnation | orders builds *within* an epoch; combined with `writer_epoch` it gives GC a total order |
+
+Each bump of the `epoch` counter also writes a fresh random 128-bit `allocation_nonce`. When a
+counter write's outcome is unclear and the counter has since moved, the allocator counts the write
+as landed only if the stored bytes match its own exactly. Two starts of the same `server_uuid` running this allocator that bump
+to the same value write different nonces, so they never both adopt one `writer_epoch`. Allocators
+of 26.6.4 write no nonce, so two of them can still collide. 26.6.4 readers skip the field.
 
 The absent-epoch branch of `allocateWriterEpoch` is deliberately paranoid: absent with a
 non-empty subtree is `CORRUPTED_DATA` (reset hazard); absent with an empty subtree decides by an
@@ -221,7 +236,7 @@ stateDiagram-v2
     Live --> Live: same-uuid claim, proven-dead token via UncleanObserved
     Live --> Live: same-uuid claim under cas_unsafe_remount_no_delay, no observation
     Fenced --> Fenced: same uuid and epoch claim, FencedSelf, no write
-    Live --> Absent: decommission tail, mount then epoch then owner tombstone
+    Terminated --> Terminated: decommission farewell, owner tombstoned and verified
     Terminated --> [*]
 ```
 
@@ -234,7 +249,7 @@ stateDiagram-v2
     Live --> TransientNotLive: renewal failure, tripMountLost, lost=true
     TransientNotLive --> Live: self-remount succeeds with a fresh epoch
     TransientNotLive --> TransientNotLive: probe inconclusive, retry with backoff
-    TransientNotLive --> IdentityLost: pool meta and owner both authoritatively absent
+    TransientNotLive --> IdentityLost: pool meta and owner both absent, or the owner at another life
     TransientNotLive --> VanishedReplaced: foreign pool_id observed
     Live --> VanishedForgotten: SYSTEM CAS FORGET
     IdentityLost --> [*]
@@ -280,13 +295,27 @@ while a stale conditional request from the predecessor is still in flight.
 and waiting out the token-stability observation, or the GC leader fencing the slot first, after
 which any reclaim is instant.
 
-**Permanent removal** of a dead replica (`Cas::decommissionPoolMember`, driven by
-`SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'`) claims the victim's mount slot
-as an administrative writer with a no-wait policy (refuses unless the slot is terminal:
-`terminated` or `fenced`; an `expired` slot is refused until the disk's GC leader fences it),
-drops every ref-bearing namespace, sweeps manifest debris before the slot (deleting the mount
-removes the watermark authority), drains staging and roots, then — only with zero warnings —
-retires in order: mount, epoch, a final liveness re-check, owner tombstone.
+**Permanent removal** of a dead replica (`Cas::decommissionPoolMember`, `SYSTEM CAS DROP POOL MEMBER '<server_root_id>' FROM DISK '<disk>'`)
+keeps `owner`, `epoch` and `mount` and removes only data, in six steps:
+
+1. Claim the victim's slot as an administrative writer with a no-wait policy. The claim needs a terminal
+   slot (`terminated` or `fenced`); an `expired` slot is refused until the disk's GC leader fences it. A
+   member without an epoch counter is refused.
+2. Tombstone the owner at the next `owner_life`, on the admin's fenced mount plane: no attempt is sent
+   after the admin's lease deadline, so a late retry cannot land on a victim that restarted after it.
+3. Confirm the slot still holds the admin's claim; otherwise roll the tombstone back, unless the owner was
+   already retired before this run. Every exit between (2) and (5) runs this confirm.
+4. Drop every namespace, sweep manifest debris, drain `staging/` and `roots/`, all on the admin's fenced
+   mount plane.
+5. Write the admin's clean farewell.
+6. Read the farewell and the tombstone back and set `retirement_verified`.
+
+`member_retired = 1` only when the owner carries a verified retirement. An owner that moved on to a later,
+unretired life after the tombstone (a rejoin, or another run's rollback) reports `member_retired = 0` with
+the warning `the owner moved on to life N`. Catalog rows GC still has to delete are reported as
+`namespaces_pending_gc`, not as a failure. The operator reruns after `member_retired = 0`; a rerun refused
+as alive or contended waits until GC fences the previous run's slot: about one mount lease TTL plus one GC
+round, with a GC leader running.
 
 ## `system.cas_mounts` {#mounts-table}
 

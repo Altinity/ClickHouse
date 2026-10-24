@@ -404,7 +404,7 @@ void burnEpochsUpTo(const BackendPtr & backend, const Layout & layout, uint64_t 
     CasRequests requests(backend, Fence::open());
     CasOperation op = requests.admit();
     for (uint64_t e = 1; e < target_live_epoch; ++e)
-        allocateWriterEpoch(op, layout, "test", EpochMintPolicy::NormalMount, 0, [] { return RefCatalog{}; });
+        allocateWriterEpoch(op, layout, "test", [] { return RefCatalog{}; });
 }
 
 /// One ordinary transaction at `id`, publishing `ref` (prepending the birth op when `birth`).
