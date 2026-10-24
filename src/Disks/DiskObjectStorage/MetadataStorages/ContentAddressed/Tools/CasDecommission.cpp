@@ -305,7 +305,7 @@ bool verifyAndMark(CasOperation & op, const Layout & layout, const String & srid
         {
             const MountLease body = decodeMountLease(slot->bytes);
             const OwnerObject owner = decodeOwner(current->bytes);
-            const bool farewell_held = body.isHeldBy(victim_uuid, admin_epoch) && !body.gc_fenced && body.isFarewell();
+            const bool farewell_held = body.isHeldBy(victim_uuid, admin_epoch) && !body.gc_fenced && body.isCleanRelease();
             const bool tombstone_held = owner.server_uuid == victim_uuid && owner.retired_at_ms
                 && owner.owner_life == tombstone.owner.owner_life;
             if (farewell_held && tombstone_held)
@@ -466,7 +466,7 @@ bool adminClaimStillHeld(CasOperation & op, const Layout & layout, const String 
     if (!slot)
         return false;
     const MountLease body = decodeMountLease(slot->bytes);
-    return body.isHeldBy(victim_uuid, admin_epoch) && !body.gc_fenced && !body.isFarewell();
+    return body.isHeldBy(victim_uuid, admin_epoch) && !body.gc_fenced && !body.isCleanRelease();
 }
 
 DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,

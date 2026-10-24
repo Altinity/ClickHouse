@@ -569,7 +569,7 @@ std::optional<uint64_t> rejoinRetiredOwner(
     if (!owner.retirement_verified)
         throwIfOwnerRetired(owner, srid, l.ownerKey(srid));
     const MountLease slot = decodeMountLease(mount->bytes);
-    if (!slot.gc_fenced && !slot.isFarewell())
+    if (!slot.gc_fenced && !slot.isCleanRelease())
         throw Exception(ErrorCodes::ABORTED,
             "CAS server-root '{}' is retired and its mount slot is held (server_uuid={}, writer_epoch={}): a "
             "decommission run is still running, or its lease has not yet lapsed and been fenced by GC. Restart this "
@@ -939,7 +939,7 @@ MountClaimResult claimMount(
 
     const MountLease existing = decodeMountLease(got->bytes);
 
-    const bool clean_marker = existing.isFarewell();
+    const bool clean_marker = existing.isCleanRelease();
 
     /// A live body of another uuid is never taken. A terminal one below our epoch is what a rejoin under a new
     /// uuid finds; it is reclaimed only once the owner reads as this claimer's own life. The owner is read before
@@ -1058,7 +1058,7 @@ void fenceOwnClaim(CasOperation & op, const Layout & l, const String & srid, UIn
             if (!observed)
                 return std::nullopt;
             const MountLease body = decodeMountLease(observed->bytes);
-            if (!body.isHeldBy(our_uuid, our_epoch) || body.gc_fenced || body.isFarewell())
+            if (!body.isHeldBy(our_uuid, our_epoch) || body.gc_fenced || body.isCleanRelease())
                 return std::nullopt;
             return encodeMountLease(body.fencedCopy());
         },
@@ -1295,7 +1295,7 @@ HeartbeatFloor computeHeartbeatFloor(CasOperation & op, const Layout & l, uint64
                     obs.erase(srid);   /// terminal — no further observation needed
                     return std::nullopt;
                 }
-                if (m.isFarewell())
+                if (m.isCleanRelease())
                 {
                     ++floor.terminated;
                     obs.erase(srid);   /// terminal — no further observation needed
@@ -1394,7 +1394,7 @@ std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(CasOperation & op, 
             return true;
         }
 
-        if (m.gc_fenced || m.isFarewell())
+        if (m.gc_fenced || m.isCleanRelease())
             return true;   /// terminal: fenced out by GC, or the holder's own graceful farewell.
 
         slots.push_back(NonTerminalMountSlot{srid, fmt::format(
@@ -1436,7 +1436,7 @@ std::vector<MountInfo> listMounts(CasOperation & op, const Layout & layout, uint
         }
         if (info.lease.gc_fenced)
             info.state = "fenced";
-        else if (info.lease.isFarewell())
+        else if (info.lease.isCleanRelease())
             info.state = "terminated";
         else if (now_ms <= info.lease.expires_at_ms + skew_margin_ms)
             info.state = "live";
@@ -1487,7 +1487,7 @@ FenceCertificate classifyFenceCertificate(const MountLease & lease, uint64_t fen
 {
     if (lease.gc_fenced)
         return FenceCertificate::GcFenced;
-    if (lease.isFarewell())
+    if (lease.isCleanRelease())
         return FenceCertificate::CleanFarewell;
     if (lease.writer_epoch != fence_writer_epoch)
         return FenceCertificate::SupersededEpoch;

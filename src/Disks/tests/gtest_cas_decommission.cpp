@@ -217,7 +217,7 @@ public:
     {
         const auto result = InMemoryBackend::write(key, bytes, expected_value, access);
         if (armed && result && key == mount_key && expected_value && !decodeMountLease(bytes).gc_fenced
-            && !decodeMountLease(bytes).isFarewell())
+            && !decodeMountLease(bytes).isCleanRelease())
             claimed = true;
         return result;
     }
@@ -257,7 +257,7 @@ public:
     std::expected<String, RawConflict> write(const String & key, const String & bytes,
                                              const std::optional<String> & expected_value, TransportAccess & access) override
     {
-        if (armed && !fenced && key == mount_key && expected_value && decodeMountLease(bytes).isFarewell())
+        if (armed && !fenced && key == mount_key && expected_value && decodeMountLease(bytes).isCleanRelease())
         {
             const auto current = InMemoryBackend::read(key, access);
             if (!InMemoryBackend::write(key, encodeMountLease(decodeMountLease(current->bytes).fencedCopy()), current->value, access))
@@ -1052,7 +1052,7 @@ TEST_F(CASDecommission, DrainClockUnifiesWithTheFarewellBootClockRegardlessOfHos
 
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_TRUE(report.member_retired);
-    EXPECT_TRUE(slot().isFarewell());
+    EXPECT_TRUE(slot().isCleanRelease());
 }
 
 /// The planes `Pool::openForDecommission` builds retry during opening, before the run installs its clock on
@@ -1071,7 +1071,7 @@ TEST_F(CASDecommission, OpeningRetriesPaceOnTheSameFakeClockAndSleepAsTheDrain)
 
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_TRUE(report.member_retired);
-    EXPECT_TRUE(slot().isFarewell());
+    EXPECT_TRUE(slot().isCleanRelease());
     EXPECT_FALSE(clock->sleeps.empty());
     EXPECT_LT(wall_elapsed, std::chrono::seconds(5));
 }
@@ -1174,7 +1174,7 @@ TEST_F(CASDecommission, UnresolvedTombstoneLeavesNoFarewell)
     expectOwner(1, false, false);
     const MountLease left = slot();
     EXPECT_EQ(left.server_uuid, victim_uuid);
-    EXPECT_FALSE(left.isFarewell());
+    EXPECT_FALSE(left.isCleanRelease());
     EXPECT_FALSE(left.gc_fenced);
 
     auto fake_boot = std::make_shared<std::atomic<uint64_t>>(0);
@@ -1271,7 +1271,7 @@ TEST_F(CASDecommission, KeepsEpochAndFarewellMount)
     EXPECT_TRUE(report.member_retired);
     const MountLease body = slot();
     EXPECT_EQ(body.writer_epoch, victim_epoch + 1) << "the admin's own clean farewell stays in the slot";
-    EXPECT_TRUE(body.isFarewell());
+    EXPECT_TRUE(body.isCleanRelease());
     EXPECT_FALSE(body.gc_fenced);
     OperationForTest raw_op(*backend);
     const auto epoch = (*raw_op).read(layout.epochKey("victim"), Retry::once());
@@ -1562,7 +1562,7 @@ TEST_F(CASDecommission, ResumesOverItsOwnTombstone)
                 /// The farewell is written by `~Pool`, which swallows a throw; die on the verify read instead.
                 backend->onWriteCommitted(layout.mountKey("victim"), [&]
                 {
-                    if (slot().isFarewell() && !std::exchange(died, true))
+                    if (slot().isCleanRelease() && !std::exchange(died, true))
                         backend->failNextReadWith(layout.ownerKey("victim"), died_with("died after the farewell"));
                 });
                 break;
@@ -2100,7 +2100,7 @@ TEST_F(CASDecommission, LaterUnverifiedTombstoneIsNotARetirement)
     bool refreshed = false;
     backend->onWriteCommitted(layout.mountKey("victim"), [&]
     {
-        if (slot().isFarewell() && !std::exchange(refreshed, true))
+        if (slot().isCleanRelease() && !std::exchange(refreshed, true))
             tombstoneOwner();
     });
 
@@ -2120,7 +2120,7 @@ TEST_F(CASDecommission, OwnerThatMovedOnIsNotReportedRetired)
     bool moved = false;
     backend->onWriteCommitted(layout.mountKey("victim"), [&]
     {
-        if (!slot().isFarewell() || std::exchange(moved, true))
+        if (!slot().isCleanRelease() || std::exchange(moved, true))
             return;
         OperationForTest op(*backend);
         const auto current = (*op).read(layout.ownerKey("victim"), Retry::once());
@@ -2156,7 +2156,7 @@ TEST_F(CASDecommission, MarkWriteConflictIsReported)
     bool farewell_landed = false;
     backend->onWriteCommitted(layout.mountKey("victim"), [&]
     {
-        if (slot().isFarewell())
+        if (slot().isCleanRelease())
             farewell_landed = true;
     });
     bool moved = false;

@@ -72,14 +72,15 @@ struct MountLease
     uint64_t started_at_ms = 0;
     uint64_t seq = 0;
     uint64_t expires_at_ms = 0;
-    uint64_t min_active_build_sequence = 0;   /// UINT64_MAX = retired (farewell)
+    uint64_t min_active_build_sequence = 0;   /// UINT64_MAX = clean release (farewell); not an owner retirement
     bool gc_fenced = false;    /// GC fence-out of an expired lease; terminal
     /// One holder-originated body identity. Every physical retry of that one logical write reuses
     /// it; a GC fence copies the observed value while every successor holder body mints a new one.
     UInt128 write_attempt_id{};
 
-    /// The holder's clean farewell (release): `min_active_build_sequence == UINT64_MAX`.
-    bool isFarewell() const { return min_active_build_sequence == std::numeric_limits<uint64_t>::max(); }
+    /// The holder released the slot cleanly (its farewell): the `UINT64_MAX` sentinel in the build
+    /// watermark. Independent of `gc_fenced`, which callers check first.
+    bool isCleanRelease() const { return min_active_build_sequence == std::numeric_limits<uint64_t>::max(); }
     bool isHeldBy(UInt128 uuid, uint64_t epoch) const { return server_uuid == uuid && writer_epoch == epoch; }
     /// What a fence writes over this body: the same holder, `gc_fenced`, one `seq` later.
     MountLease fencedCopy() const
