@@ -1425,6 +1425,7 @@ IcebergFileRecord buildIcebergFileRecord(const Iceberg::ProcessedManifestFileEnt
     record.schema_id = processed->resolved_schema_id;
     record.sequence_number = processed->sequence_number;
     record.sort_order_id = parsed.sort_order_id;
+    record.first_row_id = processed->first_row_id;
 
     for (const auto & [column_id, info] : parsed.columns_infos)
     {
@@ -2449,7 +2450,14 @@ std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImport
             try
             {
                 generateManifestList(
-                    resolver, metadata, object_storage, *external_storages, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true);
+                    resolver, metadata, object_storage, *external_storages, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true,
+                    /* per_entry_content_types */ {},
+                    /* entry_counts */ {},
+                    /* carry_forward_manifest_paths */ {},
+                    /* entry_partition_spec_ids */ {},
+                    /* entry_partition_summaries */ {},
+                    /* previous_manifest_actions */ {},
+                    /* entry_row_counts */ {total_rows});
                 buffer_manifest_list->finalize();
             }
             catch (...)
