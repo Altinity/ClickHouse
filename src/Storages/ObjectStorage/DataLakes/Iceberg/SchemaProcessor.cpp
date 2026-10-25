@@ -449,10 +449,6 @@ void IcebergSchemaProcessor::addIcebergTableSchema(
 
     std::lock_guard lock(mutex);
 
-<<<<<<< HEAD
-=======
-    Int32 schema_id = schema_ptr->getValue<Int32>(f_schema_id);
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
     if (iceberg_table_schemas_by_ids.contains(schema_id))
     {
         chassert(clickhouse_table_schemas_by_ids.contains(schema_id));
@@ -509,7 +505,6 @@ void IcebergSchemaProcessor::addIcebergTableSchema(
                 ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
                 "Iceberg schema with schema-id {} is bound to two different schemas across metadata versions",
                 schema_id);
-<<<<<<< HEAD
         }
     }
 
@@ -527,6 +522,20 @@ void IcebergSchemaProcessor::addIcebergTableSchema(
     }
 
     current_schema_id = schema_id;
+    bool parsed = false;
+    const auto rollback_unless_parsed = make_scope_guard(
+        [&]() TSA_NO_THREAD_SAFETY_ANALYSIS
+        {
+            /// TSA cannot see the lock held by the caller through this lambda.
+            current_schema_id = std::nullopt;
+            if (parsed)
+                return;
+            iceberg_table_schemas_by_ids.erase(schema_id);
+            clickhouse_table_schemas_by_ids.erase(schema_id);
+            std::erase_if(clickhouse_types_by_source_ids, [schema_id](const auto & entry) { return entry.first.first == schema_id; });
+            std::erase_if(clickhouse_ids_by_source_names, [schema_id](const auto & entry) { return entry.first.first == schema_id; });
+        });
+
     auto clickhouse_schema = std::make_shared<NamesAndTypesList>();
     String current_full_name{};
     for (size_t i = 0; i != fields->size(); ++i)
@@ -544,45 +553,7 @@ void IcebergSchemaProcessor::addIcebergTableSchema(
     iceberg_table_schemas_by_ids[schema_id] = schema_ptr;
     if (source == SchemaSource::ManifestFile)
         manifest_sourced_schema_ids.insert(schema_id);
-    current_schema_id = std::nullopt;
-=======
-        return;
-    }
-
-    current_schema_id = schema_id;
-    bool parsed = false;
-    const auto rollback_unless_parsed = make_scope_guard(
-        [&]() TSA_NO_THREAD_SAFETY_ANALYSIS
-        {
-            /// TSA cannot see the lock held by the caller through this lambda.
-            current_schema_id = std::nullopt;
-            if (parsed)
-                return;
-            iceberg_table_schemas_by_ids.erase(schema_id);
-            clickhouse_table_schemas_by_ids.erase(schema_id);
-            std::erase_if(clickhouse_types_by_source_ids, [schema_id](const auto & entry) { return entry.first.first == schema_id; });
-            std::erase_if(clickhouse_ids_by_source_names, [schema_id](const auto & entry) { return entry.first.first == schema_id; });
-        });
-
-    auto fields = schema_ptr->get(f_fields).extract<Poco::JSON::Array::Ptr>();
-    auto clickhouse_schema = std::make_shared<NamesAndTypesList>();
-    String current_full_name{};
-    for (size_t i = 0; i != fields->size(); ++i)
-    {
-        auto field = fields->getObject(static_cast<UInt32>(i));
-        auto name = field->getValue<String>(f_name);
-        bool required = field->getValue<bool>(f_required);
-        current_full_name = name;
-        auto type = getFieldType(field, f_type, context_, required, current_full_name, true);
-        clickhouse_schema->push_back(NameAndTypePair{name, type});
-        clickhouse_types_by_source_ids[{schema_id, field->getValue<Int32>(f_id)}] = NameAndTypePair{current_full_name, type};
-        clickhouse_ids_by_source_names[{schema_id, current_full_name}] = field->getValue<Int32>(f_id);
-    }
-
-    iceberg_table_schemas_by_ids[schema_id] = schema_ptr;
-    clickhouse_table_schemas_by_ids[schema_id] = clickhouse_schema;
     parsed = true;
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 }
 
 NameAndTypePair IcebergSchemaProcessor::getFieldCharacteristics(Int32 schema_version, Int32 source_id) const

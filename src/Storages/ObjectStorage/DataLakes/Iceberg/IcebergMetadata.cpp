@@ -290,11 +290,7 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
 }
 
 std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getRelevantState(
-<<<<<<< HEAD
-    const ContextPtr & context, bool force_fetch_latest_metadata) const
-=======
     const ContextPtr & context, bool force_fetch_latest_metadata, SchemaParsing schema_parsing) const
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 {
     const auto [metadata_version, metadata_file_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
@@ -407,22 +403,18 @@ Int32 IcebergMetadata::parseTableSchema(
 {
     const auto format_version = metadata_object->getValue<Int32>(f_format_version);
 
-<<<<<<< HEAD
     if (metadata_object->has(f_last_column_id) && !metadata_object->isNull(f_last_column_id))
         schema_processor.updateLastColumnId(metadata_object->getValue<Int32>(f_last_column_id));
 
-    /// v2 and v3 (and later) store schemas in the `schemas` array. Only v1 has a top-level `schema`.
-    /// Using the v1 parser first for v3 looks like a spec violation and logs a false warning.
-    if (format_version >= 2)
-=======
     auto add_schema = [&](const Poco::JSON::Object::Ptr & schema)
     {
         if (schema_parsing == SchemaParsing::Parse)
             schema_processor.addIcebergTableSchema(schema, context_);
     };
 
-    if (format_version == 2)
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
+    /// v2 and v3 (and later) store schemas in the `schemas` array. Only v1 has a top-level `schema`.
+    /// Using the v1 parser first for v3 looks like a spec violation and logs a false warning.
+    if (format_version >= 2)
     {
         auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
         add_schema(schema);
@@ -475,14 +467,9 @@ static Poco::JSON::Object::Ptr traverseMetadataAndFindNecessarySnapshotObject(
 {
     if (!metadata_object->has(f_snapshots))
         throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION, "No snapshot set found in metadata for iceberg file");
-<<<<<<< HEAD
     if (metadata_object->has(f_last_column_id) && !metadata_object->isNull(f_last_column_id))
         schema_processor->updateLastColumnId(metadata_object->getValue<Int32>(f_last_column_id));
-    auto schemas = metadata_object->get(f_schemas).extract<Poco::JSON::Array::Ptr>();
-    for (UInt32 j = 0; j < schemas->size(); ++j)
-=======
     if (schema_parsing == IcebergMetadata::SchemaParsing::Parse)
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
     {
         auto schemas = metadata_object->get(f_schemas).extract<Poco::JSON::Array::Ptr>();
         for (UInt32 j = 0; j < schemas->size(); ++j)
@@ -740,16 +727,7 @@ IcebergMetadata::getState(
         std::nullopt,
         std::nullopt);
 
-<<<<<<< HEAD
-    std::tie(data_snapshot, table_state_snapshot.schema_id) = getStateImpl(local_context, metadata_object);
-=======
-    /// The Iceberg `format-version` in the metadata file may differ from the value cached in
-    /// `persistent_components` when an external tool (e.g. Spark) upgrades the table between
-    /// queries. Downstream parsers determine the version they need from the Avro metadata of
-    /// each manifest list / manifest file, so we do not update the shared cached value here.
-
     std::tie(data_snapshot, table_state_snapshot.schema_id) = getStateImpl(local_context, metadata_object, schema_parsing);
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
     table_state_snapshot.snapshot_id = data_snapshot ? std::optional{data_snapshot->snapshot_id} : std::nullopt;
     table_state_snapshot.metadata_version = metadata_version;
     table_state_snapshot.metadata_file_path = metadata_path;
@@ -971,7 +949,6 @@ void IcebergMetadata::checkAlterIsPossible(const AlterCommands & commands)
     }
 }
 
-<<<<<<< HEAD
 void IcebergMetadata::checkAlterPartitionIsPossible(const PartitionCommands & commands) const
 {
     checkTableRootIsQueriedPath("ALTER PARTITION");
@@ -1030,7 +1007,8 @@ void IcebergMetadata::alterPartitionDropImpl(
         std::move(catalog),
         storage_id);
     executor.run();
-=======
+}
+
 static void checkAggregateFunctionStatesAllowed(const String & column_name, const DataTypePtr & type, const ContextPtr & context)
 {
     if (!type || !needsClickHouseTypeAnnotation(type))
@@ -1045,7 +1023,6 @@ static void checkAggregateFunctionStatesAllowed(const String & column_name, cons
         "allow_experimental_aggregate_function_states_in_open_formats",
         column_name,
         type->getName());
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 }
 
 void IcebergMetadata::alter(

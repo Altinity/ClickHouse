@@ -44,7 +44,9 @@ struct SchemaConverter
     /// The key is the parquet column name, without ColumnMapper.
     std::unordered_map<String, GeoColumnMetadata> geo_columns;
 
-<<<<<<< HEAD
+    /// Type names from the `clickhouse.column_types` footer metadata.
+    std::unordered_map<String, String> annotated_column_type_names;
+
     /// If precomputed_geo_columns has a value it is used directly (including the empty-map case)
     /// and the constructor skips parsing the "geo" key-value metadata. This ensures that a
     /// failed parse caught by the caller (which leaves an empty map) does not cause
@@ -52,12 +54,6 @@ struct SchemaConverter
     /// parse according to its own settings.
     SchemaConverter(const parq::FileMetaData &, const ReadOptions &, const Block *,
                     std::optional<std::unordered_map<String, GeoColumnMetadata>> precomputed_geo_columns = std::nullopt);
-=======
-    /// Type names from the `clickhouse.column_types` footer metadata.
-    std::unordered_map<String, String> annotated_column_type_names;
-
-    SchemaConverter(const parq::FileMetaData &, const ReadOptions &, const Block *);
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 
     void prepareForReading();
     NamesAndTypesList inferSchema();

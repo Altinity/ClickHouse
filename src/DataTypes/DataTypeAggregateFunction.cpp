@@ -12,8 +12,6 @@
 #include <Formats/FormatSettings.h>
 #include <DataTypes/DataTypeAggregateFunction.h>
 #include <DataTypes/DataTypeCustomSimpleAggregateFunction.h>
-<<<<<<< HEAD
-=======
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -22,7 +20,6 @@
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeTime64.h>
 #include <DataTypes/DataTypeTuple.h>
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 #include <DataTypes/Serializations/SerializationAggregateFunction.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/transformTypesRecursively.h>
@@ -108,16 +105,7 @@ bool DataTypeAggregateFunction::isVersioned() const
     return function->isVersioned();
 }
 
-<<<<<<< HEAD
-String DataTypeAggregateFunction::getNameImpl(bool with_version) const
-=======
-void DataTypeAggregateFunction::updateVersionFromRevision(size_t revision, bool if_empty) const
-{
-    setVersion(function->getVersionFromRevision(revision), if_empty);
-}
-
 String DataTypeAggregateFunction::getNameImpl(bool with_version, bool always_emit_version) const
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 {
     WriteBufferFromOwnString stream;
     stream << "AggregateFunction(";

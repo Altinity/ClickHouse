@@ -195,14 +195,9 @@ std::vector<std::pair<size_t, Field>> DataFileStatistics::getLowerBounds() const
     std::vector<std::pair<size_t, Field>> result;
     for (size_t i = 0; i < ranges.size(); ++i)
     {
-<<<<<<< HEAD
-        if (!isExcluded(i))
-            result.push_back({field_ids[i], ranges[i].left});
-=======
-        if (!track_ranges[i])
+        if (isExcluded(i) || !track_ranges[i])
             continue;
         result.push_back({field_ids[i], ranges[i].left});
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
     }
     return result;
 }
@@ -212,14 +207,9 @@ std::vector<std::pair<size_t, Field>> DataFileStatistics::getUpperBounds() const
     std::vector<std::pair<size_t, Field>> result;
     for (size_t i = 0; i < ranges.size(); ++i)
     {
-<<<<<<< HEAD
-        if (!isExcluded(i))
-            result.push_back({field_ids[i], ranges[i].right});
-=======
-        if (!track_ranges[i])
+        if (isExcluded(i) || !track_ranges[i])
             continue;
         result.push_back({field_ids[i], ranges[i].right});
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
     }
     return result;
 }

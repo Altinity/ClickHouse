@@ -6,13 +6,10 @@
 
 #include <Common/Exception.h>
 #include <Common/tests/gtest_global_context.h>
-<<<<<<< HEAD
-#include <DataTypes/DataTypeArray.h>
-#include <DataTypes/DataTypeNothing.h>
-=======
 #include <Common/tests/gtest_global_register.h>
+#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeFactory.h>
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
+#include <DataTypes/DataTypeNothing.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeString.h>
@@ -542,7 +539,6 @@ Poco::JSON::Object::Ptr makeMetadataWithField(
     return metadata;
 }
 
-<<<<<<< HEAD
 /// Ordered field names from the schema `current-schema-id` points at.
 std::vector<String> getCurrentFieldNames(const Poco::JSON::Object::Ptr & metadata)
 {
@@ -563,11 +559,7 @@ std::vector<String> getCurrentFieldNames(const Poco::JSON::Object::Ptr & metadat
     return {};
 }
 
-/// The Iceberg type recorded for `name` in the schema `current-schema-id` points at.
-Poco::Dynamic::Var findCurrentFieldType(const Poco::JSON::Object::Ptr & metadata, const String & name)
-=======
 Poco::Dynamic::Var findCurrentFieldValue(const Poco::JSON::Object::Ptr & metadata, const String & name, const String & key)
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 {
     auto current_schema_id = metadata->getValue<Int32>(f_current_schema_id);
     auto schemas = metadata->getArray(f_schemas);
@@ -585,6 +577,12 @@ Poco::Dynamic::Var findCurrentFieldValue(const Poco::JSON::Object::Ptr & metadat
         }
     }
     return {};
+}
+
+/// The Iceberg type recorded for `name` in the schema `current-schema-id` points at.
+Poco::Dynamic::Var findCurrentFieldType(const Poco::JSON::Object::Ptr & metadata, const String & name)
+{
+    return findCurrentFieldValue(metadata, name, f_type);
 }
 
 Poco::JSON::Object::Ptr makeMetadataWithAnnotatedField(
@@ -815,7 +813,6 @@ TEST(IcebergMetadataGenerator, ModifyColumnWideningRecordsTheNewTypeInANewSchema
     EXPECT_EQ(stored_type.extract<String>(), "long");
 }
 
-<<<<<<< HEAD
 
 /// --- Multi-argument transform (Iceberg V3 source-ids) tests ---
 
@@ -1255,7 +1252,8 @@ TEST(IcebergMetadataGenerator, ModifyColumnSameComplexTypeWithDocOnlyRepositions
     auto stored_fields = stored_type.extract<Poco::JSON::Object::Ptr>()->getArray(f_fields);
     ASSERT_EQ(stored_fields->size(), 1u);
     EXPECT_EQ(stored_fields->getObject(0)->getValue<String>(f_type), "int");
-=======
+}
+
 TEST(IcebergMetadataGenerator, ModifyColumnToTheSameSimpleAggregateFunctionAddsNoSchema)
 {
     tryRegisterAggregateFunctions();
@@ -1332,7 +1330,6 @@ TEST(IcebergMetadataGenerator, AddColumnRecordsAndDetectsTheClickHouseTypeAnnota
     EXPECT_FALSE(gen.isAddColumnApplied(
         "extra", DataTypeFactory::instance().get("SimpleAggregateFunction(any, Nullable(String))")));
     EXPECT_FALSE(gen.isAddColumnApplied("extra", makeNullable(std::make_shared<DataTypeString>())));
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 }
 
 #endif

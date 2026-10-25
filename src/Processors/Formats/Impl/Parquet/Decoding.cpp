@@ -6,12 +6,9 @@
 #include <DataTypes/Serializations/ISerialization.h>
 #include <Formats/FormatSettings.h>
 #include <Common/FloatUtils.h>
-<<<<<<< HEAD
 #include <Interpreters/convertFieldToType.h>
 #include <Functions/DateTimeTransforms.h>
-=======
 #include <IO/ReadBufferFromMemory.h>
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
 
 #include <arrow/util/bit_stream_utils_internal.h>
 #include <arrow/util/byte_stream_split_internal.h>

@@ -127,14 +127,6 @@ public:
 
     IcebergHistory getHistory(ContextPtr local_context) const;
 
-<<<<<<< HEAD
-=======
-    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getRelevantState(
-        const ContextPtr & context,
-        bool force_fetch_latest_metadata = false,
-        SchemaParsing schema_parsing = SchemaParsing::Parse) const;
-
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
     /// Returns file records contributed by a single manifest list entry of `data_snapshot`.
     IcebergFiles getFilesForManifest(
         const Iceberg::IcebergDataSnapshotPtr & data_snapshot,
@@ -260,10 +252,14 @@ public:
 
     std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getRelevantState(
         const ContextPtr & context,
-        bool force_fetch_latest_metadata = false) const;
+        bool force_fetch_latest_metadata = false,
+        SchemaParsing schema_parsing = SchemaParsing::Parse) const;
 
-    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot>
-    getState(const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version) const;
+    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getState(
+        const ContextPtr & local_context,
+        const String & metadata_path,
+        Int32 metadata_version,
+        SchemaParsing schema_parsing = SchemaParsing::Parse) const;
 
     const DB::Iceberg::PersistentTableComponents & getPersistentComponents() const
     {
@@ -288,13 +284,7 @@ private:
 
     Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Int32>
-<<<<<<< HEAD
-    getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) const;
-=======
     getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object, SchemaParsing schema_parsing) const;
-    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot>
-    getState(const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version, SchemaParsing schema_parsing) const;
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
     Iceberg::IcebergDataSnapshotPtr
     getRelevantDataSnapshotFromTableStateSnapshot(Iceberg::TableStateSnapshot table_state_snapshot, ContextPtr local_context) const;
     StorageObjectStorageConfigurationPtr getConfiguration() const;

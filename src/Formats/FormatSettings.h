@@ -420,11 +420,8 @@ struct FormatSettings
         double bloom_filter_bits_per_value = 10.5;
         size_t bloom_filter_flush_threshold_bytes = 1024 * 1024 * 128;
         bool allow_geoparquet_parser = true;
-<<<<<<< HEAD
         bool spatial_filter_push_down = true;
-=======
         bool allow_aggregate_function_states = false;
->>>>>>> 234f8251bd2 (Support aggregate function states in Parquet and Iceberg (Altinity/ClickHouse#2301))
         bool write_geometadata = true;
         size_t max_dictionary_size = 1024 * 1024;
     } parquet{};
