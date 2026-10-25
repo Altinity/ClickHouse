@@ -83,39 +83,14 @@ namespace
         return DB::Range(*left, true, *right, true);
     }
 
-<<<<<<< HEAD
-    bool isColumnPresenceKnown(const ParsedManifestFileEntry & parsed_entry)
-    {
-        for (const auto & [field_id, column_info] : parsed_entry.columns_infos)
-            if (column_info.bytes_size.has_value())
-                return true;
-        return false;
-    }
-
     void addRowLineageHyperrectangles(std::unordered_map<Int32, DB::Range> & hyperrectangles, const ProcessedManifestFileEntry & entry)
-=======
-    void addRowLineageHyperrectangles(
-        std::unordered_map<Int32, DB::Range> & hyperrectangles,
-        const ProcessedManifestFileEntry & entry,
-        const IcebergPathFromMetadata & path_to_manifest_file)
->>>>>>> 61038e48af1 (Merge pull request #124591 from groeneai/groeneai-iceberg-row-lineage-missing-stats-pruning)
     {
         const auto & parsed_entry = *entry.parsed_entry;
         if (!entry.first_row_id.has_value() || parsed_entry.record_count <= 0 || entry.sequence_number < 0)
             return;
 
         const UInt64 inherited_sequence_number = static_cast<UInt64>(entry.sequence_number);
-<<<<<<< HEAD
         const UInt64 last_inherited_row_id = *entry.first_row_id + static_cast<UInt64>(parsed_entry.record_count) - 1;
-        const bool column_presence_is_known = isColumnPresenceKnown(parsed_entry);
-=======
-        /// `first_row_id` and `record_count` are both writer-declared, so the block of row ids they span
-        /// need not be representable, and a wrapped last row id would sit below the block's own first one.
-        UInt64 last_inherited_row_id = 0;
-        if (common::addOverflow<UInt64>(
-                *entry.first_row_id, static_cast<UInt64>(parsed_entry.record_count) - 1, last_inherited_row_id))
-            return;
->>>>>>> 61038e48af1 (Merge pull request #124591 from groeneai/groeneai-iceberg-row-lineage-missing-stats-pruning)
         const bool row_ids_are_readable = Poco::toUpper(parsed_entry.file_format) != "ORC";
 
         for (const auto field_id : {row_id_field_id, last_updated_sequence_number_field_id})
@@ -125,19 +100,7 @@ namespace
                 continue;
             const UInt64 inherited_upper_bound = is_row_id ? last_inherited_row_id : inherited_sequence_number;
 
-<<<<<<< HEAD
-            if (!parsed_entry.columns_infos.contains(field_id))
-            {
-                if (column_presence_is_known)
-                {
-                    hyperrectangles.emplace(field_id, DB::Range(inherited_lower_bound, true, inherited_upper_bound, true));
-                    continue;
-                }
-            }
-            else if (auto range = getMaterializedRowLineageRange(parsed_entry, field_id))
-=======
-            if (auto range = getMaterializedRowLineageRange(parsed_entry, field_id, path_to_manifest_file))
->>>>>>> 61038e48af1 (Merge pull request #124591 from groeneai/groeneai-iceberg-row-lineage-missing-stats-pruning)
+            if (auto range = getMaterializedRowLineageRange(parsed_entry, field_id))
             {
                 hyperrectangles.emplace(field_id, *range);
                 continue;
