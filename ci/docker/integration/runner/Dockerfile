@@ -37,12 +37,8 @@ RUN apt-get update \
     luajit \
     libssl-dev \
     libcurl4-openssl-dev \
-<<<<<<< HEAD
-    default-jdk \
-    software-properties-common \
-=======
     openjdk-17-jdk-headless \
->>>>>>> 188290ba2c4 (Merge pull request #117198 from ClickHouse/iceberg_variant)
+    software-properties-common \
     libkrb5-dev \
     krb5-user \
     g++ \
