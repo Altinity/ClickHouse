@@ -229,12 +229,15 @@ struct AliasColumnInliner
     /// inlined, because the shipped SQL renders the entry rather than the key: `USING (x AS a)` is what lets a remote
     /// server resolve a key that exists only as an `ALIAS` column of the initiator's table. `rejectUnshippableJoinUsingKeys`
     /// reads the same shape to decide which keys no remote server can resolve.
+    /// The entry is inlined without `__aliasMarker`: `USING` takes identifiers, so a marked entry would be rendered as the
+    /// bare key name, which the shard cannot resolve.
     void inlineJoinUsingKeys(QueryTreeNodePtr & join_expression) const
     {
         auto * using_list = join_expression->as<ListNode>();
         if (!using_list)
             return;
 
+        const AliasColumnInliner unmarked_inliner{context, /*use_alias_marker=*/false};
         for (auto & using_node : using_list->getNodes())
         {
             auto * using_column = using_node->as<ColumnNode>();
@@ -253,10 +256,7 @@ struct AliasColumnInliner
                     continue;
 
                 const String key_name = side_column->getColumnName();
-                if (use_alias_marker)
-                    expression = wrapInAliasMarker(std::move(expression), *side_column, context);
-
-                inlineExpression(expression);
+                unmarked_inliner.inlineExpression(expression);
                 expression->setAlias(key_name);
                 side = std::move(expression);
             }

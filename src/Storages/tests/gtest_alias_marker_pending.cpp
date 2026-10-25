@@ -115,17 +115,11 @@ TEST(AliasMarkerPending, ProjectionAliasOnJoinUsingSide)
 
     inlineAliasColumns(root, context);
 
+    /// `USING` takes identifiers, so the side is inlined without a marker and keeps the key name as its alias.
     const auto & side = key_sides->getNodes()[0];
-    const auto * pending = side->as<FunctionNode>();
-    ASSERT_NE(pending, nullptr);
-    ASSERT_EQ(pending->getArguments().getNodes().size(), 3);
-    EXPECT_EQ(pending->getArguments().getNodes()[1]->as<ColumnNode &>().getColumnName(), "k");
-    EXPECT_THROW(assertNoPendingAliasMarkersForDistributedSerialization(root), Exception);
-
-    finalizeAliasMarkersForDistributedSerialization(root, context);
-
-    const auto & finalized_arguments = pending->getArguments().getNodes();
-    ASSERT_EQ(finalized_arguments.size(), 2);
-    EXPECT_EQ(finalized_arguments[1]->as<ConstantNode &>().getValue().safeGet<String>(), "__table1.k");
+    const auto * side_column = side->as<ColumnNode>();
+    ASSERT_NE(side_column, nullptr);
+    EXPECT_EQ(side_column->getColumnName(), "x");
+    EXPECT_EQ(side->getAlias(), "k");
     EXPECT_NO_THROW(assertNoPendingAliasMarkersForDistributedSerialization(root));
 }
