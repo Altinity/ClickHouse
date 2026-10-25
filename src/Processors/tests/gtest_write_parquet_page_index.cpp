@@ -8,6 +8,8 @@
 #    include <IO/WriteBufferFromFile.h>
 #    include <Processors/Executors/CompletedPipelineExecutor.h>
 #    include <Processors/Executors/PipelineExecutor.h>
+#    include <DataTypes/DataTypeDateTime64.h>
+#    include <Processors/Formats/Impl/Parquet/Write.h>
 #    include <Processors/Formats/Impl/ParquetBlockOutputFormat.h>
 #    include <Processors/ISource.h>
 #    include <Processors/Sources/SourceFromChunks.h>
@@ -367,6 +369,27 @@ TEST(Parquet, WriteParquetPageIndexOversizedStringStats)
     ASSERT_TRUE(offset_index_location.has_value());
     ASSERT_GT(offset_index_location.value().offset, 0);
     ASSERT_GT(offset_index_location.value().length, 0);
+}
+
+TEST(ParquetWrite, DateTime64AdjustedToUTCFromTimezone)
+{
+    auto ts = std::make_shared<DataTypeDateTime64>(9);
+    auto ts_tz = std::make_shared<DataTypeDateTime64>(9, "UTC");
+    Block sample;
+    sample.insert({ts->createColumn(), ts, "ts"});
+    sample.insert({ts_tz->createColumn(), ts_tz, "ts_tz"});
+
+    Parquet::WriteOptions default_options;
+    auto default_schema = Parquet::convertSchema(sample, default_options, std::nullopt);
+    ASSERT_EQ(default_schema.size(), 3);
+    EXPECT_TRUE(default_schema[1].logicalType.TIMESTAMP.isAdjustedToUTC);
+    EXPECT_TRUE(default_schema[2].logicalType.TIMESTAMP.isAdjustedToUTC);
+
+    Parquet::WriteOptions iceberg_options;
+    iceberg_options.output_timestamp_adjusted_to_utc_from_timezone = true;
+    auto iceberg_schema = Parquet::convertSchema(sample, iceberg_options, std::nullopt);
+    EXPECT_FALSE(iceberg_schema[1].logicalType.TIMESTAMP.isAdjustedToUTC);
+    EXPECT_TRUE(iceberg_schema[2].logicalType.TIMESTAMP.isAdjustedToUTC);
 }
 }
 #endif

@@ -32,6 +32,37 @@ namespace DB::ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+namespace
+{
+
+/// Avro does not map timestamp-nanos to DateTime64, so identity partition values for
+/// Iceberg `timestamp_ns` / `timestamptz_ns` (and similarly `Time64`) arrive as Int64.
+/// `KeyCondition` compares DateTime64/Time64 predicates as DecimalField with a scale,
+/// so wrap the raw ticks before `mayBeTrueInRange`. Calendar transforms stay Int64.
+void wrapIntegerPartitionValuesAsDateTime64(Row & partition_values, const DataTypes & data_types)
+{
+    const size_t size = std::min(partition_values.size(), data_types.size());
+    for (size_t i = 0; i < size; ++i)
+    {
+        auto & field = partition_values[i];
+        if (field.isNull() || field.getType() != Field::Types::Int64)
+            continue;
+
+        auto type = removeNullable(data_types[i]);
+        WhichDataType which(type);
+        if (which.isDateTime64())
+        {
+            field = DecimalField<DateTime64>(DateTime64(field.safeGet<Int64>()), getDecimalScale(*type));
+        }
+        else if (which.isTime64())
+        {
+            field = DecimalField<Time64>(Time64(field.safeGet<Int64>()), getDecimalScale(*type));
+        }
+    }
+}
+
+}
+
 namespace DB::Iceberg
 {
 
@@ -251,14 +282,17 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
 
         /// Project: the Avro tuple has one entry per spec field, but the key only contains the
         /// fields at the positions recorded in `partition_key_spec_positions`.  Pick exactly those.
-        std::vector<FieldRef> index_value;
-        index_value.reserve(partition_key_spec_positions.size());
+        Row projected_values;
+        projected_values.reserve(partition_key_spec_positions.size());
         for (size_t pos : partition_key_spec_positions)
         {
             if (pos >= partition_value.size())
                 return PruningReturnStatus::NOT_PRUNED; /// fail closed — cannot prune without the value
-            index_value.push_back(FieldRef(partition_value[pos]));
+            projected_values.push_back(partition_value[pos]);
         }
+        wrapIntegerPartitionValuesAsDateTime64(projected_values, partition_key->data_types);
+
+        std::vector<FieldRef> index_value(projected_values.begin(), projected_values.end());
 
         for (size_t i = 0; i < index_value.size(); ++i)
         {
