@@ -576,7 +576,7 @@ TEST(IcebergSchemaProcessor, AnnotatedSimpleAggregateFunctionFieldNeedsNoSetting
     IcebergSchemaProcessor processor(context);
     processor.addIcebergTableSchema(schema, context);
 
-    auto columns = processor.getClickhouseTableSchemaById(0);
+    auto columns = processor.getClickHouseTableSchemaById(0);
     ASSERT_EQ(columns->size(), 1u);
     EXPECT_EQ(columns->front().name, "s");
     EXPECT_EQ(columns->front().type->getName(), "SimpleAggregateFunction(sum, Int64)");
@@ -607,7 +607,7 @@ TEST(IcebergSchemaProcessor, RetryAfterRefusedAggregateFunctionStateSchemaSuccee
         EXPECT_EQ(e.code(), DB::ErrorCodes::SUPPORT_IS_DISABLED) << e.message();
     }
 
-    EXPECT_FALSE(processor.hasClickhouseTableSchemaById(0));
+    EXPECT_FALSE(processor.hasClickHouseTableSchemaById(0));
     EXPECT_FALSE(processor.tryGetFieldCharacteristics(0, 1).has_value());
     EXPECT_FALSE(processor.tryGetColumnIDByName(0, "a").has_value());
 
@@ -615,7 +615,7 @@ TEST(IcebergSchemaProcessor, RetryAfterRefusedAggregateFunctionStateSchemaSuccee
     const std::string allowed_json
         = R"json({"schema-id":0,"fields":[{"id":1,"name":"a2","required":false,"type":"int"},{"id":2,"name":"u","required":false,"type":"binary","clickhouse.type":"AggregateFunction(uniq, UInt64)"}]})json";
     ASSERT_NO_THROW(processor.addIcebergTableSchema(parseSchema(allowed_json), allowed_context));
-    auto columns = processor.getClickhouseTableSchemaById(0);
+    auto columns = processor.getClickHouseTableSchemaById(0);
     ASSERT_EQ(columns->size(), 2u);
     EXPECT_EQ(columns->front().name, "a2");
     auto field = processor.getFieldCharacteristics(0, 1);
@@ -647,14 +647,14 @@ TEST(IcebergSchemaProcessor, SkippingTheSchemaNeitherAppliesTheGateNorPublishesT
             metadata, processor, context, log, DB::IcebergMetadata::SchemaParsing::Skip));
     EXPECT_EQ(schema_id, 0);
 
-    EXPECT_FALSE(processor.hasClickhouseTableSchemaById(0));
+    EXPECT_FALSE(processor.hasClickHouseTableSchemaById(0));
     EXPECT_FALSE(processor.tryGetFieldCharacteristics(0, 1).has_value());
     EXPECT_FALSE(processor.tryGetColumnIDByName(0, "u").has_value());
 
     auto allowed_context = contextWithAggregateFunctionStates(true);
     ASSERT_NO_THROW(DB::IcebergMetadata::parseTableSchema(
         metadata, processor, allowed_context, log, DB::IcebergMetadata::SchemaParsing::Parse));
-    auto columns = processor.getClickhouseTableSchemaById(0);
+    auto columns = processor.getClickHouseTableSchemaById(0);
     ASSERT_EQ(columns->size(), 1u);
     EXPECT_EQ(columns->front().name, "u");
     EXPECT_EQ(columns->front().type->getName(), "AggregateFunction(uniq, UInt64)");

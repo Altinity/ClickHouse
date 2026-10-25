@@ -184,7 +184,8 @@ TEST(IcebergTypeMapping, AggregateFunctionMapsToBinary)
     tryRegisterAggregateFunctions();
     auto type = DataTypeFactory::instance().get("AggregateFunction(uniq, UInt64)");
     Int32 iter = 0;
-    auto [iceberg_type, required] = getIcebergType(type, iter);
+    UInt64 format_version = 3;
+    auto [iceberg_type, required] = getIcebergType(type, iter, format_version);
     ASSERT_TRUE(iceberg_type.isString());
     EXPECT_EQ(iceberg_type.extract<String>(), "binary");
     EXPECT_TRUE(required);
