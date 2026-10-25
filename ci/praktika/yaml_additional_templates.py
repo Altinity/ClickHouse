@@ -35,7 +35,7 @@ class AltinityWorkflowTemplates:
           echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 """
     # Additional jobs
-    REGRESSION_HASH = "979bb27171f92724bcd8f086989ba623f2e03fdc"
+    REGRESSION_HASH = "release"
     ALTINITY_JOBS = {
         "GrypeScan": r"""
   GrypeScanServer:
@@ -71,7 +71,7 @@ class AltinityWorkflowTemplates:
       commit: {REGRESSION_HASH}
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
   RegressionTestsAarch64:
     needs: [config_workflow, build_arm_binary]
@@ -83,7 +83,7 @@ class AltinityWorkflowTemplates:
       commit: {REGRESSION_HASH}
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
 """,
         "SignRelease": r"""

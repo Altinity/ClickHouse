@@ -34,7 +34,7 @@ workflow = Workflow.Config(
             job.set_dependency(
                 [
                     # JobNames.STYLE_CHECK, # NOTE (strtgbb): we don't run style check
-                    # JobNames.FAST_TEST, # NOTE (strtgbb): this takes too long, revisit later
+                    JobNames.FAST_TEST,
                     # JobConfigs.tidy_build_arm_jobs[0].name, # NOTE (strtgbb): this takes too long, revisit later
                 ]
             )
