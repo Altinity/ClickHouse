@@ -1043,6 +1043,10 @@ std::unordered_map<String, CHSetting> serverSettings = {
          [](RandomGenerator & rg, FuzzConfig &) { return std::to_string(rg.thresholdGenerator<uint64_t>(0.3, 0.2, 0, 10800)); },
          {},
          false)},
+<<<<<<< HEAD
+=======
+    {"iceberg_delete_data_on_drop", trueOrFalseSettingNoOracle},
+>>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
     {"iceberg_expire_default_min_snapshots_to_keep",
      CHSetting(
          [](RandomGenerator & rg, FuzzConfig &) { return std::to_string(rg.thresholdGenerator<uint64_t>(0.2, 0.2, 0, 10)); }, {}, false)},
@@ -2038,10 +2042,15 @@ void loadFuzzerServerSettings(const FuzzConfig & fc)
            "write_through_distributed_cache_buffer_size"};
     /// NonZeroUInt64 row-count settings — must not receive 0
     DB::Strings nonzero_rows_values
+<<<<<<< HEAD
         = {"delta_lake_insert_max_rows_in_data_file",
            "max_insert_block_size_rows",
            "merge_tree_min_read_task_size",
            "output_format_parquet_batch_size"};
+=======
+        = {"max_insert_block_size_rows",
+           "merge_tree_min_read_task_size"};
+>>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
     DB::Strings max_rows_values
         = {"async_insert_max_query_number",
            "cluster_table_function_buckets_batch_size",

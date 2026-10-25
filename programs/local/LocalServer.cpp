@@ -217,10 +217,13 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_format_parsing_thread_pool_size;
     extern const ServerSettingsUInt64 max_format_parsing_thread_pool_free_size;
     extern const ServerSettingsUInt64 format_parsing_thread_pool_queue_size;
+<<<<<<< HEAD
     extern const ServerSettingsUInt64 cas_blob_upload_pool_size;
     extern const ServerSettingsUInt64 max_iceberg_manifest_decode_thread_pool_size;
     extern const ServerSettingsUInt64 max_iceberg_manifest_decode_thread_pool_free_size;
     extern const ServerSettingsUInt64 iceberg_manifest_decode_thread_pool_queue_size;
+=======
+>>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
     extern const ServerSettingsNonZeroUInt64 ai_function_max_thread_pool_size;
     extern const ServerSettingsUInt64 ai_function_max_thread_pool_free_size;
     extern const ServerSettingsUInt64 ai_function_thread_pool_queue_size;
@@ -475,6 +478,7 @@ void LocalServer::initialize(Poco::Util::Application & self)
         server_settings[ServerSetting::max_format_parsing_thread_pool_free_size],
         server_settings[ServerSetting::format_parsing_thread_pool_queue_size]);
 
+<<<<<<< HEAD
     /// See the explanation near the same line in Server.cpp: `uploadPendingBlobs` reaches this
     /// pool unconditionally once a `cas` disk commits a part, so every entry point
     /// that can run a CA INSERT must initialize it, not only `clickhouse-server`.
@@ -484,6 +488,8 @@ void LocalServer::initialize(Poco::Util::Application & self)
         server_settings[ServerSetting::max_iceberg_manifest_decode_thread_pool_free_size],
         server_settings[ServerSetting::iceberg_manifest_decode_thread_pool_queue_size]);
 
+=======
+>>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
     getAIRequestThreadPool().initialize(
         server_settings[ServerSetting::ai_function_max_thread_pool_size],
         server_settings[ServerSetting::ai_function_max_thread_pool_free_size],

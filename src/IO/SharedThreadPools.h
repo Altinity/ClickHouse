@@ -71,8 +71,11 @@ private:
     M(MergeTreePrefixesDeserialization, "MergeTreePrefixesDeserializationThreadPool", MergeTreeSubcolumnsReader) \
     M(DropDistributedCache, "DropDistributedCacheThreadPool", DropDistributedCache) \
     M(FormatParsing, "FormatParsingThreadPool", FormatParsing) \
+<<<<<<< HEAD
     M(IcebergManifestDecode, "IcebergManifestDecodeThreadPool", IcebergManifestDecode) \
     M(ParquetEncoder, "ParquetEncoderThreadPool", ParquetEncoder) \
+=======
+>>>>>>> 4451bca49ac (Merge pull request #127100 from groeneai/iceberg-read-manifests-on-io-pool)
     M(AIRequest, "AIRequestThreadPool", AIRequest)
 
 #define DECLARE_STATIC_THREAD_POOL_GETTER(SUFFIX, NAME, METRIC) StaticThreadPool & get##SUFFIX##ThreadPool();
