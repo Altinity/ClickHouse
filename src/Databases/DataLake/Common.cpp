@@ -74,14 +74,9 @@ DB::DataTypePtr getType(const String & type_name, bool nullable, DB::ContextPtr 
     /// the writer that registered the table used.
     if ((name.starts_with("array<") || name.starts_with("list<")) && name.ends_with(">"))
     {
-<<<<<<< HEAD
-        String inner = name.substr(6, name.size() - 7);
-        return std::make_shared<DB::DataTypeArray>(getType(inner, nullable, context));
-=======
         const size_t open = name.find('<');
         String inner = name.substr(open + 1, name.size() - open - 2);
-        return std::make_shared<DB::DataTypeArray>(getType(inner, nullable));
->>>>>>> cf0f68d1034 (Merge pull request #121974 from groeneai/fix-glue-iceberg-varbyte-list-types)
+        return std::make_shared<DB::DataTypeArray>(getType(inner, nullable, context));
     }
 
     if (name.starts_with("map<") && name.ends_with(">"))
