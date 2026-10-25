@@ -330,7 +330,9 @@ If a setting is defined in several places, the first source in this list wins:
 3. Profiles of the user's roles. A profile can be attached to a role with `CREATE ROLE ... SETTINGS PROFILE '...'`; when several roles set the same setting, which one wins is undefined.
 4. The server's [default profile](/reference/settings/server-settings/settings/default#default_profile).
 
-In distributed queries, the resulting settings are sent to the other nodes with the query, so the profiles only need to exist on the node the user connects to.
+In distributed queries, the resulting settings that differ from their defaults are sent to the other nodes with the query, so the profiles only need to exist on the node the user connects to.
+
+Limitation: if the user has logged in directly to another node, that node keeps the profiles and roles from that login until the user's next direct login there. Its part of a distributed query uses those profiles' settings and constraints, even if the user's groups have changed.
 
 ## Forwarding the token to external services {#token-forwarding}
 
