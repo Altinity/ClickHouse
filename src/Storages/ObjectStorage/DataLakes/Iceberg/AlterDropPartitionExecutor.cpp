@@ -776,8 +776,6 @@ AlterDropPartitionExecutor::ManifestListWriteResult AlterDropPartitionExecutor::
             parsed_summary.error());
 
     auto summary = SnapshotSummary{plan.snapshot_summary_update, parsed_summary->getTotals()}.toJSON();
-    if (parent_summary->has(f_refresh_cursor))
-        summary->set(f_refresh_cursor, parent_summary->getValue<String>(f_refresh_cursor));
     new_snapshot->set(f_summary, summary);
 
     const String storage_manifest_list_path = components.path_resolver.resolve(manifest_list_path);
