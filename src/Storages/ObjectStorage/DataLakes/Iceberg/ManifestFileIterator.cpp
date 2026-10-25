@@ -83,14 +83,6 @@ namespace
         return DB::Range(*left, true, *right, true);
     }
 
-    bool isColumnPresenceKnown(const ParsedManifestFileEntry & parsed_entry)
-    {
-        for (const auto & [field_id, column_info] : parsed_entry.columns_infos)
-            if (column_info.bytes_size.has_value())
-                return true;
-        return false;
-    }
-
     void addRowLineageHyperrectangles(std::unordered_map<Int32, DB::Range> & hyperrectangles, const ProcessedManifestFileEntry & entry)
     {
         const auto & parsed_entry = *entry.parsed_entry;
@@ -99,7 +91,6 @@ namespace
 
         const UInt64 inherited_sequence_number = static_cast<UInt64>(entry.sequence_number);
         const UInt64 last_inherited_row_id = *entry.first_row_id + static_cast<UInt64>(parsed_entry.record_count) - 1;
-        const bool column_presence_is_known = isColumnPresenceKnown(parsed_entry);
         const bool row_ids_are_readable = Poco::toUpper(parsed_entry.file_format) != "ORC";
 
         for (const auto field_id : {row_id_field_id, last_updated_sequence_number_field_id})
@@ -107,23 +98,16 @@ namespace
             const bool is_row_id = field_id == row_id_field_id;
             if (is_row_id && !row_ids_are_readable)
                 continue;
-            const UInt64 inherited_lower_bound = is_row_id ? *entry.first_row_id : inherited_sequence_number;
             const UInt64 inherited_upper_bound = is_row_id ? last_inherited_row_id : inherited_sequence_number;
 
-            if (!parsed_entry.columns_infos.contains(field_id))
-            {
-                if (column_presence_is_known)
-                {
-                    hyperrectangles.emplace(field_id, DB::Range(inherited_lower_bound, true, inherited_upper_bound, true));
-                    continue;
-                }
-            }
-            else if (auto range = getMaterializedRowLineageRange(parsed_entry, field_id))
+            if (auto range = getMaterializedRowLineageRange(parsed_entry, field_id))
             {
                 hyperrectangles.emplace(field_id, *range);
                 continue;
             }
 
+            /// A missing statistic says nothing about the column, and a materialized value always predates this file, so only the
+            /// upper end of the inherited block bounds every value the file can hold.
             hyperrectangles.emplace(field_id, DB::Range(UInt64(0), true, inherited_upper_bound, true));
         }
     }
