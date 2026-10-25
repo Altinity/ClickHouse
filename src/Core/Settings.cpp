@@ -2131,11 +2131,16 @@ Possible values:
     DECLARE(ObjectStorageClusterJoinMode, object_storage_cluster_join_mode, ObjectStorageClusterJoinMode::ALLOW, R"(
 Where a [JOIN](../../sql-reference/statements/select/join.md#distributed-join) runs when its left table is a cluster table function (`s3Cluster`, `icebergCluster`, and the other `*Cluster` functions) or a table engine with [`object_storage_cluster`](#object_storage_cluster) set.
 
+Restrictions:
+
+- Only applied for `JOIN` and for `IN`/`WHERE` subqueries that reference other tables.
+- Only if the FROM section uses an object storage cluster function or table.
+
 Possible values:
 
-- `allow` — Default. Nodes read the left table and return its rows. The join runs on the initiator. The right table is read there and is not sent to the nodes.
-- `local` — The join runs on the initiator. Nodes read the left table and return its rows. The right table is read on the initiator and is not sent to the nodes.
-- `global` — `INNER`, `LEFT`, and `CROSS` run on the nodes. The initiator reads the right table once and sends it to each node. For `CROSS JOIN`, every table after the first is sent. `RIGHT` and `FULL` stay on the initiator, so unmatched rows of the preserved side are returned once.
+- `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN`. Right table executes first and is added to the secondary query as a temporary table.
+- `allow` — Default value. Reads the left object-storage table on cluster nodes and executes `JOIN` / local `IN` on the initiator, so the right table does not need to exist on remote nodes.
+- `local` — Deprecated legacy alias of `allow`.
 
 See [Distributed JOIN](../../sql-reference/statements/select/join.md#object-storage-cluster-join-mode).
 )", 0) \
