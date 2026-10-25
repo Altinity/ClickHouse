@@ -154,7 +154,6 @@ bool AuthenticationData::Util::checkPasswordBcrypt(std::string_view password [[m
 
 bool operator ==(const AuthenticationData & lhs, const AuthenticationData & rhs)
 {
-<<<<<<< HEAD
     /// `MemoryAccessStorage::updateNoLock` short-circuits when the existing
     /// entity equals the new one, so any field omitted from this comparator
     /// becomes invisible to ALTER USER -- same-type ALTER would silently
@@ -162,10 +161,7 @@ bool operator ==(const AuthenticationData & lhs, const AuthenticationData & rhs)
     /// `jwt_claims`) and they MUST take part in equality, otherwise re-pinning
     /// a JWT user via ALTER USER is a no-op (CREATE USER OR REPLACE works
     /// only by accident, via storage->insertOrReplace).
-    return (lhs.type == rhs.type) && (lhs.password_hash == rhs.password_hash)
-=======
     return (lhs.type == rhs.type) && (lhs.password_hash == rhs.password_hash) && (lhs.otp_secret == rhs.otp_secret)
->>>>>>> 7ecceca9c22 (Merge pull request #125443 from zvonand/fix/multi-auth-ignore-duplicates)
         && (lhs.ldap_server_name == rhs.ldap_server_name) && (lhs.kerberos_realm == rhs.kerberos_realm)
 #if USE_SSL
         && (lhs.ssl_certificate_subjects == rhs.ssl_certificate_subjects)
