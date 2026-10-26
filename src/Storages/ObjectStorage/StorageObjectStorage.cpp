@@ -1,4 +1,8 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include "config.h"
+#if USE_AVRO
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#endif
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 
 #include <Common/CurrentThread.h>
@@ -582,6 +586,26 @@ std::optional<UInt64> StorageObjectStorage::totalBytes(ContextPtr query_context)
 
     is_table_function ? configuration->lazyInitializeIfNeeded(object_storage, query_context) : configuration->update(object_storage, query_context);
     return configuration->totalBytes(query_context);
+}
+
+std::optional<std::vector<IdentityPartitionFile>> StorageObjectStorage::getIdentityPartitionFiles(ContextPtr query_context) const
+{
+#if USE_AVRO
+    /// A replica with `distributed_processing` sees only its own tasks. Answering from the whole
+    /// snapshot here would count every shard's rows on every shard.
+    if (distributed_processing || !configuration->isIcebergConfiguration())
+        return std::nullopt;
+
+    is_table_function ? configuration->lazyInitializeIfNeeded(object_storage, query_context) : configuration->update(object_storage, query_context);
+
+    auto iceberg = std::dynamic_pointer_cast<IcebergMetadata>(configuration->getExternalMetadata());
+    if (!iceberg)
+        return std::nullopt;
+    return iceberg->getDataFileIdentityPartitions(query_context);
+#else
+    (void)query_context;
+    return std::nullopt;
+#endif
 }
 
 void StorageObjectStorage::read(

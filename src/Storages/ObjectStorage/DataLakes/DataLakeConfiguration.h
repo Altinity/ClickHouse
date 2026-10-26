@@ -653,6 +653,9 @@ public:
     bool isStaticConfiguration() const override { return getImpl().isStaticConfiguration(); }
 
     bool isDataLakeConfiguration() const override { return getImpl().isDataLakeConfiguration(); }
+    /// `StorageIcebergConfiguration` selects S3, Azure, HDFS, or local at runtime.
+    /// `system.iceberg_files` and partition-column aggregates recognize Iceberg through this flag.
+    bool isIcebergConfiguration() const override { return getImpl().isIcebergConfiguration(); }
 
     bool supportsTotalRows(ContextPtr context, ObjectStorageType storage_type) const override { return getImpl().supportsTotalRows(context, storage_type); }
     std::optional<size_t> totalRows(ContextPtr context) override { return getImpl().totalRows(context); }

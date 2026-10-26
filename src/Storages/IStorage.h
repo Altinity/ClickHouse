@@ -25,6 +25,8 @@
 #include <expected>
 #include <optional>
 #include <list>
+#include <utility>
+#include <vector>
 
 
 namespace DB
@@ -80,6 +82,14 @@ class IObjectStorage;
 using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;
 
 class ActionsDAG;
+
+/// One live data file whose identity-partition values and `record_count` are known exactly.
+/// A null Field is SQL NULL. A column that is absent is not an identity partition of this file.
+struct IdentityPartitionFile
+{
+    std::vector<std::pair<String, Field>> identity_values;
+    UInt64 record_count = 0;
+};
 
 /** Storage. Describes the table. Responsible for
   * - storage of the table data;
@@ -869,6 +879,10 @@ It is currently only implemented in StorageObjectStorage.
 
     /// Same as above but also take partition predicate into account.
     virtual std::optional<UInt64> totalRowsByPartitionPredicate(const ActionsDAG &, ContextPtr) const { return {}; }
+
+    /// Live data files with identity partition values and `record_count`.
+    /// nullopt means the storage cannot answer exactly, so the caller must scan.
+    virtual std::optional<std::vector<IdentityPartitionFile>> getIdentityPartitionFiles(ContextPtr) const { return {}; }
 
     /// Aggregated `(num_rows, num_defaults)` for `column_name` across all visible parts,
     /// taken from per-part `SerializationInfo`. Returns nullopt when the storage cannot

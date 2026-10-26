@@ -331,6 +331,15 @@ std::optional<UInt64> StorageObjectStorageCluster::totalBytes(ContextPtr query_c
     return configuration->totalBytes(query_context);
 }
 
+std::optional<std::vector<IdentityPartitionFile>> StorageObjectStorageCluster::getIdentityPartitionFiles(ContextPtr query_context) const
+{
+    /// The initiator's `pure_storage` reads the snapshot once. Shards are not asked.
+    /// `pure_storage` itself returns nullopt when `distributed_processing` is set.
+    if (pure_storage)
+        return pure_storage->getIdentityPartitionFiles(query_context);
+    return std::nullopt;
+}
+
 bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context, bool make_cluster_function)
 {
     // Change table engine on table function for distributed request

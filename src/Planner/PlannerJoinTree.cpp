@@ -21,6 +21,19 @@
 
 #include <AggregateFunctions/AggregateFunctionCount.h>
 
+#include <Columns/ColumnAggregateFunction.h>
+#include <Columns/ColumnConst.h>
+#include <Columns/ColumnNullable.h>
+#include <Columns/ColumnsNumber.h>
+#include <Common/Arena.h>
+#include <Core/Names.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <Interpreters/ClientInfo.h>
+#include <Processors/Transforms/AggregatingTransform.h>
+#include <base/arithmeticOverflow.h>
+
+#include <map>
+
 #include <Access/Common/AccessFlags.h>
 #include <Access/ContextAccess.h>
 
@@ -707,6 +720,464 @@ RowPolicyFilterPtr getEffectiveRowPolicyFilter(const StoragePtr & storage, const
     if (!row_policy_filter || row_policy_filter->isAlwaysTrue())
         return nullptr;
     return row_policy_filter;
+}
+
+/// `min` / `max` / `count` of identity partition columns, with an optional filter on those columns only.
+/// The manifest stores the partition value and `record_count` per data file, so the aggregate does not
+/// read the files. The result is one mergeable aggregation state per group. Runs on the initiator only:
+/// a secondary query must not answer from the whole snapshot, or a cluster would count every shard twice.
+bool applyIcebergIdentityPartitionAggregationIfPossible(
+    QueryPlan & query_plan,
+    SelectQueryInfo & select_query_info,
+    const TableNode * table_node,
+    const TableFunctionNode * table_function_node,
+    const QueryTreeNodePtr & query_tree,
+    ContextMutablePtr & query_context,
+    const PlannerContextPtr & planner_context)
+{
+    if (query_plan.isInitialized())
+        return false;
+
+    const auto & settings = query_context->getSettingsRef();
+    /// `ReadFromPreparedSource` cannot be cloned by the Cascades optimizer.
+    if (settings[Setting::make_distributed_plan] && settings[Setting::enable_cascades_optimizer])
+        return false;
+
+    /// With this setting an empty input must produce no row. The prepared state always produces one
+    /// row for an aggregate without `GROUP BY`, so leave that case to the normal pipeline.
+    if (settings[Setting::empty_result_for_aggregation_by_empty_set])
+        return false;
+
+    if (query_context->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY)
+        return false;
+
+    if (settings[Setting::allow_experimental_parallel_reading_from_replicas] > 0 && settings[Setting::max_parallel_replicas] > 1)
+    {
+        if (settings[Setting::parallel_replicas_mode] == ParallelReplicasMode::CUSTOM_KEY_RANGE
+            || settings[Setting::parallel_replicas_mode] == ParallelReplicasMode::CUSTOM_KEY_SAMPLING
+            || settings[Setting::parallel_replicas_mode] == ParallelReplicasMode::SAMPLING_KEY)
+            return false;
+    }
+
+    const auto & storage = table_node ? table_node->getStorage() : table_function_node->getStorage();
+    if (!storage)
+        return false;
+
+    if (getEffectiveRowPolicyFilter(storage, query_context))
+        return false;
+
+    if (select_query_info.additional_filter_ast)
+        return false;
+
+    if (query_context->getCurrentTransaction())
+        return false;
+
+    if (hasTrivialCountIncompatibleModifiers(table_node, table_function_node))
+        return false;
+
+    auto & query_node = query_tree->as<QueryNode &>();
+    if (query_node.hasPrewhere() || query_node.hasWindow() || query_node.hasQualify())
+        return false;
+
+    if (query_node.isGroupByWithTotals() || query_node.isGroupByWithRollup() || query_node.isGroupByWithCube()
+        || query_node.isGroupByWithGroupingSets())
+        return false;
+
+    if (!query_node.getCorrelatedColumnsSet().empty() || queryHasArrayJoinInJoinTree(query_tree))
+        return false;
+
+    struct PlainColumn
+    {
+        String schema_name;
+        String action_name;
+        DataTypePtr type;
+    };
+
+    auto appendColumn = [&](const QueryTreeNodePtr & node, std::vector<PlainColumn> & out) -> bool
+    {
+        const auto * column = node->as<ColumnNode>();
+        if (!column || column->hasExpression())
+            return false;
+        String action_name = calculateActionNodeName(node, *planner_context);
+        if (action_name.empty())
+            return false;
+        out.push_back(PlainColumn{column->getColumnName(), std::move(action_name), column->getColumnType()});
+        return true;
+    };
+
+    auto collectColumns = [&](const QueryTreeNodePtr & node, std::vector<PlainColumn> & out, auto & self) -> bool
+    {
+        if (!node)
+            return true;
+
+        switch (node->getNodeType())
+        {
+            case QueryTreeNodeType::COLUMN:
+                return appendColumn(node, out);
+            case QueryTreeNodeType::CONSTANT:
+                return true;
+            case QueryTreeNodeType::FUNCTION:
+            {
+                const auto & function = node->as<const FunctionNode &>();
+                if (!function.isOrdinaryFunction() || function.getFunctionName() == "arrayJoin")
+                    return false;
+                for (const auto & argument : function.getArguments().getNodes())
+                {
+                    if (!self(argument, out, self))
+                        return false;
+                }
+                return true;
+            }
+            case QueryTreeNodeType::LIST:
+            {
+                for (const auto & child : node->as<const ListNode &>().getNodes())
+                {
+                    if (!self(child, out, self))
+                        return false;
+                }
+                return true;
+            }
+            default:
+                return false;
+        }
+    };
+
+    enum class AggKind
+    {
+        CountAll,
+        CountColumn,
+        Min,
+        Max
+    };
+
+    struct AggSpec
+    {
+        AggKind kind;
+        String schema_name;
+        String action_name;
+        AggregateFunctionPtr function;
+        DataTypePtr state_type;
+    };
+
+    std::vector<PlainColumn> referenced_columns;
+    std::vector<AggSpec> aggregates;
+    NameSet aggregate_names;
+    for (const auto & aggregate_node : collectAggregateFunctionNodes(query_tree))
+    {
+        const auto & function = aggregate_node->as<const FunctionNode &>();
+        if (!function.isAggregateFunction() || !function.getAggregateFunction())
+            return false;
+        if (!function.getParameters().getNodes().empty() || !function.getAggregateFunction()->getParameters().empty())
+            return false;
+
+        AggSpec spec;
+        spec.function = function.getAggregateFunction();
+        spec.action_name = calculateActionNodeName(aggregate_node, *planner_context);
+        if (spec.action_name.empty())
+            return false;
+        if (!aggregate_names.emplace(spec.action_name).second)
+            continue;
+
+        spec.state_type = std::make_shared<DataTypeAggregateFunction>(
+            spec.function, spec.function->getArgumentTypes(), spec.function->getParameters());
+
+        const auto & name = spec.function->getName();
+        const auto & arguments = function.getArguments().getNodes();
+        if (name == "count" && arguments.empty())
+        {
+            spec.kind = AggKind::CountAll;
+        }
+        else if (name == "count" && arguments.size() == 1)
+        {
+            if (!appendColumn(arguments.front(), referenced_columns))
+                return false;
+            spec.kind = AggKind::CountColumn;
+            spec.schema_name = referenced_columns.back().schema_name;
+        }
+        else if ((name == "min" || name == "max") && arguments.size() == 1)
+        {
+            if (!appendColumn(arguments.front(), referenced_columns))
+                return false;
+            spec.kind = name == "min" ? AggKind::Min : AggKind::Max;
+            spec.schema_name = referenced_columns.back().schema_name;
+        }
+        else
+        {
+            return false;
+        }
+        aggregates.push_back(std::move(spec));
+    }
+
+    std::vector<PlainColumn> group_keys;
+    NameSet key_names;
+    if (query_node.hasGroupBy())
+    {
+        for (const auto & key_node : query_node.getGroupBy().getNodes())
+        {
+            if (!appendColumn(key_node, group_keys))
+                return false;
+            if (!key_names.emplace(group_keys.back().action_name).second)
+            {
+                group_keys.pop_back();
+                continue;
+            }
+            referenced_columns.push_back(group_keys.back());
+        }
+    }
+
+    if (aggregates.empty() && group_keys.empty())
+        return false;
+
+    std::vector<PlainColumn> where_columns;
+    if (query_node.hasWhere())
+    {
+        if (!collectColumns(query_node.getWhere(), where_columns, collectColumns))
+            return false;
+        referenced_columns.insert(referenced_columns.end(), where_columns.begin(), where_columns.end());
+    }
+
+    auto files = storage->getIdentityPartitionFiles(query_context);
+    if (!files)
+        return false;
+
+    auto findIdentity = [](const IdentityPartitionFile & file, const String & name) -> const Field *
+    {
+        for (const auto & [column_name, value] : file.identity_values)
+        {
+            if (column_name == name)
+                return &value;
+        }
+        return nullptr;
+    };
+
+    for (const auto & column : referenced_columns)
+    {
+        for (const auto & file : *files)
+        {
+            const Field * value = findIdentity(file, column.schema_name);
+            if (!value)
+                return false;
+            if (value->isNull() && !column.type->isNullable())
+                return false;
+        }
+    }
+
+    std::vector<size_t> kept;
+    kept.reserve(files->size());
+    if (query_node.hasWhere() && !files->empty())
+    {
+        std::vector<PlainColumn> filter_columns;
+        for (const auto & column : where_columns)
+        {
+            bool seen = false;
+            for (const auto & existing : filter_columns)
+            {
+                if (existing.action_name == column.action_name)
+                {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen)
+                filter_columns.push_back(column);
+        }
+
+        ColumnsWithTypeAndName input_columns;
+        Block filter_block;
+        for (const auto & column : filter_columns)
+        {
+            auto values = column.type->createColumn();
+            for (const auto & file : *files)
+            {
+                const Field * value = findIdentity(file, column.schema_name);
+                if (!value)
+                    return false;
+                values->insert(*value);
+            }
+            input_columns.emplace_back(nullptr, column.type, column.action_name);
+            filter_block.insert(ColumnWithTypeAndName(std::move(values), column.type, column.action_name));
+        }
+        if (filter_block.columns() == 0)
+        {
+            auto dummy = ColumnUInt8::create(files->size());
+            filter_block.insert(ColumnWithTypeAndName(std::move(dummy), std::make_shared<DataTypeUInt8>(), "_dummy"));
+        }
+
+        ColumnNodePtrWithHashSet no_correlated_columns;
+        auto [filter_dag, correlated] = buildActionsDAGFromExpressionNode(
+            query_node.getWhere(), input_columns, planner_context, no_correlated_columns);
+        if (correlated.notEmpty() || filter_dag.getOutputs().size() != 1)
+            return false;
+        if (!WhichDataType(removeNullable(filter_dag.getOutputs().front()->result_type)).isUInt8())
+            return false;
+
+        const String & filter_name = filter_dag.getOutputs().front()->result_name;
+        auto actions = std::make_shared<ExpressionActions>(std::move(filter_dag));
+        size_t num_rows = filter_block.rows();
+        actions->execute(filter_block, num_rows);
+        if (!filter_block.has(filter_name))
+            return false;
+
+        const IColumn & filter_column = *filter_block.getByName(filter_name).column;
+        if (filter_column.size() != 1 && filter_column.size() != files->size())
+            return false;
+
+        auto keeps = [](const IColumn & column, size_t row, auto & self) -> bool
+        {
+            if (const auto * constant = checkAndGetColumn<ColumnConst>(&column))
+                return self(constant->getDataColumn(), 0, self);
+            if (const auto * nullable = checkAndGetColumn<ColumnNullable>(&column))
+            {
+                if (nullable->isNullAt(row))
+                    return false;
+                return nullable->getNestedColumn().getUInt(row) != 0;
+            }
+            return column.getUInt(row) != 0;
+        };
+
+        for (size_t i = 0; i < files->size(); ++i)
+        {
+            const size_t row = filter_column.size() == 1 ? 0 : i;
+            if (keeps(filter_column, row, keeps))
+                kept.push_back(i);
+        }
+    }
+    else
+    {
+        for (size_t i = 0; i < files->size(); ++i)
+            kept.push_back(i);
+    }
+
+    struct Group
+    {
+        std::vector<Field> keys;
+        UInt64 rows = 0;
+        std::vector<UInt64> column_counts;
+        std::vector<std::vector<Field>> extremal_values;
+    };
+
+    std::map<std::vector<Field>, size_t> group_positions;
+    std::vector<Group> groups;
+    if (group_keys.empty())
+    {
+        Group group;
+        group.column_counts.assign(aggregates.size(), 0);
+        group.extremal_values.resize(aggregates.size());
+        groups.push_back(std::move(group));
+    }
+
+    for (size_t index : kept)
+    {
+        const auto & file = (*files)[index];
+        std::vector<Field> key;
+        key.reserve(group_keys.size());
+        for (const auto & group_key : group_keys)
+        {
+            const Field * value = findIdentity(file, group_key.schema_name);
+            if (!value)
+                return false;
+            key.push_back(*value);
+        }
+
+        size_t group_index = 0;
+        if (!group_keys.empty())
+        {
+            auto [it, inserted] = group_positions.emplace(key, groups.size());
+            if (inserted)
+            {
+                Group group;
+                group.keys = it->first;
+                group.column_counts.assign(aggregates.size(), 0);
+                group.extremal_values.resize(aggregates.size());
+                groups.push_back(std::move(group));
+            }
+            group_index = it->second;
+        }
+
+        Group & group = groups[group_index];
+        if (common::addOverflow(group.rows, file.record_count, group.rows))
+            return false;
+
+        for (size_t agg_index = 0; agg_index < aggregates.size(); ++agg_index)
+        {
+            const auto & aggregate = aggregates[agg_index];
+            if (aggregate.kind == AggKind::CountAll)
+                continue;
+
+            const Field * value = findIdentity(file, aggregate.schema_name);
+            if (!value)
+                return false;
+            if (value->isNull())
+                continue;
+
+            if (aggregate.kind == AggKind::CountColumn)
+            {
+                if (common::addOverflow(group.column_counts[agg_index], file.record_count, group.column_counts[agg_index]))
+                    return false;
+            }
+            else
+            {
+                group.extremal_values[agg_index].push_back(*value);
+            }
+        }
+    }
+
+    Block result;
+    for (size_t key_index = 0; key_index < group_keys.size(); ++key_index)
+    {
+        auto column = group_keys[key_index].type->createColumn();
+        for (const auto & group : groups)
+            column->insert(group.keys[key_index]);
+        result.insert(ColumnWithTypeAndName(std::move(column), group_keys[key_index].type, group_keys[key_index].action_name));
+    }
+
+    for (size_t agg_index = 0; agg_index < aggregates.size(); ++agg_index)
+    {
+        const auto & aggregate = aggregates[agg_index];
+        auto state_column = ColumnAggregateFunction::create(aggregate.function);
+        for (const auto & group : groups)
+        {
+            Arena arena;
+            char * place = arena.alignedAlloc(aggregate.function->sizeOfData(), aggregate.function->alignOfData());
+            aggregate.function->create(place);
+            SCOPE_EXIT_MEMORY_SAFE(aggregate.function->destroy(place));
+
+            if (aggregate.kind == AggKind::CountAll || aggregate.kind == AggKind::CountColumn)
+            {
+                const UInt64 count_value = aggregate.kind == AggKind::CountAll ? group.rows : group.column_counts[agg_index];
+                /// `count` and `count(column)` both store `AggregateFunctionCountData`.
+                AggregateFunctionCount::set(place, count_value);
+            }
+            else if (!group.extremal_values[agg_index].empty())
+            {
+                auto argument = aggregate.function->getArgumentTypes().at(0)->createColumn();
+                for (const auto & value : group.extremal_values[agg_index])
+                    argument->insert(value);
+                const IColumn * arguments[] = {argument.get()};
+                Arena add_arena;
+                for (size_t row = 0; row < argument->size(); ++row)
+                    aggregate.function->add(place, arguments, row, &add_arena);
+            }
+            state_column->insertFrom(place);
+        }
+        result.insert(ColumnWithTypeAndName(std::move(state_column), aggregate.state_type, aggregate.action_name));
+    }
+
+    if (settings[Setting::allow_experimental_parallel_reading_from_replicas] > 0 && settings[Setting::max_parallel_replicas] > 1)
+    {
+        query_context->setSetting("allow_experimental_parallel_reading_from_replicas", Field(0));
+        LOG_TRACE(getLogger("Planner"), "Disabling parallel replicas to aggregate Iceberg partitions from metadata");
+    }
+
+    Chunk chunk(result.getColumns(), result.rows());
+    auto chunk_info = std::make_shared<AggregatedChunkInfo>();
+    chunk.getChunkInfos().add(std::move(chunk_info));
+
+    auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(result.cloneEmpty()), std::move(chunk));
+    auto prepared = std::make_unique<ReadFromPreparedSource>(Pipe(std::move(source)));
+    prepared->setStepDescription("Optimized aggregate by partition columns from metadata");
+    query_plan.addStep(std::move(prepared));
+    return true;
 }
 
 bool applyTrivialCountIfPossible(
@@ -2083,8 +2554,12 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(TableExpressionNodePtr table_
 
         /// Apply trivial_count if possible. The plain variant requires no `WHERE`; the
         /// sparsity-filter variant requires a `WHERE`, so at most one of them fires.
-        is_trivial_count_applied = !select_query_options.only_analyze && !select_query_options.build_logical_plan && is_single_table_expression
-            && (table_node || table_function_node) && select_query_info.has_aggregates
+        /// Iceberg identity partitions are answered afterwards, so an unfiltered `count()` keeps
+        /// the existing trivial-count path and its profile event.
+        const bool can_apply_metadata_aggregate = !select_query_options.only_analyze && !select_query_options.build_logical_plan
+            && is_single_table_expression && (table_node || table_function_node);
+
+        is_trivial_count_applied = can_apply_metadata_aggregate && select_query_info.has_aggregates
             && (applyTrivialCountIfPossible(
                     query_plan,
                     table_expression_query_info,
@@ -2104,6 +2579,19 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(TableExpressionNodePtr table_
                     planner_context->getMutableQueryContext(),
                     table_expression_data.getColumnNames(),
                     *planner_context));
+
+        if (!is_trivial_count_applied && can_apply_metadata_aggregate
+            && (select_query_info.has_aggregates || select_query_info.query_tree->as<QueryNode &>().hasGroupBy()))
+        {
+            is_trivial_count_applied = applyIcebergIdentityPartitionAggregationIfPossible(
+                query_plan,
+                table_expression_query_info,
+                table_node,
+                table_function_node,
+                select_query_info.query_tree,
+                planner_context->getMutableQueryContext(),
+                planner_context);
+        }
 
         if (is_trivial_count_applied)
         {

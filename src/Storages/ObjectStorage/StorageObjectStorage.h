@@ -212,6 +212,7 @@ public:
 
     std::optional<UInt64> totalRows(ContextPtr query_context) const override;
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
+    std::optional<std::vector<IdentityPartitionFile>> getIdentityPartitionFiles(ContextPtr query_context) const override;
 
     bool optimize(
         const ASTPtr & /*query*/,
