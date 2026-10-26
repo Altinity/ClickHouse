@@ -183,6 +183,31 @@ exercise()
 
 create_table "${LOCAL_TABLE}" "IcebergLocal('${LOCAL_PATH}')"
 exercise "IcebergLocal" "${LOCAL_TABLE}"
+
+# `optimize_trivial_count_query = 0` must scan. Manifest `min` / `max` / grouped `count` stay enabled.
+echo "count_setting_off"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT count() FROM ${LOCAL_TABLE}
+    SETTINGS
+        log_comment = '${PREFIX}_count_setting_off',
+        log_queries = 1,
+        optimize_trivial_count_query = 0,
+        use_iceberg_metadata_files_cache = 0,
+        enable_parallel_replicas = 0"
+${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS query_log"
+${CLICKHOUSE_CLIENT} --format TabSeparated --query "
+    SELECT if(
+        read_rows >= 10000 AND ProfileEvents['IcebergTrivialCountOptimizationApplied'] = 0,
+        'data',
+        concat('metadata read_rows=', toString(read_rows), ' trivial_count=', toString(ProfileEvents['IcebergTrivialCountOptimizationApplied'])))
+    FROM system.query_log
+    WHERE type = 'QueryFinish'
+        AND is_initial_query
+        AND current_database = currentDatabase()
+        AND log_comment = '${PREFIX}_count_setting_off'
+    ORDER BY event_time_microseconds DESC
+    LIMIT 1"
+
 exercise "icebergLocal" "icebergLocal('${LOCAL_PATH}')"
 
 create_table "${S3_TABLE}" "IcebergS3(s3_conn, filename = '${S3_KEY}')"

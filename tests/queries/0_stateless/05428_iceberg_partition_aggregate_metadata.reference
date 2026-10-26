@@ -53,6 +53,9 @@ max_of_groupby metadata
 groupby_d_only metadata
 count metadata
 max_k data
+count_setting_off
+10000
+data
 icebergLocal
 files 10
 max_d

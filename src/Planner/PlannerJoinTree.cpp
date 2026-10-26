@@ -936,6 +936,24 @@ bool applyIcebergIdentityPartitionAggregationIfPossible(
         referenced_columns.insert(referenced_columns.end(), where_columns.begin(), where_columns.end());
     }
 
+    /// `optimize_trivial_count_query = 0` disables `SELECT count() FROM table`.
+    /// Trivial count has already declined; do not answer that shape from manifests.
+    /// `WHERE` and `GROUP BY` are not the trivial-count query, so they stay here.
+    if (!settings[Setting::optimize_trivial_count_query] && !query_node.hasWhere() && !query_node.hasGroupBy())
+    {
+        bool only_count = !aggregates.empty();
+        for (const auto & aggregate : aggregates)
+        {
+            if (aggregate.kind != AggKind::CountAll && aggregate.kind != AggKind::CountColumn)
+            {
+                only_count = false;
+                break;
+            }
+        }
+        if (only_count)
+            return false;
+    }
+
     auto files = storage->getIdentityPartitionFiles(query_context);
     if (!files)
         return false;
