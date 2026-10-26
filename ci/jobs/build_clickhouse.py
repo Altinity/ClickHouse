@@ -105,6 +105,7 @@ def parse_args():
 
 def run_shell(name, command, **kwargs):
     print(f"\n>>>> {name}\n")
+    kwargs.setdefault("verbose", True)
     Shell.check(command, **kwargs)
     print(f"\n<<<< {name}\n")
 
