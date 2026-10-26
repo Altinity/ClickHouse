@@ -5,6 +5,9 @@ FROM altinityinfra/test-base:$FROM_TAG
 
 ARG odbc_driver_url="https://github.com/ClickHouse/clickhouse-odbc/releases/download/v1.1.6.20200320/clickhouse-odbc-1.1.6-Linux.tar.gz"
 
+# The test-base image carries an outdated Kitware apt key
+RUN curl -s https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor - > /etc/apt/trusted.gpg.d/kitware.gpg
+
 # golang version 1.13 on Ubuntu 20 is enough for tests
 RUN apt-get update -y \
     && env DEBIAN_FRONTEND=noninteractive \
