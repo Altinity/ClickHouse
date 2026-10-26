@@ -21,6 +21,7 @@
 #include <fmt/ranges.h>
 
 #include <Interpreters/ExpressionActions.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFileIterator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
@@ -99,7 +100,16 @@ DB::ASTPtr getASTFromTransform(const String & transform_name_src, const String &
     return makeASTFunction(transform_and_argument->transform_name, make_intrusive<ASTIdentifier>(column_name));
 }
 
-std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManifest(const DB::ActionsDAG * source_dag, std::vector<Int32> & used_columns_in_filter) const
+namespace
+{
+    constexpr const char * row_id_column = "_row_id";
+    constexpr const char * last_sequence_number_column = "_last_updated_sequence_number";
+}
+
+std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManifest(
+    const DB::ActionsDAG * source_dag,
+    std::vector<Int32> & used_columns_in_filter,
+    std::unordered_map<Int32, DB::NameAndTypePair> & row_lineage_columns_in_filter) const
 {
     const auto & inputs = source_dag->getInputs();
 
@@ -108,6 +118,14 @@ std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManife
         if (input->type == ActionsDAG::ActionType::INPUT)
         {
             std::string input_name = input->result_name;
+            if (input_name == row_id_column || input_name == last_sequence_number_column)
+            {
+                const Int32 field_id = input_name == row_id_column ? row_id_field_id : last_updated_sequence_number_field_id;
+                used_columns_in_filter.push_back(field_id);
+                row_lineage_columns_in_filter.emplace(field_id, DB::NameAndTypePair(input_name, input->result_type));
+                continue;
+            }
+
             std::optional<Int32> input_id = schema_processor.tryGetColumnIDByName(current_schema_id, input_name);
             if (input_id)
                 used_columns_in_filter.push_back(*input_id);
@@ -117,6 +135,13 @@ std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManife
     ActionsDAG dag_with_renames;
     for (const auto column_id : used_columns_in_filter)
     {
+        if (auto lineage_column = row_lineage_columns_in_filter.find(column_id); lineage_column != row_lineage_columns_in_filter.end())
+        {
+            const auto * node = &dag_with_renames.addInput(lineage_column->second.name, lineage_column->second.type);
+            dag_with_renames.getOutputs().push_back(node);
+            continue;
+        }
+
         auto column = schema_processor.tryGetFieldCharacteristics(current_schema_id, column_id);
 
         /// Columns which we dropped and don't exist in current schema
@@ -158,12 +183,13 @@ ManifestFilesPruner::ManifestFilesPruner(
 
     std::unique_ptr<ActionsDAG> transformed_dag;
     std::vector<Int32> used_columns_in_filter;
-    transformed_dag = transformFilterDagForManifest(filter_dag, used_columns_in_filter);
+    transformed_dag = transformFilterDagForManifest(filter_dag, used_columns_in_filter, row_lineage_columns);
     chassert(transformed_dag != nullptr);
 
     if (manifest_file.hasPartitionKey())
     {
         partition_key = &manifest_file.getPartitionKeyDescription();
+        partition_key_spec_positions = manifest_file.getPartitionKeySpecPositions();
         ActionsDAGWithInversionPushDown inverted_dag(transformed_dag->getOutputs().front(), context, /* boolean_context */ true);
         partition_key_condition.emplace(
             inverted_dag, context, partition_key->column_names, partition_key->expression, true /* single_point */);
@@ -171,12 +197,20 @@ ManifestFilesPruner::ManifestFilesPruner(
 
     for (Int32 used_column_id : used_columns_in_filter)
     {
-        auto name_and_type = schema_processor.tryGetFieldCharacteristics(initial_schema_id, used_column_id);
-        if (!name_and_type.has_value())
-            continue;
+        std::optional<NameAndTypePair> name_and_type;
+        if (auto lineage_column = row_lineage_columns.find(used_column_id); lineage_column != row_lineage_columns.end())
+        {
+            name_and_type = lineage_column->second;
+        }
+        else
+        {
+            name_and_type = schema_processor.tryGetFieldCharacteristics(initial_schema_id, used_column_id);
+            if (!name_and_type.has_value())
+                continue;
 
-        min_max_column_types.emplace(used_column_id, name_and_type->type);
-        name_and_type->name = DB::backQuote(DB::toString(used_column_id));
+            min_max_column_types.emplace(used_column_id, name_and_type->type);
+            name_and_type->name = DB::backQuote(DB::toString(used_column_id));
+        }
 
         ExpressionActionsPtr expression
             = std::make_shared<ExpressionActions>(ActionsDAG({name_and_type.value()}), ExpressionActionsSettings(context));
@@ -408,7 +442,16 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
 
     if (partition_key_condition.has_value())
     {
-        Row wrapped_partition_value = partition_value;
+        /// Project: the Avro tuple has one entry per spec field, but the key only contains the
+        /// fields at the positions recorded in `partition_key_spec_positions`.  Pick exactly those.
+        Row wrapped_partition_value;
+        wrapped_partition_value.reserve(partition_key_spec_positions.size());
+        for (size_t pos : partition_key_spec_positions)
+        {
+            if (pos >= partition_value.size())
+                return PruningReturnStatus::NOT_PRUNED; /// fail closed — cannot prune without the value
+            wrapped_partition_value.push_back(partition_value[pos]);
+        }
         wrapIntegerPartitionValuesAsDateTime64(wrapped_partition_value, partition_key->data_types);
 
         std::vector<FieldRef> index_value(wrapped_partition_value.begin(), wrapped_partition_value.end());
@@ -426,7 +469,7 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         }
 
         bool can_be_true = partition_key_condition->mayBeTrueInRange(
-            partition_value.size(), index_value.data(), index_value.data(), partition_key->data_types);
+            index_value.size(), index_value.data(), index_value.data(), partition_key->data_types);
 
         if (!can_be_true)
         {
@@ -436,15 +479,25 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
 
     for (const auto & [column_id, key_condition] : min_max_key_conditions)
     {
-        /// There is no such column in this manifest file
-        auto type_it = min_max_column_types.find(column_id);
-        if (type_it == min_max_column_types.end())
-            continue;
-        const auto & column_type = type_it->second;
+        DataTypePtr column_type;
+        bool has_no_nulls = true;
 
-        auto info_it = entry->parsed_entry->columns_infos.find(column_id);
-        bool has_no_nulls = info_it != entry->parsed_entry->columns_infos.end() && info_it->second.nulls_count.has_value()
-            && *info_it->second.nulls_count == 0;
+        if (auto lineage_column = row_lineage_columns.find(column_id); lineage_column != row_lineage_columns.end())
+        {
+            column_type = lineage_column->second.type;
+        }
+        else
+        {
+            /// There is no such column in this manifest file
+            auto type_it = min_max_column_types.find(column_id);
+            if (type_it == min_max_column_types.end())
+                continue;
+            column_type = type_it->second;
+
+            auto info_it = entry->parsed_entry->columns_infos.find(column_id);
+            has_no_nulls = info_it != entry->parsed_entry->columns_infos.end() && info_it->second.nulls_count.has_value()
+                && *info_it->second.nulls_count == 0;
+        }
 
         const DataTypes data_types{column_type};
 
@@ -452,7 +505,7 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         {
             for (const auto & partition_field : *entry->common_partition_specification)
             {
-                if (partition_field.source_id != column_id || partition_field.tuple_index < 0
+                if (partition_field.isMultiArg() || partition_field.source_ids[0] != column_id || partition_field.tuple_index < 0
                     || static_cast<size_t>(partition_field.tuple_index) >= partition_value.size())
                     continue;
 

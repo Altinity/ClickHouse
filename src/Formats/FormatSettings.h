@@ -376,6 +376,8 @@ struct FormatSettings
         size_t dictionary_filter_push_down = 1024 * 1024;
         /// 0 disables coalescing bloom-filter reads. See `input_format_parquet_bloom_filter_coalesce_max_bytes`.
         size_t bloom_filter_coalesce_max_bytes = 64 * 1024 * 1024;
+        /// `0` sizes the initial footer read adaptively (1% of the file, clamped to [128 KiB, 2 MiB]).
+        size_t footer_read_size = 0;
         bool page_filter_push_down = true;
         bool use_offset_index = true;
 
@@ -420,6 +422,7 @@ struct FormatSettings
         double bloom_filter_bits_per_value = 10.5;
         size_t bloom_filter_flush_threshold_bytes = 1024 * 1024 * 128;
         bool allow_geoparquet_parser = true;
+        bool detect_variant_by_structure = true;
         bool spatial_filter_push_down = true;
         bool write_geometadata = true;
         size_t max_dictionary_size = 1024 * 1024;

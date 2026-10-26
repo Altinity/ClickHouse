@@ -3,6 +3,7 @@
 
 #if USE_AVRO && USE_PARQUET
 
+#include <Access/ForwardedAuthToken.h>
 #include <Databases/DataLake/DataLakeConstants.h>
 #include <Databases/DatabasesCommon.h>
 #include <Databases/DataLake/DatabaseDataLakeSettings.h>
@@ -65,13 +66,13 @@ public:
 
     VectorWithMemoryTracking<String> getAllTableNames(ContextPtr context) const override;
 
-    void checkDatabase() const override;
+    void checkDatabase(ContextPtr context) const override;
 
     void shutdown() override {}
 
     std::vector<std::pair<ASTPtr, StoragePtr>> getTablesForBackup(const FilterByNameFunction &, const ContextPtr &) const override { return {}; }
 
-    void validateCreateTableEngine(const ASTStorage & storage) const override;
+    void validateCreateTableEngine(const ASTStorage & storage, ContextPtr context_) const override;
 
     void createTable(
         ContextPtr context,
@@ -121,6 +122,10 @@ private:
 
     void validateSettings();
 
+    void validateTokenForwardingSettings() const;
+
+    static void validateGlueTokenForwardingSettings(const DatabaseDataLakeSettings & settings);
+
     void validateCreateTableEngineArguments(const ASTFunction & engine) const;
 
     /// Builds `catalog_impl` based on the configured catalog type. Constructing a catalog can
@@ -142,7 +147,8 @@ private:
 
     StorageObjectStorageConfigurationPtr getConfiguration(
         DatabaseDataLakeStorageType type,
-        DataLakeStorageSettingsPtr storage_settings) const;
+        DataLakeStorageSettingsPtr storage_settings,
+        DataLake::DataLakeTableFormat table_format) const;
 
     std::string getStorageEndpointForTable(const DataLake::TableMetadata & table_metadata) const;
 

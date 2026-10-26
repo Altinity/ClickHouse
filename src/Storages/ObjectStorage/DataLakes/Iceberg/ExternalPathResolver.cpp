@@ -272,7 +272,8 @@ std::pair<ObjectStoragePtr, std::string> getOrCreateStorageAndKey(
                 *cfg,
                 config_prefix,
                 context,
-                /*skip_access_check*/ true);
+                /*skip_access_check*/ true,
+                RemoteHostFilterCheck::None);
         });
 }
 

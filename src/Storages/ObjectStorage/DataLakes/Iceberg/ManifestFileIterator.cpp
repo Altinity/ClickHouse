@@ -21,6 +21,7 @@
 #include <Core/Settings.h>
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypesDecimal.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <Poco/JSON/Parser.h>
 #include <Poco/String.h>
 #include <Storages/ColumnsDescription.h>
@@ -52,6 +53,65 @@ namespace ProfileEvents
 extern const Event IcebergPartitionPrunedFiles;
 extern const Event IcebergMinMaxIndexPrunedFiles;
 };
+
+namespace
+{
+    using namespace DB::Iceberg;
+
+    std::optional<DB::Range> getMaterializedRowLineageRange(const ParsedManifestFileEntry & parsed_entry, Int32 field_id)
+    {
+        auto bounds = parsed_entry.value_bounds.find(field_id);
+        if (bounds == parsed_entry.value_bounds.end())
+            return std::nullopt;
+
+        auto column_info = parsed_entry.columns_infos.find(field_id);
+        if (column_info == parsed_entry.columns_infos.end() || !column_info->second.nulls_count.has_value()
+            || *column_info->second.nulls_count != 0)
+            return std::nullopt;
+
+        String left_str;
+        String right_str;
+        if (!bounds->second.first.tryGet(left_str) || !bounds->second.second.tryGet(right_str))
+            return std::nullopt;
+
+        auto type = std::make_shared<DB::DataTypeUInt64>();
+        auto left = deserializeFieldFromBinaryRepr(left_str, type, true);
+        auto right = deserializeFieldFromBinaryRepr(right_str, type, false);
+        if (!left || !right)
+            return std::nullopt;
+
+        return DB::Range(*left, true, *right, true);
+    }
+
+    void addRowLineageHyperrectangles(std::unordered_map<Int32, DB::Range> & hyperrectangles, const ProcessedManifestFileEntry & entry)
+    {
+        const auto & parsed_entry = *entry.parsed_entry;
+        if (!entry.first_row_id.has_value() || parsed_entry.record_count <= 0 || entry.sequence_number < 0)
+            return;
+
+        const UInt64 inherited_sequence_number = static_cast<UInt64>(entry.sequence_number);
+        const UInt64 last_inherited_row_id = *entry.first_row_id + static_cast<UInt64>(parsed_entry.record_count) - 1;
+        const bool row_ids_are_readable = Poco::toUpper(parsed_entry.file_format) != "ORC";
+
+        for (const auto field_id : {row_id_field_id, last_updated_sequence_number_field_id})
+        {
+            const bool is_row_id = field_id == row_id_field_id;
+            if (is_row_id && !row_ids_are_readable)
+                continue;
+            const UInt64 inherited_upper_bound = is_row_id ? last_inherited_row_id : inherited_sequence_number;
+
+            if (auto range = getMaterializedRowLineageRange(parsed_entry, field_id))
+            {
+                hyperrectangles.emplace(field_id, *range);
+                continue;
+            }
+
+            /// A missing statistic says nothing about the column, and a materialized value always predates this file, so only the
+            /// upper end of the inherited block bounds every value the file can hold.
+            hyperrectangles.emplace(field_id, DB::Range(UInt64(0), true, inherited_upper_bound, true));
+        }
+    }
+}
 
 namespace DB::Iceberg
 {
@@ -151,6 +211,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     IcebergSchemaProcessor & schema_processor,
     Int64 inherited_sequence_number_,
     Int64 inherited_snapshot_id_,
+    std::optional<UInt64> inherited_first_row_id_,
     DB::ContextPtr context_,
     std::shared_ptr<const ActionsDAG> filter_dag_,
     Int32 table_snapshot_schema_id_,
@@ -236,11 +297,63 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     }
 
     PartitionSpecification partition_spec_vec;
+    /// Which spec-field positions made it into partition_key_ast (needed by the pruner to project
+    /// partition values, since the Avro tuple has one entry per spec field, not per kept field).
+    std::vector<size_t> partition_key_spec_positions;
     for (size_t i = 0; i != partition_specification->size(); ++i)
     {
         auto partition_specification_field = partition_specification->getObject(static_cast<UInt32>(i));
 
-        auto source_id = partition_specification_field->getValue<Int32>(f_source_id);
+        /// Iceberg V3 spec: partition fields use either singular `source-id` (single-arg transforms)
+        /// or `source-ids` (multi-arg transforms, e.g. bucket over multiple columns). They are mutually exclusive.
+        bool has_source_id = partition_specification_field->has(f_source_id);
+        bool has_source_ids = partition_specification_field->has(f_source_ids);
+
+        std::vector<Int32> source_ids;
+        if (has_source_id && has_source_ids)
+        {
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Partition field in manifest '{}' has both 'source-id' and 'source-ids' — they are mutually exclusive per the Iceberg spec",
+                path_to_manifest_file_);
+        }
+        else if (has_source_ids)
+        {
+            auto source_ids_array = partition_specification_field->getArray(f_source_ids);
+            for (UInt32 idx = 0; idx < source_ids_array->size(); ++idx)
+                source_ids.push_back(source_ids_array->getElement<Int32>(idx));
+        }
+        else if (has_source_id)
+        {
+            source_ids.push_back(partition_specification_field->getValue<Int32>(f_source_id));
+        }
+        else
+        {
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Partition field in manifest '{}' has neither 'source-id' nor 'source-ids'",
+                path_to_manifest_file_);
+        }
+
+        if (source_ids.empty())
+        {
+            throw Exception(
+                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+                "Partition field in manifest '{}' has an empty 'source-ids' array",
+                path_to_manifest_file_);
+        }
+
+        auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
+        auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
+        partition_spec_vec.emplace_back(PartitionSpecsEntry{std::move(source_ids), transform_name, partition_name, static_cast<Int32>(i)});
+
+        /// Multi-argument transforms (V3): we cannot evaluate the transform, so skip pruning for this field.
+        /// Per the Iceberg V3 spec: "all v3 readers are required to read tables with unknown transforms,
+        /// ignoring the unsupported partition fields when filtering."
+        if (partition_spec_vec.back().isMultiArg())
+            continue;
+
+        auto source_id = partition_spec_vec.back().source_ids[0];
         /// NOTE: tricky part to support RENAME column in partition key. Instead of some name
         /// we use column internal number as it's name.
         auto numeric_column_name = DB::backQuote(DB::toString(source_id));
@@ -248,9 +361,6 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
             = schema_processor.tryGetFieldCharacteristics(manifest_schema_id, source_id);
         if (!manifest_file_column_characteristics.has_value())
             continue;
-        auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
-        auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
-        partition_spec_vec.emplace_back(source_id, transform_name, partition_name, static_cast<Int32>(i));
         auto partition_ast = getASTFromTransform(transform_name, numeric_column_name, context_->getSettingsRef()[Setting::iceberg_partition_timezone]);
         /// Unsupported partition key expression
         if (partition_ast == nullptr)
@@ -262,6 +372,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
         /// against these input columns, which must contain each source column at most once.
         if (partition_columns_seen.insert(numeric_column_name).second)
             partition_columns_description.emplace_back(numeric_column_name, removeNullable(manifest_file_column_characteristics->type));
+        partition_key_spec_positions.push_back(i);
     }
 
     std::optional<DB::KeyDescription> partition_key_description;
@@ -279,10 +390,12 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
         schema_processor,
         inherited_sequence_number_,
         inherited_snapshot_id_,
+        inherited_first_row_id_,
         context_,
         manifest_schema_id,
         std::make_shared<const PartitionSpecification>(std::move(partition_spec_vec)),
         std::move(partition_key_description),
+        std::move(partition_key_spec_positions),
         total_rows,
         std::move(filter_dag_),
         table_snapshot_schema_id_,
@@ -297,10 +410,12 @@ ManifestFileIterator::ManifestFileIterator(
     IcebergSchemaProcessor & schema_processor,
     Int64 inherited_sequence_number_,
     Int64 inherited_snapshot_id_,
+    std::optional<UInt64> inherited_first_row_id_,
     DB::ContextPtr context_,
     Int32 manifest_schema_id_,
     std::shared_ptr<const PartitionSpecification> common_partition_specification_,
     std::optional<DB::KeyDescription> partition_key_description_,
+    std::vector<size_t> partition_key_spec_positions_,
     size_t total_rows_,
     std::shared_ptr<const ActionsDAG> filter_dag_,
     Int32 table_snapshot_schema_id_,
@@ -315,6 +430,7 @@ ManifestFileIterator::ManifestFileIterator(
     , manifest_schema_id(manifest_schema_id_)
     , common_partition_specification(std::move(common_partition_specification_))
     , partition_key_description(std::move(partition_key_description_))
+    , partition_key_spec_positions(std::move(partition_key_spec_positions_))
     , table_snapshot_schema_id(table_snapshot_schema_id_)
     , total_rows(total_rows_)
     , stop_flag(stop_flag_)
@@ -324,6 +440,23 @@ ManifestFileIterator::ManifestFileIterator(
     , filter_dag(std::move(filter_dag_))
     , schema_processor_ptr(&schema_processor)
 {
+    if (!inherited_first_row_id_.has_value())
+        return;
+
+    entry_first_row_ids.resize(total_rows);
+    UInt64 next_row_id = *inherited_first_row_id_;
+    for (size_t row_index = 0; row_index < total_rows; ++row_index)
+    {
+        const auto parsed_entry = manifest_file_deserializer->getParsedManifestFileEntry(row_index);
+        /// Every live data file with a null first_row_id inherits one, EXISTING ones included. A DELETED entry
+        /// takes no ids: writers reserve only the added and existing rows of a manifest.
+        if (parsed_entry->content_type != FileContentType::DATA || parsed_entry->status == ManifestEntryStatus::DELETED
+            || parsed_entry->parsed_first_row_id.has_value())
+            continue;
+
+        entry_first_row_ids[row_index] = next_row_id;
+        next_row_id += static_cast<UInt64>(parsed_entry->record_count);
+    }
 }
 
 ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
@@ -412,6 +545,10 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
     auto entry = std::make_shared<ProcessedManifestFileEntry>(
         parsed_entry, common_partition_specification, resolved_sequence_number, resolved_schema_id);
 
+    if (parsed_entry->parsed_first_row_id.has_value())
+        entry->first_row_id = parsed_entry->parsed_first_row_id;
+    else if (!entry_first_row_ids.empty())
+        entry->first_row_id = entry_first_row_ids[row_index];
 
     PruningReturnStatus pruning_status = PruningReturnStatus::NOT_PRUNED;
     if (filter_dag)
@@ -491,6 +628,8 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
 
                 hyperrectangles.emplace(column_id, DB::Range(*left, true, *right, true));
             }
+
+            addRowLineageHyperrectangles(hyperrectangles, *entry);
         }
 
         pruning_status = current_pruner->canBePruned(entry, hyperrectangles);
