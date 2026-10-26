@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -57,14 +58,8 @@ ROBOT_TOKEN = None  # type: Optional[Token]
 # and the original implementation selects the "best one". To make it simpler and iterate faster,
 # we are using only one robot and keeping the method signature. In the future we might reconsider
 # having multiple robot tokens
-def get_best_robot_token(token_prefix_env_name="github_robot_token"):
-    # Re-use already fetched token (same as in get_best_robot_token_original)
-    # except here we assume it is always a string (since we use only one token and don't do token rotation)
-    global ROBOT_TOKEN
-    if ROBOT_TOKEN is not None:
-        return ROBOT_TOKEN
-    ROBOT_TOKEN = get_parameter_from_ssm(token_prefix_env_name)
-    return ROBOT_TOKEN
+def get_best_robot_token():
+    return os.getenv("ROBOT_TOKEN")
 
 def get_best_robot_token_original(token_prefix_env_name: str="github_robot_token_") -> str:
     global ROBOT_TOKEN

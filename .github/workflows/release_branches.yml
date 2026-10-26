@@ -9,6 +9,10 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  CLICKHOUSE_TEST_STAT_LOGIN: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
+  CLICKHOUSE_TEST_STAT_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
+  CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
+  ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
 
 on: # yamllint disable-line rule:truthy
   pull_request:
@@ -30,7 +34,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   DockerHubPushAarch64:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -52,7 +56,7 @@ jobs:
           path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
 
   DockerHubPushAmd64:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -131,7 +135,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Compatibility check Aarch64
-      runner_type: altinity-on-demand, altinity-on-demand, altinity-func-tester-aarch64
+      runner_type: altinity-on-demand, altinity-func-tester-aarch64
       timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
@@ -231,7 +235,7 @@ jobs:
     needs:
       - BuilderDebRelease
       - BuilderDebAarch64
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -314,7 +318,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Install packages (arm64)
-      runner_type: altinity-on-demand, altinity-on-demand, altinity-func-tester-aarch64
+      runner_type: altinity-on-demand, altinity-func-tester-aarch64
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 install_check.py "$CHECK_NAME"
@@ -341,7 +345,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (aarch64)
-      runner_type: altinity-on-demand, altinity-style-checker-aarch64
+      runner_type: altinity-on-demand, altinity-func-tester-aarch64
       additional_envs: |
         KILL_TIMEOUT=10800
       run_command: |
@@ -440,7 +444,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (aarch64)
-      runner_type: altinity-on-demand, altinity-style-checker-aarch64
+      runner_type: altinity-on-demand, altinity-func-tester-aarch64
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
