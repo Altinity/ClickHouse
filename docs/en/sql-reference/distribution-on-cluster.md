@@ -26,6 +26,6 @@ Receiving new tasks can be resumed with the command `SYSTEM START SWARM MODE`.
 
 ## Joins {#joins}
 
-[`object_storage_cluster_join_mode`](/operations/settings/settings#object_storage_cluster_join_mode) chooses where a `JOIN` of a `*Cluster` table function, or of a table with `object_storage_cluster` set, is executed, and which table is sent to the nodes. With `allow` and `local` the nodes read the left table and the join runs on the initiator. With `global`, an `INNER`, `LEFT`, or `CROSS` join runs on the nodes and the initiator sends the right table (every table after the first, for `CROSS JOIN`). A `RIGHT` or `FULL` join stays on the initiator.
+[`object_storage_cluster_join_mode`](/operations/settings/settings#object_storage_cluster_join_mode) chooses where a `JOIN` of a `*Cluster` table function, or of a table with `object_storage_cluster` set, is executed, and which table is sent to the nodes. With `allow` the nodes read the left table and the join runs on the initiator. `local` is a deprecated alias of `allow`. With `global`, an `INNER`, `LEFT`, or `CROSS` join runs on the nodes and the initiator sends the right table (every table after the first, for `CROSS JOIN`). A `RIGHT`, `FULL`, or `PASTE` join stays on the initiator.
 
 The same rules for a `Distributed` table, including which side of a `GLOBAL` `RIGHT` join is sent, are described in [Distributed JOIN](/sql-reference/statements/select/join.md#distributed-join).

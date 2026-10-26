@@ -623,7 +623,7 @@ JoinTreeQueryPlan buildQueryPlanForParallelReplicas(
     /// buildQueryTreeForShard below rebuilds a shipped table expression from names and types only, which
     /// would drop an ALIAS column's expression and make the replica read it as physical.
     /// initial_header above is taken from the un-inlined tree, which is what the converting step matches.
-    inlineAliasColumns(modified_query_tree);
+    inlineAliasColumns(modified_query_tree, context);
     rewriteJoinToGlobalJoin(modified_query_tree, context);
     modified_query_tree = buildQueryTreeForShard(planner_context, modified_query_tree, /*allow_global_join_for_right_table*/ true);
 

@@ -133,7 +133,7 @@ std::vector<size_t> mapTargetFieldsToSpecPositions(
     {
         for (size_t j = 0; j < entry_spec.size(); ++j)
         {
-            if (entry_spec[j].source_id == signature[i].column_id
+            if (!entry_spec[j].isMultiArg() && entry_spec[j].source_ids[0] == signature[i].column_id
                 && Poco::toLower(entry_spec[j].transform_name) == signature[i].transform)
             {
                 positions[i] = j;
@@ -767,7 +767,7 @@ AlterDropPartitionExecutor::ManifestListWriteResult AlterDropPartitionExecutor::
         throw Exception(ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION, "Parent snapshot {} has no summary", parent_snapshot_id);
 
     auto parent_summary = parent_snapshot->getObject(f_summary);
-    auto parsed_summary = SnapshotSummary::fromJSON(*parent_summary, /*with_extra_fields=*/true, /*require_totals=*/true);
+    auto parsed_summary = SnapshotSummary::fromJSON(*parent_summary, /*with_extra_fields=*/false, /*require_totals=*/true);
     if (!parsed_summary)
         throw Exception(
             ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
@@ -775,8 +775,7 @@ AlterDropPartitionExecutor::ManifestListWriteResult AlterDropPartitionExecutor::
             parent_snapshot_id,
             parsed_summary.error());
 
-    /// TODO: copy refresh cursor explicitly
-    auto summary = SnapshotSummary{plan.snapshot_summary_update, parsed_summary->getTotals(), parsed_summary->getExtraFields()}.toJSON();
+    auto summary = SnapshotSummary{plan.snapshot_summary_update, parsed_summary->getTotals()}.toJSON();
     new_snapshot->set(f_summary, summary);
 
     const String storage_manifest_list_path = components.path_resolver.resolve(manifest_list_path);
@@ -936,7 +935,8 @@ bool AlterDropPartitionExecutor::commitMetadataJSON(
     /// Assume readers can reach the snapshot until the catalog says it rejected the commit.
     published = true;
     if (!catalog->updateMetadata(
-            namespace_name, table_name, components.path_resolver.resolveForCatalog(metadata_info.path), manifest_list_result.new_snapshot))
+            namespace_name, table_name, components.path_resolver.resolveForCatalog(metadata_info.path), manifest_list_result.new_snapshot,
+            context->getForwardedAuthToken()))
     {
         if (!catalogCommittedSnapshot(new_snapshot_id))
         {

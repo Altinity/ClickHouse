@@ -350,7 +350,7 @@ bool restCatalogEmpty(CatalogShape shape, bool flat_namespaces = false)
         flat_namespaces,
         context);
 
-    return catalog.empty();
+    return catalog.empty(/* auth_token */ {});
 }
 
 DataLake::ICatalog::Namespaces restCatalogNamespaces(CatalogShape shape, bool flat_namespaces)
@@ -371,7 +371,7 @@ DataLake::ICatalog::Namespaces restCatalogNamespaces(CatalogShape shape, bool fl
         flat_namespaces,
         context);
 
-    return catalog.getNamespaces();
+    return catalog.getNamespaces(/* auth_token */ {});
 }
 
 bool deltaSharingCatalogEmpty(CatalogShape shape)
@@ -392,7 +392,7 @@ bool deltaSharingCatalogEmpty(CatalogShape shape)
         /* flat_namespaces */false,
         context);
 
-    return catalog.empty();
+    return catalog.empty(/* auth_token */ {});
 }
 
 }
@@ -499,8 +499,8 @@ TEST(RestCatalog, OneLakeFlatNamespacesSettingSkipsSubNamespaceListing)
         /* flat_namespaces */true,
         context);
 
-    EXPECT_FALSE(catalog.empty());
-    EXPECT_EQ(catalog.getNamespaces(), ICatalog::Namespaces{"namespace"});
+    EXPECT_FALSE(catalog.empty(/* auth_token */ {}));
+    EXPECT_EQ(catalog.getNamespaces(/* auth_token */ {}), ICatalog::Namespaces{"namespace"});
 }
 
 TEST(RestCatalog, TryGetTableMetadataDistinguishesMissingTableFromOtherErrors)
@@ -524,15 +524,15 @@ TEST(RestCatalog, TryGetTableMetadataDistinguishesMissingTableFromOtherErrors)
     auto existing = TableMetadata().withLocation();
     EXPECT_TRUE(catalog.tryGetTableMetadata("namespace", "table_a", context, existing));
     EXPECT_EQ(existing.getLocation(), "s3://bucket/table_a");
-    EXPECT_TRUE(catalog.existsTable("namespace", "table_a"));
+    EXPECT_TRUE(catalog.existsTable("namespace", "table_a", /* auth_token */ {}));
 
     TableMetadata missing;
     EXPECT_FALSE(catalog.tryGetTableMetadata("namespace", "missing_table", context, missing));
-    EXPECT_FALSE(catalog.existsTable("namespace", "missing_table"));
+    EXPECT_FALSE(catalog.existsTable("namespace", "missing_table", /* auth_token */ {}));
 
     TableMetadata unauthorized;
     EXPECT_THROW(catalog.tryGetTableMetadata("namespace", "unauthorized_table", context, unauthorized), DB::HTTPException);
-    EXPECT_THROW(catalog.existsTable("namespace", "unauthorized_table"), DB::HTTPException);
+    EXPECT_THROW(catalog.existsTable("namespace", "unauthorized_table", /* auth_token */ {}), DB::HTTPException);
 }
 
 TEST(RestCatalog, TryGetTableMetadataAuthErrorPropagates)
@@ -571,7 +571,7 @@ TEST(RestCatalog, TryGetTableMetadataAuthErrorPropagates)
         EXPECT_NE(e.displayText().find("the token is expired"), std::string::npos);
     }
 
-    EXPECT_THROW(catalog.existsTable("namespace", "expired_token_table"), DB::HTTPException);
+    EXPECT_THROW(catalog.existsTable("namespace", "expired_token_table", /* auth_token */ {}), DB::HTTPException);
 }
 
 TEST(RestCatalog, ApplySettingsChangesWithoutAuthenticationRejected)
@@ -802,7 +802,7 @@ TEST(RestCatalog, OneLakeRefreshTokenTransparentRenewal)
     const auto token_requests_before = ProfileEvents::global_counters[ProfileEvents::OneLakeAccessTokenRequests];
     const auto expirations_before = ProfileEvents::global_counters[ProfileEvents::OneLakeAccessTokenExpirations];
 
-    EXPECT_TRUE(catalog.empty());
+    EXPECT_TRUE(catalog.empty(/* auth_token */ {}));
     EXPECT_GT(server.tokenRequests(), requests_after_construction);
 
     EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::OneLakeAccessTokenRequests], token_requests_before);
@@ -933,7 +933,7 @@ TEST(RestCatalog, HorizonCatalogAuthenticatesWithBarePAT)
     EXPECT_EQ(catalog.getCatalogType(), DB::DatabaseDataLakeCatalogType::ICEBERG_HORIZON);
     EXPECT_TRUE(catalog.getStateSnapshot()->client_id.empty());
     EXPECT_EQ(catalog.getStateSnapshot()->client_secret, "horizon-pat-without-colon");
-    EXPECT_FALSE(catalog.empty());
+    EXPECT_FALSE(catalog.empty(/* auth_token */ {}));
 
     TableMetadata metadata;
     metadata.withLocation();

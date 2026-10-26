@@ -3,6 +3,7 @@
 #include <optional>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/UnionNode.h>
+#include <Analyzer/Utils.h>
 #include <Analyzer/createUniqueAliasesIfNecessary.h>
 #include <base/scope_guard.h>
 #include <Columns/ColumnConst.h>
@@ -1267,7 +1268,7 @@ void executeQueryWithParallelReplicas(
     /// Inline ALIAS columns before shipping the query, mirroring the Distributed/remote() path.
     /// buildQueryTreeForShard below rebuilds a shipped table expression from names and types only, which
     /// would drop an ALIAS column's expression and make the replica read it as physical.
-    inlineAliasColumns(modified_query_tree);
+    inlineAliasColumns(modified_query_tree, context);
     rewriteJoinToGlobalJoin(modified_query_tree, context);
     modified_query_tree = buildQueryTreeForShard(planner_context, modified_query_tree, /*allow_global_join_for_right_table*/ true);
 
@@ -1631,6 +1632,8 @@ std::optional<QueryPipeline> executeInsertSelectWithParallelReplicas(
     {
         InterpreterSelectQueryAnalyzer analyzer(query_ast.select, new_context, {});
         const auto & query_tree = analyzer.getQueryTree();
+        /// This parallel `INSERT SELECT` path renders directly, bypassing `queryNodeToDistributedSelectQuery`.
+        assertNoPendingAliasMarkersForDistributedSerialization(query_tree);
         auto select_ast = query_tree->toAST();
 
         auto new_query_ast = query_ast.clone();
