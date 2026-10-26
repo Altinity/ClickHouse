@@ -218,6 +218,9 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_format_parsing_thread_pool_free_size;
     extern const ServerSettingsUInt64 format_parsing_thread_pool_queue_size;
     extern const ServerSettingsUInt64 cas_blob_upload_pool_size;
+    extern const ServerSettingsUInt64 max_iceberg_manifest_decode_thread_pool_size;
+    extern const ServerSettingsUInt64 max_iceberg_manifest_decode_thread_pool_free_size;
+    extern const ServerSettingsUInt64 iceberg_manifest_decode_thread_pool_queue_size;
     extern const ServerSettingsUInt64 page_cache_history_window_ms;
     extern const ServerSettingsString page_cache_policy;
     extern const ServerSettingsDouble page_cache_size_ratio;
@@ -473,6 +476,10 @@ void LocalServer::initialize(Poco::Util::Application & self)
     /// pool unconditionally once a `cas` disk commits a part, so every entry point
     /// that can run a CA INSERT must initialize it, not only `clickhouse-server`.
     DB::Cas::initializeBlobUploadPool(server_settings[ServerSetting::cas_blob_upload_pool_size]);
+    getIcebergManifestDecodeThreadPool().initialize(
+        server_settings[ServerSetting::max_iceberg_manifest_decode_thread_pool_size],
+        server_settings[ServerSetting::max_iceberg_manifest_decode_thread_pool_free_size],
+        server_settings[ServerSetting::iceberg_manifest_decode_thread_pool_queue_size]);
 }
 
 

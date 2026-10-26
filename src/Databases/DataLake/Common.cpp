@@ -1,5 +1,7 @@
 #include <Databases/DataLake/Common.h>
 
+#include <Interpreters/Context.h>
+
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime64.h>
@@ -15,6 +17,9 @@
 #include <DataTypes/IDataType.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
+
+#include <fmt/format.h>
+#include <Poco/URI.h>
 
 namespace DB::ErrorCodes
 {
@@ -65,9 +70,12 @@ DB::DataTypePtr getType(const String & type_name, bool nullable, DB::ContextPtr 
 {
     String name = trim(type_name);
 
-    if (name.starts_with("array<") && name.ends_with(">"))
+    /// Iceberg names this type `list`, Hive names it `array`; Glue passes through whichever spelling
+    /// the writer that registered the table used.
+    if ((name.starts_with("array<") || name.starts_with("list<")) && name.ends_with(">"))
     {
-        String inner = name.substr(6, name.size() - 7);
+        const size_t open = name.find('<');
+        String inner = name.substr(open + 1, name.size() - open - 2);
         return std::make_shared<DB::DataTypeArray>(getType(inner, nullable, context));
     }
 
@@ -110,6 +118,13 @@ DB::DataTypePtr getType(const String & type_name, bool nullable, DB::ContextPtr 
                     : DB::Iceberg::IcebergSchemaProcessor::getSimpleType(name, context);
 }
 
+DB::ForwardedAuthTokenPtr getForwardedAuthToken(const DB::ContextPtr & context)
+{
+    if (!context)
+        return {};
+    return context->getForwardedAuthToken();
+}
+
 std::pair<std::string, std::string> parseTableName(const std::string & name)
 {
     auto pos = name.rfind('.');
@@ -119,6 +134,90 @@ std::pair<std::string, std::string> parseTableName(const std::string & name)
     auto table_name = name.substr(pos + 1);
     auto namespace_name = name.substr(0, name.size() - table_name.size() - 1);
     return {namespace_name, table_name};
+}
+
+String constructTableLocation(
+    const String & location_scheme,
+    const String & storage_endpoint,
+    const String & namespace_name,
+    const String & table_name,
+    DB::S3UriStyle uri_style)
+{
+    Poco::URI uri(storage_endpoint);
+    auto path = uri.getPath();
+    while (path.starts_with('/'))
+        path.erase(0, 1);
+    while (path.ends_with('/'))
+        path.pop_back();
+
+    if (location_scheme == "abfss")
+    {
+        /// Azure: `abfss://<container>@<host>/<path>`. `storage_endpoint` is
+        /// `https://<host>/<container>/<extra>` or `abfss://<container>@<host>/<extra>`
+        String container = uri.getUserInfo();
+        String account_host = uri.getHost();
+        String extra_path = path;
+
+        if (container.empty())
+        {
+            auto first_slash = extra_path.find('/');
+            if (first_slash == String::npos)
+            {
+                container = std::move(extra_path);
+                extra_path.clear();
+            }
+            else
+            {
+                container = extra_path.substr(0, first_slash);
+                extra_path = extra_path.substr(first_slash + 1);
+            }
+        }
+
+        if (account_host.empty() || container.empty())
+            throw DB::Exception(
+                DB::ErrorCodes::BAD_ARGUMENTS,
+                "`storage_endpoint` ({}) for Azure must include both account host and container "
+                "(expected https://<account>.dfs.core.windows.net/<container>[/<sub-path>] or "
+                "abfss://<container>@<account>.dfs.core.windows.net[/<sub-path>])",
+                storage_endpoint);
+
+        if (extra_path.empty())
+            return fmt::format("abfss://{}@{}/{}/{}", container, account_host, namespace_name, table_name);
+        return fmt::format("abfss://{}@{}/{}/{}/{}", container, account_host, extra_path, namespace_name, table_name);
+    }
+
+    if (location_scheme == "s3")
+    {
+        if (uri_style == DB::S3UriStyle::VIRTUAL_HOSTED)
+            throw DB::Exception(
+                DB::ErrorCodes::BAD_ARGUMENTS,
+                "CREATE TABLE with `storage_uri_style = 'virtual_hosted'` cannot derive the bucket from "
+                "`storage_endpoint` ({}); set `default_base_location` (a full s3://<bucket>/<prefix>) instead.",
+                storage_endpoint);
+
+        if (path.empty())
+            throw DB::Exception(
+                DB::ErrorCodes::BAD_ARGUMENTS,
+                "`storage_endpoint` ({}) does not contain a bucket; "
+                "CREATE TABLE in DataLakeCatalog requires `storage_endpoint` to include a non-empty bucket path.",
+                storage_endpoint);
+        return fmt::format("s3://{}/{}/{}", path, namespace_name, table_name);
+    }
+
+    String authority = uri.getAuthority();
+    if (authority.empty())
+    {
+        if (path.empty())
+            throw DB::Exception(
+                DB::ErrorCodes::BAD_ARGUMENTS,
+                "`storage_endpoint` ({}) does not contain a path",
+                storage_endpoint);
+        return fmt::format("{}:///{}/{}/{}", location_scheme, path, namespace_name, table_name);
+    }
+
+    if (path.empty())
+        return fmt::format("{}://{}/{}/{}", location_scheme, authority, namespace_name, table_name);
+    return fmt::format("{}://{}/{}/{}/{}", location_scheme, authority, path, namespace_name, table_name);
 }
 
 }

@@ -16,6 +16,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 
+#include <atomic>
 #include <optional>
 #include <base/defines.h>
 
@@ -32,6 +33,9 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ExternalPathResolver.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/SnapshotFilesTraversal.h>
 
 
 namespace DB
@@ -53,6 +57,7 @@ struct IcebergFileRecord
     std::map<Int32, Int64> column_sizes;
     std::map<Int32, Int64> value_counts;
     std::vector<Int32> equality_ids;
+    std::optional<UInt64> first_row_id;
 };
 
 class IcebergMetadata : public IDataLakeMetadata
@@ -178,6 +183,8 @@ public:
 
     CompressionMethod getCompressionMethod() const { return persistent_components.metadata_compression_method; }
 
+    std::string getTableLocation() const override { return persistent_components.table_location; }
+
     bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override;
     bool optimizeManifestFiles(
         const StorageMetadataPtr & metadata_snapshot,
@@ -199,11 +206,17 @@ public:
     void modifyFormatSettings(FormatSettings & format_settings, const Context & local_context) const override;
     void addDeleteTransformers(ObjectInfoPtr object_info, QueryPipelineBuilder & builder, const std::optional<FormatSettings> & format_settings, FormatParserSharedResourcesPtr parser_shared_resources, ContextPtr local_context) const override;
     void checkAlterIsPossible(const AlterCommands & commands) override;
+    void checkAlterPartitionIsPossible(const PartitionCommands & commands) const override;
     void alter(
         const AlterCommands & params,
         ContextPtr context,
         const StorageID & storage_id,
         std::shared_ptr<DataLake::ICatalog> catalog) override;
+    Pipe alterPartition(
+        const PartitionCommands & commands,
+        ContextPtr context,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        StorageID storage_id) override;
 
     Pipe executeCommand(
         const String & command_name,
@@ -221,7 +234,8 @@ public:
         StorageMetadataPtr storage_metadata,
         ContextPtr local_context) const override;
 
-    void drop(ContextPtr context) override;
+    void checkCanBeDropped(ContextPtr query_context) const override;
+    void drop(bool delete_data) override;
 
     static DataLakeMetadataPtr createWithDeserialization(
         const ObjectStoragePtr & object_storage,
@@ -229,7 +243,12 @@ public:
         const ContextPtr & local_context,
         ReadBuffer & in);
 
-    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getRelevantState(const ContextPtr & context, bool force_fetch_latest_metadata = false) const;
+    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getRelevantState(
+        const ContextPtr & context,
+        bool force_fetch_latest_metadata = false) const;
+
+    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot>
+    getState(const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version) const;
 
     const DB::Iceberg::PersistentTableComponents & getPersistentComponents() const
     {
@@ -255,8 +274,6 @@ private:
     Iceberg::IcebergDataSnapshotPtr createIcebergDataSnapshotFromSnapshotJSON(Poco::JSON::Object::Ptr snapshot_object, Int64 snapshot_id, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Int32>
     getStateImpl(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) const;
-    std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot>
-    getState(const ContextPtr & local_context, const String & metadata_path, Int32 metadata_version) const;
     Iceberg::IcebergDataSnapshotPtr
     getRelevantDataSnapshotFromTableStateSnapshot(Iceberg::TableStateSnapshot table_state_snapshot, ContextPtr local_context) const;
     StorageObjectStorageConfigurationPtr getConfiguration() const;
@@ -295,15 +312,27 @@ private:
     std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
     KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
 
+    /// Files outside the table directory that `iceberg_delete_data_on_drop` deletes.
+    std::vector<Iceberg::ExternalFile> collectExternalFilesToDeleteOnDrop(ContextPtr context) const;
+
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
-    const DB::Iceberg::PersistentTableComponents persistent_components;
+    mutable std::shared_ptr<ExternalStorageCache> external_storages;
+    /// Set by `checkCanBeDropped` once the dropping user is allowed to delete the external files.
+    mutable std::atomic<bool> external_files_drop_authorized = false;
+    DB::Iceberg::PersistentTableComponents persistent_components;
     const DataLakeStorageSettings & data_lake_settings;
     const String write_format;
     BackgroundSchedulePoolTaskHolder background_metadata_prefetch_task;
     ObjectIterator prepared_iterator;
 
     void backgroundMetadataPrefetcherThread();
+
+    void alterPartitionDropImpl(
+        const PartitionCommand & command,
+        ContextPtr context,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & storage_id);
 };
 }
 

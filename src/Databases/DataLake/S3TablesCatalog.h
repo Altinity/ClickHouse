@@ -36,7 +36,9 @@ public:
 
     DB::DatabaseDataLakeCatalogType getCatalogType() const override { return DB::DatabaseDataLakeCatalogType::S3_TABLES; }
 
-    CatalogTables getTables() const override;
+    CatalogTables getTables(const DB::ForwardedAuthTokenPtr & auth_token) const override;
+
+    std::optional<StorageType> getStorageType() const override { return StorageType::S3; }
 
     bool managesTableLocation() const override { return true; }
 
@@ -46,7 +48,12 @@ public:
         DB::ContextPtr context_,
         TableMetadata & result) const override;
 
-    void dropTable(const String & namespace_name, const String & table_name, bool delete_data) const override;
+    void dropTable(
+        const String & namespace_name,
+        const String & table_name,
+        bool delete_data,
+        bool if_exists,
+        const DB::ForwardedAuthTokenPtr & auth_token) const override;
 
 protected:
     /// Override the network primitives instead of `getAuthHeaders` so the SigV4 signer has
@@ -55,15 +62,19 @@ protected:
     /// SigV4 signer rather than from the catalog state snapshot.
     DB::ReadWriteBufferFromHTTPPtr createReadBuffer(
         const CatalogState & catalog_state,
+        UInt64 generation,
         const std::string & endpoint,
+        const DB::ForwardedAuthTokenPtr & auth_token,
         const Poco::URI::QueryParameters & params,
         const DB::HTTPHeaderEntries & headers,
         const std::optional<DB::HTTPHeaderEntries> & auth_headers) const override;
 
     void sendRequest(
         const CatalogState & catalog_state,
+        UInt64 generation,
         const String & endpoint,
         Poco::JSON::Object::Ptr request_body,
+        const DB::ForwardedAuthTokenPtr & auth_token,
         const String & method,
         bool ignore_result) const override;
 

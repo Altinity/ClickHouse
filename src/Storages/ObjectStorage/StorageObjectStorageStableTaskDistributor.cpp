@@ -1,5 +1,6 @@
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
 #include <Common/SipHash.h>
+#include <Common/maskSensitiveQueryParameters.h>
 #include <consistent_hashing.h>
 #include <optional>
 
@@ -16,6 +17,7 @@ namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int CANNOT_READ_ALL_DATA;
+    extern const int NOT_IMPLEMENTED;
 };
 
 namespace
@@ -26,6 +28,20 @@ String getSchedulingIdentifier(const ObjectInfoPtr & object_info, bool send_over
     if (send_over_whole_archive && object_info->isArchive())
         return object_info->getIdentifierForPath(object_info->getPathToArchive());
 
+    if (auto metadata_path = object_info->getPathInDataLakeMetadata())
+    {
+        /// The coordinator may not be a replica, and replicas need not share its filesystem, so local files cannot be dispatched.
+        if (auto local_path = object_info->getExternalLocalPath())
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "Iceberg metadata references the file '{}' on the local filesystem, outside of the table location. "
+                "Such a file cannot be read by a cluster function, which distributes the work across replicas that "
+                "do not share this filesystem. Read the table without the `*Cluster` function instead",
+                *local_path);
+
+        return object_info->getIdentifierForPath(*metadata_path);
+    }
+
     return object_info->getIdentifier();
 }
 
@@ -35,15 +51,13 @@ StorageObjectStorageStableTaskDistributor::StorageObjectStorageStableTaskDistrib
     std::shared_ptr<IObjectIterator> iterator_,
     std::vector<std::string> && ids_of_nodes_,
     bool send_over_whole_archive_,
-    uint64_t lock_object_storage_task_distribution_ms_,
-    bool iceberg_read_optimization_enabled_)
+    uint64_t lock_object_storage_task_distribution_ms_)
     : iterator(std::move(iterator_))
     , send_over_whole_archive(send_over_whole_archive_)
     , connection_to_files(ids_of_nodes_.size())
     , ids_of_nodes(std::move(ids_of_nodes_))
     , lock_object_storage_task_distribution_us(lock_object_storage_task_distribution_ms_ * 1000)
     , iterator_exhausted(false)
-    , iceberg_read_optimization_enabled(iceberg_read_optimization_enabled_)
 {
     Poco::Timestamp now;
     size_t nodes = ids_of_nodes.size();
@@ -54,9 +68,20 @@ StorageObjectStorageStableTaskDistributor::StorageObjectStorageStableTaskDistrib
     }
 }
 
-ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t number_of_current_replica)
+DistributedReadTask StorageObjectStorageStableTaskDistributor::getNextTask(size_t number_of_current_replica, bool worker_supports_task_retry)
 {
     LOG_TRACE(log, "Received request from replica {} looking for a file", number_of_current_replica);
+
+    /// One peer that cannot be asked to wait makes the lock useless: that peer would take another
+    /// node's file immediately. Run the rest of the query as if the setting were 0.
+    if (!worker_supports_task_retry && !task_retry_disabled.exchange(true, std::memory_order_relaxed))
+    {
+        LOG_INFO(
+            log,
+            "Replica {} does not support task retry, ignoring `lock_object_storage_task_distribution_ms` for this query",
+            number_of_current_replica);
+    }
+    const bool allow_task_retry = worker_supports_task_retry && !task_retry_disabled.load(std::memory_order_relaxed);
 
     saveLastNodeActivity(number_of_current_replica);
 
@@ -78,7 +103,12 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t numb
         file = getMatchingFileFromIterator(number_of_current_replica);
     // 3. Process unprocessed files if iterator is exhausted
     if (!file)
-        file = getAnyUnprocessedFile(number_of_current_replica);
+    {
+        auto pending = getAnyUnprocessedFile(number_of_current_replica, allow_task_retry);
+        if (pending.retry_after_us)
+            return pending;
+        file = std::move(pending.object);
+    }
 
     if (file)
     {
@@ -95,7 +125,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t numb
             processed_file_list_ptr->second.push_back(file);
     }
 
-    return file;
+    return DistributedReadTask{.object = std::move(file), .retry_after_us = std::nullopt};
 }
 
 size_t StorageObjectStorageStableTaskDistributor::getReplicaForFile(const String & file_path)
@@ -161,7 +191,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getPreQueuedFile(size_t
         LOG_TRACE(
             log,
             "Assigning pre-queued file {} to replica {}",
-            file_identifier,
+            maskCredentialsInURI(file_identifier),
             number_of_current_replica
         );
 
@@ -202,22 +232,11 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
             file_identifier = getSchedulingIdentifier(object_info, send_over_whole_archive);
             LOG_TEST(log, "Will send over the whole archive {} to replicas. "
                      "This will be suboptimal, consider turning on "
-                     "cluster_function_process_archive_on_multiple_nodes setting", file_identifier);
+                     "cluster_function_process_archive_on_multiple_nodes setting", maskCredentialsInURI(file_identifier));
         }
         else
         {
-            file_identifier = object_info->getIdentifier();
-        }
-
-        if (iceberg_read_optimization_enabled)
-        {
-            auto file_meta_info = object_info->relative_path_with_metadata.getFileMetaInfo();
-            if (file_meta_info.has_value())
-            {
-                auto file_path = send_over_whole_archive ? object_info->getPathOrPathToArchiveIfArchive() : object_info->getPath();
-                object_info->relative_path_with_metadata.command.setFilePath(file_path);
-                object_info->relative_path_with_metadata.command.setFileMetaInfo(file_meta_info.value());
-            }
+            file_identifier = getSchedulingIdentifier(object_info, send_over_whole_archive);
         }
 
         size_t file_replica_idx;
@@ -231,7 +250,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
         {
             LOG_TRACE(
                 log, "Found file {} for replica {}",
-                file_identifier, number_of_current_replica
+                maskCredentialsInURI(file_identifier), number_of_current_replica
             );
 
             ProfileEvents::increment(ProfileEvents::ObjectStorageClusterSentToMatchedReplica);
@@ -240,7 +259,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
         LOG_TEST(
             log,
             "Found file {} for replica {} (number of current replica: {})",
-            file_identifier,
+            maskCredentialsInURI(file_identifier),
             file_replica_idx,
             number_of_current_replica
         );
@@ -256,7 +275,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
     return {};
 }
 
-ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(size_t number_of_current_replica)
+DistributedReadTask StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(size_t number_of_current_replica, bool allow_task_retry)
 {
     /// Limit time of node activity to keep task in queue
     Poco::Timestamp activity_limit;
@@ -275,6 +294,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
             auto number_of_matched_replica = it->second.second;
             auto last_activity = last_node_activity.find(number_of_matched_replica);
             if (lock_object_storage_task_distribution_us <= 0 // file deferring is turned off
+                || !allow_task_retry // this request must not wait: peer is old, or the query already saw one
                 || it->second.second == number_of_current_replica // file is matching with current replica
                 || last_activity == last_node_activity.end() // msut never be happen, last_activity is filled for each replica on start
                 || activity_limit > last_activity->second) // matched replica did not ask for a new files for a while
@@ -292,7 +312,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
                 );
 
                 ProfileEvents::increment(ProfileEvents::ObjectStorageClusterSentToNonMatchedReplica);
-                return next_file;
+                return DistributedReadTask{.object = std::move(next_file), .retry_after_us = std::nullopt};
             }
 
             oldest_activity = std::min(oldest_activity, last_activity->second);
@@ -306,11 +326,12 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
             oldest_activity - activity_limit
         );
 
-        /// All unprocessed files owned by alive replicas with recenlty activity
-        /// Need to retry after (oldest_activity - activity_limit) microseconds
-        RelativePathWithMetadata::CommandInTaskResponse response;
-        response.setRetryAfterUs(oldest_activity - activity_limit);
-        return std::make_shared<ObjectInfo>(response.toString());
+        /// All unprocessed files owned by alive replicas with recently activity.
+        /// The worker waits `(oldest_activity - activity_limit)` microseconds, then asks again.
+        auto retry_after_us = oldest_activity - activity_limit;
+        if (retry_after_us < 0)
+            retry_after_us = 0;
+        return DistributedReadTask{.object = nullptr, .retry_after_us = static_cast<UInt64>(retry_after_us)};
     }
 
     return {};

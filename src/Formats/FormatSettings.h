@@ -133,6 +133,8 @@ struct FormatSettings
 
     DateTimeOverflowBehavior date_time_overflow_behavior = DateTimeOverflowBehavior::Ignore;
 
+    bool throwOnDateTimeOverflow() const { return date_time_overflow_behavior == DateTimeOverflowBehavior::Throw; }
+
     bool input_format_ipv4_default_on_conversion_error = false;
     bool input_format_ipv6_default_on_conversion_error = false;
     bool check_conversion_from_numbers_to_enum = true;
@@ -199,6 +201,8 @@ struct FormatSettings
         ArrowCompression output_compression_method = ArrowCompression::NONE;
         bool output_date_as_uint16 = false;
         bool output_unsupported_types_as_binary = true;
+        UInt64 output_record_batch_rows = 0;
+        UInt64 output_record_batch_bytes = 0;
     } arrow{};
 
     struct AvroSchemaRegistryTimeouts
@@ -370,6 +374,8 @@ struct FormatSettings
         bool filter_push_down = true;
         bool bloom_filter_push_down = true;
         size_t dictionary_filter_push_down = 1024 * 1024;
+        /// `0` sizes the initial footer read adaptively (1% of the file, clamped to [128 KiB, 2 MiB]).
+        size_t footer_read_size = 0;
         bool page_filter_push_down = true;
         bool use_offset_index = true;
 
@@ -398,6 +404,10 @@ struct FormatSettings
         bool output_datetime_as_uint32 = false;
         bool output_date_as_uint16 = false;
         bool output_enum_as_byte_array = false;
+        /// When false (default), DateTime64 is always written as isAdjustedToUTC=true because
+        /// ClickHouse ticks are UTC. Iceberg sets this so timestamp(_ns) is false and
+        /// timestamptz(_ns) is true, matching TIMESTAMP(*, hasExplicitTimeZone()).
+        bool output_timestamp_adjusted_to_utc_from_timezone = false;
 
         bool parallel_encoding = true;
         bool write_page_index = false;
@@ -410,6 +420,7 @@ struct FormatSettings
         double bloom_filter_bits_per_value = 10.5;
         size_t bloom_filter_flush_threshold_bytes = 1024 * 1024 * 128;
         bool allow_geoparquet_parser = true;
+        bool detect_variant_by_structure = true;
         bool spatial_filter_push_down = true;
         bool write_geometadata = true;
         size_t max_dictionary_size = 1024 * 1024;

@@ -566,7 +566,7 @@ void DatabaseMySQL::detachTablePermanently(ContextPtr, const String & table_name
     table_iter->second.second->is_detached = true;
 }
 
-void DatabaseMySQL::dropTable(ContextPtr local_context, const String & table_name, bool /*sync*/)
+void DatabaseMySQL::dropTable(ContextPtr local_context, const String & table_name, bool /*sync*/, bool /*if_exists*/)
 {
     if (!persistent)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "DROP TABLE is not supported for non-persistent MySQL database");
@@ -639,7 +639,13 @@ void registerDatabaseMySQL(DatabaseFactory & factory)
         ASTs & arguments = engine->arguments->children;
         auto mysql_settings = std::make_unique<MySQLSettings>();
 
-        if (auto named_collection = tryGetNamedCollectionWithOverrides(arguments, args.context))
+        if (auto named_collection = tryGetNamedCollectionWithOverrides(
+                arguments,
+                args.context,
+                /*throw_unknown_collection=*/ true,
+                /*complex_args=*/ nullptr,
+                /*dependent_table_id=*/ nullptr,
+                engine_define->settings))
         {
             configuration = StorageMySQL::processNamedCollectionResult(*named_collection, *mysql_settings, args.context, false);
         }

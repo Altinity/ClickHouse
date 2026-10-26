@@ -3,6 +3,7 @@
 #include <optional>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/UnionNode.h>
+#include <Analyzer/Utils.h>
 #include <Analyzer/createUniqueAliasesIfNecessary.h>
 #include <base/scope_guard.h>
 #include <Columns/ColumnConst.h>
@@ -430,34 +431,23 @@ static ContextMutablePtr updateSettingsAndClientInfoForCluster(const Cluster & c
         new_settings[Setting::additional_table_filters].value.push_back(std::move(tuple));
     }
 
-    /// disable parallel replicas if cluster contains only shards with 1 replica
-    if (context->canUseTaskBasedParallelReplicas())
+    if (context->canUseTaskBasedParallelReplicas() && is_remote_function)
     {
-        bool disable_parallel_replicas = false;
-        if (is_remote_function)
-        {
-            if (cluster.getName().empty()) // disable parallel replicas with remote() table functions w/o configured cluster
-                disable_parallel_replicas = true;
-            else
-                new_settings[Setting::cluster_for_parallel_replicas] = cluster.getName();
-        }
-
-        if (!disable_parallel_replicas)
-        {
-            disable_parallel_replicas = true;
-            for (const auto & shard : cluster.getShardsInfo())
-            {
-                if (shard.getAllNodeCount() > 1)
-                {
-                    disable_parallel_replicas = false;
-                    break;
-                }
-            }
-        }
-
-        if (disable_parallel_replicas)
+        /// `remote()` without a configured cluster has no cluster to scope parallel replicas to.
+        if (cluster.getName().empty())
             new_settings[Setting::allow_experimental_parallel_reading_from_replicas] = 0;
+        else
+            new_settings[Setting::cluster_for_parallel_replicas] = cluster.getName();
     }
+    /// Parallel replicas are not disabled here for a cluster whose every shard has one replica:
+    /// `new_settings` is what the shard receives, and its own table may be a `Distributed` table over a
+    /// cluster that can use them. Whether this hop uses them is decided per shard below, and a shard
+    /// that cannot declines on its own, see `canUseParallelReplicasOnInitiator`.
+
+    /// `clusterAllReplicas` already reads every replica as a shard of its own, so there is nothing left
+    /// for parallel replicas to split
+    if (context->canUseTaskBasedParallelReplicas() && cluster.replicasAsShards())
+        new_settings[Setting::allow_experimental_parallel_reading_from_replicas] = 0;
 
     if (settings[Setting::max_execution_time_leaf].totalMicroseconds() > 0)
     {
@@ -1278,7 +1268,7 @@ void executeQueryWithParallelReplicas(
     /// Inline ALIAS columns before shipping the query, mirroring the Distributed/remote() path.
     /// buildQueryTreeForShard below rebuilds a shipped table expression from names and types only, which
     /// would drop an ALIAS column's expression and make the replica read it as physical.
-    inlineAliasColumns(modified_query_tree);
+    inlineAliasColumns(modified_query_tree, context);
     rewriteJoinToGlobalJoin(modified_query_tree, context);
     modified_query_tree = buildQueryTreeForShard(planner_context, modified_query_tree, /*allow_global_join_for_right_table*/ true);
 
@@ -1642,6 +1632,8 @@ std::optional<QueryPipeline> executeInsertSelectWithParallelReplicas(
     {
         InterpreterSelectQueryAnalyzer analyzer(query_ast.select, new_context, {});
         const auto & query_tree = analyzer.getQueryTree();
+        /// This parallel `INSERT SELECT` path renders directly, bypassing `queryNodeToDistributedSelectQuery`.
+        assertNoPendingAliasMarkersForDistributedSerialization(query_tree);
         auto select_ast = query_tree->toAST();
 
         auto new_query_ast = query_ast.clone();

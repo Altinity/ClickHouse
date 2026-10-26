@@ -6,6 +6,7 @@
 #include <Databases/DataLake/AWSV4Signer.h>
 
 #include <Common/Exception.h>
+#include <Common/HTTPHeaderFilter.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/threadPoolCallbackRunner.h>
@@ -64,7 +65,7 @@ S3TablesCatalog::S3TablesCatalog(
     const CatalogSettings & catalog_settings_,
     DB::ContextPtr context_,
     bool allow_server_credentials_in_user_queries_)
-    : RestCatalog(warehouse_, base_url_, "", "", false, catalog_settings_.namespaces, context_)
+    : RestCatalog(warehouse_, base_url_, "", "", false, catalog_settings_.namespaces, /* flat_namespaces */false, context_)
     , region(region_)
     , storage_endpoint(catalog_settings_.storage_endpoint)
     , signing_service("s3tables")
@@ -123,7 +124,8 @@ S3TablesCatalog::S3TablesCatalog(
     /// The signer is fully initialised above, so the virtual `createReadBuffer` reached by
     /// `loadConfig` dispatches to this class's SigV4 implementation.
     CatalogState initial_state;
-    initial_state.config = loadConfig(initial_state);
+    initial_state.config = loadConfig(initial_state, /* generation */ 0, /* auth_token */ {});
+    initial_state.config_loaded = true;
 
     if (initial_state.config.prefix.empty())
     {
@@ -138,9 +140,9 @@ S3TablesCatalog::S3TablesCatalog(
 /// S3 Tables only supports a single level of namespaces (no nesting), so we list the root
 /// namespaces directly with `listChildNamespaces("")` instead of the base class's recursive
 /// `getNamespacesRecursive`.
-CatalogTables S3TablesCatalog::getTables() const
+CatalogTables S3TablesCatalog::getTables(const DB::ForwardedAuthTokenPtr & auth_token) const
 {
-    auto namespaces = listChildNamespaces("");
+    auto namespaces = listChildNamespaces("", auth_token);
 
     auto & pool = getContext()->getIcebergCatalogThreadpool();
     DB::ThreadPoolCallbackRunnerLocal<void> runner(pool, DB::ThreadName::DATALAKE_REST_CATALOG);
@@ -152,7 +154,7 @@ CatalogTables S3TablesCatalog::getTables() const
         runner.enqueueAndKeepTrack(
             [&, ns]
             {
-                auto tables_in_ns = listTablesInNamespace(ns);
+                auto tables_in_ns = listTablesInNamespace(ns, auth_token);
                 std::lock_guard lock(mutex);
                 std::move(tables_in_ns.begin(), tables_in_ns.end(), std::back_inserter(tables));
             });
@@ -231,17 +233,27 @@ bool S3TablesCatalog::tryGetTableMetadata(
     return true;
 }
 
-void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name, bool delete_data) const
+void S3TablesCatalog::dropTable(
+    const String & namespace_name,
+    const String & table_name,
+    bool delete_data,
+    bool if_exists,
+    const DB::ForwardedAuthTokenPtr & auth_token) const
 {
     /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-delete.html
     if (!delete_data)
+    {
+        if (if_exists && !existsTable(namespace_name, table_name, auth_token))
+            return;
+
         throw DB::Exception(
             DB::ErrorCodes::SUPPORT_IS_DISABLED,
-            "S3 Tables cannot drop table {}.{} without deleting its data, and `iceberg_delete_data_on_drop` is disabled. "
-            "Enable `iceberg_delete_data_on_drop` to drop the table together with its data",
+            "S3 Tables cannot drop table {}.{} without deleting its data, and `data_lake_delete_data_on_drop` is disabled. "
+            "Enable `data_lake_delete_data_on_drop` to drop the table together with its data",
             namespace_name, table_name);
+    }
 
-    const auto state_snapshot = state.get();
+    const auto state_snapshot = getStateSnapshot();
     const std::string endpoint
         = (base_url / state_snapshot->config.prefix / "namespaces" / namespace_name / "tables" / table_name).string()
         + "?purgeRequested=True";
@@ -249,16 +261,18 @@ void S3TablesCatalog::dropTable(const String & namespace_name, const String & ta
     Poco::JSON::Object::Ptr request_body = nullptr;
     try
     {
-        sendRequest(*state_snapshot, endpoint, request_body, Poco::Net::HTTPRequest::HTTP_DELETE, true);
+        sendRequest(
+            *state_snapshot, state_snapshot.generation, endpoint, request_body, auth_token, Poco::Net::HTTPRequest::HTTP_DELETE, true);
         LOG_INFO(log, "S3 Tables: dropped table {}.{} (purgeRequested=True)", namespace_name, table_name);
     }
     catch (const DB::HTTPException & ex)
     {
-        if (ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_NOT_FOUND)
-            // 404 is returned by the API when the table does not exist
+        if (if_exists && ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_NOT_FOUND)
+        {
             LOG_DEBUG(log, "S3 Tables: table {}.{} already does not exist (404 on purge-delete)", namespace_name, table_name);
-        else
-            throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to drop table {}", ex.displayText());
+            return;
+        }
+        throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to drop table {}", ex.displayText());
     }
 }
 
@@ -294,7 +308,9 @@ DB::HTTPHeaderEntries extractSigV4AuthHeaders(DB::HTTPHeaderEntries && all_signe
 
 DB::ReadWriteBufferFromHTTPPtr S3TablesCatalog::createReadBuffer(
     const CatalogState & /* catalog_state */,
+    UInt64 /* generation */,
     const std::string & endpoint,
+    const DB::ForwardedAuthTokenPtr & /* auth_token */,
     const Poco::URI::QueryParameters & params,
     const DB::HTTPHeaderEntries & headers,
     const std::optional<DB::HTTPHeaderEntries> & /* auth_headers */) const
@@ -314,6 +330,8 @@ DB::ReadWriteBufferFromHTTPPtr S3TablesCatalog::createReadBuffer(
     auto result_headers = extractSigV4AuthHeaders(std::move(all_signed));
     for (const auto & h : headers)
         result_headers.push_back(h);
+    /// The signed headers contain the access key id, region and session token from the database settings.
+    context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(result_headers);
 
     LOG_DEBUG(log, "Requesting (SigV4): {}", url.toString());
 
@@ -330,8 +348,10 @@ DB::ReadWriteBufferFromHTTPPtr S3TablesCatalog::createReadBuffer(
 
 void S3TablesCatalog::sendRequest(
     const CatalogState & /* catalog_state */,
+    UInt64 /* generation */,
     const String & endpoint,
     Poco::JSON::Object::Ptr request_body,
+    const DB::ForwardedAuthTokenPtr & /* auth_token */,
     const String & method,
     bool ignore_result) const
 {
@@ -359,6 +379,7 @@ void S3TablesCatalog::sendRequest(
 
     auto headers = extractSigV4AuthHeaders(std::move(all_signed));
     headers.emplace_back("Content-Type", "application/json");
+    context->getGlobalContext()->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
 
     auto wb = DB::BuilderRWBufferFromHTTP(url)
         .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)

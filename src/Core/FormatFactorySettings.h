@@ -209,6 +209,9 @@ When reading Parquet files, skip whole row groups based on the WHERE expressions
     DECLARE(UInt64, input_format_parquet_dictionary_filter_push_down, 1024 * 1024, R"(
 When reading Parquet files (with reader v3), skip whole row groups based on the WHERE/PREWHERE expressions and the dictionary page contents, when all data pages of a column chunk are dictionary-encoded. The value is the maximum dictionary page size (in bytes) for which this optimization is applied; set to 0 to disable. This takes precedence over the bloom filter when both are available.
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_footer_read_size, 0, R"(
+Size (in bytes) of the initial tail read that fetches the Parquet footer (`FileMetaData`) when opening a file with reader v3. `0` (default) sizes the read adaptively to the file - 1% of the file size, clamped to `[128 KiB, 2 MiB]` - so it usually covers the whole footer in a single read even for wide files with hundreds of columns. Set a non-zero value to force a fixed initial read size instead of the adaptive one; this is useful for very high-latency object storage where reading a larger tail up front avoids a second round trip. The value is clamped to the file size.
+)", 0) \
     DECLARE(Bool, input_format_parquet_enable_json_parsing, true, R"(
 When reading Parquet files, parse JSON columns as ClickHouse JSON Column.
 )", 0) \
@@ -692,7 +695,7 @@ Allow data types conversion in Native input format
 Read data types in binary format instead of type names in Native input format
 )", 0) \
     DECLARE(UInt64, output_format_compression_level, 3, R"(
-Default compression level if query output is compressed. The setting is applied when `SELECT` query has `INTO OUTFILE` or when writing to table functions `file`, `url`, `hdfs`, `s3`, or `azureBlobStorage`.
+Default compression level if query output is compressed. The setting is applied when `SELECT` query has `INTO OUTFILE` or when writing to table functions `file`, `url`, `hdfs`, `s3`, or `azureBlobStorage`. It is also applied to the compressed response to an HTTP request with a method other than `gzip` and `deflate`, for which [http_zlib_compression_level](#http_zlib_compression_level) is used.
 
 Possible values: from `1` to `22`
 )", 0) \
@@ -858,7 +861,7 @@ The maximum allowed size for String in RowBinary format. It prevents allocating 
 The maximum allowed size for Array in RowBinary format. It prevents allocating large amount of memory in case of corrupted data. 0 means there is no limit
 )", 0) \
     DECLARE(UInt64, input_format_binary_max_type_complexity, 1000, R"(
-Max type nodes when decoding binary types (not depth, but total count). `Map(String, UInt32)` = 3 nodes. Protects against malicious inputs. 0 = unlimited.
+Max type nodes when decoding binary types (not depth, but total count). `Map(String, UInt32)` = 3 nodes. Parameters of `AggregateFunction` types count as one node per value, including nested ones. Protects against malicious inputs. 0 = unlimited.
 )", 0) \
     DECLARE(UInt64, format_binary_max_object_size, 100000, R"(
 The maximum allowed number of paths in a single Object for JSON type RowBinary format. It prevents allocating large amount of memory in case of corrupted data. 0 means there is no limit
@@ -1508,6 +1511,24 @@ Write Date values as plain 16-bit numbers (read back as UInt16), instead of conv
     DECLARE(Bool, output_format_arrow_unsupported_types_as_binary, true, R"(
 Output types having no conversion as raw binary data. If false - such types would raise UNKNOWN_TYPE exception.
 )", 0) \
+    DECLARE(UInt64, output_format_arrow_record_batch_size, 0, R"(
+Target number of rows per record batch for the `Arrow` and `ArrowStream` output formats. Combining small blocks reduces metadata and buffer-padding overhead, particularly for queries with selective filters.
+
+Blocks accumulate until this target or [output_format_arrow_record_batch_size_bytes](#output_format_arrow_record_batch_size_bytes) is reached. A block that already meets the row or byte target is written separately, without splitting. If you set a row target, combined batches contain fewer than twice that many rows, but a single input block can be larger.
+
+Buffering blocks can increase memory use and delay output. If the result never reaches either target, `ArrowStream` writes the first record batch only when the query finishes, though it can write the schema earlier. Leave both targets at `0` to write record batches as blocks arrive.
+
+`0` (the default) disables the row target. Try `65409` as a starting value.
+)", 0) \
+    DECLARE(UInt64, output_format_arrow_record_batch_size_bytes, 0, R"(
+Target record batch size for the `Arrow` and `ArrowStream` output formats, measured in bytes of accumulated block data. This uses the same measure as [min_insert_block_size_bytes](/reference/settings/settings#min_insert_block_size_bytes). A batch is written when either this target or [output_format_arrow_record_batch_size](#output_format_arrow_record_batch_size) is reached.
+
+Note that `LowCardinality` columns can produce Arrow batches much larger or smaller than this byte target. Repeated values expand in the output unless [output_format_arrow_low_cardinality_as_dictionary](#output_format_arrow_low_cardinality_as_dictionary) is enabled. Filtered blocks can also retain large dictionaries, so even a block with very few rows can reach the target and be written separately. For these columns, use [output_format_arrow_record_batch_size](#output_format_arrow_record_batch_size) to control the row count and set the byte target to `0`.
+
+Buffering blocks can increase memory use and delay the first record batch until the query finishes. Leave both targets at `0` to write record batches as blocks arrive.
+
+`0` (the default) disables the byte target. Try `1048576` (1 MiB) as a starting value.
+)", 0) \
     \
     DECLARE(Bool, output_format_orc_string_as_string, true, R"(
 Use ORC String type instead of Binary for String columns
@@ -1601,7 +1622,7 @@ Possible values:
 Use the precise float parsing algorithm, which always returns the closest representable value to the input. When disabled, a faster but less accurate algorithm is used that may differ from the precise result by the least significant bits.
 )", 0) \
     DECLARE(DateTimeOverflowBehavior, date_time_overflow_behavior, "ignore", R"(
-Defines the behavior when [Date](/reference/data-types/date), [Date32](/reference/data-types/date32), [DateTime](/reference/data-types/datetime), [DateTime64](/reference/data-types/datetime64) or integers are converted into Date, Date32, DateTime or DateTime64 but the value cannot be represented in the result type.
+Defines the behavior when [Date](/reference/data-types/date), [Date32](/reference/data-types/date32), [DateTime](/reference/data-types/datetime), [DateTime64](/reference/data-types/datetime64) or integers are converted into Date, Date32, DateTime or DateTime64 but the value cannot be represented in the result type. It also applies when a `Date` or `DateTime` is parsed from text, including by an input format.
 
 Possible values:
 
@@ -1711,6 +1732,9 @@ Indicate which field of protobuf oneof was found by means of setting enum value 
 )", 0) \
     DECLARE(Bool, input_format_parquet_allow_geoparquet_parser, true, R"(
 Use geo column parser to convert Array(UInt8) into Point/MultiPoint/Linestring/Polygon/MultiLineString/MultiPolygon types
+)", 0) \
+    DECLARE(Bool, input_format_parquet_detect_variant_by_structure, true, R"(
+Read a Parquet group that has no `VARIANT` logical type, but has the layout of an unshredded variant (a `metadata` and a `value` field of type `BYTE_ARRAY`), as a variant, i.e. as `Dynamic`, instead of `Tuple`. Spark 4.0 writes variant columns this way. Groups annotated with the `VARIANT` logical type are always read as a variant.
 )", 0) \
     DECLARE(Bool, output_format_parquet_geometadata, true, R"(
 Allow to write information about geo columns in parquet metadata and encode columns in WKB format.

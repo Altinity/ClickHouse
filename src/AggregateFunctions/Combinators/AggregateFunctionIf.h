@@ -64,6 +64,11 @@ public:
         return nested_func->getNormalizedStateType();
     }
 
+    bool stateIsIndependentOfNullability() const override
+    {
+        return nested_func->stateIsIndependentOfNullability();
+    }
+
     bool canMergeStateFromDifferentVariant(const IAggregateFunction & rhs) const override
     {
         if (!this->haveSameDefinition(rhs))
@@ -238,6 +243,11 @@ public:
     void insertMergeResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena * arena) const override
     {
         nested_func->insertMergeResultInto(place, to, arena);
+    }
+
+    void rollbackInsertResult(ConstAggregateDataPtr __restrict place, IColumn & to) const noexcept override
+    {
+        nested_func->rollbackInsertResult(place, to);
     }
 
     bool allocatesMemoryInArena() const override

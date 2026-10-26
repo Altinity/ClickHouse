@@ -29,6 +29,7 @@
 #include <Columns/validateColumnType.h>
 
 #include <Common/FieldVisitorToString.h>
+#include <Common/checkStackSize.h>
 #include <Common/typeid_cast.h>
 
 #include <base/unit.h>
@@ -37,6 +38,7 @@
 
 #include <Functions/FunctionHelpers.h>
 #include <Functions/FunctionFactory.h>
+#include <Functions/identity.h>
 
 #include <Storages/IStorage.h>
 
@@ -60,6 +62,7 @@
 
 #include <functional>
 #include <ranges>
+#include <vector>
 
 namespace DB
 {
@@ -1121,6 +1124,81 @@ void resolveAggregateFunctionNodeByName(FunctionNode & function_node, const Stri
     function_node.resolveAsAggregateFunction(std::move(aggregate_function));
 }
 
+namespace
+{
+
+class FinalizeAliasMarkersVisitor : public InDepthQueryTreeVisitor<FinalizeAliasMarkersVisitor>
+{
+public:
+    explicit FinalizeAliasMarkersVisitor(ContextPtr context_) : context(std::move(context_)) {}
+
+    /// Visit children first, so a nested marker chain is materialized from the inside out.
+    bool shouldTraverseTopToBottom() const { return false; }
+
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        auto * function_node = node->as<FunctionNode>();
+        if (!function_node || function_node->getFunctionName() != "__aliasMarker")
+            return;
+
+        auto & arguments = function_node->getArguments().getNodes();
+        if (arguments.size() != 3)
+            return;
+
+        if (!arguments[0] || !arguments[1] || !arguments[2])
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid internal pending __aliasMarker arguments");
+
+        const auto * token = arguments[2]->as<ConstantNode>();
+        if (!token || !isString(token->getResultType()) || token->getValue().safeGet<String>() != AliasMarkerName::pending_token)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid internal pending __aliasMarker token");
+
+        const auto * column_node = arguments[1]->as<ColumnNode>();
+        if (!column_node)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Internal pending __aliasMarker requires a column id");
+
+        const auto & column_source = column_node->getColumnSourceOrNull();
+        if (!column_source || column_source->getNodeType() == QueryTreeNodeType::LAMBDA || !column_source->hasAlias())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Internal pending __aliasMarker id has no table source alias");
+
+        auto alias_id = column_source->getAlias() + "." + column_node->getColumnName();
+        arguments[1] = std::make_shared<ConstantNode>(std::move(alias_id), std::make_shared<DataTypeString>());
+        arguments.pop_back();
+        resolveOrdinaryFunctionNodeByName(*function_node, "__aliasMarker", context);
+    }
+
+private:
+    ContextPtr context;
+};
+
+}
+
+void finalizeAliasMarkersForDistributedSerialization(QueryTreeNodePtr & node, const ContextPtr & context)
+{
+    FinalizeAliasMarkersVisitor visitor(context);
+    visitor.visit(node);
+}
+
+void assertNoPendingAliasMarkersForDistributedSerialization(const QueryTreeNodePtr & node)
+{
+    if (!node)
+        return;
+
+    std::vector<const IQueryTreeNode *> nodes_to_visit{node.get()};
+    while (!nodes_to_visit.empty())
+    {
+        const auto * current = nodes_to_visit.back();
+        nodes_to_visit.pop_back();
+
+        if (const auto * function_node = current->as<FunctionNode>();
+            function_node && function_node->getFunctionName() == "__aliasMarker" && function_node->getArguments().getNodes().size() == 3)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Internal pending __aliasMarker cannot be shipped before finalization");
+
+        for (const auto & child : current->getChildren())
+            if (child)
+                nodes_to_visit.push_back(child.get());
+    }
+}
+
 std::pair<TableExpressionNodePtr, bool> getExpressionSource(const QueryTreeNodePtr & node)
 {
     if (const auto * column = node->as<ColumnNode>())
@@ -1154,6 +1232,55 @@ std::pair<TableExpressionNodePtr, bool> getExpressionSource(const QueryTreeNodeP
         return {nullptr, true};
 
     return {nullptr, false};
+}
+
+namespace
+{
+
+class CollectPrewhereTableExpressionVisitor : public ConstInDepthQueryTreeVisitor<CollectPrewhereTableExpressionVisitor>
+{
+public:
+    const QueryTreeNodePtr & getTableExpression() const
+    {
+        return table_expression;
+    }
+
+    void visitImpl(const QueryTreeNodePtr & node)
+    {
+        const auto * column_node = node->as<ColumnNode>();
+        if (!column_node)
+            return;
+
+        auto column_source = column_node->getColumnSourceOrNull();
+        if (!column_source || (!column_source->as<TableNode>() && !column_source->as<TableFunctionNode>()))
+            return;
+
+        if (!table_expression)
+            table_expression = std::move(column_source);
+    }
+
+    static bool needChildVisit(const QueryTreeNodePtr &, const QueryTreeNodePtr & child_node)
+    {
+        const auto child_type = child_node->getNodeType();
+        return child_type != QueryTreeNodeType::QUERY
+            && child_type != QueryTreeNodeType::UNION
+            && child_type != QueryTreeNodeType::LAMBDA;
+    }
+
+private:
+    QueryTreeNodePtr table_expression;
+};
+
+}
+
+QueryTreeNodePtr getPrewhereTableExpression(const QueryTreeNodePtr & prewhere)
+{
+    if (!prewhere)
+        return {};
+
+    CollectPrewhereTableExpressionVisitor visitor;
+    visitor.visit(prewhere);
+    return visitor.getTableExpression();
 }
 
 /** There are no limits on the maximum size of the result for the subquery.
@@ -1439,6 +1566,9 @@ namespace
 
 Field getFieldFromColumnForASTLiteralImpl(const ColumnPtr & column, size_t row, const DataTypePtr & data_type, bool is_inside_object)
 {
+    /// Nesting is part of the value rather than of the query text, so no parser limit bounds it.
+    checkStackSize();
+
     if (isColumnConst(*column))
         return getFieldFromColumnForASTLiteralImpl(assert_cast<const ColumnConst& >(*column).getDataColumnPtr(), 0, data_type, is_inside_object);
 

@@ -1247,6 +1247,8 @@ The following table shows how Iceberg data types are mapped to ClickHouse data t
 | `fixed(N)` | `FixedString(N)` | |
 | `decimal(P, S)` | `Decimal(P, S)` | |
 
+Writes use the inverse mapping: `DateTime64(9)` is stored as `timestamp_ns`, and `DateTime64` with an explicit timezone and scale 9 as `timestamptz_ns`, but only when `iceberg_format_version` is 3 or higher. `DateTime` and `DateTime64` with scale 6 or less are stored as `timestamp`. Creating or altering an Iceberg table with `DateTime64` scale 9 on format version 1 or 2 raises an exception.
+
 ### Complex types {#complex-types}
 
 | Iceberg type | ClickHouse type |
@@ -1260,8 +1262,8 @@ The following table shows how Iceberg data types are mapped to ClickHouse data t
 The data type mappings above apply to reads. The following limitations apply when ClickHouse creates or evolves Iceberg schemas and writes data:
 
 - ClickHouse cannot create an Iceberg schema containing `Bool`, `Decimal`, `FixedString`, `Int8`, `UInt8`, `Int16`, or `UInt16`, or add or modify a column to one of these types. The operation fails with an unsupported-type exception. This does not prevent inserting `Bool` or `Decimal` values into existing Iceberg columns.
-- When ClickHouse creates or evolves an Iceberg schema, it maps every `DateTime` and `DateTime64` column to Iceberg `timestamp`, which has microsecond precision and no timezone. ClickHouse cannot generate `timestamptz`, `timestamp_ns`, or `timestamptz_ns` schema types, so higher precision and timezone semantics are not represented in the Iceberg schema.
-- ClickHouse cannot write to an Iceberg table that uses a `decimal`, `fixed`, `timestamp_ns`, or `timestamptz_ns` column as a direct partition field. The operation fails with an unsupported-type exception.
+- When ClickHouse creates or evolves an Iceberg schema, `DateTime` and `DateTime64` with scale 6 or less map to Iceberg `timestamp`. `DateTime64(9)` maps to `timestamp_ns`, and `DateTime64(9)` with an explicit timezone maps to `timestamptz_ns`, but only when `iceberg_format_version` is 3 or higher. Format versions 1 and 2 reject `DateTime64` scale 9. Microsecond `timestamptz` is still not generated.
+- ClickHouse cannot write to an Iceberg table that uses a `decimal` or `fixed` column as a direct partition field. The operation fails with an unsupported-type exception.
 - For data files containing types whose bounds ClickHouse cannot serialize, including `Bool` and `Decimal`, ClickHouse omits all lower and upper column bounds from the Iceberg manifest entry. Column sizes and null counts are still included, and the data remains correct, but readers cannot use manifest-level min-max pruning for those files.
 
 ## Schema evolution {#schema-evolution}
@@ -1278,6 +1280,32 @@ To read a table where the schema has changed after its creation with dynamic sch
 ## Partition pruning {#partition-pruning}
 
 ClickHouse supports partition pruning during SELECT queries for Iceberg tables, which helps optimize query performance by skipping irrelevant data files. To enable partition pruning, set `use_iceberg_partition_pruning = 1`. For more information about iceberg partition pruning address https://iceberg.apache.org/spec/#partitioning
+
+## `DROP PARTITION` {#drop-partition}
+
+`ALTER TABLE ... DROP PARTITION <value>` removes every data file belonging to a single partition and creates a new snapshot that no longer references them. It is supported for local, object-storage and catalog-backed Iceberg tables.
+
+Enable `allow_insert_into_iceberg` to use this operation.
+
+The operation is supported only for Iceberg `format-version` 2 tables. The partition value refers to the table's current partition spec. Files written under an earlier partition spec are dropped when their partition values match every field of the current spec; if such a file's spec does not contain every field of the current spec, the operation fails without changing the table. Manifests that also contain files from other partitions are rewritten without the dropped files. Position-delete and equality-delete files belonging to the partition are dropped together with its data files.
+
+The partition value follows the same rules as for `MergeTree`. For a single-column partition, pass a scalar literal; for a multi-column partition, pass a tuple of values:
+
+```sql
+ALTER TABLE iceberg_table DROP PARTITION 2;
+ALTER TABLE iceberg_table DROP PARTITION (2, 5);
+```
+
+For a partition defined with a transform, you can supply either the already-transformed partition-key value as a literal, or the same transform expression applied to a raw source value. The supported transforms are `identity`, `icebergBucket`, `icebergTruncate`, `toYearNumSinceEpoch`, `toMonthNumSinceEpoch`, `toRelativeDayNum`, and `toRelativeHourNum`. For a single-column partition the transform-expression form must be wrapped in `tuple(...)`:
+
+```sql
+ALTER TABLE iceberg_table DROP PARTITION 0;
+ALTER TABLE iceberg_table DROP PARTITION tuple(icebergBucket(4, 'apple'));
+```
+
+The operation rejects explicitly set `iceberg_snapshot_id` or `iceberg_timestamp_ms` settings, and the `iceberg_metadata_file_path` setting on tables that are not catalog-backed. It modifies the current table state, not a historical snapshot or an explicitly selected metadata version.
+
+The `DROP PARTITION ID '...'` and `DROP PARTITION ALL` forms are not supported. Dropping a partition that does not exist is a no-op. By default, the operation does not physically delete the data files. Earlier snapshots retain access to the removed rows and remain available to time-travel queries until those snapshots expire and their files are cleaned up. Enable `data_lake_delete_data_on_drop` to delete the dropped files from storage after the new snapshot is committed; this breaks time travel to earlier snapshots that reference them.
 
 ## Time travel {#time-travel}
 

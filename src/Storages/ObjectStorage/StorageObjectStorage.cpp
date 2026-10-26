@@ -64,7 +64,7 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 max_streams_for_files_processing_in_cluster_functions;
-    extern const SettingsBool iceberg_delete_data_on_drop;
+    extern const SettingsBool data_lake_delete_data_on_drop;
 }
 
 namespace ErrorCodes
@@ -75,6 +75,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int ACCESS_DENIED;
     extern const int FILE_ALREADY_EXISTS;
+    extern const int CORRUPTED_DATA;
 }
 
 namespace FailPoints
@@ -165,6 +166,7 @@ StorageObjectStorage::StorageObjectStorage(
     , is_table_function(is_table_function_)
     , log(getLogger(fmt::format("Storage{}({})", configuration->getEngineName(), table_id_.getFullTableName())))
     , catalog(catalog_)
+    , catalog_auth_token(catalog_ && context ? context->getForwardedAuthToken() : DB::ForwardedAuthTokenPtr{})
     , storage_id(table_id_)
     , background_operations_assignee(*this, table_id_, BackgroundJobsAssignee::Type::DataProcessing, Context::getGlobalContextInstance())
 {
@@ -855,7 +857,7 @@ bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
     return configuration->getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::HIVE;
 }
 
-SinkToStoragePtr StorageObjectStorage::import(
+IStorage::ImportResult StorageObjectStorage::import(
     const std::string & file_name,
     Block & block_with_partition_values,
     const std::function<void(const std::string &)> & new_file_path_callback,
@@ -870,13 +872,13 @@ SinkToStoragePtr StorageObjectStorage::import(
     {
         configuration->lazyInitializeIfNeeded(object_storage, local_context);
         auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
-        return configuration->getExternalMetadata()->import(
+        return ImportResult::createSink(configuration->getExternalMetadata()->import(
             catalog,
             new_file_path_callback,
             std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
             *iceberg_metadata_json_string,
             format_settings_ ? format_settings_ : format_settings,
-            local_context);
+            local_context));
     }
 
     std::string partition_key;
@@ -912,18 +914,35 @@ SinkToStoragePtr StorageObjectStorage::import(
 
     const auto base_path = configuration->getPathForWrite(partition_key, file_name).path;
 
-    return std::make_shared<MultiFileStorageObjectStorageSink>(
+    /// A commit file is written only once every data file has been finalized, so -- unlike the
+    /// presence of any individual data file -- it proves a previous export produced the whole
+    /// part here. There is nothing left to write, whatever the conflict policy says: that policy
+    /// governs the leftovers of an attempt that never committed. `overwrite` is asked to redo the
+    /// work, so it does not get to short-circuit.
+    if (file_already_exists_policy != MergeTreePartExportFileAlreadyExistsPolicy::overwrite)
+    {
+        if (auto committed_paths = MultiFileStorageObjectStorageSink::tryReadCommittedPaths(
+                base_path, /* transaction_id= */ file_name, object_storage, local_context))
+        {
+            if (committed_paths->empty())
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "Commit file for {} lists no data files", base_path);
+
+            return ImportResult::createAlreadyExported(std::move(*committed_paths));
+        }
+    }
+
+    return ImportResult::createSink(std::make_shared<MultiFileStorageObjectStorageSink>(
         base_path,
         /* transaction_id= */ file_name, /// not pretty, but the sink needs some sort of id to generate the commit file name. Using the source part name should be enough
         object_storage,
         configuration,
         max_bytes_per_file,
         max_rows_per_file,
-        file_already_exists_policy,
+        /* overwrite_existing_data_files= */ file_already_exists_policy != MergeTreePartExportFileAlreadyExistsPolicy::error,
         new_file_path_callback,
         format_settings_ ? format_settings_ : format_settings,
         std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
-        local_context);
+        local_context));
 }
 
 IStorage::ExportPartitionCommitInfo StorageObjectStorage::commitExportPartitionTransaction(
@@ -1035,16 +1054,43 @@ void StorageObjectStorage::truncate(
     object_storage->removeObjectsIfExist(objects);
 }
 
+void StorageObjectStorage::prepareForDrop(ContextPtr query_context)
+{
+    delete_data_on_drop = query_context->getSettingsRef()[Setting::data_lake_delete_data_on_drop];
+}
+
 void StorageObjectStorage::drop()
 {
-    /// We cannot use query context here, because drop is executed in the background.
-    auto drop_context = Context::getGlobalContextInstance();
+    dropImpl(delete_data_on_drop.load(), catalog, catalog_auth_token, configuration, storage_id, log);
+}
+
+void StorageObjectStorage::dropImpl(
+    const std::optional<bool> & delete_data_on_drop,
+    const std::shared_ptr<DataLake::ICatalog> & catalog,
+    const DB::ForwardedAuthTokenPtr & catalog_auth_token,
+    const StorageObjectStorageConfigurationPtr & configuration,
+    const StorageID & storage_id,
+    const LoggerPtr & log)
+{
+    const bool delete_data = delete_data_on_drop.value_or(false);
+
+    if (!delete_data_on_drop
+        && Context::getGlobalContextInstance()->getSettingsRef()[Setting::data_lake_delete_data_on_drop])
+    {
+        LOG_WARNING(
+            log,
+            "Keeping the data of table {} although `data_lake_delete_data_on_drop` is enabled server-wide: the value for this drop "
+            "could not be captured, which happens when the table was never loaded, and data is never deleted on a fallback path. "
+            "Access the table before dropping it, so that the settings of the `DROP TABLE` query reach the table.",
+            storage_id.getNameForLogs());
+    }
+
     if (catalog)
     {
         const auto [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        catalog->dropTable(namespace_name, table_name, drop_context->getSettingsRef()[Setting::iceberg_delete_data_on_drop]);
+        catalog->dropTable(namespace_name, table_name, delete_data, /* if_exists */ false, catalog_auth_token);
     }
-    configuration->drop(drop_context);
+    configuration->drop(delete_data);
 }
 
 std::unique_ptr<ReadBufferIterator> StorageObjectStorage::createReadBufferIterator(
@@ -1254,6 +1300,12 @@ void StorageObjectStorage::alter(const AlterCommands & params, ContextPtr contex
     setInMemoryMetadata(new_metadata);
 }
 
+Pipe StorageObjectStorage::alterPartition(
+    const StorageMetadataPtr & /*metadata_snapshot*/, const PartitionCommands & commands, ContextPtr context)
+{
+    return configuration->alterPartition(commands, std::move(context), catalog, getStorageID());
+}
+
 void StorageObjectStorage::checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const
 {
     configuration->checkAlterIsPossible(object_storage, context, commands);
@@ -1277,6 +1329,15 @@ void StorageObjectStorage::shutdown(bool)
 bool StorageObjectStorage::scheduleDataProcessingJob(BackgroundJobsAssignee & assignee)
 {
     return configuration->scheduleDataProcessingJob(assignee, *this);
+}
+
+void StorageObjectStorage::checkAlterPartitionIsPossible(
+    const PartitionCommands & commands,
+    const StorageMetadataPtr & /*metadata_snapshot*/,
+    const Settings & /*settings*/,
+    ContextPtr context) const
+{
+    configuration->checkAlterPartitionIsPossible(object_storage, context, commands);
 }
 
 }

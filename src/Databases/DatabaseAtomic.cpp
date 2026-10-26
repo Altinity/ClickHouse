@@ -189,7 +189,7 @@ StoragePtr DatabaseAtomic::detachTable(ContextPtr /* context */, const String & 
     return detached_table;
 }
 
-void DatabaseAtomic::dropTable(ContextPtr local_context, const String & table_name, bool sync)
+void DatabaseAtomic::dropTable(ContextPtr local_context, const String & table_name, bool sync, bool /*if_exists*/)
 {
     auto component_guard = Coordination::setCurrentComponent("DatabaseAtomic::dropTable");
     waitDatabaseStarted();
@@ -900,7 +900,7 @@ void registerDatabaseAtomic(DatabaseFactory & factory)
         DatabaseMetadataDiskSettings database_metadata_disk_settings;
         auto * engine_define = args.create_query.storage;
         chassert(engine_define);
-        database_metadata_disk_settings.loadFromQuery(*engine_define, args.context, isLoadingFromExistingMetadata(args.mode));
+        database_metadata_disk_settings.loadFromQuery(*engine_define, args.context, args.isLoadingFromExistingMetadata());
 
         return make_shared<DatabaseAtomic>(
             args.database_name, args.metadata_path, args.uuid, args.context, database_metadata_disk_settings);

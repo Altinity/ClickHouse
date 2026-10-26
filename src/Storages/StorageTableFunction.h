@@ -35,6 +35,12 @@ public:
         setInMemoryMetadata(cached_metadata);
     }
 
+    StoragePtr tryGetNested() const override
+    {
+        std::lock_guard lock{nested_mutex};
+        return nested;
+    }
+
     StoragePtr getNestedImpl() const
     {
         std::lock_guard lock{nested_mutex};
@@ -84,6 +90,13 @@ public:
         std::lock_guard lock{nested_mutex};
         if (nested)
             nested->drop();
+    }
+
+    void prepareForDrop(ContextPtr query_context) override
+    {
+        std::lock_guard lock{nested_mutex};
+        if (nested)
+            nested->prepareForDrop(query_context);
     }
 
     /// File-like table functions rebuild the nested storage from the current external schema and

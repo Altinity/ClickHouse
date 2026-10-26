@@ -13,6 +13,7 @@ namespace DB::Iceberg
 DEFINE_ICEBERG_FIELD(boolean);
 DEFINE_ICEBERG_FIELD(bigint);
 DEFINE_ICEBERG_FIELD(binary);
+DEFINE_ICEBERG_FIELD(varbyte);
 DEFINE_ICEBERG_FIELD(double);
 DEFINE_ICEBERG_FIELD(date);
 DEFINE_ICEBERG_FIELD(data_file);
@@ -44,6 +45,7 @@ DEFINE_ICEBERG_FIELD(summary);
 DEFINE_ICEBERG_FIELD(time);
 DEFINE_ICEBERG_FIELD(timestamp);
 DEFINE_ICEBERG_FIELD(timestamptz);
+DEFINE_ICEBERG_FIELD_ALIAS(timestamp_with_local_time_zone, timestamp with local time zone);
 DEFINE_ICEBERG_FIELD(timestamp_ns);
 DEFINE_ICEBERG_FIELD(timestamptz_ns);
 DEFINE_ICEBERG_FIELD(type)
@@ -51,6 +53,7 @@ DEFINE_ICEBERG_FIELD(logicalType); /// this field has a camelCase name
 DEFINE_ICEBERG_FIELD(transform);
 DEFINE_ICEBERG_FIELD(direction);
 
+DEFINE_ICEBERG_FIELD(unknown);
 DEFINE_ICEBERG_FIELD(uuid);
 DEFINE_ICEBERG_FIELD(value);
 DEFINE_ICEBERG_FIELD(manifest_length);
@@ -102,6 +105,7 @@ DEFINE_ICEBERG_FIELD(replace);
 DEFINE_ICEBERG_FIELD_ALIAS(format_version, format-version);
 DEFINE_ICEBERG_FIELD_ALIAS(current_snapshot_id, current-snapshot-id);
 DEFINE_ICEBERG_FIELD_ALIAS(first_row_id, first-row-id);
+DEFINE_ICEBERG_FIELD_ALIAS(manifest_first_row_id, first_row_id);
 DEFINE_ICEBERG_FIELD_ALIAS(added_rows, added-rows);
 DEFINE_ICEBERG_FIELD_ALIAS(next_row_id, next-row-id);
 DEFINE_ICEBERG_FIELD_ALIAS(metadata_snapshot_id, snapshot-id);
@@ -126,10 +130,12 @@ DEFINE_ICEBERG_FIELD_ALIAS(order_id, order-id);
 DEFINE_ICEBERG_FIELD_ALIAS(default_sort_order_id, default-sort-order-id);
 DEFINE_ICEBERG_FIELD_ALIAS(sort_orders, sort-orders);
 DEFINE_ICEBERG_FIELD_ALIAS(source_id, source-id);
+DEFINE_ICEBERG_FIELD_ALIAS(source_ids, source-ids);
 DEFINE_ICEBERG_FIELD_ALIAS(partition_transform, transform);
 DEFINE_ICEBERG_FIELD_ALIAS(partition_name, name);
 DEFINE_ICEBERG_FIELD_ALIAS(default_spec_id, default-spec-id);
 DEFINE_ICEBERG_FIELD_ALIAS(partition_spec, partition-spec);
+DEFINE_ICEBERG_FIELD_ALIAS(manifest_partition_spec_id, partition-spec-id);
 DEFINE_ICEBERG_FIELD_ALIAS(partition_specs, partition-specs);
 DEFINE_ICEBERG_FIELD_ALIAS(spec_id, spec-id);
 DEFINE_ICEBERG_FIELD_ALIAS(added_records, added-records);
@@ -192,6 +198,10 @@ DEFINE_ICEBERG_FIELD_COMPOUND(data_file, sort_order_id);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, record_count);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, file_size_in_bytes);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, key_metadata);
+DEFINE_ICEBERG_FIELD_COMPOUND(data_file, first_row_id);
+
+constexpr Int32 row_id_field_id = 2147483540;
+constexpr Int32 last_updated_sequence_number_field_id = 2147483539;
 
 /// Fallback defaults for snapshot retention policy when table properties are absent.
 /// These values follow the Java reference implementation; the Iceberg spec does not

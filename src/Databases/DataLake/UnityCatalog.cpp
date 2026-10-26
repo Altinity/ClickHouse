@@ -1,5 +1,6 @@
 #include <Databases/DataLake/UnityCatalog.h>
 #include <Interpreters/StorageID.h>
+#include <Core/UUID.h>
 
 #if USE_PARQUET
 
@@ -105,7 +106,7 @@ std::pair<Poco::Dynamic::Var, std::string> UnityCatalog::postJSONRequest(const s
     return makeHTTPRequestAndReadJSON(base_url / route, context, bearer_token, {}, {}, Poco::Net::HTTPRequest::HTTP_POST, out_stream_callaback);
 }
 
-bool UnityCatalog::empty() const
+bool UnityCatalog::empty(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     auto all_schemas = getSchemas("");
     for (const auto & schema : all_schemas)
@@ -117,7 +118,7 @@ bool UnityCatalog::empty() const
     return true;
 }
 
-CatalogTables UnityCatalog::getTables() const
+CatalogTables UnityCatalog::getTables(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     CatalogTables result;
 
@@ -131,13 +132,13 @@ CatalogTables UnityCatalog::getTables() const
     return result;
 }
 
-DataLake::ICatalog::Namespaces UnityCatalog::getNamespaces() const
+DataLake::ICatalog::Namespaces UnityCatalog::getNamespaces(const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     /// Unity schemas are flat — they cannot contain nested namespaces.
     return getSchemas("");
 }
 
-CatalogTables UnityCatalog::listTablesInNamespaceDirect(const std::string & namespace_name) const
+CatalogTables UnityCatalog::listTablesInNamespaceDirect(const std::string & namespace_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     return getTablesForSchema(namespace_name);
 }
@@ -152,11 +153,11 @@ void UnityCatalog::getTableMetadata(
         throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "No response from unity catalog");
 }
 
-Poco::JSON::Object::Ptr UnityCatalog::requestReadCredentials(const String & table_id) const
+Poco::JSON::Object::Ptr UnityCatalog::requestCredentials(const String & table_id, const String & operation) const
 {
     Poco::JSON::Object request_body;
     request_body.set("table_id", table_id);
-    request_body.set("operation", "READ");
+    request_body.set("operation", operation);
 
     auto callback = [&request_body] (std::ostream & os) { request_body.stringify(os); };
 
@@ -199,7 +200,7 @@ void UnityCatalog::getCredentials(const String & table_id, TableMetadata & metad
     if (storage_type != StorageType::S3 && storage_type != StorageType::Azure)
         return;
 
-    auto response = requestReadCredentials(table_id);
+    auto response = requestCredentials(table_id, "READ");
 
     std::shared_ptr<IStorageCredentials> creds;
     switch (storage_type)
@@ -350,7 +351,7 @@ bool UnityCatalog::tryGetTableMetadata(
     }
 }
 
-bool UnityCatalog::existsTable(const std::string & schema_name, const std::string & table_name) const
+bool UnityCatalog::existsTable(const std::string & schema_name, const std::string & table_name, const DB::ForwardedAuthTokenPtr & /*auth_token*/) const
 {
     if (!isNamespaceAllowed(schema_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED, "Namespace {} is filtered by `namespaces` database parameter", schema_name);
@@ -537,7 +538,8 @@ bool UnityCatalog::isNamespaceAllowed(const std::string & namespace_) const
     return allowed_namespaces.contains("*") || allowed_namespaces.contains(namespace_);
 }
 
-ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(const DB::StorageID & table_id)
+ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCallback(
+    const DB::StorageID & table_id, const TableMetadata & /*table_metadata*/, const DB::ForwardedAuthTokenPtr & /*auth_token*/)
 {
     if (!table_id.hasUUID())
         throw DB::Exception(
@@ -545,13 +547,28 @@ ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsConfigurationCa
             "Cannot build a Unity credentials refresh callback for `{}`: StorageID has no UUID",
             table_id.getNameForLogs());
 
-    const String unity_table_id = toString(table_id.uuid);
+    return getCredentialsCallbackForOperation(DB::toString(table_id.uuid), "READ");
+}
 
-    return [this, unity_table_id] () -> std::shared_ptr<IStorageCredentials>
+/// `StorageID::uuid` of a `DataLakeCatalog` table is the `table_id` returned by Unity.
+ICatalog::CredentialsRefreshCallback UnityCatalog::getWriteCredentialsConfigurationCallback(const DB::StorageID & table_id)
+{
+    if (table_id.uuid == DB::UUIDHelpers::Nil)
+        throw DB::Exception(
+            DB::ErrorCodes::BAD_ARGUMENTS,
+            "Cannot build a Unity credentials refresh callback for `{}`: the table has no UUID",
+            table_id.getNameForLogs());
+
+    return getCredentialsCallbackForOperation(DB::toString(table_id.uuid), "READ_WRITE");
+}
+
+ICatalog::CredentialsRefreshCallback UnityCatalog::getCredentialsCallbackForOperation(const String & unity_table_id, const String & operation)
+{
+    return [this, unity_table_id, operation] () -> std::shared_ptr<IStorageCredentials>
     {
-        LOG_DEBUG(log, "Update credentials in the catalog");
+        LOG_DEBUG(log, "Update {} credentials in the catalog", operation);
 
-        auto response = requestReadCredentials(unity_table_id);
+        auto response = requestCredentials(unity_table_id, operation);
         if (hasValueAndItsNotNone("azure_user_delegation_sas", response))
             return parseAzureCredentials(response);
         return parseS3Credentials(response);

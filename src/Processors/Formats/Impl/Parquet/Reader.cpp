@@ -1,12 +1,14 @@
 #include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnDynamic.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Processors/Formats/Impl/ArrowGeoTypes.h>
 #include <Columns/ColumnMap.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnsCommon.h>
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnVariant.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnTuple.h>
 #include <Columns/FilterDescription.h>
@@ -21,6 +23,7 @@
 #include <IO/Libdeflate.h>
 #include <Processors/Formats/Impl/Parquet/Decoding.h>
 #include <Processors/Formats/Impl/Parquet/GeoFilter.h>
+#include <Processors/Formats/Impl/Parquet/VariantEncoding.h>
 #include <Processors/Formats/Impl/Parquet/parquetBloomFilterHash.h>
 #include <Processors/Formats/Impl/Parquet/Reader.h>
 #include <Processors/Formats/Impl/Parquet/SchemaConverter.h>
@@ -218,7 +221,7 @@ void Reader::init(const ReadOptions & options_, const Block & sample_block_, For
     format_filter_info = format_filter_info_;
 }
 
-parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher)
+parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher, size_t footer_read_size)
 {
     /// Parquet file ends with:
     ///  * serialized FileMetaData struct,
@@ -229,9 +232,14 @@ parq::FileMetaData Reader::readFileMetaData(Prefetcher & prefetcher)
     if (file_size <= 8)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Parquet file too short: {} bytes", file_size);
 
-    /// Read the last 64 KiB in hopes that FileMetaData is smaller than that.
-    /// This is usually enough for files smaller than a few hundred MB.
-    size_t initial_read_size = std::min(file_size, 64ul << 10);
+    /// Read a tail sized to the file (1%, clamped to [128 KiB, 2 MiB]) so it usually covers the whole
+    /// footer - FileMetaData for wider range of layouts - in one read. A non-zero
+    /// `footer_read_size` overrides this adaptive size with a fixed read size.
+    if (footer_read_size == 0)
+        footer_read_size = std::clamp<size_t>(file_size / 100, 128ul << 10, 2ul << 20);
+    /// The read must cover at least the 8-byte trailer (metadata size + magic) so the offsets below
+    /// don't underflow; an explicit `footer_read_size` smaller than that is bumped up to 8.
+    size_t initial_read_size = std::min(file_size, std::max<size_t>(footer_read_size, 8));
     PODArray<char> buf(initial_read_size);
     prefetcher.readSync(buf.data(), initial_read_size, file_size - initial_read_size);
 
@@ -469,16 +477,25 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     /// i.e. the very same raw name `geo_meta` already carries. Translating them to the query-side
     /// name (as an earlier version of this code did) breaks the match against
     /// `primitive_columns[i].name` for any bbox sub-column that was itself renamed.
-    std::unordered_map<String, String> clickhouse_to_parquet_name;
-    const auto * query_side_column_mapper = format_filter_info->current_schema_column_mapper
-        ? format_filter_info->current_schema_column_mapper.get()
-        : format_filter_info->column_mapper.get();
-    if (query_side_column_mapper && format_filter_info->column_mapper)
-        clickhouse_to_parquet_name =
-            query_side_column_mapper->makeMapping(format_filter_info->column_mapper->getFieldIdToClickHouseName()).first;
+    std::optional<std::unordered_map<String, String>> clickhouse_to_parquet_name;
+    auto get_clickhouse_to_parquet_name = [&]() -> const std::unordered_map<String, String> &
+    {
+        if (!clickhouse_to_parquet_name)
+        {
+            clickhouse_to_parquet_name.emplace();
+            const auto * query_side_column_mapper = format_filter_info->current_schema_column_mapper
+                ? format_filter_info->current_schema_column_mapper.get()
+                : format_filter_info->column_mapper.get();
+            if (query_side_column_mapper && format_filter_info->column_mapper)
+                *clickhouse_to_parquet_name
+                    = query_side_column_mapper->makeMapping(format_filter_info->column_mapper->getFieldIdToClickHouseName()).first;
+        }
+        return *clickhouse_to_parquet_name;
+    };
     auto resolve_geo_meta = [&](const String & ch_name) -> std::unordered_map<String, DB::GeoColumnMetadata>::const_iterator
     {
-        if (auto it = clickhouse_to_parquet_name.find(ch_name); it != clickhouse_to_parquet_name.end())
+        const auto & mapping = get_clickhouse_to_parquet_name();
+        if (auto it = mapping.find(ch_name); it != mapping.end())
             return geo_meta->find(it->second);
         return geo_meta->find(ch_name);
     };
@@ -490,7 +507,8 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     /// pruning.
     auto to_raw_geometry_name = [&](const String & ch_name) -> String
     {
-        if (auto it = clickhouse_to_parquet_name.find(ch_name); it != clickhouse_to_parquet_name.end())
+        const auto & mapping = get_clickhouse_to_parquet_name();
+        if (auto it = mapping.find(ch_name); it != mapping.end())
             return it->second;
         return ch_name;
     };
@@ -3280,9 +3298,8 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
             nullable_group_null_map = ColumnUInt8::create(num_rows, UInt8(0));
     }
 
-    TypeIndex kind = output_info.nullable_group
-        ? removeNullable(output_info.input_type)->getColumnType()
-        : output_info.input_type->getColumnType();
+    /// Nullable wraps the type of a physically nullable tuple group and of a variant read as `Nullable(JSON)`.
+    TypeIndex kind = removeNullable(output_info.input_type)->getColumnType();
 
     if (output_info.is_primitive)
     {
@@ -3333,6 +3350,16 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
             res = ColumnTuple::create(num_rows);
         else
             res = ColumnTuple::create(std::move(columns));
+    }
+    else if (kind == TypeIndex::Dynamic || kind == TypeIndex::Object)
+    {
+        chassert(output_info.nested_columns.size() == 2);
+        MutableColumnPtr metadata = formOutputColumn(row_subgroup, output_info.nested_columns[0], num_rows);
+        MutableColumnPtr value = formOutputColumn(row_subgroup, output_info.nested_columns[1], num_rows);
+
+        res = output_info.input_type->createColumn();
+        res->reserve(num_rows);
+        decodeVariantColumn(*metadata, *value, *res, output_info.input_type, output_info.name, num_rows, options.format);
     }
     else
     {

@@ -46,6 +46,7 @@
 #include <Functions/FunctionFactory.h>
 #include <Functions/grouping.h>
 #include <Storages/StorageJoin.h>
+#include <Storages/StorageProxy.h>
 
 #include <Functions/UserDefined/UserDefinedExecutableFunctionFactory.h>
 #include <Functions/UserDefined/UserDefinedSQLFunctionFactory.h>
@@ -1310,7 +1311,7 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
                         scope.scope_node->formatASTForErrorMessage());
 
                 auto & table_node_typed = table_node->as<TableNode &>();
-                if (!std::dynamic_pointer_cast<StorageJoin>(table_node_typed.getStorage()))
+                if (!castStorage<StorageJoin>(table_node_typed.getStorage(), DeferredTable::Load))
                     throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
                         "Function {} table '{}' should have engine StorageJoin. In scope {}",
                         function_name,
@@ -2141,8 +2142,9 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         }
         else
         {
-            /// Replace storage with values storage of insertion block
-            if (StoragePtr storage = scope.context->getViewSource())
+            /// Replace storage with values storage of insertion block.
+            /// The inner query of an ordinary view referenced by the view query reads the table itself.
+            if (StoragePtr storage = scope.context->getViewSource(); storage && !scope.context->isViewInnerQuery())
             {
                 QueryTreeNodePtr table_expression = in_second_argument;
 
@@ -2775,8 +2777,12 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
         /// `randConstant(), randConstant()` shares. What separates two calls is their arguments, which
         /// the hash still covers: `randConstant(1)` and `randConstant(2)` keep their own values, and that
         /// is the documented way to ask for two different constants in one query.
+        ///
+        /// Server constants (`hostName`, `serverUUID`, ...) capture `Context::isDistributed` when built.
+        /// A local `UNION` branch and a later cluster branch must not share that instance.
         if (function && !function->isDeterministic() && !function->isStateful()
-            && function->isDeterministicInScopeOfQuery())
+            && function->isDeterministicInScopeOfQuery()
+            && !function->isServerConstant())
         {
             auto hash = function_node_ptr->getTreeHash({ .compare_aliases = false });
             function_base_cache = &functions_cache[hash];

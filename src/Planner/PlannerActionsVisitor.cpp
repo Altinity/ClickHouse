@@ -111,6 +111,16 @@ bool containsQueryOrUnionInSourceExpression(const QueryTreeNodePtr & node)
     return false;
 }
 
+/// Return a two-argument `__aliasMarker`'s string id, or an empty string when it has none.
+/// A three-argument pending marker always resolves to its payload in an intermediate plan.
+String tryExtractAliasMarkerId(const QueryTreeNodePtr & id_argument)
+{
+    if (const auto * id_node = id_argument->as<ConstantNode>(); id_node && isString(id_node->getResultType()))
+        return id_node->getValue().safeGet<String>();
+
+    return {};
+}
+
 class ActionNodeNameHelper
 {
 public:
@@ -213,18 +223,19 @@ public:
                 const auto & function_node = node->as<FunctionNode &>();
                 if (function_node.getFunctionName() == "__aliasMarker")
                 {
-                    /// Perform sanity check, because user may call this function with unexpected arguments
                     const auto & function_argument_nodes = function_node.getArguments().getNodes();
-                    if (function_argument_nodes.size() == 2)
-                    {
-                        if (const auto * second_argument = function_argument_nodes.at(1)->as<ConstantNode>())
-                        {
-                            if (isString(second_argument->getResultType()))
-                                result = second_argument->getValue().safeGet<String>();
-                        }
-                    }
+                    if (function_argument_nodes.size() != 2 && function_argument_nodes.size() != 3)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 or 3 arguments");
 
-                    /// Empty node name is not allowed and leads to logical errors
+                    if (function_argument_nodes.size() == 2)
+                        result = tryExtractAliasMarkerId(function_argument_nodes.at(1));
+
+                    /// A pending marker, or a hand-written one without a string id, is named after its payload.
+                    /// The pending form can reach an intermediate planner, but must be finalized before shipping.
+                    if (result.empty())
+                        result = calculateActionNodeName(function_argument_nodes.at(0));
+
+                    /// An empty node name is not allowed and leads to logical errors.
                     if (result.empty())
                         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker is internal and should not be used directly");
                     break;
@@ -1243,24 +1254,17 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
 /// gates on the setting).
 void markFoldedSecretConstants(const FunctionNode & function_node, const ActionsDAG::NodeRawConstPtrs & children)
 {
-    auto secret_arguments = FunctionSecretArgumentsFinderTreeNode(function_node).getResult();
+    const auto secret_arguments = FunctionSecretArgumentsFinderTreeNode(function_node).getResult();
     if (!secret_arguments.hasSecrets())
         return;
 
-    auto mark = [&](size_t index)
+    for (size_t i = 0; i < children.size(); ++i)
     {
         /// Any node carrying a constant column is a folded secret value, whether it is a plain COLUMN
         /// node or a FUNCTION node folded to a constant (e.g. `concat(k1, k2)`); flag either.
-        if (index < children.size() && children[index]->column && !children[index]->is_masked_secret)
-            const_cast<ActionsDAG::Node *>(children[index])->is_masked_secret = true;
-    };
-
-    for (size_t i = secret_arguments.start; i < secret_arguments.start + secret_arguments.count; ++i)
-        mark(i);
-    for (const auto & [index, _] : secret_arguments.masked_arguments)
-        mark(index);
-    for (const auto & [index, _] : secret_arguments.replaced_arguments)
-        mark(index);
+        if (secret_arguments.isSecretArgument(i) && children[i]->column && !children[i]->is_masked_secret)
+            const_cast<ActionsDAG::Node *>(children[i])->is_masked_secret = true;
+    }
 }
 
 PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::visitFunction(const QueryTreeNodePtr & node)
@@ -1270,18 +1274,18 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
     if (function_node.getFunctionName() == "__aliasMarker")
     {
         const auto & function_arguments = function_node.getArguments().getNodes();
-        if (function_arguments.size() != 2)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 arguments");
-
-        const auto * alias_id_node = function_arguments.at(1)->as<ConstantNode>();
-        if (!alias_id_node || !isString(alias_id_node->getResultType()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker is internal and should not be used directly");
-
-        const auto & alias_id = alias_id_node->getValue().safeGet<String>();
-        if (alias_id.empty())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker is internal and should not be used directly");
+        if (function_arguments.size() != 2 && function_arguments.size() != 3)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 or 3 arguments");
 
         auto [child_name, levels] = visitImpl(function_arguments.at(0));
+
+        /// An intermediate pending marker and a hand-written marker without a string id resolve to their payload.
+        String alias_id;
+        if (function_arguments.size() == 2)
+            alias_id = tryExtractAliasMarkerId(function_arguments.at(1));
+        if (alias_id.empty())
+            alias_id = child_name;
+
         if (alias_id == child_name)
             return {child_name, levels};
 

@@ -6,6 +6,9 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnsDateTime.h>
 #include <Common/DateLUTImpl.h>
+#include <Common/DateLUT.h>
+#include <Core/DecimalFunctions.h>
+#include <base/arithmeticOverflow.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <Common/logger_useful.h>
@@ -18,6 +21,7 @@
 #include <fmt/ranges.h>
 
 #include <Interpreters/ExpressionActions.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFileIterator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
@@ -29,6 +33,37 @@ namespace DB::ErrorCodes
 {
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int LOGICAL_ERROR;
+}
+
+namespace
+{
+
+/// Avro does not map timestamp-nanos to DateTime64, so identity partition values for
+/// Iceberg `timestamp_ns` / `timestamptz_ns` (and similarly `Time64`) arrive as Int64.
+/// `KeyCondition` compares DateTime64/Time64 predicates as DecimalField with a scale,
+/// so wrap the raw ticks before `mayBeTrueInRange`. Calendar transforms stay Int64.
+void wrapIntegerPartitionValuesAsDateTime64(Row & partition_values, const DataTypes & data_types)
+{
+    const size_t size = std::min(partition_values.size(), data_types.size());
+    for (size_t i = 0; i < size; ++i)
+    {
+        auto & field = partition_values[i];
+        if (field.isNull() || field.getType() != Field::Types::Int64)
+            continue;
+
+        auto type = removeNullable(data_types[i]);
+        WhichDataType which(type);
+        if (which.isDateTime64())
+        {
+            field = DecimalField<DateTime64>(DateTime64(field.safeGet<Int64>()), getDecimalScale(*type));
+        }
+        else if (which.isTime64())
+        {
+            field = DecimalField<Time64>(Time64(field.safeGet<Int64>()), getDecimalScale(*type));
+        }
+    }
+}
+
 }
 
 namespace DB::Iceberg
@@ -65,7 +100,16 @@ DB::ASTPtr getASTFromTransform(const String & transform_name_src, const String &
     return makeASTFunction(transform_and_argument->transform_name, make_intrusive<ASTIdentifier>(column_name));
 }
 
-std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManifest(const DB::ActionsDAG * source_dag, std::vector<Int32> & used_columns_in_filter) const
+namespace
+{
+    constexpr const char * row_id_column = "_row_id";
+    constexpr const char * last_sequence_number_column = "_last_updated_sequence_number";
+}
+
+std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManifest(
+    const DB::ActionsDAG * source_dag,
+    std::vector<Int32> & used_columns_in_filter,
+    std::unordered_map<Int32, DB::NameAndTypePair> & row_lineage_columns_in_filter) const
 {
     const auto & inputs = source_dag->getInputs();
 
@@ -74,6 +118,14 @@ std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManife
         if (input->type == ActionsDAG::ActionType::INPUT)
         {
             std::string input_name = input->result_name;
+            if (input_name == row_id_column || input_name == last_sequence_number_column)
+            {
+                const Int32 field_id = input_name == row_id_column ? row_id_field_id : last_updated_sequence_number_field_id;
+                used_columns_in_filter.push_back(field_id);
+                row_lineage_columns_in_filter.emplace(field_id, DB::NameAndTypePair(input_name, input->result_type));
+                continue;
+            }
+
             std::optional<Int32> input_id = schema_processor.tryGetColumnIDByName(current_schema_id, input_name);
             if (input_id)
                 used_columns_in_filter.push_back(*input_id);
@@ -83,6 +135,13 @@ std::unique_ptr<DB::ActionsDAG> ManifestFilesPruner::transformFilterDagForManife
     ActionsDAG dag_with_renames;
     for (const auto column_id : used_columns_in_filter)
     {
+        if (auto lineage_column = row_lineage_columns_in_filter.find(column_id); lineage_column != row_lineage_columns_in_filter.end())
+        {
+            const auto * node = &dag_with_renames.addInput(lineage_column->second.name, lineage_column->second.type);
+            dag_with_renames.getOutputs().push_back(node);
+            continue;
+        }
+
         auto column = schema_processor.tryGetFieldCharacteristics(current_schema_id, column_id);
 
         /// Columns which we dropped and don't exist in current schema
@@ -124,12 +183,13 @@ ManifestFilesPruner::ManifestFilesPruner(
 
     std::unique_ptr<ActionsDAG> transformed_dag;
     std::vector<Int32> used_columns_in_filter;
-    transformed_dag = transformFilterDagForManifest(filter_dag, used_columns_in_filter);
+    transformed_dag = transformFilterDagForManifest(filter_dag, used_columns_in_filter, row_lineage_columns);
     chassert(transformed_dag != nullptr);
 
     if (manifest_file.hasPartitionKey())
     {
         partition_key = &manifest_file.getPartitionKeyDescription();
+        partition_key_spec_positions = manifest_file.getPartitionKeySpecPositions();
         ActionsDAGWithInversionPushDown inverted_dag(transformed_dag->getOutputs().front(), context, /* boolean_context */ true);
         partition_key_condition.emplace(
             inverted_dag, context, partition_key->column_names, partition_key->expression, true /* single_point */);
@@ -137,11 +197,20 @@ ManifestFilesPruner::ManifestFilesPruner(
 
     for (Int32 used_column_id : used_columns_in_filter)
     {
-        auto name_and_type = schema_processor.tryGetFieldCharacteristics(initial_schema_id, used_column_id);
-        if (!name_and_type.has_value())
-            continue;
+        std::optional<NameAndTypePair> name_and_type;
+        if (auto lineage_column = row_lineage_columns.find(used_column_id); lineage_column != row_lineage_columns.end())
+        {
+            name_and_type = lineage_column->second;
+        }
+        else
+        {
+            name_and_type = schema_processor.tryGetFieldCharacteristics(initial_schema_id, used_column_id);
+            if (!name_and_type.has_value())
+                continue;
 
-        name_and_type->name = DB::backQuote(DB::toString(used_column_id));
+            min_max_column_types.emplace(used_column_id, name_and_type->type);
+            name_and_type->name = DB::backQuote(DB::toString(used_column_id));
+        }
 
         ExpressionActionsPtr expression
             = std::make_shared<ExpressionActions>(ActionsDAG({name_and_type.value()}), ExpressionActionsSettings(context));
@@ -194,13 +263,198 @@ Field decodePartitionDecimalByType(const String & bytes, const IDataType & type)
 
 }
 
+namespace
+{
+
+enum class PartitionTransformKind : uint8_t
+{
+    Day,
+    Month,
+    Year,
+    Hour,
+    NotInvertible,
+};
+
+PartitionTransformKind parsePartitionTransformKind(const String & transform_name_src)
+{
+    const String transform_name = Poco::toLower(transform_name_src);
+
+    if (transform_name == "day" || transform_name == "days" || transform_name == "date" || transform_name == "dates")
+        return PartitionTransformKind::Day;
+    if (transform_name == "month" || transform_name == "months")
+        return PartitionTransformKind::Month;
+    if (transform_name == "year" || transform_name == "years")
+        return PartitionTransformKind::Year;
+    if (transform_name == "hour" || transform_name == "hours")
+        return PartitionTransformKind::Hour;
+    return PartitionTransformKind::NotInvertible;
+}
+
+struct Interval
+{
+    Int64 first;
+    Int64 past_last;
+};
+
+std::optional<Interval> unitInterval(Int64 value)
+{
+    Int64 past_last = 0;
+    if (common::addOverflow(value, Int64{1}, past_last))
+        return {};
+    return Interval{value, past_last};
+}
+
+std::optional<Interval> refineInterval(std::optional<Interval> interval, Int64 factor)
+{
+    Int64 first = 0;
+    Int64 past_last = 0;
+    if (!interval || common::mulOverflow(interval->first, factor, first) || common::mulOverflow(interval->past_last, factor, past_last))
+        return {};
+    return Interval{first, past_last};
+}
+
+std::optional<Range> closedRange(std::optional<Interval> interval, std::optional<UInt32> decimal_scale)
+{
+    Int64 last = 0;
+    if (!interval || common::subOverflow(interval->past_last, Int64{1}, last))
+        return {};
+
+    if (decimal_scale)
+        return Range(
+            DecimalField<Decimal64>(interval->first, *decimal_scale), true, DecimalField<Decimal64>(last, *decimal_scale), true);
+    return Range(interval->first, true, last, true);
+}
+
+std::optional<Interval> dayIntervalOfMonthNum(Int64 month)
+{
+    auto months = unitInterval(month);
+    if (!months)
+        return {};
+
+    const auto & utc = DateLUT::instance("UTC");
+    const auto epoch = ExtendedDayNum(0);
+    const auto first = utc.addMonths(epoch, months->first);
+    const auto past_last = utc.addMonths(epoch, months->past_last);
+    if (utc.toMonthNumSinceEpoch(first) != months->first || utc.toMonthNumSinceEpoch(past_last) != months->past_last)
+        return {};
+
+    return Interval{Int64{first}, Int64{past_last}};
+}
+
+std::optional<Interval> dayIntervalOfYearNum(Int64 year)
+{
+    auto years = unitInterval(year);
+    if (!years)
+        return {};
+
+    const auto & utc = DateLUT::instance("UTC");
+    const auto epoch = ExtendedDayNum(0);
+    const auto first = utc.addYears(epoch, years->first);
+    const auto past_last = utc.addYears(epoch, years->past_last);
+    if (utc.toYearSinceEpoch(first) != years->first || utc.toYearSinceEpoch(past_last) != years->past_last)
+        return {};
+
+    return Interval{Int64{first}, Int64{past_last}};
+}
+
+std::optional<Interval> dayIntervalOfPartitionValue(PartitionTransformKind kind, Int64 value)
+{
+    switch (kind)
+    {
+        case PartitionTransformKind::Day:
+            return unitInterval(value);
+        case PartitionTransformKind::Month:
+            return dayIntervalOfMonthNum(value);
+        case PartitionTransformKind::Year:
+            return dayIntervalOfYearNum(value);
+        case PartitionTransformKind::Hour:
+        case PartitionTransformKind::NotInvertible:
+            return {};
+    }
+    UNREACHABLE();
+}
+
+std::optional<Interval> secondIntervalOfPartitionValue(PartitionTransformKind kind, Int64 value)
+{
+    static constexpr Int64 seconds_per_hour = 3600;
+    static constexpr Int64 seconds_per_day = 86400;
+
+    switch (kind)
+    {
+        case PartitionTransformKind::Hour:
+            return refineInterval(unitInterval(value), seconds_per_hour);
+        case PartitionTransformKind::Day:
+        case PartitionTransformKind::Month:
+        case PartitionTransformKind::Year:
+            return refineInterval(dayIntervalOfPartitionValue(kind, value), seconds_per_day);
+        case PartitionTransformKind::NotInvertible:
+            return {};
+    }
+    UNREACHABLE();
+}
+
+std::optional<Int64> partitionValueAsInt64(const Field & partition_value)
+{
+    if (partition_value.getType() == Field::Types::Int64)
+        return partition_value.safeGet<Int64>();
+
+    if (partition_value.getType() == Field::Types::UInt64)
+    {
+        const UInt64 value = partition_value.safeGet<UInt64>();
+        if (value <= static_cast<UInt64>(std::numeric_limits<Int64>::max()))
+            return static_cast<Int64>(value);
+    }
+
+    return {};
+}
+
+std::optional<Range> rangeOfPartitionValue(const String & transform_name, const Field & partition_value, const IDataType & source_type)
+{
+    const auto value = partitionValueAsInt64(partition_value);
+    if (!value)
+        return {};
+
+    const PartitionTransformKind kind = parsePartitionTransformKind(transform_name);
+    const WhichDataType which(source_type);
+
+    if (which.isDateOrDate32())
+        return closedRange(dayIntervalOfPartitionValue(kind, *value), std::nullopt);
+
+    if (which.isDateTime())
+        return closedRange(secondIntervalOfPartitionValue(kind, *value), std::nullopt);
+
+    if (which.isDateTime64())
+    {
+        const UInt32 scale = getDecimalScale(source_type);
+        return closedRange(
+            refineInterval(secondIntervalOfPartitionValue(kind, *value), DecimalUtils::scaleMultiplier<Int64>(scale)), scale);
+    }
+
+    return {};
+}
+
+}
+
 PruningReturnStatus ManifestFilesPruner::canBePruned(
     const ProcessedManifestFileEntryPtr & entry, const std::unordered_map<Int32, DB::Range> & entry_hyperrectangles) const
 {
+    const auto & partition_value = entry->parsed_entry->partition_key_value;
+
     if (partition_key_condition.has_value())
     {
-        const auto & partition_value = entry->parsed_entry->partition_key_value;
-        std::vector<FieldRef> index_value(partition_value.begin(), partition_value.end());
+        /// Project: the Avro tuple has one entry per spec field, but the key only contains the
+        /// fields at the positions recorded in `partition_key_spec_positions`.  Pick exactly those.
+        Row wrapped_partition_value;
+        wrapped_partition_value.reserve(partition_key_spec_positions.size());
+        for (size_t pos : partition_key_spec_positions)
+        {
+            if (pos >= partition_value.size())
+                return PruningReturnStatus::NOT_PRUNED; /// fail closed — cannot prune without the value
+            wrapped_partition_value.push_back(partition_value[pos]);
+        }
+        wrapIntegerPartitionValuesAsDateTime64(wrapped_partition_value, partition_key->data_types);
+
+        std::vector<FieldRef> index_value(wrapped_partition_value.begin(), wrapped_partition_value.end());
         for (size_t i = 0; i < index_value.size(); ++i)
         {
             auto & field = index_value[i];
@@ -215,7 +469,7 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
         }
 
         bool can_be_true = partition_key_condition->mayBeTrueInRange(
-            partition_value.size(), index_value.data(), index_value.data(), partition_key->data_types);
+            index_value.size(), index_value.data(), index_value.data(), partition_key->data_types);
 
         if (!can_be_true)
         {
@@ -225,23 +479,49 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
 
     for (const auto & [column_id, key_condition] : min_max_key_conditions)
     {
-        std::optional<NameAndTypePair> name_and_type = schema_processor.tryGetFieldCharacteristics(initial_schema_id, column_id);
+        DataTypePtr column_type;
+        bool has_no_nulls = true;
 
-        /// There is no such column in this manifest file
-        if (!name_and_type.has_value())
+        if (auto lineage_column = row_lineage_columns.find(column_id); lineage_column != row_lineage_columns.end())
         {
-            continue;
+            column_type = lineage_column->second.type;
+        }
+        else
+        {
+            /// There is no such column in this manifest file
+            auto type_it = min_max_column_types.find(column_id);
+            if (type_it == min_max_column_types.end())
+                continue;
+            column_type = type_it->second;
+
+            auto info_it = entry->parsed_entry->columns_infos.find(column_id);
+            has_no_nulls = info_it != entry->parsed_entry->columns_infos.end() && info_it->second.nulls_count.has_value()
+                && *info_it->second.nulls_count == 0;
+        }
+
+        const DataTypes data_types{column_type};
+
+        if (entry->common_partition_specification)
+        {
+            for (const auto & partition_field : *entry->common_partition_specification)
+            {
+                if (partition_field.isMultiArg() || partition_field.source_ids[0] != column_id || partition_field.tuple_index < 0
+                    || static_cast<size_t>(partition_field.tuple_index) >= partition_value.size())
+                    continue;
+
+                auto range = rangeOfPartitionValue(
+                    partition_field.transform_name,
+                    partition_value[partition_field.tuple_index],
+                    *removeNullable(column_type));
+
+                if (range && !key_condition.mayBeTrueInRange(1, &range->left, &range->right, data_types))
+                    return PruningReturnStatus::PARTITION_PRUNED;
+            }
         }
 
         auto rect_it = entry_hyperrectangles.find(column_id);
-        if (rect_it == entry_hyperrectangles.end())
-            continue;
-
-        auto info_it = entry->parsed_entry->columns_infos.find(column_id);
-        bool has_no_nulls = info_it != entry->parsed_entry->columns_infos.end() && info_it->second.nulls_count.has_value()
-            && *info_it->second.nulls_count == 0;
-
-        if (has_no_nulls && !key_condition.mayBeTrueInRange(1, &rect_it->second.left, &rect_it->second.right, {name_and_type->type}))
+        if (has_no_nulls && rect_it != entry_hyperrectangles.end()
+            && !key_condition.mayBeTrueInRange(1, &rect_it->second.left, &rect_it->second.right, data_types))
         {
             return PruningReturnStatus::MIN_MAX_INDEX_PRUNED;
         }

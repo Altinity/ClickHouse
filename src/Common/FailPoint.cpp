@@ -80,6 +80,7 @@ static struct InitFiu
     ONCE(rmt_lightweight_update_sleep_after_block_allocation) \
     ONCE(rmt_merge_task_sleep_in_prepare) \
     ONCE(merge_tree_refresh_parts_throw_once) \
+    REGULAR(patch_part_index_write_empty) \
     ONCE(s3_read_buffer_throw_expired_token) \
     ONCE(s3_send_request_throw_expired_token) \
     REGULAR(s3_read_inject_etag_mismatch) \
@@ -166,6 +167,7 @@ static struct InitFiu
     PAUSEABLE_ONCE(kafka2_remove_zk_before_get_children) \
     PAUSEABLE_ONCE(kafka2_remove_zk_before_final_multi) \
     PAUSEABLE_ONCE(keeper_map_delete_pause_before_multi) \
+    PAUSEABLE_ONCE(paimon_incremental_read_pause_before_is_active_remove) \
     PAUSEABLE(dummy_pausable_failpoint) \
     PAUSEABLE(paimon_incremental_read_pause_after_watermark_commit) \
     ONCE(execute_query_calling_empty_set_result_func_on_exception) \
@@ -199,6 +201,7 @@ static struct InitFiu
     REGULAR(refresh_mv_skip_execution) \
     ONCE(column_aggregate_function_ensureOwnership_exception) \
     ONCE(space_saving_copy_arena_throw) \
+    ONCE(adaptive_aggregation_drain_create_states_throw) \
     REGULAR(keepermap_fail_drop_data) \
     PAUSEABLE_ONCE(keepermap_create_pause_before_drop_lock_version) \
     REGULAR(keeper_fault_on_watch_request) \
@@ -208,6 +211,7 @@ static struct InitFiu
     REGULAR(claim_inject_stale_part_dir) \
     PAUSEABLE(infinite_sleep) \
     PAUSEABLE(async_insert_flush_pause_in_executor) \
+    PAUSEABLE(async_insert_pause_before_schedule) \
     PAUSEABLE(system_replicas_schedule_requests_pause) \
     PAUSEABLE(stop_moving_part_before_swap_with_active) \
     REGULAR(replicated_merge_tree_all_replicas_stale) \
@@ -244,6 +248,7 @@ static struct InitFiu
     REGULAR(slowdown_skip_index_read_result_build) \
     ONCE(iceberg_writes_cleanup) \
     REGULAR(iceberg_slow_manifest_read) \
+    PAUSEABLE_ONCE(iceberg_drop_partition_pause_after_discovery) \
     ONCE(iceberg_alter_catalog_update_schema_fail) \
     ONCE(iceberg_alter_catalog_commit_reported_as_failed) \
     REGULAR(storage_cluster_read_sleep) \
@@ -299,6 +304,8 @@ static struct InitFiu
     REGULAR(rmt_merge_selecting_task_no_free_threads) \
     REGULAR(rmt_merge_selecting_task_max_part_size) \
     REGULAR(merge_tree_load_statistics_throw) \
+    REGULAR(merge_tree_load_outdated_parts_retryable_error) \
+    PAUSEABLE(merge_tree_load_outdated_parts_pause) \
     PAUSEABLE(smt_mutate_task_pause_in_prepare) \
     PAUSEABLE(smt_merge_selecting_task_pause_when_scheduled) \
     REGULAR(smt_merge_selecting_task_reach_memory_limit) \
@@ -360,7 +367,9 @@ static struct InitFiu
     PAUSEABLE(keeper_changelog_readahead_serve_wait) \
     PAUSEABLE(keeper_changelog_readahead_park_armed) \
     PAUSEABLE(keeper_changelog_readahead_pre_drain) \
+    PAUSEABLE(object_storage_source_pause_before_virtual_columns) \
     REGULAR(keeper_changelog_readahead_fill_exception) \
+    ONCE(keeper_changelog_preallocate_no_space) \
     REGULAR(distributed_plan_record_failure_while_starting_tasks) \
     ONCE(zk_send_thread_request_window_throw) \
     ONCE(zk_send_thread_operations_insert_throw) \
@@ -380,7 +389,9 @@ static struct InitFiu
     REGULAR(cas_relink_sender_omit_pool_cookie) \
     REGULAR(cas_relink_receiver_drop_forced_disk) \
     ONCE(cas_gc_scheduler_fail_before_heartbeat_worker_start) \
-    ONCE(cas_gc_scheduler_fail_before_worker_start)
+    ONCE(cas_gc_scheduler_fail_before_worker_start) \
+    REGULAR(aggregate_function_state_transfer_throw) \
+    REGULAR(aggregate_function_state_transfer_throw_after_child)
 
 namespace FailPoints
 {

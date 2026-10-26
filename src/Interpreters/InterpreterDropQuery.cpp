@@ -15,6 +15,7 @@
 #include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/StorageMaterializedView.h>
+#include <Storages/StorageProxy.h>
 #include <Common/NamedCollections/NamedCollectionsFactory.h>
 #include <Common/escapeForFileName.h>
 #include <Common/quoteString.h>
@@ -98,6 +99,9 @@ BlockIO InterpreterDropQuery::execute()
 BlockIO InterpreterDropQuery::executeSingleDropQuery(const ASTPtr & drop_query_ptr)
 {
     auto & drop = drop_query_ptr->as<ASTDropQuery &>();
+    if (!drop.cluster.empty() && (drop.table || drop.database))
+        checkDatabaseSupportsOnClusterDDL(
+            DatabaseCatalog::instance().tryGetDatabase(getContext()->resolveDatabase(drop.getDatabase())));
     if (!drop.cluster.empty() && drop.table && !drop.if_empty && !maybeRemoveOnCluster(current_query_ptr, getContext()))
     {
         DDLQueryOnClusterParams params;
@@ -330,7 +334,9 @@ BlockIO InterpreterDropQuery::executeToTableImpl(const ContextPtr & context_, AS
             TableExclusiveLockHolder table_excl_lock;
             /// We don't need any lock for ReplicatedMergeTree and for simple MergeTree
             /// For the rest of tables types exclusive lock is needed
-            if (!std::dynamic_pointer_cast<MergeTreeData>(table))
+            /// An `Alias` runs the truncate on its target, so the exemption follows the target:
+            /// `isMergeTree()` resolves it, and is false while it is missing or not loaded yet.
+            if (!castStorage<MergeTreeData>(table, DeferredTable::Load) && !table->isMergeTree())
                 table_excl_lock = table->lockExclusively(context_->getCurrentQueryId(), context_->getSettingsRef()[Setting::lock_acquire_timeout]);
 
             auto metadata_snapshot = table->getInMemoryMetadataPtr(context_, false);
@@ -356,6 +362,8 @@ BlockIO InterpreterDropQuery::executeToTableImpl(const ContextPtr & context_, AS
             bool check_loading_deps = !check_ref_deps && getContext()->getSettingsRef()[Setting::check_table_dependencies];
             DatabaseCatalog::instance().checkTableCanBeRemovedOrRenamed(table_id, check_ref_deps, check_loading_deps, is_drop_or_detach_database);
 
+            table->prepareForDrop(context_);
+
             table->flushAndShutdown(true);
 
             TableExclusiveLockHolder table_lock;
@@ -364,7 +372,7 @@ BlockIO InterpreterDropQuery::executeToTableImpl(const ContextPtr & context_, AS
 
             DatabaseCatalog::instance().removeDependencies(table_id, check_ref_deps, check_loading_deps, is_drop_or_detach_database);
             NamedCollectionFactory::instance().removeDependencies(table_id);
-            database->dropTable(context_, table_id.table_name, query.sync);
+            database->dropTable(context_, table_id.table_name, query.sync, query.if_exists);
 
             /// We have to clear mmapio cache when dropping table from Ordinary database
             /// to avoid reading old data if new table with the same name is created

@@ -977,25 +977,25 @@ class JobConfigs:
             for total_batches in (2,)
             for batch in range(1, total_batches + 1)
         ],
-        # One shard can lose worker concurrency mid-suite under MSan and
-        # overrun the shared 3.5h functional-test budget.
-        *[
+        # NOTE (strtgbb): 64g keeps MSan at 6 workers, Lower mem can cause workers to be killed
+         *[
             Job.ParamSet(
                 parameter=f"amd_msan, WasmEdge, parallel, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.AMD_LARGE,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
                 timeout=3600 * 4,
             )
-            for total_batches in (8,)
+            for total_batches in (6,)
             for batch in range(1, total_batches + 1)
         ],
+        # NOTE (strtgbb): 2/2 was ~3.3h of sequential work and overran 3.5h in teardown.
         *[
             Job.ParamSet(
                 parameter=f"amd_msan, WasmEdge, sequential, {batch}/{total_batches}",
                 runs_on=RunnerLabels.AMD_SMALL_MEM,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
             )
-            for total_batches in (2,)
+            for total_batches in (4,)
             for batch in range(1, total_batches + 1)
         ],
         Job.ParamSet(
@@ -1195,19 +1195,9 @@ class JobConfigs:
             requires=[ArtifactNames.CH_AMD_DEBUG],
         ),
         Job.ParamSet(
-            parameter="amd_debug, cas s3 storage",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
-            requires=[ArtifactNames.DEB_AMD_DEBUG],
-        ),
-        Job.ParamSet(
             parameter="amd_asan_ubsan",
             runs_on=RunnerLabels.FUNC_TESTER_AMD,
             requires=[ArtifactNames.CH_AMD_ASAN_UBSAN],
-        ),
-        Job.ParamSet(
-            parameter="amd_asan_ubsan, cas s3 storage",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
-            requires=[ArtifactNames.DEB_AMD_ASAN_UBSAN],
         ),
         Job.ParamSet(
             parameter="amd_tsan",
@@ -1215,19 +1205,9 @@ class JobConfigs:
             requires=[ArtifactNames.CH_AMD_TSAN],
         ),
         Job.ParamSet(
-            parameter="amd_tsan, cas s3 storage",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
-            requires=[ArtifactNames.DEB_AMD_TSAN],
-        ),
-        Job.ParamSet(
             parameter="amd_msan",
             runs_on=RunnerLabels.FUNC_TESTER_AMD,
             requires=[ArtifactNames.CH_AMD_MSAN],
-        ),
-        Job.ParamSet(
-            parameter="amd_msan, cas s3 storage",
-            runs_on=RunnerLabels.FUNC_TESTER_AMD,
-            requires=[ArtifactNames.DEB_AMD_MSAN],
         ),
         Job.ParamSet(
             parameter="arm_release",

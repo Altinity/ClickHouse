@@ -37,6 +37,7 @@
 #include <Parsers/ASTColumnDeclaration.h>
 #include <Parsers/ASTColumnsMatcher.h>
 #include <Parsers/ASTCreateQuery.h>
+#include <Parsers/ASTDataType.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTInsertQuery.h>
@@ -50,7 +51,10 @@
 #include <Storages/MaterializedView/RefreshTask.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/StorageFactory.h>
+#include <Storages/StorageProxy.h>
 #include <Storages/StorageInMemoryMetadata.h>
+#include <Storages/StorageMaterializedView.h>
+#include <Storages/TTLDescription.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/TimeSeries/normalizeTimeSeriesDefinition.h>
 #include <Storages/WindowView/StorageWindowView.h>
@@ -120,6 +124,7 @@ namespace DB
 namespace Setting
 {
     extern const SettingsBool allow_experimental_analyzer;
+    extern const SettingsBool allow_suspicious_ttl_expressions;
     extern const SettingsBool allow_experimental_database_materialized_postgresql;
     extern const SettingsBool enable_full_text_index;
     extern const SettingsBool allow_statistics;
@@ -132,6 +137,7 @@ namespace Setting
     extern const SettingsUInt64 database_replicated_allow_explicit_uuid;
     extern const SettingsBool database_replicated_allow_heavy_create;
     extern const SettingsBool database_replicated_allow_only_replicated_engine;
+    extern const SettingsBool datalake_ignore_unsupported_table_properties;
     extern const SettingsBool data_type_default_nullable;
     extern const SettingsSQLSecurityType default_materialized_view_sql_security;
     extern const SettingsSQLSecurityType default_normal_view_sql_security;
@@ -831,7 +837,10 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
     {
         String as_database_name = getContext()->resolveDatabase(create.as_database);
         getContext()->checkAccess(AccessType::SHOW_COLUMNS, as_database_name, create.as_table);
-        StoragePtr as_storage = DatabaseCatalog::instance().getTable({as_database_name, create.as_table}, getContext());
+        /// A lazily loaded source reports only its columns, so the indices, projections, constraints
+        /// and comment copied below would silently come out empty.
+        StoragePtr as_storage = resolveStorageProxyLoading(
+            DatabaseCatalog::instance().getTable({as_database_name, create.as_table}, getContext()));
 
         /// as_storage->getColumns() and setEngine(...) must be called under structure lock of other_table for CREATE ... AS other_table.
         as_storage_lock = as_storage->lockForShare(getContext()->getCurrentQueryId(), getContext()->getSettingsRef()[Setting::lock_acquire_timeout]);
@@ -841,9 +850,10 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
         if (!create.comment && !as_storage_metadata->comment.empty())
             create.set(create.comment, make_intrusive<ASTLiteral>(as_storage_metadata->comment));
 
-        /// Secondary indices and projections make sense only for MergeTree family of storage engines.
-        /// We should not copy them for other storages.
-        if (create.storage && endsWith(create.storage->engine->name, "MergeTree"))
+        /// Retain source properties for `DataLakeCatalog` until its validation either rejects or explicitly omits them.
+        const auto target_database = DatabaseCatalog::instance().tryGetDatabase(getContext()->resolveDatabase(create.getDatabase()));
+        const bool is_datalake_catalog = target_database && target_database->isDatalakeCatalog();
+        if (is_datalake_catalog || (create.storage && create.storage->engine && endsWith(create.storage->engine->name, "MergeTree")))
         {
             /// Copy secondary indexes but only the ones which were not implicitly created. These will be re-generated later again and need
             /// not be copied.
@@ -857,7 +867,7 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
 
             /// CREATE TABLE AS should copy PRIMARY KEY, ORDER BY, and similar clauses.
             /// Note: only supports the source table engine is using the new syntax.
-            if (const auto * merge_tree_data = dynamic_cast<const MergeTreeData *>(as_storage.get()))
+            if (const auto * merge_tree_data = castStorage<MergeTreeData>(as_storage, DeferredTable::Load).get(); merge_tree_data && !is_datalake_catalog)
             {
                 if (merge_tree_data->format_version >= MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING)
                 {
@@ -1314,6 +1324,8 @@ namespace
         {
             *ptr = nullptr;
         });
+        /// children keeps the old nodes, and hasSecretParts reads them
+        storage.children.clear();
 
         auto engine_ast = make_intrusive<ASTFunction>();
         engine_ast->name = "Null";
@@ -1460,11 +1472,23 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
         String as_database_name = getContext()->resolveDatabase(create.as_database);
         String as_table_name = create.as_table;
 
+        /// check SHOW COLUMNS first, else the error tells a user who cannot see the table that it
+        /// holds credentials
+        getContext()->checkAccess(AccessType::SHOW_COLUMNS, as_database_name, as_table_name);
+
         ASTPtr as_create_ptr = DatabaseCatalog::instance().getDatabase(as_database_name)->getCreateTableQuery(as_table_name, getContext());
 
         const auto & as_create = as_create_ptr->as<ASTCreateQuery &>();
 
         const String qualified_name = backQuoteIfNeed(as_database_name) + "." + backQuoteIfNeed(as_table_name);
+
+        /// SHOW CREATE TABLE masks credentials, so a copy of them gives the source data to a user who
+        /// cannot SELECT it. SHOW COLUMNS already shows the rest
+        auto check_access_to_inherited_definition = [&](const IAST & definition)
+        {
+            if (definition.hasSecretParts())
+                getContext()->checkAccess(AccessType::SELECT, as_database_name, as_table_name);
+        };
 
         if (as_create.is_ordinary_view)
             throw Exception(ErrorCodes::INCORRECT_QUERY, "Cannot CREATE a table AS {}, it is a View", qualified_name);
@@ -1494,18 +1518,72 @@ void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
             /// clauses were specified for the new table; otherwise keep the explicit storage definition.
             if (!create.storage)
             {
+                check_access_to_inherited_definition(*as_create.as_table_function);
                 create.set(create.as_table_function, as_create.as_table_function->ptr());
                 return;
             }
         }
-        else if (as_create.storage)
+        else if (as_create.storage && as_create.storage->engine)
         {
             storage_def = boost::static_pointer_cast<ASTStorage>(as_create.storage->ptr());
             create.is_time_series_table = as_create.is_time_series_table;
+
+            /// normalizeTimeSeriesDefinition copies the settings and the inner engines of the source,
+            /// and this query inherits each one it does not give itself
+            if (as_create.is_time_series_table && as_create.storage->settings
+                && !(create.storage && create.storage->settings))
+                check_access_to_inherited_definition(*as_create.storage->settings);
+            if (as_create.is_time_series_table && as_create.targets)
+                for (const auto & target : as_create.targets->targets)
+                    if (target.inner_engine && !create.getTargetInnerEngine(target.kind))
+                        check_access_to_inherited_definition(*target.inner_engine);
+        }
+        else if (as_create.storage)
+        {
+            /// A `DataLakeCatalog` that assigns table locations itself shows its tables without `ENGINE`.
+            /// Only a `DataLakeCatalog` target can be created from such a table: it builds its own storage
+            /// and copies the keys from the source metadata.
+            const auto target_database = DatabaseCatalog::instance().tryGetDatabase(getContext()->resolveDatabase(create.getDatabase()));
+            if (!target_database || !target_database->isDatalakeCatalog())
+                throw Exception(
+                    ErrorCodes::INCORRECT_QUERY,
+                    "Cannot CREATE a table AS {}, it has no table engine. Specify ENGINE explicitly",
+                    qualified_name);
+            return;
         }
         else
         {
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot set engine, it's a bug.");
+        }
+
+        if (storage_def)
+        {
+            /// check what the server stores: settings in this query replace the source settings, and
+            /// Null can replace an external engine
+            auto inherited = boost::static_pointer_cast<ASTStorage>(storage_def->clone());
+            if (create.storage)
+            {
+                /// inheritStorageFromSource keeps the clauses this query gives, so drop them here too
+                if (create.storage->partition_by)
+                    inherited->reset(inherited->partition_by);
+                if (create.storage->primary_key)
+                    inherited->reset(inherited->primary_key);
+                if (create.storage->order_by)
+                    inherited->reset(inherited->order_by);
+                if (create.storage->sample_by)
+                    inherited->reset(inherited->sample_by);
+                if (create.storage->ttl_table)
+                    inherited->reset(inherited->ttl_table);
+                if (create.storage->unique_key)
+                    inherited->reset(inherited->unique_key);
+                if (inherited->settings && create.storage->settings)
+                    for (const auto & change : create.storage->settings->changes)
+                        inherited->settings->changes.removeSetting(change.name);
+            }
+            replaceExternalEngineWithNullIfNeeded(
+                *inherited, getContext()->getSettingsRef()[Setting::restore_replace_external_engines_to_null]);
+
+            check_access_to_inherited_definition(*inherited);
         }
     }
 
@@ -1666,6 +1744,31 @@ bool isReplicated(const ASTStorage & storage)
         return false;
     const auto & storage_name = storage.engine->name;
     return storage_name.starts_with("Replicated") || storage_name.starts_with("Shared");
+}
+
+const char * findUnsupportedDatalakeStorageClause(const ASTStorage & storage, bool allow_settings)
+{
+    if (storage.primary_key)
+        return "PRIMARY KEY";
+    if (storage.sample_by)
+        return "SAMPLE BY";
+    if (storage.ttl_table)
+        return "TTL";
+    if (storage.unique_key)
+        return "UNIQUE KEY";
+    if (!allow_settings && storage.settings)
+        return "engine SETTINGS";
+    return nullptr;
+}
+
+/// The drop privilege matching the kind of an existing table.
+AccessType getDropAccessType(const IStorage & table)
+{
+    if (table.isView())
+        return AccessType::DROP_VIEW;
+    if (table.isDictionary())
+        return AccessType::DROP_DICTIONARY;
+    return AccessType::DROP_TABLE;
 }
 
 }
@@ -1904,6 +2007,12 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
     if (!UserDefinedSQLFunctionFactory::instance().empty())
         UserDefinedSQLFunctionVisitor::visit(query_ptr, getContext());
 
+    const bool engine_user_specified = create.storage && create.storage->engine;
+
+    const char * datalake_unsupported_storage_clause = nullptr;
+    if (create.storage)
+        datalake_unsupported_storage_clause = findUnsupportedDatalakeStorageClause(*create.storage, engine_user_specified);
+
     /// Set and retrieve list of columns, indices and constraints. Set table engine if needed. Rewrite query in canonical way.
     TableProperties properties = getTablePropertiesAndNormalizeCreateQuery(create, mode);
 
@@ -1976,12 +2085,146 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
 
     if (!create.cluster.empty())
     {
+        checkDatabaseSupportsOnClusterDDL(database);
         chassert(!ddl_guard);
         return executeQueryOnCluster(create);
     }
 
     if (need_add_to_database && !database)
         throw Exception(ErrorCodes::UNKNOWN_DATABASE, "Database {} does not exist", backQuoteIfNeed(database_name));
+
+    if (database && database->isDatalakeCatalog())
+    {
+        const bool ignore_unsupported_properties
+            = getContext()->getSettingsRef()[Setting::datalake_ignore_unsupported_table_properties];
+
+        if (create.is_ordinary_view || create.is_materialized_view
+            || create.is_dictionary || create.attach || create.is_clone_as
+            || create.replace_table || create.replace_view)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "DataLakeCatalog supports only plain CREATE TABLE; "
+                "views, dictionaries, ATTACH, CLONE AS, and REPLACE TABLE are not allowed");
+
+        if (engine_user_specified)
+            database->validateCreateTableEngine(*create.storage, getContext());
+
+        if (datalake_unsupported_storage_clause && !ignore_unsupported_properties)
+        {
+            if (engine_user_specified)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "DataLakeCatalog CREATE TABLE with an explicit table engine supports only "
+                    "PARTITION BY, ORDER BY, and engine SETTINGS; "
+                    "PRIMARY KEY, SAMPLE BY, TTL, and UNIQUE KEY are not supported "
+                    "(got {})", datalake_unsupported_storage_clause);
+
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "DataLakeCatalog CREATE TABLE supports only PARTITION BY and ORDER BY; "
+                "PRIMARY KEY, SAMPLE BY, TTL, UNIQUE KEY, and engine SETTINGS are not supported "
+                "(got {})", datalake_unsupported_storage_clause);
+        }
+
+        if (!ignore_unsupported_properties)
+        {
+            for (const auto & column : properties.columns)
+            {
+                if (column.default_desc.expression || column.default_desc.kind != ColumnDefaultKind::Default)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Column '{}': {} is not yet supported by DataLakeCatalog table creation",
+                        column.name, toString(column.default_desc.kind));
+
+                if (!column.comment.empty() || column.codec || column.ttl
+                    || !column.settings.empty() || column.statistics.hasExplicitStatistics())
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Column '{}': COMMENT, CODEC, TTL, STATISTICS, SETTINGS, and PRIMARY KEY "
+                        "are not supported by DataLakeCatalog table creation",
+                        column.name);
+            }
+
+            if (!properties.indices.empty() || !properties.constraints.empty() || !properties.projections.empty()
+                || (create.columns_list && (create.columns_list->primary_key || create.columns_list->primary_key_from_columns)))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "DataLakeCatalog CREATE TABLE does not support PRIMARY KEY, indices, constraints, or projections");
+        }
+
+        if (create.comment && !ignore_unsupported_properties)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Table COMMENT is not supported by DataLakeCatalog table creation "
+                "(note: CREATE TABLE ... AS inherits the comment from the source table)");
+
+        if (!ignore_unsupported_properties && !as_table_saved.empty())
+        {
+            const ASTStorage * source_storage = create.storage;
+            ASTPtr source_create_ptr;
+            if (engine_user_specified)
+            {
+                const String as_database_name = getContext()->resolveDatabase(as_database_saved);
+                source_create_ptr = DatabaseCatalog::instance().getDatabase(as_database_name)->getCreateTableQuery(as_table_saved, getContext());
+                const auto & source_create = source_create_ptr->as<ASTCreateQuery &>();
+                source_storage = source_create.is_materialized_view
+                    ? source_create.getTargetInnerEngine(ViewTarget::To)
+                    : source_create.storage;
+            }
+
+            if (source_storage)
+            {
+                if (const char * inherited_clause = findUnsupportedDatalakeStorageClause(*source_storage, /*allow_settings=*/ true))
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Source table {}.{} has {}, which a DataLakeCatalog table cannot represent; "
+                        "CREATE TABLE ... AS supports only columns, PARTITION BY, and ORDER BY",
+                        backQuoteIfNeed(getContext()->resolveDatabase(as_database_saved)),
+                        backQuoteIfNeed(as_table_saved), inherited_clause);
+            }
+        }
+
+        if (ignore_unsupported_properties)
+        {
+            /// Validate expressions before omitting properties that the destination cannot store.
+            KeyDescription primary_key;
+            const auto ttl_validation = getContext()->getSettingsRef()[Setting::allow_suspicious_ttl_expressions]
+                ? TTLValidationMode::SkipValidation : TTLValidationMode::Validate;
+            if (create.storage)
+            {
+                auto * key = create.storage->primary_key ? create.storage->primary_key : create.storage->order_by;
+                if (key)
+                    primary_key = KeyDescription::getKeyFromAST(key->ptr(), properties.columns, {}, getContext());
+                if (create.storage->sample_by)
+                    KeyDescription::getKeyFromAST(create.storage->sample_by->ptr(), properties.columns, {}, getContext());
+                if (create.storage->unique_key)
+                    KeyDescription::getKeyFromAST(create.storage->unique_key->ptr(), properties.columns, {}, getContext());
+                if (create.storage->ttl_table)
+                    TTLTableDescription::getTTLForTableFromAST(
+                        create.storage->ttl_table->ptr(), properties.columns, getContext(), primary_key, ttl_validation);
+            }
+            for (const auto & column : properties.columns)
+                if (column.ttl)
+                    TTLDescription::getTTLFromAST(column.ttl, properties.columns, getContext(), primary_key, ttl_validation);
+            properties.constraints.getExpressions(getContext(), properties.columns.getAllPhysical());
+
+            ColumnsDescription plain_columns;
+            for (const auto & column : properties.columns)
+                plain_columns.add(ColumnDescription(column.name, column.type));
+
+            properties.columns = std::move(plain_columns);
+            properties.indices = {};
+            properties.constraints = {};
+            properties.projections = {};
+
+            auto columns_list = make_intrusive<ASTColumns>();
+            columns_list->set(columns_list->columns, formatColumns(properties.columns));
+            create.set(create.columns_list, columns_list);
+            create.reset(create.comment);
+
+            if (create.storage)
+            {
+                create.storage->reset(create.storage->primary_key);
+                create.storage->reset(create.storage->sample_by);
+                create.storage->reset(create.storage->ttl_table);
+                create.storage->reset(create.storage->unique_key);
+                if (!engine_user_specified)
+                    create.storage->reset(create.storage->settings);
+            }
+        }
+    }
 
     if (create.isTemporary() && create.replace_table)
     {
@@ -2099,7 +2342,24 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
     }
 
     /// Actually creates table
-    bool created = doCreateTable(create, properties, ddl_guard, mode);
+    bool created = false;
+    try
+    {
+        created = doCreateTable(create, properties, ddl_guard, mode, engine_user_specified);
+    }
+    catch (const Exception & e)
+    {
+        if (!create.if_not_exists || e.code() != ErrorCodes::TABLE_ALREADY_EXISTS
+            || !database || !database->isDatalakeCatalog())
+            throw;
+        LOG_INFO(
+            getLogger("InterpreterCreateQuery"),
+            "CREATE TABLE IF NOT EXISTS {}.{} created nothing: {}",
+            backQuoteIfNeed(create.getDatabase()),
+            backQuoteIfNeed(create.getTable()),
+            e.message());
+        created = false;
+    }
 
     if (!created)   /// Table already exists
     {
@@ -2147,8 +2407,9 @@ void checkForUnsupportedColumns(IStorage & storage, LoadingStrictnessLevel mode,
 
     /// Re-check inferred column types only for a fresh, persisted table: the pre-construction check
     /// does not see inferred columns, and ATTACH/RESTORE, temporary tables and views/dictionaries are
-    /// not subject to this check on load.
-    if (mode <= LoadingStrictnessLevel::CREATE && !is_temporary && !storage.isView() && !storage.isDictionary())
+    /// not subject to this check on load. Data lakes are skipped because their schema may legitimately
+    /// contain `Nullable(Nothing)` (the Iceberg v3 `unknown` type).
+    if (mode <= LoadingStrictnessLevel::CREATE && !is_temporary && !storage.isView() && !storage.isDictionary() && !storage.isDataLake())
         checkAllTypesAreAllowedInTable(metadata_snapshot->getColumns().getAll());
 
     if (mode <= LoadingStrictnessLevel::CREATE && hasColumnsWithDynamicStructure(metadata_snapshot->getColumns()) && !storage.supportsColumnsWithDynamicStructure())
@@ -2212,7 +2473,7 @@ catch (...)
 
 bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
                                            const InterpreterCreateQuery::TableProperties & properties,
-                                           DDLGuardPtr & ddl_guard, LoadingStrictnessLevel mode)
+                                           DDLGuardPtr & ddl_guard, LoadingStrictnessLevel mode, bool engine_user_specified)
 {
     if (create.isTemporary())
     {
@@ -2308,6 +2569,85 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
         /// We are not checking this for secondary creates to avoid backward compatibility issues.
         if (mode <= LoadingStrictnessLevel::CREATE)
             database->checkTableNameLength(create.getTable());
+    }
+
+    auto & create_query = query_ptr->as<ASTCreateQuery &>();
+    if (database->isDatalakeCatalog() && !as_table_saved.empty())
+    {
+        String as_database_name = getContext()->resolveDatabase(as_database_saved);
+        auto source_database = DatabaseCatalog::instance().getDatabase(as_database_name);
+        ASTPtr source_partition_by;
+        ASTPtr source_order_by;
+        if (source_database->isDatalakeCatalog())
+        {
+            /// Use the same validated definition as `SHOW CREATE TABLE`, including any explicitly permitted omissions.
+            auto source_query = source_database->getCreateTableQuery(as_table_saved, getContext());
+            const auto & source_create = source_query->as<ASTCreateQuery &>();
+            if (source_create.storage)
+            {
+                source_partition_by = source_create.storage->partition_by;
+                source_order_by = source_create.storage->order_by;
+            }
+        }
+        else
+        {
+            StoragePtr as_storage = DatabaseCatalog::instance().getTable({as_database_name, as_table_saved}, getContext());
+            /// A materialized view keeps its keys in its target table.
+            if (const auto * materialized_view = as_storage->as<StorageMaterializedView>())
+                as_storage = materialized_view->getTargetTable();
+            auto as_storage_metadata = as_storage->getInMemoryMetadataPtr(getContext(), false);
+            if (as_storage_metadata->isPartitionKeyDefined() && as_storage_metadata->hasPartitionKey())
+                source_partition_by = as_storage_metadata->getPartitionKeyAST();
+            if (as_storage_metadata->isSortingKeyDefined() && as_storage_metadata->hasSortingKey())
+                source_order_by = as_storage_metadata->getSortingKeyAST();
+        }
+
+        if (engine_user_specified)
+        {
+            if (!create_query.storage->partition_by && source_partition_by)
+                create_query.storage->set(create_query.storage->partition_by, source_partition_by->clone());
+            if (!create_query.storage->order_by && source_order_by)
+                create_query.storage->set(create_query.storage->order_by, source_order_by->clone());
+        }
+        else
+        {
+            ASTPtr partition_by;
+            ASTPtr order_by;
+            if (create_query.storage)
+            {
+                if (create_query.storage->partition_by)
+                    partition_by = create_query.storage->partition_by->clone();
+                if (create_query.storage->order_by)
+                    order_by = create_query.storage->order_by->clone();
+            }
+
+            if (!partition_by && source_partition_by)
+                partition_by = source_partition_by->clone();
+            if (!order_by && source_order_by)
+                order_by = source_order_by->clone();
+
+            auto storage_ast = make_intrusive<ASTStorage>();
+            create_query.set(create_query.storage, storage_ast);
+            if (partition_by)
+                create_query.storage->set(create_query.storage->partition_by, partition_by);
+            if (order_by)
+                create_query.storage->set(create_query.storage->order_by, order_by);
+        }
+    }
+
+    if (database->isDatalakeCatalog() && !engine_user_specified)
+    {
+        if (!create_query.columns_list
+            || !create_query.columns_list->columns
+            || create_query.columns_list->columns->children.empty())
+        {
+            auto columns_declare_list = make_intrusive<ASTColumns>();
+            columns_declare_list->set(columns_declare_list->columns, formatColumns(properties.columns));
+            create_query.set(create_query.columns_list, columns_declare_list);
+        }
+
+        database->createTable(getContext(), create.getTable(), nullptr, query_ptr);
+        return true;
     }
 
     data_path = database->getTableDataPath(create);
@@ -2430,7 +2770,6 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
             is_restore_from_backup);
 
         /// If schema was inferred while storage creation, add columns description to create query.
-        auto & create_query = query_ptr->as<ASTCreateQuery &>();
         addColumnsDescriptionToCreateQueryIfNecessary(create_query, res);
         /// Add any inferred engine args if needed. For example, data format for engines File/S3/URL/etc
         if (auto * engine_args = getEngineArgsFromCreateQuery(create_query))
@@ -2441,7 +2780,7 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
 
     if (!create.attach && getContext()->getSettingsRef()[Setting::database_replicated_allow_only_replicated_engine])
     {
-        bool is_replicated_storage = typeid_cast<const StorageReplicatedMergeTree *>(res.get()) != nullptr;
+        bool is_replicated_storage = castStorage<StorageReplicatedMergeTree>(res, DeferredTable::Skip) != nullptr;
         if (!is_replicated_storage && res->storesDataOnDisk() && database && database->getEngineName() == "Replicated")
             throw Exception(ErrorCodes::UNKNOWN_STORAGE,
                             "Only tables with a Replicated engine "
@@ -2453,7 +2792,9 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
                         "ATTACH ... FROM ... query is not supported for {} table engine, "
                         "because such tables do not store any data on disk. Use CREATE instead.", res->getName());
 
-    auto * replicated_storage = typeid_cast<StorageReplicatedMergeTree *>(res.get());
+    /// `res` is the storage this query just built, and for a table function it is a proxy that
+    /// resolving would run during CREATE.
+    auto * replicated_storage = castStorage<StorageReplicatedMergeTree>(res, DeferredTable::Skip).get();
     if (replicated_storage)
     {
         const auto probability = getContext()->getSettingsRef()[Setting::create_replicated_merge_tree_fault_injection_probability];
@@ -2622,6 +2963,8 @@ BlockIO InterpreterCreateQuery::doCreateOrReplaceTable(ASTCreateQuery & create,
                         : (create.isView() ? "CREATE OR REPLACE VIEW" : "CREATE OR REPLACE TABLE"))
                     : "REPLACE TABLE"));
 
+        chassert(!database->isDatalakeCatalog());
+
         /// For a plain create the final name must not already exist (as an active table, as a dictionary, or
         /// reserved by a detached table). Check it up front, before the create-only validations below (table
         /// name length, cyclic dependencies) and before authorizing or running the populating SELECT, so that
@@ -2747,7 +3090,7 @@ BlockIO InterpreterCreateQuery::doCreateOrReplaceTable(ASTCreateQuery & create,
     {
         /// Create temporary table (random name will be generated)
         DDLGuardPtr ddl_guard;
-        [[maybe_unused]] bool done = InterpreterCreateQuery(query_ptr, create_context).doCreateTable(create, properties, ddl_guard, mode);
+        [[maybe_unused]] bool done = InterpreterCreateQuery(query_ptr, create_context).doCreateTable(create, properties, ddl_guard, mode, /*engine_user_specified=*/false);
         ddl_guard.reset();
         chassert(done);
         created = true;
@@ -2839,12 +3182,7 @@ BlockIO InterpreterCreateQuery::doCreateOrReplaceTable(ASTCreateQuery & create,
                 {
                     /// The replaced table is dropped after the swap, under an internal temporary name that
                     /// grants cannot cover, so check the drop privilege for its kind here, on its real name.
-                    AccessType drop_access = AccessType::DROP_TABLE;
-                    if (to_drop->isView())
-                        drop_access = AccessType::DROP_VIEW;
-                    else if (to_drop->isDictionary())
-                        drop_access = AccessType::DROP_DICTIONARY;
-                    current_context->checkAccess(drop_access, to_drop_id);
+                    current_context->checkAccess(getDropAccessType(*to_drop), to_drop_id);
                     to_drop->checkTableSizeBelowDropLimit(current_context);
                 }
             });
@@ -3094,7 +3432,8 @@ StoragePtr InterpreterCreateQuery::getValidatedAtomicPopulateSource(const ASTCre
     if (context->hasQueryContext())
         context->getQueryContext()->dropStorageCacheEntry(*ref_dependencies.mv_from_dependency);
 
-    auto source = DatabaseCatalog::instance().tryGetTable(*ref_dependencies.mv_from_dependency, context);
+    auto source = resolveStorageProxyLoading(
+        DatabaseCatalog::instance().tryGetTable(*ref_dependencies.mv_from_dependency, context));
 
     /// The view's SELECT was validated against the source before the view was published, so the source
     /// existed then; not finding it now means it was dropped, renamed or exchanged away in the window
@@ -3450,6 +3789,32 @@ BlockIO InterpreterCreateQuery::execute()
                 && create.storage->engine->name == "Backup" && create.storage->engine->arguments)
                 DatabaseBackup::parseAndAuthorizeLocator(create.storage->engine->arguments->children, getContext());
 
+            /// this branch returns before setEngine, and the worker builds AS src with no user, so
+            /// check the inherited definition here, on a copy of the query
+            if (!create.as_table.empty())
+            {
+                /// a worker resolves a name without a database in its own database, so set ours, as
+                /// the UUIDs above do
+                create.as_database = getContext()->resolveDatabase(create.as_database);
+
+                /// OLDEST_VERSION sends no settings, so a worker replaces nothing with Null. check
+                /// what the worker builds, not what our settings give
+                auto preflight_context = Context::createCopy(getContext());
+                if (on_cluster_version == DDLLogEntry::OLDEST_VERSION)
+                {
+                    preflight_context->setSetting("restore_replace_external_engines_to_null", false);
+                    preflight_context->setSetting("restore_replace_external_table_functions_to_null", false);
+                }
+
+                ASTPtr inherited_query = query_ptr->clone();
+                auto & inherited = inherited_query->as<ASTCreateQuery &>();
+                InterpreterCreateQuery(inherited_query, preflight_context).setEngine(inherited);
+
+                /// getRequiredAccess sees no engine, because this query holds none of its own
+                if (inherited.storage && inherited.storage->engine)
+                    getContext()->checkAccess(AccessType::TABLE_ENGINE, inherited.storage->engine->name);
+            }
+
             return executeQueryOnCluster(create);
         }
     }
@@ -3507,6 +3872,16 @@ AccessRightsElements InterpreterCreateQuery::getRequiredAccess() const
                 required_access.emplace_back(AccessType::DROP_TABLE, create.getDatabase(), create.getTable());
             required_access.emplace_back(AccessType::CREATE_TABLE, create.getDatabase(), create.getTable());
         }
+    }
+
+    /// Replicated and ON CLUSTER replays run with full access, so the drop privilege for the replaced
+    /// table's kind must be required here, on its real name, while the query still runs as the user.
+    if ((create.replace_table || create.create_or_replace || create.replace_view) && !create.isTemporary())
+    {
+        String database_name = getContext()->resolveDatabase(create.getDatabase());
+        if (auto database = DatabaseCatalog::instance().tryGetDatabase(database_name))
+            if (auto table = database->tryGetTable(create.getTable(), getContext()))
+                required_access.emplace_back(getDropAccessType(*table), database_name, create.getTable());
     }
 
     if (create.targets)
@@ -3645,6 +4020,11 @@ void InterpreterCreateQuery::convertMergeTreeTableIfPossible(ASTCreateQuery & cr
     }
     else if (!to_replicated)
        throw Exception(ErrorCodes::INCORRECT_QUERY, "Can not attach table as not replicated, table is already not replicated");
+
+    /// Must precede every side effect below: neither the transaction metadata removal nor the
+    /// metadata rewrite can be rolled back. The other direction takes no Keeper path at all.
+    if (to_replicated)
+        DatabaseOrdinary::checkReplicaPathIsSafe(create, getContext());
 
     /// Ensure the old detached table instance is destroyed before we remove
     /// transaction metadata files. Otherwise the old table's parts still hold

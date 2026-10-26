@@ -17,6 +17,7 @@
 #include <IO/WriteSettings.h>
 #include <Disks/IO/getThreadPoolReader.h>
 #include <Formats/FormatSettings.h>
+#include <Access/ForwardedAuthToken.h>
 #include <Interpreters/ClientInfo.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>
@@ -178,6 +179,10 @@ class DDLWorker;
 class ITableFunction;
 using TableFunctionPtr = std::shared_ptr<ITableFunction>;
 class Block;
+/// An entry of the query scalar map: the scalar block plus whether it came from the client.
+/// Defined in Context.cpp, where `Block` is complete; here `std::map` only needs the forward
+/// declaration, the same way `Scalars` is a `std::map` over the forward-declared `Block`.
+struct ScalarEntry;
 class ActionLocksManager;
 using ActionLocksManagerPtr = std::shared_ptr<ActionLocksManager>;
 class ShellCommand;
@@ -368,6 +373,7 @@ protected:
     ContextSharedPart * shared{};
 
     ClientInfo client_info;
+    ForwardedAuthTokenPtr forwarded_auth_token;
     ExternalTablesInitializer external_tables_initializer_callback;
     QueryPlanDeserializationCallback query_plan_deserialization_callback;
 
@@ -422,8 +428,13 @@ protected:
 
     TemporaryTablesMapping external_tables_mapping;
     mutable std::shared_ptr<HypotheticalObjectStore> hypothetical_object_store;
-    /// Query scalars
-    Scalars scalars;
+    /// Query scalars. Each entry carries whether it was supplied by the client over the wire (the
+    /// `Scalar` packet, i.e. the `clickhouse-client --external ... --scalar` feature or an initiator
+    /// shipping scalars to a shard) rather than computed by the server itself. The origin travels with
+    /// the block so that the analyzer's scalar-subquery cache (which keys on the query-tree hash) never
+    /// mistakes a client-supplied block for an already-computed subquery result; without this a client
+    /// could forge the result of a scalar subquery used in a row policy and bypass the policy.
+    std::map<String, ScalarEntry> scalars;
     /// Used to store constant values which are different on each instance during distributed plan, such as _shard_num.
     Scalars special_scalars;
 
@@ -842,6 +853,7 @@ public:
         RABBITMQ_UNSUPPORTED_COLUMNS,
         REPLICATED_DB_WITH_ALL_GROUPS_CLUSTER_PREFIX,
         ROTATIONAL_DISK_WITH_DISABLED_READHEAD,
+        CUSTOM_DISK_NOT_ALLOWED_BY_REMOTE_URL_ALLOW_HOSTS,
         SERVER_BUILT_IN_DEBUG_MODE,
         SERVER_BUILT_WITH_COVERAGE,
         SERVER_BUILT_WITH_SANITIZERS,
@@ -1006,6 +1018,9 @@ public:
 
     /// Modify stored in the context information about the client executing a query.
     void setClientInfo(const ClientInfo & client_info_);
+
+    const ForwardedAuthTokenPtr & getForwardedAuthToken() const { return forwarded_auth_token; }
+    void setForwardedAuthToken(ForwardedAuthTokenPtr token);
     void setClientName(const String & client_name);
     void setClientInterface(ClientInfo::Interface interface);
     void setClientVersion(UInt64 client_version_major, UInt64 client_version_minor, UInt64 client_version_patch, unsigned client_tcp_protocol_version);
@@ -1060,6 +1075,16 @@ public:
     Block getScalar(const String & name) const;
     void addScalar(const String & name, const Block & block);
     bool hasScalar(const String & name) const;
+
+    /// Add a scalar received from the client over the wire (the `Scalar` packet). Unlike `addScalar`,
+    /// the entry is marked as client-supplied so that `hasComputedScalar` will not report it as a
+    /// server-computed subquery result. Explicit readers (`__getScalar`, `_shard_num`, forwarding to
+    /// shards) still see it through `getScalar` / `hasScalar` / `getScalars`.
+    void addClientScalar(const String & name, const Block & block);
+    /// Like `hasScalar`, but returns true only for scalars the server computed itself, never for
+    /// client-supplied ones. The analyzer's scalar-subquery cache must use this so that a forged
+    /// client scalar cannot stand in for the result of a (e.g. row-policy) scalar subquery.
+    bool hasComputedScalar(const String & name) const;
 
     std::optional<Block> tryGetSpecialScalar(const String & name) const;
     void addSpecialScalar(const String & name, const Block & block);
@@ -1160,6 +1185,7 @@ public:
 
     void addViewSource(const StoragePtr & storage);
     StoragePtr getViewSource() const;
+    void clearViewSource();
 
     String getCurrentDatabase() const;
     String getCurrentQueryId() const { return client_info.current_query_id; }
@@ -1232,6 +1258,8 @@ public:
     void checkSettingsConstraints(const SettingsChanges & changes, SettingSource source);
     void checkSettingsConstraints(SettingsChanges & changes, SettingSource source);
     void checkSettingsConstraintsForSettingsReset(const std::vector<String> & names, SettingSource source);
+    /// For the resets of a statement that also changes `profile`: `changes_applied_first` decides their constraints.
+    void checkSettingsConstraintsForSettingsReset(const std::vector<String> & names, const SettingsChanges & changes_applied_first, SettingSource source);
     void clampToSettingsConstraints(SettingsChanges & changes, SettingSource source);
     void checkMergeTreeSettingsConstraints(const MergeTreeSettings & merge_tree_settings, const SettingsChanges & changes) const;
 
@@ -1727,6 +1755,7 @@ public:
 
     /// Call after initialization before using system logs. Call for global context.
     void initializeSystemLogs();
+    bool hasSystemLogs() const;
 
     /// Call after initialization before using trace collector.
     void createTraceCollector();

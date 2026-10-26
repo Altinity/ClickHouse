@@ -52,6 +52,14 @@ public:
         return IStorage::getInMemoryMetadataPtr(context_, bypass_metadata_cache);
     }
 
+    StoragePtr tryGetNested() const override
+    {
+        std::lock_guard lock{nested_mutex};
+        return nested;
+    }
+
+    bool isLazyStandIn() const override { return true; }
+
     StoragePtr getNested() const override
     {
         std::lock_guard lock{nested_mutex};
@@ -95,6 +103,13 @@ public:
         std::lock_guard lock{nested_mutex};
         if (nested)
             nested->flushAndPrepareForShutdown();
+    }
+
+    void prepareForDrop(ContextPtr query_context) override
+    {
+        std::lock_guard lock{nested_mutex};
+        if (nested)
+            nested->prepareForDrop(query_context);
     }
 
     void drop() override

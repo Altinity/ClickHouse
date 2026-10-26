@@ -153,6 +153,7 @@ def setup_cluster(request):
         + request.param,
         user_configs=[
             "configs/zookeeper_retries.xml",
+            "configs/users.xml",
         ],
         with_minio=True,
         with_rustfs=True,

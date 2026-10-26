@@ -294,6 +294,15 @@ public:
     /// instead of just copying pointer to this AggregateData. Used in WindowTransform.
     virtual void insertMergeResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena * arena) const;
 
+    /// Undoes one insertResultInto(place, to): removes from `to` exactly the rows that call appended, in
+    /// the reverse of the order it appended them, and leaves every state still owned by `place` alive.
+    /// Callers invoke it from a `catch` block while an exception is in flight, so it must not allocate
+    /// and must not throw. Every insertResultInto appends exactly one top-level row, hence the default.
+    virtual void rollbackInsertResult(ConstAggregateDataPtr __restrict /*place*/, IColumn & to) const noexcept
+    {
+        to.popBack(1);
+    }
+
     /// Used for machine learning methods. Predict result from trained model.
     /// Will insert result into `to` column for rows in range [offset, offset + limit).
     virtual void predictValues(
@@ -444,6 +453,12 @@ public:
     /// but in some functions we can want to process this argument somehow (for example condition argument in If combinator).
     /// This method returns the set of argument indexes that can be always NULL, they will be skipped in combinator Null.
     virtual UnorderedSetWithMemoryTracking<size_t> getArgumentsThatCanBeOnlyNull() const { return {}; }
+
+    /** If true, the `Null` combinator (and `If` over `Nullable` arguments) only skips `NULL` rows, and its state has the same bytes and
+      * type as the state of this function for a non-`Nullable` argument, without the flag byte. Only for a function whose state of no
+      * values is the empty state, for example `uniqApacheHLL`; it requires `returns_default_when_only_null`.
+      */
+    virtual bool stateIsIndependentOfNullability() const { return false; }
 
     /** Return the nested function if this is an Aggregate Function Combinator.
       * Otherwise return nullptr.

@@ -298,6 +298,9 @@
     M(FormatParsingThreads, "Number of threads in the thread pool used for parsing input.") \
     M(FormatParsingThreadsActive, "Number of threads in the thread pool used for parsing input running a task.") \
     M(FormatParsingThreadsScheduled, "Number of queued or active jobs in the thread pool used for parsing input.") \
+    M(IcebergManifestDecodeThreads, "Number of threads in the thread pool used for decoding Iceberg data manifest files.") \
+    M(IcebergManifestDecodeThreadsActive, "Number of threads in the thread pool used for decoding Iceberg data manifest files running a task.") \
+    M(IcebergManifestDecodeThreadsScheduled, "Number of queued or active jobs in the thread pool used for decoding Iceberg data manifest files.") \
     M(OutdatedPartsLoadingThreads, "Number of threads in the threadpool for loading Outdated data parts.") \
     M(OutdatedPartsLoadingThreadsActive, "Number of active threads in the threadpool for loading Outdated data parts.") \
     M(OutdatedPartsLoadingThreadsScheduled, "Number of queued or active jobs in the threadpool for loading Outdated data parts.") \
@@ -377,6 +380,8 @@
     M(AsyncInsertCacheSize, "Number of async insert hash id in cache") \
     M(IcebergMetadataFilesCacheBytes, "Size of the Iceberg metadata cache in bytes") \
     M(IcebergMetadataFilesCacheFiles, "Number of cached files in the Iceberg metadata cache") \
+    M(GlueCatalogSchemaCacheBytes, "Size of the cache of current Iceberg schema field types in Glue catalogs in bytes") \
+    M(GlueCatalogSchemaCacheEntries, "Number of entries in the cache of current Iceberg schema field types in Glue catalogs") \
     M(PaimonMetadataFilesCacheBytes, "Size of the Paimon metadata cache in bytes") \
     M(PaimonMetadataFilesCacheFiles, "Number of cached files in the Paimon metadata cache") \
     M(ParquetMetadataCacheBytes, "Size of the Parquet metadata cache in bytes") \
@@ -408,6 +413,8 @@
     M(DNSAddressesCacheSize, "Number of cached DNS addresses") \
     M(MarkCacheBytes, "Total size of mark cache in bytes") \
     M(MarkCacheFiles, "Total number of mark files cached in the mark cache") \
+    M(DataLakeCatalogUserTokenCacheEntries, "Total number of per-user session tokens exchanged for data lake catalog access") \
+    M(DataLakeCatalogUserClientCacheEntries, "Total number of per-user catalog clients built from forwarded user tokens") \
     M(UniqueKeyIndexCacheBytes, "Total size of UNIQUE KEY index cache in bytes") \
     M(UniqueKeyIndexCacheEntries, "Total number of UNIQUE KEY index blocks cached") \
     M(DeleteBitmapCacheBytes, "Total size of the UNIQUE KEY delete-bitmap cache in bytes") \

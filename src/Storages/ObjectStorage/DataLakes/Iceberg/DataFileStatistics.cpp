@@ -3,9 +3,15 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/IColumn.h>
+#include <Core/Block.h>
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
 
 #if USE_AVRO
 
@@ -33,9 +39,8 @@ void DataFileStatistics::update(const Chunk & chunk)
     if (!chunk.hasRows())
         return;
     size_t num_columns = chunk.getNumColumns();
-    if (column_sizes.empty())
+    if (null_counts.empty())
     {
-        column_sizes.resize(num_columns, 0);
         null_counts.resize(num_columns, 0);
         for (size_t i = 0; i < num_columns; ++i)
         {
@@ -48,7 +53,6 @@ void DataFileStatistics::update(const Chunk & chunk)
     for (size_t i = 0; i < num_columns; ++i)
     {
         const auto & col = chunk.getColumns()[i];
-        column_sizes[i] += col->byteSize();
         if (const auto * nullable_col = checkAndGetColumn<ColumnNullable>(col.get()))
         {
             for (UInt8 v : nullable_col->getNullMapData())
@@ -58,23 +62,77 @@ void DataFileStatistics::update(const Chunk & chunk)
     }
 }
 
-void DataFileStatistics::merge(const DataFileStatistics & other)
+void DataFileStatistics::excludeColumns(std::vector<bool> excluded_)
 {
-    if (other.column_sizes.empty())
+    chassert(excluded_.size() == field_ids.size());
+    excluded = std::move(excluded_);
+}
+
+void DataFileStatistics::addColumnSizesOnDisk(const std::unordered_map<String, size_t> & sizes_by_column_name, const Block & sample_block)
+{
+    if (sizes_by_column_name.empty())
         return;
 
+    if (sample_block.columns() != field_ids.size())
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Iceberg data file has {} columns while its schema has {} fields",
+            sample_block.columns(),
+            field_ids.size());
+
     if (column_sizes.empty())
+        column_sizes.resize(field_ids.size(), 0);
+
+    for (size_t i = 0; i < field_ids.size(); ++i)
     {
-        column_sizes = other.column_sizes;
+        /// Columns not stored in the data file (e.g. a column of only the Iceberg `unknown` type) are
+        /// excluded by excludeColumns() and never reported by the output format; skip them exactly like the
+        /// getters do, otherwise finalize() throws for a column that was intentionally not written.
+        if (isExcluded(i))
+            continue;
+        const auto & column_name = sample_block.getByPosition(i).name;
+        auto it = sizes_by_column_name.find(column_name);
+        if (it == sizes_by_column_name.end())
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR, "Written data file does not report the on-disk size of column {}", column_name);
+        column_sizes[i] += static_cast<Int64>(it->second);
+    }
+}
+
+void DataFileStatistics::merge(const DataFileStatistics & other)
+{
+    if (excluded.size() < other.excluded.size())
+        excluded.resize(other.excluded.size(), false);
+    for (size_t i = 0; i < other.excluded.size(); ++i)
+        excluded[i] = excluded[i] || other.excluded[i];
+
+    if (!other.column_sizes.empty())
+    {
+        if (column_sizes.empty())
+        {
+            column_sizes = other.column_sizes;
+        }
+        else
+        {
+            chassert(column_sizes.size() == other.column_sizes.size());
+            for (size_t i = 0; i < column_sizes.size(); ++i)
+                column_sizes[i] += other.column_sizes[i];
+        }
+    }
+
+    if (other.null_counts.empty())
+        return;
+
+    if (null_counts.empty())
+    {
         null_counts = other.null_counts;
         ranges = other.ranges;
         return;
     }
 
-    chassert(column_sizes.size() == other.column_sizes.size());
-    for (size_t i = 0; i < column_sizes.size(); ++i)
+    chassert(null_counts.size() == other.null_counts.size());
+    for (size_t i = 0; i < null_counts.size(); ++i)
     {
-        column_sizes[i] += other.column_sizes[i];
         null_counts[i] += other.null_counts[i];
         ranges[i] = uniteRanges(ranges[i], other.ranges[i]);
     }
@@ -94,7 +152,8 @@ std::vector<std::pair<size_t, size_t>> DataFileStatistics::getColumnSizes() cons
     std::vector<std::pair<size_t, size_t>> result;
     for (size_t i = 0; i < column_sizes.size(); ++i)
     {
-        result.push_back({field_ids[i], column_sizes[i]});
+        if (!isExcluded(i))
+            result.push_back({field_ids[i], column_sizes[i]});
     }
     return result;
 }
@@ -104,7 +163,8 @@ std::vector<std::pair<size_t, size_t>> DataFileStatistics::getNullCounts() const
     std::vector<std::pair<size_t, size_t>> result;
     for (size_t i = 0; i < null_counts.size(); ++i)
     {
-        result.push_back({field_ids[i], null_counts[i]});
+        if (!isExcluded(i))
+            result.push_back({field_ids[i], null_counts[i]});
     }
     return result;
 }
@@ -115,7 +175,8 @@ std::vector<std::pair<size_t, Field>> DataFileStatistics::getLowerBounds() const
     std::vector<std::pair<size_t, Field>> result;
     for (size_t i = 0; i < ranges.size(); ++i)
     {
-        result.push_back({field_ids[i], ranges[i].left});
+        if (!isExcluded(i))
+            result.push_back({field_ids[i], ranges[i].left});
     }
     return result;
 }
@@ -125,7 +186,8 @@ std::vector<std::pair<size_t, Field>> DataFileStatistics::getUpperBounds() const
     std::vector<std::pair<size_t, Field>> result;
     for (size_t i = 0; i < ranges.size(); ++i)
     {
-        result.push_back({field_ids[i], ranges[i].right});
+        if (!isExcluded(i))
+            result.push_back({field_ids[i], ranges[i].right});
     }
     return result;
 }
