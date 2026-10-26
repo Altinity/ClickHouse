@@ -229,6 +229,15 @@ def main():
     if use_thinlto_cache:
         print(f"ThinLTO cache is enabled in {thinlto_cache_dir}")
         cmake_cmd += f" -DTHINLTO_CACHE_DIR={thinlto_cache_dir}"
+        # Optional second marker `.link_jobs` holding a number: link that many
+        # binaries concurrently instead of the memory-derived default, so the
+        # two serial thin-link phases (clickhouse, keeper) overlap.
+        link_jobs_marker = f"{thinlto_cache_dir}/.link_jobs"
+        if os.path.exists(link_jobs_marker):
+            with open(link_jobs_marker) as f:
+                link_jobs = int(f.read().strip())
+            print(f"Linking {link_jobs} binaries concurrently ({link_jobs_marker})")
+            cmake_cmd += f" -DPARALLEL_LINK_JOBS={link_jobs}"
 
     # PGO/BOLT profile integration for release builds. The sccache-warmup builds
     # are deliberately excluded: they exist only to populate the shared compiler
