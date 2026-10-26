@@ -641,6 +641,10 @@ if (ENABLE_TESTS)
         clickhouse_common_zookeeper
         hilite_comparator)
 
+    if (TARGET ch_contrib::brotli)
+        target_link_libraries(unit_tests_dbms PRIVATE ch_contrib::brotli)
+    endif()
+
     if (TARGET ch_contrib::simdjson)
         target_link_libraries(unit_tests_dbms PRIVATE ch_contrib::simdjson)
     endif()
