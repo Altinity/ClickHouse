@@ -67,17 +67,8 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 ENV NUM_TRIES=1
 ENV MAX_RUN_TIME=0
 
-# Unrelated to vars in setup_minio.sh, but should be the same there
-# to have the same binaries for local running scenario
-ARG MINIO_SERVER_VERSION=2022-01-03T18-22-58Z
-ARG MINIO_CLIENT_VERSION=2022-01-05T23-52-51Z
-ARG TARGETARCH
-
-# Download Minio-related binaries
-RUN arch=${TARGETARCH:-amd64} \
-    && curl -L "https://dl.min.io/server/minio/release/linux-${arch}/archive/minio.RELEASE.${MINIO_SERVER_VERSION}" -o ./minio \
-    && curl -L "https://dl.min.io/client/mc/release/linux-${arch}/archive/mc.RELEASE.${MINIO_CLIENT_VERSION}" -o ./mc \
-    && chmod +x ./mc ./minio
+# MinIO no longer publishes binaries on dl.min.io, take them from the mirror image
+COPY --from=clickhouse/minio-minio:RELEASE.2024-07-31T05-46-26Z /usr/bin/minio /usr/bin/mc ./
 
 RUN curl -L --no-verbose -O 'https://archive.apache.org/dist/hadoop/common/hadoop-3.3.1/hadoop-3.3.1.tar.gz' \
     && tar -xvf hadoop-3.3.1.tar.gz \
